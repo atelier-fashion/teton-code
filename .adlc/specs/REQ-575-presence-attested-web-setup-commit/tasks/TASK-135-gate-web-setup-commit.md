@@ -1,7 +1,7 @@
 ---
 id: TASK-135
 title: "Gate web/setup_commit with refuse_unattested_commitment; move it off the reader loop"
-status: draft
+status: complete
 parent: REQ-575
 created: 2026-08-14
 updated: 2026-08-14

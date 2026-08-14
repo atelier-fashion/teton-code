@@ -946,12 +946,17 @@ fn refuse_daemon_wide(conn: &ConnState, id: &Id) -> Option<String> {
 /// model-supplied shell word, so a non-descendant same-UID process still passes
 /// it. That residual is tolerable for a config read. It is **not** tolerable for
 /// a commitment whose blast radius is the whole machine — a model change, a
-/// multi-gigabyte download — which is why those two methods, and only those two,
-/// ask for presence on top.
+/// multi-gigabyte download, or writing the `[web]` egress table — which is why
+/// three methods ask for presence on top: `model/confirm`, `model/set`, and
+/// (REQ-575) `web/setup_commit`.
 ///
 /// The split is the spec's rather than a convenience: `config/get`, `cost/query`
 /// and `web/refresh` stay layer (a) only. Prompting a human to evict a cached
 /// document would train them to click through the prompt that matters.
+///
+/// `config/set` is the known next candidate — a larger blast radius still
+/// (`RegisterProvider`, `SetPrivacyBoundary`) — deliberately left at layer (a)
+/// here and tracked in REQ-576, so a fourth caller is a decision, not drift.
 ///
 /// Unlike the consent path this does **not** record into the attestation
 /// registry. There is no consent `request_id` here to bind to — these methods
@@ -1552,13 +1557,18 @@ async fn handle_client(stream: UnixStream, daemon: Arc<Daemon>, peer: PeerIdenti
         // the very `session/attach` whose consent is being answered.
         // `model/confirm` and `model/set` join for BR-10(b): a daemon-wide
         // commitment now asks for presence too, and that prompt parks on a human
-        // exactly as the consent one does.
+        // exactly as the consent one does. `web/setup_commit` joins them for the
+        // same reason (REQ-575): writing the `[web]` egress table is a daemon-wide
+        // commitment, so it now attests, and its handler moved off the reader-loop
+        // `dispatch` to here rather than parking every other RPC on this
+        // connection behind a Touch ID prompt.
         let blocks_on_a_human = matches!(
             method,
             m if m == SessionAttachParams::METHOD
                 || m == AttachConsentParams::METHOD
                 || m == ModelConfirmParams::METHOD
                 || m == ModelSetParams::METHOD
+                || m == WebSetupCommitParams::METHOD
         );
         if blocks_on_a_human {
             let daemon = Arc::clone(&daemon);
@@ -1574,8 +1584,10 @@ async fn handle_client(stream: UnixStream, daemon: Arc<Daemon>, peer: PeerIdenti
                     handle_attach_consent(&daemon, &conn, id, params).await
                 } else if method == ModelConfirmParams::METHOD {
                     handle_model_confirm(&daemon, &conn, id, params).await
-                } else {
+                } else if method == ModelSetParams::METHOD {
                     handle_model_set(&daemon, &conn, id, params).await
+                } else {
+                    handle_web_setup_commit(&daemon, &conn, id, params).await
                 };
                 // The fence for the same reason `dispatch`'s responses take it:
                 // any event already delivered to this client's subscription
@@ -2172,13 +2184,16 @@ fn dispatch(
         ConfigSetParams::METHOD => Some(handle_config_set(daemon, conn, id, params)),
         CostQueryParams::METHOD => Some(handle_cost_query(daemon, conn, id)),
         WebOverrideParams::METHOD => Some(handle_web_override(daemon, conn, id, params)),
-        // REQ-572: the three setup methods are session-scoped, so they belong
-        // here beside `web/override` and **not** in `refuse_daemon_wide`'s list
-        // — the question they ask is "may this connection drive this session",
-        // which is `may_drive`'s, not the ancestry gate's.
+        // REQ-572: the setup *reads* are session-scoped, so they belong here
+        // beside `web/override` and **not** in `refuse_daemon_wide`'s list — the
+        // question they ask is "may this connection drive this session", which is
+        // `may_drive`'s, not the ancestry gate's. `web/setup_commit` is NOT here:
+        // since REQ-575 it is additionally a BR-10(b) commitment that may attest
+        // (park on a human), so it runs on its own task in `handle_client`'s
+        // `blocks_on_a_human` path — it keeps the same `may_drive` layer-(a) gate,
+        // and adds presence on top.
         WebSetupPlanParams::METHOD => Some(handle_web_setup_plan(daemon, conn, id, params)),
         WebSetupPreviewParams::METHOD => Some(handle_web_setup_preview(daemon, conn, id, params)),
-        WebSetupCommitParams::METHOD => Some(handle_web_setup_commit(daemon, conn, id, params)),
         SessionPermissionsParams::METHOD => {
             Some(handle_session_permissions(daemon, conn, id, params))
         }
@@ -2438,7 +2453,12 @@ fn handle_web_setup_preview(daemon: &Daemon, conn: &ConnState, id: Id, params: V
 /// `may_drive` gate below is the *defense in depth* BR-4 asks for on top of it,
 /// which is why it needs a test of its own rather than resting on the
 /// structural argument (LESSON-508).
-fn handle_web_setup_commit(daemon: &Daemon, conn: &ConnState, id: Id, params: Value) -> String {
+async fn handle_web_setup_commit(
+    daemon: &Daemon,
+    conn: &ConnState,
+    id: Id,
+    params: Value,
+) -> String {
     let params: WebSetupCommitParams = match serde_json::from_value(params) {
         Ok(params) => params,
         Err(_) => return error_string(id, error_code::INVALID_PARAMS, "invalid params"),
@@ -2449,6 +2469,16 @@ fn handle_web_setup_commit(daemon: &Daemon, conn: &ConnState, id: Id, params: Va
     if let Some(refusal) =
         refuse_commit_without_session_access(daemon, conn, &id, &params.session_id)
     {
+        return refusal;
+    }
+    // BR-10(b) / REQ-575: writing the `[web]` egress table is a daemon-wide
+    // commitment, so it takes the same presence check `model/confirm` and
+    // `model/set` take — the *same* function, degrading (not refusing) where no
+    // mechanism exists (REQ-570 BR-8). Ordered **after** the session-access gate
+    // deliberately: a caller that may not drive this session at all is refused
+    // with no prompt appearing on anyone's screen (BR-2, the `model/confirm`
+    // ordering rationale).
+    if let Some(refusal) = refuse_unattested_commitment(daemon, conn, &id).await {
         return refusal;
     }
     match daemon.runtime.web_setup_commit(&params, &daemon.events) {
@@ -6938,6 +6968,39 @@ mod tests {
         })
     }
 
+    /// Drive `web/setup_commit` the way `handle_client` does after REQ-575: the
+    /// commit left the synchronous `dispatch` (it may run a presence prompt off
+    /// the reader loop, ADR-1), so a unit test reaches its async handler on a
+    /// throwaway current-thread runtime. With the default `UnavailableVerifier`
+    /// the BR-10(b) check degrades and never parks, so every outcome these tests
+    /// assert is byte-identical to when the method sat in `dispatch`.
+    fn commit_on_reader(daemon: &Daemon, conn: &ConnState, id: Id, params: Value) -> String {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("current-thread runtime for the async commit handler")
+            .block_on(handle_web_setup_commit(daemon, conn, id, params))
+    }
+
+    /// Route a setup method as `handle_client` now splits them: `web/setup_commit`
+    /// to its async handler (above), the plan/preview reads to synchronous
+    /// `dispatch`. A drop-in for `dispatch` at the setup seams — same
+    /// `Option<String>` return — so a migrated call site is a bare rename with its
+    /// `.unwrap()` intact.
+    fn route_setup(
+        daemon: &Daemon,
+        conn: &ConnState,
+        id: Id,
+        method: &str,
+        params: Value,
+    ) -> Option<String> {
+        if method == WebSetupCommitParams::METHOD {
+            Some(commit_on_reader(daemon, conn, id, params))
+        } else {
+            dispatch(daemon, conn, id, method, params)
+        }
+    }
+
     /// The `web_setup_rejected` events queued on `sub` right now.
     ///
     /// `try_recv` rather than an awaited `recv` under a timeout: `publish` is
@@ -6985,7 +7048,7 @@ mod tests {
         // this call's doing and nothing else's.
         let mut sub = daemon.events.subscribe(16);
 
-        let refused = dispatch(
+        let refused = route_setup(
             &daemon,
             &intruder,
             Id::Number(2),
@@ -7022,7 +7085,7 @@ mod tests {
             rejection.origin
         );
 
-        let owners_own = dispatch(
+        let owners_own = route_setup(
             &daemon,
             &owner,
             Id::Number(3),
@@ -7089,7 +7152,7 @@ mod tests {
 
         // The positive control, on the same connection and the same
         // subscription: what changes something still announces.
-        dispatch(
+        route_setup(
             &daemon,
             &intruder,
             Id::Number(3),
@@ -7141,7 +7204,7 @@ mod tests {
         let mut sub = daemon.events.subscribe(16);
 
         for id in [2, 3] {
-            let refused = dispatch(
+            let refused = route_setup(
                 &daemon,
                 &intruder,
                 Id::Number(id),
@@ -7169,7 +7232,7 @@ mod tests {
         // of this bound (see `ConnState::setup_rejections_announced`): what is
         // capped is one connection's loop, not a peer that reconnects.
         let second = unattached(&daemon);
-        dispatch(
+        route_setup(
             &daemon,
             &second,
             Id::Number(4),
@@ -7203,7 +7266,7 @@ mod tests {
         let intruder = unattached(&daemon);
         let mut sub = daemon.events.subscribe(16);
 
-        dispatch(
+        route_setup(
             &daemon,
             &intruder,
             Id::Number(2),
@@ -7215,7 +7278,7 @@ mod tests {
         assert_eq!(announced.len(), 1);
         assert_eq!(announced[0].session_id.as_ref(), Some(&first));
 
-        dispatch(
+        route_setup(
             &daemon,
             &intruder,
             Id::Number(3),
@@ -7262,7 +7325,7 @@ mod tests {
         // Mintable length — `sess-` plus a 26-char body — so this passes the
         // F9 length gate and reaches the announcement seam it is aimed at.
         let phantom = SessionId::from("sess-aaaaaaaaaaaaaaaaaaaaaaaaaa");
-        let refused = dispatch(
+        let refused = route_setup(
             &daemon,
             &intruder,
             Id::Number(2),
@@ -7282,7 +7345,7 @@ mod tests {
              hands every monitor an envelope wearing an attacker-chosen id"
         );
 
-        let refused = dispatch(
+        let refused = route_setup(
             &daemon,
             &intruder,
             Id::Number(3),
@@ -7329,7 +7392,7 @@ mod tests {
             WebSetupPreviewParams::METHOD,
             WebSetupCommitParams::METHOD,
         ] {
-            let refused = dispatch(
+            let refused = route_setup(
                 &daemon,
                 &intruder,
                 Id::Number(1),
@@ -7354,7 +7417,7 @@ mod tests {
         // and reaches the session gate, so the refusals above are the length
         // rule and not the setup family being unroutable.
         let session = a_session_owned_by(&daemon, &unattached(&daemon));
-        let gated = dispatch(
+        let gated = route_setup(
             &daemon,
             &intruder,
             Id::Number(2),
@@ -7494,7 +7557,7 @@ mod tests {
         );
 
         // The positive control, on the same connection and subscription.
-        dispatch(
+        route_setup(
             &daemon,
             &intruder,
             Id::Number(3),
@@ -7554,7 +7617,7 @@ mod tests {
             for method in names {
                 let daemon = Daemon::new();
                 let child = conn_with_ancestry(&daemon, ancestry);
-                let response = dispatch(
+                let response = route_setup(
                     &daemon,
                     &child,
                     Id::Number(1),
