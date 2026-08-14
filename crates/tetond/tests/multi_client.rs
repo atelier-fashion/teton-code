@@ -1518,6 +1518,16 @@ async fn the_setup_methods_answer_an_attached_client_over_the_socket() {
             .is_empty(),
         "and the plan must name the missing piece rather than only greying it out: {plan}"
     );
+    // REQ-573: the suggestion catalog rides the same result — asserted on the
+    // dispatched JSON, not a struct built in-process, so a serialization-layer
+    // drop of the field fails here independently of any client's rendering.
+    assert_eq!(
+        plan["result"]["suggestion_catalog"]["backends"]
+            .as_array()
+            .map(Vec::len),
+        Some(3),
+        "the daemon-owned suggestion catalog must travel on the wire: {plan}"
+    );
 
     a.send(4, "web/setup_preview", setup_params(&sid)).await;
     let preview = a.read_response(4).await;

@@ -711,15 +711,10 @@ fn run_session(paths: &DaemonPaths, auto_accept: bool, verbose: bool) -> anyhow:
 
         // The entry area gets its own framed prompter; permission and model
         // questions keep the plain one in `ctx` — they are dialogue, not entry.
-        let entry_prompt = if interactive {
-            if color {
-                " \x1b[36m›\x1b[0m "
-            } else {
-                " › "
-            }
-        } else {
-            "› "
-        };
+        // Plain text only: the chevron's tint is applied inside the framed
+        // prompter, after defusing (REQ-573 — caller-composed SGR in a
+        // question is sanitizer food, not styling).
+        let entry_prompt = if interactive { " › " } else { "› " };
         let mut entry = FramedStdinPrompter::new(interactive, color);
         // REQ-560: seed the status row's permission field once, from the daemon.
         // Only when interactive — BR-9 draws no row on a pipe, so a piped

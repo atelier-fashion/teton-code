@@ -171,6 +171,9 @@ use crate::router::{
 use crate::selection_store::SelectionStore;
 use crate::sessions::{SessionRegistry, TurnClaimError};
 use crate::web::{UserUrls, WebCache};
+// The module rather than the function: `suggestion_catalog()` on its own would
+// read, in a file this size, as something the runtime computes.
+use crate::web_setup_catalog;
 
 /// Separator between reply blocks in a `TETON_LOCAL_SCRIPT` file.
 const SCRIPT_SEPARATOR: &str = "---";
@@ -3931,6 +3934,10 @@ impl DaemonRuntime {
             // the same statement as "the table says off" — the fresh-install
             // case this REQ exists for keeps its own answer.
             current_web: (!config.web.is_unset()).then(|| web_table_summary(&config.web)),
+            // Always `Some` from this build: the `None` on the wire means "a
+            // daemon that predates the catalog answered", which is a statement
+            // no daemon that has one may make (REQ-573 BR-3).
+            suggestion_catalog: Some(web_setup_catalog::suggestion_catalog()),
         }
     }
 
@@ -6713,6 +6720,11 @@ fn web_table_summary(web: &WebConfig) -> WebTableSummary {
 /// use; it is a heuristic and says so in its sentence, because the alternative
 /// — saying nothing — is how a key ends up in a config file, a shell history and
 /// every `web_lookup` destination string that endpoint ever produces.
+///
+/// The catalog's BR-6 sweep (`web_setup_catalog`'s tests) shares this rule via
+/// [`endpoint_query_names_a_credential`] — the whole function, not just this
+/// list, so the extraction cannot drift either (REQ-573 verify: a `://`-gated
+/// re-derivation of the split let scheme-less shapes sweep clean).
 const CREDENTIAL_QUERY_KEYS: [&str; 4] = ["api_key", "apikey", "key", "token"];
 
 /// Whether `endpoint`'s query string carries a parameter whose **name** says it
@@ -6726,7 +6738,10 @@ const CREDENTIAL_QUERY_KEYS: [&str; 4] = ["api_key", "apikey", "key", "token"];
 /// A hand-split rather than a URL parse, for the reason the whole function is a
 /// warning and not a gate: an endpoint that does not parse has its own arm
 /// below, and this one has to work on the string the user typed.
-fn endpoint_query_names_a_credential(endpoint: &str) -> bool {
+///
+/// `pub(crate)` for one reader beyond this module: the catalog's BR-6 sweep,
+/// which refuses to ship a suggestion whose own query names a credential.
+pub(crate) fn endpoint_query_names_a_credential(endpoint: &str) -> bool {
     endpoint
         .split_once('?')
         .map(|(_, query)| query)
@@ -15954,6 +15969,27 @@ provider_id = "on-device"
                 summary.search_key_ref.as_deref(),
                 Some("keychain://teton/web-search"),
                 "the reference, which is not a secret"
+            );
+        }
+
+        /// **REQ-573 BR-1/BR-3: this daemon always names its backends.**
+        ///
+        /// `None` on the wire is a specific claim — "the daemon answering
+        /// predates the catalog" — and it is the fact the CLI's degraded path
+        /// keys off. A build that has a catalog and forgets to attach it would
+        /// send that claim falsely, and the client would drop back to naming no
+        /// backend at all while the data sat one field away.
+        #[test]
+        fn the_plan_hands_over_this_daemons_suggestions() {
+            let (runtime, _path) = runtime_on_disk("web-setup-plan-catalog");
+            let catalog = runtime
+                .web_setup_plan()
+                .suggestion_catalog
+                .expect("a daemon with a catalog must send it");
+            assert_eq!(
+                catalog,
+                crate::web_setup_catalog::suggestion_catalog(),
+                "the plan must carry the one catalog, not a copy assembled here"
             );
         }
 

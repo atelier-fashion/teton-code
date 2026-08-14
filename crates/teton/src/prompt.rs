@@ -7,6 +7,8 @@
 
 use std::io::{self, Write};
 
+use crate::render::defused;
+
 /// A source of interactive answers.
 pub trait Prompter {
     /// Show `question` and read one line of input. Returns `None` on EOF (the
@@ -30,6 +32,15 @@ pub trait Prompter {
 }
 
 /// The real prompter: writes the question to stdout and reads a line from stdin.
+///
+/// **Every question is [`defused`] on the way out** (REQ-573). A question is not
+/// always a fixed string composed by this binary: it can carry a tool name the
+/// daemon sent, or — since the `/web setup` catalog moved daemon-side — an
+/// auth-header template that arrived over RPC. Those reach a terminal that reads
+/// control characters as *commands*, exactly like the text a
+/// [`crate::render::Surface`] guards, and this writer is the one path to the
+/// screen that does not go through one. The transform is imported rather than
+/// re-implemented: two sanitizers is one sanitizer plus a gap.
 #[derive(Debug, Default)]
 pub struct StdinPrompter;
 
@@ -44,7 +55,7 @@ impl StdinPrompter {
 impl Prompter for StdinPrompter {
     fn ask(&mut self, question: &str) -> Option<String> {
         let mut out = io::stdout();
-        let _ = write!(out, "{question}");
+        let _ = write!(out, "{}", defused(question));
         let _ = out.flush();
         let mut line = String::new();
         match io::stdin().read_line(&mut line) {
@@ -56,7 +67,7 @@ impl Prompter for StdinPrompter {
 
     fn ask_secret(&mut self, question: &str) -> Option<String> {
         let mut out = io::stdout();
-        let _ = write!(out, "{question}");
+        let _ = write!(out, "{}", defused(question));
         let _ = out.flush();
         // Engaged for exactly the read and restored by the guard's `Drop`, on
         // every path out — including the error one.
@@ -310,13 +321,33 @@ impl FramedStdinPrompter {
     /// Split out so the frame's geometry — the part that stands a row up or
     /// strands it — is assertable without a terminal (REQ-560 BR-11). `draw`
     /// itself is then a `write!` of this, which is the only part that needs one.
+    ///
+    /// The question is [`defused`] here for [`StdinPrompter`]'s reason, and the
+    /// frame sharpens it: this composition's own escapes move the cursor by
+    /// exactly the rows it drew, so a question carrying its own `\x1b[…A` or a
+    /// bare `\r` would step the cursor somewhere the geometry does not know
+    /// about and shred the frame it sits in.
     fn draw_bytes(&mut self, question: &str) -> String {
+        let question = defused(question);
+        // Styling happens HERE, after defusing, or not at all. A caller
+        // hand-composing SGR into the question hands the sanitizer exactly the
+        // bytes it exists to destroy — the REQ-573 verify pass briefly shipped
+        // that as literal `[36m` debris where the chevron's tint had been. The
+        // seam owns the tint; callers hand in plain text.
+        let question = if self.color {
+            question.replace('›', "\x1b[36m›\x1b[0m")
+        } else {
+            question
+        };
         let rule = self.rule();
         // Rule, blank input row, rule, then the status row if there is one.
         let mut bytes = format!("{rule}\n\n{rule}\n");
         self.below_rows = match &self.status {
             Some(status) => {
-                bytes.push_str(status);
+                // Enum-derived content today, defused anyway: the first status
+                // field that carries daemon- or model-supplied text would
+                // otherwise reopen the seam this function just closed.
+                bytes.push_str(&defused(status));
                 bytes.push('\n');
                 1
             }
@@ -666,6 +697,100 @@ mod tests {
         // nothing was read, and what to do about it.
         assert!(ECHO_UNAVAILABLE.contains("nothing was read"));
         assert!(ECHO_UNAVAILABLE.contains("stty sane"));
+    }
+
+    /// REQ-573: a question is defused before it reaches the terminal, and an
+    /// ordinary one is not touched.
+    ///
+    /// The hazard is not hypothetical: since the `/web setup` catalog became the
+    /// daemon's (REQ-573), the auth-header template named in the prompt is an
+    /// RPC-supplied string, and the permission flow's `{tool}` prompt has carried
+    /// daemon-supplied text since it shipped. Both land here, which is the one
+    /// writer to this terminal that is not a `Surface` — so the transform has to
+    /// be *this* function rather than a second one that drifts.
+    ///
+    /// Asserted through `draw_bytes` because that is the composition a test can
+    /// read without a terminal; `StdinPrompter::ask`/`ask_secret` write the
+    /// result of the same `defused` call, and `FramedStdinPrompter` with the
+    /// frame off delegates straight to them.
+    #[test]
+    fn a_question_is_defused_before_it_reaches_the_terminal() {
+        let mut p = FramedStdinPrompter::new(true, false);
+
+        // The repaint attack, aimed at a prompt instead of at a rendered line:
+        // erase this row, step up, and rewrite the question the user already
+        // read. Every commanding byte becomes a space, so the text stays visible
+        // and stays inert.
+        let hostile = "  auth header template [Enter for `\x1b[2KX-Evil: {key}\rgotcha`]: ";
+        let expected = crate::render::defused(hostile);
+        let bytes = p.draw_bytes(hostile);
+        let (frame, question) = bytes.split_at(bytes.len() - expected.len());
+        assert_eq!(question, expected);
+        assert!(
+            frame.ends_with("\x1b[2A"),
+            "the frame's own cursor escape is the only one left: {frame:?}"
+        );
+        assert!(
+            !question.contains('\x1b') && !question.contains('\r'),
+            "no byte that commands the terminal may survive: {question:?}"
+        );
+        assert!(
+            question.contains("X-Evil: {key}") && question.contains("gotcha"),
+            "the text itself is still shown — defusing is not hiding: {question:?}"
+        );
+
+        // And the questions this binary actually composes are byte-identical, so
+        // the guard costs the ordinary path nothing.
+        for ordinary in [
+            "  tier [1-3, or Enter to cancel]: ",
+            "  auth header template [Enter for `Authorization: Bearer {key}`]: ",
+            "> ",
+        ] {
+            let bytes = p.draw_bytes(ordinary);
+            assert!(
+                bytes.ends_with(ordinary),
+                "an ordinary question must survive verbatim: {bytes:?}"
+            );
+        }
+    }
+
+    /// **The chevron's tint belongs to the seam, not the caller (REQ-573).**
+    ///
+    /// The defusing fix briefly shipped its own regression: `main.rs` used to
+    /// hand the entry prompt in with SGR already composed, which the sanitizer
+    /// then (correctly) shredded into literal `[36m` debris. The tint is now
+    /// applied here, after defusing, so a plain-text question arrives styled
+    /// and a hostile question still arrives dead.
+    #[test]
+    fn the_chevrons_tint_is_applied_after_defusing_at_the_seam() {
+        // Colour on: plain " › " in, tinted chevron out.
+        let mut tinted = FramedStdinPrompter::new(true, true);
+        let bytes = tinted.draw_bytes(" › ");
+        assert!(
+            bytes.contains(" \x1b[36m›\x1b[0m "),
+            "the seam must tint the chevron the caller handed in plain: {bytes:?}"
+        );
+
+        // Colour off: the same question stays plain, and no SGR appears.
+        let mut plain = FramedStdinPrompter::new(true, false);
+        let bytes = plain.draw_bytes(" › ");
+        assert!(
+            bytes.contains(" › ") && !bytes.contains("\x1b[36m"),
+            "no colour means no SGR at all: {bytes:?}"
+        );
+
+        // A hostile question is defused whether or not the tint applies — the
+        // erase and the carriage return die, the chevron still gets its tint.
+        let mut hostile = FramedStdinPrompter::new(true, true);
+        let bytes = hostile.draw_bytes("\x1b[2K› \r");
+        assert!(
+            !bytes.contains("\x1b[2K") && !bytes.contains('\r'),
+            "defusing must run regardless of styling: {bytes:?}"
+        );
+        assert!(
+            bytes.contains("\x1b[36m›\x1b[0m"),
+            "styling must still apply to the defused text: {bytes:?}"
+        );
     }
 
     #[test]

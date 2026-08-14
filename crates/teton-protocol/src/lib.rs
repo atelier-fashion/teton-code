@@ -115,6 +115,19 @@ pub const PROTOCOL_VERSION_MAX: ProtocolVersion = ProtocolVersion(2);
 /// The version this build prefers to speak (equal to [`PROTOCOL_VERSION_MAX`]).
 pub const PROTOCOL_VERSION: ProtocolVersion = PROTOCOL_VERSION_MAX;
 
+/// The generic auth-header shape for a search backend nothing else describes.
+///
+/// It lives here, in the crate both binaries already depend on, because both
+/// ends need the *same* string and neither owns it (REQ-573 ADR-B): the daemon
+/// sends it as [`methods::WebSetupCatalog::default_auth_template`], and the CLI
+/// falls back to it directly when a daemon that predates the catalog answers
+/// with none at all (REQ-573 BR-3). A second literal spelled out client-side is
+/// the drift this constant exists to prevent.
+///
+/// `{key}` is a placeholder, not a credential — the substitution happens only
+/// when a request is built.
+pub const GENERIC_SEARCH_AUTH_TEMPLATE: &str = "Authorization: Bearer {key}";
+
 /// Defines a transparent `String` newtype used as a stable wire identifier.
 ///
 /// Transparent serde means the wire form is just the string — the newtype only

@@ -2756,12 +2756,31 @@ fn the_walkthrough_collects_every_answer_and_the_daemon_announces_the_write() {
         "a machine with a local tier must not mark the search row unavailable; \
          output:\n{session}"
     );
-    // The suggestions were shown — the ones `web_setup_contracts.rs` pins
-    // against the production request builder.
-    assert!(
-        session.contains("self-hosted SearxNG"),
-        "the endpoint question must carry the shipped suggestions; output:\n{session}"
-    );
+    // THE CROSS-SEAM PIN (REQ-573). Every other assertion about these rows lives
+    // on one side of the seam or the other: the daemon's golden test pins the
+    // catalog it builds, and the client's `shipped_catalog()` fixture pins what
+    // the renderer does with a catalog it was handed. Both can stay green while
+    // disagreeing with each other, because the client's fixture is a hand
+    // transcription of the daemon's list and nothing compares the two.
+    //
+    // This is the one place in CI where the real daemon's catalog reaches the
+    // real renderer, so the rows are pinned **verbatim** here rather than by
+    // substring. A label reworded on one side only, a header template that
+    // drifted, a column that stopped lining up — each of them fails here, which
+    // is the whole fixture-drift class.
+    for row in [
+        "  self-hosted SearxNG  http://localhost:8888/search?format=json  (no key)",
+        "  Brave Search API     https://api.search.brave.com/res/v1/web/search  \
+         (header `X-Subscription-Token: {key}`)",
+        "  Kagi Search API      https://kagi.com/api/v0/search  \
+         (header `Authorization: Bot {key}`)",
+    ] {
+        assert!(
+            session.contains(row),
+            "the endpoint question must carry the daemon's suggestions, byte for \
+             byte — this row is not in the output:\n{row}\noutput:\n{session}"
+        );
+    }
 
     // BR-7: the exact bytes were shown before the confirm, and the host came
     // from the daemon's parse rather than from anything the client re-derived.

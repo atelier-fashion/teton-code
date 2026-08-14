@@ -720,6 +720,25 @@ fn the_key_step_does_not_echo_and_the_key_reaches_nothing() {
         final_transcript.contains(ENDPOINT),
         "the walk never previewed the endpoint; transcript:\n{final_transcript}"
     );
+    // The empty answer above took what the prompt offered, and the endpoint
+    // typed was Brave's — so what the offer *said* is now an assertion rather
+    // than a comment about one (REQ-573). Pinned in the **prompt's own wording**,
+    // not by bare containment: the preview below carries the same template, so a
+    // containment check would pass on a prompt that had offered the generic
+    // Bearer default and a walk that had gone on to send it.
+    assert!(
+        final_transcript.contains("auth header template [Enter for `X-Subscription-Token: {key}`]"),
+        "the auth prompt must offer Brave's own header for a Brave endpoint — \
+         the generic Bearer default in its place is a config Brave answers 401 \
+         to; transcript:\n{final_transcript}"
+    );
+    // …and the empty answer really did take it: the previewed table carries the
+    // offered template, which is the half a prompt's wording cannot prove.
+    assert!(
+        final_transcript.contains("search_auth = \"X-Subscription-Token: {key}\""),
+        "Enter at the auth prompt must send what was offered; \
+         transcript:\n{final_transcript}"
+    );
 
     // (2) AC-5: the key was typed into the same terminal and never appeared.
     assert!(
