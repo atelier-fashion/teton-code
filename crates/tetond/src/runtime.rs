@@ -6240,6 +6240,13 @@ fn snapshot_from_config(config: &Config, router: &Router) -> ConfigSnapshot {
         // of a gate, because this is the same question `redaction_gate` asks —
         // one switch, one reader, no second answer to drift from the first.
         redact_enabled: config.privacy.redact,
+        // REQ-572 BR-3/BR-10: the derived web capability state. `None` until
+        // TASK-129 wires the derivation in — deliberately not a hand-rolled
+        // reading of `config.web.tier` here, because a second derivation of a
+        // state the exposure predicate already answers is the one thing BR-3
+        // forbids (LESSON-456). `None` reads as "this daemon has no answer",
+        // which is exactly true of this build.
+        web_capability: None,
     }
 }
 

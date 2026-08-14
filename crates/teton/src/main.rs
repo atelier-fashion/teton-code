@@ -2189,6 +2189,11 @@ mod tests {
             // The default posture (BR-10/OQ-3). The tests that care about the
             // switch set it explicitly, in both states.
             redact_enabled: false,
+            // REQ-572: no capability answer in this fixture, which is what a
+            // daemon predating the field sends. The renderer's handling of a
+            // state that *is* present belongs with the surface that draws it
+            // (TASK-131/132), not with this routing-table fixture.
+            web_capability: None,
         }
     }
 

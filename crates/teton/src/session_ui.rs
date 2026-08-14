@@ -499,6 +499,19 @@ pub fn render_event(
             surface.line(LineKind::Notice, &format_grant_minted(minted));
             EventOutcome::Rendered
         }
+        // REQ-572's three events reach this client as of TASK-127, which added
+        // them to the protocol vocabulary. Their **rendering** is TASK-132's,
+        // with the `/web setup` walkthrough they belong to: BR-14 asks for a
+        // completion and a rejection to be in front of a human, and the
+        // sentence that does that is written where the flow's other sentences
+        // are, not guessed at here.
+        //
+        // Arms rather than a `_` catch-all, deliberately: a wildcard would
+        // absorb every event a later REQ adds and turn "this client has no
+        // rendering yet" into a silence nothing fails on.
+        Event::WebSetupCompleted(_) | Event::WebSetupRejected(_) | Event::CapabilityDeadEnd(_) => {
+            EventOutcome::Rendered
+        }
     }
 }
 
