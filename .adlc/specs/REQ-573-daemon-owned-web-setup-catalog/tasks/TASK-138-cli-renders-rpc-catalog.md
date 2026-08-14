@@ -1,7 +1,7 @@
 ---
 id: TASK-138
 title: "CLI: render suggestions from the RPC catalog; delete client-side constants"
-status: draft
+status: complete
 parent: REQ-573
 created: 2026-08-14
 updated: 2026-08-14
@@ -32,27 +32,27 @@ lines, piped `instruction_lines`, and the offered auth default from
 
 ## Acceptance Criteria
 
-- [ ] Zero backend endpoint/auth literals remain in the teton crate: grep for
+- [x] Zero backend endpoint/auth literals remain in the teton crate: grep for
       `api.search.brave.com`, `kagi.com`, `X-Subscription-Token`,
       `Authorization: Bot`, `Bearer {key}` finds no non-test occurrence
       (test fixtures use sentinels; the degraded default is the shared
       protocol const, not a local literal) (AC-2/BR-1)
-- [ ] Synthetic-catalog test (LESSON-497 sentinels, e.g. `sentinel-backend` /
+- [x] Synthetic-catalog test (LESSON-497 sentinels, e.g. `sentinel-backend` /
       `X-Sentinel-Header: {key}`): help lines, `instruction_lines`, and the
       offered default all track the injected data (AC-2)
-- [ ] Catalog-absent test: plan with `suggestion_catalog: None` → flow
+- [x] Catalog-absent test: plan with `suggestion_catalog: None` → flow
       completes; no named suggestions rendered; offered default is
       `Authorization: Bearer {key}`; needs-key default yes; no panic (AC-7,
       BR-3)
-- [ ] With a catalog carrying the real three backends, rendered help lines
+- [x] With a catalog carrying the real three backends, rendered help lines
       and piped instructions are byte-identical to the v0.1.14 strings
       (parity fixture pinned in-test, AC-6 CLI altitude); Brave-host match
       offers `X-Subscription-Token: {key}`, unknown host offers the Bearer
       default (BR-8)
-- [ ] All existing web_setup_ui unit tests pass with updated fixtures;
+- [x] All existing web_setup_ui unit tests pass with updated fixtures;
       `Answers` debug-redaction and keychain/undo tests unchanged in
       behavior
-- [ ] `cargo test -p teton` green
+- [x] `cargo test -p teton` green
 
 ## Technical Notes
 
