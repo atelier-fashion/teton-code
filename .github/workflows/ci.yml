@@ -50,6 +50,48 @@ jobs:
       - name: Tests
         run: cargo test --workspace
 
+  gated:
+    name: feature-gated targets compile (all features)
+    # Every other job compiles the workspace with DEFAULT features, so a target
+    # gated behind a non-default feature (`llama`, `presence`, `live`,
+    # `test-seam`) is a file CI can see but never compiles — and a file that
+    # exists while nothing asserts it still builds is LESSON-510's shape
+    # exactly (existence checked, freshness not). BUG-166 is what that looks
+    # like in practice: the REQ-554 AC-6 weights smoke
+    # (crates/tetond/tests/template_smoke.rs) sat broken on main through a
+    # constructor change, CI green the whole time.
+    #
+    # Compiling is cheap where running is not: the gated tests need real
+    # weights or live keys to RUN, but only cmake to BUILD (llama.cpp compiles
+    # from source; the runner image ships cmake). Weights and keys stay out of
+    # CI; every `#[ignore]` stays ignored — this job runs no tests at all.
+    #
+    # macos-latest deliberately: `presence` is cfg-gated to
+    # `target_os = "macos"`, so an ubuntu leg with --all-features would still
+    # strip the LocalAuthentication FFI and claim more than it checked — the
+    # same trap this job exists to close. The macOS runner is the one place
+    # every gated cfg branch actually expands.
+    #
+    # Clippy rather than bare `cargo check`, warnings denied, so gated code
+    # meets the same bar the always-on clippy leg holds the rest of the tree
+    # to — a target that only compiles "on its own terms" would drift the
+    # moment it was next touched.
+    runs-on: macos-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install pinned Rust toolchain
+        run: |
+          rustup show active-toolchain || rustup toolchain install
+          rustup component add clippy
+
+      - name: Cache cargo build
+        uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+
+      - name: Clippy over every target with every feature (warnings denied)
+        run: cargo clippy --workspace --all-targets --all-features -- -D warnings
+
   catalog:
     name: catalog integrity (BR-8/AC-8)
     runs-on: ubuntu-latest

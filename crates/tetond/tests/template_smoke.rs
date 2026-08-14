@@ -78,6 +78,8 @@ async fn a_templated_turn_yields_one_well_formed_tool_call() {
 
     // The format is passed the way the daemon's engine slot passes it —
     // resolved from the engine at install, never locked for on the async path.
+    // The session id is the prefix cache's key (REQ-564 BR-3); this smoke
+    // drives one turn in one session, so any fixed id is faithful.
     let format = engine.chat_format();
     let engine: Arc<Mutex<dyn Engine>> = Arc::new(Mutex::new(engine));
     let mut source = LocalEngineSource::new(engine, format, SessionId::from("template-smoke"));
