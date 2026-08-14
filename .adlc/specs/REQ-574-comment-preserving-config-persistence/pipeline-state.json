@@ -3,10 +3,12 @@
   "branch": "feat/REQ-574-comment-preserving-config-persistence",
   "startedAt": "2026-08-14T00:00:00Z",
   "completed": false,
-  "currentPhase": 2,
+  "currentPhase": 4,
   "completedPhases": [
     0,
-    1
+    1,
+    2,
+    3
   ],
   "phaseHistory": [
     {
@@ -17,6 +19,16 @@
     {
       "phase": 1,
       "name": "Validate Requirement Spec",
+      "completedAt": "2026-08-14T00:00:00Z"
+    },
+    {
+      "phase": 2,
+      "name": "Architect & Break Into Tasks",
+      "completedAt": "2026-08-14T00:00:00Z"
+    },
+    {
+      "phase": 3,
+      "name": "Validate Architecture & Tasks",
       "completedAt": "2026-08-14T00:00:00Z"
     }
   ],
