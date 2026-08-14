@@ -2353,6 +2353,12 @@ impl DaemonRuntime {
         let tool_ctx = ToolContext::new(session_cwd.as_deref().unwrap_or(&self.repo_root));
         let stream_events = SessionEvents::new(events.clone(), session_id.clone());
 
+        // REQ-572 BR-3: the prompt's capability clause reads the same classifier
+        // that decides tool exposure — stated here, where both inputs live, so
+        // the SearchUnavailable clause can reach a session (the registry
+        // fallback alone cannot distinguish it from Ready).
+        route.harness.web_capability =
+            Some(web_capability_state(&config.web, self.local_model_present()));
         let system = build_system_prompt(&tools, &route.harness);
         // REQ-567 BR-1: this turn begins from what the session has already said.
         // The head was rebuilt from *this* turn's tools and route, and the
