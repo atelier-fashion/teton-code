@@ -160,7 +160,7 @@ and it is recorded at that strength rather than oversold.
 |---|---|---|---|
 | `model/confirm` | `handle_model_confirm(daemon, id, params)` — no conn | ancestry gate | **yes** — commits a multi-GB download + daemon-wide model change |
 | `model/set` | `handle_model_set(daemon, id, params)` — no conn | ancestry gate | **yes** — same commitment |
-| `config/set` | `handle_config_set(daemon, id, params)` — no conn | ancestry gate | no (see note) |
+| `config/set` | `handle_config_set(daemon, id, params)` — no conn | ancestry gate | **yes, since REQ-576** — reverses the "no (see note)" below; commits an egress endpoint / privacy-boundary rewrite |
 | `config/get` | `handle_config_get(daemon, id)` — no conn | ancestry gate | no |
 | `cost/query` | `handle_cost_query(daemon, id)` — no conn | ancestry gate | no |
 | `web/refresh` | `handle_web_refresh(daemon, id, params)` — no conn | ancestry gate | no |
@@ -171,10 +171,14 @@ never consults the gate, so a daemon descendant that BR-4 forbids from
 *attaching* may still create and drive its own session on the user's provider
 credits. Same fix, one line, same seam.
 
-`config/set` keeps BUG-162's own downgrade reasoning: config lives at
+`config/set` originally kept BUG-162's own downgrade reasoning: config lives at
 `base_dir/config.toml`, which any same-UID process can already write directly,
-so gating the RPC removes *immediacy*, not a capability. Worth doing as defense
-in depth; not load-bearing, and not worth an attestation prompt.
+so gating the RPC removes *immediacy*, not a capability. **Superseded by
+REQ-576:** that reasoning was reversed once `web/setup_commit` (REQ-575)
+established that immediacy-removal IS worth attesting for a daemon-wide
+commitment — the same "editable then restart" argument applies to `model/set`,
+which is gated. `config/set` is now a BR-10(b) commitment (the row above is
+updated); the layer-(b) `no` here is historical.
 
 ---
 

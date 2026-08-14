@@ -1,7 +1,7 @@
 ---
 id: REQ-576
 title: "Presence attestation for config/set (the larger daemon-wide sibling)"
-status: draft
+status: approved
 deployable: true
 created: 2026-08-14
 updated: 2026-08-14
@@ -111,18 +111,36 @@ regression concern). Decide gate-vs-accept explicitly rather than by omission.
 
 ## Assumptions
 
-- `config/set`'s current gating is `refuse_daemon_wide` only (verified at REQ-575
-  time). Re-verify at implementation start (the id-recheck-style discipline).
-- REQ-575 has landed (or lands first), so the three-method BR-10(b) set and the
-  `blocks_on_a_human` precedent exist to extend to four.
+- **VALIDATED (2026-08-14, at /validate):** `config/set`'s current gating is
+  `refuse_daemon_wide` only, it is `fn` (synchronous) in the `dispatch` match
+  (not on `blocks_on_a_human`), and its `ConfigUpdate` enum carries
+  `RegisterProvider`, `SetTierBinding`, `SetCategoryBinding`, `SetPrivacyBoundary`,
+  `SetEffort`. Re-verify again at implementation start (id-recheck discipline).
+- **VALIDATED:** REQ-575 has landed (merged as `c81e156`), so the three-method
+  BR-10(b) set, the `blocks_on_a_human` precedent, and the
+  `TETON_PRESENCE_ACCEPT=fail` test seam all exist to extend to four.
+- **Architecture note (surfaced at /validate):** unlike `web/setup_commit`,
+  `config/set` is a genuine `daemon_wide_method` (uses `refuse_daemon_wide`, the
+  ancestry gate) — it is already in `daemon_wide_methods()` and `route_for_test`,
+  so its BR-10(b) commitment coverage plugs directly into the existing shared
+  `only_a_daemon_wide_commitment_demands_presence` harness rather than needing a
+  session-scoped variant. `/architect` should leverage this.
 
 ## Open Questions
 
-- [ ] OQ-1: Do any programmatic (non-CLI, non-user-initiated) `config/set`
-  callers exist that a presence prompt would deadlock or break? Enumerate all
-  `apply_config_update` call paths before gating.
-- [ ] OQ-2: Should `SetPrivacyBoundary` carry a distinct, stronger prompt reason
-  than `RegisterProvider`, given it mutates the privacy promise directly?
+- [x] OQ-1 — **RESOLVED in architecture (ADR-2), re-verified at implementation.**
+  No: `apply_config_update` has exactly one production caller (`handle_config_set`);
+  the three other references are test code. No first-run/migration/programmatic
+  path reaches it (first-run uses the already-gated `model/confirm`/`model/set`),
+  so a prompt deadlocks nothing.
+- [x] OQ-2 — **RESOLVED in architecture (ADR-2).** Generic prompt for v1:
+  `refuse_unattested_commitment`/`PresenceVerifier::verify` carry no per-method
+  reason string, so a distinct `SetPrivacyBoundary` prompt is a mechanism-layer
+  change, deferred as a future nicety rather than done half-way.
+- [ ] OQ-3 (surfaced at verify): should a consent-path `enable_permanent` answer
+  be further bounded in *which* tier it may persist (ADR-3 accepted it as
+  raise-only within an already-configured `[web]` table; the tier raise is a
+  bounded capability increase). Deferred; the accept decision stands for now.
 
 ## Out of Scope
 

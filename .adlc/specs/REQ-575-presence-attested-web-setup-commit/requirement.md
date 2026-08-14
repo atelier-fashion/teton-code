@@ -191,8 +191,9 @@ per-connection budget are untouched.
   commitment method cannot skip it silently? (Template changes ride
   `/template-drift` conventions; deciding this here would be scope creep.)
 - [x] OQ-3 (raised at `/validate`, deferred to this phase by product owner) —
-  **RESOLVED in architecture (ADR-2).** `config/set` (the larger sibling) is
-  gated in its own tracked follow-up, **REQ-576**, not folded here: gating it
+  **RESOLVED in architecture (ADR-2); follow-up REQ-576 has since LANDED.**
+  `config/set` (the larger sibling) is gated in its own tracked follow-up,
+  **REQ-576** (now implemented/merged), not folded here: gating it
   reverses a documented BUG-162 decision and touches `SetPrivacyBoundary`, so
   it warrants its own spec/review rather than a rider on a web-setup REQ. The
   consent-path `persist_web_tier` is scoped out as a documented low-severity

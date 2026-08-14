@@ -229,13 +229,19 @@ It does **not** close the REQ-569 ADR-A ancestry escape (BR-10(b) is the
 compensating control). Shipping the control on release builds is a REQ-570-scope
 decision (enable `presence` once its own AC-3b lands), not REQ-575's.
 
-**Tracked residual — `config/set`.** REQ-575's validation surfaced that
-`config/set` (`RegisterProvider` = an egress endpoint, `SetPrivacyBoundary` = the
-privacy boundary itself) is a *larger* daemon-wide config writer still gated at
-layer (a) only. It is the same class of finding, tracked in **REQ-576** (it
-reverses a documented BUG-162 decision, so it takes its own spec/review). The
-consent-path `persist_web_tier` is a documented low-severity residual (raise-only
-within an already-configured `[web]` table), folded into REQ-576's scope.
+**Tracked residual — `config/set` — now CLOSED by REQ-576.** REQ-575's
+validation surfaced that `config/set` (`RegisterProvider` = an egress endpoint,
+`SetPrivacyBoundary` = the privacy boundary itself) is a *larger* daemon-wide
+config writer that was still gated at layer (a) only. **REQ-576 gated it** under
+the same BR-10(b) presence check, reversing its documented BUG-162
+layer-(a)-only posture — so the four daemon-wide config-writers known today
+(`model/confirm`, `model/set`, `web/setup_commit`, `config/set`) are all
+classified. Same shipped-build caveat as above (the release build ships without
+`presence`, so the control degrades there until `presence` ships). The
+consent-path `persist_web_tier` was given a considered disposition in REQ-576
+(ADR-3): **accepted, not gated** — raise-only within an already-configured
+`[web]` table, and gating it would prompt on the ordinary "enable permanently"
+consent answer.
 
 ### ADR-4: `capability_dead_end` fires where the daemon can actually see it
 
