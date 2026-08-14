@@ -2,7 +2,7 @@
   "req": "REQ-577",
   "branch": "feat/REQ-577-vendor-recipes-and-teton-docs-tool",
   "startedAt": "2026-08-14T19:14:15Z",
-  "completed": false,
+  "completed": true,
   "currentPhase": 8,
   "completedPhases": [
     0,
@@ -12,7 +12,8 @@
     4,
     5,
     6,
-    7
+    7,
+    8
   ],
   "integrationBranch": "main",
   "phaseHistory": [
@@ -55,6 +56,11 @@
       "phase": 7,
       "name": "PR Cleanup & CI",
       "completedAt": "2026-08-15T00:45:00Z"
+    },
+    {
+      "phase": 8,
+      "name": "Wrapup (merge b0f59b9 + knowledge capture)",
+      "completedAt": "2026-08-15T01:15:00Z"
     }
   ],
   "repos": {
@@ -67,7 +73,7 @@
       "prUrl": "https://github.com/atelier-fashion/teton-code/pull/144",
       "prNumber": 144,
       "prCreatedAt": "2026-08-14T19:14:18Z",
-      "merged": false,
+      "merged": true,
       "snapshotBranch": null,
       "snapshotPR": null
     }
