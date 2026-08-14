@@ -1,7 +1,7 @@
 ---
 id: TASK-136
 title: "Daemon: web_setup_catalog module + populate setup_plan"
-status: draft
+status: complete
 parent: REQ-573
 created: 2026-08-14
 updated: 2026-08-14
@@ -27,21 +27,21 @@ today's exact strings (BR-7), and wire it into `runtime.web_setup_plan()`.
 
 ## Acceptance Criteria
 
-- [ ] Golden-string unit test pins all three entries byte-exact (AC-6 daemon
+- [x] Golden-string unit test pins all three entries byte-exact (AC-6 daemon
       altitude): SearxNG `http://localhost:8888/search?format=json`
       keyless/no-host; Brave host `api.search.brave.com`, template
       `X-Subscription-Token: {key}`; Kagi host `kagi.com`, template
       `Authorization: Bot {key}`; default template `Authorization: Bearer
       {key}` via the shared const
-- [ ] Invariants unit-tested: ids unique; `auth_template.is_some() ==
+- [x] Invariants unit-tested: ids unique; `auth_template.is_some() ==
       needs_key` per entry; every template contains `{key}`; no entry or
       field contains a secret-shaped value (BR-6)
-- [ ] The factory takes no arguments and reads no env/config/TTY state
+- [x] The factory takes no arguments and reads no env/config/TTY state
       (LESSON-481 purity — reviewable by signature, pinned by a test module
       that calls it with no setup)
-- [ ] `web_setup_plan()` returns `Some(catalog)` — asserted by a runtime-level
+- [x] `web_setup_plan()` returns `Some(catalog)` — asserted by a runtime-level
       test if one exists for the method, else by the TASK-137 suite
-- [ ] `cargo test -p tetond` green (contract suite still passes untouched at
+- [x] `cargo test -p tetond` green (contract suite still passes untouched at
       this point — it parses source text until TASK-137 lands)
 
 ## Technical Notes
