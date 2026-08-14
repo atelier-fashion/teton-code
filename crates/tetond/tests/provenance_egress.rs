@@ -408,6 +408,88 @@ async fn glob_enumerating_a_boundary_file_blocks_the_next_remote_turn() {
 }
 
 // ---------------------------------------------------------------------------
+// teton_docs — no repo file, and therefore no taint (REQ-577 BR-6)
+// ---------------------------------------------------------------------------
+
+/// **REQ-577 BR-6: the bundled-docs tool surfaces nothing from the repository,
+/// so the session it runs in is not pinned.**
+///
+/// The boundary claim for `teton_docs` is a negative one, and a negative claim
+/// needs the fixture that could falsify it: the repo here *has* the boundary
+/// file every other test in this suite leaks through, and the second remote turn
+/// nonetheless goes out. A tool that had quietly read a path — or tagged its
+/// result `Unknown` the way `shell` must — would fail-close that turn, which is
+/// exactly what the three tests above assert happening.
+///
+/// Paired with the positive half in the same run (LESSON-520): the topic body
+/// really is in the context, framed as untrusted like every other built-in
+/// result. Without that, "no provenance" would be a statement about an empty
+/// result rather than about a served one.
+#[tokio::test]
+async fn teton_docs_touches_no_repo_file_and_leaves_the_next_remote_turn_free() {
+    let repo = temp_repo();
+    let (result, captured, blocks, ctx) =
+        run_touching_tool(&repo, ("c1", "teton_docs", r#"{"topic":"providers"}"#)).await;
+
+    // The positive half: the bundled topic was served and folded into context.
+    let framed = ctx
+        .blocks()
+        .iter()
+        .rev()
+        .find(|b| {
+            matches!(
+                b.provenance,
+                tetond::harness::context::Provenance::Tool { .. }
+            )
+        })
+        .map(|b| b.text.clone())
+        .expect("the docs result was folded into context");
+    assert!(
+        framed.contains("teton provider add"),
+        "the providers topic was not served: {framed}"
+    );
+    assert_last_tool_result_is_framed(&ctx);
+
+    // The negative half, which is the boundary claim.
+    let provenance = context_provenance(&ctx);
+    assert!(
+        !provenance.is_unknown(),
+        "a bundled body has knowable provenance — `Unknown` would fail-close egress over \
+         the daemon's own documentation"
+    );
+    assert_eq!(
+        provenance.len(),
+        0,
+        "`teton_docs` opened no path, so there is no identity to carry: {:?}",
+        provenance.sources().collect::<Vec<_>>()
+    );
+
+    // And therefore the turn that carries the result is not refused — the leg
+    // that makes the assertions above mean something (LESSON-479).
+    assert!(
+        result.is_ok(),
+        "reading bundled docs must not block the next remote turn: {result:?}"
+    );
+    assert!(
+        blocks.is_empty(),
+        "no privacy block was warranted: {blocks:?}"
+    );
+    assert_eq!(
+        captured.len(),
+        2,
+        "the fixture must really have put a second request on the wire, or 'not blocked' \
+         is an observation about a turn that never happened"
+    );
+    for body in &captured {
+        assert!(
+            !contains_bytes(body, SECRET),
+            "boundary content reached egress through a tool that reads no files"
+        );
+    }
+    std::fs::remove_dir_all(&repo).ok();
+}
+
+// ---------------------------------------------------------------------------
 // REQ-571 AC-8 — the taint pin and the web channel, reached by a non-canonical
 // spelling
 // ---------------------------------------------------------------------------

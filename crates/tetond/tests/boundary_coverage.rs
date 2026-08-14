@@ -55,6 +55,7 @@ use tetond::mcp::namespaced_tool_name;
 /// and that test compares the declarations against this list.
 const TOOL_SOURCES: &[(&str, &str)] = &[
     ("mod.rs", include_str!("../src/harness/tools/mod.rs")),
+    ("docs.rs", include_str!("../src/harness/tools/docs.rs")),
     ("edit.rs", include_str!("../src/harness/tools/edit.rs")),
     ("glob.rs", include_str!("../src/harness/tools/glob.rs")),
     ("grep.rs", include_str!("../src/harness/tools/grep.rs")),
@@ -176,6 +177,25 @@ const COVERAGE: &[Covered] = &[
         tests: &[(
             "provenance_egress.rs",
             "shell_cat_of_a_boundary_file_blocks_the_next_remote_turn",
+        )],
+    },
+    Covered {
+        tool_type: "DocsTool",
+        registered: Some("teton_docs"),
+        builtin: true,
+        // The one entry whose `surfaces` is an argument rather than a warning,
+        // which is exactly why it is written down (REQ-577). This tool reads no
+        // path and opens no socket: its bodies are `include_str!`d at compile
+        // time, so `Sources(∅)` is a fact rather than an omission. The claim is
+        // still checked rather than asserted in prose — the cited test drives a
+        // real turn against a repo that *has* a boundary file, and the next
+        // remote turn goes out, which is only true if nothing was touched.
+        mention: "teton_docs",
+        surfaces: "bundled documentation compiled into this binary — no repo file, no \
+                   network, and therefore no provenance to carry",
+        tests: &[(
+            "provenance_egress.rs",
+            "teton_docs_touches_no_repo_file_and_leaves_the_next_remote_turn_free",
         )],
     },
     Covered {
@@ -420,7 +440,7 @@ fn every_content_surfacing_tool_has_a_boundary_test() {
     // an empty claim (BUG-159).
     assert_eq!(
         TOOL_SOURCES.len(),
-        8,
+        9,
         "the embedded source list shrank; the scan below is narrower than the module"
     );
     for (file, text) in TOOL_SOURCES {
@@ -501,7 +521,7 @@ fn the_builtin_registry_registers_nothing_the_enumeration_has_not_claimed() {
 
     // Non-vacuity: an empty registry would satisfy any subset claim.
     assert!(
-        registered.len() >= 5,
+        registered.len() >= 6,
         "`with_builtins` registered {} tools; the registry under test is not the \
          populated one",
         registered.len()
@@ -548,7 +568,7 @@ fn the_builtin_registry_registers_nothing_the_enumeration_has_not_claimed() {
 fn every_tool_source_file_is_scanned() {
     let declared = declared_modules(production_half(source(TOOL_SOURCES, "mod.rs")));
     assert!(
-        declared.len() >= 7,
+        declared.len() >= 8,
         "found {} module declarations in the tools module; the extractor is broken: \
          {declared:?}",
         declared.len()

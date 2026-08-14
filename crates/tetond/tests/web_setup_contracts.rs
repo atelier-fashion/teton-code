@@ -54,6 +54,18 @@
 //! | BR-9 (a suggestion is a config a user could write) | [`every_suggested_backend_is_a_config_this_daemon_would_load`] |
 //! | REQ-573 BR-4, the keyless entry's leg (REQ-572 AC-8) | [`the_keyless_suggestion_needs_no_credential_anywhere`] |
 //! | BUG-165 continuity (the unnamed backend's default) | [`the_unnamed_backend_default_is_a_whole_contract`] |
+//! | REQ-577 BR-2 / AC-7 (providers topic ↔ recipe catalog, bidirectional) | [`the_providers_topic_and_the_recipe_catalog_agree`] |
+//! | REQ-577 BR-2 (web topic ↔ suggestion catalog auth shapes) | [`the_web_topic_and_the_suggestion_catalog_agree`] |
+//!
+//! ## A third prose surface, on a second catalog (REQ-577)
+//!
+//! The `teton_docs` topics are the same kind of artifact as the guide and the
+//! README rows — hand-written prose carrying third-party facts — so they are
+//! checked here, in the file that already owns that pattern, rather than in a
+//! suite of their own. `providers.md` is gated against
+//! [`tetond::provider_recipes::recipe_catalog`] and `web.md` against the search
+//! catalog this file was built for. Two catalogs, one rule: a fact spelled in
+//! prose must be a fact some typed source ships, and the reverse.
 //!
 //! ## What "the production builder" means here, exactly
 //!
@@ -77,6 +89,7 @@ use std::sync::{Arc, Mutex};
 use async_trait::async_trait;
 
 use teton_core::config::{Config, WebConfig, WebTier};
+use teton_core::entities::ProviderKind;
 use teton_providers::transport::{
     HttpMethod, Transport, TransportError, TransportRequest, TransportResponse,
 };
@@ -87,6 +100,7 @@ use tetond::egress::{
     Authorship, Egress, HttpTransport, LookupContext, LookupRequest, NoopSink, RedactionGate,
     RedactionVerdict, TaintView,
 };
+use tetond::provider_recipes::recipe_catalog;
 use tetond::web_setup_catalog::suggestion_catalog;
 
 // ---------------------------------------------------------------------------
@@ -104,6 +118,13 @@ const BUNDLED_GUIDE: &str = include_str!("../src/harness/self_config.md");
 /// daemon's catalog, and the pairing is only checkable from a place that can see
 /// both.
 const README: &str = include_str!("../../../README.md");
+
+/// The `teton_docs` providers topic — the same bytes `DocsTool` serves
+/// (REQ-577 BR-2), not a copy of them.
+const PROVIDERS_TOPIC: &str = include_str!("../src/harness/docs/providers.md");
+
+/// The `teton_docs` web topic, gated on the search catalog's auth shapes.
+const WEB_TOPIC: &str = include_str!("../src/harness/docs/web.md");
 
 // ---------------------------------------------------------------------------
 // The contracts
@@ -638,6 +659,227 @@ fn the_readme_backend_rows_and_the_catalog_agree() {
              unlisted.\noffered: {offered:?}"
         );
     }
+}
+
+// ---------------------------------------------------------------------------
+// teton_docs topics ↔ the two catalogs (REQ-577 BR-2 / AC-7)
+// ---------------------------------------------------------------------------
+
+/// The `--kind` value a recipe's [`ProviderKind`] is spelled as on the command
+/// line, taken from the serde casing rather than a second table — the flag the
+/// CLI parses and the flag the prose prints are one string.
+fn kind_flag(kind: ProviderKind) -> String {
+    serde_json::to_value(kind)
+        .ok()
+        .and_then(|v| v.as_str().map(str::to_owned))
+        .expect("a provider kind serializes to its kebab-case wire name")
+}
+
+/// The `teton provider add <id> …` command as the providers topic prints it:
+/// the line that starts it plus the line that continues it, because the recipes
+/// wrap after `--kind`.
+///
+/// Panics when the id is absent rather than returning an empty string. A parse
+/// that fails open is the `ENDPOINT_HELP` mistake this suite's header describes:
+/// every assertion below would then hold vacuously over nothing.
+fn provider_add_command(text: &str, id: &str) -> String {
+    let needle = format!("teton provider add {id} ");
+    let lines: Vec<&str> = text.lines().collect();
+    let at = lines
+        .iter()
+        .position(|line| line.contains(&needle))
+        .unwrap_or_else(|| {
+            panic!(
+                "the providers topic (crates/tetond/src/harness/docs/providers.md) has no \
+                 `{needle}` command, so the catalog ships a recipe the topic never teaches. \
+                 Add the recipe block, or remove the entry from \
+                 crates/tetond/src/provider_recipes.rs if the vendor was dropped."
+            )
+        });
+    lines[at..(at + 2).min(lines.len())].join(" ")
+}
+
+/// **The `teton_docs` providers topic and the recipe catalog say the same
+/// thing, in both directions** (REQ-577 BR-2, AC-7).
+///
+/// Same posture as the guide and README gates above, on the second catalog. The
+/// topic is the surface that answers "how do I hook up Kimi" at depth, so a
+/// stale endpoint here is a runnable-*looking* command whose failure arrives a
+/// step away from its cause — the BUG-165 texture, which is why drift is a
+/// build failure rather than a doc bug.
+///
+/// Both directions, because they fail differently: a catalog recipe the topic
+/// never teaches is knowledge the tool cannot serve, and a URL the topic prints
+/// that no recipe ships is a vendor fact nothing in this repository verified.
+#[test]
+fn the_providers_topic_and_the_recipe_catalog_agree() {
+    let catalog = recipe_catalog();
+    // Non-vacuity: an empty catalog would satisfy every loop below.
+    assert!(
+        catalog.len() >= 6,
+        "the recipe catalog ships {} entries; the sweep below is narrower than the \
+         roster it is supposed to cover",
+        catalog.len()
+    );
+
+    // Catalog → topic: every recipe is a runnable pair of commands in the prose.
+    for recipe in &catalog {
+        let command = provider_add_command(PROVIDERS_TOPIC, &recipe.id_suggestion);
+        let flag = kind_flag(recipe.kind);
+        assert!(
+            command.contains(&format!("--kind {flag}")),
+            "the providers topic registers `{}` with a different kind than the catalog's \
+             `{flag}`. A wrong kind sends the wrong auth header and 401s on a good \
+             key.\ncommand: {command}",
+            recipe.id_suggestion
+        );
+        match &recipe.endpoint {
+            Some(endpoint) => assert!(
+                command.contains(endpoint.as_str()),
+                "the catalog gives `{}` the endpoint `{endpoint}` and the topic's command \
+                 does not carry it. Edit \
+                 crates/tetond/src/harness/docs/providers.md — the catalog \
+                 (crates/tetond/src/provider_recipes.rs) is the source and it moves \
+                 first.\ncommand: {command}",
+                recipe.id_suggestion
+            ),
+            // The absent endpoint is a *fact*, not a gap: the `anthropic` kind
+            // carries its own address, so a printed `--endpoint` is a user error
+            // the topic would be teaching.
+            None => assert!(
+                !command.contains("--endpoint"),
+                "the catalog gives `{}` no endpoint — its kind knows its own address — and \
+                 the topic prints one anyway.\ncommand: {command}",
+                recipe.id_suggestion
+            ),
+        }
+        assert!(
+            command.contains(&format!("--model {}", recipe.example_model)),
+            "the catalog's example model for `{}` is `{}` and the topic's command names a \
+             different one. A retired model id is a 404 a user cannot debug from the \
+             message.\ncommand: {command}",
+            recipe.id_suggestion,
+            recipe.example_model
+        );
+        // BR-1's second half: registering a provider routes nothing, so a recipe
+        // without its routing step is a recipe that appears to do nothing.
+        assert!(
+            PROVIDERS_TOPIC.lines().any(|line| {
+                let line = line.trim();
+                line.starts_with("teton policy set-tier")
+                    && line.ends_with(recipe.id_suggestion.as_str())
+            }),
+            "the providers topic never routes a tier to `{}`, so following it registers a \
+             provider that no work reaches. Add the `teton policy set-tier … {}` line.",
+            recipe.id_suggestion,
+            recipe.id_suggestion
+        );
+    }
+
+    // Topic → catalog: a URL in the prose that no recipe ships is a vendor fact
+    // nobody verified, printed into somebody's shell.
+    let offered: BTreeSet<&str> = catalog
+        .iter()
+        .filter_map(|r| r.endpoint.as_deref())
+        .collect();
+    let in_topic = http_urls(PROVIDERS_TOPIC);
+    assert!(
+        in_topic.len() >= offered.len(),
+        "the URL parse found {} URLs in a topic that must teach {} endpoints, so it is \
+         reading less than the topic holds: {in_topic:?}",
+        in_topic.len(),
+        offered.len()
+    );
+    for url in in_topic {
+        assert!(
+            offered.contains(url),
+            "the providers topic prints `{url}` and the recipe catalog ships no vendor \
+             with that endpoint. Edit \
+             crates/tetond/src/harness/docs/providers.md if the recipe was dropped or \
+             renamed, or crates/tetond/src/provider_recipes.rs if the vendor is real and \
+             unlisted — every URL this topic prints is one a user will paste into a \
+             command.\noffered: {offered:?}"
+        );
+    }
+}
+
+/// **The `teton_docs` web topic and the search catalog agree on the auth
+/// shapes** (REQ-577 BR-2).
+///
+/// The narrower claim of the two, and deliberately so: what the web topic adds
+/// over the bundled guide is depth about tiers, the keychain reference and when
+/// a change takes effect — none of which any catalog owns. The header shapes are
+/// the part a third party owns, and they are the part BUG-165 got wrong, so they
+/// are the part under CI.
+#[test]
+fn the_web_topic_and_the_suggestion_catalog_agree() {
+    let catalog = suggestion_catalog();
+    let in_topic = suggested_auth_templates(WEB_TOPIC);
+    assert!(
+        in_topic.len() >= 3,
+        "the web topic must still name the auth templates it documents; found: {in_topic:?}"
+    );
+
+    let in_catalog: BTreeSet<&str> = catalog
+        .backends
+        .iter()
+        .filter_map(|b| b.auth_template.as_deref())
+        .collect();
+    assert!(
+        !in_catalog.is_empty(),
+        "the catalog must still offer at least one keyed backend"
+    );
+
+    // Topic → catalog: a shape the topic tells a model to suggest, that the
+    // daemon offers for nothing, is advice that ends in a 401.
+    for template in &in_topic {
+        assert!(
+            in_catalog.contains(template.as_str()) || *template == catalog.default_auth_template,
+            "the web topic (crates/tetond/src/harness/docs/web.md) documents `{template}` \
+             and the daemon catalog offers no backend with that template and no such \
+             default. Update the catalog (crates/tetond/src/web_setup_catalog.rs) if the \
+             backend is real, or the topic if the line is stale.\ncatalog: {in_catalog:?} \
+             + default `{}`",
+            catalog.default_auth_template
+        );
+    }
+
+    // Catalog → topic: a backend the daemon offers whose header the topic never
+    // names is one the model cannot talk a user through.
+    for template in &in_catalog {
+        assert!(
+            in_topic.contains(*template),
+            "the daemon catalog offers `{template}` and the web topic \
+             (crates/tetond/src/harness/docs/web.md) does not name it — the model reading \
+             that topic has never heard of it. Add it to the topic; unlike the bundled \
+             guide, the topic is not resident prompt and has room.\ntopic: {in_topic:?}"
+        );
+    }
+    assert!(
+        in_topic.contains(&catalog.default_auth_template),
+        "the catalog's default template `{}` is not in the web topic, so the shape offered \
+         for every unnamed backend is one the topic never explains.\ntopic: {in_topic:?}",
+        catalog.default_auth_template
+    );
+
+    // The keyless entry is prose on both sides, and its endpoint *shape* is the
+    // load-bearing half: without `format=json` a SearxNG instance answers HTML.
+    let searxng = catalog
+        .backends
+        .iter()
+        .find(|b| !b.needs_key)
+        .expect("the catalog still offers a keyless backend");
+    assert!(
+        WEB_TOPIC.contains("/search?format=json"),
+        "the web topic no longer shows the `/search?format=json` endpoint shape, so a user \
+         following it configures an instance that answers HTML"
+    );
+    assert!(
+        searxng.endpoint.ends_with("/search?format=json"),
+        "the catalog's keyless endpoint `{}` no longer ends `/search?format=json` while the \
+         topic still documents that shape",
+        searxng.endpoint
+    );
 }
 
 // ---------------------------------------------------------------------------

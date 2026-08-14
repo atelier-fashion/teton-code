@@ -169,6 +169,25 @@ failure message. Live wording verification rides AC-1/AC-2 (ADR-5).
 None persisted. No config keys, no protocol changes, no events beyond the
 existing `tool_call` shape (title via `describe_call`).
 
+## Deviations
+
+**ADR-5 amendment (TASK-145): `REDACT_BODY_OVERHEAD_BYTES` raised 8 → 9 KiB.**
+ADR-5 assumed the margin tests would simply re-measure and stay green. They did
+not: the system prompt was 4,849 bytes against an effective ceiling of 4,868
+(8,192 overhead − 3,276 escaping − the 48-byte floor), leaving **19 bytes of
+slack**, while `teton_docs` costs 274 bytes of tool docs and ~156 even stripped
+to a bare description and schema. No trim could close a 255-byte deficit, and
+the deficit predates any guide growth, so ADR-2's fallback posture — move the
+recipes into the topic — does not reach it either; BR-7 forbids dropping the
+tool. The budgeting *assumption* moved instead, exactly as its own doc comment
+anticipates ("if a later REQ adds enough tools to overflow that, the assumption
+turns red"). `MIN_PROMPT_HEADROOM_BYTES` is untouched: that floor is the line
+BR-4 forbids trading. Chunk arithmetic is unchanged — 2×(32,768+9,216) = 83,968
+≤ 108,280, and 83,968/27,070 = 3.10 still rounds to 4 chunks, so
+`REDACT_INPUT_MAX_BYTES` does not move. Recorded margins are now 817 bytes
+(opted-out shape) and 865 (opted-in), leaving roughly **769 usable bytes** for
+TASK-144's guide recipe line and referral sentence against its ≤450-byte target.
+
 ## Proposed Additions to `.adlc/context/architecture.md`
 
 At wrapup, extend the "Suggestion data is daemon-owned, typed, and seam-pinned"

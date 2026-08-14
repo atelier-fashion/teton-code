@@ -254,6 +254,15 @@ pub const REDACT_CHUNK_MAX_BYTES: usize =
 /// escaping, must fit inside it. If a later REQ adds enough tools to overflow
 /// that, the assumption turns red instead of silently eating the margin.
 ///
+/// Raised 8→9 KiB by REQ-577 when `teton_docs` (a sixth, cap-exempt builtin)
+/// made the 8 KiB assumption red; chunk caps and [`REDACT_INPUT_MAX_BYTES`] are
+/// unchanged (verify: 2×(32768+9216)=83968 ≤ 108280, chunks stay 4). That is
+/// this doc's own prescription being followed rather than worked around: the
+/// tool's docs are 274 bytes and the 8 KiB assumption had 19 bytes of slack
+/// above [`MIN_PROMPT_HEADROOM_BYTES`], so no trim of any description could
+/// have closed it. The floor itself is untouched — it is the line the margin is
+/// never traded away across (REQ-577 BR-4).
+///
 /// `pub(crate)` because the *other* prompt shape has to clear it too and cannot
 /// be built from here: with `[web] tier` above `off` the system prompt carries
 /// the web tool's docs instead of REQ-563's BR-6 opt-in clause, and building
@@ -263,7 +272,7 @@ pub const REDACT_CHUNK_MAX_BYTES: usize =
 /// this is the number both of them measure against, so the two shapes cannot
 /// come to disagree about the budget.
 #[cfg(test)]
-pub(crate) const REDACT_BODY_OVERHEAD_BYTES: usize = 8 * 1024;
+pub(crate) const REDACT_BODY_OVERHEAD_BYTES: usize = 9 * 1024;
 
 /// The smallest headroom [`REDACT_BODY_OVERHEAD_BYTES`] may be left with after
 /// the largest system prompt this build produces (REQ-572 verify).
@@ -291,20 +300,25 @@ pub(crate) const MIN_PROMPT_HEADROOM_BYTES: usize = 48;
 ///
 /// ```text
 ///   HarnessConfig::context_budget_bytes   32,768 bytes  (turn_loop.rs)
-///   + `REDACT_BODY_OVERHEAD_BYTES`         8,192 bytes  (system prompt, tool
+///   + `REDACT_BODY_OVERHEAD_BYTES`         9,216 bytes  (system prompt, tool
 ///                                                        descriptions, JSON
 ///                                                        envelope + escaping —
 ///                                                        the assumption, and
 ///                                                        the test below checks
 ///                                                        it against the real
 ///                                                        system prompt)
-///   = the largest ordinary outbound body  40,960 bytes
+///   = the largest ordinary outbound body  41,984 bytes
 ///   × 2 (the margin — a cap that only just clears the body it has to hold is
 ///        one context-budget bump away from being the old collision again)
-///   = 81,920 bytes to clear
-///   ÷ REDACT_CHUNK_MAX_BYTES              81,920 / 27,070 = 3.03
+///   = 83,968 bytes to clear
+///   ÷ REDACT_CHUNK_MAX_BYTES              83,968 / 27,070 = 3.10
 ///   → the next whole chunk up                        4
 /// ```
+///
+/// The overhead term moved 8→9 KiB in REQ-577 and the quotient moved 3.03→3.10,
+/// which is the point of writing the arithmetic out rather than the answer: the
+/// chunk count is unchanged, so [`REDACT_INPUT_MAX_BYTES`] is unchanged, and a
+/// reader can see that rather than take it on trust.
 ///
 /// The other half of the choice is the chunk **count**, because every chunk is
 /// a model call and ADR-8's budget is per call. With the
@@ -336,8 +350,8 @@ const REDACT_TOTAL_CAP_CHUNKS: usize = 4;
 ///
 /// **This is the number that used to sit under the harness's context budget**
 /// (32,768) and block every context-budget-full remote turn. It is now
-/// **108,280** — 3.3× that budget, 2.6× a full body with the system prompt and
-/// JSON overhead on top of it. The collision is closed rather than measured;
+/// **108,280** — 3.3× that budget, 2.58× a full body with the system prompt and
+/// JSON overhead on top of it (2.6× before REQ-577 widened the overhead term). The collision is closed rather than measured;
 /// what `docs/manual-verification.md` now records is the *chunk-count
 /// distribution*, which is where the cost went.
 pub const REDACT_INPUT_MAX_BYTES: usize = REDACT_TOTAL_CAP_CHUNKS * REDACT_CHUNK_MAX_BYTES;
@@ -1934,6 +1948,12 @@ mod tests {
     /// margin, because "it fits" and "it fits by nine bytes" are different
     /// facts, and only one of them survives the next sentence somebody adds to
     /// the bundled guide (AC-9).
+    ///
+    /// **Recorded headroom at REQ-577:** the worst prompt is 5,123 bytes, so
+    /// `spent` is 8,399 against a 9,216-byte overhead — **817 bytes of margin**
+    /// over the 48-byte floor. It was 67 before this REQ, against an 8 KiB
+    /// overhead; `teton_docs`'s 274 bytes of tool docs did not fit in the 19
+    /// bytes that left, which is why the assumption moved rather than the floor.
     #[test]
     fn the_total_cap_clears_the_harness_context_budget_with_margin() {
         use teton_core::capability::{SearchGap, WebCapabilityState};

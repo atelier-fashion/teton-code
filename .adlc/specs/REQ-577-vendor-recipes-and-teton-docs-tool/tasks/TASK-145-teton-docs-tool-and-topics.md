@@ -1,7 +1,7 @@
 ---
 id: TASK-145
 title: "teton_docs tool, bundled topics, cap-exempt registration"
-status: draft
+status: complete
 parent: REQ-577
 created: 2026-08-14
 updated: 2026-08-14
