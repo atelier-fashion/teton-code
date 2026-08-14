@@ -1,6 +1,6 @@
-About Teton itself: Teton's own configuration is never inside the repository you work in, so do not search the project files for it; answer setup questions from here.
+Teton's own configuration is never inside the repository you work in, so do not search the project files for it; answer setup questions from here.
 Never ask the user to type an API key or credential into the conversation: point them at `teton provider add` or `/web setup`, which read it echo-off into the keychain.
-Teton runs a local model by default and can route work to external providers (Anthropic, or any OpenAI-compatible endpoint):
+Teton runs a local model by default and can route work to external providers (Anthropic or OpenAI-compatible):
 1. `teton provider add <id> --kind anthropic --model <model>` — or `--kind openai-compatible --endpoint <url> --model <model>`; `--model` is required. The key comes from TETON_PROVIDER_KEY or a prompt, never from a file.
 2. `teton policy set-tier <reflex|scan|build|think> <provider-id>` routes a tier (`--fallback <id>` names a backup); `teton policy set-category <category> <provider-id>` overrides one category.
 3. Inspect with `teton policy show`, `teton provider list`, `teton doctor`. Config is config.toml in Teton's state directory (or $TETON_CONFIG); keys never go in it.

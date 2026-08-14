@@ -611,10 +611,12 @@ async fn tier_off_makes_zero_lookup_traffic_across_a_scripted_session() {
         "the prompt must name the opt-in key; prompt:\n{}",
         off.system_prompt
     );
-    // ...and it must not send the model looking through the repo for it.
+    // ...and it must not send the model looking through the repo for it —
+    // spelled as the missing premise since BUG-168: web-off beside "use tools"
+    // read as "so check the files instead" until the prompt said outright that
+    // outside-world facts are never in them.
     assert!(
-        off.system_prompt
-            .contains("instead of searching the repository for it"),
+        off.system_prompt.contains("do not search the repository"),
         "prompt:\n{}",
         off.system_prompt
     );

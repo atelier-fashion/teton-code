@@ -234,9 +234,12 @@ fn a_fresh_config_tells_the_model_the_capability_is_off() {
         ("the capability exists and is off", "switched off"),
         ("the in-session enablement path", "/web setup"),
         ("the config key", "[web] tier"),
+        // Spelled as the missing premise since BUG-168: web-off beside "use
+        // tools" read as "so check the files instead" until the prompt said
+        // outright that outside-world facts are never in them.
         (
             "and it must forbid the repository hunt",
-            "instead of searching the repository for it",
+            "do not search the repository",
         ),
     ] {
         assert!(
