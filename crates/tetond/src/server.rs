@@ -7877,4 +7877,50 @@ mod tests {
              synchronous dispatch: {preview}"
         );
     }
+
+    /// **config/set left the synchronous dispatch (REQ-576).** Like the other
+    /// BR-10(b) commitments it may attest, so it runs on `handle_client`'s
+    /// `blocks_on_a_human` task, not inline in `dispatch`. Proof: `dispatch`
+    /// answers `method not found` for it, while `config/get` — a read — stays.
+    /// The full client path still reaches config/set (the daemon-wide commitment
+    /// harness plus the config/set integration/e2e suites), which is what makes
+    /// this "moved off the reader loop" rather than "removed". Its reader-loop
+    /// liveness is inherited from the shared `blocks_on_a_human` machinery
+    /// REQ-575's `a_parked_web_setup_commit_does_not_stall_the_connection` pins on
+    /// a multi-thread runtime.
+    #[test]
+    fn config_set_left_the_reader_loop_dispatch_while_config_get_stayed() {
+        let daemon = Daemon::new();
+        let conn = unattached(&daemon);
+
+        let set = dispatch(
+            &daemon,
+            &conn,
+            Id::Number(2),
+            ConfigSetParams::METHOD,
+            serde_json::json!({"update": {"op": "register_provider", "id": "x",
+                "kind": "openai", "endpoint": "http://127.0.0.1:9", "model": "m"}}),
+        )
+        .unwrap();
+        assert!(
+            set.contains(&error_code::METHOD_NOT_FOUND.to_string()),
+            "config/set must not be served inline by `dispatch` — it runs on the \
+             blocks_on_a_human task so a presence prompt cannot park the reader \
+             loop: {set}"
+        );
+
+        let get = dispatch(
+            &daemon,
+            &conn,
+            Id::Number(3),
+            ConfigGetParams::METHOD,
+            serde_json::json!({}),
+        )
+        .unwrap();
+        assert!(
+            !get.contains(&error_code::METHOD_NOT_FOUND.to_string()),
+            "config/get is a read that never attests, so it stays on the \
+             synchronous dispatch: {get}"
+        );
+    }
 }

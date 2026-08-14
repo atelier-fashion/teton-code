@@ -1,7 +1,7 @@
 ---
 id: TASK-141
 title: "AC-1 disk-inspection e2e for RegisterProvider/SetPrivacyBoundary + the off-dispatch routing pin"
-status: draft
+status: complete
 parent: REQ-576
 created: 2026-08-14
 updated: 2026-08-14
