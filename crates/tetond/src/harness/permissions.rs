@@ -876,6 +876,21 @@ impl PermissionGate {
     /// said yes, and the only thing that did not happen is the part that would
     /// have outlived the session. The line names the reason so "why am I being
     /// asked again next time" has an answer on this machine.
+    ///
+    /// **Deliberately NOT a BR-10(b) commitment (REQ-576 ADR-3).** This durable
+    /// write reaches the same `config.toml` the daemon-wide commitments do, so it
+    /// meets REQ-575 BR-5's classification trigger — and it is **accepted, not
+    /// gated**. It is raise-only within an already-configured `[web]` table (it
+    /// appends the answered tier and raises the ceiling; see `persist_web_tier`'s
+    /// own docs on the runtime) and cannot author an endpoint, a credential, or a
+    /// new capability — the powers `config/set`/`web/setup_commit` gate. It is
+    /// reached only by a user answering `enable_permanent` on a genuine web-consent
+    /// prompt in their own session, via `permission/respond`, not by a daemon-wide
+    /// commitment method. Bringing it under presence would put a Touch ID prompt
+    /// on that ordinary "yes, permanently" answer (a REQ-570 AC-8 regression) for
+    /// marginal security value. The no-regression proof is
+    /// `enable_permanent_writes_a_ceiling_the_next_daemon_start_honours`
+    /// (web_consent_matrix.rs): the path persists with no presence step.
     fn persist_web_tier(&self, tier: WebTier) -> WebConsentScope {
         let Some(sink) = &self.web_persistence else {
             eprintln!(

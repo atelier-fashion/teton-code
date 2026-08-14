@@ -1,7 +1,7 @@
 ---
 id: TASK-142
 title: "Consent-path persist_web_tier disposition (accept), four-method docs, AC-6 stub, finding-7 update"
-status: draft
+status: complete
 parent: REQ-576
 created: 2026-08-14
 updated: 2026-08-14

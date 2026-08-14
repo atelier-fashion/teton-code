@@ -779,6 +779,13 @@ async fn allow_for_this_session_lasts_to_session_end_and_not_beyond() {
 /// and `register_web_tool` — the single place the "is this machine opted in"
 /// condition is expressed (D-1) — is asked about the reloaded config. It
 /// answered `false` before the consent and must answer `true` after.
+///
+/// **Also the REQ-576 ADR-3 no-regression pin.** `config/set` became a BR-10(b)
+/// commitment (REQ-576), but this consent-path `enable_permanent` write was
+/// deliberately **not** brought under presence (raise-only, can't author an
+/// endpoint; gating it would prompt on the ordinary "yes, permanently" answer).
+/// This test proves that acceptance holds: the path persists with **no presence
+/// step** — a future edit that accidentally gated it would make this go red.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn enable_permanent_writes_a_ceiling_the_next_daemon_start_honours() {
     let dir = scratch("permanent");

@@ -1354,3 +1354,53 @@ Approved commit applied and served in-session (no restart) : yes / no
 Cancelled commit refused, config byte-identical (nothing written) : yes / no
 Notes / findings :
 ```
+
+# Manual verification runbook — REQ-576 AC-6
+
+**Status: OUTSTANDING.** REQ-576 gates `config/set` behind the same BR-10(b)
+presence check as `model/confirm`/`model/set`/`web/setup_commit`. CI proves the
+gate refuses (`AlwaysFailsVerifier` via the shared commitment harness and the
+`TETON_PRESENCE_ACCEPT=fail` e2e), degrades (no-mechanism), and leaves
+`config.toml` byte-identical on a refusal. What no CI run can prove is that a
+**real OS presence prompt** appears in front of a **real human** when a user
+changes machine-wide config — because the accept/fail seams simulate the human.
+Leave this outstanding in
+`.adlc/specs/REQ-576-presence-attested-config-set/requirement.md` (AC-6) until a
+person runs the procedure below.
+
+## What this proves that CI does not
+
+That on a `--features presence` build, `teton provider add` (or a tier/privacy
+`config/set`) raises the OS presence prompt; an approval lands the config change
+(and the capability is live with no restart); and a **cancel refuses it with
+nothing written** — the same-UID quiet-path hole REQ-572 finding 7 named, closed
+on a presence build for the config writer with the largest blast radius.
+
+## Procedure
+
+1. `cargo build --features presence` (macOS, Apple M-series). Confirm
+   `TETON_TEST_SEAMS` / `TETON_PRESENCE_ACCEPT` are **unset**.
+2. Start the daemon; run `teton provider add <id> --model <m> …` (a
+   `RegisterProvider`), or a `teton privacy add` (`SetPrivacyBoundary`).
+3. **Approve** at the OS prompt. Expect: the command succeeds, `config.toml`
+   gains the entry, and the change is live with no restart.
+4. Repeat and **cancel** the OS prompt. Expect: refused with a distinct
+   attestation code, and `config.toml` **byte-identical** to before.
+
+## Sign-off
+
+```
+REQ-576 AC-6 sign-off
+---------------------
+Verified by      :
+Date             :
+Platform / OS    :               (e.g. macOS 26.6, Apple M-series)
+Build            :               (cargo build --features presence)
+TETON_TEST_SEAMS / TETON_PRESENCE_ACCEPT confirmed unset : yes / no
+OS prompt appeared on the config change : yes / no
+Variant exercised : provider add / tier binding / privacy boundary
+Biometry or password used : Touch ID / login credential
+Approved change applied and live (no restart) : yes / no
+Cancelled change refused, config byte-identical (nothing written) : yes / no
+Notes / findings :
+```
