@@ -42,6 +42,14 @@
 //! the reader loop above them, so the direct-RPC tests exercise the real gate
 //! (LESSON-484).
 //!
+//! REQ-572 adds the `web/setup_*` family to that list ([`handle_web_setup_plan`],
+//! [`handle_web_setup_preview`], [`handle_web_setup_commit`]): enabling a
+//! capability is driving the session that asked for it. The two that can change
+//! something additionally *announce* their refusal into that session
+//! ([`refuse_setup_without_session_access`]) — an RPC error reaches only the
+//! caller, and BR-4 wants the user to see that somebody else reached for their
+//! configuration.
+//!
 //! `permission/respond` joined that list at REQ-569 (BR-9, ADR-F). It used to be
 //! ungated, which meant a monitor — which by design *sees* every session's
 //! `permission_request` — could answer one and so authorize another session's
@@ -100,7 +108,7 @@ use tokio::task::JoinHandle;
 
 use teton_protocol::events::{
     AttachConsentRequested, AttachRefused, AttachRefusedReason, ConsentScope, DaemonClientAttach,
-    Event, EventEnvelope, PhaseTransition, SessionGrantMinted, EVENT_METHOD,
+    Event, EventEnvelope, PhaseTransition, SessionGrantMinted, WebSetupRejected, EVENT_METHOD,
     SUBSCRIPTION_LAGGED_METHOD,
 };
 use teton_protocol::handshake::{self, HandshakeParams, HandshakeResult};
@@ -112,7 +120,8 @@ use teton_protocol::methods::{
     PermissionRespondResult, PromptBlock, PromptTurnParams, RpcMethod, SessionAttachParams,
     SessionAttachResult, SessionClearParams, SessionCreateParams, SessionCreateResult,
     SessionListParams, SessionListResult, SessionPermissionsParams, SessionSummary,
-    WebOverrideParams, WebRefreshParams,
+    WebOverrideParams, WebRefreshParams, WebSetupCommitParams, WebSetupPlanParams,
+    WebSetupPreviewParams,
 };
 use teton_protocol::{RequestId, SessionId};
 
@@ -2093,6 +2102,13 @@ fn dispatch(
         ConfigSetParams::METHOD => Some(handle_config_set(daemon, conn, id, params)),
         CostQueryParams::METHOD => Some(handle_cost_query(daemon, conn, id)),
         WebOverrideParams::METHOD => Some(handle_web_override(daemon, conn, id, params)),
+        // REQ-572: the three setup methods are session-scoped, so they belong
+        // here beside `web/override` and **not** in `refuse_daemon_wide`'s list
+        // — the question they ask is "may this connection drive this session",
+        // which is `may_drive`'s, not the ancestry gate's.
+        WebSetupPlanParams::METHOD => Some(handle_web_setup_plan(daemon, conn, id, params)),
+        WebSetupPreviewParams::METHOD => Some(handle_web_setup_preview(daemon, conn, id, params)),
+        WebSetupCommitParams::METHOD => Some(handle_web_setup_commit(daemon, conn, id, params)),
         SessionPermissionsParams::METHOD => {
             Some(handle_session_permissions(daemon, conn, id, params))
         }
@@ -2129,6 +2145,155 @@ fn handle_web_override(daemon: &Daemon, conn: &ConnState, id: Id, params: Value)
         return error_string(id, error_code::NOT_ATTACHED, NOT_ATTACHED_MESSAGE);
     }
     ok_string(id, &daemon.runtime.web_override(&params, &daemon.events))
+}
+
+/// What a gate-failed setup call is announced as (REQ-572 BR-4/AC-4).
+///
+/// A **kind**, never an identity: not the connection id, not the peer pid, not
+/// the requester string the handshake carried. The notice exists to put the
+/// refusal in front of the user, so it lands in a session transcript — and a
+/// notice that fingerprinted the caller would write into that transcript the
+/// very sort of thing the refusal is there to keep out (the payload's own doc
+/// says so, and conventions forbid connection internals in an event).
+///
+/// One sentence for both `preview` and `commit`, because what the user needs to
+/// know is the same for either: something that is not their session's client
+/// tried to configure this session's web access.
+const SETUP_REJECTED_ORIGIN: &str = "connection without session access";
+
+/// The REQ-572 BR-4 gate on a setup call: [`ConnState::may_drive`], plus the
+/// announcement a refusal owes the user.
+///
+/// The gate itself is [`handle_web_override`]'s, for its reason — changing what
+/// a session's model may reach is driving that session. What this adds is the
+/// *second* half of BR-4: an RPC error travels back to the caller and nowhere
+/// else, so a refusal that stopped there would be visible only to the party it
+/// refused. LESSON-505 is the standing form of that mistake, and AC-4 asks for
+/// its opposite: the notice is published into the session whose configuration
+/// was reached for, which is where its user is looking.
+///
+/// The event is session-scoped and delivered by the ordinary policy
+/// ([`ConnState::may_receive`]), so it reaches the session's own clients. The
+/// refused connection is unattached by construction — or it would not be on
+/// this path — so it does not receive its own rejection unless it is a monitor
+/// that was already entitled to that session's events, which is REQ-568's
+/// settled receive-side policy and not this gate's to relitigate.
+///
+/// **It is not an oracle** (ADR-B). The caller's answer is byte-identical
+/// whether the named session exists, belongs to somebody else, or never
+/// existed; a notice published for a session nobody holds reaches nobody.
+///
+/// Called as a line at the top of `preview` and `commit` rather than folded
+/// into [`dispatch`], for [`refuse_daemon_wide`]'s reason: the mutation check
+/// has to be able to delete **one method's** check (LESSON-502/LESSON-508), and
+/// a gate applied once for everybody has only one thing to delete.
+fn refuse_setup_without_session_access(
+    daemon: &Daemon,
+    conn: &ConnState,
+    id: &Id,
+    session_id: &SessionId,
+) -> Option<String> {
+    if conn.may_drive(session_id) {
+        return None;
+    }
+    daemon.events.publish(
+        Some(session_id.clone()),
+        Event::WebSetupRejected(WebSetupRejected {
+            origin: SETUP_REJECTED_ORIGIN.to_owned(),
+        }),
+    );
+    Some(error_string(
+        id.clone(),
+        error_code::NOT_ATTACHED,
+        NOT_ATTACHED_MESSAGE,
+    ))
+}
+
+/// Answer what enabling web lookup would involve (`web/setup_plan`, REQ-572
+/// BR-1/BR-3).
+///
+/// Read-only: it derives from the config and the engine slot, writes nothing,
+/// and remembers nothing (ADR-1 — there is no server-held flow state for a
+/// caller to step into). It is gated all the same, for
+/// [`handle_session_permissions`]'s reason: reading a session's posture is
+/// still reading that session, and a gate that let the read through would make
+/// the refusal an oracle for which sessions exist.
+///
+/// It deliberately publishes **no** rejection. BR-4's announcement is about
+/// something trying to *change* this session's capability; firing it for every
+/// refused read would hand any same-UID peer a way to write lines into a
+/// stranger's session at will — a notice that cried wolf on demand, which is
+/// how a real one stops being read.
+///
+/// [`DaemonRuntime::web_setup_plan`] takes no session id because it reads
+/// nothing per-session (TASK-129). The id in the params exists for this gate,
+/// which is where "may this connection ask" belongs.
+fn handle_web_setup_plan(daemon: &Daemon, conn: &ConnState, id: Id, params: Value) -> String {
+    let params: WebSetupPlanParams = match serde_json::from_value(params) {
+        Ok(params) => params,
+        Err(_) => return error_string(id, error_code::INVALID_PARAMS, "invalid params"),
+    };
+    if !conn.may_drive(&params.session_id) {
+        return error_string(id, error_code::NOT_ATTACHED, NOT_ATTACHED_MESSAGE);
+    }
+    ok_string(id, &daemon.runtime.web_setup_plan())
+}
+
+/// Render the `[web]` table a set of answers would write, without writing it
+/// (`web/setup_preview`, REQ-572 BR-7).
+///
+/// Announced on refusal like the commit rather than silent like the plan, even
+/// though it changes nothing durable: a preview is a *step of the enablement
+/// flow*, and a stranger stepping into that flow is exactly what BR-4 wants the
+/// user to be told about. The attacker's answer is the same either way; what
+/// differs is whether the user finds out it happened.
+///
+/// A candidate the daemon refuses comes back as the runtime's own
+/// `WEB_SETUP_INVALID` carrying the validator's sentence — never as a preview
+/// with a note attached.
+fn handle_web_setup_preview(daemon: &Daemon, conn: &ConnState, id: Id, params: Value) -> String {
+    let params: WebSetupPreviewParams = match serde_json::from_value(params) {
+        Ok(params) => params,
+        Err(_) => return error_string(id, error_code::INVALID_PARAMS, "invalid params"),
+    };
+    if let Some(refusal) =
+        refuse_setup_without_session_access(daemon, conn, &id, &params.session_id)
+    {
+        return refusal;
+    }
+    match daemon.runtime.web_setup_preview(&params) {
+        Ok(result) => ok_string(id, &result),
+        Err(err) => error_from(id, err),
+    }
+}
+
+/// Write the candidate `[web]` table and make the capability live
+/// (`web/setup_commit`, REQ-572 BR-8/AC-3).
+///
+/// **This function is the entire path to that write**, and the same channel
+/// argument [`handle_web_override`] records applies unchanged: the commit is a
+/// client RPC, tool dispatch holds a `ToolContext` rather than a
+/// `DaemonRuntime`, so a model that emits a tool call named `web/setup_commit`
+/// reaches the tool registry, finds no such tool, and is told so. AC-4's "a
+/// model tool call attempting the setup RPC is rejected" is a fact about which
+/// channel this hangs off, not a check that could be omitted — and the
+/// `may_drive` gate below is the *defense in depth* BR-4 asks for on top of it,
+/// which is why it needs a test of its own rather than resting on the
+/// structural argument (LESSON-508).
+fn handle_web_setup_commit(daemon: &Daemon, conn: &ConnState, id: Id, params: Value) -> String {
+    let params: WebSetupCommitParams = match serde_json::from_value(params) {
+        Ok(params) => params,
+        Err(_) => return error_string(id, error_code::INVALID_PARAMS, "invalid params"),
+    };
+    if let Some(refusal) =
+        refuse_setup_without_session_access(daemon, conn, &id, &params.session_id)
+    {
+        return refusal;
+    }
+    match daemon.runtime.web_setup_commit(&params, &daemon.events) {
+        Ok(result) => ok_string(id, &result),
+        Err(err) => error_from(id, err),
+    }
 }
 
 /// Read or set a session's permission level (`session/permissions`, REQ-560
@@ -6577,6 +6742,302 @@ mod tests {
                 !response.contains("-32601"),
                 "`{method}` must be a routed client method: {response}"
             );
+        }
+    }
+
+    // ------------------------------------------------------------------
+    // REQ-572 BR-4 / AC-4: the setup family and its session-access gate
+    // ------------------------------------------------------------------
+
+    /// A session created by `owner`, who is attached to it by having created it.
+    fn a_session_owned_by(daemon: &Daemon, owner: &ConnState) -> SessionId {
+        let created = handle_session_create(
+            daemon,
+            owner,
+            Id::Number(1),
+            serde_json::json!({"mode": "freeform"}),
+        );
+        created_session_id(&created)
+    }
+
+    /// Setup params a bare test daemon accepts as far as its own gates: the
+    /// `fetch_any_url` tier needs no endpoint and no key, and — unlike `search`
+    /// — is servable on a machine with no local model, so a refusal below is
+    /// this seam's answer and never `WEB_SETUP_INVALID` wearing its shape.
+    fn setup_params(session: &SessionId) -> Value {
+        serde_json::json!({
+            "session_id": session.to_string(),
+            "tier": "fetch_any_url",
+        })
+    }
+
+    /// The `web_setup_rejected` events queued on `sub` right now.
+    ///
+    /// `try_recv` rather than an awaited `recv` under a timeout: `publish` is
+    /// synchronous, so once `dispatch` has returned everything it was going to
+    /// announce is already queued, and draining is a decidable fact rather than
+    /// a race against the CI scheduler (LESSON-450).
+    fn drain_rejections(sub: &mut Subscription) -> Vec<EventEnvelope> {
+        let mut seen = Vec::new();
+        while let Some(envelope) = sub.try_recv() {
+            if matches!(envelope.event, Event::WebSetupRejected(_)) {
+                seen.push(envelope);
+            }
+        }
+        seen
+    }
+
+    /// **The mutation check AC-4 names, at the commit seam (LESSON-508 rule 2).**
+    ///
+    /// This test exists because the check it pins is *redundant with a
+    /// structural property* — `web/setup_commit` hangs off the client RPC
+    /// channel, and tool dispatch cannot reach a `DaemonRuntime`, so no model
+    /// tool call can arrive here at all — and a redundant check is precisely
+    /// the kind that gets deleted as dead weight by a later reader who
+    /// rediscovers the structural argument and not the defense-in-depth reason.
+    /// LESSON-508 rule 2: a seam whose enforcement is unreachable end-to-end
+    /// still needs its own test, or "unreachable" quietly becomes "unchecked"
+    /// the first time the wire shape changes.
+    ///
+    /// Deleting the `refuse_setup_without_session_access` line from
+    /// [`handle_web_setup_commit`] fails this test twice over: the intruder's
+    /// call reaches the runtime and comes back with something other than
+    /// `NOT_ATTACHED`, and the session's subscriber is told nothing.
+    ///
+    /// The owner's own commit is the non-vacuity control. It is **not**
+    /// asserted to succeed — a bare test daemon has no config path to write to,
+    /// which is TASK-129's seam and pinned there — only that whatever it gets
+    /// back is not this gate's refusal.
+    #[test]
+    fn a_commit_without_session_access_is_refused_and_the_session_is_told() {
+        let daemon = Daemon::new();
+        let owner = unattached(&daemon);
+        let session = a_session_owned_by(&daemon, &owner);
+        let intruder = unattached(&daemon);
+        // Subscribed after the create-time traffic, so what is drained below is
+        // this call's doing and nothing else's.
+        let mut sub = daemon.events.subscribe(16);
+
+        let refused = dispatch(
+            &daemon,
+            &intruder,
+            Id::Number(2),
+            WebSetupCommitParams::METHOD,
+            setup_params(&session),
+        )
+        .unwrap();
+        assert!(
+            refused.contains(&error_code::NOT_ATTACHED.to_string()),
+            "a connection that may not drive this session must not commit its \
+             configuration: {refused}"
+        );
+
+        let announced = drain_rejections(&mut sub);
+        assert_eq!(
+            announced.len(),
+            1,
+            "the refusal must be announced once into the session it was aimed \
+             at — an RPC error reaches only the attacker (BR-4, LESSON-505)"
+        );
+        assert_eq!(
+            announced[0].session_id.as_ref(),
+            Some(&session),
+            "and it must be scoped to that session, not broadcast daemon-wide"
+        );
+        let Event::WebSetupRejected(rejection) = &announced[0].event else {
+            unreachable!("filtered above");
+        };
+        assert_eq!(rejection.origin, SETUP_REJECTED_ORIGIN);
+        assert!(
+            !rejection.origin.chars().any(|c| c.is_ascii_digit()),
+            "the origin names a kind, never an identity: a connection id or a \
+             pid would put a number in this string ({})",
+            rejection.origin
+        );
+
+        let owners_own = dispatch(
+            &daemon,
+            &owner,
+            Id::Number(3),
+            WebSetupCommitParams::METHOD,
+            setup_params(&session),
+        )
+        .unwrap();
+        assert!(
+            !owners_own.contains(&error_code::NOT_ATTACHED.to_string()),
+            "the session's own client must reach the runtime: {owners_own}"
+        );
+        assert!(
+            drain_rejections(&mut sub).is_empty(),
+            "and a served commit must announce no rejection: {owners_own}"
+        );
+    }
+
+    /// The same gate at the **preview** seam, asserted separately on purpose.
+    ///
+    /// LESSON-502: an invariant enforced at several seams needs a test at each
+    /// one, because the seams are separate lines a future edit drops one at a
+    /// time. A single representative test would stay green with the preview's
+    /// check deleted — and a preview is where the enablement walkthrough a user
+    /// is being led through would be hijacked, one step before the write.
+    #[test]
+    fn a_preview_without_session_access_is_refused_and_the_session_is_told() {
+        let daemon = Daemon::new();
+        let owner = unattached(&daemon);
+        let session = a_session_owned_by(&daemon, &owner);
+        let intruder = unattached(&daemon);
+        let mut sub = daemon.events.subscribe(16);
+
+        let refused = dispatch(
+            &daemon,
+            &intruder,
+            Id::Number(2),
+            WebSetupPreviewParams::METHOD,
+            setup_params(&session),
+        )
+        .unwrap();
+        assert!(
+            refused.contains(&error_code::NOT_ATTACHED.to_string()),
+            "a preview is a step of the flow, and stepping into somebody's flow \
+             is what BR-4 refuses: {refused}"
+        );
+
+        let announced = drain_rejections(&mut sub);
+        assert_eq!(announced.len(), 1, "and the session is told about it");
+        assert_eq!(announced[0].session_id.as_ref(), Some(&session));
+
+        let served = dispatch(
+            &daemon,
+            &owner,
+            Id::Number(3),
+            WebSetupPreviewParams::METHOD,
+            setup_params(&session),
+        )
+        .unwrap();
+        assert!(
+            served.contains("\"toml\""),
+            "the session's own client must be shown what would be written: {served}"
+        );
+        assert!(drain_rejections(&mut sub).is_empty());
+    }
+
+    /// The **plan** is gated too, and announces nothing — both halves together,
+    /// because each is wrong without the other.
+    ///
+    /// Gated: reading a session's capability posture is still reading that
+    /// session, and an ungated read would make the refusal an oracle for which
+    /// sessions exist (ADR-B).
+    ///
+    /// Silent: BR-4's notice is about something trying to *change* the
+    /// capability. If a refused read announced too, any same-UID peer could
+    /// write lines into a stranger's session on demand — a notice that can be
+    /// made to cry wolf is one users learn to skip past, which costs the
+    /// commit's rejection the attention it exists for.
+    ///
+    /// The absence is decided by *ordering*, not by a timer: the commit that
+    /// follows on the same connection and the same subscription does publish
+    /// one, so the empty drain cannot be the bus being broken or the
+    /// subscription being dead.
+    #[test]
+    fn a_refused_plan_is_silent_while_a_refused_commit_is_not() {
+        let daemon = Daemon::new();
+        let owner = unattached(&daemon);
+        let session = a_session_owned_by(&daemon, &owner);
+        let intruder = unattached(&daemon);
+        let mut sub = daemon.events.subscribe(16);
+
+        let refused = dispatch(
+            &daemon,
+            &intruder,
+            Id::Number(2),
+            WebSetupPlanParams::METHOD,
+            serde_json::json!({"session_id": session.to_string()}),
+        )
+        .unwrap();
+        assert!(
+            refused.contains(&error_code::NOT_ATTACHED.to_string()),
+            "a plan for a session this connection may not drive is refused: {refused}"
+        );
+        assert!(
+            drain_rejections(&mut sub).is_empty(),
+            "a refused *read* must not put a notice in the user's session"
+        );
+
+        // The positive control, on the same connection and subscription.
+        dispatch(
+            &daemon,
+            &intruder,
+            Id::Number(3),
+            WebSetupCommitParams::METHOD,
+            setup_params(&session),
+        )
+        .unwrap();
+        assert_eq!(
+            drain_rejections(&mut sub).len(),
+            1,
+            "the subscription is live and the bus does carry this event — which \
+             is what makes the silence above a fact rather than a broken fixture"
+        );
+
+        // And the session's own client is served the plan.
+        let served = dispatch(
+            &daemon,
+            &owner,
+            Id::Number(4),
+            WebSetupPlanParams::METHOD,
+            serde_json::json!({"session_id": session.to_string()}),
+        )
+        .unwrap();
+        assert!(
+            served.contains("\"state\""),
+            "the attached client must be told what enabling would involve: {served}"
+        );
+    }
+
+    /// **AC-4's last clause**: the three setup methods are session-scoped, so
+    /// none of them joins [`refuse_daemon_wide`]'s list.
+    ///
+    /// Asserted twice, because the two halves catch different mistakes. The
+    /// enumeration catches a future edit that adds one to the daemon-wide set;
+    /// the behavioural half catches the gate itself being swapped — a
+    /// connection the ancestry gate would refuse is answered `NOT_ATTACHED`
+    /// here, the same refusal any unattached peer gets, so the setup family's
+    /// question stays "may this connection drive this session" rather than
+    /// "where did this process come from".
+    ///
+    /// It doubles as the routing pin: `METHOD_NOT_FOUND` would fail every arm.
+    #[test]
+    fn the_setup_methods_are_session_scoped_and_never_daemon_wide() {
+        let names = [
+            WebSetupPlanParams::METHOD,
+            WebSetupPreviewParams::METHOD,
+            WebSetupCommitParams::METHOD,
+        ];
+        for (method, _) in daemon_wide_methods() {
+            assert!(
+                !names.contains(&method),
+                "`{method}` is session-scoped and must not be gated as daemon-wide"
+            );
+        }
+
+        for ancestry in [Ancestry::Descendant, Ancestry::Indeterminate] {
+            for method in names {
+                let daemon = Daemon::new();
+                let child = conn_with_ancestry(&daemon, ancestry);
+                let response = dispatch(
+                    &daemon,
+                    &child,
+                    Id::Number(1),
+                    method,
+                    setup_params(&SessionId::from("sess-not-this-connections")),
+                )
+                .unwrap();
+                assert!(
+                    response.contains(&error_code::NOT_ATTACHED.to_string()),
+                    "`{method}` must answer the session gate, not the ancestry \
+                     gate and not `method not found`: {response}"
+                );
+            }
         }
     }
 }

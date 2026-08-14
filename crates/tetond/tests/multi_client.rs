@@ -1459,6 +1459,175 @@ async fn web_override_is_refused_until_the_connection_attaches() {
     let _ = std::fs::remove_file(&path);
 }
 
+/// The setup answers a bare fixture daemon can give: `fetch_any_url` needs no
+/// endpoint and no key, and — unlike `search` — is servable on a machine with
+/// no local model, so nothing below is a `WEB_SETUP_INVALID` in disguise.
+fn setup_params(session_id: &str) -> Value {
+    json!({"session_id": session_id, "tier": "fetch_any_url"})
+}
+
+/// REQ-572 AC-1 at the wire: all three `web/setup_*` methods are routed and
+/// answered on a connection attached to the session they name.
+///
+/// The point is the *surface*, not the payloads: a gate a client enforces is a
+/// rendering choice (LESSON-484), so the family has to be reachable and gated
+/// where every client crosses it. The answers are still asserted to be the
+/// daemon's real derivations rather than empty shells — this fixture has no
+/// local model, so the plan must say the `search` tier is unofferable and name
+/// the gap, and the preview must come back with the bytes a commit would write.
+///
+/// **The commit's answer here is the no-config-file error, and that is the
+/// honest shape of this fixture**: an in-process `Daemon::new()` has no
+/// configuration path (`DaemonRuntime::minimal`), so there is nothing on disk
+/// for it to write. What that leaves asserted is exactly what this file is for
+/// — the call is routed, reaches the runtime, and answers — while the write,
+/// the validate-then-swap and the `web_setup_completed` announcement are pinned
+/// where they live, in `runtime::tests`' on-disk fixtures (TASK-129).
+#[tokio::test]
+async fn the_setup_methods_answer_an_attached_client_over_the_socket() {
+    let path = temp_socket("setup-ok");
+    let listener = server::bind_listener(&path).unwrap();
+    let daemon = test_daemon();
+    let server_task = tokio::spawn(server::serve(listener, daemon));
+
+    let mut a = TestClient::connect(&path).await;
+    assert!(a.handshake(1).await.get("result").is_some());
+    a.send(2, "session/create", json!({"mode": "freeform"}))
+        .await;
+    let sid = a.read_response(2).await["result"]["session_id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+
+    a.send(3, "web/setup_plan", json!({"session_id": sid.clone()}))
+        .await;
+    let plan = a.read_response(3).await;
+    assert!(
+        plan["result"]["state"].is_object(),
+        "the plan must answer with the typed capability state: {plan}"
+    );
+    assert_eq!(
+        plan["result"]["search_available"].as_bool(),
+        Some(false),
+        "this daemon has no local model, so the search tier is not offerable: {plan}"
+    );
+    assert!(
+        !plan["result"]["search_gap"]
+            .as_str()
+            .unwrap_or_default()
+            .is_empty(),
+        "and the plan must name the missing piece rather than only greying it out: {plan}"
+    );
+
+    a.send(4, "web/setup_preview", setup_params(&sid)).await;
+    let preview = a.read_response(4).await;
+    assert!(
+        preview["result"]["toml"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("[web]"),
+        "the preview must be the bytes a commit would write: {preview}"
+    );
+
+    a.send(5, "web/setup_commit", setup_params(&sid)).await;
+    let commit = a.read_response(5).await;
+    assert_ne!(
+        commit["error"]["code"].as_i64(),
+        Some(error_code::METHOD_NOT_FOUND),
+        "the commit must be a routed method: {commit}"
+    );
+    assert_ne!(
+        commit["error"]["code"].as_i64(),
+        Some(error_code::NOT_ATTACHED),
+        "and the session's own client must get past the gate: {commit}"
+    );
+
+    server_task.abort();
+    let _ = std::fs::remove_file(&path);
+}
+
+/// REQ-572 BR-4 / AC-4 at the wire: a commit from a connection without session
+/// access is refused **and** the session's own client is told.
+///
+/// The second half is the one that needs a socket. A `NOT_ATTACHED` travels
+/// back to the caller and nowhere else, so a daemon that refused and said
+/// nothing would pass every assertion an attacker's connection can make while
+/// leaving the user with no idea that somebody reached for their configuration
+/// (LESSON-505). So the notice is asserted **at a client** — A reads it off its
+/// own socket, as a frame the daemon actually sent — rather than in a log line
+/// or on an in-process bus.
+///
+/// B has A's session armed as forbidden, so the same read that proves the
+/// refusal also proves the notice was not delivered to the connection it was
+/// about: a rejection that reached the attacker would fail B's next read.
+///
+/// Deleting the `may_drive` check from `handle_web_setup_commit` fails the
+/// first assertion; deleting only the `publish` beside it fails the second.
+#[tokio::test]
+async fn a_setup_commit_without_session_access_is_refused_and_the_owner_is_told() {
+    let path = temp_socket("setup-gate");
+    let listener = server::bind_listener(&path).unwrap();
+    let daemon = test_daemon();
+    let server_task = tokio::spawn(server::serve(listener, daemon));
+
+    let mut a = TestClient::connect(&path).await;
+    assert!(a.handshake(1).await.get("result").is_some());
+    a.send(2, "session/create", json!({"mode": "freeform"}))
+        .await;
+    let sid = a.read_response(2).await["result"]["session_id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+
+    let mut b = TestClient::connect(&path).await;
+    assert!(b.handshake(1).await.get("result").is_some());
+    // B never attached to A's session, so no envelope of it may reach B —
+    // including the rejection its own call is about to raise.
+    b.forbid_session(&sid);
+
+    // B learns the id the way any same-UID peer would: by asking.
+    b.send(2, "session/list", json!({})).await;
+    assert_eq!(session_ids(&b.read_response(2).await), vec![sid.clone()]);
+
+    b.send(3, "web/setup_commit", setup_params(&sid)).await;
+    let refused = b.read_response(3).await;
+    assert_eq!(
+        refused["error"]["code"].as_i64(),
+        Some(error_code::NOT_ATTACHED),
+        "a connection without session access must not commit that session's \
+         configuration: {refused}"
+    );
+
+    let notice = a.read_event("web_setup_rejected").await;
+    assert_eq!(
+        notice["params"]["session_id"].as_str(),
+        Some(sid.as_str()),
+        "the notice belongs to the session that was reached for: {notice}"
+    );
+    let origin = notice["params"]["origin"]
+        .as_str()
+        .unwrap_or_else(|| panic!("the rejection carried no origin: {notice}"));
+    assert!(
+        !origin.is_empty() && !origin.chars().any(|c| c.is_ascii_digit()),
+        "the origin names a kind, never an identity — a pid or a connection id \
+         would put a number in it: {origin}"
+    );
+
+    // The non-vacuity control: A's own commit is not refused by this gate. It
+    // fails for its own reason on a fixture daemon with no config file, which
+    // is not this test's claim.
+    a.send(4, "web/setup_commit", setup_params(&sid)).await;
+    let served = a.read_response(4).await;
+    assert_ne!(
+        served["error"]["code"].as_i64(),
+        Some(error_code::NOT_ATTACHED),
+        "the session's own client must reach the runtime: {served}"
+    );
+
+    server_task.abort();
+    let _ = std::fs::remove_file(&path);
+}
+
 /// REQ-569 BR-9 / AC-9 at the raw RPC surface: an unattached connection cannot
 /// answer another session's permission prompt, and the refusal does not consume
 /// the prompt.
