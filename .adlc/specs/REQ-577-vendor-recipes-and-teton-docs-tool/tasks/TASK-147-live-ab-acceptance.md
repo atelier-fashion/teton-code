@@ -1,7 +1,7 @@
 ---
 id: TASK-147
 title: "Live A/B acceptance against an isolated llama daemon"
-status: draft
+status: complete
 parent: REQ-577
 created: 2026-08-14
 updated: 2026-08-14
@@ -27,17 +27,47 @@ deferred manual verification — never claim it done.
 
 ## Acceptance Criteria
 
-- [ ] Weights availability checked first (weights dir present + symlinkable);
+- [x] Weights availability checked first (weights dir present + symlinkable);
   the outcome path taken is stated plainly in verification.md.
-- [ ] If run: AC-1 (Kimi request → exact `teton provider add kimi --kind
+- [x] If run: AC-1 (Kimi request → exact `teton provider add kimi --kind
   openai-compatible --endpoint <catalog endpoint> --model <example>` +
   `teton policy set-tier think kimi`, zero repo-search calls, ≥ 3 trials)
   and AC-2 (Claude request → `--kind anthropic` recipe; control "What
   version is this crate? Check Cargo.toml." still calls `read`) both
   recorded with baseline comparison.
+  **Ticked for the recording, which is this task's deliverable — and the
+  recording says spec AC-1 FAILED.** See Outcome below; do not read this box
+  as spec AC-1 being met.
 - [ ] If deferred: verification.md carries the full manual protocol and the
   REQ's acceptance state says "CI-verified; live A/B deferred (weights
-  absent)" — the honest claim, per ethos #7.
+  absent)" — the honest claim, per ethos #7. **Not applicable: the weights
+  were present and the live A/B ran.**
+
+## Outcome (2026-08-14)
+
+The run happened — 27 sessions against two isolated real-weights daemons,
+baseline `main@4569311` vs candidate `9ea2988`, byte-identical replies across
+trials at temperature 0.2. Full record:
+[`../verification.md`](../verification.md).
+
+- **Spec AC-2: PASS.** `--kind anthropic --model claude-opus-5`, no
+  `--endpoint`, `teton policy set-tier think claude`, 4/4; the control still
+  calls `read` and answers from `Cargo.toml`, 3/3.
+- **Spec AC-1: FAIL.** The provider command is exactly right — Moonshot's real
+  endpoint and `kimi-k3` where the baseline fabricates `https://api.kimi.com/v1
+  --model gpt-4` — and there are **zero** repository-search calls in every
+  trial, including in a working tree full of Teton's own docs. But the routing
+  command is `teton policy set-tier reflex kimi`, not `think`, in 4/4 trials.
+  AC-1 asks for both commands, so it is not met. Recorded as failed rather
+  than reworded (ethos #7).
+- **Two defects found that only a live run could find** (verification.md §5):
+  `teton_docs` trips a permission prompt at the default level and is denied
+  outright at `plan` — the requirement's Permissions table says it must not
+  prompt — and two llama daemons cannot be resident at once on this machine,
+  so an A/B of this shape must be serialized.
+
+REQ-577's honest acceptance state is therefore: **AC-2 live-verified; AC-1 not
+met**; a prompt fix plus a re-run of this matrix is the remaining work.
 
 ## Technical Notes
 
