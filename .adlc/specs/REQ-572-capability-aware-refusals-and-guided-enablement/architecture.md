@@ -104,8 +104,10 @@ commit. See ADR-1 and the spec-mapping table below.
   `web/setup_plan`, `web/setup_preview`, `web/setup_commit`.
 - **Events**: `WebSetupCompleted { tiers, config_path }` (session-scoped;
   LESSON-505: an event in front of a human, not a log line);
-  `WebSetupRejected { origin }` published when a commit/preview arrives from a
-  connection that fails the gate (spec BR-4/AC-4 defense-in-depth).
+  `WebSetupRejected { origin }` published when a **commit** arrives from a
+  connection that fails the gate, at most once per connection (spec BR-4/AC-4
+  defense-in-depth; the preview's silence and the budget are the recorded
+  deviation in the spec-mapping table below).
 - **Error code**: `WEB_SETUP_INVALID = -32020` (next free after
   `SELF_APPROVAL_REFUSED`) — a candidate config failing validation at
   preview/commit, message carrying the validator's own sentence. Gate failures
@@ -140,6 +142,7 @@ is also where the write happened).
 | Entities: SetupFlow (daemon, session-scoped) | daemon state machine | client-local collection + stateless endpoints | BR-5's motive is thin clients + id hygiene; daemon keeps sole authority over validation/preview/commit, and the id-collision surface BR-5 guards against now has zero instances |
 | Events: setup_started / setup_step / setup_aborted | daemon events | not emitted — no daemon state changes before commit | BR-14 requires announcing **completions and rejections**, which remain events; steps with no daemon effect have nothing to announce (LESSON-505 is about state changes) |
 | AC-11 concurrent flows | id isolation across flows | no shared flow state; commits serialize on the config mutex | the failure mode AC-11 hunts (cross-answered steps) is structurally unrepresentable; the AC's event-delivery leg is still asserted at the client |
+| BR-4 / AC-4 rejection announcement | `web_setup_rejected` published for **both** a refused preview and a refused commit | published for a refused **commit only**, and at most **once per connection** | *As-built, changed during the verify pass — source: the 6-agent review of this REQ's implementation.* Both legs of the spec's version were a same-UID **write primitive**: `session/list` is ungated, so any peer can enumerate session ids, and a refused preview — which writes nothing else at all — turned each call into a line published into a stranger's transcript, at whatever rate the caller liked. The preview therefore refuses silently, on `web/setup_plan`'s own cry-wolf rationale (a notice that fires on demand is one users read past, which costs the real one its attention), and the commit's notice is budgeted per connection like `session_grant_minted` (`ConnState::may_announce_grant`). **The intent holds**: BR-4's subject is something trying to *change* this session's capability, and that is exactly the call that still announces. Enforcement is untouched — every refused preview and every refused commit past the budget is still `NOT_ATTACHED`; only the announcement is bounded. Pinned by `server.rs`'s `a_refused_preview_is_silent_while_a_refused_commit_is_not` and `a_connection_announces_at_most_one_setup_rejection`. |
 
 ### ADR-2: The commit re-runs the startup path on a candidate, then swaps
 

@@ -44,11 +44,15 @@
 //!
 //! REQ-572 adds the `web/setup_*` family to that list ([`handle_web_setup_plan`],
 //! [`handle_web_setup_preview`], [`handle_web_setup_commit`]): enabling a
-//! capability is driving the session that asked for it. The two that can change
-//! something additionally *announce* their refusal into that session
-//! ([`refuse_setup_without_session_access`]) — an RPC error reaches only the
+//! capability is driving the session that asked for it. The **one** that can
+//! change something additionally *announces* its refusal into that session
+//! ([`refuse_commit_without_session_access`]) — an RPC error reaches only the
 //! caller, and BR-4 wants the user to see that somebody else reached for their
-//! configuration.
+//! configuration. The two reads refuse silently and the announcement is
+//! budgeted per connection, because a notice an unattached peer can fire at will
+//! is a way to write into a stranger's transcript rather than a warning
+//! (REQ-572 verify, FIX 1b/1c). All three bound the `session_id` first, at
+//! REQ-569 F9's length ([`refuse_unmintable_session_id`]).
 //!
 //! `permission/respond` joined that list at REQ-569 (BR-9, ADR-F). It used to be
 //! ungated, which meant a monitor — which by design *sees* every session's
@@ -95,7 +99,7 @@
 
 use std::collections::HashSet;
 use std::path::Path;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 
 use serde::Serialize;
@@ -625,6 +629,29 @@ struct ConnState {
     /// two, because a connection's handlers run on several tasks and a
     /// per-clone budget would be no budget at all.
     announcements: Arc<Mutex<GrantAnnouncementBudget>>,
+    /// Whether this connection has already spent its one
+    /// [`Event::WebSetupRejected`] announcement (REQ-572 verify, FIX 1c).
+    ///
+    /// The same argument [`Self::announcements`] records, taken to its limit
+    /// because the subject is different: a grant announcement is a *legitimate*
+    /// notice that can be produced too often, so it gets an allowance per
+    /// window; a setup rejection is produced only by a caller that had no
+    /// business calling, so one is all a user ever needs — the second says
+    /// nothing the first did not. Anything more is an attacker choosing how many
+    /// lines to write into a stranger's transcript, which is the same wolf-crying
+    /// the plan and preview handlers refuse outright.
+    ///
+    /// A `bool` rather than a counter and no window: the refusal itself never
+    /// stops (every offending commit still answers `NOT_ATTACHED`), so there is
+    /// no arrears figure worth carrying and nothing a later window would let
+    /// through that the first notice did not already say. Swapped rather than
+    /// read-then-set, so two concurrent refused commits on one connection cannot
+    /// both find it unspent.
+    ///
+    /// **Per connection, so it does not bound a peer that reconnects** — the
+    /// same stated limit [`GRANT_ANNOUNCEMENTS_PER_WINDOW`] carries, and for the
+    /// same reason: this daemon has no subject an attacker cannot re-mint.
+    setup_rejection_spent: Arc<AtomicBool>,
 }
 
 /// One connection's rolling allowance of grant announcements (R3).
@@ -681,6 +708,7 @@ impl ConnState {
                 announced: 0,
                 suppressed: 0,
             })),
+            setup_rejection_spent: Arc::new(AtomicBool::new(false)),
         }
     }
 
@@ -697,6 +725,18 @@ impl ConnState {
             .lock()
             .expect("grant announcement budget lock poisoned")
             .take(std::time::Instant::now(), window)
+    }
+
+    /// Whether this connection's one setup-rejection announcement is still
+    /// unspent, claiming it if so (REQ-572 verify, FIX 1c).
+    ///
+    /// One `swap`, for [`Self::may_announce_grant`]'s reason expressed with an
+    /// atomic instead of a lock: two refused commits arriving on two of this
+    /// connection's tasks would otherwise both read `false` and both publish,
+    /// turning a bound of one into a bound of "one per interleaving". This
+    /// decides; the caller does the I/O.
+    fn may_announce_setup_rejection(&self) -> bool {
+        !self.setup_rejection_spent.swap(true, Ordering::Relaxed)
     }
 
     /// Grant this connection sight of `session_id`'s events. Idempotent.
@@ -2156,13 +2196,39 @@ fn handle_web_override(daemon: &Daemon, conn: &ConnState, id: Id, params: Value)
 /// very sort of thing the refusal is there to keep out (the payload's own doc
 /// says so, and conventions forbid connection internals in an event).
 ///
-/// One sentence for both `preview` and `commit`, because what the user needs to
-/// know is the same for either: something that is not their session's client
-/// tried to configure this session's web access.
+/// One sentence, and only the commit publishes it: what the user needs to know
+/// is that something which is not their session's client tried to *change* this
+/// session's web access (see [`refuse_commit_without_session_access`] for why
+/// the two reads stay silent).
 const SETUP_REJECTED_ORIGIN: &str = "connection without session access";
 
-/// The REQ-572 BR-4 gate on a setup call: [`ConnState::may_drive`], plus the
-/// announcement a refusal owes the user.
+/// Refuse a setup call whose `session_id` is longer than this daemon could ever
+/// have minted (REQ-572 verify, FIX 1a — REQ-569 F9's rule at a second family
+/// of seams).
+///
+/// The three setup handlers take an attacker-chosen `session_id` bounded only by
+/// [`MAX_FRAME`] — ~4 MiB — and each of them then does work proportional to it:
+/// `may_drive` hashes it, and the commit's refusal used to clone it into an
+/// event envelope that every subscriber of the bus holds. A length check ahead
+/// of all of that costs a comparison and removes the amplification.
+///
+/// Called as a line at the top of each handler rather than folded into
+/// [`dispatch`], for [`refuse_daemon_wide`]'s reason: three seams are three
+/// lines a future edit drops one at a time, and the mutation check has to be
+/// able to delete exactly one (LESSON-502/LESSON-508).
+///
+/// **Not an oracle** (ADR-B), and this is why it is length-only and comes
+/// first: every id of a plausible length draws the same refusal whether it names
+/// a live session or nothing at all. What it separates is "no daemon ever minted
+/// this" from "this session is not yours", and only the first is a
+/// well-formedness fact the caller already knows.
+fn refuse_unmintable_session_id(id: &Id, session_id: &SessionId) -> Option<String> {
+    (!sessions::within_minted_length(session_id))
+        .then(|| error_string(id.clone(), error_code::INVALID_PARAMS, "invalid params"))
+}
+
+/// The REQ-572 BR-4 gate on a setup **commit**: [`ConnState::may_drive`], plus
+/// the announcement a refusal owes the user.
 ///
 /// The gate itself is [`handle_web_override`]'s, for its reason — changing what
 /// a session's model may reach is driving that session. What this adds is the
@@ -2183,11 +2249,28 @@ const SETUP_REJECTED_ORIGIN: &str = "connection without session access";
 /// whether the named session exists, belongs to somebody else, or never
 /// existed; a notice published for a session nobody holds reaches nobody.
 ///
-/// Called as a line at the top of `preview` and `commit` rather than folded
-/// into [`dispatch`], for [`refuse_daemon_wide`]'s reason: the mutation check
-/// has to be able to delete **one method's** check (LESSON-502/LESSON-508), and
-/// a gate applied once for everybody has only one thing to delete.
-fn refuse_setup_without_session_access(
+/// **The commit only, and at most once per connection** (REQ-572 verify, FIX
+/// 1b/1c — a deviation from BR-4/AC-4's "preview and commit", recorded in the
+/// architecture's spec-mapping table). Two findings drove it, and both are about
+/// the same primitive:
+///
+///   - the preview is a *read*. It writes nothing, and `session/list` hands any
+///     same-UID peer the session ids to aim at — so a refused preview that
+///     published was a transcript-injection primitive on demand, at whatever
+///     rate the attacker liked. [`handle_web_setup_plan`]'s cry-wolf rationale
+///     applies to it unchanged, so the preview now answers `NOT_ATTACHED`
+///     silently exactly as the plan does.
+///   - the commit's notice is worth publishing — something tried to *change*
+///     the capability — but the second one says nothing the first did not, so it
+///     is budgeted per connection ([`ConnState::may_announce_setup_rejection`],
+///     the [`ConnState::may_announce_grant`] precedent). A refused commit past
+///     the budget is still refused; it is only the notice that stops.
+///
+/// Called as a line at the top of `commit` rather than folded into
+/// [`dispatch`], for [`refuse_daemon_wide`]'s reason: the mutation check has to
+/// be able to delete **one method's** check (LESSON-502/LESSON-508), and a gate
+/// applied once for everybody has only one thing to delete.
+fn refuse_commit_without_session_access(
     daemon: &Daemon,
     conn: &ConnState,
     id: &Id,
@@ -2196,12 +2279,14 @@ fn refuse_setup_without_session_access(
     if conn.may_drive(session_id) {
         return None;
     }
-    daemon.events.publish(
-        Some(session_id.clone()),
-        Event::WebSetupRejected(WebSetupRejected {
-            origin: SETUP_REJECTED_ORIGIN.to_owned(),
-        }),
-    );
+    if conn.may_announce_setup_rejection() {
+        daemon.events.publish(
+            Some(session_id.clone()),
+            Event::WebSetupRejected(WebSetupRejected {
+                origin: SETUP_REJECTED_ORIGIN.to_owned(),
+            }),
+        );
+    }
     Some(error_string(
         id.clone(),
         error_code::NOT_ATTACHED,
@@ -2233,6 +2318,9 @@ fn handle_web_setup_plan(daemon: &Daemon, conn: &ConnState, id: Id, params: Valu
         Ok(params) => params,
         Err(_) => return error_string(id, error_code::INVALID_PARAMS, "invalid params"),
     };
+    if let Some(refusal) = refuse_unmintable_session_id(&id, &params.session_id) {
+        return refusal;
+    }
     if !conn.may_drive(&params.session_id) {
         return error_string(id, error_code::NOT_ATTACHED, NOT_ATTACHED_MESSAGE);
     }
@@ -2242,11 +2330,19 @@ fn handle_web_setup_plan(daemon: &Daemon, conn: &ConnState, id: Id, params: Valu
 /// Render the `[web]` table a set of answers would write, without writing it
 /// (`web/setup_preview`, REQ-572 BR-7).
 ///
-/// Announced on refusal like the commit rather than silent like the plan, even
-/// though it changes nothing durable: a preview is a *step of the enablement
-/// flow*, and a stranger stepping into that flow is exactly what BR-4 wants the
-/// user to be told about. The attacker's answer is the same either way; what
-/// differs is whether the user finds out it happened.
+/// Gated like the commit and **silent like the plan** on refusal (REQ-572
+/// verify, FIX 1b — a recorded deviation from AC-4's "preview and commit", see
+/// [`refuse_commit_without_session_access`]).
+///
+/// It once announced, on the reasoning that a preview is a step of the
+/// enablement flow and a stranger stepping into that flow is worth telling the
+/// user about. What that missed is that a preview *writes nothing*, so the
+/// notice was the only effect an unattached caller could produce — and with
+/// session ids readable from an ungated `session/list`, that made a refused
+/// preview a same-UID transcript-injection primitive callable at will.
+/// [`handle_web_setup_plan`]'s own cry-wolf argument applies to it word for
+/// word: a notice that can be made to fire on demand is one users learn to read
+/// past, which costs the commit's rejection the attention it exists for.
 ///
 /// A candidate the daemon refuses comes back as the runtime's own
 /// `WEB_SETUP_INVALID` carrying the validator's sentence — never as a preview
@@ -2256,10 +2352,11 @@ fn handle_web_setup_preview(daemon: &Daemon, conn: &ConnState, id: Id, params: V
         Ok(params) => params,
         Err(_) => return error_string(id, error_code::INVALID_PARAMS, "invalid params"),
     };
-    if let Some(refusal) =
-        refuse_setup_without_session_access(daemon, conn, &id, &params.session_id)
-    {
+    if let Some(refusal) = refuse_unmintable_session_id(&id, &params.session_id) {
         return refusal;
+    }
+    if !conn.may_drive(&params.session_id) {
+        return error_string(id, error_code::NOT_ATTACHED, NOT_ATTACHED_MESSAGE);
     }
     match daemon.runtime.web_setup_preview(&params) {
         Ok(result) => ok_string(id, &result),
@@ -2285,8 +2382,11 @@ fn handle_web_setup_commit(daemon: &Daemon, conn: &ConnState, id: Id, params: Va
         Ok(params) => params,
         Err(_) => return error_string(id, error_code::INVALID_PARAMS, "invalid params"),
     };
+    if let Some(refusal) = refuse_unmintable_session_id(&id, &params.session_id) {
+        return refusal;
+    }
     if let Some(refusal) =
-        refuse_setup_without_session_access(daemon, conn, &id, &params.session_id)
+        refuse_commit_without_session_access(daemon, conn, &id, &params.session_id)
     {
         return refusal;
     }
@@ -6799,7 +6899,7 @@ mod tests {
     /// still needs its own test, or "unreachable" quietly becomes "unchecked"
     /// the first time the wire shape changes.
     ///
-    /// Deleting the `refuse_setup_without_session_access` line from
+    /// Deleting the `refuse_commit_without_session_access` line from
     /// [`handle_web_setup_commit`] fails this test twice over: the intruder's
     /// call reaches the runtime and comes back with something other than
     /// `NOT_ATTACHED`, and the session's subscriber is told nothing.
@@ -6873,15 +6973,28 @@ mod tests {
         );
     }
 
-    /// The same gate at the **preview** seam, asserted separately on purpose.
+    /// The same gate at the **preview** seam, asserted separately on purpose —
+    /// and, since the REQ-572 verify pass, asserted to be *silent* (FIX 1b).
     ///
     /// LESSON-502: an invariant enforced at several seams needs a test at each
     /// one, because the seams are separate lines a future edit drops one at a
     /// time. A single representative test would stay green with the preview's
     /// check deleted — and a preview is where the enablement walkthrough a user
     /// is being led through would be hijacked, one step before the write.
+    ///
+    /// The silence is the recorded deviation from AC-4's "preview and commit"
+    /// (architecture ADR-1's spec-mapping table). A preview writes nothing, so
+    /// the notice was the *only* effect an unattached caller could produce; with
+    /// session ids readable from an ungated `session/list` that made it a
+    /// transcript-injection primitive any same-UID peer could fire at will. The
+    /// gate stays; the announcement went to the commit alone.
+    ///
+    /// The absence is decided by **ordering**, not a timer, exactly as
+    /// [`a_refused_plan_is_silent_while_a_refused_commit_is_not`] decides its
+    /// own: the commit that follows on the same connection and subscription does
+    /// publish one, so an empty drain cannot be a dead subscription.
     #[test]
-    fn a_preview_without_session_access_is_refused_and_the_session_is_told() {
+    fn a_refused_preview_is_silent_while_a_refused_commit_is_not() {
         let daemon = Daemon::new();
         let owner = unattached(&daemon);
         let session = a_session_owned_by(&daemon, &owner);
@@ -6898,18 +7011,36 @@ mod tests {
         .unwrap();
         assert!(
             refused.contains(&error_code::NOT_ATTACHED.to_string()),
-            "a preview is a step of the flow, and stepping into somebody's flow \
-             is what BR-4 refuses: {refused}"
+            "a preview reads a session's would-be configuration, so a connection \
+             that may not drive it is refused: {refused}"
+        );
+        assert!(
+            drain_rejections(&mut sub).is_empty(),
+            "a refused preview writes nothing, so announcing it would hand an \
+             unattached peer a line in a stranger's transcript on demand"
         );
 
-        let announced = drain_rejections(&mut sub);
-        assert_eq!(announced.len(), 1, "and the session is told about it");
-        assert_eq!(announced[0].session_id.as_ref(), Some(&session));
+        // The positive control, on the same connection and the same
+        // subscription: what changes something still announces.
+        dispatch(
+            &daemon,
+            &intruder,
+            Id::Number(3),
+            WebSetupCommitParams::METHOD,
+            setup_params(&session),
+        )
+        .unwrap();
+        assert_eq!(
+            drain_rejections(&mut sub).len(),
+            1,
+            "the subscription is live and the bus does carry this event — which \
+             is what makes the silence above a fact rather than a broken fixture"
+        );
 
         let served = dispatch(
             &daemon,
             &owner,
-            Id::Number(3),
+            Id::Number(4),
             WebSetupPreviewParams::METHOD,
             setup_params(&session),
         )
@@ -6919,6 +7050,136 @@ mod tests {
             "the session's own client must be shown what would be written: {served}"
         );
         assert!(drain_rejections(&mut sub).is_empty());
+    }
+
+    /// **One notice per connection, however many commits it refuses** (REQ-572
+    /// verify, FIX 1c — the [`ConnState::may_announce_grant`] precedent).
+    ///
+    /// The refusal is unbounded and free to the caller, so an unbudgeted
+    /// announcement is a line the attacker gets to write into a stranger's
+    /// transcript once per RPC — which is both a flood and, worse, the way a
+    /// genuine warning is buried under its own repetitions.
+    ///
+    /// Both halves matter and both are asserted: the *second* commit is still
+    /// refused (the budget bounds the notice, never the enforcement), and the
+    /// notice count for the connection's whole life is exactly one.
+    #[test]
+    fn a_connection_announces_at_most_one_setup_rejection() {
+        let daemon = Daemon::new();
+        let owner = unattached(&daemon);
+        let session = a_session_owned_by(&daemon, &owner);
+        let intruder = unattached(&daemon);
+        let mut sub = daemon.events.subscribe(16);
+
+        for id in [2, 3] {
+            let refused = dispatch(
+                &daemon,
+                &intruder,
+                Id::Number(id),
+                WebSetupCommitParams::METHOD,
+                setup_params(&session),
+            )
+            .unwrap();
+            assert!(
+                refused.contains(&error_code::NOT_ATTACHED.to_string()),
+                "the budget bounds the announcement, never the refusal — commit \
+                 {id} must still be refused: {refused}"
+            );
+        }
+
+        assert_eq!(
+            drain_rejections(&mut sub).len(),
+            1,
+            "two refused commits from one connection announced more than once: \
+             the second notice says nothing the first did not, and a caller that \
+             can repeat it chooses how much of the user's transcript it writes"
+        );
+
+        // A *different* connection has its own budget, which is the stated limit
+        // of this bound (see `ConnState::setup_rejection_spent`): what is capped
+        // is one connection's loop, not a peer that reconnects.
+        let second = unattached(&daemon);
+        dispatch(
+            &daemon,
+            &second,
+            Id::Number(4),
+            WebSetupCommitParams::METHOD,
+            setup_params(&session),
+        )
+        .unwrap();
+        assert_eq!(
+            drain_rejections(&mut sub).len(),
+            1,
+            "the budget is per connection, so a fresh connection's first refusal \
+             is still announced — the alternative would silence the notice for \
+             every client after the first offender"
+        );
+    }
+
+    /// **A `session_id` longer than this daemon could have minted is refused
+    /// before anything else happens** (REQ-572 verify, FIX 1a; REQ-569 F9's
+    /// rule at the setup family's three seams).
+    ///
+    /// The id is attacker-chosen and bounded only by [`MAX_FRAME`], and each
+    /// handler then did work proportional to it — a hash on every `may_drive`,
+    /// and, at the commit, a clone into an event envelope every subscriber
+    /// holds. All three are asserted, because they are three separate lines
+    /// (LESSON-502).
+    ///
+    /// `INVALID_PARAMS`, not `NOT_ATTACHED`: this is a well-formedness fact the
+    /// caller already knows, so answering it reveals nothing about which
+    /// sessions exist (ADR-B). And the commit's arm asserts the **silence**,
+    /// which is the point of putting the check first: an oversized id must not
+    /// buy the publish that a plausible one would.
+    #[test]
+    fn an_unmintable_session_id_is_refused_by_every_setup_method_before_anything_else() {
+        let daemon = Daemon::new();
+        let intruder = unattached(&daemon);
+        let mut sub = daemon.events.subscribe(16);
+        let oversized = SessionId::from(format!("sess-{}", "a".repeat(4096)).as_str());
+
+        for method in [
+            WebSetupPlanParams::METHOD,
+            WebSetupPreviewParams::METHOD,
+            WebSetupCommitParams::METHOD,
+        ] {
+            let refused = dispatch(
+                &daemon,
+                &intruder,
+                Id::Number(1),
+                method,
+                setup_params(&oversized),
+            )
+            .unwrap();
+            assert!(
+                refused.contains(&error_code::INVALID_PARAMS.to_string()),
+                "`{method}` accepted an id no daemon could have minted, so an \
+                 unattached peer sizes the work it costs: {refused}"
+            );
+        }
+
+        assert!(
+            drain_rejections(&mut sub).is_empty(),
+            "the length check must come before the publish, or a 4 MiB id still \
+             buys a 4 MiB event envelope in every subscriber's queue"
+        );
+
+        // Non-vacuity: the same call with a *mintable* id gets past this check
+        // and reaches the session gate, so the refusals above are the length
+        // rule and not the setup family being unroutable.
+        let session = a_session_owned_by(&daemon, &unattached(&daemon));
+        let gated = dispatch(
+            &daemon,
+            &intruder,
+            Id::Number(2),
+            WebSetupCommitParams::METHOD,
+            setup_params(&session),
+        )
+        .unwrap();
+        assert!(
+            gated.contains(&error_code::NOT_ATTACHED.to_string()),
+            "a plausible id must reach the session gate: {gated}"
+        );
     }
 
     /// The **plan** is gated too, and announces nothing — both halves together,
