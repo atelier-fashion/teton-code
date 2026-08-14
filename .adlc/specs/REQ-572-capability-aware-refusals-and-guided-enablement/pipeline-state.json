@@ -3,9 +3,23 @@
   "branch": "feat/REQ-572-capability-aware-refusals",
   "startedAt": "2026-08-13T17:35:00Z",
   "completed": false,
-  "currentPhase": 0,
-  "completedPhases": [],
-  "phaseHistory": [],
+  "currentPhase": 2,
+  "completedPhases": [
+    0,
+    1
+  ],
+  "phaseHistory": [
+    {
+      "phase": 0,
+      "name": "Create Worktree + Draft PR",
+      "completedAt": "2026-08-13T17:50:00Z"
+    },
+    {
+      "phase": 1,
+      "name": "Validate Spec",
+      "completedAt": "2026-08-13T17:55:00Z"
+    }
+  ],
   "integrationBranch": "main",
   "repos": {
     "teton-code": {
@@ -14,15 +28,17 @@
       "worktree": "/Users/brettluelling/Documents/GitHub/teton-code/.worktrees/REQ-572",
       "branch": "feat/REQ-572-capability-aware-refusals",
       "touched": true,
-      "prUrl": null,
-      "prNumber": null,
-      "prCreatedAt": null,
+      "prUrl": "https://github.com/atelier-fashion/teton-code/pull/124",
+      "prNumber": 124,
+      "prCreatedAt": "2026-08-14T00:49:03Z",
       "merged": false,
       "snapshotBranch": null,
       "snapshotPR": null
     }
   },
-  "mergeOrder": ["teton-code"],
+  "mergeOrder": [
+    "teton-code"
+  ],
   "phase4": {
     "currentTask": null,
     "completedTasks": [],
