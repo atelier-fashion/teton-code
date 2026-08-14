@@ -331,17 +331,24 @@ The `?format=json` on a SearxNG endpoint is load-bearing: without it the
 instance answers with a web page rather than JSON.
 
 <!--
-Drift check. The three backend rows above, the `[web]` keys below, and the
-keychain reference are the same strings as two places in the tree, and all of
-them must move together:
-  - `crates/tetond/src/harness/self_config.md` — the guide bundled into the
-    system prompt, and the single source REQ-572's AC-8 backend contract suite
-    (`crates/tetond/tests/web_setup_contracts.rs`) enumerates the suggestion
-    list from, so a backend added there without a contract fixture fails the
-    suite;
-  - `crates/teton/src/web_setup_ui.rs` — `ENDPOINT_HELP` (what `/web setup`
-    prints above the endpoint prompt) and `instruction_lines` (what a piped
-    session is told).
+Drift check. One in-tree source for the three backend rows above:
+`crates/tetond/src/web_setup_catalog.rs`. The rows are a prose mirror of it —
+change the catalog first, then this table. The `[web]` key names and the
+`keychain://teton/web-search` reference below are the bundled guide's strings,
+and the guide is itself checked against that catalog.
+
+Where every other surface's sync is enforced:
+  - `crates/tetond/tests/web_setup_contracts.rs` (REQ-572 AC-8) enumerates the
+    catalog typed, parsing no one's source text, so a backend added to the
+    catalog without a contract fixture fails CI;
+  - `crates/tetond/src/harness/self_config.md`, the guide bundled into the
+    system prompt, is checked against the catalog in both directions
+    (`the_bundled_guide_and_the_catalog_agree`) — a template only one side
+    names fails, whichever side moved;
+  - `crates/teton/src/web_setup_ui.rs` keeps no copy: `/web setup` renders the
+    catalog the daemon hands it on `web/setup_plan`, the piped instructions
+    included.
+Only this table is unenforced. It is prose; this comment is the pointer.
 -->
 
 **Or write the table by hand.** `/web setup` exists because it is live in the
