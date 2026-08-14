@@ -351,6 +351,14 @@ mod tests {
     /// `X-Subscription-Token` are both exactly twenty characters that way, and
     /// the segmented threshold sits above them rather than under a UUID's
     /// thirty-six.
+    ///
+    /// The headroom is four characters and deliberate: a future legitimate
+    /// value that trips this (a longer host, say) gets a named per-value
+    /// allowance beside the golden test, never a raised threshold — raising the
+    /// bar for everyone is how the sweep stops catching anything. Base64's
+    /// `+`/`/`/`=` are deliberately NOT run-internal: `/` glues every URL path
+    /// into one giant run, and the golden test pins every shipped byte anyway —
+    /// this sweep is the second net, not the first.
     fn has_opaque_run(text: &str) -> bool {
         const BARE_RUN: usize = 20;
         const SEGMENTED_RUN: usize = 24;
@@ -364,51 +372,31 @@ mod tests {
         bare || segmented
     }
 
-    /// Whether `text` is a URL carrying userinfo before its host — the shape a
-    /// credential takes when it hides inside an endpoint.
+    /// Whether `text` carries userinfo before a host — the shape a credential
+    /// takes when it hides inside an endpoint.
     ///
     /// **Any** non-empty userinfo, not just `user:pass@`: a bare-token userinfo
     /// (`https://a1b2c3tok@kagi.com/…`) is the form an API key actually takes
-    /// when someone pastes one into a URL, and it carries no colon at all.
+    /// when someone pastes one into a URL, and it carries no colon at all. The
+    /// scheme is optional: the `host` field is structurally scheme-less, and
+    /// gating on `://` was how `u:p@kagi.com` in a host swept clean while the
+    /// runtime's own preview warning flagged the same shape (REQ-573 verify).
     fn has_userinfo(text: &str) -> bool {
-        url_parts(text).is_some_and(|(authority, _query)| {
-            matches!(authority.split_once('@'), Some((userinfo, _)) if !userinfo.is_empty())
-        })
-    }
-
-    /// Whether `text` is a URL whose query carries a parameter *named* like a
-    /// credential.
-    ///
-    /// Name-based, and the value is never read — the same rule, and the same
-    /// list, as the `/web setup` preview's warning
-    /// (`runtime::endpoint_query_names_a_credential`). The list is shared rather
-    /// than mirrored: a warning and a gate disagreeing about what a credential
-    /// is named is how one of them ends up wrong.
-    fn query_names_a_credential(text: &str) -> bool {
-        let Some((_authority, query)) = url_parts(text) else {
-            return false;
-        };
-        query
-            .split(['&', ';'])
-            .filter_map(|pair| pair.split('=').next())
-            .any(|name| {
-                let name = name.trim().to_ascii_lowercase();
-                crate::runtime::CREDENTIAL_QUERY_KEYS.contains(&name.as_str())
-            })
-    }
-
-    /// The authority and the query of `text`, when it is shaped like a URL.
-    ///
-    /// A hand-split rather than a URL parse, for the reason the whole sweep is
-    /// shape-based: what has to be caught is the string a human pasted, which
-    /// may well not parse.
-    fn url_parts(text: &str) -> Option<(&str, &str)> {
-        let (_scheme, after) = text.split_once("://")?;
+        let after = text.split_once("://").map_or(text, |(_, after)| after);
         let authority = after.split(['/', '?', '#']).next().unwrap_or("");
-        let query = after
-            .split_once('?')
-            .map_or("", |(_, rest)| rest.split('#').next().unwrap_or(""));
-        Some((authority, query))
+        matches!(authority.split_once('@'), Some((userinfo, _)) if !userinfo.is_empty())
+    }
+
+    /// Whether `text`'s query carries a parameter *named* like a credential.
+    ///
+    /// The same **function**, not merely the same list, as the `/web setup`
+    /// preview's warning: the sweep's first cut shared
+    /// `CREDENTIAL_QUERY_KEYS` but re-derived the extraction behind a `://`
+    /// gate, so a scheme-less `kagi.com/api?api_key=…` swept clean while the
+    /// runtime flagged it — the exact two-answers drift the sharing was meant
+    /// to prevent (REQ-573 verify).
+    fn query_names_a_credential(text: &str) -> bool {
+        crate::runtime::endpoint_query_names_a_credential(text)
     }
 
     /// **The purity pin (LESSON-481).**

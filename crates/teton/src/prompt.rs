@@ -329,12 +329,25 @@ impl FramedStdinPrompter {
     /// about and shred the frame it sits in.
     fn draw_bytes(&mut self, question: &str) -> String {
         let question = defused(question);
+        // Styling happens HERE, after defusing, or not at all. A caller
+        // hand-composing SGR into the question hands the sanitizer exactly the
+        // bytes it exists to destroy — the REQ-573 verify pass briefly shipped
+        // that as literal `[36m` debris where the chevron's tint had been. The
+        // seam owns the tint; callers hand in plain text.
+        let question = if self.color {
+            question.replace('›', "\x1b[36m›\x1b[0m")
+        } else {
+            question
+        };
         let rule = self.rule();
         // Rule, blank input row, rule, then the status row if there is one.
         let mut bytes = format!("{rule}\n\n{rule}\n");
         self.below_rows = match &self.status {
             Some(status) => {
-                bytes.push_str(status);
+                // Enum-derived content today, defused anyway: the first status
+                // field that carries daemon- or model-supplied text would
+                // otherwise reopen the seam this function just closed.
+                bytes.push_str(&defused(status));
                 bytes.push('\n');
                 1
             }
@@ -739,6 +752,45 @@ mod tests {
                 "an ordinary question must survive verbatim: {bytes:?}"
             );
         }
+    }
+
+    /// **The chevron's tint belongs to the seam, not the caller (REQ-573).**
+    ///
+    /// The defusing fix briefly shipped its own regression: `main.rs` used to
+    /// hand the entry prompt in with SGR already composed, which the sanitizer
+    /// then (correctly) shredded into literal `[36m` debris. The tint is now
+    /// applied here, after defusing, so a plain-text question arrives styled
+    /// and a hostile question still arrives dead.
+    #[test]
+    fn the_chevrons_tint_is_applied_after_defusing_at_the_seam() {
+        // Colour on: plain " › " in, tinted chevron out.
+        let mut tinted = FramedStdinPrompter::new(true, true);
+        let bytes = tinted.draw_bytes(" › ");
+        assert!(
+            bytes.contains(" \x1b[36m›\x1b[0m "),
+            "the seam must tint the chevron the caller handed in plain: {bytes:?}"
+        );
+
+        // Colour off: the same question stays plain, and no SGR appears.
+        let mut plain = FramedStdinPrompter::new(true, false);
+        let bytes = plain.draw_bytes(" › ");
+        assert!(
+            bytes.contains(" › ") && !bytes.contains("\x1b[36m"),
+            "no colour means no SGR at all: {bytes:?}"
+        );
+
+        // A hostile question is defused whether or not the tint applies — the
+        // erase and the carriage return die, the chevron still gets its tint.
+        let mut hostile = FramedStdinPrompter::new(true, true);
+        let bytes = hostile.draw_bytes("\x1b[2K› \r");
+        assert!(
+            !bytes.contains("\x1b[2K") && !bytes.contains('\r'),
+            "defusing must run regardless of styling: {bytes:?}"
+        );
+        assert!(
+            bytes.contains("\x1b[36m›\x1b[0m"),
+            "styling must still apply to the defused text: {bytes:?}"
+        );
     }
 
     #[test]

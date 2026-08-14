@@ -6721,11 +6721,11 @@ fn web_table_summary(web: &WebConfig) -> WebTableSummary {
 /// — saying nothing — is how a key ends up in a config file, a shell history and
 /// every `web_lookup` destination string that endpoint ever produces.
 ///
-/// `pub(crate)` for one reader beyond this module: the catalog's BR-6 sweep
-/// (`web_setup_catalog`'s tests) refuses to ship a suggestion whose own query
-/// names a credential. Shared rather than mirrored — a second copy of this list
-/// would be a warning and a gate disagreeing about what a credential is named.
-pub(crate) const CREDENTIAL_QUERY_KEYS: [&str; 4] = ["api_key", "apikey", "key", "token"];
+/// The catalog's BR-6 sweep (`web_setup_catalog`'s tests) shares this rule via
+/// [`endpoint_query_names_a_credential`] — the whole function, not just this
+/// list, so the extraction cannot drift either (REQ-573 verify: a `://`-gated
+/// re-derivation of the split let scheme-less shapes sweep clean).
+const CREDENTIAL_QUERY_KEYS: [&str; 4] = ["api_key", "apikey", "key", "token"];
 
 /// Whether `endpoint`'s query string carries a parameter whose **name** says it
 /// holds a credential (REQ-572 verify).
@@ -6738,7 +6738,10 @@ pub(crate) const CREDENTIAL_QUERY_KEYS: [&str; 4] = ["api_key", "apikey", "key",
 /// A hand-split rather than a URL parse, for the reason the whole function is a
 /// warning and not a gate: an endpoint that does not parse has its own arm
 /// below, and this one has to work on the string the user typed.
-fn endpoint_query_names_a_credential(endpoint: &str) -> bool {
+///
+/// `pub(crate)` for one reader beyond this module: the catalog's BR-6 sweep,
+/// which refuses to ship a suggestion whose own query names a credential.
+pub(crate) fn endpoint_query_names_a_credential(endpoint: &str) -> bool {
     endpoint
         .split_once('?')
         .map(|(_, query)| query)
