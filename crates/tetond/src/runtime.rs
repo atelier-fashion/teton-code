@@ -89,21 +89,19 @@ use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use teton_core::apply_config_delta;
 use teton_core::boundary::BoundaryMatcher;
 use teton_core::capability::{web_capability_state, SearchGap, WebCapabilityState};
 use teton_core::category::{
     category_for_phase, BindingSource as CoreBindingSource, Category, CategoryOverride,
     CategoryResolution, CategoryTable, ConfigurableCategory, Tier, TierBinding,
 };
-use teton_core::config::{
-    web_table_toml, Config, LocalModelConfig, RoutingMigration, WebConfig, WebTier,
-};
+use teton_core::config::{Config, LocalModelConfig, RoutingMigration, WebConfig, WebTier};
 use teton_core::entities::{
     BoundaryMode, ModelProvider, PrivacyBoundary, ProviderCapabilities, ProviderKind,
 };
 use teton_core::phase::Phase as CorePhase;
 use teton_core::policy::ProviderHealth;
+use teton_core::{apply_config_delta, table_section};
 
 use teton_inference::benchmark::{BenchmarkResult, DutySpec};
 use teton_inference::catalog::Catalog;
@@ -3942,40 +3940,59 @@ impl DaemonRuntime {
         }
     }
 
-    /// Exactly what a candidate `[web]` table would write, without writing it
-    /// (`web/setup_preview`, BR-7).
+    /// Exactly what a commit would leave on disk, without writing it
+    /// (`web/setup_preview`, REQ-572 BR-7, REQ-574 BR-3).
     ///
-    /// The bytes come from [`web_table_toml`] over the candidate the commit
-    /// would build from the same answers, so "what the user confirmed is what
-    /// is written" is a property of the code path rather than of two renderers
-    /// agreeing.
+    /// The `toml` field is the `[web]` table **sliced out of the edited
+    /// document** — the document [`render_persisted_document`] derives by
+    /// applying this candidate's delta to the file as it stands right now — so
+    /// the user's own comments inside `[web]` appear in the preview they
+    /// confirm, and "what the user confirmed is what is written" stays a
+    /// property of the code path rather than of two renderers agreeing. Preview
+    /// and commit share that one derivation (ADR-3, LESSON-451): there is no
+    /// second renderer to drift out of step with the writer.
     ///
-    /// That property held only for the four fields the answers pin. The rest of
-    /// the document rides along from the live config, which another session can
-    /// move while the user is reading — so the answer also carries a
-    /// [`candidate_digest`] of the whole candidate document, and the commit
-    /// refuses to write anything that no longer digests to it (BR-7, the verify
-    /// pass's TOCTOU fix).
+    /// Only four fields come from the answers. Everything else rides along from
+    /// the document and from the live config, either of which another session
+    /// can move while the user is reading — so the answer also carries a digest
+    /// of the whole edited text, and the commit refuses to write anything that
+    /// no longer digests to it (BR-3, AC-4).
+    ///
+    /// # This reads the config file, and still writes nothing
+    ///
+    /// Deliberate new I/O in a preview path: the bytes a commit would write are
+    /// a function of the document on disk, so a preview that did not read it
+    /// could only describe a document that does not exist. The read happens
+    /// under the **same** config mutex the commit holds across its own
+    /// derivation and write, so a preview and a concurrent commit in this
+    /// daemon cannot interleave over the base; a write from anywhere else is
+    /// exactly what the digest is for.
     ///
     /// # Errors
     /// [`error_code::WEB_SETUP_INVALID`] when the candidate would not load,
-    /// carrying the validator's own sentence, or when the answers name a tier
-    /// this machine cannot serve (AC-7). Nothing is written either way — this
-    /// method has no write path at all.
+    /// when the answers name a tier this machine cannot serve (AC-7), or when
+    /// the *edited* document would not load — a hand edit this daemon has not
+    /// seen can fail validation in a key the flow never touches (BR-4, AC-10).
+    /// [`error_code::INTERNAL_ERROR`] when the document cannot be derived at
+    /// all. Nothing is written in any of those cases: this method has no write
+    /// path.
     pub fn web_setup_preview(
         &self,
         params: &WebSetupPreviewParams,
     ) -> Result<WebSetupPreviewResult, RpcError> {
         let answers = WebSetupAnswers::from_preview(params);
-        let current = self.config.lock().expect("config mutex poisoned").clone();
-        let candidate = self.web_setup_candidate(&answers, &current)?;
+        // Held across the derivation rather than cloned out of the way, which
+        // is what the old whole-candidate rendering could afford: the base of
+        // the edit is the file, and a commit takes this same lock across its
+        // read-edit-write. Releasing it here would let a commit land between
+        // the base this preview read and the digest it took over it.
+        let config = self.config.lock().expect("config mutex poisoned");
+        let candidate = self.web_setup_candidate(&answers, &config)?;
+        let rendered = render_persisted_document(self.config_path.as_deref(), &config, &candidate)?;
+        let warnings = web_setup_warnings(&config.web, &candidate.web);
+        drop(config);
         Ok(WebSetupPreviewResult {
-            toml: web_table_toml(&candidate.web).map_err(|err| {
-                RpcError::new(
-                    error_code::INTERNAL_ERROR,
-                    format!("the candidate `[web]` table could not be rendered ({err})"),
-                )
-            })?,
+            toml: rendered.web_section,
             // The host from the **executor's** parse (BR-9, LESSON-494) — the
             // same `crate::web` parser the lookup seam records a search's
             // destination with, so the string at the confirm step is the host
@@ -3985,11 +4002,8 @@ impl DaemonRuntime {
                 .search_endpoint
                 .as_deref()
                 .and_then(crate::web::canonical_host_of),
-            warnings: web_setup_warnings(&current.web, &candidate.web),
-            // Computed last, over the finished candidate, so what the client
-            // hands back names exactly the document the rest of this answer
-            // describes (see `candidate_digest`).
-            digest: candidate_digest(&candidate)?,
+            warnings,
+            digest: rendered.digest,
         })
     }
 
@@ -4002,15 +4016,20 @@ impl DaemonRuntime {
     ///
     /// 1. the candidate is rebuilt **from the answers** — never from a preview
     ///    the client kept, which is what stops a client committing something
-    ///    this daemon never validated (BR-8, LESSON-501) — and, when the caller
-    ///    sent one, is checked against the preview's
+    ///    this daemon never validated (BR-8, LESSON-501) — and the document it
+    ///    would produce is derived once, through the same
+    ///    [`render_persisted_document`] the preview used, and, when the caller
+    ///    sent one, checked against the preview's
     ///    [`digest`](WebSetupCommitParams::expect_digest), so re-deriving cannot
     ///    quietly pick up a change another session made in between;
-    /// 2. the document is written atomically, through the same
-    ///    [`persist_config`] seam [`Self::persist_web_tier`] uses, so there is
-    ///    exactly one config-write body in this daemon — and, since REQ-574, the
-    ///    write edits the on-disk document rather than replacing it, so the
-    ///    user's comments and unknown keys survive a setup commit;
+    /// 2. **that derived text** is written atomically, through the one
+    ///    [`write_config_atomically`] body [`Self::persist_web_tier`] reaches by
+    ///    way of [`persist_config`], so there is exactly one config-write body
+    ///    in this daemon — and, since REQ-574, the write edits the on-disk
+    ///    document rather than replacing it, so the user's comments and unknown
+    ///    keys survive a setup commit. The bytes handed to the writer are the
+    ///    ones the digest was taken over, never a second derivation: two reads
+    ///    of the file would check one document and write another (ADR-3);
     /// 3. only then is the in-memory config replaced. `build_tools` clones that
     ///    config per turn, so the very next turn of **every** session picks the
     ///    capability up with no restart (ADR-1, OQ-1).
@@ -4037,21 +4056,29 @@ impl DaemonRuntime {
         let answers = WebSetupAnswers::from_commit(params);
         let mut config = self.config.lock().expect("config mutex poisoned");
         let candidate = self.web_setup_candidate(&answers, &config)?;
+        // The one derivation, and the text the write below actually takes. It
+        // runs unconditionally — before the digest check that needs it, and so
+        // before the no-op short-circuit — because a second derivation inside
+        // the writer would digest one document and write another the moment the
+        // file moved between the two reads (ADR-3, LESSON-451).
+        let rendered = render_persisted_document(self.config_path.as_deref(), &config, &candidate)?;
         // BR-7's second half, and the reason it needs one: the answers pin the
         // four fields the flow collects, and everything else in the document
-        // rides along from whatever the config held *at this moment*. A
-        // `persist_web_tier` from any other session between the preview and here
-        // rewrites `permission_allow`, so re-deriving from the answers alone
-        // faithfully writes a document the user never saw. The check sits
-        // **before** the no-op short-circuit below: a divergence is a refusal
-        // whether or not the `[web]` table itself ended up unchanged.
+        // rides along — from whatever the config held *at this moment*, and
+        // since REQ-574 from whatever the file holds too. A `persist_web_tier`
+        // from any other session between the preview and here rewrites
+        // `permission_allow`, and a hand edit rewrites anything at all, so
+        // re-deriving from the answers alone would faithfully write a document
+        // the user never saw. The check sits **before** the no-op short-circuit
+        // below: a divergence is a refusal whether or not the `[web]` table
+        // itself ended up unchanged.
         //
         // A guard on the outcome, never a substitute for re-deriving it: the
         // candidate above was already rebuilt and re-validated, so a forged
         // digest buys nothing the answers had not already earned (BR-8,
         // LESSON-501).
         if let Some(expected) = params.expect_digest.as_deref() {
-            if candidate_digest(&candidate)? != expected {
+            if rendered.digest != expected {
                 return Err(RpcError::new(
                     error_code::WEB_SETUP_INVALID,
                     SETUP_DIGEST_STALE,
@@ -4075,12 +4102,16 @@ impl DaemonRuntime {
                  enabled",
             ));
         };
-        persist_config(path, &config, &candidate).map_err(|err| {
+        // The text the digest above was taken over, handed to the writer as-is.
+        // Not `persist_config`: that would re-read and re-edit the file, which
+        // is the one thing a digest-checked write must not do. The validation
+        // `persist_config` performs happened inside the derivation, so the bytes
+        // that land are still the bytes that were validated (BR-4).
+        write_config_atomically(path, &rendered.full_text).map_err(|err| {
             // Names the failure class and never the path (BR-11), exactly as
             // `persist_web_tier`'s own message does. The parenthesis carries the
-            // *inner* reason — an unparseable document, a hand edit that fails
-            // validation — because a user who has to fix their file needs to be
-            // told what is wrong with it (REQ-574 BR-6, LESSON-456).
+            // *inner* reason, because a user who has to fix something needs to
+            // be told what is wrong (REQ-574 BR-6, LESSON-456).
             RpcError::new(
                 error_code::INTERNAL_ERROR,
                 format!("the configuration could not be saved ({err})"),
@@ -4129,11 +4160,11 @@ impl DaemonRuntime {
     ///
     ///   - a candidate whose `[web]` table holds every default is
     ///     [`WebConfig::is_unset`], and `Config` skips serializing an unset
-    ///     table — so the preview rendered a `[web]` section that the write
-    ///     would then *omit*. That asymmetry is documented at
-    ///     [`web_table_toml`] as unreachable precisely because "the setup flow
-    ///     writes a tier, and a tier above `off` is not the default"; this is
-    ///     the line that makes the sentence true.
+    ///     table — so its delta writes no `[web]` section at all, and since
+    ///     REQ-574 the preview is *sliced from* the document that delta
+    ///     produces ([`render_persisted_document`]). There would be nothing to
+    ///     slice. This line is what keeps that unreachable: the setup flow
+    ///     writes a tier, and a tier above `off` is not the default.
     ///   - the commit's `WebSetupCompleted` carries the candidate's tier, and
     ///     that payload's own doc says it is never `Off` — "a completed setup
     ///     enabled something".
@@ -4631,7 +4662,72 @@ impl WebTierPersistence for DaemonRuntime {
 }
 
 /// Make `candidate` durable at `path` by **editing the document that is there**
-/// (REQ-574 BR-1/BR-5) — the one config-write entry point in this daemon.
+/// (REQ-574 BR-1/BR-5) — the config-write entry point every writer but
+/// `web/setup_commit` uses.
+///
+/// Two steps, and each has its own home so neither can be half-done: derive the
+/// document ([`render_config_document`], which also validates it) and then land
+/// it ([`write_config_atomically`], which owns atomicity and the file's mode).
+/// `web_setup_commit` is the one caller that splits them, because it has to
+/// digest the derived text and check it against the preview the user confirmed
+/// before writing; it goes through the same two functions in the same order, so
+/// there is still exactly one derivation and one write body in this daemon (BR-2,
+/// REQ-572 BR-11).
+///
+/// # Errors
+/// Returns an error whose `Display` **carries the underlying reason** — the
+/// parse failure, the validator's own sentence, or the I/O error — because a
+/// caller renders it into a sentence a user has to act on, and "the
+/// configuration could not be saved" alone is the silent downgrade LESSON-456
+/// and BUG-146 are about. Nothing is written and the on-disk file is untouched
+/// in every failing case.
+fn persist_config(path: &Path, current: &Config, candidate: &Config) -> anyhow::Result<()> {
+    let edited = render_config_document(Some(path), current, candidate)?;
+    write_config_atomically(path, &edited)
+}
+
+/// Why the document a write would produce could not be derived.
+///
+/// Typed rather than `anyhow`, because two callers have to **classify** the
+/// failure and not merely report it: `/web setup`'s preview and commit answer a
+/// document that would not load with [`error_code::WEB_SETUP_INVALID`] — the
+/// drift is in the user's file and the validator's sentence names the key to fix
+/// — and everything else with an internal error.
+///
+/// Every variant's `Display` **embeds** the inner reason rather than attaching it
+/// as context, because every caller formats with `{err}` and anyhow shows only
+/// the outermost layer (LESSON-456, BUG-146: a write that fails must say what
+/// failed, not "write failed").
+#[derive(Debug, thiserror::Error)]
+enum RenderError {
+    /// The file is there and could not be read. An unreadable file is not an
+    /// empty one.
+    #[error(
+        "the existing configuration could not be read for editing, so nothing was written: {0}"
+    )]
+    Read(std::io::Error),
+
+    /// The document could not be edited — an unparseable file, in practice
+    /// (BR-6). Carries [`teton_core::DeltaError`]'s own sentence unchanged.
+    #[error("{0}")]
+    Edit(#[from] teton_core::DeltaError),
+
+    /// The edited bytes would not load. The validator's own sentence rides
+    /// inside, because it names the key the user has to fix (BR-4, AC-10).
+    #[error("the edited configuration would not load, so nothing was written: {0}")]
+    Invalid(String),
+}
+
+/// The document a write of `candidate` would leave at `path` — derived,
+/// validated, and not yet written (REQ-574 BR-1/BR-4).
+///
+/// The derivation half of the write seam, and the **only** one:
+/// [`persist_config`] hands what this returns straight to
+/// [`write_config_atomically`], and `/web setup`'s preview and commit reach it
+/// through [`render_persisted_document`]. So the bytes a user confirms and the
+/// bytes that land are one computation rather than two computations that agree
+/// — LESSON-451's rule (a seam fakes the boundary, never the commit path)
+/// applied to serialization, and the reason ADR-3 asks for a single derivation.
 ///
 /// Every daemon-side write used to hand [`write_config_atomically`] a whole
 /// `Config` and get a fresh `Config::to_toml()` serialization on disk, so a
@@ -4664,51 +4760,122 @@ impl WebTierPersistence for DaemonRuntime {
 /// different questions. A parseable hand edit that fails validation therefore
 /// makes this refuse rather than overwrite it — a deliberate behavior change,
 /// and the fail-safe one: the daemon neither destroys the user's edit nor writes
-/// a document it would refuse to start on.
+/// a document it would refuse to start on. `/web setup`'s preview inherits that
+/// refusal, which is the honest answer there too: it has nothing truthful to
+/// show for a document no commit could write.
 ///
 /// # Refusal, never a silent rewrite
 ///
 /// An unparseable document (a half-finished hand edit) refuses with the parse
 /// failure named; falling back to a full re-serialization would make the write
-/// succeed by destroying the edit in progress, which BR-6 forbids outright. A
-/// **missing** file is not that case: the edit base is the empty document and
-/// the delta base is `Config::default()` — the parse of an empty document — so
-/// every non-default key of the candidate is written and the fresh file's parse
-/// equals the candidate (AC-6).
+/// succeed by destroying the edit in progress, which BR-6 forbids outright.
 ///
-/// # Errors
-/// Returns an error whose `Display` **carries the underlying reason** — the
-/// parse failure, the validator's own sentence, or the I/O error — because a
-/// caller renders it into a sentence a user has to act on, and "the
-/// configuration could not be saved" alone is the silent downgrade LESSON-456
-/// and BUG-146 are about. Nothing is written and the on-disk file is untouched
-/// in every failing case.
-fn persist_config(path: &Path, current: &Config, candidate: &Config) -> anyhow::Result<()> {
+/// # A missing file, and a daemon with no file at all, are the same base
+///
+/// Neither is that case. A `path` of `None` — a daemon started with no config
+/// file — still previews, because the question is "what would a write produce",
+/// and the answer for both is a fresh document. In both, the edit base is the
+/// empty document **and the delta base is `Config::default()`**, the parse of an
+/// empty document, rather than the caller's `current`: that is what makes every
+/// non-default key of the candidate get written and the fresh file's parse equal
+/// the candidate (ADR-1, AC-6). Diffing against `current` there would produce a
+/// document naming only what changed, which is not a config anyone could boot on.
+fn render_config_document(
+    path: Option<&Path>,
+    current: &Config,
+    candidate: &Config,
+) -> Result<String, RenderError> {
     // Named so the missing-file base can be borrowed alongside `current`; a
     // default `Config` is the parse of an empty document, which is exactly what
     // the delta must diff against when there is no file yet (ADR-1).
     let fresh = Config::default();
-    let (document, base) = match std::fs::read_to_string(path) {
-        Ok(text) => (text, current),
-        Err(err) if err.kind() == std::io::ErrorKind::NotFound => (String::new(), &fresh),
+    let (document, base) = match path.map(std::fs::read_to_string) {
+        Some(Ok(text)) => (text, current),
+        None => (String::new(), &fresh),
+        Some(Err(err)) if err.kind() == std::io::ErrorKind::NotFound => (String::new(), &fresh),
         // Any other read failure is a real one — an unreadable file is not an
         // empty one, and treating it as one would write a fresh document over
         // whatever is actually there.
-        Err(err) => {
-            return Err(anyhow::anyhow!(
-                "the existing configuration could not be read for editing, so nothing was \
-                 written: {err}"
-            ))
-        }
+        Some(Err(err)) => return Err(RenderError::Read(err)),
     };
     let edited = apply_config_delta(&document, base, candidate)?;
-    // The validator's sentence rides *inside* this message rather than being
-    // attached as context, because callers format the error with `{err}` and
-    // anyhow's `Display` shows only the outermost layer (LESSON-456).
-    Config::load(&edited).map_err(|err| {
-        anyhow::anyhow!("the edited configuration would not load, so nothing was written: {err}")
+    Config::load(&edited).map_err(|err| RenderError::Invalid(err.to_string()))?;
+    Ok(edited)
+}
+
+/// The document `/web setup` describes and then writes, in the three shapes the
+/// flow needs it (REQ-574 BR-3, ADR-3).
+struct RenderedCandidate {
+    /// The whole edited document — byte-for-byte what the commit writes.
+    full_text: String,
+    /// The `[web]` table as it appears *inside* `full_text`, decor and the
+    /// user's own comments included. What the preview shows.
+    web_section: String,
+    /// `sha256(full_text)` — see [`render_persisted_document`] for why the whole
+    /// document and not the section.
+    digest: String,
+}
+
+/// Derive the document a `/web setup` commit would write, and the two views its
+/// preview describes it with (BR-3, AC-3/AC-4).
+///
+/// One derivation for both seams. The preview slices and digests what this
+/// returns; the commit calls it, compares the digest the user confirmed against
+/// what it just derived, and writes that same `full_text`. There is no second
+/// renderer to drift out of step with the writer (LESSON-451) and no second read
+/// either — deriving here and again inside [`persist_config`] would digest one
+/// document and write another whenever the file moved between the two reads,
+/// which is a TOCTOU the daemon would have opened on itself.
+///
+/// # Why the digest covers the whole document
+///
+/// REQ-572's guard digested the candidate's canonical serialization, which
+/// caught the race it was built for: the answers pin four fields and the rest of
+/// the `[web]` table rides along from the live config, so another session's
+/// "enable permanently" ([`DaemonRuntime::persist_web_tier`]) moves
+/// `permission_allow` underneath a preview the user is still reading. Digesting
+/// the **edited document** keeps that and delivers the rest of the promise: a
+/// hand edit anywhere in the file — a comment on its own line, a key this flow
+/// never touches — changes the bytes that would land, so it changes the digest
+/// and the commit refuses with [`SETUP_DIGEST_STALE`] (BR-3, AC-4).
+///
+/// Deterministic because the derivation is: the same document and the same
+/// candidate produce the same text on both calls, which is what makes an
+/// inequality evidence of a *change* rather than of two renderings.
+///
+/// # Errors
+/// [`error_code::WEB_SETUP_INVALID`] when the edited document would not load,
+/// carrying the validator's own sentence (BR-4, AC-10).
+/// [`error_code::INTERNAL_ERROR`] when the document could not be derived at all
+/// — an unparseable file (BR-6) or an unreadable one — or when it names no
+/// `[web]` table. That last one is unreachable through the flow, which never
+/// writes a candidate whose table is `WebConfig::is_unset`: a delta that changes
+/// any `[web]` key writes the section, and a delta that changes none is the
+/// commit's own no-op case.
+fn render_persisted_document(
+    path: Option<&Path>,
+    current: &Config,
+    candidate: &Config,
+) -> Result<RenderedCandidate, RpcError> {
+    let full_text = render_config_document(path, current, candidate).map_err(|err| match &err {
+        RenderError::Invalid(_) => RpcError::new(error_code::WEB_SETUP_INVALID, err.to_string()),
+        RenderError::Read(_) | RenderError::Edit(_) => RpcError::new(
+            error_code::INTERNAL_ERROR,
+            format!("the configuration could not be saved ({err})"),
+        ),
     })?;
-    write_config_atomically(path, &edited)
+    let web_section = table_section(&full_text, "web").ok_or_else(|| {
+        RpcError::new(
+            error_code::INTERNAL_ERROR,
+            "the document this would write names no `[web]` table, so there is nothing to show",
+        )
+    })?;
+    let digest = teton_inference::sha256_hex(full_text.as_bytes());
+    Ok(RenderedCandidate {
+        full_text,
+        web_section,
+        digest,
+    })
 }
 
 /// Replace `path` with `text` **atomically** — a sibling temp file, flushed to
@@ -6730,44 +6897,6 @@ impl<'a> WebSetupAnswers<'a> {
     }
 }
 
-/// The digest a preview promises and a commit checks (REQ-572 verify, BR-7).
-///
-/// Over the **whole serialized document** rather than over the rendered `[web]`
-/// section the preview displays. The setup flow collects four fields and
-/// carries the rest of the table along from the live config
-/// ([`DaemonRuntime::web_setup_candidate`]), so any other session answering
-/// "enable permanently" ([`DaemonRuntime::persist_web_tier`]) moves
-/// `permission_allow` — and with it the file — underneath a preview the user is
-/// still reading. A digest over the section alone would catch that one race and
-/// nothing else; digesting what is written pins the whole promise.
-///
-/// Deterministic because `Config`'s maps are `BTreeMap`s: the same candidate
-/// serializes to the same bytes on both calls, which is what makes an inequality
-/// evidence of a *change* rather than of two serializations.
-///
-/// **Interim, REQ-574**: the write seam now edits the on-disk document
-/// ([`persist_config`]) instead of replacing it with this serialization, so what
-/// is digested here names the *candidate* rather than the bytes that land. The
-/// TOCTOU guard still works — the candidate carries the live config's other
-/// fields, which is the race it was built for — but BR-3's byte-equality needs
-/// the digest re-derived from the edited document, which is TASK-137's.
-///
-/// # Errors
-/// [`error_code::INTERNAL_ERROR`] when the candidate will not serialize — the
-/// same failure the commit's own write would hit one step later, surfaced at the
-/// preview instead of after the confirmation.
-fn candidate_digest(candidate: &Config) -> Result<String, RpcError> {
-    candidate
-        .to_toml()
-        .map(|document| teton_inference::sha256_hex(document.as_bytes()))
-        .map_err(|err| {
-            RpcError::new(
-                error_code::INTERNAL_ERROR,
-                format!("the candidate configuration could not be rendered ({err})"),
-            )
-        })
-}
-
 /// What a commit is told when the document moved under its preview (BR-7).
 ///
 /// Names the fact and the remedy and **echoes nothing** — not the digests, not
@@ -6863,19 +6992,15 @@ fn endpoint_query_names_a_credential(endpoint: &str) -> bool {
 /// left for this function is the set of things that are legitimate
 /// configurations and still probably not what the user meant, each stated as
 /// the consequence rather than as a scolding.
+///
+/// Every note is **conditional**. There used to be an unconditional first one,
+/// disclosing that a save rewrote the whole file and took the user's comments
+/// and unrecognized keys with it. REQ-574 removed the behavior, so BR-7 removes
+/// the disclosure: a warning that no longer describes what happens is worse than
+/// no warning, because it teaches a user to fear a save that is now surgical.
+/// A candidate with nothing to say about it therefore draws an empty list.
 fn web_setup_warnings(current: &WebConfig, candidate: &WebConfig) -> Vec<String> {
-    // First, and unconditional, because it is the one note that is true of every
-    // commit and is the only thing on this list the user cannot undo: the write
-    // is a whole-document `Config::to_toml`, so a hand-edited config comes back
-    // canonicalised — comments gone, key order normalised, anything this build's
-    // schema does not know about dropped. Disclosed rather than fixed here: a
-    // `toml_edit` round-trip is a separate change to the one config-write body
-    // this daemon has, and a user confirming a preview deserves to know now
-    // rather than to find out from `git diff`.
-    let mut warnings = vec![
-        "saving rewrites the whole config file — comments and unrecognized keys do not survive."
-            .to_owned(),
-    ];
+    let mut warnings: Vec<String> = Vec::new();
     if candidate.tier < WebTier::Search && candidate.search_endpoint.is_some() {
         warnings.push(format!(
             "`search_endpoint` is written, but `[web] tier` is \"{}\", which does not reach \
@@ -15841,12 +15966,37 @@ search_auth = "X-Subscription-Token: {key}"
             SessionId::from("sess-setup")
         }
 
+        /// A hand-written config with the shapes REQ-574 is *about*: comments
+        /// above and beside keys inside `[web]`, a comment block above the
+        /// header, a deliberate key order, and a key this schema has never heard
+        /// of. The tier is one the setup answers below all move off, so a commit
+        /// over this seed always has something to do.
+        const COMMENTED_SEED: &str = "\
+# my teton config, written by hand
+# (and I would like to keep these notes)
+
+[privacy]
+redact = true
+
+# web is on because I said so
+[web]
+tier = \"fetch_user_url\"  # the ceiling, not a consent answer
+# a key this build has never heard of
+max_page_bytes_from_the_future = 4096
+";
+
         /// A daemon with a real config file, seeded and loaded — what a commit
         /// needs and `minimal()` deliberately has not got.
         fn runtime_on_disk(tag: &str) -> (Arc<DaemonRuntime>, PathBuf) {
+            runtime_seeded(tag, SEED)
+        }
+
+        /// [`runtime_on_disk`] over a document of the caller's choosing, for the
+        /// tests whose subject is the document itself (REQ-574).
+        fn runtime_seeded(tag: &str, document: &str) -> (Arc<DaemonRuntime>, PathBuf) {
             let dir = super::scratch_dir(tag);
             let config_path = dir.join("config.toml");
-            std::fs::write(&config_path, SEED).expect("seed a config");
+            std::fs::write(&config_path, document).expect("seed a config");
             let mut runtime = DaemonRuntime::minimal();
             runtime.config_path = Some(config_path.clone());
             runtime.data_dir = dir;
@@ -15911,39 +16061,25 @@ search_auth = "X-Subscription-Token: {key}"
             }
         }
 
-        /// The `[web]` section of a rendered document, by the same reading
-        /// `teton_core`'s renderer test uses: everything from `[web]` up to the
-        /// next table header.
-        fn web_section_of(document: &str) -> String {
-            let mut section = String::new();
-            let mut inside = false;
-            for line in document.lines() {
-                if line.starts_with('[') {
-                    if inside {
-                        break;
-                    }
-                    inside = line == "[web]";
-                }
-                if inside {
-                    section.push_str(line);
-                    section.push('\n');
-                }
-            }
-            while section.ends_with("\n\n") {
-                section.pop();
-            }
-            section
-        }
+        // -- AC-1 / REQ-574 AC-3: one derivation, one document -----------------
 
-        // -- AC-1: one candidate, one rendering --------------------------------
-
-        /// **What the user confirmed is what is written** (BR-7, AC-1).
+        /// **What the user confirmed is what is written** (REQ-572 BR-7/AC-1,
+        /// REQ-574 BR-3/AC-3).
         ///
         /// Not "the two functions agree today": the preview's `toml` is compared
         /// against the `[web]` section of the bytes the commit actually left on
-        /// disk, for three shapes of answer. A second renderer, or a commit that
-        /// patched the table instead of rebuilding it from the same answers,
-        /// fails here.
+        /// disk, and its `digest` against a digest of the whole written file,
+        /// for three shapes of answer. A second renderer, a commit that patched
+        /// the table instead of rebuilding it from the same answers, or a commit
+        /// that re-derived the document from a second read of the file all fail
+        /// here.
+        ///
+        /// The seed is a **hand-written** config, which is the half REQ-574
+        /// added: the section the preview shows carries the user's own comments
+        /// and their unknown key, because it is sliced out of their document
+        /// rather than re-rendered from the schema. Under the old seam the
+        /// preview showed a canonical table and the commit wrote one, and the
+        /// two agreed by both being lossy.
         #[test]
         fn a_preview_renders_the_bytes_the_commit_goes_on_to_write() {
             let shapes = [
@@ -15972,7 +16108,7 @@ search_auth = "X-Subscription-Token: {key}"
             ];
 
             for (label, params) in shapes {
-                let (runtime, config_path) = runtime_on_disk("web-setup-parity");
+                let (runtime, config_path) = runtime_seeded("web-setup-parity", COMMENTED_SEED);
                 // The search shapes need a local model, or AC-7 refuses them
                 // before they can be rendered at all.
                 with_local_model(&runtime);
@@ -15987,17 +16123,42 @@ search_auth = "X-Subscription-Token: {key}"
                 assert!(committed.applied, "{label}: the commit changed nothing");
 
                 let document = std::fs::read_to_string(&config_path).expect("read the config back");
+                let written_section = teton_core::table_section(&document, "web")
+                    .unwrap_or_else(|| panic!("{label}: the written document names [web]"));
                 assert_eq!(
-                    web_section_of(&document),
-                    preview.toml,
+                    written_section, preview.toml,
                     "{label}: the user confirmed one table and a different one was written.\n\
                      document:\n{document}"
                 );
-                // Non-vacuity: the preview really did say something.
+                // AC-3's second half: the digest names the whole file, not the
+                // section — so a commit that wrote a differently-based document
+                // than the one it digested is caught even where the `[web]`
+                // table happens to come out the same.
+                assert_eq!(
+                    preview.digest,
+                    teton_inference::sha256_hex(document.as_bytes()),
+                    "{label}: the confirmed digest is not the digest of the file that landed.\n\
+                     document:\n{document}"
+                );
+
+                // Non-vacuity, and the point of the commented seed: the preview
+                // is the user's own bytes, not a canonical re-rendering of them.
+                for surviving in [
+                    "# web is on because I said so",
+                    "# the ceiling, not a consent answer",
+                    "# a key this build has never heard of",
+                    "max_page_bytes_from_the_future = 4096",
+                ] {
+                    assert!(
+                        preview.toml.contains(surviving),
+                        "{label}: the preview dropped `{surviving}`, so it is not the \
+                         section the write leaves:\n{}",
+                        preview.toml
+                    );
+                }
                 assert!(
-                    preview.toml.starts_with("[web]\n"),
-                    "{label}: {}",
-                    preview.toml
+                    document.contains("# (and I would like to keep these notes)"),
+                    "{label}: a comment outside [web] did not survive the commit:\n{document}"
                 );
             }
         }
@@ -16341,6 +16502,12 @@ search_auth = "X-Subscription-Token: {key}"
         /// the preview says so: dropping back to a fetch tier removes the search
         /// keys rather than leaving them behind, and the user is told at the one
         /// point they can still say no.
+        ///
+        /// Since REQ-574 the removal travels the delta path — the key is deleted
+        /// out of the document (with the comment block attached to it, spec
+        /// OQ-1) rather than omitted from a fresh serialization — and the
+        /// preview is sliced from that edited document, so the two still have to
+        /// agree byte-for-byte.
         #[test]
         fn an_answer_that_omits_a_key_removes_it_and_says_so() {
             let (runtime, config_path) = runtime_on_disk("web-setup-rederive");
@@ -16379,7 +16546,10 @@ search_auth = "X-Subscription-Token: {key}"
                 .expect("the lowering commits");
             let written = std::fs::read_to_string(&config_path).expect("read");
             assert!(!written.contains("search_endpoint"), "{written}");
-            assert_eq!(web_section_of(&written), preview.toml);
+            assert_eq!(
+                teton_core::table_section(&written, "web").expect("the document names [web]"),
+                preview.toml
+            );
         }
 
         /// A keyless search backend is a legitimate configuration, so it is a
@@ -16412,10 +16582,11 @@ search_auth = "X-Subscription-Token: {key}"
         /// The CLI never offers it; the candidate is built from wire params, so
         /// "the CLI never offers it" is not a gate. Sending it produced three
         /// wrong answers at once, and the test asserts the refusal rather than
-        /// any of them: an `is_unset` `[web]` table renders in the preview and
-        /// is *dropped* by the write (the asymmetry `web_table_toml` documents
-        /// as unreachable), and the commit's `WebSetupCompleted` would carry a
-        /// tier its own payload doc says it never carries.
+        /// any of them: an `is_unset` `[web]` table is one `Config` skips
+        /// serializing, so its delta writes no section and there would be
+        /// nothing for the preview to slice out of the document (REQ-574 BR-3),
+        /// and the commit's `WebSetupCompleted` would carry a tier its own
+        /// payload doc says it never carries.
         ///
         /// Both seams, because they are two lines (LESSON-502), and the file is
         /// asserted untouched: a refusal that had already written is not a
@@ -16589,25 +16760,25 @@ search_auth = "X-Subscription-Token: {key}"
             }
         }
 
-        /// **Every preview discloses that the write is a whole-file rewrite**
-        /// (the verify pass's honest-disclosure floor).
+        /// **No preview claims the save rewrites the file** (REQ-574 BR-7,
+        /// AC-7).
         ///
-        /// The commit's one write body is `Config::to_toml` over the whole
-        /// document, so a hand-edited config comes back canonicalised: comments
-        /// gone, unrecognized keys dropped. That is a real loss, it is not
-        /// undoable, and the preview is the last moment a user can decline it —
-        /// so the note is unconditional and first, rather than conditioned on
-        /// the daemon somehow knowing whether *this* file has comments in it.
+        /// The retired warning said saving destroyed comments and unrecognized
+        /// keys. It was true and it was the honest thing to disclose; REQ-574
+        /// removed the behavior, so keeping the sentence would have taught users
+        /// to fear a save that is now surgical. Asserted as an absence over the
+        /// two shapes that drew it, and paired with the *conditional* warnings
+        /// below, which this change leaves exactly where they were.
         ///
-        /// Pinned as the first element and not merely as "present anywhere":
-        /// a warning list is read from the top, and this is the one that is true
-        /// of every commit.
+        /// The falsification is the second half: a clean fetch candidate now
+        /// draws **no** warnings at all, which is what "the first one was
+        /// unconditional" means once it is gone.
         #[test]
-        fn every_preview_says_the_save_rewrites_the_whole_file() {
-            let (runtime, _path) = runtime_on_disk("web-setup-rewrite-note");
+        fn no_preview_claims_the_save_rewrites_the_whole_file() {
+            let (runtime, _path) = runtime_seeded("web-setup-rewrite-note", COMMENTED_SEED);
             with_local_model(&runtime);
             for params in [
-                preview_params(WireWebTier::FetchUserUrl, None, None, None),
+                preview_params(WireWebTier::FetchAnyUrl, None, None, None),
                 preview_params(
                     WireWebTier::Search,
                     Some("https://search.example.com/search?format=json"),
@@ -16616,16 +16787,106 @@ search_auth = "X-Subscription-Token: {key}"
                 ),
             ] {
                 let preview = runtime.web_setup_preview(&params).expect("previews");
-                let first = preview
-                    .warnings
-                    .first()
-                    .unwrap_or_else(|| panic!("no warnings at all: {:?}", preview.warnings));
                 assert!(
-                    first.contains("rewrites the whole config file") && first.contains("comments"),
-                    "the rewrite is the one loss a preview cannot let a user \
-                     discover afterwards: {first}"
+                    !preview
+                        .warnings
+                        .iter()
+                        .any(|w| w.contains("rewrites the whole config file")),
+                    "the write preserves the document now, so nothing may say \
+                     otherwise: {:?}",
+                    preview.warnings
                 );
             }
+
+            let clean = runtime
+                .web_setup_preview(&preview_params(WireWebTier::FetchAnyUrl, None, None, None))
+                .expect("previews");
+            assert!(
+                clean.warnings.is_empty(),
+                "a candidate with nothing to warn about must draw an empty list: {:?}",
+                clean.warnings
+            );
+        }
+
+        /// **A comment-only hand edit between preview and commit is refused**
+        /// (REQ-574 BR-3, AC-4).
+        ///
+        /// The strengthening REQ-574 buys, and the one the old digest could not
+        /// deliver: the edit below changes **no** key, so the candidate the
+        /// commit re-derives is byte-identical to the one the preview built and
+        /// a digest over the candidate would have sailed through. A digest over
+        /// the *edited document* sees it, because the comment is part of the
+        /// bytes that would land — which is the whole of BR-3's claim that the
+        /// preview shows what is written.
+        ///
+        /// Three legs: the refusal, the file untouched (a refusal that had
+        /// already written would be worse than no check), and a fresh preview
+        /// that commits — so this is a divergence detector and not a wedge, and
+        /// the hand-added comment rides through the write it eventually allows.
+        #[test]
+        fn a_comment_only_hand_edit_between_preview_and_commit_is_refused() {
+            let (runtime, config_path) = runtime_on_disk("web-setup-comment-drift");
+            let events = Arc::new(EventBus::new());
+            let mut subscriber = events.subscribe(4);
+            let answers = preview_params(WireWebTier::FetchAnyUrl, None, None, None);
+
+            let preview = runtime.web_setup_preview(&answers).expect("previews");
+            assert!(
+                !preview.digest.is_empty(),
+                "a preview with no digest gives the commit nothing to check"
+            );
+
+            // One comment line, and nothing else. The semantic config is
+            // identical before and after.
+            let hand_edited = format!("# I added this while reading the preview\n{SEED}");
+            std::fs::write(&config_path, &hand_edited).expect("the hand edit lands");
+            assert_eq!(
+                Config::load(&hand_edited).expect("it still loads").privacy,
+                Config::load(SEED).expect("as does the seed").privacy,
+                "non-vacuity: the edit is invisible to the schema, which is why \
+                 only a document digest can see it"
+            );
+
+            let stale = runtime
+                .web_setup_commit(&as_commit_expecting(&answers, &preview.digest), &events)
+                .expect_err("the confirmed bytes no longer describe this document");
+            assert_eq!(stale.code, error_code::WEB_SETUP_INVALID);
+            assert!(
+                stale.message.contains("run `/web setup` again"),
+                "the refusal must name the remedy: {}",
+                stale.message
+            );
+            assert_eq!(
+                std::fs::read_to_string(&config_path).expect("read"),
+                hand_edited,
+                "a refused commit must not have written anything"
+            );
+            assert!(
+                subscriber.try_recv().is_none(),
+                "and must not have announced anything"
+            );
+
+            // The detector does not wedge the flow, and the comment survives the
+            // write it goes on to allow (BR-1).
+            let fresh = runtime
+                .web_setup_preview(&answers)
+                .expect("the same answers preview against the edited document");
+            assert_ne!(
+                fresh.digest, preview.digest,
+                "non-vacuity: the document really did move, so the two digests \
+                 must differ — otherwise the refusal above proved nothing"
+            );
+            assert!(
+                runtime
+                    .web_setup_commit(&as_commit_expecting(&answers, &fresh.digest), &events)
+                    .expect("a fresh preview's digest matches")
+                    .applied
+            );
+            let written = std::fs::read_to_string(&config_path).expect("read");
+            assert!(
+                written.contains("# I added this while reading the preview"),
+                "the hand-added comment was collateral of the commit:\n{written}"
+            );
         }
 
         /// **A key in the endpoint's query string is named, and never echoed.**
@@ -16895,30 +17156,36 @@ search_auth = "X-Subscription-Token: {key}"
         /// The digest is a digest of the **document**, not of the `[web]`
         /// section the preview displays — which is the difference between
         /// catching this race and catching only the part of it that happens to
-        /// show up in the rendered table.
+        /// show up in the section.
         ///
-        /// Falsification-shaped: the two previews below render *identical*
+        /// Falsification-shaped: the two previews below produce *identical*
         /// `toml`, so a digest taken over `preview.toml` would be equal and the
         /// stale commit above would sail through.
+        ///
+        /// The move is made **on disk**, which is REQ-574's change to what this
+        /// test can even ask. Before, the commit re-serialized the whole
+        /// in-memory config, so flipping `privacy.redact` in memory moved the
+        /// bytes that would land; now the write carries the document's own
+        /// `[privacy]` table through untouched (BR-5), so an in-memory flip
+        /// moves nothing and the honest way to move the written bytes is to move
+        /// the file. Same claim, asked of the seam that now exists.
         #[test]
         fn the_digest_covers_the_whole_document_not_the_rendered_table() {
-            let (runtime, _path) = runtime_on_disk("web-setup-digest-scope");
+            let (runtime, config_path) = runtime_on_disk("web-setup-digest-scope");
             let answers = preview_params(WireWebTier::FetchAnyUrl, None, None, None);
             let before = runtime.web_setup_preview(&answers).expect("previews");
 
-            // A change the `[web]` rendering of *this candidate* does not show:
-            // the `[privacy]` table beside it, which the commit writes all the
-            // same because the commit writes the whole file.
-            {
-                let mut config = runtime.config.lock().expect("config mutex");
-                config.privacy.redact = !config.privacy.redact;
-            }
+            // A change the `[web]` section of *this candidate* does not show:
+            // the `[privacy]` table beside it, which the commit carries along
+            // into the bytes it writes.
+            std::fs::write(&config_path, "[privacy]\nredact = false\n")
+                .expect("the document moves under the preview");
 
             let after = runtime.web_setup_preview(&answers).expect("previews again");
             assert_eq!(
                 before.toml, after.toml,
-                "non-vacuity: the rendered [web] table is unchanged, so a digest \
-                 over it would be blind to this"
+                "non-vacuity: the [web] section is unchanged, so a digest over it \
+                 would be blind to this"
             );
             assert_ne!(
                 before.digest, after.digest,

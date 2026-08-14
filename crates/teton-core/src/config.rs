@@ -489,48 +489,14 @@ impl WebConfig {
     }
 }
 
-/// A one-key document whose only table is `[web]`.
-///
-/// The whole reason [`web_table_toml`] can promise the bytes it returns are the
-/// bytes the file will hold: serializing this goes through the *same* serde
-/// path and the *same* `toml::to_string_pretty` as [`Config::to_toml`], with
-/// the same field attributes on the same [`WebConfig`], rather than through a
-/// hand-written renderer that would have to be kept in step with the struct by
-/// discipline. A key added to `WebConfig` appears in both renderings or in
-/// neither.
-#[derive(Serialize)]
-struct WebTableDocument<'a> {
-    web: &'a WebConfig,
-}
-
-/// Render exactly the `[web]` table, byte-for-byte as [`Config::to_toml`]
-/// writes it inside the whole document (REQ-572 BR-7).
-///
-/// The setup flow shows a preview and then commits, and BR-7 asks that what the
-/// user confirmed *be* what is written — a property this makes structural
-/// rather than aspirational, because preview and commit call this one function
-/// on the same candidate table. Two renderers agreeing today is a coincidence
-/// with an expiry date; this is the shape LESSON-456's one-classifier rule asks
-/// for, applied to serialization.
-///
-/// # The one case where the document has no such section
-///
-/// `Config` carries `#[serde(skip_serializing_if = "WebConfig::is_unset")]` on
-/// its `web` field, so a table still holding every default is left out of the
-/// document entirely (there is nothing to say). This function renders it
-/// anyway: it is asked to render a table, not to decide whether the document
-/// names one. A caller previewing an unset table would therefore be previewing
-/// a section the write drops — which the setup flow never does (it writes a
-/// tier, and a tier above `off` is not the default), and which
-/// `an_unset_web_table_is_the_one_section_the_document_omits` pins so the
-/// asymmetry is discovered by a test rather than by a user.
-///
-/// # Errors
-/// Returns the underlying TOML serialization error, which is unreachable for a
-/// well-formed [`WebConfig`] — the same caveat [`Config::to_toml`] carries.
-pub fn web_table_toml(web: &WebConfig) -> Result<String, toml::ser::Error> {
-    toml::to_string_pretty(&WebTableDocument { web })
-}
+// REQ-574 retired `web_table_toml` and its one-key `WebTableDocument`. It
+// existed so `/web setup`'s preview and its commit could not disagree about the
+// `[web]` section: both rendered it through the same serde path. The seam no
+// longer *renders* a section at all — the write applies a delta to the document
+// on disk and the preview slices `[web]` back out of that same edited text
+// (`config_doc::table_section`, REQ-574 BR-3), so the two cannot disagree
+// because there is only one text. A second renderer kept alive beside it would
+// be exactly the drift LESSON-451 warns about.
 
 /// The parsed shape of [`WebConfig::search_auth`]: which header the search
 /// credential rides, and the scheme word (if any) in front of the secret.
@@ -5208,13 +5174,17 @@ cache_ttl_secs = 60
     }
 
     // -----------------------------------------------------------------------
-    // [web] table rendering — REQ-572 BR-7
+    // [web] table sectioning — REQ-572 BR-7, REQ-574 BR-3
     // -----------------------------------------------------------------------
 
     /// The `[web]` section of a rendered document: its header line and every
     /// line up to the next top-level table, with the blank line the serializer
     /// puts between tables dropped (it belongs to the document's layout, not to
     /// the section).
+    ///
+    /// A deliberately naive line reader, kept as the *independent* answer
+    /// [`crate::config_doc::table_section`] is checked against: two ways of
+    /// finding the same bytes, so agreement is evidence rather than a tautology.
     fn web_section_of(document: &str) -> String {
         let mut section = String::new();
         let mut inside = false;
@@ -5277,12 +5247,18 @@ cache_ttl_secs = 60
     }
 
     #[test]
-    fn the_web_table_renderer_reproduces_the_documents_section_byte_for_byte() {
-        // BR-7: the setup flow previews with this renderer and commits with
-        // `to_toml`, so "what the user confirmed is what is written" holds only
-        // while these two agree on every byte — for a table with an endpoint, a
-        // key reference, an auth template, an allowlist and a permission list,
-        // not just for the easy default.
+    fn the_sliced_web_section_is_the_documents_own_bytes() {
+        // REQ-574 BR-3: `/web setup`'s preview is the `[web]` section sliced
+        // out of the document the commit writes, so "what the user confirmed is
+        // what is written" holds only while the slicer really returns the
+        // document's own bytes — for a table with an endpoint, a key reference,
+        // an auth template, an allowlist and a permission list, not just for the
+        // easy default.
+        //
+        // These fixtures are the schema's side of that claim: `table_section`
+        // has its own unit tests over a hand-written document, and this one
+        // asks the same question of every shape `WebConfig` can actually
+        // serialize into.
         for (label, web) in web_rendering_fixtures() {
             let cfg = Config {
                 web: web.clone(),
@@ -5291,21 +5267,23 @@ cache_ttl_secs = 60
             cfg.validate()
                 .unwrap_or_else(|e| panic!("the {label} fixture must be a loadable config: {e}"));
             let document = cfg.to_toml().expect("serialize");
-            let rendered = web_table_toml(&web).expect("render");
+            let sliced = crate::config_doc::table_section(&document, "web")
+                .unwrap_or_else(|| panic!("{label}: the document names [web]:\n{document}"));
 
-            // The strict claim: the rendered section appears in the document
-            // verbatim, not merely equivalently.
+            // The strict claim: the section appears in the document verbatim,
+            // not merely equivalently.
             assert!(
-                document.contains(&rendered),
-                "{label}: the rendered table is not a substring of the document.\n\
-                 rendered:\n{rendered}\ndocument:\n{document}"
+                document.contains(sliced.trim_end()),
+                "{label}: the sliced table is not a substring of the document.\n\
+                 sliced:\n{sliced}\ndocument:\n{document}"
             );
-            // And the converse, so a key the document carries but the renderer
-            // drops (or the reverse) cannot hide behind the substring check.
+            // And the converse, read by an independent line walk, so a key the
+            // document carries but the slice drops (or the reverse) cannot hide
+            // behind the substring check.
             assert_eq!(
                 web_section_of(&document),
-                rendered,
-                "{label}: the document's [web] section and the rendered table differ"
+                sliced,
+                "{label}: the document's [web] section and the sliced table differ"
             );
         }
     }
@@ -5313,11 +5291,12 @@ cache_ttl_secs = 60
     #[test]
     fn an_unset_web_table_is_the_one_section_the_document_omits() {
         // `Config.web` is `skip_serializing_if = "WebConfig::is_unset"`, so a
-        // table holding every default is left out of the document entirely
-        // while `web_table_toml` still renders it. Recorded as a test rather
-        // than as a comment because it is the single input for which preview
-        // and commit do *not* agree — and the setup flow's protection against
-        // it is that it always writes a tier above `off`.
+        // table holding every default is left out of the document entirely —
+        // and, since REQ-574, there is then no section to slice out of it
+        // either, which is what `/web setup` would have to show. Recorded as a
+        // test rather than as a comment because it is the single input for
+        // which the flow has nothing to preview, and its protection against
+        // reaching that state is that it always writes a tier above `off`.
         let unset = WebConfig::default();
         assert!(unset.is_unset());
         let document = Config::default().to_toml().expect("serialize");
@@ -5325,10 +5304,9 @@ cache_ttl_secs = 60
             !document.contains("[web]"),
             "an unset [web] table must not be written: {document}"
         );
-        let rendered = web_table_toml(&unset).expect("render");
         assert!(
-            rendered.starts_with("[web]\n"),
-            "the renderer renders the table it is handed: {rendered}"
+            crate::config_doc::table_section(&document, "web").is_none(),
+            "a document with no [web] table has no [web] section: {document}"
         );
     }
 

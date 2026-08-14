@@ -289,7 +289,8 @@ impl Answers {
     /// keychain actually returned rather than the one this struct predicted,
     /// and the previewed document's digest so the daemon refuses to write
     /// bytes the user never confirmed (BR-7; the daemon-side check is
-    /// `candidate_digest`).
+    /// `render_persisted_document`, whose digest covers the whole edited
+    /// document — REQ-574 BR-3, so even a comment-only hand edit refuses).
     fn commit_params(
         &self,
         session_id: &SessionId,
