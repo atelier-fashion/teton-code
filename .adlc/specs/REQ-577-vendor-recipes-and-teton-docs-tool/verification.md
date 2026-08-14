@@ -4,6 +4,14 @@
 symlinkable, so this is the real A/B against two isolated real-weights daemons,
 not the deferred-manual fallback.
 
+> **Final state: AC-1 and AC-2 both PASS** — after two fixes the first run
+> forced. Sections 1–7 are **round 1**, which failed AC-1; sections 8–10 are the
+> fixes and the re-run. Round 1 is kept whole rather than rewritten: it is the
+> evidence for why the fixes exist, and it is the standing proof that a prompt
+> change moves behaviour it was not about.
+
+## Round 1 (as run, before any fix)
+
 **Headline: AC-2 passes; AC-1 fails on its second command.** The candidate
 build produces the exact `teton provider add` line for Moonshot — real
 endpoint, real kind, catalog example model — where the baseline fabricates a
@@ -244,10 +252,12 @@ evidence for BR-5, on a shape no AC covers.
 | TASK-147 AC "weights checked first, outcome path stated" | **PASS** | §Outcome path, §2 |
 | TASK-147 AC "if run: AC-1 and AC-2 recorded with baseline comparison" | **PASS as a record** | §3 — and the record says AC-1 failed |
 
-**REQ-577's honest acceptance state:** AC-2 is live-verified; **AC-1 is not
-met**. The half of AC-1 the REQ exists for — the vendor facts, and the absence
-of a repository hunt — is verified and is a clear improvement over the
-baseline. The routing half regressed relative to the baseline.
+**REQ-577's acceptance state at the end of round 1:** AC-2 live-verified;
+**AC-1 not met**. The half of AC-1 the REQ exists for — the vendor facts, and
+the absence of a repository hunt — is verified and is a clear improvement over
+the baseline. The routing half regressed relative to the baseline. (Both are
+fixed and re-verified in §8–§10; this paragraph describes the build that was
+run here, not the one on the branch now.)
 
 ## 5. Findings
 
@@ -362,3 +372,123 @@ qwen3-coder-30b-a3b (18,556,689,568-byte GGUF), temperature-0.2 profile.
 **Not signed off by a human.** Every line above is from the two isolated
 daemons on this machine; the transcripts they were written from are the
 27 session captures described in §3.
+
+---
+
+# Round 2 — after the two fixes (2026-08-14, same day)
+
+Everything above is the **first** run and stands as written: it is the record
+of a build that failed AC-1, and deleting it would delete the evidence that the
+fixes below were needed. This section is what changed and what the same matrix
+then did.
+
+## 8. What was fixed
+
+**Fix 1 — `teton_docs` is callable (F-2).**
+`crates/tetond/src/harness/permissions.rs`: `DOCS_TOOL_NAME` joins
+`READ_ONLY_TOOLS`, so every level's table allows it — `Allow` at `guarded`,
+`edits` and `plan` instead of `Ask`/`Ask`/`Deny`. The constant is used rather
+than a fifth spelling of the string.
+
+Two tests, because the missing coverage was a whole *class* — every existing
+`teton_docs` test asserts **exposure** (it is in the tool list, it survives the
+`max_tools` cap), and none asserted **callability**:
+
+- `permissions::tests::a_bundled_docs_read_is_allowed_at_every_level_and_asks_nothing`
+  — drives the real `PermissionGate` at every `PermissionLevel::ALL` and
+  asserts three things per level: the decision is `Allowed`, no prompt is
+  registered (`pending_count() == 0`), and nothing is published on the bus.
+- `permissions::tests::each_level_expands_to_its_documented_table` — the
+  hand-written golden table gains a `teton_docs → Allow` row for `guarded`,
+  `edits` and `plan`.
+
+Both were **mutation-checked**: with `DOCS_TOOL_NAME` removed from
+`READ_ONLY_TOOLS` the golden table fails with ``guarded: `teton_docs` should be
+Allow`` and the gate test fails in 5 s with ``guarded: `teton_docs` blocked
+waiting for an answer``.
+
+That timeout is itself a finding worth recording. The **first** draft of the
+gate test had no timeout, and under the mutation it did not fail — it **hung**,
+because `authorize` on an `ask` policy waits for a client answer that no test
+will ever give. It had to be killed by hand. This is precisely the trap the
+neighbouring `answer_next` helper documents ("a hang reads as infrastructure
+trouble and gets retried; a failure gets read"), and the draft walked into it
+from the other direction — that helper bounds a test that *expects* a prompt,
+and this one bounds a test that expects none. Both need the bound, for opposite
+reasons.
+
+**Fix 2 — the resident guide names what a tier is for (F-1).**
+`crates/tetond/src/harness/self_config.md`, step 2 only. The tier enumeration
+`<reflex|scan|build|think>` becomes `<tier>` and the purposes move into the
+sentence, with the failing mapping dictated outright as its own sentence rather
+than left to be inferred (BUG-168's rule):
+
+> 2. `teton policy set-tier <tier> <provider-id>` routes a tier: `reflex`
+> always-on duties, `scan` bulk reads, `build` edits, `think` deep reasoning.
+> Deep reasoning means `think`. …
+
+**+95 bytes.** Nothing else in the guide moved: the recipe line and the
+referral sentence are byte-identical. Both margin tests re-measured and
+re-recorded in their doc comments:
+
+| Prompt shape | Worst prompt | Spent | Margin (floor 48) |
+|---|---|---|---|
+| opted-out (`egress::redact`) | 5,711 B (was 5,616) | 8,987 | **229** (was 324) |
+| web opted-in (`tools::web`) | 5,663 B (was 5,568) | 8,939 | **277** (was 372) |
+
+`REDACT_BODY_OVERHEAD_BYTES` was **not** raised; the 95 bytes came out of the
+margin, which is the decision the floor exists to force somebody to make.
+
+## 9. The re-run (candidate only)
+
+The baseline is unchanged and unrebuilt, so its results above still stand as
+the comparison. Serialized per F-4: the round-1 candidate daemon was stopped
+before this one started, same isolation, same `/tmp/t577proj` cwd, one session
+per trial. Rebuild: `Finished` in 19.5 s. 8 sessions; replies byte-identical
+within each shape.
+
+| Trial | Result |
+|---|---|
+| **fix-A-1/2/3** — "I want to hook up Kimi for deep reasoning" | `teton provider add kimi --kind openai-compatible --endpoint https://api.moonshot.ai/v1 --model kimi-k3` **and** `teton policy set-tier think kimi`. 0 repo-search calls, 0 `teton_docs` calls. 2.6–2.8 s. **3/3 PASS** |
+| **fix-B-1/2** — "How do I connect Claude?" | `teton provider add claude --kind anthropic --model claude-opus-5` (no `--endpoint`), `teton policy set-tier think claude`. 0 repo calls. **2/2 PASS, no regression** |
+| **fix-C-1** — control | ` - read Cargo.toml` → "The crate version is 0.4.2". **PASS** |
+| **fix-P1** — "What topics can teton_docs show? Read the providers one…" | ` - teton_docs providers [running]` → **`[done]`**, no permission prompt; answer names all four topics and the six vendor recipes. **PASS** |
+| **fix-P2** — "What do Teton's routing tiers … mean?" | ` - teton_docs policy [running]` → **`[done]`**, no permission prompt; all four tiers correct with their categories. **PASS** (round 1: same call, `[failed]` on the denied prompt) |
+
+The shape-A answer in full, in the two positions AC-1 names:
+
+> 1. **Add Kimi as a provider**:
+> ```bash
+> teton provider add kimi --kind openai-compatible --endpoint https://api.moonshot.ai/v1 --model kimi-k3
+> ```
+> 2. **Assign Kimi to the `think` tier**:
+> ```bash
+> teton policy set-tier think kimi
+> ```
+
+`? permission requested` appears in **zero** of the 8 sessions.
+
+## 10. Final verdicts
+
+| Criterion | Round 1 | Round 2 |
+|---|---|---|
+| **AC-1** — exact two commands, zero repo-search, ≤ 1 `teton_docs`, ≥ 3 trials, baseline recorded | **FAIL** (`set-tier reflex`) | **PASS** — 3/3, both commands exact, 0 repo calls, 0 docs calls |
+| **AC-2** — `--kind anthropic` recipe + routing step; control still calls `read` | PASS | **PASS** — 2/2 plus the control |
+| Requirement Permissions row — `teton_docs` callable without a prompt | **violated** | **holds**, live and in CI (two mutation-checked tests) |
+
+**REQ-577's acceptance state after round 2: AC-1 and AC-2 are both
+live-verified**, on this platform, on this build, against this model. AC-3
+through AC-8 are CI claims covered by TASK-143..146 and are not what this
+document speaks to.
+
+Findings F-3 (the tool is not reached on provider-setup shapes — the inline
+recipes answer without it, and P1/P2 now prove the tool works when it *is*
+reached), F-4 (serialize the daemons) and F-5 (clause bleed) are unchanged by
+this round and stand as recorded.
+
+**A caveat this document should carry rather than bury:** both fixes are prompt
+and policy changes verified at temperature 0.2 against one model on one
+machine. Round 1 is the standing evidence that a byte-level prompt change moves
+behaviour that the change was not about — the recipes fixed the endpoint and
+broke the tier. Any future edit to `self_config.md` re-opens this question and
+should re-run §7's matrix rather than reason about it.

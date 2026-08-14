@@ -47,7 +47,10 @@ user having asked for it.
   the resident prompt of every turn. Nothing is fetched: the topics are
   compiled into this binary and served out of process memory, so a docs read
   opens no file, no socket and no network destination, produces no egress
-  event, and works in a fully offline session. It is exempt from the
+  event, and works in a fully offline session. It also never stops a turn to
+  ask your permission — there is nothing to consent to — at any permission
+  level, including `plan`, where reading is the only thing allowed. It is
+  exempt from the
   tool-count cap that trims tool lists on weak or degraded providers, so it is
   present in exactly the sessions whose model is least likely to know Teton's
   setup surface, and it never displaces a file tool to get there. An upgrade

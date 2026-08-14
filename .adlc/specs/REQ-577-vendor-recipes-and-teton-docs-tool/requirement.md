@@ -136,16 +136,21 @@ No new event types. `teton_docs` calls never produce egress events (BR-6).
 
 ## Acceptance Criteria
 
-- [ ] AC-1: Live A/B against an isolated daemon (release build with
+- [x] AC-1: Live A/B against an isolated daemon (release build with
   `tetond/llama`, the LESSON-482 isolation method): "I want to hook up Kimi
   for deep reasoning" yields the exact two commands — `teton provider add`
   with Moonshot's real endpoint and kind, then `teton policy set-tier think
   <id>` — with zero repository-search tool calls (at most one `teton_docs`
   call). Baseline pre-fix run recorded for comparison.
-- [ ] AC-2: Same method: "How do I connect Claude?" answers with the
+- [x] AC-2: Same method: "How do I connect Claude?" answers with the
   `--kind anthropic` recipe (no endpoint flag) and the routing step; the
   control question ("What version is this crate? Check Cargo.toml.") still
   calls `read` — the tool path is unchanged.
+  <!-- AC-1/AC-2 ticked from the TASK-147 live run, verification.md: round 1
+  (2026-08-14) failed AC-1 on `set-tier reflex`; round 2, after the tier
+  purposes were added to the resident guide, passes 3/3 with both exact
+  commands and zero repository-search calls. AC-3..AC-8 remain unticked here:
+  they are CI claims and this run does not speak to them. -->
 - [ ] AC-3: `teton_docs` returns the providers topic containing every
   canonical recipe; an unknown topic returns the didactic error naming all
   valid topics (unit + e2e).
