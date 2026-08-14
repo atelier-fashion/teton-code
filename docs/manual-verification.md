@@ -1167,7 +1167,23 @@ reason).
 
 **Run it once on macOS, with a config you are willing to have written** (point
 `TETON_CONFIG` at a scratch file). A real search key is not needed — any dummy
-string proves storage.
+string proves storage. Seed that scratch file by hand first, with a comment and
+a key this build has never heard of — REQ-574 made the commit an in-place edit
+of the document on disk, and a hand-commented config is the thing worth
+watching a real write survive:
+
+```
+cat > "$TETON_CONFIG" <<'EOF'
+# My machine. Hand-written, and staying that way.
+effort = "high"
+
+[web]
+# This line sits on the key the flow changes.
+tier = "off"
+# Nothing in this build reads this key.
+experimental_reranker = "colbert"
+EOF
+```
 
 1. Start the daemon, then run `teton` **in a real terminal**. A piped session is
    a different, already-automated path (it prints instructions and reads
@@ -1177,8 +1193,10 @@ string proves storage.
    `X-Subscription-Token: {key}` → a dummy key → `y` at
    `write this to your config? [y/N]`.
 3. **Expect** the key prompt to echo nothing as you type, the preview to show
-   the exact `[web]` table and `searches would go to: api.search.brave.com`, and
-   the completion notice:
+   the exact `[web]` table — **including the comments already in your file**,
+   since the preview is sliced from the document the commit will write rather
+   than re-rendered (REQ-574 BR-3) — and `searches would go to:
+   api.search.brave.com`, and the completion notice:
    ```
    web lookup enabled (`search`) — written to your Teton config. Nothing has
    been looked up yet: the next web-needing question will ask before anything
@@ -1191,8 +1209,15 @@ string proves storage.
    security find-generic-password -s teton -a web-search      # must succeed
    grep -n 'search_key_ref' "$TETON_CONFIG"                   # keychain://teton/web-search
    grep -c '<the dummy key>' "$TETON_CONFIG"                  # must be 0
+   grep -n 'staying that way' "$TETON_CONFIG"                 # your comment survived
+   grep -n 'sits on the key' "$TETON_CONFIG"                  # and so did the one on `tier`
+   grep -n 'experimental_reranker' "$TETON_CONFIG"            # as did the unknown key
    ```
-   Nothing in the session transcript should contain the dummy key either.
+   Nothing in the session transcript should contain the dummy key either. The
+   three `grep`s for your own text are the manual half of REQ-574's preservation
+   claim — the middle one is the interesting one, since that comment sits
+   directly on a key the commit rewrites: only `tier` and the keys `/web setup`
+   sets may have moved.
 5. **Abort path.** Remove the entry, then run the flow again and answer `n` at
    the confirm:
    ```

@@ -72,14 +72,14 @@ land, not who may land them._
       all five writers: `persist_web_tier`, `web_setup_commit`,
       `apply_config_update`, the REQ-557 model migration, and the
       routing-category migration. (informed by REQ-563, REQ-572)
-- [ ] BR-2: **One write body stays one, and keeps its guarantees.** The daemon
+- [x] BR-2: **One write body stays one, and keeps its guarantees.** The daemon
       retains exactly one config-write body (the current
       `write_config_atomically` invariant, the "single commit point" REQ-572
       BR-11 relies on). Preservation is implemented at that seam, not
       per-caller. Atomicity (temp file + fsync + rename), permission-mode
       preservation, and the `0600` first-write fallback are unchanged — the
       file can hold secret-adjacent material and must never widen.
-- [ ] BR-3: **The preview shows the bytes that land.** `/web setup`'s preview
+- [x] BR-3: **The preview shows the bytes that land.** `/web setup`'s preview
       `toml` field is the `[web]` table exactly as it will appear in the
       written document — sliced from the edited document, never rendered by a
       fresh serialization — so a user's own comments inside `[web]` appear in
@@ -111,7 +111,7 @@ land, not who may land them._
       view stays blind to it until restart, exactly as today; hot-reload is
       out of scope). Where a hand edit collides with the operation's own keys,
       the operation's value wins at those keys only.
-- [ ] BR-6: **Degradation is a loud refusal, never a silent rewrite.** If the
+- [x] BR-6: **Degradation is a loud refusal, never a silent rewrite.** If the
       on-disk document cannot be parsed for editing at write time (e.g. a
       half-finished hand edit), the write refuses with an error naming the
       parse failure, writes nothing, and leaves in-memory state unchanged
@@ -121,7 +121,7 @@ land, not who may land them._
       base is the empty document and the write produces a fresh document whose
       parse equals the candidate, at mode `0600`. (informed by LESSON-456,
       BUG-146)
-- [ ] BR-7: **The disclosure warning retires with the behavior it disclosed.**
+- [x] BR-7: **The disclosure warning retires with the behavior it disclosed.**
       The unconditional `/web setup` preview warning ("saving rewrites the
       whole config file…") is removed — with preservation in place it would be
       false. The README's hand-written commented `[web]` example and
@@ -148,7 +148,7 @@ land, not who may land them._
       `web_consent_matrix.rs` TASK-129 pin) are updated to assert this
       stronger property — preview rendering read off the edited document —
       and pass.
-- [ ] AC-4: A comment-only hand edit landing on disk between preview and
+- [x] AC-4: A comment-only hand edit landing on disk between preview and
       commit causes the commit to refuse with the existing stale-digest
       message; nothing is written.
 - [ ] AC-5: An unparseable on-disk config at write time causes each writer to
@@ -156,15 +156,15 @@ land, not who may land them._
       file's bytes are untouched and the in-memory config is unchanged.
       Startup-migration writers warn and continue (their existing
       failure-tolerance), naming the parse failure.
-- [ ] AC-6: With `config_path` set but no file on disk, a write produces a
+- [x] AC-6: With `config_path` set but no file on disk, a write produces a
       fresh `0600` document whose parse equals the candidate (existing
       first-write behavior preserved).
-- [ ] AC-7: The unconditional rewrite warning no longer appears in any
+- [x] AC-7: The unconditional rewrite warning no longer appears in any
       preview; the remaining conditional warnings are unaffected.
 - [ ] AC-8: Written bytes are parsed back through the production loader in
       tests and yield the expected semantic config (the existing
       `web_consent_matrix.rs` read-back posture, retained under the new seam).
-- [ ] AC-9: A config file at `0600` remains `0600` after a write; the
+- [x] AC-9: A config file at `0600` remains `0600` after a write; the
       temp-file + rename atomicity tests (including the fixed-temp-path
       concurrent-commit test) pass unchanged. Concurrent `web_setup_commit`
       calls still serialize under the config mutex. (informed by BUG-161)

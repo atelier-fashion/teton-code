@@ -332,7 +332,7 @@ instance answers with a web page rather than JSON.
 
 <!--
 Drift check. The three backend rows above, the `[web]` keys below, and the
-keychain reference are the same strings as two places in the tree, and all of
+keychain reference are the same strings as three places in the tree, and all of
 them must move together:
   - `crates/tetond/src/harness/self_config.md` — the guide bundled into the
     system prompt, and the single source REQ-572's AC-8 backend contract suite
@@ -341,11 +341,21 @@ them must move together:
     suite;
   - `crates/teton/src/web_setup_ui.rs` — `ENDPOINT_HELP` (what `/web setup`
     prints above the endpoint prompt) and `instruction_lines` (what a piped
-    session is told).
+    session is told);
+  - `crates/teton-core/src/config_doc.rs` — the fenced `[web]` block below is
+    copied into the `HAND_WRITTEN_CONFIG` fixture byte-for-byte (REQ-574 AC-1
+    wants the README's own block as the preservation test vector, not a
+    paraphrase of it), so a line edited inside the fence fails that module's
+    tests until the fixture is moved with it.
 -->
 
 **Or write the table by hand.** `/web setup` exists because it is live in the
-session; a hand-edited config is read when the daemon next starts.
+session; a hand-edited config is read when the daemon next starts. Neither
+choice costs you the other: every daemon-side save — `/web setup`'s commit, an
+"enable permanently" answer at a lookup prompt, a provider registration, a
+startup migration — edits the file in place rather than re-serializing it, so a
+save moves exactly the keys its own operation is about. Comments, key order,
+and keys this build has never heard of survive it untouched.
 
 ```toml
 [web]
@@ -373,6 +383,13 @@ history.
 A keyless backend is the same table with `search_key_ref` and `search_auth`
 left out. `tier = "search"` with no `search_endpoint` is the one combination
 the daemon refuses to start on, and it names the missing key when it does.
+
+What a save edits is the document on disk, not the copy the daemon booted on —
+so an edit you make while it runs rides along instead of being clobbered, and
+is still only *read* at the next start. The other side of that is a refusal: a
+file that no longer parses, or that parses but fails the validation startup
+runs, stops the next daemon-side save with the reason rather than overwriting
+your work to make the save succeed.
 
 Config lives in `config.toml` in Teton's state directory
 (`$XDG_RUNTIME_DIR/teton` when that is set, else
