@@ -1,5 +1,5 @@
 ---
-id: BUG-166
+id: BUG-169
 title: "A model-loaded llama daemon aborts (SIGABRT, exit 134) on every process exit"
 status: resolved
 severity: high
@@ -13,6 +13,11 @@ tags: ["req-565", "shutdown", "sigterm", "exit-code", "ggml", "static-destructor
 ---
 
 ## Description
+
+> **ID note:** filed and merged as BUG-166 (PR #136) in a parallel session,
+> colliding with BUG-166-a-rejection-notice-can-be-spent-on-nobody (PR #130,
+> which landed first and keeps the number). Renumbered to BUG-169 — commits
+> referencing `BUG-166` for the daemon-abort fix mean this record.
 
 A `--features tetond/llama` daemon that has loaded the local model cannot exit
 cleanly. Every exit path that leaves `main` normally — SIGTERM/SIGINT (the
@@ -95,7 +100,7 @@ Three facts compose:
 
 `main` now ends in `libc::_exit(code)` after the ordered teardown, so C++
 static destructors never run mid-teardown (`crates/tetond/src/main.rs`,
-BUG-166 comment block). Nothing the skip discards is load-bearing:
+BUG-169 comment block). Nothing the skip discards is load-bearing:
 
 - the cost ledger is SQLite in autocommit — durable per `record` (BR-8);
 - `shutdown()` already unlinked the socket, in-order, before this point;
@@ -138,7 +143,7 @@ resident (~18 GiB RSS) in both:
 ## Files Changed
 
 - `crates/tetond/src/main.rs` — `main` ends in `libc::_exit`; the why is the
-  BUG-166 comment block; `shutdown()`'s lock-ordering doc updated.
+  BUG-169 comment block; `shutdown()`'s lock-ordering doc updated.
 - `crates/tetond/tests/e2e/daemon_lifetime.rs` — new SIGTERM teardown e2e.
 - `crates/tetond/Cargo.toml` — `libc` added to dev-dependencies (the test
   delivers a real `kill(2)`).
