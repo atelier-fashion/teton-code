@@ -64,9 +64,10 @@ pub fn suggestion_catalog() -> WebSetupCatalog {
                 // because the header is unknown.
                 auth_template: None,
                 needs_key: false,
-                notes: Some(
-                    "you run the instance, so the endpoint is wherever you run it".to_owned(),
-                ),
+                // No notes on any shipped entry: REQ-573 moves ownership of
+                // the suggestions, not their content, so the rendered block
+                // stays line-identical to v0.1.14 (spec Assumptions).
+                notes: None,
             },
             WebBackendSuggestion {
                 id: "brave".to_owned(),
@@ -161,6 +162,12 @@ mod tests {
             "BUG-165: Kagi's scheme is `Bot`"
         );
         assert!(kagi.needs_key);
+
+        assert!(
+            catalog.backends.iter().all(|b| b.notes.is_none()),
+            "REQ-573 moves ownership, not content: a note would add a rendered \
+             line the v0.1.14 flow never showed"
+        );
     }
 
     /// Ids are what callers and tests key on, so two entries sharing one would
