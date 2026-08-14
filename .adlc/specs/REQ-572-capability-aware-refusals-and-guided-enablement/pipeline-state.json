@@ -3,14 +3,16 @@
   "branch": "feat/REQ-572-capability-aware-refusals",
   "startedAt": "2026-08-13T17:35:00Z",
   "completed": false,
-  "currentPhase": 6,
+  "currentPhase": 8,
   "completedPhases": [
     0,
     1,
     2,
     3,
     4,
-    5
+    5,
+    6,
+    7
   ],
   "phaseHistory": [
     {
@@ -42,6 +44,16 @@
       "phase": 5,
       "name": "Verify (6-agent + fix pass + re-verify)",
       "completedAt": "2026-08-13T23:30:00Z"
+    },
+    {
+      "phase": 6,
+      "name": "PR ready",
+      "completedAt": "2026-08-13T23:45:00Z"
+    },
+    {
+      "phase": 7,
+      "name": "CI green",
+      "completedAt": "2026-08-14T00:05:00Z"
     }
   ],
   "integrationBranch": "main",
