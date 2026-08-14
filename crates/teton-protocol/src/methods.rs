@@ -1534,6 +1534,26 @@ pub struct WebSetupPreviewResult {
     /// spelling.
     #[serde(default)]
     pub warnings: Vec<String>,
+    /// A digest of the **whole document** this preview's candidate would write
+    /// — what the client hands back as [`WebSetupCommitParams::expect_digest`]
+    /// so the commit can refuse to write bytes the user never saw (REQ-572
+    /// verify, BR-7).
+    ///
+    /// It covers the whole config, not just the `[web]` table, because the whole
+    /// config is what the commit writes. The fields the flow does *not* collect
+    /// — `permission_allow`, `allowed_domains`, `cache_ttl_secs` — ride along
+    /// from whatever the live config held when the candidate was built, and any
+    /// other session answering "enable permanently" moves them underneath a
+    /// preview the user is still reading. Digesting the rendered `[web]` section
+    /// alone would catch that particular race and miss the general one; the
+    /// bytes the user confirmed are the bytes that get written, so the bytes are
+    /// what is pinned.
+    ///
+    /// Opaque to the client: it round-trips it and never parses it. Empty from a
+    /// daemon that predates this field, which a client must read as "this daemon
+    /// cannot check" rather than as a digest that failed to match.
+    #[serde(default)]
+    pub digest: String,
 }
 
 impl RpcMethod for WebSetupPreviewParams {
@@ -1569,6 +1589,22 @@ pub struct WebSetupCommitParams {
     /// The auth-header template, as in the preview.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub search_auth: Option<String>,
+    /// [`WebSetupPreviewResult::digest`], handed back — the daemon writes only
+    /// if the candidate it rebuilds still digests to this (REQ-572 verify,
+    /// BR-7).
+    ///
+    /// **Not a substitute for re-deriving.** The candidate is still rebuilt from
+    /// the answers above and put through the same validator (BR-8,
+    /// LESSON-501); this is a *guard on the outcome*, so a client cannot use it
+    /// to commit a document the daemon never validated — the worst a forged
+    /// digest buys is a write the answers already earned.
+    ///
+    /// `None` means "do not check", which is what a client that predates the
+    /// field sends and what a caller with no preview to compare against sends.
+    /// The check is opt-in for that reason, not because it is optional in the
+    /// flow: `/web setup` always sends it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expect_digest: Option<String>,
 }
 
 /// Result of [`WebSetupCommitParams`].
@@ -2684,6 +2720,7 @@ mod tests {
             toml: "[web]\ntier = \"search\"\n".to_owned(),
             search_host: Some("search.example.com".to_owned()),
             warnings: vec!["this backend usually needs a key".to_owned()],
+            digest: "a".repeat(64),
         });
         // A clean candidate: no host to show below the search tier, and an
         // empty warning list rather than an absent one.
@@ -2691,8 +2728,15 @@ mod tests {
             toml: "[web]\ntier = \"fetch_user_url\"\n".to_owned(),
             search_host: None,
             warnings: vec![],
+            digest: "b".repeat(64),
         });
         assert!(WebSetupPreviewResult::default().warnings.is_empty());
+        // The compat reading of an absent digest: a daemon that predates the
+        // field answers "cannot check", never "checked and matched nothing".
+        assert!(WebSetupPreviewResult::default().digest.is_empty());
+        let old_preview: WebSetupPreviewResult =
+            serde_json::from_str(r#"{"toml":"[web]\n","warnings":[]}"#).unwrap();
+        assert!(old_preview.digest.is_empty());
 
         round_trip(&WebSetupCommitParams {
             session_id: SessionId::from("s1"),
@@ -2700,7 +2744,21 @@ mod tests {
             search_endpoint: Some("https://search.example.com/search?format=json".to_owned()),
             search_key_ref: Some("keychain://teton/web-search".to_owned()),
             search_auth: None,
+            expect_digest: Some("c".repeat(64)),
         });
+        // And the same commit with no digest to check — the shape an old client
+        // sends, which stays a legal request rather than a parse failure.
+        round_trip(&WebSetupCommitParams {
+            session_id: SessionId::from("s1"),
+            tier: WebTier::FetchAnyUrl,
+            search_endpoint: None,
+            search_key_ref: None,
+            search_auth: None,
+            expect_digest: None,
+        });
+        let old_commit: WebSetupCommitParams =
+            serde_json::from_str(r#"{"session_id":"s1","tier":"fetch_any_url"}"#).unwrap();
+        assert_eq!(old_commit.expect_digest, None);
         // Both answers: a commit that changed the config, and one whose
         // candidate matched what was already there. Neither is an error.
         round_trip(&WebSetupCommitResult {
@@ -2737,6 +2795,7 @@ mod tests {
             search_endpoint: Some("https://search.example.com/search".to_owned()),
             search_key_ref: Some("keychain://teton/web-search".to_owned()),
             search_auth: Some("X-Subscription-Token: {key}".to_owned()),
+            expect_digest: Some("d".repeat(64)),
         })
         .unwrap();
 
@@ -2761,6 +2820,7 @@ mod tests {
         assert_eq!(
             keys,
             [
+                "expect_digest",
                 "search_auth",
                 "search_endpoint",
                 "search_key_ref",

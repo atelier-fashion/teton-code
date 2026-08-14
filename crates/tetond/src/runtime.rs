@@ -112,7 +112,7 @@ use teton_inference::{ChatFormat, Completion, Engine, EngineError, GenParams, Mo
 use teton_protocol::events::{
     BlockCause, CapabilityDeadEnd, ContextCleared, Event, ModelLifecycle, ModelLifecycleStage,
     PrivacyAction, SessionTitled, WebCapabilityState as WireWebCapabilityState, WebLookup,
-    WebSetupCompleted, WebTaintOverridden,
+    WebSetupCompleted, WebTaintOverridden, WebTier as WireWebTier,
 };
 use teton_protocol::jsonrpc::{error_code, RpcError};
 use teton_protocol::methods::{
@@ -3925,6 +3925,13 @@ impl DaemonRuntime {
     /// is written" is a property of the code path rather than of two renderers
     /// agreeing.
     ///
+    /// That property held only for the four fields the answers pin. The rest of
+    /// the document rides along from the live config, which another session can
+    /// move while the user is reading — so the answer also carries a
+    /// [`candidate_digest`] of the whole candidate document, and the commit
+    /// refuses to write anything that no longer digests to it (BR-7, the verify
+    /// pass's TOCTOU fix).
+    ///
     /// # Errors
     /// [`error_code::WEB_SETUP_INVALID`] when the candidate would not load,
     /// carrying the validator's own sentence, or when the answers name a tier
@@ -3954,6 +3961,10 @@ impl DaemonRuntime {
                 .as_deref()
                 .and_then(crate::web::canonical_host_of),
             warnings: web_setup_warnings(&current.web, &candidate.web),
+            // Computed last, over the finished candidate, so what the client
+            // hands back names exactly the document the rest of this answer
+            // describes (see `candidate_digest`).
+            digest: candidate_digest(&candidate)?,
         })
     }
 
@@ -3966,7 +3977,10 @@ impl DaemonRuntime {
     ///
     /// 1. the candidate is rebuilt **from the answers** — never from a preview
     ///    the client kept, which is what stops a client committing something
-    ///    this daemon never validated (BR-8, LESSON-501);
+    ///    this daemon never validated (BR-8, LESSON-501) — and, when the caller
+    ///    sent one, is checked against the preview's
+    ///    [`digest`](WebSetupCommitParams::expect_digest), so re-deriving cannot
+    ///    quietly pick up a change another session made in between;
     /// 2. the whole document is written atomically, through the same
     ///    [`write_config_atomically`] seam [`Self::persist_web_tier`] uses, so
     ///    there is exactly one config-write body in this daemon;
@@ -3979,9 +3993,10 @@ impl DaemonRuntime {
     /// `applied: false`, which is a truthful answer and not a failure.
     ///
     /// # Errors
-    /// - [`error_code::WEB_SETUP_INVALID`] — the candidate would not load, or
-    ///   names a tier this machine cannot serve. Nothing is written and the
-    ///   in-memory config is untouched.
+    /// - [`error_code::WEB_SETUP_INVALID`] — the candidate would not load,
+    ///   names a tier this machine cannot serve, or no longer matches the
+    ///   digest the caller confirmed. Nothing is written and the in-memory
+    ///   config is untouched.
     /// - [`error_code::CONFIG_REJECTED`] — this daemon has no config file, so
     ///   there is nowhere for the answer to land.
     /// - [`error_code::INTERNAL_ERROR`] — the write itself failed. The
@@ -3995,6 +4010,27 @@ impl DaemonRuntime {
         let answers = WebSetupAnswers::from_commit(params);
         let mut config = self.config.lock().expect("config mutex poisoned");
         let candidate = self.web_setup_candidate(&answers, &config)?;
+        // BR-7's second half, and the reason it needs one: the answers pin the
+        // four fields the flow collects, and everything else in the document
+        // rides along from whatever the config held *at this moment*. A
+        // `persist_web_tier` from any other session between the preview and here
+        // rewrites `permission_allow`, so re-deriving from the answers alone
+        // faithfully writes a document the user never saw. The check sits
+        // **before** the no-op short-circuit below: a divergence is a refusal
+        // whether or not the `[web]` table itself ended up unchanged.
+        //
+        // A guard on the outcome, never a substitute for re-deriving it: the
+        // candidate above was already rebuilt and re-validated, so a forged
+        // digest buys nothing the answers had not already earned (BR-8,
+        // LESSON-501).
+        if let Some(expected) = params.expect_digest.as_deref() {
+            if candidate_digest(&candidate)? != expected {
+                return Err(RpcError::new(
+                    error_code::WEB_SETUP_INVALID,
+                    SETUP_DIGEST_STALE,
+                ));
+            }
+        }
         // Read back off the candidate, never echoed from the params: the tier
         // reported is the tier that was validated (the reason
         // `SessionPermissionsResult::level` is read from the gate).
@@ -6498,24 +6534,87 @@ struct WebSetupAnswers<'a> {
 }
 
 impl<'a> WebSetupAnswers<'a> {
-    fn from_preview(params: &'a WebSetupPreviewParams) -> Self {
+    /// The **one** reading of the four wire fields: the tier mapping, the trim,
+    /// and blank-as-absent all happen here and nowhere else.
+    ///
+    /// The two constructors below are the two wire types calling it with their
+    /// own fields. They stay separate because the *types* are deliberately
+    /// separate (the commit re-asks rather than trusting a preview's blob), but
+    /// what they do with those fields was byte-identical prose in two places —
+    /// which is one place for a trim rule to be tightened and missed.
+    fn new(
+        tier: WireWebTier,
+        search_endpoint: Option<&'a str>,
+        search_key_ref: Option<&'a str>,
+        search_auth: Option<&'a str>,
+    ) -> Self {
         Self {
-            tier: from_protocol_web_tier(params.tier),
-            search_endpoint: setup_answer(params.search_endpoint.as_deref()),
-            search_key_ref: setup_answer(params.search_key_ref.as_deref()),
-            search_auth: setup_answer(params.search_auth.as_deref()),
+            tier: from_protocol_web_tier(tier),
+            search_endpoint: setup_answer(search_endpoint),
+            search_key_ref: setup_answer(search_key_ref),
+            search_auth: setup_answer(search_auth),
         }
     }
 
+    fn from_preview(params: &'a WebSetupPreviewParams) -> Self {
+        Self::new(
+            params.tier,
+            params.search_endpoint.as_deref(),
+            params.search_key_ref.as_deref(),
+            params.search_auth.as_deref(),
+        )
+    }
+
     fn from_commit(params: &'a WebSetupCommitParams) -> Self {
-        Self {
-            tier: from_protocol_web_tier(params.tier),
-            search_endpoint: setup_answer(params.search_endpoint.as_deref()),
-            search_key_ref: setup_answer(params.search_key_ref.as_deref()),
-            search_auth: setup_answer(params.search_auth.as_deref()),
-        }
+        Self::new(
+            params.tier,
+            params.search_endpoint.as_deref(),
+            params.search_key_ref.as_deref(),
+            params.search_auth.as_deref(),
+        )
     }
 }
+
+/// The digest a preview promises and a commit checks (REQ-572 verify, BR-7).
+///
+/// Over the **whole serialized document** — the very bytes
+/// [`write_config_atomically`] would put on disk — rather than over the rendered
+/// `[web]` section the preview displays. The setup flow collects four fields and
+/// carries the rest of the table along from the live config
+/// ([`DaemonRuntime::web_setup_candidate`]), so any other session answering
+/// "enable permanently" ([`DaemonRuntime::persist_web_tier`]) moves
+/// `permission_allow` — and with it the file — underneath a preview the user is
+/// still reading. A digest over the section alone would catch that one race and
+/// nothing else; digesting what is written pins the whole promise.
+///
+/// Deterministic because `Config`'s maps are `BTreeMap`s: the same candidate
+/// serializes to the same bytes on both calls, which is what makes an inequality
+/// evidence of a *change* rather than of two serializations.
+///
+/// # Errors
+/// [`error_code::INTERNAL_ERROR`] when the candidate will not serialize — the
+/// same failure the commit's own write would hit one step later, surfaced at the
+/// preview instead of after the confirmation.
+fn candidate_digest(candidate: &Config) -> Result<String, RpcError> {
+    candidate
+        .to_toml()
+        .map(|document| teton_inference::sha256_hex(document.as_bytes()))
+        .map_err(|err| {
+            RpcError::new(
+                error_code::INTERNAL_ERROR,
+                format!("the candidate configuration could not be rendered ({err})"),
+            )
+        })
+}
+
+/// What a commit is told when the document moved under its preview (BR-7).
+///
+/// Names the fact and the remedy and **echoes nothing** — not the digests, not
+/// the field that changed, not the document: a client renders this into a
+/// transcript, and the thing that moved may be another session's answer.
+const SETUP_DIGEST_STALE: &str =
+    "the configuration changed since the preview, so this would write bytes you did not \
+     confirm — run `/web setup` again";
 
 /// One setup answer, trimmed, with blank read as absent — see
 /// [`WebSetupAnswers`] for why.
@@ -15222,6 +15321,11 @@ provider_id = "on-device"
         /// The same answers as a commit — spelled through the preview params so
         /// a test cannot accidentally preview one thing and commit another,
         /// which is the very property AC-1 is about.
+        ///
+        /// No `expect_digest`: this is the old client's shape, and every test
+        /// that does not name the divergence check is asserting the flow that
+        /// still has to work without one. The digest's own tests build their
+        /// commit with [`as_commit_expecting`].
         fn as_commit(params: &WebSetupPreviewParams) -> WebSetupCommitParams {
             WebSetupCommitParams {
                 session_id: params.session_id.clone(),
@@ -15229,6 +15333,19 @@ provider_id = "on-device"
                 search_endpoint: params.search_endpoint.clone(),
                 search_key_ref: params.search_key_ref.clone(),
                 search_auth: params.search_auth.clone(),
+                expect_digest: None,
+            }
+        }
+
+        /// [`as_commit`] with the preview's digest carried back, which is what
+        /// the real client sends (BR-7).
+        fn as_commit_expecting(
+            params: &WebSetupPreviewParams,
+            digest: &str,
+        ) -> WebSetupCommitParams {
+            WebSetupCommitParams {
+                expect_digest: Some(digest.to_owned()),
+                ..as_commit(params)
             }
         }
 
@@ -15725,6 +15842,155 @@ provider_id = "on-device"
                     .any(|w| w.contains("no `search_key_ref`")),
                 "{:?}",
                 preview.warnings
+            );
+        }
+
+        // -- BR-7: the preview→commit window ----------------------------------
+
+        /// **A document that moved under the preview is not written** (BR-7,
+        /// the verify pass's TOCTOU fix).
+        ///
+        /// The gap is real and this is its exact shape: the answers pin four
+        /// fields, and `permission_allow` is not one of them — it rides along
+        /// from the live config. Any *other* session answering "enable
+        /// permanently" runs [`DaemonRuntime::persist_web_tier`], which appends
+        /// to it and rewrites the file. A commit that only re-derived from the
+        /// answers would faithfully, silently write a document with that change
+        /// folded in, which the user never saw and never agreed to.
+        ///
+        /// Three legs, and the middle one is what makes the first honest:
+        ///
+        /// 1. the stale digest is refused and the file is **byte-identical** to
+        ///    what the interloping write left — a refusal that had already
+        ///    written would be worse than no check;
+        /// 2. a *fresh* preview over the moved config commits, so the check is
+        ///    a divergence detector and not a wedge;
+        /// 3. `expect_digest: None` — the old client, and the caller with no
+        ///    preview to compare — still commits, because the field is additive.
+        #[test]
+        fn a_commit_whose_document_moved_under_the_preview_is_refused() {
+            let (runtime, config_path) = runtime_on_disk("web-setup-digest");
+            let events = Arc::new(EventBus::new());
+            let answers = preview_params(WireWebTier::FetchAnyUrl, None, None, None);
+
+            let preview = runtime.web_setup_preview(&answers).expect("previews");
+            assert!(
+                !preview.digest.is_empty(),
+                "a preview with no digest gives the commit nothing to check"
+            );
+
+            // The interloper: another session's "enable permanently", which
+            // touches `permission_allow` — a field the setup answers do not name
+            // and the commit would otherwise carry along unnoticed.
+            runtime
+                .persist_web_tier(WebTier::FetchUserUrl)
+                .expect("the consent answer persists");
+            let after_interloper = std::fs::read_to_string(&config_path).expect("read");
+
+            let stale = runtime
+                .web_setup_commit(&as_commit_expecting(&answers, &preview.digest), &events)
+                .expect_err("the confirmed bytes no longer describe this document");
+            assert_eq!(stale.code, error_code::WEB_SETUP_INVALID);
+            assert!(
+                stale.message.contains("run `/web setup` again"),
+                "the refusal must name the remedy: {}",
+                stale.message
+            );
+            // Non-echoing (BR-6's rule applied to a refusal): the sentence
+            // carries neither digest, and no fragment of the document.
+            assert!(
+                !stale.message.contains(&preview.digest)
+                    && !stale.message.contains("permission_allow"),
+                "the refusal echoed what changed: {}",
+                stale.message
+            );
+            assert_eq!(
+                std::fs::read_to_string(&config_path).expect("read"),
+                after_interloper,
+                "a refused commit must not have written anything"
+            );
+
+            // (2) A fresh preview over the moved document commits. The check
+            // detects divergence; it does not wedge the flow.
+            let fresh = runtime
+                .web_setup_preview(&answers)
+                .expect("the same answers preview against the new document");
+            assert_ne!(
+                fresh.digest, preview.digest,
+                "non-vacuity: the document really did move, so the two digests \
+                 must differ — otherwise the refusal above proved nothing"
+            );
+            assert!(
+                runtime
+                    .web_setup_commit(&as_commit_expecting(&answers, &fresh.digest), &events)
+                    .expect("a fresh preview's digest matches")
+                    .applied
+            );
+        }
+
+        /// A commit that sends no digest behaves exactly as it did before the
+        /// field existed — the compatibility leg, asserted rather than assumed.
+        ///
+        /// `expect_digest` is `#[serde(default)]`, so an old client's frame
+        /// deserializes to `None`; the check is opt-in for that reason, and a
+        /// daemon that quietly started requiring it would refuse every such
+        /// client with a sentence about a preview it never ran.
+        #[test]
+        fn a_commit_with_no_digest_is_checked_against_nothing_and_still_lands() {
+            let (runtime, config_path) = runtime_on_disk("web-setup-digest-compat");
+            let events = Arc::new(EventBus::new());
+            let answers = preview_params(WireWebTier::FetchAnyUrl, None, None, None);
+
+            runtime.web_setup_preview(&answers).expect("previews");
+            runtime
+                .persist_web_tier(WebTier::FetchUserUrl)
+                .expect("the document moves underneath it");
+
+            let params = as_commit(&answers);
+            assert_eq!(params.expect_digest, None);
+            assert!(
+                runtime
+                    .web_setup_commit(&params, &events)
+                    .expect("no digest, nothing to check")
+                    .applied
+            );
+            assert!(std::fs::read_to_string(&config_path)
+                .expect("read")
+                .contains("fetch_any_url"));
+        }
+
+        /// The digest is a digest of the **document**, not of the `[web]`
+        /// section the preview displays — which is the difference between
+        /// catching this race and catching only the part of it that happens to
+        /// show up in the rendered table.
+        ///
+        /// Falsification-shaped: the two previews below render *identical*
+        /// `toml`, so a digest taken over `preview.toml` would be equal and the
+        /// stale commit above would sail through.
+        #[test]
+        fn the_digest_covers_the_whole_document_not_the_rendered_table() {
+            let (runtime, _path) = runtime_on_disk("web-setup-digest-scope");
+            let answers = preview_params(WireWebTier::FetchAnyUrl, None, None, None);
+            let before = runtime.web_setup_preview(&answers).expect("previews");
+
+            // A change the `[web]` rendering of *this candidate* does not show:
+            // the `[privacy]` table beside it, which the commit writes all the
+            // same because the commit writes the whole file.
+            {
+                let mut config = runtime.config.lock().expect("config mutex");
+                config.privacy.redact = !config.privacy.redact;
+            }
+
+            let after = runtime.web_setup_preview(&answers).expect("previews again");
+            assert_eq!(
+                before.toml, after.toml,
+                "non-vacuity: the rendered [web] table is unchanged, so a digest \
+                 over it would be blind to this"
+            );
+            assert_ne!(
+                before.digest, after.digest,
+                "the digest must follow the bytes the commit writes, which are \
+                 the whole document"
             );
         }
 
