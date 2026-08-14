@@ -59,10 +59,24 @@ impl Prompter for StdinPrompter {
         let _ = write!(out, "{question}");
         let _ = out.flush();
         // Engaged for exactly the read and restored by the guard's `Drop`, on
-        // every path out — including the error one. `None` means the terminal
-        // would not have echoed anyway (stdin is a pipe, or the query failed),
-        // which is the same read with nothing to switch off.
-        let hidden = EchoOff::engage();
+        // every path out — including the error one.
+        let hidden = match EchoOff::engage() {
+            EchoState::Hidden(guard) => Some(guard),
+            // Nothing to switch off: stdin is a pipe, so the terminal was never
+            // going to paint anything. The same read, unhidden because there is
+            // no screen to hide it from.
+            EchoState::NoTerminal => None,
+            // Fail **closed**. Somebody is at a terminal and the terminal would
+            // paint every character of the credential into their scrollback.
+            // Reading anyway is the failure mode this branch exists to refuse:
+            // it looks exactly like a working prompt and leaks the key.
+            EchoState::Failed => {
+                let _ = writeln!(out);
+                let _ = writeln!(out, "{ECHO_UNAVAILABLE}");
+                let _ = out.flush();
+                return None;
+            }
+        };
         let mut line = String::new();
         let read = io::stdin().read_line(&mut line);
         let was_hidden = hidden.is_some();
@@ -101,32 +115,86 @@ struct EchoOff {
     saved: libc::termios,
 }
 
+/// What [`EchoOff::engage`] found — three states, because two of them are safe
+/// to read a credential through and one is not.
+enum EchoState {
+    /// Echo is off for the life of the guard.
+    Hidden(EchoOff),
+    /// There is no terminal echo to switch off: stdin is not a tty, so nothing
+    /// was ever going to be painted.
+    NoTerminal,
+    /// Stdin **is** a terminal and echo could not be cleared.
+    Failed,
+}
+
+/// [`EchoState`] without the guard — the shape the rule is stated in, so it can
+/// be asserted with no terminal in the room.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum EchoOutcome {
+    Hidden,
+    NoTerminal,
+    Failed,
+}
+
+/// The fail-closed rule, from the three facts the syscalls report.
+///
+/// Pure, and separate from [`EchoOff::engage`], because the branch that matters
+/// is the one a test process cannot otherwise reach: a real tty whose
+/// `tcgetattr`/`tcsetattr` fails. Folding it into the `unsafe` block would leave
+/// the security-relevant decision assertable only by breaking a terminal.
+///
+/// **Closed, not open.** A tty that would not clear `ECHO` yields `Failed` and
+/// the caller refuses to read, rather than reading with the characters painted
+/// back. The only state that reads unhidden is the one where there was nothing
+/// to hide from.
+fn classify_echo(is_tty: bool, got_attrs: bool, set_attrs: bool) -> EchoOutcome {
+    if !is_tty {
+        return EchoOutcome::NoTerminal;
+    }
+    if got_attrs && set_attrs {
+        EchoOutcome::Hidden
+    } else {
+        EchoOutcome::Failed
+    }
+}
+
+/// What a terminal that will not hide the typing is told.
+///
+/// It names the thing that did not happen (nothing was read), the reason, and
+/// the two ways out — because a user who has just been refused a prompt needs to
+/// know whether to retype or to fix their terminal.
+const ECHO_UNAVAILABLE: &str =
+    "error: this terminal would not turn echo off, so the key would have been shown as you \
+     typed it and left in your scrollback — nothing was read and nothing was stored. Run `stty \
+     sane` and try again, or use a different terminal.";
+
 impl EchoOff {
-    /// Switch echo off, or answer `None` when there is nothing to switch off.
-    fn engage() -> Option<Self> {
+    /// Switch echo off, and say which of the three states that landed in.
+    fn engage() -> EchoState {
         // SAFETY: `isatty` reads a descriptor number; `tcgetattr` and
         // `tcsetattr` read and write a single owned `termios` through the
         // pointer and touch nothing else. Every failure is reported through the
         // return code, which is checked. Same shape as the `poll` and
         // `TIOCGWINSZ` calls in this module.
-        unsafe {
-            if libc::isatty(libc::STDIN_FILENO) != 1 {
-                return None;
-            }
-            let mut saved: libc::termios = std::mem::zeroed();
-            if libc::tcgetattr(libc::STDIN_FILENO, &raw mut saved) != 0 {
-                return None;
-            }
+        let mut saved: libc::termios = unsafe { std::mem::zeroed() };
+        let is_tty = unsafe { libc::isatty(libc::STDIN_FILENO) } == 1;
+        let got_attrs =
+            is_tty && unsafe { libc::tcgetattr(libc::STDIN_FILENO, &raw mut saved) } == 0;
+        let set_attrs = got_attrs && {
             let mut hidden = saved;
             hidden.c_lflag &= !libc::ECHO;
             // TCSAFLUSH: anything typed ahead of the prompt is discarded rather
             // than read as the start of a credential — the standard posture for
             // a password prompt, and the one that keeps a stray paste out of the
             // keychain.
-            if libc::tcsetattr(libc::STDIN_FILENO, libc::TCSAFLUSH, &raw const hidden) != 0 {
-                return None;
-            }
-            Some(Self { saved })
+            let rc =
+                unsafe { libc::tcsetattr(libc::STDIN_FILENO, libc::TCSAFLUSH, &raw const hidden) };
+            rc == 0
+        };
+        match classify_echo(is_tty, got_attrs, set_attrs) {
+            EchoOutcome::Hidden => EchoState::Hidden(Self { saved }),
+            EchoOutcome::NoTerminal => EchoState::NoTerminal,
+            EchoOutcome::Failed => EchoState::Failed,
         }
     }
 }
@@ -571,6 +639,33 @@ mod tests {
             p.below_rows, 0,
             "an unframed prompter must not accrue rows to step over"
         );
+    }
+
+    /// REQ-572 AC-5, fail **closed**: a terminal whose echo could not be
+    /// switched off is refused, not read through.
+    ///
+    /// The dangerous state is the one in the middle. `isatty` passing and
+    /// `tcgetattr`/`tcsetattr` failing used to fall into the same `None` as "this
+    /// is a pipe", and the read went ahead — at a real terminal, with a real
+    /// person typing a real key, and every character painted back. The two
+    /// `None`s were the bug: one of them means there is no screen to leak to and
+    /// the other means there is one and the guard failed.
+    #[test]
+    fn a_terminal_that_will_not_hide_the_typing_is_refused_rather_than_read() {
+        // A pipe: nothing to switch off, and the read is fine unhidden.
+        assert_eq!(classify_echo(false, false, false), EchoOutcome::NoTerminal);
+        // The flags a non-tty cannot produce are still a non-tty.
+        assert_eq!(classify_echo(false, true, true), EchoOutcome::NoTerminal);
+        // A terminal with echo cleared: the happy path.
+        assert_eq!(classify_echo(true, true, true), EchoOutcome::Hidden);
+        // A terminal whose settings could not be read, or could not be written.
+        assert_eq!(classify_echo(true, false, false), EchoOutcome::Failed);
+        assert_eq!(classify_echo(true, true, false), EchoOutcome::Failed);
+
+        // And the refusal says the two things a refused prompt has to: that
+        // nothing was read, and what to do about it.
+        assert!(ECHO_UNAVAILABLE.contains("nothing was read"));
+        assert!(ECHO_UNAVAILABLE.contains("stty sane"));
     }
 
     #[test]

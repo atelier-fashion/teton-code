@@ -1847,9 +1847,22 @@ fn read_secret(id: &str) -> anyhow::Result<String> {
             return Ok(key);
         }
     }
-    let mut prompter = StdinPrompter::new();
-    match prompter.ask(&format!(
-        "API key for `{id}` (read from stdin, stored only in the keychain): "
+    prompt_for_secret(id, &mut StdinPrompter::new())
+}
+
+/// Ask for a provider API key through the **hiding** prompt (REQ-572 AC-5).
+///
+/// `ask_secret`, not `ask`: this is the same class of value `/web setup`
+/// collects — a credential typed at a terminal — and `teton provider add` was
+/// painting it into the user's scrollback and into any recording of the session.
+/// One prompt kind for one kind of value.
+///
+/// Split out of [`read_secret`] so that choice is assertable without a terminal
+/// and without the environment: the env-var shortcut stays above, and what is
+/// left here is which seam the question goes through.
+fn prompt_for_secret(id: &str, prompter: &mut dyn Prompter) -> anyhow::Result<String> {
+    match prompter.ask_secret(&format!(
+        "API key for `{id}` (not shown; stored only in the keychain): "
     )) {
         Some(key) if !key.trim().is_empty() => Ok(key.trim().to_owned()),
         _ => anyhow::bail!("no API key provided; set TETON_PROVIDER_KEY or enter the key"),
@@ -2784,6 +2797,39 @@ mod tests {
             keychain.stored_secret("anthropic").as_deref(),
             Some("sk-super-secret")
         );
+    }
+
+    /// REQ-572 AC-5, at the other place a credential is typed: `teton provider
+    /// add` asks through the **hiding** prompt.
+    ///
+    /// The same value, the same terminal, the same scrollback — a key echoed
+    /// here is as leaked as a key echoed in `/web setup`, and this command
+    /// predates the hiding path, so it was still using the echoing one. A
+    /// scripted prompter has no echo to check; what it can prove is which seam
+    /// the question went through, which is the thing that silently regresses.
+    #[test]
+    fn a_provider_key_is_asked_for_through_the_hiding_path() {
+        let mut prompter = ScriptedPrompter::new(&["sk-provider-secret"]);
+        let key = prompt_for_secret("anthropic", &mut prompter).unwrap();
+
+        assert_eq!(key, "sk-provider-secret");
+        assert_eq!(
+            prompter.secrets.len(),
+            1,
+            "the key question must go through `ask_secret`, not `ask`"
+        );
+        assert!(
+            prompter.secrets[0].contains("anthropic") && prompter.secrets[0].contains("not shown"),
+            "the prompt names the provider and says the typing is hidden: {:?}",
+            prompter.secrets[0]
+        );
+
+        // An empty answer is refused rather than stored as a credential.
+        let mut blank = ScriptedPrompter::new(&["   "]);
+        assert!(prompt_for_secret("anthropic", &mut blank).is_err());
+        // As is EOF.
+        let mut eof = ScriptedPrompter::new(&[]);
+        assert!(prompt_for_secret("anthropic", &mut eof).is_err());
     }
 
     #[test]
