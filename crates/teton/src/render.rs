@@ -1,6 +1,10 @@
 //! The rendering seam.
 //!
-//! Every character the CLI shows goes through a [`Surface`]. The MVP ships one
+//! Every character the CLI *renders* goes through a [`Surface`]. The one other
+//! writer to the same terminal is a [`crate::prompt::Prompter`], which puts a
+//! question on the row it is about to read from; it is not a `Surface`, so it
+//! calls [`defused`] itself and the guard covers both writers rather than one
+//! of them (REQ-573). The MVP ships one
 //! implementation, [`PlainSurface`], that writes plain streaming text — but the
 //! whole UI is written against the trait, not against `stdout`, so a future
 //! ratatui front-end is a new `Surface` impl and nothing else changes (the
@@ -238,7 +242,13 @@ fn neutralized(text: &str, keep_newlines: bool) -> String {
 }
 
 /// [`neutralized`] for a verb that owns exactly one row: no newline survives.
-fn defused(text: &str) -> String {
+///
+/// `pub(crate)` since REQ-573: a [`crate::prompt::Prompter`] writes its question
+/// straight to the terminal without going through a [`Surface`], and the question
+/// can carry daemon-supplied text (the offered auth template, a tool name). That
+/// writer needs *this* transform rather than a second one — one sanitizer, two
+/// writers, or the two drift and the weaker one is the way in.
+pub(crate) fn defused(text: &str) -> String {
     neutralized(text, false)
 }
 

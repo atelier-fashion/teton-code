@@ -1459,9 +1459,15 @@ pub struct WebBackendSuggestion {
     /// and the substitution happens only when the request is built.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub auth_template: Option<String>,
-    /// Whether this backend needs a key at all — the answer the flow defaults
-    /// to, rather than a client's guess re-derived from the template's
-    /// presence.
+    /// Whether this backend needs a key at all — what a client **may** default
+    /// its key question to, stated by the daemon rather than re-derived from
+    /// whether [`Self::auth_template`] happens to be present.
+    ///
+    /// A default a client is free not to take: today's CLI asks the key question
+    /// unconditionally, with a yes default of its own, and uses this field only
+    /// to say `(no key)` or `(needs a key)` beside the suggestion (REQ-572
+    /// parity). The field is the daemon's statement of fact about the backend;
+    /// what a client does with it at a prompt is the client's.
     pub needs_key: bool,
     /// A sentence to show beside the suggestion, when there is one worth
     /// showing. `None` is the common case and absent from the wire.
