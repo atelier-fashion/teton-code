@@ -988,10 +988,23 @@ pub async fn run_routed_session_turn(
 /// the table's keys, the keychain reference a search key lives behind, and the
 /// header template a backend needs (BUG-165).
 ///
+/// It also carries the one **prohibition** in this block, and it is here rather
+/// than in a clause because it is not conditional on any capability state: never
+/// ask the user to type a credential into the conversation. The rest of the
+/// guide teaches the model that a search backend needs a key, and the helpful
+/// next move it suggests — asking for it — would put a live secret in the
+/// transcript, in REQ-567's carried conversation, and in whatever the redactor
+/// scans on the next remote turn. Nothing downstream can catch that: by the time
+/// the user has typed it the damage *is* the typing, so the only place to stop
+/// it is the prompt (`the_system_prompt_forbids_asking_for_a_credential_in_the_conversation`).
+///
 /// Sized to stay resident in every turn: the whole system prompt must clear
-/// `REDACT_BODY_OVERHEAD_BYTES` with escaping headroom —
-/// `the_total_cap_clears_the_harness_context_budget_with_margin`
-/// (`egress/redact.rs`) measures the real prompt and turns red on overflow.
+/// `REDACT_BODY_OVERHEAD_BYTES` with escaping headroom, and clear it by at least
+/// `MIN_PROMPT_HEADROOM_BYTES` — `the_total_cap_clears_the_harness_context_budget_with_margin`
+/// (`egress/redact.rs`) and `the_web_tool_docs_clear_the_outbound_body_overhead`
+/// (`harness/tools/web.rs`) measure the two real prompt shapes and turn red on
+/// overflow *and* on the margin being spent. A sentence added here is paid for
+/// by shortening another one.
 const SELF_CONFIG_GUIDE: &str = include_str!("self_config.md");
 
 /// The ending a question that needs the live web must have when the capability
@@ -2068,6 +2081,56 @@ mod tests {
                  configuration is not in the user's repo — that clause is \
                  what stops the file hunt:\n{system}"
             );
+        }
+    }
+
+    /// **REQ-572 verify: the model must never solicit a credential in chat.**
+    ///
+    /// This REQ's whole subject is a model that has been given something useful
+    /// to say about an unconfigured capability — and the most natural helpful
+    /// next move, once it knows a search backend needs a key, is to ask for the
+    /// key. That would put a live credential in the transcript, in the carried
+    /// conversation REQ-567 replays, and in whatever the redactor has to scan on
+    /// the next remote turn. The rule has to be *in the prompt*, because there is
+    /// no seam that can catch it afterwards: by the time the user has typed it,
+    /// the damage is the typing.
+    ///
+    /// Pinned by content and on both profiles, exactly like BUG-154's and
+    /// BUG-160's clauses: a strong model that asks for a key in chat is no
+    /// better than the local tier doing it. The needle is the *prohibition*, not
+    /// the command names — the guide already names `teton provider add` and
+    /// `/web setup` several lines up, so asserting on those would stay green with
+    /// this sentence deleted.
+    #[test]
+    fn the_system_prompt_forbids_asking_for_a_credential_in_the_conversation() {
+        for config in [HarnessConfig::default(), HarnessConfig::for_strong_model()] {
+            let system = build_system_prompt(&ToolRegistry::with_builtins(), &config);
+            for (needle, missing) in [
+                (
+                    "Never ask the user to type an API key",
+                    "the guide no longer forbids soliciting a credential in chat — \
+                     which is the move a model makes the moment it learns a search \
+                     backend needs a key, and it puts the secret in the transcript",
+                ),
+                (
+                    "echo-off",
+                    "the guide no longer says what the alternative path does with \
+                     the key, so 'ask somewhere else' reads as a formality rather \
+                     than as the reason",
+                ),
+                (
+                    "keychain",
+                    "the guide no longer names where the credential actually ends \
+                     up, which is the fact that makes the redirection worth making",
+                ),
+            ] {
+                assert!(
+                    system.contains(needle),
+                    "{missing}. If the wording was changed deliberately, update \
+                     this expectation to the new wording; do not just delete the \
+                     assertion.\n{system}"
+                );
+            }
         }
     }
 

@@ -265,6 +265,24 @@ pub const REDACT_CHUNK_MAX_BYTES: usize =
 #[cfg(test)]
 pub(crate) const REDACT_BODY_OVERHEAD_BYTES: usize = 8 * 1024;
 
+/// The smallest headroom [`REDACT_BODY_OVERHEAD_BYTES`] may be left with after
+/// the largest system prompt this build produces (REQ-572 verify).
+///
+/// The two headroom tests already refused a prompt that *exceeded* the
+/// assumption and a prompt that filled it *exactly*. Between those lies the case
+/// that actually happens: a prompt that clears it by a handful of bytes, which
+/// passes, tells nobody, and leaves the next sentence anyone adds unable to
+/// land. The floor turns that from a discovery into a **decision** — a change
+/// that eats the last of the margin has to either shorten something or move this
+/// number, and moving it is a diff someone reviews.
+///
+/// Forty-eight bytes: about one short clause, which is the unit these prompts
+/// actually grow in. Small enough that it is not a second budget competing with
+/// the overhead it guards, large enough that "there is room for one more
+/// sentence" is true rather than nearly true.
+#[cfg(test)]
+pub(crate) const MIN_PROMPT_HEADROOM_BYTES: usize = 48;
+
 /// How many per-chunk windows the total cap is worth — the multiple that turns
 /// [`REDACT_CHUNK_MAX_BYTES`] into [`REDACT_INPUT_MAX_BYTES`].
 ///
@@ -1962,25 +1980,32 @@ mod tests {
             .expect("the state sweep is not empty");
 
         let spent = worst + escaping;
+        // Strictly under, and asserted **before** the subtraction below: a
+        // `spent` at or above the overhead would make that subtraction panic
+        // with an arithmetic message instead of this sentence, which is the one
+        // that says what to do about it.
         assert!(
-            spent <= REDACT_BODY_OVERHEAD_BYTES,
+            spent < REDACT_BODY_OVERHEAD_BYTES,
             "the assumed body overhead no longer covers what a body carries: a \
              {worst}-byte system prompt (the largest capability clause) plus \
              {escaping} bytes of escaping against an assumed \
-             {REDACT_BODY_OVERHEAD_BYTES} — over by {} bytes. Shorten the bundled \
-             guide or a clause; do not raise the overhead without re-checking the \
-             two claims below.",
-            spent - REDACT_BODY_OVERHEAD_BYTES
+             {REDACT_BODY_OVERHEAD_BYTES}. Shorten the bundled guide or a clause; \
+             do not raise the overhead without re-checking the two claims below."
         );
-        // The margin is asserted, not merely implied by the line above: a
-        // system prompt that exactly filled the overhead would pass that
-        // assertion and leave the next added sentence nowhere to go.
+        // The margin is asserted against a **floor**, not merely against zero: a
+        // prompt that cleared the overhead by three bytes would pass a `> 0`
+        // check, say nothing, and leave the next sentence anyone writes with
+        // nowhere to go. Spending the last of it is a decision, so it fails here
+        // and gets made on purpose.
         let margin = REDACT_BODY_OVERHEAD_BYTES - spent;
         assert!(
-            margin > 0,
-            "the system prompt now fills the assumed overhead exactly ({worst} bytes \
-             of prompt + {escaping} of escaping = {REDACT_BODY_OVERHEAD_BYTES}), \
-             leaving no margin at all"
+            margin >= MIN_PROMPT_HEADROOM_BYTES,
+            "the system prompt leaves {margin} bytes of headroom against a floor \
+             of {MIN_PROMPT_HEADROOM_BYTES} ({worst} bytes of prompt + {escaping} \
+             of escaping against an assumed {REDACT_BODY_OVERHEAD_BYTES}). \
+             Eroding the last of the margin is a decision, not a side effect: \
+             shorten the bundled guide or a clause, or move \
+             `MIN_PROMPT_HEADROOM_BYTES` deliberately."
         );
 
         let body = budget + REDACT_BODY_OVERHEAD_BYTES;

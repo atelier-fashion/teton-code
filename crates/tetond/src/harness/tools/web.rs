@@ -2227,7 +2227,7 @@ mod tests {
     async fn the_web_tool_docs_clear_the_outbound_body_overhead() {
         use teton_core::capability::{SearchGap, WebCapabilityState};
 
-        use crate::egress::redact::REDACT_BODY_OVERHEAD_BYTES;
+        use crate::egress::redact::{MIN_PROMPT_HEADROOM_BYTES, REDACT_BODY_OVERHEAD_BYTES};
         use crate::harness::turn_loop::{build_system_prompt, HarnessConfig};
 
         let dir = temp_dir("budget");
@@ -2287,19 +2287,28 @@ mod tests {
 
         let escaping = base.context_budget_bytes / 10;
         let spent = worst + escaping;
+        // Strictly under, and checked before the subtraction: otherwise an
+        // overflowing prompt panics on the arithmetic instead of on the sentence
+        // that says what to shorten.
         assert!(
-            spent <= REDACT_BODY_OVERHEAD_BYTES,
+            spent < REDACT_BODY_OVERHEAD_BYTES,
             "the web tool's docs and capability clause pushed the outbound body past \
              its assumed overhead: a {worst}-byte system prompt plus {escaping} bytes \
-             of escaping against an assumed {REDACT_BODY_OVERHEAD_BYTES} — over by {} \
-             bytes. Shorten the bundled guide, the clause, the description or the \
-             schema; do not raise the assumption without raising the cap it feeds.",
-            spent - REDACT_BODY_OVERHEAD_BYTES
+             of escaping against an assumed {REDACT_BODY_OVERHEAD_BYTES}. Shorten the \
+             bundled guide, the clause, the description or the schema; do not raise \
+             the assumption without raising the cap it feeds."
         );
+        // The same floor the opted-out shape clears (`egress::redact`'s
+        // `MIN_PROMPT_HEADROOM_BYTES`), so the two prompt shapes cannot come to
+        // hold different ideas of how much room is left.
+        let margin = REDACT_BODY_OVERHEAD_BYTES - spent;
         assert!(
-            REDACT_BODY_OVERHEAD_BYTES - spent > 0,
-            "the largest system prompt now fills the assumed overhead exactly, leaving \
-             the next sentence anyone adds nowhere to go"
+            margin >= MIN_PROMPT_HEADROOM_BYTES,
+            "the largest system prompt leaves {margin} bytes of headroom against a \
+             floor of {MIN_PROMPT_HEADROOM_BYTES}. Eroding the last of the margin is \
+             a decision, not a side effect: shorten the bundled guide, the clause, \
+             the description or the schema, or move `MIN_PROMPT_HEADROOM_BYTES` \
+             deliberately."
         );
         std::fs::remove_dir_all(&dir).ok();
     }
