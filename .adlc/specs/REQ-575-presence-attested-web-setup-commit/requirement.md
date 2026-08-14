@@ -1,7 +1,7 @@
 ---
 id: REQ-575
 title: "Presence attestation for the web setup commit"
-status: approved
+status: complete
 deployable: true
 created: 2026-08-14
 updated: 2026-08-14
