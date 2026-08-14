@@ -645,9 +645,12 @@ fn format_web_setup_completed(completed: &WebSetupCompleted) -> String {
 /// is rendered rather than branched on — the client's only job with it is to
 /// show it. What this adds is the part the user cares about: nothing happened.
 fn format_web_setup_rejected(rejected: &WebSetupRejected) -> String {
+    // "tried to change": since the verify pass, this event fires only for a
+    // refused COMMIT (previews refuse silently), so the one audit line the
+    // user gets must describe an attempted write, not minimize it as a read.
     format!(
-        "web setup refused: the request came from {} rather than from this session's user, so \
-         nothing was previewed and nothing was written.",
+        "web setup refused: {} tried to change this session's web configuration, and was not \
+         allowed to. Nothing was written.",
         rejected.origin
     )
 }
@@ -3235,7 +3238,11 @@ mod tests {
         let notice = surface.lines_of(LineKind::Notice).join("\n");
         assert!(notice.contains("web setup refused"), "{notice}");
         assert!(notice.contains("an unattached connection"), "{notice}");
-        assert!(notice.contains("nothing was written"), "{notice}");
+        assert!(notice.contains("Nothing was written"), "{notice}");
+        // The event fires only for a refused COMMIT since the verify pass, so
+        // the line must describe an attempted write — not minimize it as a
+        // read (re-verify security finding, wording drift).
+        assert!(notice.contains("tried to change"), "{notice}");
         assert!(
             state.web.capability.is_none(),
             "a refusal changes no capability state"

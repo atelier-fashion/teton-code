@@ -50,6 +50,8 @@
 //! ordering, the delete-on-failure and every abort point be pinned with no
 //! socket, no keychain and no tty (REQ-556/REQ-560 BR-8's pattern).
 
+use std::fmt;
+
 use teton_protocol::events::{WebCapabilityState, WebTier};
 use teton_protocol::jsonrpc::{error_code, RpcError};
 use teton_protocol::methods::{
@@ -484,7 +486,6 @@ pub(crate) fn drive(
 /// machine — and the three are genuinely three, not a `bool` with a failure
 /// case: "nothing was here" licenses a delete, "this was here" obliges a
 /// restore, and "I could not find out" licenses neither.
-#[derive(Debug)]
 enum PriorKey {
     /// The account was empty. This run created the entry, so the undo is to
     /// remove it (BR-11's "any keychain entry the aborted flow run itself
@@ -497,6 +498,20 @@ enum PriorKey {
     /// The store could not be read. Both undos are unsafe: the delete might take
     /// out a credential in use, and there is nothing to restore.
     Unreadable(KeychainError),
+}
+
+/// Hand-written for the same reason `Answers` withholds its derive: `Present`
+/// holds the displaced credential's plaintext, and a derived `Debug` would
+/// print a live key into any `{:?}`, panic message, or future test assertion
+/// — the exact residue the AC-5 sweep exists to catch.
+impl fmt::Debug for PriorKey {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Absent => f.write_str("PriorKey::Absent"),
+            Self::Present(_) => f.write_str("PriorKey::Present(<redacted>)"),
+            Self::Unreadable(err) => write!(f, "PriorKey::Unreadable({err})"),
+        }
+    }
 }
 
 impl PriorKey {
