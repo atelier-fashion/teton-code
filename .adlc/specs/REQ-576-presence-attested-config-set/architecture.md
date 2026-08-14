@@ -33,12 +33,16 @@ explicit branch ahead of REQ-575's `unreachable!()` else), and the test router
 `model/confirm` (a caller that fails the ancestry gate is refused with no prompt,
 BR-2). Reusing `refuse_unattested_commitment` is BR-1/LESSON-499. The
 `commitments`-list addition is the payoff of config/set being a real
-`daemon_wide_method`: the shared harness already iterates `daemon_wide_methods()`
-(which includes config/set) through `route_for_test`, so once config/set is in
-`commitments`, `only_a_daemon_wide_commitment_demands_presence` asserts it
-**refuses** under `AlwaysFailsVerifier`, `a_commitment_degrades_to_layer_a_where_no_mechanism_exists`
-asserts it **degrades** (BR-2), and `layer_a_refuses_independently_of_any_attestation_mechanism`
-asserts the ancestry gate still answers first — three ACs covered by one list edit.
+`daemon_wide_method`: the two shared tests that iterate `daemon_wide_methods()`
+(which already includes config/set) cover it once config/set is in `commitments` —
+`only_a_daemon_wide_commitment_demands_presence` asserts it **refuses** under
+`AlwaysFailsVerifier` (AC-3), and `layer_a_refuses_independently_of_any_attestation_mechanism`
+asserts the ancestry gate still answers first. **Caveat (found at /validate):**
+`a_commitment_degrades_to_layer_a_where_no_mechanism_exists` iterates a *hardcoded*
+`[model/confirm, model/set]` list, not `daemon_wide_methods()`, so config/set's
+**degradation (AC-2/BR-2)** needs config/set added to *that* list too (TASK-140
+step 5b) — or, better, that test refactored to iterate the shared `commitments`
+set so the next method cannot drift.
 
 **Degrade, don't refuse (BR-2)**: inherited verbatim from
 `refuse_unattested_commitment`'s `Unavailable` arm. Shipped builds gain **zero**

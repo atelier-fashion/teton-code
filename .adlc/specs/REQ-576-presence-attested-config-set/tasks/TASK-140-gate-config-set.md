@@ -32,7 +32,18 @@ BUG-162 layer-(a)-only comment. Foundational task; the others depend on it. See
   (~4190): add a `ConfigSetParams::METHOD` async branch (so the daemon_wide tests
   reach the real handler off the reader loop). (5) In
   `only_a_daemon_wide_commitment_demands_presence` (~4287): add
-  `ConfigSetParams::METHOD` to the `commitments` array. (6) Rewrite the
+  `ConfigSetParams::METHOD` to the `commitments` array (this test loops
+  `daemon_wide_methods()`, which already includes config/set, and checks
+  membership — so this one edit makes it assert config/set refuses).
+  (5b) **Also add `ConfigSetParams::METHOD` to the hardcoded
+  `[ModelConfirmParams::METHOD, ModelSetParams::METHOD]` list in
+  `a_commitment_degrades_to_layer_a_where_no_mechanism_exists`** — that test does
+  NOT loop `daemon_wide_methods()`, so config/set's **degradation (AC-2)** is not
+  asserted without this. (`layer_a_refuses_independently_of_any_attestation_mechanism`
+  loops `daemon_wide_methods()`, so it auto-covers config/set — no edit needed.)
+  Consider refactoring `a_commitment_degrades` to iterate the shared `commitments`
+  set to prevent this drift for the next method; minimal fix is adding config/set
+  to its list. (6) Rewrite the
   `handle_config_set` doc comment (BR-7): it no longer claims layer (a) suffices —
   a daemon-wide commitment now attests, and the "can edit config.toml directly"
   mitigation is insufficient for a commitment (REQ-570/REQ-575 reasoning). (7)

@@ -3,11 +3,12 @@
   "branch": "feat/REQ-576-presence-attested-config-set",
   "startedAt": "2026-08-14T14:20:00Z",
   "completed": false,
-  "currentPhase": 3,
+  "currentPhase": 4,
   "completedPhases": [
     0,
     1,
-    2
+    2,
+    3
   ],
   "integrationBranch": "main",
   "notes": "Working in place in the harness worktree great-gagarin-419527 (same as REQ-575). Draft PR deferred to Phase 6 (LESSON-004: branch had no commits at Step 0). Reuses REQ-575's refuse_unattested_commitment, blocks_on_a_human path, and TETON_PRESENCE_ACCEPT=fail seam.",
@@ -29,6 +30,12 @@
       "name": "Architect & Break Into Tasks",
       "completedAt": "2026-08-14T14:35:00Z",
       "notes": "OQ-1 safe (single prod caller); OQ-2 generic prompt; BR-6 accept consent-path. Tasks 140-142."
+    },
+    {
+      "phase": 3,
+      "name": "Validate Architecture & Tasks",
+      "completedAt": "2026-08-14T14:42:00Z",
+      "verdict": "VALIDATED \u2014 fixed AC-2 degradation-test gap (a_commitment_degrades hardcoded list needs config/set)"
     }
   ],
   "repos": {
