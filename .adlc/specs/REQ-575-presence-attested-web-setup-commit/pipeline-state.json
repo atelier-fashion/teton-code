@@ -31,7 +31,7 @@
   "mergeOrder": ["teton-code"],
   "phase4": {
     "currentTask": null,
-    "completedTasks": [],
+    "completedTasks": ["TASK-135", "TASK-136", "TASK-137", "TASK-138"],
     "failedTasks": []
   }
 }
