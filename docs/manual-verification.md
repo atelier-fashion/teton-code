@@ -1072,6 +1072,153 @@ paraphrased its **system prompt** (tools, providers, configuration) rather
 than saying "nothing yet" — correct on the load-bearing claim (no cleared
 content resurfaced), just a weak model filling silence with what it can see.
 
+## REQ-572 — capability-aware refusals and guided web enablement
+
+REQ-572's machinery is covered without a model or a keychain: the per-state
+prompt clauses (`tetond/src/harness/turn_loop.rs`), the classifier every
+consumer reads (`teton-core/src/capability.rs`), the plan/preview/commit
+endpoints and their atomic write (`tetond/src/runtime.rs`), and the whole
+client flow against a fake keychain and a scripted daemon
+(`teton/src/web_setup_ui.rs`). Three legs are left over, and each needs
+something CI does not have: a real model's *prose* (twice), and a real OS
+keychain (once).
+
+A rule that holds in all three, and is worth watching for rather than assuming:
+**the model may name the opt-in; only the user can run it.** `/web setup` is a
+client command, and tool dispatch has no path to that table
+(`teton/src/slash.rs`, `handle_web_setup`) — so the only failure available to a
+model here is *prose claiming* it enabled something. If you see that, it is a
+finding.
+
+### Not automated: that a real model refuses a web question by naming the opt-in (AC-1)
+
+**What is uncovered.** The prompt clause is pinned by content
+(`the_off_clause_names_the_capability_its_off_state_and_both_enablement_paths`,
+`turn_loop.rs`), and the turn has no web tool to call in this state at all
+(`registration_is_the_capability_classifiers_exposure_predicate`,
+`harness/tools/web.rs`). What no test can prove is that a real model, handed
+that clause, *uses* it: says the capability is off, names `/web setup`, and
+stops — instead of answering from stale weights or hunting through the open
+repository for Teton's config, which is BUG-160's failure one capability over.
+
+**Procedure.**
+
+1. Build the workspace — *not* a targeted test target, or the CLI drives a
+   stale daemon (BUG-164):
+   ```
+   cargo build --workspace --features tetond/llama
+   ```
+2. Start an isolated daemon with a real model (short `XDG_RUNTIME_DIR`,
+   symlinked weights — the REQ-564 setup) over a config with **no** `[web]`
+   table, so the capability derives as `OffAvailable`:
+   ```
+   grep -n '^\[web\]' "$TETON_CONFIG"      # must print nothing
+   ```
+3. Open a session in a directory that is a real repository (the hunt this leg
+   watches for needs somewhere to hunt), and ask a question the weights cannot
+   answer, e.g.:
+   ```
+   What is the current released version of tokio on crates.io?
+   ```
+4. **Expect**: an answer that says web lookup is available on this machine but
+   off, names `/web setup` (naming the `[web]` config table as well is correct,
+   not a second failure), and makes **zero tool calls** in that turn — tool
+   lines always render, so an empty turn is visibly empty (`/verbose` adds the
+   routing notices, which are worth having for context).
+5. **Failure shapes**, in the order they are worth reporting: a `grep`/`glob`/
+   `read` sweep for the opt-in (the clause's third sentence did not land); a
+   confident version number with no hedge (the refusal ending was not taken at
+   all); a refusal that names no enablement path (the clause reached the model
+   but not the answer); prose claiming the model turned the capability on.
+6. Note what the status row does, and do not expect it to appear: a session
+   that has not touched the web draws no `web:` row, capability or not — that
+   is deliberate and pinned by
+   `the_capability_alone_never_makes_the_row_appear` (`teton/src/session_ui.rs`).
+
+**Status: NOT RUN.**
+
+### Not automated: that the second offer in a conversation is one line (AC-9)
+
+**What is uncovered.** The *instruction* is pinned
+(`every_capability_clause_carries_the_repeat_instruction_and_only_a_clause_does`,
+`turn_loop.rs`): every capability clause ends with "If you already said this
+earlier in this conversation, refer back to it in one line." Whether a model
+obeys it is model behavior, and this is the leg that reads it.
+
+**Procedure.** In the same session as the leg above, immediately after the first
+refusal, ask a second web-needing question on a different subject (e.g. "and
+what did the last Rust release change about `impl Trait`?").
+
+**Expect**: the second answer refers back to the offer in about a line — "as
+above, this needs `/web setup`" — rather than repeating the paragraph. A verbatim
+repeat is the failure this instruction exists to prevent; it is a wording
+problem, not a wiring one, so record the exact text of both answers.
+
+**Status: NOT RUN.**
+
+### Not automated: the flow against a real OS keychain (AC-5/AC-6, macOS)
+
+**What is uncovered.** Every keychain assertion in the suite runs against
+`MockKeychain`. The real `security_framework` calls — the store, the delete, and
+the fact that the entry lands under the service and account the config
+reference names — are exercised nowhere, exactly as `teton provider add`'s
+write is not (see the REQ-557 section above; this is the same gap for the same
+reason).
+
+**Run it once on macOS, with a config you are willing to have written** (point
+`TETON_CONFIG` at a scratch file). A real search key is not needed — any dummy
+string proves storage.
+
+1. Start the daemon, then run `teton` **in a real terminal**. A piped session is
+   a different, already-automated path (it prints instructions and reads
+   nothing).
+2. `/web setup`, and answer: `3` (search) →
+   `https://api.search.brave.com/res/v1/web/search` → `y` (needs a key) →
+   `X-Subscription-Token: {key}` → a dummy key → `y` at
+   `write this to your config? [y/N]`.
+3. **Expect** the key prompt to echo nothing as you type, the preview to show
+   the exact `[web]` table and `searches would go to: api.search.brave.com`, and
+   the completion notice:
+   ```
+   web lookup enabled (`search`) — written to <config path>. Nothing has been
+   looked up yet: the next web-needing question will ask before anything leaves
+   the machine.
+   ```
+4. Check the store and the config, in that order:
+   ```
+   security find-generic-password -s teton -a web-search      # must succeed
+   grep -n 'search_key_ref' "$TETON_CONFIG"                   # keychain://teton/web-search
+   grep -c '<the dummy key>' "$TETON_CONFIG"                  # must be 0
+   ```
+   Nothing in the session transcript should contain the dummy key either.
+5. **Abort path.** Remove the entry, then run the flow again and answer `n` at
+   the confirm:
+   ```
+   security delete-generic-password -s teton -a web-search
+   ```
+   Expect nothing stored (`security find-generic-password -s teton -a web-search`
+   exits non-zero with "The specified item could not be found in the keychain.")
+   and the config byte-identical — the store deliberately happens *after* the
+   confirm, so a declined preview never reaches the keychain at all.
+6. **Cleanup-after-a-failed-commit path** (optional, and the only way to see the
+   delete run for real): put the config in a directory you then make read-only
+   (`chmod 555`), so the daemon's atomic write fails *after* the key is stored.
+   Run the flow and confirm. Expect the daemon's own sentence ("the
+   configuration could not be saved …") followed by "the key that was stored for
+   this attempt has been removed from your keychain.", and
+   `security find-generic-password -s teton -a web-search` failing afterwards.
+   Restore the directory's mode when done.
+7. Delete any leftover `teton` / `web-search` entry from Keychain Access when
+   you are finished.
+
+**Known residual, not a finding.** Ctrl-C *during* the key prompt kills the
+process before the echo-restoring guard runs, leaving the terminal with echo
+off; `stty sane` fixes it. Every `read -s`-shaped prompt without a signal
+handler has this window. The ordinary aborts (Enter, EOF) restore normally — if
+*those* leave the terminal silent, that is a real defect.
+
+**Status: NOT RUN.**
+
 ---
 
 # Manual verification runbook — REQ-570 AC-3b
