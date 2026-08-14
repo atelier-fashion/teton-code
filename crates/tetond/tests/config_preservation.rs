@@ -306,13 +306,18 @@ impl Daemon {
 
 /// A throwaway directory under the system temp dir, unique per test.
 fn scratch_dir(tag: &str) -> PathBuf {
+    // pid + nanos alone can collide when two tests hit the same clock tick;
+    // the counter is what the sibling integration suites' `temp_dir` helpers
+    // add for exactly that reason (e.g. model_consent.rs).
+    static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
     let dir = std::env::temp_dir().join(format!(
-        "teton-cfgpreserve-{tag}-{}-{}",
+        "teton-cfgpreserve-{tag}-{}-{}-{}",
         std::process::id(),
         std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .expect("clock")
-            .as_nanos()
+            .as_nanos(),
+        NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
     ));
     std::fs::create_dir_all(&dir).expect("create the scratch directory");
     dir
