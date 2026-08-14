@@ -365,6 +365,11 @@ allowed_domains = ["docs.rs", "crates.io"]
 cache_ttl_secs = 900
 ```
 
+The keychain entry `search_key_ref` names is created by `/web setup`; to write
+it by hand, run `security add-generic-password -s teton -a web-search -w` — put
+`-w` last and it prompts for the key instead of leaving it in your shell
+history.
+
 A keyless backend is the same table with `search_key_ref` and `search_auth`
 left out. `tier = "search"` with no `search_endpoint` is the one combination
 the daemon refuses to start on, and it names the missing key when it does.

@@ -11,19 +11,35 @@
 //!
 //! The `[web]` TOML shown at the confirm step and the host it would reach are
 //! the **daemon's own bytes**, rendered verbatim. Nothing in this file composes
-//! a config table, parses an endpoint, or forms an opinion about what a valid
-//! candidate is: a client-side re-derivation would be a second answer to a
-//! question the daemon has already answered, and the two would agree right up
-//! until the one that mattered (LESSON-494, BR-7). What the user confirms is
-//! what the commit re-derives from the same answers.
+//! a config table or forms an opinion about what a valid candidate is: a
+//! client-side re-derivation would be a second answer to a question the daemon
+//! has already answered, and the two would agree right up until the one that
+//! mattered (LESSON-494, BR-7). What the user confirms is what the commit
+//! re-derives from the same answers.
+//!
+//! The one thing this file *does* read out of a typed endpoint is its host, and
+//! only to decide which auth-header template the next **prompt offers as its
+//! default** ([`offered_auth`]). That is a question about what to put in front of
+//! a person, not about what is valid — the daemon still validates, and a user who
+//! types a template over the offer is obeyed. Offering the generic Bearer to
+//! somebody who just typed Brave's endpoint is how a walkthrough hands out a
+//! config that 401s.
 //!
 //! ## The secret's whole life is in this process (ADR-3)
 //!
 //! The key is read echo-off into memory, written to the OS keychain by
 //! [`Keychain::store`] **after** the user has confirmed the preview, and only
-//! its reference — `keychain://teton/web-search` — travels to the daemon. If
-//! the commit that reference was written for fails, the entry is deleted again,
-//! so a refused setup leaves no credential behind that nothing will ever read.
+//! its reference — `keychain://teton/web-search` — travels to the daemon.
+//!
+//! The account is fixed, so that store is **destructive**: on a rotation it
+//! overwrites a credential the live config still references. The flow therefore
+//! reads the account before it writes ([`Keychain::read`]) and, when the commit
+//! the write was made for is refused, puts back exactly what it displaced rather
+//! than deleting — BR-11 removes "any keychain entry the aborted flow run itself
+//! created", and a rotation created none. A *transport* failure is the third
+//! case and is left alone entirely: the commit may have landed, so both undos
+//! could be the destructive one, and the honest answer is a notice rather than a
+//! guess ([`ambiguous_commit_line`]).
 //!
 //! ## Everything but the bytes is testable without a terminal
 //!
@@ -43,7 +59,7 @@ use teton_protocol::methods::{
 use teton_protocol::SessionId;
 
 use crate::client::{Connection, UiContext};
-use crate::keychain::{auth_ref_for, Keychain};
+use crate::keychain::{auth_ref_for, Keychain, KeychainError};
 use crate::prompt::Prompter;
 use crate::render::{LineKind, Surface};
 use crate::session_ui::web_tier_name;
@@ -280,6 +296,13 @@ impl Answers {
             search_endpoint: self.search_endpoint.clone(),
             search_key_ref: key_ref,
             search_auth: self.search_auth.clone(),
+            // NOT THREADED HERE. The daemon-side digest guard landed in the same
+            // verify pass as this file's changes; carrying the previewed digest
+            // through to the commit is the integrating change, and doing it from
+            // two sides at once is how the two halves disagree. `None` is the
+            // protocol's own "do not check", so this compiles and behaves
+            // exactly as it did before the field existed.
+            expect_digest: None,
         }
     }
 }
@@ -379,53 +402,141 @@ pub(crate) fn drive(
     // human said yes, immediately before the commit it was collected for — so
     // the window in which an orphan can exist is one RPC wide rather than the
     // length of the flow.
-    let key_ref = match answers.search_key.as_deref() {
-        Some(secret) => match keychain.store(SEARCH_KEY_ACCOUNT, secret) {
-            Ok(reference) => Some(reference),
-            Err(err) => {
-                io.surface().line(
-                    LineKind::Error,
-                    &format!(
-                        "the key could not be stored in the OS keychain ({err}); nothing was \
-                         written to your config."
-                    ),
-                );
-                return Ok(());
+    //
+    // `prior` is read in the same breath and for the same reason the store is
+    // late: the account is fixed, so this write displaces whatever a previous
+    // run put there, and after it there is no way left to find out what that was.
+    let (key_ref, prior) = match answers.search_key.as_deref() {
+        Some(secret) => {
+            let prior = PriorKey::read(keychain);
+            match keychain.store(SEARCH_KEY_ACCOUNT, secret) {
+                Ok(reference) => (Some(reference), Some(prior)),
+                Err(err) => {
+                    io.surface().line(
+                        LineKind::Error,
+                        &format!(
+                            "the key could not be stored in the OS keychain ({err}); nothing was \
+                             written to your config."
+                        ),
+                    );
+                    return Ok(());
+                }
             }
-        },
-        None => None,
+        }
+        None => (None, None),
     };
 
-    match io.commit(answers.commit_params(session_id, key_ref.clone()))? {
+    // Bound rather than `?`-ed. A transport failure here is not the same event
+    // as a daemon that answered "no": the commit may have landed, and letting
+    // the error out would end the session on the one path where the user most
+    // needs the flow to tell them what state their machine is in.
+    match io.commit(answers.commit_params(session_id, key_ref.clone())) {
         // Nothing is rendered here on purpose. The daemon publishes
         // `web_setup_completed` for this session, and `Connection::call` has
         // already pumped it through `session_ui` by the time this returns — the
         // daemon fences a request's events ahead of its response. A second line
         // composed here would say the same thing twice to the one person who
         // already knew, which is the drift `/clear` avoids the same way.
-        Ok(result) if result.applied => {}
-        Ok(result) => io.surface().line(
-            LineKind::Notice,
-            &format!(
-                "web lookup was already configured exactly this way (`{}`), so nothing changed.",
-                web_tier_name(result.tier)
-            ),
-        ),
-        Err(err) => {
+        Ok(Ok(result)) if result.applied => {}
+        Ok(Ok(result)) => io
+            .surface()
+            .line(LineKind::Notice, &unchanged_line(result.tier, &prior)),
+        Ok(Err(err)) => {
             // The entry that was written a moment ago exists only for this
             // commit, and this commit did not happen (ADR-3). A flow that stored
-            // nothing has nothing to take back.
-            let cleanup = key_ref
-                .as_ref()
-                .map(|_| keychain.delete(SEARCH_KEY_ACCOUNT));
+            // nothing has nothing to take back; a flow that *displaced* one owes
+            // the machine what it displaced, not a delete.
+            let cleanup = prior.as_ref().map(|prior| prior.undo(keychain));
             io.surface()
                 .line(LineKind::Error, &refused_line(&err, "written"));
             if let Some(cleanup) = cleanup {
                 io.surface().line(LineKind::Notice, &cleanup_line(&cleanup));
             }
         }
+        Err(transport) => {
+            // Deliberately **no** keychain mutation. Either undo is destructive
+            // in one of the two states this error is consistent with, and there
+            // is nothing here that can tell them apart — so the user gets the
+            // ambiguity itself, with the command that resolves it.
+            io.surface().line(
+                LineKind::Error,
+                &format!("the daemon did not answer the commit: {transport}"),
+            );
+            io.surface()
+                .line(LineKind::Notice, &ambiguous_commit_line(&prior));
+        }
     }
     Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// The undo (ADR-3, BR-11)
+// ---------------------------------------------------------------------------
+
+/// What the keychain held for [`SEARCH_KEY_ACCOUNT`] *before* this run stored
+/// anything.
+///
+/// Read once, immediately before the store, because the store is what destroys
+/// the answer. Which variant this is decides what a refused commit owes the
+/// machine — and the three are genuinely three, not a `bool` with a failure
+/// case: "nothing was here" licenses a delete, "this was here" obliges a
+/// restore, and "I could not find out" licenses neither.
+#[derive(Debug)]
+enum PriorKey {
+    /// The account was empty. This run created the entry, so the undo is to
+    /// remove it (BR-11's "any keychain entry the aborted flow run itself
+    /// created").
+    Absent,
+    /// The account already held a credential — a rotation. The live config still
+    /// references it, so the undo is to put those exact bytes back. A delete
+    /// here destroys a working setup the user never agreed to give up.
+    Present(String),
+    /// The store could not be read. Both undos are unsafe: the delete might take
+    /// out a credential in use, and there is nothing to restore.
+    Unreadable(KeychainError),
+}
+
+impl PriorKey {
+    /// Read the account, classifying a missing entry as a state rather than a
+    /// failure.
+    ///
+    /// A read failure does **not** stop the flow. It is a transient backend
+    /// condition on the one platform that has a backend at all, the user has
+    /// asked for this key to be stored, and refusing here would trade a
+    /// hypothetical loss for a certain one. What it does is downgrade the undo
+    /// to "leave it alone and say so".
+    fn read(keychain: &dyn Keychain) -> Self {
+        match keychain.read(SEARCH_KEY_ACCOUNT) {
+            Ok(Some(existing)) => PriorKey::Present(existing),
+            Ok(None) => PriorKey::Absent,
+            Err(err) => PriorKey::Unreadable(err),
+        }
+    }
+
+    /// Undo this run's store, given what it displaced.
+    fn undo(&self, keychain: &dyn Keychain) -> Cleanup {
+        match self {
+            PriorKey::Absent => Cleanup::Deleted(keychain.delete(SEARCH_KEY_ACCOUNT)),
+            PriorKey::Present(previous) => {
+                Cleanup::Restored(keychain.store(SEARCH_KEY_ACCOUNT, previous).map(|_| ()))
+            }
+            // The reason travels with the decision: "left alone" without "because
+            // your keychain would not answer" reads as the flow shrugging.
+            PriorKey::Unreadable(err) => Cleanup::LeftInPlace(err.to_string()),
+        }
+    }
+}
+
+/// What the failure path did about the entry this run wrote.
+#[derive(Debug)]
+enum Cleanup {
+    /// The entry this run created was removed — or the removal was refused.
+    Deleted(Result<(), KeychainError>),
+    /// The credential this run displaced was put back — or could not be.
+    Restored(Result<(), KeychainError>),
+    /// Nothing was touched, because nothing could be shown to be the safe move.
+    /// Carries why the store could not be read.
+    LeftInPlace(String),
 }
 
 // ---------------------------------------------------------------------------
@@ -442,8 +553,13 @@ const ENDPOINT_QUESTION: &str = "  search endpoint [Enter to cancel]: ";
 /// whether the echo-off prompt is asked (a self-hosted SearxNG needs no key).
 const KEY_NEEDED_QUESTION: &str = "  does this backend need an API key? [Y/n] ";
 
-/// The advanced auth-header question. Enter takes the daemon's default.
-const AUTH_QUESTION: &str = "  auth header template [Enter for `Authorization: Bearer {key}`]: ";
+/// The advanced auth-header question, naming the template Enter would take.
+///
+/// The offer is part of the question because it is what an empty answer means,
+/// and it is not always the same offer — see [`offered_auth`].
+fn auth_question(offered: &str) -> String {
+    format!("  auth header template [Enter for `{offered}`]: ")
+}
 
 /// The credential question. It says where the key goes, because that is the part
 /// the user is agreeing to.
@@ -511,13 +627,25 @@ fn collect(plan: &WebSetupPlanResult, io: &mut dyn SetupIo) -> Option<Answers> {
 
     let needs_key = is_yes_by_default(&io.prompter().ask(KEY_NEEDED_QUESTION)?);
     let (search_auth, search_key) = if needs_key {
-        let auth = io.prompter().ask(AUTH_QUESTION)?;
+        let offered = offered_auth(endpoint);
+        let auth = io.prompter().ask(&auth_question(offered))?;
         let auth = auth.trim();
-        // Empty here is an answer — "use the default" — and not an abort, which
-        // is why this question says what Enter means. The daemon writes no
-        // `search_auth` key at all for `None`, so the default stays one value in
-        // one place instead of being copied into every config this flow writes.
-        let auth = (!auth.is_empty()).then(|| auth.to_owned());
+        // Empty here is an answer — "take what was offered" — and not an abort,
+        // which is why the question says what Enter means.
+        //
+        // What that resolves to differs by offer, and the difference is the
+        // point. For the generic Bearer it is `None`: the daemon writes no
+        // `search_auth` key at all and applies exactly that default, so the
+        // default stays one value in one place instead of being copied into
+        // every config this flow writes. For a backend whose own header was
+        // offered, it is that template on the wire — a `None` there would write
+        // a Bearer config against a backend that answers 401 to it, which is a
+        // walkthrough handing out a broken setup and blaming the key.
+        let auth = if auth.is_empty() {
+            (offered != DEFAULT_SEARCH_AUTH).then(|| offered.to_owned())
+        } else {
+            Some(auth.to_owned())
+        };
         let key = io.prompter().ask_secret(KEY_QUESTION)?;
         let key = key.trim();
         if key.is_empty() {
@@ -675,6 +803,60 @@ const ENDPOINT_HELP: &[&str] = &[
     "  Kagi Search API      https://kagi.com/api/v0/search  (header `Authorization: Bot {key}`)",
 ];
 
+/// The credential header each backend in [`ENDPOINT_HELP`] actually needs,
+/// keyed by the host of the endpoint it is offered under.
+///
+/// Two lists, one fact: the block above tells the user what the header is, and
+/// this makes it the offer when they type that endpoint. They are kept adjacent
+/// because a backend added to one and not the other is exactly the trap this
+/// closes — an endpoint the walkthrough suggests, an offered default the backend
+/// rejects, and a 401 the user reads as a bad key.
+///
+/// **Enumerated elsewhere.** `crates/tetond/tests/web_setup_contracts.rs` reads
+/// *this file's source text* for the product's suggestions: URLs from the
+/// `ENDPOINT_HELP` slice literal (so it must keep that name and stay a
+/// `];`-terminated literal) and credential-header templates from every
+/// backtick-quoted span in the file, which it then requires the daemon's bundled
+/// guide to name too. A template added here whose backend has no contract row
+/// there turns that suite red — which is the arrangement, not an accident.
+const KNOWN_BACKEND_AUTH: &[(&str, &str)] = &[
+    ("api.search.brave.com", "X-Subscription-Token: {key}"),
+    ("kagi.com", "Authorization: Bot {key}"),
+];
+
+/// The auth-header template to offer for `endpoint`.
+///
+/// A known host gets its own backend's header; everything else — including a
+/// self-hosted instance, a proxy, or anything unparseable — gets the generic
+/// Bearer the daemon defaults to. This decides a *default*, never a value: an
+/// answer typed over the offer wins, and the daemon validates either way.
+fn offered_auth(endpoint: &str) -> &'static str {
+    let Some(host) = endpoint_host(endpoint) else {
+        return DEFAULT_SEARCH_AUTH;
+    };
+    KNOWN_BACKEND_AUTH
+        .iter()
+        .find(|(known, _)| host.eq_ignore_ascii_case(known))
+        .map_or(DEFAULT_SEARCH_AUTH, |(_, template)| *template)
+}
+
+/// The host of an absolute `http(s)` endpoint, or `None` when it is not one.
+///
+/// Deliberately small and deliberately not a validator: whether the endpoint is
+/// acceptable is the daemon's answer (BR-7), and this only has to be right
+/// enough to recognise a host the product itself suggested. Anything it cannot
+/// read falls back to the generic offer, which is the pre-existing behaviour.
+fn endpoint_host(endpoint: &str) -> Option<&str> {
+    let endpoint = endpoint.trim();
+    let rest = endpoint
+        .strip_prefix("https://")
+        .or_else(|| endpoint.strip_prefix("http://"))?;
+    let authority = rest.split(['/', '?', '#']).next()?;
+    // Userinfo first (everything before the last `@`), then the port.
+    let host = authority.rsplit('@').next()?.split(':').next()?;
+    (!host.is_empty()).then_some(host)
+}
+
 /// The refusal a `search` selection gets when the plan says the machine cannot
 /// serve it. It names the missing piece — the daemon's sentence — and the tier
 /// that *is* reachable, so the answer is not a dead end.
@@ -735,21 +917,91 @@ fn refused_line(err: &RpcError, stage: &str) -> String {
     format!("nothing was {stage}: {}", err.message)
 }
 
-/// What the delete-on-failure did, said out loud.
+/// What the undo did, said out loud — including when it did nothing.
 ///
 /// A failure to clean up is reported rather than swallowed: the user is the only
-/// one who can remove the entry by hand, and an orphaned credential they were
-/// never told about is exactly the residue ADR-3 exists to avoid.
-fn cleanup_line(cleanup: &Result<(), crate::keychain::KeychainError>) -> String {
+/// one who can act on the keychain by hand, and a credential left in a state
+/// they were never told about is exactly the residue ADR-3 exists to avoid. Each
+/// arm therefore ends in the command that finishes the job it could not.
+fn cleanup_line(cleanup: &Cleanup) -> String {
     match cleanup {
-        Ok(()) => "the key that was stored for this attempt has been removed from your keychain."
-            .to_owned(),
-        Err(err) => format!(
+        Cleanup::Deleted(Ok(())) => {
+            "the key that was stored for this attempt has been removed from your keychain."
+                .to_owned()
+        }
+        Cleanup::Deleted(Err(err)) => format!(
             "the key stored for this attempt could not be removed from your keychain ({err}) — \
-             it is unreferenced, and `security delete-generic-password -s teton -a web-search` \
-             clears it."
+             it is unreferenced, and `security delete-generic-password -s teton -a \
+             {SEARCH_KEY_ACCOUNT}` clears it."
+        ),
+        Cleanup::Restored(Ok(())) => format!(
+            "the key stored for this attempt has been replaced with the one that was there \
+             before, so the `{SEARCH_KEY_ACCOUNT}` entry your config already points at is \
+             unchanged."
+        ),
+        Cleanup::Restored(Err(err)) => format!(
+            "the key that was in your keychain as `{SEARCH_KEY_ACCOUNT}` before this attempt \
+             could not be put back ({err}) — the entry now holds the key you just typed, so a \
+             config pointing at it is using the new key. Run `/web setup` again, or restore the \
+             entry with `security add-generic-password -U -s teton -a {SEARCH_KEY_ACCOUNT} -w`."
+        ),
+        Cleanup::LeftInPlace(why) => format!(
+            "your keychain could not be read before this attempt ({why}), so the key you typed \
+             was left in `{SEARCH_KEY_ACCOUNT}` rather than risk removing a credential your \
+             config still uses — `security find-generic-password -s teton -a \
+             {SEARCH_KEY_ACCOUNT}` shows what is there."
         ),
     }
+}
+
+/// What a commit that applied nothing says.
+///
+/// "Nothing changed" is true of the config and **false of the keychain** when
+/// this run stored a key: the table already matched, so no write was needed, but
+/// the credential behind `search_key_ref` is the one just typed. A user rotating
+/// a key against an unchanged config would otherwise be told their rotation did
+/// not happen, and go looking for the reason.
+fn unchanged_line(tier: WebTier, prior: &Option<PriorKey>) -> String {
+    let tier = web_tier_name(tier);
+    match prior {
+        None => format!(
+            "web lookup was already configured exactly this way (`{tier}`), so nothing changed."
+        ),
+        Some(_) => format!(
+            "web lookup was already configured exactly this way (`{tier}`), so your config is \
+             unchanged — the key stored in your keychain as `{SEARCH_KEY_ACCOUNT}` was updated to \
+             the one you just typed."
+        ),
+    }
+}
+
+/// What a commit the daemon never answered says.
+///
+/// The one honest sentence available: the write either landed or did not, this
+/// process cannot tell, and there is a command that can. Everything about the
+/// keychain is reported as *left alone* because that is what happened — the
+/// alternative was to guess which of two destructive undos was the right one and
+/// be wrong half the time (a delete orphans a landed config; a restore
+/// resurrects the key the user was replacing).
+fn ambiguous_commit_line(prior: &Option<PriorKey>) -> String {
+    let mut line = String::from(
+        "your config may or may not have been written — run `/web setup` again to see which: its \
+         first lines report the `[web]` table as it now stands.",
+    );
+    match prior {
+        None => {}
+        Some(PriorKey::Present(_)) => line.push_str(&format!(
+            " The key you typed is in your keychain as `{SEARCH_KEY_ACCOUNT}`, in place of the one \
+             that was there before, and was left there: taking it back out would break the setup \
+             if the write did land."
+        )),
+        Some(PriorKey::Absent | PriorKey::Unreadable(_)) => line.push_str(&format!(
+            " The key you typed is in your keychain as `{SEARCH_KEY_ACCOUNT}` and was left there: \
+             taking it back out would break the setup if the write did land. If it did not, \
+             `security delete-generic-password -s teton -a {SEARCH_KEY_ACCOUNT}` removes it."
+        )),
+    }
+    line
 }
 
 /// What a piped session is told instead of being asked (BR-12 / AC-10).
@@ -799,6 +1051,19 @@ fn instruction_lines() -> Vec<(LineKind, String)> {
                  (default `{DEFAULT_SEARCH_AUTH}`)"
             ),
         ),
+        // The reference above names an entry that does not exist yet, and the
+        // walkthrough is the only thing that creates one — which on a piped
+        // session is precisely what is unavailable. Without this line the
+        // instructions describe a config that cannot be made to work.
+        (
+            LineKind::Info,
+            format!(
+                "the keychain entry itself is written with `security add-generic-password -s \
+                 {} -a {SEARCH_KEY_ACCOUNT} -w` — put `-w` last and it prompts for the key \
+                 instead of leaving it in your shell history.",
+                crate::keychain::SERVICE
+            ),
+        ),
         (
             LineKind::Info,
             "the `search` tier also needs the local model, which scans every query before it \
@@ -820,6 +1085,10 @@ mod tests {
     /// and serialized frames means something.
     const PLANTED_KEY: &str = "sk-planted-web-search-key";
 
+    /// The credential a rotation displaces — the one the live config already
+    /// references, and the one a refused commit owes the machine back.
+    const PREVIOUS_KEY: &str = "sk-previous-web-search-key";
+
     /// The seam, wired to canned answers and a recording surface.
     struct FakeIo {
         surface: RecordingSurface,
@@ -827,6 +1096,15 @@ mod tests {
         plan: Result<WebSetupPlanResult, RpcError>,
         preview: Result<WebSetupPreviewResult, RpcError>,
         commit: Result<WebSetupCommitResult, RpcError>,
+        /// When set, `commit` fails at the **transport** level instead of
+        /// answering: the socket broke, or the daemon died, after the frame went
+        /// out.
+        ///
+        /// A different event from `commit = Err(RpcError)`, and the difference is
+        /// the whole point: a daemon that answers "no" has certainly not
+        /// written, while a daemon that does not answer may have written and
+        /// died. One of those licenses an undo and the other does not.
+        commit_transport_error: Option<&'static str>,
         /// Every frame that crossed, kept as sent — the capture AC-5's "the
         /// secret appears in no RPC params" is asserted against.
         previews: Vec<WebSetupPreviewParams>,
@@ -844,6 +1122,7 @@ mod tests {
                     applied: true,
                     tier: WebTier::Search,
                 }),
+                commit_transport_error: None,
                 previews: Vec::new(),
                 commits: Vec::new(),
             }
@@ -899,8 +1178,13 @@ mod tests {
             &mut self,
             params: WebSetupCommitParams,
         ) -> anyhow::Result<Result<WebSetupCommitResult, RpcError>> {
+            // Recorded before the failure: the frame went out either way, which
+            // is exactly why a transport failure leaves the outcome unknown.
             self.commits.push(params);
-            Ok(self.commit.clone())
+            match self.commit_transport_error {
+                Some(message) => Err(anyhow::anyhow!(message)),
+                None => Ok(self.commit.clone()),
+            }
         }
     }
 
@@ -935,6 +1219,10 @@ mod tests {
             warnings: vec![
                 "this replaces the current `[web]` table: search_auth will be removed.".to_owned(),
             ],
+            // The flow does not thread this yet — see `commit_params`. A daemon
+            // that predates the field sends exactly this, so the fixture is also
+            // the compatibility case.
+            digest: String::new(),
         }
     }
 
@@ -981,6 +1269,15 @@ mod tests {
         assert!(
             rendered.contains("keychain://teton/web-search"),
             "the instructions must name the reference, not leave it to be guessed: {rendered}"
+        );
+        // …and the way to make the thing that reference names. The walkthrough
+        // is the only other way to create the entry, and it is exactly what this
+        // session cannot run — instructions for a config that cannot be made to
+        // work are not a degradation, they are a dead end (BR-12/AC-10).
+        assert!(
+            rendered.contains("security add-generic-password -s teton -a web-search -w"),
+            "the instructions must say how to create the entry, not only how to \
+             reference it: {rendered}"
         );
     }
 
@@ -1139,6 +1436,218 @@ mod tests {
         assert!(!rendered.contains(PLANTED_KEY), "{rendered}");
     }
 
+    /// The credential a **rotation** displaces belongs to the live config, and a
+    /// refused commit puts it back rather than deleting it.
+    ///
+    /// This is BR-11 read exactly: the undo removes "any keychain entry the
+    /// aborted flow run itself created", and a run that overwrote an existing
+    /// entry created none. Deleting here destroys a working setup — the user
+    /// tried to rotate a key, the daemon refused the new table, and they are
+    /// left with a `search_key_ref` pointing at nothing.
+    #[test]
+    fn a_refused_commit_after_a_rotation_puts_the_previous_key_back() {
+        let mut io = FakeIo::new(FULL_WALK);
+        io.commit = Err(RpcError::new(
+            error_code::WEB_SETUP_INVALID,
+            "web.search_endpoint must be an absolute http(s) URL",
+        ));
+        let keychain = MockKeychain::new();
+        keychain.store(SEARCH_KEY_ACCOUNT, PREVIOUS_KEY).unwrap();
+
+        drive(&mut io, &keychain, &session(), Gate::Walk).unwrap();
+
+        assert_eq!(
+            keychain.stored_secret(SEARCH_KEY_ACCOUNT).as_deref(),
+            Some(PREVIOUS_KEY),
+            "the credential the live config references must survive a refused rotation"
+        );
+        assert!(
+            keychain.deletes().is_empty(),
+            "an entry this run did not create must not be deleted"
+        );
+        let rendered = io.rendered();
+        assert!(
+            rendered.contains("the one that was there before"),
+            "the user must be told a restore happened, not a removal: {rendered}"
+        );
+        assert!(
+            !rendered.contains(PLANTED_KEY) && !rendered.contains(PREVIOUS_KEY),
+            "neither credential may be rendered: {rendered}"
+        );
+    }
+
+    /// The other half of the same decision: with nothing there before, the undo
+    /// really is a delete, and the line says so.
+    #[test]
+    fn a_refused_commit_on_a_fresh_account_deletes_and_says_removed() {
+        let mut io = FakeIo::new(FULL_WALK);
+        io.commit = Err(RpcError::new(error_code::WEB_SETUP_INVALID, "no."));
+        let keychain = MockKeychain::new();
+
+        drive(&mut io, &keychain, &session(), Gate::Walk).unwrap();
+
+        assert!(keychain.is_empty(), "a fresh entry must be taken back out");
+        assert_eq!(keychain.deletes(), vec![SEARCH_KEY_ACCOUNT.to_owned()]);
+        let rendered = io.rendered();
+        assert!(
+            rendered.contains("has been removed from your keychain"),
+            "{rendered}"
+        );
+        assert!(
+            !rendered.contains("the one that was there before"),
+            "nothing was displaced, so nothing was restored: {rendered}"
+        );
+    }
+
+    /// A store that could not find out what it was displacing does **neither**
+    /// undo, and says which of the two it declined to guess at.
+    #[test]
+    fn a_refused_commit_after_an_unreadable_keychain_leaves_the_entry_alone() {
+        let mut io = FakeIo::new(FULL_WALK);
+        io.commit = Err(RpcError::new(error_code::WEB_SETUP_INVALID, "no."));
+        let keychain = MockKeychain::new();
+        keychain.fail_read_with("the keychain is locked");
+
+        drive(&mut io, &keychain, &session(), Gate::Walk).unwrap();
+
+        assert!(
+            keychain.deletes().is_empty(),
+            "a delete against an unknown prior state is the destructive guess"
+        );
+        assert_eq!(
+            keychain.stored_secret(SEARCH_KEY_ACCOUNT).as_deref(),
+            Some(PLANTED_KEY),
+            "the store still happened; it is the undo that was declined"
+        );
+        let rendered = io.rendered();
+        assert!(
+            rendered.contains("could not be read") && rendered.contains("the keychain is locked"),
+            "the reason must reach the user: {rendered}"
+        );
+        assert!(
+            rendered.contains("security find-generic-password"),
+            "and so must the way to look: {rendered}"
+        );
+    }
+
+    /// FIX 3's case: the daemon refuses **and** the cleanup the refusal triggers
+    /// fails too. Both facts are the user's, and only the second comes with
+    /// something they can do about it.
+    #[test]
+    fn a_refused_commit_whose_own_cleanup_also_fails_reports_both_failures() {
+        let mut io = FakeIo::new(FULL_WALK);
+        io.commit = Err(RpcError::new(
+            error_code::WEB_SETUP_INVALID,
+            "web.search_endpoint must be an absolute http(s) URL",
+        ));
+        let keychain = MockKeychain::new();
+        keychain.fail_delete_with("the keychain is locked");
+
+        drive(&mut io, &keychain, &session(), Gate::Walk).unwrap();
+
+        // The attempt was made and refused, so the entry is still there — which
+        // is precisely why the user has to be told.
+        assert_eq!(keychain.deletes(), vec![SEARCH_KEY_ACCOUNT.to_owned()]);
+        assert_eq!(
+            keychain.stored_secret(SEARCH_KEY_ACCOUNT).as_deref(),
+            Some(PLANTED_KEY)
+        );
+
+        let rendered = io.rendered();
+        assert!(
+            rendered.contains("web.search_endpoint must be an absolute http(s) URL"),
+            "the daemon's own refusal must still reach the user: {rendered}"
+        );
+        assert!(
+            rendered.contains("could not be removed from your keychain")
+                && rendered.contains("the keychain is locked"),
+            "the cleanup failure must be reported, not swallowed: {rendered}"
+        );
+        assert!(
+            rendered.contains("security delete-generic-password -s teton -a web-search"),
+            "the user is the only one who can finish this, so they get the command: {rendered}"
+        );
+        assert!(!rendered.contains(PLANTED_KEY), "{rendered}");
+    }
+
+    /// FIX 2: a commit the daemon never *answered* ends the command, not the
+    /// session, and touches the keychain not at all.
+    ///
+    /// The write may have landed. A delete would then orphan a live config, and
+    /// a restore would resurrect the key the user was replacing — so both undos
+    /// are the wrong one half the time, and the honest move is to say so and
+    /// name the command that resolves it.
+    #[test]
+    fn a_commit_that_never_answered_leaves_the_keychain_alone_and_says_so() {
+        let mut io = FakeIo::new(FULL_WALK);
+        io.commit_transport_error = Some("connection reset by peer");
+        let keychain = MockKeychain::new();
+
+        // The whole point: `Ok`, so the session survives to run the next command.
+        drive(&mut io, &keychain, &session(), Gate::Walk)
+            .expect("a transport failure must end the command, never the session");
+
+        assert_eq!(io.commits.len(), 1, "the frame did go out");
+        assert_eq!(
+            keychain.stored_secret(SEARCH_KEY_ACCOUNT).as_deref(),
+            Some(PLANTED_KEY),
+            "the store stands; nothing beyond it may have happened"
+        );
+        assert!(
+            keychain.deletes().is_empty(),
+            "no undo may be guessed at on an unknown outcome"
+        );
+
+        let rendered = io.rendered();
+        assert!(
+            rendered.contains("connection reset by peer"),
+            "the transport failure itself must be named: {rendered}"
+        );
+        assert!(
+            rendered.contains("may or may not have been written"),
+            "the ambiguity is the fact: {rendered}"
+        );
+        assert!(
+            rendered.contains("web-search"),
+            "the notice must name the account the key sits in: {rendered}"
+        );
+        assert!(
+            rendered.contains("/web setup"),
+            "and the command that shows the current state: {rendered}"
+        );
+        assert!(!rendered.contains(PLANTED_KEY), "{rendered}");
+    }
+
+    /// The same unanswered commit over a **rotation**: still no mutation, and the
+    /// notice says which key is now in the account rather than implying the old
+    /// one survived.
+    #[test]
+    fn an_unanswered_commit_after_a_rotation_says_the_previous_key_was_replaced() {
+        let mut io = FakeIo::new(FULL_WALK);
+        io.commit_transport_error = Some("connection reset by peer");
+        let keychain = MockKeychain::new();
+        keychain.store(SEARCH_KEY_ACCOUNT, PREVIOUS_KEY).unwrap();
+
+        drive(&mut io, &keychain, &session(), Gate::Walk).unwrap();
+
+        assert_eq!(
+            keychain.stored_secret(SEARCH_KEY_ACCOUNT).as_deref(),
+            Some(PLANTED_KEY)
+        );
+        assert!(keychain.deletes().is_empty());
+        let rendered = io.rendered();
+        assert!(
+            rendered.contains("in place of the one that was there before"),
+            "{rendered}"
+        );
+        // No delete instruction here: the previous key is already gone, so
+        // removing the entry would leave a rotation half-done either way.
+        assert!(
+            !rendered.contains("security delete-generic-password"),
+            "a rotation has no clean removal to suggest: {rendered}"
+        );
+    }
+
     /// A refused **preview** never gets as far as the keychain: the store is
     /// after the confirm, and there is nothing to confirm.
     #[test]
@@ -1272,22 +1781,187 @@ mod tests {
     }
 
     /// A commit that changed nothing says so, because no event announces a
-    /// change that did not happen.
+    /// change that did not happen — and it says it about the **config**, which
+    /// is the only thing `applied: false` is a fact about.
+    ///
+    /// The keychain is the other half of this setup and it did move: the same
+    /// table with a rotated key is exactly the case where the commit applies
+    /// nothing and the credential behind it is new. "Nothing changed" there is
+    /// false, and sends a user who just rotated a key looking for the reason it
+    /// did not take.
     #[test]
-    fn a_commit_that_applied_nothing_says_so() {
+    fn a_commit_that_applied_nothing_says_which_half_of_the_setup_moved() {
+        // A key was stored: the config is unchanged, the credential is not.
         let mut io = FakeIo::new(FULL_WALK);
         io.commit = Ok(WebSetupCommitResult {
             applied: false,
             tier: WebTier::Search,
         });
         let keychain = MockKeychain::new();
+        keychain.store(SEARCH_KEY_ACCOUNT, PREVIOUS_KEY).unwrap();
+        drive(&mut io, &keychain, &session(), Gate::Walk).unwrap();
+
+        let rendered = io.rendered();
+        assert!(
+            rendered.contains("already configured exactly this way"),
+            "{rendered}"
+        );
+        assert!(
+            rendered.contains("your config is unchanged")
+                && rendered.contains("was updated to the one you just typed"),
+            "a rotation against an unchanged table must not be reported as a no-op: {rendered}"
+        );
+        assert!(
+            !rendered.contains("so nothing changed"),
+            "that sentence is false of the keychain here: {rendered}"
+        );
+        assert_eq!(
+            keychain.stored_secret(SEARCH_KEY_ACCOUNT).as_deref(),
+            Some(PLANTED_KEY),
+            "and the new key really is what the account now holds"
+        );
+
+        // No key at all (a fetch tier): nothing changed anywhere, and the line
+        // is the plain one.
+        let mut io = FakeIo::new(&["2", "y"]);
+        io.commit = Ok(WebSetupCommitResult {
+            applied: false,
+            tier: WebTier::FetchAnyUrl,
+        });
+        let keychain = MockKeychain::new();
+        drive(&mut io, &keychain, &session(), Gate::Walk).unwrap();
+        let rendered = io.rendered();
+        assert!(
+            rendered.contains("so nothing changed"),
+            "with no key collected, nothing changed is the whole truth: {rendered}"
+        );
+        assert!(
+            !rendered.contains("was updated to the one you just typed"),
+            "no key was collected, so no key was updated: {rendered}"
+        );
+        // The line itself, away from the preview fixture's own `keychain://`
+        // reference: with nothing collected it does not mention the store.
+        assert!(
+            !unchanged_line(WebTier::FetchAnyUrl, &None).contains("keychain"),
+            "{}",
+            unchanged_line(WebTier::FetchAnyUrl, &None)
+        );
+    }
+
+    /// AC-8's trap, closed: the walkthrough offers Brave's *own* header when the
+    /// user types Brave's endpoint, and pressing Enter sends that on the wire.
+    ///
+    /// The generic Bearer against `api.search.brave.com` is a 401 the user reads
+    /// as a bad key — a suggestion list that names the right header in one line
+    /// and offers the wrong one at the next prompt is worse than no suggestion.
+    #[test]
+    fn a_known_backend_is_offered_its_own_auth_header_and_enter_takes_it() {
+        const BRAVE_WALK: &[&str] = &[
+            "3",
+            "https://api.search.brave.com/res/v1/web/search",
+            "y",
+            "", // Enter: take what was offered.
+            PLANTED_KEY,
+            "y",
+        ];
+        let mut io = FakeIo::new(BRAVE_WALK);
+        let keychain = MockKeychain::new();
+        drive(&mut io, &keychain, &session(), Gate::Walk).unwrap();
+
+        assert!(
+            io.prompter
+                .any_question_contains("X-Subscription-Token: {key}"),
+            "the offer must be stated in the prompt, since Enter is how it is taken: {:?}",
+            io.prompter.questions
+        );
+        assert_eq!(io.commits.len(), 1);
+        assert_eq!(
+            io.commits[0].search_auth.as_deref(),
+            Some("X-Subscription-Token: {key}"),
+            "an empty answer must put the offered template on the wire, not a Bearer default"
+        );
+
+        // An unknown host is unchanged: the generic Bearer is offered, and an
+        // empty answer still means "no key at all", so the daemon's one default
+        // stays one value in one place.
+        let mut io = FakeIo::new(&[
+            "3",
+            "https://example.test/search",
+            "y",
+            "",
+            PLANTED_KEY,
+            "y",
+        ]);
+        let keychain = MockKeychain::new();
         drive(&mut io, &keychain, &session(), Gate::Walk).unwrap();
         assert!(
-            io.rendered()
-                .contains("already configured exactly this way"),
-            "{}",
-            io.rendered()
+            io.prompter
+                .any_question_contains("Authorization: Bearer {key}"),
+            "{:?}",
+            io.prompter.questions
         );
+        assert_eq!(
+            io.commits[0].search_auth, None,
+            "the generic default is the daemon's to apply, not this flow's to copy"
+        );
+    }
+
+    /// The offer is decided from the endpoint's host, and everything it cannot
+    /// read falls back to the generic Bearer — which is the behaviour that was
+    /// there before this table existed.
+    #[test]
+    fn the_offered_auth_header_follows_the_endpoints_host() {
+        for endpoint in [
+            "https://api.search.brave.com/res/v1/web/search",
+            "https://API.Search.Brave.com/res/v1/web/search",
+            "https://api.search.brave.com:443/res/v1/web/search?q=x",
+        ] {
+            assert_eq!(
+                offered_auth(endpoint),
+                "X-Subscription-Token: {key}",
+                "{endpoint}"
+            );
+        }
+        assert_eq!(
+            offered_auth("https://kagi.com/api/v0/search"),
+            "Authorization: Bot {key}"
+        );
+        for endpoint in [
+            "http://localhost:8888/search?format=json",
+            "https://example.test/search",
+            // A host that merely *contains* a known one is not that host.
+            "https://api.search.brave.com.evil.test/res/v1/web/search",
+            "not-a-url",
+            "",
+            "ftp://api.search.brave.com/x",
+        ] {
+            assert_eq!(offered_auth(endpoint), DEFAULT_SEARCH_AUTH, "{endpoint}");
+        }
+
+        // The host parse itself, including the parts that are not the host.
+        assert_eq!(
+            endpoint_host("https://user:pw@kagi.com:443/api/v0/search#frag"),
+            Some("kagi.com")
+        );
+        assert_eq!(endpoint_host("https:///search"), None);
+        assert_eq!(endpoint_host("kagi.com/api"), None);
+    }
+
+    /// Every template this flow offers is one a backend actually accepts — the
+    /// list and the table are two spellings of one fact, and the trap is what
+    /// happens when they drift.
+    #[test]
+    fn every_offered_template_belongs_to_a_backend_the_help_names() {
+        for (host, template) in KNOWN_BACKEND_AUTH {
+            assert!(
+                ENDPOINT_HELP.iter().any(|line| line.contains(host)),
+                "`{host}` is offered a header by a walkthrough that never suggests it"
+            );
+            assert!(
+                ENDPOINT_HELP.iter().any(|line| line.contains(template)),
+                "`{template}` is offered for {host} and named nowhere the user can read it"
+            );
+        }
     }
 
     /// Both tier spellings reach the same tier, and nothing else resolves to

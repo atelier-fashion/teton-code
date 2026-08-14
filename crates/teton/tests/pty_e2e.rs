@@ -676,7 +676,9 @@ fn the_key_step_does_not_echo_and_the_key_reaches_nothing() {
         &format!("{ECHO_WITNESS}\r"),
         "auth header template",
     );
-    // Empty: take the daemon's default template.
+    // Empty: take whatever the prompt offered. The endpoint above is Brave's,
+    // so what is offered — and what an empty answer therefore sends — is
+    // Brave's own `X-Subscription-Token: {key}` and not the generic Bearer.
     step(&mut writer, "\r", "API key (not shown");
 
     // THE STEP THIS TEST IS ABOUT.

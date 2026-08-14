@@ -86,17 +86,47 @@ pub fn parse_auth_ref(auth_ref: &str) -> Result<(String, String), KeychainError>
 
 /// A credential store. The secret goes in; only the `auth_ref` comes back.
 ///
-/// The CLI only ever *writes* a credential — the daemon is the resolver that
-/// reads it back at call time (surface parity, BR-4), so there is deliberately
-/// no `retrieve` on this client-side trait.
+/// The CLI *writes* credentials and the daemon is the resolver that reads them
+/// back at call time (surface parity, BR-4) — so [`Self::read`] is deliberately
+/// not a resolution path. It exists for one thing: [`Self::store`] on an account
+/// that already holds a credential is a **destructive** write, and the only way
+/// to put the old one back if the operation it was written for fails is to have
+/// read it first.
 pub trait Keychain {
     /// Store `secret` for `account` under the Teton service and return the
     /// `auth_ref` that references it. The secret is never returned or logged.
+    ///
+    /// **Overwrites.** An account that already holds a credential loses it, and
+    /// the caller is the only one that can know whether that matters — see
+    /// [`Self::read`].
     ///
     /// # Errors
     ///
     /// Returns a [`KeychainError`] if the backend rejects the write.
     fn store(&self, account: &str, secret: &str) -> Result<String, KeychainError>;
+
+    /// The credential currently filed for `account`, or `None` when there is
+    /// none.
+    ///
+    /// **Not a resolver.** The daemon resolves `auth_ref`s at call time; nothing
+    /// on this side reads a credential in order to *use* it. This is the
+    /// read half of a read-before-write, and it has exactly one caller: the
+    /// `/web setup` flow, which stores into the fixed `web-search` account and
+    /// must be able to restore what it displaced when the commit that write was
+    /// made for is refused (REQ-572 BR-11 — "removes any keychain entry the
+    /// aborted flow run itself created", which a rotation did not create).
+    ///
+    /// `Ok(None)` and an error are deliberately different answers: "there is
+    /// nothing here" licenses a delete, and "I could not find out" licenses
+    /// neither a delete nor a restore.
+    ///
+    /// # Errors
+    ///
+    /// Returns a [`KeychainError`] when the backend refuses the read or hands
+    /// back bytes that are not a UTF-8 credential. A missing entry is `Ok(None)`
+    /// rather than [`KeychainError::NotFound`], because absence is the state
+    /// this call exists to distinguish and not a failure to answer.
+    fn read(&self, account: &str) -> Result<Option<String>, KeychainError>;
 
     /// Remove the entry for `account` (REQ-572 ADR-3).
     ///
@@ -149,6 +179,23 @@ impl Keychain for MacKeychain {
         Ok(auth_ref_for(account))
     }
 
+    fn read(&self, account: &str) -> Result<Option<String>, KeychainError> {
+        match security_framework::passwords::get_generic_password(SERVICE, account) {
+            Ok(bytes) => String::from_utf8(bytes)
+                .map(Some)
+                // The bytes are not shown, quoted or logged — only the fact that
+                // they are not a credential this side could put back.
+                .map_err(|_| {
+                    KeychainError::Backend("the stored credential is not valid UTF-8".to_owned())
+                }),
+            // The one backend failure that is really a *state*, classified on
+            // the code rather than the message (LESSON-456), exactly as the
+            // delete below does.
+            Err(e) if e.code() == ERR_SEC_ITEM_NOT_FOUND => Ok(None),
+            Err(e) => Err(KeychainError::Backend(e.to_string())),
+        }
+    }
+
     fn delete(&self, account: &str) -> Result<(), KeychainError> {
         security_framework::passwords::delete_generic_password(SERVICE, account).map_err(|e| {
             if e.code() == ERR_SEC_ITEM_NOT_FOUND {
@@ -172,6 +219,13 @@ impl Keychain for UnsupportedKeychain {
         Err(KeychainError::Unsupported)
     }
 
+    /// `Err`, never `Ok(None)`: this platform cannot tell an empty store from a
+    /// store it cannot see, and answering "there is nothing there" would license
+    /// a caller to delete an entry it never established was absent.
+    fn read(&self, _account: &str) -> Result<Option<String>, KeychainError> {
+        Err(KeychainError::Unsupported)
+    }
+
     fn delete(&self, _account: &str) -> Result<(), KeychainError> {
         Err(KeychainError::Unsupported)
     }
@@ -191,12 +245,36 @@ pub(crate) struct MockKeychain {
     /// leave an empty map either way, and only the record tells "never stored"
     /// from "stored and taken back out".
     deletes: std::cell::RefCell<Vec<String>>,
+    /// When set, every [`Keychain::delete`] fails with this backend message
+    /// instead of removing anything.
+    ///
+    /// A mock that can only succeed makes the *reporting* of a failed cleanup
+    /// untestable, and that reporting is the whole remedy the user has: they are
+    /// the only one who can remove an entry the flow could not. Without this
+    /// seam the recovery instruction is a line nothing ever reads.
+    delete_failure: std::cell::RefCell<Option<String>>,
+    /// When set, every [`Keychain::read`] fails with this backend message.
+    ///
+    /// The other half of the same argument: a store that cannot find out what it
+    /// is about to displace must neither delete nor restore, and that third
+    /// branch is only reachable through a read that fails.
+    read_failure: std::cell::RefCell<Option<String>>,
 }
 
 #[cfg(test)]
 impl MockKeychain {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Make every subsequent [`Keychain::delete`] fail with `message`.
+    pub fn fail_delete_with(&self, message: &str) {
+        *self.delete_failure.borrow_mut() = Some(message.to_owned());
+    }
+
+    /// Make every subsequent [`Keychain::read`] fail with `message`.
+    pub fn fail_read_with(&self, message: &str) {
+        *self.read_failure.borrow_mut() = Some(message.to_owned());
     }
 
     /// The secret stored for `account`, if any — lets a test assert the key
@@ -226,8 +304,22 @@ impl Keychain for MockKeychain {
         Ok(auth_ref_for(account))
     }
 
+    fn read(&self, account: &str) -> Result<Option<String>, KeychainError> {
+        if let Some(message) = self.read_failure.borrow().as_deref() {
+            return Err(KeychainError::Backend(message.to_owned()));
+        }
+        Ok(self.entries.borrow().get(account).cloned())
+    }
+
     fn delete(&self, account: &str) -> Result<(), KeychainError> {
+        // Recorded before the injected failure is consulted: a delete that was
+        // *attempted* and refused is still an attempt, and the record is what
+        // distinguishes "the flow never tried" from "the flow tried and the
+        // store said no".
         self.deletes.borrow_mut().push(account.to_owned());
+        if let Some(message) = self.delete_failure.borrow().as_deref() {
+            return Err(KeychainError::Backend(message.to_owned()));
+        }
         match self.entries.borrow_mut().remove(account) {
             Some(_) => Ok(()),
             None => Err(KeychainError::NotFound),
@@ -299,5 +391,52 @@ mod tests {
             Err(KeychainError::NotFound)
         ));
         assert_eq!(kc.deletes().len(), 2);
+    }
+
+    /// A read tells "nothing is filed here" from "I could not find out", which
+    /// is the distinction the whole restore-or-delete decision rests on: only
+    /// the first of the two licenses a delete.
+    #[test]
+    fn a_read_distinguishes_an_empty_account_from_an_unreadable_store() {
+        let kc = MockKeychain::new();
+        assert_eq!(kc.read("web-search").unwrap(), None);
+
+        kc.store("web-search", "sk-first").unwrap();
+        assert_eq!(kc.read("web-search").unwrap().as_deref(), Some("sk-first"));
+
+        // A store over an existing account replaces it — which is why the read
+        // has to happen first.
+        kc.store("web-search", "sk-second").unwrap();
+        assert_eq!(kc.read("web-search").unwrap().as_deref(), Some("sk-second"));
+
+        kc.fail_read_with("the keychain is locked");
+        assert!(matches!(
+            kc.read("web-search"),
+            Err(KeychainError::Backend(_))
+        ));
+    }
+
+    /// The delete-failure seam: without it, the branch that tells the user their
+    /// keychain still holds an entry nobody will read is unreachable from a test.
+    #[test]
+    fn an_injected_delete_failure_is_reported_and_leaves_the_entry() {
+        let kc = MockKeychain::new();
+        kc.store("web-search", "sk-search-value").unwrap();
+        kc.fail_delete_with("the keychain is locked");
+
+        assert!(matches!(
+            kc.delete("web-search"),
+            Err(KeychainError::Backend(_))
+        ));
+        assert_eq!(
+            kc.stored_secret("web-search").as_deref(),
+            Some("sk-search-value"),
+            "a refused delete must leave the entry where it was"
+        );
+        assert_eq!(
+            kc.deletes(),
+            vec!["web-search".to_owned()],
+            "an attempted-and-refused delete is still an attempt"
+        );
     }
 }
