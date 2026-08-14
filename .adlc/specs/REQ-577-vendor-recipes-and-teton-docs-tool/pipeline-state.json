@@ -1,0 +1,34 @@
+{
+  "req": "REQ-577",
+  "branch": "feat/REQ-577-vendor-recipes-and-teton-docs-tool",
+  "startedAt": "2026-08-14T19:14:15Z",
+  "completed": false,
+  "currentPhase": 2,
+  "completedPhases": [0, 1],
+  "integrationBranch": "main",
+  "phaseHistory": [
+    { "phase": 0, "name": "Resolve Repos + Create Worktrees + Preflight", "completedAt": "2026-08-14T19:14:18Z" },
+    { "phase": 1, "name": "Validate Requirement Spec", "completedAt": "2026-08-14T19:16:00Z" }
+  ],
+  "repos": {
+    "teton-code": {
+      "primary": true,
+      "path": "/Users/brettluelling/Documents/GitHub/teton-code",
+      "worktree": "/Users/brettluelling/Documents/GitHub/teton-code/.worktrees/REQ-577",
+      "branch": "feat/REQ-577-vendor-recipes-and-teton-docs-tool",
+      "touched": true,
+      "prUrl": "https://github.com/atelier-fashion/teton-code/pull/144",
+      "prNumber": 144,
+      "prCreatedAt": "2026-08-14T19:14:18Z",
+      "merged": false,
+      "snapshotBranch": null,
+      "snapshotPR": null
+    }
+  },
+  "mergeOrder": ["teton-code"],
+  "phase4": {
+    "currentTask": null,
+    "completedTasks": [],
+    "failedTasks": []
+  }
+}
