@@ -64,9 +64,10 @@ error introduced by an unrelated change, on a machine that may also need the
 - When adding a new feature gate, ask what re-checks it and when. If the
   answer is "whoever next runs it by hand", say so in the gated file's header
   comment, the way `template_smoke.rs` documents its manual invocation.
-- Standing candidate: a CI leg that compiles the gated surface with all
-  features on — PR #129 proposes exactly this (all-features clippy on macOS);
-  it would close this class without running any weights.
+- The class guard landed with PR #129: the `gated` CI job runs all-features
+  clippy on macOS, so every gated target is compiled at the standing lint bar
+  on every push without running any weights. The manual sweep above remains
+  the local, pre-push version of the same check.
 
 ## Related
 
