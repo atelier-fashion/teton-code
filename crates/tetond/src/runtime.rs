@@ -96,6 +96,7 @@ use teton_core::category::{
     CategoryResolution, CategoryTable, ConfigurableCategory, Tier, TierBinding,
 };
 use teton_core::config::{Config, LocalModelConfig, RoutingMigration, WebConfig, WebTier};
+use teton_core::config_doc::document_is_effectively_empty;
 use teton_core::entities::{
     BoundaryMode, ModelProvider, PrivacyBoundary, ProviderCapabilities, ProviderKind,
 };
@@ -3968,6 +3969,16 @@ impl DaemonRuntime {
     /// daemon cannot interleave over the base; a write from anywhere else is
     /// exactly what the digest is for.
     ///
+    /// # The warnings describe the change against the *document*
+    ///
+    /// [`web_setup_warnings`] is handed the derivation's own base
+    /// ([`RenderedCandidate::base_web`]) as the "current" side, not the live
+    /// config's table. The notes say what this answer *does* — "`search_key_ref`
+    /// will be removed" — and the thing it does it to is the document the user
+    /// is keeping. Comparing against memory instead let a sentence contradict
+    /// the bytes shown right beside it whenever the file had drifted (the verify
+    /// pass's finding).
+    ///
     /// # Errors
     /// [`error_code::WEB_SETUP_INVALID`] when the candidate would not load,
     /// when the answers name a tier this machine cannot serve (AC-7), or when
@@ -3989,7 +4000,7 @@ impl DaemonRuntime {
         let config = self.config.lock().expect("config mutex poisoned");
         let candidate = self.web_setup_candidate(&answers, &config)?;
         let rendered = render_persisted_document(self.config_path.as_deref(), &config, &candidate)?;
-        let warnings = web_setup_warnings(&config.web, &candidate.web);
+        let warnings = web_setup_warnings(&rendered.base_web, &candidate.web);
         drop(config);
         Ok(WebSetupPreviewResult {
             toml: rendered.web_section,
@@ -4034,20 +4045,39 @@ impl DaemonRuntime {
     ///    config per turn, so the very next turn of **every** session picks the
     ///    capability up with no restart (ADR-1, OQ-1).
     ///
-    /// A commit whose candidate matches what is already configured writes
-    /// nothing, swaps nothing, and announces nothing — it reports
-    /// `applied: false`, which is a truthful answer and not a failure.
+    /// # What counts as a no-op
+    ///
+    /// Both halves have to be already true: the derived document is
+    /// byte-identical to the file, **and** the candidate matches the live
+    /// config. Only then does the commit write nothing, swap nothing, announce
+    /// nothing, and report `applied: false` — a truthful answer and not a
+    /// failure. Note the derivation still runs first; a commit cannot know
+    /// whether it would change the file without deriving the file it would
+    /// write, and the digest check needs that derivation anyway.
+    ///
+    /// Either half alone lies under drift, in opposite directions. The
+    /// in-memory comparison alone reported `applied: false` for an answer that
+    /// **would** have rewritten a document that drifted at one of the four
+    /// pinned fields. The byte comparison alone would report `applied: false`
+    /// when the document already says what the answers say but this process's
+    /// config does not — where writing nothing is right and leaving the
+    /// capability dark until a restart is not, so that case takes the (byte-
+    /// identical) write, the swap, and the notice.
     ///
     /// # Errors
     /// - [`error_code::WEB_SETUP_INVALID`] — the candidate would not load,
-    ///   names a tier this machine cannot serve, or no longer matches the
-    ///   digest the caller confirmed. Nothing is written and the in-memory
-    ///   config is untouched.
+    ///   names a tier this machine cannot serve, no longer matches the digest
+    ///   the caller confirmed, or the **edited document** would not load: a hand
+    ///   edit this daemon has not seen can fail validation in a key the flow
+    ///   never touches, and the refusal carries the validator's own sentence
+    ///   (REQ-574 BR-4, AC-10). Nothing is written and the in-memory config is
+    ///   untouched.
     /// - [`error_code::CONFIG_REJECTED`] — this daemon has no config file, so
     ///   there is nowhere for the answer to land.
-    /// - [`error_code::INTERNAL_ERROR`] — the write itself failed. The
-    ///   in-memory config is still untouched: the swap happens after the file
-    ///   lands, never before.
+    /// - [`error_code::INTERNAL_ERROR`] — the write itself failed, or the
+    ///   document could not be derived at all (an unparseable or unreadable
+    ///   file, REQ-574 BR-6). The in-memory config is untouched in both: the
+    ///   swap happens after the file lands, never before.
     pub fn web_setup_commit(
         &self,
         params: &WebSetupCommitParams,
@@ -4089,7 +4119,11 @@ impl DaemonRuntime {
         // reported is the tier that was validated (the reason
         // `SessionPermissionsResult::level` is read from the gate).
         let tier = to_protocol_web_tier(candidate.web.tier);
-        if candidate.web == config.web {
+        // Both halves, and the derivation is what supplies the first one — see
+        // "What counts as a no-op" above. `rendered.unchanged` is the file's
+        // answer, taken over the same read the digest was taken over, so there
+        // is no second read to disagree with it.
+        if rendered.unchanged && candidate.web == config.web {
             return Ok(WebSetupCommitResult {
                 applied: false,
                 tier,
@@ -4682,8 +4716,13 @@ impl WebTierPersistence for DaemonRuntime {
 /// and BUG-146 are about. Nothing is written and the on-disk file is untouched
 /// in every failing case.
 fn persist_config(path: &Path, current: &Config, candidate: &Config) -> anyhow::Result<()> {
-    let edited = render_config_document(Some(path), current, candidate)?;
-    write_config_atomically(path, &edited)
+    // [`DeltaBase::InMemory`] — ADR-1's rule, unqualified. These four writers
+    // are each *about* a change to in-memory state, so the operation's footprint
+    // is exactly where `current` and `candidate` differ; `/web setup` is the one
+    // whose footprint is fixed by answers instead, and it does not come through
+    // here.
+    let edited = render_config_document(Some(path), current, candidate, DeltaBase::InMemory)?;
+    write_config_atomically(path, &edited.text)
 }
 
 /// Why the document a write would produce could not be derived.
@@ -4702,8 +4741,15 @@ fn persist_config(path: &Path, current: &Config, candidate: &Config) -> anyhow::
 enum RenderError {
     /// The file is there and could not be read. An unreadable file is not an
     /// empty one.
+    ///
+    /// The **kind** and not the whole `io::Error`, which is what the neighboring
+    /// [`load_config`] already does for the same file (REQ-572 BR-11): the
+    /// `Display` of an I/O error can carry the path it failed on, and a config
+    /// path is a filesystem fact this daemon does not put in a message a client
+    /// renders.
     #[error(
-        "the existing configuration could not be read for editing, so nothing was written: {0}"
+        "the existing configuration could not be read for editing, so nothing was written: {}",
+        .0.kind()
     )]
     Read(std::io::Error),
 
@@ -4712,10 +4758,151 @@ enum RenderError {
     #[error("{0}")]
     Edit(#[from] teton_core::DeltaError),
 
-    /// The edited bytes would not load. The validator's own sentence rides
-    /// inside, because it names the key the user has to fix (BR-4, AC-10).
+    /// The edited bytes would not load. Built by [`load_failure_reason`], which
+    /// is where the two halves of that are told apart: the validator's own
+    /// sentence rides inside because it names the key the user has to fix (BR-4,
+    /// AC-10), and a *parse* failure is reduced to its location.
     #[error("the edited configuration would not load, so nothing was written: {0}")]
     Invalid(String),
+}
+
+/// The sentence [`RenderError::Invalid`] carries for a [`Config::load`] failure
+/// on the **edited** bytes.
+///
+/// # The validator's arm goes through verbatim
+///
+/// A `ConfigError` is a sentence this codebase writes — "`default_provider`
+/// names provider 'ghost', which is not registered" — naming a key and a rule.
+/// It is the whole value of BR-4's refusal: a user whose hand edit is the
+/// obstacle is told which key to fix. Rewording it here would make the daemon's
+/// two refusal paths (startup and write) describe the same file differently.
+///
+/// # The parser's arm is reduced to a location, deliberately
+///
+/// [`toml::de::Error`]'s `Display` reproduces the offending source line under a
+/// caret, and its `message()` alone still quotes the offending *value* for a
+/// type mismatch (`invalid type: string "…", expected u64`). Either one puts a
+/// line of the user's config into an RPC error string that travels to a client
+/// and into a transcript — and `[mcp_server.transport] env` values, `auth_ref`
+/// and a pasted `search_endpoint` are exactly the lines that hold credentials
+/// (REQ-563 BR-7's rule, which the whole web event family follows). So the
+/// location is reported and the text is not.
+///
+/// The cost is real and it is the right trade: this arm means the delta engine
+/// emitted TOML it cannot re-read, which is a bug in this daemon and not in the
+/// user's file. It is near-unreachable, it must stay loud — the line and column
+/// are enough to reproduce it against a document the reporter still has — and
+/// it must not be the one path that leaks what every other path redacts.
+fn load_failure_reason(err: &teton_core::config::LoadError, edited: &str) -> String {
+    match err {
+        // `#[error(transparent)]` — this *is* the validator's sentence.
+        teton_core::config::LoadError::Validate(_) => err.to_string(),
+        teton_core::config::LoadError::Parse(parse) => {
+            let at = parse
+                .span()
+                .map(|span| line_and_column(edited, span.start))
+                .map_or_else(
+                    || "somewhere this daemon could not locate".to_owned(),
+                    |(line, column)| format!("line {line}, column {column}"),
+                );
+            format!(
+                "the document this write derived is not parseable TOML at {at}, which is a bug \
+                 in this daemon rather than in your file. The offending text is deliberately \
+                 not quoted here: a config line can hold a credential."
+            )
+        }
+    }
+}
+
+/// The 1-based line and column of `offset` in `text`.
+///
+/// Byte-counted, like the span it is given: a column here locates a failure for
+/// a bug report, it does not index a grapheme.
+fn line_and_column(text: &str, offset: usize) -> (usize, usize) {
+    let head = &text[..offset.min(text.len())];
+    let line = head.matches('\n').count() + 1;
+    let column = head
+        .rfind('\n')
+        .map_or(head.len(), |nl| head.len() - nl - 1)
+        + 1;
+    (line, column)
+}
+
+/// Which config the delta's `current` side is taken from.
+///
+/// ADR-1's answer is [`Self::InMemory`] for every writer, and it is right for
+/// every writer whose operation is *about* in-memory state. `/web setup` is not
+/// one: its four fields are pinned by answers the user just gave, and a delta
+/// that never mentions them writes a document that contradicts them. See
+/// [`DeltaBase::DocumentPinsWebAnswers`].
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum DeltaBase {
+    /// The caller's `current`, exactly as ADR-1 describes: the operation's
+    /// footprint is where `current` and `candidate` differ, so drift at every
+    /// other key is never in the delta and survives by construction (BR-5).
+    InMemory,
+
+    /// The caller's `current`, with the four fields `/web setup` collects —
+    /// `tier`, `search_endpoint`, `search_key_ref`, `search_auth` — replaced by
+    /// the **document's own** parse of them.
+    ///
+    /// The verify pass's finding, and the one case where a pure in-memory base
+    /// silently drops an answer. The flow's candidate is memory-plus-answers, so
+    /// an answer that happens to equal memory is not in `diff(current,
+    /// candidate)` at all — and if the document has drifted at that field (the
+    /// user commented `tier` out mid-session), the delta names nothing, the
+    /// document keeps the drift, and the daemon still reports `applied: true`
+    /// with a `WebSetupCompleted` naming the tier it did not write. Pinning
+    /// these four to the document makes "the user answered it" and "the document
+    /// says it" the same statement, which is what the confirm step promises.
+    ///
+    /// Only these four. `permission_allow`, `allowed_domains` and
+    /// `cache_ttl_secs` ride along from memory and keep the in-memory base, so
+    /// drift there is still absent from the delta and still survives (BR-5) —
+    /// a setup answer is not an answer about consent (LESSON-495).
+    DocumentPinsWebAnswers,
+}
+
+/// One derivation's output: the bytes a write would leave, and the two facts
+/// about *how* they were derived that `/web setup` has to ask.
+struct EditedDocument {
+    /// The document a write would produce — validated, not yet written.
+    text: String,
+
+    /// Whether `text` is byte-identical to the document that was read.
+    ///
+    /// The only truthful "this write would change nothing" test under drift: a
+    /// candidate equal to the in-memory config can still edit the file (the
+    /// document drifted at a key the answers pin), and a candidate that differs
+    /// from it can leave the file alone (the document drifted *to* the answer).
+    unchanged: bool,
+
+    /// The `[web]` table of the delta's base — memory's, or, under
+    /// [`DeltaBase::DocumentPinsWebAnswers`], memory's with the four pinned
+    /// fields taken from the document.
+    ///
+    /// What the preview's warnings describe the change against, so "this
+    /// replaces the current `[web]` table" is a sentence about the document the
+    /// user is keeping rather than about a memory it has drifted from.
+    base_web: WebConfig,
+}
+
+/// `current` with the four fields `/web setup` pins replaced by the document's
+/// own parse of them, or `None` when the document does not load.
+///
+/// `None` is not a failure and is not reported: a document that will not parse
+/// is refused by [`apply_config_delta`] a moment later with the parse named, and
+/// one that parses but will not validate is refused by the edited-bytes gate at
+/// the end of the derivation. Falling back to the in-memory base keeps both of
+/// those the single place that speaks.
+fn pinned_delta_base(current: &Config, document: &str) -> Option<Config> {
+    let on_disk = Config::load(document).ok()?;
+    let mut base = current.clone();
+    base.web.tier = on_disk.web.tier;
+    base.web.search_endpoint = on_disk.web.search_endpoint;
+    base.web.search_key_ref = on_disk.web.search_key_ref;
+    base.web.search_auth = on_disk.web.search_auth;
+    Some(base)
 }
 
 /// The document a write of `candidate` would leave at `path` — derived,
@@ -4749,6 +4936,11 @@ enum RenderError {
 /// "changed" and write the stale in-memory value back over it: the exact clobber
 /// this REQ exists to remove. With `current`, drift at a key the operation does
 /// not touch is never in the delta and survives by construction.
+///
+/// The one bounded exception is `base_rule`: `/web setup` pins four fields by
+/// asking the user about them, and for *those four* the document's own parse is
+/// the base ([`DeltaBase::DocumentPinsWebAnswers`]). Every other key, and every
+/// other writer, keeps the rule above.
 ///
 /// # The bytes that land are the bytes that were validated
 ///
@@ -4784,27 +4976,53 @@ fn render_config_document(
     path: Option<&Path>,
     current: &Config,
     candidate: &Config,
-) -> Result<String, RenderError> {
+    base_rule: DeltaBase,
+) -> Result<EditedDocument, RenderError> {
     // Named so the missing-file base can be borrowed alongside `current`; a
     // default `Config` is the parse of an empty document, which is exactly what
     // the delta must diff against when there is no file yet (ADR-1).
     let fresh = Config::default();
-    let (document, base) = match path.map(std::fs::read_to_string) {
-        Some(Ok(text)) => (text, current),
-        None => (String::new(), &fresh),
-        Some(Err(err)) if err.kind() == std::io::ErrorKind::NotFound => (String::new(), &fresh),
+    let (document, present) = match path.map(std::fs::read_to_string) {
+        // A file holding only blank lines is a missing file that happens to
+        // exist — the shape a truncated write leaves behind. The engine already
+        // makes it the empty *edit* base; the matching *delta* base is this
+        // caller's to choose, and choosing `fresh` is what makes the next write
+        // heal it into a whole document instead of a diff against a state no
+        // file ever held (`document_is_effectively_empty`'s own contract).
+        Some(Ok(text)) => {
+            let present = !document_is_effectively_empty(&text);
+            (text, present)
+        }
+        None => (String::new(), false),
+        Some(Err(err)) if err.kind() == std::io::ErrorKind::NotFound => (String::new(), false),
         // Any other read failure is a real one — an unreadable file is not an
         // empty one, and treating it as one would write a fresh document over
         // whatever is actually there.
         Some(Err(err)) => return Err(RenderError::Read(err)),
     };
-    let edited = apply_config_delta(&document, base, candidate)?;
-    Config::load(&edited).map_err(|err| RenderError::Invalid(err.to_string()))?;
-    Ok(edited)
+    // A document that is not there pins nothing: the base stays `fresh`, which
+    // is what makes every non-default key of the candidate get written (AC-6).
+    let pinned = match base_rule {
+        DeltaBase::DocumentPinsWebAnswers if present => pinned_delta_base(current, &document),
+        DeltaBase::DocumentPinsWebAnswers | DeltaBase::InMemory => None,
+    };
+    let base = match (&pinned, present) {
+        (Some(pinned), _) => pinned,
+        (None, true) => current,
+        (None, false) => &fresh,
+    };
+    let text = apply_config_delta(&document, base, candidate)?;
+    Config::load(&text).map_err(|err| RenderError::Invalid(load_failure_reason(&err, &text)))?;
+    Ok(EditedDocument {
+        unchanged: text == document,
+        base_web: base.web.clone(),
+        text,
+    })
 }
 
-/// The document `/web setup` describes and then writes, in the three shapes the
-/// flow needs it (REQ-574 BR-3, ADR-3).
+/// The document `/web setup` describes and then writes — the three shapes the
+/// flow renders it in, and the two facts about the derivation the commit and the
+/// preview decide with (REQ-574 BR-3, ADR-3).
 struct RenderedCandidate {
     /// The whole edited document — byte-for-byte what the commit writes.
     full_text: String,
@@ -4814,6 +5032,13 @@ struct RenderedCandidate {
     /// `sha256(full_text)` — see [`render_persisted_document`] for why the whole
     /// document and not the section.
     digest: String,
+    /// Whether `full_text` is byte-identical to the document on disk — the
+    /// file half of the commit's no-op rule. See [`EditedDocument::unchanged`].
+    unchanged: bool,
+    /// The `[web]` table the delta was diffed against, which under this flow's
+    /// base rule is the document's own four pinned fields over memory's rest.
+    /// The preview's warnings compare the candidate to *this*.
+    base_web: WebConfig,
 }
 
 /// Derive the document a `/web setup` commit would write, and the two views its
@@ -4843,38 +5068,61 @@ struct RenderedCandidate {
 /// candidate produce the same text on both calls, which is what makes an
 /// inequality evidence of a *change* rather than of two renderings.
 ///
+/// # The base is the document's own answer at the four pinned fields
+///
+/// This is the one caller that asks for [`DeltaBase::DocumentPinsWebAnswers`],
+/// and the reason is that its candidate is memory-plus-answers: an answer that
+/// happens to repeat what memory holds is not a *difference*, so a pure
+/// `diff(current, candidate)` never mentions it — and a document that has
+/// drifted at that field then keeps the drift while the commit reports the
+/// answer as applied. Pinning those four to the document closes it; see that
+/// variant for the full account.
+///
 /// # Errors
 /// [`error_code::WEB_SETUP_INVALID`] when the edited document would not load,
 /// carrying the validator's own sentence (BR-4, AC-10).
 /// [`error_code::INTERNAL_ERROR`] when the document could not be derived at all
 /// — an unparseable file (BR-6) or an unreadable one — or when it names no
-/// `[web]` table. That last one is unreachable through the flow, which never
-/// writes a candidate whose table is `WebConfig::is_unset`: a delta that changes
-/// any `[web]` key writes the section, and a delta that changes none is the
-/// commit's own no-op case.
+/// `[web]` table.
+///
+/// That last arm is defensive rather than live. The flow refuses a `tier` of
+/// `off`, so the candidate's table is never `WebConfig::is_unset`; and with this
+/// caller's base rule the four pinned fields are diffed against the *document*,
+/// so a document that names no `[web]` table (a user who deleted it mid-session)
+/// disagrees with the candidate at `tier` and gets the section written back
+/// rather than leaving the delta empty. Reaching the arm would mean the delta
+/// engine dropped a key it was told to set, which is why it stays an internal
+/// error and not a `WEB_SETUP_INVALID`: nothing about the user's file would be
+/// the thing to fix.
 fn render_persisted_document(
     path: Option<&Path>,
     current: &Config,
     candidate: &Config,
 ) -> Result<RenderedCandidate, RpcError> {
-    let full_text = render_config_document(path, current, candidate).map_err(|err| match &err {
-        RenderError::Invalid(_) => RpcError::new(error_code::WEB_SETUP_INVALID, err.to_string()),
-        RenderError::Read(_) | RenderError::Edit(_) => RpcError::new(
-            error_code::INTERNAL_ERROR,
-            format!("the configuration could not be saved ({err})"),
-        ),
-    })?;
-    let web_section = table_section(&full_text, "web").ok_or_else(|| {
+    let edited =
+        render_config_document(path, current, candidate, DeltaBase::DocumentPinsWebAnswers)
+            .map_err(|err| match &err {
+                RenderError::Invalid(_) => {
+                    RpcError::new(error_code::WEB_SETUP_INVALID, err.to_string())
+                }
+                RenderError::Read(_) | RenderError::Edit(_) => RpcError::new(
+                    error_code::INTERNAL_ERROR,
+                    format!("the configuration could not be saved ({err})"),
+                ),
+            })?;
+    let web_section = table_section(&edited.text, "web").ok_or_else(|| {
         RpcError::new(
             error_code::INTERNAL_ERROR,
             "the document this would write names no `[web]` table, so there is nothing to show",
         )
     })?;
-    let digest = teton_inference::sha256_hex(full_text.as_bytes());
+    let digest = teton_inference::sha256_hex(edited.text.as_bytes());
     Ok(RenderedCandidate {
-        full_text,
+        full_text: edited.text,
         web_section,
         digest,
+        unchanged: edited.unchanged,
+        base_web: edited.base_web,
     })
 }
 
@@ -6999,6 +7247,13 @@ fn endpoint_query_names_a_credential(endpoint: &str) -> bool {
 /// the disclosure: a warning that no longer describes what happens is worse than
 /// no warning, because it teaches a user to fear a save that is now surgical.
 /// A candidate with nothing to say about it therefore draws an empty list.
+///
+/// `current` is the **delta's base**, not the live config's table
+/// ([`DaemonRuntime::web_setup_preview`] passes
+/// [`RenderedCandidate::base_web`]). Only the removal note reads it, and what a
+/// removal note is about is the document the answer is being applied to: with
+/// the live table instead, a file that had drifted drew a sentence contradicting
+/// the bytes printed directly beside it.
 fn web_setup_warnings(current: &WebConfig, candidate: &WebConfig) -> Vec<String> {
     let mut warnings: Vec<String> = Vec::new();
     if candidate.tier < WebTier::Search && candidate.search_endpoint.is_some() {
@@ -7792,7 +8047,10 @@ provider_id = "on-device"
     /// here is the seam's own contract: refuse loudly, write fresh when there is
     /// no file, and never touch what the delta does not name.
     mod config_document_seam {
-        use super::{load_config, scratch_dir, Config, DaemonRuntime, WebTier};
+        use super::{
+            load_config, scratch_dir, set_dir_readonly, Config, DaemonRuntime, ModelProvider,
+            PriceTable, ProviderCapabilities, ProviderKind, WebTier,
+        };
 
         /// A hand-written config with the shapes preservation is *about*:
         /// comments above and beside keys, a deliberate key order, and — added
@@ -8026,6 +8284,243 @@ search_auth = "X-Subscription-Token: {key}"
                     .permission_allow
                     .is_empty(),
                 "the in-memory swap happens after the write, never before"
+            );
+        }
+
+        /// **A file that is there and cannot be read is not treated as an empty
+        /// one** (BR-6, AC-5) — the `RenderError::Read` arm, which nothing
+        /// exercised.
+        ///
+        /// The failure this guards is the same shape as the unparseable one: a
+        /// read error swallowed into "there is no document" would derive a fresh
+        /// document from the empty base and write it over a config the daemon
+        /// could not even look at. So the refusal has to name the failure
+        /// *class*, and it names only that: the `io::Error`'s own `Display`
+        /// carries `(os error 13)` and the neighboring [`super::load_config`]
+        /// deliberately formats `kind()` alone (REQ-572 BR-11) — two sentences
+        /// about one file should not disagree about how much they say.
+        #[test]
+        fn an_unreadable_file_refuses_the_write_and_names_the_failure_class() {
+            use std::os::unix::fs::PermissionsExt as _;
+
+            let seed = "[web]\ntier = \"fetch_any_url\"\n";
+            let (runtime, path) = runtime_over("persist-unreadable", seed);
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o000))
+                .expect("close the file");
+
+            // Root reads everything, and so do some filesystems. Ask rather than
+            // assume: a test that silently passes for the wrong reason is worse
+            // than one that says it did not run.
+            if std::fs::read_to_string(&path).is_ok() {
+                let _ = std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600));
+                return;
+            }
+
+            let refused = runtime
+                .persist_web_tier(WebTier::FetchUserUrl)
+                .expect_err("a file that cannot be read must not be written over");
+            assert!(
+                refused.contains("could not be read for editing")
+                    && refused.contains("permission denied"),
+                "the refusal must name the failure class: {refused}"
+            );
+            assert!(
+                !refused.contains("os error"),
+                "the message carries the error's kind and nothing finer (REQ-572 \
+                 BR-11): {refused}"
+            );
+
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))
+                .expect("reopen the file");
+            assert_eq!(
+                std::fs::read_to_string(&path).expect("read"),
+                seed,
+                "a refused write reached the file"
+            );
+            assert!(
+                runtime
+                    .config
+                    .lock()
+                    .expect("config mutex")
+                    .web
+                    .permission_allow
+                    .is_empty(),
+                "the in-memory swap happens after the write, never before"
+            );
+        }
+
+        /// **A write that cannot land leaves memory where it was** (AC-5),
+        /// asserted at an RPC writer rather than at a migration.
+        ///
+        /// `a_migration_that_cannot_be_saved_leaves_the_config_byte_for_byte_
+        /// intact` pins the same mechanism for a startup path, where the answer
+        /// is warn-and-continue. Here the answer is a refusal the user reads,
+        /// and the thing that must not move is the live config: reporting a
+        /// consent answer as durable when the file rejected it is the silent
+        /// downgrade REQ-563's `Persistent` scope depends on not happening.
+        #[test]
+        fn a_write_that_cannot_land_refuses_and_moves_nothing() {
+            let seed = "[web]\ntier = \"fetch_any_url\"\n";
+            let (runtime, path) = runtime_over("persist-readonly-dir", seed);
+            let dir = path.parent().expect("the scratch directory").to_owned();
+
+            set_dir_readonly(&dir, true);
+            // Same question as above, asked of the directory: root creates files
+            // in a `r-x` directory, and this test would then assert nothing.
+            if std::fs::File::create(dir.join(".probe")).is_ok() {
+                let _ = std::fs::remove_file(dir.join(".probe"));
+                set_dir_readonly(&dir, false);
+                return;
+            }
+
+            let refused = runtime
+                .persist_web_tier(WebTier::FetchUserUrl)
+                .expect_err("a write that cannot create its temp file must be reported");
+            set_dir_readonly(&dir, false);
+
+            assert!(
+                refused.contains("could not be saved") && refused.contains("denied"),
+                "the refusal must carry the inner reason, not just the failure \
+                 (LESSON-456): {refused}"
+            );
+            assert_eq!(
+                std::fs::read_to_string(&path).expect("read"),
+                seed,
+                "the atomic write left a partial document behind"
+            );
+            assert!(
+                runtime
+                    .config
+                    .lock()
+                    .expect("config mutex")
+                    .web
+                    .permission_allow
+                    .is_empty(),
+                "the answer was reported as durable while the file rejected it"
+            );
+        }
+
+        /// **A startup migration whose document cannot be edited warns and keeps
+        /// the session** (AC-5's second sentence, BR-6).
+        ///
+        /// The migration's failure tolerance is deliberate and asymmetric to the
+        /// RPC writers': refusing to start because a hand edit is half-finished
+        /// would strand the user, so the in-memory migration stands for this
+        /// session, the file is left exactly as found, and the absence guard
+        /// makes the next start try again.
+        ///
+        /// The warning's *text* is asserted through the value it interpolates
+        /// rather than by capturing stderr: `eprintln!` writes to a
+        /// process-global fd, and redirecting it from a test that runs beside
+        /// others is a race, not a witness. `persist_config` over the same three
+        /// inputs is the `{err}` that warning carries, so its sentence is the
+        /// warning's sentence.
+        #[test]
+        fn a_migration_that_cannot_edit_the_document_warns_and_keeps_the_session() {
+            let broken = "default_provider = \"cheap\n\n[[providers]]\nid = \"cheap\"\n";
+            let dir = scratch_dir("migrate-unparseable");
+            let path = dir.join("config.toml");
+            std::fs::write(&path, broken).expect("seed a half-finished hand edit");
+
+            // A config the REQ-557 pass has something to do to: one provider it
+            // cannot resolve a model for (which is what makes the pass run at
+            // all) and one it can default to.
+            let provider = |id: &str, model: Option<&str>| ModelProvider {
+                id: id.to_owned(),
+                kind: ProviderKind::OpenaiCompatible,
+                endpoint: Some("https://api.deepseek.com".to_owned()),
+                model: model.map(str::to_owned),
+                auth_ref: Some(format!("keychain:{id}")),
+                capabilities: ProviderCapabilities::default(),
+            };
+            let mut config = Config {
+                providers: vec![
+                    provider("cheap", Some("deepseek-chat")),
+                    provider("ghost", None),
+                ],
+                ..Config::default()
+            };
+            let before = config.clone();
+
+            super::migrate_and_report_provider_models(
+                &mut config,
+                Some(&path),
+                &PriceTable::bundled(),
+            );
+
+            assert_eq!(
+                config.default_provider.as_deref(),
+                Some("cheap"),
+                "the in-memory migration must still stand: a failed write costs a \
+                 warning, never the session's routing"
+            );
+            assert_eq!(
+                std::fs::read_to_string(&path).expect("read"),
+                broken,
+                "the migration rewrote a document it could not parse — the silent \
+                 repair-by-destruction BR-6 forbids"
+            );
+
+            // The sentence the warning carries, taken from the call it makes.
+            let err = super::persist_config(&path, &before, &config)
+                .expect_err("the same write, refused the same way");
+            assert!(
+                err.to_string().contains("could not be parsed for editing"),
+                "the migration's warning must name the parse failure, or a user \
+                 whose file is the obstacle is never told which file: {err}"
+            );
+
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+
+        /// **A parse failure of the edited bytes is located, never quoted**
+        /// (BR-7's rule applied to the one message that could reproduce a config
+        /// line).
+        ///
+        /// This arm means the delta engine emitted TOML it cannot re-read — a
+        /// bug in this daemon, not in the user's file, and unreachable through
+        /// any input a test can hand the flow. So the classifier is asked
+        /// directly, with the failure it would be handed: a *value*-shaped one,
+        /// where `toml`'s own `message()` quotes the offending value even
+        /// without its source line, and the value is the shape of a token.
+        ///
+        /// The other arm is asserted here too, because the two are a pair: the
+        /// validator's sentence must survive **verbatim** (it names the key the
+        /// user has to fix, BR-4/AC-10), and
+        /// `a_hand_edit_that_fails_validation_refuses_the_write_and_survives_it`
+        /// pins the same sentence arriving through the RPC writer.
+        #[test]
+        fn a_parse_failure_of_the_edited_bytes_is_located_and_never_quoted() {
+            let planted = "ghp_FAKE_NOT_A_REAL_SECRET";
+            let edited =
+                format!("[web]\ntier = \"fetch_any_url\"\ncache_ttl_secs = \"{planted}\"\n");
+            let err = Config::load(&edited).expect_err("a string is not a number of seconds");
+            let reason = super::load_failure_reason(&err, &edited);
+
+            assert!(
+                reason.contains("line 3"),
+                "a near-unreachable failure still has to be locatable: {reason}"
+            );
+            assert!(
+                !reason.contains(planted),
+                "the offending value reached an error string that travels to a \
+                 client and into a transcript: {reason}"
+            );
+            // Belt and braces: the whole assignment, which is what the parser's
+            // own `Display` prints under a caret.
+            assert!(
+                !reason.contains("cache_ttl_secs ="),
+                "the offending source line was reproduced: {reason}"
+            );
+
+            // And the validator's arm, unchanged and unwrapped.
+            let invalid = "default_provider = \"ghost\"\n";
+            let validate = Config::load(invalid).expect_err("an unregistered default is refused");
+            assert!(
+                super::load_failure_reason(&validate, invalid)
+                    .contains("default_provider names provider 'ghost'"),
+                "the validator's own sentence must go through verbatim: it names \
+                 the key the user has to fix"
             );
         }
     }
@@ -14861,7 +15356,14 @@ search_auth = "X-Subscription-Token: {key}"
             let (runtime, config_path, _dir) = runtime_on_disk("persist-permission");
             {
                 // The realistic shape: the ceiling is already where the lookup
-                // needs it, so the tier raise has nothing to do.
+                // needs it, so the tier raise has nothing to do. It is a
+                // *configured* ceiling, so it is on disk as well as in memory —
+                // the state a real start produces. Since REQ-574 a write edits
+                // the document rather than replacing it, so a ceiling that only
+                // ever existed in memory would make this test about drift
+                // instead of about the permission it is named for.
+                std::fs::write(&config_path, "[web]\ntier = \"fetch_any_url\"\n")
+                    .expect("seed the configured ceiling");
                 let mut config = runtime.config.lock().expect("config mutex");
                 config.web.tier = WebTier::FetchAnyUrl;
             }
@@ -14915,7 +15417,16 @@ search_auth = "X-Subscription-Token: {key}"
             let (runtime, config_path, _dir) = runtime_on_disk("per-tier-consent");
             {
                 // The ceiling is at the top, so nothing here is refused by tier —
-                // whatever is still asked is asked because consent says so.
+                // whatever is still asked is asked because consent says so. On
+                // disk as well as in memory, for the reason
+                // `persisting_a_lower_tier_never_demotes_the_configured_ceiling`
+                // gives: since REQ-574 a memory-only ceiling is drift, and this
+                // test is about consent rather than about drift.
+                std::fs::write(
+                    &config_path,
+                    "[web]\ntier = \"search\"\nsearch_endpoint = \"https://search.example/api\"\n",
+                )
+                .expect("seed the configured ceiling");
                 let mut config = runtime.config.lock().expect("config mutex");
                 config.web.tier = WebTier::Search;
                 config.web.search_endpoint = Some("https://search.example/api".to_owned());
@@ -16080,6 +16591,20 @@ max_page_bytes_from_the_future = 4096
         /// rather than re-rendered from the schema. Under the old seam the
         /// preview showed a canonical table and the commit wrote one, and the
         /// two agreed by both being lossy.
+        ///
+        /// # What this no longer checks, and where that check lives
+        ///
+        /// Both sides of the comparison below now come from `table_section`, so
+        /// a bug *inside* the slicer would agree with itself here. That is the
+        /// price of BR-3 — the preview is defined as the writer's own slice, and
+        /// a second renderer to cross-check it against is exactly what ADR-3
+        /// deleted. The independent readings are kept where they can be
+        /// independent: `config.rs`'s
+        /// `the_sliced_web_section_is_the_documents_own_bytes` checks
+        /// `table_section` against a deliberately naive line reader, and
+        /// `tests/config_preservation.rs` walks the written documents with its
+        /// own reader rather than with this one. What *this* test pins is the
+        /// property those cannot see: one derivation reaching two seams.
         #[test]
         fn a_preview_renders_the_bytes_the_commit_goes_on_to_write() {
             let shapes = [
@@ -16366,6 +16891,276 @@ max_page_bytes_from_the_future = 4096
                 after_first
             );
             assert!(subscriber.try_recv().is_none());
+        }
+
+        // -- REQ-574 verify: an answered field lands even when memory agrees ---
+
+        /// **An answer the document lost is written back** (BR-3/BR-5, the
+        /// verify pass's finding).
+        ///
+        /// The hole this closes: the delta is `diff(memory, candidate)` and the
+        /// candidate is memory-plus-answers, so an answer that *repeats* what
+        /// memory holds is not a difference and never enters the delta. Let the
+        /// document drift at that same field — the user comments `tier` out
+        /// mid-session — and the flow wrote a document with no `tier` at all
+        /// while reporting `applied: true` and announcing `WebSetupCompleted`
+        /// with the tier in it. Three lies for one missing key.
+        ///
+        /// The fix pins the four answered fields to the *document's* own parse
+        /// ([`super::DeltaBase::DocumentPinsWebAnswers`]), so "the user answered
+        /// it" and "the document says it" become one statement. Asserted at both
+        /// seams, because the preview is what the user reads before saying yes.
+        #[test]
+        fn an_answer_the_document_lost_is_written_back_even_when_memory_agrees() {
+            const AGREED: &str = "\
+# my teton config, written by hand
+[web]
+tier = \"search\"
+search_endpoint = \"https://search.example.com/search\"
+";
+            let (runtime, config_path) = runtime_seeded("web-setup-drift-tier", AGREED);
+            with_local_model(&runtime);
+            let events = Arc::new(EventBus::new());
+            assert_eq!(
+                runtime.config.lock().expect("config mutex").web.tier,
+                WebTier::Search,
+                "non-vacuity: memory and the document agreed at the field about \
+                 to drift, which is what makes the answer a no-op in memory"
+            );
+
+            // The hand edit, made while the daemon runs: the tier line is
+            // commented out and nothing else moves.
+            let drifted = AGREED.replace("tier = \"search\"\n", "# tier = \"search\"\n");
+            std::fs::write(&config_path, &drifted).expect("the hand edit lands");
+            assert_eq!(
+                load_config(Some(&config_path))
+                    .expect("the drifted document still loads")
+                    .web
+                    .tier,
+                WebTier::Off,
+                "non-vacuity: the document really did lose the tier"
+            );
+
+            // The same answers the file used to hold.
+            let params = preview_params(
+                WireWebTier::Search,
+                Some("https://search.example.com/search"),
+                None,
+                None,
+            );
+            let preview = runtime.web_setup_preview(&params).expect("previews");
+            assert!(
+                preview.toml.contains("tier = \"search\""),
+                "the preview must show the tier it is about to write: {}",
+                preview.toml
+            );
+
+            let committed = runtime
+                .web_setup_commit(&as_commit_expecting(&params, &preview.digest), &events)
+                .expect("commits");
+            assert!(
+                committed.applied,
+                "the commit reported no change while the document needed the \
+                 answered tier written back"
+            );
+            assert_eq!(committed.tier, WireWebTier::Search);
+
+            let written = std::fs::read_to_string(&config_path).expect("read");
+            assert_eq!(
+                load_config(Some(&config_path))
+                    .expect("the written document loads")
+                    .web
+                    .tier,
+                WebTier::Search,
+                "the answered tier is missing from the file the daemon would boot \
+                 on:\n{written}"
+            );
+            assert_eq!(
+                teton_core::table_section(&written, "web").expect("the document names [web]"),
+                preview.toml,
+                "the confirmed section and the written one came apart:\n{written}"
+            );
+            assert!(
+                written.contains("# my teton config, written by hand"),
+                "the answer was written back by rewriting the document:\n{written}"
+            );
+        }
+
+        /// **A `[web]` table deleted mid-session is restored, not refused**
+        /// (BR-3, the same finding at its loudest).
+        ///
+        /// Before the base fix this was the `INTERNAL_ERROR` two reviewers
+        /// flagged: memory-matching answers produced an empty delta, the empty
+        /// delta left the document with no `[web]` table, and the preview — which
+        /// slices that table out of the document — had nothing to show and said
+        /// so with an internal error. The user's remedy would have been to guess.
+        ///
+        /// With the pinned base the answers disagree with the document at `tier`,
+        /// so the section is written back and the flow does what the user asked.
+        #[test]
+        fn a_hand_deleted_web_table_is_restored_by_the_next_commit() {
+            const WITH_WEB: &str = "\
+[privacy]
+redact = true
+
+[web]
+tier = \"fetch_user_url\"
+";
+            let (runtime, config_path) = runtime_seeded("web-setup-drift-table", WITH_WEB);
+            let events = Arc::new(EventBus::new());
+            assert_eq!(
+                runtime.config.lock().expect("config mutex").web.tier,
+                WebTier::FetchUserUrl,
+                "non-vacuity: the table was there when the daemon started"
+            );
+
+            // The whole table, gone.
+            let without_web = "[privacy]\nredact = true\n";
+            std::fs::write(&config_path, without_web).expect("the deletion lands");
+
+            let params = preview_params(WireWebTier::FetchUserUrl, None, None, None);
+            let preview = runtime.web_setup_preview(&params).expect(
+                "a preview of a document with no [web] table is a preview of what it gains",
+            );
+            assert!(
+                preview.toml.contains("tier = \"fetch_user_url\""),
+                "the preview must show the table being restored: {}",
+                preview.toml
+            );
+
+            assert!(
+                runtime
+                    .web_setup_commit(&as_commit_expecting(&params, &preview.digest), &events)
+                    .expect("the restore commits")
+                    .applied
+            );
+            let written = std::fs::read_to_string(&config_path).expect("read");
+            assert_eq!(
+                load_config(Some(&config_path))
+                    .expect("the written document loads")
+                    .web
+                    .tier,
+                WebTier::FetchUserUrl,
+                "the deleted table was not restored:\n{written}"
+            );
+            assert!(
+                written.contains("[privacy]") && written.contains("redact = true"),
+                "the restore rewrote the rest of the document:\n{written}"
+            );
+        }
+
+        /// **A document that already holds the answer still makes the capability
+        /// live** — the other edge of the no-op rule.
+        ///
+        /// The mirror of the two tests above, and the reason that rule is a
+        /// conjunction and not a byte comparison alone. Here the drift runs the
+        /// other way: the user enabled the tier by hand while the daemon ran, so
+        /// the *file* already says what the answers say and the write has
+        /// nothing to change — but this process's config is still where it was
+        /// at start. Short-circuiting on the bytes alone would leave the user
+        /// with a config file that grants the capability, a `/web setup` that
+        /// reported doing nothing, and no web tool until they restart.
+        #[test]
+        fn a_document_that_already_holds_the_answer_still_makes_the_capability_live() {
+            let (runtime, config_path) = runtime_on_disk("web-setup-drift-ahead");
+            let events = Arc::new(EventBus::new());
+            let mut subscriber = events.subscribe(4);
+            assert_eq!(
+                runtime.config.lock().expect("config mutex").web.tier,
+                WebTier::Off,
+                "non-vacuity: this process started before the hand edit"
+            );
+
+            // The hand edit runs ahead of the daemon rather than behind it.
+            let ahead = format!("{SEED}\n[web]\ntier = \"fetch_any_url\"\n");
+            std::fs::write(&config_path, &ahead).expect("the hand edit lands");
+
+            let params = preview_params(WireWebTier::FetchAnyUrl, None, None, None);
+            let preview = runtime.web_setup_preview(&params).expect("previews");
+            let committed = runtime
+                .web_setup_commit(&as_commit_expecting(&params, &preview.digest), &events)
+                .expect("commits");
+
+            assert!(
+                committed.applied,
+                "the answer changed this daemon's live config, so reporting no \
+                 change is a lie the user pays for with a restart"
+            );
+            assert_eq!(
+                std::fs::read_to_string(&config_path).expect("read"),
+                ahead,
+                "the document already said it, so the write had nothing to change"
+            );
+            assert_eq!(
+                runtime.config.lock().expect("config mutex").web.tier,
+                WebTier::FetchAnyUrl,
+                "the capability stayed dark in the process the user is talking to"
+            );
+            assert!(
+                subscriber.try_recv().is_some(),
+                "a change to the live config is announced like any other"
+            );
+        }
+
+        /// **A removal note describes the document, not a stale memory**
+        /// (REQ-574 verify, the warnings half).
+        ///
+        /// The notes sit directly beside the bytes the preview shows. Comparing
+        /// the candidate against the *live* config let the note say a key "will
+        /// be removed" while the section printed under it had no such key — a
+        /// sentence contradicting its own evidence. The comparison is against the
+        /// delta's base, which is the document at these four fields.
+        #[test]
+        fn a_removal_note_describes_the_document_and_not_a_stale_memory() {
+            const KEYED: &str = "\
+[web]
+tier = \"search\"
+search_endpoint = \"https://search.example.com/search\"
+search_key_ref = \"keychain://teton/web-search\"
+";
+            let (runtime, config_path) = runtime_seeded("web-setup-drift-warning", KEYED);
+            with_local_model(&runtime);
+            let params = preview_params(
+                WireWebTier::Search,
+                Some("https://search.example.com/search"),
+                None,
+                None,
+            );
+
+            // Non-vacuity first: while the document still holds the key, the
+            // answer that omits it is a removal and is announced as one.
+            assert!(
+                runtime
+                    .web_setup_preview(&params)
+                    .expect("previews")
+                    .warnings
+                    .iter()
+                    .any(|w| w.contains("search_key_ref") && w.contains("removed")),
+                "an answer that drops a key the document holds must say so"
+            );
+
+            // The user removes it by hand instead. Memory still remembers it;
+            // the document does not, and the document is what the note is about.
+            std::fs::write(
+                &config_path,
+                KEYED.replace("search_key_ref = \"keychain://teton/web-search\"\n", ""),
+            )
+            .expect("the hand edit lands");
+            let preview = runtime.web_setup_preview(&params).expect("previews");
+            assert!(
+                !preview.toml.contains("search_key_ref"),
+                "non-vacuity: the section shown really has no key: {}",
+                preview.toml
+            );
+            assert!(
+                !preview
+                    .warnings
+                    .iter()
+                    .any(|w| w.contains("search_key_ref") && w.contains("removed")),
+                "the note promises to remove a key the document no longer has, \
+                 contradicting the bytes printed beside it: {:?}",
+                preview.warnings
+            );
         }
 
         /// With nowhere to write, the capability cannot be enabled — reported
