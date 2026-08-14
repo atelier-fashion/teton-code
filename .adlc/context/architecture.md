@@ -156,6 +156,20 @@
   the bytes that reach the terminal stay gated. Otherwise the gate that hides the
   feature from users hides it from the test suite too, and the feature ships
   unverified (REQ-556, REQ-560 BR-8, LESSON-481).
+- **Enablement is collection at the edge, commitment at the core** — a guided
+  setup flow holds no server-side step state: clients collect and buffer
+  answers (input buffering is not session state), the daemon exposes
+  plan/preview/commit endpoints, validation is the startup validator run on a
+  candidate, the preview is digest-bound to the commit so what the user
+  confirmed is what is written, and the commit point is the config swap every
+  consumer already reads per turn. Secrets are written by the surface that
+  collected them, by reference everywhere else, with a displaced-state-aware
+  undo (REQ-572 ADR-1/ADR-2/ADR-3, LESSON-514).
+- **A pre-authorization publish is attacker-paced** — any event published
+  before an authorization gate answers needs the caller-chosen-id length
+  bound AND a per-connection budget, and read-only endpoints prefer silent
+  refusal over announcement (REQ-572 verify, LESSON-513; the
+  `may_announce_grant` precedent generalized).
 - **Adapter degradation** — providers with weak tool-calling get a reduced
   harness profile (smaller tool set, shorter loops, mandatory verification)
   rather than the full loop (BR-6).
