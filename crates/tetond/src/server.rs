@@ -7633,4 +7633,105 @@ mod tests {
             }
         }
     }
+
+    /// **AC-1 / AC-5 (REQ-575): the commit meets the BR-10(b) presence gate, and
+    /// that gate is load-bearing.**
+    ///
+    /// With a *present-but-refusing* verifier, the session's own (attached)
+    /// client — one that clears every earlier gate — is still refused, with the
+    /// attestation code and not the runtime's `CONFIG_REJECTED`. That is the proof
+    /// the check fires *before* the runtime is reached, so nothing is written.
+    ///
+    /// It is also the mutation test the new seam owes (LESSON-508 rule 2):
+    /// deleting the `refuse_unattested_commitment` line from
+    /// [`handle_web_setup_commit`] drops the owner's commit through to the runtime,
+    /// which answers `CONFIG_REJECTED` (a bare daemon has no config path) — a
+    /// different code, so this test goes red. It is red for a reason unique to
+    /// this seam, independent of the `model/confirm`/`model/set` seams.
+    #[test]
+    fn a_web_setup_commit_refuses_when_the_presence_check_fails() {
+        let daemon = Daemon::new().with_presence_verifier(Box::new(
+            crate::attest::AlwaysFailsVerifier::new(crate::attest::AttestationMethod::OsBiometric),
+        ));
+        let owner = unattached(&daemon);
+        let session = a_session_owned_by(&daemon, &owner);
+
+        let refused = commit_on_reader(&daemon, &owner, Id::Number(2), setup_params(&session));
+        assert!(
+            refused.contains(&error_code::ATTESTATION_FAILED.to_string()),
+            "the session's own client still meets the presence gate: {refused}"
+        );
+        assert!(
+            !refused.contains(&error_code::CONFIG_REJECTED.to_string()),
+            "the refusal is the presence gate, not the runtime — a CONFIG_REJECTED \
+             here means the commit reached the runtime, i.e. the attestation line \
+             was skipped: {refused}"
+        );
+    }
+
+    /// **AC-4 (REQ-575, BR-2): the session and length gates answer before the
+    /// presence gate, so a caller that may not act triggers no prompt.**
+    ///
+    /// `AlwaysFailsVerifier` is the tripwire: if the presence check ran first,
+    /// each of these callers would receive `ATTESTATION_FAILED` instead of the
+    /// refusal it actually earns. The point of the ordering is that a stranger, or
+    /// a malformed id, never puts an OS prompt on anyone's screen.
+    #[test]
+    fn a_web_setup_commit_answers_the_earlier_gates_before_the_presence_gate() {
+        let daemon = Daemon::new().with_presence_verifier(Box::new(
+            crate::attest::AlwaysFailsVerifier::new(crate::attest::AttestationMethod::OsBiometric),
+        ));
+        let owner = unattached(&daemon);
+        let session = a_session_owned_by(&daemon, &owner);
+        let intruder = unattached(&daemon);
+
+        let unattached_refusal =
+            commit_on_reader(&daemon, &intruder, Id::Number(2), setup_params(&session));
+        assert!(
+            unattached_refusal.contains(&error_code::NOT_ATTACHED.to_string())
+                && !unattached_refusal.contains(&error_code::ATTESTATION_FAILED.to_string()),
+            "the session gate must answer before the presence gate, so an unattached \
+             caller never triggers a prompt: {unattached_refusal}"
+        );
+
+        let oversized = SessionId::from(format!("sess-{}", "a".repeat(4096)).as_str());
+        let unmintable_refusal =
+            commit_on_reader(&daemon, &owner, Id::Number(3), setup_params(&oversized));
+        assert!(
+            unmintable_refusal.contains(&error_code::INVALID_PARAMS.to_string())
+                && !unmintable_refusal.contains(&error_code::ATTESTATION_FAILED.to_string()),
+            "the length gate must answer before the presence gate: {unmintable_refusal}"
+        );
+    }
+
+    /// **AC-3 (REQ-575, BR-3): a build with no presence mechanism degrades — it
+    /// does not refuse.**
+    ///
+    /// `Daemon::new()`'s default is the shipped `UnavailableVerifier`, so
+    /// `refuse_unattested_commitment` returns `None` with a stderr notice and the
+    /// commit is allowed past the BR-10(b) gate to the runtime — gaining no new
+    /// prompt (REQ-570 BR-8's asymmetry). The owner's commit therefore reaches the
+    /// runtime and answers the runtime's own `CONFIG_REJECTED` (no config path),
+    /// never an attestation code. This is the non-vacuity contrast to
+    /// [`a_web_setup_commit_refuses_when_the_presence_check_fails`]: same attached
+    /// owner, opposite verifier, opposite outcome.
+    #[test]
+    fn a_web_setup_commit_degrades_where_no_presence_mechanism_exists() {
+        let daemon = Daemon::new();
+        let owner = unattached(&daemon);
+        let session = a_session_owned_by(&daemon, &owner);
+
+        let committed = commit_on_reader(&daemon, &owner, Id::Number(2), setup_params(&session));
+        assert!(
+            !committed.contains(&error_code::ATTESTATION_FAILED.to_string())
+                && !committed.contains(&error_code::ATTESTATION_UNAVAILABLE.to_string()),
+            "no mechanism must degrade, not refuse — the commit reaches the runtime \
+             rather than being stopped at the presence gate: {committed}"
+        );
+        assert!(
+            committed.contains(&error_code::CONFIG_REJECTED.to_string()),
+            "with no config path the runtime is what answers, proving the commit got \
+             past the degraded presence gate: {committed}"
+        );
+    }
 }
