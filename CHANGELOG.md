@@ -18,9 +18,48 @@ unchanged. What belongs here is what an *upgrade* does to a machine that was
 already running — above all, anything that changes where data goes without the
 user having asked for it.
 
-## [Unreleased]
+## [0.1.15] - 2026-08-14
+
+### Added
+
+- **Teton now helps you turn capabilities on instead of dead-ending
+  (REQ-572).** Ask a question that needs the web with web lookup off, and the
+  answer names the capability, says it is available but switched off, and
+  gives the enablement path — it no longer hunts your repository or leaves
+  you with a bare "I cannot search the web." Upgrading changes nothing on its
+  own: web lookup stays off by default, the model can only *tell* you about
+  the opt-in, and enabling remains your act alone (REQ-575 hardens that: the
+  commit that writes config requires a human-present, session-holding caller
+  — a headless same-UID process cannot make it).
+
+  The act itself is now guided: **`/web setup`** walks tier → backend →
+  key → preview → confirm, and the capability is live in the same session
+  with no daemon restart. The key is collected echo-off and written straight
+  to the OS keychain by the CLI — it never crosses the daemon socket and
+  never appears in config — the preview shows the exact `[web]` TOML and the
+  destination host derived from the same parse the lookup will use, the
+  confirm defaults to no, and the commit refuses if the config moved since
+  the preview you read. Backend suggestions (Brave, Kagi, keyless SearxNG,
+  with their real auth-header shapes) are served by the daemon
+  (REQ-573), so every client offers the same list and a suggested backend is
+  one whose request shape ships tested.
+
+- **Daemon config writes now preserve your hand-written comments and unknown
+  keys (REQ-574).** "Enable permanently" consent answers and `/web setup`
+  commits previously rewrote `config.toml` from the parsed document,
+  dropping comments; writes now edit in place.
+
+- **`config/set` requires presence attestation (REQ-576).** The same
+  human-present rule the model-change surface already enforces now covers
+  daemon-wide config mutation — a tightening; interactive use is unchanged.
 
 ### Fixed
+
+- **The web-off refusal now actually says the sentence (BUG-168).** The prompt
+  clause that names the opt-in was descriptive, and the local tier routinely
+  paraphrased it away — users got "I cannot search the web" with no mention
+  that the capability exists. The clause now dictates the ending, so the
+  refusal names web lookup, the off state, and `/web setup` in so many words.
 
 - **A stranger's refused attempt to change your session's web setup is now
   announced reliably (BUG-166).** The `web_setup_rejected` notice was budgeted
