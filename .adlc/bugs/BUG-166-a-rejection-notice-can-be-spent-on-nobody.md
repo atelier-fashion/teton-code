@@ -1,7 +1,7 @@
 ---
 id: BUG-166
 title: "A refused commit's one rejection notice can be spent on a session nobody holds"
-status: open
+status: resolved
 severity: high
 created: 2026-08-14
 updated: 2026-08-14
@@ -231,6 +231,26 @@ Bundled residuals, all landed in the same pass:
   exact sentence, on both model profiles. Verified by mutation: appending
   "unless they offer it" to the guide's sentence fails the test that the old
   substring needles passed.
+
+## Verification
+
+- `cargo test --workspace --no-fail-fast` after a full `cargo build
+  --workspace` (the BUG-164 freshness rule): 2417 passed, 0 failed, 50 test
+  targets, exit 0. `cargo clippy --workspace --all-targets` clean;
+  `cargo fmt --all -- --check` clean; `tools/release/changelog-section.sh`
+  exit 0.
+- Mutation checks run by hand: deleting the existence gate fails
+  `a_nonexistent_session_buys_no_notice_and_burns_no_budget`; weakening the
+  guide's prohibition sentence with "unless they offer it" fails the
+  rewritten content pin (it passed the old needles).
+- CI on PR #130: all seven checks pass on both platforms.
+
+## Deployment
+
+- No service deploys in this repo (plain OSS flow, PR-gated CI on `main`).
+  Merged to `main` as `33d1ce1` (PR #130); the fix rides the next tagged
+  release, and the `[Unreleased]` changelog section becomes its upgrade
+  notes.
 
 ## Lessons Captured
 
