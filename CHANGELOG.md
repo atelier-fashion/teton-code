@@ -22,6 +22,22 @@ user having asked for it.
 
 ### Fixed
 
+- **A stranger's refused attempt to change your session's web setup is now
+  announced reliably (BUG-166).** The `web_setup_rejected` notice was budgeted
+  at one per client connection, spent whether or not it reached anyone — so
+  one refused call aimed at a session id that named nothing silently used up
+  the only notice that connection would ever produce, and later refused
+  attempts against your real sessions were never announced. The budget is now
+  per (connection, targeted session) and is spent only when the targeted
+  session actually exists, so each session's user hears about each offending
+  connection exactly once. Refusal enforcement itself was never affected.
+  Alongside it, the same audit's smaller findings: session-id length checks
+  now guard every session-driving RPC (not only the setup family); `/web
+  setup` against an older daemon now *says* when the commit cannot be pinned
+  to the previewed bytes instead of degrading silently; and the
+  credential-prohibition line in the model's self-help guide is pinned by
+  exact wording so a softened edit fails the suite.
+
 - **The search credential can now ride the header your backend actually wants
   (BUG-165).** `[web] search_key_ref` was always sent as
   `Authorization: Bearer <key>` — and neither of the search backends REQ-563

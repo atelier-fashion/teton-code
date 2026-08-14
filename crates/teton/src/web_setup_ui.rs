@@ -105,6 +105,18 @@ const SETUP_ABORTED: &str =
 const SETUP_DECLINED: &str =
     "not written. Nothing was changed and no key was stored; run `/web setup` again to start over.";
 
+/// What the flow says when the daemon offered no preview digest (BUG-166
+/// residual (a)).
+///
+/// A daemon built before BR-7's digest field degrades the commit to the
+/// protocol's own "do not check" — correct, and previously silent, which made
+/// the loss of the confirmed-bytes guard a fact only the source code knew.
+/// A version fact, not a failure, so it wears no `error:` prefix (BUG-152) —
+/// the commit still lands; what changed is which guard rides it.
+const DIGEST_CHECK_UNAVAILABLE: &str =
+    "this daemon build offers no preview digest, so the commit is not pinned to the previewed \
+     bytes — upgrade and restart the daemon to restore that check.";
+
 // ---------------------------------------------------------------------------
 // The world seam
 // ---------------------------------------------------------------------------
@@ -391,6 +403,19 @@ pub(crate) fn drive(
         io.surface().line(kind, &text);
     }
 
+    // The previewed document's digest rides the commit so the daemon refuses
+    // to write bytes the user never confirmed (BR-7). An empty digest is a
+    // daemon that predates the field — degrade to the protocol's own
+    // "do not check" rather than sending a value that can only mismatch, and
+    // say so **before the confirm question**: a guard that turns itself off on
+    // version skew must do it where the user can still act on the fact, and
+    // declining is the one act this flow offers (BUG-166 residual (a)).
+    let expect_digest = Some(preview.digest.clone()).filter(|digest| !digest.is_empty());
+    if expect_digest.is_none() {
+        io.surface()
+            .line(LineKind::Notice, DIGEST_CHECK_UNAVAILABLE);
+    }
+
     // LESSON-470: the write is the costly wrong answer, so silence declines.
     let confirmed = matches!(io.prompter().ask(CONFIRM_QUESTION), Some(answer) if is_yes(&answer));
     if !confirmed {
@@ -426,11 +451,6 @@ pub(crate) fn drive(
         None => (None, None),
     };
 
-    // The previewed document's digest rides the commit so the daemon refuses
-    // to write bytes the user never confirmed (BR-7). An empty digest is a
-    // daemon that predates the field — degrade to the protocol's own
-    // "do not check" rather than sending a value that can only mismatch.
-    let expect_digest = Some(preview.digest.clone()).filter(|digest| !digest.is_empty());
     // Bound rather than `?`-ed. A transport failure here is not the same event
     // as a daemon that answered "no": the commit may have landed, and letting
     // the error out would end the session on the one path where the user most
@@ -1266,6 +1286,14 @@ mod tests {
     /// commit — and only when the daemon offered one: an empty digest is a
     /// daemon that predates the field, and inventing a value for it could
     /// only ever mismatch.
+    ///
+    /// The degrade must also be **said** (BUG-166 residual (a)): silently
+    /// dropping the confirmed-bytes check on version skew made the guard's
+    /// absence a fact only the source code knew, and it is rendered before
+    /// the confirm question because declining is the one act the flow offers
+    /// a user who minds. Both directions are pinned — the notice when the
+    /// check is off, its absence when the check is on — or the line would
+    /// drift into constant noise the first time someone hoisted it.
     #[test]
     fn a_previewed_digest_rides_the_commit_and_an_absent_one_does_not() {
         let mut io = FakeIo::new(FULL_WALK);
@@ -1273,6 +1301,10 @@ mod tests {
         let keychain = MockKeychain::new();
         drive(&mut io, &keychain, &session(), Gate::Walk).unwrap();
         assert_eq!(io.commits[0].expect_digest.as_deref(), Some("abc123"));
+        assert!(
+            !io.rendered().contains(DIGEST_CHECK_UNAVAILABLE),
+            "a daemon that offered a digest must not be reported as lacking one"
+        );
 
         let mut io = FakeIo::new(FULL_WALK);
         let keychain = MockKeychain::new();
@@ -1280,6 +1312,11 @@ mod tests {
         assert_eq!(
             io.commits[0].expect_digest, None,
             "an empty digest from an old daemon must degrade to the protocol's own do-not-check"
+        );
+        assert!(
+            io.rendered().contains(DIGEST_CHECK_UNAVAILABLE),
+            "and the degrade must be rendered, not silent: the user is about to \
+             confirm bytes the daemon will not be held to"
         );
     }
 

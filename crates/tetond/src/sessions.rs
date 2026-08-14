@@ -467,6 +467,23 @@ impl SessionRegistry {
             .collect()
     }
 
+    /// Whether `id` names a live session.
+    ///
+    /// [`Self::get`] without the summary clone. The distinction earns its own
+    /// method because the one caller (BUG-166's announcement gate,
+    /// `server::refuse_commit_without_session_access`) runs on a refusal path
+    /// an unattached peer can drive at will — the answer is a bound on what
+    /// that peer's calls may allocate, so the check itself should allocate
+    /// nothing.
+    #[must_use]
+    pub fn contains(&self, id: &SessionId) -> bool {
+        self.sessions
+            .lock()
+            .expect("session registry mutex poisoned")
+            .iter()
+            .any(|record| &record.summary.session_id == id)
+    }
+
     /// Looks up a session by id.
     #[must_use]
     pub fn get(&self, id: &SessionId) -> Option<SessionSummary> {

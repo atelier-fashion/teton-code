@@ -99,7 +99,7 @@
 
 use std::collections::HashSet;
 use std::path::Path;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 
 use serde::Serialize;
@@ -629,29 +629,42 @@ struct ConnState {
     /// two, because a connection's handlers run on several tasks and a
     /// per-clone budget would be no budget at all.
     announcements: Arc<Mutex<GrantAnnouncementBudget>>,
-    /// Whether this connection has already spent its one
-    /// [`Event::WebSetupRejected`] announcement (REQ-572 verify, FIX 1c).
+    /// The sessions this connection has already had an
+    /// [`Event::WebSetupRejected`] announced into (REQ-572 verify FIX 1c,
+    /// re-keyed by BUG-166).
     ///
-    /// The same argument [`Self::announcements`] records, taken to its limit
-    /// because the subject is different: a grant announcement is a *legitimate*
-    /// notice that can be produced too often, so it gets an allowance per
-    /// window; a setup rejection is produced only by a caller that had no
-    /// business calling, so one is all a user ever needs — the second says
-    /// nothing the first did not. Anything more is an attacker choosing how many
-    /// lines to write into a stranger's transcript, which is the same wolf-crying
-    /// the plan and preview handlers refuse outright.
+    /// The same argument [`Self::announcements`] records, with one correction
+    /// the first cut got wrong: the notice's *audience* is the target session's
+    /// own user, so the budget's key has to carry the session. A single
+    /// per-connection bool meant a connection refused on session A and then on
+    /// session B announced only into A — B's user, a different person watching
+    /// a different transcript, was never told — and, worse, one refusal aimed
+    /// at a session id that named nothing spent the bool on nobody and
+    /// silenced every real notice the connection owed afterwards (the BUG-166
+    /// burn attack). Keyed per (connection, session), the second notice into
+    /// the *same* session is still suppressed — it says nothing the first did
+    /// not, to the same reader — while the first notice into each session is
+    /// guaranteed its landing.
     ///
-    /// A `bool` rather than a counter and no window: the refusal itself never
-    /// stops (every offending commit still answers `NOT_ATTACHED`), so there is
-    /// no arrears figure worth carrying and nothing a later window would let
-    /// through that the first notice did not already say. Swapped rather than
-    /// read-then-set, so two concurrent refused commits on one connection cannot
-    /// both find it unspent.
+    /// **Bounded by what the daemon minted, not by what a caller invents**:
+    /// ids enter this set only after the registry answers for them
+    /// ([`refuse_commit_without_session_access`] checks existence before it
+    /// spends), so its size is capped by the real sessions this connection's
+    /// lifetime overlaps — never by the ≤ 31-byte strings an attacker can mint
+    /// for free, which is the allocation trap `session/attach`'s length gate
+    /// exists for.
     ///
-    /// **Per connection, so it does not bound a peer that reconnects** — the
-    /// same stated limit [`GRANT_ANNOUNCEMENTS_PER_WINDOW`] carries, and for the
-    /// same reason: this daemon has no subject an attacker cannot re-mint.
-    setup_rejection_spent: Arc<AtomicBool>,
+    /// No arrears figure, unlike [`Self::announcements`], and deliberately: a
+    /// suppressed grant announcement carries information (a *different* grant
+    /// was minted), so its count is owed to the reader; a suppressed rejection
+    /// here is a byte-identical duplicate to the identical audience, and "3
+    /// more identical sentences were not repeated" tells that reader nothing.
+    ///
+    /// **Per connection underneath, so it does not bound a peer that
+    /// reconnects** — the same stated limit [`GRANT_ANNOUNCEMENTS_PER_WINDOW`]
+    /// carries, and for the same reason: this daemon has no subject an
+    /// attacker cannot re-mint.
+    setup_rejections_announced: Arc<Mutex<HashSet<SessionId>>>,
 }
 
 /// One connection's rolling allowance of grant announcements (R3).
@@ -708,7 +721,7 @@ impl ConnState {
                 announced: 0,
                 suppressed: 0,
             })),
-            setup_rejection_spent: Arc::new(AtomicBool::new(false)),
+            setup_rejections_announced: Arc::new(Mutex::new(HashSet::new())),
         }
     }
 
@@ -727,16 +740,24 @@ impl ConnState {
             .take(std::time::Instant::now(), window)
     }
 
-    /// Whether this connection's one setup-rejection announcement is still
-    /// unspent, claiming it if so (REQ-572 verify, FIX 1c).
+    /// Whether this connection's one setup-rejection announcement **for
+    /// `session_id`** is still unspent, claiming it if so (REQ-572 verify
+    /// FIX 1c, re-keyed by BUG-166 — see [`Self::setup_rejections_announced`]).
     ///
-    /// One `swap`, for [`Self::may_announce_grant`]'s reason expressed with an
-    /// atomic instead of a lock: two refused commits arriving on two of this
-    /// connection's tasks would otherwise both read `false` and both publish,
-    /// turning a bound of one into a bound of "one per interleaving". This
-    /// decides; the caller does the I/O.
-    fn may_announce_setup_rejection(&self) -> bool {
-        !self.setup_rejection_spent.swap(true, Ordering::Relaxed)
+    /// The insert happens under the set's own lock, for
+    /// [`Self::may_announce_grant`]'s reason: two refused commits against one
+    /// session arriving on two of this connection's tasks would otherwise both
+    /// find the pair unclaimed and both publish, turning a bound of one into a
+    /// bound of "one per interleaving". This decides; the caller does the I/O.
+    ///
+    /// The caller is responsible for asking only about sessions the registry
+    /// answers for — this method records what it is told, and recording an
+    /// uncheckable id here would grow the set by attacker-minted keys.
+    fn may_announce_setup_rejection(&self, session_id: &SessionId) -> bool {
+        self.setup_rejections_announced
+            .lock()
+            .expect("setup rejection announcement set poisoned")
+            .insert(session_id.clone())
     }
 
     /// Grant this connection sight of `session_id`'s events. Idempotent.
@@ -1694,6 +1715,15 @@ fn spawn_prompt_turn(
         }
     };
 
+    // F9's length rule, ahead of the `may_drive` hash below for the reason it
+    // sits ahead of the setup handlers' (BUG-166 residual (c)): the id is
+    // attacker-chosen and bounded only by `MAX_FRAME`, and a prompt is the
+    // seam a caller can drive most freely.
+    if let Some(refusal) = refuse_unmintable_session_id(&id, &params.session_id) {
+        let _ = out_tx.try_send(refusal);
+        return None;
+    }
+
     // REQ-568 BR-4, and its position is the requirement: ahead of the registry
     // lookup below, ahead of the lifetime claim, ahead of the spawn. A refused
     // prompt starts no task and touches no runtime state — so a connection that
@@ -2181,6 +2211,9 @@ fn handle_web_override(daemon: &Daemon, conn: &ConnState, id: Id, params: Value)
         Ok(params) => params,
         Err(_) => return error_string(id, error_code::INVALID_PARAMS, "invalid params"),
     };
+    if let Some(refusal) = refuse_unmintable_session_id(&id, &params.session_id) {
+        return refusal;
+    }
     if !conn.may_drive(&params.session_id) {
         return error_string(id, error_code::NOT_ATTACHED, NOT_ATTACHED_MESSAGE);
     }
@@ -2202,18 +2235,27 @@ fn handle_web_override(daemon: &Daemon, conn: &ConnState, id: Id, params: Value)
 /// the two reads stay silent).
 const SETUP_REJECTED_ORIGIN: &str = "connection without session access";
 
-/// Refuse a setup call whose `session_id` is longer than this daemon could ever
-/// have minted (REQ-572 verify, FIX 1a — REQ-569 F9's rule at a second family
-/// of seams).
+/// Refuse a session-scoped call whose `session_id` is longer than this daemon
+/// could ever have minted (REQ-572 verify FIX 1a — REQ-569 F9's rule — applied
+/// to every `may_drive` seam by BUG-166 residual (c)).
 ///
-/// The three setup handlers take an attacker-chosen `session_id` bounded only by
+/// Each of these handlers takes an attacker-chosen `session_id` bounded only by
 /// [`MAX_FRAME`] — ~4 MiB — and each of them then does work proportional to it:
-/// `may_drive` hashes it, and the commit's refusal used to clone it into an
-/// event envelope that every subscriber of the bus holds. A length check ahead
-/// of all of that costs a comparison and removes the amplification.
+/// `may_drive` hashes it, and the setup commit's refusal used to clone it into
+/// an event envelope that every subscriber of the bus holds. A length check
+/// ahead of all of that costs a comparison and removes the amplification.
+///
+/// The seams: the three setup handlers (where FIX 1a introduced it), and —
+/// since BUG-166 — `web/override`, `session/permissions`, `session/clear`, and
+/// the `session/prompt` spawn, which hash the same attacker-chosen id through
+/// the same gate and had no length rule in front of it. `session/attach` keeps
+/// its own inline check (its refusal also has an allocation to bound, and a
+/// different error-shape argument sits with it there);
+/// `permission/respond` needs none, because its `may_drive` takes an owner the
+/// *registry* resolved, never the caller's string.
 ///
 /// Called as a line at the top of each handler rather than folded into
-/// [`dispatch`], for [`refuse_daemon_wide`]'s reason: three seams are three
+/// [`dispatch`], for [`refuse_daemon_wide`]'s reason: these seams are separate
 /// lines a future edit drops one at a time, and the mutation check has to be
 /// able to delete exactly one (LESSON-502/LESSON-508).
 ///
@@ -2247,12 +2289,21 @@ fn refuse_unmintable_session_id(id: &Id, session_id: &SessionId) -> Option<Strin
 ///
 /// **It is not an oracle** (ADR-B). The caller's answer is byte-identical
 /// whether the named session exists, belongs to somebody else, or never
-/// existed; a notice published for a session nobody holds reaches nobody.
+/// existed. The *notice* is published only when the named session exists
+/// (BUG-166) — a check the caller cannot observe, because it changes what the
+/// session's own subscribers receive and never one byte of the refusal.
+/// Publishing for a nonexistent id informed nobody entitled and cost two real
+/// things: it spent the announcement budget on an audience of zero (the
+/// burn attack — one junk-id refusal silenced every real notice the
+/// connection owed afterwards), and it handed every monitor-scope subscriber
+/// — whose delivery policy is "all sessions", [`ConnState::may_receive`] — a
+/// stream of envelopes wearing attacker-chosen session ids.
 ///
-/// **The commit only, and at most once per connection** (REQ-572 verify, FIX
-/// 1b/1c — a deviation from BR-4/AC-4's "preview and commit", recorded in the
-/// architecture's spec-mapping table). Two findings drove it, and both are about
-/// the same primitive:
+/// **The commit only, and at most once per (connection, session)** (REQ-572
+/// verify FIX 1b/1c, re-keyed by BUG-166 — a deviation from BR-4/AC-4's
+/// "preview and commit", recorded in the architecture's spec-mapping table).
+/// Two findings drove the original narrowing, and both are about the same
+/// primitive:
 ///
 ///   - the preview is a *read*. It writes nothing, and `session/list` hands any
 ///     same-UID peer the session ids to aim at — so a refused preview that
@@ -2261,10 +2312,20 @@ fn refuse_unmintable_session_id(id: &Id, session_id: &SessionId) -> Option<Strin
 ///     applies to it unchanged, so the preview now answers `NOT_ATTACHED`
 ///     silently exactly as the plan does.
 ///   - the commit's notice is worth publishing — something tried to *change*
-///     the capability — but the second one says nothing the first did not, so it
-///     is budgeted per connection ([`ConnState::may_announce_setup_rejection`],
-///     the [`ConnState::may_announce_grant`] precedent). A refused commit past
-///     the budget is still refused; it is only the notice that stops.
+///     the capability — but a repeat into the **same session** says nothing
+///     the first did not, so it is budgeted per (connection, session)
+///     ([`ConnState::may_announce_setup_rejection`], the
+///     [`ConnState::may_announce_grant`] precedent). The key carries the
+///     session because the audience does: each targeted session's user hears
+///     about this connection once, rather than the first target's user
+///     hearing for everyone (BUG-166). A refused commit past the budget is
+///     still refused; it is only the notice that stops.
+///
+/// Existence is checked **before** the budget is spent, and the ordering is
+/// load-bearing twice over: a junk id must not burn anything, and — because
+/// only ids the registry answered for ever reach the set — the set stays
+/// bounded by sessions the daemon minted instead of strings the caller can
+/// invent (the allocation trap `session/attach`'s length gate exists for).
 ///
 /// Called as a line at the top of `commit` rather than folded into
 /// [`dispatch`], for [`refuse_daemon_wide`]'s reason: the mutation check has to
@@ -2279,7 +2340,7 @@ fn refuse_commit_without_session_access(
     if conn.may_drive(session_id) {
         return None;
     }
-    if conn.may_announce_setup_rejection() {
+    if daemon.sessions.contains(session_id) && conn.may_announce_setup_rejection(session_id) {
         daemon.events.publish(
             Some(session_id.clone()),
             Event::WebSetupRejected(WebSetupRejected {
@@ -2421,6 +2482,9 @@ fn handle_session_permissions(daemon: &Daemon, conn: &ConnState, id: Id, params:
         Ok(params) => params,
         Err(_) => return error_string(id, error_code::INVALID_PARAMS, "invalid params"),
     };
+    if let Some(refusal) = refuse_unmintable_session_id(&id, &params.session_id) {
+        return refusal;
+    }
     if !conn.may_drive(&params.session_id) {
         return error_string(id, error_code::NOT_ATTACHED, NOT_ATTACHED_MESSAGE);
     }
@@ -3507,6 +3571,9 @@ fn handle_session_clear(daemon: &Daemon, conn: &ConnState, id: Id, params: Value
         Ok(params) => params,
         Err(_) => return error_string(id, error_code::INVALID_PARAMS, "invalid params"),
     };
+    if let Some(refusal) = refuse_unmintable_session_id(&id, &params.session_id) {
+        return refusal;
+    }
     if !conn.may_drive(&params.session_id) {
         return error_string(id, error_code::NOT_ATTACHED, NOT_ATTACHED_MESSAGE);
     }
@@ -7052,8 +7119,9 @@ mod tests {
         assert!(drain_rejections(&mut sub).is_empty());
     }
 
-    /// **One notice per connection, however many commits it refuses** (REQ-572
-    /// verify, FIX 1c — the [`ConnState::may_announce_grant`] precedent).
+    /// **One notice per (connection, session), however many commits it
+    /// refuses** (REQ-572 verify FIX 1c, re-keyed by BUG-166 — the
+    /// [`ConnState::may_announce_grant`] precedent).
     ///
     /// The refusal is unbounded and free to the caller, so an unbudgeted
     /// announcement is a line the attacker gets to write into a stranger's
@@ -7062,9 +7130,10 @@ mod tests {
     ///
     /// Both halves matter and both are asserted: the *second* commit is still
     /// refused (the budget bounds the notice, never the enforcement), and the
-    /// notice count for the connection's whole life is exactly one.
+    /// notice count for this (connection, session) pair's whole life is
+    /// exactly one.
     #[test]
-    fn a_connection_announces_at_most_one_setup_rejection() {
+    fn a_connection_announces_at_most_one_setup_rejection_per_session() {
         let daemon = Daemon::new();
         let owner = unattached(&daemon);
         let session = a_session_owned_by(&daemon, &owner);
@@ -7090,14 +7159,15 @@ mod tests {
         assert_eq!(
             drain_rejections(&mut sub).len(),
             1,
-            "two refused commits from one connection announced more than once: \
-             the second notice says nothing the first did not, and a caller that \
-             can repeat it chooses how much of the user's transcript it writes"
+            "two refused commits from one connection against one session \
+             announced more than once: the second notice says nothing the first \
+             did not, and a caller that can repeat it chooses how much of the \
+             user's transcript it writes"
         );
 
         // A *different* connection has its own budget, which is the stated limit
-        // of this bound (see `ConnState::setup_rejection_spent`): what is capped
-        // is one connection's loop, not a peer that reconnects.
+        // of this bound (see `ConnState::setup_rejections_announced`): what is
+        // capped is one connection's loop, not a peer that reconnects.
         let second = unattached(&daemon);
         dispatch(
             &daemon,
@@ -7114,6 +7184,122 @@ mod tests {
              is still announced — the alternative would silence the notice for \
              every client after the first offender"
         );
+    }
+
+    /// **The budget's key carries the session, because the audience does**
+    /// (BUG-166 consequence 2).
+    ///
+    /// Under the original per-connection bool, a connection refused on session
+    /// A and then on session B announced only into A — and B's user, a
+    /// different person watching a different transcript, was never told that
+    /// something tried to change *their* session's capability. Reverting the
+    /// key to the connection alone fails this test's second drain.
+    #[test]
+    fn a_refusal_against_a_second_session_announces_into_that_session_too() {
+        let daemon = Daemon::new();
+        let owner = unattached(&daemon);
+        let first = a_session_owned_by(&daemon, &owner);
+        let second = a_session_owned_by(&daemon, &owner);
+        let intruder = unattached(&daemon);
+        let mut sub = daemon.events.subscribe(16);
+
+        dispatch(
+            &daemon,
+            &intruder,
+            Id::Number(2),
+            WebSetupCommitParams::METHOD,
+            setup_params(&first),
+        )
+        .unwrap();
+        let announced = drain_rejections(&mut sub);
+        assert_eq!(announced.len(), 1);
+        assert_eq!(announced[0].session_id.as_ref(), Some(&first));
+
+        dispatch(
+            &daemon,
+            &intruder,
+            Id::Number(3),
+            WebSetupCommitParams::METHOD,
+            setup_params(&second),
+        )
+        .unwrap();
+        let announced = drain_rejections(&mut sub);
+        assert_eq!(
+            announced.len(),
+            1,
+            "the same connection aimed at a *different* session, and that \
+             session's user is owed their own notice — a budget keyed on the \
+             connection alone spends B's warning on A's transcript"
+        );
+        assert_eq!(
+            announced[0].session_id.as_ref(),
+            Some(&second),
+            "and it must be scoped to the session that was aimed at"
+        );
+    }
+
+    /// **A session id that names nothing buys no notice and burns no budget**
+    /// (BUG-166 consequences 1 and 3's motive — the burn attack).
+    ///
+    /// Under the unconditional spend, one refused commit against a
+    /// plausible-length id that named nothing published into the void, spent
+    /// the connection's whole announcement budget on an audience of zero, and
+    /// silenced every later notice the connection owed real sessions — an
+    /// attacker's first call, needing no real session id at all, muted BR-4's
+    /// announcement leg for the connection's life. Both halves are asserted:
+    /// the junk-id refusal publishes **nothing** (a monitor-scope subscriber
+    /// receives every session's events, so a phantom envelope wearing an
+    /// attacker-chosen id is itself injected noise), and the same connection's
+    /// next refusal against a real session still lands in that session.
+    #[test]
+    fn a_nonexistent_session_buys_no_notice_and_burns_no_budget() {
+        let daemon = Daemon::new();
+        let owner = unattached(&daemon);
+        let session = a_session_owned_by(&daemon, &owner);
+        let intruder = unattached(&daemon);
+        let mut sub = daemon.events.subscribe(16);
+
+        // Mintable length — `sess-` plus a 26-char body — so this passes the
+        // F9 length gate and reaches the announcement seam it is aimed at.
+        let phantom = SessionId::from("sess-aaaaaaaaaaaaaaaaaaaaaaaaaa");
+        let refused = dispatch(
+            &daemon,
+            &intruder,
+            Id::Number(2),
+            WebSetupCommitParams::METHOD,
+            setup_params(&phantom),
+        )
+        .unwrap();
+        assert!(
+            refused.contains(&error_code::NOT_ATTACHED.to_string()),
+            "the refusal must stay byte-identical for a session that never \
+             existed — the existence check gates the notice, never the answer \
+             (ADR-B): {refused}"
+        );
+        assert!(
+            drain_rejections(&mut sub).is_empty(),
+            "a notice for a session nobody minted informs nobody entitled and \
+             hands every monitor an envelope wearing an attacker-chosen id"
+        );
+
+        let refused = dispatch(
+            &daemon,
+            &intruder,
+            Id::Number(3),
+            WebSetupCommitParams::METHOD,
+            setup_params(&session),
+        )
+        .unwrap();
+        assert!(refused.contains(&error_code::NOT_ATTACHED.to_string()));
+        let announced = drain_rejections(&mut sub);
+        assert_eq!(
+            announced.len(),
+            1,
+            "the junk-id refusal above must not have spent this connection's \
+             budget — that spend is the BUG-166 burn attack, and it silences \
+             the one notice a real session's user is owed"
+        );
+        assert_eq!(announced[0].session_id.as_ref(), Some(&session));
     }
 
     /// **A `session_id` longer than this daemon could have minted is refused
@@ -7179,6 +7365,89 @@ mod tests {
         assert!(
             gated.contains(&error_code::NOT_ATTACHED.to_string()),
             "a plausible id must reach the session gate: {gated}"
+        );
+    }
+
+    /// **F9's length rule at the driving seams the setup family's fix left
+    /// out** (BUG-166 residual (c)): `web/override`, `session/permissions`,
+    /// `session/clear`.
+    ///
+    /// Each hashes an attacker-chosen id through `may_drive` with nothing in
+    /// front of it, so an unattached peer sized the work its refusal cost. The
+    /// three are asserted in one loop because the claim is identical, but each
+    /// iteration exercises its own handler's line — deleting any one of the
+    /// three checks fails its iteration (LESSON-502).
+    ///
+    /// The non-vacuity control mirrors the setup family's: a *mintable* id
+    /// draws `NOT_ATTACHED` from the same call, so the refusals above are the
+    /// length rule and not the methods being unroutable.
+    #[test]
+    fn an_unmintable_session_id_is_refused_by_every_driving_method_before_the_gate() {
+        let daemon = Daemon::new();
+        let intruder = unattached(&daemon);
+        let oversized = SessionId::from(format!("sess-{}", "a".repeat(4096)).as_str());
+
+        for method in [
+            WebOverrideParams::METHOD,
+            SessionPermissionsParams::METHOD,
+            SessionClearParams::METHOD,
+        ] {
+            let refused = dispatch(
+                &daemon,
+                &intruder,
+                Id::Number(1),
+                method,
+                serde_json::json!({"session_id": oversized.to_string()}),
+            )
+            .unwrap();
+            assert!(
+                refused.contains(&error_code::INVALID_PARAMS.to_string()),
+                "`{method}` accepted an id no daemon could have minted: {refused}"
+            );
+
+            let gated = dispatch(
+                &daemon,
+                &intruder,
+                Id::Number(2),
+                method,
+                serde_json::json!({"session_id": "sess-plausible"}),
+            )
+            .unwrap();
+            assert!(
+                gated.contains(&error_code::NOT_ATTACHED.to_string()),
+                "`{method}`: a plausible id must reach the session gate: {gated}"
+            );
+        }
+    }
+
+    /// The same rule at the **prompt** spawn, asserted apart from its dispatch
+    /// siblings because `session/prompt` bypasses `dispatch` entirely — its
+    /// gate lives in `spawn_prompt_turn`, which is a separate line a future
+    /// edit drops separately (LESSON-502; BUG-166 residual (c)).
+    #[tokio::test]
+    async fn an_unmintable_session_id_is_refused_by_the_prompt_spawn() {
+        let daemon = Arc::new(Daemon::new());
+        let conn = unattached(&daemon);
+        let oversized = format!("sess-{}", "a".repeat(4096));
+        let prompt = serde_json::json!({
+            "session_id": oversized,
+            "prompt": [{"type": "text", "text": "hello"}],
+        });
+        let (tx, mut rx) = mpsc::channel::<String>(4);
+
+        let handle = spawn_prompt_turn(&daemon, &conn, Id::Number(1), prompt, &tx, None);
+        assert!(
+            handle.is_none(),
+            "an unmintable id must not spawn a turn task"
+        );
+        let refused = rx.try_recv().expect("a refusal is queued for the client");
+        assert!(
+            refused.contains(&error_code::INVALID_PARAMS.to_string()),
+            "the length rule answers before the attachment gate: {refused}"
+        );
+        assert!(
+            !refused.contains(&error_code::NOT_ATTACHED.to_string()),
+            "{refused}"
         );
     }
 

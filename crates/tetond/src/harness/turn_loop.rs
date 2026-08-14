@@ -2095,42 +2095,46 @@ mod tests {
     /// no seam that can catch it afterwards: by the time the user has typed it,
     /// the damage is the typing.
     ///
-    /// Pinned by content and on both profiles, exactly like BUG-154's and
-    /// BUG-160's clauses: a strong model that asks for a key in chat is no
-    /// better than the local tier doing it. The needle is the *prohibition*, not
-    /// the command names — the guide already names `teton provider add` and
-    /// `/web setup` several lines up, so asserting on those would stay green with
-    /// this sentence deleted.
+    /// Pinned by **whole-line equality** on both profiles (BUG-166 residual
+    /// (d)), exactly where BUG-154's and BUG-160's clauses are pinned by
+    /// content: a strong model that asks for a key in chat is no better than
+    /// the local tier doing it.
+    ///
+    /// Equality replaced the original substring needles because they were
+    /// weaker than they read: the `"keychain"` needle was satisfied by the
+    /// `[web]` reference line naming `keychain://` — vacuously green with the
+    /// prohibition sentence deleted — and every needle was a substring, so a
+    /// weakening composed *around* one (`... unless they offer it`) passed
+    /// untouched. Equality on the whole line fails on deletion and on any
+    /// in-line edit alike. What it cannot catch is a contradicting sentence
+    /// added elsewhere in the guide; no content pin can, and pretending
+    /// otherwise is how the last set went vacuous.
     #[test]
     fn the_system_prompt_forbids_asking_for_a_credential_in_the_conversation() {
+        const PROHIBITION: &str =
+            "Never ask the user to type an API key or credential into the conversation: point \
+             them at `teton provider add` or `/web setup`, which read it echo-off into the \
+             keychain.";
         for config in [HarnessConfig::default(), HarnessConfig::for_strong_model()] {
             let system = build_system_prompt(&ToolRegistry::with_builtins(), &config);
-            for (needle, missing) in [
-                (
-                    "Never ask the user to type an API key",
-                    "the guide no longer forbids soliciting a credential in chat — \
-                     which is the move a model makes the moment it learns a search \
-                     backend needs a key, and it puts the secret in the transcript",
-                ),
-                (
-                    "echo-off",
-                    "the guide no longer says what the alternative path does with \
-                     the key, so 'ask somewhere else' reads as a formality rather \
-                     than as the reason",
-                ),
-                (
-                    "keychain",
-                    "the guide no longer names where the credential actually ends \
-                     up, which is the fact that makes the redirection worth making",
-                ),
-            ] {
-                assert!(
-                    system.contains(needle),
-                    "{missing}. If the wording was changed deliberately, update \
-                     this expectation to the new wording; do not just delete the \
-                     assertion.\n{system}"
+            let Some(line) = system
+                .lines()
+                .find(|line| line.trim_start().starts_with("Never ask"))
+            else {
+                panic!(
+                    "the guide no longer forbids soliciting a credential in chat — which is \
+                     the move a model makes the moment it learns a search backend needs a \
+                     key, and it puts the secret in the transcript.\n{system}"
                 );
-            }
+            };
+            assert_eq!(
+                line.trim(),
+                PROHIBITION,
+                "the prohibition sentence was edited. If the wording was changed \
+                 deliberately, update this expectation to the new wording — an in-line \
+                 weakening (`unless ...`) is exactly what whole-line equality exists to \
+                 catch; do not just delete the assertion."
+            );
         }
     }
 

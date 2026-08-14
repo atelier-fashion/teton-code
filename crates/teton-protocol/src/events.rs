@@ -1577,6 +1577,18 @@ pub struct WebSetupCompleted {
     /// just agreed to. A path the user already owns and typed their way to —
     /// not a secret, and never the key that may now sit beside it (BR-6: the
     /// value is in the keychain and the config holds a reference).
+    ///
+    /// **Kept on the wire deliberately, monitor-scope receivers included**
+    /// (BUG-166 residual (b) — a decision, not an oversight). Every
+    /// connection on this daemon's socket is same-UID, a monitor additionally
+    /// holds a consent-granted scope, and the path itself is derivable by any
+    /// such peer (`teton status` serves it; the state-dir convention names
+    /// it). Blanking it here would protect nothing from the only parties who
+    /// can receive it, while breaking the field's one promise for any client
+    /// that renders it. The real exposure — an absolute home path, and
+    /// therefore a username, on *somebody else's screen* — is a rendering
+    /// concern and is handled at the renderer: the CLI deliberately does not
+    /// print it (`format_web_setup_completed`).
     pub config_path: String,
 }
 
