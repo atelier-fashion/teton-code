@@ -6720,7 +6720,12 @@ fn web_table_summary(web: &WebConfig) -> WebTableSummary {
 /// use; it is a heuristic and says so in its sentence, because the alternative
 /// — saying nothing — is how a key ends up in a config file, a shell history and
 /// every `web_lookup` destination string that endpoint ever produces.
-const CREDENTIAL_QUERY_KEYS: [&str; 4] = ["api_key", "apikey", "key", "token"];
+///
+/// `pub(crate)` for one reader beyond this module: the catalog's BR-6 sweep
+/// (`web_setup_catalog`'s tests) refuses to ship a suggestion whose own query
+/// names a credential. Shared rather than mirrored — a second copy of this list
+/// would be a warning and a gate disagreeing about what a credential is named.
+pub(crate) const CREDENTIAL_QUERY_KEYS: [&str; 4] = ["api_key", "apikey", "key", "token"];
 
 /// Whether `endpoint`'s query string carries a parameter whose **name** says it
 /// holds a credential (REQ-572 verify).

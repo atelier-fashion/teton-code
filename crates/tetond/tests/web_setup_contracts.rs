@@ -16,14 +16,22 @@
 //! was handed over RPC, so this suite reads no client source text — it
 //! enumerates the typed catalog directly, and a fourth entry added there turns
 //! [`every_suggestion_has_a_contract_and_every_contract_a_suggestion`] red until
-//! the backend is driven here. The one file still read as bytes is the daemon's
-//! own bundled guide, because prose cannot be enumerated; it is checked
-//! **against** the catalog, in both directions ([`the_bundled_guide_and_the_catalog_agree`]).
+//! the backend is driven here.
+//!
+//! Two files are still read as bytes, both of them prose, because prose cannot
+//! be enumerated: the daemon's own bundled guide
+//! ([`the_bundled_guide_and_the_catalog_agree`]) and the README's backend rows
+//! ([`the_readme_backend_rows_and_the_catalog_agree`]). Neither is a source of
+//! truth — each is checked **against** the catalog, in both directions, and each
+//! failure names which side to edit.
 //!
 //! Before REQ-573 this suite parsed `ENDPOINT_HELP` out of the CLI crate's
 //! source with `include_str!`. That is gone with the constant it parsed: a
 //! cross-crate source parse is a gate that fails open the day someone renames
-//! the thing it looks for (architecture ADR-A).
+//! the thing it looks for (architecture ADR-A). The README parse is the same
+//! technique and does not inherit that failure mode, because it is anchored and
+//! **fails closed**: a missing anchor panics with the instruction to re-anchor,
+//! rather than finding no rows and passing.
 //!
 //! ## Expectations are written down, not derived (LESSON-512)
 //!
@@ -40,10 +48,12 @@
 //! |----|------|
 //! | REQ-573 AC-3 (typed enumeration, both ways) | [`every_suggestion_has_a_contract_and_every_contract_a_suggestion`] |
 //! | REQ-573 AC-4 (guide ↔ catalog, bidirectional) | [`the_bundled_guide_and_the_catalog_agree`] |
+//! | REQ-573 AC-5 / BR-5 (README rows ↔ catalog, bidirectional) | [`the_readme_backend_rows_and_the_catalog_agree`] |
 //! | AC-8 (request shape, per backend) | [`every_suggested_backend_drives_the_production_search_request`] |
 //! | AC-8 (auth header shape, per backend) | [`every_suggested_backend_gets_the_header_it_documents`] |
 //! | BR-9 (a suggestion is a config a user could write) | [`every_suggested_backend_is_a_config_this_daemon_would_load`] |
-//! | REQ-573 AC-5 (the keyless one takes no credential) | [`the_keyless_suggestion_needs_no_credential_anywhere`] |
+//! | REQ-573 BR-4, the keyless entry's leg (REQ-572 AC-8) | [`the_keyless_suggestion_needs_no_credential_anywhere`] |
+//! | BUG-165 continuity (the unnamed backend's default) | [`the_unnamed_backend_default_is_a_whole_contract`] |
 //!
 //! ## What "the production builder" means here, exactly
 //!
@@ -84,9 +94,16 @@ use tetond::web_setup_catalog::suggestion_catalog;
 // ---------------------------------------------------------------------------
 
 /// The daemon's bundled setup guide — the same bytes `build_system_prompt`
-/// embeds (BR-2), not a copy. The only `include_str!` in the suite, and it
-/// reads a file inside this crate.
+/// embeds (BR-2), not a copy.
 const BUNDLED_GUIDE: &str = include_str!("../src/harness/self_config.md");
+
+/// The shipped README, whose backend rows BR-5 puts under CI.
+///
+/// Reached across the crate boundary deliberately, the way `boundary_coverage.rs`
+/// reaches `../../teton-core/src/boundary.rs`: the rows are prose about the
+/// daemon's catalog, and the pairing is only checkable from a place that can see
+/// both.
+const README: &str = include_str!("../../../README.md");
 
 // ---------------------------------------------------------------------------
 // The contracts
@@ -216,6 +233,22 @@ fn config_for(backend: &WebBackendSuggestion, contract: &Contract) -> WebConfig 
         search_key_ref: matches!(contract.credential, Credential::Header { .. })
             .then(|| "keychain://teton/web-search".to_owned()),
         search_auth: backend.auth_template.clone(),
+        ..WebConfig::default()
+    }
+}
+
+/// The `[web]` table for a backend the catalog does not name.
+///
+/// A real endpoint, a key reference, and **no** `search_auth` at all — which is
+/// the shape every pre-BUG-165 config has, and the reason the default template
+/// exists. Written once because two tests drive it: the header shape it
+/// inherits, and the whole contract around it.
+fn unnamed_backend_config() -> WebConfig {
+    WebConfig {
+        tier: WebTier::Search,
+        search_endpoint: Some(UNNAMED_BACKEND_ENDPOINT.to_owned()),
+        search_key_ref: Some("keychain://teton/web-search".to_owned()),
+        search_auth: None,
         ..WebConfig::default()
     }
 }
@@ -463,6 +496,151 @@ fn the_bundled_guide_and_the_catalog_agree() {
 }
 
 // ---------------------------------------------------------------------------
+// README rows ↔ catalog (REQ-573 AC-5 / BR-5)
+// ---------------------------------------------------------------------------
+
+/// The line that introduces the README's backend table.
+///
+/// The region parse is anchored on it and **panics** when it is gone rather than
+/// quietly finding no rows: a parse that fails open is the `ENDPOINT_HELP`
+/// mistake wearing a different filename.
+const README_TABLE_ANCHOR: &str = "Backends whose shapes are known to work:";
+
+/// The README's backend table — the markdown table that follows the anchor, and
+/// nothing else in the file.
+///
+/// Scoped deliberately. The README quotes a suggested endpoint again in the
+/// hand-edit TOML block and names an unrelated provider's endpoint in the remote
+/// section; unscoped, either would answer for a row that is not there.
+fn readme_backend_rows() -> Vec<&'static str> {
+    let (_, after) = README.split_once(README_TABLE_ANCHOR).unwrap_or_else(|| {
+        panic!(
+            "the README no longer introduces its backend table with \
+             `{README_TABLE_ANCHOR}`, so this check has nothing to read. Restore the line, \
+             or re-anchor this test on whatever replaced it — do not leave the table \
+             unchecked."
+        )
+    });
+    let rows: Vec<&str> = after
+        .lines()
+        .skip_while(|line| line.trim().is_empty())
+        .take_while(|line| line.trim_start().starts_with('|'))
+        .collect();
+    // Non-vacuity: a header, a separator, and one row per suggested backend.
+    assert!(
+        rows.len() >= 2 + suggestion_catalog().backends.len(),
+        "the README's backend table parsed as {} lines, which is fewer than a header, a \
+         separator and one row per suggestion. Either the table moved out from under \
+         `{README_TABLE_ANCHOR}` or rows were dropped.\nparsed: {rows:?}",
+        rows.len()
+    );
+    rows
+}
+
+/// Every `http(s)` URL in `text`, ended at the first character markdown or prose
+/// would put after one.
+///
+/// Forgiving on purpose: the rows are a hand-written table and their URLs are
+/// backtick-quoted inside `|` cells, so the terminator set is what surrounds a
+/// URL rather than what a URL may legally contain.
+fn http_urls(text: &str) -> Vec<&str> {
+    const AFTER_A_URL: [char; 10] = ['`', '|', '"', '\'', '(', ')', '<', '>', ',', ';'];
+
+    let mut found = Vec::new();
+    let mut rest = text;
+    while let Some(at) = rest.find("http") {
+        let candidate = &rest[at..];
+        if candidate.starts_with("http://") || candidate.starts_with("https://") {
+            let end = candidate
+                .find(|c: char| c.is_whitespace() || AFTER_A_URL.contains(&c))
+                .unwrap_or(candidate.len());
+            found.push(&candidate[..end]);
+            rest = &candidate[end..];
+        } else {
+            rest = &candidate["http".len()..];
+        }
+    }
+    found
+}
+
+/// **The README's backend rows and the daemon catalog say the same thing, in
+/// both directions** (REQ-573 AC-5, discharging BR-5's README half).
+///
+/// BR-5 says derived surfaces cannot drift and names the README rows among them.
+/// They are the surface a user reads *before* running anything, so a stale row
+/// is BUG-165 in its original form: prose offering a header the product does not
+/// send. The table stays hand-written — it is prose, with a "keyless" cell no
+/// catalog field spells — and is mechanically checked instead, which is the
+/// other option BR-5 allows.
+#[test]
+fn the_readme_backend_rows_and_the_catalog_agree() {
+    let catalog = suggestion_catalog();
+    let table = readme_backend_rows().join("\n");
+
+    // Catalog → README: a backend the daemon offers whose endpoint or header the
+    // table does not show is a row nobody wrote.
+    for backend in &catalog.backends {
+        assert!(
+            table.contains(backend.endpoint.as_str()),
+            "the daemon catalog offers `{endpoint}` for `{id}` and the README's backend \
+             table does not show it. Edit the README table — the catalog \
+             (crates/tetond/src/web_setup_catalog.rs) is the source, and it moves \
+             first.\ntable:\n{table}",
+            endpoint = backend.endpoint,
+            id = backend.id
+        );
+        if let Some(template) = &backend.auth_template {
+            assert!(
+                table.contains(template.as_str()),
+                "the daemon catalog offers `{template}` for `{id}` and the README's \
+                 backend table shows a different header shape or none. Edit the README \
+                 table; a row that names the wrong header is exactly what BUG-165 \
+                 was.\ntable:\n{table}",
+                id = backend.id
+            );
+        }
+    }
+
+    // The default shape is not a row — it is what a backend the catalog does not
+    // name inherits — so it is checked against the whole file, where the
+    // walkthrough and the hand-edit block both name it.
+    assert!(
+        README.contains(catalog.default_auth_template.as_str()),
+        "the catalog's default template `{}` appears nowhere in the README, so the shape \
+         offered for every unnamed backend is one the README never shows. Update the \
+         README's walkthrough, or the catalog's `default_auth_template` if the default \
+         changed.",
+        catalog.default_auth_template
+    );
+
+    // README → catalog: a URL in the table that no suggestion offers is a
+    // backend this daemon never drives, recommended in print.
+    let offered: BTreeSet<&str> = catalog
+        .backends
+        .iter()
+        .map(|b| b.endpoint.as_str())
+        .collect();
+    let in_table = http_urls(&table);
+    assert!(
+        in_table.len() >= catalog.backends.len(),
+        "the URL parse found {} URLs in a table of {} suggestions, so it is reading less \
+         than the table holds: {in_table:?}",
+        in_table.len(),
+        catalog.backends.len()
+    );
+    for url in in_table {
+        assert!(
+            offered.contains(url),
+            "the README's backend table shows `{url}` and the daemon catalog offers no \
+             backend with that endpoint. Edit the README row if the suggestion was \
+             dropped or renamed, or the catalog \
+             (crates/tetond/src/web_setup_catalog.rs) if the backend is real and \
+             unlisted.\noffered: {offered:?}"
+        );
+    }
+}
+
+// ---------------------------------------------------------------------------
 // The contracts themselves
 // ---------------------------------------------------------------------------
 
@@ -476,68 +654,75 @@ fn the_bundled_guide_and_the_catalog_agree() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn every_suggested_backend_drives_the_production_search_request() {
     for (backend, _) in contracts_paired_with_the_catalog() {
-        let id = &backend.id;
-        let sent = search_request_for(&backend.endpoint).await;
-        assert_eq!(
-            sent.len(),
-            1,
-            "{id}: the suggested endpoint must produce exactly one request"
-        );
-        let request = &sent[0];
-        assert_eq!(
-            request.method,
-            HttpMethod::Get,
-            "{id}: the search contract is a GET"
-        );
+        assert_search_request_shape(&backend.id, &backend.endpoint).await;
+    }
+}
+
+/// The request-shape assertions for one endpoint, driven through the production
+/// choke point.
+///
+/// A function rather than a loop body because two callers need it: the
+/// enumeration above, and the unnamed backend below — which is not a catalog
+/// entry, is therefore not enumerated, and is exactly the case that quietly lost
+/// this coverage once already.
+async fn assert_search_request_shape(id: &str, endpoint: &str) {
+    let sent = search_request_for(endpoint).await;
+    assert_eq!(
+        sent.len(),
+        1,
+        "{id}: the suggested endpoint must produce exactly one request"
+    );
+    let request = &sent[0];
+    assert_eq!(
+        request.method,
+        HttpMethod::Get,
+        "{id}: the search contract is a GET"
+    );
+    assert!(
+        request.body.is_empty(),
+        "{id}: and carries no body: {:?}",
+        request.body
+    );
+    assert!(
+        request.url.contains("q=rust"),
+        "{id}: the terms must ride as `q`: {}",
+        request.url
+    );
+    // The endpoint's own path and parameters survive verbatim — the property
+    // SearxNG's `?format=json` depends on, asserted for every backend so a
+    // builder that special-cased one of them is visible.
+    let (base, params) = endpoint.split_once('?').map_or((endpoint, ""), |p| p);
+    assert!(
+        request.url.starts_with(base),
+        "{id}: the suggested endpoint's path must survive: {}",
+        request.url
+    );
+    for param in params.split('&').filter(|p| !p.is_empty()) {
         assert!(
-            request.body.is_empty(),
-            "{id}: and carries no body: {:?}",
-            request.body
-        );
-        assert!(
-            request.url.contains("q=rust"),
-            "{id}: the terms must ride as `q`: {}",
+            request.url.contains(param),
+            "{id}: the endpoint's own `{param}` must survive: {}",
             request.url
-        );
-        // The endpoint's own path and parameters survive verbatim — the
-        // property SearxNG's `?format=json` depends on, asserted for every
-        // backend so a builder that special-cased one of them is visible.
-        let (base, params) = backend
-            .endpoint
-            .split_once('?')
-            .map_or((backend.endpoint.as_str(), ""), |p| p);
-        assert!(
-            request.url.starts_with(base),
-            "{id}: the suggested endpoint's path must survive: {}",
-            request.url
-        );
-        for param in params.split('&').filter(|p| !p.is_empty()) {
-            assert!(
-                request.url.contains(param),
-                "{id}: the endpoint's own `{param}` must survive: {}",
-                request.url
-            );
-        }
-        assert!(
-            request
-                .headers
-                .iter()
-                .any(|(name, value)| name == "accept" && value == "application/json"),
-            "{id}: a search asks for JSON: {:?}",
-            request.headers
-        );
-        // The credential is not composed here, for any backend: it is attached
-        // by the endpoint-bound transport, which is what keeps it off a page
-        // fetch (REQ-563 BR-7). The next test is where the shape is asserted.
-        assert!(
-            !request
-                .headers
-                .iter()
-                .any(|(_, value)| value.contains(SECRET)),
-            "{id}: the request builder must compose no credential: {:?}",
-            request.headers
         );
     }
+    assert!(
+        request
+            .headers
+            .iter()
+            .any(|(name, value)| name == "accept" && value == "application/json"),
+        "{id}: a search asks for JSON: {:?}",
+        request.headers
+    );
+    // The credential is not composed here, for any backend: it is attached by
+    // the endpoint-bound transport, which is what keeps it off a page fetch
+    // (REQ-563 BR-7). The header-shape test is where the shape is asserted.
+    assert!(
+        !request
+            .headers
+            .iter()
+            .any(|(_, value)| value.contains(SECRET)),
+        "{id}: the request builder must compose no credential: {:?}",
+        request.headers
+    );
 }
 
 /// **Every suggested backend gets the credential header its documentation
@@ -571,14 +756,9 @@ fn every_suggested_backend_gets_the_header_it_documents() {
 
     // The backend the catalog does not name rides its `default_auth_template`,
     // reached by a config with no `search_auth` key at all — BUG-165's
-    // continuity promise, that every pre-template config keeps working.
-    let default = WebConfig {
-        tier: WebTier::Search,
-        search_endpoint: Some(UNNAMED_BACKEND_ENDPOINT.to_owned()),
-        search_key_ref: Some("keychain://teton/web-search".to_owned()),
-        search_auth: None,
-        ..WebConfig::default()
-    };
+    // continuity promise, that every pre-template config keeps working. Its
+    // other two legs are [`the_unnamed_backend_default_is_a_whole_contract`].
+    let default = unnamed_backend_config();
     DEFAULT_CREDENTIAL.assert_shape_matches("default", &default);
     // The catalog offers clients that same shape as a literal, so the two
     // spellings of "what an unnamed backend gets" must agree.
@@ -634,7 +814,44 @@ fn every_suggested_backend_is_a_config_this_daemon_would_load() {
     }
 }
 
-/// **The keyless suggestion takes no credential anywhere** (REQ-573 AC-5).
+/// **The backend the catalog does not name gets the whole contract, not just a
+/// header shape** (BUG-165's continuity promise).
+///
+/// The default is not a catalog entry, so it has no [`CONTRACTS`] row and does
+/// not ride the enumeration — which is how it kept only its header leg when this
+/// suite was re-pointed at the catalog, while the config it loads and the
+/// request it drives went unasserted. Both are back: the same
+/// `Config::validate` gate and rendered-document sweep every suggestion gets,
+/// and the same production request builder.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_unnamed_backend_default_is_a_whole_contract() {
+    let config = Config {
+        web: unnamed_backend_config(),
+        ..Config::default()
+    };
+    assert!(
+        config.validate().is_ok(),
+        "a config with no `search_auth` must still load — refusing it would break every \
+         install written before the template existed: {:?}",
+        config.validate().err()
+    );
+    let document = config.to_toml().expect("the default config renders");
+    assert!(
+        !document.contains(SECRET),
+        "the unnamed backend's rendered config must carry a reference, never a \
+         key:\n{document}"
+    );
+    assert!(
+        document.contains("keychain://teton/web-search"),
+        "the unnamed backend's rendered config must carry the keychain reference the user \
+         configured:\n{document}"
+    );
+
+    assert_search_request_shape("default", UNNAMED_BACKEND_ENDPOINT).await;
+}
+
+/// **The keyless suggestion takes no credential anywhere** (REQ-573 BR-4's
+/// keyless leg, inherited from REQ-572 AC-8).
 ///
 /// Asserted separately because every other backend's contract is about *which*
 /// header the key rides, and this one's is that no key is resolved, no reference
