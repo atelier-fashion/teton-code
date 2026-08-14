@@ -38,6 +38,12 @@
 //!   categories, with a bypass that issues no call at all when the local tier
 //!   cannot serve (BR-5). It lives beside the router rather than inside it
 //!   because no routing function may see prompt text.
+//! - [`provider_recipes`] — the vendor `provider add` recipes Teton's own
+//!   guidance hands a user (REQ-577 ADR-1), as one pure factory over static
+//!   product data verified against the vendors' current docs. Same posture as
+//!   [`web_setup_catalog`] and for the same reason: the guide, the README and
+//!   the bundled docs topic are gated against this list rather than each keeping
+//!   a copy that goes stale unnoticed.
 //! - [`router`] — category routing (REQ-558 BR-1), BR-6 degradation, remote
 //!   wiring through egress (BR-1/BR-2), and provider fallback on failure (AC-7).
 //! - [`runtime`] — the assembled engine/router/egress/cost/MCP state the JSON-RPC
@@ -85,6 +91,7 @@ pub mod lifetime;
 pub mod mcp;
 pub mod model_consent;
 pub mod peer;
+pub mod provider_recipes;
 pub mod router;
 pub mod runtime;
 pub mod selection_store;
