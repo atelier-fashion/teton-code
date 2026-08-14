@@ -526,3 +526,232 @@ fn the_status_row_renders_below_the_frame_and_survives_a_redraw() {
         "the frame was never redrawn, so this leg proves nothing; transcript:\n{after}"
     );
 }
+
+// ---------------------------------------------------------------------------
+// REQ-572 AC-5 — secret hygiene, at a real terminal (TASK-133)
+// ---------------------------------------------------------------------------
+//
+// AC → test map for this section:
+//
+//   AC-5 (input echo is off at the key step) + AC-5 (the planted key appears in
+//   no transcript, no config file, no daemon log)
+//       → `the_key_step_does_not_echo_and_the_key_reaches_nothing`
+//
+// AC-5's remaining surfaces, and where each is asserted:
+//
+//   * **no event payload, no RPC frame** — the daemon is never sent the value:
+//     only `search_key_ref` crosses the wire. Pinned at the client's own seam by
+//     `web_setup_ui`'s `a_full_walk_stores_the_key_and_sends_only_its_reference`
+//     (the planted key swept out of the serialized preview *and* commit frames
+//     and out of every rendered line), and by this file's daemon-log sweep.
+//   * **"egress-capture shows zero packets attributable to the flow itself"** —
+//     `tetond`'s `web_setup_flow.rs`, where a live HTTP server watches the whole
+//     plan → preview → commit and receives nothing.
+//
+// The walk here stops at the confirm rather than completing, and the reason is
+// not convenience: see the test's own doc comment. The shipped CLI writes to the
+// real OS keychain, and a completed walk would put a credential in — and then
+// possibly take one out of — whoever's login keychain ran the suite.
+
+/// The key this test types. Distinctive enough that finding it anywhere is
+/// unambiguous, and it is a plausible credential rather than a marker word so
+/// nothing downstream can be excused for treating it as test noise.
+const PLANTED_KEY: &str = "sk-web-PLANTED-DO-NOT-ECHO-4Kq2vZ";
+
+/// Typed at the prompt immediately before the key prompt, where the client
+/// renders it nowhere. It is the control for [`PLANTED_KEY`]'s absence: the
+/// same terminal, the same reader thread, one question apart.
+const ECHO_WITNESS: &str = "yes-echo-witness-7Qx";
+
+/// **AC-5: the key step does not echo, and the key appears nowhere afterwards.**
+///
+/// This is the one claim in REQ-572 that a pipe is structurally blind to.
+/// `cli_e2e.rs` can drive the whole walkthrough — it does — but a pipe has no
+/// `ECHO` bit to clear, so "input echo is off at the key step" is unobservable
+/// there, and the transcript it captures is the CLI's own output rather than
+/// what a terminal put on screen. Only a pty carries both.
+///
+/// ## The non-vacuity leg, and why it is the important half
+///
+/// A transcript that recorded no typed input at all would pass a "the key is
+/// absent" assertion while proving nothing. So the walk types the **endpoint**
+/// at an ordinary `ask` prompt first and asserts it *does* appear: the tty is
+/// echoing, the reader thread is capturing it, and the key's absence a few
+/// lines later is therefore the `EchoOff` guard doing its job and not a blind
+/// instrument.
+///
+/// ## Why the walk stops at the confirm
+///
+/// The shipped `teton` writes credentials to the **real OS keychain**
+/// (`keychain::default_keychain`); there is no test seam that redirects it, and
+/// adding one would mean shipping a debug build that can be talked into writing
+/// a plaintext secret somewhere else. A confirmed walk would therefore create —
+/// and, on a refused commit, delete — a `teton/web-search` entry in whoever's
+/// login keychain ran the suite, destroying a real credential if one was there.
+/// No test may do that.
+///
+/// The step this stops short of is `Keychain::store` → `web/setup_commit`, and
+/// it is pinned against a fake keychain in `web_setup_ui`'s own suite
+/// (`a_full_walk_stores_the_key_and_sends_only_its_reference`, which sweeps the
+/// planted key out of the serialized preview and commit frames and out of every
+/// rendered line). What this test owns is everything a fake keychain cannot
+/// reach: the terminal's echo bit, and the bytes a screen actually showed.
+#[test]
+fn the_key_step_does_not_echo_and_the_key_reaches_nothing() {
+    let daemon_path = daemon_bin();
+    // Every tier bound to the scripted local tier, so the session is servable
+    // and — the part this test needs — the daemon reports a local model, which
+    // is what makes the `search` tier (the only branch that asks for a key)
+    // offerable at all.
+    let tiers: String = ["reflex", "scan", "build", "think"]
+        .iter()
+        .map(|t| format!("[[tiers]]\ntier = \"{t}\"\nprovider_id = \"local\"\n\n"))
+        .collect();
+    let config = format!("[[providers]]\nid = \"local\"\nkind = \"local\"\n\n{tiers}");
+    let daemon = TestDaemon::spawn_with(&daemon_path, &config, &["a scripted reply."]);
+    let config_path = daemon.root.join("config.toml");
+
+    let pty = native_pty_system()
+        .openpty(PtySize {
+            rows: 40,
+            cols: 100,
+            pixel_width: 0,
+            pixel_height: 0,
+        })
+        .expect("openpty");
+
+    let mut cmd = CommandBuilder::new(teton_bin());
+    cmd.env("XDG_RUNTIME_DIR", &daemon.runtime_dir);
+    cmd.env("TETON_CONFIG", &config_path);
+    cmd.env("TETON_REPO_ROOT", &daemon.root);
+    let mut session = pty.slave.spawn_command(cmd).expect("spawn teton under pty");
+    drop(pty.slave);
+    let transcript = spawn_reader(pty.master.try_clone_reader().expect("pty reader"));
+    let mut writer = pty.master.take_writer().expect("pty writer");
+
+    assert!(
+        wait_for(&transcript, "ready (freeform)"),
+        "the session never reached the entry prompt; transcript:\n{}",
+        snapshot(&transcript)
+    );
+
+    // Read the baseline **here**, not at spawn: a starting daemon rewrites its
+    // own config once (the REQ-557 model migration normalises the document), so
+    // bytes read before the socket was up would compare a pre-migration file
+    // against a post-migration one and report a write this walk never made.
+    // Reaching the entry prompt is the state that says startup is over.
+    let before = std::fs::read(&config_path).expect("the fixture config exists");
+
+    // Every step is a state-derived sync point: type, then wait for the next
+    // question to appear. Never a sleep (LESSON-450).
+    let step = |writer: &mut Box<dyn Write + Send>, text: &str, until: &str| {
+        writer
+            .write_all(text.as_bytes())
+            .expect("type into the pty");
+        writer.flush().ok();
+        assert!(
+            wait_for(&transcript, until),
+            "the walk never reached {until:?}; transcript:\n{}",
+            snapshot(&transcript)
+        );
+    };
+
+    step(&mut writer, "/web setup\r", "tier [1-3");
+    // `3` is `search` — the only tier that asks for an endpoint and a key.
+    step(&mut writer, "3\r", "search endpoint");
+    const ENDPOINT: &str = "https://api.search.brave.com/res/v1/web/search";
+    step(
+        &mut writer,
+        &format!("{ENDPOINT}\r"),
+        "does this backend need an API key?",
+    );
+    // THE ECHO WITNESS. `is_yes_by_default` reads anything that is not `n`/`no`
+    // as yes, so this answer means "yes, it needs a key" — and nothing in the
+    // client ever renders it back. Its presence in the transcript can therefore
+    // only be the **terminal echoing what was typed**, which is the property the
+    // key assertion below depends on. (The endpoint would not do: the preview
+    // prints it, so its appearance proves rendering, not echo.)
+    step(
+        &mut writer,
+        &format!("{ECHO_WITNESS}\r"),
+        "auth header template",
+    );
+    // Empty: take the daemon's default template.
+    step(&mut writer, "\r", "API key (not shown");
+
+    // THE STEP THIS TEST IS ABOUT.
+    step(
+        &mut writer,
+        &format!("{PLANTED_KEY}\r"),
+        "write this to your config?",
+    );
+
+    // Decline: the walk stops one step before the keychain write (see the doc
+    // comment). Everything a screen could have shown has now been shown.
+    writer.write_all(b"n\r").expect("decline the confirm");
+    writer.flush().ok();
+    let declined = wait_for(&transcript, "no key was stored");
+
+    let final_transcript = snapshot(&transcript);
+    let _ = session.kill();
+    let _ = session.wait();
+
+    assert!(
+        declined,
+        "the confirm step never resolved; transcript:\n{final_transcript}"
+    );
+
+    // (1) NON-VACUITY. The witness was typed at the prompt immediately before
+    // the key prompt, is echoed by the tty and rendered by nothing, and it is
+    // here. So this transcript records typed input, the reader thread is
+    // capturing it, and the key's absence below is echo suppression rather than
+    // a blind instrument.
+    assert!(
+        final_transcript.contains(ECHO_WITNESS),
+        "the pty transcript records nothing the user typed at an ordinary \
+         prompt, so the sweep below would prove nothing; \
+         transcript:\n{final_transcript}"
+    );
+    // And the walk really did get as far as the endpoint (which the preview
+    // renders, so this is a progress check and not a second echo check).
+    assert!(
+        final_transcript.contains(ENDPOINT),
+        "the walk never previewed the endpoint; transcript:\n{final_transcript}"
+    );
+
+    // (2) AC-5: the key was typed into the same terminal and never appeared.
+    assert!(
+        !final_transcript.contains(PLANTED_KEY),
+        "AC-5 VIOLATION: the API key was echoed to the terminal. The key step \
+         must clear ECHO for the duration of the read; transcript:\n{final_transcript}"
+    );
+    // Not even a fragment: a partial echo is a leaked credential too.
+    assert!(
+        !final_transcript.contains("PLANTED-DO-NOT-ECHO"),
+        "AC-5 VIOLATION: part of the API key reached the terminal; \
+         transcript:\n{final_transcript}"
+    );
+
+    // (3) The preview the user *did* read carried the reference and not the
+    // value — which is what makes the confirm step honest (BR-6/BR-7).
+    assert!(
+        final_transcript.contains("keychain://teton/web-search"),
+        "the preview must show the keychain reference the commit would write; \
+         transcript:\n{final_transcript}"
+    );
+
+    // (4) Nothing was written, and the config the daemon holds is untouched.
+    assert_eq!(
+        std::fs::read(&config_path).ok().as_deref(),
+        Some(before.as_slice()),
+        "a declined confirm must leave the config byte-identical"
+    );
+
+    // (5) The daemon never saw the key at all — only a reference crossed the
+    // wire, so nothing it logs can contain the value.
+    let log = std::fs::read_to_string(daemon.root.join("tetond.log")).unwrap_or_default();
+    assert!(
+        !log.contains(PLANTED_KEY),
+        "AC-5 VIOLATION: the API key reached the daemon's log:\n{log}"
+    );
+}
