@@ -194,8 +194,10 @@ suggestions.
 
 **Decision**: AC-6 byte-parity is asserted (a) in the daemon catalog unit
 test (golden strings for the three entries) and (b) by the existing e2e
-tests (`a_piped_web_setup_prints_the_instructions_and_asks_nothing` asserts
-the SearxNG text end-to-end against the real daemon). **Note** (LESSON-510):
+tests (`the_walkthrough_collects_every_answer_and_the_daemon_announces_the_write`
+asserts the rendered SearxNG text end-to-end against the real daemon;
+`a_piped_web_setup_prints_the_instructions_and_asks_nothing` covers the
+piped/no-prompt path). **Note** (LESSON-510):
 e2e verification must build the workspace first — a targeted
 `-p teton --test cli_e2e` run against a stale `tetond` binary would test the
 old daemon's catalog.
