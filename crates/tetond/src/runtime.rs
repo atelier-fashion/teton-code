@@ -4077,17 +4077,38 @@ impl DaemonRuntime {
     /// construction preview and commit share (AC-1).
     ///
     /// Current config **cloned and re-derived**, never patched in place
-    /// (BR-8/LESSON-501), and then put through the two gates in the order a
+    /// (BR-8/LESSON-501), and then put through the three gates in the order a
     /// user needs them:
     ///
-    /// 1. [`Config::validate`] — the *same* validator startup runs, so a
+    /// 1. **The floor**: `off` is not something this flow writes. It is the one
+    ///    answer that is not an enablement, and every layer downstream was built
+    ///    on that — see below.
+    /// 2. [`Config::validate`] — the *same* validator startup runs, so a
     ///    document this accepts is a document that daemon would boot on. Its
     ///    own sentence is carried verbatim rather than re-worded.
-    /// 2. [`web_capability_state`] — the machine's answer, not the document's.
+    /// 3. [`web_capability_state`] — the machine's answer, not the document's.
     ///    A perfectly valid `tier = "search"` on a machine with no local model
     ///    is refused here (AC-7), because REQ-563 BR-14 would block every query
     ///    it produced; writing it would be walking a user through configuring a
     ///    capability that refuses to serve.
+    ///
+    /// ## Why `off` is a refusal and not a tier like any other
+    ///
+    /// The CLI never offers it, but the candidate is built from **wire params**,
+    /// and a client sending `tier: "off"` got three wrong answers at once:
+    ///
+    ///   - a candidate whose `[web]` table holds every default is
+    ///     [`WebConfig::is_unset`], and `Config` skips serializing an unset
+    ///     table — so the preview rendered a `[web]` section that the write
+    ///     would then *omit*. That asymmetry is documented at
+    ///     [`web_table_toml`] as unreachable precisely because "the setup flow
+    ///     writes a tier, and a tier above `off` is not the default"; this is
+    ///     the line that makes the sentence true.
+    ///   - the commit's `WebSetupCompleted` carries the candidate's tier, and
+    ///     that payload's own doc says it is never `Off` — "a completed setup
+    ///     enabled something".
+    ///   - and it is simply not what the flow is for. Turning the capability off
+    ///     is removing the table, which the user does in their editor.
     ///
     /// Only the four fields the flow collects are set. `permission_allow`,
     /// `allowed_domains` and `cache_ttl_secs` ride along from the current table
@@ -4095,12 +4116,18 @@ impl DaemonRuntime {
     /// per-capability rule, LESSON-495).
     ///
     /// # Errors
-    /// [`error_code::WEB_SETUP_INVALID`] for either gate.
+    /// [`error_code::WEB_SETUP_INVALID`] for any of the three gates.
     fn web_setup_candidate(
         &self,
         answers: &WebSetupAnswers<'_>,
         current: &Config,
     ) -> Result<Config, RpcError> {
+        if answers.tier == WebTier::Off {
+            return Err(RpcError::new(
+                error_code::WEB_SETUP_INVALID,
+                "setup enables a capability; to turn web lookup off, remove the `[web]` table",
+            ));
+        }
         let mut candidate = current.clone();
         candidate.web.tier = answers.tier;
         candidate.web.search_endpoint = answers.search_endpoint.map(str::to_owned);
@@ -15843,6 +15870,60 @@ provider_id = "on-device"
                 "{:?}",
                 preview.warnings
             );
+        }
+
+        /// **`tier: "off"` is refused at both entry points** (the verify pass's
+        /// wire-hole fix).
+        ///
+        /// The CLI never offers it; the candidate is built from wire params, so
+        /// "the CLI never offers it" is not a gate. Sending it produced three
+        /// wrong answers at once, and the test asserts the refusal rather than
+        /// any of them: an `is_unset` `[web]` table renders in the preview and
+        /// is *dropped* by the write (the asymmetry `web_table_toml` documents
+        /// as unreachable), and the commit's `WebSetupCompleted` would carry a
+        /// tier its own payload doc says it never carries.
+        ///
+        /// Both seams, because they are two lines (LESSON-502), and the file is
+        /// asserted untouched: a refusal that had already written is not a
+        /// refusal.
+        #[test]
+        fn a_setup_answer_of_off_is_refused_at_both_seams() {
+            let (runtime, config_path) = runtime_on_disk("web-setup-off");
+            let events = Arc::new(EventBus::new());
+            let before = std::fs::read_to_string(&config_path).expect("read");
+            let params = preview_params(WireWebTier::Off, None, None, None);
+
+            for err in [
+                runtime
+                    .web_setup_preview(&params)
+                    .expect_err("a preview of `off` is a preview of nothing"),
+                runtime
+                    .web_setup_commit(&as_commit(&params), &events)
+                    .expect_err("and a commit of it is refused too"),
+            ] {
+                assert_eq!(err.code, error_code::WEB_SETUP_INVALID);
+                assert!(
+                    err.message.contains("remove the `[web]` table"),
+                    "the refusal must name what turning it off actually is: {}",
+                    err.message
+                );
+            }
+
+            assert_eq!(
+                std::fs::read_to_string(&config_path).expect("read"),
+                before,
+                "a refused answer reached the file"
+            );
+            assert!(
+                events.subscribe(4).try_recv().is_none(),
+                "and nothing was announced"
+            );
+
+            // Non-vacuity: the next tier up, with the same everything else, is
+            // accepted — so the refusal above is the floor and not the fixture.
+            runtime
+                .web_setup_preview(&preview_params(WireWebTier::FetchUserUrl, None, None, None))
+                .expect("the lowest enabling tier previews");
         }
 
         // -- BR-7: the preview→commit window ----------------------------------
