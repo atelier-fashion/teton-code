@@ -175,6 +175,16 @@
   rather than the full loop (BR-6).
 - **Graceful absence** — the local tier disables itself below the hardware
   floor or under memory pressure rather than degrading the machine (BR-8/BR-9).
+- **Suggestion data is daemon-owned, typed, and seam-pinned** — a list clients
+  display (search backends; the model catalog before it) is one daemon factory
+  returning protocol types, carried on an existing stateless RPC as an
+  additive field. Contract tests enumerate the typed source, never another
+  crate's source text; prose copies (bundled guide, README rows) are CI-gated
+  against it bidirectionally; and cross-binary parity is asserted on the bytes
+  that cross the seam in e2e, not by twin goldens that each verify their own
+  author. Corollary: a seam that gains a sanitizer takes over every legitimate
+  use of the alphabet it destroys — styling moves inside the seam, applied
+  after defusing (REQ-573, LESSON-517).
 
 ## ADRs
 
