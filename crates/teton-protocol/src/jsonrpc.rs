@@ -466,6 +466,29 @@ pub mod error_code {
         /// regression test rather than a property merely avoided by
         /// construction (LESSON-502).
         SELF_APPROVAL_REFUSED = -32019;
+        /// A candidate `[web]` configuration failed validation at
+        /// `web/setup_preview` or `web/setup_commit` (REQ-572 BR-8).
+        ///
+        /// The message carries the **validator's own sentence** — the same
+        /// `ConfigError` the daemon would have refused the file with at
+        /// startup — because the candidate was refused by that validator and
+        /// re-wording it here would be a second explanation of one rejection
+        /// (LESSON-456).
+        ///
+        /// Distinct from [`CONFIG_REJECTED`], which answers `config/set`: that
+        /// is a mutation the daemon *applied* rules to, this is a document the
+        /// daemon *would have loaded* and would not. A client renders this one
+        /// as guidance mid-flow — the user is three answers into a walkthrough
+        /// and one of them needs changing — rather than as a failed write, and
+        /// nothing has been written when it arrives (BR-11: the commit is the
+        /// single commit point).
+        ///
+        /// A caller that fails the user-only gate does **not** get this code.
+        /// That is [`NOT_ATTACHED`] plus a `web_setup_rejected` event (BR-4):
+        /// "you may not do this" and "this config would not load" are
+        /// different answers, and folding them would tell an unattached
+        /// connection its TOML was the problem.
+        WEB_SETUP_INVALID = -32020;
     }
 }
 
@@ -485,6 +508,20 @@ mod tests {
                 assert_ne!(a, b, "{name_a} and {name_b} both use code {a}");
             }
         }
+    }
+
+    /// REQ-572's code takes the next free number and moves nobody.
+    ///
+    /// The distinctness sweep above catches a *collision*; it says nothing
+    /// about a code that was renumbered into a free slot, which is the change
+    /// that silently reclassifies every error an already-installed client
+    /// knows. The two neighbours are pinned beside it so a renumbering has to
+    /// edit an assertion that names the release it would break.
+    #[test]
+    fn the_web_setup_code_is_the_next_free_one_and_renumbers_nothing() {
+        assert_eq!(error_code::WEB_SETUP_INVALID, -32020);
+        assert_eq!(error_code::SELF_APPROVAL_REFUSED, -32019);
+        assert_eq!(error_code::NOT_ATTACHED, -32009);
     }
 
     #[test]

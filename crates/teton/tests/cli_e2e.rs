@@ -2615,3 +2615,204 @@ fn a_level_line_typed_at_an_open_prompt_answers_the_prompt_and_changes_nothing()
         );
     }
 }
+
+// ---------------------------------------------------------------------------
+// REQ-572 — the `/web setup` walkthrough, at the client (TASK-133)
+// ---------------------------------------------------------------------------
+//
+// AC → test map for this section:
+//
+//   AC-10 (non-interactive degradation) + BR-12
+//       → `a_piped_web_setup_prints_the_instructions_and_asks_nothing`
+//   AC-3 (the walk, client half) + BR-7 (preview then confirm) +
+//   BR-14 (the completion is announced, not merely returned)
+//       → `the_walkthrough_collects_every_answer_and_the_daemon_announces_the_write`
+//
+// What this section deliberately does **not** hold:
+//
+//   * the **echo-off key step and the secret sweep (AC-5)** — a pipe cannot
+//     observe echo, which is the whole of that claim. It is `pty_e2e.rs`'s.
+//   * the daemon-side flow (AC-1/AC-3/AC-6/AC-7) — `tetond`'s
+//     `web_setup_flow.rs` drives it against a spawned daemon that owns a config
+//     file, which is where the write and the live pickup can be observed.
+//   * AC-4's user-only gate — `tetond`'s `multi_client.rs` and `server.rs`.
+//
+// **Every walk here is keyless, and that is a constraint rather than a
+// preference.** The shipped CLI writes credentials to the real OS keychain
+// (`keychain::default_keychain`), and a test that entered a key would create —
+// and on a failed commit delete — a `teton/web-search` entry in the developer's
+// own login keychain, clobbering a real one if it existed. No test may do that.
+// The keyless SearxNG branch exists in the flow precisely because that backend
+// needs no credential (AC-8), so it is a real user path and not a test-only
+// one; the store-then-commit ordering and the delete-on-failure are pinned
+// against a fake keychain in `web_setup_ui`'s own suite (TASK-132).
+
+/// **AC-10 / BR-12: on a pipe the command prints the instructions, asks
+/// nothing, and the session carries on.**
+///
+/// The degradation is the requirement, not a fallback: a walkthrough that drew
+/// a prompt at a pipe would read the next line of the *session's* input as a
+/// tier answer (LESSON-470's is-terminal rule). So the assertions are in three
+/// parts — what was printed, what was **not** asked, and that the line after
+/// the command still reached the model.
+#[test]
+fn a_piped_web_setup_prints_the_instructions_and_asks_nothing() {
+    let daemon_path = daemon_bin();
+    let daemon = TestDaemon::spawn_scripted(&daemon_path, TURN_REPLIES);
+    let teton = teton_bin();
+    let config_path = daemon.root.join("config.toml");
+    let before = std::fs::read(&config_path).expect("the fixture config exists");
+
+    // No `run_cli_seamed`: this is the shipped posture, with the test seam off.
+    let session = daemon.run_cli_with_stdin(&teton, &[], "/web setup\nhello there\n");
+
+    // (1) The daemon's plan was rendered — the command ran, it did not refuse.
+    assert!(
+        session.contains("web lookup is available on this machine and currently off"),
+        "`/web setup` must report the capability state even on a pipe; \
+         output:\n{session}"
+    );
+    // (2) …and then it degraded to instructions, saying why.
+    assert!(
+        session.contains("which needs a terminal"),
+        "AC-10: the piped branch must say why it is not asking; output:\n{session}"
+    );
+    assert!(
+        session.contains("keychain reference"),
+        "and it must still name the keychain rule, which is the part a user \
+         writing the table by hand most needs; output:\n{session}"
+    );
+    // (3) It asked nothing. A drawn prompt is the defect this branch exists to
+    // avoid, and its bytes are unmistakable.
+    assert!(
+        !session.contains("tier [1-3"),
+        "AC-10: no prompt may be drawn on a pipe; output:\n{session}"
+    );
+    assert!(
+        !session.contains("write this to your config?"),
+        "and certainly no confirm; output:\n{session}"
+    );
+    // (4) Nothing was written.
+    assert_eq!(
+        std::fs::read(&config_path).ok().as_deref(),
+        Some(before.as_slice()),
+        "AC-10: the degraded path must leave the config untouched"
+    );
+    // (5) BR-12: "the session continues normally" — the line after the command
+    // reached the model, so no session input was eaten by a prompt that was not
+    // drawn.
+    assert!(
+        session.contains(TURN_REPLIES[0]),
+        "the next typed line must still reach the model; output:\n{session}\n\
+         daemon log:\n{}",
+        daemon.log()
+    );
+}
+
+/// **AC-3's client half: the walk collects every answer, previews the exact
+/// bytes, and the write is announced by the daemon rather than by the client.**
+///
+/// Driven over pipes through the debug-build test seam, which the flow's gate
+/// honours with the polarity `slash::test_seams_allowed` documents as the safe
+/// one: the seam can only make the walkthrough *reachable*, so a release binary
+/// ignoring it can only fall back to printing instructions. That is what lets
+/// the whole walk — a tier answer, an endpoint, the keyless branch, the preview,
+/// the default-no confirm — be driven without a terminal.
+///
+/// The tier is `search` on purpose. It is the only branch that asks the endpoint
+/// and key-needed questions, and the endpoint is the keyless SearxNG shape the
+/// flow itself suggests (AC-8) — so this test also proves that suggestion is
+/// walkable end to end and not just parseable.
+#[test]
+fn the_walkthrough_collects_every_answer_and_the_daemon_announces_the_write() {
+    let daemon_path = daemon_bin();
+    let daemon = TestDaemon::spawn_scripted(&daemon_path, TURN_REPLIES);
+    let teton = teton_bin();
+    let config_path = daemon.root.join("config.toml");
+
+    // Non-vacuity: this machine has no `[web]` table before the walk.
+    let before = std::fs::read_to_string(&config_path).expect("the fixture config exists");
+    assert!(
+        !before.contains("[web]"),
+        "the fixture must start with no `[web]` table:\n{before}"
+    );
+
+    const ENDPOINT: &str = "http://localhost:8888/search?format=json";
+    let session = daemon.run_cli_seamed(
+        &teton,
+        &[],
+        // tier → endpoint → "no key" → confirm.
+        &format!("/web setup\n3\n{ENDPOINT}\nn\ny\n"),
+    );
+
+    // The menu was drawn, with the search row offered (this daemon has a
+    // scripted local tier, so the search leg can serve — AC-7's other half).
+    assert!(
+        session.contains("3) search"),
+        "the tier menu must be drawn; output:\n{session}"
+    );
+    assert!(
+        !session.contains("(unavailable:"),
+        "a machine with a local tier must not mark the search row unavailable; \
+         output:\n{session}"
+    );
+    // The suggestions were shown — the ones `web_setup_contracts.rs` pins
+    // against the production request builder.
+    assert!(
+        session.contains("self-hosted SearxNG"),
+        "the endpoint question must carry the shipped suggestions; output:\n{session}"
+    );
+
+    // BR-7: the exact bytes were shown before the confirm, and the host came
+    // from the daemon's parse rather than from anything the client re-derived.
+    assert!(
+        session.contains("this is what would be written to your config:"),
+        "the preview must be rendered; output:\n{session}"
+    );
+    assert!(
+        session.contains("tier = \"search\""),
+        "and it must carry the candidate table verbatim; output:\n{session}"
+    );
+    assert!(
+        session.contains("searches would go to: localhost"),
+        "the confirm step must name the host a query would reach; output:\n{session}"
+    );
+    assert!(
+        session.contains("write this to your config? [y/N]"),
+        "the one confirmation is default-no (LESSON-470); output:\n{session}"
+    );
+
+    // BR-14: the completion is the **daemon's** event reaching this client, not
+    // a line the handler composed — which is why it names the config path the
+    // daemon wrote.
+    assert!(
+        session.contains("web lookup enabled (`search`)"),
+        "AC-3: the completion notice must render; output:\n{session}\n\
+         daemon log:\n{}",
+        daemon.log()
+    );
+    assert!(
+        session.contains("Nothing has been looked up yet"),
+        "and it must say that enabling looked nothing up (BR-13/OQ-2); \
+         output:\n{session}"
+    );
+
+    // The write landed, in the file this daemon was given.
+    let written = std::fs::read_to_string(&config_path).expect("read the config back");
+    assert!(
+        written.contains("[web]") && written.contains("tier = \"search\""),
+        "the walk must have written the table:\n{written}"
+    );
+    assert!(
+        written.contains(ENDPOINT),
+        "including the endpoint the user typed:\n{written}"
+    );
+    assert!(
+        !written.contains("search_key_ref"),
+        "a keyless walk must reference no key:\n{written}"
+    );
+
+    // And none of it spent a model call — a command is not a prompt (BR-7 of
+    // REQ-555, and the reason the walk is a client command at all).
+    assert_no_turn_ran(&session, "the /web setup walkthrough");
+}

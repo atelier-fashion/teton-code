@@ -47,6 +47,7 @@ use async_trait::async_trait;
 use serde_json::{json, Value};
 use tokio::runtime::Handle;
 
+use teton_core::capability::web_capability_state;
 use teton_core::config::{WebConfig, WebTier};
 use teton_protocol::events::{WebLookupKind, WebLookupOutcome};
 
@@ -363,13 +364,21 @@ impl WebTool {
         let needed = call.needed_tier();
         if !self.tier.allows(needed) {
             self.record_local(&call, WebLookupOutcome::RefusedTier);
+            // REQ-572 ADR-4's second dead-end site. The sentence the model
+            // reads is **unchanged** (REQ-563 AC-4 pins it); what is added is
+            // the capability the turn ran out of, named in the catalog's own
+            // vocabulary so the daemon can announce it to the human. The id is
+            // `permission_key()` — the consent subject for the tier this call
+            // needed — rather than a second spelling of the same capability,
+            // for the reason `permission_key_for` exists at all.
             return ToolOutcome::error(format!(
                 "web lookup refused: this needs the `{}` tier, and `[web] tier` is set to \
                  `{}`. Do not retry it — say the lookup is not available at the granted \
                  tier and continue.",
                 tier_name(needed),
                 tier_name(self.tier),
-            ));
+            ))
+            .dead_ending(call.permission_key());
         }
 
         // --- gate: the allowlist, initial destination only (BR-11, AC-9) ---
@@ -818,6 +827,13 @@ impl Tool for WebTool {
 /// duplicated at two call sites is a condition that will eventually hold at one
 /// of them.
 ///
+/// Since REQ-572 BR-3 the condition is not even *written* here: it is
+/// [`teton_core::capability::WebCapabilityState::exposes_web_tool`], the same
+/// classifier the prompt clause and the status surface read. `config.tier == WebTier::Off` spelled
+/// out here was a second copy of that rule, and a second copy is what
+/// eventually disagrees — a refusal naming a state the machine is not in
+/// (LESSON-456).
+///
 /// Registered **cap-exempt** (REQ-563 decision 2026-08-09): a capability the
 /// user explicitly opted into must never be displaced by a degraded provider's
 /// `max_tools` cap — and it would be, because `DEGRADED_MAX_TOOLS` equals the
@@ -837,7 +853,16 @@ pub fn register_web_tool(
     seam: Arc<dyn WebLookupSeam>,
     runtime: Handle,
 ) -> bool {
-    if config.tier == WebTier::Off {
+    // Exposure is the one question `web_capability_state` answers identically
+    // whether or not a local model is loaded — `SearchUnavailable` is a
+    // *registered* capability with one blocked leg, not an absent one — so the
+    // fact this call site does not have is a fact it does not need. That
+    // independence is not an assumption here: it is asserted in every cell by
+    // `tool_exposure_is_exactly_a_tier_above_off_in_every_cell` (teton-core)
+    // and re-asserted against this function by
+    // `registration_is_the_capability_classifiers_exposure_predicate` below.
+    const EXPOSURE_IGNORES_THE_LOCAL_MODEL: bool = false;
+    if !web_capability_state(config, EXPOSURE_IGNORES_THE_LOCAL_MODEL).exposes_web_tool() {
         return false;
     }
     reg.register_cap_exempt(Arc::new(WebTool::new(
@@ -1828,6 +1853,181 @@ mod tests {
         std::fs::remove_dir_all(&dir).ok();
     }
 
+    /// **REQ-572 BR-3 / TASK-131 AC-3.** Registration is not a rule written
+    /// here that happens to agree with the capability classifier — it *is* the
+    /// classifier's exposure predicate.
+    ///
+    /// Both paths are fed the **same** `WebConfig` value, in every tier and
+    /// under both answers to "is a local model loaded?", because the failure
+    /// this guards is a disagreement, and a disagreement only shows when the
+    /// two are asked the same question. The local-model sweep is what pins the
+    /// state this REQ is most likely to get wrong: `search` with no local model
+    /// is a *registered* capability whose search leg blocks per query, so a
+    /// predicate written as "is it Ready" would withdraw fetching from every
+    /// machine without one.
+    #[tokio::test]
+    async fn registration_is_the_capability_classifiers_exposure_predicate() {
+        let dir = temp_dir("register-predicate");
+        let seam = FakeSeam::new();
+        let (_bus, _pending, gate) = gate(PermissionPolicy::Ask);
+
+        for tier in WebTier::ALL {
+            // A document the validator would accept at this tier, so no cell
+            // below is secretly testing a config the daemon could never hold.
+            let config = WebConfig {
+                tier,
+                search_endpoint: (tier == WebTier::Search)
+                    .then(|| "https://search.example.test/search".to_owned()),
+                ..WebConfig::default()
+            };
+            let mut reg = ToolRegistry::with_builtins();
+            let registered = register_web_tool(
+                &mut reg,
+                &config,
+                WebCache::from_config(&dir, &config),
+                Arc::new(Mutex::new(UserUrls::new())),
+                Arc::clone(&gate),
+                Arc::clone(&seam) as Arc<dyn WebLookupSeam>,
+                Handle::current(),
+            );
+            assert_eq!(
+                registered,
+                reg.get(WEB_TOOL_NAME).is_some(),
+                "{tier:?}: the return value and the registry disagree about what happened"
+            );
+            for local_model_present in [false, true] {
+                assert_eq!(
+                    registered,
+                    web_capability_state(&config, local_model_present).exposes_web_tool(),
+                    "{tier:?} (local_model_present={local_model_present}): registration \
+                     and the one capability classifier gave different answers about the \
+                     same config — the refusal text, the status surface and the tool \
+                     registry are no longer describing the same machine"
+                );
+            }
+        }
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// **REQ-572 ADR-4, the tool's half.** A tier-gap refusal names the
+    /// capability the turn ran out of, in the catalog's vocabulary, while the
+    /// sentence the model reads is untouched (REQ-563 AC-4).
+    ///
+    /// Both gaps, because they are two different capabilities and a single
+    /// hard-coded id would report one of them wrong: a model-composed URL above
+    /// a `fetch_user_url` ceiling ran out of `web_fetch_any_url`, and a search
+    /// above a fetch ceiling ran out of `web_search`.
+    #[tokio::test]
+    async fn a_tier_gap_refusal_names_the_capability_it_ran_out_of() {
+        for (tag, tier, args, expected) in [
+            (
+                "dead-end-fetch",
+                WebTier::FetchUserUrl,
+                json!({ "url": "https://docs.rs/tokio" }),
+                PERMISSION_KEY_FETCH_ANY_URL,
+            ),
+            (
+                "dead-end-search",
+                WebTier::FetchAnyUrl,
+                json!({ "query": "tokio task pinning" }),
+                PERMISSION_KEY_SEARCH,
+            ),
+        ] {
+            // Allow, so nothing here can be the permission gate's refusal.
+            let fx = fixture(tag, web_config(tier), PermissionPolicy::Allow, &[]);
+            let out = fx.tool.lookup(&args).await;
+            assert!(out.is_error, "{args} was served at {tier:?}");
+            assert_eq!(
+                out.dead_end.as_deref(),
+                Some(expected),
+                "the tier refusal at {tier:?} did not name the capability it ran out \
+                 of, so the daemon has nothing to announce to the user"
+            );
+            // The refusal text is REQ-563 AC-4's, unchanged by the marker.
+            assert!(
+                out.content.contains("web lookup refused: this needs the"),
+                "the refusal sentence changed: {}",
+                out.content
+            );
+        }
+
+        // One spelling across the two emission sites. TASK-129 names the search
+        // capability in `teton-protocol` so the unserved-turn path and this one
+        // cannot drift; the ids emitted here come from `permission_key_for`,
+        // which is the tier→subject mapping's single definition. The bridge
+        // between those two single definitions is this equality, asserted
+        // rather than assumed.
+        //
+        // **All three tiers**, since the verify pass: the dead-end ids this tool
+        // emits are `permission_key_for`'s answers, so every tier above `off`
+        // already puts its key into the wire vocabulary — but only `web_search`
+        // had a constant to be pinned against, which left the other two as
+        // strings a rename could move on one side and not the other. Swept from
+        // `WebTier::ALL` rather than listed, so a tier added later has to be
+        // given both spellings before this compiles.
+        use teton_protocol::events::CapabilityDeadEnd;
+        for (tier, catalog_id) in [
+            (WebTier::FetchUserUrl, CapabilityDeadEnd::WEB_FETCH_USER_URL),
+            (WebTier::FetchAnyUrl, CapabilityDeadEnd::WEB_FETCH_ANY_URL),
+            (WebTier::Search, CapabilityDeadEnd::WEB_SEARCH),
+        ] {
+            assert_eq!(
+                permission_key_for(tier).expect("every tier above off has a key"),
+                catalog_id,
+                "the consent subject and the dead-end catalog id for {tier:?} have \
+                 drifted apart; a client would render one capability under two names"
+            );
+        }
+        assert_eq!(
+            PERMISSION_KEY_SEARCH,
+            CapabilityDeadEnd::WEB_SEARCH,
+            "and the search key by its own name, which is the one the two \
+             emission sites share"
+        );
+    }
+
+    /// The falsification: a refusal that is **not** a dead end must not be
+    /// marked as one. A declined prompt and a blocked destination are things a
+    /// configured capability did; enabling something would not have helped, so
+    /// announcing a dead end would send the user to a setting that is already
+    /// set.
+    #[tokio::test]
+    async fn a_refusal_that_is_not_a_capability_gap_names_no_dead_end() {
+        let denied = fixture(
+            "dead-end-denied",
+            web_config(WebTier::FetchAnyUrl),
+            PermissionPolicy::Deny,
+            &[],
+        );
+        let out = denied
+            .tool
+            .lookup(&json!({ "url": "https://docs.rs/x" }))
+            .await;
+        assert!(out.is_error, "{}", out.content);
+        assert_eq!(
+            out.dead_end, None,
+            "a declined prompt was announced as a capability dead end: {}",
+            out.content
+        );
+
+        let blocked = fixture(
+            "dead-end-domain",
+            allowlisted(WebTier::FetchAnyUrl, &["docs.rs"]),
+            PermissionPolicy::Allow,
+            &[],
+        );
+        let out = blocked
+            .tool
+            .lookup(&json!({ "url": "https://elsewhere.test/x" }))
+            .await;
+        assert!(out.is_error, "{}", out.content);
+        assert_eq!(
+            out.dead_end, None,
+            "an allowlist refusal was announced as a capability dead end: {}",
+            out.content
+        );
+    }
+
     /// A connector that never connects — enough to construct an
     /// [`McpRegistry`](crate::mcp::McpRegistry) for a handle whose `run` is never
     /// called. The sweep below asks each tool a question about itself, not about
@@ -2017,9 +2217,17 @@ mod tests {
     /// length, because the schema is the larger half and a terse description
     /// beside a verbose schema is exactly the shape that would pass a
     /// description-only check.
+    ///
+    /// Since REQ-572 this is also the **worst case overall**, and that is why
+    /// the capability state is swept here: `SearchUnavailable` is the one state
+    /// that carries a clause *and* registers the tool, so this prompt — guide,
+    /// clause, description and schema together — is the largest one the daemon
+    /// ever builds. The margin is asserted rather than left implied (AC-9).
     #[tokio::test]
     async fn the_web_tool_docs_clear_the_outbound_body_overhead() {
-        use crate::egress::redact::REDACT_BODY_OVERHEAD_BYTES;
+        use teton_core::capability::{SearchGap, WebCapabilityState};
+
+        use crate::egress::redact::{MIN_PROMPT_HEADROOM_BYTES, REDACT_BODY_OVERHEAD_BYTES};
         use crate::harness::turn_loop::{build_system_prompt, HarnessConfig};
 
         let dir = temp_dir("budget");
@@ -2042,9 +2250,9 @@ mod tests {
             Handle::current(),
         ));
 
-        let harness = HarnessConfig::for_strong_model();
-        let system = build_system_prompt(&tools, &harness);
+        let base = HarnessConfig::for_strong_model();
         // Non-vacuity: the tool's docs really are in what is being measured.
+        let system = build_system_prompt(&tools, &base);
         assert!(system.contains(WEB_TOOL_NAME), "{system}");
         assert!(system.contains(DESCRIPTION_SEARCH), "{system}");
         assert!(
@@ -2052,15 +2260,55 @@ mod tests {
             "the schema is missing:\n{system}"
         );
 
-        let escaping = harness.context_budget_bytes / 10;
+        // The two states this registry can be in: ready (docs, no clause) and
+        // search-blocked (docs *and* clause — the largest prompt there is).
+        // `OffAvailable` is absent because it cannot occur here: it is exactly
+        // the state in which this tool does not register.
+        let worst = [
+            None,
+            Some(WebCapabilityState::Ready(WebTier::Search)),
+            Some(WebCapabilityState::SearchUnavailable {
+                reason: SearchGap::NoLocalModel,
+            }),
+        ]
+        .into_iter()
+        .map(|web_capability| {
+            build_system_prompt(
+                &tools,
+                &HarnessConfig {
+                    web_capability,
+                    ..base.clone()
+                },
+            )
+            .len()
+        })
+        .max()
+        .expect("the state sweep is not empty");
+
+        let escaping = base.context_budget_bytes / 10;
+        let spent = worst + escaping;
+        // Strictly under, and checked before the subtraction: otherwise an
+        // overflowing prompt panics on the arithmetic instead of on the sentence
+        // that says what to shorten.
         assert!(
-            system.len() + escaping <= REDACT_BODY_OVERHEAD_BYTES,
-            "the web tool's docs pushed the outbound body past its assumed \
-             overhead: a {}-byte system prompt plus {escaping} bytes of escaping \
-             against an assumed {REDACT_BODY_OVERHEAD_BYTES}. Shorten the \
-             description or the schema; do not raise the assumption without \
-             raising the cap it feeds.",
-            system.len()
+            spent < REDACT_BODY_OVERHEAD_BYTES,
+            "the web tool's docs and capability clause pushed the outbound body past \
+             its assumed overhead: a {worst}-byte system prompt plus {escaping} bytes \
+             of escaping against an assumed {REDACT_BODY_OVERHEAD_BYTES}. Shorten the \
+             bundled guide, the clause, the description or the schema; do not raise \
+             the assumption without raising the cap it feeds."
+        );
+        // The same floor the opted-out shape clears (`egress::redact`'s
+        // `MIN_PROMPT_HEADROOM_BYTES`), so the two prompt shapes cannot come to
+        // hold different ideas of how much room is left.
+        let margin = REDACT_BODY_OVERHEAD_BYTES - spent;
+        assert!(
+            margin >= MIN_PROMPT_HEADROOM_BYTES,
+            "the largest system prompt leaves {margin} bytes of headroom against a \
+             floor of {MIN_PROMPT_HEADROOM_BYTES}. Eroding the last of the margin is \
+             a decision, not a side effect: shorten the bundled guide, the clause, \
+             the description or the schema, or move `MIN_PROMPT_HEADROOM_BYTES` \
+             deliberately."
         );
         std::fs::remove_dir_all(&dir).ok();
     }
