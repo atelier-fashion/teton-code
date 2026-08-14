@@ -3448,12 +3448,24 @@ impl DaemonRuntime {
     /// The search endpoint and its resolved credential header, or `None` when
     /// there is no endpoint, no key reference, or the reference does not resolve.
     ///
-    /// A bearer token, matching what `provider_auth_headers` sends to an
-    /// OpenAI-compatible or custom endpoint: there is no blessed search backend
-    /// (BR-8), and `Authorization: Bearer` is what an unblessed one is most
-    /// likely to accept. The secret exists only inside the returned header and
-    /// is dropped once the endpoint-bound transport is built — it reaches no
+    /// The header's *shape* is `[web] search_auth` (BUG-165): there is no
+    /// blessed search backend (BR-8), so no fixed shape can be right — the
+    /// spec's own example backends want three different ones
+    /// (`Authorization: Bearer` for an OpenAI-compatible endpoint,
+    /// `X-Subscription-Token` for Brave, `Authorization: Bot` for Kagi). An
+    /// absent `search_auth` means Bearer, which is every pre-BUG-165 config
+    /// unchanged. The secret exists only inside the returned header and is
+    /// dropped once the endpoint-bound transport is built — it reaches no
     /// log, no event, and no ledger row.
+    ///
+    /// A `search_auth` that does not parse is refused at config load, so the
+    /// `None` arm of `search_auth_shape` is reachable only through a config
+    /// that skipped validation — and it means **no credential**, never
+    /// "assume Bearer": a mis-spelled shape must not put the key on the wire
+    /// in a shape the user did not write. Like an unresolvable
+    /// `search_key_ref`, the failure is reported by key name — never by value
+    /// — the backend answers 401, and the lookup ends as an HTTP-status
+    /// ending, which is a truthful thing for the user to be told.
     fn search_auth(&self, config: &Config) -> Option<(String, Vec<(String, String)>)> {
         let endpoint = config.web.search_endpoint.clone()?;
         let key_ref = config.web.search_key_ref.as_deref()?;
@@ -3466,11 +3478,18 @@ impl DaemonRuntime {
             );
             return None;
         }
+        let Some(shape) = config.web.search_auth_shape() else {
+            eprintln!(
+                "teton: [web] search_auth is not a usable credential-header template, so the \
+                 resolved key has no shape to ride; searching without a credential."
+            );
+            return None;
+        };
         match self.secret_resolver.resolve(key_ref) {
-            Ok(secret) => Some((
-                endpoint,
-                vec![("authorization".to_owned(), format!("Bearer {secret}"))],
-            )),
+            Ok(secret) => {
+                let value = shape.header_value(&secret);
+                Some((endpoint, vec![(shape.header, value)]))
+            }
             Err(err) => {
                 // Names the reference (config, safe) and never the value.
                 eprintln!("teton: [web] search_key_ref could not be resolved ({err})");
@@ -14104,6 +14123,85 @@ provider_id = "on-device"
                  credential — an unauthenticated backend is a legitimate \
                  configuration; request head:\n{}",
                 unauthenticated.requests()[0]
+            );
+        }
+
+        /// BUG-165 — `[web] search_auth` decides the shape the key rides, read
+        /// off the same wire as the binding test above.
+        ///
+        /// The two shapes are the REQ's own example backends' spellings,
+        /// neither of which is Bearer: Brave's bare key in a header of its own,
+        /// and Kagi's scheme word on the standard header. The default —
+        /// absent key ⇒ `Authorization: Bearer` — is already pinned by leg 1
+        /// of the binding test, which is what makes this pair sufficient:
+        /// together the three cover "another header", "another scheme", and
+        /// "the unchanged default".
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn the_configured_search_auth_shape_is_the_shape_on_the_wire() {
+            let engine = CountingEngine::answering("NONE");
+            let session = SessionId::from("search-auth-shape");
+            let events = Arc::new(EventBus::new());
+
+            let searched_with = |shape: &'static str| {
+                let engine = &engine;
+                let session = &session;
+                let events = &events;
+                async move {
+                    let backend = CaptureServer::bind().await;
+                    let endpoint = backend.url("/api");
+                    let runtime =
+                        searching_runtime(&endpoint, Some("keychain://teton/search"), engine);
+                    runtime.config.lock().expect("config mutex").web.search_auth =
+                        Some(shape.to_owned());
+                    let config = runtime.config.lock().expect("config mutex").clone();
+                    let router = router_for(&runtime);
+                    let egress = runtime
+                        .web_lookup_egress(&router, &config, events, session)
+                        .expect("the lookup choke point must build");
+                    let taint = runtime.web_taint_view();
+                    let ctx = LookupContext::new(session.clone(), taint.as_ref(), &allow_any_host)
+                        .with_search_endpoint(&endpoint);
+                    let ending = egress
+                        .lookup(
+                            &LookupRequest::search("tokio task pinning", Authorship::ModelComposed),
+                            &ctx,
+                        )
+                        .await;
+                    assert_eq!(
+                        ending.outcome(),
+                        WebLookupOutcome::Completed,
+                        "the search must reach the endpoint, or there is no \
+                         request to read a header off: {:?}",
+                        ending.detail()
+                    );
+                    assert_eq!(backend.requests().len(), 1, "exactly one search went out");
+                    backend
+                }
+            };
+
+            // --- Brave's shape: a bare key in a header of its own ----------
+            let brave = searched_with("X-Subscription-Token: {key}").await;
+            let head = brave.requests()[0].to_ascii_lowercase();
+            assert!(
+                head.contains(&format!("x-subscription-token: {SEARCH_SECRET}")),
+                "the key did not ride the configured header; request head:\n{}",
+                brave.requests()[0]
+            );
+            assert!(
+                !brave.carried_auth(0),
+                "a shape naming its own header must not also send the Bearer \
+                 default — one credential, one header; request head:\n{}",
+                brave.requests()[0]
+            );
+
+            // --- Kagi's shape: the standard header, another scheme word ----
+            let kagi = searched_with("Authorization: Bot {key}").await;
+            let head = kagi.requests()[0].to_ascii_lowercase();
+            assert!(
+                head.contains(&format!("authorization: bot {SEARCH_SECRET}")),
+                "the scheme word in the template is the scheme word on the \
+                 wire; request head:\n{}",
+                kagi.requests()[0]
             );
         }
     }

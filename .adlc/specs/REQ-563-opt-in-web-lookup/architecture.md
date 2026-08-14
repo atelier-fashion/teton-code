@@ -399,6 +399,22 @@ wording actually resolves to.
     plumbing its host to the resolver through the unauthenticated-endpoint path
     too (a `runtime.rs` change); left out because `localhost` and a literal IP
     both work today and are the documented shapes.
+13. **The search credential's header shape is a config key, not a constant
+    (BUG-165, post-ship).** The original `search_auth` hardcoded
+    `Authorization: Bearer <key>`, reasoning that Bearer is what an unblessed
+    backend most likely accepts — but the spec's own example backends are the
+    counterexamples (Brave: `X-Subscription-Token: <key>`; Kagi:
+    `Authorization: Bot <key>`), so both 401'd on every search. BR-8 ("no
+    blessed backend") cuts both ways: nothing ships a default backend, so
+    nothing can assume every backend's header either. `[web] search_auth` is a
+    template naming the one header the key rides, with `{key}` marking the
+    secret's place; absent means the Bearer default, so every pre-BUG-165
+    config is unchanged. The secret still never appears in config (BR-7): the
+    template is validated to *contain* `{key}` (a value without it is refused
+    the way a raw key in `search_key_ref` is), parsing lives in `teton-core`
+    as the one function `Config::validate` and the daemon share, and the
+    endpoint-origin binding (M-3) is untouched — the shape changes what the
+    header says, never where it may travel.
 
 ## Risks / Notes for Implementation
 
