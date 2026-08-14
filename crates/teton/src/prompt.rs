@@ -12,6 +12,21 @@ pub trait Prompter {
     /// Show `question` and read one line of input. Returns `None` on EOF (the
     /// user pressed Ctrl-D), which callers treat as a cancel.
     fn ask(&mut self, question: &str) -> Option<String>;
+
+    /// Show `question` and read one line **that is not shown back** — the
+    /// credential prompt (REQ-572 ADR-3, AC-5).
+    ///
+    /// Same contract as [`Self::ask`] in every other respect: one line, trimmed
+    /// of its terminator, `None` on EOF.
+    ///
+    /// **Deliberately has no default implementation.** A default would have to
+    /// be `ask`, and a `Prompter` that forgot to override it would echo a
+    /// credential into the user's scrollback and into any pty capture of the
+    /// session while looking exactly like a working one. There are three
+    /// implementors and they all live in this module; a fourth — the ratatui
+    /// front-end the `Surface`/`Prompter` seams exist for — must answer this
+    /// question explicitly rather than inherit the wrong answer silently.
+    fn ask_secret(&mut self, question: &str) -> Option<String>;
 }
 
 /// The real prompter: writes the question to stdout and reads a line from stdin.
@@ -36,6 +51,164 @@ impl Prompter for StdinPrompter {
             Ok(0) => None, // EOF
             Ok(_) => Some(line.trim_end_matches(['\n', '\r']).to_owned()),
             Err(_) => None,
+        }
+    }
+
+    fn ask_secret(&mut self, question: &str) -> Option<String> {
+        let mut out = io::stdout();
+        let _ = write!(out, "{question}");
+        let _ = out.flush();
+        // Engaged for exactly the read and restored by the guard's `Drop`, on
+        // every path out — including the error one.
+        let hidden = match EchoOff::engage() {
+            EchoState::Hidden(guard) => Some(guard),
+            // Nothing to switch off: stdin is a pipe, so the terminal was never
+            // going to paint anything. The same read, unhidden because there is
+            // no screen to hide it from.
+            EchoState::NoTerminal => None,
+            // Fail **closed**. Somebody is at a terminal and the terminal would
+            // paint every character of the credential into their scrollback.
+            // Reading anyway is the failure mode this branch exists to refuse:
+            // it looks exactly like a working prompt and leaks the key.
+            EchoState::Failed => {
+                let _ = writeln!(out);
+                let _ = writeln!(out, "{ECHO_UNAVAILABLE}");
+                let _ = out.flush();
+                return None;
+            }
+        };
+        let mut line = String::new();
+        let read = io::stdin().read_line(&mut line);
+        let was_hidden = hidden.is_some();
+        drop(hidden);
+        if was_hidden {
+            // The terminal echoed nothing, the user's own Enter included, so the
+            // cursor is still sitting at the end of the question. Without this
+            // the next line the session draws would land beside the prompt.
+            let _ = writeln!(out);
+            let _ = out.flush();
+        }
+        match read {
+            Ok(0) | Err(_) => None,
+            Ok(_) => Some(line.trim_end_matches(['\n', '\r']).to_owned()),
+        }
+    }
+}
+
+/// Terminal echo, switched off for the life of the guard and restored on drop
+/// (REQ-572 AC-5).
+///
+/// Canonical mode is deliberately left alone: only `ECHO` is cleared, so the
+/// kernel still assembles the line and `read_line` behaves exactly as it does
+/// for every other prompt — the one difference is that the characters are not
+/// painted back.
+///
+/// **Accepted residual**: a signal that kills the process between `engage` and
+/// the drop (Ctrl-C at the key prompt) leaves the user's terminal with echo off
+/// until they run `stty sane`, because `Drop` does not run for a process the
+/// kernel terminates. Every `read -s`-style prompt without a signal handler has
+/// this window, and installing one from a CLI that has no other signal handling
+/// would be a larger change than the wart it removes. The ordinary abort paths
+/// — EOF, an empty answer — return through the guard normally and restore.
+struct EchoOff {
+    /// The terminal settings as they were, to be put back verbatim.
+    saved: libc::termios,
+}
+
+/// What [`EchoOff::engage`] found — three states, because two of them are safe
+/// to read a credential through and one is not.
+enum EchoState {
+    /// Echo is off for the life of the guard.
+    Hidden(EchoOff),
+    /// There is no terminal echo to switch off: stdin is not a tty, so nothing
+    /// was ever going to be painted.
+    NoTerminal,
+    /// Stdin **is** a terminal and echo could not be cleared.
+    Failed,
+}
+
+/// [`EchoState`] without the guard — the shape the rule is stated in, so it can
+/// be asserted with no terminal in the room.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum EchoOutcome {
+    Hidden,
+    NoTerminal,
+    Failed,
+}
+
+/// The fail-closed rule, from the three facts the syscalls report.
+///
+/// Pure, and separate from [`EchoOff::engage`], because the branch that matters
+/// is the one a test process cannot otherwise reach: a real tty whose
+/// `tcgetattr`/`tcsetattr` fails. Folding it into the `unsafe` block would leave
+/// the security-relevant decision assertable only by breaking a terminal.
+///
+/// **Closed, not open.** A tty that would not clear `ECHO` yields `Failed` and
+/// the caller refuses to read, rather than reading with the characters painted
+/// back. The only state that reads unhidden is the one where there was nothing
+/// to hide from.
+fn classify_echo(is_tty: bool, got_attrs: bool, set_attrs: bool) -> EchoOutcome {
+    if !is_tty {
+        return EchoOutcome::NoTerminal;
+    }
+    if got_attrs && set_attrs {
+        EchoOutcome::Hidden
+    } else {
+        EchoOutcome::Failed
+    }
+}
+
+/// What a terminal that will not hide the typing is told.
+///
+/// It names the thing that did not happen (nothing was read), the reason, and
+/// the two ways out — because a user who has just been refused a prompt needs to
+/// know whether to retype or to fix their terminal.
+const ECHO_UNAVAILABLE: &str =
+    "error: this terminal would not turn echo off, so the key would have been shown as you \
+     typed it and left in your scrollback — nothing was read and nothing was stored. Run `stty \
+     sane` and try again, or use a different terminal.";
+
+impl EchoOff {
+    /// Switch echo off, and say which of the three states that landed in.
+    fn engage() -> EchoState {
+        // SAFETY: `isatty` reads a descriptor number; `tcgetattr` and
+        // `tcsetattr` read and write a single owned `termios` through the
+        // pointer and touch nothing else. Every failure is reported through the
+        // return code, which is checked. Same shape as the `poll` and
+        // `TIOCGWINSZ` calls in this module.
+        let mut saved: libc::termios = unsafe { std::mem::zeroed() };
+        let is_tty = unsafe { libc::isatty(libc::STDIN_FILENO) } == 1;
+        let got_attrs =
+            is_tty && unsafe { libc::tcgetattr(libc::STDIN_FILENO, &raw mut saved) } == 0;
+        let set_attrs = got_attrs && {
+            let mut hidden = saved;
+            hidden.c_lflag &= !libc::ECHO;
+            // TCSAFLUSH: anything typed ahead of the prompt is discarded rather
+            // than read as the start of a credential — the standard posture for
+            // a password prompt, and the one that keeps a stray paste out of the
+            // keychain.
+            let rc =
+                unsafe { libc::tcsetattr(libc::STDIN_FILENO, libc::TCSAFLUSH, &raw const hidden) };
+            rc == 0
+        };
+        match classify_echo(is_tty, got_attrs, set_attrs) {
+            EchoOutcome::Hidden => EchoState::Hidden(Self { saved }),
+            EchoOutcome::NoTerminal => EchoState::NoTerminal,
+            EchoOutcome::Failed => EchoState::Failed,
+        }
+    }
+}
+
+impl Drop for EchoOff {
+    fn drop(&mut self) {
+        // SAFETY: as in `engage` — one owned `termios`, by pointer, and the
+        // result is deliberately unused because a failure here has no remedy
+        // and must not panic a drop.
+        unsafe {
+            // TCSANOW, not TCSAFLUSH: the line the user just submitted has been
+            // read, and discarding whatever they typed after it would eat the
+            // next answer of the very flow that asked for this one.
+            libc::tcsetattr(libc::STDIN_FILENO, libc::TCSANOW, &raw const self.saved);
         }
     }
 }
@@ -241,6 +414,19 @@ impl Prompter for FramedStdinPrompter {
         self.draw(question);
         self.read_line()
     }
+
+    /// A credential is never asked for inside the entry frame.
+    ///
+    /// The frame's geometry is built around a line the terminal echoes back into
+    /// the input row (`advance_bytes` steps over exactly the rows the echo
+    /// produced); a read with echo off writes nothing there, so the frame would
+    /// be stepped through wrong. It is also the wrong *place*: a credential
+    /// question is dialogue, like the permission and model prompts, and those go
+    /// to the session's plain prompter. This delegates rather than reimplements,
+    /// so the hiding has one implementation.
+    fn ask_secret(&mut self, question: &str) -> Option<String> {
+        StdinPrompter::new().ask_secret(question)
+    }
 }
 
 /// Wait up to `timeout` for stdin to have something to read (REQ-556 BR-1).
@@ -309,6 +495,15 @@ pub(crate) struct ScriptedPrompter {
     /// that wording assertable only through an e2e (REQ-563 BR-4 — the
     /// persistent key must be offered on exactly the prompts that honour it).
     pub questions: Vec<String>,
+    /// The questions asked through [`Prompter::ask_secret`] rather than
+    /// [`Prompter::ask`] (REQ-572 AC-5).
+    ///
+    /// A scripted prompter has no terminal and therefore no echo to switch off,
+    /// so the *only* thing a unit test can check is that the flow reached for the
+    /// hiding path at all — which is exactly the thing that would silently
+    /// regress if a later edit swapped the call back to `ask`. The pty
+    /// assertion that the bytes really do not appear is TASK-133's.
+    pub secrets: Vec<String>,
 }
 
 #[cfg(test)]
@@ -319,6 +514,7 @@ impl ScriptedPrompter {
             answers: answers.iter().map(|s| (*s).to_owned()).collect(),
             asked: 0,
             questions: Vec::new(),
+            secrets: Vec::new(),
         }
     }
 
@@ -334,6 +530,15 @@ impl Prompter for ScriptedPrompter {
         self.asked += 1;
         self.questions.push(question.to_owned());
         self.answers.pop_front()
+    }
+
+    /// The same scripted answer, from the same queue — a test's answers are a
+    /// sequence of what the user typed, and which prompt hid the typing does not
+    /// change what was typed. What is recorded is *that* this question went
+    /// through the hiding path.
+    fn ask_secret(&mut self, question: &str) -> Option<String> {
+        self.secrets.push(question.to_owned());
+        self.ask(question)
     }
 }
 
@@ -436,6 +641,33 @@ mod tests {
         );
     }
 
+    /// REQ-572 AC-5, fail **closed**: a terminal whose echo could not be
+    /// switched off is refused, not read through.
+    ///
+    /// The dangerous state is the one in the middle. `isatty` passing and
+    /// `tcgetattr`/`tcsetattr` failing used to fall into the same `None` as "this
+    /// is a pipe", and the read went ahead — at a real terminal, with a real
+    /// person typing a real key, and every character painted back. The two
+    /// `None`s were the bug: one of them means there is no screen to leak to and
+    /// the other means there is one and the guard failed.
+    #[test]
+    fn a_terminal_that_will_not_hide_the_typing_is_refused_rather_than_read() {
+        // A pipe: nothing to switch off, and the read is fine unhidden.
+        assert_eq!(classify_echo(false, false, false), EchoOutcome::NoTerminal);
+        // The flags a non-tty cannot produce are still a non-tty.
+        assert_eq!(classify_echo(false, true, true), EchoOutcome::NoTerminal);
+        // A terminal with echo cleared: the happy path.
+        assert_eq!(classify_echo(true, true, true), EchoOutcome::Hidden);
+        // A terminal whose settings could not be read, or could not be written.
+        assert_eq!(classify_echo(true, false, false), EchoOutcome::Failed);
+        assert_eq!(classify_echo(true, true, false), EchoOutcome::Failed);
+
+        // And the refusal says the two things a refused prompt has to: that
+        // nothing was read, and what to do about it.
+        assert!(ECHO_UNAVAILABLE.contains("nothing was read"));
+        assert!(ECHO_UNAVAILABLE.contains("stty sane"));
+    }
+
     #[test]
     fn scripted_prompter_replays_then_reports_eof() {
         let mut p = ScriptedPrompter::new(&["y", "n"]);
@@ -443,5 +675,19 @@ mod tests {
         assert_eq!(p.ask("q2"), Some("n".to_owned()));
         assert_eq!(p.ask("q3"), None);
         assert_eq!(p.asked, 3);
+    }
+
+    /// REQ-572 AC-5's unit-testable half: a secret question is answered from the
+    /// same queue and is recorded as having taken the hiding path, so a flow that
+    /// asked for a credential through the echoing `ask` fails here rather than in
+    /// a pty capture nobody reads.
+    #[test]
+    fn a_scripted_secret_answers_from_the_same_queue_and_is_recorded_separately() {
+        let mut p = ScriptedPrompter::new(&["plain", "sk-secret"]);
+        assert_eq!(p.ask("endpoint? "), Some("plain".to_owned()));
+        assert_eq!(p.ask_secret("api key: "), Some("sk-secret".to_owned()));
+        assert_eq!(p.secrets, vec!["api key: ".to_owned()]);
+        assert_eq!(p.questions.len(), 2, "both questions are still recorded");
+        assert_eq!(p.asked, 2, "a secret read is still a read");
     }
 }

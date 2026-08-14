@@ -27,6 +27,25 @@
 //! | AC-13 (Unavailable) | [`an_unavailable_scan_blocks_the_query_and_sends_nothing`] |
 //! | AC-13 (loaderless) | [`on_a_loaderless_build_the_real_search_gate_refuses_every_query`] |
 //!
+//! ## REQ-572 (TASK-133) — what the guided setup flow does *not* change here
+//!
+//! | AC | Test |
+//! |----|------|
+//! | REQ-572 BR-7 / AC-3 (a commit grants nothing) | [`a_setup_commit_enables_the_tier_and_answers_no_consent_question`] |
+//! | REQ-572 AC-4 (no setup tool exists) | [`no_tool_is_named_for_the_setup_flow`] |
+//!
+//! The rest of REQ-572's matrix is elsewhere, and deliberately: `web_setup_flow.rs`
+//! drives plan → preview → commit → live use against a spawned daemon that owns a
+//! config file, `web_setup_contracts.rs` pins AC-8's suggested backends against
+//! the production request builder, and AC-4's user-only gate is asserted at the
+//! two seams that enforce it (`server.rs`'s mutation-checked unit tests and
+//! `multi_client.rs`'s socket-level rejection + event). What belongs *here* are
+//! the two REQ-572 claims this file's own subject answers: that enabling a
+//! capability is not answering a question about a lookup, and — AC-4's
+//! model-tool-call leg — that the tool registry a model can reach names no setup
+//! method at all, which is the claim the override and refresh already make one
+//! table up.
+//!
 //! ## Falsification (LESSON-479)
 //!
 //! Every refusal below is paired in the same test with the *permissive* run of
@@ -45,10 +64,14 @@ use tokio::runtime::Handle;
 
 use teton_core::category::CategoryTable;
 use teton_core::config::{Config, WebConfig, WebTier};
+use teton_protocol::events::WebTier as WireWebTier;
 use teton_protocol::events::{
     BlockCause, Event, WebConsentScope, WebLookupOutcome, OPTION_ID_ENABLE_PERMANENT,
 };
-use teton_protocol::methods::{PermissionOutcome, WebOverrideParams};
+use teton_protocol::methods::{
+    PermissionOutcome, RpcMethod, WebOverrideParams, WebSetupCommitParams, WebSetupPlanParams,
+    WebSetupPreviewParams,
+};
 use teton_protocol::{RequestId, SessionId};
 use teton_providers::transport::{Transport, TransportError, TransportRequest, TransportResponse};
 
@@ -1558,6 +1581,81 @@ async fn no_tool_is_named_for_the_override_or_the_refresh() {
     fx.cleanup();
 }
 
+/// **REQ-572 AC-4's model-tool-call leg, by the same argument** (the verify
+/// pass's missing-seam fix).
+///
+/// AC-4 asks that a model tool call attempting the setup RPC be rejected, and
+/// the daemon's answer is that there is nothing to attempt: `web/setup_*` are
+/// client RPCs, tool dispatch holds a `ToolContext` and never a `DaemonRuntime`,
+/// so the call reaches the registry and finds no such tool. `server.rs` pins the
+/// `may_drive` gate that backs that up in depth; what was missing is the half
+/// this file's precedent above already knows how to state — **the registry does
+/// not name it** — and until it is asserted, "structurally impossible" is a
+/// paragraph rather than a fact.
+///
+/// The method names come from [`RpcMethod::METHOD`] rather than being spelled
+/// again, so a renamed method renames the thing being swept for instead of
+/// leaving this test green over a stale string. Registered at the `search` tier
+/// for the reason its neighbour is: the interesting claim is about the state in
+/// which the web capability *exists*.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn no_tool_is_named_for_the_setup_flow() {
+    let fx = Setup::at(WebTier::Search)
+        .searching(
+            "https://search.example.test/api",
+            Arc::new(ForwardingGate) as Arc<dyn RedactionGate>,
+        )
+        .build("no-setup-tool");
+
+    assert!(fx.registered, "non-vacuity: the web capability IS present");
+    assert!(
+        fx.tools.get(WEB_TOOL_NAME).is_some(),
+        "and the model can reach the lookup tool"
+    );
+
+    // Every spelling a model might emit for the three methods: the wire name,
+    // the underscored form a tool name would take, and the bare verb.
+    let methods = [
+        WebSetupPlanParams::METHOD,
+        WebSetupPreviewParams::METHOD,
+        WebSetupCommitParams::METHOD,
+    ];
+    for method in methods {
+        for spelling in [
+            method.to_owned(),
+            method.replace('/', "_"),
+            method.replace('/', " "),
+        ] {
+            assert!(
+                fx.tools.get(&spelling).is_none(),
+                "`{spelling}` is reachable from tool dispatch, so a model could \
+                 configure the capability it is being gated by"
+            );
+        }
+    }
+    for bare in ["setup", "web_setup", "setup_commit"] {
+        assert!(fx.tools.get(bare).is_none(), "`{bare}` is model-reachable");
+    }
+
+    // And over the whole namespace, so a differently-spelled tool cannot slip
+    // past the list above.
+    for name in fx.tools.names() {
+        assert!(
+            !name.contains("setup"),
+            "`{name}` is a tool the model can call, and it names the user-only \
+             enablement flow (AC-4)"
+        );
+        for method in methods {
+            assert_ne!(
+                name, method,
+                "`{name}` exposes a setup RPC through tool dispatch"
+            );
+        }
+    }
+
+    fx.cleanup();
+}
+
 // ---------------------------------------------------------------------------
 // AC-13 — the search/redact coupling
 // ---------------------------------------------------------------------------
@@ -1740,6 +1838,126 @@ async fn on_a_loaderless_build_the_real_search_gate_refuses_every_query() {
          which is not a scan refusal: {:?}",
         fetched.detail()
     );
+}
+
+// ---------------------------------------------------------------------------
+// REQ-572 AC-3 / BR-7 — what a setup commit does NOT do (TASK-133)
+// ---------------------------------------------------------------------------
+
+/// **A guided setup commit enables a tier and grants no consent** (REQ-572 BR-7,
+/// LESSON-495).
+///
+/// The two writes this daemon can make to `[web]` are easy to confuse and mean
+/// opposite things. `enable_permanent` answers a *question the user was asked
+/// about one lookup*, and the test above it pins that it therefore appends to
+/// `permission_allow` — so the next session stops asking. `/web setup` answers
+/// "may this machine reach the web at all", which is a **ceiling**, not an
+/// answer: every lookup under it is still the user's to allow or refuse.
+///
+/// A setup flow that quietly did both would be the LESSON-495 defect in its
+/// worst form — a user who walked a setup wizard would have consented, forever
+/// and on every future session, to a question nobody put to them.
+///
+/// The claim is made in the two halves that have to agree, the shape the
+/// `enable_permanent` test uses:
+///
+/// 1. **what the flow writes** — read off the *production* preview, whose bytes
+///    are the bytes the commit goes on to write (TASK-129 pins that equality),
+///    parsed back through the production loader as a restarted daemon reads it;
+/// 2. **what a session built from exactly those bytes does** — it asks.
+///
+/// Falsified in place: the same fixture, at the same tier, with the tier listed
+/// in `permission_allow` — which is precisely what `enable_permanent` writes —
+/// does *not* ask. So "it asked" is a fact about the bytes the setup flow wrote
+/// and not about a fixture that always prompts.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_setup_commit_enables_the_tier_and_answers_no_consent_question() {
+    // (1) What `/web setup` writes, from the daemon's own renderer. `minimal()`
+    // has no config path, which is exactly right here: this is a question about
+    // the *candidate bytes*, and a preview is the production path that produces
+    // them without a write.
+    let runtime = DaemonRuntime::minimal();
+    let preview = runtime
+        .web_setup_preview(&WebSetupPreviewParams {
+            session_id: SessionId::from("sess-setup"),
+            tier: WireWebTier::FetchAnyUrl,
+            search_endpoint: None,
+            search_key_ref: None,
+            search_auth: None,
+        })
+        .expect("a fetch tier previews on any machine");
+
+    let written = Config::load(&preview.toml).expect("the previewed table loads and validates");
+    assert_eq!(
+        written.web.tier,
+        WebTier::FetchAnyUrl,
+        "non-vacuity: the flow really did raise the ceiling; table:\n{}",
+        preview.toml
+    );
+    assert!(
+        written.web.permission_allow.is_empty(),
+        "BR-7/LESSON-495: enabling a tier must not answer a consent question. \
+         Table as written:\n{}",
+        preview.toml
+    );
+
+    // (2) A session on a machine configured by that commit, and nothing else.
+    // The consent list comes from the written bytes rather than from a literal,
+    // so a commit that started fanning out grants would change this fixture
+    // rather than slip past it.
+    let fx = Setup::at(written.web.tier)
+        .policy(PermissionPolicy::Ask)
+        .consented(&written.web.permission_allow)
+        .build("post-commit");
+    let answerer = Answerer::spawn(&fx.bus, &fx.pending, vec!["allow_once"]);
+
+    let out = fx.fetch(DOCS_URL);
+    assert!(!out.is_error, "{}", out.content);
+    assert_eq!(
+        answerer.count(),
+        1,
+        "the first lookup after a setup commit must still ask"
+    );
+    assert_eq!(fx.transport.calls(), 1, "and the answer let it through");
+    // The key it asked under is the tier's, exactly as it was before the commit
+    // — a setup write touches no consent key at all (LESSON-495).
+    assert_eq!(
+        answerer.prompts()[0].key,
+        PERMISSION_KEY_FETCH_ANY_URL,
+        "the question is the tier's own, unchanged by the commit"
+    );
+    // And the grant it bought is still one lookup wide.
+    let second = fx.fetch("https://docs.rs/serde/latest/serde/");
+    assert!(
+        second.is_error,
+        "allow-once still means once: {}",
+        second.content
+    );
+    assert_eq!(answerer.count(), 2, "so the next lookup asked again");
+
+    // --- falsification: the bytes `enable_permanent` writes ------------------
+    let granted = Setup::at(WebTier::FetchAnyUrl)
+        .policy(PermissionPolicy::Ask)
+        .consented(&[WebTier::FetchAnyUrl])
+        .build("post-commit-granted");
+    // An empty script: any prompt at all would be cancelled, so a lookup that
+    // succeeds here is one that was never asked about.
+    let unasked = Answerer::spawn(&granted.bus, &granted.pending, Vec::new());
+    let allowed = granted.fetch(DOCS_URL);
+    assert!(
+        !allowed.is_error,
+        "a listed tier must not ask: {}",
+        allowed.content
+    );
+    assert_eq!(
+        unasked.count(),
+        0,
+        "this is the state a setup commit must NOT produce — if it asked nothing \
+         here too, the assertion above measures nothing"
+    );
+
+    fx.cleanup();
+    granted.cleanup();
 }
 
 fn allow_any_host(_host: &str) -> bool {

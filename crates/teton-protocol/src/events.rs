@@ -138,6 +138,14 @@ pub enum Event {
     /// The daemon minted a session grant (REQ-569 verify, F6). Daemon-scoped —
     /// it names no session — so every handshaked connection is told.
     SessionGrantMinted(SessionGrantMinted),
+    /// A guided web-setup flow committed a config change (REQ-572 BR-14).
+    WebSetupCompleted(WebSetupCompleted),
+    /// A setup call was refused because it did not come from the user
+    /// (REQ-572 BR-4).
+    WebSetupRejected(WebSetupRejected),
+    /// A turn dead-ended on a capability that is off or unconfigured
+    /// (REQ-572 AC-2, architecture ADR-4).
+    CapabilityDeadEnd(CapabilityDeadEnd),
 }
 
 impl Event {
@@ -167,6 +175,9 @@ impl Event {
             Event::AttachConsentRequested(_) => "attach_consent_requested",
             Event::AttachRefused(_) => "attach_refused",
             Event::SessionGrantMinted(_) => "session_grant_minted",
+            Event::WebSetupCompleted(_) => "web_setup_completed",
+            Event::WebSetupRejected(_) => "web_setup_rejected",
+            Event::CapabilityDeadEnd(_) => "capability_dead_end",
         }
     }
 }
@@ -1483,6 +1494,163 @@ pub struct WebTaintOverridden {
     /// this list stays absent, and [`WebTier::Off`] never appears here —
     /// "restored to nothing" is an empty list.
     pub tiers_restored: Vec<WebTier>,
+}
+
+// ---------------------------------------------------------------------------
+// web capability state + web_setup_completed / web_setup_rejected /
+// capability_dead_end (REQ-572)
+// ---------------------------------------------------------------------------
+
+/// What the web capability can actually do right now (REQ-572 BR-3, BR-10).
+///
+/// Mirrors `teton_core`'s `WebCapabilityState` the way [`WebTier`] mirrors
+/// `teton_core::config::WebTier`, and for the same reason: the daemon derives
+/// the state once, from the predicate that governs tool exposure, and this is
+/// the shape that derivation travels in. Two surfaces describing one capability
+/// must not be able to disagree (LESSON-456), and a state a client re-derives
+/// from prose is a second derivation.
+///
+/// **Distinct values, not distinguishing prose** (BR-10): a client branches on
+/// the variant — "off but available" is an offer to set it up, "search cannot
+/// serve" is a named missing piece — and never on the wording.
+///
+/// # Why [`Self::SearchUnavailable`]'s reason is a `String`
+///
+/// It is the daemon's own sentence naming the missing piece, rendered verbatim.
+/// The CLI shows it; it never branches on it. A structured gap enum would be a
+/// vocabulary both ends have to agree on for a value whose only consumer is a
+/// human reading a line — and the branch a client *does* take is already the
+/// variant it is attached to.
+///
+/// # There is no `PartiallyConfigured`
+///
+/// `tier = "search"` with no `search_endpoint` cannot be observed at runtime:
+/// `Config::validate()` refuses that document at load
+/// (`WebSearchTierWithoutEndpoint`), so a running daemon never holds one. The
+/// partially-configured experience lives at **preview** time, in
+/// [`crate::methods::WebSetupPreviewResult::warnings`], where a candidate is
+/// checked before it is ever written (architecture, Approach).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "state", rename_all = "snake_case")]
+pub enum WebCapabilityState {
+    /// The tier is above [`WebTier::Off`], so the web tool registers and the
+    /// capability can serve. Carries the ceiling, because "on" is not one
+    /// answer: a `fetch_user_url` session and a `search` session are told
+    /// different things about what they can ask for.
+    Ready {
+        /// The configured ceiling. Never [`WebTier::Off`] — that is
+        /// [`Self::OffAvailable`].
+        tier: WebTier,
+    },
+    /// No `[web]` table, or `tier = "off"`: the capability ships in this binary
+    /// and is one config table away. **The observed failure this REQ exists
+    /// for** — a state that used to be indistinguishable from "impossible".
+    OffAvailable,
+    /// The tier permits search structurally, but the search leg cannot serve.
+    SearchUnavailable {
+        /// The daemon's sentence naming the missing piece, for rendering.
+        reason: String,
+    },
+}
+
+/// A guided setup flow committed a `[web]` config change (spec:
+/// `setup_completed`; BR-14, AC-11).
+///
+/// Session-scoped: it is delivered under the committing session's
+/// [`EventEnvelope::session_id`], like every other event a user's own command
+/// produces. Bystander sessions pick the capability up on their next turn (the
+/// daemon rebuilds its tool registry per turn) and read the new state from
+/// their status surface rather than from this event — announcing another
+/// session's command in this one's transcript is the cross-session noise
+/// BUG-161 taught us to keep out.
+///
+/// It exists as an event and not only as the commit RPC's answer because BR-14
+/// asks for the change to be **in front of a human** (LESSON-505): a second
+/// client attached to the same session watched the capability change under it
+/// and is owed the news.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WebSetupCompleted {
+    /// The ceiling now written to config. Never [`WebTier::Off`]: a completed
+    /// setup enabled something.
+    pub tier: WebTier,
+    /// The config file the write landed in, so the user can go read what they
+    /// just agreed to. A path the user already owns and typed their way to —
+    /// not a secret, and never the key that may now sit beside it (BR-6: the
+    /// value is in the keychain and the config holds a reference).
+    pub config_path: String,
+}
+
+/// A setup call was refused because it did not come from the user (spec:
+/// `setup_rejected_nonuser`; BR-4, AC-4).
+///
+/// Defense in depth, announced rather than logged. The gate that produced it
+/// answers the caller with `NOT_ATTACHED`; this event is what tells the
+/// **session's own user** that something else tried, which a log line an
+/// adversary can rotate away does not (LESSON-505).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WebSetupRejected {
+    /// What the refused caller was, in the daemon's own words — an unattached
+    /// connection, a monitor, a tool call. Rendered and never branched on, for
+    /// the reason [`WebCapabilityState::SearchUnavailable`]'s `reason` is a
+    /// string: the client's only job with it is to show it.
+    ///
+    /// It names a **kind**, never an identity: no pid, no socket peer, no
+    /// credential. A refusal notice that fingerprinted the caller would put
+    /// data in a transcript that the refusal itself exists to keep out.
+    pub origin: String,
+}
+
+/// A turn dead-ended on a capability that is off or unconfigured (spec:
+/// `capability_dead_end`).
+///
+/// Emitted only where the daemon can actually see the dead end (architecture
+/// ADR-4): the unserved-turn path when routing wanted a tier nothing is
+/// configured for, and the web tool's tier-gap refusals. A prose-only refusal
+/// by the model — the fully-off case, where the tool does not exist to be
+/// called — emits nothing, because classifying model-authored prose as "that
+/// was a capability refusal" would be a second classifier over text
+/// (LESSON-456). The per-state prompt clause is the mitigation there.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CapabilityDeadEnd {
+    /// The capability catalog id, e.g. `web_search` or `remote_provider`.
+    ///
+    /// A `String` rather than an enum for the same reason the catalog is
+    /// bundled text: the set is small, static, and rendered — and a client
+    /// built before a capability existed must be able to report a dead end it
+    /// has never heard of rather than fail to parse the frame.
+    pub capability: String,
+}
+
+impl CapabilityDeadEnd {
+    /// A turn needed a remote provider and none is configured (REQ-572 AC-2).
+    ///
+    /// The **settled** absence only: a provider registered without a model, an
+    /// unset `default_provider` and a routing mismatch are all configured
+    /// remote tiers whose remedy the turn's own error sentence already names,
+    /// and a tier that is merely still warming is not a dead end at all.
+    pub const REMOTE_PROVIDER: &'static str = "remote_provider";
+    /// A web lookup dead-ended on the `[web]` capability — the tool refused a
+    /// tier the configured ceiling does not reach.
+    ///
+    /// Named here beside [`Self::REMOTE_PROVIDER`] rather than spelled as a
+    /// literal at the emission site, so the daemon and the client that renders
+    /// the id cannot come to hold two spellings of one capability.
+    pub const WEB_SEARCH: &'static str = "web_search";
+    /// A lookup dead-ended at the `fetch_user_url` tier — the tool refused a
+    /// fetch of a URL the user themselves pasted, because the configured ceiling
+    /// does not reach even that.
+    ///
+    /// Here for [`Self::WEB_SEARCH`]'s reason, and here *now* because the reason
+    /// was only half-served while one of the three tiers had a constant and the
+    /// other two did not: the emission site derives the id from the tier
+    /// (`permission_key_for`), so all three ids are already in the wire
+    /// vocabulary — two of them only as strings nothing pins. A rename of either
+    /// would have gone silently past every test.
+    pub const WEB_FETCH_USER_URL: &'static str = "web_fetch_user_url";
+    /// A lookup dead-ended at the `fetch_any_url` tier — a fetch of a URL the
+    /// *model* chose, refused by the configured ceiling. See
+    /// [`Self::WEB_FETCH_USER_URL`].
+    pub const WEB_FETCH_ANY_URL: &'static str = "web_fetch_any_url";
 }
 
 // ---------------------------------------------------------------------------
@@ -3094,6 +3262,101 @@ mod tests {
         round_trip(&none_restored);
         let wire = envelope_wire(Event::WebTaintOverridden(none_restored));
         assert_eq!(wire["tiers_restored"].as_array().unwrap().len(), 0);
+    }
+
+    /// REQ-572 BR-14 / AC-11's wire half: all three new events reach a client
+    /// as flat objects naming the session they belong to, through the envelope
+    /// like every other session-scoped event.
+    ///
+    /// The scoping is asserted on the wire object rather than on the payloads
+    /// because the envelope is what carries it — and `envelope_wire`
+    /// round-trips before returning, so a `session_id` field added to any of
+    /// these payloads fails here on the duplicate key rather than reaching a
+    /// client (the shape [`WebTaintOverridden`] documents).
+    #[test]
+    fn the_setup_events_are_session_scoped_under_their_wire_names() {
+        let completed = WebSetupCompleted {
+            tier: WebTier::Search,
+            config_path: "/Users/dev/.config/teton/config.toml".to_owned(),
+        };
+        round_trip(&completed);
+        let wire = envelope_wire(Event::WebSetupCompleted(completed));
+        assert_eq!(wire["event"], "web_setup_completed");
+        assert_eq!(wire["session_id"], "s1");
+        assert_eq!(wire["tier"], "search");
+        assert_eq!(wire["config_path"], "/Users/dev/.config/teton/config.toml");
+
+        let rejected = WebSetupRejected {
+            origin: "a connection not attached to this session".to_owned(),
+        };
+        round_trip(&rejected);
+        let wire = envelope_wire(Event::WebSetupRejected(rejected));
+        assert_eq!(wire["event"], "web_setup_rejected");
+        assert_eq!(wire["session_id"], "s1");
+        assert_eq!(wire["origin"], "a connection not attached to this session");
+
+        let dead_end = CapabilityDeadEnd {
+            capability: "web_search".to_owned(),
+        };
+        round_trip(&dead_end);
+        let wire = envelope_wire(Event::CapabilityDeadEnd(dead_end));
+        assert_eq!(wire["event"], "capability_dead_end");
+        assert_eq!(wire["session_id"], "s1");
+        assert_eq!(wire["capability"], "web_search");
+
+        // Non-vacuity: the key above comes from the envelope's scope and not
+        // from a payload that always emits one. Scoped to nothing, it is
+        // absent — which is why publishing one of these without a session is a
+        // bug the daemon can commit, not a shape this type prevents.
+        let wire = serde_json::to_value(EventEnvelope::new(
+            2,
+            None,
+            Event::CapabilityDeadEnd(CapabilityDeadEnd {
+                capability: "remote_provider".to_owned(),
+            }),
+        ))
+        .unwrap();
+        assert!(wire.get("session_id").is_none(), "{wire}");
+    }
+
+    /// BR-10: the three states are distinguished on the wire by a **tag**, not
+    /// by prose a client would have to re-parse. Each one round-trips, and the
+    /// tag spellings are pinned literally because they are the contract.
+    #[test]
+    fn every_web_capability_state_round_trips_under_its_own_tag() {
+        for (state, expected_tag) in [
+            (
+                WebCapabilityState::Ready {
+                    tier: WebTier::FetchUserUrl,
+                },
+                "ready",
+            ),
+            (WebCapabilityState::OffAvailable, "off_available"),
+            (
+                WebCapabilityState::SearchUnavailable {
+                    reason: "search needs the local model, which is not loaded".to_owned(),
+                },
+                "search_unavailable",
+            ),
+        ] {
+            round_trip(&state);
+            let wire = serde_json::to_value(&state).unwrap();
+            assert_eq!(wire["state"], expected_tag, "{wire}");
+        }
+
+        // The payloads ride beside the tag rather than inside a nested object,
+        // so a renderer reads one flat shape per state.
+        let wire = serde_json::to_value(WebCapabilityState::Ready {
+            tier: WebTier::Search,
+        })
+        .unwrap();
+        assert_eq!(wire["tier"], "search");
+
+        // A state this build has never heard of is an error, not a silent
+        // reading of one of these three: guessing "ready" for an unknown tag
+        // would tell a user a capability is live when the daemon said
+        // something else entirely.
+        assert!(serde_json::from_str::<WebCapabilityState>(r#"{"state":"someday"}"#).is_err());
     }
 
     /// Forward compatibility for the web family specifically: a newer daemon

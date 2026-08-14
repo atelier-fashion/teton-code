@@ -286,6 +286,19 @@ const COMMANDS: &[CommandSpec] = &[
     // call named `web allow` reaches nothing (AC-12). Listed here — and
     // therefore in `/help` — because a command a user cannot discover is a
     // command they do not have (BUG-153).
+    // REQ-572 OQ-3: the enablement walkthrough joins the `/web` family rather
+    // than opening a capability-generic `/setup` namespace — a namespace the
+    // provider flow can still introduce later without breaking this spelling.
+    // It leads the family because it is the command a user with no `[web]`
+    // table needs, and the other two are about a capability that is already on.
+    CommandSpec {
+        name: "web setup",
+        aliases: &[],
+        summary: "Set up web lookup: pick a tier, name a backend, confirm before anything is \
+                  written.",
+        args: Args::None,
+        handler: handle_web_setup,
+    },
     CommandSpec {
         name: "web allow",
         aliases: &[],
@@ -543,7 +556,12 @@ fn typed_token(name: &str) -> String {
 /// *argument* rather than a command name — `/permissions bogus` — passes through
 /// the same guards instead of growing a second, subtly different copy of them.
 /// One place to check, on the way in.
-fn echoed(text: &str) -> String {
+///
+/// `pub(crate)` since REQ-572: the `/web setup` flow quotes a mistyped tier
+/// answer back, which is the same arbitrary-user-bytes problem, and a second
+/// copy of the bounding and defusing is a second place for one of them to be
+/// forgotten.
+pub(crate) fn echoed(text: &str) -> String {
     let mut out = String::with_capacity(text.len());
     let mut chars = text.chars();
     for ch in chars.by_ref().take(ECHO_MAX_CHARS) {
@@ -814,6 +832,33 @@ fn handle_web_allow(
         ctx.surface
             .line(LineKind::Notice, &render_web_override(&result));
     }
+    Ok(CommandOutcome::Continue)
+}
+
+/// The `/web setup` handler: the guided enablement walkthrough (REQ-572 BR-2,
+/// ADR-1/ADR-3).
+///
+/// User-only by construction, exactly as `/web allow` is: it is a slash command,
+/// and tool dispatch has no path to this table — a model that emits a tool call
+/// named `web setup` reaches the tool registry and finds no such tool. The
+/// daemon does not take that on trust and gates all three RPCs on session
+/// attachment anyway (TASK-130), announcing a refusal it did not admit.
+///
+/// Everything it does lives in [`crate::web_setup_ui`]: the collection, the
+/// preview render, the default-no confirm, the keychain write and its undo. The
+/// handler's whole job is to hand that flow the session's connection, the
+/// session's context and the platform keychain — the same division `/model set`
+/// has with [`crate::apply_model_set`], and for the same reason (LESSON-441: one
+/// consent gate, one implementation).
+fn handle_web_setup(
+    conn: &mut Connection,
+    ctx: &mut UiContext<'_>,
+    _args: &str,
+) -> anyhow::Result<CommandOutcome> {
+    // Constructed here rather than inside the flow so the flow takes a
+    // `&dyn Keychain` and its tests can hand it one that touches no OS store.
+    let keychain = crate::keychain::default_keychain();
+    crate::web_setup_ui::run(conn, ctx, keychain.as_ref())?;
     Ok(CommandOutcome::Continue)
 }
 
@@ -1281,7 +1326,12 @@ fn model_set_gate(typed_input: bool, seams_allowed: bool) -> ModelSetGate {
 /// — ignoring it would silently loosen the shipped binary — and must mirror the
 /// daemon's posture instead (`tetond`'s `test_seams_enabled`: refuse to run at
 /// all rather than run with an unhonoured seam).
-fn test_seams_allowed() -> bool {
+///
+/// REQ-572 adds the second consumer, [`crate::web_setup_ui::gate`], with the
+/// **same** polarity: the seam lets the walkthrough run on a pipe, so a release
+/// build ignoring the switch can only fall back to printing instructions. The
+/// invariant above is what made that reuse legitimate rather than convenient.
+pub(crate) fn test_seams_allowed() -> bool {
     cfg!(debug_assertions) && std::env::var("TETON_TEST_SEAMS").ok().as_deref() == Some("1")
 }
 
@@ -1495,6 +1545,11 @@ mod tests {
             // be a spec decision rather than a drive-by.
             "web allow",
             "web refresh",
+            // REQ-572 BR-2 / OQ-3: the guided enablement walkthrough, declared
+            // here for the reason the rows above were. The spelling is the
+            // settled one — it joins the `/web` family rather than opening a
+            // `/setup` namespace this REQ would then own alone.
+            "web setup",
             // REQ-567 BR-8: the user-only clear, declared here for the same
             // reason the web rows were — a new command is a spec decision.
             "clear",
@@ -1954,6 +2009,44 @@ mod tests {
         assert!(listing.contains("/web refresh <url>"), "{listing}");
         // And `/web allow`'s summary must not imply it grants anything (BR-13).
         assert!(listing.contains("grants no new tier"), "{listing}");
+    }
+
+    /// REQ-572 BR-2: the enablement path has to be discoverable from inside the
+    /// session that just refused to do something, which means `/help`. Its
+    /// summary must also say that nothing is written without a confirmation —
+    /// a command that edits config is one users should be able to try.
+    #[test]
+    fn help_lists_the_setup_command_and_promises_the_confirmation() {
+        let mut surface = RecordingSurface::new();
+        render_help(&mut surface);
+        let listing = surface.lines_of(LineKind::Info).join("\n");
+
+        assert!(listing.contains("/web setup"), "{listing}");
+        assert!(
+            listing.contains("confirm before anything is written"),
+            "the summary must promise the confirm step: {listing}"
+        );
+    }
+
+    /// The longest-match rule keeps the third `/web` row apart from the other
+    /// two, and the row takes no argument — `/web setup search` is a typo, not a
+    /// way to skip the menu, and answering it as one would set a tier from a
+    /// line nobody previewed.
+    #[test]
+    fn the_setup_command_parses_and_takes_no_arguments() {
+        let Input::Command { name, args } = classify("/web setup") else {
+            panic!("`/web setup` did not classify as a command");
+        };
+        assert_eq!((name, args), ("web setup", ""));
+        assert!(matches!(resolve(name, args), Resolution::Run(_, "")));
+
+        let Input::Command { name, args } = classify("/web setup search") else {
+            panic!("did not classify as a command");
+        };
+        let Resolution::Rejected(hint) = resolve(name, args) else {
+            panic!("`/web setup search` reached the handler");
+        };
+        assert!(hint.contains("takes no arguments"), "{hint}");
     }
 
     /// Both spellings parse to their own row, and the argument rules are the

@@ -11,7 +11,8 @@ use serde::{Deserialize, Serialize};
 
 use crate::effort::{EffortLevel, ResolvedEffort};
 use crate::events::{
-    CatalogEntryView, ModelSelectionProposed, ProbeReportView, SelectionSource, WebTier,
+    CatalogEntryView, ModelSelectionProposed, ProbeReportView, SelectionSource, WebCapabilityState,
+    WebTier,
 };
 use crate::jsonrpc::{Id, Request};
 use crate::permissions::PermissionLevel;
@@ -989,6 +990,26 @@ pub struct ConfigSnapshot {
     /// populates it.
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub effort: Option<EffortView>,
+    /// What the web capability can actually do (REQ-572 BR-3, BR-10).
+    ///
+    /// On the existing snapshot rather than behind a new RPC, for
+    /// [`Self::effort`]'s reason: the status surface needs to say "web lookup
+    /// is available but off" in the same breath it says everything else, and a
+    /// second round-trip is a second answer that can arrive from a different
+    /// moment than the first.
+    ///
+    /// A **typed** state, not a sentence (BR-10): a client renders guidance by
+    /// branching on the variant, and prose it would have to re-parse is the
+    /// second classifier LESSON-456 warns about.
+    ///
+    /// `Option` for wire additivity only, like the two fields above — a daemon
+    /// that has this field always populates it, and `None` therefore reads as
+    /// "this daemon predates the field", never as a state. That is why the
+    /// absent case is not folded into [`WebCapabilityState::OffAvailable`]:
+    /// "off, and one table away" is a claim about the user's config, and an
+    /// older daemon's silence is not evidence for it.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub web_capability: Option<WebCapabilityState>,
 }
 
 /// The global effort setting, plus what it resolves to for each registered
@@ -1342,6 +1363,270 @@ pub struct WebRefreshResult {
 impl RpcMethod for WebRefreshParams {
     const METHOD: &'static str = "web/refresh";
     type Result = WebRefreshResult;
+}
+
+// ---------------------------------------------------------------------------
+// guided web setup (REQ-572)
+// ---------------------------------------------------------------------------
+//
+// Three stateless endpoints — plan, preview, commit — and **no flow state
+// anywhere on this wire** (architecture ADR-1). The client collects answers
+// locally, which is what every client already does with a prompt line, and the
+// daemon stays the sole authority on validation, on what the preview says, and
+// on the commit. There is no flow id here because there is no flow to name: the
+// pending-prompt registries we have shipped each grew a cross-session or
+// bystander-answer bug (BUG-161, BUG-162), and the cheapest such surface is the
+// one that does not exist.
+//
+// Like `web/override`, these are **client** RPCs and never harness tools, and
+// that placement is BR-4's enforcement rather than a convention: tool dispatch
+// and the client socket are structurally distinct channels, so a model emitting
+// a tool call named `web/setup_commit` reaches nothing at all. The connection
+// gate (attachment) is the second leg, and a caller that fails it is answered
+// with `NOT_ATTACHED` and announced with a `web_setup_rejected` event.
+//
+// Types only — the derivation, the validator, the atomic write and the config
+// swap land with the daemon (TASK-129/130), and the walkthrough with the CLI
+// (TASK-132).
+
+/// What the `[web]` table says today, for the flow to show before it changes it
+/// (REQ-572 AC-7).
+///
+/// Deliberately **not** the whole table: this is the summary a user needs to
+/// answer "what am I about to replace", and every field here is already
+/// non-secret by construction — a tier, a host, and two references. The search
+/// endpoint appears as a **host** (BR-7 of REQ-563, the rule the whole web
+/// event family follows) and the key appears as the reference the config holds,
+/// never the value the keychain holds (BR-6).
+///
+/// No `Default`, deliberately: [`WebTier`] on this wire has none either, and a
+/// summary that could be built out of nothing is one a daemon could send in
+/// place of the `None` that means "there is no `[web]` table" — the exact
+/// distinction [`WebSetupPlanResult::current_web`] exists to keep.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WebTableSummary {
+    /// The configured ceiling. [`WebTier::Off`] is a legitimate value here —
+    /// a `[web]` table that names `off` is the state
+    /// [`WebCapabilityState::OffAvailable`] describes, written down.
+    pub tier: WebTier,
+    /// The configured search backend's **host**, from the executor's own parse
+    /// of the endpoint (BR-9, LESSON-494) — never the full endpoint, its path,
+    /// or its query.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub search_host: Option<String>,
+    /// The configured key **reference**, e.g. `keychain://teton/web-search`.
+    /// A name, not a secret: the value it points at never crosses this socket
+    /// in either direction (BR-6, ADR-3).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub search_key_ref: Option<String>,
+    /// The configured auth-header template, e.g. `X-Subscription-Token: {key}`
+    /// (BUG-165). Carries no credential by construction — `{key}` is where one
+    /// would go, and the substitution happens only when the request is built.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub search_auth: Option<String>,
+}
+
+/// Ask what enabling web lookup would involve (REQ-572 BR-1, BR-3).
+///
+/// Read-only, and the flow's first step: it answers with the capability state
+/// the **exposure predicate** produced — not a second derivation the client
+/// could disagree with — plus what the search leg needs and what is configured
+/// today. A client can render all of it as instructions and stop there, which
+/// is BR-12's degradation path: the walkthrough is an enhancement over this
+/// answer, never the only way to reach it.
+///
+/// It carries a `session_id` for [`WebOverrideParams`]'s reason: the gate that
+/// admits it is session attachment, so the call has to name the session it
+/// claims.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WebSetupPlanParams {
+    /// The session asking.
+    pub session_id: SessionId,
+}
+
+/// Result of [`WebSetupPlanParams`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WebSetupPlanResult {
+    /// What the capability can do right now — the typed state (BR-10), from
+    /// the one classifier that also governs tool exposure (BR-3).
+    pub state: WebCapabilityState,
+    /// Whether the `search` tier is worth **offering** in the tier menu.
+    ///
+    /// Not derivable from [`Self::state`], which describes the capability as
+    /// configured: a machine sitting at `off_available` may still be unable to
+    /// serve search (REQ-563 BR-14 couples search egress to the redaction
+    /// scan, which needs the local model), and a menu that offered it anyway
+    /// would walk a user through configuring a tier that refuses every query.
+    pub search_available: bool,
+    /// When [`Self::search_available`] is false, the missing piece named — the
+    /// sentence the client shows beside the greyed-out menu entry (AC-7).
+    /// `None` when search is offerable, and the field is then absent from the
+    /// wire.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub search_gap: Option<String>,
+    /// The `[web]` table as it stands, or `None` when the config has none —
+    /// the fresh-install case this REQ exists for.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub current_web: Option<WebTableSummary>,
+}
+
+impl RpcMethod for WebSetupPlanParams {
+    const METHOD: &'static str = "web/setup_plan";
+    type Result = WebSetupPlanResult;
+}
+
+/// Show exactly what a candidate `[web]` table would write, without writing it
+/// (REQ-572 BR-7).
+///
+/// The daemon builds the candidate config, runs the **same** `Config::validate`
+/// startup runs, and serializes the result — so the preview is the bytes, not a
+/// description of them. Nothing is written and nothing is remembered: a preview
+/// the user abandons leaves the daemon exactly as it found it (BR-11).
+///
+/// The answer's own fields, not this call, are what a user confirms; the same
+/// parameters are then sent to [`WebSetupCommitParams`], which re-derives from
+/// them rather than trusting a preview it kept.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WebSetupPreviewParams {
+    /// The session previewing.
+    pub session_id: SessionId,
+    /// The ceiling the candidate would set.
+    pub tier: WebTier,
+    /// The search backend's endpoint as the user typed it. Absent below the
+    /// `search` tier, where there is no backend to name.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub search_endpoint: Option<String>,
+    /// A **reference** to the key the client has already written to the OS
+    /// keychain, e.g. `keychain://teton/web-search`.
+    ///
+    /// The secret itself never appears in these params — the CLI collects it
+    /// echo-off, stores it, and sends the name (ADR-3). A raw key here is
+    /// refused by the same predicate that refuses one in a provider's
+    /// `auth_ref`, so the rule is enforced rather than requested.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub search_key_ref: Option<String>,
+    /// The auth-header template, `{key}` marking where the credential goes
+    /// (BUG-165). Absent means `Authorization: Bearer {key}`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub search_auth: Option<String>,
+}
+
+/// Result of [`WebSetupPreviewParams`] — what the commit would write.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WebSetupPreviewResult {
+    /// The `[web]` table, serialized exactly as it would be written (BR-7).
+    /// The user confirms these bytes, and the commit re-derives them from the
+    /// same parameters — so what was agreed to is what lands.
+    pub toml: String,
+    /// The host the endpoint parsed to, from the **executor's** parser rather
+    /// than a second one (BR-9, LESSON-494): the string shown at the confirm
+    /// step is the destination the request builder would actually reach, not a
+    /// separately-parsed lookalike.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub search_host: Option<String>,
+    /// Non-fatal notes about the candidate — a tier configured below what the
+    /// answers imply, a backend that will need a key it was not given.
+    ///
+    /// Warnings, never errors: a candidate the validator **refuses** is not a
+    /// preview with a note attached, it is a `WEB_SETUP_INVALID` response
+    /// carrying the validator's own sentence. Empty for a clean candidate, and
+    /// the field is a list rather than an `Option` so "nothing to say" has one
+    /// spelling.
+    #[serde(default)]
+    pub warnings: Vec<String>,
+    /// A digest of the **whole document** this preview's candidate would write
+    /// — what the client hands back as [`WebSetupCommitParams::expect_digest`]
+    /// so the commit can refuse to write bytes the user never saw (REQ-572
+    /// verify, BR-7).
+    ///
+    /// It covers the whole config, not just the `[web]` table, because the whole
+    /// config is what the commit writes. The fields the flow does *not* collect
+    /// — `permission_allow`, `allowed_domains`, `cache_ttl_secs` — ride along
+    /// from whatever the live config held when the candidate was built, and any
+    /// other session answering "enable permanently" moves them underneath a
+    /// preview the user is still reading. Digesting the rendered `[web]` section
+    /// alone would catch that particular race and miss the general one; the
+    /// bytes the user confirmed are the bytes that get written, so the bytes are
+    /// what is pinned.
+    ///
+    /// Opaque to the client: it round-trips it and never parses it. Empty from a
+    /// daemon that predates this field, which a client must read as "this daemon
+    /// cannot check" rather than as a digest that failed to match.
+    #[serde(default)]
+    pub digest: String,
+}
+
+impl RpcMethod for WebSetupPreviewParams {
+    const METHOD: &'static str = "web/setup_preview";
+    type Result = WebSetupPreviewResult;
+}
+
+/// Write the candidate `[web]` table and make the capability live (REQ-572
+/// BR-8, AC-3).
+///
+/// The **single commit point** (BR-11): before this call nothing durable
+/// exists, and this call either writes the file and swaps the daemon's config
+/// or changes nothing at all.
+///
+/// Its fields are [`WebSetupPreviewParams`]'s, deliberately — the commit
+/// re-derives the candidate from the answers rather than accepting a blob the
+/// preview handed back, so a client cannot commit something the daemon never
+/// validated (BR-8, LESSON-501). Carrying its own copy is what makes the two
+/// calls independent; it is not a duplicated struct so much as the same
+/// question asked twice, once for show and once for real.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WebSetupCommitParams {
+    /// The session committing.
+    pub session_id: SessionId,
+    /// The ceiling to write.
+    pub tier: WebTier,
+    /// The search backend's endpoint, as in the preview.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub search_endpoint: Option<String>,
+    /// The keychain **reference**, as in the preview — never the key (BR-6).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub search_key_ref: Option<String>,
+    /// The auth-header template, as in the preview.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub search_auth: Option<String>,
+    /// [`WebSetupPreviewResult::digest`], handed back — the daemon writes only
+    /// if the candidate it rebuilds still digests to this (REQ-572 verify,
+    /// BR-7).
+    ///
+    /// **Not a substitute for re-deriving.** The candidate is still rebuilt from
+    /// the answers above and put through the same validator (BR-8,
+    /// LESSON-501); this is a *guard on the outcome*, so a client cannot use it
+    /// to commit a document the daemon never validated — the worst a forged
+    /// digest buys is a write the answers already earned.
+    ///
+    /// `None` means "do not check", which is what a client that predates the
+    /// field sends and what a caller with no preview to compare against sends.
+    /// The check is opt-in for that reason, not because it is optional in the
+    /// flow: `/web setup` always sends it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expect_digest: Option<String>,
+}
+
+/// Result of [`WebSetupCommitParams`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WebSetupCommitResult {
+    /// Whether the config changed.
+    ///
+    /// `false` is not a failure and not an error response: it is a commit whose
+    /// candidate matched what was already configured, and the distinction keeps
+    /// the client's confirmation honest — the same reason
+    /// [`WebOverrideResult::was_restricted`] exists. A failed commit is an
+    /// error response, never `applied: false`.
+    pub applied: bool,
+    /// The ceiling now in force. Read back rather than assumed, like
+    /// [`SessionPermissionsResult::level`]: a client that rendered the tier it
+    /// *sent* could confirm a state the daemon does not hold.
+    pub tier: WebTier,
+}
+
+impl RpcMethod for WebSetupCommitParams {
+    const METHOD: &'static str = "web/setup_commit";
+    type Result = WebSetupCommitResult;
 }
 
 #[cfg(test)]
@@ -1840,6 +2125,9 @@ mod tests {
                     mode: PrivacyMode::LocalOnly,
                 }],
                 redact_enabled: true,
+                web_capability: Some(WebCapabilityState::Ready {
+                    tier: WebTier::FetchUserUrl,
+                }),
             },
         });
     }
@@ -1881,6 +2169,81 @@ mod tests {
             let snapshot: ConfigSnapshot = serde_json::from_value(wire).unwrap();
             assert_eq!(snapshot.redact_enabled, stated);
         }
+    }
+
+    /// REQ-572's addition, same posture: a snapshot from a daemon that never
+    /// heard of `web_capability` still deserializes, and reads as **no answer**
+    /// rather than as a state.
+    ///
+    /// The fixture is the shape a v2 daemon shipped before this REQ — the same
+    /// pre-REQ-572 body `config/get` returns today — so the claim is about the
+    /// field's compatibility posture and not about a hand-trimmed object.
+    /// `None` is the honest reading: such a daemon derived no capability state
+    /// at all, and a client that turned its silence into `off_available` would
+    /// be reporting the user's configuration from a build that never looked.
+    #[test]
+    fn a_snapshot_with_no_web_capability_key_reads_as_no_answer() {
+        let pre_572 = serde_json::json!({
+            "providers": [],
+            "tiers": [],
+            "routing": [],
+            "privacy": [{"path_glob": "secrets/**", "mode": "local_only"}],
+            "redact_enabled": true
+        });
+        let snapshot: ConfigSnapshot = serde_json::from_value(pre_572.clone()).unwrap();
+        assert_eq!(
+            snapshot.web_capability, None,
+            "an absent answer must not be read as a capability state"
+        );
+        // The rest still arrives: the default is a default, not a fallback for
+        // a body that failed to parse.
+        assert_eq!(snapshot.privacy.len(), 1);
+        assert!(snapshot.redact_enabled);
+
+        // Non-vacuity, both directions (LESSON-485): the default is not
+        // swallowing a key that *is* present, in any of the three states.
+        for state in [
+            WebCapabilityState::Ready {
+                tier: WebTier::Search,
+            },
+            WebCapabilityState::OffAvailable,
+            WebCapabilityState::SearchUnavailable {
+                reason: "search needs the local model, which is not loaded".to_owned(),
+            },
+        ] {
+            let mut wire = pre_572.clone();
+            wire["web_capability"] = serde_json::to_value(&state).unwrap();
+            let snapshot: ConfigSnapshot = serde_json::from_value(wire).unwrap();
+            assert_eq!(snapshot.web_capability, Some(state));
+        }
+
+        // And the other direction: a client built before the field reads a
+        // snapshot that carries it, which is what keeps
+        // `crate::PROTOCOL_VERSION` still across this addition.
+        #[derive(Deserialize)]
+        struct PreSetupSnapshot {
+            privacy: Vec<PrivacyBoundaryConfig>,
+        }
+        let wire = serde_json::to_string(&ConfigSnapshot {
+            privacy: vec![PrivacyBoundaryConfig {
+                path_glob: "secrets/**".to_owned(),
+                mode: PrivacyMode::LocalOnly,
+            }],
+            web_capability: Some(WebCapabilityState::OffAvailable),
+            ..ConfigSnapshot::default()
+        })
+        .unwrap();
+        assert!(
+            wire.contains(r#""web_capability":{"state":"off_available"}"#),
+            "the fixture must actually carry the new key: {wire}"
+        );
+        let old: PreSetupSnapshot = serde_json::from_str(&wire).unwrap();
+        assert_eq!(old.privacy.len(), 1, "the old reader still gets its fields");
+
+        // A default snapshot omits the key entirely rather than sending
+        // `null` — the same wire an older daemon writes.
+        let empty = serde_json::to_value(ConfigSnapshot::default()).unwrap();
+        assert!(empty.get("web_capability").is_none(), "{empty}");
     }
 
     /// The other direction of the same claim: a client that predates the field
@@ -2230,6 +2593,9 @@ mod tests {
         assert_eq!(WebOverrideParams::METHOD, "web/override");
         assert_eq!(SessionPermissionsParams::METHOD, "session/permissions");
         assert_eq!(WebRefreshParams::METHOD, "web/refresh");
+        assert_eq!(WebSetupPlanParams::METHOD, "web/setup_plan");
+        assert_eq!(WebSetupPreviewParams::METHOD, "web/setup_preview");
+        assert_eq!(WebSetupCommitParams::METHOD, "web/setup_commit");
         assert_eq!(
             request(Id::Number(2), ModelStatusParams::default()).method,
             "model/status"
@@ -2263,6 +2629,205 @@ mod tests {
         for outcome in [WebRefreshOutcome::Evicted, WebRefreshOutcome::Absent] {
             round_trip(&WebRefreshResult { outcome });
         }
+    }
+
+    /// REQ-572's three setup endpoints round-trip, including the answers whose
+    /// *absence* is a distinct fact: no `[web]` table yet, no search gap, no
+    /// warnings.
+    ///
+    /// Each is exercised at both ends of its own question — a fresh machine
+    /// with nothing configured, and a fully-specified search backend — because
+    /// the empty side is the state this REQ exists for and the one a default
+    /// would quietly manufacture.
+    #[test]
+    fn the_web_setup_methods_round_trip() {
+        round_trip(&WebSetupPlanParams {
+            session_id: SessionId::from("s1"),
+        });
+
+        // The fresh-install answer: nothing configured, search not offerable,
+        // and the gap named.
+        let fresh = WebSetupPlanResult {
+            state: WebCapabilityState::OffAvailable,
+            search_available: false,
+            search_gap: Some("search needs the local model, which is not loaded".to_owned()),
+            current_web: None,
+        };
+        round_trip(&fresh);
+        let wire = serde_json::to_value(&fresh).unwrap();
+        assert_eq!(wire["state"]["state"], "off_available");
+        assert!(
+            wire.get("current_web").is_none(),
+            "no `[web]` table must be an absent key, not an empty summary: {wire}"
+        );
+
+        // The configured answer: a table exists, search is offerable, and the
+        // gap key drops off the wire.
+        let configured = WebSetupPlanResult {
+            state: WebCapabilityState::Ready {
+                tier: WebTier::Search,
+            },
+            search_available: true,
+            search_gap: None,
+            current_web: Some(WebTableSummary {
+                tier: WebTier::Search,
+                search_host: Some("search.example.com".to_owned()),
+                search_key_ref: Some("keychain://teton/web-search".to_owned()),
+                search_auth: Some("X-Subscription-Token: {key}".to_owned()),
+            }),
+        };
+        round_trip(&configured);
+        let wire = serde_json::to_value(&configured).unwrap();
+        assert!(wire.get("search_gap").is_none(), "{wire}");
+        assert_eq!(wire["current_web"]["search_host"], "search.example.com");
+
+        // A `[web]` table that exists and says `off` — a different fact from
+        // no table at all, and the one whose keys all drop off the wire.
+        let says_off = WebTableSummary {
+            tier: WebTier::Off,
+            search_host: None,
+            search_key_ref: None,
+            search_auth: None,
+        };
+        round_trip(&says_off);
+        let wire = serde_json::to_value(&says_off).unwrap();
+        assert_eq!(
+            wire.as_object().unwrap().keys().collect::<Vec<_>>(),
+            ["tier"]
+        );
+
+        // Preview: the same params the commit takes, at both ends of the
+        // ladder — a keyless tier bump and a full search backend.
+        for params in [
+            WebSetupPreviewParams {
+                session_id: SessionId::from("s1"),
+                tier: WebTier::FetchUserUrl,
+                search_endpoint: None,
+                search_key_ref: None,
+                search_auth: None,
+            },
+            WebSetupPreviewParams {
+                session_id: SessionId::from("s1"),
+                tier: WebTier::Search,
+                search_endpoint: Some("https://search.example.com/search?format=json".to_owned()),
+                search_key_ref: Some("keychain://teton/web-search".to_owned()),
+                search_auth: Some("X-Subscription-Token: {key}".to_owned()),
+            },
+        ] {
+            round_trip(&params);
+        }
+        round_trip(&WebSetupPreviewResult {
+            toml: "[web]\ntier = \"search\"\n".to_owned(),
+            search_host: Some("search.example.com".to_owned()),
+            warnings: vec!["this backend usually needs a key".to_owned()],
+            digest: "a".repeat(64),
+        });
+        // A clean candidate: no host to show below the search tier, and an
+        // empty warning list rather than an absent one.
+        round_trip(&WebSetupPreviewResult {
+            toml: "[web]\ntier = \"fetch_user_url\"\n".to_owned(),
+            search_host: None,
+            warnings: vec![],
+            digest: "b".repeat(64),
+        });
+        assert!(WebSetupPreviewResult::default().warnings.is_empty());
+        // The compat reading of an absent digest: a daemon that predates the
+        // field answers "cannot check", never "checked and matched nothing".
+        assert!(WebSetupPreviewResult::default().digest.is_empty());
+        let old_preview: WebSetupPreviewResult =
+            serde_json::from_str(r#"{"toml":"[web]\n","warnings":[]}"#).unwrap();
+        assert!(old_preview.digest.is_empty());
+
+        round_trip(&WebSetupCommitParams {
+            session_id: SessionId::from("s1"),
+            tier: WebTier::Search,
+            search_endpoint: Some("https://search.example.com/search?format=json".to_owned()),
+            search_key_ref: Some("keychain://teton/web-search".to_owned()),
+            search_auth: None,
+            expect_digest: Some("c".repeat(64)),
+        });
+        // And the same commit with no digest to check — the shape an old client
+        // sends, which stays a legal request rather than a parse failure.
+        round_trip(&WebSetupCommitParams {
+            session_id: SessionId::from("s1"),
+            tier: WebTier::FetchAnyUrl,
+            search_endpoint: None,
+            search_key_ref: None,
+            search_auth: None,
+            expect_digest: None,
+        });
+        let old_commit: WebSetupCommitParams =
+            serde_json::from_str(r#"{"session_id":"s1","tier":"fetch_any_url"}"#).unwrap();
+        assert_eq!(old_commit.expect_digest, None);
+        // Both answers: a commit that changed the config, and one whose
+        // candidate matched what was already there. Neither is an error.
+        round_trip(&WebSetupCommitResult {
+            applied: true,
+            tier: WebTier::Search,
+        });
+        round_trip(&WebSetupCommitResult {
+            applied: false,
+            tier: WebTier::FetchAnyUrl,
+        });
+    }
+
+    /// BR-6 / ADR-3's wire half: **no setup type can carry the key**, in either
+    /// direction. The secret's whole lifecycle stays in the client process, and
+    /// what travels is a reference.
+    ///
+    /// Asserted on the serialized key sets rather than on a reading of the
+    /// structs, so a `search_key` field added later turns this red instead of
+    /// riding along with the reference that was supposed to replace it.
+    #[test]
+    fn no_setup_payload_has_anywhere_to_put_the_key() {
+        let planted = "sk-live-do-not-log-me";
+        let preview = serde_json::to_string(&WebSetupPreviewParams {
+            session_id: SessionId::from("s1"),
+            tier: WebTier::Search,
+            search_endpoint: Some("https://search.example.com/search".to_owned()),
+            search_key_ref: Some("keychain://teton/web-search".to_owned()),
+            search_auth: Some("X-Subscription-Token: {key}".to_owned()),
+        })
+        .unwrap();
+        let commit = serde_json::to_string(&WebSetupCommitParams {
+            session_id: SessionId::from("s1"),
+            tier: WebTier::Search,
+            search_endpoint: Some("https://search.example.com/search".to_owned()),
+            search_key_ref: Some("keychain://teton/web-search".to_owned()),
+            search_auth: Some("X-Subscription-Token: {key}".to_owned()),
+            expect_digest: Some("d".repeat(64)),
+        })
+        .unwrap();
+
+        for wire in [&preview, &commit] {
+            assert!(!wire.contains(planted), "{wire}");
+            // The only credential-shaped key is the reference, and the header
+            // template still says `{key}` — nothing substituted a value in.
+            assert!(wire.contains("keychain://teton/web-search"), "{wire}");
+            assert!(wire.contains("{key}"), "{wire}");
+        }
+
+        // Every field name the commit can carry, spelled out (sorted, which is
+        // how `serde_json` hands back an object's keys): a key-carrying field
+        // would have to be added to this list to be added to the type.
+        let keys: Vec<String> = serde_json::from_str::<serde_json::Value>(&commit)
+            .unwrap()
+            .as_object()
+            .unwrap()
+            .keys()
+            .cloned()
+            .collect();
+        assert_eq!(
+            keys,
+            [
+                "expect_digest",
+                "search_auth",
+                "search_endpoint",
+                "search_key_ref",
+                "session_id",
+                "tier"
+            ]
+        );
     }
 
     /// BR-7's boundary drawn where it actually is: the request may name a URL

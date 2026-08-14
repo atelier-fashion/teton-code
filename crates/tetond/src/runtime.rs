@@ -90,11 +90,14 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use teton_core::boundary::BoundaryMatcher;
+use teton_core::capability::{web_capability_state, SearchGap, WebCapabilityState};
 use teton_core::category::{
     category_for_phase, BindingSource as CoreBindingSource, Category, CategoryOverride,
     CategoryResolution, CategoryTable, ConfigurableCategory, Tier, TierBinding,
 };
-use teton_core::config::{Config, LocalModelConfig, RoutingMigration, WebTier};
+use teton_core::config::{
+    web_table_toml, Config, LocalModelConfig, RoutingMigration, WebConfig, WebTier,
+};
 use teton_core::entities::{
     BoundaryMode, ModelProvider, PrivacyBoundary, ProviderCapabilities, ProviderKind,
 };
@@ -107,8 +110,9 @@ use teton_inference::probe::{decide, GpuClass, HardwareProfile, TierDecision, GI
 use teton_inference::{ChatFormat, Completion, Engine, EngineError, GenParams, MockEngine};
 
 use teton_protocol::events::{
-    BlockCause, ContextCleared, Event, ModelLifecycle, ModelLifecycleStage, PrivacyAction,
-    SessionTitled, WebLookup, WebTaintOverridden,
+    BlockCause, CapabilityDeadEnd, ContextCleared, Event, ModelLifecycle, ModelLifecycleStage,
+    PrivacyAction, SessionTitled, WebCapabilityState as WireWebCapabilityState, WebLookup,
+    WebSetupCompleted, WebTaintOverridden, WebTier as WireWebTier,
 };
 use teton_protocol::jsonrpc::{error_code, RpcError};
 use teton_protocol::methods::{
@@ -117,7 +121,8 @@ use teton_protocol::methods::{
     ModelSetResult, ModelStatusResult, PrivacyBoundaryConfig, PromptTurnResult, ProviderConfig,
     SessionClearParams, SessionClearResult, SessionPermissionsParams, SessionPermissionsResult,
     TierRouteView, WebOverrideParams, WebOverrideResult, WebRefreshOutcome, WebRefreshParams,
-    WebRefreshResult, WebTotalsView,
+    WebRefreshResult, WebSetupCommitParams, WebSetupCommitResult, WebSetupPlanResult,
+    WebSetupPreviewParams, WebSetupPreviewResult, WebTableSummary, WebTotalsView,
 };
 use teton_protocol::permissions::PermissionLevel;
 use teton_protocol::{
@@ -139,9 +144,9 @@ use crate::classify::Classification;
 use crate::cost::{CostLedger, CostReport, GroupTotals, PriceTable, WebLookupRow, WebOverrideRow};
 use crate::download::{HttpRangeFetcher, RetryPolicy};
 use crate::egress::{
-    inspect, origin_of, to_protocol_web_tier, Egress, EgressError, HttpTransport, LookupContext,
-    LookupOutcome, LookupRecord, LookupRecorder, LookupRequest, Provenance, RedactionGate,
-    RedactionVerdict, TaintView,
+    from_protocol_web_tier, inspect, origin_of, to_protocol_web_tier, Egress, EgressError,
+    HttpTransport, LookupContext, LookupOutcome, LookupRecord, LookupRecorder, LookupRequest,
+    Provenance, RedactionGate, RedactionVerdict, TaintView,
 };
 use crate::harness::completion::{context_provenance, RemoteProviderSource};
 use crate::harness::context::NoopProvenanceHook;
@@ -1611,7 +1616,7 @@ impl DaemonRuntime {
         // to keep agreeing, so the two causes REQ-557 introduces are branches
         // *here* rather than a parallel machine somewhere else.
         let unusable = config.unusable_providers();
-        let has_remote = config.providers.iter().any(|p| p.kind.is_remote());
+        let has_remote = has_remote_provider(config);
         let usable_remote: Vec<&str> = config
             .providers
             .iter()
@@ -1773,6 +1778,49 @@ impl DaemonRuntime {
             "{}{add_provider}",
             no_local_engine_reason(&model_id)
         ))
+    }
+
+    /// [`Self::unserved_turn_error`], plus the one dead end the daemon can
+    /// actually see it standing in (REQ-572 ADR-4, AC-2).
+    ///
+    /// The classifier itself is untouched: every code and every sentence
+    /// BUG-152 settled comes back exactly as it was, and this adds an
+    /// **announcement** beside it rather than a fifth arm inside it. The
+    /// announcement is made only where both halves of "this is a dead end"
+    /// hold, and each half is a guard against a way the event would lie:
+    ///
+    /// - **the classification is settled** (`UNKNOWN_PROVIDER`). A
+    ///   `TIER_WARMING` turn is not dead-ended on anything — its tier is
+    ///   finishing a download or a load — and telling that user to configure a
+    ///   capability would be advice to act on a state that is about to resolve
+    ///   itself. This is the BUG-152 split being *consumed*, which is the point
+    ///   of having made it.
+    /// - **no remote provider is configured at all**. That is the one arm of
+    ///   the remote half naming an absent capability; a provider registered
+    ///   with no model, an unset `default_provider` and a routing mismatch are
+    ///   all *configured* remote tiers whose remedy the turn's own sentence
+    ///   already carries, and `capability_dead_end` is not the vocabulary for
+    ///   a misconfiguration. Read through [`has_remote_provider`], the same
+    ///   function the classifier's own arm reads.
+    ///
+    /// Session-scoped, like every event a user's own turn produces.
+    fn unserved_turn_error_announcing(
+        &self,
+        config: &Config,
+        category: Option<Category>,
+        events: &Arc<EventBus>,
+        session_id: &SessionId,
+    ) -> RpcError {
+        let error = self.unserved_turn_error(config, category);
+        if error.code == error_code::UNKNOWN_PROVIDER && !has_remote_provider(config) {
+            events.publish(
+                Some(session_id.clone()),
+                Event::CapabilityDeadEnd(CapabilityDeadEnd {
+                    capability: CapabilityDeadEnd::REMOTE_PROVIDER.to_owned(),
+                }),
+            );
+        }
+        error
     }
 
     /// Whether the local tier may serve a turn right now.
@@ -2058,7 +2106,7 @@ impl DaemonRuntime {
             self.local_tier_available(),
             &self.health_snapshot(),
         );
-        snapshot_from_config(&config, &router)
+        snapshot_from_config(&config, &router, self.local_model_present())
     }
 
     /// Each provider's health as routing should see it right now: the persisted
@@ -2297,7 +2345,14 @@ impl DaemonRuntime {
         // than built, because a gate rebuilt per turn forgets every
         // "allow for this session" answer at the end of the turn that earned it.
         let gate = self.permission_gate_for(&session_id, events, &config);
-        let tools = self.build_tools(&router, events, &session_id, &gate).await;
+        // This turn's config snapshot, handed on rather than re-read: the route,
+        // the gate, the registry and the capability clause below are then four
+        // readings of ONE config, so a commit that lands mid-turn moves the next
+        // turn instead of leaving this one's prompt disagreeing with its own
+        // tool set (REQ-572 verify).
+        let tools = self
+            .build_tools(&router, events, &session_id, &gate, &config)
+            .await;
         // BUG-147: jail this session's tools to the CLIENT's working directory.
         // The daemon-global `repo_root` is only a fallback for clients that did
         // not send one — under launchd it is `/`, which is what had every tool
@@ -2305,6 +2360,14 @@ impl DaemonRuntime {
         let tool_ctx = ToolContext::new(session_cwd.as_deref().unwrap_or(&self.repo_root));
         let stream_events = SessionEvents::new(events.clone(), session_id.clone());
 
+        // REQ-572 BR-3: the prompt's capability clause reads the same classifier
+        // that decides tool exposure — stated here, where both inputs live, so
+        // the SearchUnavailable clause can reach a session (the registry
+        // fallback alone cannot distinguish it from Ready).
+        route.harness.web_capability = Some(web_capability_state(
+            &config.web,
+            self.local_model_present(),
+        ));
         let system = build_system_prompt(&tools, &route.harness);
         // REQ-567 BR-1: this turn begins from what the session has already said.
         // The head was rebuilt from *this* turn's tools and route, and the
@@ -2473,9 +2536,12 @@ impl DaemonRuntime {
                     // resolution rather than recomputed, and `None` for the taint
                     // pin, which resolved no category at all (BR-7).
                     let category = route.resolution.as_ref().map(|r| r.category);
+                    // REQ-572 ADR-4: the same classification, plus the
+                    // `capability_dead_end` announcement for the one cause that
+                    // names an absent capability rather than a broken one.
                     break 'turn Err(unserved_turn_sentence(
                         &route,
-                        self.unserved_turn_error(&config, category),
+                        self.unserved_turn_error_announcing(&config, category, events, &session_id),
                     ));
                 }
                 // REQ-544 M-3: a credential that will not resolve is a config
@@ -2662,19 +2728,27 @@ impl DaemonRuntime {
     /// special case: [`ToolRegistry::exposed_names`] caps from the front, so a
     /// degraded provider's `max_tools` cuts the opt-in capability before it cuts
     /// a server the user configured.
+    ///
+    /// `config` is the **caller's** snapshot, not a second read of the mutex
+    /// (REQ-572 verify): [`Self::run_prompt_turn`] already clones the config to
+    /// build its route, its gate and its capability clause, and a `web/setup_
+    /// commit` landing between that clone and this one gave the turn a prompt
+    /// that said the capability was off while the registry it was handed had the
+    /// tool in it. One turn, one snapshot — which is also what makes ADR-1's
+    /// "the config **is** the flow state" true per turn rather than per read.
     async fn build_tools(
         self: &Arc<Self>,
         router: &Router,
         events: &Arc<EventBus>,
         session_id: &SessionId,
         gate: &Arc<PermissionGate>,
+        config: &Config,
     ) -> ToolRegistry {
         let mut tools = ToolRegistry::with_builtins();
-        let config = self.config.lock().expect("config mutex poisoned").clone();
         if !self.mcp_servers.is_empty() {
             if let Ok(transport) = HttpTransport::new() {
                 let egress =
-                    Arc::new(self.mcp_egress(transport, router, &config, events, session_id));
+                    Arc::new(self.mcp_egress(transport, router, config, events, session_id));
                 let registry =
                     Arc::new(
                         McpRegistry::with_egress(
@@ -2711,7 +2785,9 @@ impl DaemonRuntime {
             Arc::new(RuntimeLookupSeam {
                 runtime: Arc::clone(self),
                 router: router.clone(),
-                config,
+                // The seam outlives this call, so it takes an owned copy — of
+                // the caller's snapshot, which is the whole point.
+                config: config.clone(),
                 events: Arc::clone(events),
                 session_id: session_id.clone(),
             }),
@@ -3783,6 +3859,313 @@ impl DaemonRuntime {
             .map_err(|err| format!("the configuration could not be saved ({err})"))?;
         *config = candidate;
         Ok(())
+    }
+
+    // -----------------------------------------------------------------------
+    // REQ-572: the guided `[web]` setup flow (architecture ADR-1, ADR-2)
+    // -----------------------------------------------------------------------
+
+    /// Whether a local model is live right now — the one runtime fact
+    /// [`web_capability_state`] takes, read from the slot the search leg
+    /// itself reads.
+    ///
+    /// REQ-563 BR-14 hard-couples the search tier to the redact scan, and that
+    /// scan runs on whatever [`EngineSlot`] holds:
+    /// [`RedactionGateImpl::redact_route`] asks the slot **per scan** and
+    /// blocks when it is empty. This asks the same slot, so "the setup flow
+    /// says search cannot serve" and "a search actually refuses" cannot come
+    /// apart (LESSON-456).
+    ///
+    /// It deliberately does not also re-resolve `Category::Redact` the way that
+    /// route does. That resolution answers *which provider serves the scan*,
+    /// not *whether this machine has a local model*, and asking it would need a
+    /// `Router` that a config read has no business building. The slot is the
+    /// half of the gate's condition this question is about.
+    fn local_model_present(&self) -> bool {
+        self.engine.present()
+    }
+
+    /// The gap that would block a `search` candidate on this machine right now,
+    /// or `None` when the tier is worth offering.
+    ///
+    /// Asked **of** [`web_capability_state`] rather than restated as
+    /// `!local_model_present()`: the menu must not be able to offer a tier the
+    /// classifier would refuse, and the only way to guarantee that is for both
+    /// answers to come out of the same function (LESSON-456). The probe table
+    /// names the tier and nothing else, because the classifier reads exactly
+    /// the tier and the local-model fact — whether an endpoint is set is a
+    /// *validation* question, which the candidate path below asks separately.
+    fn search_tier_gap(&self) -> Option<SearchGap> {
+        let probe = WebConfig {
+            tier: WebTier::Search,
+            ..WebConfig::default()
+        };
+        match web_capability_state(&probe, self.local_model_present()) {
+            WebCapabilityState::SearchUnavailable { reason } => Some(reason),
+            WebCapabilityState::Ready(_) | WebCapabilityState::OffAvailable => None,
+        }
+    }
+
+    /// What enabling web lookup would involve (`web/setup_plan`, BR-1/BR-3).
+    ///
+    /// Read-only and stateless: it writes nothing, remembers nothing, and a
+    /// client may render its answer as plain instructions and stop there
+    /// (BR-12's degradation path). The capability state is the **one**
+    /// classifier's answer — the same function that decides whether the web
+    /// tool is registered at all — so a client can never be told the machine is
+    /// in a state its tool registry disagrees with.
+    ///
+    /// The session id is the *gate's* business, not this read's: attachment is
+    /// checked at dispatch (TASK-130), and nothing here is per-session — which
+    /// is exactly why the endpoints can be stateless (ADR-1).
+    #[must_use]
+    pub fn web_setup_plan(&self) -> WebSetupPlanResult {
+        let config = self.config.lock().expect("config mutex poisoned");
+        let state = web_capability_state(&config.web, self.local_model_present());
+        let gap = self.search_tier_gap();
+        WebSetupPlanResult {
+            state: to_protocol_capability_state(state),
+            search_available: gap.is_none(),
+            search_gap: gap.map(|gap| gap.as_str().to_owned()),
+            // `None` means "this config names no `[web]` table", which is not
+            // the same statement as "the table says off" — the fresh-install
+            // case this REQ exists for keeps its own answer.
+            current_web: (!config.web.is_unset()).then(|| web_table_summary(&config.web)),
+        }
+    }
+
+    /// Exactly what a candidate `[web]` table would write, without writing it
+    /// (`web/setup_preview`, BR-7).
+    ///
+    /// The bytes come from [`web_table_toml`] over the candidate the commit
+    /// would build from the same answers, so "what the user confirmed is what
+    /// is written" is a property of the code path rather than of two renderers
+    /// agreeing.
+    ///
+    /// That property held only for the four fields the answers pin. The rest of
+    /// the document rides along from the live config, which another session can
+    /// move while the user is reading — so the answer also carries a
+    /// [`candidate_digest`] of the whole candidate document, and the commit
+    /// refuses to write anything that no longer digests to it (BR-7, the verify
+    /// pass's TOCTOU fix).
+    ///
+    /// # Errors
+    /// [`error_code::WEB_SETUP_INVALID`] when the candidate would not load,
+    /// carrying the validator's own sentence, or when the answers name a tier
+    /// this machine cannot serve (AC-7). Nothing is written either way — this
+    /// method has no write path at all.
+    pub fn web_setup_preview(
+        &self,
+        params: &WebSetupPreviewParams,
+    ) -> Result<WebSetupPreviewResult, RpcError> {
+        let answers = WebSetupAnswers::from_preview(params);
+        let current = self.config.lock().expect("config mutex poisoned").clone();
+        let candidate = self.web_setup_candidate(&answers, &current)?;
+        Ok(WebSetupPreviewResult {
+            toml: web_table_toml(&candidate.web).map_err(|err| {
+                RpcError::new(
+                    error_code::INTERNAL_ERROR,
+                    format!("the candidate `[web]` table could not be rendered ({err})"),
+                )
+            })?,
+            // The host from the **executor's** parse (BR-9, LESSON-494) — the
+            // same `crate::web` parser the lookup seam records a search's
+            // destination with, so the string at the confirm step is the host
+            // a query would actually reach.
+            search_host: candidate
+                .web
+                .search_endpoint
+                .as_deref()
+                .and_then(crate::web::canonical_host_of),
+            warnings: web_setup_warnings(&current.web, &candidate.web),
+            // Computed last, over the finished candidate, so what the client
+            // hands back names exactly the document the rest of this answer
+            // describes (see `candidate_digest`).
+            digest: candidate_digest(&candidate)?,
+        })
+    }
+
+    /// Write the candidate `[web]` table and make the capability live
+    /// (`web/setup_commit`, BR-8, AC-3).
+    ///
+    /// The **single commit point** (BR-11), and it is three things in one
+    /// critical section, holding the config mutex throughout so two commits
+    /// serialize rather than interleave:
+    ///
+    /// 1. the candidate is rebuilt **from the answers** — never from a preview
+    ///    the client kept, which is what stops a client committing something
+    ///    this daemon never validated (BR-8, LESSON-501) — and, when the caller
+    ///    sent one, is checked against the preview's
+    ///    [`digest`](WebSetupCommitParams::expect_digest), so re-deriving cannot
+    ///    quietly pick up a change another session made in between;
+    /// 2. the whole document is written atomically, through the same
+    ///    [`write_config_atomically`] seam [`Self::persist_web_tier`] uses, so
+    ///    there is exactly one config-write body in this daemon;
+    /// 3. only then is the in-memory config replaced. `build_tools` clones that
+    ///    config per turn, so the very next turn of **every** session picks the
+    ///    capability up with no restart (ADR-1, OQ-1).
+    ///
+    /// A commit whose candidate matches what is already configured writes
+    /// nothing, swaps nothing, and announces nothing — it reports
+    /// `applied: false`, which is a truthful answer and not a failure.
+    ///
+    /// # Errors
+    /// - [`error_code::WEB_SETUP_INVALID`] — the candidate would not load,
+    ///   names a tier this machine cannot serve, or no longer matches the
+    ///   digest the caller confirmed. Nothing is written and the in-memory
+    ///   config is untouched.
+    /// - [`error_code::CONFIG_REJECTED`] — this daemon has no config file, so
+    ///   there is nowhere for the answer to land.
+    /// - [`error_code::INTERNAL_ERROR`] — the write itself failed. The
+    ///   in-memory config is still untouched: the swap happens after the file
+    ///   lands, never before.
+    pub fn web_setup_commit(
+        &self,
+        params: &WebSetupCommitParams,
+        events: &Arc<EventBus>,
+    ) -> Result<WebSetupCommitResult, RpcError> {
+        let answers = WebSetupAnswers::from_commit(params);
+        let mut config = self.config.lock().expect("config mutex poisoned");
+        let candidate = self.web_setup_candidate(&answers, &config)?;
+        // BR-7's second half, and the reason it needs one: the answers pin the
+        // four fields the flow collects, and everything else in the document
+        // rides along from whatever the config held *at this moment*. A
+        // `persist_web_tier` from any other session between the preview and here
+        // rewrites `permission_allow`, so re-deriving from the answers alone
+        // faithfully writes a document the user never saw. The check sits
+        // **before** the no-op short-circuit below: a divergence is a refusal
+        // whether or not the `[web]` table itself ended up unchanged.
+        //
+        // A guard on the outcome, never a substitute for re-deriving it: the
+        // candidate above was already rebuilt and re-validated, so a forged
+        // digest buys nothing the answers had not already earned (BR-8,
+        // LESSON-501).
+        if let Some(expected) = params.expect_digest.as_deref() {
+            if candidate_digest(&candidate)? != expected {
+                return Err(RpcError::new(
+                    error_code::WEB_SETUP_INVALID,
+                    SETUP_DIGEST_STALE,
+                ));
+            }
+        }
+        // Read back off the candidate, never echoed from the params: the tier
+        // reported is the tier that was validated (the reason
+        // `SessionPermissionsResult::level` is read from the gate).
+        let tier = to_protocol_web_tier(candidate.web.tier);
+        if candidate.web == config.web {
+            return Ok(WebSetupCommitResult {
+                applied: false,
+                tier,
+            });
+        }
+        let Some(path) = &self.config_path else {
+            return Err(RpcError::new(
+                error_code::CONFIG_REJECTED,
+                "this daemon has no configuration file to write, so the capability could not be \
+                 enabled",
+            ));
+        };
+        write_config_atomically(path, &candidate).map_err(|err| {
+            // Names the failure class and never the path (BR-11), exactly as
+            // `persist_web_tier`'s own message does.
+            RpcError::new(
+                error_code::INTERNAL_ERROR,
+                format!("the configuration could not be saved ({err})"),
+            )
+        })?;
+        let config_path = path.display().to_string();
+        *config = candidate;
+        // The lock is released before the announcement: a subscriber runs on
+        // the publishing thread, and holding the config mutex across arbitrary
+        // subscriber work is a lock-ordering hazard for a notice that needs
+        // nothing from the config.
+        drop(config);
+        events.publish(
+            Some(params.session_id.clone()),
+            Event::WebSetupCompleted(WebSetupCompleted { tier, config_path }),
+        );
+        Ok(WebSetupCommitResult {
+            applied: true,
+            tier,
+        })
+    }
+
+    /// The candidate `Config` a set of setup answers describes — the one
+    /// construction preview and commit share (AC-1).
+    ///
+    /// Current config **cloned and re-derived**, never patched in place
+    /// (BR-8/LESSON-501), and then put through the three gates in the order a
+    /// user needs them:
+    ///
+    /// 1. **The floor**: `off` is not something this flow writes. It is the one
+    ///    answer that is not an enablement, and every layer downstream was built
+    ///    on that — see below.
+    /// 2. [`Config::validate`] — the *same* validator startup runs, so a
+    ///    document this accepts is a document that daemon would boot on. Its
+    ///    own sentence is carried verbatim rather than re-worded.
+    /// 3. [`web_capability_state`] — the machine's answer, not the document's.
+    ///    A perfectly valid `tier = "search"` on a machine with no local model
+    ///    is refused here (AC-7), because REQ-563 BR-14 would block every query
+    ///    it produced; writing it would be walking a user through configuring a
+    ///    capability that refuses to serve.
+    ///
+    /// ## Why `off` is a refusal and not a tier like any other
+    ///
+    /// The CLI never offers it, but the candidate is built from **wire params**,
+    /// and a client sending `tier: "off"` got three wrong answers at once:
+    ///
+    ///   - a candidate whose `[web]` table holds every default is
+    ///     [`WebConfig::is_unset`], and `Config` skips serializing an unset
+    ///     table — so the preview rendered a `[web]` section that the write
+    ///     would then *omit*. That asymmetry is documented at
+    ///     [`web_table_toml`] as unreachable precisely because "the setup flow
+    ///     writes a tier, and a tier above `off` is not the default"; this is
+    ///     the line that makes the sentence true.
+    ///   - the commit's `WebSetupCompleted` carries the candidate's tier, and
+    ///     that payload's own doc says it is never `Off` — "a completed setup
+    ///     enabled something".
+    ///   - and it is simply not what the flow is for. Turning the capability off
+    ///     is removing the table, which the user does in their editor.
+    ///
+    /// Only the four fields the flow collects are set. `permission_allow`,
+    /// `allowed_domains` and `cache_ttl_secs` ride along from the current table
+    /// untouched — a setup answer is not an answer about consent (BR-7's
+    /// per-capability rule, LESSON-495).
+    ///
+    /// # Errors
+    /// [`error_code::WEB_SETUP_INVALID`] for any of the three gates.
+    fn web_setup_candidate(
+        &self,
+        answers: &WebSetupAnswers<'_>,
+        current: &Config,
+    ) -> Result<Config, RpcError> {
+        if answers.tier == WebTier::Off {
+            return Err(RpcError::new(
+                error_code::WEB_SETUP_INVALID,
+                "setup enables a capability; to turn web lookup off, remove the `[web]` table",
+            ));
+        }
+        let mut candidate = current.clone();
+        candidate.web.tier = answers.tier;
+        candidate.web.search_endpoint = answers.search_endpoint.map(str::to_owned);
+        candidate.web.search_key_ref = answers.search_key_ref.map(str::to_owned);
+        candidate.web.search_auth = answers.search_auth.map(str::to_owned);
+        candidate
+            .validate()
+            .map_err(|err| RpcError::new(error_code::WEB_SETUP_INVALID, err.to_string()))?;
+        if let WebCapabilityState::SearchUnavailable { reason } =
+            web_capability_state(&candidate.web, self.local_model_present())
+        {
+            return Err(RpcError::new(
+                error_code::WEB_SETUP_INVALID,
+                format!(
+                    "this machine cannot serve the `search` tier: {} — every query would be \
+                     refused. Choose `fetch_any_url` or lower, or open the local tier first.",
+                    reason.as_str()
+                ),
+            ));
+        }
+        Ok(candidate)
     }
 
     /// Name this session after `prompt`, at most once for its whole life
@@ -6172,6 +6555,317 @@ pub(crate) fn context_is_sensitive(ctx: &ContextManager, boundaries: &[PrivacyBo
 // Config <-> protocol conversions
 // ---------------------------------------------------------------------------
 
+/// The four answers a `/web setup` flow collects, borrowed out of whichever of
+/// the two identical param structs carried them (REQ-572 ADR-2).
+///
+/// It exists so preview and commit cannot build their candidates differently:
+/// [`DaemonRuntime::web_setup_candidate`] takes this and nothing else, and the
+/// only two ways to make one are the two constructors below. `WebSetupPreviewParams`
+/// and `WebSetupCommitParams` are deliberately separate wire types — the commit
+/// re-asks rather than trusting a blob — and this is where the two stop being
+/// two things.
+///
+/// **A blank answer is an absent one.** `Config::validate` already reads a
+/// blank `search_endpoint` and a blank `search_auth` as unset ("not configured
+/// is one state, not two"), so trimming to `None` here means the document the
+/// flow writes says it the same way — rather than persisting `search_endpoint = ""`,
+/// which validates and then reads as nothing.
+struct WebSetupAnswers<'a> {
+    tier: WebTier,
+    search_endpoint: Option<&'a str>,
+    search_key_ref: Option<&'a str>,
+    search_auth: Option<&'a str>,
+}
+
+impl<'a> WebSetupAnswers<'a> {
+    /// The **one** reading of the four wire fields: the tier mapping, the trim,
+    /// and blank-as-absent all happen here and nowhere else.
+    ///
+    /// The two constructors below are the two wire types calling it with their
+    /// own fields. They stay separate because the *types* are deliberately
+    /// separate (the commit re-asks rather than trusting a preview's blob), but
+    /// what they do with those fields was byte-identical prose in two places —
+    /// which is one place for a trim rule to be tightened and missed.
+    fn new(
+        tier: WireWebTier,
+        search_endpoint: Option<&'a str>,
+        search_key_ref: Option<&'a str>,
+        search_auth: Option<&'a str>,
+    ) -> Self {
+        Self {
+            tier: from_protocol_web_tier(tier),
+            search_endpoint: setup_answer(search_endpoint),
+            search_key_ref: setup_answer(search_key_ref),
+            search_auth: setup_answer(search_auth),
+        }
+    }
+
+    fn from_preview(params: &'a WebSetupPreviewParams) -> Self {
+        Self::new(
+            params.tier,
+            params.search_endpoint.as_deref(),
+            params.search_key_ref.as_deref(),
+            params.search_auth.as_deref(),
+        )
+    }
+
+    fn from_commit(params: &'a WebSetupCommitParams) -> Self {
+        Self::new(
+            params.tier,
+            params.search_endpoint.as_deref(),
+            params.search_key_ref.as_deref(),
+            params.search_auth.as_deref(),
+        )
+    }
+}
+
+/// The digest a preview promises and a commit checks (REQ-572 verify, BR-7).
+///
+/// Over the **whole serialized document** — the very bytes
+/// [`write_config_atomically`] would put on disk — rather than over the rendered
+/// `[web]` section the preview displays. The setup flow collects four fields and
+/// carries the rest of the table along from the live config
+/// ([`DaemonRuntime::web_setup_candidate`]), so any other session answering
+/// "enable permanently" ([`DaemonRuntime::persist_web_tier`]) moves
+/// `permission_allow` — and with it the file — underneath a preview the user is
+/// still reading. A digest over the section alone would catch that one race and
+/// nothing else; digesting what is written pins the whole promise.
+///
+/// Deterministic because `Config`'s maps are `BTreeMap`s: the same candidate
+/// serializes to the same bytes on both calls, which is what makes an inequality
+/// evidence of a *change* rather than of two serializations.
+///
+/// # Errors
+/// [`error_code::INTERNAL_ERROR`] when the candidate will not serialize — the
+/// same failure the commit's own write would hit one step later, surfaced at the
+/// preview instead of after the confirmation.
+fn candidate_digest(candidate: &Config) -> Result<String, RpcError> {
+    candidate
+        .to_toml()
+        .map(|document| teton_inference::sha256_hex(document.as_bytes()))
+        .map_err(|err| {
+            RpcError::new(
+                error_code::INTERNAL_ERROR,
+                format!("the candidate configuration could not be rendered ({err})"),
+            )
+        })
+}
+
+/// What a commit is told when the document moved under its preview (BR-7).
+///
+/// Names the fact and the remedy and **echoes nothing** — not the digests, not
+/// the field that changed, not the document: a client renders this into a
+/// transcript, and the thing that moved may be another session's answer.
+const SETUP_DIGEST_STALE: &str =
+    "the configuration changed since the preview, so this would write bytes you did not \
+     confirm — run `/web setup` again";
+
+/// One setup answer, trimmed, with blank read as absent — see
+/// [`WebSetupAnswers`] for why.
+fn setup_answer(value: Option<&str>) -> Option<&str> {
+    value.map(str::trim).filter(|value| !value.is_empty())
+}
+
+/// The semantic capability state as it travels on the wire.
+///
+/// The daemon's boundary conversion, and the only one: TASK-128 left it here
+/// deliberately, because this is where the wire type is actually named. The
+/// gap's sentence comes from [`SearchGap::as_str`] rather than being written
+/// again, so the status line, the prompt clause and the setup flow cannot each
+/// invent a phrasing of one fact (BR-3, LESSON-456).
+fn to_protocol_capability_state(state: WebCapabilityState) -> WireWebCapabilityState {
+    match state {
+        WebCapabilityState::Ready(tier) => WireWebCapabilityState::Ready {
+            tier: to_protocol_web_tier(tier),
+        },
+        WebCapabilityState::OffAvailable => WireWebCapabilityState::OffAvailable,
+        WebCapabilityState::SearchUnavailable { reason } => {
+            WireWebCapabilityState::SearchUnavailable {
+                reason: reason.as_str().to_owned(),
+            }
+        }
+    }
+}
+
+/// The `[web]` table as the setup flow shows it — a tier, a host, and two
+/// references (REQ-572 AC-7).
+///
+/// Every field is non-secret by construction: the endpoint appears as its
+/// **host** only (REQ-563 BR-7, the rule the whole web event family follows),
+/// and the key appears as the reference config holds rather than the value the
+/// keychain holds (BR-6).
+fn web_table_summary(web: &WebConfig) -> WebTableSummary {
+    WebTableSummary {
+        tier: to_protocol_web_tier(web.tier),
+        search_host: web
+            .search_endpoint
+            .as_deref()
+            .and_then(crate::web::canonical_host_of),
+        search_key_ref: web.search_key_ref.clone(),
+        search_auth: web.search_auth.clone(),
+    }
+}
+
+/// Query-parameter **names** that mean a credential is riding in the URL.
+///
+/// Lowercased and compared whole, so `key` matches and `keyword` does not. The
+/// list is the four spellings the search backends this flow suggests actually
+/// use; it is a heuristic and says so in its sentence, because the alternative
+/// — saying nothing — is how a key ends up in a config file, a shell history and
+/// every `web_lookup` destination string that endpoint ever produces.
+const CREDENTIAL_QUERY_KEYS: [&str; 4] = ["api_key", "apikey", "key", "token"];
+
+/// Whether `endpoint`'s query string carries a parameter whose **name** says it
+/// holds a credential (REQ-572 verify).
+///
+/// Name-based, and the value is never read, let alone echoed: what the warning
+/// needs to say is "there is a key in this URL", and reading the value to say it
+/// would put a secret in a `Vec<String>` that travels to a client and into a
+/// transcript (BR-6's rule, which the whole web event family follows).
+///
+/// A hand-split rather than a URL parse, for the reason the whole function is a
+/// warning and not a gate: an endpoint that does not parse has its own arm
+/// below, and this one has to work on the string the user typed.
+fn endpoint_query_names_a_credential(endpoint: &str) -> bool {
+    endpoint
+        .split_once('?')
+        .map(|(_, query)| query)
+        .into_iter()
+        .flat_map(|query| query.split(['&', ';']))
+        .filter_map(|pair| pair.split('=').next())
+        .any(|name| {
+            let name = name.trim().to_ascii_lowercase();
+            CREDENTIAL_QUERY_KEYS.contains(&name.as_str())
+        })
+}
+
+/// Non-fatal notes about a candidate the validator already accepted.
+///
+/// Warnings, never errors — a candidate the validator **refuses** is a
+/// `WEB_SETUP_INVALID` response, not a preview with a note attached. What is
+/// left for this function is the set of things that are legitimate
+/// configurations and still probably not what the user meant, each stated as
+/// the consequence rather than as a scolding.
+fn web_setup_warnings(current: &WebConfig, candidate: &WebConfig) -> Vec<String> {
+    // First, and unconditional, because it is the one note that is true of every
+    // commit and is the only thing on this list the user cannot undo: the write
+    // is a whole-document `Config::to_toml`, so a hand-edited config comes back
+    // canonicalised — comments gone, key order normalised, anything this build's
+    // schema does not know about dropped. Disclosed rather than fixed here: a
+    // `toml_edit` round-trip is a separate change to the one config-write body
+    // this daemon has, and a user confirming a preview deserves to know now
+    // rather than to find out from `git diff`.
+    let mut warnings = vec![
+        "saving rewrites the whole config file — comments and unrecognized keys do not survive."
+            .to_owned(),
+    ];
+    if candidate.tier < WebTier::Search && candidate.search_endpoint.is_some() {
+        warnings.push(format!(
+            "`search_endpoint` is written, but `[web] tier` is \"{}\", which does not reach \
+             search — the backend will not be queried until the tier is raised.",
+            tier_name(candidate.tier)
+        ));
+    }
+    if candidate.tier == WebTier::Search && candidate.search_key_ref.is_none() {
+        warnings.push(
+            "no `search_key_ref`, so searches go out with no credential — right for a \
+             self-hosted backend, and refused by one that requires a key."
+                .to_owned(),
+        );
+    }
+    // A credential with nothing to bind to. The second arm is the exact
+    // condition `DaemonRuntime::search_auth` fails closed on, asked here so the
+    // user learns it at the confirm step rather than from a 401 — and it is
+    // genuinely reachable past the validator, whose `is_absolute_http_url` is a
+    // looser reading of a URL than the `reqwest::Url` parse the transport binds
+    // the key with.
+    if candidate.search_key_ref.is_some() {
+        match candidate.search_endpoint.as_deref() {
+            None => warnings.push(
+                "`search_key_ref` is written with no `search_endpoint`, so there is no request \
+                 for the key to ride — it stays inert until a backend is named."
+                    .to_owned(),
+            ),
+            Some(endpoint) if origin_of(endpoint).is_none() => warnings.push(
+                "`search_endpoint` does not parse to a network origin, so the resolved key has \
+                 nothing to be bound to and searches would go out with no credential."
+                    .to_owned(),
+            ),
+            Some(_) => {}
+        }
+    }
+    // A key in the URL itself. Legitimate for a backend that takes no header —
+    // which is why it is a note and not a refusal — and worth saying out loud
+    // because `search_endpoint` is the one `[web]` field that is *not* treated
+    // as a secret anywhere: it goes in the config in clear, and its host travels
+    // in every `web_lookup` event. The name is matched and the value is never
+    // read, so this note cannot itself become the leak it is warning about.
+    if candidate
+        .search_endpoint
+        .as_deref()
+        .is_some_and(endpoint_query_names_a_credential)
+    {
+        warnings.push(
+            "the endpoint's query string looks like it carries a credential; keys belong in \
+             the keychain (`search_key_ref`), not in a config file."
+                .to_owned(),
+        );
+    }
+    // The candidate is a re-derivation, not a patch (BR-8), so an answer that
+    // omits a key the current table has is an answer that removes it. Said out
+    // loud, because the preview is where a user can still say no.
+    let dropped: Vec<&str> = [
+        (
+            "search_endpoint",
+            &current.search_endpoint,
+            &candidate.search_endpoint,
+        ),
+        (
+            "search_key_ref",
+            &current.search_key_ref,
+            &candidate.search_key_ref,
+        ),
+        ("search_auth", &current.search_auth, &candidate.search_auth),
+    ]
+    .into_iter()
+    .filter(|(_, before, after)| before.is_some() && after.is_none())
+    .map(|(key, _, _)| key)
+    .collect();
+    if !dropped.is_empty() {
+        let mut removal = format!(
+            "this replaces the current `[web]` table: {} will be removed.",
+            dropped.join(", ")
+        );
+        // Dropping the *reference* does not drop the secret. The key's whole
+        // lifecycle lives in the client process (ADR-3), so the daemon has no
+        // way to delete it and would not be the right holder if it had — but it
+        // is the party that knows the reference is about to stop existing, and a
+        // user who is never told is left with a live credential nothing points
+        // at. The entry named is the one `/web setup` writes (service `teton`,
+        // account `web-search`), not one parsed out of the reference: building a
+        // shell command out of a config string is how a note becomes an
+        // instruction to run something the user did not write.
+        if dropped.contains(&"search_key_ref") {
+            removal.push_str(
+                " The stored key remains in the keychain; remove it with: \
+                 security delete-generic-password -s teton -a web-search",
+            );
+        }
+        warnings.push(removal);
+    }
+    warnings
+}
+
+/// Whether any remote provider is configured at all.
+///
+/// One spelling, read by [`DaemonRuntime::unserved_turn_error`]'s remote half
+/// and by the dead-end announcement that keys on the same fact — two readings
+/// of one question is how the message and the event come to disagree about
+/// which state the machine is in (LESSON-456).
+fn has_remote_provider(config: &Config) -> bool {
+    config.providers.iter().any(|p| p.kind.is_remote())
+}
+
 /// Project a [`Config`] into the protocol [`ConfigSnapshot`] for `config/get`.
 ///
 /// The phase table that used to fill `routing` is gone (AC-9). What replaced it
@@ -6180,7 +6874,17 @@ pub(crate) fn context_is_sensitive(ctx: &ContextManager, boundaries: &[PrivacyBo
 /// — but the resolver's own answer for each of the eleven categories, taken from
 /// `router` so that `teton policy show` and `route_decided` are two renderings of
 /// one value rather than two computations of one question (ADR-D, BR-6, AC-11).
-fn snapshot_from_config(config: &Config, router: &Router) -> ConfigSnapshot {
+///
+/// `local_model_present` is the one runtime fact the projection cannot read off
+/// the config: the web capability state depends on whether a local model is
+/// live (REQ-563 BR-14), and that lives in the daemon's engine slot. Passed in
+/// rather than reached for, so the whole projection stays a function of its
+/// arguments and every cell of it is testable without a daemon.
+fn snapshot_from_config(
+    config: &Config,
+    router: &Router,
+    local_model_present: bool,
+) -> ConfigSnapshot {
     // REQ-559 BR-9 / AC-8: every row comes from `Router::effort_for`, the SAME
     // function the router calls per model call. The surfaces therefore cannot
     // describe a provider differently from the request that goes to it — which
@@ -6240,6 +6944,16 @@ fn snapshot_from_config(config: &Config, router: &Router) -> ConfigSnapshot {
         // of a gate, because this is the same question `redaction_gate` asks —
         // one switch, one reader, no second answer to drift from the first.
         redact_enabled: config.privacy.redact,
+        // REQ-572 BR-3/BR-10: the derived web capability state, from the same
+        // classifier that governs whether the web tool is registered at all —
+        // never a second reading of `config.web.tier` here, which is the one
+        // thing BR-3 forbids (LESSON-456). `Some` on every daemon that can
+        // answer, which is every daemon since TASK-129; the field stays
+        // optional because a *client* may be talking to an older one.
+        web_capability: Some(to_protocol_capability_state(web_capability_state(
+            &config.web,
+            local_model_present,
+        ))),
     }
 }
 
@@ -7477,7 +8191,7 @@ provider_id = "on-device"
         // AC-9: no phase-keyed routing row is written by any config op.
         assert!(config.legacy_routing.is_empty());
 
-        let snap = snapshot_from_config(&config, &router_for_config(&config));
+        let snap = snapshot_from_config(&config, &router_for_config(&config), false);
         assert_eq!(snap.providers.len(), 1);
         assert_eq!(snap.providers[0].kind, ProtoProviderKind::OpenaiCompatible);
         assert_eq!(snap.privacy[0].mode, PrivacyMode::LocalOnly);
@@ -7507,7 +8221,7 @@ provider_id = "on-device"
             "the fixture must model the default, or the `false` leg proves nothing"
         );
         assert!(
-            !snapshot_from_config(&absent, &router_for_config(&absent)).redact_enabled,
+            !snapshot_from_config(&absent, &router_for_config(&absent), false).redact_enabled,
             "an un-opted-in daemon must report the scan as off"
         );
 
@@ -7517,7 +8231,7 @@ provider_id = "on-device"
             ..Config::default()
         };
         assert!(
-            snapshot_from_config(&opted_in, &router_for_config(&opted_in)).redact_enabled,
+            snapshot_from_config(&opted_in, &router_for_config(&opted_in), false).redact_enabled,
             "`[privacy] redact = true` must reach the client that asked for the config"
         );
     }
@@ -7596,7 +8310,7 @@ provider_id = "on-device"
 
         // And the resolver reports the override as an override, which is what
         // `teton policy show` prints — not a re-derivation from the reason.
-        let snap = snapshot_from_config(&config, &router_for_config(&config));
+        let snap = snapshot_from_config(&config, &router_for_config(&config), false);
         let review = snap
             .routing
             .iter()
@@ -7796,7 +8510,7 @@ provider_id = "on-device"
         let mut config = config_with_remote("cheap");
         config.default_provider = Some("cheap".to_owned());
         config.judgment_default = teton_core::category::JudgmentCategory::Debug;
-        let snap = snapshot_from_config(&config, &router_for_config(&config));
+        let snap = snapshot_from_config(&config, &router_for_config(&config), false);
 
         assert_eq!(snap.routing.len(), 11, "every category gets a row");
         let unreached: Vec<&str> = snap
@@ -7868,7 +8582,7 @@ provider_id = "on-device"
                 fallback_id: None,
             }),
         );
-        let snap = snapshot_from_config(&config, &router_for_config(&config));
+        let snap = snapshot_from_config(&config, &router_for_config(&config), false);
         let row = |tier: ProtoTier| {
             snap.tiers
                 .iter()
@@ -14583,10 +15297,9 @@ provider_id = "on-device"
         async fn the_web_tool_is_registered_exactly_when_the_tier_is_above_off() {
             for tier in WebTier::ALL {
                 let runtime = runtime_at(tier);
-                let router = {
-                    let config = runtime.config.lock().expect("config mutex").clone();
-                    build_router(&config, runtime.local_tier_available(), &BTreeMap::new())
-                };
+                let config = runtime.config.lock().expect("config mutex").clone();
+                let router =
+                    build_router(&config, runtime.local_tier_available(), &BTreeMap::new());
                 let events = Arc::new(EventBus::new());
                 let session = SessionId::from("s");
                 let gate = Arc::new(PermissionGate::new(
@@ -14596,7 +15309,9 @@ provider_id = "on-device"
                     Arc::clone(&runtime.pending),
                 ));
 
-                let tools = runtime.build_tools(&router, &events, &session, &gate).await;
+                let tools = runtime
+                    .build_tools(&router, &events, &session, &gate, &config)
+                    .await;
 
                 assert_eq!(
                     tools.get(WEB_TOOL_NAME).is_some(),
@@ -14625,6 +15340,68 @@ provider_id = "on-device"
                     }
                 }
             }
+        }
+
+        /// **One turn, one config snapshot** (REQ-572 verify).
+        ///
+        /// [`DaemonRuntime::run_prompt_turn`] clones the config to build its
+        /// route, its permission gate and the prompt's capability clause;
+        /// `build_tools` used to take a *second* clone off the mutex. A
+        /// `web/setup_commit` landing between the two gave that turn a system
+        /// prompt saying the capability was off while the registry it was handed
+        /// had the web tool in it — the model reading a contradiction and one of
+        /// the two being wrong for a whole turn.
+        ///
+        /// Asserted where the seam actually is, and in both directions, because
+        /// a signature that takes a config it then ignores would pass a
+        /// one-directional check: the registry follows the config it is **given**
+        /// even when the runtime's live config says the opposite. That is the
+        /// property that makes "the caller's snapshot" true rather than merely
+        /// written down.
+        #[tokio::test]
+        async fn the_tool_registry_follows_the_config_it_is_handed_not_the_live_one() {
+            let runtime = runtime_at(WebTier::Off);
+            let events = Arc::new(EventBus::new());
+            let session = SessionId::from("s");
+            let gate = Arc::new(PermissionGate::new(
+                session.clone(),
+                crate::harness::table_for(runtime.default_permission_level),
+                Arc::clone(&events),
+                Arc::clone(&runtime.pending),
+            ));
+            let live = runtime.config.lock().expect("config mutex").clone();
+            let router = build_router(&live, runtime.local_tier_available(), &BTreeMap::new());
+
+            // The live config is `off`; the snapshot says `fetch_any_url`. This
+            // is the shape of a turn that read the config *before* a commit
+            // landed — except here the turn is the one holding the older answer.
+            let snapshot = Config {
+                web: WebConfig {
+                    tier: WebTier::FetchAnyUrl,
+                    ..live.web.clone()
+                },
+                ..live.clone()
+            };
+            assert!(
+                runtime
+                    .build_tools(&router, &events, &session, &gate, &snapshot)
+                    .await
+                    .get(WEB_TOOL_NAME)
+                    .is_some(),
+                "the registry re-read the live config instead of using the turn's \
+                 snapshot, so a turn's prompt and its tool set can disagree"
+            );
+            // And the other direction: the live config is untouched by any of
+            // this, so the same call with the live snapshot has no web tool.
+            assert!(
+                runtime
+                    .build_tools(&router, &events, &session, &gate, &live)
+                    .await
+                    .get(WEB_TOOL_NAME)
+                    .is_none(),
+                "non-vacuity: the live config really does say `off`, so the \
+                 registration above came from the snapshot"
+            );
         }
 
         /// **BR-3's ingestion.** A message that pastes a URL and asks about it
@@ -14660,6 +15437,1282 @@ provider_id = "on-device"
             runtime.record_user_prompt_urls(&SessionId::from("a"), "see https://docs.rs/tokio");
             let other = runtime.user_urls_for(&SessionId::from("b"));
             assert!(other.lock().expect("user url mutex").is_empty());
+        }
+    }
+
+    /// REQ-572 TASK-129 — the daemon half of the guided `[web]` setup flow:
+    /// what a plan reports, what a preview promises, what a commit writes, and
+    /// the one dead end the unserved-turn path can see.
+    ///
+    /// These sit beside the `persist_web_tier` tests deliberately: the two are
+    /// the daemon's only config-writing paths, they share one atomic-write
+    /// body, and a change to that body has to answer to both.
+    mod web_setup_flow {
+        use super::*;
+        use crate::harness::tools::WEB_TOOL_NAME;
+        use teton_core::config::WebTier;
+        use teton_protocol::events::{WebCapabilityState, WebTier as WireWebTier};
+        use teton_protocol::methods::{WebSetupCommitParams, WebSetupPreviewParams};
+
+        /// A config document with something in it, so "the file is byte-identical
+        /// after a refused commit" is a claim about content and not about an
+        /// empty file staying empty.
+        const SEED: &str = "[privacy]\nredact = true\n";
+
+        fn session() -> SessionId {
+            SessionId::from("sess-setup")
+        }
+
+        /// A daemon with a real config file, seeded and loaded — what a commit
+        /// needs and `minimal()` deliberately has not got.
+        fn runtime_on_disk(tag: &str) -> (Arc<DaemonRuntime>, PathBuf) {
+            let dir = super::scratch_dir(tag);
+            let config_path = dir.join("config.toml");
+            std::fs::write(&config_path, SEED).expect("seed a config");
+            let mut runtime = DaemonRuntime::minimal();
+            runtime.config_path = Some(config_path.clone());
+            runtime.data_dir = dir;
+            *runtime.config.lock().expect("config mutex") =
+                load_config(Some(&config_path)).expect("the seeded config loads");
+            (Arc::new(runtime), config_path)
+        }
+
+        /// Put a model in the slot — the fact `web_capability_state` reads as
+        /// "a local model is present", installed the way the consent commit
+        /// installs one.
+        fn with_local_model(runtime: &DaemonRuntime) {
+            runtime.engine.install(
+                "setup-test-local".to_owned(),
+                Arc::new(Mutex::new(MockEngine::new("setup-test-local"))) as Arc<Mutex<dyn Engine>>,
+            );
+        }
+
+        fn preview_params(
+            tier: WireWebTier,
+            endpoint: Option<&str>,
+            key_ref: Option<&str>,
+            auth: Option<&str>,
+        ) -> WebSetupPreviewParams {
+            WebSetupPreviewParams {
+                session_id: session(),
+                tier,
+                search_endpoint: endpoint.map(str::to_owned),
+                search_key_ref: key_ref.map(str::to_owned),
+                search_auth: auth.map(str::to_owned),
+            }
+        }
+
+        /// The same answers as a commit — spelled through the preview params so
+        /// a test cannot accidentally preview one thing and commit another,
+        /// which is the very property AC-1 is about.
+        ///
+        /// No `expect_digest`: this is the old client's shape, and every test
+        /// that does not name the divergence check is asserting the flow that
+        /// still has to work without one. The digest's own tests build their
+        /// commit with [`as_commit_expecting`].
+        fn as_commit(params: &WebSetupPreviewParams) -> WebSetupCommitParams {
+            WebSetupCommitParams {
+                session_id: params.session_id.clone(),
+                tier: params.tier,
+                search_endpoint: params.search_endpoint.clone(),
+                search_key_ref: params.search_key_ref.clone(),
+                search_auth: params.search_auth.clone(),
+                expect_digest: None,
+            }
+        }
+
+        /// [`as_commit`] with the preview's digest carried back, which is what
+        /// the real client sends (BR-7).
+        fn as_commit_expecting(
+            params: &WebSetupPreviewParams,
+            digest: &str,
+        ) -> WebSetupCommitParams {
+            WebSetupCommitParams {
+                expect_digest: Some(digest.to_owned()),
+                ..as_commit(params)
+            }
+        }
+
+        /// The `[web]` section of a rendered document, by the same reading
+        /// `teton_core`'s renderer test uses: everything from `[web]` up to the
+        /// next table header.
+        fn web_section_of(document: &str) -> String {
+            let mut section = String::new();
+            let mut inside = false;
+            for line in document.lines() {
+                if line.starts_with('[') {
+                    if inside {
+                        break;
+                    }
+                    inside = line == "[web]";
+                }
+                if inside {
+                    section.push_str(line);
+                    section.push('\n');
+                }
+            }
+            while section.ends_with("\n\n") {
+                section.pop();
+            }
+            section
+        }
+
+        // -- AC-1: one candidate, one rendering --------------------------------
+
+        /// **What the user confirmed is what is written** (BR-7, AC-1).
+        ///
+        /// Not "the two functions agree today": the preview's `toml` is compared
+        /// against the `[web]` section of the bytes the commit actually left on
+        /// disk, for three shapes of answer. A second renderer, or a commit that
+        /// patched the table instead of rebuilding it from the same answers,
+        /// fails here.
+        #[test]
+        fn a_preview_renders_the_bytes_the_commit_goes_on_to_write() {
+            let shapes = [
+                (
+                    "fetch only",
+                    preview_params(WireWebTier::FetchAnyUrl, None, None, None),
+                ),
+                (
+                    "keyless search",
+                    preview_params(
+                        WireWebTier::Search,
+                        Some("https://searx.example.com/search?format=json"),
+                        None,
+                        None,
+                    ),
+                ),
+                (
+                    "search with a key reference and an auth template",
+                    preview_params(
+                        WireWebTier::Search,
+                        Some("https://api.search.brave.com/res/v1/web/search"),
+                        Some("keychain://teton/web-search"),
+                        Some("X-Subscription-Token: {key}"),
+                    ),
+                ),
+            ];
+
+            for (label, params) in shapes {
+                let (runtime, config_path) = runtime_on_disk("web-setup-parity");
+                // The search shapes need a local model, or AC-7 refuses them
+                // before they can be rendered at all.
+                with_local_model(&runtime);
+                let events = Arc::new(EventBus::new());
+
+                let preview = runtime
+                    .web_setup_preview(&params)
+                    .unwrap_or_else(|err| panic!("{label}: the candidate must preview: {err:?}"));
+                let committed = runtime
+                    .web_setup_commit(&as_commit(&params), &events)
+                    .unwrap_or_else(|err| panic!("{label}: the candidate must commit: {err:?}"));
+                assert!(committed.applied, "{label}: the commit changed nothing");
+
+                let document = std::fs::read_to_string(&config_path).expect("read the config back");
+                assert_eq!(
+                    web_section_of(&document),
+                    preview.toml,
+                    "{label}: the user confirmed one table and a different one was written.\n\
+                     document:\n{document}"
+                );
+                // Non-vacuity: the preview really did say something.
+                assert!(
+                    preview.toml.starts_with("[web]\n"),
+                    "{label}: {}",
+                    preview.toml
+                );
+            }
+        }
+
+        /// The host at the confirm step comes from the executor's parse
+        /// (BR-9, LESSON-494) — a host, never the path or the query the
+        /// endpoint carries.
+        #[test]
+        fn the_previewed_host_is_the_one_the_request_would_reach() {
+            let (runtime, _path) = runtime_on_disk("web-setup-host");
+            with_local_model(&runtime);
+            let preview = runtime
+                .web_setup_preview(&preview_params(
+                    WireWebTier::Search,
+                    Some("https://Search.Example.COM/api?format=json"),
+                    None,
+                    None,
+                ))
+                .expect("the candidate previews");
+            assert_eq!(preview.search_host.as_deref(), Some("search.example.com"));
+        }
+
+        // -- AC-2: a refused candidate touches nothing -------------------------
+
+        /// **A commit is all-or-nothing** (BR-11, AC-2).
+        ///
+        /// The candidate is a document this daemon would refuse to start on, so
+        /// the validator refuses it here — and the file is byte-identical, the
+        /// in-memory config is untouched, and nothing is announced. Any one of
+        /// those three failing is a half-applied commit.
+        #[test]
+        fn a_candidate_that_would_not_load_writes_nothing_and_moves_nothing() {
+            let (runtime, config_path) = runtime_on_disk("web-setup-invalid");
+            with_local_model(&runtime);
+            let events = Arc::new(EventBus::new());
+            let mut subscriber = events.subscribe(4);
+            let before_bytes = std::fs::read_to_string(&config_path).expect("read");
+            let before_web = runtime.config.lock().expect("config mutex").web.clone();
+
+            // `tier = "search"` with no endpoint — the exact document
+            // `Config::validate` refuses at load.
+            let err = runtime
+                .web_setup_commit(
+                    &as_commit(&preview_params(WireWebTier::Search, None, None, None)),
+                    &events,
+                )
+                .expect_err("search with no endpoint must be refused");
+
+            assert_eq!(err.code, error_code::WEB_SETUP_INVALID);
+            assert!(
+                err.message.contains("search_endpoint"),
+                "the validator's own sentence must be carried, naming the missing key: {}",
+                err.message
+            );
+            assert_eq!(
+                std::fs::read_to_string(&config_path).expect("read"),
+                before_bytes,
+                "a refused commit rewrote the file"
+            );
+            assert_eq!(
+                runtime.config.lock().expect("config mutex").web,
+                before_web,
+                "a refused commit moved the in-memory config"
+            );
+            assert!(
+                subscriber.try_recv().is_none(),
+                "a refused commit announced something (AC-4: no event on failed validation)"
+            );
+            // And the same answers refuse identically at preview, so a client
+            // cannot learn one thing and commit another.
+            assert_eq!(
+                runtime
+                    .web_setup_preview(&preview_params(WireWebTier::Search, None, None, None))
+                    .expect_err("preview refuses it too")
+                    .code,
+                error_code::WEB_SETUP_INVALID
+            );
+        }
+
+        // -- AC-3: live pickup, no restart -------------------------------------
+
+        /// **The capability is live in this process** (BR-8, AC-3).
+        ///
+        /// The evidence is the registry `build_tools` produces — the same
+        /// function a turn calls — plus the plan's own report, both taken before
+        /// and after the commit with no restart in between and nothing but the
+        /// config swap having changed.
+        #[tokio::test]
+        async fn a_committed_tier_reaches_the_next_registry_and_the_next_plan() {
+            let (runtime, _config_path) = runtime_on_disk("web-setup-live");
+            let events = Arc::new(EventBus::new());
+            let session = session();
+
+            let registry = |runtime: Arc<DaemonRuntime>,
+                            events: Arc<EventBus>,
+                            session: SessionId| async move {
+                let config = runtime.config.lock().expect("config mutex").clone();
+                let router =
+                    build_router(&config, runtime.local_tier_available(), &BTreeMap::new());
+                let gate = Arc::new(PermissionGate::new(
+                    session.clone(),
+                    crate::harness::table_for(runtime.default_permission_level),
+                    Arc::clone(&events),
+                    Arc::clone(&runtime.pending),
+                ));
+                runtime
+                    .build_tools(&router, &events, &session, &gate, &config)
+                    .await
+                    .get(WEB_TOOL_NAME)
+                    .is_some()
+            };
+
+            assert!(
+                !registry(Arc::clone(&runtime), Arc::clone(&events), session.clone()).await,
+                "non-vacuity: a fresh install has no web tool to find"
+            );
+            assert_eq!(
+                runtime.web_setup_plan().state,
+                WebCapabilityState::OffAvailable,
+                "non-vacuity: the capability really was off first"
+            );
+
+            runtime
+                .web_setup_commit(
+                    &as_commit(&preview_params(WireWebTier::FetchAnyUrl, None, None, None)),
+                    &events,
+                )
+                .expect("the commit lands");
+
+            assert!(
+                registry(Arc::clone(&runtime), Arc::clone(&events), session.clone()).await,
+                "the committed tier did not reach the next registry — this is the restart \
+                 BR-8 forbids"
+            );
+            assert_eq!(
+                runtime.web_setup_plan().state,
+                WebCapabilityState::Ready {
+                    tier: WireWebTier::FetchAnyUrl
+                },
+                "the plan and the registry must be the same classifier's answer"
+            );
+        }
+
+        // -- AC-4: the announcement --------------------------------------------
+
+        /// **The change is announced to the session that made it** (BR-14,
+        /// AC-4, LESSON-505) — and to that session only, by scope.
+        #[test]
+        fn a_commit_announces_itself_to_the_committing_session() {
+            let (runtime, config_path) = runtime_on_disk("web-setup-event");
+            let events = Arc::new(EventBus::new());
+            let mut subscriber = events.subscribe(4);
+
+            runtime
+                .web_setup_commit(
+                    &as_commit(&preview_params(WireWebTier::FetchUserUrl, None, None, None)),
+                    &events,
+                )
+                .expect("the commit lands");
+
+            let envelope = subscriber.try_recv().expect("exactly one event");
+            assert_eq!(
+                envelope.session_id,
+                Some(session()),
+                "the notice must be scoped to the committing session"
+            );
+            match envelope.event {
+                Event::WebSetupCompleted(completed) => {
+                    assert_eq!(completed.tier, WireWebTier::FetchUserUrl);
+                    assert_eq!(completed.config_path, config_path.display().to_string());
+                }
+                other => panic!("unexpected event: {other:?}"),
+            }
+            assert!(subscriber.try_recv().is_none(), "and exactly one");
+        }
+
+        /// A commit that changes nothing says so — and stays quiet. `applied:
+        /// false` is a truthful answer, not a failure, and announcing a change
+        /// that did not happen would be the lie the flag exists to prevent.
+        #[test]
+        fn a_commit_that_changes_nothing_applies_nothing_and_announces_nothing() {
+            let (runtime, config_path) = runtime_on_disk("web-setup-idempotent");
+            let events = Arc::new(EventBus::new());
+            let params = as_commit(&preview_params(WireWebTier::FetchAnyUrl, None, None, None));
+
+            assert!(
+                runtime
+                    .web_setup_commit(&params, &events)
+                    .expect("the first commit lands")
+                    .applied
+            );
+            let after_first = std::fs::read_to_string(&config_path).expect("read");
+            let mut subscriber = events.subscribe(4);
+
+            let second = runtime
+                .web_setup_commit(&params, &events)
+                .expect("a repeat commit is not an error");
+            assert!(
+                !second.applied,
+                "the repeat reported a change it did not make"
+            );
+            assert_eq!(second.tier, WireWebTier::FetchAnyUrl);
+            assert_eq!(
+                std::fs::read_to_string(&config_path).expect("read"),
+                after_first
+            );
+            assert!(subscriber.try_recv().is_none());
+        }
+
+        /// With nowhere to write, the capability cannot be enabled — reported
+        /// rather than applied in memory, exactly as `persist_web_tier` reports
+        /// it, because an in-memory-only "enabled" outlives nothing.
+        #[test]
+        fn a_daemon_with_no_config_file_refuses_the_commit() {
+            let runtime = DaemonRuntime::minimal();
+            let events = Arc::new(EventBus::new());
+            let err = runtime
+                .web_setup_commit(
+                    &as_commit(&preview_params(WireWebTier::FetchAnyUrl, None, None, None)),
+                    &events,
+                )
+                .expect_err("no file, nowhere to enable it");
+            assert_eq!(err.code, error_code::CONFIG_REJECTED);
+            assert_eq!(
+                runtime.config.lock().expect("config mutex").web.tier,
+                WebTier::Off,
+                "a refused commit must not have opened the capability in memory"
+            );
+        }
+
+        // -- AC-7: search is never offered where BR-14 forbids it --------------
+
+        /// **Search is refused, not warned about, on a machine that cannot scan**
+        /// (AC-7, REQ-563 BR-14).
+        ///
+        /// The plan greys the tier out with the missing piece *named*, and both
+        /// write-path entry points refuse it — a client that skipped the plan
+        /// cannot commit its way past the same gate.
+        #[test]
+        fn search_is_refused_where_the_local_model_is_missing() {
+            let (runtime, config_path) = runtime_on_disk("web-setup-no-model");
+            let events = Arc::new(EventBus::new());
+            let before = std::fs::read_to_string(&config_path).expect("read");
+
+            let plan = runtime.web_setup_plan();
+            assert!(!plan.search_available, "search cannot serve without a scan");
+            assert_eq!(
+                plan.search_gap.as_deref(),
+                Some(SearchGap::NoLocalModel.as_str()),
+                "the gap must be the one phrasing of it, not a second wording"
+            );
+
+            let params = preview_params(
+                WireWebTier::Search,
+                Some("https://search.example.com/search"),
+                None,
+                None,
+            );
+            for err in [
+                runtime
+                    .web_setup_preview(&params)
+                    .expect_err("preview must refuse the tier"),
+                runtime
+                    .web_setup_commit(&as_commit(&params), &events)
+                    .expect_err("commit must refuse it too"),
+            ] {
+                assert_eq!(err.code, error_code::WEB_SETUP_INVALID);
+                assert!(
+                    err.message.contains(SearchGap::NoLocalModel.as_str()),
+                    "the refusal must name the missing piece: {}",
+                    err.message
+                );
+            }
+            assert_eq!(
+                std::fs::read_to_string(&config_path).expect("read"),
+                before,
+                "a refused tier reached the file"
+            );
+
+            // Non-vacuity, and the other half of the rule: the same answers on
+            // the same machine, once a model is in the slot, are accepted.
+            with_local_model(&runtime);
+            assert!(runtime.web_setup_plan().search_available);
+            runtime
+                .web_setup_preview(&params)
+                .expect("with a local model the same candidate previews");
+        }
+
+        /// The fetch tiers are untouched by the search gap: a machine with no
+        /// local model can still be walked through `fetch_any_url`, which is the
+        /// distinction `SearchUnavailable` exists to keep (TASK-128).
+        #[test]
+        fn a_missing_local_model_does_not_cost_the_fetch_tiers() {
+            let (runtime, _path) = runtime_on_disk("web-setup-fetch-still-open");
+            assert!(!runtime.local_model_present());
+            runtime
+                .web_setup_preview(&preview_params(WireWebTier::FetchAnyUrl, None, None, None))
+                .expect("a fetch tier needs no scan");
+        }
+
+        // -- the plan's reading of the current table ---------------------------
+
+        /// "There is no `[web]` table" and "the table says off" are two answers,
+        /// and the plan keeps them apart — the fresh-install case this REQ
+        /// exists for.
+        #[test]
+        fn the_plan_distinguishes_an_absent_table_from_one_that_says_off() {
+            let (runtime, _path) = runtime_on_disk("web-setup-plan-table");
+            assert!(
+                runtime.web_setup_plan().current_web.is_none(),
+                "a document with no [web] table has no summary to give"
+            );
+
+            {
+                let mut config = runtime.config.lock().expect("config mutex");
+                config.web.tier = WebTier::Search;
+                config.web.search_endpoint =
+                    Some("https://search.example.com/api?format=json".to_owned());
+                config.web.search_key_ref = Some("keychain://teton/web-search".to_owned());
+            }
+            let summary = runtime
+                .web_setup_plan()
+                .current_web
+                .expect("a configured table summarises");
+            assert_eq!(summary.tier, WireWebTier::Search);
+            assert_eq!(
+                summary.search_host.as_deref(),
+                Some("search.example.com"),
+                "the summary carries a host and nothing finer (REQ-563 BR-7)"
+            );
+            assert_eq!(
+                summary.search_key_ref.as_deref(),
+                Some("keychain://teton/web-search"),
+                "the reference, which is not a secret"
+            );
+        }
+
+        // -- the answers are re-derived, not patched ---------------------------
+
+        /// **The candidate is rebuilt from the answers** (BR-8, LESSON-501), and
+        /// the preview says so: dropping back to a fetch tier removes the search
+        /// keys rather than leaving them behind, and the user is told at the one
+        /// point they can still say no.
+        #[test]
+        fn an_answer_that_omits_a_key_removes_it_and_says_so() {
+            let (runtime, config_path) = runtime_on_disk("web-setup-rederive");
+            with_local_model(&runtime);
+            let events = Arc::new(EventBus::new());
+            runtime
+                .web_setup_commit(
+                    &as_commit(&preview_params(
+                        WireWebTier::Search,
+                        Some("https://search.example.com/search"),
+                        Some("keychain://teton/web-search"),
+                        None,
+                    )),
+                    &events,
+                )
+                .expect("the search setup lands");
+
+            let lowered = preview_params(WireWebTier::FetchUserUrl, None, None, None);
+            let preview = runtime.web_setup_preview(&lowered).expect("previews");
+            assert!(
+                !preview.toml.contains("search_endpoint"),
+                "the candidate kept a key the answers did not name: {}",
+                preview.toml
+            );
+            assert!(
+                preview
+                    .warnings
+                    .iter()
+                    .any(|w| w.contains("search_endpoint") && w.contains("removed")),
+                "a removal has to be visible before it happens: {:?}",
+                preview.warnings
+            );
+
+            runtime
+                .web_setup_commit(&as_commit(&lowered), &events)
+                .expect("the lowering commits");
+            let written = std::fs::read_to_string(&config_path).expect("read");
+            assert!(!written.contains("search_endpoint"), "{written}");
+            assert_eq!(web_section_of(&written), preview.toml);
+        }
+
+        /// A keyless search backend is a legitimate configuration, so it is a
+        /// **warning** and not a refusal — and the note says which way it cuts.
+        #[test]
+        fn a_keyless_search_backend_is_a_note_rather_than_a_refusal() {
+            let (runtime, _path) = runtime_on_disk("web-setup-keyless");
+            with_local_model(&runtime);
+            let preview = runtime
+                .web_setup_preview(&preview_params(
+                    WireWebTier::Search,
+                    Some("https://searx.example.com/search?format=json"),
+                    None,
+                    None,
+                ))
+                .expect("keyless search is configurable");
+            assert!(
+                preview
+                    .warnings
+                    .iter()
+                    .any(|w| w.contains("no `search_key_ref`")),
+                "{:?}",
+                preview.warnings
+            );
+        }
+
+        /// **`tier: "off"` is refused at both entry points** (the verify pass's
+        /// wire-hole fix).
+        ///
+        /// The CLI never offers it; the candidate is built from wire params, so
+        /// "the CLI never offers it" is not a gate. Sending it produced three
+        /// wrong answers at once, and the test asserts the refusal rather than
+        /// any of them: an `is_unset` `[web]` table renders in the preview and
+        /// is *dropped* by the write (the asymmetry `web_table_toml` documents
+        /// as unreachable), and the commit's `WebSetupCompleted` would carry a
+        /// tier its own payload doc says it never carries.
+        ///
+        /// Both seams, because they are two lines (LESSON-502), and the file is
+        /// asserted untouched: a refusal that had already written is not a
+        /// refusal.
+        #[test]
+        fn a_setup_answer_of_off_is_refused_at_both_seams() {
+            let (runtime, config_path) = runtime_on_disk("web-setup-off");
+            let events = Arc::new(EventBus::new());
+            let before = std::fs::read_to_string(&config_path).expect("read");
+            let params = preview_params(WireWebTier::Off, None, None, None);
+
+            for err in [
+                runtime
+                    .web_setup_preview(&params)
+                    .expect_err("a preview of `off` is a preview of nothing"),
+                runtime
+                    .web_setup_commit(&as_commit(&params), &events)
+                    .expect_err("and a commit of it is refused too"),
+            ] {
+                assert_eq!(err.code, error_code::WEB_SETUP_INVALID);
+                assert!(
+                    err.message.contains("remove the `[web]` table"),
+                    "the refusal must name what turning it off actually is: {}",
+                    err.message
+                );
+            }
+
+            assert_eq!(
+                std::fs::read_to_string(&config_path).expect("read"),
+                before,
+                "a refused answer reached the file"
+            );
+            assert!(
+                events.subscribe(4).try_recv().is_none(),
+                "and nothing was announced"
+            );
+
+            // Non-vacuity: the next tier up, with the same everything else, is
+            // accepted — so the refusal above is the floor and not the fixture.
+            runtime
+                .web_setup_preview(&preview_params(WireWebTier::FetchUserUrl, None, None, None))
+                .expect("the lowest enabling tier previews");
+        }
+
+        /// **Two sessions committing at once leave one candidate's state, whole**
+        /// (AC-11, BR-11; the `two_concurrent_installs_of_one_entry_do_not_both_
+        /// fetch_or_corrupt` precedent applied to the config file).
+        ///
+        /// ADR-1's answer to AC-11 is that there is no shared flow state and
+        /// commits serialize on the config mutex. That is an argument about a
+        /// lock, and the thing it is protecting is not obvious from reading the
+        /// lock: [`write_config_atomically`] writes through a **fixed** temp
+        /// path (`config.toml.tmp`), so two writers admitted at once would
+        /// truncate each other's staging file and rename a half-written document
+        /// into place. Nothing in the commit's body says so; the mutex is what
+        /// makes it unreachable, and a later edit narrowing that critical section
+        /// "for concurrency" would reintroduce it silently.
+        ///
+        /// So the property is asserted on the artifact rather than on the lock:
+        /// the file **parses**, and its `[web]` table is exactly one of the two
+        /// candidates — never a field from each. The two answers are chosen to
+        /// make a mixture visible: a `search` endpoint under a `fetch_user_url`
+        /// ceiling is a state neither commit could have produced.
+        ///
+        /// The event leg is the second half of AC-11: exactly one
+        /// `WebSetupCompleted` per commit that reported `applied`, each scoped to
+        /// its own session — a commit that announced another session's change, or
+        /// announced one it did not make, is the cross-session noise BUG-161 is
+        /// about.
+        #[test]
+        fn two_concurrent_commits_leave_one_candidates_state_and_one_notice_each() {
+            let (runtime, config_path) = runtime_on_disk("web-setup-concurrent");
+            with_local_model(&runtime);
+            let events = Arc::new(EventBus::new());
+            let mut subscriber = events.subscribe(16);
+
+            let fetch = WebSetupCommitParams {
+                session_id: SessionId::from("sess-fetch"),
+                ..as_commit(&preview_params(WireWebTier::FetchUserUrl, None, None, None))
+            };
+            let search = WebSetupCommitParams {
+                session_id: SessionId::from("sess-search"),
+                ..as_commit(&preview_params(
+                    WireWebTier::Search,
+                    Some("https://search.example.com/search?format=json"),
+                    Some("keychain://teton/web-search"),
+                    None,
+                ))
+            };
+
+            let (first, second) = std::thread::scope(|scope| {
+                let a = {
+                    let (runtime, events, params) =
+                        (Arc::clone(&runtime), Arc::clone(&events), fetch.clone());
+                    scope.spawn(move || runtime.web_setup_commit(&params, &events))
+                };
+                let b = {
+                    let (runtime, events, params) =
+                        (Arc::clone(&runtime), Arc::clone(&events), search.clone());
+                    scope.spawn(move || runtime.web_setup_commit(&params, &events))
+                };
+                (
+                    a.join().expect("the fetch commit did not panic"),
+                    b.join().expect("the search commit did not panic"),
+                )
+            });
+
+            // Both are legal candidates on this machine, so neither is refused:
+            // what the race decides is which one lands, not whether one errors.
+            let applied = [&first, &second]
+                .into_iter()
+                .map(|result| {
+                    result
+                        .as_ref()
+                        .unwrap_or_else(|err| panic!("a concurrent commit was refused: {err:?}"))
+                        .applied
+                })
+                .filter(|applied| *applied)
+                .count();
+
+            // The file is a document, not a splice of two.
+            let written = std::fs::read_to_string(&config_path).expect("read");
+            let parsed = Config::load(&written).unwrap_or_else(|err| {
+                panic!("the config on disk no longer loads: {err}\n{written}")
+            });
+            let landed = &parsed.web;
+            let is_fetch = landed.tier == WebTier::FetchUserUrl
+                && landed.search_endpoint.is_none()
+                && landed.search_key_ref.is_none();
+            let is_search = landed.tier == WebTier::Search
+                && landed.search_endpoint.as_deref()
+                    == Some("https://search.example.com/search?format=json")
+                && landed.search_key_ref.as_deref() == Some("keychain://teton/web-search");
+            assert!(
+                is_fetch != is_search,
+                "the written `[web]` table is neither commit's candidate but a \
+                 mixture of the two — which is what a shared staging path or a \
+                 narrowed critical section produces: {landed:?}"
+            );
+
+            // And the daemon's in-memory config is the file, not a third state.
+            assert_eq!(
+                runtime.config.lock().expect("config mutex").web,
+                *landed,
+                "the swap and the write came apart: a turn would build its tools \
+                 from a config no restart would reproduce"
+            );
+
+            let mut completed = Vec::new();
+            while let Some(envelope) = subscriber.try_recv() {
+                if let Event::WebSetupCompleted(done) = envelope.event {
+                    completed.push((envelope.session_id, done.tier));
+                }
+            }
+            assert_eq!(
+                completed.len(),
+                applied,
+                "one notice per commit that actually changed something, no more \
+                 and no fewer: {completed:?}"
+            );
+            for (session_id, tier) in &completed {
+                let expected = match session_id.as_ref().map(SessionId::to_string).as_deref() {
+                    Some("sess-fetch") => WireWebTier::FetchUserUrl,
+                    Some("sess-search") => WireWebTier::Search,
+                    other => panic!("a notice for a session that committed nothing: {other:?}"),
+                };
+                assert_eq!(
+                    *tier, expected,
+                    "the notice carried another session's tier: {completed:?}"
+                );
+            }
+        }
+
+        /// **Every preview discloses that the write is a whole-file rewrite**
+        /// (the verify pass's honest-disclosure floor).
+        ///
+        /// The commit's one write body is `Config::to_toml` over the whole
+        /// document, so a hand-edited config comes back canonicalised: comments
+        /// gone, unrecognized keys dropped. That is a real loss, it is not
+        /// undoable, and the preview is the last moment a user can decline it —
+        /// so the note is unconditional and first, rather than conditioned on
+        /// the daemon somehow knowing whether *this* file has comments in it.
+        ///
+        /// Pinned as the first element and not merely as "present anywhere":
+        /// a warning list is read from the top, and this is the one that is true
+        /// of every commit.
+        #[test]
+        fn every_preview_says_the_save_rewrites_the_whole_file() {
+            let (runtime, _path) = runtime_on_disk("web-setup-rewrite-note");
+            with_local_model(&runtime);
+            for params in [
+                preview_params(WireWebTier::FetchUserUrl, None, None, None),
+                preview_params(
+                    WireWebTier::Search,
+                    Some("https://search.example.com/search?format=json"),
+                    Some("keychain://teton/web-search"),
+                    None,
+                ),
+            ] {
+                let preview = runtime.web_setup_preview(&params).expect("previews");
+                let first = preview
+                    .warnings
+                    .first()
+                    .unwrap_or_else(|| panic!("no warnings at all: {:?}", preview.warnings));
+                assert!(
+                    first.contains("rewrites the whole config file") && first.contains("comments"),
+                    "the rewrite is the one loss a preview cannot let a user \
+                     discover afterwards: {first}"
+                );
+            }
+        }
+
+        /// **A key in the endpoint's query string is named, and never echoed.**
+        ///
+        /// `search_endpoint` is the one `[web]` field treated as non-secret
+        /// everywhere — it sits in the config in clear and its host rides every
+        /// `web_lookup` event — so a user who pastes a backend URL with the key
+        /// already in it has put a credential somewhere nothing will redact.
+        ///
+        /// A note rather than a refusal (a keyless-header backend is a real
+        /// shape), and the assertion has two halves: the warning appears, and
+        /// the planted secret does **not**, anywhere in the answer. The second
+        /// half is the one that matters — a warning that quoted the parameter to
+        /// be helpful would be the leak it is about.
+        #[test]
+        fn a_credential_shaped_query_parameter_is_named_without_echoing_it() {
+            let (runtime, _path) = runtime_on_disk("web-setup-url-key");
+            with_local_model(&runtime);
+            let planted = "sk-live-do-not-echo-me";
+
+            let preview = runtime
+                .web_setup_preview(&preview_params(
+                    WireWebTier::Search,
+                    Some(&format!(
+                        "https://search.example.com/search?api_key={planted}"
+                    )),
+                    None,
+                    None,
+                ))
+                .expect("a key in the URL is a legal configuration, not a refusal");
+            assert!(
+                preview
+                    .warnings
+                    .iter()
+                    .any(|w| w.contains("looks like it carries a credential")),
+                "{:?}",
+                preview.warnings
+            );
+            for warning in &preview.warnings {
+                assert!(
+                    !warning.contains(planted),
+                    "the warning echoed the secret it is about: {warning}"
+                );
+            }
+            assert!(
+                !preview
+                    .search_host
+                    .as_deref()
+                    .unwrap_or_default()
+                    .contains(planted),
+                "the host must be a host: {:?}",
+                preview.search_host
+            );
+
+            // Falsification: an ordinary parameter draws no such note, so the
+            // arm is a credential detector and not a "there is a query string"
+            // detector.
+            let benign = runtime
+                .web_setup_preview(&preview_params(
+                    WireWebTier::Search,
+                    Some("https://searx.example.com/search?format=json&keyword=rust"),
+                    None,
+                    None,
+                ))
+                .expect("previews");
+            assert!(
+                !benign
+                    .warnings
+                    .iter()
+                    .any(|w| w.contains("carries a credential")),
+                "`format` and `keyword` are not credentials: {:?}",
+                benign.warnings
+            );
+        }
+
+        /// **Dropping the reference does not drop the key, and the user is told
+        /// how to.**
+        ///
+        /// ADR-3 puts the secret's whole lifecycle in the client process, so the
+        /// daemon cannot delete the keychain entry — but it is the party that
+        /// knows the reference is about to stop existing, and a user who is
+        /// never told is left holding a live credential nothing points at.
+        ///
+        /// The command names the entry `/web setup` writes rather than one
+        /// parsed out of the reference: a shell command assembled from a config
+        /// string is an instruction to run something the user did not write.
+        #[test]
+        fn dropping_the_key_reference_says_how_to_remove_the_key_itself() {
+            let (runtime, _path) = runtime_on_disk("web-setup-drop-key");
+            with_local_model(&runtime);
+            let events = Arc::new(EventBus::new());
+            runtime
+                .web_setup_commit(
+                    &as_commit(&preview_params(
+                        WireWebTier::Search,
+                        Some("https://search.example.com/search"),
+                        Some("keychain://teton/web-search"),
+                        None,
+                    )),
+                    &events,
+                )
+                .expect("the search setup lands");
+
+            let preview = runtime
+                .web_setup_preview(&preview_params(WireWebTier::FetchUserUrl, None, None, None))
+                .expect("previews");
+            let removal = preview
+                .warnings
+                .iter()
+                .find(|w| w.contains("search_key_ref") && w.contains("removed"))
+                .unwrap_or_else(|| panic!("no removal note: {:?}", preview.warnings));
+            assert!(
+                removal.contains("security delete-generic-password -s teton -a web-search"),
+                "the note has to say what to actually run, or the key just \
+                 stays: {removal}"
+            );
+
+            // Falsification: dropping something that is *not* the key reference
+            // says nothing about the keychain — there would be nothing there to
+            // remove, and an unconditional line would train the user to skip it.
+            let (runtime, _path) = runtime_on_disk("web-setup-drop-endpoint");
+            with_local_model(&runtime);
+            runtime
+                .web_setup_commit(
+                    &as_commit(&preview_params(
+                        WireWebTier::Search,
+                        Some("https://searx.example.com/search?format=json"),
+                        None,
+                        None,
+                    )),
+                    &events,
+                )
+                .expect("a keyless search setup lands");
+            let lowered = runtime
+                .web_setup_preview(&preview_params(WireWebTier::FetchUserUrl, None, None, None))
+                .expect("previews");
+            assert!(
+                lowered
+                    .warnings
+                    .iter()
+                    .any(|w| w.contains("search_endpoint") && w.contains("removed")),
+                "non-vacuity: something really is being dropped: {:?}",
+                lowered.warnings
+            );
+            assert!(
+                !lowered.warnings.iter().any(|w| w.contains("keychain")),
+                "there was never a key, so there is nothing to tell the user to \
+                 delete: {:?}",
+                lowered.warnings
+            );
+        }
+
+        // -- BR-7: the preview→commit window ----------------------------------
+
+        /// **A document that moved under the preview is not written** (BR-7,
+        /// the verify pass's TOCTOU fix).
+        ///
+        /// The gap is real and this is its exact shape: the answers pin four
+        /// fields, and `permission_allow` is not one of them — it rides along
+        /// from the live config. Any *other* session answering "enable
+        /// permanently" runs [`DaemonRuntime::persist_web_tier`], which appends
+        /// to it and rewrites the file. A commit that only re-derived from the
+        /// answers would faithfully, silently write a document with that change
+        /// folded in, which the user never saw and never agreed to.
+        ///
+        /// Three legs, and the middle one is what makes the first honest:
+        ///
+        /// 1. the stale digest is refused and the file is **byte-identical** to
+        ///    what the interloping write left — a refusal that had already
+        ///    written would be worse than no check;
+        /// 2. a *fresh* preview over the moved config commits, so the check is
+        ///    a divergence detector and not a wedge;
+        /// 3. `expect_digest: None` — the old client, and the caller with no
+        ///    preview to compare — still commits, because the field is additive.
+        #[test]
+        fn a_commit_whose_document_moved_under_the_preview_is_refused() {
+            let (runtime, config_path) = runtime_on_disk("web-setup-digest");
+            let events = Arc::new(EventBus::new());
+            let answers = preview_params(WireWebTier::FetchAnyUrl, None, None, None);
+
+            let preview = runtime.web_setup_preview(&answers).expect("previews");
+            assert!(
+                !preview.digest.is_empty(),
+                "a preview with no digest gives the commit nothing to check"
+            );
+
+            // The interloper: another session's "enable permanently", which
+            // touches `permission_allow` — a field the setup answers do not name
+            // and the commit would otherwise carry along unnoticed.
+            runtime
+                .persist_web_tier(WebTier::FetchUserUrl)
+                .expect("the consent answer persists");
+            let after_interloper = std::fs::read_to_string(&config_path).expect("read");
+
+            let stale = runtime
+                .web_setup_commit(&as_commit_expecting(&answers, &preview.digest), &events)
+                .expect_err("the confirmed bytes no longer describe this document");
+            assert_eq!(stale.code, error_code::WEB_SETUP_INVALID);
+            assert!(
+                stale.message.contains("run `/web setup` again"),
+                "the refusal must name the remedy: {}",
+                stale.message
+            );
+            // Non-echoing (BR-6's rule applied to a refusal): the sentence
+            // carries neither digest, and no fragment of the document.
+            assert!(
+                !stale.message.contains(&preview.digest)
+                    && !stale.message.contains("permission_allow"),
+                "the refusal echoed what changed: {}",
+                stale.message
+            );
+            assert_eq!(
+                std::fs::read_to_string(&config_path).expect("read"),
+                after_interloper,
+                "a refused commit must not have written anything"
+            );
+
+            // (2) A fresh preview over the moved document commits. The check
+            // detects divergence; it does not wedge the flow.
+            let fresh = runtime
+                .web_setup_preview(&answers)
+                .expect("the same answers preview against the new document");
+            assert_ne!(
+                fresh.digest, preview.digest,
+                "non-vacuity: the document really did move, so the two digests \
+                 must differ — otherwise the refusal above proved nothing"
+            );
+            assert!(
+                runtime
+                    .web_setup_commit(&as_commit_expecting(&answers, &fresh.digest), &events)
+                    .expect("a fresh preview's digest matches")
+                    .applied
+            );
+        }
+
+        /// A commit that sends no digest behaves exactly as it did before the
+        /// field existed — the compatibility leg, asserted rather than assumed.
+        ///
+        /// `expect_digest` is `#[serde(default)]`, so an old client's frame
+        /// deserializes to `None`; the check is opt-in for that reason, and a
+        /// daemon that quietly started requiring it would refuse every such
+        /// client with a sentence about a preview it never ran.
+        #[test]
+        fn a_commit_with_no_digest_is_checked_against_nothing_and_still_lands() {
+            let (runtime, config_path) = runtime_on_disk("web-setup-digest-compat");
+            let events = Arc::new(EventBus::new());
+            let answers = preview_params(WireWebTier::FetchAnyUrl, None, None, None);
+
+            runtime.web_setup_preview(&answers).expect("previews");
+            runtime
+                .persist_web_tier(WebTier::FetchUserUrl)
+                .expect("the document moves underneath it");
+
+            let params = as_commit(&answers);
+            assert_eq!(params.expect_digest, None);
+            assert!(
+                runtime
+                    .web_setup_commit(&params, &events)
+                    .expect("no digest, nothing to check")
+                    .applied
+            );
+            assert!(std::fs::read_to_string(&config_path)
+                .expect("read")
+                .contains("fetch_any_url"));
+        }
+
+        /// The digest is a digest of the **document**, not of the `[web]`
+        /// section the preview displays — which is the difference between
+        /// catching this race and catching only the part of it that happens to
+        /// show up in the rendered table.
+        ///
+        /// Falsification-shaped: the two previews below render *identical*
+        /// `toml`, so a digest taken over `preview.toml` would be equal and the
+        /// stale commit above would sail through.
+        #[test]
+        fn the_digest_covers_the_whole_document_not_the_rendered_table() {
+            let (runtime, _path) = runtime_on_disk("web-setup-digest-scope");
+            let answers = preview_params(WireWebTier::FetchAnyUrl, None, None, None);
+            let before = runtime.web_setup_preview(&answers).expect("previews");
+
+            // A change the `[web]` rendering of *this candidate* does not show:
+            // the `[privacy]` table beside it, which the commit writes all the
+            // same because the commit writes the whole file.
+            {
+                let mut config = runtime.config.lock().expect("config mutex");
+                config.privacy.redact = !config.privacy.redact;
+            }
+
+            let after = runtime.web_setup_preview(&answers).expect("previews again");
+            assert_eq!(
+                before.toml, after.toml,
+                "non-vacuity: the rendered [web] table is unchanged, so a digest \
+                 over it would be blind to this"
+            );
+            assert_ne!(
+                before.digest, after.digest,
+                "the digest must follow the bytes the commit writes, which are \
+                 the whole document"
+            );
+        }
+
+        // -- AC-5: the dead end the daemon can see -----------------------------
+
+        /// **The unserved remote turn announces a dead end** (ADR-4, AC-2/AC-5)
+        /// — and only where "dead end" is the truth.
+        ///
+        /// Three legs, because the guard is worth more than the emission: a
+        /// machine with nothing configured is announced; a machine whose remote
+        /// tier is *misconfigured* is not (its remedy is in the sentence, and
+        /// the capability is not absent); a machine whose local tier is still
+        /// warming is not (BUG-152's transient code is exactly the state where
+        /// telling a user to configure something is wrong).
+        #[test]
+        fn the_unserved_remote_turn_announces_a_dead_end_only_when_there_is_one() {
+            use crate::model_consent::WeightsInstaller;
+            use teton_core::entities::{ModelSelection, SelectionSource};
+            use teton_inference::catalog::ModelEntry;
+            use teton_protocol::methods::InstallStatus;
+
+            let dead_end =
+                |events: &Arc<EventBus>, subscriber: &mut crate::broadcast::Subscription| {
+                    let mut seen = Vec::new();
+                    while let Some(envelope) = subscriber.try_recv() {
+                        if let Event::CapabilityDeadEnd(dead_end) = envelope.event {
+                            seen.push((envelope.session_id, dead_end.capability));
+                        }
+                    }
+                    let _ = events;
+                    seen
+                };
+
+            // 1. Nothing configured: no local tier, no remote provider.
+            let runtime = DaemonRuntime::minimal();
+            let events = Arc::new(EventBus::new());
+            let mut subscriber = events.subscribe(8);
+            let config = Config::default();
+            let announced =
+                runtime.unserved_turn_error_announcing(&config, None, &events, &session());
+            assert_eq!(
+                announced.code,
+                error_code::UNKNOWN_PROVIDER,
+                "the classifier's own code must survive the announcement: {}",
+                announced.message
+            );
+            assert_eq!(
+                announced.message,
+                runtime.unserved_turn_error(&config, None).message,
+                "the sentence must be the classifier's, unchanged"
+            );
+            assert_eq!(
+                dead_end(&events, &mut subscriber),
+                vec![(
+                    Some(session()),
+                    CapabilityDeadEnd::REMOTE_PROVIDER.to_owned()
+                )],
+                "an unserved turn with no remote provider is the dead end AC-2 names"
+            );
+
+            // 2. A remote provider IS configured; the turn simply did not route
+            //    to it. The remedy is in the message, not in a capability that
+            //    does not exist.
+            let configured = Config {
+                providers: vec![ModelProvider {
+                    id: "remote".to_owned(),
+                    kind: ProviderKind::OpenaiCompatible,
+                    endpoint: Some("https://api.example.com".to_owned()),
+                    model: Some("m".to_owned()),
+                    auth_ref: None,
+                    capabilities: ProviderCapabilities::default(),
+                }],
+                default_provider: Some("remote".to_owned()),
+                ..Config::default()
+            };
+            let mut subscriber = events.subscribe(8);
+            assert_eq!(
+                runtime
+                    .unserved_turn_error_announcing(&configured, None, &events, &session())
+                    .code,
+                error_code::UNKNOWN_PROVIDER
+            );
+            assert!(
+                dead_end(&events, &mut subscriber).is_empty(),
+                "a configured-but-unrouted remote tier is a misconfiguration, not a dead end"
+            );
+
+            // 3. A local tier mid-load, still with no remote provider: the
+            //    transient code, and no advice to go configure anything.
+            struct VerifiedInstaller;
+            impl WeightsInstaller for VerifiedInstaller {
+                fn install(
+                    &self,
+                    _entry: &ModelEntry,
+                ) -> Result<(), crate::model_consent::InstallError> {
+                    Ok(())
+                }
+                fn status(&self, _entry: &ModelEntry) -> InstallStatus {
+                    InstallStatus::Verified
+                }
+            }
+            let model = Catalog::bundled()
+                .models
+                .first()
+                .expect("the bundled catalog is non-empty")
+                .name
+                .clone();
+            let store = Arc::new(SelectionStore::in_memory());
+            store
+                .record(&ModelSelection::accepted(&model, SelectionSource::Probe, 1))
+                .expect("in-memory record");
+            let mut warming = DaemonRuntime {
+                consent: Arc::new(ModelConsentGate::new(
+                    HardwareProfile {
+                        ram_bytes: 48 * GIB,
+                        free_disk_bytes: 500 * GIB,
+                        gpu: GpuClass::AppleSilicon,
+                    },
+                    Catalog::bundled(),
+                    LocalModelConfig::default(),
+                    Arc::new(EventBus::new()),
+                    Arc::new(PendingModelDecisions::new()),
+                    store,
+                    Arc::new(VerifiedInstaller),
+                )),
+                ..DaemonRuntime::minimal()
+            };
+            warming.weights_loader_present = true;
+            let mut subscriber = events.subscribe(8);
+            let warming_err =
+                warming.unserved_turn_error_announcing(&config, None, &events, &session());
+            assert_eq!(
+                warming_err.code,
+                error_code::TIER_WARMING,
+                "non-vacuity: this machine really is in the transient state: {}",
+                warming_err.message
+            );
+            assert!(
+                dead_end(&events, &mut subscriber).is_empty(),
+                "a tier that is thirty seconds from serving is not a dead end"
+            );
+        }
+
+        /// The derived capability state reaches `config/get` — the status
+        /// surface reads the classifier's answer rather than re-deriving one
+        /// (BR-3/BR-10).
+        #[test]
+        fn the_config_snapshot_carries_the_derived_capability_state() {
+            let (runtime, _path) = runtime_on_disk("web-setup-snapshot");
+            assert_eq!(
+                runtime.config_snapshot().web_capability,
+                Some(WebCapabilityState::OffAvailable)
+            );
+
+            let events = Arc::new(EventBus::new());
+            runtime
+                .web_setup_commit(
+                    &as_commit(&preview_params(WireWebTier::FetchAnyUrl, None, None, None)),
+                    &events,
+                )
+                .expect("the commit lands");
+            assert_eq!(
+                runtime.config_snapshot().web_capability,
+                Some(WebCapabilityState::Ready {
+                    tier: WireWebTier::FetchAnyUrl
+                })
+            );
         }
     }
 

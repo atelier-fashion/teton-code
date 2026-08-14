@@ -315,6 +315,25 @@ pub struct ToolOutcome {
     /// length off its last line, which command output can forge. Neither is
     /// reachable through a number the tool hands over directly.
     pub measured: Option<usize>,
+    /// **The capability this call dead-ended on**, as a catalog id
+    /// (`web_fetch_any_url`, `web_search`, …), or `None` — which is every call
+    /// that did not end that way (REQ-572 ADR-4).
+    ///
+    /// Carried as data for the same reason [`Self::measured`] is: the only
+    /// place with the session's event sink is the turn loop, and the only other
+    /// way for it to learn that a refusal was a *capability* dead end would be
+    /// to re-read the tool's own sentence — a second classifier over text,
+    /// which is precisely what ADR-4 declines to build (LESSON-456). The tool
+    /// that refused knows which capability it refused, says so once here, and
+    /// [`run_session_turn`](crate::harness::turn_loop::run_session_turn)
+    /// publishes `capability_dead_end` from it.
+    ///
+    /// It is deliberately **not** set by every refusal. A declined permission
+    /// prompt, an allowlist refusal or an unreachable host are things a
+    /// *configured* capability did; a dead end is the turn running out of
+    /// capability altogether, which is the only thing the user can act on by
+    /// enabling something.
+    pub dead_end: Option<String>,
 }
 
 impl ToolOutcome {
@@ -325,6 +344,7 @@ impl ToolOutcome {
             is_error: false,
             provenance: ToolProvenance::none(),
             measured: None,
+            dead_end: None,
         }
     }
 
@@ -335,7 +355,20 @@ impl ToolOutcome {
             is_error: true,
             provenance: ToolProvenance::none(),
             measured: None,
+            dead_end: None,
         }
+    }
+
+    /// Mark this outcome as the point a turn ran out of `capability` — a
+    /// catalog id, never a sentence. See [`ToolOutcome::dead_end`].
+    ///
+    /// The refusal text is the tool's own and is unchanged by this call: what
+    /// the model reads and what the daemon announces are two audiences, and
+    /// this is only the second one.
+    #[must_use]
+    pub fn dead_ending(mut self, capability: impl Into<String>) -> Self {
+        self.dead_end = Some(capability.into());
+        self
     }
 
     /// Record what this call found, in the measuring tool's own unit — see

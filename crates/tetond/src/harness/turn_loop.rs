@@ -31,13 +31,14 @@
 //! loop.
 
 use std::sync::{Arc, Mutex};
+use teton_core::capability::WebCapabilityState;
 use teton_core::effort::{EffortOmission, ResolvedEffort};
 
 use serde_json::Value;
 
 use teton_inference::{ChatFormat, Engine, EngineError, GenParams};
 use teton_protocol::events::{
-    Event, PrefixCache, SessionUpdate, SessionUpdatePayload, ToolCallStatus,
+    CapabilityDeadEnd, Event, PrefixCache, SessionUpdate, SessionUpdatePayload, ToolCallStatus,
 };
 use teton_protocol::methods::StopReason;
 use teton_protocol::{ProviderId, SessionId};
@@ -173,6 +174,24 @@ pub struct HarnessConfig {
     pub require_verification: bool,
     /// Generation parameters passed to the engine.
     pub gen_params: GenParams,
+    /// What this machine's web-lookup capability is, for the prompt clause that
+    /// describes it (REQ-572 BR-1) — or `None` when the caller has not said.
+    ///
+    /// The state is the *caller's* fact and not this module's, because deriving
+    /// it needs two things the harness deliberately cannot see: the `[web]`
+    /// table and whether a local model is loaded. `web_capability_state` in
+    /// `teton-core` is the one classifier that turns those into this
+    /// ([`WebCapabilityState`]); the daemon reads it per turn and puts the
+    /// answer here.
+    ///
+    /// `None` is not a fourth state. It means "not supplied", and
+    /// [`build_system_prompt`] then falls back to the only capability fact a
+    /// bare [`ToolRegistry`] carries — whether the web tool is exposed — which
+    /// is exactly the pre-REQ-572 keying. So an existing caller that never sets
+    /// this field (`template_smoke.rs`, `offline_session.rs`, `remote_loop.rs`,
+    /// and any test constructing `HarnessConfig::default()`) keeps the behaviour
+    /// it had, and a caller that *does* set it gets the finer clause.
+    pub web_capability: Option<WebCapabilityState>,
 }
 
 impl Default for HarnessConfig {
@@ -194,6 +213,10 @@ impl Default for HarnessConfig {
                 max_tokens: 1_024,
                 temperature: 0.2,
             },
+            // Unsupplied, not "off": see the field's docs. The prompt falls back
+            // to the tool registry, which is what every caller keyed on before
+            // this field existed.
+            web_capability: None,
         }
     }
 }
@@ -334,6 +357,25 @@ impl SessionEvents {
     pub fn prefix_cache(&self, cache: PrefixCache) {
         self.bus
             .publish(Some(self.session_id.clone()), Event::PrefixCache(cache));
+    }
+
+    /// Announce that this turn ran out of `capability` (REQ-572 ADR-4).
+    ///
+    /// `capability` is a catalog id (`web_search`, `web_fetch_any_url`, …), not
+    /// a sentence: the client renders it, so a dead end announced here and one
+    /// announced by the unserved-turn path are the same fact in the same
+    /// vocabulary rather than two phrasings a UI has to reconcile.
+    ///
+    /// A narrow typed emitter for the reason [`Self::prefix_cache`] is one —
+    /// the session attribution stays owned by this type, so no caller can
+    /// announce a dead end against the wrong session.
+    pub fn capability_dead_end(&self, capability: impl Into<String>) {
+        self.bus.publish(
+            Some(self.session_id.clone()),
+            Event::CapabilityDeadEnd(CapabilityDeadEnd {
+                capability: capability.into(),
+            }),
+        );
     }
 
     fn agent_message(&self, text: &str) {
@@ -795,7 +837,16 @@ pub async fn run_session_turn_with_source(
                             is_error,
                             provenance,
                             measured: _,
+                            dead_end,
                         } = outcome;
+                        // REQ-572 ADR-4: the tool named the capability it ran
+                        // out of; this is the layer that holds the session's
+                        // event sink, so this is where it is announced. Nothing
+                        // here reads `content` to decide — a refusal is a dead
+                        // end only if the tool said so (LESSON-456).
+                        if let Some(capability) = dead_end {
+                            events.capability_dead_end(capability);
+                        }
                         let folded = if is_error {
                             format!("ERROR: {content}")
                         } else {
@@ -931,30 +982,136 @@ pub async fn run_routed_session_turn(
 /// templates are (`structured/templates.rs`): a fresh install needs nothing on
 /// disk for it to hold.
 ///
+/// REQ-572 adds the `[web]` surface to it, because "how do I turn on web
+/// lookup?" was the same hole one capability over: the clause above names
+/// `/web setup`, and this is where the model finds what that command writes —
+/// the table's keys, the keychain reference a search key lives behind, and the
+/// header template a backend needs (BUG-165).
+///
+/// It also carries the one **prohibition** in this block, and it is here rather
+/// than in a clause because it is not conditional on any capability state: never
+/// ask the user to type a credential into the conversation. The rest of the
+/// guide teaches the model that a search backend needs a key, and the helpful
+/// next move it suggests — asking for it — would put a live secret in the
+/// transcript, in REQ-567's carried conversation, and in whatever the redactor
+/// scans on the next remote turn. Nothing downstream can catch that: by the time
+/// the user has typed it the damage *is* the typing, so the only place to stop
+/// it is the prompt (`the_system_prompt_forbids_asking_for_a_credential_in_the_conversation`).
+///
 /// Sized to stay resident in every turn: the whole system prompt must clear
-/// `REDACT_BODY_OVERHEAD_BYTES` with escaping headroom —
-/// `the_total_cap_clears_the_harness_context_budget_with_margin`
-/// (`egress/redact.rs`) measures the real prompt and turns red on overflow.
+/// `REDACT_BODY_OVERHEAD_BYTES` with escaping headroom, and clear it by at least
+/// `MIN_PROMPT_HEADROOM_BYTES` — `the_total_cap_clears_the_harness_context_budget_with_margin`
+/// (`egress/redact.rs`) and `the_web_tool_docs_clear_the_outbound_body_overhead`
+/// (`harness/tools/web.rs`) measure the two real prompt shapes and turn red on
+/// overflow *and* on the margin being spent. A sentence added here is paid for
+/// by shortening another one.
 const SELF_CONFIG_GUIDE: &str = include_str!("self_config.md");
 
-/// The ending a question that needs the live web must have when web lookup is
-/// off (REQ-563 BR-6, the BUG-154/LESSON-482 pattern).
+/// The ending a question that needs the live web must have when the capability
+/// exists but is switched off (REQ-563 BR-6, upgraded by REQ-572 BR-1; the
+/// BUG-154/LESSON-482 pattern).
 ///
 /// Without it the prompt describes no legal move for "what is the current
 /// version of tokio": answering from weights is wrong, and the only other shape
 /// on offer is a tool call — so the model searches the repository for a fact
 /// that cannot be in it, which is exactly BUG-160's failure with a different
-/// subject. Naming the opt-in makes saying so a *described* ending, and gives
-/// the user the one sentence that turns the refusal into an action.
+/// subject. Naming the enablement path makes saying so a *described* ending, and
+/// gives the user the one sentence that turns the refusal into an action.
 ///
-/// It is spelled with the config key because that is what the user has to
-/// change; a vaguer "web access is disabled" would end the hunt and leave the
-/// user nowhere (LESSON-493: an ending is only reachable if its knowledge
-/// source exists, and Teton's config surface is never in the user's repo).
-const WEB_OPT_IN_CLAUSE: &str =
-    "Web lookup is off on this machine. If a question needs the live web, say so and name \
-     the opt-in — `[web] tier` in Teton's config — instead of searching the repository for \
-     the answer.\n";
+/// Three things it must say, and each is here because leaving it out was a
+/// failure someone actually had:
+///
+/// 1. **The capability exists and is off** — not "there is no web tool". A
+///    model told a capability is absent has nothing to offer the user; a model
+///    told it is *available and off* has an action to name (REQ-572's whole
+///    subject).
+/// 2. **Both enablement paths**, `/web setup` in this session and the `[web]`
+///    table on disk. The command is the one that finishes in the conversation
+///    the user is already in; the config table is what the command writes, and
+///    naming it keeps the sentence true for someone editing the file directly.
+/// 3. **Do not go looking for it in the repository** (LESSON-493): Teton's own
+///    configuration is never inside the project being worked on, so a repo
+///    search for the opt-in is a hunt with no possible ending — the bundled
+///    guide below says the same thing for provider setup.
+const WEB_OFF_AVAILABLE_CLAUSE: &str =
+    "Web lookup is available on this machine but switched off by default, so you have no web \
+     tool this turn. If a question needs the live web, say so and name how to turn it on — the \
+     user can run `/web setup` in this session, or set `[web] tier` in Teton's config — instead \
+     of searching the repository for it.\n";
+
+/// The ending a search-shaped question must have when the ceiling permits
+/// search but the search leg cannot serve (REQ-572 BR-1, the
+/// [`WebCapabilityState::SearchUnavailable`] state).
+///
+/// The distinction this clause protects is the one the state exists for: the
+/// capability is **configured and exposed**, and only the search leg is
+/// blocked. Rendering it as "web lookup is off" would tell a user who has web
+/// fetching that they do not, and would push the model away from a tool it can
+/// legitimately use.
+///
+/// The `{reason}` slot is filled by [`SearchGap::as_str`](teton_core::capability::SearchGap::as_str)
+/// and never re-phrased here: one gap, one sentence, wherever it is shown.
+const WEB_SEARCH_UNAVAILABLE_CLAUSE: &str =
+    "Web search is unavailable on this machine — {reason}. Fetching a page by URL still works. \
+     If a question needs a search, say so and name what is missing instead of retrying it or \
+     searching the repository.\n";
+
+/// The once-per-conversation instruction that rides with whichever clause is
+/// emitted (REQ-572 BR-1).
+///
+/// REQ-567's conversation carry means the model can see that it already made
+/// this offer three turns ago; what it lacks is an instruction about what to do
+/// with that. Without one, a session where every question needs the web becomes
+/// the same paragraph repeated, which is how a genuinely useful offer turns
+/// into noise the user reads past.
+///
+/// It is appended to a clause rather than written into each one, so the two
+/// states cannot come to word this differently, and it is emitted only when
+/// there *is* a clause — with the capability ready there is nothing to repeat.
+const CAPABILITY_REPEAT_CLAUSE: &str =
+    "If you already said this earlier in this conversation, refer back to it in one line.\n";
+
+/// The prompt clause for a web capability `state`, or `None` when the state
+/// needs no words (REQ-572 BR-1).
+///
+/// One function, three states, and the [`WebCapabilityState`] match is what
+/// makes a future state a compile error here rather than a silently missing
+/// sentence. [`WebCapabilityState::Ready`] returns `None` on purpose: the tool
+/// is exposed and its own docs are all the model needs, so a clause would only
+/// be prose describing a tool the model can already see.
+fn web_capability_clause(state: WebCapabilityState) -> Option<String> {
+    let clause = match state {
+        // Nothing to say, and saying something anyway is how a prompt grows a
+        // paragraph per capability (LESSON-493's other edge).
+        WebCapabilityState::Ready(_) => return None,
+        WebCapabilityState::OffAvailable => WEB_OFF_AVAILABLE_CLAUSE.to_owned(),
+        WebCapabilityState::SearchUnavailable { reason } => {
+            WEB_SEARCH_UNAVAILABLE_CLAUSE.replace("{reason}", reason.as_str())
+        }
+    };
+    Some(format!("{clause}{CAPABILITY_REPEAT_CLAUSE}"))
+}
+
+/// The clause this turn's prompt carries, from the state the caller supplied —
+/// or, when it supplied none, from the one capability fact the registry holds.
+///
+/// The fallback is the whole of the additive-field promise: a caller that never
+/// heard of `web_capability` still gets the pre-REQ-572 keying (tool absent →
+/// the off-and-available clause; tool present → no clause), because tool
+/// exposure is exactly [`WebCapabilityState::exposes_web_tool`] and the only
+/// clause exposure *alone* can justify is the off one. What the registry cannot
+/// tell us is which tier is granted or whether search can serve — which is why
+/// the finer `SearchUnavailable` clause appears only for a caller that supplies
+/// the state.
+fn effective_web_clause(tools: &ToolRegistry, config: &HarnessConfig) -> Option<String> {
+    match config.web_capability {
+        Some(state) => web_capability_clause(state),
+        None if tools.get(WEB_TOOL_NAME).is_none() => {
+            web_capability_clause(WebCapabilityState::OffAvailable)
+        }
+        None => None,
+    }
+}
 
 /// Build the system prompt: the agent's instructions, Teton's bundled
 /// self-configuration guide, the exposed tool docs, and the tool-call format
@@ -979,19 +1136,16 @@ pub fn build_system_prompt(tools: &ToolRegistry, config: &HarnessConfig) -> Stri
              with the shell tool) before finishing.\n",
         );
     }
-    // REQ-563 BR-6/D-1. **Two** states, and the second needs no words:
+    // REQ-563 BR-6/D-1, per-state since REQ-572 BR-1. The states and their
+    // words live in `web_capability_clause`; what is decided here is only
+    // *which state applies*, and that is `effective_web_clause`'s one job.
     //
-    // - not registered — `[web] tier` is `off`, the capability was never opted
-    //   into, and naming the opt-in is the honest and actionable thing to say;
-    // - registered — the tool is exposed (it is cap-exempt, so a degraded
-    //   profile's `max_tools` cap never cuts it, REQ-563 decision 2026-08-09),
-    //   and the tool's own docs below are all the model needs.
-    //
-    // There is deliberately no third "configured but out of reach" clause: an
-    // opted-in web tool is always exposed now, so there is no profile in which
-    // the model holds the capability in config yet cannot call it.
-    if tools.get(WEB_TOOL_NAME).is_none() {
-        s.push_str(WEB_OPT_IN_CLAUSE);
+    // There is deliberately still no "configured but out of reach" clause: an
+    // opted-in web tool is cap-exempt and therefore always exposed (REQ-563
+    // decision 2026-08-09), so no profile leaves the model holding the
+    // capability in config yet unable to call it.
+    if let Some(clause) = effective_web_clause(tools, config) {
+        s.push_str(&clause);
     }
     s.push('\n');
     s.push_str(SELF_CONFIG_GUIDE);
@@ -1100,6 +1254,8 @@ mod tests {
     use super::*;
 
     use async_trait::async_trait;
+    use teton_core::capability::SearchGap;
+    use teton_core::config::WebTier;
     use teton_inference::{ChatFormat, MockEngine};
     use teton_providers::TokenUsage;
 
@@ -1928,6 +2084,56 @@ mod tests {
         }
     }
 
+    /// **REQ-572 verify: the model must never solicit a credential in chat.**
+    ///
+    /// This REQ's whole subject is a model that has been given something useful
+    /// to say about an unconfigured capability — and the most natural helpful
+    /// next move, once it knows a search backend needs a key, is to ask for the
+    /// key. That would put a live credential in the transcript, in the carried
+    /// conversation REQ-567 replays, and in whatever the redactor has to scan on
+    /// the next remote turn. The rule has to be *in the prompt*, because there is
+    /// no seam that can catch it afterwards: by the time the user has typed it,
+    /// the damage is the typing.
+    ///
+    /// Pinned by content and on both profiles, exactly like BUG-154's and
+    /// BUG-160's clauses: a strong model that asks for a key in chat is no
+    /// better than the local tier doing it. The needle is the *prohibition*, not
+    /// the command names — the guide already names `teton provider add` and
+    /// `/web setup` several lines up, so asserting on those would stay green with
+    /// this sentence deleted.
+    #[test]
+    fn the_system_prompt_forbids_asking_for_a_credential_in_the_conversation() {
+        for config in [HarnessConfig::default(), HarnessConfig::for_strong_model()] {
+            let system = build_system_prompt(&ToolRegistry::with_builtins(), &config);
+            for (needle, missing) in [
+                (
+                    "Never ask the user to type an API key",
+                    "the guide no longer forbids soliciting a credential in chat — \
+                     which is the move a model makes the moment it learns a search \
+                     backend needs a key, and it puts the secret in the transcript",
+                ),
+                (
+                    "echo-off",
+                    "the guide no longer says what the alternative path does with \
+                     the key, so 'ask somewhere else' reads as a formality rather \
+                     than as the reason",
+                ),
+                (
+                    "keychain",
+                    "the guide no longer names where the credential actually ends \
+                     up, which is the fact that makes the redirection worth making",
+                ),
+            ] {
+                assert!(
+                    system.contains(needle),
+                    "{missing}. If the wording was changed deliberately, update \
+                     this expectation to the new wording; do not just delete the \
+                     assertion.\n{system}"
+                );
+            }
+        }
+    }
+
     /// A stand-in for the real [`WebTool`](super::tools::WebTool), registered
     /// under the name the prompt builder and the untrusted-framing list key on.
     ///
@@ -1939,6 +2145,10 @@ mod tests {
     struct StubWebTool {
         /// What `run` returns; sized by the test that builds it.
         result: String,
+        /// When set, `run` returns [`result`](Self::result) as a **refusal**
+        /// marked as this capability's dead end — the shape the real tool's
+        /// tier gate produces (REQ-572 ADR-4). `None` is the ordinary success.
+        dead_end: Option<&'static str>,
     }
 
     impl super::super::tools::Tool for StubWebTool {
@@ -1955,104 +2165,278 @@ mod tests {
             true
         }
         fn run(&self, _ctx: &ToolContext, _args: &Value) -> ToolOutcome {
-            ToolOutcome::ok(self.result.clone())
+            match self.dead_end {
+                Some(capability) => ToolOutcome::error(self.result.clone()).dead_ending(capability),
+                None => ToolOutcome::ok(self.result.clone()),
+            }
         }
     }
 
     fn registry_with_web(result: &str) -> ToolRegistry {
+        registry_with_web_stub(result, None)
+    }
+
+    fn registry_with_web_stub(result: &str, dead_end: Option<&'static str>) -> ToolRegistry {
         let mut reg = ToolRegistry::with_builtins();
         // Cap-exempt, exactly as `register_web_tool` adds the real tool
         // (REQ-563 decision 2026-08-09), so the stub is exposed under a
         // degraded profile's cap the same way production is.
         reg.register_cap_exempt(Arc::new(StubWebTool {
             result: result.to_owned(),
+            dead_end,
         }));
         reg
     }
 
-    /// **REQ-563 BR-6 / AC-1.** With web lookup off the tool is absent, and the
-    /// prompt has to give the model a legal ending for a question that needs
-    /// the live web — otherwise the only shape on offer is a tool call and it
-    /// searches the repository for a fact that cannot be in it (BUG-154's
-    /// failure, BUG-160's subject).
-    #[test]
-    fn the_system_prompt_names_the_web_opt_in_when_the_tool_is_absent() {
-        // Both profiles, for the reason BUG-154's and BUG-160's tests check
-        // both: a strong model that greps a repo for the current version of a
-        // crate is just as wrong as the local tier.
-        for config in [HarnessConfig::default(), HarnessConfig::for_strong_model()] {
-            let system = build_system_prompt(&ToolRegistry::with_builtins(), &config);
-            assert!(
-                system.contains("Web lookup is off on this machine."),
-                "the web opt-in clause is gone from the system prompt — a question \
-                 needing the live web will go searching the repo again. If this clause \
-                 was reworded deliberately, update this test to the new wording; do not \
-                 just delete the assertion.\n{system}"
-            );
-            assert!(
-                system.contains("`[web] tier`"),
-                "the clause no longer names the config key the user has to change, so \
-                 the ending it offers leaves them nowhere (LESSON-493). If the key was \
-                 renamed, update this test; do not delete the assertion.\n{system}"
-            );
-            // A second legal ending, not a replacement: BUG-154's clause must
-            // still be beside it.
-            assert!(
-                system.contains("answer it directly in plain text and call no tool"),
-                "{system}"
-            );
+    /// Both prompt profiles, for the reason BUG-154's and BUG-160's tests check
+    /// both: a strong model that greps a repo for the current version of a
+    /// crate is just as wrong as the local tier.
+    fn both_profiles() -> [HarnessConfig; 2] {
+        [HarnessConfig::default(), HarnessConfig::for_strong_model()]
+    }
+
+    /// `base` with the web capability state stated.
+    fn at_state(base: &HarnessConfig, state: WebCapabilityState) -> HarnessConfig {
+        HarnessConfig {
+            web_capability: Some(state),
+            ..base.clone()
         }
     }
 
-    /// The other half, and the one that makes the first non-vacuous: with the
-    /// tool registered the clause is gone, because it would then be false.
+    /// **REQ-563 BR-6 / AC-1, upgraded by REQ-572 BR-1.** With web lookup off
+    /// the tool is absent, and the prompt has to give the model a legal ending
+    /// for a question that needs the live web — otherwise the only shape on
+    /// offer is a tool call and it searches the repository for a fact that
+    /// cannot be in it (BUG-154's failure, BUG-160's subject).
+    ///
+    /// Pinned by **content**, and against the clause the builder actually
+    /// emitted rather than against the whole prompt: the bundled guide names
+    /// `/web setup` too, so `system.contains("/web setup")` alone would stay
+    /// green with the clause deleted. Asking the function for its clause and
+    /// then asserting the prompt carries it keeps both halves honest, and keeps
+    /// a strengthened rewording of the sentence composable (architecture,
+    /// "Interaction with in-flight work").
     #[test]
-    fn the_web_opt_in_clause_disappears_once_the_tool_is_registered() {
-        let config = HarnessConfig::for_strong_model();
-        let system = build_system_prompt(&registry_with_web("x"), &config);
-        assert!(
-            !system.contains("Web lookup is off"),
-            "the prompt told a machine that opted in that web lookup is off:\n{system}"
-        );
-        // And the tool's own docs are what tell the model it exists — no extra
-        // prose is added for the present case.
-        assert!(system.contains(WEB_TOOL_NAME), "{system}");
+    fn the_off_clause_names_the_capability_its_off_state_and_both_enablement_paths() {
+        let clause = web_capability_clause(WebCapabilityState::OffAvailable)
+            .expect("the off-but-available state must have a clause");
+
+        for (needle, missing) in [
+            (
+                "available",
+                "the clause no longer says the capability EXISTS — a model told only \
+                 that it has no web tool has nothing to offer the user, which is the \
+                 whole failure REQ-572 was written for",
+            ),
+            (
+                "switched off",
+                "the clause no longer says the capability is OFF, so it no longer \
+                 describes a state the user can change",
+            ),
+            (
+                "/web setup",
+                "the clause no longer names the in-session enablement path, which is \
+                 the one that finishes without leaving the conversation",
+            ),
+            (
+                "[web] tier",
+                "the clause no longer names the config key, so the ending it offers \
+                 leaves someone editing the file by hand nowhere (LESSON-493)",
+            ),
+            (
+                "repositor",
+                "the clause no longer forbids the repository hunt, which is the move \
+                 the model makes when no other ending is described (BUG-160)",
+            ),
+        ] {
+            assert!(
+                clause.contains(needle),
+                "{missing}. If the wording was changed deliberately, update this \
+                 expectation to the new wording; do not delete the assertion.\n{clause}"
+            );
+        }
+
+        for config in both_profiles() {
+            for config in [
+                config.clone(),
+                at_state(&config, WebCapabilityState::OffAvailable),
+            ] {
+                let system = build_system_prompt(&ToolRegistry::with_builtins(), &config);
+                assert!(
+                    system.contains(&clause),
+                    "the off-but-available clause is gone from the system prompt — a \
+                     question needing the live web will go searching the repo again \
+                     (web_capability = {:?}):\n{system}",
+                    config.web_capability
+                );
+                // A second legal ending, not a replacement: BUG-154's clause
+                // must still be beside it.
+                assert!(
+                    system.contains("answer it directly in plain text and call no tool"),
+                    "{system}"
+                );
+            }
+        }
     }
 
-    /// **An opted-in web tool needs no special clause, even under the tool cap.**
-    ///
-    /// The web tool is cap-exempt (REQ-563 decision 2026-08-09), so a degraded
-    /// profile whose `max_tools` equals the built-in count still exposes it —
-    /// the model reaches it through its own docs and there is nothing extra to
-    /// say. The opt-in clause must not appear either: it names `[web] tier` for
-    /// a user to set, and this user already set it. Two states, not three.
+    /// **REQ-572 BR-1.** The search-blocked state gets its own clause, and the
+    /// thing it must not do is claim web lookup is off: fetching still works on
+    /// that machine, and the tool is still exposed.
     #[test]
-    fn an_opted_in_web_tool_gets_neither_clause_even_on_a_capped_profile() {
-        let tools = registry_with_web("x");
-        // The default (weak-model) profile caps at the built-in count; the web
-        // tool is cap-exempt, so it is still exposed.
-        let capped = HarnessConfig::default();
+    fn the_search_unavailable_clause_names_the_gap_and_keeps_fetching_alive() {
+        let clause = web_capability_clause(WebCapabilityState::SearchUnavailable {
+            reason: SearchGap::NoLocalModel,
+        })
+        .expect("a blocked search leg must have a clause");
+
         assert!(
-            tools
-                .exposed_names(capped.max_tools)
-                .contains(&WEB_TOOL_NAME),
-            "non-vacuity: the opted-in web tool must survive the degraded-profile cap"
-        );
-        let system = build_system_prompt(&tools, &capped);
-        assert!(
-            system.contains(WEB_TOOL_NAME),
-            "the exposed web tool is missing from the prompt:\n{system}"
+            clause.contains(SearchGap::NoLocalModel.as_str()),
+            "the clause no longer renders the gap's own sentence — the daemon, the \
+             status line and the setup flow must not each invent a phrasing of one \
+             fact. Render `SearchGap::as_str()`; do not re-word it here.\n{clause}"
         );
         assert!(
-            !system.contains("Web lookup is off"),
-            "the opt-in clause tells a user who already set `[web] tier` to set it \
-             again:\n{system}"
+            clause.contains("Fetching"),
+            "the clause no longer says fetching still works, so it takes a capability \
+             away from every machine without a local model. If reworded, update this \
+             expectation; do not delete it.\n{clause}"
+        );
+        let off = web_capability_clause(WebCapabilityState::OffAvailable)
+            .expect("the off state has a clause");
+        assert_ne!(
+            clause, off,
+            "the two states are two, and neither may borrow the other's sentence"
         );
 
-        // And the off case keeps the opt-in clause — the two states are two, and
-        // neither borrows the other's sentence.
-        let off = build_system_prompt(&ToolRegistry::with_builtins(), &capped);
-        assert!(off.contains("Web lookup is off"), "{off}");
+        for config in both_profiles() {
+            let config = at_state(
+                &config,
+                WebCapabilityState::SearchUnavailable {
+                    reason: SearchGap::NoLocalModel,
+                },
+            );
+            // The registry carries the tool, because this state *is* exposed —
+            // pinning the clause on a registry without it would describe a
+            // machine that cannot exist.
+            let system = build_system_prompt(&registry_with_web("x"), &config);
+            assert!(system.contains(&clause), "{system}");
+            assert!(
+                !system.contains(&off),
+                "a machine with working web fetching was told web lookup is off:\n{system}"
+            );
+            assert!(system.contains(WEB_TOOL_NAME), "{system}");
+        }
+    }
+
+    /// The half that makes the two above non-vacuous: a ready capability gets
+    /// **neither** clause, because both would then be false.
+    #[test]
+    fn a_ready_capability_gets_neither_clause_on_either_profile() {
+        let clauses = [
+            web_capability_clause(WebCapabilityState::OffAvailable).expect("off has a clause"),
+            web_capability_clause(WebCapabilityState::SearchUnavailable {
+                reason: SearchGap::NoLocalModel,
+            })
+            .expect("the blocked search leg has a clause"),
+        ];
+        for base in both_profiles() {
+            for tier in [WebTier::FetchUserUrl, WebTier::FetchAnyUrl, WebTier::Search] {
+                let config = at_state(&base, WebCapabilityState::Ready(tier));
+                assert!(
+                    web_capability_clause(WebCapabilityState::Ready(tier)).is_none(),
+                    "a ready capability needs no prose: the tool's own docs are what \
+                     tell the model it exists"
+                );
+                let system = build_system_prompt(&registry_with_web("x"), &config);
+                for clause in &clauses {
+                    assert!(
+                        !system.contains(clause.as_str()),
+                        "the prompt told a machine at tier {tier:?} that its web \
+                         capability is missing:\n{system}"
+                    );
+                }
+                // And the tool's own docs are what tell the model it exists.
+                assert!(system.contains(WEB_TOOL_NAME), "{system}");
+            }
+        }
+    }
+
+    /// **The additive field's promise.** A caller that never sets
+    /// `web_capability` — every pre-REQ-572 call site — keys on exactly what it
+    /// keyed on before: the tool's presence in the registry.
+    ///
+    /// This is what makes the field additive rather than a silent behaviour
+    /// change: without it, defaulting to any concrete state would have made
+    /// `template_smoke.rs` and friends describe a capability nobody asked them
+    /// about.
+    #[test]
+    fn an_unstated_capability_falls_back_to_the_tool_registry() {
+        let off =
+            web_capability_clause(WebCapabilityState::OffAvailable).expect("off has a clause");
+        for config in both_profiles() {
+            assert!(
+                config.web_capability.is_none(),
+                "the default must stay 'unstated', not a concrete state"
+            );
+            let absent = build_system_prompt(&ToolRegistry::with_builtins(), &config);
+            assert!(
+                absent.contains(&off),
+                "an unstated capability with no web tool must still name the opt-in:\n{absent}"
+            );
+            // The web tool is cap-exempt (REQ-563 decision 2026-08-09), so even
+            // the degraded profile's `max_tools` cut leaves it exposed — which
+            // is what makes the second leg a real registry difference.
+            let tools = registry_with_web("x");
+            assert!(
+                tools
+                    .exposed_names(config.max_tools)
+                    .contains(&WEB_TOOL_NAME),
+                "non-vacuity: the opted-in web tool must survive the degraded-profile cap"
+            );
+            let present = build_system_prompt(&tools, &config);
+            assert!(
+                !present.contains(&off),
+                "the opt-in clause tells a user who already opted in to opt in \
+                 again:\n{present}"
+            );
+            assert!(present.contains(WEB_TOOL_NAME), "{present}");
+        }
+    }
+
+    /// **REQ-572 BR-1's dedup half.** Whichever clause is emitted carries the
+    /// once-per-conversation instruction, and a state with no clause carries no
+    /// instruction either — there is nothing to avoid repeating.
+    ///
+    /// Written against the constant rather than its wording: the claim is
+    /// structural (every clause ends with it), so a reworded instruction should
+    /// not turn this red, and a clause that *drops* it must.
+    #[test]
+    fn every_capability_clause_carries_the_repeat_instruction_and_only_a_clause_does() {
+        for state in [
+            WebCapabilityState::OffAvailable,
+            WebCapabilityState::SearchUnavailable {
+                reason: SearchGap::NoLocalModel,
+            },
+        ] {
+            let clause = web_capability_clause(state).expect("this state has a clause");
+            assert!(
+                clause.ends_with(CAPABILITY_REPEAT_CLAUSE),
+                "the {state:?} clause lost the repeat instruction, so a session where \
+                 every question needs the web becomes the same paragraph over and \
+                 over:\n{clause}"
+            );
+        }
+        let system = build_system_prompt(
+            &registry_with_web("x"),
+            &at_state(
+                &HarnessConfig::for_strong_model(),
+                WebCapabilityState::Ready(WebTier::Search),
+            ),
+        );
+        assert!(
+            !system.contains(CAPABILITY_REPEAT_CLAUSE),
+            "a ready capability is told not to repeat an offer it never made:\n{system}"
+        );
     }
 
     /// **AC-1's structural half.** Absent is absent: the registry does not
@@ -2248,6 +2632,138 @@ mod tests {
             },
             "a web lookup pinned the session's egress provenance"
         );
+    }
+
+    /// **REQ-572 ADR-4, the loop's half.** A tool that names the capability it
+    /// ran out of gets that dead end announced to the session, and the refusal
+    /// the model reads is folded exactly as the tool wrote it.
+    ///
+    /// The two halves are one test on purpose: the announcement is for the
+    /// human and the sentence is for the model, and the failure worth catching
+    /// is the one where adding the first quietly rewrites the second.
+    ///
+    /// Nothing here reads the refusal text to decide whether to announce — the
+    /// marker is data on the outcome, which is what keeps this from becoming a
+    /// second classifier over model-visible prose (LESSON-456).
+    #[tokio::test]
+    async fn a_tool_that_names_its_dead_end_gets_it_announced_to_the_session() {
+        const REFUSAL: &str = "web lookup refused: this needs the `fetch_any_url` tier.";
+        let session_id = SessionId::from("dead-end");
+        let bus = Arc::new(EventBus::new());
+        let mut sub = bus.subscribe(64);
+        let gate = PermissionGate::new(
+            session_id.clone(),
+            PermissionConfig::with_default(super::super::permissions::PermissionPolicy::Deny),
+            Arc::clone(&bus),
+            Arc::new(PendingPermissions::new()),
+        );
+        let events = SessionEvents::new(Arc::clone(&bus), session_id);
+        let config = HarnessConfig {
+            max_turns: 1,
+            ..HarnessConfig::default()
+        };
+        let tools = registry_with_web_stub(REFUSAL, Some("web_fetch_any_url"));
+        let tool_ctx = ToolContext::new(std::env::temp_dir());
+        let mut hook = NoopProvenanceHook;
+        let mut ctx = ContextManager::new("sys", 1_000_000);
+        ctx.push_user("what does example.test say");
+
+        let mut source = WebThenEndSource { calls: 0 };
+        run_session_turn_with_source(
+            &mut source,
+            &tools,
+            &tool_ctx,
+            &gate,
+            &events,
+            &mut ctx,
+            &config,
+            &mut hook,
+            &DutyRoute::unresolved("no digest route in this test"),
+            &DutyRoute::unresolved("no compact route in this test"),
+            &ToolDuties {
+                triage: &DutyRoute::unresolved("no triage route in this test"),
+                shell: &DutyRoute::unresolved("no shell route in this test"),
+            },
+        )
+        .await
+        .expect("the turn completes");
+
+        let mut dead_ends = Vec::new();
+        while let Some(envelope) = sub.try_recv() {
+            if let Event::CapabilityDeadEnd(dead_end) = envelope.event {
+                dead_ends.push(dead_end.capability);
+            }
+        }
+        assert_eq!(
+            dead_ends,
+            vec!["web_fetch_any_url".to_owned()],
+            "the dead end the tool named was not announced exactly once"
+        );
+
+        let folded = ctx
+            .blocks()
+            .iter()
+            .rev()
+            .find(|b| b.role == crate::harness::context::BlockRole::Tool)
+            .map(|b| b.text.clone())
+            .expect("the refusal was folded into context");
+        assert!(
+            folded.contains(REFUSAL),
+            "announcing the dead end changed what the model reads:\n{folded}"
+        );
+    }
+
+    /// The other half: a tool that names no dead end announces none. Without
+    /// this, "the event fires" would be satisfied by a loop that fires it on
+    /// every tool result.
+    #[tokio::test]
+    async fn an_ordinary_tool_result_announces_no_dead_end() {
+        let session_id = SessionId::from("no-dead-end");
+        let bus = Arc::new(EventBus::new());
+        let mut sub = bus.subscribe(64);
+        let gate = PermissionGate::new(
+            session_id.clone(),
+            PermissionConfig::with_default(super::super::permissions::PermissionPolicy::Deny),
+            Arc::clone(&bus),
+            Arc::new(PendingPermissions::new()),
+        );
+        let events = SessionEvents::new(Arc::clone(&bus), session_id);
+        let config = HarnessConfig {
+            max_turns: 1,
+            ..HarnessConfig::default()
+        };
+        let tools = registry_with_web("a perfectly ordinary page");
+        let tool_ctx = ToolContext::new(std::env::temp_dir());
+        let mut hook = NoopProvenanceHook;
+        let mut ctx = ContextManager::new("sys", 1_000_000);
+        ctx.push_user("what does example.test say");
+
+        let mut source = WebThenEndSource { calls: 0 };
+        run_session_turn_with_source(
+            &mut source,
+            &tools,
+            &tool_ctx,
+            &gate,
+            &events,
+            &mut ctx,
+            &config,
+            &mut hook,
+            &DutyRoute::unresolved("no digest route in this test"),
+            &DutyRoute::unresolved("no compact route in this test"),
+            &ToolDuties {
+                triage: &DutyRoute::unresolved("no triage route in this test"),
+                shell: &DutyRoute::unresolved("no shell route in this test"),
+            },
+        )
+        .await
+        .expect("the turn completes");
+
+        while let Some(envelope) = sub.try_recv() {
+            assert!(
+                !matches!(envelope.event, Event::CapabilityDeadEnd(_)),
+                "a served lookup was announced as a capability dead end"
+            );
+        }
     }
 
     /// **The request a duty is measured against survives a retry**

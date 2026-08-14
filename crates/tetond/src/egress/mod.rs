@@ -104,8 +104,9 @@ use crate::cost::{CostAttribution, CostMeter};
 
 pub use inspector::{first_malformed_source, inspect, Inspection, MalformedSource, Violation};
 pub use lookup::{
-    to_protocol_web_tier, AddressClass, Authorship, LookupContext, LookupDetail, LookupKind,
-    LookupOutcome, LookupRecord, LookupRecorder, LookupRequest, NoopLookupRecorder, TaintView,
+    from_protocol_web_tier, to_protocol_web_tier, AddressClass, Authorship, LookupContext,
+    LookupDetail, LookupKind, LookupOutcome, LookupRecord, LookupRecorder, LookupRequest,
+    NoopLookupRecorder, TaintView,
 };
 pub use provenance::{
     assembled_provenance, rejection_reason, sanitize_reported_source, ContextBlock, Provenance,

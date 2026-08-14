@@ -265,6 +265,24 @@ pub const REDACT_CHUNK_MAX_BYTES: usize =
 #[cfg(test)]
 pub(crate) const REDACT_BODY_OVERHEAD_BYTES: usize = 8 * 1024;
 
+/// The smallest headroom [`REDACT_BODY_OVERHEAD_BYTES`] may be left with after
+/// the largest system prompt this build produces (REQ-572 verify).
+///
+/// The two headroom tests already refused a prompt that *exceeded* the
+/// assumption and a prompt that filled it *exactly*. Between those lies the case
+/// that actually happens: a prompt that clears it by a handful of bytes, which
+/// passes, tells nobody, and leaves the next sentence anyone adds unable to
+/// land. The floor turns that from a discovery into a **decision** — a change
+/// that eats the last of the margin has to either shorten something or move this
+/// number, and moving it is a diff someone reviews.
+///
+/// Forty-eight bytes: about one short clause, which is the unit these prompts
+/// actually grow in. Small enough that it is not a second budget competing with
+/// the overhead it guards, large enough that "there is room for one more
+/// sentence" is true rather than nearly true.
+#[cfg(test)]
+pub(crate) const MIN_PROMPT_HEADROOM_BYTES: usize = 48;
+
 /// How many per-chunk windows the total cap is worth — the multiple that turns
 /// [`REDACT_CHUNK_MAX_BYTES`] into [`REDACT_INPUT_MAX_BYTES`].
 ///
@@ -1909,8 +1927,18 @@ mod tests {
     ///    the budget for escaping. An assumption nobody checks is a number that
     ///    drifts.
     /// 2. The total cap is at least **twice** that whole body.
+    ///
+    /// Since REQ-572 the prompt's capability clause is **per state**, and the
+    /// states are different lengths — so the measurement is the worst of them,
+    /// swept rather than sampled. The failure message states the remaining
+    /// margin, because "it fits" and "it fits by nine bytes" are different
+    /// facts, and only one of them survives the next sentence somebody adds to
+    /// the bundled guide (AC-9).
     #[test]
     fn the_total_cap_clears_the_harness_context_budget_with_margin() {
+        use teton_core::capability::{SearchGap, WebCapabilityState};
+        use teton_core::config::WebTier;
+
         use crate::harness::tools::ToolRegistry;
         use crate::harness::turn_loop::{build_system_prompt, HarnessConfig};
 
@@ -1918,21 +1946,66 @@ mod tests {
         // description is in the prompt: the larger of the two harness configs
         // is the one the overhead has to cover.
         //
-        // This registry is the **opted-out** shape (REQ-563 D-1): no web tool,
-        // and therefore the BR-6 opt-in clause in its place. The opted-in shape
-        // — web tool docs, no clause — is measured against this same constant
-        // beside the tool, because building one needs a permission gate and a
-        // choke-point seam that do not belong in this module.
-        let config = HarnessConfig::for_strong_model();
-        let system = build_system_prompt(&ToolRegistry::with_builtins(), &config);
-        let budget = config.context_budget_bytes;
+        // This registry is the **opted-out** shape (REQ-563 D-1): no web tool.
+        // The opted-in shape — web tool docs in place of the off clause — is
+        // measured against this same constant beside the tool, because building
+        // one needs a permission gate and a choke-point seam that do not belong
+        // in this module.
+        let base = HarnessConfig::for_strong_model();
+        let budget = base.context_budget_bytes;
         let escaping = budget / 10;
+
+        // Every state a clause can be built from, plus the unsupplied case that
+        // falls back to the registry. A state added to the classifier without a
+        // row here would go unmeasured, which is how a prompt grows past a
+        // ceiling one capability at a time.
+        let states = [
+            None,
+            Some(WebCapabilityState::OffAvailable),
+            Some(WebCapabilityState::SearchUnavailable {
+                reason: SearchGap::NoLocalModel,
+            }),
+            Some(WebCapabilityState::Ready(WebTier::Search)),
+        ];
+        let worst = states
+            .into_iter()
+            .map(|web_capability| {
+                let config = HarnessConfig {
+                    web_capability,
+                    ..base.clone()
+                };
+                build_system_prompt(&ToolRegistry::with_builtins(), &config).len()
+            })
+            .max()
+            .expect("the state sweep is not empty");
+
+        let spent = worst + escaping;
+        // Strictly under, and asserted **before** the subtraction below: a
+        // `spent` at or above the overhead would make that subtraction panic
+        // with an arithmetic message instead of this sentence, which is the one
+        // that says what to do about it.
         assert!(
-            system.len() + escaping <= REDACT_BODY_OVERHEAD_BYTES,
+            spent < REDACT_BODY_OVERHEAD_BYTES,
             "the assumed body overhead no longer covers what a body carries: a \
-             {}-byte system prompt plus {escaping} bytes of escaping against an \
-             assumed {REDACT_BODY_OVERHEAD_BYTES}",
-            system.len()
+             {worst}-byte system prompt (the largest capability clause) plus \
+             {escaping} bytes of escaping against an assumed \
+             {REDACT_BODY_OVERHEAD_BYTES}. Shorten the bundled guide or a clause; \
+             do not raise the overhead without re-checking the two claims below."
+        );
+        // The margin is asserted against a **floor**, not merely against zero: a
+        // prompt that cleared the overhead by three bytes would pass a `> 0`
+        // check, say nothing, and leave the next sentence anyone writes with
+        // nowhere to go. Spending the last of it is a decision, so it fails here
+        // and gets made on purpose.
+        let margin = REDACT_BODY_OVERHEAD_BYTES - spent;
+        assert!(
+            margin >= MIN_PROMPT_HEADROOM_BYTES,
+            "the system prompt leaves {margin} bytes of headroom against a floor \
+             of {MIN_PROMPT_HEADROOM_BYTES} ({worst} bytes of prompt + {escaping} \
+             of escaping against an assumed {REDACT_BODY_OVERHEAD_BYTES}). \
+             Eroding the last of the margin is a decision, not a side effect: \
+             shorten the bundled guide or a clause, or move \
+             `MIN_PROMPT_HEADROOM_BYTES` deliberately."
         );
 
         let body = budget + REDACT_BODY_OVERHEAD_BYTES;

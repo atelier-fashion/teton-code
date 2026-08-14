@@ -52,7 +52,7 @@ use serde_json::json;
 use tokio::runtime::Handle;
 
 use teton_core::config::{WebConfig, WebTier};
-use teton_protocol::events::{BlockCause, WebLookupKind, WebLookupOutcome};
+use teton_protocol::events::{BlockCause, Event, WebLookupKind, WebLookupOutcome};
 use teton_protocol::SessionId;
 use teton_providers::transport::{Transport, TransportError, TransportRequest, TransportResponse};
 use teton_providers::{OpenAiCompatAdapter, OpenAiCompatConfig};
@@ -368,6 +368,9 @@ struct SessionRun {
     lookup_requests: Vec<TransportRequest>,
     /// Every lookup the choke point (or a local refusal) recorded.
     records: Vec<LookupRecord>,
+    /// Every event the session published, drained after the turn — the
+    /// daemon-visible half of what happened (REQ-572 ADR-4).
+    events: Vec<Event>,
     system_prompt: String,
     web_registered: bool,
     dir: PathBuf,
@@ -382,6 +385,29 @@ impl SessionRun {
     /// of "a lookup failure fails the turn" (BR-9).
     fn completed(&self) -> bool {
         self.result.is_ok()
+    }
+
+    /// The capabilities this session announced as dead ends (REQ-572 ADR-4).
+    fn dead_ends(&self) -> Vec<String> {
+        self.events
+            .iter()
+            .filter_map(|event| match event {
+                Event::CapabilityDeadEnd(dead_end) => Some(dead_end.capability.clone()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// What the model was handed back for its tool call — the refusal sentence
+    /// in the refusing cases, read off the provider's *second* request body,
+    /// which is the only place the folded tool result is observable from here.
+    fn tool_result_seen_by_the_model(&self) -> String {
+        String::from_utf8_lossy(
+            self.provider_payloads
+                .last()
+                .expect("the model was called at least once"),
+        )
+        .into_owned()
     }
 
     fn cleanup(self) {
@@ -443,6 +469,8 @@ async fn scripted_session(
 
     // --- the harness -------------------------------------------------------
     let bus = Arc::new(EventBus::new());
+    // Subscribed before the turn, so nothing published during it is missed.
+    let mut published = bus.subscribe(256);
     let pending = Arc::new(PendingPermissions::new());
     // Permissive **and** every tier listed in `[web] permission_allow`: consent is
     // `web_consent_matrix.rs`'s subject, and a prompt here would make every
@@ -509,11 +537,17 @@ async fn scripted_session(
     )
     .await;
 
+    let mut events = Vec::new();
+    while let Some(envelope) = published.try_recv() {
+        events.push(envelope.event);
+    }
+
     SessionRun {
         result,
         provider_payloads: sse.captured(),
         lookup_requests: lookup.captured(),
         records: recorder.records(),
+        events,
         system_prompt,
         web_registered,
         dir,
@@ -554,11 +588,22 @@ async fn tier_off_makes_zero_lookup_traffic_across_a_scripted_session() {
     assert!(off.completed(), "the session still finished normally");
 
     // BR-6/LESSON-482: the prompt describes the ending this state has, and
-    // names the key the user would have to change (LESSON-493).
+    // names both paths out of it (LESSON-493, REQ-572 BR-1). Pinned by content
+    // rather than by the clause's exact bytes, so a strengthened wording of the
+    // same three facts composes with this test instead of breaking it.
+    //
+    // What this file measures is the whole prompt a real session was given —
+    // clause *and* bundled guide, which is what the model actually reads. That
+    // the clause specifically carries each fact (the guide names `/web setup`
+    // too) is pinned where the clause is built, in `turn_loop.rs`.
     assert!(
+        off.system_prompt.contains("switched off"),
+        "the prompt must say the capability exists and is off; prompt:\n{}",
         off.system_prompt
-            .contains("Web lookup is off on this machine"),
-        "the prompt must name the state; prompt:\n{}",
+    );
+    assert!(
+        off.system_prompt.contains("/web setup"),
+        "the prompt must name the in-session enablement path; prompt:\n{}",
         off.system_prompt
     );
     assert!(
@@ -569,7 +614,7 @@ async fn tier_off_makes_zero_lookup_traffic_across_a_scripted_session() {
     // ...and it must not send the model looking through the repo for it.
     assert!(
         off.system_prompt
-            .contains("instead of searching the repository for the answer"),
+            .contains("instead of searching the repository for it"),
         "prompt:\n{}",
         off.system_prompt
     );
@@ -600,13 +645,107 @@ async fn tier_off_makes_zero_lookup_traffic_across_a_scripted_session() {
     assert_eq!(on.records.len(), 1, "one attempt, one row (BR-7)");
     assert_eq!(on.records[0].outcome, WebLookupOutcome::Completed);
     assert!(
-        !on.system_prompt
-            .contains("Web lookup is off on this machine"),
+        !on.system_prompt.contains("switched off"),
         "an opted-in machine must not be told it is opted out"
+    );
+    assert!(
+        !on.system_prompt.contains("no web tool this turn"),
+        "an opted-in machine must not be told the tool is absent; prompt:\n{}",
+        on.system_prompt
     );
 
     off.cleanup();
     on.cleanup();
+}
+
+/// **REQ-572 AC-4 (TASK-131).** A whole scripted session whose model composes a
+/// URL against a `fetch_user_url` ceiling: the daemon announces the capability
+/// the turn ran out of, the model gets REQ-563 AC-4's refusal **unchanged**, and
+/// nothing reaches the wire.
+///
+/// End-to-end and not at the tool, because the announcement is a collaboration:
+/// the tool names the capability on its outcome and the turn loop publishes it.
+/// A test at either half alone would keep passing with the other half deleted.
+///
+/// The falsification leg is the same session one tier up, where the identical
+/// call is served: no dead end is announced, so "the event fires" cannot be
+/// satisfied by a daemon that announces one for every lookup.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_tier_gap_in_a_scripted_session_announces_the_capability_it_ran_out_of() {
+    // Model-composed (nothing pasted), so the call needs `fetch_any_url`.
+    let args = r#"{"url":"https://docs.rs/tokio/latest/tokio/"}"#;
+
+    let refused = scripted_session(
+        "ac4-gap",
+        web_config(WebTier::FetchUserUrl),
+        args,
+        &[],
+        vec![],
+    )
+    .await;
+
+    assert!(
+        refused.web_registered,
+        "the tool must be registered for its tier gate to be the thing refusing"
+    );
+    assert_eq!(
+        refused.dead_ends(),
+        vec!["web_fetch_any_url".to_owned()],
+        "a turn that ran out of `fetch_any_url` announced no dead end, so nothing \
+         tells the user which capability to enable"
+    );
+    assert_eq!(
+        refused.lookup_calls(),
+        0,
+        "a tier-refused lookup reached the wire"
+    );
+    assert_eq!(
+        refused.records.len(),
+        1,
+        "the refusal is still one ledger row (BR-7)"
+    );
+    assert_eq!(refused.records[0].outcome, WebLookupOutcome::RefusedTier);
+    assert!(refused.completed(), "the session still finished normally");
+
+    // REQ-563 AC-4, intact: the sentence the model reads names the tier it
+    // needed and the tier it has, and the announcement did not rewrite it.
+    let seen = refused.tool_result_seen_by_the_model();
+    assert!(
+        seen.contains("fetch_any_url"),
+        "the refusal no longer names the missing tier:\n{seen}"
+    );
+    assert!(
+        seen.contains("fetch_user_url"),
+        "the refusal no longer names the granted tier:\n{seen}"
+    );
+
+    // --- the falsification leg: flip ONLY the tier ------------------------
+    let served = scripted_session(
+        "ac4-served",
+        web_config(WebTier::FetchAnyUrl),
+        args,
+        &[],
+        vec![Ok((
+            200,
+            None,
+            b"<html><body>pinning</body></html>".to_vec(),
+        ))],
+    )
+    .await;
+
+    assert_eq!(
+        served.lookup_calls(),
+        1,
+        "the control leg has to reach the wire, or the refusal above measures nothing"
+    );
+    assert!(
+        served.dead_ends().is_empty(),
+        "a served lookup was announced as a capability dead end: {:?}",
+        served.dead_ends()
+    );
+
+    refused.cleanup();
+    served.cleanup();
 }
 
 // ---------------------------------------------------------------------------

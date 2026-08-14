@@ -273,6 +273,119 @@ Two promises, both made visible:
   leaves your machine. Enforced at the daemon's single egress point, verified by
   egress-capture tests, not vibes.
 
+### Turning on web lookup
+
+Web lookup ships **off**. Nothing is fetched, searched, or sent anywhere until
+you turn it on, and turning it on is a *user* act. The model is told the
+capability exists, that it is off, and how to enable it — so a question that
+needs the live web gets a refusal that names the way forward instead of a hunt
+through your repository for Teton's config. It cannot take that way forward
+itself: `/web setup` is a client command, and a model that emits a tool call by
+that name reaches no tool.
+
+In a session:
+
+```
+/web setup
+```
+
+It asks, in this order, and writes nothing until the last answer:
+
+1. **tier** — `1) fetch_user_url` (fetch a URL you pasted into the session),
+   `2) fetch_any_url` (also fetch a URL the model composed), `3) search` (also
+   search through a backend you name). Each tier includes the ones before it.
+   On a machine that cannot serve `search`, that row is marked
+   `(unavailable: …)` with the reason, and choosing it is refused rather than
+   written.
+2. **search endpoint** — `search` only; the three shapes below are printed
+   above the prompt.
+3. **does this backend need an API key? [Y/n]** — answer `n` for a keyless
+   self-hosted backend.
+4. **auth header template** — Enter takes the default,
+   `Authorization: Bearer {key}`.
+5. **API key** — not echoed. It goes straight into the OS keychain as
+   `keychain://teton/web-search`; only that *reference* is written to your
+   config, and only that reference crosses the socket to the daemon.
+
+Then it prints the exact `[web]` TOML it would write and the host searches would
+go to, and asks `write this to your config? [y/N]` — default **no**. Answer `y`
+and the table is written atomically and is live immediately: that session and
+every other open session pick the capability up on their next turn, with no
+restart. Enter, an empty answer, EOF or Ctrl-C at any prompt leaves the config
+untouched and stores no key. On a piped (non-terminal) session the command asks
+nothing at all and prints the hand-edit instructions below instead.
+
+Enabling is not consenting. Every lookup still asks before anything leaves the
+machine; the durable-consent key (`permission_allow`) is written only when you
+answer "enable permanently" at a lookup prompt, never by `/web setup`.
+
+Backends whose shapes are known to work:
+
+| Backend | Endpoint | `search_auth` |
+|---|---|---|
+| SearxNG (self-hosted) | `http://localhost:8888/search?format=json` | none — keyless |
+| Brave Search API | `https://api.search.brave.com/res/v1/web/search` | `X-Subscription-Token: {key}` |
+| Kagi Search API | `https://kagi.com/api/v0/search` | `Authorization: Bot {key}` |
+
+The `?format=json` on a SearxNG endpoint is load-bearing: without it the
+instance answers with a web page rather than JSON.
+
+<!--
+Drift check. The three backend rows above, the `[web]` keys below, and the
+keychain reference are the same strings as two places in the tree, and all of
+them must move together:
+  - `crates/tetond/src/harness/self_config.md` — the guide bundled into the
+    system prompt, and the single source REQ-572's AC-8 backend contract suite
+    (`crates/tetond/tests/web_setup_contracts.rs`) enumerates the suggestion
+    list from, so a backend added there without a contract fixture fails the
+    suite;
+  - `crates/teton/src/web_setup_ui.rs` — `ENDPOINT_HELP` (what `/web setup`
+    prints above the endpoint prompt) and `instruction_lines` (what a piped
+    session is told).
+-->
+
+**Or write the table by hand.** `/web setup` exists because it is live in the
+session; a hand-edited config is read when the daemon next starts.
+
+```toml
+[web]
+# "off" (default) | "fetch_user_url" | "fetch_any_url" | "search"
+tier = "search"
+search_endpoint = "https://api.search.brave.com/res/v1/web/search"
+# A reference, never a raw key — the value lives in the OS keychain.
+search_key_ref = "keychain://teton/web-search"
+# The header the key rides, `{key}` marking the secret. Absent means
+# `Authorization: Bearer {key}`, and it is refused with no key reference
+# beside it — a header shape with no secret to place would do nothing.
+search_auth = "X-Subscription-Token: {key}"
+# Optional; constrains model-chosen destinations only. Absent = unrestricted,
+# present but empty = nothing allowed. A URL you pasted yourself is exempt.
+allowed_domains = ["docs.rs", "crates.io"]
+# Cache freshness window in seconds; 0 means no caching. Defaults to 900.
+cache_ttl_secs = 900
+```
+
+The keychain entry `search_key_ref` names is created by `/web setup`; to write
+it by hand, run `security add-generic-password -s teton -a web-search -w` — put
+`-w` last and it prompts for the key instead of leaving it in your shell
+history.
+
+A keyless backend is the same table with `search_key_ref` and `search_auth`
+left out. `tier = "search"` with no `search_endpoint` is the one combination
+the daemon refuses to start on, and it names the missing key when it does.
+
+Config lives in `config.toml` in Teton's state directory
+(`$XDG_RUNTIME_DIR/teton` when that is set, else
+`~/Library/Application Support/teton` on macOS; `TETON_CONFIG` overrides both).
+Keys are never stored in it — `search_key_ref` names a keychain entry under the
+same `teton` service every Teton credential is filed under, which is why writing
+one is the CLI's job and never the daemon's.
+
+The `search` tier also needs the local model: every query is scanned before it
+leaves the machine, so a machine with no local model can fetch but cannot
+search. That is why the tier menu marks `search` unavailable there rather than
+letting you configure a tier that would refuse every query.
+
 ## Architecture
 
 Engine/surface separation: all differentiating logic (router, workflow state,
