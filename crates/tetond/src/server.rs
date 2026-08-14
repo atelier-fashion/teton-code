@@ -7853,6 +7853,49 @@ mod tests {
         );
     }
 
+    /// **AC-2 (REQ-576): config/set degrades where no presence mechanism exists,
+    /// and lands.**
+    ///
+    /// The shared `a_commitment_degrades_to_layer_a_where_no_mechanism_exists`
+    /// asserts only the *negative* (config/set is not refused for presence). This
+    /// adds the *positive* landing proof its `web/setup_commit` sibling above
+    /// already carries: with the default `UnavailableVerifier`,
+    /// `refuse_unattested_commitment` returns `None` and a valid config/set reaches
+    /// the runtime and **applies** (`applied: true` — in-memory on a config-less
+    /// `Daemon::new()`, since `apply_config_update` skips the disk write when there
+    /// is no path), rather than being stopped at the presence gate. (Degrade is
+    /// behaviourally identical to no-gate here by design, so this pins "lands",
+    /// not "gate present" — the latter is `only_a_daemon_wide_commitment_demands_presence`'s job.)
+    #[test]
+    fn a_config_set_degrades_where_no_presence_mechanism_exists() {
+        let daemon = Daemon::new();
+        let conn = unattached(&daemon);
+
+        let applied = route_setup(
+            &daemon,
+            &conn,
+            Id::Number(2),
+            ConfigSetParams::METHOD,
+            serde_json::json!({"update": {
+                "op": "set_privacy_boundary",
+                "path_glob": "degrade-fixture/**",
+                "mode": "local_only",
+            }}),
+        )
+        .unwrap();
+        assert!(
+            !applied.contains(&error_code::ATTESTATION_FAILED.to_string())
+                && !applied.contains(&error_code::ATTESTATION_UNAVAILABLE.to_string()),
+            "no mechanism must degrade, not refuse — config/set reaches the runtime \
+             rather than being stopped at the presence gate: {applied}"
+        );
+        assert!(
+            applied.contains("\"applied\":true"),
+            "and it lands: a degraded config/set applies (in-memory on a config-less \
+             daemon), proving it got past the degraded presence gate: {applied}"
+        );
+    }
+
     /// **`web/setup_commit` left the synchronous dispatch (REQ-575 ADR-1) — the
     /// reader loop cannot park on its presence prompt.**
     ///
