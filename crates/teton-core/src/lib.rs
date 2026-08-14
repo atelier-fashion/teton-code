@@ -17,6 +17,11 @@
 //!   this crate no longer duplicates them.
 //! - [`config`] — the TOML config schema and its validation, including the
 //!   BR-7 no-raw-credentials rule.
+//! - [`capability`] — the one derivation of the web capability's state
+//!   ([`WebCapabilityState`]) from the `[web]` table plus local-model presence.
+//!   Shared by the refusal clause, the status surface, the setup flow, and the
+//!   web tool's registration predicate, so those four cannot disagree about
+//!   what this machine can do (REQ-572 BR-3).
 //! - [`mcp`] — user-declared MCP servers (the `[[mcp_server]]` config table,
 //!   ADR-003 / AC-9).
 //! - [`policy`] — the shared decision vocabulary: [`ProviderHealth`] in,
@@ -31,6 +36,7 @@
 //!   socket, launchd, or a TTY (REQ-565 BR-9).
 
 pub mod boundary;
+pub mod capability;
 pub mod category;
 pub mod config;
 pub mod effort;
@@ -42,6 +48,11 @@ pub mod policy;
 pub mod provenance_id;
 
 pub use boundary::{match_boundary, BoundaryError, BoundaryMatcher};
+// REQ-572 BR-3: re-exported at the crate root because the classifier's whole
+// point is that one answer serves the prompt, the status surface, the setup
+// flow and the tool registry — `teton_core::web_capability_state` is the one
+// path all of them name it by.
+pub use capability::{web_capability_state, SearchGap, WebCapabilityState};
 // REQ-558: `TierBinding`/`CategoryOverride` live beside the resolver that reads
 // them rather than in `entities`, so the type that makes a `redact` binding
 // unrepresentable (ADR-B) sits next to the match arm that relies on it. They are
@@ -52,9 +63,9 @@ pub use category::{
     ParseCategoryError, ParseJudgmentCategoryError, ParseTierError, Tier, TierBinding,
 };
 pub use config::{
-    Config, ConfigError, LegacyRoutingRule, LifetimeConfig, LoadError, LocalModelConfig,
-    MigratedPhase, PermissionsConfig, PrivacyConfig, RoutingMigration, ShutdownPolicyKind,
-    SkippedRule, WebConfig, WebTier,
+    web_table_toml, Config, ConfigError, LegacyRoutingRule, LifetimeConfig, LoadError,
+    LocalModelConfig, MigratedPhase, PermissionsConfig, PrivacyConfig, RoutingMigration,
+    ShutdownPolicyKind, SkippedRule, WebConfig, WebTier,
 };
 // REQ-559: the effort vocabulary is re-exported at the crate root so
 // `teton_core::EffortLevel` is the stable path for the daemon, the adapters and
