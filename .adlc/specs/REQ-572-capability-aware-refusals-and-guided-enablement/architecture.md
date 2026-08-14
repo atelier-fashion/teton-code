@@ -183,6 +183,19 @@ user confirms the preview); an orphaned `teton/web-search` entry is inert
 is asserted at every user-reachable abort point; the kill-window residual is
 this paragraph.
 
+**Second accepted residual (added by the verify fix pass)**: a **transport**
+failure during the commit RPC — socket closed, daemon died mid-call — leaves
+the commit's outcome unknown: the write may or may not have landed. On that
+path the flow deliberately performs **no** keychain undo (deleting would break
+the setup in the landed case; restoring would un-rotate a key the landed
+config now expects) and instead renders one honest notice naming the
+`web-search` account, both possibilities, and `/web setup` as the check. When
+the commit did *not* land, the stored entry is therefore orphaned — a
+deliberate divergence from AC-6's letter on this one path, accepted for the
+same reason as the kill window above: the ambiguous state licenses no
+mutation, and an honest notice beats a clever guess. Pinned by
+`a_commit_that_never_answered_leaves_the_keychain_alone_and_says_so`.
+
 ### ADR-4: `capability_dead_end` fires where the daemon can actually see it
 
 **Decision**: the event is emitted at the two daemon-observable dead ends —

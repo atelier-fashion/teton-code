@@ -284,11 +284,15 @@ impl Answers {
     }
 
     /// The commit request these answers describe, carrying the reference the
-    /// keychain actually returned rather than the one this struct predicted.
+    /// keychain actually returned rather than the one this struct predicted,
+    /// and the previewed document's digest so the daemon refuses to write
+    /// bytes the user never confirmed (BR-7; the daemon-side check is
+    /// `candidate_digest`).
     fn commit_params(
         &self,
         session_id: &SessionId,
         key_ref: Option<String>,
+        expect_digest: Option<String>,
     ) -> WebSetupCommitParams {
         WebSetupCommitParams {
             session_id: session_id.clone(),
@@ -296,13 +300,7 @@ impl Answers {
             search_endpoint: self.search_endpoint.clone(),
             search_key_ref: key_ref,
             search_auth: self.search_auth.clone(),
-            // NOT THREADED HERE. The daemon-side digest guard landed in the same
-            // verify pass as this file's changes; carrying the previewed digest
-            // through to the commit is the integrating change, and doing it from
-            // two sides at once is how the two halves disagree. `None` is the
-            // protocol's own "do not check", so this compiles and behaves
-            // exactly as it did before the field existed.
-            expect_digest: None,
+            expect_digest,
         }
     }
 }
@@ -426,11 +424,16 @@ pub(crate) fn drive(
         None => (None, None),
     };
 
+    // The previewed document's digest rides the commit so the daemon refuses
+    // to write bytes the user never confirmed (BR-7). An empty digest is a
+    // daemon that predates the field — degrade to the protocol's own
+    // "do not check" rather than sending a value that can only mismatch.
+    let expect_digest = Some(preview.digest.clone()).filter(|digest| !digest.is_empty());
     // Bound rather than `?`-ed. A transport failure here is not the same event
     // as a daemon that answered "no": the commit may have landed, and letting
     // the error out would end the session on the one path where the user most
     // needs the flow to tell them what state their machine is in.
-    match io.commit(answers.commit_params(session_id, key_ref.clone())) {
+    match io.commit(answers.commit_params(session_id, key_ref.clone(), expect_digest)) {
         // Nothing is rendered here on purpose. The daemon publishes
         // `web_setup_completed` for this session, and `Connection::call` has
         // already pumped it through `session_ui` by the time this returns — the
@@ -1219,10 +1222,18 @@ mod tests {
             warnings: vec![
                 "this replaces the current `[web]` table: search_auth will be removed.".to_owned(),
             ],
-            // The flow does not thread this yet — see `commit_params`. A daemon
-            // that predates the field sends exactly this, so the fixture is also
-            // the compatibility case.
+            // A daemon that predates the field sends exactly this, so the
+            // fixture doubles as the compatibility case: the flow degrades an
+            // empty digest to "do not check" (pinned by
+            // `a_previewed_digest_rides_the_commit_and_an_absent_one_does_not`).
             digest: String::new(),
+        }
+    }
+
+    fn preview_result_with_digest(digest: &str) -> WebSetupPreviewResult {
+        WebSetupPreviewResult {
+            digest: digest.to_owned(),
+            ..preview_result()
         }
     }
 
@@ -1235,6 +1246,27 @@ mod tests {
         PLANTED_KEY,
         "y",
     ];
+
+    /// BR-7's guard is only real if the previewed digest actually rides the
+    /// commit — and only when the daemon offered one: an empty digest is a
+    /// daemon that predates the field, and inventing a value for it could
+    /// only ever mismatch.
+    #[test]
+    fn a_previewed_digest_rides_the_commit_and_an_absent_one_does_not() {
+        let mut io = FakeIo::new(FULL_WALK);
+        io.preview = Ok(preview_result_with_digest("abc123"));
+        let keychain = MockKeychain::new();
+        drive(&mut io, &keychain, &session(), Gate::Walk).unwrap();
+        assert_eq!(io.commits[0].expect_digest.as_deref(), Some("abc123"));
+
+        let mut io = FakeIo::new(FULL_WALK);
+        let keychain = MockKeychain::new();
+        drive(&mut io, &keychain, &session(), Gate::Walk).unwrap();
+        assert_eq!(
+            io.commits[0].expect_digest, None,
+            "an empty digest from an old daemon must degrade to the protocol's own do-not-check"
+        );
+    }
 
     /// The gate is the one thing that decides whether a question is ever put to
     /// a stdin nobody is typing into (LESSON-470).

@@ -28,7 +28,7 @@ capability field.
 
 - [x] `/web setup` on a TTY walks all steps and a scripted daemon answers; on non-TTY it prints instructions, consumes no stdin line meant for the session, and exits the command cleanly — `a_piped_session_is_told_what_to_type_and_asked_nothing` (asked == 0, no frames, keychain empty) and `the_gate_walks_at_a_terminal_and_degrades_on_a_pipe`; the walk itself is `a_full_walk_stores_the_key_and_sends_only_its_reference`. Both branches were also driven manually against a real `teton-code` (plan → menu → endpoint → keyless → preview → confirm → commit wrote the `[web]` table; a second session's plan then read it back). The **pty** leg is TASK-133's
 - [x] The key prompt does not echo (pty assertion in TASK-133 — this task provides the hook), the secret appears in no RPC params (fake-client capture: only `search_key_ref` crosses), and abort at every prompt leaves the fake keychain empty — the hook is `Prompter::ask_secret` (no default implementation; `StdinPrompter` clears `ECHO` through a restoring guard, `ScriptedPrompter` records that the hiding path was taken); the capture is `a_full_walk_stores_the_key_and_sends_only_its_reference` (planted key absent from the serialized preview **and** commit frames and from every rendered line); the aborts are `an_abort_at_every_prompt_stores_nothing_and_commits_nothing`, over EOF **and** empty answers at every position. **Not ticked for the echo itself** — that needs a terminal and is TASK-133's assertion
-- [x] Commit failure deletes the just-stored fake-keychain entry and renders the daemon's validator sentence — `a_refused_commit_deletes_the_key_it_stored_and_renders_the_daemons_sentence` (delete recorded, store emptied, the validator's own words on screen, planted key nowhere); `a_refused_preview_asks_for_no_confirmation_and_stores_nothing` covers the earlier failure point, where there is nothing to clean up
+- [x] Commit failure undoes the keychain effect this run caused and renders the daemon's validator sentence — **amended by the verify fix pass** (the original unconditional delete destroyed a rotated-over credential): the undo is now conditional via `PriorKey` — delete when this run *created* the entry (`a_refused_commit_on_a_fresh_account_deletes_and_says_removed`), restore the displaced bytes when it *rotated* one (`a_refused_commit_after_a_rotation_puts_the_previous_key_back`), leave alone when the prior state was unreadable (`a_refused_commit_after_an_unreadable_keychain_leaves_the_entry_alone`) or when the commit's outcome is transport-ambiguous (`a_commit_that_never_answered_leaves_the_keychain_alone_and_says_so`); a cleanup that itself fails reports both failures with the recovery command (`a_refused_commit_whose_own_cleanup_also_fails_reports_both_failures`); `a_refused_preview_asks_for_no_confirmation_and_stores_nothing` still covers the earlier failure point
 - [x] Status line shows `web: off (available)` from a snapshot with the new field, and existing `WebState` precedence (overridden > restricted > granted) is unchanged — `the_capability_field_tells_off_from_off_but_available` and `the_configured_capability_never_outranks_what_the_session_did`. Read honestly with note 6 below: the *field* renders it; whether the *row* is drawn is REQ-563's rule, deliberately untouched
 
 ## Technical Notes
@@ -81,9 +81,18 @@ Deviations from the letter of this file, each with its reason:
    backend need an API key? [Y/n]" is asked before the key prompt: it is what
    makes a keyless SearxNG reachable (AC-8) while keeping "empty means abort"
    true of every prompt that needs a value. The `search_auth` prompt is the one
-   place where empty means "use the daemon's default" — stated in the question
-   itself — because a template nobody typed is `None` on the wire, not a copy of
-   the default in every config this flow writes.
+   place where empty means "take what the prompt offered" — stated in the
+   question itself. **Amended by the verify fix pass**: the offer is the
+   daemon's Bearer default only for an unrecognised host; a known backend
+   (Brave, Kagi — `KNOWN_BACKEND_AUTH` beside `ENDPOINT_HELP`) is offered its
+   own documented template, closing the guided path that used to recreate
+   BUG-165's 401. An empty answer to a known-host offer sends that template on
+   the wire; an empty answer to the generic offer stays `None`.
+   Verify-pass surface additions: `PriorKey`, `Cleanup`, `unchanged_line`,
+   `ambiguous_commit_line`, `offered_auth`, `endpoint_host`, `auth_question`,
+   `Keychain::read`, `MockKeychain::{fail_delete_with, fail_read_with}`,
+   `EchoState`/`classify_echo` (fail-closed secret prompt), and
+   `prompt_for_secret` (provider-add parity).
 4. **The preview carries the key *reference* before the key is stored.** The
    reference is a name (`keychain://teton/web-search`), not a value, so it is
    knowable up front — and it has to be, or the confirmed bytes would differ

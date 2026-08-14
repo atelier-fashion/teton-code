@@ -147,18 +147,20 @@ consented, and inert with no signal). The dividing line this REQ draws:
 
 ## Open Questions
 
-- [ ] Should concurrent *already-running* sessions (other than the one that
-  completed the flow) also gain the capability live, or only sessions started
-  after commit? (BR-8 currently requires the committing session + new
-  sessions; extending to bystander sessions touches the BUG-161/162
-  cross-session surface and may not be worth it.)
-- [ ] Should the flow end by offering a consented "try one lookup now"
-  (ordinary REQ-563 Ask prompt), or end silently? BR-13 permits the former;
-  product taste call.
-- [ ] Command spelling: `/setup web` (capability-generic namespace, matches
-  the follow-up provider flow) vs `/web setup` (matches the existing
-  `/web refresh` / `/web allow` family). Architecture may decide; naming is
-  user-visible so flagged here.
+All three settled during architecture (see architecture.md "Settled Open
+Questions" for the recorded rationale):
+
+- [x] OQ-1 (bystander live pickup): settled better than the minimum — every
+  session's next turn re-derives from the swapped config, so bystanders gain
+  the capability live; their *status surface* refreshes only at the next
+  snapshot read (running sessions render the old field until then — a
+  recorded cosmetic residual, not a capability gap).
+- [x] OQ-2 (post-setup lookup offer): no auto-fired lookup; the completion
+  notice states the capability is live and that the next web-needing question
+  raises the ordinary Ask consent.
+- [x] OQ-3 (command spelling): `/web setup`, joining the existing `/web`
+  family; a capability-generic `/setup` namespace can arrive with the
+  provider flow without breaking it.
 
 ## Out of Scope
 
