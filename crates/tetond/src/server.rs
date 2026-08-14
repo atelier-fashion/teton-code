@@ -946,12 +946,22 @@ fn refuse_daemon_wide(conn: &ConnState, id: &Id) -> Option<String> {
 /// model-supplied shell word, so a non-descendant same-UID process still passes
 /// it. That residual is tolerable for a config read. It is **not** tolerable for
 /// a commitment whose blast radius is the whole machine — a model change, a
-/// multi-gigabyte download — which is why those two methods, and only those two,
-/// ask for presence on top.
+/// multi-gigabyte download, or writing the `[web]` egress table — which is why
+/// three methods ask for presence on top: `model/confirm`, `model/set`, and
+/// (REQ-575) `web/setup_commit`.
 ///
 /// The split is the spec's rather than a convenience: `config/get`, `cost/query`
 /// and `web/refresh` stay layer (a) only. Prompting a human to evict a cached
 /// document would train them to click through the prompt that matters.
+///
+/// **Standing obligation (REQ-575 BR-5).** Any future method that durably
+/// rewrites `config.toml` or live-swaps daemon-wide in-memory state must be
+/// classified against BR-10(b) in its own architecture phase — the omission of
+/// exactly that classification is how REQ-572 finding 7 arose (a daemon-wide
+/// committing method shipped with no BR-10(b) analysis). `config/set` is the
+/// known next candidate — a larger blast radius still (`RegisterProvider`,
+/// `SetPrivacyBoundary`) — deliberately left at layer (a) here and tracked in
+/// REQ-576, so a fourth caller is a decision, not drift.
 ///
 /// Unlike the consent path this does **not** record into the attestation
 /// registry. There is no consent `request_id` here to bind to — these methods
@@ -1552,13 +1562,18 @@ async fn handle_client(stream: UnixStream, daemon: Arc<Daemon>, peer: PeerIdenti
         // the very `session/attach` whose consent is being answered.
         // `model/confirm` and `model/set` join for BR-10(b): a daemon-wide
         // commitment now asks for presence too, and that prompt parks on a human
-        // exactly as the consent one does.
+        // exactly as the consent one does. `web/setup_commit` joins them for the
+        // same reason (REQ-575): writing the `[web]` egress table is a daemon-wide
+        // commitment, so it now attests, and its handler moved off the reader-loop
+        // `dispatch` to here rather than parking every other RPC on this
+        // connection behind a Touch ID prompt.
         let blocks_on_a_human = matches!(
             method,
             m if m == SessionAttachParams::METHOD
                 || m == AttachConsentParams::METHOD
                 || m == ModelConfirmParams::METHOD
                 || m == ModelSetParams::METHOD
+                || m == WebSetupCommitParams::METHOD
         );
         if blocks_on_a_human {
             let daemon = Arc::clone(&daemon);
@@ -1574,8 +1589,18 @@ async fn handle_client(stream: UnixStream, daemon: Arc<Daemon>, peer: PeerIdenti
                     handle_attach_consent(&daemon, &conn, id, params).await
                 } else if method == ModelConfirmParams::METHOD {
                     handle_model_confirm(&daemon, &conn, id, params).await
-                } else {
+                } else if method == ModelSetParams::METHOD {
                     handle_model_set(&daemon, &conn, id, params).await
+                } else if method == WebSetupCommitParams::METHOD {
+                    handle_web_setup_commit(&daemon, &conn, id, params).await
+                } else {
+                    // Unreachable: the `blocks_on_a_human` `matches!` guard admits
+                    // exactly the five methods branched above. Made explicit rather
+                    // than a catch-all so a future sixth member (REQ-576's
+                    // `config/set`) that updates the guard but forgets a branch
+                    // fails loudly here instead of being silently misrouted into
+                    // `handle_web_setup_commit`.
+                    unreachable!("blocks_on_a_human admitted an unrouted method: {method}")
                 };
                 // The fence for the same reason `dispatch`'s responses take it:
                 // any event already delivered to this client's subscription
@@ -2172,13 +2197,16 @@ fn dispatch(
         ConfigSetParams::METHOD => Some(handle_config_set(daemon, conn, id, params)),
         CostQueryParams::METHOD => Some(handle_cost_query(daemon, conn, id)),
         WebOverrideParams::METHOD => Some(handle_web_override(daemon, conn, id, params)),
-        // REQ-572: the three setup methods are session-scoped, so they belong
-        // here beside `web/override` and **not** in `refuse_daemon_wide`'s list
-        // — the question they ask is "may this connection drive this session",
-        // which is `may_drive`'s, not the ancestry gate's.
+        // REQ-572: the setup *reads* are session-scoped, so they belong here
+        // beside `web/override` and **not** in `refuse_daemon_wide`'s list — the
+        // question they ask is "may this connection drive this session", which is
+        // `may_drive`'s, not the ancestry gate's. `web/setup_commit` is NOT here:
+        // since REQ-575 it is additionally a BR-10(b) commitment that may attest
+        // (park on a human), so it runs on its own task in `handle_client`'s
+        // `blocks_on_a_human` path — it keeps the same `may_drive` layer-(a) gate,
+        // and adds presence on top.
         WebSetupPlanParams::METHOD => Some(handle_web_setup_plan(daemon, conn, id, params)),
         WebSetupPreviewParams::METHOD => Some(handle_web_setup_preview(daemon, conn, id, params)),
-        WebSetupCommitParams::METHOD => Some(handle_web_setup_commit(daemon, conn, id, params)),
         SessionPermissionsParams::METHOD => {
             Some(handle_session_permissions(daemon, conn, id, params))
         }
@@ -2438,7 +2466,12 @@ fn handle_web_setup_preview(daemon: &Daemon, conn: &ConnState, id: Id, params: V
 /// `may_drive` gate below is the *defense in depth* BR-4 asks for on top of it,
 /// which is why it needs a test of its own rather than resting on the
 /// structural argument (LESSON-508).
-fn handle_web_setup_commit(daemon: &Daemon, conn: &ConnState, id: Id, params: Value) -> String {
+async fn handle_web_setup_commit(
+    daemon: &Daemon,
+    conn: &ConnState,
+    id: Id,
+    params: Value,
+) -> String {
     let params: WebSetupCommitParams = match serde_json::from_value(params) {
         Ok(params) => params,
         Err(_) => return error_string(id, error_code::INVALID_PARAMS, "invalid params"),
@@ -2449,6 +2482,16 @@ fn handle_web_setup_commit(daemon: &Daemon, conn: &ConnState, id: Id, params: Va
     if let Some(refusal) =
         refuse_commit_without_session_access(daemon, conn, &id, &params.session_id)
     {
+        return refusal;
+    }
+    // BR-10(b) / REQ-575: writing the `[web]` egress table is a daemon-wide
+    // commitment, so it takes the same presence check `model/confirm` and
+    // `model/set` take — the *same* function, degrading (not refusing) where no
+    // mechanism exists (REQ-570 BR-8). Ordered **after** the session-access gate
+    // deliberately: a caller that may not drive this session at all is refused
+    // with no prompt appearing on anyone's screen (BR-2, the `model/confirm`
+    // ordering rationale).
+    if let Some(refusal) = refuse_unattested_commitment(daemon, conn, &id).await {
         return refusal;
     }
     match daemon.runtime.web_setup_commit(&params, &daemon.events) {
@@ -4124,13 +4167,26 @@ mod tests {
         ]
     }
 
-    /// Route a request the way [`handle_client`] does.
+    /// Route a request the way [`handle_client`] does — the **single** routing
+    /// authority the test module has, so no test re-encodes "which methods run
+    /// off the reader loop" (the sync `#[test]` bridge [`route_setup`] delegates
+    /// here rather than deciding it a second time).
     ///
-    /// Four methods run on their own task because they may park on a human, so
-    /// they are absent from [`dispatch`]. A test that reached only for
-    /// `dispatch` would get `METHOD_NOT_FOUND` for those and could report a
-    /// security gate as "passing" while never invoking it — so the routing is
-    /// mirrored here rather than duplicated per test.
+    /// Five methods run on their own task because they may park on a human, so
+    /// they are absent from [`dispatch`]: `session/attach`, `attach/consent`,
+    /// `model/confirm`, `model/set`, and (REQ-575) `web/setup_commit`. A test
+    /// that reached only for `dispatch` would get `METHOD_NOT_FOUND` for those
+    /// and could report a security gate as "passing" while never invoking it —
+    /// so the routing is mirrored here rather than duplicated per test.
+    ///
+    /// `web/setup_commit` is the odd one out: its **layer (a)** gate is
+    /// session-scoped (`may_drive`, via `refuse_commit_without_session_access`),
+    /// not the ancestry gate the other four daemon-wide methods use — so it is
+    /// deliberately absent from [`daemon_wide_methods`], and its BR-10(b)
+    /// commitment coverage lives in its own session-scoped tests
+    /// (`a_web_setup_commit_refuses_when_the_presence_check_fails` and siblings)
+    /// rather than in the shared daemon-wide table, which cannot supply an
+    /// attached owner.
     async fn route_for_test(
         daemon: &Daemon,
         conn: &ConnState,
@@ -4146,6 +4202,8 @@ mod tests {
             handle_model_confirm(daemon, conn, id, params).await
         } else if method == ModelSetParams::METHOD {
             handle_model_set(daemon, conn, id, params).await
+        } else if method == WebSetupCommitParams::METHOD {
+            handle_web_setup_commit(daemon, conn, id, params).await
         } else {
             dispatch(daemon, conn, id, method, params).expect("a routed method answers")
         }
@@ -6938,6 +6996,35 @@ mod tests {
         })
     }
 
+    /// The synchronous `#[test]` bridge to [`route_for_test`], so the setup
+    /// family's pre-existing `#[test]` functions can drive `web/setup_commit`
+    /// (which left the reader-loop `dispatch` in REQ-575 and may attest on its
+    /// own task) without the whole group being rewritten to `#[tokio::test]`.
+    ///
+    /// **Routing is not decided here.** It delegates to [`route_for_test`] — the
+    /// single routing authority — inside a throwaway current-thread runtime, so
+    /// the "which methods run off the reader loop" decision cannot drift between
+    /// two helpers. Returns `Option<String>` to stay a drop-in for `dispatch(...)`
+    /// at the migrated `.unwrap()` call sites. With the default
+    /// `UnavailableVerifier` the BR-10(b) check degrades and never parks, so
+    /// every migrated test's outcome is byte-identical to when it called
+    /// `dispatch` directly.
+    fn route_setup(
+        daemon: &Daemon,
+        conn: &ConnState,
+        id: Id,
+        method: &str,
+        params: Value,
+    ) -> Option<String> {
+        Some(
+            tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("current-thread runtime for the async setup handler")
+                .block_on(route_for_test(daemon, conn, id, method, params)),
+        )
+    }
+
     /// The `web_setup_rejected` events queued on `sub` right now.
     ///
     /// `try_recv` rather than an awaited `recv` under a timeout: `publish` is
@@ -6985,7 +7072,7 @@ mod tests {
         // this call's doing and nothing else's.
         let mut sub = daemon.events.subscribe(16);
 
-        let refused = dispatch(
+        let refused = route_setup(
             &daemon,
             &intruder,
             Id::Number(2),
@@ -7022,7 +7109,7 @@ mod tests {
             rejection.origin
         );
 
-        let owners_own = dispatch(
+        let owners_own = route_setup(
             &daemon,
             &owner,
             Id::Number(3),
@@ -7089,7 +7176,7 @@ mod tests {
 
         // The positive control, on the same connection and the same
         // subscription: what changes something still announces.
-        dispatch(
+        route_setup(
             &daemon,
             &intruder,
             Id::Number(3),
@@ -7141,7 +7228,7 @@ mod tests {
         let mut sub = daemon.events.subscribe(16);
 
         for id in [2, 3] {
-            let refused = dispatch(
+            let refused = route_setup(
                 &daemon,
                 &intruder,
                 Id::Number(id),
@@ -7169,7 +7256,7 @@ mod tests {
         // of this bound (see `ConnState::setup_rejections_announced`): what is
         // capped is one connection's loop, not a peer that reconnects.
         let second = unattached(&daemon);
-        dispatch(
+        route_setup(
             &daemon,
             &second,
             Id::Number(4),
@@ -7203,7 +7290,7 @@ mod tests {
         let intruder = unattached(&daemon);
         let mut sub = daemon.events.subscribe(16);
 
-        dispatch(
+        route_setup(
             &daemon,
             &intruder,
             Id::Number(2),
@@ -7215,7 +7302,7 @@ mod tests {
         assert_eq!(announced.len(), 1);
         assert_eq!(announced[0].session_id.as_ref(), Some(&first));
 
-        dispatch(
+        route_setup(
             &daemon,
             &intruder,
             Id::Number(3),
@@ -7262,7 +7349,7 @@ mod tests {
         // Mintable length — `sess-` plus a 26-char body — so this passes the
         // F9 length gate and reaches the announcement seam it is aimed at.
         let phantom = SessionId::from("sess-aaaaaaaaaaaaaaaaaaaaaaaaaa");
-        let refused = dispatch(
+        let refused = route_setup(
             &daemon,
             &intruder,
             Id::Number(2),
@@ -7282,7 +7369,7 @@ mod tests {
              hands every monitor an envelope wearing an attacker-chosen id"
         );
 
-        let refused = dispatch(
+        let refused = route_setup(
             &daemon,
             &intruder,
             Id::Number(3),
@@ -7329,7 +7416,7 @@ mod tests {
             WebSetupPreviewParams::METHOD,
             WebSetupCommitParams::METHOD,
         ] {
-            let refused = dispatch(
+            let refused = route_setup(
                 &daemon,
                 &intruder,
                 Id::Number(1),
@@ -7354,7 +7441,7 @@ mod tests {
         // and reaches the session gate, so the refusals above are the length
         // rule and not the setup family being unroutable.
         let session = a_session_owned_by(&daemon, &unattached(&daemon));
-        let gated = dispatch(
+        let gated = route_setup(
             &daemon,
             &intruder,
             Id::Number(2),
@@ -7494,7 +7581,7 @@ mod tests {
         );
 
         // The positive control, on the same connection and subscription.
-        dispatch(
+        route_setup(
             &daemon,
             &intruder,
             Id::Number(3),
@@ -7554,7 +7641,7 @@ mod tests {
             for method in names {
                 let daemon = Daemon::new();
                 let child = conn_with_ancestry(&daemon, ancestry);
-                let response = dispatch(
+                let response = route_setup(
                     &daemon,
                     &child,
                     Id::Number(1),
@@ -7569,5 +7656,181 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// **AC-1 / AC-5 (REQ-575): the commit meets the BR-10(b) presence gate, and
+    /// that gate is load-bearing.**
+    ///
+    /// With a *present-but-refusing* verifier, the session's own (attached)
+    /// client — one that clears every earlier gate — is still refused, with the
+    /// attestation code and not the runtime's `CONFIG_REJECTED`. That is the proof
+    /// the check fires *before* the runtime is reached, so nothing is written.
+    ///
+    /// It is also the mutation test the new seam owes (LESSON-508 rule 2):
+    /// deleting the `refuse_unattested_commitment` line from
+    /// [`handle_web_setup_commit`] drops the owner's commit through to the runtime,
+    /// which answers `CONFIG_REJECTED` (a bare daemon has no config path) — a
+    /// different code, so this test goes red. It is red for a reason unique to
+    /// this seam, independent of the `model/confirm`/`model/set` seams.
+    #[test]
+    fn a_web_setup_commit_refuses_when_the_presence_check_fails() {
+        let daemon = Daemon::new().with_presence_verifier(Box::new(
+            crate::attest::AlwaysFailsVerifier::new(crate::attest::AttestationMethod::OsBiometric),
+        ));
+        let owner = unattached(&daemon);
+        let session = a_session_owned_by(&daemon, &owner);
+
+        let refused = route_setup(
+            &daemon,
+            &owner,
+            Id::Number(2),
+            WebSetupCommitParams::METHOD,
+            setup_params(&session),
+        )
+        .unwrap();
+        assert!(
+            refused.contains(&error_code::ATTESTATION_FAILED.to_string()),
+            "the session's own client still meets the presence gate: {refused}"
+        );
+        assert!(
+            !refused.contains(&error_code::CONFIG_REJECTED.to_string()),
+            "the refusal is the presence gate, not the runtime — a CONFIG_REJECTED \
+             here means the commit reached the runtime, i.e. the attestation line \
+             was skipped: {refused}"
+        );
+    }
+
+    /// **AC-4 (REQ-575, BR-2): the session and length gates answer before the
+    /// presence gate, so a caller that may not act triggers no prompt.**
+    ///
+    /// `AlwaysFailsVerifier` is the tripwire: if the presence check ran first,
+    /// each of these callers would receive `ATTESTATION_FAILED` instead of the
+    /// refusal it actually earns. The point of the ordering is that a stranger, or
+    /// a malformed id, never puts an OS prompt on anyone's screen.
+    #[test]
+    fn a_web_setup_commit_answers_the_earlier_gates_before_the_presence_gate() {
+        let daemon = Daemon::new().with_presence_verifier(Box::new(
+            crate::attest::AlwaysFailsVerifier::new(crate::attest::AttestationMethod::OsBiometric),
+        ));
+        let owner = unattached(&daemon);
+        let session = a_session_owned_by(&daemon, &owner);
+        let intruder = unattached(&daemon);
+
+        let unattached_refusal = route_setup(
+            &daemon,
+            &intruder,
+            Id::Number(2),
+            WebSetupCommitParams::METHOD,
+            setup_params(&session),
+        )
+        .unwrap();
+        assert!(
+            unattached_refusal.contains(&error_code::NOT_ATTACHED.to_string())
+                && !unattached_refusal.contains(&error_code::ATTESTATION_FAILED.to_string()),
+            "the session gate must answer before the presence gate, so an unattached \
+             caller never triggers a prompt: {unattached_refusal}"
+        );
+
+        let oversized = SessionId::from(format!("sess-{}", "a".repeat(4096)).as_str());
+        let unmintable_refusal = route_setup(
+            &daemon,
+            &owner,
+            Id::Number(3),
+            WebSetupCommitParams::METHOD,
+            setup_params(&oversized),
+        )
+        .unwrap();
+        assert!(
+            unmintable_refusal.contains(&error_code::INVALID_PARAMS.to_string())
+                && !unmintable_refusal.contains(&error_code::ATTESTATION_FAILED.to_string()),
+            "the length gate must answer before the presence gate: {unmintable_refusal}"
+        );
+    }
+
+    /// **AC-3 (REQ-575, BR-3): a build with no presence mechanism degrades — it
+    /// does not refuse.**
+    ///
+    /// `Daemon::new()`'s default is the shipped `UnavailableVerifier`, so
+    /// `refuse_unattested_commitment` returns `None` with a stderr notice and the
+    /// commit is allowed past the BR-10(b) gate to the runtime — gaining no new
+    /// prompt (REQ-570 BR-8's asymmetry). The owner's commit therefore reaches the
+    /// runtime and answers the runtime's own `CONFIG_REJECTED` (no config path),
+    /// never an attestation code. This is the non-vacuity contrast to
+    /// [`a_web_setup_commit_refuses_when_the_presence_check_fails`]: same attached
+    /// owner, opposite verifier, opposite outcome.
+    #[test]
+    fn a_web_setup_commit_degrades_where_no_presence_mechanism_exists() {
+        let daemon = Daemon::new();
+        let owner = unattached(&daemon);
+        let session = a_session_owned_by(&daemon, &owner);
+
+        let committed = route_setup(
+            &daemon,
+            &owner,
+            Id::Number(2),
+            WebSetupCommitParams::METHOD,
+            setup_params(&session),
+        )
+        .unwrap();
+        assert!(
+            !committed.contains(&error_code::ATTESTATION_FAILED.to_string())
+                && !committed.contains(&error_code::ATTESTATION_UNAVAILABLE.to_string()),
+            "no mechanism must degrade, not refuse — the commit reaches the runtime \
+             rather than being stopped at the presence gate: {committed}"
+        );
+        assert!(
+            committed.contains(&error_code::CONFIG_REJECTED.to_string()),
+            "with no config path the runtime is what answers, proving the commit got \
+             past the degraded presence gate: {committed}"
+        );
+    }
+
+    /// **`web/setup_commit` left the synchronous dispatch (REQ-575 ADR-1) — the
+    /// reader loop cannot park on its presence prompt.**
+    ///
+    /// It may attest, and a presence prompt parks on a human, so like
+    /// `model/confirm` it runs on `handle_client`'s `blocks_on_a_human` task
+    /// rather than inline in `dispatch`. The direct proof it is no longer served
+    /// on the reader loop: `dispatch` answers `method not found` for it, while the
+    /// setup *reads* (`plan`, `preview`) — which never attest — are still served
+    /// there. The full client path still reaches the commit (the
+    /// `web_setup_flow` / `multi_client` integration suites drive it end to end),
+    /// which is what makes this the "moved off the reader loop" fact rather than
+    /// "removed". Re-adding it to `dispatch` (reintroducing the parking hazard)
+    /// turns this red.
+    #[test]
+    fn the_commit_left_the_reader_loop_dispatch_while_the_reads_stayed() {
+        let daemon = Daemon::new();
+        let owner = unattached(&daemon);
+        let session = a_session_owned_by(&daemon, &owner);
+
+        let commit = dispatch(
+            &daemon,
+            &owner,
+            Id::Number(2),
+            WebSetupCommitParams::METHOD,
+            setup_params(&session),
+        )
+        .unwrap();
+        assert!(
+            commit.contains(&error_code::METHOD_NOT_FOUND.to_string()),
+            "web/setup_commit must not be served inline by `dispatch` — it runs on \
+             the blocks_on_a_human task so a Touch ID prompt cannot park the reader \
+             loop: {commit}"
+        );
+
+        let preview = dispatch(
+            &daemon,
+            &owner,
+            Id::Number(3),
+            WebSetupPreviewParams::METHOD,
+            setup_params(&session),
+        )
+        .unwrap();
+        assert!(
+            !preview.contains(&error_code::METHOD_NOT_FOUND.to_string()),
+            "web/setup_preview is a read that never attests, so it stays on the \
+             synchronous dispatch: {preview}"
+        );
     }
 }
