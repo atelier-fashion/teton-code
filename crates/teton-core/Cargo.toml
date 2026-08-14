@@ -30,6 +30,12 @@ test-seam = []
 teton-protocol = { path = "../teton-protocol" }
 serde = { version = "1", features = ["derive"] }
 toml = "0.8"
+# REQ-574: format-preserving TOML editing, so a config write changes the keys
+# its operation is about and leaves the user's comments, key order and unknown
+# keys byte-for-byte alone (BR-1). This is a *parsing* library, not I/O — the
+# no-I/O rule above still holds — and `toml 0.8` above is itself built on it, so
+# the lockfile already carries toml_edit 0.22.27 and the tree gains no new code.
+toml_edit = "0.22"
 thiserror = "2"
 globset = "0.4"
 

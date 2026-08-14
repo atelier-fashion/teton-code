@@ -353,11 +353,34 @@ Where every surface's sync is enforced:
     names fails, whichever side moved;
   - `crates/teton/src/web_setup_ui.rs` keeps no copy: `/web setup` renders the
     catalog the daemon hands it on `web/setup_plan`, the piped instructions
-    included.
+    included;
+  - the fenced `[web]` block below: `README_WEB_BLOCK` in
+    `crates/tetond/tests/config_preservation.rs` is that block copied
+    byte-for-byte, and `the_fixture_is_the_readmes_own_block_byte_for_byte`
+    reads *this file* at test time and fails on any edit inside the fence the
+    fixture did not follow (REQ-574 AC-1 wants the README's own block as the
+    preservation test vector, not a paraphrase of it);
+  - `crates/teton-core/src/config_doc.rs` — `HAND_WRITTEN_CONFIG` embeds the
+    same block again, as the delta engine's own unit-test vector. Nothing there
+    reads this file, so that copy is not self-enforcing: move it by hand when
+    the fence moves.
 -->
 
 **Or write the table by hand.** `/web setup` exists because it is live in the
-session; a hand-edited config is read when the daemon next starts.
+session; a hand-edited config is read when the daemon next starts. Neither
+choice costs you the other: every daemon-side save — `/web setup`'s commit, an
+"enable permanently" answer at a lookup prompt, a provider registration, a
+startup migration — edits the file in place rather than re-serializing it, so a
+save moves exactly the keys its own operation is about. Comments, key order,
+and keys this build has never heard of survive it untouched.
+
+That holds inside lists like `[[providers]]` too: registering a provider appends
+an entry and leaves the ones already there exactly as you wrote them, and a save
+that changes one entry touches only that entry. The one exception is a list a
+save genuinely *reshapes* — an entry removed, or the order changed — where there
+is no longer any way to match the old entries to the new ones; that list alone is
+rewritten whole, and comments inside it go with it. Everything outside it is
+still untouched.
 
 ```toml
 [web]
@@ -385,6 +408,13 @@ history.
 A keyless backend is the same table with `search_key_ref` and `search_auth`
 left out. `tier = "search"` with no `search_endpoint` is the one combination
 the daemon refuses to start on, and it names the missing key when it does.
+
+What a save edits is the document on disk, not the copy the daemon booted on —
+so an edit you make while it runs rides along instead of being clobbered, and
+is still only *read* at the next start. The other side of that is a refusal: a
+file that no longer parses, or that parses but fails the validation startup
+runs, stops the next daemon-side save with the reason rather than overwriting
+your work to make the save succeed.
 
 Config lives in `config.toml` in Teton's state directory
 (`$XDG_RUNTIME_DIR/teton` when that is set, else

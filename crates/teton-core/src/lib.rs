@@ -17,6 +17,10 @@
 //!   this crate no longer duplicates them.
 //! - [`config`] — the TOML config schema and its validation, including the
 //!   BR-7 no-raw-credentials rule.
+//! - [`config_doc`] — the format-preserving delta engine: what a config change
+//!   does to the *document* it lands in, so a write touches its own keys and
+//!   leaves the user's comments, ordering and unknown keys byte-for-byte alone
+//!   (REQ-574 BR-1). Pure text-in/text-out; the atomic write stays in `tetond`.
 //! - [`capability`] — the one derivation of the web capability's state
 //!   ([`WebCapabilityState`]) from the `[web]` table plus local-model presence.
 //!   Shared by the refusal clause, the status surface, the setup flow, and the
@@ -39,6 +43,7 @@ pub mod boundary;
 pub mod capability;
 pub mod category;
 pub mod config;
+pub mod config_doc;
 pub mod effort;
 pub mod entities;
 pub mod lifetime;
@@ -63,10 +68,15 @@ pub use category::{
     ParseCategoryError, ParseJudgmentCategoryError, ParseTierError, Tier, TierBinding,
 };
 pub use config::{
-    web_table_toml, Config, ConfigError, LegacyRoutingRule, LifetimeConfig, LoadError,
-    LocalModelConfig, MigratedPhase, PermissionsConfig, PrivacyConfig, RoutingMigration,
-    ShutdownPolicyKind, SkippedRule, WebConfig, WebTier,
+    Config, ConfigError, LegacyRoutingRule, LifetimeConfig, LoadError, LocalModelConfig,
+    MigratedPhase, PermissionsConfig, PrivacyConfig, RoutingMigration, ShutdownPolicyKind,
+    SkippedRule, WebConfig, WebTier,
 };
+// REQ-574: re-exported at the crate root for the same reason the config schema
+// is — the daemon's one config-write body and the `/web setup` preview both
+// name these, and `teton_core::apply_config_delta` is the single path to the
+// only code that may edit a user's config document.
+pub use config_doc::{apply_config_delta, table_section, DeltaError};
 // REQ-559: the effort vocabulary is re-exported at the crate root so
 // `teton_core::EffortLevel` is the stable path for the daemon, the adapters and
 // the CLI alike — one ladder, one clamp, one resolver (BR-3, BR-9).
