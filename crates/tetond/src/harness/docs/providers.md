@@ -56,8 +56,9 @@ DeepSeek. The one path here with no `/v1` segment:
     teton policy set-tier build deepseek
 
 Ollama. Local: it serves the models you have pulled and authenticates nothing.
-It ignores the key, but `provider add` still asks for one, so any placeholder
-does — `TETON_PROVIDER_KEY=ollama` skips the prompt.
+It ignores the key, but `provider add` still asks for one, so enter any
+placeholder at the (echo-off) prompt. Never put a real key on a command line —
+it lands in shell history and in the process list.
 
     teton provider add ollama --kind openai-compatible \
       --endpoint http://localhost:11434/v1/chat/completions --model llama3.2

@@ -772,11 +772,13 @@ fn readme_recipe_commands() -> &'static str {
 /// below would then hold vacuously over an empty list.
 fn guide_recipe_segments(catalog: &[ProviderRecipe]) -> Vec<&'static str> {
     let line = guide_recipe_line();
-    let first = catalog
+    // The first vendor in the list, found by whichever recipe's endpoint appears
+    // earliest. Derived rather than anchored on a phrase, so there is one less
+    // piece of prose that can be reworded out from under this suite.
+    let (first_endpoint, first_recipe) = catalog
         .iter()
-        .filter_map(|r| r.endpoint.as_deref())
-        .filter_map(|endpoint| line.find(endpoint))
-        .min()
+        .filter_map(|r| line.find(r.endpoint.as_deref()?).map(|at| (at, r)))
+        .min_by_key(|(at, _)| *at)
         .unwrap_or_else(|| {
             panic!(
                 "the bundled guide's recipe step carries none of the catalog's endpoints, \
@@ -785,16 +787,25 @@ fn guide_recipe_segments(catalog: &[ProviderRecipe]) -> Vec<&'static str> {
                  check.\nline: {line}"
             )
         });
-    // Back up over the opening backtick the endpoint is wrapped in. Cutting
-    // between a backtick and the URL it opens inverts the parity of every
-    // backtick after it, so the first segment's model would be read as prose and
-    // its prose as a model — a parse that fails *quietly*, giving one fewer
-    // candidate than there are vendors.
-    let start = if first > 0 && line.as_bytes()[first - 1] == b'`' {
-        first - 1
-    } else {
-        first
-    };
+    // Start at that vendor's **name**, not at its URL. Two reasons, and both are
+    // failures this parse has already had. The name is a fact the pairing check
+    // below asserts, so a slice that began at the URL would cut the first
+    // vendor's name out of its own segment. And the URL is wrapped in backticks:
+    // cutting between the opening backtick and the URL inverts the parity of
+    // every backtick after it, so the token parse reads prose as models and
+    // models as prose — quietly, yielding one fewer candidate than there are
+    // vendors rather than an error.
+    let start = line[..first_endpoint]
+        .rfind(first_recipe.guide_spelling.as_str())
+        .unwrap_or_else(|| {
+            panic!(
+                "the guide's first recipe is `{}` (its endpoint appears earliest) and the \
+                 line does not name it as `{}` anywhere before that URL, so the recipe list \
+                 has no findable start. Either the guide dropped the vendor's name or the \
+                 catalog's `guide_spelling` is stale.\nline: {line}",
+                first_recipe.id_suggestion, first_recipe.guide_spelling
+            )
+        });
     line[start..].split(';').collect()
 }
 
@@ -956,8 +967,24 @@ fn the_bundled_guide_and_the_recipe_catalog_agree() {
     let line = guide_recipe_line();
     let segments = guide_recipe_segments(&catalog);
 
+    // A lost `;` merges two vendors into one segment, and every per-segment
+    // assertion below would then still pass — the merged segment contains both
+    // endpoints and both models, so each vendor "finds" its pair. The split has
+    // to be shown to have happened before anything is concluded from it.
+    assert!(
+        segments.len() >= catalog.len(),
+        "the guide's recipe list split into {} segments for {} recipes, so at least two \
+         vendors share one. Every pairing check below would pass over a merged segment \
+         while the line itself reads as one vendor's endpoint beside another's model. \
+         Restore the `;` separators in crates/tetond/src/harness/self_config.md.\n\
+         segments: {segments:?}",
+        segments.len(),
+        catalog.len()
+    );
+
     // Catalog → guide, **paired per vendor**: each endpoint is on the line, and
-    // the example model that belongs to it is in the *same* segment.
+    // the vendor's name and the example model that belong to it are in the
+    // *same* segment.
     for recipe in &catalog {
         let endpoint = recipe.endpoint.as_deref().unwrap_or_else(|| {
             panic!(
@@ -989,6 +1016,52 @@ fn the_bundled_guide_and_the_recipe_catalog_agree() {
             recipe.id_suggestion,
             recipe.example_model
         );
+
+        // The vendor's *name* is the third fact in the pair, and the one a user
+        // reads first. An endpoint and a model can both be right and be filed
+        // under the wrong company — "Moonshot/Kimi `https://api.x.ai/…`" is six
+        // verified facts arranged into two wrong recipes, and the endpoint and
+        // model checks above pass on it, because each still finds its partner.
+        assert!(
+            segment.contains(recipe.guide_spelling.as_str()),
+            "the guide's recipe segment carrying `{}`'s endpoint does not name it. The \
+             catalog says the guide spells this vendor `{}` (ProviderRecipe::guide_spelling) \
+             — either the guide moved a name off its own recipe, or the spelling changed \
+             and the catalog has not. Edit \
+             crates/tetond/src/harness/self_config.md, or the catalog if the guide's \
+             wording is the intended one.\nsegment: {segment}",
+            recipe.id_suggestion,
+            recipe.guide_spelling
+        );
+        for other in &catalog {
+            if other.id_suggestion == recipe.id_suggestion {
+                continue;
+            }
+            assert!(
+                !segment.contains(other.guide_spelling.as_str()),
+                "the guide's recipe segment for `{}` also names `{}` (`{}`). Two vendors in \
+                 one segment means a name has been swapped onto a neighbour's URL, or the \
+                 `;` separators no longer divide the list one vendor per \
+                 segment.\nsegment: {segment}",
+                recipe.id_suggestion,
+                other.id_suggestion,
+                other.guide_spelling
+            );
+            // And the same claim for the model ids, over the raw segment rather
+            // than the backticked tokens: a model id that leaked into a
+            // neighbour's prose is still a model id a reader would attach to the
+            // wrong endpoint, and dropping the backticks is how it would evade
+            // the token parse below.
+            assert!(
+                !segment.contains(other.example_model.as_str()),
+                "the guide's recipe segment for `{}` also names `{}`, which is `{}`'s \
+                 example model. Whichever of the two a reader pastes, one of them is going \
+                 to the wrong vendor.\nsegment: {segment}",
+                recipe.id_suggestion,
+                other.example_model,
+                other.id_suggestion
+            );
+        }
     }
 
     // Guide → catalog, the models: a model id printed here is one a user pastes
@@ -1363,6 +1436,99 @@ fn the_providers_topic_and_the_recipe_catalog_agree() {
              command.\noffered: {offered:?}"
         );
     }
+}
+
+// ---------------------------------------------------------------------------
+// The consent rule, as every surface states it (REQ-577 phase 5)
+// ---------------------------------------------------------------------------
+
+/// `text` with its whitespace collapsed to single spaces.
+///
+/// Unlike [`normalized`] below, backticks and case survive: these are pins on
+/// sentences whose exact wording is the point, and the only thing being
+/// forgiven is the line wrapping that markdown imposes on a paragraph.
+fn collapsed(text: &str) -> String {
+    text.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+/// The consent rule as the `web` topic must state it.
+const TOPIC_CONSENT_RULE: &str = "a lookup asks before anything leaves the machine \
+     **unless** that tier has already been granted — for the session, or permanently via \
+     `[web] permission_allow`";
+
+/// The same rule as the README must state it.
+const README_CONSENT_RULE: &str = "A lookup asks before anything leaves the machine unless \
+     that tier has already been granted — for the session, or permanently via `[web] \
+     permission_allow`.";
+
+/// The absolute neither surface may return to.
+const FALSE_ABSOLUTE: &str = "every lookup still asks";
+
+/// **Both consent surfaces state the rule with its exception, and neither
+/// states the absolute that was false** (REQ-577 phase 5).
+///
+/// The defect this pins is a *claim*, not a fact about a third party, so it
+/// drifts differently from everything else in this file: nobody has to change a
+/// vendor's API for it to go wrong, only to tidy a sentence. Both surfaces
+/// carried "every lookup still asks before anything leaves the machine", and
+/// both were wrong the moment `permission_allow` shipped — a tier listed there,
+/// or granted for the session, is not asked about again. Overstating a privacy
+/// guarantee is worse than understating one: it is the sentence a user relies on
+/// when deciding whether to enable a tier at all.
+///
+/// Pinned as **collapsed-whitespace equality on the claim**, the markdown
+/// analogue of the whole-line equality the prompt clauses use (BUG-168 residual
+/// (d)): a substring needle on "asks before anything leaves the machine" would
+/// be satisfied by the false absolute itself, which is exactly how this survived
+/// the first pass. The negative half is checked too, because a surface can
+/// acquire a correct sentence and keep the wrong one next to it.
+#[test]
+fn both_consent_surfaces_state_the_rule_with_its_exception() {
+    let topic = collapsed(WEB_TOPIC);
+    let readme = collapsed(README);
+
+    assert!(
+        topic.contains(&collapsed(TOPIC_CONSENT_RULE)),
+        "the `web` topic (crates/tetond/src/harness/docs/web.md) no longer states the \
+         consent rule with its exception. If the wording changed deliberately, update this \
+         expectation — and keep the exception in it: a tier granted for the session or \
+         listed in `[web] permission_allow` is not asked about again, so any sentence \
+         promising that every lookup asks is false. Do not delete the \
+         assertion.\nexpected: {}",
+        collapsed(TOPIC_CONSENT_RULE)
+    );
+    assert!(
+        readme.contains(&collapsed(README_CONSENT_RULE)),
+        "the README no longer states the consent rule with its exception. Same rule as the \
+         `web` topic's, and the README is the surface a user reads *before* enabling \
+         anything.\nexpected: {}",
+        collapsed(README_CONSENT_RULE)
+    );
+
+    for (surface, text) in [("the `web` topic", &topic), ("the README", &readme)] {
+        assert!(
+            !text.to_lowercase().contains(FALSE_ABSOLUTE),
+            "{surface} says {FALSE_ABSOLUTE:?} again. That absolute is false: a tier \
+             granted for the session, or listed in `[web] permission_allow`, is not asked \
+             about again. State the exception with the rule."
+        );
+    }
+
+    // The durable key has to be documented where it is claimed, including how a
+    // user takes it back — a consent switch with no documented off is a switch
+    // a user cannot audit.
+    assert!(
+        topic.contains("Removing a tier from it restores asking")
+            && topic.contains("after the daemon next starts"),
+        "the `web` topic documents `permission_allow` without saying how to revoke it or \
+         when a revocation takes effect. A hand edit of config.toml is read at daemon \
+         start, and a user who removes a line and sees the tier still silent needs that \
+         sentence."
+    );
+    assert!(
+        readme.contains("Removing a tier from `permission_allow` restores asking"),
+        "the README documents `permission_allow` without saying how to revoke it."
+    );
 }
 
 // ---------------------------------------------------------------------------

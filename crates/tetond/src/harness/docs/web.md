@@ -45,8 +45,10 @@ which reads exactly like a bad key and is not one:
 `permission_allow` is the durable half of the consent prompt: it lists the
 tiers whose "enable permanently" answer was given, one entry each, and defaults
 to empty. Removing a tier from it restores asking for that tier and nothing
-else. It cannot widen `tier` — the ceiling is checked before any prompt exists,
-so a tier listed here that `tier` does not reach simply never comes up.
+else, and — because it is a hand edit of `config.toml` — that takes effect
+after the daemon next starts. It cannot widen `tier`: the ceiling is checked
+before any prompt exists, so a tier listed here that `tier` does not reach
+simply never comes up.
 
 `allowed_domains` constrains model-composed destinations only: absent means
 unrestricted, present but empty means nothing is allowed, and a URL the user

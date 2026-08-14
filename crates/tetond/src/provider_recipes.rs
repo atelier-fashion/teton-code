@@ -20,10 +20,11 @@
 //!
 //! This is the fact the first version of this file got wrong, and it is worth
 //! stating before the data rather than after it. Teton's `--endpoint` is the
-//! **absolute URL the adapter POSTs to, verbatim**: `OpenAiCompatAdapter`
-//! builds its request with `url: self.config.endpoint.clone()` and
-//! `AnthropicAdapter` with `url: self.endpoint.clone()`. Nothing anywhere joins
-//! a path onto it. So a recipe carrying a vendor's *`base_url`* — the value
+//! **absolute URL the adapter POSTs to, verbatim** — pinned against a capturing
+//! transport by `a_configured_endpoint_is_the_request_url_verbatim`
+//! (`teton-providers/tests/conformance.rs`), which drives both adapters with a
+//! sentinel URL and asserts it comes back out of the request unchanged. Nothing
+//! anywhere joins a path onto it. So a recipe carrying a vendor's *`base_url`* — the value
 //! their SDK quickstart hands to an OpenAI client, which the client then
 //! appends `/chat/completions` to — describes a provider that registers
 //! cleanly, passes validation, and 404s on its first turn. That failure lands a
@@ -103,6 +104,24 @@ pub struct ProviderRecipe {
     pub id_suggestion: String,
     /// The vendor's display name, spelled the way the vendor spells it.
     pub label: String,
+    /// The same vendor, spelled the way the **bundled guide's** recipe line
+    /// spells it — `Moonshot/Kimi` where [`label`](Self::label) is
+    /// `Moonshot (Kimi)`.
+    ///
+    /// A second spelling is here rather than in a test's lookup table because
+    /// it is product data with a product reason: the guide is resident prompt
+    /// under a byte ceiling with double-digit margin, so it abbreviates the two
+    /// vendors whose names carry a parenthetical, and it uses a slash because
+    /// both halves are names a user might type. That is a decision about what
+    /// ships, not a formatting accident, and the surface that owns it is this
+    /// one.
+    ///
+    /// What it buys the gates is exactness. Without it, the guide↔catalog check
+    /// can pair a vendor with an endpoint only by *position*, which passes a
+    /// line that swapped two vendors' names over their neighbours' URLs — six
+    /// verified facts, two of them attached to the wrong company. With it, the
+    /// pairing is a string comparison against data the catalog ships.
+    pub guide_spelling: String,
     /// Which adapter the vendor speaks, and therefore which URL shape
     /// [`endpoint`](Self::endpoint) has to be.
     pub kind: ProviderKind,
@@ -155,6 +174,7 @@ pub fn recipe_catalog() -> Vec<ProviderRecipe> {
         ProviderRecipe {
             id_suggestion: "anthropic".to_owned(),
             label: "Anthropic".to_owned(),
+            guide_spelling: "Anthropic".to_owned(),
             kind: ProviderKind::Anthropic,
             // Round 1 shipped `None` here on the theory that "the adapter
             // carries the Messages API address". It does not: `AnthropicAdapter`
@@ -181,6 +201,7 @@ pub fn recipe_catalog() -> Vec<ProviderRecipe> {
         ProviderRecipe {
             id_suggestion: "openai".to_owned(),
             label: "OpenAI".to_owned(),
+            guide_spelling: "OpenAI".to_owned(),
             // The kind is named after this API because this API is the shape
             // every other entry below imitates; OpenAI gets no special adapter.
             kind: ProviderKind::OpenaiCompatible,
@@ -198,6 +219,7 @@ pub fn recipe_catalog() -> Vec<ProviderRecipe> {
         ProviderRecipe {
             id_suggestion: "kimi".to_owned(),
             label: "Moonshot (Kimi)".to_owned(),
+            guide_spelling: "Moonshot/Kimi".to_owned(),
             kind: ProviderKind::OpenaiCompatible,
             endpoint: Some("https://api.moonshot.ai/v1/chat/completions".to_owned()),
             example_model: "kimi-k3".to_owned(),
@@ -218,6 +240,7 @@ pub fn recipe_catalog() -> Vec<ProviderRecipe> {
         ProviderRecipe {
             id_suggestion: "deepseek".to_owned(),
             label: "DeepSeek".to_owned(),
+            guide_spelling: "DeepSeek".to_owned(),
             kind: ProviderKind::OpenaiCompatible,
             endpoint: Some("https://api.deepseek.com/chat/completions".to_owned()),
             example_model: "deepseek-v4-pro".to_owned(),
@@ -240,6 +263,7 @@ pub fn recipe_catalog() -> Vec<ProviderRecipe> {
         ProviderRecipe {
             id_suggestion: "ollama".to_owned(),
             label: "Ollama".to_owned(),
+            guide_spelling: "Ollama".to_owned(),
             kind: ProviderKind::OpenaiCompatible,
             endpoint: Some("http://localhost:11434/v1/chat/completions".to_owned()),
             example_model: "llama3.2".to_owned(),
@@ -263,6 +287,7 @@ pub fn recipe_catalog() -> Vec<ProviderRecipe> {
         ProviderRecipe {
             id_suggestion: "grok".to_owned(),
             label: "Grok (xAI)".to_owned(),
+            guide_spelling: "Grok/xAI".to_owned(),
             kind: ProviderKind::OpenaiCompatible,
             endpoint: Some("https://api.x.ai/v1/chat/completions".to_owned()),
             example_model: "grok-4.6".to_owned(),
@@ -325,6 +350,12 @@ mod tests {
             drift("Anthropic's label")
         );
         assert_eq!(
+            anthropic.guide_spelling,
+            "Anthropic",
+            "{}",
+            drift("Anthropic's guide spelling")
+        );
+        assert_eq!(
             anthropic.kind,
             ProviderKind::Anthropic,
             "{}",
@@ -351,6 +382,12 @@ mod tests {
 
         let openai = &catalog[1];
         assert_eq!(openai.label, "OpenAI", "{}", drift("OpenAI's label"));
+        assert_eq!(
+            openai.guide_spelling,
+            "OpenAI",
+            "{}",
+            drift("OpenAI's guide spelling")
+        );
         assert_eq!(
             openai.kind,
             ProviderKind::OpenaiCompatible,
@@ -379,6 +416,12 @@ mod tests {
             drift("Moonshot's label")
         );
         assert_eq!(
+            kimi.guide_spelling,
+            "Moonshot/Kimi",
+            "{}",
+            drift("Moonshot's guide spelling — the guide abbreviates under its byte ceiling")
+        );
+        assert_eq!(
             kimi.kind,
             ProviderKind::OpenaiCompatible,
             "{}",
@@ -400,6 +443,12 @@ mod tests {
 
         let deepseek = &catalog[3];
         assert_eq!(deepseek.label, "DeepSeek", "{}", drift("DeepSeek's label"));
+        assert_eq!(
+            deepseek.guide_spelling,
+            "DeepSeek",
+            "{}",
+            drift("DeepSeek's guide spelling")
+        );
         assert_eq!(
             deepseek.kind,
             ProviderKind::OpenaiCompatible,
@@ -428,6 +477,12 @@ mod tests {
         let ollama = &catalog[4];
         assert_eq!(ollama.label, "Ollama", "{}", drift("Ollama's label"));
         assert_eq!(
+            ollama.guide_spelling,
+            "Ollama",
+            "{}",
+            drift("Ollama's guide spelling")
+        );
+        assert_eq!(
             ollama.kind,
             ProviderKind::OpenaiCompatible,
             "{}",
@@ -454,6 +509,12 @@ mod tests {
 
         let grok = &catalog[5];
         assert_eq!(grok.label, "Grok (xAI)", "{}", drift("Grok's label"));
+        assert_eq!(
+            grok.guide_spelling,
+            "Grok/xAI",
+            "{}",
+            drift("Grok's guide spelling — the guide abbreviates under its byte ceiling")
+        );
         assert_eq!(
             grok.kind,
             ProviderKind::OpenaiCompatible,
@@ -535,11 +596,21 @@ mod tests {
     ///    already in the keychain.
     ///
     /// 2. **Would the first turn reach anything?** The endpoint is POSTed
-    ///    verbatim — `OpenAiCompatAdapter::build_request` sets `url` to
-    ///    `config.endpoint`, `AnthropicAdapter` likewise — so the path has to be
-    ///    the one that adapter's protocol serves: `/chat/completions` for the
-    ///    OpenAI shape, `/v1/messages` for Anthropic's. A vendor `base_url`
-    ///    passes every other test in this file and 404s here.
+    ///    verbatim, so the path has to be the one that adapter's protocol
+    ///    serves: `/chat/completions` for the OpenAI shape, `/v1/messages` for
+    ///    Anthropic's. A vendor `base_url` passes every other test in this file
+    ///    and 404s here.
+    ///
+    ///    "Verbatim" is not this test's claim to make, and it used to be
+    ///    asserted here only as a sentence citing two lines of adapter source —
+    ///    which is code inspection standing in for a wire fact, and the wrong
+    ///    half of the belief that produced BUG-170 in the first place. It is
+    ///    pinned where it belongs, against a capturing transport:
+    ///    `teton-providers/tests/conformance.rs`,
+    ///    `a_configured_endpoint_is_the_request_url_verbatim`. If that test ever
+    ///    goes red, the suffix table below is describing a contract that no
+    ///    longer holds and this test is worse than useless — it would be
+    ///    enforcing a path the adapter no longer requests.
     ///
     /// The failure messages state the verbatim-POST contract rather than naming
     /// the expected suffix, because the next person to see one will be adding a
@@ -679,6 +750,45 @@ mod tests {
         );
     }
 
+    /// The guide spellings carry a stronger requirement than uniqueness: **no
+    /// one may be a substring of another.**
+    ///
+    /// The guide↔catalog gate identifies a vendor's segment by looking for its
+    /// spelling and by checking that no *other* vendor's spelling is in the same
+    /// segment. If `Grok` and `Grok/xAI` both existed, every Grok/xAI segment
+    /// would contain `Grok` too and the gate would fail on a correct guide —
+    /// which is the kind of false failure that gets a check deleted rather than
+    /// understood. Non-empty because a `""` spelling is a substring of
+    /// everything and would fail the whole roster at once.
+    #[test]
+    fn no_guide_spelling_is_a_substring_of_another() {
+        let catalog = recipe_catalog();
+        for recipe in &catalog {
+            assert!(
+                !recipe.guide_spelling.trim().is_empty(),
+                "`{}` has no guide spelling; the guide has to name every vendor it lists",
+                recipe.id_suggestion
+            );
+        }
+        for a in &catalog {
+            for b in &catalog {
+                if a.id_suggestion == b.id_suggestion {
+                    continue;
+                }
+                assert!(
+                    !b.guide_spelling.contains(a.guide_spelling.as_str()),
+                    "`{}`'s guide spelling {:?} contains `{}`'s {:?}, so the guide gate \
+                     cannot tell their recipe segments apart and would fail on a correct \
+                     guide. Pick spellings that are distinguishable, not merely different.",
+                    b.id_suggestion,
+                    b.guide_spelling,
+                    a.id_suggestion,
+                    a.guide_spelling
+                );
+            }
+        }
+    }
+
     /// **BR-6, inherited: no field may carry a credential.**
     ///
     /// This catalog has no auth field to begin with, which is the real
@@ -703,6 +813,7 @@ mod tests {
             let ProviderRecipe {
                 id_suggestion,
                 label,
+                guide_spelling,
                 kind,
                 endpoint,
                 example_model,
@@ -710,6 +821,7 @@ mod tests {
             } = recipe;
             fields.push(id_suggestion);
             fields.push(label);
+            fields.push(guide_spelling);
             fields.push(example_model);
             fields.extend(endpoint);
             fields.extend(notes);
@@ -722,7 +834,7 @@ mod tests {
         // catalog: every recipe contributes its three non-optional strings, so a
         // sweep reading fewer than that is reading something other than this
         // catalog.
-        const ALWAYS_PRESENT_PER_RECIPE: usize = 3; // id_suggestion, label, example_model
+        const ALWAYS_PRESENT_PER_RECIPE: usize = 4; // id_suggestion, label, guide_spelling, example_model
         let floor = ALWAYS_PRESENT_PER_RECIPE * recipe_count;
         assert!(
             recipe_count >= 6,

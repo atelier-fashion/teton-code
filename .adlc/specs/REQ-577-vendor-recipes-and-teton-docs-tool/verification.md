@@ -337,6 +337,12 @@ instance of prompt-adjacent output moving under a change that was not about it.
 
 ## 7. Reproduction
 
+> **Superseded by §12–13.** The commands here still reproduce the *setup*, but
+> the expectations below are the **pre-fix defects**: they call for
+> `https://api.moonshot.ai/v1` and for an `anthropic` registration with no
+> `--endpoint`, both of which BUG-170 showed cannot serve a turn. Follow §12–13
+> (round 3) for the runnable matrix and the current expectations.
+
 ```sh
 # baseline
 cd <main checkout @ 4569311>
@@ -553,6 +559,26 @@ which is itself the observation.
 `? permission requested` appears in **zero** of the 8 sessions. No ` - read`,
 ` - grep`, ` - glob` or ` - shell` line appears in any shape-A or shape-B
 session.
+
+### One resident-prompt change landed after this run, deliberately un-A/B'd
+
+The re-review pass that followed round 3 reworded the web tool's own
+description — `every lookup asks the user` → `asks unless already allowed` —
+because the old spelling was the same false absolute the `web` topic and the
+README carried. It is resident prompt, so §14's caveat applies to it and is not
+being waved away: it is recorded here as an **accepted sub-threshold change**
+rather than re-verified.
+
+The reasons it is accepted, stated so a later reader can disagree with them:
+two words inside an existing clause of an existing sentence, **+1 byte**; it
+appears only in the *opted-in* prompt shape, which is not the shape any AC-1 or
+AC-2 trial ran (every round-3 session had web lookup off, so this string was in
+none of the 8 prompts measured); and none of `self_config.md`'s model-facing
+lines moved. Round 1 is the standing warning that byte-level prompt changes move
+unrelated behaviour — but round 1's change was 379 bytes of new recipe list in
+the resident guide, and the honest comparison is with that, not with this. If a
+later run shows web-tool selection behaving differently, this paragraph is where
+to start.
 
 **D1 (diagnostic, no AC covers it) — "How do I hook up Together AI as a
 provider?"** A vendor the catalog does *not* ship, which is the only shape that

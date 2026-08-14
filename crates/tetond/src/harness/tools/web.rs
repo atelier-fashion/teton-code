@@ -124,11 +124,11 @@ const FETCHABLE_SCHEMES: [&str; 2] = ["http://", "https://"];
 
 /// Model-facing description at a fetch-only ceiling (< 100 chars — tool docs
 /// are resident prompt bytes, LESSON-493).
-const DESCRIPTION_FETCH: &str = "Fetch one web page by URL. Opt-in; every lookup asks the user.";
+const DESCRIPTION_FETCH: &str = "Fetch one web page by URL. Opt-in; asks unless already allowed.";
 
 /// Model-facing description when the `search` tier is configured.
 const DESCRIPTION_SEARCH: &str =
-    "Fetch a web page by URL, or search the web. Opt-in; every lookup asks the user.";
+    "Fetch a web page by URL, or search the web. Opt-in; asks unless already allowed.";
 
 /// The daemon-side seam one lookup crosses.
 ///
@@ -2224,14 +2224,23 @@ mod tests {
     /// clause, description and schema together — is the largest one the daemon
     /// ever builds. The margin is asserted rather than left implied (AC-9).
     ///
-    /// **Recorded headroom at REQ-577:** the worst prompt here is 5,799 bytes,
-    /// so `spent` is 9,075 against a 9,216-byte overhead — **141 bytes of
-    /// margin** over the 48-byte floor (865 before TASK-144 added 493 bytes of
+    /// **Recorded headroom at REQ-577:** the worst prompt here is 5,800 bytes,
+    /// so `spent` is 9,076 against a 9,216-byte overhead — **140 bytes of
+    /// margin** over the 48-byte floor. The last byte went to
+    /// [`DESCRIPTION_SEARCH`], whose "every lookup asks the user" was the same
+    /// false absolute the `web` topic and the README carried: a lookup does not
+    /// ask when its tier is already granted for the session or listed in
+    /// `[web] permission_allow`. "asks unless already allowed" is one byte
+    /// dearer and true, which is the right trade at 140 bytes and would still
+    /// have been the right trade nearer the floor — the fallback there is to
+    /// shorten something else, never to keep a resident sentence that misstates
+    /// a consent rule. (865 before TASK-144 added 493 bytes of
     /// vendor recipes and the referral sentence to the bundled guide, then 372
     /// before TASK-147 added 95 bytes of tier purposes to the routing step, then
     /// 277 before the phase-5 correction added 136 bytes of request paths to
-    /// every recipe endpoint; all three moved both shapes by exactly the same
-    /// amount, because the guide is included verbatim in each). It was 115
+    /// every recipe endpoint; those three moved both shapes by exactly the same
+    /// amount, because the guide is included verbatim in each, and the
+    /// description byte above moves only this one.) It was 115
     /// before this REQ, against an 8 KiB overhead. This shape stays the
     /// *smaller* of the two prompts measured against that constant, because a
     /// registered web tool replaces the opt-out clause rather than adding to it.

@@ -2305,8 +2305,10 @@ mod tests {
                  enumerated them without their purposes once, and the local tier answered \
                  `set-tier reflex` to a deep-reasoning request 4/4 (REQ-577 \
                  verification.md round 1). If the wording was changed deliberately, update \
-                 this expectation — and re-run verification.md §7's matrix, because a \
-                 prompt change here is unverified until it is A/B'd.\n{system}"
+                 this expectation — and re-run the live matrix, because a prompt change \
+                 here is unverified until it is A/B'd. The runnable procedure is \
+                 verification.md §12-13 (round 3); §7 is the pre-fix version and its \
+                 expectations are the defects.\n{system}"
             );
             assert!(
                 system.contains(DICTATED),
@@ -2314,7 +2316,8 @@ mod tests {
                  The purposes alone leave it to be inferred, and inference is what failed \
                  4/4 in REQ-577 verification.md round 1 (BUG-168's rule: dictate the \
                  payload, do not describe it). Update this expectation rather than \
-                 deleting it, and re-run the live matrix.\n{system}"
+                 deleting it, and re-run the live matrix per verification.md §12-13 (not \
+                 §7, whose expectations are the pre-fix defects).\n{system}"
             );
         }
     }
@@ -2395,7 +2398,11 @@ mod tests {
             WEB_TOOL_NAME
         }
         fn description(&self) -> &str {
-            "Fetch one web page by URL. Opt-in; every lookup asks the user."
+            // Kept in step with the real `DESCRIPTION_FETCH` by hand. Nothing
+            // gates on it — these tests key on the tool's *name* — but a stub
+            // carrying a sentence the product corrected is a copy that reads as
+            // authority the next time somebody greps for the claim.
+            "Fetch one web page by URL. Opt-in; asks unless already allowed."
         }
         fn input_schema(&self) -> Value {
             serde_json::json!({ "type": "object" })

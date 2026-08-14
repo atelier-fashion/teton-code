@@ -324,9 +324,14 @@ restart. Enter, an empty answer, EOF or Ctrl-C at any prompt leaves the config
 untouched and stores no key. On a piped (non-terminal) session the command asks
 nothing at all and prints the hand-edit instructions below instead.
 
-Enabling is not consenting. Every lookup still asks before anything leaves the
-machine; the durable-consent key (`permission_allow`) is written only when you
-answer "enable permanently" at a lookup prompt, never by `/web setup`.
+Enabling is not consenting. A lookup asks before anything leaves the machine
+unless that tier has already been granted — for the session, or permanently via
+`[web] permission_allow`. The durable-consent key is written only when you
+answer "enable permanently" at a lookup prompt, never by `/web setup`; once it
+is written, lookups at that tier stop asking. The three tiers are consented
+separately, so an answer about one is never an answer about the others.
+Removing a tier from `permission_allow` restores asking for it, and takes
+effect when the daemon next starts.
 
 Backends whose shapes are known to work:
 

@@ -88,8 +88,15 @@ const TOPIC_INDEX: &str = "providers, policy, web, doctor";
 /// into a tool result and an event title, i.e. straight back into the context
 /// window the next turn has to fit. Sixty-four characters is far past any real
 /// topic name (the longest is nine) and far short of anything that costs
-/// context. Truncation is by `char`, not by byte, so a multi-byte spelling is
-/// never split mid-codepoint.
+/// context.
+///
+/// **The bound is characters, not bytes**, and that is deliberate rather than
+/// overlooked. Truncating by byte would split a multi-byte codepoint and panic
+/// on an argument a model chose, which turns a malformed tool call into a
+/// crashed turn. The cost of counting the other unit is that the worst case is
+/// 64 four-byte codepoints plus the one-character ellipsis: **259 bytes**, not
+/// 64. That is the number to reason about for context, and it is still three
+/// orders of magnitude below anything that matters against the window.
 pub(crate) const MAX_ECHOED_TOPIC_CHARS: usize = 64;
 
 /// `topic`, bounded to [`MAX_ECHOED_TOPIC_CHARS`] and marked when it was cut.
