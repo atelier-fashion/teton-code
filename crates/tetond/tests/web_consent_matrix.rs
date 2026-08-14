@@ -32,15 +32,19 @@
 //! | AC | Test |
 //! |----|------|
 //! | REQ-572 BR-7 / AC-3 (a commit grants nothing) | [`a_setup_commit_enables_the_tier_and_answers_no_consent_question`] |
+//! | REQ-572 AC-4 (no setup tool exists) | [`no_tool_is_named_for_the_setup_flow`] |
 //!
 //! The rest of REQ-572's matrix is elsewhere, and deliberately: `web_setup_flow.rs`
 //! drives plan → preview → commit → live use against a spawned daemon that owns a
 //! config file, `web_setup_contracts.rs` pins AC-8's suggested backends against
 //! the production request builder, and AC-4's user-only gate is asserted at the
 //! two seams that enforce it (`server.rs`'s mutation-checked unit tests and
-//! `multi_client.rs`'s socket-level rejection + event). What belongs *here* is
-//! the one REQ-572 claim that is a claim about consent: enabling a capability
-//! is not answering a question about a lookup.
+//! `multi_client.rs`'s socket-level rejection + event). What belongs *here* are
+//! the two REQ-572 claims this file's own subject answers: that enabling a
+//! capability is not answering a question about a lookup, and — AC-4's
+//! model-tool-call leg — that the tool registry a model can reach names no setup
+//! method at all, which is the claim the override and refresh already make one
+//! table up.
 //!
 //! ## Falsification (LESSON-479)
 //!
@@ -64,7 +68,10 @@ use teton_protocol::events::WebTier as WireWebTier;
 use teton_protocol::events::{
     BlockCause, Event, WebConsentScope, WebLookupOutcome, OPTION_ID_ENABLE_PERMANENT,
 };
-use teton_protocol::methods::{PermissionOutcome, WebOverrideParams, WebSetupPreviewParams};
+use teton_protocol::methods::{
+    PermissionOutcome, RpcMethod, WebOverrideParams, WebSetupCommitParams, WebSetupPlanParams,
+    WebSetupPreviewParams,
+};
 use teton_protocol::{RequestId, SessionId};
 use teton_providers::transport::{Transport, TransportError, TransportRequest, TransportResponse};
 
@@ -1569,6 +1576,81 @@ async fn no_tool_is_named_for_the_override_or_the_refresh() {
             !name.contains("override") && !name.contains("refresh"),
             "`{name}` is a tool the model can call, and it names a user-only action"
         );
+    }
+
+    fx.cleanup();
+}
+
+/// **REQ-572 AC-4's model-tool-call leg, by the same argument** (the verify
+/// pass's missing-seam fix).
+///
+/// AC-4 asks that a model tool call attempting the setup RPC be rejected, and
+/// the daemon's answer is that there is nothing to attempt: `web/setup_*` are
+/// client RPCs, tool dispatch holds a `ToolContext` and never a `DaemonRuntime`,
+/// so the call reaches the registry and finds no such tool. `server.rs` pins the
+/// `may_drive` gate that backs that up in depth; what was missing is the half
+/// this file's precedent above already knows how to state — **the registry does
+/// not name it** — and until it is asserted, "structurally impossible" is a
+/// paragraph rather than a fact.
+///
+/// The method names come from [`RpcMethod::METHOD`] rather than being spelled
+/// again, so a renamed method renames the thing being swept for instead of
+/// leaving this test green over a stale string. Registered at the `search` tier
+/// for the reason its neighbour is: the interesting claim is about the state in
+/// which the web capability *exists*.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn no_tool_is_named_for_the_setup_flow() {
+    let fx = Setup::at(WebTier::Search)
+        .searching(
+            "https://search.example.test/api",
+            Arc::new(ForwardingGate) as Arc<dyn RedactionGate>,
+        )
+        .build("no-setup-tool");
+
+    assert!(fx.registered, "non-vacuity: the web capability IS present");
+    assert!(
+        fx.tools.get(WEB_TOOL_NAME).is_some(),
+        "and the model can reach the lookup tool"
+    );
+
+    // Every spelling a model might emit for the three methods: the wire name,
+    // the underscored form a tool name would take, and the bare verb.
+    let methods = [
+        WebSetupPlanParams::METHOD,
+        WebSetupPreviewParams::METHOD,
+        WebSetupCommitParams::METHOD,
+    ];
+    for method in methods {
+        for spelling in [
+            method.to_owned(),
+            method.replace('/', "_"),
+            method.replace('/', " "),
+        ] {
+            assert!(
+                fx.tools.get(&spelling).is_none(),
+                "`{spelling}` is reachable from tool dispatch, so a model could \
+                 configure the capability it is being gated by"
+            );
+        }
+    }
+    for bare in ["setup", "web_setup", "setup_commit"] {
+        assert!(fx.tools.get(bare).is_none(), "`{bare}` is model-reachable");
+    }
+
+    // And over the whole namespace, so a differently-spelled tool cannot slip
+    // past the list above.
+    for name in fx.tools.names() {
+        assert!(
+            !name.contains("setup"),
+            "`{name}` is a tool the model can call, and it names the user-only \
+             enablement flow (AC-4)"
+        );
+        for method in methods {
+            assert_ne!(
+                name, method,
+                "`{name}` exposes a setup RPC through tool dispatch"
+            );
+        }
     }
 
     fx.cleanup();

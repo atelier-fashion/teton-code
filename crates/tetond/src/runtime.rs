@@ -15926,6 +15926,135 @@ provider_id = "on-device"
                 .expect("the lowest enabling tier previews");
         }
 
+        /// **Two sessions committing at once leave one candidate's state, whole**
+        /// (AC-11, BR-11; the `two_concurrent_installs_of_one_entry_do_not_both_
+        /// fetch_or_corrupt` precedent applied to the config file).
+        ///
+        /// ADR-1's answer to AC-11 is that there is no shared flow state and
+        /// commits serialize on the config mutex. That is an argument about a
+        /// lock, and the thing it is protecting is not obvious from reading the
+        /// lock: [`write_config_atomically`] writes through a **fixed** temp
+        /// path (`config.toml.tmp`), so two writers admitted at once would
+        /// truncate each other's staging file and rename a half-written document
+        /// into place. Nothing in the commit's body says so; the mutex is what
+        /// makes it unreachable, and a later edit narrowing that critical section
+        /// "for concurrency" would reintroduce it silently.
+        ///
+        /// So the property is asserted on the artifact rather than on the lock:
+        /// the file **parses**, and its `[web]` table is exactly one of the two
+        /// candidates — never a field from each. The two answers are chosen to
+        /// make a mixture visible: a `search` endpoint under a `fetch_user_url`
+        /// ceiling is a state neither commit could have produced.
+        ///
+        /// The event leg is the second half of AC-11: exactly one
+        /// `WebSetupCompleted` per commit that reported `applied`, each scoped to
+        /// its own session — a commit that announced another session's change, or
+        /// announced one it did not make, is the cross-session noise BUG-161 is
+        /// about.
+        #[test]
+        fn two_concurrent_commits_leave_one_candidates_state_and_one_notice_each() {
+            let (runtime, config_path) = runtime_on_disk("web-setup-concurrent");
+            with_local_model(&runtime);
+            let events = Arc::new(EventBus::new());
+            let mut subscriber = events.subscribe(16);
+
+            let fetch = WebSetupCommitParams {
+                session_id: SessionId::from("sess-fetch"),
+                ..as_commit(&preview_params(WireWebTier::FetchUserUrl, None, None, None))
+            };
+            let search = WebSetupCommitParams {
+                session_id: SessionId::from("sess-search"),
+                ..as_commit(&preview_params(
+                    WireWebTier::Search,
+                    Some("https://search.example.com/search?format=json"),
+                    Some("keychain://teton/web-search"),
+                    None,
+                ))
+            };
+
+            let (first, second) = std::thread::scope(|scope| {
+                let a = {
+                    let (runtime, events, params) =
+                        (Arc::clone(&runtime), Arc::clone(&events), fetch.clone());
+                    scope.spawn(move || runtime.web_setup_commit(&params, &events))
+                };
+                let b = {
+                    let (runtime, events, params) =
+                        (Arc::clone(&runtime), Arc::clone(&events), search.clone());
+                    scope.spawn(move || runtime.web_setup_commit(&params, &events))
+                };
+                (
+                    a.join().expect("the fetch commit did not panic"),
+                    b.join().expect("the search commit did not panic"),
+                )
+            });
+
+            // Both are legal candidates on this machine, so neither is refused:
+            // what the race decides is which one lands, not whether one errors.
+            let applied = [&first, &second]
+                .into_iter()
+                .map(|result| {
+                    result
+                        .as_ref()
+                        .unwrap_or_else(|err| panic!("a concurrent commit was refused: {err:?}"))
+                        .applied
+                })
+                .filter(|applied| *applied)
+                .count();
+
+            // The file is a document, not a splice of two.
+            let written = std::fs::read_to_string(&config_path).expect("read");
+            let parsed = Config::load(&written).unwrap_or_else(|err| {
+                panic!("the config on disk no longer loads: {err}\n{written}")
+            });
+            let landed = &parsed.web;
+            let is_fetch = landed.tier == WebTier::FetchUserUrl
+                && landed.search_endpoint.is_none()
+                && landed.search_key_ref.is_none();
+            let is_search = landed.tier == WebTier::Search
+                && landed.search_endpoint.as_deref()
+                    == Some("https://search.example.com/search?format=json")
+                && landed.search_key_ref.as_deref() == Some("keychain://teton/web-search");
+            assert!(
+                is_fetch != is_search,
+                "the written `[web]` table is neither commit's candidate but a \
+                 mixture of the two — which is what a shared staging path or a \
+                 narrowed critical section produces: {landed:?}"
+            );
+
+            // And the daemon's in-memory config is the file, not a third state.
+            assert_eq!(
+                runtime.config.lock().expect("config mutex").web,
+                *landed,
+                "the swap and the write came apart: a turn would build its tools \
+                 from a config no restart would reproduce"
+            );
+
+            let mut completed = Vec::new();
+            while let Some(envelope) = subscriber.try_recv() {
+                if let Event::WebSetupCompleted(done) = envelope.event {
+                    completed.push((envelope.session_id, done.tier));
+                }
+            }
+            assert_eq!(
+                completed.len(),
+                applied,
+                "one notice per commit that actually changed something, no more \
+                 and no fewer: {completed:?}"
+            );
+            for (session_id, tier) in &completed {
+                let expected = match session_id.as_ref().map(SessionId::to_string).as_deref() {
+                    Some("sess-fetch") => WireWebTier::FetchUserUrl,
+                    Some("sess-search") => WireWebTier::Search,
+                    other => panic!("a notice for a session that committed nothing: {other:?}"),
+                };
+                assert_eq!(
+                    *tier, expected,
+                    "the notice carried another session's tier: {completed:?}"
+                );
+            }
+        }
+
         // -- BR-7: the preview→commit window ----------------------------------
 
         /// **A document that moved under the preview is not written** (BR-7,
