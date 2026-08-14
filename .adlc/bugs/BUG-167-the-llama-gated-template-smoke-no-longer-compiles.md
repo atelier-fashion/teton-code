@@ -1,5 +1,5 @@
 ---
-id: BUG-166
+id: BUG-167
 title: "The llama-gated template smoke no longer compiles"
 status: resolved
 severity: low
@@ -9,17 +9,18 @@ component: "daemon"
 domain: "harness"
 stack: ["rust", "daemon", "ci"]
 concerns: ["reliability", "developer-experience"]
-tags: ["llama", "feature-gate", "compile-drift", "template-smoke", "req-571", "ci-blind-spot", "bug-164"]
+tags: ["llama", "feature-gate", "compile-drift", "template-smoke", "req-564", "ci-blind-spot", "bug-164"]
 ---
 
 ## Description
 
-REQ-571 (PR #121) added a `SessionId` parameter to `LocalEngineSource::new` so
-a source carries its canonical provenance identity. Every call site the
-compiler could see was updated — including `tests/conversation_carry.rs`, which
-compiles under the default feature set. `crates/tetond/tests/template_smoke.rs`
-is `#![cfg(feature = "llama")]`, so it was outside the compiler's sight for the
-whole REQ-571 change, and kept passing two arguments.
+REQ-564 (PR #81) added a `SessionId` parameter to `LocalEngineSource::new` —
+the prefix cache's key — and updated every call site the compiler could see.
+`crates/tetond/tests/template_smoke.rs` is `#![cfg(feature = "llama")]`, so it
+was outside the compiler's sight for that change and for every API pass since
+(REQ-571 among them), and kept passing two arguments. The ungated
+`conversation_carry.rs` constructs the same source with three arguments; only
+the gated target could drift.
 
 Default (no-llama) CI never compiles this target — that is the point of the
 gate, since compiling it means building llama.cpp — so the break was invisible
@@ -35,7 +36,7 @@ verification was actually needed.
 
 ## Reproduction Steps
 
-1. Check out `origin/main` at `d093ede`.
+1. Check out `origin/main` at `d093ede` (or any commit since PR #81).
 2. `cargo build --release -p tetond --features llama --test template_smoke`
 3. E0061 at `tests/template_smoke.rs:82`: `LocalEngineSource::new(engine,
    format)` is missing the `SessionId` argument.
@@ -48,12 +49,13 @@ combination, whether or not any CI leg happens to exercise it.
 ## Actual Behavior
 
 The `template_smoke` test target fails to compile with `--features llama`, and
-has since REQ-571 merged (2026-08-13).
+has since REQ-564 merged (PR #81, 2026-08-10) — the breakage shipped in the
+0.1.14 tag.
 
 ## Environment
 
 - Platform: macOS (Apple Silicon), toolchain per workspace
-- Version: workspace 0.1.14
+- Version: broken since PR #81 (post-0.1.13); present in the 0.1.14 tag
 - Affected: any `--features llama` build of the `template_smoke` target.
   Default builds and CI are unaffected — which is precisely the defect's cover.
 
@@ -83,6 +85,10 @@ on `feature = "llama"` (`tetond/tests/template_smoke.rs`,
 `teton-inference/tests/llama_smoke.rs`, and the gated source in `runtime.rs`,
 `lib.rs`, `engine.rs`) type-checks clean; only `template_smoke` had drifted.
 
+This PR fixes the instance. The class — no CI leg compiles gated targets —
+remains open here; PR #129, prepared in parallel, proposes an all-features
+clippy leg to close it structurally.
+
 ## Verification
 
 - The exact repro command,
@@ -97,12 +103,12 @@ on `feature = "llama"` (`tetond/tests/template_smoke.rs`,
 
 ## Lessons Captured
 
-- `LESSON-513` — a feature-gated target is invisible to every refactor: the
+- `LESSON-515` — a feature-gated target is invisible to every refactor: the
   compiler's completeness verdict is scoped to the features compiled with, so
   gated targets need an explicit sweep after any shared-API change.
 
 ## Files Changed
 
-- `.adlc/knowledge/lessons/LESSON-513-a-feature-gated-target-is-invisible-to-refactors.md` — new.
+- `.adlc/knowledge/lessons/LESSON-515-a-feature-gated-target-is-invisible-to-refactors.md` — new.
 - `crates/tetond/tests/template_smoke.rs` — import `SessionId`, pass it at the
   `LocalEngineSource::new` call site.
