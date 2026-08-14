@@ -1,7 +1,7 @@
 ---
 id: BUG-171
 title: "A refused provider registration keeps the key it collected — and doesn't say so"
-status: open
+status: resolved
 severity: medium
 created: 2026-08-14
 updated: 2026-08-14
@@ -118,3 +118,13 @@ longer claim a key was stored under ref `—`.
   `report_registration_outcome`, `provider_cleanup_line`,
   `registration_unanswered_line` added; eight new unit tests driving every arm
   through `MockKeychain` + `RecordingSurface`.
+
+## Deployment
+
+n/a — plain OSS flow (PR-gated CI on `main`, no staging pipeline); ships in
+the next tagged release. Fix PR: #146.
+
+## Lessons
+
+- LESSON-525 — sweep every concern across every surface the REQ already
+  enumerated ("exactly one caller" docs are standing audit prompts).
