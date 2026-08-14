@@ -28,14 +28,42 @@
 //!
 //! - **Tables recurse**, key by key, so a change inside `[web]` touches one
 //!   line of it.
-//! - **Arrays are one key** — value arrays and arrays-of-tables alike. A
-//!   changed array is replaced wholesale with the candidate's canonical
-//!   rendering (ADR-1: element-wise diffing needs an identity function per
-//!   array type and mis-targets when on-disk order drifted). Comments *inside*
-//!   a changed array do not survive; comments everywhere else do.
+//! - **Value arrays are one key.** A changed `allowed_domains` is replaced
+//!   wholesale with the candidate's canonical rendering; its elements have no
+//!   identity to diff by.
+//! - **Arrays of tables are diffed element-wise**, because BR-1 says *unknown
+//!   keys survive for all writers* and the two writers that touch
+//!   `[[providers]]` — provider registration and the REQ-557 model migration —
+//!   are exactly the writers a wholesale replacement would make lie. See
+//!   `plan_array_edit` for the four cases and the residual the index-matching
+//!   one carries.
 //! - **Removal takes the key's attached decor with it** (spec OQ-1): the
 //!   comment block prefixed to a key documents that key, so it travels with it.
 //!   Free-standing comments and every other key's decor survive.
+//!
+//! # Refusals are loggable
+//!
+//! A refusal names *where* the document is broken and *what* is wrong with it,
+//! and never quotes the document back. `toml_edit`'s own `Display` prints the
+//! offending source line under a caret gutter, and that line can be
+//! `search_key_ref`, an endpoint with a credential in its query string, or an
+//! `Authorization` template — the config file is secret-adjacent, which is why
+//! `tetond` keeps it at `0600`. [`DeltaError`] therefore carries a *sanitized*
+//! rendering built at construction (`parse_refusal`), on the same reasoning
+//! [`crate::config`]'s validator states for its own messages: "the value is not
+//! echoed … this message is loggable" (BR-7).
+//!
+//! # Recorded limitations
+//!
+//! - **CRLF line endings are normalized once.** `toml_edit` re-emits a parsed
+//!   document with `\n` endings, so the first daemon write to a config authored
+//!   with `\r\n` rewrites the file's line endings. Content, comments, key order
+//!   and unknown keys all survive that write; only the invisible bytes change,
+//!   and the second write is a no-op on them. Re-applying `\r\n` afterwards
+//!   would mean editing the rendered text outside the parser — a second
+//!   renderer to keep in agreement, for line endings — so the behavior is
+//!   pinned by a test rather than papered over
+//!   (`the_first_write_to_a_crlf_document_normalizes_its_line_endings`).
 //!
 //! # Purity
 //!
@@ -45,13 +73,14 @@
 //! preservation logic is testable without a directory.
 
 use crate::config::Config;
-use toml_edit::{DocumentMut, InlineTable, Item, Table, Value};
+use toml_edit::{ArrayOfTables, Decor, DocumentMut, InlineTable, Item, RawString, Table, Value};
 
 /// Why a config document could not be edited.
 ///
 /// BR-6: degradation is a loud refusal, never a silent rewrite. Every variant
 /// carries the underlying failure so the caller can name it (LESSON-456,
-/// BUG-146: a write that fails must say what failed, not "write failed").
+/// BUG-146: a write that fails must say what failed, not "write failed"), and
+/// none of them carries the document — see the module's "Refusals are loggable".
 #[derive(Debug, thiserror::Error)]
 pub enum DeltaError {
     /// The document handed in is not parseable TOML — typically a half-finished
@@ -60,8 +89,14 @@ pub enum DeltaError {
     /// The caller refuses the write rather than falling back to a full
     /// re-serialization: that fallback would make the write succeed by
     /// destroying the edit in progress, which is the one outcome BR-6 forbids.
+    ///
+    /// The payload is `parse_refusal`'s sanitized rendering — location and
+    /// diagnosis, no source line — and deliberately **not** the
+    /// `toml_edit::TomlError`, whose `Display` reproduces the offending line and
+    /// whose `Debug` retains the whole document. This message reaches the RPC
+    /// surface and the daemon log; the line it points at may hold a credential.
     #[error("the config file could not be parsed for editing, so nothing was written: {0}")]
-    Parse(toml_edit::TomlError),
+    Parse(String),
 
     /// A [`Config`] could not be serialized to its canonical TOML.
     ///
@@ -69,15 +104,105 @@ pub enum DeltaError {
     /// [`Config::to_toml`] carries — and represented anyway because the
     /// alternative is a `.expect()` in the one code path whose whole purpose is
     /// to not lose the user's file.
+    ///
+    /// `toml::ser::Error` is carried whole, unlike [`Self::Parse`]: it is a
+    /// message about a *shape* the serializer cannot express (an unsupported
+    /// type, a non-string key), and neither its `Display` nor its `Debug`
+    /// reaches for the value being serialized.
     #[error("the config could not be serialized to TOML, so nothing was written: {0}")]
     Serialize(toml::ser::Error),
+}
+
+/// A parse failure rendered so it can be logged: where the document is broken
+/// and what is wrong with it, and nothing *from* the document.
+///
+/// `toml_edit::TomlError`'s own `Display` is
+///
+/// ```text
+/// TOML parse error at line 9, column 52
+///   |
+/// 9 | search_key_ref = "sk-live-abc123…"
+///   |                                    ^
+/// expected `.`, `=`
+/// ```
+///
+/// — the offending line, verbatim, in a message that ends up in the daemon log
+/// and in an RPC error a client renders. This keeps the first line and the
+/// diagnosis and drops the quotation, matching the posture
+/// [`crate::config`]'s validator already states for endpoints, auth templates
+/// and domains: the value is not echoed, because it can carry a credential and
+/// the message is loggable (REQ-563 BR-7).
+///
+/// `input` is the text the error's span indexes into — the document for a
+/// user-supplied parse, the canonical rendering for [`canonical_document`]'s.
+fn parse_refusal(error: &toml_edit::TomlError, input: &str) -> DeltaError {
+    let diagnosis: Vec<&str> = error
+        .message()
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .collect();
+    let diagnosis = diagnosis.join("; ");
+    DeltaError::Parse(match error.span() {
+        Some(span) => {
+            let (line, column) = position_of(input, span.start);
+            format!("TOML parse error at line {line}, column {column}: {diagnosis}")
+        }
+        // Spanless in principle only; a location-free diagnosis still beats
+        // silence, and it still quotes nothing.
+        None => format!("TOML parse error: {diagnosis}"),
+    })
+}
+
+/// The 1-based line and column a byte offset falls at, counting characters
+/// rather than bytes so a comment in another script does not skew the column.
+///
+/// Deliberately its own arithmetic rather than a slice of `input`: the offset
+/// arrives from a parser and lands on no char boundary the day it is wrong,
+/// and a panic in the code path whose job is to refuse safely would be its own
+/// bug.
+fn position_of(input: &str, offset: usize) -> (usize, usize) {
+    let bytes = input.as_bytes();
+    let offset = offset.min(bytes.len());
+    let mut line = 1;
+    let mut column = 1;
+    for byte in &bytes[..offset] {
+        if *byte == b'\n' {
+            line += 1;
+            column = 1;
+        } else if byte & 0xC0 != 0x80 {
+            // Not a UTF-8 continuation byte, so it starts a character.
+            column += 1;
+        }
+    }
+    (line, column)
+}
+
+/// Whether a document holds nothing an edit could preserve.
+///
+/// A file of blank lines is a missing file that happens to exist — the shape a
+/// truncated write leaves behind — and editing it as if it had content only
+/// carries that emptiness forward. Treated here exactly like the empty string,
+/// so the next write heals it into a complete document.
+///
+/// Exposed because the *caller* decides the delta base, and the two decisions
+/// have to agree: [`apply_config_delta`] can only make the edit base empty; a
+/// caller that also wants the delta base to be `Config::default()` for such a
+/// file — so every candidate key is written, as it is for a missing one —
+/// needs to ask this question itself before choosing what to pass as `current`.
+#[must_use]
+pub fn document_is_effectively_empty(doc_text: &str) -> bool {
+    doc_text.trim().is_empty()
 }
 
 /// Apply the `current` → `candidate` delta to `doc_text`, returning the edited
 /// document.
 ///
 /// `doc_text` is the document as it exists on disk (the empty string for a file
-/// that is not there yet — a missing file is not an error, BR-6). `current` is
+/// that is not there yet — a missing file is not an error, BR-6). A document
+/// holding only whitespace is treated as that same empty base
+/// ([`document_is_effectively_empty`]): there is nothing in it to preserve, and
+/// editing around its blank lines would carry them forward forever. `current` is
 /// the caller's pre-mutation config and `candidate` the config it wants
 /// durable; every call site already holds both, because candidates are built by
 /// clone-and-mutate.
@@ -94,7 +219,16 @@ pub fn apply_config_delta(
     current: &Config,
     candidate: &Config,
 ) -> Result<String, DeltaError> {
-    let mut document: DocumentMut = doc_text.parse().map_err(DeltaError::Parse)?;
+    // A whitespace-only file heals to a complete candidate on the next write,
+    // exactly as a missing one does — as far as this engine can, anyway: the
+    // *delta base* is the caller's to choose, and a caller that hands in a
+    // non-default `current` for such a file gets only the delta's keys written.
+    let base = if document_is_effectively_empty(doc_text) {
+        ""
+    } else {
+        doc_text
+    };
+    let mut document: DocumentMut = base.parse().map_err(|error| parse_refusal(&error, base))?;
 
     // ADR-1, and the single most load-bearing line in this module: the two
     // sides of the diff are the caller's configs, NEVER the parse of
@@ -148,11 +282,10 @@ pub fn table_section(doc_text: &str, key: &str) -> Option<String> {
 /// reported rather than unwrapped, for the reason [`DeltaError::Serialize`]
 /// gives.
 fn canonical_document(config: &Config) -> Result<DocumentMut, DeltaError> {
-    config
-        .to_toml()
-        .map_err(DeltaError::Serialize)?
+    let canonical = config.to_toml().map_err(DeltaError::Serialize)?;
+    canonical
         .parse()
-        .map_err(DeltaError::Parse)
+        .map_err(|error| parse_refusal(&error, &canonical))
 }
 
 /// Apply one table's worth of delta to `target`.
@@ -207,13 +340,27 @@ fn apply_key_delta(
                 (Some(current_table), Some(candidate_table)) => {
                     apply_sub_table_delta(target, key, current_table, candidate_table, appended_at);
                 }
-                // Not a table on both sides: a scalar, a value array or an
-                // array-of-tables. All three are one key (ADR-1).
-                _ => {
-                    if !items_agree(current_item, candidate_item) {
-                        target.set(key, candidate_item, appended_at);
+                // An array of tables — `[[providers]]` — is diffed element-wise
+                // (see `plan_array_edit`); everything else here is a scalar or a
+                // value array, which is one key (ADR-1).
+                _ => match (
+                    current_item.as_array_of_tables(),
+                    candidate_item.as_array_of_tables(),
+                ) {
+                    (Some(current_array), Some(candidate_array)) => apply_array_of_tables_delta(
+                        target,
+                        key,
+                        current_array,
+                        candidate_array,
+                        candidate_item,
+                        appended_at,
+                    ),
+                    _ => {
+                        if !items_agree(current_item, candidate_item) {
+                            target.set(key, candidate_item, appended_at);
+                        }
                     }
-                }
+                },
             }
         }
         (None, Some(candidate_item)) => match candidate_item.as_table() {
@@ -269,6 +416,146 @@ fn apply_sub_table_delta(
     }
 }
 
+/// What a canonical array-of-tables delta asks of the document's own array.
+enum ArrayEdit {
+    /// The two canonical arrays say the same thing; the document keeps its own.
+    Untouched,
+    /// The candidate is the current array plus elements from this index on.
+    Append { from: usize },
+    /// Same length, differing at these indexes.
+    PerIndex(Vec<usize>),
+    /// Shrunk, reordered, or reshaped — no index correspondence to trust.
+    Wholesale,
+}
+
+/// Classify an array-of-tables delta.
+///
+/// ADR-1 wrote arrays off as one key, on the ground that element-wise diffing
+/// needs a per-array identity function and mis-targets when on-disk order
+/// drifted. That is right about identity and wrong about the cost: BR-1 says
+/// unknown keys and comments survive **for all five writers**, and the two that
+/// touch `[[providers]]` are precisely provider registration (an append) and the
+/// REQ-557 model migration (one key added to each entry). Under the wholesale
+/// rule those two writers re-render the array canonically, which deletes every
+/// comment and every unknown key inside `[[providers]]` — BR-1 broken by the
+/// only writers that could break it. So the two shapes that *do* have a
+/// trustworthy correspondence get one, and everything else keeps the recorded
+/// exception:
+///
+/// - **Append** — the common prefix is untouched and the candidate is longer.
+///   Position is not an identity claim here: the elements that already exist are
+///   not touched at all, only pushed past.
+/// - **Per-index** — same length, some elements differ. This is the migration
+///   shape, and at migration time `current` was parsed from this very document,
+///   so index *i* on both sides is the same provider.
+/// - **Wholesale** — anything else. The document's array is replaced with the
+///   candidate's canonical rendering, comments inside it and all.
+///
+/// # The residual
+///
+/// Per-index matching trusts position, and BR-5 leaves the daemon blind to
+/// drift: nothing re-reads the file until restart. So a user who *reorders*
+/// `[[providers]]` by hand mid-session, without changing how many there are, and
+/// is then hit by a same-length element edit, gets that edit applied at the
+/// position rather than to the provider — `model` landing on the entry that now
+/// sits where the intended one used to. The result still goes through
+/// `Config::validate` before it lands (BR-4), and the alternative — wholesale —
+/// destroys strictly more in that same scenario (every comment and unknown key
+/// in the array, not one mis-set key). Recorded rather than fixed: fixing it
+/// means an identity function per array type, which is the cost ADR-1 declined
+/// and which a `providers` array whose ids are themselves editable does not
+/// actually escape.
+fn plan_array_edit(current: &ArrayOfTables, candidate: &ArrayOfTables) -> ArrayEdit {
+    if candidate.len() < current.len() {
+        return ArrayEdit::Wholesale;
+    }
+    let differing: Vec<usize> = (0..current.len())
+        .filter(|index| !tables_agree(current.get(*index), candidate.get(*index)))
+        .collect();
+    if candidate.len() > current.len() {
+        return if differing.is_empty() {
+            ArrayEdit::Append {
+                from: current.len(),
+            }
+        } else {
+            ArrayEdit::Wholesale
+        };
+    }
+    if differing.is_empty() {
+        ArrayEdit::Untouched
+    } else {
+        ArrayEdit::PerIndex(differing)
+    }
+}
+
+/// Apply an array-of-tables delta to the document's own array.
+///
+/// Every branch that needs the document's array to cooperate checks that it
+/// does — that the document spells the key as `[[key]]` sections at all, and
+/// that it holds the number of elements the delta's indexes were computed
+/// against — and falls back to the wholesale replacement when it does not. A
+/// document that disagrees about the array's shape is exactly the case with no
+/// correspondence to preserve.
+fn apply_array_of_tables_delta(
+    target: &mut TargetTable<'_>,
+    key: &str,
+    current: &ArrayOfTables,
+    candidate: &ArrayOfTables,
+    candidate_item: &Item,
+    appended_at: usize,
+) {
+    match plan_array_edit(current, candidate) {
+        ArrayEdit::Untouched => return,
+        ArrayEdit::Append { from } => {
+            if let Some(document_array) = target.array_of_tables(key) {
+                // The existing elements are not read, not re-rendered and not
+                // moved: their comments, unknown keys and formatting are
+                // untouched by construction. The new ones render as a block
+                // continuing the one already there — same position, and
+                // toml_edit's sort is stable, so they follow it.
+                let carried = document_array
+                    .iter()
+                    .filter_map(Table::position)
+                    .max()
+                    .unwrap_or(appended_at);
+                for index in from..candidate.len() {
+                    let Some(element) = candidate.get(index) else {
+                        continue;
+                    };
+                    let mut fresh = element.clone();
+                    place_at(&mut fresh, carried);
+                    document_array.push(fresh);
+                }
+                return;
+            }
+        }
+        ArrayEdit::PerIndex(indexes) => {
+            if let Some(document_array) = target.array_of_tables(key) {
+                if document_array.len() == current.len() {
+                    for index in indexes {
+                        let (Some(before), Some(after), Some(element)) = (
+                            current.get(index),
+                            candidate.get(index),
+                            document_array.get_mut(index),
+                        ) else {
+                            continue;
+                        };
+                        apply_table_delta(
+                            &mut TargetTable::Standard(element),
+                            before,
+                            after,
+                            appended_at,
+                        );
+                    }
+                    return;
+                }
+            }
+        }
+        ArrayEdit::Wholesale => {}
+    }
+    target.set(key, candidate_item, appended_at);
+}
+
 /// The table an edit lands in, as the *document* spells it.
 ///
 /// Two shapes, because the document is the user's: a table written as `[web]`
@@ -302,20 +589,68 @@ impl TargetTable<'_> {
         match self {
             Self::Standard(table) => {
                 let mut replacement = item.clone();
-                if let Some(existing) = table.get_mut(key) {
-                    carry_document_placement(existing, &mut replacement);
-                    *existing = replacement;
-                } else {
+                let Some(existing) = table.get(key) else {
                     place_addition(&mut replacement, appended_at);
                     let _ = table.insert(key, replacement);
+                    return;
+                };
+                // The document spells the key as a *value* — `providers = [ { …
+                // } ]` — and the delta needs sections. Everything the key's own
+                // decor was written for now renders *inside the brackets*: the
+                // space before the `=` comes out as `[[providers ]]`, and a
+                // comment block above the key comes out as an unparseable
+                // `[[# …⏎providers]]`. And a value carries no render position,
+                // so the canonical positions inside the replacement would
+                // strand `[providers.capabilities]` on the far side of the
+                // user's `[web]` block. So the key reverts to the header
+                // default, its comment moves onto the block it documents (OQ-1:
+                // a comment travels with its key), and the block is placed as an
+                // addition so it renders contiguously.
+                let reshapes_a_value_into_sections = matches!(existing, Item::Value(_))
+                    && matches!(replacement, Item::Table(_) | Item::ArrayOfTables(_));
+                carry_document_placement(existing, &mut replacement);
+                if reshapes_a_value_into_sections {
+                    let carried_comment = table
+                        .key(key)
+                        .and_then(|header| header.leaf_decor().prefix())
+                        .and_then(RawString::as_str)
+                        .filter(|prefix| prefix.contains('#'))
+                        .map(strip_leading_blank_lines);
+                    place_addition(&mut replacement, appended_at);
+                    if let Some(comment) = carried_comment {
+                        prefix_first_section(&mut replacement, &format!("\n{comment}"));
+                    }
+                }
+                if let Some(existing) = table.get_mut(key) {
+                    *existing = replacement;
+                }
+                if reshapes_a_value_into_sections {
+                    if let Some(mut header) = table.key_mut(key) {
+                        *header.leaf_decor_mut() = Decor::default();
+                    }
                 }
             }
             Self::Inline(table) => {
                 // A table nested in an inline table can only be spelled inline;
                 // `into_value` performs that conversion and fails only for
                 // `Item::None`, which never reaches here.
-                let Ok(mut value) = item.clone().into_value() else {
-                    return;
+                let mut value = match item.clone().into_value() {
+                    Ok(value) => value,
+                    Err(unconvertible) => {
+                        // Unreachable, and a silent drop if it ever stops being:
+                        // the key would keep its old value while the caller
+                        // believes the write landed. Loud in debug, and still
+                        // non-panicking in release — this code path exists to
+                        // not lose the user's file. The item is named by *type*,
+                        // never by content: a panic message is as loggable as an
+                        // error message.
+                        debug_assert!(
+                            false,
+                            "a `{}` will not convert to an inline value, so `{key}` was not set",
+                            unconvertible.type_name(),
+                        );
+                        return;
+                    }
                 };
                 if let Some(existing) = table.get_mut(key) {
                     *value.decor_mut() = existing.decor().clone();
@@ -352,6 +687,24 @@ impl TargetTable<'_> {
                 Value::InlineTable(nested) => Some(TargetTable::Inline(nested)),
                 _ => None,
             },
+        }
+    }
+
+    /// The document's own array-of-tables at `key`, or `None` when the document
+    /// spells that key some other way — an inline `key = [ { … } ]`, a scalar,
+    /// or nothing at all.
+    ///
+    /// `None` is what sends [`apply_array_of_tables_delta`] to its wholesale
+    /// branch: element-wise editing needs elements the document agrees are
+    /// elements.
+    fn array_of_tables(&mut self, key: &str) -> Option<&mut ArrayOfTables> {
+        match self {
+            Self::Standard(table) => match table.get_mut(key)? {
+                Item::ArrayOfTables(array) => Some(array),
+                _ => None,
+            },
+            // An inline table cannot hold `[[…]]` sections at all.
+            Self::Inline(_) => None,
         }
     }
 }
@@ -408,6 +761,23 @@ fn place_addition(addition: &mut Item, appended_at: usize) {
             }
         }
         _ => {}
+    }
+}
+
+/// Render `comment` in front of the first section an item produces.
+///
+/// Only used when a key changes spelling from a value to a section: the comment
+/// block that sat above `providers = [ … ]` belongs above the `[[providers]]`
+/// header it becomes, and a header's own decor is the only place a comment can
+/// live there.
+fn prefix_first_section(item: &mut Item, comment: &str) {
+    let first = match item {
+        Item::Table(table) => Some(table),
+        Item::ArrayOfTables(array) => array.iter_mut().next(),
+        _ => None,
+    };
+    if let Some(table) = first {
+        table.decor_mut().set_prefix(comment);
     }
 }
 
@@ -472,6 +842,20 @@ fn place_at(table: &mut Table, position: usize) {
 fn items_agree(left: &Item, right: &Item) -> bool {
     match (semantic_value(left), semantic_value(right)) {
         (Some(left), Some(right)) => left == right,
+        _ => false,
+    }
+}
+
+/// Whether two canonical array elements say the same thing.
+///
+/// A missing element on either side is "different", which is the safe direction
+/// for the same reason [`items_agree`] gives: the caller's fallback is to write
+/// the candidate, and the candidate is validated before it lands (BR-4).
+fn tables_agree(left: Option<&Table>, right: Option<&Table>) -> bool {
+    match (left, right) {
+        (Some(left), Some(right)) => {
+            items_agree(&Item::Table(left.clone()), &Item::Table(right.clone()))
+        }
         _ => false,
     }
 }
@@ -701,7 +1085,11 @@ knob = 3
     }
 
     #[test]
-    fn a_changed_array_of_tables_is_replaced_wholesale_where_it_stood() {
+    fn an_element_wise_change_to_an_array_of_tables_edits_the_element_in_place() {
+        // The REQ-557 model migration in miniature: one key added to each
+        // `[[providers]]` entry. Under the old wholesale rule this re-rendered
+        // the array canonically and deleted the comment inside it — BR-1 broken
+        // by one of the five writers BR-1 names.
         let current = hand_written();
         let mut candidate = current.clone();
         candidate.providers[0].model = Some("claude-sonnet-4".to_owned());
@@ -709,17 +1097,131 @@ knob = 3
         let edited =
             apply_config_delta(HAND_WRITTEN_CONFIG, &current, &candidate).expect("edit applies");
 
-        assert!(edited.contains(r#"model = "claude-sonnet-4""#), "{edited}");
-        // ADR-1's stated cost, pinned rather than hoped for: a comment *inside*
-        // a replaced array does not survive.
+        let added = r#"model = "claude-sonnet-4""#;
+        assert!(edited.contains(added), "{edited}");
+        assert!(
+            edited.contains("# The one I actually pay for."),
+            "a comment inside a *touched* element survives, because only the \
+             delta's own key is written:\n{edited}",
+        );
+        // The whole assertion BR-1 actually asks for: one line added, and every
+        // other line of the document byte-identical and in the same order.
+        let without_the_addition: Vec<&str> =
+            edited.lines().filter(|line| *line != added).collect();
+        assert_eq!(
+            without_the_addition,
+            HAND_WRITTEN_CONFIG.lines().collect::<Vec<&str>>(),
+            "only the operation's key may change:\n{edited}",
+        );
+
+        let reloaded = Config::load(&edited).expect("the edited document must load");
+        assert_eq!(reloaded, candidate);
+    }
+
+    /// A config whose `[[providers]]` entry carries exactly what a wholesale
+    /// replacement destroys: a comment inside the entry, and a key this build
+    /// has never heard of. The engine-level witness for BR-1's "unknown keys
+    /// survive" *inside an array*; the per-writer witness is `tetond`'s.
+    const REGISTERED_PROVIDER_CONFIG: &str = r#"effort = "high"
+
+[[providers]]
+# The one I actually pay for.
+id = "anthropic"
+kind = "anthropic"
+endpoint = "https://api.anthropic.com"
+auth_ref = "keychain:anthropic"
+model = "claude-opus-5"
+# Nothing in this build reads this key.
+nickname = "the good one"
+
+[web]
+# The comment that must not move.
+tier = "off"
+"#;
+
+    fn registered_provider() -> Config {
+        Config::load(REGISTERED_PROVIDER_CONFIG).expect("a registered provider loads")
+    }
+
+    fn second_provider() -> crate::entities::ModelProvider {
+        crate::entities::ModelProvider {
+            id: "cheap".to_owned(),
+            kind: crate::entities::ProviderKind::OpenaiCompatible,
+            endpoint: Some("https://api.deepseek.com/v1".to_owned()),
+            model: Some("deepseek-chat".to_owned()),
+            auth_ref: Some("keychain:deepseek".to_owned()),
+            capabilities: crate::entities::ProviderCapabilities::default(),
+        }
+    }
+
+    #[test]
+    fn registering_a_provider_appends_and_reads_nothing_of_the_entries_already_there() {
+        let current = registered_provider();
+        let mut candidate = current.clone();
+        candidate.providers.push(second_provider());
+
+        let edited = apply_config_delta(REGISTERED_PROVIDER_CONFIG, &current, &candidate)
+            .expect("edit applies");
+
+        // The registration is an append: every line the user wrote is still
+        // there, in order, including the comment and the unknown key *inside*
+        // the array — the two things the wholesale rule deleted.
+        let mut before = REGISTERED_PROVIDER_CONFIG.lines();
+        let mut expected = before.next();
+        for line in edited.lines() {
+            if Some(line) == expected {
+                expected = before.next();
+            }
+        }
+        assert_eq!(
+            expected, None,
+            "the document the user wrote must survive an append intact:\n{edited}",
+        );
+        assert!(edited.contains("# The one I actually pay for."), "{edited}");
+        assert!(edited.contains(r#"nickname = "the good one""#), "{edited}");
+
+        // And the new entry renders as a block continuing the array, rather
+        // than being scattered past the user's [web] section.
+        let first_at = edited.find(r#"id = "anthropic""#).expect("first provider");
+        let second_at = edited.find(r#"id = "cheap""#).expect("second provider");
+        let web_at = edited.find("[web]").expect("web section");
+        assert!(
+            first_at < second_at && second_at < web_at,
+            "an appended element continues the array where it stands:\n{edited}",
+        );
+
+        let reloaded = Config::load(&edited).expect("the edited document must load");
+        assert_eq!(reloaded, candidate);
+    }
+
+    #[test]
+    fn a_reshaped_array_of_tables_is_replaced_wholesale_where_it_stood() {
+        // ADR-1's exception, kept and pinned: an array that shrank has no index
+        // correspondence to preserve, so it is re-rendered canonically and the
+        // comments inside it do not survive. Everything outside it does.
+        let mut current = registered_provider();
+        current.providers.push(second_provider());
+        let seed = apply_config_delta(REGISTERED_PROVIDER_CONFIG, &registered_provider(), &current)
+            .expect("the two-provider document is built by an append");
+        let mut candidate = current.clone();
+        candidate.providers.remove(0);
+
+        let edited = apply_config_delta(&seed, &current, &candidate).expect("edit applies");
+
+        assert!(!edited.contains(r#"id = "anthropic""#), "{edited}");
+        assert!(edited.contains(r#"id = "cheap""#), "{edited}");
         assert!(
             !edited.contains("# The one I actually pay for."),
-            "the array is re-rendered canonically:\n{edited}",
+            "a shrunk array is re-rendered canonically — the recorded cost:\n{edited}",
         );
-        // The section keeps its place in the file, ahead of [web] and the
-        // unknown table, and it renders as one block — the nested
-        // `[providers.capabilities]` table comes with it rather than stranding
-        // itself on the far side of the user's [web] block.
+        assert!(
+            !edited.contains(r#"nickname = "the good one""#),
+            "and the unknown key inside it goes with the element:\n{edited}",
+        );
+        // The section keeps its place in the file, ahead of [web], and it
+        // renders as one block — the nested `[providers.capabilities]` table
+        // comes with it rather than stranding itself on the far side of the
+        // user's [web] block.
         let providers_at = edited.find("[[providers]]").expect("providers section");
         let capabilities_at = edited
             .find("[providers.capabilities]")
@@ -729,13 +1231,95 @@ knob = 3
             providers_at < capabilities_at && capabilities_at < web_at,
             "a replaced section stays put, whole:\n{edited}",
         );
-        assert!(edited.contains("# My machine. Hand-written"), "{edited}");
-        assert!(edited.contains("# \"off\" (default)"), "{edited}");
         assert!(
-            edited.contains(r#"experimental_reranker = "colbert""#),
+            edited.contains("# The comment that must not move."),
+            "everything outside the array survives:\n{edited}",
+        );
+
+        let reloaded = Config::load(&edited).expect("the edited document must load");
+        assert_eq!(reloaded, candidate);
+    }
+
+    #[test]
+    fn an_inline_array_of_tables_is_rewritten_as_a_block_the_document_can_hold() {
+        // The third spelling of an array-of-tables: values, not sections. The
+        // delta's replacement *is* sections, so this is the one edit that
+        // reshapes the document — and it must reshape it into something legible
+        // rather than into `[[providers ]]` with a stranded sub-table. (The
+        // blank line the vacated `providers = …` line leaves behind is the
+        // separator the *next* section owns, and is left alone: trimming it
+        // would mean editing rendered text outside the parser.)
+        let document = r#"# The provider, on one line because I like it that way.
+providers = [ { id = "anthropic", kind = "anthropic", endpoint = "https://api.anthropic.com", auth_ref = "keychain:anthropic" } ]
+
+[web]
+# The comment that must not move.
+tier = "off"
+"#;
+        let current = Config::load(document).expect("an inline providers array loads");
+        let mut candidate = current.clone();
+        candidate.providers[0].model = Some("claude-sonnet-4".to_owned());
+
+        let edited = apply_config_delta(document, &current, &candidate).expect("edit applies");
+
+        assert!(
+            !edited.contains("[[providers ]]"),
+            "the inline key's decor must not leak into the header:\n{edited}",
+        );
+        assert!(edited.contains("[[providers]]"), "{edited}");
+        assert!(!edited.contains("providers = ["), "{edited}");
+        let providers_at = edited.find("[[providers]]").expect("providers section");
+        let capabilities_at = edited
+            .find("[providers.capabilities]")
+            .expect("capabilities section");
+        let web_at = edited.find("[web]").expect("web section");
+        assert!(
+            web_at < providers_at && providers_at < capabilities_at,
+            "the reshaped block renders contiguously, past what the user wrote:\n{edited}",
+        );
+        assert!(
+            edited.contains("# The comment that must not move."),
             "{edited}"
         );
-        assert!(edited.contains("knob = 3"), "{edited}");
+        // The comment above the key documented the key, and the key still
+        // exists — only its spelling changed. Rendered through the header's own
+        // decor it would have produced `[[# …⏎providers]]`, which is not TOML at
+        // all, so it moves onto the block instead of into the brackets (OQ-1).
+        assert!(
+            edited
+                .contains("# The provider, on one line because I like it that way.\n[[providers]]"),
+            "the key's comment travels with it:\n{edited}",
+        );
+
+        let reloaded = Config::load(&edited).expect("the edited document must load");
+        assert_eq!(reloaded, candidate);
+    }
+
+    #[test]
+    fn a_dotted_key_is_edited_where_the_document_spells_it() {
+        // The third spelling of a *table*: `web.tier = …` at the top level,
+        // which the module claims to edit in place alongside `[web]` and
+        // `web = { … }`. Claimed, therefore pinned.
+        let document = r#"# The knob I flip most.
+web.tier = "fetch_user_url"
+# Nothing in this build reads this one.
+web.mood = "curious"
+"#;
+        let current = Config::load(document).expect("a dotted [web] loads");
+        let mut candidate = current.clone();
+        candidate.web.tier = WebTier::FetchAnyUrl;
+
+        let edited = apply_config_delta(document, &current, &candidate).expect("edit applies");
+
+        let changed = changed_lines(document, &edited);
+        assert_eq!(
+            changed,
+            vec![1],
+            "a dotted key is edited in place:\n{edited}"
+        );
+        assert!(edited.contains(r#"web.tier = "fetch_any_url""#), "{edited}");
+        assert!(edited.contains(r#"web.mood = "curious""#), "{edited}");
+        assert!(edited.contains("# The knob I flip most."), "{edited}");
 
         let reloaded = Config::load(&edited).expect("the edited document must load");
         assert_eq!(reloaded, candidate);
@@ -900,17 +1484,111 @@ mood = "curious"
     }
 
     #[test]
-    fn an_unparseable_document_refuses_and_names_the_parse_failure() {
+    fn an_unparseable_document_refuses_and_names_where_the_parse_failed() {
         let error = apply_config_delta("[web\ntier = ", &hand_written(), &hand_written())
             .expect_err("a half-finished hand edit must refuse, not panic");
 
         match &error {
-            DeltaError::Parse(inner) => assert!(
-                error.to_string().contains(&inner.to_string()),
+            DeltaError::Parse(sanitized) => assert!(
+                error.to_string().contains(sanitized.as_str())
+                    && sanitized.starts_with("TOML parse error at line 1, column "),
                 "the refusal must carry the underlying failure, got: {error}",
             ),
             DeltaError::Serialize(_) => panic!("expected a parse refusal, got: {error}"),
         }
+    }
+
+    #[test]
+    fn a_parse_refusal_says_where_and_what_without_quoting_the_line() {
+        // The config file is secret-adjacent — `tetond` keeps it at 0600 — and
+        // this message reaches the daemon log and an RPC error a client renders.
+        // toml_edit's own Display would print the offending source line under a
+        // caret gutter; the line here is the one that would hurt.
+        const SECRET: &str = "sk-live-4b7-not-a-real-key";
+        let document = format!(
+            "[web]\ntier = \"search\"\nsearch_key_ref = \"keychain://teton/{SECRET}\nsearch_endpoint = \"https://x.example/api\"\n"
+        );
+
+        let error = apply_config_delta(&document, &hand_written(), &hand_written())
+            .expect_err("an unterminated string must refuse");
+
+        let message = error.to_string();
+        assert!(
+            message.contains("could not be parsed for editing"),
+            "{message}"
+        );
+        // Where, and what — the two things a user needs to fix it.
+        assert!(
+            message.contains("TOML parse error at line 3, column "),
+            "the refusal must locate the failure: {message}",
+        );
+        assert!(
+            message.contains("invalid basic string"),
+            "the refusal must diagnose the failure: {message}",
+        );
+        // And nothing of the line itself, through either rendering: `Display`
+        // is what gets logged, `Debug` is what a `{:?}` in a caller would log.
+        assert!(
+            !message.contains(SECRET) && !message.contains("search_key_ref"),
+            "the refusal quoted the document back: {message}",
+        );
+        let debugged = format!("{error:?}");
+        assert!(
+            !debugged.contains(SECRET) && !debugged.contains("search_key_ref"),
+            "the error retained the document: {debugged}",
+        );
+    }
+
+    #[test]
+    fn a_whitespace_only_document_is_the_same_edit_base_as_a_missing_one() {
+        // What a truncated write leaves behind. There is nothing in it to
+        // preserve, so it heals into a complete document rather than carrying
+        // its blank lines forward.
+        assert!(document_is_effectively_empty("  \n\n\t\n"));
+        assert!(document_is_effectively_empty(""));
+        assert!(!document_is_effectively_empty("# a comment\n"));
+
+        let mut candidate = Config::default();
+        candidate.web.tier = WebTier::FetchUserUrl;
+
+        let healed = apply_config_delta("  \n\n\t\n", &Config::default(), &candidate)
+            .expect("a whitespace-only document is a valid edit base");
+        let fresh = apply_config_delta("", &Config::default(), &candidate)
+            .expect("the empty document is a valid edit base");
+
+        assert_eq!(healed, fresh, "the two bases must agree");
+        let reloaded = Config::load(&healed).expect("the healed document must load");
+        assert_eq!(reloaded, candidate);
+    }
+
+    #[test]
+    fn the_first_write_to_a_crlf_document_normalizes_its_line_endings() {
+        // A recorded limitation, pinned so it is visible rather than silent:
+        // toml_edit re-emits a parsed document with `\n`, so the first daemon
+        // write to a config authored on Windows rewrites its line endings once.
+        // Content, comments, key order and unknown keys all survive it.
+        let document = HAND_WRITTEN_CONFIG.replace('\n', "\r\n");
+        let current = Config::load(&document).expect("a CRLF document loads");
+        let mut candidate = current.clone();
+        candidate.web.tier = WebTier::FetchAnyUrl;
+
+        let edited = apply_config_delta(&document, &current, &candidate).expect("edit applies");
+
+        assert!(
+            !edited.contains('\r'),
+            "the write normalizes CRLF to LF — recorded, not fixed:\n{edited}",
+        );
+        assert_eq!(
+            changed_lines(HAND_WRITTEN_CONFIG, &edited),
+            vec![HAND_WRITTEN_CONFIG
+                .lines()
+                .position(|line| line == r#"tier = "search""#)
+                .expect("fixture holds the tier line")],
+            "and it changes nothing else — the CRLF document ends up exactly \
+             where the LF one would:\n{edited}",
+        );
+        let reloaded = Config::load(&edited).expect("the edited document must load");
+        assert_eq!(reloaded, candidate);
     }
 
     #[test]
