@@ -173,6 +173,17 @@
 - **Adapter degradation** — providers with weak tool-calling get a reduced
   harness profile (smaller tool set, shorter loops, mandatory verification)
   rather than the full loop (BR-6).
+- **A durable document is edited, never re-uttered** — a writer that persists
+  user-authored configuration applies its semantic delta (diff of the caller's
+  pre-mutation state vs its candidate, never a diff against the document) to
+  the document as it exists on disk, and validates the exact bytes it will
+  write — so comments, key order, and unknown keys are not collateral of an
+  unrelated save, hand-edit drift at untouched keys survives, and an
+  unparseable document is a loud refusal rather than a silent rewrite. An
+  element-wise edit inside an array re-establishes the element's *identity*
+  (its natural key) before writing; when identity cannot be established,
+  wholesale replacement is strictly safer than a positional guess (REQ-574
+  ADR-1/ADR-4, LESSON-522, LESSON-456).
 - **Graceful absence** — the local tier disables itself below the hardware
   floor or under memory pressure rather than degrading the machine (BR-8/BR-9).
 - **Suggestion data is daemon-owned, typed, and seam-pinned** — a list clients
