@@ -45,6 +45,7 @@
 //! | AC-2 (`apply_config_update`) | [`registering_a_provider_leaves_the_web_table_and_its_comments_alone`] |
 //! | BR-1 (unknown key *inside* `[[providers]]`, twice over) | [`an_unknown_key_inside_a_provider_entry_survives_a_registration`] |
 //! | BR-5 (mid-session hand edit at an unrelated key) | [`a_hand_edit_mid_session_survives_a_provider_registration`] |
+//! | BR-4/BR-5 (mid-session hand edit *inside* `[[providers]]`, the append branch's deliberate blind spot) | [`a_hand_added_provider_under_the_id_being_registered_refuses_the_write`] |
 //! | AC-2 (REQ-557 model migration) | [`the_model_migration_carries_a_commented_config_across_the_upgrade`] |
 //! | AC-2 (REQ-558 routing migration) + idempotence | [`the_routing_migration_retires_its_table_without_taking_the_rest_of_the_file`] |
 //! | AC-5 (unparseable document, per RPC writer) | [`an_unparseable_document_is_refused_by_the_writers_that_would_have_rewritten_it`] |
@@ -979,6 +980,80 @@ fn a_hand_edit_mid_session_survives_a_provider_registration() {
         "the document is the truth about a key the operation never named"
     );
     assert_eq!(reloaded.providers.len(), 2);
+    daemon.cleanup();
+}
+
+/// **A provider hand-added mid-session under the id being registered makes the
+/// write refuse, and the file survives it** (spec BR-4/BR-5, AC-10).
+///
+/// The append branch of the array rule is the one branch that reads *no*
+/// existing element — it pushes past them — which is what makes it safe under a
+/// reorder and also what makes it blind to a hand-added element. The per-index
+/// branch closes that blindness itself, by checking the document's element
+/// carries the identity key the delta's index was computed against
+/// (`config_doc::identity_field`). This test pins the deliberate decision **not**
+/// to give the append branch the same guard: the collision it can produce is a
+/// duplicate id, the edited-bytes gate already refuses exactly that, and the
+/// refusal names the key in the validator's own words. A second guard would buy
+/// a different sentence for a case already covered, at the cost of turning a
+/// safe append into a wholesale rewrite whenever the document's array is longer
+/// than memory's.
+///
+/// So: the daemon starts holding one provider, the user hand-adds a second one
+/// mid-session, and then registers a provider with that same id. The write is
+/// refused, the message says which id is doubled, and both the file and the live
+/// config are exactly where they were.
+#[test]
+fn a_hand_added_provider_under_the_id_being_registered_refuses_the_write() {
+    let seeded = readme_config();
+    let daemon = Daemon::start("register-hand-added-twin", Some(&seeded));
+    assert_eq!(
+        daemon.reload().providers.len(),
+        1,
+        "the daemon started holding one provider"
+    );
+
+    // The user adds the provider by hand, in the file the daemon is not
+    // watching — and then reaches for `teton provider add` for the same id,
+    // having forgotten (or not known) that the edit already landed.
+    let drifted = seeded.replace(
+        "[web]\n",
+        "[[providers]]\n\
+         # added by hand, five minutes ago\n\
+         id = \"cheap\"\n\
+         kind = \"openai-compatible\"\n\
+         endpoint = \"https://api.deepseek.com\"\n\
+         model = \"deepseek-chat\"\n\
+         auth_ref = \"keychain:cheap\"\n\n\
+         [web]\n",
+    );
+    assert_ne!(drifted, seeded, "the fixture must hold a `[web]` header");
+    daemon.hand_edit(&drifted);
+
+    let refused = daemon
+        .runtime
+        .apply_config_update(register("cheap"))
+        .expect_err("a registration that would double an id must not be written");
+
+    assert_eq!(refused.code, error_code::CONFIG_REJECTED);
+    assert!(
+        refused
+            .message
+            .contains("provider 'cheap' is defined more than once"),
+        "the refusal must carry the validator's own sentence, which names the id \
+         the user has to resolve: {}",
+        refused.message
+    );
+    assert_eq!(
+        daemon.document(),
+        drifted,
+        "a refused write reached the file"
+    );
+    assert_eq!(
+        daemon.runtime.config_snapshot().providers.len(),
+        1,
+        "the in-memory swap happens after the write, never before"
+    );
     daemon.cleanup();
 }
 

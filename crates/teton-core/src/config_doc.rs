@@ -35,8 +35,9 @@
 //!   keys survive for all writers* and the two writers that touch
 //!   `[[providers]]` — provider registration and the REQ-557 model migration —
 //!   are exactly the writers a wholesale replacement would make lie. See
-//!   `plan_array_edit` for the four cases and the residual the index-matching
-//!   one carries.
+//!   `plan_array_edit` for the four cases, and `identity_field` for the guard
+//!   that keeps a per-index edit on the element it was computed for even when
+//!   the document's order has drifted underneath it.
 //! - **Removal takes the key's attached decor with it** (spec OQ-1): the
 //!   comment block prefixed to a key documents that key, so it travels with it.
 //!   Free-standing comments and every other key's decor survive.
@@ -44,7 +45,13 @@
 //! # Refusals are loggable
 //!
 //! A refusal names *where* the document is broken and *what* is wrong with it,
-//! and never quotes the document back. `toml_edit`'s own `Display` prints the
+//! and never quotes a *value* from the document. (The parser's diagnosis is
+//! kept verbatim, and for one class of failure — a duplicate key — that
+//! diagnosis names the offending **key**. A key name is schema vocabulary; the
+//! secret is always on the right-hand side, and that is the side this refuses
+//! to reproduce. Pinned by
+//! `a_duplicate_key_refusal_names_the_key_and_still_quotes_no_value`.)
+//! `toml_edit`'s own `Display` prints the
 //! offending source line under a caret gutter, and that line can be
 //! `search_key_ref`, an endpoint with a credential in its query string, or an
 //! `Authorization` template — the config file is secret-adjacent, which is why
@@ -160,8 +167,16 @@ fn parse_refusal(error: &toml_edit::TomlError, input: &str) -> DeltaError {
 /// Deliberately its own arithmetic rather than a slice of `input`: the offset
 /// arrives from a parser and lands on no char boundary the day it is wrong,
 /// and a panic in the code path whose job is to refuse safely would be its own
-/// bug.
-fn position_of(input: &str, offset: usize) -> (usize, usize) {
+/// bug. An out-of-range offset is clamped to the end of the input for the same
+/// reason.
+///
+/// Exposed because `tetond` locates the *other* parser's spans — `toml::de`'s,
+/// over the bytes a write derived — and needs the same answer with the same
+/// safety. One implementation, so a span that lands mid-character cannot panic
+/// in one of the two refusal paths and not the other (it would panic there
+/// holding the config mutex, which poisons it for every later reader).
+#[must_use]
+pub fn position_of(input: &str, offset: usize) -> (usize, usize) {
     let bytes = input.as_bytes();
     let offset = offset.min(bytes.len());
     let mut line = 1;
@@ -446,25 +461,15 @@ enum ArrayEdit {
 ///   Position is not an identity claim here: the elements that already exist are
 ///   not touched at all, only pushed past.
 /// - **Per-index** — same length, some elements differ. This is the migration
-///   shape, and at migration time `current` was parsed from this very document,
-///   so index *i* on both sides is the same provider.
+///   shape. The correspondence it assumes is *checked against the document*
+///   before anything is written — see [`identity_field`] — and falls back to
+///   wholesale when the check fails.
 /// - **Wholesale** — anything else. The document's array is replaced with the
 ///   candidate's canonical rendering, comments inside it and all.
 ///
-/// # The residual
-///
-/// Per-index matching trusts position, and BR-5 leaves the daemon blind to
-/// drift: nothing re-reads the file until restart. So a user who *reorders*
-/// `[[providers]]` by hand mid-session, without changing how many there are, and
-/// is then hit by a same-length element edit, gets that edit applied at the
-/// position rather than to the provider — `model` landing on the entry that now
-/// sits where the intended one used to. The result still goes through
-/// `Config::validate` before it lands (BR-4), and the alternative — wholesale —
-/// destroys strictly more in that same scenario (every comment and unknown key
-/// in the array, not one mis-set key). Recorded rather than fixed: fixing it
-/// means an identity function per array type, which is the cost ADR-1 declined
-/// and which a `providers` array whose ids are themselves editable does not
-/// actually escape.
+/// This function sees only the two canonical arrays, so what it returns is a
+/// *proposal*. [`apply_array_of_tables_delta`] is where the document gets a
+/// vote, and where a per-index proposal is downgraded.
 fn plan_array_edit(current: &ArrayOfTables, candidate: &ArrayOfTables) -> ArrayEdit {
     if candidate.len() < current.len() {
         return ArrayEdit::Wholesale;
@@ -488,14 +493,105 @@ fn plan_array_edit(current: &ArrayOfTables, candidate: &ArrayOfTables) -> ArrayE
     }
 }
 
+/// The key inside an array element that says *which* entity the element is —
+/// the natural identity of each array the schema declares.
+///
+/// Read off `Config`'s own fields (serialized names, `serde(rename)` included)
+/// and the element structs they hold:
+///
+/// | array | element type | identity key |
+/// |-------|--------------|--------------|
+/// | `providers` | `ModelProvider` | `id` |
+/// | `mcp_server` | `McpServerConfig` | `id` |
+/// | `boundaries` | `PrivacyBoundary` | `path_glob` |
+/// | `tiers` | `TierBinding` | `tier` |
+/// | `categories` | `CategoryOverride` | `name` |
+/// | `routing` (`Config::legacy_routing`, `serde(rename = "routing")`) | `LegacyRoutingRule` | `phase` |
+///
+/// This is not a second opinion about identity. For the four arrays a daemon
+/// writer actually mutates, it is the key that writer *already* matched on:
+/// `apply_update` does replace-or-insert by `id` for `providers`, by `tier` for
+/// `tiers`, by `name` for `categories`, and by `path_glob` for `boundaries`. So
+/// the question asked of the document is the same question the mutation asked of
+/// memory.
+///
+/// The other two rows are forward-looking, and named so rather than implied:
+/// `mcp_server` is hand-declared and has no per-element daemon writer today, and
+/// `routing` is read once and cleared wholesale by the REQ-558 migration. Their
+/// keys are the ones the schema treats as the row's identity anyway —
+/// `Config::validate` rejects two `mcp_server` entries sharing an `id`, and a
+/// phase → provider table is keyed by its phase — so a writer that arrives later
+/// finds the guard already right rather than already wrong.
+///
+/// `None` means "no known identity", which sends a per-index edit to the
+/// wholesale fallback. It is the conservative default and it is also nearly
+/// unreachable: both sides of the delta are *canonical serializations of
+/// `Config`*, so a key this table has never heard of cannot appear in the delta
+/// at all. It exists so that adding an array to the schema and forgetting this
+/// table degrades to a costly-but-safe rewrite rather than to a
+/// position-trusting edit.
+fn identity_field(array_key: &str) -> Option<&'static str> {
+    match array_key {
+        "providers" | "mcp_server" => Some("id"),
+        "boundaries" => Some("path_glob"),
+        "tiers" => Some("tier"),
+        "categories" => Some("name"),
+        "routing" => Some("phase"),
+        _ => None,
+    }
+}
+
+/// Whether the document's element and the canonical `current` element the
+/// delta's index was computed against are the **same entity**.
+///
+/// A missing identity key on either side is a mismatch, not a pass: an element
+/// the document spells without an `id` is one this engine cannot recognize, and
+/// "cannot recognize" must not read as "matches".
+fn elements_share_identity(identity: &str, current: &Table, document: &Table) -> bool {
+    match (present(current, identity), present(document, identity)) {
+        (Some(current_id), Some(document_id)) => items_agree(current_id, document_id),
+        _ => false,
+    }
+}
+
 /// Apply an array-of-tables delta to the document's own array.
 ///
-/// Every branch that needs the document's array to cooperate checks that it
-/// does — that the document spells the key as `[[key]]` sections at all, and
-/// that it holds the number of elements the delta's indexes were computed
-/// against — and falls back to the wholesale replacement when it does not. A
-/// document that disagrees about the array's shape is exactly the case with no
-/// correspondence to preserve.
+/// # The per-index branch checks the document's element is the right one
+///
+/// A per-index edit is a claim about *position*, and BR-5 leaves the daemon
+/// blind to the file until restart: a user who reorders `[[boundaries]]` or
+/// `[[providers]]` by hand mid-session, without changing how many there are,
+/// leaves the daemon's index *i* pointing at a different entity than the
+/// document's index *i*. Applied blind, a `SetPrivacyBoundary` for `docs/**`
+/// lands on `secrets/**` — a privacy guarantee silently inverted, and one
+/// `Config::validate` has no way to catch, because the result is a perfectly
+/// valid config that says something the user never asked for. The same shape
+/// binds a rotated `auth_ref` to another provider's endpoint.
+///
+/// So before an element is edited, the document's element at that index must
+/// agree with the canonical `current` element on the array's identity key
+/// ([`identity_field`]). Any mismatch — including an array whose identity this
+/// engine does not know — falls through to the wholesale replacement, which is
+/// semantically correct in every case and costs the comments and unknown keys
+/// *inside* the array (nothing outside it). That is the honest trade: a lossy
+/// write the user can see, instead of a lossless write of the wrong thing.
+///
+/// Only the indexes this delta actually edits are checked. An element the write
+/// does not touch may sit wherever the user moved it — refusing over drift
+/// somewhere else in the array would spend the array's comments to protect an
+/// element nothing was going to write to.
+///
+/// # The other branches
+///
+/// *Untouched* reads the document not at all. *Append* reads no existing element
+/// either — it pushes past them — so it needs no identity check and gets none:
+/// a hand-added element it cannot see is caught downstream instead, by the
+/// caller's validation of the edited bytes (a hand-added `[[providers]]` whose
+/// id is the one being registered makes the write refuse with the validator's
+/// duplicate-id sentence, and the file is left alone). What every document-
+/// reading branch does check is that the document spells the key as `[[key]]`
+/// sections at all; the per-index branch additionally checks it holds the number
+/// of elements the delta's indexes were computed against.
 fn apply_array_of_tables_delta(
     target: &mut TargetTable<'_>,
     key: &str,
@@ -546,8 +642,20 @@ fn apply_array_of_tables_delta(
             }
         }
         ArrayEdit::PerIndex(indexes) => {
-            if let Some(document_array) = target.array_of_tables(key) {
-                if document_array.len() == current.len() {
+            // No identity to check by is not permission to trust position; it is
+            // the reason not to (`identity_field`).
+            if let (Some(identity), Some(document_array)) =
+                (identity_field(key), target.array_of_tables(key))
+            {
+                let addresses_the_same_entities = document_array.len() == current.len()
+                    && indexes.iter().all(|index| {
+                        matches!(
+                            (current.get(*index), document_array.get(*index)),
+                            (Some(before), Some(element))
+                                if elements_share_identity(identity, before, element)
+                        )
+                    });
+                if addresses_the_same_entities {
                     for index in indexes {
                         let (Some(before), Some(after), Some(element)) = (
                             current.get(index),
@@ -631,19 +739,14 @@ impl TargetTable<'_> {
                 // so the canonical positions inside the replacement would
                 // strand `[providers.capabilities]` on the far side of the
                 // user's `[web]` block. So the key reverts to the header
-                // default, its comment moves onto the block it documents (OQ-1:
-                // a comment travels with its key), and the block is placed as an
-                // addition so it renders contiguously.
+                // default, the comments it carried move onto the block they
+                // document (OQ-1: a comment travels with its key), and the block
+                // is placed as an addition so it renders contiguously.
                 let reshapes_a_value_into_sections = matches!(existing, Item::Value(_))
                     && matches!(replacement, Item::Table(_) | Item::ArrayOfTables(_));
                 carry_document_placement(existing, &mut replacement);
                 if reshapes_a_value_into_sections {
-                    let carried_comment = table
-                        .key(key)
-                        .and_then(|header| header.leaf_decor().prefix())
-                        .and_then(RawString::as_str)
-                        .filter(|prefix| prefix.contains('#'))
-                        .map(strip_leading_blank_lines);
+                    let carried_comment = carried_key_comment(table, key, existing);
                     place_addition(&mut replacement, appended_at);
                     if let Some(comment) = carried_comment {
                         prefix_first_section(&mut replacement, &format!("\n{comment}"));
@@ -790,6 +893,44 @@ fn place_addition(addition: &mut Item, appended_at: usize) {
         }
         _ => {}
     }
+}
+
+/// Every comment a key carries, gathered because the key's *spelling* is about
+/// to change from a value to `[[sections]]`.
+///
+/// Two places hold one, and both document the key rather than the old value:
+/// the block written above it (the key's own leaf decor) and the note written
+/// beside it (`providers = [ … ] # the one I pay for`, which lives in the
+/// value's suffix decor). The key survives the reshape — only its spelling
+/// changes — so both travel with it (OQ-1). A header's own decor is the only
+/// place a comment can live above a `[[…]]` block, so the note that sat beside
+/// the old line becomes a line of its own beneath the block that sat above it,
+/// in the order the two were written.
+///
+/// `None` when the key carried no comment at all, so nothing is prefixed.
+fn carried_key_comment(table: &Table, key: &str, existing: &Item) -> Option<String> {
+    let mut above = table
+        .key(key)
+        .and_then(|header| header.leaf_decor().prefix())
+        .and_then(RawString::as_str)
+        .filter(|prefix| prefix.contains('#'))
+        .map(strip_leading_blank_lines)
+        .unwrap_or_default();
+    if !above.is_empty() && !above.ends_with('\n') {
+        above.push('\n');
+    }
+    // Only the first line of the suffix: a trailing comment ends at the end of
+    // its line, and anything past that belongs to whatever follows the key.
+    let beside = existing
+        .as_value()
+        .and_then(|value| value.decor().suffix())
+        .and_then(RawString::as_str)
+        .map(|suffix| suffix.lines().next().unwrap_or_default().trim())
+        .filter(|note| note.starts_with('#'))
+        .map(|note| format!("{note}\n"))
+        .unwrap_or_default();
+    let carried = format!("{above}{beside}");
+    (!carried.is_empty()).then_some(carried)
 }
 
 /// Render `comment` in front of the first section an item produces.
@@ -1343,6 +1484,272 @@ tier = "off"
         assert_eq!(reloaded, candidate);
     }
 
+    /// Two privacy boundaries, each with a comment of its own, in the order the
+    /// daemon read them. `teton privacy set <glob> <mode>` replaces the matching
+    /// row in place, so this is the array whose per-index edits are a *privacy*
+    /// claim rather than a formatting one.
+    const BOUNDARIES_CONFIG: &str = r#"effort = "high"
+
+[[boundaries]]
+# The one that must never leave this machine.
+path_glob = "secrets/**"
+mode = "local-only"
+
+[[boundaries]]
+# Notes. Fine to send once they have been through the redactor.
+path_glob = "docs/**"
+mode = "local-only"
+"#;
+
+    /// The same two boundaries, swapped by hand while the daemon runs — the
+    /// drift BR-5 leaves the daemon blind to.
+    const BOUNDARIES_REORDERED: &str = r#"effort = "high"
+
+[[boundaries]]
+# Notes. Fine to send once they have been through the redactor.
+path_glob = "docs/**"
+mode = "local-only"
+
+[[boundaries]]
+# The one that must never leave this machine.
+path_glob = "secrets/**"
+mode = "local-only"
+"#;
+
+    /// The mode the written document gives a glob, read back through the
+    /// production loader — the only reading that matters, because it is the one
+    /// the daemon boots on.
+    fn boundary_mode(document: &str, glob: &str) -> Option<crate::entities::BoundaryMode> {
+        Config::load(document)
+            .expect("the edited document must load")
+            .boundaries
+            .iter()
+            .find(|boundary| boundary.path_glob == glob)
+            .map(|boundary| boundary.mode)
+    }
+
+    #[test]
+    fn a_per_index_edit_lands_on_the_element_it_names_even_after_a_hand_reorder() {
+        use crate::entities::BoundaryMode;
+
+        // The security case, at the engine. The daemon holds [secrets, docs];
+        // `SetPrivacyBoundary { path_glob: "docs/**", … }` replaces the row it
+        // matches, so the delta is a same-length one-element edit at **index
+        // 1**. Let the user swap the two blocks in the file mid-session and
+        // index 1 of the document is `secrets/**`: applied by position, this
+        // write relaxes the secrets boundary to `redact-then-remote` and
+        // validates cleanly — a privacy guarantee inverted with no error
+        // anywhere to notice it by.
+        let current = Config::load(BOUNDARIES_CONFIG).expect("two boundaries load");
+        assert_eq!(
+            current.boundaries[1].path_glob, "docs/**",
+            "non-vacuity: the edit below is at index 1",
+        );
+        assert_eq!(
+            Config::load(BOUNDARIES_REORDERED)
+                .expect("the reordered document loads")
+                .boundaries[1]
+                .path_glob,
+            "secrets/**",
+            "non-vacuity: index 1 of the document is now the other boundary",
+        );
+        let mut candidate = current.clone();
+        candidate.boundaries[1].mode = BoundaryMode::RedactThenRemote;
+
+        // In order: the identity key agrees, so the edit is applied in place and
+        // the comments inside the array survive — the whole reason per-index
+        // matching exists.
+        let in_order =
+            apply_config_delta(BOUNDARIES_CONFIG, &current, &candidate).expect("edit applies");
+        assert_eq!(
+            boundary_mode(&in_order, "docs/**"),
+            Some(BoundaryMode::RedactThenRemote)
+        );
+        assert_eq!(
+            boundary_mode(&in_order, "secrets/**"),
+            Some(BoundaryMode::LocalOnly)
+        );
+        assert!(
+            in_order.contains("# The one that must never leave this machine."),
+            "an in-order per-index edit keeps the array's comments:\n{in_order}",
+        );
+
+        // Reordered: `path_glob` disagrees at the index the delta names, so the
+        // edit falls through to the wholesale replacement.
+        let edited =
+            apply_config_delta(BOUNDARIES_REORDERED, &current, &candidate).expect("edit applies");
+
+        assert_eq!(
+            boundary_mode(&edited, "docs/**"),
+            Some(BoundaryMode::RedactThenRemote),
+            "the write must land on the glob it named:\n{edited}",
+        );
+        assert_eq!(
+            boundary_mode(&edited, "secrets/**"),
+            Some(BoundaryMode::LocalOnly),
+            "and must not relax the one it did not name:\n{edited}",
+        );
+        // Which path was taken, said out loud rather than inferred: the
+        // fallback re-renders the array, so the comments *inside* it are the
+        // price of not writing to the wrong element. Everything outside it
+        // survives, as it does under every other branch.
+        assert!(
+            !edited.contains("# The one that must never leave this machine."),
+            "the wholesale fallback is what ran, and its cost is the array's \
+             comments — if this survived, the per-index path took the edit and \
+             the assertions above are passing for the wrong reason:\n{edited}",
+        );
+        assert!(
+            edited.contains(r#"effort = "high""#),
+            "the fallback replaces one key, not the document:\n{edited}",
+        );
+    }
+
+    #[test]
+    fn a_reordered_providers_array_does_not_bind_a_rotated_credential_to_another_endpoint() {
+        // The same defect in the array the writers touch most. Memory holds
+        // [anthropic, mirror]; the user swaps them by hand; `teton provider add
+        // anthropic --auth-ref …` rotates the credential, which
+        // replace-or-insert applies at **index 0**. By position that writes the
+        // new keychain reference — and anthropic's model and kind — onto the
+        // mirror's entry, leaving a document that sends the rotated credential
+        // to `mirror.example.com` and still validates.
+        const IN_ORDER: &str = r#"[[providers]]
+# The one I actually pay for.
+id = "anthropic"
+kind = "anthropic"
+endpoint = "https://api.anthropic.com"
+model = "claude-opus-5"
+auth_ref = "keychain:anthropic-old"
+
+[[providers]]
+id = "mirror"
+kind = "openai-compatible"
+endpoint = "https://mirror.example.com/v1"
+model = "mirror-model"
+auth_ref = "keychain:mirror"
+"#;
+        let reordered = {
+            let mut blocks: Vec<&str> = IN_ORDER.split("[[providers]]").collect();
+            blocks.swap(1, 2);
+            blocks.join("[[providers]]")
+        };
+        let current = Config::load(IN_ORDER).expect("two providers load");
+        assert_eq!(current.providers[0].id, "anthropic");
+        assert_eq!(
+            Config::load(&reordered)
+                .expect("the reordered document loads")
+                .providers[0]
+                .id,
+            "mirror",
+            "non-vacuity: the document's index 0 is the other provider",
+        );
+        let mut candidate = current.clone();
+        candidate.providers[0].auth_ref = Some("keychain:anthropic-rotated".to_owned());
+
+        let edited = apply_config_delta(&reordered, &current, &candidate).expect("edit applies");
+
+        let reloaded = Config::load(&edited).expect("the edited document must load");
+        let provider = |id: &str| {
+            reloaded
+                .providers
+                .iter()
+                .find(|provider| provider.id == id)
+                .unwrap_or_else(|| panic!("`{id}` survived the write:\n{edited}"))
+                .clone()
+        };
+        assert_eq!(
+            provider("anthropic").auth_ref.as_deref(),
+            Some("keychain:anthropic-rotated"),
+            "the rotation must land on the provider it named:\n{edited}",
+        );
+        assert_eq!(
+            provider("mirror").auth_ref.as_deref(),
+            Some("keychain:mirror"),
+            "and must not attach the new credential to another endpoint:\n{edited}",
+        );
+        assert_eq!(
+            provider("mirror").endpoint.as_deref(),
+            Some("https://mirror.example.com/v1"),
+        );
+        assert!(
+            !edited.contains("# The one I actually pay for."),
+            "the wholesale fallback is what ran; if this comment survived, the \
+             per-index path took the edit:\n{edited}",
+        );
+    }
+
+    #[test]
+    fn a_longer_candidate_whose_prefix_also_changed_is_replaced_wholesale() {
+        // The classification edge with no witness until now, and the costliest
+        // of the four branches to reach silently: the array grew *and* an
+        // element already there changed, so neither "append past what is there"
+        // nor "edit at these indexes" describes it. There is no correspondence
+        // worth trusting, so the array is re-rendered — and the comment and
+        // unknown key inside the existing entry are the recorded cost.
+        let current = registered_provider();
+        let mut candidate = current.clone();
+        candidate.providers[0].model = Some("claude-sonnet-4".to_owned());
+        candidate.providers.push(second_provider());
+
+        let edited = apply_config_delta(REGISTERED_PROVIDER_CONFIG, &current, &candidate)
+            .expect("edit applies");
+
+        let reloaded = Config::load(&edited).expect("the edited document must load");
+        assert_eq!(
+            reloaded, candidate,
+            "the array says what the candidate says"
+        );
+        assert!(
+            !edited.contains("# The one I actually pay for."),
+            "a wholesale replacement re-renders the array canonically:\n{edited}",
+        );
+        assert!(
+            !edited.contains(r#"nickname = "the good one""#),
+            "and takes the unknown key inside it with it — the cost, pinned so a \
+             change to the classification cannot make it silent:\n{edited}",
+        );
+        assert!(
+            edited.contains("# The comment that must not move."),
+            "everything outside the array survives:\n{edited}",
+        );
+    }
+
+    #[test]
+    fn a_duplicate_key_refusal_names_the_key_and_still_quotes_no_value() {
+        // The module's claim, narrowed to what it can actually promise. A
+        // duplicate key is a *parse* failure whose diagnosis names the key —
+        // schema vocabulary, and the one thing from the document that does
+        // reach the log. The value on the line never does, which is the half
+        // that matters: this file is secret-adjacent.
+        const DOUBLED: &str = "[web]\n\
+                               tier = \"off\"\n\
+                               search_key_ref = \"keychain://teton/web-search\"\n\
+                               tier = \"search\"\n";
+        let current = Config::default();
+        let mut candidate = current.clone();
+        candidate.web.tier = WebTier::FetchAnyUrl;
+
+        let refusal = apply_config_delta(DOUBLED, &current, &candidate)
+            .expect_err("a duplicate key is not parseable TOML");
+
+        let message = refusal.to_string();
+        assert!(
+            message.contains("line 4"),
+            "a refusal says where:\n{message}",
+        );
+        assert!(
+            message.contains("tier"),
+            "the parser's diagnosis names the duplicated key, and this keeps it \
+             verbatim:\n{message}",
+        );
+        assert!(
+            !message.contains("keychain://teton/web-search"),
+            "no value from the document may reach a loggable message \
+             (BR-7):\n{message}",
+        );
+    }
+
     #[test]
     fn an_inline_array_of_tables_is_rewritten_as_a_block_the_document_can_hold() {
         // The third spelling of an array-of-tables: values, not sections. The
@@ -1353,7 +1760,7 @@ tier = "off"
         // separator the *next* section owns, and is left alone: trimming it
         // would mean editing rendered text outside the parser.)
         let document = r#"# The provider, on one line because I like it that way.
-providers = [ { id = "anthropic", kind = "anthropic", endpoint = "https://api.anthropic.com", auth_ref = "keychain:anthropic" } ]
+providers = [ { id = "anthropic", kind = "anthropic", endpoint = "https://api.anthropic.com", auth_ref = "keychain:anthropic" } ] # and the one I pay for
 
 [web]
 # The comment that must not move.
@@ -1384,14 +1791,22 @@ tier = "off"
             edited.contains("# The comment that must not move."),
             "{edited}"
         );
-        // The comment above the key documented the key, and the key still
+        // The comments around the key documented the key, and the key still
         // exists — only its spelling changed. Rendered through the header's own
-        // decor it would have produced `[[# …⏎providers]]`, which is not TOML at
-        // all, so it moves onto the block instead of into the brackets (OQ-1).
+        // decor they would have produced `[[# …⏎providers]]`, which is not TOML
+        // at all, so they move onto the block instead of into the brackets
+        // (OQ-1). Both of them: the block above the key *and* the note that sat
+        // beside it, which has nowhere else to go once the line it annotated is
+        // gone — a comment silently deleted is the collateral this whole module
+        // exists to end.
         assert!(
-            edited
-                .contains("# The provider, on one line because I like it that way.\n[[providers]]"),
-            "the key's comment travels with it:\n{edited}",
+            edited.contains(
+                "# The provider, on one line because I like it that way.\n\
+                 # and the one I pay for\n\
+                 [[providers]]"
+            ),
+            "both of the key's comments travel with it, in the order they were \
+             written:\n{edited}",
         );
 
         let reloaded = Config::load(&edited).expect("the edited document must load");

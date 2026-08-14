@@ -59,11 +59,14 @@ exactly those key-level sets/removals to the on-disk document parsed with
     existing elements are not read, re-rendered or moved; only the new ones are
     written, at the render position past the whole of the array already there
     (its nested sub-tables included — see the limitations below);
-  - *per-index* — same length, some elements differ. Each differing element is
-    recursed into as a table, so only the keys that changed inside it move;
-  - *wholesale* — shrunk, reordered, or the document spells the array some other
-    way. No index correspondence to trust, so the array is replaced with the
-    candidate's canonical rendering where it stood, comments inside it and all.
+  - *per-index* — same length, some elements differ, **and the document's
+    element at each edited index carries the same identity key value as the
+    `current` element the index was computed against**. Each differing element
+    is recursed into as a table, so only the keys that changed inside it move;
+  - *wholesale* — shrunk, reordered, the identity check failed, or the document
+    spells the array some other way. No index correspondence to trust, so the
+    array is replaced with the candidate's canonical rendering where it stood,
+    comments inside it and all.
 
   The original decision wrote arrays off as one key on the ground that
   element-wise diffing needs an identity function per array type. That is right
@@ -75,20 +78,72 @@ exactly those key-level sets/removals to the on-disk document parsed with
   writers that could break it. So the two shapes that *do* have a trustworthy
   correspondence get one, and everything else keeps the recorded exception.
 
-  **The index-matching residual.** Per-index matching trusts position, and BR-5
-  leaves the daemon blind to drift until restart. A user who *reorders*
-  `[[providers]]` by hand mid-session, without changing how many there are, and
-  is then hit by a same-length element edit, gets that edit applied at the
-  position rather than to the provider. The result still passes
-  `Config::validate` before it lands (BR-4), and the alternative — wholesale —
-  destroys strictly more in that same scenario. Recorded, not fixed: fixing it
-  means the per-array identity function this ADR declined, which a `providers`
-  array whose ids are themselves editable does not actually escape.
+  **The index-matching residual is closed by an identity guard.** *Amended
+  again after the final verify pass; what this paragraph previously recorded as
+  an accepted residual was a security defect, and it shipped fixed.* Per-index
+  matching trusts position, and BR-5 leaves the daemon blind to drift until
+  restart. A user who *reorders* an array by hand mid-session, without changing
+  how many there are, and is then hit by a same-length element edit, got that
+  edit applied at the position rather than to the entity — and `Config::validate`
+  cannot catch it, because the result is a perfectly valid config that says
+  something the user never asked for. Reproduced end to end, twice:
+  `SetPrivacyBoundary { path_glob: "docs/**", mode: redact-then-remote }` after a
+  reorder relaxed `secrets/**` instead (a privacy guarantee silently inverted),
+  and re-registering a provider with a rotated `auth_ref` bound the new keychain
+  reference to another entry's endpoint.
+
+  The fix is the per-array identity function this ADR twice declined, and it is
+  cheaper than the ADR assumed because it is not a new opinion about identity —
+  it is the key the *writers already match on*, asked of the document
+  (`config_doc::identity_field`):
+
+  | array | element type | identity key |
+  |-------|--------------|--------------|
+  | `providers` | `ModelProvider` | `id` |
+  | `mcp_server` | `McpServerConfig` | `id` |
+  | `boundaries` | `PrivacyBoundary` | `path_glob` |
+  | `tiers` | `TierBinding` | `tier` |
+  | `categories` | `CategoryOverride` | `name` |
+  | `routing` (`legacy_routing`) | `LegacyRoutingRule` | `phase` |
+
+  Before an element is edited, the document's element at that index must agree
+  with canonical(`current`)'s at the same index on that key. A mismatch, a
+  missing key on either side, or an array name not in the table above (the
+  conservative default — unreachable in practice, since both sides of the delta
+  are canonical `Config` serializations) falls through to *wholesale*. Only the
+  indexes the delta actually edits are checked: an element the write never
+  touches may sit wherever the user moved it, and refusing over that would spend
+  the array's comments to protect something nothing was going to write to.
+
+  **The cost, stated honestly.** The fallback is semantically correct in every
+  case — the named entity gets the change, the others keep their values — but it
+  re-renders the array, so comments and unknown keys *inside* it are lost
+  (nothing outside it moves). That is the trade this now makes deliberately: a
+  lossy write the user can see, rather than a lossless write of the wrong thing.
+  Witnesses: `config_doc::a_per_index_edit_lands_on_the_element_it_names_even_
+  after_a_hand_reorder` (which asserts both the semantics and, via comment
+  survival, *which* branch ran) and `config_doc::a_reordered_providers_array_
+  does_not_bind_a_rotated_credential_to_another_endpoint`.
+
+  **The append branch deliberately has no such guard**, and that is a decision
+  rather than an omission: it reads no existing element (it pushes past them), so
+  there is no element to mis-target. The one collision it can produce is a
+  duplicate identity from an element the user hand-added mid-session, and the
+  edited-bytes gate already refuses exactly that, in the validator's own words,
+  leaving the file untouched. Adding a second guard would buy a different
+  sentence for a case already covered while turning every safe append into a
+  wholesale rewrite whenever the document's array is longer than memory's.
+  Witness: `config_preservation::a_hand_added_provider_under_the_id_being_
+  registered_refuses_the_write`.
 
   **The inline spelling reshapes.** A document that spells the array as values
   (`providers = [ { … } ]`) cannot hold the delta's sections, so that one edit
-  rewrites the key into `[[providers]]` blocks and moves the key's comment onto
-  the first header (OQ-1: a comment travels with its key).
+  rewrites the key into `[[providers]]` blocks and moves the key's comments onto
+  the first header (OQ-1: a comment travels with its key). *Both* of them: the
+  block written above the key and the note written beside it
+  (`providers = [ … ] # mine`), which lives in the value's suffix decor and had
+  nowhere to go once the line it annotated was gone. They render as consecutive
+  comment lines above the block, in the order they were written.
 - **Key removal (resolves spec OQ-1)**: a key present in canonical(current)
   but absent in canonical(candidate) is removed from the document. toml_edit
   removes the key together with its attached decor (the comment block prefixed
@@ -96,6 +151,32 @@ exactly those key-level sets/removals to the on-disk document parsed with
   comments travel with their key; free-standing table decor survives. The
   existing `an_answer_that_omits_a_key_removes_it_and_says_so` behavior
   (runtime.rs:15967) is preserved through this path.
+
+- **One bounded exception to the base rule: `/web setup`'s four answered
+  fields** (`DeltaBase::DocumentPinsWebAnswers`, added during implementation).
+  The flow's candidate is memory-plus-answers, so an answer that happens to
+  *equal* memory is not in `diff(current, candidate)` at all — and if the
+  document has drifted at that field, the delta names nothing, the drift stays,
+  and the daemon still reports `applied: true`. So for `tier`,
+  `search_endpoint`, `search_key_ref` and `search_auth`, and only those four,
+  the delta base takes the **document's own parse**. Every other key, and every
+  other writer, keeps the rule above (`permission_allow`, `cache_ttl_secs` and
+  `allowed_domains` ride along from memory — a setup answer is not an answer
+  about consent, LESSON-495; witness `web_setup_flow::a_key_the_answers_are_
+  not_about_survives_a_commit_that_lands`).
+
+  That parse is `Config::from_toml`, **not** `Config::load`: validity is a
+  property of the whole config, so validating here let an unrelated invalid key
+  switch the pinning off — and the case that costs is the one `/web setup` is
+  re-run *for*. Comment out `search_endpoint` under `tier = "search"` and the
+  document is invalid at the pinned field itself; pinning fell back to memory,
+  memory still held the endpoint, the delta came out empty, and the edited-bytes
+  gate then refused the write over the drift the user was trying to heal.
+  Parsing instead makes the document's missing endpoint part of the base, so the
+  answer is written back. Nothing is loosened: the bytes that would land still
+  go through the full `Config::load` gate (BR-4). Witness:
+  `web_setup_flow::a_document_invalid_at_web_is_healed_by_re_running_setup_with_
+  the_same_answers`.
 
 #### Recorded limitations of the shipped engine
 
@@ -106,6 +187,11 @@ here rather than left to be rediscovered:
    endings as `\n`, so the first daemon-side save to a CRLF document converts
    the whole file. Nothing else about it moves. Witness:
    `config_doc::the_first_write_to_a_crlf_document_normalizes_its_line_endings`.
+   One consequence reaches the wire: `/web setup`'s no-op test is a *byte*
+   comparison, so the first commit over a CRLF-authored document reports
+   `applied: true` for answers the document already agrees with. Honest (the
+   file did change), once per document, and noted at
+   `EditedDocument::unchanged`.
 2. **A whitespace-only file is the empty edit base.** The engine treats a
    document holding only whitespace as the empty document
    (`document_is_effectively_empty`): there is nothing in it to preserve, and

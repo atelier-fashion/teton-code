@@ -4064,6 +4064,11 @@ impl DaemonRuntime {
     /// capability dark until a restart is not, so that case takes the (byte-
     /// identical) write, the swap, and the notice.
     ///
+    /// The byte half is a claim about bytes, line endings included: the first
+    /// commit over a CRLF-authored document reports `applied: true` even for
+    /// answers the document already agrees with, because the write normalizes
+    /// its line endings (see [`EditedDocument::unchanged`]). Once.
+    ///
     /// # Errors
     /// - [`error_code::WEB_SETUP_INVALID`] — the candidate would not load,
     ///   names a tier this machine cannot serve, no longer matches the digest
@@ -4816,16 +4821,17 @@ fn load_failure_reason(err: &teton_core::config::LoadError, edited: &str) -> Str
 
 /// The 1-based line and column of `offset` in `text`.
 ///
-/// Byte-counted, like the span it is given: a column here locates a failure for
-/// a bug report, it does not index a grapheme.
+/// [`teton_core::config_doc::position_of`]'s arithmetic, not a second copy of
+/// it. This used to slice `&text[..offset]`, which **panics** when a span lands
+/// mid-character — and a config document holds arbitrary UTF-8 in its comments,
+/// so a byte offset into one is not a char boundary by construction. The panic
+/// would fire inside the held config mutex, poisoning it, and every later
+/// `lock().expect(…)` in this daemon would abort the process: a mislocated
+/// column in a bug report turned into a daemon that stops serving. The shared
+/// function walks bytes instead, and counts characters for the column, so an
+/// offset that lands anywhere at all still answers.
 fn line_and_column(text: &str, offset: usize) -> (usize, usize) {
-    let head = &text[..offset.min(text.len())];
-    let line = head.matches('\n').count() + 1;
-    let column = head
-        .rfind('\n')
-        .map_or(head.len(), |nl| head.len() - nl - 1)
-        + 1;
-    (line, column)
+    teton_core::config_doc::position_of(text, offset)
 }
 
 /// Which config the delta's `current` side is taken from.
@@ -4875,6 +4881,15 @@ struct EditedDocument {
     /// candidate equal to the in-memory config can still edit the file (the
     /// document drifted at a key the answers pin), and a candidate that differs
     /// from it can leave the file alone (the document drifted *to* the answer).
+    ///
+    /// **Byte-identical, and CRLF is a byte.** The engine re-renders a document
+    /// authored with `\r\n` using `\n` on the first write it makes to it
+    /// (`config_doc`'s recorded limitation). So the first commit over such a
+    /// file reports `unchanged: false` — and `applied: true` — for an answer
+    /// that changes nothing *semantically*: the diff is the invisible line
+    /// endings. That is honest rather than a bug (the file really did change,
+    /// and the user's next `git diff` will say so), it happens once per
+    /// document, and the second commit over the same answers is a true no-op.
     unchanged: bool,
 
     /// The `[web]` table of the delta's base — memory's, or, under
@@ -4888,15 +4903,30 @@ struct EditedDocument {
 }
 
 /// `current` with the four fields `/web setup` pins replaced by the document's
-/// own parse of them, or `None` when the document does not load.
+/// own parse of them, or `None` when the document does not parse.
 ///
 /// `None` is not a failure and is not reported: a document that will not parse
-/// is refused by [`apply_config_delta`] a moment later with the parse named, and
-/// one that parses but will not validate is refused by the edited-bytes gate at
-/// the end of the derivation. Falling back to the in-memory base keeps both of
-/// those the single place that speaks.
+/// is refused by [`apply_config_delta`] a moment later with the parse named.
+/// Falling back to the in-memory base keeps that the single place that speaks.
+///
+/// # Parse, not load — the gate is deliberately not doubled here
+///
+/// This asks the document *what it says*, and `Config::from_toml` answers that.
+/// It used to ask `Config::load`, which also **validates** — and validity is a
+/// property of the whole config, so an unrelated invalid key switched the
+/// pinning off. The case that costs: a user comments out `search_endpoint`
+/// under `tier = "search"` mid-session. The document is now invalid at `[web]`,
+/// so pinning would fall back to memory; memory still holds the endpoint, the
+/// answers repeat it, the delta is empty, and the edited-bytes gate then refuses
+/// the write over the very drift re-running `/web setup` with the same answers
+/// exists to heal. Parsing instead makes the document's missing endpoint part of
+/// the base, so the answer is written back and the file heals.
+///
+/// Nothing is loosened by this: the bytes that would land still go through
+/// `Config::load` at the end of the derivation (BR-4), so an edit that does not
+/// heal the document is still refused, with the validator's own sentence.
 fn pinned_delta_base(current: &Config, document: &str) -> Option<Config> {
-    let on_disk = Config::load(document).ok()?;
+    let on_disk = Config::from_toml(document).ok()?;
     let mut base = current.clone();
     base.web.tier = on_disk.web.tier;
     base.web.search_endpoint = on_disk.web.search_endpoint;
@@ -7778,13 +7808,21 @@ mod tests {
 
     /// A throwaway directory under the system temp dir, unique per test.
     fn scratch_dir(tag: &str) -> PathBuf {
+        // pid + nanos alone can collide when two tests hit the same clock tick,
+        // and this helper is shared by every `mod` below — including the ones
+        // that seed a config file and then read it back, where a collision is
+        // one test reading another's document. The counter is what the sibling
+        // integration suites add for the same reason (`config_preservation.rs`,
+        // `model_consent.rs`).
+        static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
         let dir = std::env::temp_dir().join(format!(
-            "teton-loadcfg-{tag}-{}-{}",
+            "teton-loadcfg-{tag}-{}-{}-{}",
             std::process::id(),
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .unwrap()
-                .as_nanos()
+                .as_nanos(),
+            NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
         ));
         std::fs::create_dir_all(&dir).unwrap();
         dir
@@ -8285,6 +8323,116 @@ search_auth = "X-Subscription-Token: {key}"
                     .is_empty(),
                 "the in-memory swap happens after the write, never before"
             );
+        }
+
+        /// **A span that lands mid-character is located, not panicked on**
+        /// (REQ-574 BR-6's mechanics).
+        ///
+        /// [`super::line_and_column`] used to slice `&text[..offset]`, which
+        /// **panics** on a byte offset that is not a char boundary — and a
+        /// config document holds arbitrary UTF-8 in its comments, so the offsets
+        /// a parser hands back are byte offsets into exactly that. Worse than a
+        /// crash on its own: this runs on the refusal path, under the held
+        /// config mutex, so the panic poisons the mutex and every later
+        /// `lock().expect(…)` in this daemon aborts the process. A mislocated
+        /// column is a cosmetic defect in a bug report; a poisoned config mutex
+        /// is a daemon that stops serving.
+        ///
+        /// So every offset into a multi-byte document must answer, including the
+        /// ones inside a character and the ones past the end.
+        #[test]
+        fn a_span_that_lands_mid_character_is_located_rather_than_panicked_on() {
+            const MULTI_BYTE: &str = "# ✅ の note\n[web]\ntier = \"off\"\n";
+            for offset in 0..=MULTI_BYTE.len() + 8 {
+                let (line, column) = super::line_and_column(MULTI_BYTE, offset);
+                assert!(
+                    line >= 1 && column >= 1,
+                    "offset {offset} answered ({line}, {column})"
+                );
+            }
+
+            // And it is still the right answer for the offsets the old slice
+            // could handle.
+            assert_eq!(super::line_and_column(MULTI_BYTE, 0), (1, 1));
+            let web_at = MULTI_BYTE.find("[web]").expect("the fixture names [web]");
+            assert_eq!(super::line_and_column(MULTI_BYTE, web_at), (2, 1));
+            let quote_at = MULTI_BYTE.find('"').expect("the fixture quotes a value");
+            assert_eq!(super::line_and_column(MULTI_BYTE, quote_at), (3, 8));
+            // Columns count characters, not bytes: `note` is the 7th character
+            // of that comment and the 11th byte of it, and a reader looking for
+            // column 11 in a line 10 characters long finds nothing.
+            let note_at = MULTI_BYTE.find("note").expect("the fixture has a note");
+            assert_eq!(super::line_and_column(MULTI_BYTE, note_at), (1, 7));
+        }
+
+        /// **The pinned base is the document's four answered fields over
+        /// memory's everything else** (ADR-1's one bounded exception).
+        ///
+        /// Asserted directly, because the flow-level witnesses can only see the
+        /// consequence: the four fields are the ones `/web setup` asks about, and
+        /// every other key — including the two `[web]` keys the flow carries
+        /// along without asking — must keep coming from memory, or a setup answer
+        /// would silently become an answer about consent (LESSON-495).
+        #[test]
+        fn the_pinned_base_takes_the_answered_fields_from_the_document_and_the_rest_from_memory() {
+            let mut memory = Config::default();
+            memory.web.tier = WebTier::Search;
+            memory.web.search_endpoint = Some("https://memory.example/search".to_owned());
+            memory.web.search_key_ref = Some("keychain://teton/memory".to_owned());
+            memory.web.search_auth = Some("X-Memory: {key}".to_owned());
+            memory.web.cache_ttl_secs = 900;
+            memory.web.permission_allow = vec![WebTier::Search];
+            memory.web.allowed_domains = Some(vec!["docs.rs".to_owned()]);
+            memory.effort = teton_core::effort::EffortLevel::High;
+
+            const DOCUMENT: &str = "\
+[web]
+tier = \"fetch_any_url\"
+search_endpoint = \"https://document.example/search\"
+search_key_ref = \"keychain://teton/document\"
+search_auth = \"X-Document: {key}\"
+cache_ttl_secs = 42
+permission_allow = [\"fetch_user_url\"]
+";
+            let base = super::pinned_delta_base(&memory, DOCUMENT).expect("the document parses");
+
+            assert_eq!(base.web.tier, WebTier::FetchAnyUrl);
+            assert_eq!(
+                base.web.search_endpoint.as_deref(),
+                Some("https://document.example/search")
+            );
+            assert_eq!(
+                base.web.search_key_ref.as_deref(),
+                Some("keychain://teton/document")
+            );
+            assert_eq!(base.web.search_auth.as_deref(), Some("X-Document: {key}"));
+            // Everything else is memory's, so drift there is still absent from
+            // the delta and still survives the write (BR-5).
+            assert_eq!(base.web.cache_ttl_secs, 900);
+            assert_eq!(base.web.permission_allow, vec![WebTier::Search]);
+            assert_eq!(base.web.allowed_domains, memory.web.allowed_domains);
+            assert_eq!(base.effort, teton_core::effort::EffortLevel::High);
+
+            // Parse, not load. A document that is *invalid* — `search` with the
+            // endpoint commented out, the shape a mid-session hand edit leaves —
+            // still pins, because pinning is how the answer that heals it gets
+            // written. Validating here instead would fall back to memory, leave
+            // the delta empty, and refuse the write at the edited-bytes gate:
+            // `/web setup` declining to fix the very drift it was re-run for.
+            let invalid = super::pinned_delta_base(&memory, "[web]\ntier = \"search\"\n")
+                .expect("an invalid document still parses");
+            assert!(
+                invalid.web.search_endpoint.is_none(),
+                "the document's missing endpoint is what the answer is written against"
+            );
+            assert!(
+                Config::load("[web]\ntier = \"search\"\n").is_err(),
+                "non-vacuity: that document really would not load"
+            );
+
+            // Unparseable is the one case with no answer here; the delta engine
+            // refuses a moment later, naming the parse failure.
+            assert!(super::pinned_delta_base(&memory, "[web]\ntier = ").is_none());
         }
 
         /// **A file that is there and cannot be read is not treated as an empty
@@ -16983,6 +17131,154 @@ search_endpoint = \"https://search.example.com/search\"
             assert!(
                 written.contains("# my teton config, written by hand"),
                 "the answer was written back by rewriting the document:\n{written}"
+            );
+        }
+
+        /// **A document the hand edit made *invalid* is healed by re-running
+        /// setup, not refused** (REQ-574 BR-3/BR-4, ADR-1's pinned base).
+        ///
+        /// The sharper edge of the case above, and the one the pinned base used
+        /// to miss because it asked `Config::load` — parse **and** validate —
+        /// what the document says. Comment out `search_endpoint` under
+        /// `tier = "search"` and the document is invalid *at the very field the
+        /// answers pin*: pinning switched off, the base fell back to memory,
+        /// memory still held the endpoint, so the answers matched the base, the
+        /// delta was empty, and the edited-bytes gate then refused the write over
+        /// the drift. `/web setup`, re-run with the same answers, declining to
+        /// fix the thing it was re-run to fix — with an error naming a key the
+        /// user had just been asked about.
+        ///
+        /// Asking `Config::from_toml` instead makes the document's *missing*
+        /// endpoint part of the base, so the answer is a difference, and the
+        /// write heals the file. Nothing is loosened: the bytes that land still
+        /// go through the full validator (BR-4), which is what makes this land
+        /// rather than merely attempt.
+        #[test]
+        fn a_document_invalid_at_web_is_healed_by_re_running_setup_with_the_same_answers() {
+            const SEARCHING: &str = "\
+# my teton config, written by hand
+[web]
+tier = \"search\"
+search_endpoint = \"https://search.example.com/search\"
+";
+            let (runtime, config_path) = runtime_seeded("web-setup-heal-invalid", SEARCHING);
+            with_local_model(&runtime);
+            let events = Arc::new(EventBus::new());
+
+            // The hand edit: the endpoint is commented out and the tier is left
+            // where it was, which is a document the daemon would refuse to
+            // start on.
+            let drifted =
+                SEARCHING.replace("search_endpoint = \"https", "# search_endpoint = \"https");
+            std::fs::write(&config_path, &drifted).expect("the hand edit lands");
+            assert!(
+                load_config(Some(&config_path)).is_err(),
+                "non-vacuity: the drifted document really is invalid, not merely \
+                 changed"
+            );
+
+            // The same answers the file used to hold — the user re-running
+            // `/web setup` to put it back.
+            let params = preview_params(
+                WireWebTier::Search,
+                Some("https://search.example.com/search"),
+                None,
+                None,
+            );
+            let preview = runtime
+                .web_setup_preview(&params)
+                .expect("a document this write would heal must still preview");
+            let committed = runtime
+                .web_setup_commit(&as_commit_expecting(&params, &preview.digest), &events)
+                .expect("the commit heals the document rather than refusing it");
+            assert!(committed.applied);
+
+            let written = std::fs::read_to_string(&config_path).expect("read");
+            let healed = load_config(Some(&config_path))
+                .unwrap_or_else(|err| panic!("the written document must load: {err}\n{written}"));
+            assert_eq!(healed.web.tier, WebTier::Search);
+            assert_eq!(
+                healed.web.search_endpoint.as_deref(),
+                Some("https://search.example.com/search"),
+                "the answered endpoint is missing from the file the daemon would \
+                 boot on:\n{written}"
+            );
+            assert!(
+                written.contains("# my teton config, written by hand"),
+                "the document was healed by editing it, not by replacing it:\n{written}"
+            );
+        }
+
+        /// **A key the answers are not about survives a commit that lands**
+        /// (BR-5, LESSON-495).
+        ///
+        /// The pinned base is a bounded exception — four fields — and the bound
+        /// is what this pins. `cache_ttl_secs` and `permission_allow` sit in the
+        /// same `[web]` table, ride along in the candidate from memory, and are
+        /// never asked about; a hand edit to either must therefore survive a
+        /// commit that really does write. The neighbouring witnesses all watch
+        /// commits that *refuse* or that change only the pinned fields, so a base
+        /// rule that quietly widened to "the whole `[web]` table" would pass every
+        /// one of them and clobber a consent decision here.
+        #[test]
+        fn a_key_the_answers_are_not_about_survives_a_commit_that_lands() {
+            const SEED: &str = "\
+# my teton config, written by hand
+[web]
+tier = \"fetch_user_url\"
+cache_ttl_secs = 900
+permission_allow = [\"fetch_user_url\"]
+";
+            let (runtime, config_path) = runtime_seeded("web-setup-unpinned-drift", SEED);
+            let events = Arc::new(EventBus::new());
+            {
+                let config = runtime.config.lock().expect("config mutex");
+                assert_eq!(config.web.cache_ttl_secs, 900);
+                assert_eq!(config.web.permission_allow, vec![WebTier::FetchUserUrl]);
+            }
+
+            // The user edits two keys `/web setup` never asks about, while the
+            // daemon runs and stays blind to it.
+            let drifted = SEED
+                .replace("cache_ttl_secs = 900", "cache_ttl_secs = 42")
+                .replace(
+                    "permission_allow = [\"fetch_user_url\"]",
+                    "permission_allow = [\"fetch_user_url\", \"fetch_any_url\"]",
+                );
+            std::fs::write(&config_path, &drifted).expect("the hand edit lands");
+
+            // A commit that changes something: the ceiling moves up a rung.
+            let params = preview_params(WireWebTier::FetchAnyUrl, None, None, None);
+            let preview = runtime.web_setup_preview(&params).expect("previews");
+            let committed = runtime
+                .web_setup_commit(&as_commit_expecting(&params, &preview.digest), &events)
+                .expect("commits");
+            assert!(
+                committed.applied,
+                "non-vacuity: this must be a write that actually lands, or the \
+                 survival below is the survival of a file nobody touched"
+            );
+
+            let written = std::fs::read_to_string(&config_path).expect("read");
+            let reloaded = load_config(Some(&config_path)).expect("the written document loads");
+            assert_eq!(
+                reloaded.web.tier,
+                WebTier::FetchAnyUrl,
+                "the answer landed:\n{written}"
+            );
+            assert_eq!(
+                reloaded.web.cache_ttl_secs, 42,
+                "a key the answers are not about was rewritten from memory \
+                 (BR-5):\n{written}"
+            );
+            assert_eq!(
+                reloaded.web.permission_allow,
+                vec![WebTier::FetchUserUrl, WebTier::FetchAnyUrl],
+                "a setup answer is not an answer about consent (LESSON-495):\n{written}"
+            );
+            assert!(
+                written.contains("# my teton config, written by hand"),
+                "{written}"
             );
         }
 
