@@ -89,6 +89,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
+use teton_core::apply_config_delta;
 use teton_core::boundary::BoundaryMatcher;
 use teton_core::capability::{web_capability_state, SearchGap, WebCapabilityState};
 use teton_core::category::{
@@ -2185,8 +2186,11 @@ impl DaemonRuntime {
             .validate()
             .map_err(|e| RpcError::new(error_code::CONFIG_REJECTED, e.to_string()))?;
         if let Some(path) = &self.config_path {
-            // BUG-155: atomic, like every other durable write in this daemon.
-            if let Err(err) = write_config_atomically(path, &candidate) {
+            // BUG-155: atomic, like every other durable write in this daemon —
+            // and, since REQ-574, an edit of the on-disk document rather than a
+            // re-serialization of it, with the still-held `config` as the
+            // delta's `current` side (ADR-1).
+            if let Err(err) = persist_config(path, &config, &candidate) {
                 return Err(RpcError::new(
                     error_code::CONFIG_REJECTED,
                     format!(
@@ -3816,8 +3820,8 @@ impl DaemonRuntime {
     /// to say.
     ///
     /// # Errors
-    /// A message naming what stopped the write, in two cases the caller must
-    /// distinguish from success because both mean "this did not become
+    /// A message naming what stopped the write, in three cases the caller must
+    /// distinguish from success because each means "this did not become
     /// permanent":
     ///
     /// - **no config file** — a defaulted config has no path to write, so
@@ -3828,6 +3832,10 @@ impl DaemonRuntime {
     ///   `search_endpoint` is a config this daemon refuses to start on, so
     ///   validating the candidate first is what keeps a consent answer from
     ///   bricking the next start.
+    /// - **the document on disk cannot be edited** — an unparseable file, or one
+    ///   whose own hand edits fail validation, refuses with that reason named
+    ///   rather than being overwritten (REQ-574 BR-4/BR-6, via
+    ///   [`persist_config`]).
     pub fn persist_web_tier(&self, tier: WebTier) -> Result<(), String> {
         let mut config = self.config.lock().expect("config mutex poisoned");
         let mut candidate = config.clone();
@@ -3855,7 +3863,7 @@ impl DaemonRuntime {
                     .to_owned(),
             );
         };
-        write_config_atomically(path, &candidate)
+        persist_config(path, &config, &candidate)
             .map_err(|err| format!("the configuration could not be saved ({err})"))?;
         *config = candidate;
         Ok(())
@@ -3998,9 +4006,11 @@ impl DaemonRuntime {
     ///    sent one, is checked against the preview's
     ///    [`digest`](WebSetupCommitParams::expect_digest), so re-deriving cannot
     ///    quietly pick up a change another session made in between;
-    /// 2. the whole document is written atomically, through the same
-    ///    [`write_config_atomically`] seam [`Self::persist_web_tier`] uses, so
-    ///    there is exactly one config-write body in this daemon;
+    /// 2. the document is written atomically, through the same
+    ///    [`persist_config`] seam [`Self::persist_web_tier`] uses, so there is
+    ///    exactly one config-write body in this daemon — and, since REQ-574, the
+    ///    write edits the on-disk document rather than replacing it, so the
+    ///    user's comments and unknown keys survive a setup commit;
     /// 3. only then is the in-memory config replaced. `build_tools` clones that
     ///    config per turn, so the very next turn of **every** session picks the
     ///    capability up with no restart (ADR-1, OQ-1).
@@ -4065,9 +4075,12 @@ impl DaemonRuntime {
                  enabled",
             ));
         };
-        write_config_atomically(path, &candidate).map_err(|err| {
+        persist_config(path, &config, &candidate).map_err(|err| {
             // Names the failure class and never the path (BR-11), exactly as
-            // `persist_web_tier`'s own message does.
+            // `persist_web_tier`'s own message does. The parenthesis carries the
+            // *inner* reason — an unparseable document, a hand edit that fails
+            // validation — because a user who has to fix their file needs to be
+            // told what is wrong with it (REQ-574 BR-6, LESSON-456).
             RpcError::new(
                 error_code::INTERNAL_ERROR,
                 format!("the configuration could not be saved ({err})"),
@@ -4617,8 +4630,93 @@ impl WebTierPersistence for DaemonRuntime {
     }
 }
 
-/// Serialize `config` and replace `path` with it **atomically** — a sibling temp
-/// file, flushed to disk, then renamed over the target.
+/// Make `candidate` durable at `path` by **editing the document that is there**
+/// (REQ-574 BR-1/BR-5) — the one config-write entry point in this daemon.
+///
+/// Every daemon-side write used to hand [`write_config_atomically`] a whole
+/// `Config` and get a fresh `Config::to_toml()` serialization on disk, so a
+/// consent answer about `[web]` normalized key order, dropped every comment, and
+/// silently discarded unknown keys the schema ignores at load. The README
+/// teaches a hand-written, heavily commented `[web]` block *and* `/web setup` in
+/// the same section, which made that collateral user-facing. Here the on-disk
+/// text is read, the operation's semantic delta is applied to it
+/// ([`apply_config_delta`]), and everything the delta does not name survives
+/// byte-for-byte.
+///
+/// # The delta base is the caller's `current`, never the parse of the file
+///
+/// ADR-1, and the line the whole preservation property rests on: the delta is
+/// `diff(current, candidate)`, and both come from the caller — which holds them
+/// already, because every candidate here is built by clone-and-mutate. Diffing
+/// the *document* against the candidate instead would classify a hand edit the
+/// daemon has not seen (it stays blind to drift until restart, BR-5) as
+/// "changed" and write the stale in-memory value back over it: the exact clobber
+/// this REQ exists to remove. With `current`, drift at a key the operation does
+/// not touch is never in the delta and survives by construction.
+///
+/// # The bytes that land are the bytes that were validated
+///
+/// The edited text is put through [`Config::load`] — parse *and*
+/// `Config::validate`, the same gate startup runs — before anything is written
+/// (BR-4). Callers validate their candidate in memory too, and this is not that
+/// check twice: the document carries drift the candidate never saw, so "the
+/// candidate validates" and "the file the daemon would boot on validates" are
+/// different questions. A parseable hand edit that fails validation therefore
+/// makes this refuse rather than overwrite it — a deliberate behavior change,
+/// and the fail-safe one: the daemon neither destroys the user's edit nor writes
+/// a document it would refuse to start on.
+///
+/// # Refusal, never a silent rewrite
+///
+/// An unparseable document (a half-finished hand edit) refuses with the parse
+/// failure named; falling back to a full re-serialization would make the write
+/// succeed by destroying the edit in progress, which BR-6 forbids outright. A
+/// **missing** file is not that case: the edit base is the empty document and
+/// the delta base is `Config::default()` — the parse of an empty document — so
+/// every non-default key of the candidate is written and the fresh file's parse
+/// equals the candidate (AC-6).
+///
+/// # Errors
+/// Returns an error whose `Display` **carries the underlying reason** — the
+/// parse failure, the validator's own sentence, or the I/O error — because a
+/// caller renders it into a sentence a user has to act on, and "the
+/// configuration could not be saved" alone is the silent downgrade LESSON-456
+/// and BUG-146 are about. Nothing is written and the on-disk file is untouched
+/// in every failing case.
+fn persist_config(path: &Path, current: &Config, candidate: &Config) -> anyhow::Result<()> {
+    // Named so the missing-file base can be borrowed alongside `current`; a
+    // default `Config` is the parse of an empty document, which is exactly what
+    // the delta must diff against when there is no file yet (ADR-1).
+    let fresh = Config::default();
+    let (document, base) = match std::fs::read_to_string(path) {
+        Ok(text) => (text, current),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => (String::new(), &fresh),
+        // Any other read failure is a real one — an unreadable file is not an
+        // empty one, and treating it as one would write a fresh document over
+        // whatever is actually there.
+        Err(err) => {
+            return Err(anyhow::anyhow!(
+                "the existing configuration could not be read for editing, so nothing was \
+                 written: {err}"
+            ))
+        }
+    };
+    let edited = apply_config_delta(&document, base, candidate)?;
+    // The validator's sentence rides *inside* this message rather than being
+    // attached as context, because callers format the error with `{err}` and
+    // anyhow's `Display` shows only the outermost layer (LESSON-456).
+    Config::load(&edited).map_err(|err| {
+        anyhow::anyhow!("the edited configuration would not load, so nothing was written: {err}")
+    })?;
+    write_config_atomically(path, &edited)
+}
+
+/// Replace `path` with `text` **atomically** — a sibling temp file, flushed to
+/// disk, then renamed over the target.
+///
+/// The mechanism half of the write seam: [`persist_config`] decides what the
+/// bytes are, this decides how they land. Nothing else in the daemon writes the
+/// config file (BR-2 / REQ-572 BR-11).
 ///
 /// BUG-155. The previous `std::fs::write` truncated the user's config in place.
 /// That is not merely untidy, it is fail-OPEN: every `Config` field is
@@ -4653,13 +4751,12 @@ impl WebTierPersistence for DaemonRuntime {
 /// permissions from an inherited umask.
 ///
 /// # Errors
-/// Returns the underlying I/O or serialization error. The caller decides
-/// whether that is fatal; the on-disk file is left untouched either way.
-fn write_config_atomically(path: &Path, config: &Config) -> anyhow::Result<()> {
+/// Returns the underlying I/O error. The caller decides whether that is fatal;
+/// the on-disk file is left untouched either way.
+fn write_config_atomically(path: &Path, text: &str) -> anyhow::Result<()> {
     use std::io::Write as _;
     use std::os::unix::fs::PermissionsExt as _;
 
-    let text = config.to_toml()?;
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
     }
@@ -4722,6 +4819,12 @@ fn migrate_and_report_provider_models(
     // condition keeps the two from drifting (LESSON-456).
     let pending = config.unusable_providers();
     if !pending.is_empty() {
+        // The delta's `current` side, captured before the mutation that makes
+        // this config the candidate (REQ-574 ADR-1). A migration edits its
+        // config in place, so without this snapshot there is no "before" left to
+        // diff against — and a migration's write is exactly the unattended one
+        // that used to canonicalize every upgrading user's file.
+        let before = config.clone();
         let unresolved = config.migrate_models(|provider_id| {
             prices
                 .models
@@ -4791,12 +4894,15 @@ fn migrate_and_report_provider_models(
                      change; freeform turns with no matching policy route to it."
                 );
             }
-            // A missing config path (a defaulted config) or a config that will
-            // not serialize falls through silently: the in-memory migration
-            // still stands for this session, and the absence guard makes a
-            // re-run on the next start harmless.
+            // A missing config path (a defaulted config) falls through
+            // silently, and a document that cannot be edited — unparseable, or
+            // carrying a hand edit that fails validation — warns and continues:
+            // the in-memory migration still stands for this session, and the
+            // absence guard makes a re-run on the next start harmless. The
+            // warning carries the inner reason, so a user whose file is the
+            // obstacle is told what about it (REQ-574 BR-6, LESSON-456).
             if let Some(path) = path {
-                if let Err(err) = write_config_atomically(path, config) {
+                if let Err(err) = persist_config(path, &before, config) {
                     eprintln!(
                         "tetond: WARNING — the model migration could not be saved ({err}), so it \
                          will run again on the next start. Your existing config file is \
@@ -4999,6 +5105,11 @@ fn digest_egress_notice(provider: &str) -> String {
 /// again next start — the in-memory result still stands for this session, so a
 /// failed write costs a warning rather than a session.
 fn migrate_and_report_routing_table(config: &mut Config, path: Option<&Path>) {
+    // The delta's `current` side, taken before the in-place migration (REQ-574
+    // ADR-1) — unconditionally, because whether this migration changes anything
+    // is only known after it has run. One clone on one startup path is a cheap
+    // price for a write that edits the user's document instead of replacing it.
+    let before = config.clone();
     let report = config.migrate_routing_to_categories();
     if report.is_empty() {
         return;
@@ -5012,7 +5123,7 @@ fn migrate_and_report_routing_table(config: &mut Config, path: Option<&Path>) {
     // in-memory migration still stands for this session, and there is no file
     // whose retired table could be found again.
     if let Some(path) = path {
-        if let Err(err) = write_config_atomically(path, config) {
+        if let Err(err) = persist_config(path, &before, config) {
             eprintln!(
                 "tetond: WARNING — the routing migration could not be saved ({err}), so it will \
                  run again on the next start. Your existing config file is unchanged and routing \
@@ -6621,9 +6732,8 @@ impl<'a> WebSetupAnswers<'a> {
 
 /// The digest a preview promises and a commit checks (REQ-572 verify, BR-7).
 ///
-/// Over the **whole serialized document** — the very bytes
-/// [`write_config_atomically`] would put on disk — rather than over the rendered
-/// `[web]` section the preview displays. The setup flow collects four fields and
+/// Over the **whole serialized document** rather than over the rendered `[web]`
+/// section the preview displays. The setup flow collects four fields and
 /// carries the rest of the table along from the live config
 /// ([`DaemonRuntime::web_setup_candidate`]), so any other session answering
 /// "enable permanently" ([`DaemonRuntime::persist_web_tier`]) moves
@@ -6634,6 +6744,13 @@ impl<'a> WebSetupAnswers<'a> {
 /// Deterministic because `Config`'s maps are `BTreeMap`s: the same candidate
 /// serializes to the same bytes on both calls, which is what makes an inequality
 /// evidence of a *change* rather than of two serializations.
+///
+/// **Interim, REQ-574**: the write seam now edits the on-disk document
+/// ([`persist_config`]) instead of replacing it with this serialization, so what
+/// is digested here names the *candidate* rather than the bytes that land. The
+/// TOCTOU guard still works — the candidate carries the live config's other
+/// fields, which is the race it was built for — but BR-3's byte-equality needs
+/// the digest re-derived from the edited document, which is TASK-137's.
 ///
 /// # Errors
 /// [`error_code::INTERNAL_ERROR`] when the candidate will not serialize — the
@@ -7521,7 +7638,11 @@ provider_id = "on-device"
         //    than whatever the umask happens to be — the same choice
         //    `auth::secure_socket_permissions` makes.
         let fresh = dir.join("fresh.toml");
-        write_config_atomically(&fresh, &Config::default()).expect("writes");
+        // REQ-574 split the seam: the writer now takes rendered text, so the
+        // serialization this used to do inline happens here. The mechanic under
+        // test — the mode a *created* file gets — is unchanged.
+        let text = Config::default().to_toml().expect("serializes");
+        write_config_atomically(&fresh, &text).expect("writes");
         assert_eq!(
             mode_of(&fresh),
             0o600,
@@ -7536,6 +7657,252 @@ provider_id = "on-device"
         use std::os::unix::fs::PermissionsExt as _;
         let mode = if readonly { 0o555 } else { 0o755 };
         std::fs::set_permissions(dir, std::fs::Permissions::from_mode(mode)).unwrap();
+    }
+
+    /// **The write seam edits the document it finds** (REQ-574 TASK-136).
+    ///
+    /// The properties of [`persist_config`] itself, asserted at the seam and at
+    /// one RPC writer above it. The per-writer preservation suite — all five
+    /// writers, the README's `[web]` block verbatim — is TASK-138's; what is
+    /// here is the seam's own contract: refuse loudly, write fresh when there is
+    /// no file, and never touch what the delta does not name.
+    mod config_document_seam {
+        use super::{load_config, scratch_dir, Config, DaemonRuntime, WebTier};
+
+        /// A hand-written config with the shapes preservation is *about*:
+        /// comments above and beside keys, a deliberate key order, and — added
+        /// by the tests that need it — keys this schema does not know.
+        const HAND_WRITTEN_CONFIG: &str = r#"# my teton config, written by hand
+# (and I would like to keep these notes)
+
+[web]
+# search is on because I set up a backend below
+tier = "search"
+search_endpoint = "https://api.search.brave.com/res/v1/web/search"  # brave
+search_key_ref = "keychain://teton/web-search"
+search_auth = "X-Subscription-Token: {key}"
+"#;
+
+        /// A runtime whose config is the given document — memory and disk
+        /// agreeing, which is what a real start produces.
+        fn runtime_over(tag: &str, document: &str) -> (DaemonRuntime, std::path::PathBuf) {
+            let dir = scratch_dir(tag);
+            let path = dir.join("config.toml");
+            std::fs::write(&path, document).expect("seed the config");
+            let mut runtime = DaemonRuntime::minimal();
+            if let Ok(config) = Config::load(document) {
+                runtime.config = std::sync::Mutex::new(config);
+            }
+            runtime.config_path = Some(path.clone());
+            runtime.data_dir = dir;
+            (runtime, path)
+        }
+
+        /// **A document that cannot be parsed is not overwritten** (BR-6, AC-5).
+        ///
+        /// The failure mode this replaces is the quiet one: the old seam
+        /// serialized the in-memory config over whatever was there, so a
+        /// half-finished hand edit was *repaired* by being destroyed. Refusal is
+        /// the fail-safe answer, and the refusal has to say what is wrong with
+        /// the file — a bare "could not be saved" leaves the user with a daemon
+        /// that will not write and no idea why (LESSON-456, BUG-146).
+        ///
+        /// Two levels, because the message has to survive the trip: the seam
+        /// itself, and `persist_web_tier`'s wrapper around it.
+        #[test]
+        fn an_unparseable_document_refuses_the_write_and_names_the_parse_failure() {
+            let broken = "[web]\ntier = \"search\nsearch_endpoint = \"https://x.example/api\"\n";
+            let (runtime, path) = runtime_over("persist-unparseable", broken);
+
+            let mut candidate = Config::default();
+            candidate.web.permission_allow.push(WebTier::FetchUserUrl);
+            let err = super::persist_config(&path, &Config::default(), &candidate)
+                .expect_err("an unparseable document must not be written over");
+            let seam_message = format!("{err}");
+            assert!(
+                seam_message.contains("could not be parsed for editing"),
+                "the refusal must name the parse failure, not just the write: {seam_message}"
+            );
+
+            // And through the RPC writer, whose own sentence wraps it.
+            let refused = runtime
+                .persist_web_tier(WebTier::FetchUserUrl)
+                .expect_err("the consent answer must not land on a broken document");
+            assert!(
+                refused.contains("could not be saved")
+                    && refused.contains("could not be parsed for editing"),
+                "the writer's sentence must carry the inner reason: {refused}"
+            );
+
+            assert_eq!(
+                std::fs::read_to_string(&path).expect("read"),
+                broken,
+                "the user's half-finished edit was rewritten by the refusal"
+            );
+            assert!(
+                runtime
+                    .config
+                    .lock()
+                    .expect("config mutex")
+                    .web
+                    .permission_allow
+                    .is_empty(),
+                "the in-memory swap happens after the write, never before"
+            );
+        }
+
+        /// **A missing file is not an error** (BR-6, AC-6): the edit base is the
+        /// empty document, so the fresh file's parse *is* the candidate — and it
+        /// is owner-only, because this file can hold secret-adjacent material
+        /// and a created one must not inherit the umask.
+        #[test]
+        fn a_missing_file_is_written_fresh_at_owner_only_and_parses_back_to_the_candidate() {
+            use std::os::unix::fs::PermissionsExt as _;
+
+            let dir = scratch_dir("persist-missing");
+            let path = dir.join("nested").join("config.toml");
+
+            let mut candidate = Config::default();
+            candidate.web.tier = WebTier::FetchAnyUrl;
+            candidate.web.permission_allow.push(WebTier::FetchUserUrl);
+
+            // The delta base is `Config::default()` — the parse of an empty
+            // document — and NOT the caller's `current`, which is what makes the
+            // written file complete rather than a diff against a state no file
+            // ever held. Passing a `current` that differs from the default is
+            // the falsification: with the wrong base, `tier` never gets written.
+            let mut current = Config::default();
+            current.web.tier = WebTier::FetchAnyUrl;
+            super::persist_config(&path, &current, &candidate)
+                .expect("a fresh document is written");
+
+            let written = load_config(Some(&path)).expect("the fresh document loads");
+            assert_eq!(written.web.tier, WebTier::FetchAnyUrl);
+            assert_eq!(written.web.permission_allow, vec![WebTier::FetchUserUrl]);
+            assert_eq!(
+                std::fs::metadata(&path).expect("stat").permissions().mode() & 0o7777,
+                0o600,
+                "a config this daemon created gets owner-only, not the umask default"
+            );
+
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+
+        /// **A write touches only its keys** (BR-1/BR-5), asserted at the seam
+        /// through the writer a user actually reaches: comments, key order, an
+        /// unknown key inside a known table and an unknown top-level table all
+        /// survive a consent answer, and the only difference is the answer's own
+        /// key.
+        ///
+        /// One witness here; the per-writer suite is TASK-138's.
+        #[test]
+        fn a_web_tier_write_leaves_every_key_it_is_not_about_alone() {
+            let seed = format!(
+                "{HAND_WRITTEN_CONFIG}max_page_bytes_from_the_future = 4096\n\n\
+                 # a table this schema has never heard of\n\
+                 [experiment]\nknob = true\n"
+            );
+            let (runtime, path) = runtime_over("persist-preserves", &seed);
+
+            runtime
+                .persist_web_tier(WebTier::FetchUserUrl)
+                .expect("the consent answer lands");
+
+            let after = std::fs::read_to_string(&path).expect("read");
+            for surviving in [
+                "# my teton config, written by hand",
+                "# (and I would like to keep these notes)",
+                "# search is on because I set up a backend below",
+                "# brave",
+                "# a table this schema has never heard of",
+                "max_page_bytes_from_the_future = 4096",
+                "[experiment]",
+                "knob = true",
+                "search_auth = \"X-Subscription-Token: {key}\"",
+            ] {
+                assert!(
+                    after.contains(surviving),
+                    "a consent answer destroyed `{surviving}`:\n{after}"
+                );
+            }
+            assert!(
+                after.find("tier =").expect("tier is still there")
+                    < after
+                        .find("search_endpoint =")
+                        .expect("endpoint is still there"),
+                "the user's key order was normalized:\n{after}"
+            );
+
+            // The one difference, stated as a difference: the seed plus the
+            // answer's key is the whole change.
+            let added = after.replace("permission_allow = [\"fetch_user_url\"]\n", "");
+            assert_eq!(
+                added, seed,
+                "the write changed something other than the key it is about"
+            );
+
+            // And the meaning is what the user asked for, read back through the
+            // production loader.
+            let reloaded = load_config(Some(&path)).expect("the edited document loads");
+            assert_eq!(reloaded.web.permission_allow, vec![WebTier::FetchUserUrl]);
+            assert_eq!(reloaded.web.tier, WebTier::Search);
+        }
+
+        /// **A hand edit that parses but does not validate is refused, not
+        /// overwritten** (BR-4's stated consequence, AC-10).
+        ///
+        /// The validator runs on the *edited bytes*, so "the candidate
+        /// validates" cannot stand in for "the file the daemon would boot on
+        /// validates": the drift here is in a key the operation never touches,
+        /// and the candidate is clean. Today's alternative would be to write the
+        /// candidate over the user's invalid edit — silently erasing it — which
+        /// is the worse half of a bad pair. Refusal keeps both the edit and the
+        /// daemon's ability to start.
+        #[test]
+        fn a_hand_edit_that_fails_validation_refuses_the_write_and_survives_it() {
+            // The daemon started on a config it would boot on...
+            let (runtime, path) =
+                runtime_over("persist-invalid-drift", "[web]\ntier = \"fetch_any_url\"\n");
+            assert!(runtime
+                .config
+                .lock()
+                .expect("config mutex")
+                .validate()
+                .is_ok());
+            // ...and the user then hand-edited the file into one it would not,
+            // in a key this operation never touches. The candidate is clean;
+            // only the bytes that would land are not.
+            let drifted = "default_provider = \"ghost\"\n\n[web]\ntier = \"fetch_any_url\"\n";
+            std::fs::write(&path, drifted).expect("the hand edit lands");
+
+            let refused = runtime
+                .persist_web_tier(WebTier::FetchUserUrl)
+                .expect_err("a document that would not load must not be written");
+            assert!(
+                refused.contains("would not load"),
+                "the refusal must say the edited document is the problem: {refused}"
+            );
+            assert!(
+                refused.contains("default_provider names provider 'ghost'"),
+                "and must carry the validator's own sentence, which names the \
+                 key the user has to fix: {refused}"
+            );
+            assert_eq!(
+                std::fs::read_to_string(&path).expect("read"),
+                drifted,
+                "the invalid hand edit was overwritten by the refusal"
+            );
+            assert!(
+                runtime
+                    .config
+                    .lock()
+                    .expect("config mutex")
+                    .web
+                    .permission_allow
+                    .is_empty(),
+                "the in-memory swap happens after the write, never before"
+            );
+        }
     }
 
     #[test]
@@ -14320,6 +14687,17 @@ provider_id = "on-device"
         #[test]
         fn persisting_a_lower_tier_never_demotes_the_configured_ceiling() {
             let (runtime, config_path, _dir) = runtime_on_disk("no-demote");
+            // The ceiling is a *configured* one, so it is on disk as well as in
+            // memory — the state a real start produces. Since REQ-574 a write
+            // edits the document rather than replacing it, so a value that only
+            // ever existed in memory is drift the seam deliberately leaves out
+            // of the delta (BR-5/ADR-1); seeding the file is what makes this
+            // test about the no-demote rule rather than about that.
+            std::fs::write(
+                &config_path,
+                "[web]\ntier = \"search\"\nsearch_endpoint = \"https://search.example/api\"\n",
+            )
+            .expect("seed the configured ceiling");
             {
                 let mut config = runtime.config.lock().expect("config mutex");
                 config.web.tier = WebTier::Search;
