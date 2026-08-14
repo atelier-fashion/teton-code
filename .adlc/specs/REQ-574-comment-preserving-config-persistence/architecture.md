@@ -49,14 +49,46 @@ exactly those key-level sets/removals to the on-disk document parsed with
 - **Missing file**: the edit base is the empty document and the delta base is
   `Config::default()` (the parse of an empty document), so every non-default
   candidate key is written and AC-6's "parse equals the candidate" holds.
-- **Array granularity (resolves spec OQ-2's granularity half)**: tables recurse
-  key-by-key; **arrays (value arrays and arrays-of-tables) are one key**. If
-  the canonical arrays differ, the document's array is replaced wholesale with
-  the candidate's canonical rendering. Element-wise array diffing needs an
-  identity function per array type and mis-targets when on-disk order drifted;
-  wholesale replacement is honest, simple, and matches the spec's out-of-scope
-  note that a *changed* key may re-render canonically. Comments inside a
-  changed array section do not survive; comments everywhere else do.
+- **Array granularity (resolves spec OQ-2's granularity half)** — *amended
+  during implementation; the rule below is what shipped*. Tables recurse
+  key-by-key. **Value arrays are one key.** **Arrays of tables are diffed
+  element-wise**, in four cases (`plan_array_edit`):
+  - *untouched* — the canonical arrays agree, and the document's array is not
+    read at all;
+  - *append* — the common prefix agrees and the candidate is longer. The
+    existing elements are not read, re-rendered or moved; only the new ones are
+    written, at the render position past the whole of the array already there
+    (its nested sub-tables included — see the limitations below);
+  - *per-index* — same length, some elements differ. Each differing element is
+    recursed into as a table, so only the keys that changed inside it move;
+  - *wholesale* — shrunk, reordered, or the document spells the array some other
+    way. No index correspondence to trust, so the array is replaced with the
+    candidate's canonical rendering where it stood, comments inside it and all.
+
+  The original decision wrote arrays off as one key on the ground that
+  element-wise diffing needs an identity function per array type. That is right
+  about identity and wrong about the cost: BR-1 says comments and unknown keys
+  survive **for all five writers**, and the two that touch `[[providers]]` are
+  precisely provider registration (an append) and the REQ-557 model migration
+  (one key added per entry). Under the wholesale rule those two writers deleted
+  every comment and unknown key inside `[[providers]]` — BR-1 broken by the only
+  writers that could break it. So the two shapes that *do* have a trustworthy
+  correspondence get one, and everything else keeps the recorded exception.
+
+  **The index-matching residual.** Per-index matching trusts position, and BR-5
+  leaves the daemon blind to drift until restart. A user who *reorders*
+  `[[providers]]` by hand mid-session, without changing how many there are, and
+  is then hit by a same-length element edit, gets that edit applied at the
+  position rather than to the provider. The result still passes
+  `Config::validate` before it lands (BR-4), and the alternative — wholesale —
+  destroys strictly more in that same scenario. Recorded, not fixed: fixing it
+  means the per-array identity function this ADR declined, which a `providers`
+  array whose ids are themselves editable does not actually escape.
+
+  **The inline spelling reshapes.** A document that spells the array as values
+  (`providers = [ { … } ]`) cannot hold the delta's sections, so that one edit
+  rewrites the key into `[[providers]]` blocks and moves the key's comment onto
+  the first header (OQ-1: a comment travels with its key).
 - **Key removal (resolves spec OQ-1)**: a key present in canonical(current)
   but absent in canonical(candidate) is removed from the document. toml_edit
   removes the key together with its attached decor (the comment block prefixed
@@ -64,6 +96,40 @@ exactly those key-level sets/removals to the on-disk document parsed with
   comments travel with their key; free-standing table decor survives. The
   existing `an_answer_that_omits_a_key_removes_it_and_says_so` behavior
   (runtime.rs:15967) is preserved through this path.
+
+#### Recorded limitations of the shipped engine
+
+Three things the implementation does that this ADR did not originally say, kept
+here rather than left to be rediscovered:
+
+1. **CRLF is normalized on the first write.** `toml_edit` re-renders line
+   endings as `\n`, so the first daemon-side save to a CRLF document converts
+   the whole file. Nothing else about it moves. Witness:
+   `config_doc::the_first_write_to_a_crlf_document_normalizes_its_line_endings`.
+2. **A whitespace-only file is the empty edit base.** The engine treats a
+   document holding only whitespace as the empty document
+   (`document_is_effectively_empty`): there is nothing in it to preserve, and
+   editing around its blank lines would carry them forward forever. The engine
+   only decides the *edit* base; the *delta* base is the caller's, and a caller
+   that hands in a non-default `current` for such a file would get a document
+   naming only the delta's keys.
+3. **Empty-vs-missing is aligned at the call site.** `render_config_document`
+   adopts the same predicate, so a whitespace-only file selects
+   `Config::default()` as the delta base exactly as a missing one does, and the
+   next write heals it into a whole document (verified in `runtime.rs`, the
+   `present` binding). This is what commit 3c520b9 adopted; the two bases now
+   agree, and AC-6's "parse equals the candidate" holds for both.
+
+**Element positions are a render order, not a tree.** `toml_edit` renders
+sections sorted by a numeric position, and an array element's sub-tables are
+parented by the `[[…]]` header that precedes them rather than by their own
+header path. So any section this engine *adds* near an array must be positioned
+against the whole array — element headers and their sub-tables — and a section
+added *inside* an element takes that element's own position. Getting either
+wrong re-parents an existing `[providers.capabilities]` onto the wrong entry and
+yields a document that does not parse, which the write then refuses. Witnesses:
+`config_doc::a_second_append_renders_past_the_first_ones_sub_table` and
+`config_doc::a_section_added_inside_an_array_element_renders_beside_that_element`.
 
 ### ADR-2: The delta engine is pure and lives in teton-core; I/O and atomicity stay in tetond
 
@@ -110,6 +176,15 @@ existing `SETUP_DIGEST_STALE` message (spec BR-3, AC-4).
   the check, and the write path is now drift-preserving — the cost of a
   "redundant" write is a preserved file, not a clobber, so the extra
   complexity buys nothing user-visible.
+- **Amended for `/web setup`'s commit only** (3c520b9): that flow reads the file
+  anyway to derive its preview, so its no-op test is the **conjunction** — the
+  derived text must be byte-identical to the file *and* the candidate must match
+  the live config. The in-memory half alone reported `applied: false` for an
+  answer that would have rewritten a drifted document; byte equality alone would
+  report `applied: false` when the document already holds the answer but this
+  process does not, leaving the capability dark until a restart. Both edges have
+  witnesses in `runtime::tests::web_setup_flow`. The other four writers keep the
+  in-memory check above — they never read the file before deciding.
 
 ## Data model changes
 

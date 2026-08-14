@@ -26,7 +26,7 @@ acceptance boxes.
 ## Acceptance Criteria
 
 - [x] README no longer warns (anywhere) that daemon-side saves destroy comments or unknown keys; the hand-written block section reflects preservation — the "Or write the table by hand" intro now names the four daemon-side savers and states the in-place edit, and a second paragraph after the block states the edit base (BR-5) and the parse/validate refusal (BR-4/BR-6). The fenced TOML is byte-untouched (it is TASK-135's fixture)
-- [x] The README drift-check triple (backend rows / `[web]` keys / `web_setup_ui.rs` constants) still holds — no stale reference to the removed warning; `ENDPOINT_HELP` (`web_setup_ui.rs:817`) and `instruction_lines` (`:1032`) both still exist under those names, and `web_setup_contracts.rs` still reads `self_config.md` via `include_str!`. It is now a quartet: `crates/teton-core/src/config_doc.rs`'s `HAND_WRITTEN_CONFIG` was added as the fourth surface (TASK-135's flagged follow-up)
+- [x] The README drift-check note still holds — no stale reference to the removed warning; `ENDPOINT_HELP` (`web_setup_ui.rs:817`) and `instruction_lines` (`:1032`) both still exist under those names, and `web_setup_contracts.rs` still reads `self_config.md` via `include_str!`. The note now lists **four** surfaces, matching its own opening sentence: the two above, plus `crates/tetond/tests/config_preservation.rs`'s `README_WEB_BLOCK` — the only machine-checked one, since `the_fixture_is_the_readmes_own_block_byte_for_byte` reads README.md at test time — and `crates/teton-core/src/config_doc.rs`'s `HAND_WRITTEN_CONFIG` (TASK-135's flagged follow-up), which nothing enforces and which the note describes as hand-kept rather than claiming a test guards it
 - [x] `self_config.md` reviewed; updated or explicitly confirmed clean — **confirmed clean**: it describes what `/web setup` writes (`[web]` keys, `search_auth` shapes, keychain reference) and never claims anything about how the file is rewritten. No edit made
 - [x] Spec AC checkboxes updated to match reality (each box ticked only if its test exists and passes) — ticked AC-4, AC-6, AC-7, AC-9 and BR-2, BR-3, BR-6, BR-7; left AC-1, AC-2, AC-3, AC-5, AC-8, AC-10 and BR-1, BR-4, BR-5 unticked. Rationale per line in the notes below
 - [x] `rg -n "rewrites the whole config" --hidden` over the repo returns no hits outside `.adlc/` history artifacts — one hit remains and it must: `crates/tetond/src/runtime.rs:16794`, inside TASK-137's `no_preview_claims_the_save_rewrites_the_whole_file`, which asserts the string's **absence** from every preview's warnings. That is the pin, not a claim; deleting it would delete the guard
@@ -100,3 +100,14 @@ open questions rather than ticked from a doc task.
 
 **`status` was not flipped on the requirement** (Phase 6 owns that), and its
 `updated:` was already today's date.
+
+**Closed out in the verify phase, after TASK-138's witnesses landed.** Every box
+this task deferred — AC-1, AC-2, AC-3, AC-5, AC-8, AC-10, BR-1, BR-4, BR-5 and
+the three OQs — is now ticked in `requirement.md`, each naming its witness on the
+tick's own line. Two carry recorded deviations rather than clean ticks: AC-3
+(the `web_consent_matrix.rs` TASK-129 pin was deliberately not reseeded — it
+drives a `FileTierSink` double and a path-less `minimal()` runtime, so a
+preservation assertion there would be about the double, LESSON-451) and BR-1
+(a genuinely reshaped array of tables still re-renders canonically; appends and
+per-element edits preserve). The README's array claim and the drift-check note
+were rewritten in the same pass to match.

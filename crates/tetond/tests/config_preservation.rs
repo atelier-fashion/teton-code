@@ -40,8 +40,11 @@
 //! | AC | Test |
 //! |----|------|
 //! | AC-1 (`persist_web_tier`, README block verbatim) | [`a_consent_answer_moves_its_own_keys_and_leaves_the_readme_config_alone`] |
+//! | AC-1 / BR-1 (`[web]` spelled inline) | [`an_inline_web_table_keeps_the_keys_the_consent_answer_is_not_about`] |
 //! | AC-2 (`web_setup_commit`) + AC-3 (preview == written section) | [`a_setup_commit_writes_the_bytes_its_preview_showed_and_moves_nothing_else`] |
 //! | AC-2 (`apply_config_update`) | [`registering_a_provider_leaves_the_web_table_and_its_comments_alone`] |
+//! | BR-1 (unknown key *inside* `[[providers]]`, twice over) | [`an_unknown_key_inside_a_provider_entry_survives_a_registration`] |
+//! | BR-5 (mid-session hand edit at an unrelated key) | [`a_hand_edit_mid_session_survives_a_provider_registration`] |
 //! | AC-2 (REQ-557 model migration) | [`the_model_migration_carries_a_commented_config_across_the_upgrade`] |
 //! | AC-2 (REQ-558 routing migration) + idempotence | [`the_routing_migration_retires_its_table_without_taking_the_rest_of_the_file`] |
 //! | AC-5 (unparseable document, per RPC writer) | [`an_unparseable_document_is_refused_by_the_writers_that_would_have_rewritten_it`] |
@@ -59,8 +62,15 @@
 //!   re-asserted here once, against the README fixture, because the tie between
 //!   "the preview showed this" and "the file says this" is the claim AC-3 makes
 //!   about *bytes on disk* and this is the only suite that has them.
+//! * **BR-5 through `/web setup`** — `runtime::tests::web_setup_flow`'s pinned
+//!   -field group (an answer the document lost, a hand-deleted `[web]` table, a
+//!   document that already holds the answer, a removal note describing the
+//!   document). The drift leg added here is the *other* rule, the one every
+//!   writer but `/web setup` follows: a key the operation never names is not in
+//!   the delta at all.
 //! * **The delta engine's own properties** (insertion, removal with attached
-//!   decor, array-wholesale) — `teton_core::config_doc` unit tests.
+//!   decor, element-wise array editing, the reshaped-array fallback) —
+//!   `teton_core::config_doc` unit tests.
 //!
 //! No test here is feature-gated: they run in the default `cargo test
 //! --workspace` leg, which is the only leg that exists in CI (BUG-166,
@@ -109,10 +119,10 @@ cache_ttl_secs = 900
 "#;
 
 /// What sits above the README block: a file-level comment, a top-level key, and
-/// a provider whose own comment is inside an **array of tables** — the one
-/// construct ADR-1 re-renders wholesale when it changes, which
-/// [`registering_a_provider_leaves_the_web_table_and_its_comments_alone`]
-/// states as a cost rather than leaving it to be discovered.
+/// a provider whose own comment is inside an **array of tables** — the construct
+/// ADR-1 originally wrote off as one key, and the one
+/// [`registering_a_provider_leaves_the_web_table_and_its_comments_alone`] now
+/// holds to the same standard as the rest of the document.
 ///
 /// The provider declares a `model`, which keeps the REQ-557 startup migration
 /// out of these tests: a migration that fired at `from_env` would rewrite the
@@ -603,6 +613,90 @@ fn a_consent_answer_moves_its_own_keys_and_leaves_the_readme_config_alone() {
     daemon.cleanup();
 }
 
+/// **A `[web]` table the user spelled inline is edited inline, unknown keys and
+/// all** (spec BR-1, AC-8).
+///
+/// TOML gives the same table two spellings, and a writer that only knows the
+/// `[header]` one has a second way to destroy a document: replacing
+/// `web = { … }` wholesale drops every key inside it the schema cannot see. The
+/// engine recurses into both (`config_doc`'s
+/// `an_inline_table_keeps_the_keys_the_delta_never_names`); this is the witness
+/// that a *writer* gets that behaviour, on the one shape where the whole table
+/// is a single line and "only the keys this write is about moved" is a claim
+/// about the characters in it.
+///
+/// The answer has two keys here — the consent record, which is an insertion,
+/// and the ceiling, which the answer raises — so both the insert and the assign
+/// paths through the inline table are exercised.
+#[test]
+fn an_inline_web_table_keeps_the_keys_the_consent_answer_is_not_about() {
+    // The inline table sits above every section header: a bare key written
+    // below one would belong to *that* table, which is TOML rather than
+    // anything this test is about.
+    let before = r#"# My machine. Hand-written, and staying that way.
+effort = "high"
+# the whole table on one line, because I like it that way
+web = { tier = "fetch_user_url", search_endpoint = "https://api.search.brave.com/res/v1/web/search", search_key_ref = "keychain://teton/web-search", experimental_reranker = "colbert" }
+
+[[providers]]
+id = "anthropic"
+kind = "anthropic"
+endpoint = "https://api.anthropic.com"
+model = "claude-opus-4"
+auth_ref = "keychain:anthropic"
+
+# Nothing in this build reads this table either.
+[experimental]
+knob = 3
+"#;
+    let daemon = Daemon::start("consent-inline", Some(before));
+    assert_eq!(
+        daemon.reload().web.tier,
+        WebTier::FetchUserUrl,
+        "the inline spelling must load, or this test is about a document the \
+         daemon never understood"
+    );
+
+    daemon
+        .runtime
+        .persist_web_tier(WebTier::FetchAnyUrl)
+        .expect("the consent answer lands");
+
+    let after = daemon.document();
+    // One line changed — the inline table's — and the rest of the file is
+    // untouched, the comment above the key included.
+    let (removed, added) = line_diff(before, &after);
+    assert_eq!(removed.len(), 1, "{after}");
+    assert_eq!(added.len(), 1, "{after}");
+    assert!(
+        added[0].starts_with("web = {"),
+        "the table keeps the spelling the user gave it:\n{after}"
+    );
+    assert!(
+        added[0].contains(r#"experimental_reranker = "colbert""#),
+        "a key inside the inline table that this build cannot see survives the \
+         write (BR-1):\n{after}"
+    );
+    assert!(
+        added[0].contains(r#"search_key_ref = "keychain://teton/web-search""#),
+        "and so does every key the answer is not about:\n{after}"
+    );
+    assert!(
+        after.contains("# the whole table on one line, because I like it that way"),
+        "{after}"
+    );
+
+    // AC-8: and the one line the write did change means what the answer asked.
+    let reloaded = daemon.reload();
+    assert_eq!(reloaded.web.tier, WebTier::FetchAnyUrl);
+    assert_eq!(reloaded.web.permission_allow, vec![WebTier::FetchAnyUrl]);
+    assert_eq!(
+        reloaded.web.search_key_ref.as_deref(),
+        Some("keychain://teton/web-search")
+    );
+    daemon.cleanup();
+}
+
 // ---------------------------------------------------------------------------
 // Writer 2 — `web_setup_commit` (REQ-572's guided flow)
 // ---------------------------------------------------------------------------
@@ -698,16 +792,15 @@ fn a_setup_commit_writes_the_bytes_its_preview_showed_and_moves_nothing_else() {
 /// re-serialized the whole document, so a user who had hand-written the README's
 /// block lost all of it to an unrelated command.
 ///
-/// It also states ADR-1's one deliberate cost out loud. Arrays of tables are
-/// diffed as a single key, so a `[[providers]]` append re-renders the array
-/// wholesale: the comment *inside* the existing provider entry goes, and the
-/// defaulted `[providers.capabilities]` sub-tables arrive. Everything outside
-/// the array — the file header, `effort`, the whole `[web]` table with its
-/// comments and unknown key, and the unknown top-level table — is byte-identical.
-/// Element-wise array diffing was rejected in architecture (it needs an identity
-/// function per array type and mis-targets when on-disk order has drifted), so
-/// this is the documented behaviour rather than a defect, and pinning it here is
-/// what makes a future narrowing visible.
+/// It is also the integration-level witness that BR-1 reaches *inside*
+/// `[[providers]]`. ADR-1 originally wrote arrays off as one key, which meant a
+/// registration re-rendered the array wholesale and deleted the comment inside
+/// the entry the user already had. The amended rule diffs the array element-wise:
+/// an append leaves every existing element unread and unmoved, so this write
+/// deletes **nothing at all** — the entry's own comment survives, and the only
+/// insertion is the entry the registration is about. The `[web]` block, the
+/// unknown key inside it and the unknown top-level table are byte-identical, as
+/// they always were.
 #[test]
 fn registering_a_provider_leaves_the_web_table_and_its_comments_alone() {
     let before = readme_config();
@@ -722,16 +815,13 @@ fn registering_a_provider_leaves_the_web_table_and_its_comments_alone() {
     assert_only_these_lines_changed(
         &before,
         &after,
-        // ADR-1: the comment inside the changed array does not survive it.
-        &["# The one I actually pay for."],
+        // An append reads nothing of what is already there, so it deletes
+        // nothing — the comment inside the existing entry included (BR-1).
+        &[],
         &[
-            // The existing entry's defaulted capabilities, now written out...
-            "[providers.capabilities]",
-            r#"tool_call_tier = "native""#,
-            "parallel_calls = false",
-            "max_context = 0",
-            "",
-            // ...and the entry the registration is actually about.
+            // Only the entry the registration is actually about, with the
+            // capabilities block the canonical rendering of a *new* element
+            // carries. Nothing is written out for the entry already there.
             "[[providers]]",
             r#"id = "cheap""#,
             r#"kind = "openai-compatible""#,
@@ -745,6 +835,11 @@ fn registering_a_provider_leaves_the_web_table_and_its_comments_alone() {
             "max_context = 0",
             "",
         ],
+    );
+    assert!(
+        after.contains("# The one I actually pay for."),
+        "the comment inside the existing `[[providers]]` entry survives an \
+         append (BR-1):\n{after}"
     );
     // Said again as the property the test is named for, so a future change to
     // the array-rendering rule cannot quietly take the `[web]` block with it.
@@ -761,6 +856,124 @@ fn registering_a_provider_leaves_the_web_table_and_its_comments_alone() {
         reloaded.web.search_auth.as_deref(),
         Some("X-Subscription-Token: {key}")
     );
+    daemon.cleanup();
+}
+
+/// **An unknown key inside a `[[providers]]` entry survives a registration, and
+/// survives the next one** (spec BR-1, AC-2, AC-8).
+///
+/// The half of BR-1 no schema-shaped assertion can see, in the one place it was
+/// hardest to keep: *inside* an array element. `Config` drops unknown keys at
+/// load, so under the original wholesale array rule a registration re-rendered
+/// `[[providers]]` from the in-memory config and this key went without a word.
+/// The engine has its own witness
+/// (`config_doc::registering_a_provider_appends_and_reads_nothing_of_the_
+/// entries_already_there`); this is the one that says the daemon's writer
+/// actually reaches it — LESSON-502's rule, and the reason both exist.
+///
+/// The second registration is not a repetition. An appended element brings a
+/// nested `[providers.capabilities]` section, and a second append has to render
+/// past *that* rather than merely past the last `[[providers]]` header;
+/// getting it wrong re-parents the first entry's sub-table onto the new one and
+/// leaves a document that no longer parses, so the write is refused and
+/// `teton provider add` fails outright the second time it is used.
+#[test]
+fn an_unknown_key_inside_a_provider_entry_survives_a_registration() {
+    let before = readme_config().replace(
+        "auth_ref = \"keychain:anthropic\"\n",
+        "auth_ref = \"keychain:anthropic\"\n\
+         # Nothing in this build reads this key.\nnickname = \"the good one\"\n",
+    );
+    assert!(
+        before.contains(r#"nickname = "the good one""#),
+        "the fixture must actually carry an unknown key inside the array"
+    );
+    let daemon = Daemon::start("register-unknown", Some(&before));
+
+    daemon
+        .runtime
+        .apply_config_update(register("cheap"))
+        .expect("the first registration lands");
+    let once = daemon.document();
+    assert!(
+        once.contains(r#"nickname = "the good one""#)
+            && once.contains("# Nothing in this build reads this key."),
+        "an unknown key inside `[[providers]]` survives an append:\n{once}"
+    );
+
+    daemon
+        .runtime
+        .apply_config_update(register("local"))
+        .expect("the second registration lands too");
+    let twice = daemon.document();
+    assert!(
+        twice.contains(r#"nickname = "the good one""#),
+        "and survives the next one:\n{twice}"
+    );
+
+    let reloaded = daemon.reload();
+    assert_eq!(reloaded.providers.len(), 3);
+    assert_eq!(reloaded.web.tier, WebTier::Search);
+    daemon.cleanup();
+}
+
+/// **A hand edit made while the daemon runs survives an unrelated write**
+/// (spec BR-5, AC-8, AC-10's premise).
+///
+/// The clobber BR-5 names, driven through the writer most likely to cause it:
+/// the daemon reads the config once at start and stays blind to the file until
+/// a restart, so its in-memory `cache_ttl_secs` still says 900 while the file
+/// says 42. A write that diffed the *document* against the candidate would call
+/// that key "changed" and put 900 back; a write that re-serialized the whole
+/// config would do it without even noticing. The delta is `diff(current,
+/// candidate)` instead (ADR-1), so a key the registration never names cannot
+/// enter it.
+///
+/// `config_doc::a_hand_edit_the_daemon_never_read_rides_along_untouched` is the
+/// engine's leg of this; here the drift is a real edit to a real file behind a
+/// running daemon, and the write is one a user reaches with
+/// `teton provider add`.
+#[test]
+fn a_hand_edit_mid_session_survives_a_provider_registration() {
+    let seeded = readme_config();
+    let daemon = Daemon::start("register-drift", Some(&seeded));
+    assert_eq!(
+        daemon.reload().web.cache_ttl_secs,
+        900,
+        "the daemon started on the fixture's value"
+    );
+
+    // The user edits the file the daemon is not watching.
+    let drifted = seeded.replace("cache_ttl_secs = 900", "cache_ttl_secs = 42");
+    assert_ne!(drifted, seeded, "the fixture must hold the cache line");
+    daemon.hand_edit(&drifted);
+
+    daemon
+        .runtime
+        .apply_config_update(register("cheap"))
+        .expect("the registration lands");
+
+    // Measured against the *drifted* document: the only change is the entry the
+    // registration is about, so the hand edit is still there and nothing else
+    // moved either.
+    let after = daemon.document();
+    let (removed, added) = line_diff(&drifted, &after);
+    assert!(removed.is_empty(), "the write deleted nothing:\n{after}");
+    assert!(
+        added.contains(&r#"id = "cheap""#.to_owned()),
+        "the registration landed:\n{after}"
+    );
+    assert!(
+        !added.iter().any(|line| line.contains("cache_ttl_secs")),
+        "a key this write is not about must not be rewritten (BR-5):\n{after}"
+    );
+
+    let reloaded = daemon.reload();
+    assert_eq!(
+        reloaded.web.cache_ttl_secs, 42,
+        "the document is the truth about a key the operation never named"
+    );
+    assert_eq!(reloaded.providers.len(), 2);
     daemon.cleanup();
 }
 
@@ -787,19 +1000,18 @@ fn the_model_migration_carries_a_commented_config_across_the_upgrade() {
     assert_only_these_lines_changed(
         PRE_REQ_557_CONFIG,
         &after,
-        // The migrated key lives in an array of tables, so the array is
-        // re-rendered and its inner comment travels with it (ADR-1).
-        &["# no model here — the field did not exist yet"],
-        &[
-            // The key the migration resolved, and the capabilities block the
-            // array's wholesale re-rendering writes out with it.
-            r#"model = "claude-opus-4""#,
-            "[providers.capabilities]",
-            r#"tool_call_tier = "native""#,
-            "parallel_calls = false",
-            "max_context = 0",
-            "",
-        ],
+        // The migrated key lives in an array of tables, and the amended ADR-1
+        // rule edits the element in place rather than re-rendering the array —
+        // so the migration deletes nothing, not even the comment that says the
+        // field did not exist yet.
+        &[],
+        // One key, which is what the migration is about.
+        &[r#"model = "claude-opus-4""#],
+    );
+    assert!(
+        after.contains("# no model here — the field did not exist yet"),
+        "a per-element edit leaves the element's own comments in place \
+         (BR-1):\n{after}"
     );
 
     let reloaded = daemon.reload();

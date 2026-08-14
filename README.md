@@ -332,7 +332,7 @@ instance answers with a web page rather than JSON.
 
 <!--
 Drift check. The three backend rows above, the `[web]` keys below, and the
-keychain reference are the same strings as three places in the tree, and all of
+keychain reference are the same strings as four places in the tree, and all of
 them must move together:
   - `crates/tetond/src/harness/self_config.md` — the guide bundled into the
     system prompt, and the single source REQ-572's AC-8 backend contract suite
@@ -342,11 +342,17 @@ them must move together:
   - `crates/teton/src/web_setup_ui.rs` — `ENDPOINT_HELP` (what `/web setup`
     prints above the endpoint prompt) and `instruction_lines` (what a piped
     session is told);
-  - `crates/teton-core/src/config_doc.rs` — the fenced `[web]` block below is
-    copied into the `HAND_WRITTEN_CONFIG` fixture byte-for-byte (REQ-574 AC-1
-    wants the README's own block as the preservation test vector, not a
-    paraphrase of it), so a line edited inside the fence fails that module's
-    tests until the fixture is moved with it.
+  - `crates/tetond/tests/config_preservation.rs` — `README_WEB_BLOCK` is the
+    fenced `[web]` block below, copied byte-for-byte, and
+    `the_fixture_is_the_readmes_own_block_byte_for_byte` reads *this file* at
+    test time and fails on any edit inside the fence the fixture did not follow
+    (REQ-574 AC-1 wants the README's own block as the preservation test vector,
+    not a paraphrase of it). It is the only machine-checked entry in this list;
+    the other three are kept honest by this note;
+  - `crates/teton-core/src/config_doc.rs` — `HAND_WRITTEN_CONFIG` embeds the
+    same block again, as the delta engine's own unit-test vector. Nothing there
+    reads this file, so that copy is not self-enforcing: move it by hand when
+    the fence moves.
 -->
 
 **Or write the table by hand.** `/web setup` exists because it is live in the
@@ -356,6 +362,14 @@ choice costs you the other: every daemon-side save — `/web setup`'s commit, an
 startup migration — edits the file in place rather than re-serializing it, so a
 save moves exactly the keys its own operation is about. Comments, key order,
 and keys this build has never heard of survive it untouched.
+
+That holds inside lists like `[[providers]]` too: registering a provider appends
+an entry and leaves the ones already there exactly as you wrote them, and a save
+that changes one entry touches only that entry. The one exception is a list a
+save genuinely *reshapes* — an entry removed, or the order changed — where there
+is no longer any way to match the old entries to the new ones; that list alone is
+rewritten whole, and comments inside it go with it. Everything outside it is
+still untouched.
 
 ```toml
 [web]

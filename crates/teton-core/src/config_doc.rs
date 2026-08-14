@@ -513,9 +513,25 @@ fn apply_array_of_tables_delta(
                 // untouched by construction. The new ones render as a block
                 // continuing the one already there — same position, and
                 // toml_edit's sort is stable, so they follow it.
+                //
+                // "The one already there" means the whole of it, sub-tables
+                // included: an element carries `[providers.capabilities]`,
+                // which parses at a *later* position than its own header. Take
+                // only the headers' positions and the appended element lands
+                // between an existing element and that element's own sub-table
+                // — which, since a section's parent is whatever `[[…]]` header
+                // precedes it, silently re-parents the sub-table onto the new
+                // entry and leaves the document holding two
+                // `[providers.capabilities]` under one element. It stops
+                // parsing at that point, so the write is refused and the
+                // second registration onto a config fails outright.
                 let carried = document_array
                     .iter()
-                    .filter_map(Table::position)
+                    .filter_map(|element| {
+                        element
+                            .position()
+                            .map(|position| position.max(last_render_position(element)))
+                    })
                     .max()
                     .unwrap_or(appended_at);
                 for index in from..candidate.len() {
@@ -540,11 +556,23 @@ fn apply_array_of_tables_delta(
                         ) else {
                             continue;
                         };
+                        // A section this edit *adds* inside an element belongs
+                        // to that element, and only to it because of where it
+                        // renders: an array element's sub-tables are parented
+                        // by the `[[…]]` header above them, not by their own
+                        // header path the way `[web.nested]` is. Placed at the
+                        // document's append position, a new
+                        // `[providers.capabilities]` would render past
+                        // everything else in the file, land under whichever
+                        // element is *last*, and collide with that element's
+                        // own sub-table. So inside an element, "append" means
+                        // the element's position.
+                        let element_at = element.position().unwrap_or(appended_at);
                         apply_table_delta(
                             &mut TargetTable::Standard(element),
                             before,
                             after,
-                            appended_at,
+                            element_at,
                         );
                     }
                     return;
@@ -1192,6 +1220,81 @@ tier = "off"
 
         let reloaded = Config::load(&edited).expect("the edited document must load");
         assert_eq!(reloaded, candidate);
+    }
+
+    #[test]
+    fn a_second_append_renders_past_the_first_ones_sub_table() {
+        // Every appended element brings a nested `[providers.capabilities]`
+        // section with it. The second append therefore has to render past the
+        // *whole* of the array already in the document, sub-tables included —
+        // not merely past the last `[[providers]]` header. An element wedged
+        // between an existing entry and that entry's own sub-table re-parents
+        // the sub-table onto the new entry, and the document stops parsing at
+        // all: `duplicate key capabilities in table providers`.
+        let mut third_provider = second_provider();
+        third_provider.id = "local".to_owned();
+
+        let current = registered_provider();
+        let mut candidate = current.clone();
+        candidate.providers.push(second_provider());
+        let once = apply_config_delta(REGISTERED_PROVIDER_CONFIG, &current, &candidate)
+            .expect("the first append applies");
+        assert_eq!(
+            once.matches("[providers.capabilities]").count(),
+            1,
+            "the appended element brings its own sub-table:\n{once}",
+        );
+
+        let current = candidate;
+        let mut candidate = current.clone();
+        candidate.providers.push(third_provider);
+        let twice = apply_config_delta(&once, &current, &candidate).expect("edit applies");
+
+        let reloaded = Config::load(&twice).expect("the twice-appended document must load");
+        assert_eq!(reloaded, candidate);
+        assert_eq!(
+            twice.matches("[providers.capabilities]").count(),
+            2,
+            "each appended element keeps its own sub-table:\n{twice}",
+        );
+        // And the user's own entry is still untouched under both appends.
+        assert!(twice.contains("# The one I actually pay for."), "{twice}");
+        assert!(twice.contains(r#"nickname = "the good one""#), "{twice}");
+    }
+
+    #[test]
+    fn a_section_added_inside_an_array_element_renders_beside_that_element() {
+        // The per-index counterpart of the append defect above, and the same
+        // cause: a sub-table added to element 0 of a two-element array is
+        // parented by the `[[providers]]` header that precedes it. Placed at
+        // the *document's* append position it renders past `[web]`, lands
+        // under the last element, and collides with that element's own
+        // `[providers.capabilities]` — an unparseable document.
+        let mut current = registered_provider();
+        current.providers.push(second_provider());
+        let seed = apply_config_delta(REGISTERED_PROVIDER_CONFIG, &registered_provider(), &current)
+            .expect("the two-provider document is built by an append");
+        let mut candidate = current.clone();
+        candidate.providers[0].capabilities.max_context = 4242;
+
+        let edited = apply_config_delta(&seed, &current, &candidate).expect("edit applies");
+
+        let reloaded = Config::load(&edited).expect("the edited document must load");
+        assert_eq!(reloaded, candidate);
+        assert_eq!(
+            reloaded.providers[0].capabilities.max_context, 4242,
+            "the added section belongs to the element the delta named:\n{edited}",
+        );
+        let first_at = edited.find(r#"id = "anthropic""#).expect("first provider");
+        let second_at = edited.find(r#"id = "cheap""#).expect("second provider");
+        let added_at = edited
+            .find("[providers.capabilities]")
+            .expect("added section");
+        assert!(
+            first_at < added_at && added_at < second_at,
+            "an addition inside an element renders inside that element:\n{edited}",
+        );
+        assert!(edited.contains("# The one I actually pay for."), "{edited}");
     }
 
     #[test]
