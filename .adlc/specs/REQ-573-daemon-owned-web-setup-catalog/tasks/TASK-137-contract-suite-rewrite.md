@@ -1,7 +1,7 @@
 ---
 id: TASK-137
 title: "Contract suite enumerates the typed catalog; guide sync goes bidirectional"
-status: draft
+status: complete
 parent: REQ-573
 created: 2026-08-14
 updated: 2026-08-14
@@ -29,25 +29,25 @@ still drives the production request builder.
 
 ## Acceptance Criteria
 
-- [ ] No `include_str!` of any path outside the tetond crate remains in the
+- [x] No `include_str!` of any path outside the tetond crate remains in the
       suite (AC-3); `BUNDLED_GUIDE` (self_config.md) parsing stays
-- [ ] Exhaustive zip both ways: a catalog entry with no expectation row FAILS
+- [x] Exhaustive zip both ways: a catalog entry with no expectation row FAILS
       with a message naming the entry ("suggestion with no contract test");
       an expectation row with no catalog entry FAILS (stale table)
-- [ ] Per keyed entry, the production builder assertions hold: GET via
+- [x] Per keyed entry, the production builder assertions hold: GET via
       `Egress::lookup` with terms as `q` and endpoint path/query preserved;
       `search_auth_shape()`/`header_value()` produce the documented header
       name/value; `Config::validate()` accepts the suggested shape and the
       rendered TOML carries no raw secret (BR-4)
-- [ ] Guide sync bidirectional (AC-4): every backtick `{key}` template in
+- [x] Guide sync bidirectional (AC-4): every backtick `{key}` template in
       self_config.md is a catalog `auth_template` or the generic default, AND
       every catalog `auth_template` appears in the guide; the SearxNG
       endpoint-shape string appears in both
-- [ ] The keyless SearxNG entry is asserted too: config with no key ref
+- [x] The keyless SearxNG entry is asserted too: config with no key ref
       validates, and the built request carries no auth header
-- [ ] The prompt-size ceiling test and BUG-160 guide-content regression tests
+- [x] The prompt-size ceiling test and BUG-160 guide-content regression tests
       still pass unmodified
-- [ ] `cargo test -p tetond` green
+- [x] `cargo test -p tetond` green
 
 ## Technical Notes
 
