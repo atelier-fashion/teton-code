@@ -3,12 +3,13 @@
   "branch": "feat/REQ-576-presence-attested-config-set",
   "startedAt": "2026-08-14T14:20:00Z",
   "completed": false,
-  "currentPhase": 4,
+  "currentPhase": 5,
   "completedPhases": [
     0,
     1,
     2,
-    3
+    3,
+    4
   ],
   "integrationBranch": "main",
   "notes": "Working in place in the harness worktree great-gagarin-419527 (same as REQ-575). Draft PR deferred to Phase 6 (LESSON-004: branch had no commits at Step 0). Reuses REQ-575's refuse_unattested_commitment, blocks_on_a_human path, and TETON_PRESENCE_ACCEPT=fail seam.",
@@ -36,6 +37,12 @@
       "name": "Validate Architecture & Tasks",
       "completedAt": "2026-08-14T14:42:00Z",
       "verdict": "VALIDATED \u2014 fixed AC-2 degradation-test gap (a_commitment_degrades hardcoded list needs config/set)"
+    },
+    {
+      "phase": 4,
+      "name": "Implement",
+      "completedAt": "2026-08-14T15:10:00Z",
+      "notes": "TASK-140..142 complete; 1558 tests green; recovered a python-truncated TASK-140.md. config/set mutation-verified."
     }
   ],
   "repos": {
@@ -58,7 +65,11 @@
   ],
   "phase4": {
     "currentTask": null,
-    "completedTasks": [],
+    "completedTasks": [
+      "TASK-140",
+      "TASK-141",
+      "TASK-142"
+    ],
     "failedTasks": []
   }
 }
