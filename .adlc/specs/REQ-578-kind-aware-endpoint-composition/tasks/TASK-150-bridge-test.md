@@ -1,7 +1,7 @@
 ---
 id: TASK-150
 title: "Catalog↔composition bridge test (AC-7 mutation vehicle)"
-status: draft
+status: complete
 parent: REQ-578
 created: 2026-08-15
 updated: 2026-08-15
