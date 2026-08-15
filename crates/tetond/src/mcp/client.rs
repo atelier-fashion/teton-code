@@ -726,8 +726,17 @@ const MCP_BASE_ENV_ALLOW: &[&str] = &[
 /// essentials drawn from `daemon_vars`, then the per-server `declared` vars
 /// layered on top (a declared var may override a base one). Nothing outside the
 /// allowlist and the declared set is passed on — so the daemon's provider keys
-/// never reach the child (REQ-544 MED-2). Pure, so it is testable without a
-/// subprocess.
+/// never reach the child (REQ-544 MED-2).
+///
+/// `PATH` is on the allowlist, which means this inherits the daemon's own — and
+/// under launchd that names no package-manager prefix, so an MCP server invoked
+/// as `npx …` or any other brew-installed command cannot be launched at all
+/// (BUG-174). It is floored before `declared` is layered on, so a server that
+/// declares its own `PATH` still overrides it untouched.
+///
+/// Not pure — the floor asks the filesystem which prefixes exist here — but the
+/// allowlist and override semantics remain testable without a subprocess, and
+/// the floor's own decision is unit-tested in [`crate::env_path`].
 fn compose_child_env<I>(
     daemon_vars: I,
     declared: &BTreeMap<String, String>,
@@ -735,10 +744,12 @@ fn compose_child_env<I>(
 where
     I: IntoIterator<Item = (String, String)>,
 {
-    let mut env: BTreeMap<String, String> = daemon_vars
+    let mut base: Vec<(String, String)> = daemon_vars
         .into_iter()
         .filter(|(k, _)| MCP_BASE_ENV_ALLOW.contains(&k.as_str()))
         .collect();
+    crate::env_path::apply_path_floor(&mut base);
+    let mut env: BTreeMap<String, String> = base.into_iter().collect();
     for (k, v) in declared {
         env.insert(k.clone(), v.clone());
     }
@@ -1374,6 +1385,39 @@ mod tests {
                 .find(|(k, _)| k == "TERM")
                 .map(|(_, v)| v.as_str()),
             Some("dumb")
+        );
+    }
+
+    /// BUG-174: an MCP server invoked as `npx …` is unlaunchable when the
+    /// daemon's inherited `PATH` names no package-manager prefix, which is
+    /// exactly what launchd hands it.
+    #[test]
+    fn an_inherited_launchd_path_is_floored_for_the_child() {
+        let daemon_vars = vec![("PATH".to_owned(), "/usr/bin:/bin".to_owned())];
+        let env = compose_child_env(daemon_vars, &BTreeMap::new());
+        let path = env
+            .iter()
+            .find(|(k, _)| k == "PATH")
+            .map(|(_, v)| v.as_str())
+            .expect("a child must always receive a PATH");
+        assert!(path.starts_with("/usr/bin:/bin"), "{path}");
+        // Whatever this machine actually has, the floor may only ever add.
+        assert!(path.len() >= "/usr/bin:/bin".len(), "{path}");
+    }
+
+    /// A server that declares its own `PATH` has said what it wants; the floor
+    /// is applied to the inherited value beneath it and must not survive on top.
+    #[test]
+    fn a_declared_path_overrides_the_floor_untouched() {
+        let daemon_vars = vec![("PATH".to_owned(), "/usr/bin".to_owned())];
+        let mut declared = BTreeMap::new();
+        declared.insert("PATH".to_owned(), "/only/this".to_owned());
+        let env = compose_child_env(daemon_vars, &declared);
+        assert_eq!(
+            env.iter()
+                .find(|(k, _)| k == "PATH")
+                .map(|(_, v)| v.as_str()),
+            Some("/only/this")
         );
     }
 

@@ -1,7 +1,8 @@
 //! The `shell` tool: run a command under a timeout, a cwd jail, and a scrubbed
 //! environment.
 //!
-//! Three hard constraints, each a security property (AC):
+//! Three hard constraints, each a security property (AC) — plus one usability
+//! guarantee about `PATH` that the security constraints do not imply:
 //!
 //! - **cwd jail** — the command runs with the repo root as its working
 //!   directory. (Absolute paths a command constructs itself are outside the
@@ -10,8 +11,13 @@
 //!   (`SECRET`, `PASSWORD`, `PASSWD`, `TOKEN`, `KEY`, `CREDENTIAL`, or a `PAT`
 //!   token) or whose *value* is a credential-bearing URL (`scheme://user:pass@…`)
 //!   is removed before the child starts, so a secret in the daemon's environment
-//!   can never leak into a model-driven `env`/`printenv` (BR-7). `PATH`, `HOME`,
-//!   and the rest pass through so ordinary commands still work.
+//!   can never leak into a model-driven `env`/`printenv` (BR-7). `HOME` and the
+//!   rest pass through so ordinary commands still work.
+//! - **PATH floor** — `PATH` passes through *and is then floored* with the
+//!   package-manager prefixes in [`PATH_FLOOR`](crate::env_path::PATH_FLOOR). Inheriting it unmodified was
+//!   the BUG-174 defect: the daemon's `PATH` is only as good as whatever started
+//!   it, and under launchd that is `/usr/bin:/bin:/usr/sbin:/sbin`, in which no
+//!   Homebrew binary — `teton` included — can be found.
 //! - **timeout** — a runaway command is `SIGKILL`ed after the deadline and the
 //!   timeout is reported to the model, so a bad command can never hang the loop.
 //!   The child is spawned as its own process-group leader and the whole group is
@@ -58,6 +64,7 @@ use serde_json::{json, Value};
 use super::{
     opt_str_arg, opt_u64_arg, str_arg, RefinedOutcome, Tool, ToolContext, ToolDuties, ToolOutcome,
 };
+use crate::env_path::apply_path_floor;
 use crate::harness::digest::tool_result_provenance;
 use crate::harness::shell_duty;
 
@@ -148,7 +155,11 @@ impl Tool for ShellTool {
             .unwrap_or(self.default_timeout_ms)
             .min(self.max_timeout_ms);
 
-        let scrubbed = scrub(std::env::vars());
+        let mut scrubbed = scrub(std::env::vars());
+        // BUG-174: the daemon's own `PATH` is only as good as whatever started
+        // it, and launchd starts it with a bare one. Floor it before the child
+        // inherits it, or every user-installed command is unreachable.
+        apply_path_floor(&mut scrubbed);
 
         let mut cmd = Command::new("sh");
         cmd.arg("-c")
@@ -477,7 +488,7 @@ fn render_output(command: &str, output: &Output) -> ToolOutcome {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::path::PathBuf;
+    use std::path::{Path, PathBuf};
 
     /// The counter, not the timestamp, guarantees uniqueness: `SystemTime::now()`
     /// can return the same value for two calls within one clock tick.
@@ -650,7 +661,6 @@ mod tests {
     // hand-write the notice, which is exactly the code under test.
     // -----------------------------------------------------------------------
 
-    use std::path::Path;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::{Arc, Mutex};
 

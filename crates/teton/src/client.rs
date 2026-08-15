@@ -850,13 +850,49 @@ fn poll_for_daemon(paths: &DaemonPaths) -> anyhow::Result<Option<Connection>> {
 /// a second build on disk. The *classification* lives in `teton-protocol`, which
 /// is transport-free and knows nothing about how a client is installed; the
 /// remedy sentence lives here, where that is known.
-fn build_skew_line(client_version: &str, daemon_version: &str) -> Option<String> {
+fn build_skew_line(
+    client_version: &str,
+    daemon_version: &str,
+    lifetime: DaemonLifetime,
+) -> Option<String> {
     let skew = handshake::build_skew(client_version, daemon_version)?;
+    let remedy = match lifetime {
+        DaemonLifetime::OnDemand => {
+            "Exit every teton session to stop it; the next one starts the new daemon."
+        }
+        // BUG-174: an always-on daemon is running under `--shutdown-policy
+        // never`, so closing sessions is precisely the thing that cannot reach
+        // it. Naming `brew services stop` is the difference between a notice
+        // the user can act on and one that repeats forever.
+        DaemonLifetime::AlwaysOnService => {
+            "This is the always-on `brew services` daemon, which does not exit with your last \
+             session — run `brew services stop teton` once, and the next command starts the new \
+             daemon on demand."
+        }
+    };
     Some(format!(
         "this CLI is {} but the running daemon is {} — commands are being served by the older \
-         binary. Exit every teton session to stop it; the next one starts the new daemon.",
+         binary. {remedy}",
         skew.client_version, skew.daemon_version
     ))
+}
+
+/// How the daemon now serving us was started — the fact that decides which
+/// remedy can actually end it (BUG-174).
+///
+/// This is not cosmetic. The two lifetimes are stopped by disjoint actions, and
+/// the remedy for one is a no-op against the other: a user on an always-on
+/// daemon who is told to close their sessions will close them, see the same
+/// notice, and conclude the tool is broken.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum DaemonLifetime {
+    /// Started on demand by a CLI. It exits with its last client (REQ-565), so
+    /// ending every session is sufficient and sufficient advice.
+    OnDemand,
+    /// Registered with `brew services`. The formula runs it under
+    /// `--shutdown-policy never` (REQ-565 BR-5), so it *by design* does not
+    /// exit with its last client, and only `brew services stop` ends it.
+    AlwaysOnService,
 }
 
 /// Render [`build_skew_line`] for a freshly attached connection.
@@ -864,7 +900,17 @@ fn report_build_skew(conn: &Connection, surface: &mut dyn Surface) {
     let Some(daemon_version) = conn.daemon_version() else {
         return;
     };
-    if let Some(line) = build_skew_line(CLIENT_VERSION, daemon_version) {
+    // Decide there is something to say *before* paying for a `brew` subprocess:
+    // skew is the rare case, and this runs on every attach.
+    if handshake::build_skew(CLIENT_VERSION, daemon_version).is_none() {
+        return;
+    }
+    let lifetime = if crate::service::brew_reports_service_running() {
+        DaemonLifetime::AlwaysOnService
+    } else {
+        DaemonLifetime::OnDemand
+    };
+    if let Some(line) = build_skew_line(CLIENT_VERSION, daemon_version, lifetime) {
         surface.line(LineKind::Notice, &line);
     }
 }
@@ -1703,12 +1749,16 @@ mod tests {
 
     #[test]
     fn matching_builds_say_nothing() {
-        assert_eq!(build_skew_line("0.1.13", "0.1.13"), None);
+        assert_eq!(
+            build_skew_line("0.1.13", "0.1.13", DaemonLifetime::OnDemand),
+            None
+        );
     }
 
     #[test]
     fn a_stale_daemon_produces_one_line_naming_both_versions_and_the_remedy() {
-        let line = build_skew_line("0.1.13", "0.1.12").expect("a skew must be reported");
+        let line = build_skew_line("0.1.13", "0.1.12", DaemonLifetime::OnDemand)
+            .expect("a skew must be reported");
         assert!(line.contains("0.1.13"), "{line}");
         assert!(line.contains("0.1.12"), "{line}");
         // The remedy has to be actionable: under exit-on-last-client, ending
@@ -1732,17 +1782,62 @@ mod tests {
             .is_ok(),
             "the pairing under test must be one that negotiates cleanly"
         );
-        assert!(build_skew_line("0.1.13", "0.1.12").is_some());
+        assert!(build_skew_line("0.1.13", "0.1.12", DaemonLifetime::OnDemand).is_some());
+    }
+
+    // -----------------------------------------------------------------------
+    // The remedy has to match how the daemon was started — BUG-174
+    // -----------------------------------------------------------------------
+
+    /// The regression this bug exists for: an always-on daemon runs under
+    /// `--shutdown-policy never`, so telling the user to close their sessions
+    /// is advice that provably cannot work. It must name `brew services stop`.
+    #[test]
+    fn an_always_on_daemon_is_told_to_stop_the_service_not_close_sessions() {
+        let line = build_skew_line("0.1.16", "0.1.13", DaemonLifetime::AlwaysOnService)
+            .expect("a skew must be reported");
+        assert!(line.contains("brew services stop teton"), "{line}");
+        assert!(
+            !line.contains("Exit every teton session"),
+            "the on-demand remedy is a no-op against a `--shutdown-policy never` daemon and must \
+             not be offered: {line}"
+        );
+        assert!(line.contains("0.1.16") && line.contains("0.1.13"), "{line}");
+        assert_eq!(line.lines().count(), 1, "exactly one line: {line}");
+    }
+
+    /// The two lifetimes must not converge on one sentence — if they ever did,
+    /// this bug would be back with no test failing.
+    #[test]
+    fn the_two_lifetimes_give_different_remedies() {
+        let on_demand = build_skew_line("0.1.16", "0.1.13", DaemonLifetime::OnDemand).unwrap();
+        let service = build_skew_line("0.1.16", "0.1.13", DaemonLifetime::AlwaysOnService).unwrap();
+        assert_ne!(on_demand, service);
+        // Neither may offer the other's remedy.
+        assert!(!on_demand.contains("brew services stop"), "{on_demand}");
+        assert!(!service.contains("Exit every teton session"), "{service}");
+    }
+
+    /// Agreement is still silence on both lifetimes: the lifetime decides the
+    /// remedy, never whether there is anything to report.
+    #[test]
+    fn matching_builds_say_nothing_on_either_lifetime() {
+        for lifetime in [DaemonLifetime::OnDemand, DaemonLifetime::AlwaysOnService] {
+            assert_eq!(build_skew_line("0.1.16", "0.1.16", lifetime), None);
+        }
     }
 
     /// A daemon whose version we never learned (no completed handshake) must not
     /// invent one — silence beats a fabricated comparison.
     #[test]
     fn a_connection_without_a_handshake_reports_no_version() {
-        assert_eq!(build_skew_line("0.1.13", "0.1.13"), None);
+        assert_eq!(
+            build_skew_line("0.1.13", "0.1.13", DaemonLifetime::OnDemand),
+            None
+        );
         // And the accessor's default is genuinely absent, not an empty string
         // that would compare unequal to every real version.
-        assert!(build_skew_line("", "0.1.13").is_some());
+        assert!(build_skew_line("", "0.1.13", DaemonLifetime::OnDemand).is_some());
     }
 
     // -----------------------------------------------------------------------
