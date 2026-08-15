@@ -69,9 +69,24 @@ AC-6 freezes `provider_recipes.rs`, `conformance.rs`, and
 asserts, for every `recipe_catalog()` entry: (a) **idempotence** —
 `compose_endpoint(kind, Some(recipe.endpoint))` returns it unchanged with
 `changed: false`; (b) **base→full agreement** — composing the recipe
-endpoint's origin (and its bare-`/v1` form where the canonical path begins
-with `/v1`) yields exactly the recipe's endpoint; (c) the Anthropic default
-constant equals the Anthropic recipe's endpoint. Now the two spellings of the
+endpoint's **vendor-documented base form** yields exactly the recipe's
+endpoint: the bare-`/v1` form for recipes whose endpoint carries a `/v1`
+segment (OpenAI, Moonshot, Ollama, xAI), the bare origin otherwise
+(DeepSeek, Anthropic). Derive the base form from the recipe endpoint by
+stripping the kind's `canonical_request_path()` suffix — never hand-write
+base URLs; (c) the Anthropic default constant equals the Anthropic recipe's
+endpoint.
+
+**Known limit (recorded 2026-08-15, TASK-148):** a bare *origin* for a
+`/v1`-family vendor (`https://api.openai.com`) composes to
+`…/chat/completions` without `/v1` — a URL that vendor does not serve. This
+is BR-2 as specified: the kind-level rule cannot know whether `/v1` belongs
+(DeepSeek's documented base has none), and per-vendor variants are out of
+scope. Mitigations already in the design: vendors document their base URLs
+*with* `/v1` where it belongs, so the common paste composes correctly; BR-4's
+echo shows the composed value before any key is read; the doctor advisory
+names the full form for bare shapes. TASK-149's echo tests must include a
+bare-origin case so the visibility claim is itself tested. Now the two spellings of the
 contract fail together on drift, and (b) is AC-7's mutation target: stub the
 composition to identity and this test fails on the missing path.
 
