@@ -46,6 +46,7 @@ mod keychain;
 mod loading;
 mod model_ui;
 mod prompt;
+mod provider_setup_ui;
 mod render;
 mod service;
 mod session_ui;
@@ -1994,35 +1995,93 @@ const FORBIDDEN_ENDPOINT_BYTES: [char; 3] = ['\t', '\n', '\r'];
 /// with a recording surface — the real flow needs a daemon connection, and the
 /// ordering claim (BR-5) is exactly the kind of property that regresses when a
 /// later edit moves one line.
+///
+/// The six steps themselves live in [`settle_endpoint_text`]; what is left here
+/// is the rendering. `/provider setup` calls that core directly (REQ-579 ADR-8):
+/// one compose-and-echo seam, not two that agree until the day they do not
+/// (LESSON-528).
 fn settle_endpoint(
     id: &str,
     kind: ProviderKind,
     endpoint: Option<String>,
     surface: &mut dyn Surface,
 ) -> anyhow::Result<Option<String>> {
+    let settled =
+        settle_endpoint_text(id, kind, endpoint.as_deref()).map_err(anyhow::Error::msg)?;
+    // The echo first, the warning second: the warning is about the key prompt
+    // that follows, so it sits immediately above it (step 6).
+    if let Some(echo) = &settled.echo {
+        surface.line(LineKind::Info, echo);
+    }
+    if let Some(warning) = &settled.cleartext_warning {
+        surface.line(LineKind::Notice, warning);
+    }
+    Ok(settled.stored)
+}
+
+/// What [`settle_endpoint_text`] decided: the value to persist, and the two
+/// lines a caller owes the user before it asks for a credential.
+///
+/// `echo` and `cleartext_warning` are *content*, not output. The surface a
+/// caller renders them on is its own — `teton provider add` writes them to
+/// stdout, `/provider setup` writes them to the session's `Surface` — and
+/// keeping them as data is what lets both callers share the decision rather
+/// than each re-deriving it (REQ-579 ADR-8).
+pub(crate) struct SettledEndpoint {
+    /// The absolute request URL to persist, or `None` when there is nothing to
+    /// store (the `Local` kind).
+    pub stored: Option<String>,
+    /// The "endpoint stored as …" line, when the stored value is not what was
+    /// typed (REQ-578 BR-4). `None` when they are the same string.
+    pub echo: Option<String>,
+    /// The "this key travels in the clear" line, when the endpoint is `http://`
+    /// to a non-loopback host. `None` otherwise.
+    pub cleartext_warning: Option<String>,
+}
+
+/// The endpoint this registration will persist, decided and nothing else
+/// (REQ-578 BR-1/BR-3/BR-4/BR-5; REQ-579 ADR-8).
+///
+/// The pure half of [`settle_endpoint`] — same six steps, same order, same
+/// sentences — returning the refusal as a `String` rather than bailing and the
+/// two advisory lines as data rather than as surface calls. `/provider setup`
+/// is the second caller, and it has a different surface, a different abort
+/// (a rendered line, not a process exit) and no argv to name; a second copy of
+/// this logic there is exactly the mirrored predicate LESSON-528 is about.
+///
+/// # Errors
+///
+/// The refusal sentence, ready to render. Every one of them ends by saying that
+/// nothing was changed and no credential was read, which is true of both
+/// callers: each runs this before it asks for a key.
+pub(crate) fn settle_endpoint_text(
+    id: &str,
+    kind: ProviderKind,
+    endpoint: Option<&str>,
+) -> Result<SettledEndpoint, String> {
     // Both checks read the value as *supplied* rather than the composed one:
     // what is at stake is the string the user typed and can see, and composition
     // only ever appends a path to it.
-    if let Some(supplied) = endpoint.as_deref() {
+    if let Some(supplied) = endpoint {
         if supplied.contains(FORBIDDEN_ENDPOINT_BYTES) {
-            anyhow::bail!(
+            return Err(format!(
                 "provider `{id}`: the `--endpoint` value contains a tab, newline or carriage \
                  return. Teton refuses it rather than guessing which one you meant: URL parsers \
                  *delete* those bytes while a terminal *renders* them as spacing, so the address \
                  shown back to you would not be the address Teton dials and nothing on screen \
                  would say so. Re-paste the URL without them — a stray one usually comes from a \
                  copy that spanned a line break. Nothing was changed and no credential was read."
-            );
+            ));
         }
     }
 
     // Blank is "absent" here exactly as it is inside `compose_endpoint`, so a
     // `--endpoint ""` on `--kind anthropic` still reaches BR-3's default rather
     // than being shape-checked and refused.
-    let supplied = endpoint.as_deref().map(str::trim).filter(|v| !v.is_empty());
+    let supplied = endpoint.map(str::trim).filter(|v| !v.is_empty());
     if let Some(supplied) = supplied {
         if !matches!(kind, ProviderKind::Local) && !is_absolute_http_url(supplied) {
-            anyhow::bail!(
+            return Err(format!(
                 "provider `{id}`: `--endpoint {supplied}` is not an absolute `http://` or \
                  `https://` URL with a host. Teton refuses it rather than storing it, because \
                  several near-misses are read one way by a URL parser and another way by anything \
@@ -2032,11 +2091,11 @@ fn settle_endpoint(
                  will not register. Pass the URL with its scheme, e.g. \
                  `--endpoint https://api.moonshot.ai/v1`. Nothing was changed and no credential \
                  was read."
-            );
+            ));
         }
     }
 
-    let composed = compose_endpoint(CoreProviderKind::from(kind), endpoint.as_deref());
+    let composed = compose_endpoint(CoreProviderKind::from(kind), endpoint);
 
     if !matches!(kind, ProviderKind::Local)
         && composed.stored.as_deref().unwrap_or("").trim().is_empty()
@@ -2053,10 +2112,10 @@ fn settle_endpoint(
             "Nothing is completed for a `custom` kind — Teton does not know your adapter's \
              protocol — so pass the full request URL your gateway serves."
         };
-        anyhow::bail!(
+        return Err(format!(
             "provider `{id}` is a remote provider and must declare the URL it calls: pass \
              `--endpoint <url>`. {completion} Nothing was changed and no credential was read."
-        );
+        ));
     }
 
     // Remote kinds only. The echo's sentence is "that exact URL is what Teton
@@ -2064,11 +2123,9 @@ fn settle_endpoint(
     // registration whose endpoint was merely trimmed (the one way `changed` can
     // fire for a kind that is never composed) would be told something false
     // about a value the daemon ignores.
-    if composed.changed && !matches!(kind, ProviderKind::Local) {
-        if let Some(stored) = composed.stored.as_deref() {
-            surface.line(LineKind::Info, &endpoint_echo_line(stored));
-        }
-    }
+    let echo = (composed.changed && !matches!(kind, ProviderKind::Local))
+        .then(|| composed.stored.as_deref().map(endpoint_echo_line))
+        .flatten();
 
     // Last, and only for a kind that is about to be asked for a credential: a
     // local provider has none, so there is nothing to expose and nothing to say.
@@ -2079,17 +2136,22 @@ fn settle_endpoint(
     // endpoint that reaches here has a host by construction, so the `and_then`
     // is total in practice; it is written as an option chain because `url_host`
     // is honest about a shape this path can no longer produce.
-    if !matches!(kind, ProviderKind::Local) {
-        if let Some(stored) = composed.stored.as_deref() {
-            if is_cleartext_to_a_remote_host(stored) {
-                if let Some(host) = url_host(stored) {
-                    surface.line(LineKind::Notice, &cleartext_endpoint_line(id, host));
-                }
-            }
-        }
-    }
+    let cleartext_warning = (!matches!(kind, ProviderKind::Local))
+        .then(|| {
+            composed
+                .stored
+                .as_deref()
+                .filter(|stored| is_cleartext_to_a_remote_host(stored))
+                .and_then(url_host)
+                .map(|host| cleartext_endpoint_line(id, host))
+        })
+        .flatten();
 
-    Ok(composed.stored)
+    Ok(SettledEndpoint {
+        stored: composed.stored,
+        echo,
+        cleartext_warning,
+    })
 }
 
 /// A registration whose endpoint has been settled: everything `config/set` will
