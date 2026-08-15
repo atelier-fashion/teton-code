@@ -1,7 +1,7 @@
 ---
 id: REQ-579
 title: "Guided in-session provider setup: `/provider setup` collects, the daemon commits, the model hands off"
-status: draft
+status: approved
 deployable: true
 created: 2026-08-15
 updated: 2026-08-15
