@@ -83,6 +83,7 @@ pub mod consent;
 pub mod cost;
 pub mod download;
 pub mod egress;
+pub mod env_path;
 pub mod grants;
 pub mod harness;
 pub mod install;

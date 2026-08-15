@@ -118,6 +118,14 @@ A PATH floor is warranted independently of the lifecycle fix: any daemon started
 from a thin environment (launchd, a GUI IDE, a system supervisor) has the same
 defect.
 
+**Symptom 2 has a second spawn site**, found while fixing the first.
+`crates/tetond/src/mcp/client.rs` composes a stdio MCP server's environment from
+a positive allowlist (`MCP_BASE_ENV_ALLOW`, REQ-544 MED-2) — and `PATH` is on
+that allowlist, drawn from the daemon's own. So an MCP server declared as
+`npx @scope/server` is not merely degraded under launchd, it **cannot be
+launched at all**. Same root condition, same fix; fixing only the `shell` tool
+would have left the identical bug one module over.
+
 ## Why the fix belongs here and not in the formula
 
 The obvious reading — "`brew upgrade` should stop the daemon" — turns out to be
@@ -163,24 +171,33 @@ for a `brew services info` subprocess, so the common (no-skew) attach is
 unchanged. The detector itself already existed as
 `service::brew_reports_service_running` and only needed `pub(crate)`.
 
-**The `shell` tool now floors its `PATH`.** `PATH_FLOOR` lists the
-package-manager prefixes a supervisor-started daemon lacks, and `floored_path`
-appends any that exist and are not already named. Appended, never prepended: a
-directory already in the inherited `PATH` keeps its position, so a daemon
-started from a real login shell gets byte-identical behaviour and the floor can
-never change which binary an already-working `PATH` selects. An empty result
-falls back to the POSIX default rather than handing the child no `PATH`. The
-existence check is injected so the behaviour is testable off the host's install.
+**Both child-spawning sites now floor their `PATH`.** The floor lives in a new
+daemon-wide module, `crates/tetond/src/env_path.rs`, rather than inside the
+`shell` tool — precisely because it turned out not to be a `shell` concern:
+`PATH_FLOOR` lists the package-manager prefixes a supervisor-started daemon
+lacks, and `floored_path` appends any that exist and are not already named.
+
+Appended, never prepended: a directory already in the inherited `PATH` keeps its
+position, so a daemon started from a real login shell gets byte-identical
+behaviour and the floor can never change which binary an already-working `PATH`
+selects. An empty result falls back to the POSIX default rather than handing the
+child no `PATH`. The existence check is injected so the behaviour is testable
+off whatever the host happens to have installed.
+
+For MCP the floor is applied to the *inherited* pairs **before** the per-server
+`declared` map is layered on, so a server that declares its own `PATH` still
+overrides it untouched.
 
 The module doc's false claim — that `PATH` "pass[es] through so ordinary
 commands still work" — is corrected, since that assertion is what stopped anyone
 adding a floor earlier.
 
-**Tests** (9 new, all passing; full suite 2608 passed / 0 failed):
+**Tests** (11 new, all passing; full suite 2610 passed / 0 failed):
 `an_always_on_daemon_is_told_to_stop_the_service_not_close_sessions` is the
 direct regression; `the_two_lifetimes_give_different_remedies` fails if the two
 branches ever converge back onto one sentence, which is how this bug would
-return silently.
+return silently; `a_declared_path_overrides_the_floor_untouched` pins the MCP
+layering order.
 
 ## Files Changed
 
@@ -189,5 +206,10 @@ return silently.
   skew exists; 4 new tests, 5 existing call sites updated
 - `crates/teton/src/service.rs` — `brew_reports_service_running` made
   `pub(crate)` so the skew path can reach the existing detector
-- `crates/tetond/src/harness/tools/shell.rs` — `PATH_FLOOR`, `floored_path`,
-  `apply_path_floor`, applied in `run`; module doc corrected; 5 new tests
+- `crates/tetond/src/env_path.rs` — **new**: `PATH_FLOOR`, `floored_path`,
+  `apply_path_floor`, and the 5 unit tests for the floor's decision
+- `crates/tetond/src/lib.rs` — registers `env_path`
+- `crates/tetond/src/harness/tools/shell.rs` — floors `PATH` before the child
+  inherits it; module doc corrected
+- `crates/tetond/src/mcp/client.rs` — floors the allowlisted `PATH` beneath the
+  declared vars, so `npx`-style servers launch under launchd; 2 new tests
