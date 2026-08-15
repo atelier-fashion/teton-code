@@ -1534,6 +1534,7 @@ dependencies = [
  "portable-pty",
  "security-framework",
  "serde_json",
+ "teton-core",
  "teton-protocol",
 ]
 

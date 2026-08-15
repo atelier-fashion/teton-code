@@ -15,6 +15,11 @@ use std::process::ExitCode;
 
 use clap::{Parser, Subcommand, ValueEnum};
 
+// REQ-578: the one home of the per-kind canonical request paths. Aliased on the
+// way in because this binary's `ProviderKind` is the *wire* one it parses and
+// sends; the composition rule is written against the core enum, and [`core_kind`]
+// is the only place the two meet.
+use teton_core::{compose_endpoint, ProviderKind as CoreProviderKind};
 use teton_protocol::effort::EffortLevel;
 use teton_protocol::jsonrpc::{error_code, RpcError};
 use teton_protocol::methods::{
@@ -1339,6 +1344,26 @@ fn run_provider_add(
         }
     }
 
+    // REQ-578 BR-3/BR-4/BR-5: the last thing settled before a credential is
+    // typed. Composition itself is a fact about the argv and could be computed
+    // earlier, but the *refusal* and the *echo* belong here, after the
+    // duplicate-id probe:
+    //
+    // - A command that is already refused for a better reason must keep being
+    //   refused for that reason. `provider add deepseek --kind
+    //   openai-compatible --model x` on an id that already exists answered
+    //   "already registered" before this REQ and answers it still (BR-7) —
+    //   a missing-`--endpoint` message there would be true, unhelpful, and a
+    //   change to a shipped refusal.
+    // - An echo printed before a refusal would say "endpoint stored as …"
+    //   about a registration that is not happening.
+    //
+    // ADR-3 sketched this step one line earlier, before the probe; the shipped
+    // order is that sketch minus those two consequences, and it keeps ADR-3's
+    // reason intact — everything the user needs in order to decide whether to
+    // type a key is on screen before they are asked for one.
+    let endpoint = settle_endpoint(id, kind, endpoint, &mut surface)?;
+
     let keychain = keychain::default_keychain();
     // Local providers have no credential; every remote kind requires a key.
     let secret = if matches!(kind, ProviderKind::Local) {
@@ -1815,6 +1840,87 @@ fn binding_source_label(source: BindingSource) -> &'static str {
     }
 }
 
+/// The composition rule's kind, from the wire kind this binary parses.
+///
+/// Two enums with the same four variants: [`ProviderKind`] is the protocol type
+/// the CLI parses and sends, [`CoreProviderKind`] is the one the composition
+/// rule is written against. Spelled as an exhaustive match rather than a `_`
+/// arm — the same technique `tetond`'s `to_core_kind` uses — so a fifth kind
+/// has to be *decided* here rather than silently mapped onto a neighbour whose
+/// request path it does not share.
+fn core_kind(kind: ProviderKind) -> CoreProviderKind {
+    match kind {
+        ProviderKind::Local => CoreProviderKind::Local,
+        ProviderKind::OpenaiCompatible => CoreProviderKind::OpenaiCompatible,
+        ProviderKind::Anthropic => CoreProviderKind::Anthropic,
+        ProviderKind::Custom => CoreProviderKind::Custom,
+    }
+}
+
+/// The one line `provider add` says about an endpoint it did not store exactly
+/// as typed (REQ-578 BR-4).
+///
+/// It names the stored value and what will be done with it, because the thing a
+/// user has to be able to catch is a URL that is *plausible and wrong*: the
+/// kind-level rule cannot know whether a `/v1` belongs to a given vendor's base
+/// URL (DeepSeek's documented base has none, OpenAI's has one), so a bare origin
+/// for a `/v1`-family vendor composes to an address that vendor does not serve
+/// (ADR-2's recorded known limit). This line is that limit's mitigation, which
+/// is why it is emitted before a credential is typed rather than after a 404.
+fn endpoint_echo_line(stored: &str) -> String {
+    format!("endpoint stored as {stored} — that exact URL is what Teton will POST.")
+}
+
+/// The endpoint this registration will persist, settled before anything
+/// credential-shaped happens (REQ-578 BR-1/BR-3/BR-4/BR-5).
+///
+/// Three things, in this order, and the order is the point:
+///
+/// 1. **Compose.** A vendor *base* URL becomes the absolute request URL Teton
+///    POSTs verbatim, and `--kind anthropic` with no `--endpoint` gets the
+///    official Messages URL written explicitly into config (BR-3). The rule
+///    itself lives in `teton_core::compose_endpoint` and nowhere else.
+/// 2. **Refuse what cannot work.** A remote registration with no endpoint is
+///    the BUG-170 sequence: the daemon's validator refuses it — *after* the
+///    user's key has been read and stored. The predicate here is the validator's
+///    own (`kind.is_remote() && endpoint.trim().is_empty()`), so this adds no
+///    new fatal class (BR-6); it only moves the existing one in front of the
+///    prompt, and names the flag that fixes it.
+/// 3. **Echo, when the stored value is not what was typed.** Only then, and
+///    only for a registration that is still going ahead.
+///
+/// Split out of [`run_provider_add`] so all three are drivable from a unit test
+/// with a recording surface — the real flow needs a daemon connection, and the
+/// ordering claim (BR-5) is exactly the kind of property that regresses when a
+/// later edit moves one line.
+fn settle_endpoint(
+    id: &str,
+    kind: ProviderKind,
+    endpoint: Option<String>,
+    surface: &mut dyn Surface,
+) -> anyhow::Result<Option<String>> {
+    let composed = compose_endpoint(core_kind(kind), endpoint.as_deref());
+
+    if !matches!(kind, ProviderKind::Local)
+        && composed.stored.as_deref().unwrap_or("").trim().is_empty()
+    {
+        anyhow::bail!(
+            "provider `{id}` is a remote provider and must declare the URL it calls: pass \
+             `--endpoint <url>`. Your vendor's documented base URL is enough (e.g. \
+             `--endpoint https://api.moonshot.ai/v1`) — Teton completes it to the request \
+             URL and tells you what it stored. Nothing was changed and no credential was read."
+        );
+    }
+
+    if composed.changed {
+        if let Some(stored) = composed.stored.as_deref() {
+            surface.line(LineKind::Info, &endpoint_echo_line(stored));
+        }
+    }
+
+    Ok(composed.stored)
+}
+
 /// Build the provider registration, storing any secret in the keychain first so
 /// only the reference travels onward (BR-7).
 fn build_provider_registration(
@@ -2078,6 +2184,7 @@ mod tests {
     use crate::keychain::MockKeychain;
     use crate::prompt::ScriptedPrompter;
     use crate::render::RecordingSurface;
+    use teton_core::ANTHROPIC_DEFAULT_ENDPOINT;
 
     /// Parse args as the CLI would, panicking with clap's message on error.
     fn parse(args: &[&str]) -> Cli {
@@ -2987,6 +3094,242 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
+    // REQ-578: what `provider add` decides to store, and when it says so.
+    //
+    // The composition *rule* is tabled where it lives
+    // (`teton_core::endpoint_composition`); what these drive is the CLI's half
+    // of it — the echo (BR-4), the Anthropic default arriving through the same
+    // seam (BR-3), and the refusal that has to land before a credential is
+    // typed (BR-5). AC-1..AC-5 through a real daemon are the e2e's.
+    // -----------------------------------------------------------------------
+
+    /// Run the composition step the way `run_provider_add` runs it: what it
+    /// settled on, and everything it said while doing so.
+    fn settled(kind: ProviderKind, endpoint: Option<&str>) -> (Option<String>, RecordingSurface) {
+        let mut surface = RecordingSurface::new();
+        let stored = settle_endpoint("kimi", kind, endpoint.map(str::to_owned), &mut surface)
+            .expect("a structurally complete registration settles");
+        (stored, surface)
+    }
+
+    /// AC-1's input: the base URL Moonshot documents becomes the request URL
+    /// Teton POSTs, and the user is told the full form.
+    #[test]
+    fn a_pasted_base_url_is_composed_and_the_stored_form_is_echoed() {
+        let (stored, surface) = settled(
+            ProviderKind::OpenaiCompatible,
+            Some("https://api.moonshot.ai/v1"),
+        );
+
+        assert_eq!(
+            stored.as_deref(),
+            Some("https://api.moonshot.ai/v1/chat/completions"),
+            "the persisted value is always the absolute request URL (BR-1)"
+        );
+        assert!(
+            surface.any_line_contains(
+                LineKind::Info,
+                "https://api.moonshot.ai/v1/chat/completions"
+            ),
+            "a composed endpoint has to be said out loud, in full: {:?}",
+            surface.lines_of(LineKind::Info)
+        );
+    }
+
+    /// The echo's load-bearing case (ADR-2's recorded known limit): a bare
+    /// *origin* for a `/v1`-family vendor composes to a URL that vendor does
+    /// **not** serve — `https://api.openai.com/chat/completions` is a 404.
+    ///
+    /// That is BR-2 as specified rather than a defect: the rule is per *kind*,
+    /// and the kind cannot know whose base URL carries a version segment
+    /// (OpenAI's does, DeepSeek's does not). What makes the limit survivable is
+    /// that the composed URL is shown before a credential is typed — so the
+    /// visibility is itself a claim, and this is the test of it. If a future
+    /// edit ever narrows the echo to "only when we are confident", this fails,
+    /// which is the intent.
+    #[test]
+    fn a_bare_origin_is_echoed_precisely_because_the_composed_url_may_be_wrong() {
+        let (stored, surface) = settled(
+            ProviderKind::OpenaiCompatible,
+            Some("https://api.openai.com"),
+        );
+
+        assert_eq!(
+            stored.as_deref(),
+            Some("https://api.openai.com/chat/completions")
+        );
+        assert!(
+            surface.any_line_contains(LineKind::Info, "https://api.openai.com/chat/completions"),
+            "the one mitigation for the known limit is that the user sees this URL while a \
+             credential is still untyped: {:?}",
+            surface.lines_of(LineKind::Info)
+        );
+    }
+
+    /// BR-3/AC-3: `--kind anthropic` with no `--endpoint` registers the official
+    /// Messages URL, written explicitly and echoed like any other composed value.
+    #[test]
+    fn the_anthropic_default_endpoint_is_stored_and_echoed() {
+        let (stored, surface) = settled(ProviderKind::Anthropic, None);
+
+        assert_eq!(stored.as_deref(), Some(ANTHROPIC_DEFAULT_ENDPOINT));
+        assert!(
+            surface.any_line_contains(LineKind::Info, ANTHROPIC_DEFAULT_ENDPOINT),
+            "a default the user did not type is exactly the case they need told about: {:?}",
+            surface.lines_of(LineKind::Info)
+        );
+    }
+
+    /// AC-2 and AC-4: an endpoint stored exactly as typed produces no line at
+    /// all — every previously documented full-URL command reads byte-identically
+    /// to how it read before this REQ (BR-7), and a gateway's custom path is
+    /// neither rewritten nor remarked upon.
+    #[test]
+    fn an_endpoint_stored_as_typed_says_nothing() {
+        for (kind, endpoint) in [
+            (
+                ProviderKind::OpenaiCompatible,
+                "https://api.moonshot.ai/v1/chat/completions",
+            ),
+            (ProviderKind::Anthropic, ANTHROPIC_DEFAULT_ENDPOINT),
+            // AC-4: an explicit path is somebody's deliberate address.
+            (
+                ProviderKind::OpenaiCompatible,
+                "https://gw.example.com/llm/proxy",
+            ),
+            (ProviderKind::Anthropic, "https://gw.example.com/llm/proxy"),
+        ] {
+            let (stored, surface) = settled(kind, Some(endpoint));
+            assert_eq!(stored.as_deref(), Some(endpoint));
+            assert!(
+                surface.calls.is_empty(),
+                "{kind:?} with `{endpoint}` stored it verbatim and still said something: {:?}",
+                surface.calls
+            );
+        }
+    }
+
+    /// BR-5, at the seam a unit test can reach: the stored endpoint is told
+    /// before the key is asked for.
+    ///
+    /// The two halves are driven in the order [`run_provider_add`] calls them —
+    /// [`settle_endpoint`], whose `?` gates everything after it, then the
+    /// credential read — and what is pinned is that the echo is already on the
+    /// surface at the moment the hiding prompt is put, and that the prompt adds
+    /// nothing to the surface that could have preceded it. The whole-command
+    /// form of this claim (real argv, real daemon) is AC-3's e2e.
+    #[test]
+    fn the_stored_endpoint_is_told_before_the_key_is_asked_for() {
+        let mut surface = RecordingSurface::new();
+        let mut prompter = ScriptedPrompter::new(&["sk-typed-after-the-echo"]);
+
+        let stored =
+            settle_endpoint("claude", ProviderKind::Anthropic, None, &mut surface).unwrap();
+        assert_eq!(stored.as_deref(), Some(ANTHROPIC_DEFAULT_ENDPOINT));
+
+        assert!(
+            prompter.secrets.is_empty(),
+            "nothing may have been asked yet — this is the step that decides whether the \
+             registration is worth typing a key into"
+        );
+        assert!(
+            surface.any_line_contains(LineKind::Info, ANTHROPIC_DEFAULT_ENDPOINT),
+            "and the user has already been told what will be called: {:?}",
+            surface.lines_of(LineKind::Info)
+        );
+        let said_before_the_prompt = surface.calls.len();
+
+        let key = prompt_for_secret("claude", &mut prompter).unwrap();
+
+        assert_eq!(key, "sk-typed-after-the-echo");
+        assert_eq!(prompter.secrets.len(), 1);
+        assert_eq!(
+            surface.calls.len(),
+            said_before_the_prompt,
+            "the credential prompt writes to the prompter, not the surface — so the echo \
+             recorded above is unambiguously the earlier of the two"
+        );
+    }
+
+    /// BR-5's other half: a registration that cannot work is refused with the
+    /// credential still untyped, and the message names the flag that fixes it.
+    ///
+    /// This is the BUG-170 sequence, inverted. The predicate is the daemon
+    /// validator's own (`is_remote && endpoint.trim().is_empty()`), so no new
+    /// fatal class is introduced (BR-6) — it is the *same* refusal, moved in
+    /// front of the prompt. `run_provider_add` reaches `read_secret` only past
+    /// this `?`, so an `Err` here is a refusal with nothing asked and nothing
+    /// stored.
+    #[test]
+    fn a_remote_registration_with_no_endpoint_refuses_before_any_prompt() {
+        for endpoint in [None, Some("   ")] {
+            let mut surface = RecordingSurface::new();
+            let refused = settle_endpoint(
+                "gw",
+                ProviderKind::OpenaiCompatible,
+                endpoint.map(str::to_owned),
+                &mut surface,
+            )
+            .expect_err("an openai-compatible provider has no host to default to (BR-3)");
+
+            let message = refused.to_string();
+            assert!(
+                message.contains("--endpoint"),
+                "the refusal must name the flag: {message}"
+            );
+            assert!(
+                message.contains("no credential was read"),
+                "and say what it did not do with the user's key: {message}"
+            );
+            assert!(
+                surface.calls.is_empty(),
+                "a registration that is not happening has no stored endpoint to echo: {:?}",
+                surface.calls
+            );
+        }
+
+        // The on-device tier has no endpoint and never did — the refusal is
+        // about remote kinds only, exactly as `Config::validate`'s is.
+        let mut surface = RecordingSurface::new();
+        let stored = settle_endpoint("local", ProviderKind::Local, None, &mut surface).unwrap();
+        assert_eq!(stored, None);
+        assert!(surface.calls.is_empty());
+    }
+
+    /// The wire kind and the composition rule's kind are the same four kinds.
+    ///
+    /// A mapping that drifted would compose an Anthropic registration with the
+    /// OpenAI-compatible path — a wrong URL written into a user's config by a
+    /// typo no type checker can see.
+    #[test]
+    fn every_wire_kind_maps_to_its_own_composition_kind() {
+        for (wire, core) in [
+            (ProviderKind::Local, CoreProviderKind::Local),
+            (
+                ProviderKind::OpenaiCompatible,
+                CoreProviderKind::OpenaiCompatible,
+            ),
+            (ProviderKind::Anthropic, CoreProviderKind::Anthropic),
+            (ProviderKind::Custom, CoreProviderKind::Custom),
+        ] {
+            assert_eq!(core_kind(wire), core, "{wire:?} maps to the wrong kind");
+        }
+    }
+
+    /// `custom` names an operator's own adapter, whose protocol Teton does not
+    /// know — so nothing is composed onto it, and what they typed is what they
+    /// get. It is still remote, so it still owes an endpoint.
+    #[test]
+    fn a_custom_kind_is_never_composed_but_still_owes_an_endpoint() {
+        let (stored, surface) = settled(ProviderKind::Custom, Some("https://gw.example.com/v1"));
+        assert_eq!(stored.as_deref(), Some("https://gw.example.com/v1"));
+        assert!(surface.calls.is_empty());
+
+        let mut surface = RecordingSurface::new();
+        assert!(settle_endpoint("gw", ProviderKind::Custom, None, &mut surface).is_err());
+    }
+
+    // -----------------------------------------------------------------------
     // BUG-171: a rejected registration must settle the keychain entry it
     // stored. These drive `report_registration_outcome` the way
     // `run_provider_add` does — prior read, then store, then the daemon's
@@ -3001,7 +3344,10 @@ mod tests {
         let config = build_provider_registration(
             id,
             ProviderKind::Anthropic,
-            Some("https://api.anthropic.com/v1/messages".to_owned()),
+            // The value the flow's composition step would have handed it
+            // (REQ-578 BR-3), read from the constant rather than re-typed: a
+            // fixture that spells a product fact by hand is a second copy of it.
+            Some(ANTHROPIC_DEFAULT_ENDPOINT.to_owned()),
             Some("claude-opus-5".to_owned()),
             kc,
             Some(secret),
