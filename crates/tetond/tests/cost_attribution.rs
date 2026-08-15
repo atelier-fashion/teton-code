@@ -143,10 +143,10 @@ async fn every_egress_call_yields_exactly_one_attributed_cost_record() {
     // (phase, provider, model) for each call — implement routes to a cheap
     // provider, the frontier phases to Anthropic (AC-3 shape).
     let calls = [
-        (Phase::Spec, "anthropic", "claude-opus-4"),
-        (Phase::Architect, "anthropic", "claude-opus-4"),
-        (Phase::Implement, "deepseek", "deepseek-chat"),
-        (Phase::Review, "anthropic", "claude-opus-4"),
+        (Phase::Spec, "anthropic", "claude-opus-5"),
+        (Phase::Architect, "anthropic", "claude-opus-5"),
+        (Phase::Implement, "deepseek", "deepseek-v4-pro"),
+        (Phase::Review, "anthropic", "claude-opus-5"),
     ];
 
     for (phase, provider, model) in calls {
@@ -210,8 +210,8 @@ async fn every_egress_call_yields_exactly_one_attributed_cost_record() {
         report.savings.methodology.contains("Estimate"),
         "savings carries its methodology string (OQ-6)"
     );
-    // Implement went to a cheaper provider than the Opus baseline, so there is a
-    // strictly positive estimated saving.
+    // Implement went to a cheaper provider than the Fable baseline, so there is
+    // a strictly positive estimated saving.
     assert!(report.savings.savings_usd_micros > 0);
 }
 
@@ -230,7 +230,7 @@ async fn a_privacy_blocked_call_is_never_billed() {
     // with billing attribution attached — is refused before the forward point.
     let ctx = EgressContext::new("anthropic")
         .with_session("sess-blocked")
-        .with_cost(CostAttribution::new("claude-opus-4").with_phase(Phase::Review));
+        .with_cost(CostAttribution::new("claude-opus-5").with_phase(Phase::Review));
     let err = egress
         .send(
             request(SECRET),
@@ -283,7 +283,7 @@ async fn a_retry_is_recorded_as_its_own_call() {
     for _ in 0..2 {
         let ctx = EgressContext::new("anthropic")
             .with_session("sess-retry")
-            .with_cost(CostAttribution::new("claude-opus-4").with_phase(Phase::Implement));
+            .with_cost(CostAttribution::new("claude-opus-5").with_phase(Phase::Implement));
         let resp = egress
             .send(request("prompt"), &Provenance::empty(), &ctx)
             .await
@@ -308,7 +308,7 @@ async fn no_ledger_row_carries_prompt_or_credential_content() {
 
     let ctx = EgressContext::new("anthropic")
         .with_session("sess-privacy")
-        .with_cost(CostAttribution::new("claude-opus-4").with_phase(Phase::Spec));
+        .with_cost(CostAttribution::new("claude-opus-5").with_phase(Phase::Spec));
     let resp = egress
         .send(request(SECRET), &Provenance::empty(), &ctx)
         .await
@@ -327,7 +327,7 @@ async fn no_ledger_row_carries_prompt_or_credential_content() {
         assert!(!field.contains("API_KEY"));
     }
     assert_eq!(row.session_id, "sess-privacy");
-    assert_eq!(row.model, "claude-opus-4");
+    assert_eq!(row.model, "claude-opus-5");
     // The emitted event is equally content-free.
     let events = cost_sink.records.lock().unwrap();
     assert!(!events[0].model.contains("sk-live"));

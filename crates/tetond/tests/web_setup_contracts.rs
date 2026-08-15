@@ -60,6 +60,7 @@
 //! | REQ-577 BR-2 / AC-7 (README walkthrough ↔ recipe catalog, bidirectional) | [`the_readme_recipes_and_the_catalog_agree`] |
 //! | REQ-577 BR-2 (recipe notes ↔ the prose that echoes them, bidirectional) | [`the_recipe_notes_and_the_prose_that_echoes_them_agree`] |
 //! | REQ-577 BR-2 (policy topic ↔ `Category::tier()`) | [`the_policy_topic_files_every_category_under_its_own_tier`] |
+//! | REQ-577 follow-up (price table ↔ recipe catalog example models) | [`the_price_table_and_the_recipe_catalogs_example_models_agree`] |
 //!
 //! ## Facts are checked **paired**, not as sets (phase-5)
 //!
@@ -124,6 +125,7 @@ use tetond::egress::{
     Authorship, Egress, HttpTransport, LookupContext, LookupRequest, NoopSink, RedactionGate,
     RedactionVerdict, TaintView,
 };
+use tetond::cost::prices::PriceTable;
 use tetond::provider_recipes::{recipe_catalog, ProviderRecipe};
 use tetond::web_setup_catalog::suggestion_catalog;
 
@@ -2278,4 +2280,68 @@ impl RedactionGate for ForwardingGate {
 
 fn allow_any_host(_host: &str) -> bool {
     true
+}
+
+// ---------------------------------------------------------------------------
+// The price table ↔ the recipe catalog's example models (REQ-577 follow-up)
+// ---------------------------------------------------------------------------
+
+/// **Every remote recipe's example model has a price row** (REQ-577 follow-up).
+///
+/// The gates above pin *prose* against the catalog. This one pins *data*:
+/// `data/prices.toml` is keyed on the exact model string a provider declares
+/// (REQ-557 ADR-A), and a row keyed on a retired vendor id does not error —
+/// the calls it used to price silently become unpriced, so the cost meter
+/// under-reports and nobody sees it. Exactly that happened: the table carried
+/// `kimi-k2` for months after Moonshot discontinued the id, and by the time it
+/// was swept every row in the file was dead. A recipe's example model is the
+/// one string our own docs put into a user's config, so it is the one string
+/// the table must always price.
+///
+/// Deliberately one-directional, unlike the prose gates: the table may price
+/// models the catalog does not exemplify (pinned snapshots, cheaper tiers of
+/// the same vendor), so a reverse sweep would forbid legitimate rows. The
+/// local recipe is the exception, gated in the *other* direction: its example
+/// model must NOT be priced, because the local tier is deliberately empty
+/// (BUG-155) — keyed on the model alone, a row for it would bill any remote
+/// gateway serving the same model name.
+///
+/// Red here? Re-verify the vendor's public pricing page first (the REQ-577
+/// BR-3 discipline), then edit `data/prices.toml` — never the catalog — and
+/// remember its own header rules: micro-USD per Mtok, no zero rows, no
+/// duplicate model keys.
+#[test]
+fn the_price_table_and_the_recipe_catalogs_example_models_agree() {
+    let table = PriceTable::bundled();
+    for recipe in recipe_catalog() {
+        // The local entry is the one whose endpoint is an on-device example
+        // address; on-device inference is never metered, so its model stays
+        // out of the table (BUG-155).
+        let is_local = recipe
+            .endpoint
+            .as_deref()
+            .is_some_and(|endpoint| endpoint.starts_with("http://localhost"));
+        if is_local {
+            assert!(
+                table.entry(&recipe.example_model).is_none(),
+                "the local recipe `{}` has a price row for its example model `{}`. The \
+                 local tier of data/prices.toml is deliberately empty (BUG-155): lookup \
+                 keys on the model alone, so this row would price any remote gateway \
+                 declaring the same model name. Remove the row.",
+                recipe.id_suggestion,
+                recipe.example_model,
+            );
+        } else {
+            assert!(
+                table.entry(&recipe.example_model).is_some(),
+                "recipe `{}`: example model `{}` has no row in data/prices.toml, so the \
+                 cost meter silently under-reports for exactly the model our own recipes \
+                 tell a user to type. Verify the vendor's current public pricing page, \
+                 then add the row (micro-USD per Mtok) — do not edit the catalog to make \
+                 this pass.",
+                recipe.id_suggestion,
+                recipe.example_model,
+            );
+        }
+    }
 }

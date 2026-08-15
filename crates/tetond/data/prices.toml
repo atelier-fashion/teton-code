@@ -19,6 +19,13 @@
 #     declaring that model, including a paid gateway, which would then be
 #     reported as free AND credited with the full baseline as savings (BUG-155).
 #     Both rules are enforced by tests in `src/cost/prices.rs`.
+#   - A row keyed on a RETIRED vendor id does not error — the calls it used to
+#     price silently become unpriced, so the meter under-reports and nobody
+#     sees it. That is why every remote recipe's example model must have a row
+#     here: `the_price_table_and_the_recipe_catalogs_example_models_agree`
+#     (tests/web_setup_contracts.rs) goes red when the catalog and this table
+#     drift apart. Fix a red gate by re-verifying the vendor's pricing page and
+#     editing THIS file, never by editing the catalog.
 #
 #   input_usd_micros_per_mtok  = micro-USD charged per 1,000,000 input tokens
 #   output_usd_micros_per_mtok = micro-USD charged per 1,000,000 output tokens
@@ -36,56 +43,116 @@
 # estimate (OQ-6): the report reprices every priced call's token volume at this
 # model and reports the difference as an *estimate* (never as measured fact).
 #
-# NOTE: the rates below are representative public list prices at authoring time,
-# kept here as data so they can be corrected without a code change.
+# NOTE: the rates below are public list prices (standard tier: cache-miss
+# input, no batch/priority discounts), verified 2026-08-14 against each
+# vendor's own pricing page, kept here as data so they can be corrected
+# without a code change. Version 1's rows were all keyed on ids their vendors
+# have since retired (claude-opus-4 / claude-sonnet-4 / claude-3-5-haiku,
+# retired 2026-06-15 and 2026-02-19; deepseek-chat / deepseek-reasoner,
+# retired 2026-07-24; kimi-k2, discontinued 2026-05-25) — exactly the silent
+# under-reporting the gate above now catches.
 
-version = 1
+version = 2
 
 # The all-frontier baseline for the savings estimate (AC-4 / OQ-6). Must name a
-# model that also appears in `[[models]]` below.
+# model that also appears in `[[models]]` below. `claude-fable-5` is the most
+# capable generally available frontier model at authoring time — the honest
+# "what if every call had gone to the frontier" comparator now that the
+# retired claude-opus-4's $15/$75 tier no longer exists to be compared against.
 [baseline]
 provider_id = "anthropic"
-model = "claude-opus-4"
+model = "claude-fable-5"
 
 # --- Anthropic ---------------------------------------------------------------
+# Verified 2026-08-14 against platform.claude.com/docs/en/about-claude/pricing
+# and .../models/overview.
 
 [[models]]
 provider_id = "anthropic"
-model = "claude-opus-4"
-input_usd_micros_per_mtok = 15_000_000
-output_usd_micros_per_mtok = 75_000_000
+model = "claude-fable-5"
+input_usd_micros_per_mtok = 10_000_000
+output_usd_micros_per_mtok = 50_000_000
 
 [[models]]
 provider_id = "anthropic"
-model = "claude-sonnet-4"
-input_usd_micros_per_mtok = 3_000_000
-output_usd_micros_per_mtok = 15_000_000
+model = "claude-opus-5"
+input_usd_micros_per_mtok = 5_000_000
+output_usd_micros_per_mtok = 25_000_000
+
+# Sonnet 5's launch pricing was made the standard price on 2026-08 (the
+# announced 2026-09-01 increase to $3/$15 was cancelled).
+[[models]]
+provider_id = "anthropic"
+model = "claude-sonnet-5"
+input_usd_micros_per_mtok = 2_000_000
+output_usd_micros_per_mtok = 10_000_000
 
 [[models]]
 provider_id = "anthropic"
-model = "claude-3-5-haiku"
-input_usd_micros_per_mtok = 800_000
-output_usd_micros_per_mtok = 4_000_000
+model = "claude-haiku-4-5"
+input_usd_micros_per_mtok = 1_000_000
+output_usd_micros_per_mtok = 5_000_000
 
-# --- OpenAI-compatible (DeepSeek, Kimi, …) -----------------------------------
+# --- OpenAI ------------------------------------------------------------------
+# Verified 2026-08-14 against developers.openai.com/api/docs/pricing. The
+# `gpt-5.6` alias routes to (and bills as) the `gpt-5.6-sol` snapshot; both
+# spellings get a row because lookup keys on the exact string a provider
+# declares, and a user may pin the snapshot. Same model, same rate — this is
+# two spellings priced once each, not a duplicate row for one key.
+
+[[models]]
+provider_id = "openai"
+model = "gpt-5.6"
+input_usd_micros_per_mtok = 5_000_000
+output_usd_micros_per_mtok = 30_000_000
+
+[[models]]
+provider_id = "openai"
+model = "gpt-5.6-sol"
+input_usd_micros_per_mtok = 5_000_000
+output_usd_micros_per_mtok = 30_000_000
+
+# --- DeepSeek ----------------------------------------------------------------
+# Verified 2026-08-14 against api-docs.deepseek.com/quick_start/pricing.
+# CAVEAT: DeepSeek switches to peak/off-peak time-of-day billing on 2026-08-16
+# 16:00 UTC (peak = 2x off-peak; v4-pro peak $1.32/$3.96, off-peak $0.66/$1.98).
+# This table's schema is one flat rate per model and cannot express that, so
+# after 2026-08-16 these rows are an approximation whichever figure they carry.
+# They hold the flat rates in effect at verification time; revisit after the
+# switch and pick a documented convention (e.g. peak, as the conservative
+# ceiling).
 
 [[models]]
 provider_id = "deepseek"
-model = "deepseek-chat"
-input_usd_micros_per_mtok = 270_000
-output_usd_micros_per_mtok = 1_100_000
+model = "deepseek-v4-pro"
+input_usd_micros_per_mtok = 435_000
+output_usd_micros_per_mtok = 870_000
 
 [[models]]
 provider_id = "deepseek"
-model = "deepseek-reasoner"
-input_usd_micros_per_mtok = 550_000
-output_usd_micros_per_mtok = 2_190_000
+model = "deepseek-v4-flash"
+input_usd_micros_per_mtok = 140_000
+output_usd_micros_per_mtok = 280_000
+
+# --- Moonshot (Kimi) ---------------------------------------------------------
+# Verified 2026-08-14 against platform.kimi.ai/docs/pricing/chat-k3.
 
 [[models]]
 provider_id = "moonshot"
-model = "kimi-k2"
-input_usd_micros_per_mtok = 600_000
-output_usd_micros_per_mtok = 2_500_000
+model = "kimi-k3"
+input_usd_micros_per_mtok = 3_000_000
+output_usd_micros_per_mtok = 15_000_000
+
+# --- xAI (Grok) --------------------------------------------------------------
+# Verified 2026-08-14 against docs.x.ai/docs/models. Standard tier (prompts
+# under 200k tokens); the >=200k-prompt tier bills all tokens at 2x these
+# rates, which this schema cannot express.
+
+[[models]]
+provider_id = "xai"
+model = "grok-4.6"
+input_usd_micros_per_mtok = 2_000_000
+output_usd_micros_per_mtok = 6_000_000
 
 # --- Local tier --------------------------------------------------------------
 # DELIBERATELY EMPTY (BUG-155).

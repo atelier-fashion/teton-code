@@ -407,10 +407,10 @@ mod tests {
                 "s1",
                 Some(Phase::Review),
                 "anthropic",
-                "claude-opus-4",
+                "claude-fable-5",
                 1000,
                 500,
-                prices.price("claude-opus-4", 1000, 500),
+                prices.price("claude-fable-5", 1000, 500),
             ),
         ];
         let report = aggregate(&rows, &[], &prices);
@@ -423,7 +423,7 @@ mod tests {
         );
         // The priced model is NOT in the bucket — this names what needs a price,
         // not what was called.
-        assert!(!report.unpriced.models.contains("claude-opus-4"));
+        assert!(!report.unpriced.models.contains("claude-fable-5"));
     }
 
     /// A minimal table: one frontier row (so the baseline resolves) and one
@@ -516,14 +516,14 @@ mod tests {
     #[test]
     fn two_providers_calling_one_model_are_priced_identically() {
         let prices = PriceTable::bundled();
-        let cost = prices.price("claude-opus-4", 1000, 500);
+        let cost = prices.price("claude-fable-5", 1000, 500);
         assert!(cost.is_some());
         let rows = vec![
             row(
                 "s1",
                 None,
                 "anthropic-direct",
-                "claude-opus-4",
+                "claude-fable-5",
                 1000,
                 500,
                 cost,
@@ -532,7 +532,7 @@ mod tests {
                 "s1",
                 None,
                 "anthropic-gateway",
-                "claude-opus-4",
+                "claude-fable-5",
                 1000,
                 500,
                 cost,
@@ -571,25 +571,25 @@ mod tests {
     #[test]
     fn aggregates_by_session_phase_and_provider() {
         let prices = PriceTable::bundled();
-        // Two priced calls (opus review + cheap-remote implement) and one unpriced.
+        // Two priced calls (frontier review + cheap-remote implement) and one unpriced.
         let rows = vec![
             row(
                 "s1",
                 Some(Phase::Review),
                 "anthropic",
-                "claude-opus-4",
+                "claude-fable-5",
                 1000,
                 500,
-                prices.price("claude-opus-4", 1000, 500),
+                prices.price("claude-fable-5", 1000, 500),
             ),
             row(
                 "s1",
                 Some(Phase::Implement),
                 "deepseek",
-                "deepseek-chat",
+                "deepseek-v4-pro",
                 4000,
                 2000,
-                prices.price("deepseek-chat", 4000, 2000),
+                prices.price("deepseek-v4-pro", 4000, 2000),
             ),
             row(
                 "s2",
@@ -639,38 +639,38 @@ mod tests {
         // turns are never metered, and keyed on the model alone the rows priced
         // any remote provider declaring that model at zero). A genuinely cheap
         // remote call tests the same claim and is the case the estimate exists for.
-        let cheap_cost = prices.price("deepseek-chat", 10_000, 5000);
+        let cheap_cost = prices.price("deepseek-v4-pro", 10_000, 5000);
         let rows = vec![row(
             "s1",
             Some(Phase::Implement),
             "deepseek",
-            "deepseek-chat",
+            "deepseek-v4-pro",
             10_000,
             5000,
             cheap_cost,
         )];
         let report = aggregate(&rows, &[], &prices);
 
-        // Actual: deepseek-chat at $0.27/$1.10 per Mtok.
-        //   10_000 * 0.27 + 5_000 * 1.10 = 2_700 + 5_500 = 8_200 micro-USD
-        assert_eq!(report.savings.actual_usd_micros, 8_200);
-        // Baseline: the same volume at Opus ($15/$75 per Mtok).
-        //   10_000 * 15 + 5_000 * 75 = 150_000 + 375_000 = 525_000 micro-USD
-        assert_eq!(report.savings.baseline_usd_micros, 525_000);
-        assert_eq!(report.savings.savings_usd_micros, 525_000 - 8_200);
+        // Actual: deepseek-v4-pro at $0.435/$0.87 per Mtok.
+        //   10_000 * 0.435 + 5_000 * 0.87 = 4_350 + 4_350 = 8_700 micro-USD
+        assert_eq!(report.savings.actual_usd_micros, 8_700);
+        // Baseline: the same volume at Fable ($10/$50 per Mtok).
+        //   10_000 * 10 + 5_000 * 50 = 100_000 + 250_000 = 350_000 micro-USD
+        assert_eq!(report.savings.baseline_usd_micros, 350_000);
+        assert_eq!(report.savings.savings_usd_micros, 350_000 - 8_700);
         assert_eq!(report.savings.priced_calls, 1);
-        assert_eq!(report.savings.baseline_model, "anthropic/claude-opus-4");
+        assert_eq!(report.savings.baseline_model, "anthropic/claude-fable-5");
     }
 
     #[test]
     fn using_the_baseline_model_itself_yields_zero_savings() {
         let prices = PriceTable::bundled();
-        let cost = prices.price("claude-opus-4", 2000, 1000);
+        let cost = prices.price("claude-fable-5", 2000, 1000);
         let rows = vec![row(
             "s1",
             Some(Phase::Spec),
             "anthropic",
-            "claude-opus-4",
+            "claude-fable-5",
             2000,
             1000,
             cost,
@@ -695,10 +695,10 @@ mod tests {
             "s1",
             Some(Phase::Implement),
             "deepseek",
-            "deepseek-chat",
+            "deepseek-v4-pro",
             4000,
             2000,
-            prices.price("deepseek-chat", 4000, 2000),
+            prices.price("deepseek-v4-pro", 4000, 2000),
         )];
         let lookup = |session: &str, outcome, bytes_in| WebLookupRow {
             session_id: session.to_owned(),
@@ -755,7 +755,7 @@ mod tests {
     #[test]
     fn a_ledger_with_no_lookups_reports_no_web_rollup() {
         let prices = PriceTable::bundled();
-        let rows = vec![row("s1", None, "deepseek", "deepseek-chat", 10, 5, Some(1))];
+        let rows = vec![row("s1", None, "deepseek", "deepseek-v4-pro", 10, 5, Some(1))];
         let report = aggregate(&rows, &[], &prices);
         assert!(report.web_per_session.is_empty());
         assert_eq!(report.per_session.len(), 1);
@@ -765,7 +765,7 @@ mod tests {
     fn methodology_names_the_baseline_and_flags_estimate() {
         let report = aggregate(&[], &[], &PriceTable::bundled());
         assert!(report.methodology.contains("Estimate"));
-        assert!(report.methodology.contains("anthropic/claude-opus-4"));
+        assert!(report.methodology.contains("anthropic/claude-fable-5"));
         assert!(report.savings.is_estimate);
         // The savings payload carries the same methodology string.
         assert_eq!(report.methodology, report.savings.methodology);

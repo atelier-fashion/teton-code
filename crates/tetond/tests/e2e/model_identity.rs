@@ -77,8 +77,10 @@ fn migration_resolves_what_it_can_reports_what_it_cannot_and_does_not_re_run() {
 
     let mut config = String::new();
     // `deepseek` IS in the bundled price table, so the legacy provider-id lookup
-    // resolves it to `deepseek-chat` — the model it was implicitly being billed
-    // as before this REQ, which is exactly what migration should preserve.
+    // resolves it to `deepseek-v4-pro` — the table's first row under that
+    // vendor label. (Not the id it was billed as pre-REQ: the table has since
+    // been swept for retired vendor ids, and migrating to a dead model would
+    // hand the user a config that fails its first call.)
     config.push_str(&legacy_provider_block(
         "deepseek",
         "openai-compatible",
@@ -106,7 +108,7 @@ fn migration_resolves_what_it_can_reports_what_it_cannot_and_does_not_re_run() {
     // Leg 1 — resolvable: migrated to a declared model, written back to disk.
     assert_eq!(
         model_in_config_file(&ws, "deepseek").as_deref(),
-        Some("deepseek-chat"),
+        Some("deepseek-v4-pro"),
         "the resolvable provider must be migrated to a declared model and \
          PERSISTED; an in-memory-only migration re-runs forever"
     );
@@ -139,7 +141,7 @@ fn migration_resolves_what_it_can_reports_what_it_cannot_and_does_not_re_run() {
             .as_str()
             .map(str::to_owned)
     };
-    assert_eq!(model_of("deepseek").as_deref(), Some("deepseek-chat"));
+    assert_eq!(model_of("deepseek").as_deref(), Some("deepseek-v4-pro"));
     assert_eq!(model_of("mystery"), None);
 
     let after_first_start = std::fs::read_to_string(&ws.config_path).expect("config file");
