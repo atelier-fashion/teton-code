@@ -327,6 +327,14 @@ impl TestDaemon {
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
+        // Removed rather than simply not set, for the same reason as
+        // `TETON_TEST_SEAMS` below: a developer who exports a provider key in
+        // their shell must still run the test CI runs. `read_secret` takes this
+        // variable ahead of the prompt, so an exported value would flip every
+        // REQ-578 registration test off the "stdin is closed, so the flow stops
+        // at the credential step" path they are all written against — and onto
+        // one that writes to the **real OS keychain**, which has no test seam.
+        command.env_remove("TETON_PROVIDER_KEY");
         match seams {
             CliSeams::On => command.env("TETON_TEST_SEAMS", "1"),
             // Removed rather than simply not set: a developer who exports the
@@ -1899,7 +1907,13 @@ fn provider_add_composes_a_pasted_base_url_and_says_so_before_asking_for_a_key()
     let daemon = TestDaemon::spawn(&daemon);
     let teton = teton_bin();
 
-    let (output, status) = daemon.run_cli_capture(
+    // **Stdout alone**, not the combined capture. An ordering claim compared
+    // across two concatenated streams is not an ordering claim: everything on
+    // stdout precedes everything on stderr in that string no matter what order
+    // the user saw, so a prompt that moved to stderr would keep passing. Both
+    // lines under test are stdout's (the surface writes there, and so does the
+    // hiding prompter), which is exactly why the comparison must be made there.
+    let (output, stderr, status) = daemon.run_cli_streams(
         &teton,
         &[
             "provider",
@@ -1913,6 +1927,7 @@ fn provider_add_composes_a_pasted_base_url_and_says_so_before_asking_for_a_key()
             "kimi-k3",
         ],
         "",
+        CliSeams::Off,
     );
 
     let composed = output
@@ -1920,13 +1935,13 @@ fn provider_add_composes_a_pasted_base_url_and_says_so_before_asking_for_a_key()
         .unwrap_or_else(|| {
             panic!(
                 "AC-1: the base URL must be completed to the request URL and echoed in full; \
-                 output:\n{output}"
+                 stdout:\n{output}\nstderr:\n{stderr}"
             )
         });
     assert!(
         output.contains("endpoint stored as"),
         "AC-1/BR-4: the echo must say the URL is what was *stored*, not merely mention it; \
-         output:\n{output}"
+         stdout:\n{output}"
     );
 
     // BR-5, end to end: the credential prompt is downstream of the decision.
@@ -1934,13 +1949,13 @@ fn provider_add_composes_a_pasted_base_url_and_says_so_before_asking_for_a_key()
         panic!(
             "the flow must reach the credential step (and fail there on a closed stdin), or \
              this test is asserting about a command that stopped for some other reason; \
-             output:\n{output}"
+             stdout:\n{output}\nstderr:\n{stderr}"
         )
     });
     assert!(
         composed < asked,
         "BR-5: the stored endpoint must be on screen BEFORE the key is asked for — a user \
-         decides whether to type a credential by reading what will be called; output:\n{output}"
+         decides whether to type a credential by reading what will be called; stdout:\n{output}"
     );
 
     // The key step is where this run ends, so nothing was registered and no
@@ -2013,7 +2028,9 @@ fn provider_add_anthropic_defaults_its_endpoint_and_shows_it_first() {
     let daemon = TestDaemon::spawn(&daemon);
     let teton = teton_bin();
 
-    let (output, _status) = daemon.run_cli_capture(
+    // Stdout alone — see AC-1 above for why an ordering claim may not be made
+    // over the concatenation of two streams.
+    let (output, stderr, _status) = daemon.run_cli_streams(
         &teton,
         &[
             "provider",
@@ -2025,24 +2042,28 @@ fn provider_add_anthropic_defaults_its_endpoint_and_shows_it_first() {
             "claude-opus-5",
         ],
         "",
+        CliSeams::Off,
     );
 
     let defaulted = output
         .find("https://api.anthropic.com/v1/messages")
         .unwrap_or_else(|| {
-            panic!("AC-3: the Anthropic default must be echoed in full; output:\n{output}")
+            panic!(
+                "AC-3: the Anthropic default must be echoed in full; stdout:\n{output}\n\
+                 stderr:\n{stderr}"
+            )
         });
     assert!(
         output.contains("endpoint stored as"),
         "AC-3/BR-3: the default is *stored*, not applied at call time, and the echo is how a \
-         user learns that; output:\n{output}"
+         user learns that; stdout:\n{output}"
     );
     let asked = output
         .find("API key for")
-        .unwrap_or_else(|| panic!("the flow must reach the credential step; output:\n{output}"));
+        .unwrap_or_else(|| panic!("the flow must reach the credential step; stdout:\n{output}"));
     assert!(
         defaulted < asked,
-        "AC-3: the endpoint must be determined and shown before the key prompt; output:\n{output}"
+        "AC-3: the endpoint must be determined and shown before the key prompt; stdout:\n{output}"
     );
 }
 

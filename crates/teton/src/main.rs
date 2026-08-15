@@ -19,7 +19,7 @@ use clap::{Parser, Subcommand, ValueEnum};
 // way in because this binary's `ProviderKind` is the *wire* one it parses and
 // sends; the composition rule is written against the core enum, and [`core_kind`]
 // is the only place the two meet.
-use teton_core::{compose_endpoint, ProviderKind as CoreProviderKind};
+use teton_core::{canonical_request_path, compose_endpoint, ProviderKind as CoreProviderKind};
 use teton_protocol::effort::EffortLevel;
 use teton_protocol::jsonrpc::{error_code, RpcError};
 use teton_protocol::methods::{
@@ -165,7 +165,9 @@ enum ProviderAction {
         /// Provider family.
         #[arg(long, value_enum)]
         kind: CliProviderKind,
-        /// Endpoint URL (required for remote kinds).
+        /// Endpoint URL: your vendor's documented base URL or the full request
+        /// URL (a base URL is completed and echoed). Required for remote kinds
+        /// except `anthropic`, which defaults to the official Messages URL.
         #[arg(long)]
         endpoint: Option<String>,
         /// The model this provider calls, e.g. `claude-opus-5` (REQ-557 BR-1).
@@ -1843,20 +1845,32 @@ fn binding_source_label(source: BindingSource) -> &'static str {
     }
 }
 
-/// The composition rule's kind, from the wire kind this binary parses.
+/// An endpoint as it should be **shown**, with any `user:password@` userinfo
+/// replaced (REQ-578 verify).
 ///
-/// Two enums with the same four variants: [`ProviderKind`] is the protocol type
-/// the CLI parses and sends, [`CoreProviderKind`] is the one the composition
-/// rule is written against. Spelled as an exhaustive match rather than a `_`
-/// arm — the same technique `tetond`'s `to_core_kind` uses — so a fifth kind
-/// has to be *decided* here rather than silently mapped onto a neighbour whose
-/// request path it does not share.
-fn core_kind(kind: ProviderKind) -> CoreProviderKind {
-    match kind {
-        ProviderKind::Local => CoreProviderKind::Local,
-        ProviderKind::OpenaiCompatible => CoreProviderKind::OpenaiCompatible,
-        ProviderKind::Anthropic => CoreProviderKind::Anthropic,
-        ProviderKind::Custom => CoreProviderKind::Custom,
+/// The stored value is untouched: composition decides paths, and an address the
+/// user typed is dialled as typed. What changes is the *rendering*, because
+/// every line this module prints goes somewhere a credential should not — a
+/// terminal scrollback, a session recording, the output a user pastes into a bug
+/// report. `render_config`'s own pre-existing exposure is a separate surface and
+/// is deliberately left alone here.
+///
+/// Replaced rather than deleted, so the rendered URL still says a credential was
+/// there. A line that silently dropped it would claim to be showing "that exact
+/// URL" while showing a different one, which is the specific failure the echo
+/// exists to prevent.
+fn displayed_endpoint(url: &str) -> String {
+    let Some((scheme, rest)) = url.split_once("://") else {
+        return url.to_owned();
+    };
+    let authority_end = rest.find(['/', '?', '#']).unwrap_or(rest.len());
+    let (authority, tail) = rest.split_at(authority_end);
+    // The *last* `@` ends the userinfo: a password may contain one, and the
+    // authority ends at the last — the same reading `teton_core`'s `url_host`
+    // takes of the same region.
+    match authority.rsplit_once('@') {
+        Some((_, host)) => format!("{scheme}://***@{host}{tail}"),
+        None => url.to_owned(),
     }
 }
 
@@ -1871,28 +1885,104 @@ fn core_kind(kind: ProviderKind) -> CoreProviderKind {
 /// (ADR-2's recorded known limit). This line is that limit's mitigation, which
 /// is why it is emitted before a credential is typed rather than after a 404.
 fn endpoint_echo_line(stored: &str) -> String {
-    format!("endpoint stored as {stored} — that exact URL is what Teton will POST.")
+    format!(
+        "endpoint stored as {} — that exact URL is what Teton will POST.",
+        displayed_endpoint(stored)
+    )
 }
+
+/// The host a credential typed at this registration would reach **in the
+/// clear**, or `None` when it would not.
+///
+/// A mirror of `teton_core::config`'s `is_cleartext_to_a_remote_host` and its
+/// `url_host`, which are private to that module and answer for a different value
+/// (the `[web]` search endpoint). Same rule, deliberately: `http://` to loopback
+/// is not an exposure — nothing leaves the machine, and a self-hosted Ollama on
+/// `http://localhost:11434` is an ordinary configuration — while `http://` to
+/// anything else puts the key on a wire any hop can read. If that predicate ever
+/// moves, this is the second copy to fix.
+///
+/// Returns the host rather than a `bool` so the warning can name where the key
+/// would go; a warning that says only "unencrypted" leaves the user to work out
+/// which host it meant.
+fn cleartext_remote_host(url: &str) -> Option<&str> {
+    // Case-insensitively, because `HTTP://` is the same request and a
+    // case-sensitive test here would be a silent exemption.
+    let head = url.get(.."http://".len())?;
+    if !head.eq_ignore_ascii_case("http://") {
+        return None;
+    }
+    let rest = &url["http://".len()..];
+    // A backslash ends the authority too: WHATWG reads `\` as `/` in a special
+    // scheme, so `http://evil.example\@127.0.0.1/x` is a request to
+    // `evil.example` — and a splitter that stopped at `/?#` alone would take the
+    // userinfo off at the last `@`, conclude the host is loopback, and stay
+    // silent about a key going to `evil.example`.
+    let authority = rest.split(['/', '?', '#', '\\']).next().unwrap_or_default();
+    let host_port = authority
+        .rsplit_once('@')
+        .map_or(authority, |(_, after)| after);
+    let host = host_port.strip_prefix('[').map_or_else(
+        || host_port.split(':').next().unwrap_or_default(),
+        |bracketed| bracketed.split(']').next().unwrap_or_default(),
+    );
+    if host.is_empty() {
+        // No host to reason about. Failing safe would mean warning, but there is
+        // nothing to name in the warning, and `Config::validate` refuses this
+        // shape downstream.
+        return None;
+    }
+    let loopback = host.eq_ignore_ascii_case("localhost")
+        || host
+            .parse::<std::net::IpAddr>()
+            .is_ok_and(|address| address.is_loopback());
+    (!loopback).then_some(host)
+}
+
+/// The warning `provider add` gives before asking for a key that will travel
+/// unencrypted (REQ-578 verify).
+fn cleartext_endpoint_line(id: &str, host: &str) -> String {
+    format!(
+        "`{id}`'s endpoint is `http://`, so the API key you are about to type travels to {host} \
+         in the clear — every hop between this machine and that host can read it. Use `https://` \
+         if {host} serves it. (A loopback address is exempt: nothing leaves the machine.)"
+    )
+}
+
+/// Bytes an endpoint may not contain, because the terminal and the network stack
+/// would disagree about what the URL is (REQ-578 verify).
+///
+/// TAB, LF and CR are *deleted* by URL parsers (WHATWG strips them from every
+/// position) and *rendered as spacing* by a terminal. So an endpoint carrying one
+/// would be echoed back as a string that is not the string Teton dials, with the
+/// difference invisible on screen — which defeats the one mitigation BR-4 offers
+/// for a composed URL. A paste that spanned a line break is the usual source.
+const FORBIDDEN_ENDPOINT_BYTES: [char; 3] = ['\t', '\n', '\r'];
 
 /// The endpoint this registration will persist, settled before anything
 /// credential-shaped happens (REQ-578 BR-1/BR-3/BR-4/BR-5).
 ///
-/// Three things, in this order, and the order is the point:
+/// Five things, in this order, and the order is the point:
 ///
-/// 1. **Compose.** A vendor *base* URL becomes the absolute request URL Teton
+/// 1. **Refuse bytes that render differently from how they dial.** See
+///    [`FORBIDDEN_ENDPOINT_BYTES`]: an endpoint whose echo cannot be trusted is
+///    worse than no echo, so it is refused before anything else happens to it.
+/// 2. **Compose.** A vendor *base* URL becomes the absolute request URL Teton
 ///    POSTs verbatim, and `--kind anthropic` with no `--endpoint` gets the
 ///    official Messages URL written explicitly into config (BR-3). The rule
 ///    itself lives in `teton_core::compose_endpoint` and nowhere else.
-/// 2. **Refuse what cannot work.** A remote registration with no endpoint is
+/// 3. **Refuse what cannot work.** A remote registration with no endpoint is
 ///    the BUG-170 sequence: the daemon's validator refuses it — *after* the
 ///    user's key has been read and stored. The predicate here is the validator's
 ///    own (`kind.is_remote() && endpoint.trim().is_empty()`), so this adds no
 ///    new fatal class (BR-6); it only moves the existing one in front of the
 ///    prompt, and names the flag that fixes it.
-/// 3. **Echo, when the stored value is not what was typed.** Only then, and
+/// 4. **Echo, when the stored value is not what was typed.** Only then, and
 ///    only for a registration that is still going ahead.
+/// 5. **Warn when the key would travel in the clear.** Last, so it sits
+///    immediately above the prompt it is about.
 ///
-/// Split out of [`run_provider_add`] so all three are drivable from a unit test
+/// Split out of [`run_provider_add`] so all five are drivable from a unit test
 /// with a recording surface — the real flow needs a daemon connection, and the
 /// ordering claim (BR-5) is exactly the kind of property that regresses when a
 /// later edit moves one line.
@@ -1902,22 +1992,56 @@ fn settle_endpoint(
     endpoint: Option<String>,
     surface: &mut dyn Surface,
 ) -> anyhow::Result<Option<String>> {
-    let composed = compose_endpoint(core_kind(kind), endpoint.as_deref());
+    // Checked on the value as *supplied*, not on the composed one: what is at
+    // stake is whether the string the user can see is the string that gets
+    // dialled, and composition only ever appends to what it was given.
+    if let Some(supplied) = endpoint.as_deref() {
+        if supplied.contains(FORBIDDEN_ENDPOINT_BYTES) {
+            anyhow::bail!(
+                "provider `{id}`: the `--endpoint` value contains a tab, newline or carriage \
+                 return. Teton refuses it rather than guessing which one you meant: URL parsers \
+                 *delete* those bytes while a terminal *renders* them as spacing, so the address \
+                 shown back to you would not be the address Teton dials and nothing on screen \
+                 would say so. Re-paste the URL without them — a stray one usually comes from a \
+                 copy that spanned a line break. Nothing was changed and no credential was read."
+            );
+        }
+    }
+
+    let composed = compose_endpoint(CoreProviderKind::from(kind), endpoint.as_deref());
 
     if !matches!(kind, ProviderKind::Local)
         && composed.stored.as_deref().unwrap_or("").trim().is_empty()
     {
+        // The completion sentence is true only for a kind Teton knows a request
+        // path for. `custom` names an operator's own adapter, so there is
+        // nothing to complete and offering to would send the user looking for a
+        // behaviour that does not exist.
+        let completion = if canonical_request_path(CoreProviderKind::from(kind)).is_some() {
+            "Your vendor's documented base URL is enough (e.g. `--endpoint \
+             https://api.moonshot.ai/v1`) — Teton completes it to the request URL and tells you \
+             what it stored."
+        } else {
+            "Nothing is completed for a `custom` kind — Teton does not know your adapter's \
+             protocol — so pass the full request URL your gateway serves."
+        };
         anyhow::bail!(
             "provider `{id}` is a remote provider and must declare the URL it calls: pass \
-             `--endpoint <url>`. Your vendor's documented base URL is enough (e.g. \
-             `--endpoint https://api.moonshot.ai/v1`) — Teton completes it to the request \
-             URL and tells you what it stored. Nothing was changed and no credential was read."
+             `--endpoint <url>`. {completion} Nothing was changed and no credential was read."
         );
     }
 
     if composed.changed {
         if let Some(stored) = composed.stored.as_deref() {
             surface.line(LineKind::Info, &endpoint_echo_line(stored));
+        }
+    }
+
+    // Last, and only for a kind that is about to be asked for a credential: a
+    // local provider has none, so there is nothing to expose and nothing to say.
+    if !matches!(kind, ProviderKind::Local) {
+        if let Some(host) = composed.stored.as_deref().and_then(cleartext_remote_host) {
+            surface.line(LineKind::Notice, &cleartext_endpoint_line(id, host));
         }
     }
 
@@ -1929,13 +2053,20 @@ fn settle_endpoint(
 /// ADR-4).
 ///
 /// The predicate is [`compose_endpoint`] itself, not a second reading of BR-2's
-/// classes: an endpoint that would still *change* if it went through the
-/// registration seam again is, by definition, one of the class (b) shapes — a
-/// bare origin, a bare `/`, or a bare `/v1`. Custom paths (class (c)) and
-/// endpoints that already carry the kind's request path (class (a)) return
-/// `changed: false` and are therefore silent here, which is the half of AC-5
-/// that keeps this from becoming a scold: a gateway serving chat completions at
-/// `/llm/proxy` is a first-class deployment, not a mistake.
+/// classes: an endpoint the registration seam would still *complete* is, by
+/// definition, one of the class (b) shapes — a bare origin, a bare `/`, or a
+/// bare `/v1`. Custom paths (class (c)) and endpoints that already carry the
+/// kind's request path (class (a)) compose to themselves and are therefore
+/// silent here, which is the half of AC-5 that keeps this from becoming a scold:
+/// a gateway serving chat completions at `/llm/proxy` is a first-class
+/// deployment, not a mistake.
+///
+/// "Composes to itself" is read whitespace-insensitively rather than off
+/// `ComposedEndpoint::changed`, because that flag also fires when trimming alone
+/// moved the bytes — which is the right trigger for the registration echo (the
+/// user typed something that was not stored) and the wrong one here (a stored
+/// endpoint with a stray blank has not gained a request path and will not 404
+/// for want of one).
 ///
 /// **Advisory, never a fault.** `Config::validate` gains no new fatal class
 /// (BR-6) and doctor's exit status is untouched: a bare origin can even be
@@ -1947,22 +2078,59 @@ fn settle_endpoint(
 /// A registration made through `provider add` is composed at the seam and so is
 /// never flagged; what reaches this pass is a config somebody wrote by hand, or
 /// one written before this composition existed.
+///
+/// **What the line may claim.** Only what Teton would do — never what the
+/// vendor serves. For a bare `/v1` base the composed form is the one address the
+/// rule can be sure of, and the sentence says so plainly. For a bare *origin* on
+/// an OpenAI-compatible provider it cannot: `/chat/completions` is right for
+/// DeepSeek and wrong for OpenAI, whose base carries a `/v1`, and this pass has
+/// no way to tell the two hosts apart (ADR-2's recorded known limit). That case
+/// therefore names the composed form *and* the `/v1` alternative and sends the
+/// user to their vendor's docs, because an advisory that stated a false fact
+/// about a real vendor would be worse than the 404 it is trying to explain — it
+/// was live-observed advising `https://api.openai.com/chat/completions`, which
+/// 404s. Anthropic has no such ambiguity: its canonical path *is* versioned, so
+/// a bare origin composes to the one URL that vendor documents.
 fn base_url_advisory(provider: &ProviderConfig) -> Option<String> {
     let endpoint = provider.endpoint.as_deref()?;
-    let composed = compose_endpoint(core_kind(provider.kind), Some(endpoint));
-    if !composed.changed {
+    let full = compose_endpoint(CoreProviderKind::from(provider.kind), Some(endpoint)).stored?;
+    // Whitespace-insensitively, because composition trims its input: an endpoint
+    // that differs from its composition only by surrounding blanks has gained no
+    // request path, and advising on it would be a scold about bytes TOML kept
+    // rather than about a URL that answers 404.
+    if full == endpoint.trim() {
         return None;
     }
-    let full = composed.stored?;
+
+    // The `/v1` alternative, derived from the module's own canonical path rather
+    // than by re-parsing the URL: strip the path composition appended and what
+    // is left is the stem the user supplied. A stem that already ends in `/v1`,
+    // or a canonical path that carries its own version segment, leaves nothing
+    // ambiguous — so there is no second form to offer.
+    let canonical = canonical_request_path(CoreProviderKind::from(provider.kind))?;
+    let versioned = full
+        .strip_suffix(canonical)
+        .filter(|stem| !canonical.starts_with("/v1") && !stem.ends_with("/v1"))
+        .map(|stem| format!("{}/v1{canonical}", displayed_endpoint(stem)));
+
     let id = &provider.id;
-    let kind = kind_label(provider.kind);
+    let shown = displayed_endpoint(endpoint);
+    let full = displayed_endpoint(&full);
+    let completion = match versioned {
+        Some(versioned) => format!(
+            "Teton would store `{full}`, but many vendors serve this under `/v1` (e.g. \
+             `{versioned}`) — check your vendor's docs."
+        ),
+        None => format!(
+            "Teton would store `{full}` — re-add the provider, or edit config.toml to use it."
+        ),
+    };
     Some(format!(
-        "provider `{id}`: the stored endpoint `{endpoint}` looks like a vendor base URL. Teton \
-         POSTs the stored endpoint verbatim and joins nothing onto it at call time, so the \
-         request URL a {kind} provider on that host serves is `{full}`. This is advice, not a \
-         fault — the config is valid and doctor's status is unchanged — but if `{id}` answers \
-         404 on its first turn, that is the reason; `teton provider add` composes this form for \
-         you, and a hand-edited config can be set to it directly."
+        "provider `{id}`: the stored endpoint `{shown}` looks like a vendor base URL. Teton \
+         POSTs the stored endpoint verbatim and joins nothing onto it at call time, so it has to \
+         be the full request URL. {completion} This is advice, not a fault — the config is valid \
+         and doctor's status is unchanged — but if `{id}` answers 404 on its first turn, that is \
+         the reason."
     ))
 }
 
@@ -3361,7 +3529,10 @@ mod tests {
     ///
     /// A mapping that drifted would compose an Anthropic registration with the
     /// OpenAI-compatible path — a wrong URL written into a user's config by a
-    /// typo no type checker can see.
+    /// typo no type checker can see. The mapping itself is now
+    /// `teton_core`'s one `From` impl, shared with the daemon's `to_core_kind`
+    /// (REQ-578 verify), and this is the CLI's own check that the conversion it
+    /// reaches for is the right one.
     #[test]
     fn every_wire_kind_maps_to_its_own_composition_kind() {
         for (wire, core) in [
@@ -3373,13 +3544,22 @@ mod tests {
             (ProviderKind::Anthropic, CoreProviderKind::Anthropic),
             (ProviderKind::Custom, CoreProviderKind::Custom),
         ] {
-            assert_eq!(core_kind(wire), core, "{wire:?} maps to the wrong kind");
+            assert_eq!(
+                CoreProviderKind::from(wire),
+                core,
+                "{wire:?} maps to the wrong kind"
+            );
         }
     }
 
     /// `custom` names an operator's own adapter, whose protocol Teton does not
     /// know — so nothing is composed onto it, and what they typed is what they
     /// get. It is still remote, so it still owes an endpoint.
+    ///
+    /// And the refusal has to say *that*: the completion sentence every other
+    /// remote kind gets ("your vendor's base URL is enough") is false here, and
+    /// a user who follows it pastes a base URL, gets it stored verbatim, and
+    /// lands on the 404 this REQ exists to prevent.
     #[test]
     fn a_custom_kind_is_never_composed_but_still_owes_an_endpoint() {
         let (stored, surface) = settled(ProviderKind::Custom, Some("https://gw.example.com/v1"));
@@ -3387,7 +3567,210 @@ mod tests {
         assert!(surface.calls.is_empty());
 
         let mut surface = RecordingSurface::new();
-        assert!(settle_endpoint("gw", ProviderKind::Custom, None, &mut surface).is_err());
+        let refused = settle_endpoint("gw", ProviderKind::Custom, None, &mut surface)
+            .expect_err("a custom provider is remote and owes an endpoint");
+        let message = refused.to_string();
+        assert!(
+            message.contains("--endpoint") && message.contains("full request URL"),
+            "the refusal must name the flag and what to put after it: {message}"
+        );
+        assert!(
+            !message.contains("Teton completes it"),
+            "Teton completes nothing for a kind whose protocol it does not know, and a refusal \
+             that promises otherwise sends the user back with a base URL: {message}"
+        );
+
+        // The kinds that *do* have a canonical path keep the sentence.
+        let mut surface = RecordingSurface::new();
+        let refused = settle_endpoint("gw", ProviderKind::OpenaiCompatible, None, &mut surface)
+            .expect_err("an openai-compatible provider has no host to default to");
+        assert!(
+            refused.to_string().contains("Teton completes it"),
+            "{refused}"
+        );
+    }
+
+    /// An endpoint whose rendering and whose dialling would differ is refused
+    /// outright, before anything else this function does (REQ-578 verify).
+    ///
+    /// TAB, LF and CR are deleted by URL parsers and drawn as spacing by a
+    /// terminal, so an endpoint carrying one would be echoed as a string that is
+    /// not the string Teton POSTs — with nothing on screen to say so. That
+    /// defeats the single mitigation BR-4 offers for a composed URL, so the
+    /// refusal comes first and, like every other refusal here, lands with the
+    /// credential still untyped.
+    #[test]
+    fn an_endpoint_carrying_a_tab_or_a_newline_is_refused_before_any_prompt() {
+        for supplied in [
+            "https://api.moonshot.ai/v1\tchat",
+            "https://api.moonshot.ai\n/v1",
+            "https://api.moonshot.ai/v1\r",
+            "\thttps://api.moonshot.ai/v1",
+        ] {
+            let mut surface = RecordingSurface::new();
+            let refused = settle_endpoint(
+                "kimi",
+                ProviderKind::OpenaiCompatible,
+                Some(supplied.to_owned()),
+                &mut surface,
+            )
+            .expect_err("`{supplied}` cannot be echoed truthfully, so it is not stored");
+
+            let message = refused.to_string();
+            assert!(
+                message.contains("tab, newline or carriage return"),
+                "the refusal has to name what it found: {message}"
+            );
+            assert!(
+                message.contains("no credential was read"),
+                "and say what it did not do with the user's key: {message}"
+            );
+            assert!(
+                surface.calls.is_empty(),
+                "nothing may be echoed about a value that is not being stored: {:?}",
+                surface.calls
+            );
+        }
+    }
+
+    /// A key about to be typed into an `http://` registration is a key about to
+    /// cross the network in the clear, and the user is told so while it is still
+    /// untyped (REQ-578 verify).
+    ///
+    /// Loopback is exempt and must stay exempt: a self-hosted Ollama on
+    /// `http://localhost:11434` is the ordinary configuration this product
+    /// supports, nothing leaves the machine, and a warning there is noise that
+    /// teaches users to skip the one that matters.
+    #[test]
+    fn a_cleartext_endpoint_to_a_remote_host_is_warned_about_and_loopback_is_not() {
+        let (stored, surface) =
+            settled(ProviderKind::OpenaiCompatible, Some("http://192.0.2.1/v1"));
+        assert_eq!(
+            stored.as_deref(),
+            Some("http://192.0.2.1/v1/chat/completions")
+        );
+        let warned = surface.lines_of(LineKind::Notice);
+        assert_eq!(warned.len(), 1, "one warning, once: {warned:?}");
+        assert!(
+            warned[0].contains("192.0.2.1") && warned[0].contains("in the clear"),
+            "the warning must name the host the key would reach: {warned:?}"
+        );
+
+        for silent in [
+            "http://localhost:11434/v1",
+            "http://127.0.0.1:11434/v1",
+            "http://[::1]:11434/v1",
+            // TLS is the whole point of the check.
+            "https://api.moonshot.ai/v1",
+        ] {
+            let (_, surface) = settled(ProviderKind::OpenaiCompatible, Some(silent));
+            assert!(
+                surface.lines_of(LineKind::Notice).is_empty(),
+                "`{silent}` exposes nothing and must not be warned about: {:?}",
+                surface.lines_of(LineKind::Notice)
+            );
+        }
+
+        // A local provider is never asked for a credential, so there is no
+        // exposure to warn about even on a cleartext address.
+        let (_, surface) = settled(ProviderKind::Local, Some("http://192.0.2.1/v1"));
+        assert!(surface.lines_of(LineKind::Notice).is_empty());
+    }
+
+    /// The endpoint that was echoed is the endpoint that reaches the payload
+    /// (REQ-578 verify).
+    ///
+    /// The e2e suite stops one step short of the keychain, so it can show that
+    /// the composed URL was *printed* and not that it was the value handed to
+    /// `config/set`. Those are two different strings until something compares
+    /// them, and "the code obviously passes it through" is the class of claim
+    /// that stops being true one refactor later. This drives the real sequence —
+    /// `settle_endpoint` then `build_provider_registration`, exactly as
+    /// [`run_provider_add`] does — against a mock keychain, and compares them.
+    ///
+    /// What stays a recorded known limit is the last hop: the whole CLI → RPC
+    /// flow needs the real OS keychain, which has no test seam.
+    #[test]
+    fn the_endpoint_that_is_echoed_is_the_endpoint_that_is_registered() {
+        for (kind, supplied, expected) in [
+            (
+                ProviderKind::OpenaiCompatible,
+                Some("https://api.moonshot.ai/v1"),
+                "https://api.moonshot.ai/v1/chat/completions",
+            ),
+            (ProviderKind::Anthropic, None, ANTHROPIC_DEFAULT_ENDPOINT),
+        ] {
+            let keychain = MockKeychain::new();
+            let mut surface = RecordingSurface::new();
+
+            let settled = settle_endpoint("kimi", kind, supplied.map(str::to_owned), &mut surface)
+                .expect("a structurally complete registration settles");
+            let config = build_provider_registration(
+                "kimi",
+                kind,
+                settled.clone(),
+                Some("a-model".to_owned()),
+                &keychain,
+                Some("sk-typed-after-the-echo"),
+            )
+            .expect("the mock keychain stores");
+
+            assert_eq!(
+                config.endpoint, settled,
+                "{kind:?}: the registration must carry the value the seam settled on, not a \
+                 second reading of the argv"
+            );
+            assert_eq!(config.endpoint.as_deref(), Some(expected));
+            assert!(
+                surface.any_line_contains(LineKind::Info, expected),
+                "and that value is the one the user was shown: {:?}",
+                surface.lines_of(LineKind::Info)
+            );
+        }
+    }
+
+    /// A credential embedded in the endpoint is stored as typed and **printed
+    /// redacted** (REQ-578 verify).
+    ///
+    /// Both halves matter. Dropping the userinfo from what gets stored would
+    /// dial an address the user did not ask for; printing it would put a
+    /// password into the scrollback, the session recording, and whatever the
+    /// user pastes into a bug report.
+    #[test]
+    fn userinfo_in_an_endpoint_is_stored_but_never_printed() {
+        let (stored, surface) = settled(
+            ProviderKind::OpenaiCompatible,
+            Some("https://alice:hunter2@gw.example.com/v1"),
+        );
+        assert_eq!(
+            stored.as_deref(),
+            Some("https://alice:hunter2@gw.example.com/v1/chat/completions"),
+            "the stored endpoint is the address the user gave, credential and all"
+        );
+        let said = surface.lines_of(LineKind::Info).join("\n");
+        assert!(
+            !said.contains("hunter2") && !said.contains("alice"),
+            "no part of the userinfo may reach the surface: {said}"
+        );
+        assert!(
+            said.contains("***@gw.example.com/v1/chat/completions"),
+            "and the redaction has to be visible, or the line claims to show the exact URL \
+             while showing a different one: {said}"
+        );
+
+        // Doctor's advisory renders the same value and owes the same redaction.
+        let advisory = base_url_advisory(&teton_protocol::methods::ProviderConfig {
+            id: ProviderId::from("gw"),
+            kind: ProviderKind::OpenaiCompatible,
+            endpoint: Some("https://alice:hunter2@gw.example.com/v1".to_owned()),
+            model: Some("a-model".to_owned()),
+            auth_ref: None,
+        })
+        .expect("a bare `/v1` base URL is advised on");
+        assert!(
+            !advisory.contains("hunter2"),
+            "doctor prints into the same places: {advisory}"
+        );
     }
 
     /// REQ-578 BR-6 / AC-5: doctor names the full request URL for a stored
@@ -3415,6 +3798,11 @@ mod tests {
             auth_ref: None,
         };
 
+        // Counts are assertable here because this table is the test's own. The
+        // e2e form deliberately uses `any`/`!any` instead: its `TestDaemon`
+        // fixture config already carries a class-(b) `deepseek` endpoint, so a
+        // count there would be an assertion about the fixture rather than about
+        // the advisory.
         let mut surface = RecordingSurface::new();
         advise_on_base_url_endpoints(
             &[
@@ -3423,6 +3811,16 @@ mod tests {
                     "kimi",
                     ProviderKind::OpenaiCompatible,
                     Some("https://api.moonshot.ai/v1"),
+                ),
+                // Flagged, and the *ambiguous* half of the advisory: a bare
+                // origin on an OpenAI-compatible provider. The composed form is
+                // right for this vendor and wrong for OpenAI, and the rule
+                // cannot tell the two apart — so the line must hedge rather than
+                // state a fact about a host it does not know.
+                provider(
+                    "deepseek",
+                    ProviderKind::OpenaiCompatible,
+                    Some("https://api.deepseek.com"),
                 ),
                 // Flagged: the Anthropic kind's own bare shape, whose full form
                 // is a *different* path — the advice is per kind, not a suffix.
@@ -3452,8 +3850,8 @@ mod tests {
         let advised = surface.lines_of(LineKind::Notice);
         assert_eq!(
             advised.len(),
-            2,
-            "exactly the two base-URL shapes are advised on: {advised:?}"
+            3,
+            "exactly the three base-URL shapes are advised on: {advised:?}"
         );
         assert!(
             surface.any_line_contains(
@@ -3470,6 +3868,42 @@ mod tests {
         assert!(
             rendered.contains("kimi") && rendered.contains("claude"),
             "each line must name the provider it is about: {rendered}"
+        );
+
+        // The wording, pinned per shape, because the difference between the two
+        // is the difference between a true sentence and a false one.
+        let line = |id: &str| {
+            advised
+                .iter()
+                .find(|line| line.contains(&format!("`{id}`")))
+                .unwrap_or_else(|| panic!("no advisory for `{id}`: {advised:?}"))
+                .to_string()
+        };
+        for (id, unambiguous) in [("kimi", true), ("claude", true), ("deepseek", false)] {
+            let line = line(id);
+            assert_eq!(
+                !line.contains("many vendors serve this under `/v1`"),
+                unambiguous,
+                "`{id}`'s advisory hedges when it must not, or states a fact it cannot know: \
+                 {line}"
+            );
+        }
+        assert!(
+            line("deepseek").contains("https://api.deepseek.com/v1/chat/completions"),
+            "the hedged form has to name the `/v1` alternative outright — a user told only that \
+             vendors differ is left exactly where they were: {}",
+            line("deepseek")
+        );
+        assert!(
+            !line("claude").contains("/v1/v1/"),
+            "the Anthropic canonical path is versioned already; offering a `/v1` alternative \
+             would double it: {}",
+            line("claude")
+        );
+        assert!(
+            !rendered.contains(" a openai-compatible") && !rendered.contains(" a anthropic"),
+            "the advisory used to interpolate the kind label behind `a`, which reads wrong for \
+             every kind it has: {rendered}"
         );
         // Needles that cannot appear in a flagged line's own text: `openai`
         // alone would match the *kind* name every openai-compatible advisory

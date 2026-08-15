@@ -90,16 +90,59 @@ bare-origin case so the visibility claim is itself tested. Now the two spellings
 contract fail together on drift, and (b) is AC-7's mutation target: stub the
 composition to identity and this test fails on the missing path.
 
+*Amended (2026-08-15, verify pass):* the doctor advisory no longer asserts
+what the vendor serves. For a bare origin on an OpenAI-compatible provider it
+names the composed form **and** the `/v1` alternative and points at the
+vendor's docs; the unambiguous shapes (bare `/v1`, and Anthropic's bare
+origin, whose canonical path carries its own version segment) keep the single
+plain form. The old wording was live-observed advising
+`https://api.openai.com/chat/completions`, which 404s.
+
+**Second known limit (recorded 2026-08-15, verify pass):** a *versioned but
+non-`/v1`* base — `https://host/v2`, `https://host/v1beta`,
+`https://host/openai/v1` — is BR-2 class (c): an explicit path, so it is
+stored verbatim, with **no echo and no doctor advisory**. That is correct per
+BR-2 (class (b) is an exhaustive list of three bare shapes, deliberately not
+"roughly empty-looking"), and it is silent by design rather than by oversight:
+a rule that guessed at arbitrary version segments would start rewriting the
+gateway paths class (c) exists to protect. The cost is that this shape gets
+neither of the two mitigations above, so it fails the way the pre-REQ product
+failed — a 404 on the first turn. Recorded rather than fixed; a per-vendor
+recipe lookup is the shape of an answer, and it is out of scope here.
+
 ### ADR-3: Flow order in `run_provider_add`
 
-`--model` pre-check → **compose + Anthropic default** → **echo when
-`changed`** (via `surface.line`, before any prompt) → duplicate-id pre-check
-→ `read_secret` → `build_provider_registration(composed_endpoint)` → RPC.
-The echo lands before the credential prompt so the user sees what will be
-stored before committing a key (BR-4/BR-5 together); BUG-171's rejection
-take-back stays byte-untouched downstream. The existing e2e
+**Decision (amended 2026-08-15, TASK-149):** `--model` pre-check →
+duplicate-id pre-check → **compose + Anthropic default** → **echo when
+`changed`** (via `surface.line`, before any prompt) → `read_secret` →
+`build_provider_registration(composed_endpoint)` → RPC. The echo lands before
+the credential prompt so the user sees what will be stored before committing a
+key (BR-4/BR-5 together); BUG-171's rejection take-back stays byte-untouched
+downstream. The existing e2e
 `provider_add_without_a_model_refuses_before_asking_for_a_credential`
 (cli_e2e.rs:1706) is the pattern for the new ordering test.
+
+The amendment is the position of the duplicate-id probe, which this ADR
+originally sketched *after* the composition step. Two consequences moved it
+back in front, and neither weakens the decision's own reason — everything the
+user needs in order to decide whether to type a key is still on screen before
+they are asked for one:
+
+- A command already refused for a better reason must keep being refused for
+  that reason. `provider add deepseek …` on an existing id answered "already
+  registered" before this REQ and answers it still (BR-7); a
+  missing-`--endpoint` message there would be true, unhelpful, and a change to
+  a shipped refusal.
+- An echo printed before a refusal would say "endpoint stored as …" about a
+  registration that is not happening.
+
+**Further amended (2026-08-15, verify pass):** `settle_endpoint` also refuses
+an endpoint containing TAB/LF/CR *before* composing — those bytes are deleted
+by URL parsers and rendered as spacing by a terminal, so the echoed string
+would not be the dialled string and BR-4's mitigation would be defeated — and
+emits a cleartext-credential notice (`http://` to a non-loopback host) after
+the echo, so it sits immediately above the prompt it is about. Both are inside
+the same pre-credential window and change no ordering already claimed.
 
 ### ADR-4: Doctor advisory is CLI-side, reusing the classifier
 

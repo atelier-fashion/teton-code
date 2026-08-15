@@ -46,17 +46,27 @@ user having asked for it.
   config file so the document still states exactly what will be called — there
   is no invisible runtime default. The missing endpoint used to be refused by
   the daemon *after* `provider add` had already read your API key into the
-  keychain (BUG-170). That sequence is now impossible: every check that can
-  refuse a registration — the model, the id, and now the endpoint — runs before
-  you are asked for a credential, and the endpoint that will be stored is on
-  screen before you type one.
+  keychain (BUG-170). That particular sequence is now impossible: the endpoint —
+  along with the model and the provider id — is settled and shown before you are
+  asked for a credential. A registration can still be refused after the key is
+  read for reasons only the daemon can know at that moment, and when that
+  happens Teton takes the key back out and tells you so.
+
+  If the endpoint is `http://` to anything but your own machine, `provider add`
+  now says so before the prompt: the key you are about to type would cross the
+  network in the clear. An address carrying a tab or a line break is refused
+  outright rather than guessed at, because such a URL renders differently from
+  how it dials.
 
 - **`teton doctor` now names the request URL for an endpoint that looks like a
   base URL (REQ-578).** If a provider's stored endpoint has no request path —
   because you wrote the config by hand, or registered before the completion
-  above existed — doctor prints the exact full form to use. It is advice and
-  nothing more: the config stays valid, doctor's exit status is unchanged, and
-  the file is not edited. A custom gateway path is never flagged.
+  above existed — doctor prints the form Teton would store. Where that form is
+  genuinely ambiguous — a bare host for an OpenAI-compatible provider, since
+  some vendors serve `/v1` and some do not — it says so and points you at your
+  vendor's documentation rather than asserting an address it cannot know. It is
+  advice and nothing more: the config stays valid, doctor's exit status is
+  unchanged, and the file is not edited. A custom gateway path is never flagged.
 
 - **Teton now hands you the exact command for the provider you name
   (REQ-577).** "How do I connect Claude / Kimi / DeepSeek?" is answered from

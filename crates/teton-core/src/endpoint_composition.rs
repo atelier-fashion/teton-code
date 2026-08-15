@@ -27,6 +27,11 @@
 //! | (b) | absent, a bare `/`, or a bare `/v1`(`/`) | the canonical path is appended, `changed: true` |
 //! | (c) | anything else | stored verbatim, `changed: false` |
 //!
+//! Input is trimmed and a blank value read as absent before those classes are
+//! applied, so `--endpoint ""` means the same thing as no `--endpoint` at all —
+//! the reading `Config::validate` already takes of a blank endpoint, moved to
+//! the seam that decides what gets written.
+//!
 //! Class (c) is the load-bearing one. Self-hosted gateways and proxies serve
 //! chat completions at arbitrary paths, so an explicit path is trusted rather
 //! than "corrected" — a normalizer that knew better than its user would break
@@ -120,17 +125,24 @@ pub const ANTHROPIC_DEFAULT_ENDPOINT: &str = "https://api.anthropic.com/v1/messa
 /// `changed` exists for the user, not for the code: BR-4 requires the CLI to
 /// echo the stored value whenever composition applied or the Anthropic default
 /// filled in, so the user learns what will be called at the moment it is
-/// decided rather than from a downstream 404 (LESSON-456, BUG-146). It is also
-/// `doctor`'s advisory predicate (BR-6): a stored endpoint that would still
-/// change if it were re-composed is one of BR-2's class (b) shapes, and
-/// `stored` is then the exact full form to tell the user about.
+/// decided rather than from a downstream 404 (LESSON-456, BUG-146). It answers
+/// "were the bytes stored the bytes typed?", which includes whitespace this
+/// module trimmed off — invisible on screen, and therefore exactly the edit a
+/// user has to be told about.
+///
+/// `doctor`'s BR-6 advisory reads [`Self::stored`] against its own input instead,
+/// because it is asking the narrower question: did composition *complete a path*?
+/// A stored endpoint that gained one is a class (b) shape and `stored` is then
+/// the exact full form to tell the user about; one that only lost a stray blank
+/// is not something to advise anybody about.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ComposedEndpoint {
     /// The absolute request URL to persist, or `None` when there is nothing to
     /// store. A `None` here is not an error: the missing-endpoint refusal stays
     /// where it already lives, in `Config::validate` (BR-6).
     pub stored: Option<String>,
-    /// Whether `stored` differs from the caller's input.
+    /// Whether `stored` differs from the caller's input **as supplied** —
+    /// including when the only difference is whitespace that was trimmed off.
     pub changed: bool,
 }
 
@@ -178,12 +190,36 @@ pub fn canonical_request_path(kind: ProviderKind) -> Option<&'static str> {
 /// ```
 #[must_use]
 pub fn compose_endpoint(kind: ProviderKind, input: Option<&str>) -> ComposedEndpoint {
+    // Normalize once, here, before any rule below sees the value.
+    //
+    // Surrounding whitespace is what a paste brings along, and `--endpoint ""`
+    // is what a shell hands over when the variable behind it is unset — so
+    // "blank" has to mean the same thing as "absent" or `--kind anthropic
+    // --endpoint "$MY_URL"` would refuse where `--kind anthropic` defaults.
+    // `Config::validate` already reads a blank endpoint as unset, and this is
+    // that same reading moved to the seam that decides what gets written.
+    //
+    // `changed` is then measured against what the caller *actually supplied*,
+    // not against the cleaned value: the flag drives BR-4's echo, and whitespace
+    // silently dropped from a stored URL is precisely the kind of edit a user
+    // cannot see and therefore has to be told about.
+    let supplied = input;
+    let input = input.map(str::trim).filter(|value| !value.is_empty());
+    let stored = composed_value(kind, input);
+    ComposedEndpoint {
+        changed: stored.as_deref() != supplied,
+        stored,
+    }
+}
+
+/// The value [`compose_endpoint`] persists, given already-normalized input.
+///
+/// Split out so the `changed` comparison above has exactly one place to read
+/// from — a per-branch flag was how the two could disagree.
+fn composed_value(kind: ProviderKind, input: Option<&str>) -> Option<String> {
     let Some(canonical) = canonical_request_path(kind) else {
         // No canonical path: pass through, including `None`.
-        return ComposedEndpoint {
-            stored: input.map(str::to_owned),
-            changed: false,
-        };
+        return input.map(str::to_owned);
     };
 
     let Some(input) = input else {
@@ -191,28 +227,11 @@ pub fn compose_endpoint(kind: ProviderKind, input: Option<&str>) -> ComposedEndp
         // OpenAI-compatible there is no such thing as "the" host, so a missing
         // endpoint stays missing and `Config::validate` refuses it exactly as
         // it does today.
-        return match kind {
-            ProviderKind::Anthropic => ComposedEndpoint {
-                stored: Some(ANTHROPIC_DEFAULT_ENDPOINT.to_owned()),
-                changed: true,
-            },
-            _ => ComposedEndpoint {
-                stored: None,
-                changed: false,
-            },
-        };
+        return matches!(kind, ProviderKind::Anthropic)
+            .then(|| ANTHROPIC_DEFAULT_ENDPOINT.to_owned());
     };
 
-    match compose_path(input, canonical) {
-        Some(composed) => ComposedEndpoint {
-            stored: Some(composed),
-            changed: true,
-        },
-        None => ComposedEndpoint {
-            stored: Some(input.to_owned()),
-            changed: false,
-        },
-    }
+    Some(compose_path(input, canonical).unwrap_or_else(|| input.to_owned()))
 }
 
 /// The composed URL for a BR-2 class (b) input, or `None` for classes (a) and
@@ -359,6 +378,35 @@ mod tests {
                 Some("https://api.moonshot.ai/v1/chat/completions"),
                 true,
             ),
+            // (b) an IPv6 literal host — the authority is bracketed, so a
+            // classifier that split on `:` before `/` would read the path as
+            // starting inside the address. `[::1]:11434` is the shape a
+            // dual-stack Ollama prints.
+            (
+                OpenaiCompatible,
+                Some("http://[::1]:11434/v1"),
+                Some("http://[::1]:11434/v1/chat/completions"),
+                true,
+            ),
+            // (a) the same host, already a request URL.
+            (
+                OpenaiCompatible,
+                Some("http://[::1]:11434/v1/chat/completions"),
+                Some("http://[::1]:11434/v1/chat/completions"),
+                false,
+            ),
+            // (b) userinfo in the authority. Composed like any other class (b)
+            // and stored with the credential intact — this module decides
+            // *paths*, and silently dropping part of an address the user typed
+            // would dial somewhere they did not ask for. What it costs is a
+            // rendering problem, not a storage one, and the CLI redacts the
+            // userinfo out of every line it prints (REQ-578 display hygiene).
+            (
+                OpenaiCompatible,
+                Some("https://user:pw@gw.example.com/v1"),
+                Some("https://user:pw@gw.example.com/v1/chat/completions"),
+                true,
+            ),
             // (c) explicit custom path — AC-4.
             (
                 OpenaiCompatible,
@@ -373,6 +421,25 @@ mod tests {
                 Some("api.moonshot.ai/v1"),
                 false,
             ),
+            // Normalization, before any class applies: a padded paste is
+            // trimmed and then composed, and a padded *full* URL is trimmed and
+            // therefore `changed` — the user typed bytes that were not stored,
+            // which is exactly what BR-4's echo is for.
+            (
+                OpenaiCompatible,
+                Some("  https://api.moonshot.ai/v1  "),
+                Some("https://api.moonshot.ai/v1/chat/completions"),
+                true,
+            ),
+            (
+                OpenaiCompatible,
+                Some(" https://api.moonshot.ai/v1/chat/completions "),
+                Some("https://api.moonshot.ai/v1/chat/completions"),
+                true,
+            ),
+            // Blank is absent, and for this kind absent stays absent.
+            (OpenaiCompatible, Some(""), None, true),
+            (OpenaiCompatible, Some("   "), None, true),
             // no input at all.
             (OpenaiCompatible, None, None, false),
             // --- anthropic -----------------------------------------------
@@ -427,6 +494,16 @@ mod tests {
             ),
             // no input at all — BR-3's default.
             (Anthropic, None, Some(ANTHROPIC_DEFAULT_ENDPOINT), true),
+            // A blank endpoint is an absent one, so it reaches the same default:
+            // `--endpoint "$UNSET_VAR"` must not behave differently from
+            // omitting the flag.
+            (Anthropic, Some(""), Some(ANTHROPIC_DEFAULT_ENDPOINT), true),
+            (
+                Anthropic,
+                Some("  "),
+                Some(ANTHROPIC_DEFAULT_ENDPOINT),
+                true,
+            ),
             // --- local ---------------------------------------------------
             // The on-device tier has no endpoint; whatever is passed comes back.
             (
@@ -435,7 +512,10 @@ mod tests {
                 Some("https://api.moonshot.ai/v1"),
                 false,
             ),
-            (Local, Some(""), Some(""), false),
+            // Blank is absent here too — normalization runs above the per-kind
+            // branch, so `Local` cannot be the one kind that stores an empty
+            // string where every other kind stores nothing.
+            (Local, Some(""), None, true),
             (Local, None, None, false),
             // --- custom --------------------------------------------------
             // Remote, but of a protocol Teton does not know — never composed.
@@ -445,6 +525,7 @@ mod tests {
                 Some("https://gw.example.com/v1"),
                 false,
             ),
+            (Custom, Some("   "), None, true),
             (Custom, None, None, false),
         ];
 
@@ -536,6 +617,9 @@ mod tests {
             "https://api.anthropic.com/v1/",
             "https://gw.example.com/llm/proxy",
             "api.moonshot.ai/v1",
+            // Normalization is part of the fixed point: a padded paste settles
+            // on its trimmed composition and stays there.
+            "  https://api.moonshot.ai/v1  ",
         ];
 
         for kind in [ProviderKind::OpenaiCompatible, ProviderKind::Anthropic] {
@@ -568,7 +652,6 @@ mod tests {
             "api.moonshot.ai/v1",
             "localhost:11434",
             "/v1",
-            "",
             // Scheme present, authority empty.
             "https:///v1",
             "://api.moonshot.ai",
@@ -643,17 +726,62 @@ mod tests {
 
     /// `Local` is not merely uncomposed, it is untouched: the on-device tier
     /// reaches nothing off the machine, so there is no request URL to complete.
+    ///
+    /// The one thing that *is* applied is the normalization every kind gets — a
+    /// blank endpoint is an absent one — because the alternative is a single
+    /// kind that stores `Some("")` where the other three store `None`, and a
+    /// downstream reader would then have two spellings of "no endpoint" to know
+    /// about.
     #[test]
     fn the_local_kind_passes_its_input_through() {
-        for input in [
-            Some("https://api.moonshot.ai/v1"),
-            Some("anything at all"),
-            Some(""),
-            None,
-        ] {
+        for input in [Some("https://api.moonshot.ai/v1"), Some("anything at all")] {
             let composed = compose_endpoint(ProviderKind::Local, input);
             assert_eq!(composed.stored.as_deref(), input);
             assert!(!composed.changed);
         }
+
+        for blank in [Some(""), Some("  "), None] {
+            assert_eq!(
+                compose_endpoint(ProviderKind::Local, blank).stored,
+                None,
+                "a blank local endpoint is no endpoint: {blank:?}"
+            );
+        }
+    }
+
+    /// Normalization, stated on its own because it decides which *branch* the
+    /// input reaches rather than what a branch does with it (REQ-578 verify).
+    ///
+    /// `--endpoint ""` is what a shell produces from an unset variable, and a
+    /// user who writes `--endpoint "$ANTHROPIC_URL"` with nothing in it has
+    /// asked for the default in every sense that matters. The padded rows are
+    /// the other half: a paste carries whitespace, the stored value must not,
+    /// and the user has to be told — so `changed` is true even when trimming was
+    /// the only thing that happened.
+    #[test]
+    fn a_blank_endpoint_is_an_absent_one_and_a_padded_one_is_trimmed() {
+        assert_eq!(
+            compose_endpoint(ProviderKind::Anthropic, Some("  ")),
+            compose_endpoint(ProviderKind::Anthropic, None),
+            "`--endpoint \"\"` must reach BR-3's default exactly as omitting the flag does — \
+             two spellings of the same intent that behaved differently would be a trap that \
+             only shows up in a script"
+        );
+
+        let padded = compose_endpoint(
+            ProviderKind::OpenaiCompatible,
+            Some("  https://api.moonshot.ai/v1/chat/completions  "),
+        );
+        assert_eq!(
+            padded.stored.as_deref(),
+            Some("https://api.moonshot.ai/v1/chat/completions"),
+            "the stored endpoint is POSTed verbatim, so whitespace in it is a request to a URL \
+             that does not exist"
+        );
+        assert!(
+            padded.changed,
+            "the bytes stored differ from the bytes typed, and the difference is invisible on \
+             screen — which is precisely the case BR-4's echo exists for"
+        );
     }
 }
