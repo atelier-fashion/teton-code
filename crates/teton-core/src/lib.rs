@@ -73,10 +73,16 @@ pub use category::{
     CategoryOverride, CategoryResolution, CategoryTable, ConfigurableCategory, JudgmentCategory,
     ParseCategoryError, ParseJudgmentCategoryError, ParseTierError, Tier, TierBinding,
 };
+// REQ-578: the three URL predicates are re-exported alongside the schema they
+// were written for. `teton provider add` gates its registration seam on the same
+// shape rule the `[web]` search endpoint is held to, and warns about the same
+// cleartext condition — one spelling each, so the CLI and the validator cannot
+// come to different conclusions about the same string.
 pub use config::{
-    Config, ConfigError, LegacyRoutingRule, LifetimeConfig, LoadError, LocalModelConfig,
-    MigratedPhase, PermissionsConfig, PrivacyConfig, RoutingMigration, ShutdownPolicyKind,
-    SkippedRule, WebConfig, WebTier,
+    is_absolute_http_url, is_cleartext_to_a_remote_host, url_host, Config, ConfigError,
+    LegacyRoutingRule, LifetimeConfig, LoadError, LocalModelConfig, MigratedPhase,
+    PermissionsConfig, PrivacyConfig, RoutingMigration, ShutdownPolicyKind, SkippedRule, WebConfig,
+    WebTier,
 };
 // REQ-574: re-exported at the crate root for the same reason the config schema
 // is — the daemon's one config-write body and the `/web setup` preview both

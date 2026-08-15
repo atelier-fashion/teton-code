@@ -54,9 +54,15 @@ user having asked for it.
 
   If the endpoint is `http://` to anything but your own machine, `provider add`
   now says so before the prompt: the key you are about to type would cross the
-  network in the clear. An address carrying a tab or a line break is refused
-  outright rather than guessed at, because such a URL renders differently from
-  how it dials.
+  network in the clear.
+
+  `provider add` also refuses an `--endpoint` that is not an absolute `http://`
+  or `https://` URL with a host — including near-misses like `http:/host` or an
+  address with a tab or line break in it, which a URL parser and a plain string
+  read differently. Teton will not register an address it cannot show you the
+  same way it dials it. **This is a check on the command, not on your config:**
+  a config file that already holds such an endpoint still loads and the daemon
+  still starts, exactly as before, and `teton doctor` is where you will see it.
 
 - **`teton doctor` now names the request URL for an endpoint that looks like a
   base URL (REQ-578).** If a provider's stored endpoint has no request path —

@@ -98,6 +98,29 @@ origin, whose canonical path carries its own version segment) keep the single
 plain form. The old wording was live-observed advising
 `https://api.openai.com/chat/completions`, which 404s.
 
+**Scope of the settle seam's guarantees (recorded 2026-08-15, verify pass).**
+Everything `settle_endpoint` promises — the TAB/LF/CR refusal, the
+absolute-URL shape gate, the composition, the echo, the cleartext warning — is
+**CLI-local**, and deliberately so. `Config::validate` is unchanged (BR-6), so
+a config that already carries any of the refused shapes still loads and still
+starts the daemon, and a client calling `config/set` directly bypasses all of
+it by OQ-1's design: raw `config/set` stays verbatim under REQ-574's
+durable-document posture. The surface for those configs is `teton doctor`,
+which is why its advisory renders defensively (userinfo redacted, control
+bytes escaped, the authority read the way WHATWG reads it) rather than
+assuming the seam already cleaned the value. The shape gate in particular is a
+*registration-seam* rule, not a validity condition; moving it into
+`Config::validate` would brick every machine whose config predates it.
+
+**Third known limit (recorded 2026-08-15, verify pass):** IDNA / homograph
+hosts. The echo and the advisory print the bytes the user supplied, so a host
+in a confusable script (or any non-ASCII label the resolver will punycode)
+renders pre-conversion — `https://аpple.com/v1` with a Cyrillic `а` shows as
+typed and dials `xn--pple-43d.com`. This is inherent to echoing what was typed,
+which is the whole point of BR-4; the alternative — echoing the punycode form —
+would make the common case unreadable to trade for a case the user has already
+been fooled by upstream. Recorded, not mitigated.
+
 **Second known limit (recorded 2026-08-15, verify pass):** a *versioned but
 non-`/v1`* base — `https://host/v2`, `https://host/v1beta`,
 `https://host/openai/v1` — is BR-2 class (c): an explicit path, so it is
@@ -136,13 +159,32 @@ they are asked for one:
 - An echo printed before a refusal would say "endpoint stored as …" about a
   registration that is not happening.
 
-**Further amended (2026-08-15, verify pass):** `settle_endpoint` also refuses
-an endpoint containing TAB/LF/CR *before* composing — those bytes are deleted
-by URL parsers and rendered as spacing by a terminal, so the echoed string
-would not be the dialled string and BR-4's mitigation would be defeated — and
-emits a cleartext-credential notice (`http://` to a non-loopback host) after
-the echo, so it sits immediately above the prompt it is about. Both are inside
-the same pre-credential window and change no ordering already claimed.
+**Further amended (2026-08-15, verify pass):** `settle_endpoint` gained three
+steps, all inside the same pre-credential window, changing no ordering already
+claimed:
+
+1. a TAB/LF/CR refusal *before* composing — those bytes are deleted by URL
+   parsers and rendered as spacing by a terminal, so the echoed string would
+   not be the dialled string and BR-4's mitigation would be defeated;
+2. a shape gate on `teton_core::is_absolute_http_url` — the predicate the
+   `[web]` search endpoint is already held to, now `pub` with the settle seam
+   as its second consumer. It removes the family of strings a URL parser reads
+   as an authority and a string-splitter does not (`http:/host`,
+   `http:\\host`, `http:/\host`, `http:\/host`, `http:///v1`, and
+   `https://a\@b/`, whose host is `a` under WHATWG and `b` under a naive
+   read). Everything downstream — the cleartext warning, every rendering — may
+   therefore assume a URL whose host it can name;
+3. a cleartext-credential notice (`http://` to a non-loopback host) after the
+   echo, so it sits immediately above the prompt it is about. It calls
+   `teton_core`'s `is_cleartext_to_a_remote_host`/`url_host` directly; the CLI
+   copy of that predicate was deleted, because the shape gate above supplies
+   the precondition the originals are written against.
+
+Also amended: the post-settle wiring. `run_provider_add` now hands the settled
+endpoint to `registration_params` through a `SettledRegistration` value and
+never names the raw argv again — a reviewer showed the two-live-values shape
+could be mutated to register the raw endpoint while echoing the composed one,
+with all 35 e2e tests green.
 
 ### ADR-4: Doctor advisory is CLI-side, reusing the classifier
 
