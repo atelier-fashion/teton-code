@@ -121,11 +121,11 @@ use teton_providers::transport::{
 
 use teton_protocol::methods::WebBackendSuggestion;
 use teton_protocol::SessionId;
+use tetond::cost::prices::PriceTable;
 use tetond::egress::{
     Authorship, Egress, HttpTransport, LookupContext, LookupRequest, NoopSink, RedactionGate,
     RedactionVerdict, TaintView,
 };
-use tetond::cost::prices::PriceTable;
 use tetond::provider_recipes::{recipe_catalog, ProviderRecipe};
 use tetond::web_setup_catalog::suggestion_catalog;
 

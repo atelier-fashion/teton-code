@@ -755,7 +755,15 @@ mod tests {
     #[test]
     fn a_ledger_with_no_lookups_reports_no_web_rollup() {
         let prices = PriceTable::bundled();
-        let rows = vec![row("s1", None, "deepseek", "deepseek-v4-pro", 10, 5, Some(1))];
+        let rows = vec![row(
+            "s1",
+            None,
+            "deepseek",
+            "deepseek-v4-pro",
+            10,
+            5,
+            Some(1),
+        )];
         let report = aggregate(&rows, &[], &prices);
         assert!(report.web_per_session.is_empty());
         assert_eq!(report.per_session.len(), 1);
