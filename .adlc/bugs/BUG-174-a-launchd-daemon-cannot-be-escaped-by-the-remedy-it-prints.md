@@ -1,7 +1,7 @@
 ---
 id: BUG-174
 title: "A launchd daemon cannot be escaped by the remedy it prints"
-status: open
+status: resolved
 severity: high
 created: 2026-08-15
 updated: 2026-08-15
@@ -213,3 +213,20 @@ layering order.
   inherits it; module doc corrected
 - `crates/tetond/src/mcp/client.rs` — floors the allowlisted `PATH` beneath the
   declared vars, so `npx`-style servers launch under launchd; 2 new tests
+
+## Deployment
+
+Merged to `main` as PR #157 on 2026-08-15 (squash, CI green on all 7 checks).
+
+This repo is a plain OSS flow with no Cloud Run or iOS targets, so there is no
+staging/production promotion to confirm — the fix ships to users in the next
+Homebrew tap release. Until then, anyone already stuck behind the old remedy
+needs the manual `brew services stop teton` this bug is about; the fix ensures
+the product tells them so from that release onward.
+
+## Follow-up captured
+
+`[[LESSON-531]]` — "A supervisor-started daemon does not have your shell's
+environment", filed with BUG-175. Its three sections are the three traps this
+investigation hit: `PATH` is not a given, remedy text can be unreachable, and
+"scrub the secrets" can break a feature that reads them on purpose.
