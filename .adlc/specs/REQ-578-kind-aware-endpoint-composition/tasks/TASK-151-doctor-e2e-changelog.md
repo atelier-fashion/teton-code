@@ -1,7 +1,7 @@
 ---
 id: TASK-151
 title: "Doctor advisory, e2e acceptance, changelog, gates"
-status: draft
+status: complete
 parent: REQ-578
 created: 2026-08-15
 updated: 2026-08-15
@@ -50,3 +50,36 @@ a real daemon, the changelog entry, and the full workspace gates.
   hand-edit path is exactly what the advisory exists for).
 - REQ-576 presence attestation degrades to allow on no-presence builds, so
   the e2e needs no seams (integration explorer confirmed).
+
+## Implementation Note (2026-08-15) — the AC-1..AC-4 e2e stops before the keychain
+
+ADR-5 put "AC-1 base-URL composition through real `config/set`" in
+`cli_e2e.rs`. It cannot go there whole, and the reason is a rule this
+repository already states twice: the shipped CLI writes credentials to the
+**real OS keychain** (`keychain::default_keychain`) with no test seam in front
+of it, so "no test may do that" (cli_e2e.rs's `/web setup` section header,
+echoed in pty_e2e.rs). A completed remote `provider add` would create — and on
+a rejected registration delete — an entry in whoever's login keychain ran the
+suite, and would additionally fail outright on the Linux CI leg, where
+`UnsupportedKeychain` refuses every store.
+
+So the flow is proven in two halves that meet at one literal value:
+
+1. **`crates/teton/tests/cli_e2e.rs` (real binary, real daemon, real argv)** —
+   AC-1/AC-2/AC-3/AC-4 on what the registration flow *decides and says*: the
+   composed URL echoed in full, silence for a verbatim store, the Anthropic
+   default, the custom path untouched, and the BR-5 ordering (the echo's offset
+   in stdout precedes the credential prompt's). Each run then ends at the
+   credential step on a closed stdin — which is why no keychain is reached, and
+   is itself evidence for BR-5.
+2. **`crates/tetond/tests/composed_endpoint_registration.rs` (new)** — the
+   composed URL and `ANTHROPIC_DEFAULT_ENDPOINT` driven through the real
+   `config/set` over the socket, asserted on the persisted document *and* the
+   live `config/get` snapshot. No credential anywhere: the payload's `auth_ref`
+   is an `env:` reference to a variable that is never set. This is BR-8's
+   "at least one end-to-end registration that executes the composed result
+   through the real `config/set` validation path".
+
+AC-5 is unaffected and lands whole in `cli_e2e.rs` — a hand-written config, a
+real `teton doctor`, the advisory's full form asserted per line, the custom-path
+provider asserted *not* flagged, and the exit status asserted unchanged.

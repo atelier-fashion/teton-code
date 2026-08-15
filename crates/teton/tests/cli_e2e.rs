@@ -91,6 +91,18 @@ impl TestDaemon {
         Self::spawn_with_script(daemon, Some(replies), extra)
     }
 
+    /// A daemon with no local engine whose config carries `extra` — the
+    /// [`Self::spawn`] fixture plus one more appended block.
+    ///
+    /// REQ-578's doctor advisory is about configs somebody **wrote by hand**,
+    /// which is the one shape `provider add` can never produce: the registration
+    /// seam composes a base URL into the request URL before it stores anything,
+    /// so the endpoint the advisory exists for cannot be created through the
+    /// CLI. Appending providers to the fixture config is how a test gets one.
+    fn spawn_with_config(daemon: &Path, extra: &str) -> Self {
+        Self::spawn_with_script(daemon, None, extra)
+    }
+
     fn spawn_with_script(daemon: &Path, replies: Option<&[&str]>, extra_config: &str) -> Self {
         static SEQ: AtomicUsize = AtomicUsize::new(0);
         let seq = SEQ.fetch_add(1, Ordering::SeqCst);
@@ -1844,6 +1856,305 @@ fn provider_add_refuses_an_id_that_is_already_registered() {
     assert!(
         !listed.contains("deepseek-v4-flash"),
         "the refused registration must not have landed; output:\n{listed}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// REQ-578 — a pasted base URL becomes the request URL, and the CLI says so
+// ---------------------------------------------------------------------------
+//
+// AC-1..AC-4 are claims about the **shipped binary's** registration flow: what
+// it decides to store when a user pastes what their vendor documents, and when
+// it says so. Each runs the real `teton` against a real daemon, with the
+// endpoint decision reached through the real argv and the real
+// `settle_endpoint` — the seam a unit test can only drive directly.
+//
+// **Every run here stops one step short of the keychain, and that is a
+// constraint rather than a preference.** The shipped CLI writes credentials to
+// the real OS keychain (`keychain::default_keychain`) with no test seam in
+// front of it — the same rule the `/web setup` section below states, and the
+// reason none of these tests supplies a key. What that costs is the last hop:
+// stdin is closed, so `read_secret` gets EOF, the command exits non-zero
+// naming the missing key, and no registration reaches `config/set`. What it
+// does not cost is any part of AC-1..AC-4, because the whole endpoint decision
+// — compose, echo, refuse — happens *before* the credential is read. That
+// ordering is BR-5, and the fact that these tests can make their assertions at
+// all with the key step unreached is itself evidence for it.
+//
+// The other half — that a composed endpoint is a registration the daemon's own
+// `config/set` accepts and persists byte-identically (BR-8) — is
+// `tetond/tests/composed_endpoint_registration.rs`, which drives the RPC
+// directly and needs no credential at all.
+
+/// **AC-1: the base URL Moonshot documents is stored as the URL Teton POSTs,
+/// and the user is told the full form before a key is asked for.**
+///
+/// The command a user actually types, run as they type it. `https://api.moonshot.ai/v1`
+/// is what Moonshot's quickstart hands an OpenAI-compatible SDK, and before
+/// this REQ it registered cleanly and 404'd on the first turn — one step
+/// removed from its cause (BUG-170, LESSON-523).
+#[test]
+fn provider_add_composes_a_pasted_base_url_and_says_so_before_asking_for_a_key() {
+    let daemon = daemon_bin();
+    let daemon = TestDaemon::spawn(&daemon);
+    let teton = teton_bin();
+
+    let (output, status) = daemon.run_cli_capture(
+        &teton,
+        &[
+            "provider",
+            "add",
+            "kimi",
+            "--kind",
+            "openai-compatible",
+            "--endpoint",
+            "https://api.moonshot.ai/v1",
+            "--model",
+            "kimi-k3",
+        ],
+        "",
+    );
+
+    let composed = output
+        .find("https://api.moonshot.ai/v1/chat/completions")
+        .unwrap_or_else(|| {
+            panic!(
+                "AC-1: the base URL must be completed to the request URL and echoed in full; \
+                 output:\n{output}"
+            )
+        });
+    assert!(
+        output.contains("endpoint stored as"),
+        "AC-1/BR-4: the echo must say the URL is what was *stored*, not merely mention it; \
+         output:\n{output}"
+    );
+
+    // BR-5, end to end: the credential prompt is downstream of the decision.
+    let asked = output.find("API key for").unwrap_or_else(|| {
+        panic!(
+            "the flow must reach the credential step (and fail there on a closed stdin), or \
+             this test is asserting about a command that stopped for some other reason; \
+             output:\n{output}"
+        )
+    });
+    assert!(
+        composed < asked,
+        "BR-5: the stored endpoint must be on screen BEFORE the key is asked for — a user \
+         decides whether to type a credential by reading what will be called; output:\n{output}"
+    );
+
+    // The key step is where this run ends, so nothing was registered and no
+    // keychain entry was created (see the section header).
+    assert!(
+        !status.success(),
+        "with no key on a closed stdin the command must fail; output:\n{output}"
+    );
+    let listed = daemon.run_cli(&teton, &["provider", "list"]);
+    assert!(
+        !listed.contains("kimi"),
+        "a registration that never supplied a key must not appear; output:\n{listed}"
+    );
+}
+
+/// **AC-2: the full request URL is stored byte-identically, with no echo.**
+///
+/// Idempotence for everyone who followed the documentation (BR-7). The
+/// documented form is still the canonical one — composition is forgiveness, not
+/// the new convention — so the command that was correct before this REQ must
+/// read *exactly* as it did before, silence included. An echo here would tell a
+/// user who did it right that something was changed.
+#[test]
+fn provider_add_stores_a_full_request_url_without_a_word_about_it() {
+    let daemon = daemon_bin();
+    let daemon = TestDaemon::spawn(&daemon);
+    let teton = teton_bin();
+
+    let (output, _status) = daemon.run_cli_capture(
+        &teton,
+        &[
+            "provider",
+            "add",
+            "kimi",
+            "--kind",
+            "openai-compatible",
+            "--endpoint",
+            "https://api.moonshot.ai/v1/chat/completions",
+            "--model",
+            "kimi-k3",
+        ],
+        "",
+    );
+
+    assert!(
+        !output.contains("endpoint stored as"),
+        "AC-2: an endpoint stored exactly as typed must produce no echo at all; output:\n{output}"
+    );
+    // Non-vacuity: the flow really did run the endpoint step, it just had
+    // nothing to say — it reached the credential prompt beyond it.
+    assert!(
+        output.contains("API key for"),
+        "the command must have reached the credential step, or the silence above is the \
+         silence of a command that never got this far; output:\n{output}"
+    );
+}
+
+/// **AC-3: `--kind anthropic` with no `--endpoint` registers the official
+/// Messages URL, echoes it, and does so before the key prompt.**
+///
+/// The BUG-170 sequence, inverted. Before this REQ the missing endpoint was
+/// refused by the daemon's validator — *after* the user's key had been read and
+/// stored — and there was no way to spell the command that worked without
+/// knowing a URL the product never printed. Now the default is written
+/// explicitly into config (BR-3) and shown (BR-4), so the address is the user's
+/// to check rather than a runtime secret.
+#[test]
+fn provider_add_anthropic_defaults_its_endpoint_and_shows_it_first() {
+    let daemon = daemon_bin();
+    let daemon = TestDaemon::spawn(&daemon);
+    let teton = teton_bin();
+
+    let (output, _status) = daemon.run_cli_capture(
+        &teton,
+        &[
+            "provider",
+            "add",
+            "claude",
+            "--kind",
+            "anthropic",
+            "--model",
+            "claude-opus-5",
+        ],
+        "",
+    );
+
+    let defaulted = output
+        .find("https://api.anthropic.com/v1/messages")
+        .unwrap_or_else(|| {
+            panic!("AC-3: the Anthropic default must be echoed in full; output:\n{output}")
+        });
+    assert!(
+        output.contains("endpoint stored as"),
+        "AC-3/BR-3: the default is *stored*, not applied at call time, and the echo is how a \
+         user learns that; output:\n{output}"
+    );
+    let asked = output
+        .find("API key for")
+        .unwrap_or_else(|| panic!("the flow must reach the credential step; output:\n{output}"));
+    assert!(
+        defaulted < asked,
+        "AC-3: the endpoint must be determined and shown before the key prompt; output:\n{output}"
+    );
+}
+
+/// **AC-4: an explicit gateway path is stored verbatim, with no composition and
+/// no warning.**
+///
+/// The class this rule is most easily got wrong. A self-hosted gateway serves
+/// chat completions wherever its operator put them, so `/llm/proxy` is a
+/// deliberate address and not a mistake to correct — a normalizer that appended
+/// `/chat/completions` here would break the deployments Teton exists to
+/// support, and one that merely *warned* would teach its users to ignore it.
+#[test]
+fn provider_add_stores_a_custom_gateway_path_verbatim_and_silently() {
+    let daemon = daemon_bin();
+    let daemon = TestDaemon::spawn(&daemon);
+    let teton = teton_bin();
+
+    for kind in ["openai-compatible", "anthropic"] {
+        let (output, _status) = daemon.run_cli_capture(
+            &teton,
+            &[
+                "provider",
+                "add",
+                "gw",
+                "--kind",
+                kind,
+                "--endpoint",
+                "https://gw.example.com/llm/proxy",
+                "--model",
+                "gateway-model",
+            ],
+            "",
+        );
+
+        assert!(
+            !output.contains("endpoint stored as"),
+            "AC-4 ({kind}): an explicit path must be stored as typed, with nothing said about \
+             it; output:\n{output}"
+        );
+        assert!(
+            !output.contains("/llm/proxy/chat/completions") && !output.contains("/llm/proxy/v1"),
+            "AC-4 ({kind}): nothing may be appended to a custom path; output:\n{output}"
+        );
+        assert!(
+            output.contains("API key for"),
+            "({kind}) the command must have reached the credential step; output:\n{output}"
+        );
+    }
+}
+
+/// **AC-5: `teton doctor` flags a hand-edited base-URL endpoint with the exact
+/// full form, does not flag a custom path, and its exit status is unchanged.**
+///
+/// The advisory exists for the config `provider add` can no longer produce: one
+/// somebody wrote by hand, or wrote before the composition existed. Since
+/// REQ-577 the stored endpoint is POSTed verbatim, so such a config is valid,
+/// starts the daemon, lists cleanly — and 404s on the first turn with nothing
+/// naming the cause. Doctor is where a user goes with exactly that symptom.
+///
+/// All three claims are load-bearing together. Flagging without the full form
+/// would leave the user where they were; flagging the gateway would make the
+/// notice noise; and failing the exit status would turn a valid config into a
+/// broken-looking one and change what every script wrapping `teton doctor`
+/// sees (BR-6: no new fatal class).
+#[test]
+fn doctor_flags_a_hand_edited_base_url_endpoint_and_stays_green() {
+    let daemon_path = daemon_bin();
+    // Hand-written, exactly as a user following a vendor quickstart would write
+    // it: `kimi` carries the bare `/v1` base URL, `gw` a deliberate gateway
+    // path. Neither could have been produced by `provider add` after this REQ.
+    let daemon = TestDaemon::spawn_with_config(
+        &daemon_path,
+        "[[providers]]\nid = \"kimi\"\nkind = \"openai-compatible\"\n\
+         endpoint = \"https://api.moonshot.ai/v1\"\nmodel = \"kimi-k3\"\n\n\
+         [[providers]]\nid = \"gw\"\nkind = \"openai-compatible\"\n\
+         endpoint = \"https://gw.example.com/llm/proxy\"\nmodel = \"gateway-model\"\n\n",
+    );
+    let teton = teton_bin();
+
+    let (output, status) = daemon.run_cli_capture(&teton, &["doctor"], "");
+
+    assert!(
+        status.success(),
+        "AC-5: the advisory must not change doctor's exit status; output:\n{output}\n\
+         daemon log:\n{}",
+        daemon.log()
+    );
+    // The advisory lines, picked out of doctor's report by the phrase that
+    // makes one an advisory. Per line, because both providers are *listed*
+    // either way: what is at issue is which of them is advised about.
+    let advisories: Vec<&str> = output
+        .lines()
+        .filter(|line| line.contains("looks like a vendor base URL"))
+        .collect();
+
+    assert!(
+        advisories.iter().any(|line| line.contains("`kimi`")
+            && line.contains("https://api.moonshot.ai/v1/chat/completions")),
+        "AC-5: the hand-edited base URL must be flagged, by name, with the exact full form to \
+         use — an advisory that only says something is off leaves the user where they were; \
+         advisories:\n{advisories:#?}\nfull output:\n{output}"
+    );
+    assert!(
+        !advisories.iter().any(|line| line.contains("`gw`")),
+        "AC-5: a custom gateway path must not be advised on — it is a first-class deployment, \
+         and an advisory that fires on it is noise a user learns to skip; \
+         advisories:\n{advisories:#?}"
+    );
+    assert!(
+        output.contains("https://gw.example.com/llm/proxy")
+            && !output.contains("https://gw.example.com/llm/proxy/chat"),
+        "the gateway must still be listed, and listed as it was written; output:\n{output}"
     );
 }
 

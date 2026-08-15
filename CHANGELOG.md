@@ -22,6 +22,42 @@ user having asked for it.
 
 ### Added
 
+- **`teton provider add` now takes the base URL your vendor documents
+  (REQ-578).** Paste `https://api.moonshot.ai/v1` — the address Moonshot's
+  quickstart prints and every OpenAI-compatible SDK takes — and Teton registers
+  `https://api.moonshot.ai/v1/chat/completions`, the URL it will actually POST,
+  and says so on the spot: `endpoint stored as … — that exact URL is what Teton
+  will POST.` The full request URL remains the canonical documented form and
+  still registers byte-identically, in silence: composition is forgiveness, not
+  a new convention.
+
+  It completes only what is unambiguously missing — a URL with no path, a bare
+  `/`, or a bare `/v1` — and **never touches an explicit path**. A gateway or
+  proxy serving chat completions at `/llm/proxy` is a first-class deployment,
+  not a typo to correct. The completion happens once, at registration, and
+  nothing joins a path at call time before or after this change: what is in
+  your config is exactly what leaves the machine.
+
+  **This upgrade rewrites nothing.** No existing config is migrated or
+  normalized, and a provider you registered earlier keeps the endpoint it has.
+
+- **`--kind anthropic` no longer needs an `--endpoint` (REQ-578).** It defaults
+  to `https://api.anthropic.com/v1/messages`, written explicitly into your
+  config file so the document still states exactly what will be called — there
+  is no invisible runtime default. The missing endpoint used to be refused by
+  the daemon *after* `provider add` had already read your API key into the
+  keychain (BUG-170). That sequence is now impossible: every check that can
+  refuse a registration — the model, the id, and now the endpoint — runs before
+  you are asked for a credential, and the endpoint that will be stored is on
+  screen before you type one.
+
+- **`teton doctor` now names the request URL for an endpoint that looks like a
+  base URL (REQ-578).** If a provider's stored endpoint has no request path —
+  because you wrote the config by hand, or registered before the completion
+  above existed — doctor prints the exact full form to use. It is advice and
+  nothing more: the config stays valid, doctor's exit status is unchanged, and
+  the file is not edited. A custom gateway path is never flagged.
+
 - **Teton now hands you the exact command for the provider you name
   (REQ-577).** "How do I connect Claude / Kimi / DeepSeek?" is answered from
   recipes that ship inside the binary — the vendor's real endpoint, which

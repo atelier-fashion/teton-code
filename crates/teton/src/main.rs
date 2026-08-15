@@ -1179,7 +1179,10 @@ fn run_doctor(paths: &DaemonPaths) -> anyhow::Result<()> {
                 let mut prompter = StdinPrompter::new();
                 let mut ctx = passive_ctx(&mut surface, &mut state, &mut prompter);
                 match conn.call(ConfigGetParams::default(), &mut ctx)? {
-                    Ok(cfg) => render_config(&cfg.snapshot.providers, ctx.surface),
+                    Ok(cfg) => {
+                        render_config(&cfg.snapshot.providers, ctx.surface);
+                        advise_on_base_url_endpoints(&cfg.snapshot.providers, ctx.surface);
+                    }
                     Err(err) if err.code == error_code::METHOD_NOT_FOUND => ctx.surface.line(
                         LineKind::Notice,
                         "config: not exposed by this daemon build yet (config/get pending).",
@@ -1919,6 +1922,64 @@ fn settle_endpoint(
     }
 
     Ok(composed.stored)
+}
+
+/// What `teton doctor` says about a stored endpoint that looks like a vendor
+/// *base* URL, or `None` for one it has nothing to say about (REQ-578 BR-6,
+/// ADR-4).
+///
+/// The predicate is [`compose_endpoint`] itself, not a second reading of BR-2's
+/// classes: an endpoint that would still *change* if it went through the
+/// registration seam again is, by definition, one of the class (b) shapes — a
+/// bare origin, a bare `/`, or a bare `/v1`. Custom paths (class (c)) and
+/// endpoints that already carry the kind's request path (class (a)) return
+/// `changed: false` and are therefore silent here, which is the half of AC-5
+/// that keeps this from becoming a scold: a gateway serving chat completions at
+/// `/llm/proxy` is a first-class deployment, not a mistake.
+///
+/// **Advisory, never a fault.** `Config::validate` gains no new fatal class
+/// (BR-6) and doctor's exit status is untouched: a bare origin can even be
+/// right, if a host really does serve the protocol at its root. What it cannot
+/// be is *invisible* — since REQ-577 the stored endpoint is POSTed verbatim, so
+/// a config hand-edited to a base URL fails on the first turn with a 404 that
+/// names nothing. This line is that 404's cause, said in advance.
+///
+/// A registration made through `provider add` is composed at the seam and so is
+/// never flagged; what reaches this pass is a config somebody wrote by hand, or
+/// one written before this composition existed.
+fn base_url_advisory(provider: &ProviderConfig) -> Option<String> {
+    let endpoint = provider.endpoint.as_deref()?;
+    let composed = compose_endpoint(core_kind(provider.kind), Some(endpoint));
+    if !composed.changed {
+        return None;
+    }
+    let full = composed.stored?;
+    let id = &provider.id;
+    let kind = kind_label(provider.kind);
+    Some(format!(
+        "provider `{id}`: the stored endpoint `{endpoint}` looks like a vendor base URL. Teton \
+         POSTs the stored endpoint verbatim and joins nothing onto it at call time, so the \
+         request URL a {kind} provider on that host serves is `{full}`. This is advice, not a \
+         fault — the config is valid and doctor's status is unchanged — but if `{id}` answers \
+         404 on its first turn, that is the reason; `teton provider add` composes this form for \
+         you, and a hand-edited config can be set to it directly."
+    ))
+}
+
+/// Doctor's pass over the configured providers (REQ-578 ADR-4).
+///
+/// One [`LineKind::Notice`] per class-(b)-shaped endpoint and nothing at all for
+/// the rest, emitted after the provider listing so the advice sits under the
+/// thing it is about. Reuses the composition rule rather than re-deriving it:
+/// the "full form" this names has to be the same string `provider add` would
+/// have stored, or the advice would send a user somewhere the product itself
+/// would not.
+fn advise_on_base_url_endpoints(providers: &[ProviderConfig], surface: &mut dyn Surface) {
+    for provider in providers {
+        if let Some(advice) = base_url_advisory(provider) {
+            surface.line(LineKind::Notice, &advice);
+        }
+    }
 }
 
 /// Build the provider registration, storing any secret in the keychain first so
@@ -3327,6 +3388,104 @@ mod tests {
 
         let mut surface = RecordingSurface::new();
         assert!(settle_endpoint("gw", ProviderKind::Custom, None, &mut surface).is_err());
+    }
+
+    /// REQ-578 BR-6 / AC-5: doctor names the full request URL for a stored
+    /// endpoint that is really a base URL, and says nothing about the rest.
+    ///
+    /// Both halves are the claim. The flagged one is what a config hand-edited
+    /// from a vendor's quickstart looks like, and before this pass its only
+    /// symptom was a 404 with nothing in it. The **silent** one is what keeps
+    /// the advice worth reading: a gateway at `/llm/proxy` and an endpoint that
+    /// already carries the request path are both correct, and an advisory that
+    /// fired on them would be noise a user learns to skip past — which is the
+    /// state in which the one line that mattered goes unread.
+    ///
+    /// The end-to-end form (real binary, real daemon, exit status unchanged) is
+    /// `cli_e2e`'s `doctor_flags_a_hand_edited_base_url_endpoint_and_stays_green`.
+    #[test]
+    fn doctor_advises_on_base_url_endpoints_and_is_silent_on_the_rest() {
+        use teton_protocol::methods::ProviderConfig;
+
+        let provider = |id: &str, kind: ProviderKind, endpoint: Option<&str>| ProviderConfig {
+            id: ProviderId::from(id),
+            kind,
+            endpoint: endpoint.map(str::to_owned),
+            model: Some("a-model".to_owned()),
+            auth_ref: None,
+        };
+
+        let mut surface = RecordingSurface::new();
+        advise_on_base_url_endpoints(
+            &[
+                // Flagged: the bare-`/v1` paste this REQ exists for.
+                provider(
+                    "kimi",
+                    ProviderKind::OpenaiCompatible,
+                    Some("https://api.moonshot.ai/v1"),
+                ),
+                // Flagged: the Anthropic kind's own bare shape, whose full form
+                // is a *different* path — the advice is per kind, not a suffix.
+                provider(
+                    "claude",
+                    ProviderKind::Anthropic,
+                    Some("https://api.anthropic.com"),
+                ),
+                // Silent: an explicit gateway path (BR-2 class (c)).
+                provider(
+                    "gw",
+                    ProviderKind::OpenaiCompatible,
+                    Some("https://gw.example.com/llm/proxy"),
+                ),
+                // Silent: already the request URL (BR-2 class (a)).
+                provider(
+                    "openai",
+                    ProviderKind::OpenaiCompatible,
+                    Some("https://api.openai.com/v1/chat/completions"),
+                ),
+                // Silent: the on-device tier has no endpoint to advise on.
+                provider("on-device", ProviderKind::Local, None),
+            ],
+            &mut surface,
+        );
+
+        let advised = surface.lines_of(LineKind::Notice);
+        assert_eq!(
+            advised.len(),
+            2,
+            "exactly the two base-URL shapes are advised on: {advised:?}"
+        );
+        assert!(
+            surface.any_line_contains(
+                LineKind::Notice,
+                "https://api.moonshot.ai/v1/chat/completions"
+            ),
+            "the advice has to carry the exact full form a user can paste: {advised:?}"
+        );
+        assert!(
+            surface.any_line_contains(LineKind::Notice, "https://api.anthropic.com/v1/messages"),
+            "and the Anthropic kind's own path, not its neighbour's: {advised:?}"
+        );
+        let rendered = advised.join("\n");
+        assert!(
+            rendered.contains("kimi") && rendered.contains("claude"),
+            "each line must name the provider it is about: {rendered}"
+        );
+        // Needles that cannot appear in a flagged line's own text: `openai`
+        // alone would match the *kind* name every openai-compatible advisory
+        // carries, and a silence assertion that can never fail is not one.
+        for silent in ["gw.example.com", "llm/proxy", "api.openai.com", "on-device"] {
+            assert!(
+                !rendered.contains(silent),
+                "`{silent}` is a correct endpoint and must not be advised on: {rendered}"
+            );
+        }
+        assert_eq!(
+            advised.len(),
+            surface.calls.len(),
+            "the pass is advisory: it writes notices and nothing else: {:?}",
+            surface.calls
+        );
     }
 
     // -----------------------------------------------------------------------
