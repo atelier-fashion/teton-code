@@ -7731,13 +7731,16 @@ fn to_proto_kind(kind: ProviderKind) -> ProtoProviderKind {
     }
 }
 
+/// The wire kind as the domain kind.
+///
+/// The mapping itself is `teton_core`'s one `From` impl (REQ-578): the CLI's
+/// endpoint composition needs the same conversion, and two hand-written matches
+/// of the same four variants is exactly the pair that drifts into composing an
+/// Anthropic registration with the OpenAI-compatible request path. This wrapper
+/// stays because its callers read better naming the direction than spelling a
+/// turbofished `into()`.
 fn to_core_kind(kind: ProtoProviderKind) -> ProviderKind {
-    match kind {
-        ProtoProviderKind::Local => ProviderKind::Local,
-        ProtoProviderKind::OpenaiCompatible => ProviderKind::OpenaiCompatible,
-        ProtoProviderKind::Anthropic => ProviderKind::Anthropic,
-        ProtoProviderKind::Custom => ProviderKind::Custom,
-    }
+    kind.into()
 }
 
 // `to_proto_phase` went with the snapshot's phase-table projection: the phase

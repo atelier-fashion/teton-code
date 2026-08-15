@@ -2049,7 +2049,24 @@ fn url_authority(rest: &str) -> &str {
 /// [`url_authority`]. An authority containing one is refused here rather than
 /// interpreted, because the two available interpretations name two different
 /// hosts and this crate is not the parser that settles it.
-fn is_absolute_http_url(value: &str) -> bool {
+///
+/// **Public since REQ-578, for a second consumer.** `teton provider add` gates
+/// its registration seam on exactly this predicate before it composes or stores
+/// anything, so a provider endpoint and a `[web]` search endpoint are held to one
+/// shape rule rather than two. It is deliberately *not* wired into
+/// [`Config::validate`]: a hand-written config that already carries an odd
+/// endpoint must keep loading (REQ-578 BR-6), and the shapes this refuses are
+/// ones the CLI can still refuse at the moment they are typed.
+///
+/// What that buys the registration seam is the family of strings a URL parser
+/// reads as an authority while a string-splitter does not: `http:/host`,
+/// `http:\\host`, `http:/\host`, `http:\/host` (all of which `url` 2.5 resolves
+/// to `http://host`), and `https://evil.example\@127.0.0.1/x`, whose host is
+/// `evil.example` under WHATWG and `127.0.0.1` under a naive read. Requiring the
+/// literal `://` and refusing a backslash in the authority removes the whole
+/// family in one rule.
+#[must_use]
+pub fn is_absolute_http_url(value: &str) -> bool {
     if value.chars().any(|c| c.is_whitespace() || c.is_control()) {
         return false;
     }
@@ -2096,7 +2113,13 @@ fn url_query_names(url: &str) -> impl Iterator<Item = &str> {
 /// — belt and braces, since `is_absolute_http_url` has already refused a URL
 /// whose authority contains one, and the two readings must not be able to drift
 /// apart if that order ever changes.
-fn url_host(url: &str) -> Option<&str> {
+///
+/// **Public since REQ-578**, so `teton provider add`'s cleartext warning can name
+/// the host a key would travel to rather than carrying a second copy of this
+/// reading. Callers owe it the same precondition the `[web]` path meets:
+/// [`is_absolute_http_url`] first.
+#[must_use]
+pub fn url_host(url: &str) -> Option<&str> {
     let (_, rest) = split_http_scheme(url)?;
     let authority = url_authority(rest);
     let host_port = authority
@@ -2117,7 +2140,21 @@ fn url_host(url: &str) -> Option<&str> {
 ///
 /// A host that cannot be extracted counts as remote — the failing-safe reading,
 /// though [`is_absolute_http_url`] has already refused the hostless shapes.
-fn is_cleartext_to_a_remote_host(url: &str) -> bool {
+///
+/// The loopback set is `localhost` plus anything [`std::net::IpAddr`] calls
+/// loopback. It is deliberately *narrower* than the set of strings that reach
+/// loopback: `http://127.1`, `http://2130706433` and `http://[::ffff:127.0.0.1]`
+/// all land on this machine and none of them parse as loopback here, so all three
+/// are called remote. That errs towards saying "this is exposed" about something
+/// that is not — noise, not a hole — which is the direction a credential warning
+/// should fail in.
+///
+/// **Public since REQ-578**, so `teton provider add` can warn before a key is
+/// typed into an `http://` registration using this rule rather than a copy of it.
+/// Callers owe it [`is_absolute_http_url`] first, exactly as the `[web]` path
+/// does.
+#[must_use]
+pub fn is_cleartext_to_a_remote_host(url: &str) -> bool {
     split_http_scheme(url).is_some_and(|(cleartext, _)| cleartext)
         && !url_host(url).is_some_and(is_loopback_host)
 }

@@ -21,6 +21,11 @@
 //!   does to the *document* it lands in, so a write touches its own keys and
 //!   leaves the user's comments, ordering and unknown keys byte-for-byte alone
 //!   (REQ-574 BR-1). Pure text-in/text-out; the atomic write stays in `tetond`.
+//! - [`endpoint_composition`] — what `provider add` persists when a user pastes
+//!   a vendor's *base* URL instead of the absolute request URL Teton POSTs
+//!   verbatim. The per-kind canonical request paths live here and nowhere else
+//!   (REQ-578 BR-2); composition happens at the registration seam only, so
+//!   every downstream consumer keeps seeing the literal request URL.
 //! - [`capability`] — the one derivation of the web capability's state
 //!   ([`WebCapabilityState`]) from the `[web]` table plus local-model presence.
 //!   Shared by the refusal clause, the status surface, the setup flow, and the
@@ -45,6 +50,7 @@ pub mod category;
 pub mod config;
 pub mod config_doc;
 pub mod effort;
+pub mod endpoint_composition;
 pub mod entities;
 pub mod lifetime;
 pub mod mcp;
@@ -67,10 +73,16 @@ pub use category::{
     CategoryOverride, CategoryResolution, CategoryTable, ConfigurableCategory, JudgmentCategory,
     ParseCategoryError, ParseJudgmentCategoryError, ParseTierError, Tier, TierBinding,
 };
+// REQ-578: the three URL predicates are re-exported alongside the schema they
+// were written for. `teton provider add` gates its registration seam on the same
+// shape rule the `[web]` search endpoint is held to, and warns about the same
+// cleartext condition — one spelling each, so the CLI and the validator cannot
+// come to different conclusions about the same string.
 pub use config::{
-    Config, ConfigError, LegacyRoutingRule, LifetimeConfig, LoadError, LocalModelConfig,
-    MigratedPhase, PermissionsConfig, PrivacyConfig, RoutingMigration, ShutdownPolicyKind,
-    SkippedRule, WebConfig, WebTier,
+    is_absolute_http_url, is_cleartext_to_a_remote_host, url_host, Config, ConfigError,
+    LegacyRoutingRule, LifetimeConfig, LoadError, LocalModelConfig, MigratedPhase,
+    PermissionsConfig, PrivacyConfig, RoutingMigration, ShutdownPolicyKind, SkippedRule, WebConfig,
+    WebTier,
 };
 // REQ-574: re-exported at the crate root for the same reason the config schema
 // is — the daemon's one config-write body and the `/web setup` preview both
@@ -83,6 +95,15 @@ pub use config_doc::{apply_config_delta, table_section, DeltaError};
 pub use effort::{
     default_ladder_for, default_shape_for, level_list, resolve_effort, EffortLadder, EffortLevel,
     EffortOmission, ParseEffortLevelError, ReasoningShape, ResolvedEffort, ALL_LEVELS,
+};
+// REQ-578: re-exported at the crate root for the same reason the config schema
+// is — the CLI's registration flow, its doctor advisory and the tetond-side
+// bridge test that pins these against the recipe catalog all name them, and
+// `teton_core::compose_endpoint` is the one path to the only code allowed to
+// decide what a provider's stored endpoint is.
+pub use endpoint_composition::{
+    canonical_request_path, compose_endpoint, ComposedEndpoint, ANTHROPIC_DEFAULT_ENDPOINT,
+    ANTHROPIC_REQUEST_PATH, OPENAI_COMPATIBLE_REQUEST_PATH,
 };
 pub use entities::{
     BoundaryMode, ModelProvider, ModelSelection, PrivacyBoundary, ProviderCapabilities,
