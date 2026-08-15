@@ -651,13 +651,14 @@ mod tests {
         )];
         let report = aggregate(&rows, &[], &prices);
 
-        // Actual: deepseek-v4-pro at $0.435/$0.87 per Mtok.
-        //   10_000 * 0.435 + 5_000 * 0.87 = 4_350 + 4_350 = 8_700 micro-USD
-        assert_eq!(report.savings.actual_usd_micros, 8_700);
+        // Actual: deepseek-v4-pro at the peak-ceiling $1.32/$3.96 per Mtok
+        // (time-of-day convention documented in prices.toml).
+        //   10_000 * 1.32 + 5_000 * 3.96 = 13_200 + 19_800 = 33_000 micro-USD
+        assert_eq!(report.savings.actual_usd_micros, 33_000);
         // Baseline: the same volume at Fable ($10/$50 per Mtok).
         //   10_000 * 10 + 5_000 * 50 = 100_000 + 250_000 = 350_000 micro-USD
         assert_eq!(report.savings.baseline_usd_micros, 350_000);
-        assert_eq!(report.savings.savings_usd_micros, 350_000 - 8_700);
+        assert_eq!(report.savings.savings_usd_micros, 350_000 - 33_000);
         assert_eq!(report.savings.priced_calls, 1);
         assert_eq!(report.savings.baseline_model, "anthropic/claude-fable-5");
     }

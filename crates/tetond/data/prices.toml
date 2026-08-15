@@ -113,26 +113,32 @@ input_usd_micros_per_mtok = 5_000_000
 output_usd_micros_per_mtok = 30_000_000
 
 # --- DeepSeek ----------------------------------------------------------------
-# Verified 2026-08-14 against api-docs.deepseek.com/quick_start/pricing.
-# CAVEAT: DeepSeek switches to peak/off-peak time-of-day billing on 2026-08-16
-# 16:00 UTC (peak = 2x off-peak; v4-pro peak $1.32/$3.96, off-peak $0.66/$1.98).
-# This table's schema is one flat rate per model and cannot express that, so
-# after 2026-08-16 these rows are an approximation whichever figure they carry.
-# They hold the flat rates in effect at verification time; revisit after the
-# switch and pick a documented convention (e.g. peak, as the conservative
-# ceiling).
+# DeepSeek bills by time of day from 2026-08-16 16:00 UTC: peak hours are
+# 01:00-04:00 and 06:00-10:00 UTC, every other hour is off-peak at half the
+# peak rate (off-peak: v4-pro $0.66/$1.98, v4-flash $0.22/$0.66 per Mtok).
+# This table's schema is one flat rate per model, so BY CONVENTION these rows
+# carry the PEAK rate: the ceiling can over-state actual spend (up to 2x for
+# off-peak calls) but never under-states it, and so never inflates the savings
+# estimate — silent under-reporting is the failure mode the version note above
+# exists to catch. If the off-peak error ever matters, first-class time-of-day
+# rates are a schema change (REQ-sized), not a data edit.
+# Announced schedule verified 2026-08-14 against
+# api-docs.deepseek.com/quick_start/pricing. Shipped 2026-08-14, ahead of the
+# switch, by decision — until it lands these rows overstate DeepSeek spend
+# (true flat rates then: v4-pro $0.435/$0.87, v4-flash $0.14/$0.28). Re-verify
+# the live page once time-of-day billing is in effect.
 
 [[models]]
 provider_id = "deepseek"
 model = "deepseek-v4-pro"
-input_usd_micros_per_mtok = 435_000
-output_usd_micros_per_mtok = 870_000
+input_usd_micros_per_mtok = 1_320_000
+output_usd_micros_per_mtok = 3_960_000
 
 [[models]]
 provider_id = "deepseek"
 model = "deepseek-v4-flash"
-input_usd_micros_per_mtok = 140_000
-output_usd_micros_per_mtok = 280_000
+input_usd_micros_per_mtok = 440_000
+output_usd_micros_per_mtok = 1_320_000
 
 # --- Moonshot (Kimi) ---------------------------------------------------------
 # Verified 2026-08-14 against platform.kimi.ai/docs/pricing/chat-k3.

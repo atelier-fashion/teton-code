@@ -363,16 +363,17 @@ fn ac4_cost_meter_reports_totals_phases_and_savings() {
     // positive is caught. Both mocks report 1000 input / 200 output tokens.
     //   spec  → anthropic/claude-fable-5 @ $10/$50 per Mtok:
     //           1000*10 + 200*50          = 10_000 + 10_000 = 20_000 µ$
-    //   impl  → deepseek/deepseek-v4-pro  @ $0.435/$0.87 per Mtok:
-    //           1000*0.435 + 200*0.87     =     435 +    174 =    609 µ$
+    //   impl  → deepseek/deepseek-v4-pro  @ $1.32/$3.96 per Mtok (the
+    //           time-of-day peak ceiling, per the prices.toml convention):
+    //           1000*1.32 + 200*3.96      =   1_320 +    792 =  2_112 µ$
     // Baseline reprices BOTH priced calls' token volume (1000/200 each) at
     // Fable:  2 * 20_000                                     = 40_000 µ$
-    //   savings = baseline - actual = 40_000 - 20_609        = 19_391 µ$
+    //   savings = baseline - actual = 40_000 - 22_112        = 17_888 µ$
     const SPEC_MICROS: i64 = 20_000;
-    const IMPLEMENT_MICROS: i64 = 609;
-    const TOTAL_MICROS: i64 = SPEC_MICROS + IMPLEMENT_MICROS; // 20_609
+    const IMPLEMENT_MICROS: i64 = 2_112;
+    const TOTAL_MICROS: i64 = SPEC_MICROS + IMPLEMENT_MICROS; // 22_112
     const BASELINE_MICROS: i64 = 40_000;
-    const SAVINGS_MICROS: i64 = BASELINE_MICROS - TOTAL_MICROS; // 19_391
+    const SAVINGS_MICROS: i64 = BASELINE_MICROS - TOTAL_MICROS; // 17_888
 
     assert_eq!(report["total_calls"].as_u64(), Some(2), "{report}");
     assert_eq!(report["priced_calls"].as_u64(), Some(2), "{report}");

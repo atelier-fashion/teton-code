@@ -307,7 +307,7 @@ mod tests {
         // that a single row serves the model. The cross-provider claim is tested
         // where provider ids exist: `report.rs`'s
         // `two_providers_calling_one_model_are_priced_identically`.
-        assert_eq!(table.price("deepseek-v4-pro", 1000, 200), Some(435 + 174));
+        assert_eq!(table.price("deepseek-v4-pro", 1000, 200), Some(1_320 + 792));
         assert_eq!(
             table
                 .models
