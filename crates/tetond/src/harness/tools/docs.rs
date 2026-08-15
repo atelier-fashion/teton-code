@@ -233,12 +233,13 @@ mod tests {
     /// prompt against a 48-byte floor, so a description written without a number
     /// in front of it spends headroom the bundled guide is competing for.
     ///
-    /// It lives in this module and not beside [`DESCRIPTION`] for a mechanical
-    /// reason worth knowing: `boundary_coverage.rs` derives the universe of
-    /// tools from the source text *before* each file's first `#[cfg(test)]`
-    /// line, so a `cfg(test)` item above the `impl Tool` block hides the tool
-    /// from that scan entirely — narrowing the universe, which is the one
-    /// direction that fail-safe is not safe in.
+    /// It lives in this module and not beside [`DESCRIPTION`] because only the
+    /// tests read it. It once *had* to: `boundary_coverage.rs` used to truncate
+    /// its source scan at each file's first `#[cfg(test)]` line, so a
+    /// `cfg(test)` item above the `impl Tool` block hid the tool from the
+    /// derived universe. The scan now anchors on the test module itself and
+    /// pins that with a regression test, so the placement is convention, not a
+    /// constraint.
     pub(super) const MAX_DESCRIPTION_CHARS: usize = 120;
 
     fn ctx() -> ToolContext {
