@@ -18,6 +18,53 @@ unchanged. What belongs here is what an *upgrade* does to a machine that was
 already running — above all, anything that changes where data goes without the
 user having asked for it.
 
+## [0.1.17] - 2026-08-15
+
+### Fixed
+
+- **If you run the always-on daemon, the stale-build notice finally tells you
+  something that works (BUG-174).** When your CLI outran the daemon serving it,
+  Teton has always said: *"Exit every teton session to stop it; the next one
+  starts the new daemon."* For a daemon you started with `brew services` that
+  advice could never work — the formula runs it under `--shutdown-policy never`,
+  so it does not exit with your last session, by design. Closing every session
+  changed nothing, the same notice printed again, and there was no way out of
+  the loop from inside the product. It now detects an always-on daemon and names
+  the command that actually ends it:
+
+  ```
+  this CLI is 0.1.17 but the running daemon is 0.1.13 — commands are being
+  served by the older binary. This is the always-on `brew services` daemon,
+  which does not exit with your last session — run `brew services stop teton`
+  once, and the next command starts the new daemon on demand.
+  ```
+
+  **This is the one upgrade note worth reading.** If you are on an always-on
+  daemon older than 0.1.14, upgrading to 0.1.17 does *not* by itself put the new
+  daemon in charge — Homebrew cannot unload a launchd agent registered by an
+  earlier version of the formula. Run `brew services stop teton` once (close any
+  open session first); from then on the CLI starts a daemon on demand and stops
+  it with your last session. Confirm with `teton doctor`, which prints the
+  version of the daemon that actually answered.
+
+- **Commands installed by Homebrew are visible to the agent again
+  (BUG-174).** A daemon started by launchd inherits launchd's `PATH` —
+  `/usr/bin:/bin:/usr/sbin:/sbin` — which names no package-manager prefix at
+  all, and the daemon passed that straight to every subprocess it spawned. So
+  inside a session, `gh`, `rg`, `jq`, Homebrew's `python3` and `teton` itself
+  were simply not found: the agent saw "command not found" and would report that
+  Teton was not installed while running inside Teton. The daemon now floors the
+  `PATH` it hands its children with the usual package-manager prefixes.
+
+  The same starved `PATH` reached **stdio MCP servers**, where it was worse than
+  degraded: a server declared as `npx @scope/server` could not be launched at
+  all under an always-on daemon. It is floored on that path too.
+
+  Floor entries are appended, never prepended, so if your daemon already had a
+  working `PATH` — anything started from a normal shell — nothing about which
+  binary a command resolves to changes. A server that declares its own `PATH`
+  still overrides the floor untouched.
+
 ## [0.1.16] - 2026-08-15
 
 ### Added
