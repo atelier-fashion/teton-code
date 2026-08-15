@@ -489,6 +489,29 @@ pub mod error_code {
         /// different answers, and folding them would tell an unattached
         /// connection its TOML was the problem.
         WEB_SETUP_INVALID = -32020;
+        /// A candidate provider registration failed validation at
+        /// `provider/setup_preview` or `provider/setup_commit`, or a commit's
+        /// digest no longer matched the preview the user confirmed (REQ-579
+        /// BR-3, BR-9).
+        ///
+        /// [`WEB_SETUP_INVALID`]'s sibling, and separate from it for the reason
+        /// that one is separate from [`CONFIG_REJECTED`]: a client renders this
+        /// mid-flow — the user is several answers into a walkthrough and one of
+        /// them needs changing — and the two flows have different remedies to
+        /// offer, so a client that keyed off a shared code could not tell a
+        /// user which question to go back to. Nothing has been written when it
+        /// arrives, and on the commit arm no key has been stored either (BR-8).
+        ///
+        /// The message carries the **validator's own sentence** where the
+        /// candidate was refused by `Config::validate`, rather than a second
+        /// wording of one rejection (LESSON-456).
+        ///
+        /// A caller that fails the user-only gate does **not** get this code —
+        /// that is [`NOT_ATTACHED`], plus a `provider_setup_rejected_nonuser`
+        /// event on the commit arm alone (BR-12). "You may not do this" and
+        /// "this config would not load" are different answers, and folding them
+        /// would tell an unattached connection its endpoint was the problem.
+        PROVIDER_SETUP_INVALID = -32021;
     }
 }
 
@@ -522,6 +545,19 @@ mod tests {
         assert_eq!(error_code::WEB_SETUP_INVALID, -32020);
         assert_eq!(error_code::SELF_APPROVAL_REFUSED, -32019);
         assert_eq!(error_code::NOT_ATTACHED, -32009);
+    }
+
+    /// REQ-579's code does the same: the next free number, moving nobody.
+    ///
+    /// Pinned for the test above's reason — the distinctness sweep catches a
+    /// *collision* and says nothing about a code renumbered into a free slot,
+    /// which is the change that silently reclassifies every error an
+    /// already-installed client knows. Its neighbour is asserted beside it so a
+    /// renumbering has to edit an assertion naming the release it would break.
+    #[test]
+    fn the_provider_setup_code_is_the_next_free_one_and_renumbers_nothing() {
+        assert_eq!(error_code::PROVIDER_SETUP_INVALID, -32021);
+        assert_eq!(error_code::WEB_SETUP_INVALID, -32020);
     }
 
     #[test]

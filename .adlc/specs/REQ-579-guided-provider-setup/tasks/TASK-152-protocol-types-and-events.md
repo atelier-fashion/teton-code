@@ -1,7 +1,7 @@
 ---
 id: TASK-152
 title: "Protocol: ProviderSetup{Plan,Preview,Commit} types, ProviderRecipeEntry, two events, error code"
-status: draft
+status: complete
 parent: REQ-579
 created: 2026-08-15
 updated: 2026-08-15

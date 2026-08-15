@@ -30,10 +30,10 @@ use teton_protocol::events::{
     DaemonLifetimeStage, Event, EventEnvelope, EvictionReason, FailureClass, ModelLifecycle,
     ModelSelectionProposed, PermissionOption, PermissionOptionKind, PermissionRequest,
     PhaseTransition, PrefixCache, PrefixCacheMiss, PrefixCacheOutcome, PrivacyAction, PrivacyBlock,
-    ProvenanceRejected, ProvenanceRejection, ProviderDegraded, RouteDecided, SessionGrantMinted,
-    SessionUpdatePayload, ToolCallStatus, WebCapabilityState, WebConsentDecided, WebConsentScope,
-    WebLookup, WebLookupKind, WebLookupOutcome, WebSetupCompleted, WebSetupRejected, WebTier,
-    OPTION_ID_ENABLE_PERMANENT,
+    ProvenanceRejected, ProvenanceRejection, ProviderDegraded, ProviderSetupCompleted,
+    ProviderSetupRejected, RouteDecided, SessionGrantMinted, SessionUpdatePayload, ToolCallStatus,
+    WebCapabilityState, WebConsentDecided, WebConsentScope, WebLookup, WebLookupKind,
+    WebLookupOutcome, WebSetupCompleted, WebSetupRejected, WebTier, OPTION_ID_ENABLE_PERMANENT,
 };
 use teton_protocol::methods::{
     AttachConsentOutcome, AttachConsentParams, PermissionOutcome, PermissionRespondParams,
@@ -595,6 +595,26 @@ pub fn render_event(
             surface.line(LineKind::Notice, &format_web_setup_rejected(rejected));
             EventOutcome::Rendered
         }
+        // REQ-579 BR-15, and the web pair's arrangement applied to the second
+        // flow: never verbose-gated, because the config on disk changed and this
+        // session can now route somewhere it could not a moment ago. A second
+        // client attached to the same session watched that happen and is owed
+        // the news (LESSON-505).
+        Event::ProviderSetupCompleted(completed) => {
+            surface.line(
+                LineKind::Notice,
+                &format_provider_setup_completed(completed),
+            );
+            EventOutcome::Rendered
+        }
+        // BR-12's defense in depth, announced rather than logged: something that
+        // was not this session's user tried to commit a provider registration
+        // and was refused. The user is the only one who can act on that, so it
+        // is never verbose-gated either.
+        Event::ProviderSetupRejected(rejected) => {
+            surface.line(LineKind::Notice, &format_provider_setup_rejected(rejected));
+            EventOutcome::Rendered
+        }
         // Diagnostic chrome, and deliberately thin. The turn that dead-ended
         // has already told the user what it could not do and what would fix it
         // — the unserved-turn sentence and the web tool's own refusal both name
@@ -652,6 +672,47 @@ fn format_web_setup_rejected(rejected: &WebSetupRejected) -> String {
         "web setup refused: {} tried to change this session's web configuration, and was not \
          allowed to. Nothing was written.",
         rejected.origin
+    )
+}
+
+/// The line a completed `/provider setup` renders (REQ-579 BR-15).
+///
+/// Three facts and no more: which id was registered, which model it is pinned
+/// to, and what now routes to it — including the honest "nothing yet" for the
+/// registered-but-unrouted outcome BR-7 permits, which a line that simply
+/// omitted the tiers would leave a user guessing about.
+///
+/// It names **no endpoint and no key reference**. The event carries neither
+/// (BR-2), and this notice reaches every session attached to the one that ran
+/// the walkthrough — the same audience reason `format_web_setup_completed` keeps
+/// the config path off screen.
+fn format_provider_setup_completed(completed: &ProviderSetupCompleted) -> String {
+    let routing = if completed.bindings.is_empty() {
+        "nothing routes to it yet".to_owned()
+    } else {
+        let tiers: Vec<&str> = completed
+            .bindings
+            .iter()
+            .map(|binding| binding.tier.as_str())
+            .collect();
+        format!("`{}` now routes to it", tiers.join("`, `"))
+    };
+    format!(
+        "provider `{}` registered (model `{}`) — {routing}.",
+        completed.provider_id, completed.model,
+    )
+}
+
+/// The line a refused provider-setup commit renders (REQ-579 BR-12).
+///
+/// The daemon names the *method* and never the caller, and it is rendered rather
+/// than branched on. What this adds is the part the user cares about: nothing
+/// was written, and no key was stored.
+fn format_provider_setup_rejected(rejected: &ProviderSetupRejected) -> String {
+    format!(
+        "provider setup refused: something that is not this session's user tried to run `{}`, \
+         and was not allowed to. Nothing was written and no key was stored.",
+        rejected.method
     )
 }
 
@@ -1491,7 +1552,8 @@ mod tests {
         ByteSpan, ContextCleared, CostRecord, CostRecorded, FindingKind, ModelSelectionDecided,
         PlanEntry, PlanEntryStatus, SelectionSource, SessionUpdate, WebTaintOverridden,
     };
-    use teton_protocol::{ProviderId, RequestId, SessionId};
+    use teton_protocol::methods::TierBinding;
+    use teton_protocol::{ProviderId, ProviderKind, RequestId, SessionId, Tier};
 
     /// A consent request as the daemon would publish it.
     fn consent_request(scope: ConsentScope) -> AttachConsentRequested {
@@ -3247,6 +3309,78 @@ mod tests {
             state.web.capability.is_none(),
             "a refusal changes no capability state"
         );
+    }
+
+    /// REQ-579 BR-15's client leg: a committed registration is announced to
+    /// every session attached, naming the id, the model, and what now routes to
+    /// it — and naming neither the endpoint nor the key reference, neither of
+    /// which the event carries (BR-2).
+    #[test]
+    fn a_completed_provider_setup_is_announced_with_what_now_routes_to_it() {
+        let mut surface = RecordingSurface::new();
+        let mut state = SessionState::new();
+
+        render_event(
+            &envelope(Event::ProviderSetupCompleted(ProviderSetupCompleted {
+                provider_id: ProviderId::from("kimi"),
+                kind: ProviderKind::OpenaiCompatible,
+                model: "kimi-k2-turbo-preview".to_owned(),
+                bindings: vec![TierBinding {
+                    tier: Tier::Think,
+                    provider_id: ProviderId::from("kimi"),
+                }],
+            })),
+            &mut surface,
+            &mut state,
+        );
+
+        let notice = surface.lines_of(LineKind::Notice).join("\n");
+        assert!(notice.contains("provider `kimi` registered"), "{notice}");
+        assert!(notice.contains("`kimi-k2-turbo-preview`"), "{notice}");
+        assert!(notice.contains("`think` now routes to it"), "{notice}");
+        assert!(
+            surface.lines_of(LineKind::Error).is_empty(),
+            "a registration is not an error"
+        );
+
+        // BR-7's declined-every-binding outcome says so plainly rather than
+        // trailing off after the model name.
+        let mut surface = RecordingSurface::new();
+        render_event(
+            &envelope(Event::ProviderSetupCompleted(ProviderSetupCompleted {
+                provider_id: ProviderId::from("kimi"),
+                kind: ProviderKind::OpenaiCompatible,
+                model: "kimi-k2-turbo-preview".to_owned(),
+                bindings: vec![],
+            })),
+            &mut surface,
+            &mut state,
+        );
+        let notice = surface.lines_of(LineKind::Notice).join("\n");
+        assert!(notice.contains("nothing routes to it yet"), "{notice}");
+    }
+
+    /// REQ-579 BR-12's client leg: a refused commit is announced to the
+    /// session's own user, names the method the daemon named, and says that
+    /// nothing was written and no key was stored.
+    #[test]
+    fn a_refused_provider_setup_commit_says_nothing_was_written_or_stored() {
+        let mut surface = RecordingSurface::new();
+        let mut state = SessionState::new();
+
+        render_event(
+            &envelope(Event::ProviderSetupRejected(ProviderSetupRejected {
+                method: "provider/setup_commit".to_owned(),
+            })),
+            &mut surface,
+            &mut state,
+        );
+
+        let notice = surface.lines_of(LineKind::Notice).join("\n");
+        assert!(notice.contains("provider setup refused"), "{notice}");
+        assert!(notice.contains("provider/setup_commit"), "{notice}");
+        assert!(notice.contains("Nothing was written"), "{notice}");
+        assert!(notice.contains("no key was stored"), "{notice}");
     }
 
     /// A dead end is chrome: the turn that hit it already said what it could not

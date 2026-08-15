@@ -49,9 +49,9 @@ write today, through the same comment-preserving writer (REQ-574).
 | `ProviderSetupPreviewResult` | D→C | `toml, dial_host, warnings: Vec<String>, digest, replaces: Option<ExistingProvider>` |
 | `ProviderSetupCommitParams` | C→D | `session_id, candidate, expect_digest: Option<String>` |
 | `ProviderSetupCommitResult` | D→C | `applied, provider_id, bindings` |
-| `Event::ProviderSetupCompleted` | D→clients | `session_id, provider_id, kind, model, bindings` |
-| `Event::ProviderSetupRejected` | D→clients | `session_id, method` — wire name `provider_setup_rejected_nonuser` |
-| error code | | `PROVIDER_SETUP_INVALID` (candidate refused by validation / digest mismatch); reuse `SETUP_REJECTED_NONUSER` for the caller gate |
+| `Event::ProviderSetupCompleted` | D→clients | `provider_id, kind, model, bindings` — session scope comes from the `EventEnvelope`, which flattens over the payload; a payload `session_id` would be a duplicate wire key (the web precedent's test asserts this) |
+| `Event::ProviderSetupRejected` | D→clients | `method` — wire name `provider_setup_rejected_nonuser` (serde rename; scope from the envelope) |
+| error code | | `PROVIDER_SETUP_INVALID` (candidate refused by validation / digest mismatch). The caller gate answers a foreign connection with the existing `NOT_ATTACHED` code — exactly as `web/setup_*` does — and the commit additionally announces `provider_setup_rejected_nonuser`. (There is no `SETUP_REJECTED_NONUSER` code in the codebase; an earlier draft of this table assumed one.) |
 
 `key_ref` is a keychain reference (`keychain://teton/<id>`); the daemon rejects
 any candidate whose `key_ref` does not parse as a reference — the same
@@ -83,6 +83,10 @@ No change to `config/set`, `RegisterProvider`, or `SetTierBinding`; the commit
 
 **tetond/src/server.rs** — `handle_provider_setup_{plan,preview,commit}`; the
 commit is added to the async-spawn router and to `COMMITMENT_METHODS`.
+
+**teton/src/session_ui.rs** — `render_event` is an exhaustive match, so the two
+new `Event` variants require render arms; TASK-152 added them (a swallowed
+`provider_setup_completed` would be a BR-15 defect). TASK-155 may reword.
 
 **teton/src/provider_setup_ui.rs** — `run(conn, ctx, keychain, vendor_arg,
 tier_arg)`; a `Gate` (walk vs instructions); a lenient vendor resolver over the
