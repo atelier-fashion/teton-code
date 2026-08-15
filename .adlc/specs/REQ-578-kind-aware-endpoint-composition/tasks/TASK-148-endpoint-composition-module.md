@@ -1,7 +1,7 @@
 ---
 id: TASK-148
 title: "teton-core endpoint composition module with unit table"
-status: draft
+status: complete
 parent: REQ-578
 created: 2026-08-15
 updated: 2026-08-15
