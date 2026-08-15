@@ -1,0 +1,41 @@
+{
+  "req": "REQ-579",
+  "branch": "feat/REQ-579-guided-provider-setup",
+  "startedAt": "2026-08-15T20:33:42Z",
+  "completed": false,
+  "currentPhase": 1,
+  "completedPhases": [
+    0
+  ],
+  "phaseHistory": [
+    {
+      "phase": 0,
+      "name": "Create Worktree",
+      "completedAt": "2026-08-15T20:33:53Z"
+    }
+  ],
+  "integrationBranch": "main",
+  "repos": {
+    "teton-code": {
+      "primary": true,
+      "path": "/Users/brettluelling/Documents/GitHub/teton-code",
+      "worktree": "/Users/brettluelling/Documents/GitHub/teton-code/.worktrees/REQ-579",
+      "branch": "feat/REQ-579-guided-provider-setup",
+      "touched": true,
+      "prUrl": "https://github.com/atelier-fashion/teton-code/pull/161",
+      "prNumber": 161,
+      "prCreatedAt": "2026-08-15T20:33:44Z",
+      "merged": false,
+      "snapshotBranch": null,
+      "snapshotPR": null
+    }
+  },
+  "mergeOrder": [
+    "teton-code"
+  ],
+  "phase4": {
+    "currentTask": null,
+    "completedTasks": [],
+    "failedTasks": []
+  }
+}
