@@ -1,7 +1,7 @@
 ---
 id: REQ-578
 title: "Kind-aware endpoint composition at the provider registration seam"
-status: draft
+status: approved
 deployable: true
 created: 2026-08-15
 updated: 2026-08-15
@@ -146,23 +146,28 @@ existing output surface, not a new event.
 
 - Canonical request paths are stable at release cadence (they survived the
   REQ-577 round-2 re-verification unchanged even as doc hosts moved).
-- The in-flight chip "Clean up keychain entry on rejected provider add"
-  (task_956eff31, running in a separate session) edits the same registration
-  flow's rejection branch; BR-5 edits its pre-prompt ordering. A rebase of
-  whichever lands second is expected and acceptable — the changes are
-  complementary, not conflicting in intent.
+- ~~The in-flight chip "Clean up keychain entry on rejected provider add"
+  (task_956eff31) edits the same registration flow's rejection branch; BR-5
+  edits its pre-prompt ordering. A rebase of whichever lands second is
+  expected.~~ **Resolved 2026-08-15 before implementation began:** the chip
+  landed first as BUG-171 (PR #146, commit 4e16d14) and this REQ's branch is
+  cut from a main that already carries it. BR-5's prevention layers on top
+  of the landed take-back fallback; no rebase needed. Implementation must
+  read the post-BUG-171 shape of the rejection branch, not the pre-chip one
+  described in older review notes.
 - Composition needs exactly two kind rules today (`openai-compatible`,
   `anthropic`); the typed source makes a third kind's rule a compile-time
   addition, not a convention.
 
 ## Open Questions
 
-- [ ] OQ-1: Which surfaces compose? *Recommendation:* the shared
+- [x] OQ-1: Which surfaces compose? **Resolved (adopted at /proceed launch,
+  2026-08-15, per the draft's recommendation):** the shared
   registration-building path the CLI uses (so any future client of that
   path — the VS Code extension's add-provider flow — inherits it), while a
   raw `config/set` carrying an explicit `ProviderConfig` stays verbatim: it
   is the programmatic/power-user seam, and silently rewriting its payload
-  would violate the durable-document posture (REQ-574). Confirm or widen.
+  would violate the durable-document posture (REQ-574).
 
 ## Out of Scope
 
