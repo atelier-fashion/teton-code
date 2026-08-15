@@ -110,11 +110,13 @@ pub trait Keychain {
     ///
     /// **Not a resolver.** The daemon resolves `auth_ref`s at call time; nothing
     /// on this side reads a credential in order to *use* it. This is the
-    /// read half of a read-before-write, and it has exactly one caller: the
-    /// `/web setup` flow, which stores into the fixed `web-search` account and
-    /// must be able to restore what it displaced when the commit that write was
-    /// made for is refused (REQ-572 BR-11 — "removes any keychain entry the
-    /// aborted flow run itself created", which a rotation did not create).
+    /// read half of a read-before-write, reached only through
+    /// [`PriorKey::read`]: the flows that store a credential immediately before
+    /// the commit RPC it was collected for — `/web setup` (REQ-572 BR-11) and
+    /// `teton provider add` (BUG-171) — must be able to restore what the store
+    /// displaced when that commit is refused (BR-11's "removes any keychain
+    /// entry the aborted flow run itself created", which a rotation did not
+    /// create).
     ///
     /// `Ok(None)` and an error are deliberately different answers: "there is
     /// nothing here" licenses a delete, and "I could not find out" licenses
@@ -130,10 +132,11 @@ pub trait Keychain {
 
     /// Remove the entry for `account` (REQ-572 ADR-3).
     ///
-    /// The undo half of [`Self::store`], and it exists for one caller: the
-    /// `/web setup` flow writes the key immediately before the commit RPC it was
-    /// collected for, so a commit the daemon refuses must take the entry back
-    /// out. Without this, a refused setup would leave a credential on the
+    /// The undo half of [`Self::store`], reached only through
+    /// [`PriorKey::undo`]: the flows that write a key immediately before the
+    /// commit RPC it was collected for — `/web setup` and `teton provider add`
+    /// (BUG-171) — must take the entry back out when the daemon refuses that
+    /// commit. Without this, a refused setup would leave a credential on the
     /// machine that no config references and nothing will ever read — a residue
     /// the user did not agree to and cannot see.
     ///
@@ -229,6 +232,114 @@ impl Keychain for UnsupportedKeychain {
     fn delete(&self, _account: &str) -> Result<(), KeychainError> {
         Err(KeychainError::Unsupported)
     }
+}
+
+// ---------------------------------------------------------------------------
+// The read-before-write undo (REQ-572 ADR-3/BR-11; generalized for BUG-171)
+// ---------------------------------------------------------------------------
+
+/// What the keychain held for an account *before* a flow stored anything there.
+///
+/// Read once, immediately before the store, because the store is what destroys
+/// the answer — and the account is captured *inside* the value, so the undo
+/// cannot be aimed at a different entry than the one that was inspected (one
+/// spelling; a second copy of the account is how a flow comes to delete an
+/// entry it never read). Which state this is decides what a refused commit
+/// owes the machine, and the three are genuinely three, not a `bool` with a
+/// failure case: "nothing was here" licenses a delete, "this was here" obliges
+/// a restore, and "I could not find out" licenses neither.
+///
+/// Built for `/web setup` (REQ-572 BR-11) and adopted by `teton provider add`
+/// (BUG-171) — the two places a credential is typed at a terminal and stored
+/// for a commit the daemon may still refuse.
+pub struct PriorKey {
+    /// The account the pre-store read inspected — the only entry the undo
+    /// will touch.
+    account: String,
+    held: Held,
+}
+
+/// The three answers a pre-store read can produce.
+enum Held {
+    /// The account was empty. The flow's store created the entry, so the undo
+    /// is to remove it (BR-11's "any keychain entry the aborted flow run
+    /// itself created").
+    Absent,
+    /// The account already held a credential. Whatever references that entry is
+    /// still pointing at it, so the undo is to put those exact bytes back — a
+    /// delete here destroys a working setup the user never agreed to give up.
+    Present(String),
+    /// The store could not be read. Both undos are unsafe: the delete might
+    /// take out a credential in use, and there is nothing to restore.
+    Unreadable(KeychainError),
+}
+
+/// Hand-written because `Present` holds the displaced credential's plaintext,
+/// and a derived `Debug` would print a live key into any `{:?}`, panic message,
+/// or future test assertion — the exact residue the REQ-572 AC-5 sweep exists
+/// to catch.
+impl fmt::Debug for PriorKey {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match &self.held {
+            Held::Absent => write!(f, "PriorKey::Absent(`{}`)", self.account),
+            Held::Present(_) => write!(f, "PriorKey::Present(`{}`, <redacted>)", self.account),
+            Held::Unreadable(err) => write!(f, "PriorKey::Unreadable(`{}`, {err})", self.account),
+        }
+    }
+}
+
+impl PriorKey {
+    /// Read `account`, classifying a missing entry as a state rather than a
+    /// failure.
+    ///
+    /// A read failure does **not** stop the calling flow. It is a transient
+    /// backend condition on the one platform that has a backend at all, the
+    /// user has asked for this key to be stored, and refusing here would trade
+    /// a hypothetical loss for a certain one. What it does is downgrade the
+    /// undo to "leave it alone and say so".
+    pub fn read(keychain: &dyn Keychain, account: &str) -> Self {
+        let held = match keychain.read(account) {
+            Ok(Some(existing)) => Held::Present(existing),
+            Ok(None) => Held::Absent,
+            Err(err) => Held::Unreadable(err),
+        };
+        Self {
+            account: account.to_owned(),
+            held,
+        }
+    }
+
+    /// Whether the store this value was read ahead of displaced a credential
+    /// that was already filed there.
+    pub fn displaced(&self) -> bool {
+        matches!(self.held, Held::Present(_))
+    }
+
+    /// Undo the store this value was read ahead of, given what it displaced.
+    pub fn undo(&self, keychain: &dyn Keychain) -> Cleanup {
+        match &self.held {
+            Held::Absent => Cleanup::Deleted(keychain.delete(&self.account)),
+            Held::Present(previous) => {
+                Cleanup::Restored(keychain.store(&self.account, previous).map(|_| ()))
+            }
+            // The reason travels with the decision: "left alone" without
+            // "because your keychain would not answer" reads as the flow
+            // shrugging.
+            Held::Unreadable(err) => Cleanup::LeftInPlace(err.to_string()),
+        }
+    }
+}
+
+/// What the failure path did about the entry a flow wrote.
+#[derive(Debug)]
+pub enum Cleanup {
+    /// The entry the flow created was removed — or the removal was refused.
+    Deleted(Result<(), KeychainError>),
+    /// The credential the flow displaced was put back — or could not be.
+    Restored(Result<(), KeychainError>),
+    /// Nothing was touched, because nothing could be shown to be the safe move.
+    /// Carries why the store could not be read.
+    LeftInPlace(String),
 }
 
 /// An in-memory keychain for tests: it proves a secret was captured out of the
@@ -414,6 +525,86 @@ mod tests {
             kc.read("web-search"),
             Err(KeychainError::Backend(_))
         ));
+    }
+
+    /// BUG-171: a store over an empty account owes the machine a delete — and
+    /// the undo aims at the account the read inspected, which travels inside
+    /// the value rather than being passed in a second time.
+    #[test]
+    fn a_prior_read_of_an_empty_account_licenses_a_delete() {
+        let kc = MockKeychain::new();
+        let prior = PriorKey::read(&kc, "opus");
+        assert!(!prior.displaced());
+
+        kc.store("opus", "sk-typed-this-run").unwrap();
+        let cleanup = prior.undo(&kc);
+        assert!(matches!(cleanup, Cleanup::Deleted(Ok(()))));
+        assert!(kc.is_empty(), "the entry this flow created must be gone");
+        assert_eq!(kc.deletes(), vec!["opus".to_owned()]);
+    }
+
+    /// BUG-171: a store over an occupied account owes the machine a restore of
+    /// the exact displaced bytes — a delete here would destroy a credential
+    /// something else may still reference.
+    #[test]
+    fn a_prior_read_of_an_occupied_account_obliges_a_restore() {
+        let kc = MockKeychain::new();
+        kc.store("opus", "sk-the-one-that-was-there").unwrap();
+
+        let prior = PriorKey::read(&kc, "opus");
+        assert!(prior.displaced());
+
+        kc.store("opus", "sk-typed-this-run").unwrap();
+        let cleanup = prior.undo(&kc);
+        assert!(matches!(cleanup, Cleanup::Restored(Ok(()))));
+        assert_eq!(
+            kc.stored_secret("opus").as_deref(),
+            Some("sk-the-one-that-was-there"),
+            "the displaced credential must be back, byte for byte"
+        );
+        assert!(
+            kc.deletes().is_empty(),
+            "a restore is a store, not a delete"
+        );
+    }
+
+    /// BUG-171: a read the backend refused licenses neither undo — the entry is
+    /// left where it is and the reason rides along for the caller to say.
+    #[test]
+    fn an_unreadable_prior_leaves_the_entry_alone() {
+        let kc = MockKeychain::new();
+        kc.fail_read_with("the keychain is locked");
+        let prior = PriorKey::read(&kc, "opus");
+        assert!(!prior.displaced());
+
+        *kc.read_failure.borrow_mut() = None;
+        kc.store("opus", "sk-typed-this-run").unwrap();
+        let cleanup = prior.undo(&kc);
+        match &cleanup {
+            Cleanup::LeftInPlace(why) => assert!(why.contains("locked"), "{why}"),
+            other => panic!("expected LeftInPlace, got {other:?}"),
+        }
+        assert_eq!(
+            kc.stored_secret("opus").as_deref(),
+            Some("sk-typed-this-run"),
+            "neither undo may run when the prior state is unknown"
+        );
+        assert!(kc.deletes().is_empty());
+    }
+
+    /// The displaced plaintext must never reach a `{:?}` — the hand-written
+    /// `Debug` is the only thing standing between `Present` and a panic message
+    /// that prints a live key.
+    #[test]
+    fn a_prior_key_debug_redacts_the_displaced_credential() {
+        let kc = MockKeychain::new();
+        kc.store("opus", "sk-the-one-that-was-there").unwrap();
+        let rendered = format!("{:?}", PriorKey::read(&kc, "opus"));
+        assert!(
+            !rendered.contains("sk-the-one-that-was-there"),
+            "a displaced credential leaked into Debug output"
+        );
+        assert!(rendered.contains("opus") && rendered.contains("redacted"));
     }
 
     /// The delete-failure seam: without it, the branch that tells the user their
