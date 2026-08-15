@@ -22,6 +22,58 @@ user having asked for it.
 
 ### Added
 
+- **`teton provider add` now takes the base URL your vendor documents
+  (REQ-578).** Paste `https://api.moonshot.ai/v1` — the address Moonshot's
+  quickstart prints and every OpenAI-compatible SDK takes — and Teton registers
+  `https://api.moonshot.ai/v1/chat/completions`, the URL it will actually POST,
+  and says so on the spot: `endpoint stored as … — that exact URL is what Teton
+  will POST.` The full request URL remains the canonical documented form and
+  still registers byte-identically, in silence: composition is forgiveness, not
+  a new convention.
+
+  It completes only what is unambiguously missing — a URL with no path, a bare
+  `/`, or a bare `/v1` — and **never touches an explicit path**. A gateway or
+  proxy serving chat completions at `/llm/proxy` is a first-class deployment,
+  not a typo to correct. The completion happens once, at registration, and
+  nothing joins a path at call time before or after this change: what is in
+  your config is exactly what leaves the machine.
+
+  **This upgrade rewrites nothing.** No existing config is migrated or
+  normalized, and a provider you registered earlier keeps the endpoint it has.
+
+- **`--kind anthropic` no longer needs an `--endpoint` (REQ-578).** It defaults
+  to `https://api.anthropic.com/v1/messages`, written explicitly into your
+  config file so the document still states exactly what will be called — there
+  is no invisible runtime default. The missing endpoint used to be refused by
+  the daemon *after* `provider add` had already read your API key into the
+  keychain (BUG-170). That particular sequence is now impossible: the endpoint —
+  along with the model and the provider id — is settled and shown before you are
+  asked for a credential. A registration can still be refused after the key is
+  read for reasons only the daemon can know at that moment, and when that
+  happens Teton takes the key back out and tells you so.
+
+  If the endpoint is `http://` to anything but your own machine, `provider add`
+  now says so before the prompt: the key you are about to type would cross the
+  network in the clear.
+
+  `provider add` also refuses an `--endpoint` that is not an absolute `http://`
+  or `https://` URL with a host — including near-misses like `http:/host` or an
+  address with a tab or line break in it, which a URL parser and a plain string
+  read differently. Teton will not register an address it cannot show you the
+  same way it dials it. **This is a check on the command, not on your config:**
+  a config file that already holds such an endpoint still loads and the daemon
+  still starts, exactly as before, and `teton doctor` is where you will see it.
+
+- **`teton doctor` now names the request URL for an endpoint that looks like a
+  base URL (REQ-578).** If a provider's stored endpoint has no request path —
+  because you wrote the config by hand, or registered before the completion
+  above existed — doctor prints the form Teton would store. Where that form is
+  genuinely ambiguous — a bare host for an OpenAI-compatible provider, since
+  some vendors serve `/v1` and some do not — it says so and points you at your
+  vendor's documentation rather than asserting an address it cannot know. It is
+  advice and nothing more: the config stays valid, doctor's exit status is
+  unchanged, and the file is not edited. A custom gateway path is never flagged.
+
 - **Teton now hands you the exact command for the provider you name
   (REQ-577).** "How do I connect Claude / Kimi / DeepSeek?" is answered from
   recipes that ship inside the binary — the vendor's real endpoint, which

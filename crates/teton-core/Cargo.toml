@@ -1,6 +1,6 @@
 [package]
 name = "teton-core"
-description = "Router, session state, and cost ledger — pure logic, no I/O."
+description = "Pure, I/O-free domain logic — routing, config, and registration rules — shared by the daemon and its clients."
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -26,7 +26,10 @@ test-seam = []
 # (REQ-565). teton-protocol is a pure leaf — serde/serde_json/thiserror only —
 # so it carries no I/O and the rule above still holds. The edge points this way
 # because the protocol types are shared by daemon *and* clients, while this
-# crate is daemon-side domain logic; teton-protocol must never depend back.
+# crate is pure, I/O-free domain logic consumed by tetond AND by thin clients
+# that need a policy answer without doing I/O to get it — the CLI's endpoint
+# composition is the first of those (REQ-578). teton-protocol must never depend
+# back.
 teton-protocol = { path = "../teton-protocol" }
 serde = { version = "1", features = ["derive"] }
 toml = "0.8"

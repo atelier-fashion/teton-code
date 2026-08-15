@@ -15,6 +15,16 @@ authors.workspace = true
 # a workspace deny-check enforces.
 [dependencies]
 teton-protocol = { path = "../teton-protocol" }
+# REQ-578 ADR-1/OQ-1: the endpoint-composition rule — what `provider add`
+# persists when a user pastes a vendor's *base* URL — has exactly one home, and
+# the CLI's registration flow is one of its callers (the doctor advisory and the
+# tetond-side bridge test are the others). A second copy of the per-kind request
+# paths living here is the drift this REQ exists to prevent, so the edge is
+# declared rather than the rule duplicated. teton-core is pure logic with no I/O
+# dependency of any kind (its own manifest forbids one), so the thin-client rule
+# above is untouched: this adds no transport, no runtime, and nothing the egress
+# deny-check would object to.
+teton-core = { path = "../teton-core" }
 # Command tree + typed argument parsing; `derive` for the declarative CLI.
 clap = { version = "4", features = ["derive"] }
 # JSON-RPC (de)serialization of the newline-delimited wire frames.

@@ -203,6 +203,17 @@
   only for a stated, doc-commented rationale distinct per tool (web = user
   opt-in; teton_docs = self-serving product knowledge), so the exempt set
   stays a checked rule rather than a dumping ground (LESSON-524).
+- **A forgiving input surface normalizes at the write seam and echoes what
+  it stored** — the persisted value is always the literal contract value
+  (an absolute request URL), so every downstream consumer (validation,
+  adapters, egress origin-binding) stays verbatim; composition never runs at
+  request time, the seam is gated by the same shape check its predicates
+  presuppose, and the echo renders the host the request will actually reach
+  (REQ-578, LESSON-528, LESSON-529). Corollary: a pure, I/O-free slice of
+  daemon-side logic may be linked into a thin client when duplicating it
+  would be the drift risk — the crate's manifest states the widened
+  consumer set, and the thin-client rule is preserved by the purity, not by
+  the dependency direction (REQ-578 ADR-1).
 
 ## ADRs
 

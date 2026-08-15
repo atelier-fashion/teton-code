@@ -38,6 +38,33 @@ impl ProviderKind {
     }
 }
 
+/// The wire kind, read as the domain kind.
+///
+/// [`teton_protocol::ProviderKind`] is the vocabulary the socket speaks; this
+/// one is what the domain rules are written against. They carry the same four
+/// variants by construction — same names, same `kebab-case` rule (see above) —
+/// and this is the **one** place the two meet, so the daemon's `to_core_kind`
+/// and the CLI's registration flow cannot drift into two different mappings.
+/// They used to each spell the match themselves; a typo in either would compose
+/// an Anthropic registration with the OpenAI-compatible request path, which is a
+/// wrong URL written into a user's config that no type checker can see
+/// (REQ-578).
+///
+/// An exhaustive match rather than a `_` arm, for the same reason
+/// [`crate::canonical_request_path`] is one: a fifth kind has to be *decided*
+/// here rather than silently mapped onto a neighbour whose protocol it does not
+/// share.
+impl From<teton_protocol::ProviderKind> for ProviderKind {
+    fn from(kind: teton_protocol::ProviderKind) -> Self {
+        match kind {
+            teton_protocol::ProviderKind::Local => ProviderKind::Local,
+            teton_protocol::ProviderKind::OpenaiCompatible => ProviderKind::OpenaiCompatible,
+            teton_protocol::ProviderKind::Anthropic => ProviderKind::Anthropic,
+            teton_protocol::ProviderKind::Custom => ProviderKind::Custom,
+        }
+    }
+}
+
 /// How reliably a provider follows tool-call protocol. Drives adapter
 /// degradation (BR-6): weak tool-callers get a reduced harness profile rather
 /// than the full agent loop.
@@ -307,6 +334,35 @@ mod tests {
         assert!(ProviderKind::OpenaiCompatible.is_remote());
         assert!(ProviderKind::Anthropic.is_remote());
         assert!(ProviderKind::Custom.is_remote());
+    }
+
+    /// The wire enum and the domain enum are the same four kinds, and the
+    /// conversion between them is total.
+    ///
+    /// Not a formality: the daemon reads a registration through this mapping and
+    /// the CLI composes an endpoint through it, so a pair that drifted would
+    /// write the wrong vendor's request path into a user's config. Stated once
+    /// here, now that both callers share the one `impl` (REQ-578).
+    #[test]
+    fn every_wire_provider_kind_becomes_its_own_domain_kind() {
+        for (wire, domain) in [
+            (teton_protocol::ProviderKind::Local, ProviderKind::Local),
+            (
+                teton_protocol::ProviderKind::OpenaiCompatible,
+                ProviderKind::OpenaiCompatible,
+            ),
+            (
+                teton_protocol::ProviderKind::Anthropic,
+                ProviderKind::Anthropic,
+            ),
+            (teton_protocol::ProviderKind::Custom, ProviderKind::Custom),
+        ] {
+            assert_eq!(
+                ProviderKind::from(wire),
+                domain,
+                "{wire:?} maps to the wrong domain kind"
+            );
+        }
     }
 
     #[test]
