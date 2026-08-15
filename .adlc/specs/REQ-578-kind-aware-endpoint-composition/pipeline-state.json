@@ -2,7 +2,7 @@
   "req": "REQ-578",
   "branch": "feat/REQ-578-kind-aware-endpoint-composition",
   "startedAt": "2026-08-15T00:05:48Z",
-  "completed": false,
+  "completed": true,
   "currentPhase": 8,
   "completedPhases": [
     0,
@@ -12,7 +12,8 @@
     4,
     5,
     6,
-    7
+    7,
+    8
   ],
   "integrationBranch": "main",
   "phaseHistory": [
@@ -55,6 +56,11 @@
       "phase": 7,
       "name": "PR Cleanup & CI",
       "completedAt": "2026-08-15T05:35:00Z"
+    },
+    {
+      "phase": 8,
+      "name": "Wrapup (merge 9d4ad19 + knowledge capture)",
+      "completedAt": "2026-08-15T05:55:00Z"
     }
   ],
   "repos": {
@@ -67,7 +73,7 @@
       "prUrl": "https://github.com/atelier-fashion/teton-code/pull/147",
       "prNumber": 147,
       "prCreatedAt": "2026-08-15T00:05:51Z",
-      "merged": false,
+      "merged": true,
       "snapshotBranch": null,
       "snapshotPR": null
     }
