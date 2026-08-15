@@ -46,8 +46,17 @@ use common::{daemon_bin, teton_bin};
 
 /// How long to wait for a marker before declaring it absent. Generous: this
 /// asserts on **state reached**, never on a fixed sleep, so a slow machine costs
-/// latency rather than a flake (LESSON-450).
-const WINDOW: Duration = Duration::from_secs(20);
+/// latency rather than a flake (LESSON-450) — and the cost lands only on a run
+/// that is already failing, because a passing wait returns the moment its
+/// marker arrives.
+///
+/// 60s rather than 20s (BUG-173): a degraded ubuntu runner spent a full 20s
+/// window getting a correctly-behaving session to its entry prompt (CI run
+/// 31853759487, PR #151, a docs-only change), so 20s was a ceiling real startup
+/// could reach rather than a bound only a hang could. The entry-prompt wait
+/// covers a client process spawn, two RPC round-trips, and a session create;
+/// the ceiling has to be one that machine slowness cannot touch.
+const WINDOW: Duration = Duration::from_secs(60);
 
 /// The pty's output, accumulated by a reader thread.
 ///
@@ -171,11 +180,59 @@ impl TestDaemon {
             .stderr(std::process::Stdio::from(log))
             .spawn()
             .expect("spawn daemon");
-        Self {
+        let daemon = Self {
             root,
             runtime_dir,
             child,
+        };
+        // Constructed before the wait so a panic below still runs `Drop` —
+        // the child is killed and the root removed, not leaked.
+        daemon.wait_for_socket();
+        daemon
+    }
+
+    /// Block until this daemon accepts a connection, or panic with its log
+    /// (BUG-173).
+    ///
+    /// The same barrier `cli_e2e`'s fixture has always had, and the piece this
+    /// copy of its shape dropped. The daemon binds its socket only after
+    /// `DaemonRuntime::from_env` finishes (`tetond/src/main.rs`, H-1: the order
+    /// is load-bearing) and serves the accept loop immediately after, so a
+    /// successful connect means startup is over — everything a test's
+    /// `wait_for` window still has to cover is client-side. Without the
+    /// barrier, the entry-prompt window absorbed daemon startup as well, and on
+    /// a degraded CI runner the sum crossed the window with every process
+    /// behaving correctly.
+    ///
+    /// The barrier also closes a race meaner than slowness. A pty client that
+    /// reached a not-yet-bound socket walked `teton`'s autostart path and
+    /// spawned a *second* daemon from beside its own binary — one that
+    /// inherited none of this fixture's seams (`TETON_LOCAL_SCRIPT`,
+    /// `TETON_TEST_SEAMS`, the probe pins) and raced the fixture for the
+    /// single-instance flock; on a win it served the session with the real
+    /// machine's probe and no scripted tier. BUG-164's resolution records that
+    /// exact signature (the CLI "autostarted its own, hitting the
+    /// model-consent prompt and timing out"). A fixture that is known-ready
+    /// before any client exists makes the autostart path unreachable.
+    fn wait_for_socket(&self) {
+        let socket = self.runtime_dir.join("teton").join("tetond.sock");
+        let deadline = Instant::now() + WINDOW;
+        while Instant::now() < deadline {
+            // A connect, not an existence check: the path appears at `bind`,
+            // but only a successful connect proves the accept loop is serving.
+            // The probe connection is dropped unhandshaken, which the daemon
+            // treats as any other departing client (`cli_e2e` has done exactly
+            // this before every test since its fixture existed).
+            if std::os::unix::net::UnixStream::connect(&socket).is_ok() {
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(25));
         }
+        let log = std::fs::read_to_string(self.root.join("tetond.log")).unwrap_or_default();
+        panic!(
+            "daemon socket never appeared at {}. log:\n{log}",
+            socket.display()
+        );
     }
 }
 
