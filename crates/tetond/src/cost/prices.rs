@@ -189,22 +189,22 @@ mod tests {
     #[test]
     fn bundled_table_parses_and_baseline_is_present() {
         let table = PriceTable::bundled();
-        assert_eq!(table.version, 1);
+        assert_eq!(table.version, 2);
         assert_eq!(table.baseline.provider_id, "anthropic");
-        assert_eq!(table.baseline.model, "claude-opus-4");
+        assert_eq!(table.baseline.model, "claude-fable-5");
         // The invariant `bundled()` asserts: the baseline names a listed model.
         assert!(table.baseline_price().is_some());
-        assert_eq!(table.baseline_label(), "anthropic/claude-opus-4");
+        assert_eq!(table.baseline_label(), "anthropic/claude-fable-5");
     }
 
     #[test]
     fn known_model_prices_by_the_integer_micro_usd_formula() {
         let table = PriceTable::bundled();
-        // Opus: $15/Mtok in, $75/Mtok out. 1000 in + 500 out.
-        //   1000 * 15_000_000 / 1_000_000 = 15_000 micro-USD
-        //    500 * 75_000_000 / 1_000_000 = 37_500 micro-USD
-        let cost = table.price("claude-opus-4", 1000, 500).unwrap();
-        assert_eq!(cost, 15_000 + 37_500);
+        // Fable: $10/Mtok in, $50/Mtok out. 1000 in + 500 out.
+        //   1000 * 10_000_000 / 1_000_000 = 10_000 micro-USD
+        //    500 * 50_000_000 / 1_000_000 = 25_000 micro-USD
+        let cost = table.price("claude-fable-5", 1000, 500).unwrap();
+        assert_eq!(cost, 10_000 + 25_000);
     }
 
     #[test]
@@ -267,16 +267,16 @@ mod tests {
     #[test]
     fn baseline_cost_reprices_at_the_frontier() {
         let table = PriceTable::bundled();
-        // A cheap DeepSeek call's token volume repriced at Opus.
+        // A cheap DeepSeek call's token volume repriced at the Fable baseline.
         let baseline = table.baseline_cost(2000, 1000).unwrap();
-        // 2000 * 15_000_000/1e6 + 1000 * 75_000_000/1e6 = 30_000 + 75_000
-        assert_eq!(baseline, 105_000);
+        // 2000 * 10_000_000/1e6 + 1000 * 50_000_000/1e6 = 20_000 + 50_000
+        assert_eq!(baseline, 70_000);
     }
 
     #[test]
     fn zero_tokens_cost_zero() {
         let table = PriceTable::bundled();
-        assert_eq!(table.price("claude-opus-4", 0, 0), Some(0));
+        assert_eq!(table.price("claude-fable-5", 0, 0), Some(0));
     }
 
     #[test]
@@ -307,12 +307,12 @@ mod tests {
         // that a single row serves the model. The cross-provider claim is tested
         // where provider ids exist: `report.rs`'s
         // `two_providers_calling_one_model_are_priced_identically`.
-        assert_eq!(table.price("deepseek-chat", 1000, 200), Some(270 + 220));
+        assert_eq!(table.price("deepseek-v4-pro", 1000, 200), Some(435 + 174));
         assert_eq!(
             table
                 .models
                 .iter()
-                .filter(|m| m.model == "deepseek-chat")
+                .filter(|m| m.model == "deepseek-v4-pro")
                 .count(),
             1,
             "one row, so no provider needs a duplicate of it"
@@ -327,8 +327,8 @@ mod tests {
     fn a_model_is_priced_whoever_serves_it() {
         let table = PriceTable::bundled();
         assert_eq!(
-            table.price("claude-opus-4", 1000, 500),
-            Some(15_000 + 37_500),
+            table.price("claude-fable-5", 1000, 500),
+            Some(10_000 + 25_000),
             "a known model must price regardless of which provider declared it"
         );
     }

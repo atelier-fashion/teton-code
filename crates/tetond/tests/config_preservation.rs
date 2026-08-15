@@ -1086,7 +1086,7 @@ fn the_model_migration_carries_a_commented_config_across_the_upgrade() {
         // field did not exist yet.
         &[],
         // One key, which is what the migration is about.
-        &[r#"model = "claude-opus-4""#],
+        &[r#"model = "claude-fable-5""#],
     );
     assert!(
         after.contains("# no model here — the field did not exist yet"),
@@ -1097,7 +1097,7 @@ fn the_model_migration_carries_a_commented_config_across_the_upgrade() {
     let reloaded = daemon.reload();
     assert_eq!(
         reloaded.providers[0].model.as_deref(),
-        Some("claude-opus-4"),
+        Some("claude-fable-5"),
         "the migration must actually have run — otherwise this test asserts \
          preservation across a write that never happened"
     );

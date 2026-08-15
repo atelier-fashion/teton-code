@@ -426,7 +426,7 @@ fn teton_doctor_and_cost_report_against_a_live_daemon() {
         "cost should render the daemon's report; output:\n{cost}"
     );
     assert!(
-        cost.contains("anthropic/claude-opus-4"),
+        cost.contains("anthropic/claude-fable-5"),
         "cost should show the daemon's savings baseline model; output:\n{cost}"
     );
     assert!(
@@ -926,7 +926,7 @@ fn slash_cost_renders_the_daemons_report_mid_session() {
     );
     assert_eq!(
         session
-            .matches("estimated savings vs anthropic/claude-opus-4")
+            .matches("estimated savings vs anthropic/claude-fable-5")
             .count(),
         2,
         "/cost must render the daemon's savings baseline, not a stub; output:\n{session}"
@@ -1785,7 +1785,7 @@ fn provider_list_renders_the_declared_model() {
     // the load-time migration resolves it through the legacy price lookup.
     let listed = daemon.run_cli(&teton, &["provider", "list"]);
     assert!(
-        listed.contains("deepseek-chat"),
+        listed.contains("deepseek-v4-pro"),
         "the listing must show the model the provider calls, not only its id; \
          output:\n{listed}"
     );
@@ -1817,7 +1817,7 @@ fn provider_add_refuses_an_id_that_is_already_registered() {
             "--kind",
             "openai-compatible",
             "--model",
-            "deepseek-reasoner",
+            "deepseek-v4-flash",
         ],
         "",
     );
@@ -1838,11 +1838,11 @@ fn provider_add_refuses_an_id_that_is_already_registered() {
     // The original registration is intact — not replaced by the refused one.
     let listed = daemon.run_cli(&teton, &["provider", "list"]);
     assert!(
-        listed.contains("deepseek-chat"),
+        listed.contains("deepseek-v4-pro"),
         "the existing provider must keep its model; output:\n{listed}"
     );
     assert!(
-        !listed.contains("deepseek-reasoner"),
+        !listed.contains("deepseek-v4-flash"),
         "the refused registration must not have landed; output:\n{listed}"
     );
 }

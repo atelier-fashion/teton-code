@@ -334,13 +334,13 @@ fn ac4_cost_meter_reports_totals_phases_and_savings() {
         &frontier.anthropic_endpoint(),
         // The model the arithmetic below prices against; pre-REQ this was
         // derived from the price table by provider id, now it is declared.
-        "claude-opus-4",
+        "claude-fable-5",
     ));
     config.push_str(&provider_block(
         "deepseek",
         "openai-compatible",
         &cheap.openai_endpoint(),
-        "deepseek-chat",
+        "deepseek-v4-pro",
     ));
     config.push_str(&tier_block("think", "anthropic", None));
     config.push_str(&tier_block("build", "deepseek", None));
@@ -361,18 +361,18 @@ fn ac4_cost_meter_reports_totals_phases_and_savings() {
     // EXACT arithmetic (not just direction) for the known scripted token counts
     // against the bundled price table, so a math-corruption bug that still lands
     // positive is caught. Both mocks report 1000 input / 200 output tokens.
-    //   spec  → anthropic/claude-opus-4  @ $15/$75 per Mtok:
-    //           1000*15 + 200*75          = 15_000 + 15_000 = 30_000 µ$
-    //   impl  → deepseek/deepseek-chat    @ $0.27/$1.10 per Mtok:
-    //           1000*0.27 + 200*1.10      =     270 +    220 =    490 µ$
-    // Baseline reprices BOTH priced calls' token volume (1000/200 each) at Opus:
-    //           2 * 30_000                                    = 60_000 µ$
-    //   savings = baseline - actual = 60_000 - 30_490         = 29_510 µ$
-    const SPEC_MICROS: i64 = 30_000;
-    const IMPLEMENT_MICROS: i64 = 490;
-    const TOTAL_MICROS: i64 = SPEC_MICROS + IMPLEMENT_MICROS; // 30_490
-    const BASELINE_MICROS: i64 = 60_000;
-    const SAVINGS_MICROS: i64 = BASELINE_MICROS - TOTAL_MICROS; // 29_510
+    //   spec  → anthropic/claude-fable-5 @ $10/$50 per Mtok:
+    //           1000*10 + 200*50          = 10_000 + 10_000 = 20_000 µ$
+    //   impl  → deepseek/deepseek-v4-pro  @ $0.435/$0.87 per Mtok:
+    //           1000*0.435 + 200*0.87     =     435 +    174 =    609 µ$
+    // Baseline reprices BOTH priced calls' token volume (1000/200 each) at
+    // Fable:  2 * 20_000                                     = 40_000 µ$
+    //   savings = baseline - actual = 40_000 - 20_609        = 19_391 µ$
+    const SPEC_MICROS: i64 = 20_000;
+    const IMPLEMENT_MICROS: i64 = 609;
+    const TOTAL_MICROS: i64 = SPEC_MICROS + IMPLEMENT_MICROS; // 20_609
+    const BASELINE_MICROS: i64 = 40_000;
+    const SAVINGS_MICROS: i64 = BASELINE_MICROS - TOTAL_MICROS; // 19_391
 
     assert_eq!(report["total_calls"].as_u64(), Some(2), "{report}");
     assert_eq!(report["priced_calls"].as_u64(), Some(2), "{report}");
@@ -411,7 +411,7 @@ fn ac4_cost_meter_reports_totals_phases_and_savings() {
     // Savings vs the all-frontier baseline: exact figures, with its methodology.
     assert_eq!(
         report["baseline_model"].as_str(),
-        Some("anthropic/claude-opus-4"),
+        Some("anthropic/claude-fable-5"),
         "{report}"
     );
     assert_eq!(

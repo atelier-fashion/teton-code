@@ -1237,7 +1237,7 @@ mod tests {
             .record_call(
                 "sess-under-test",
                 "anthropic",
-                &CostAttribution::new("claude-opus-4")
+                &CostAttribution::new("claude-fable-5")
                     .with_phase(Phase::Review)
                     .with_category(Category::Review),
                 1000,
@@ -1250,17 +1250,17 @@ mod tests {
         assert_eq!(rows[0].phase, Some(Phase::Review));
         assert_eq!(rows[0].category, Some(Category::Review));
         assert_eq!(rows[0].provider_id, "anthropic");
-        assert_eq!(rows[0].model, "claude-opus-4");
+        assert_eq!(rows[0].model, "claude-fable-5");
         assert_eq!(rows[0].input_tokens, 1000);
         assert_eq!(rows[0].output_tokens, 500);
-        assert_eq!(rows[0].usd_micros, Some(15_000 + 37_500));
+        assert_eq!(rows[0].usd_micros, Some(10_000 + 25_000));
         // The event fired with the same attribution.
         let recorded = sink.records.lock().unwrap();
         assert_eq!(recorded.len(), 1);
         assert_eq!(recorded[0].session_id, SessionId::from("sess-under-test"));
         assert_eq!(recorded[0].phase, Some(Phase::Review));
         assert_eq!(recorded[0].category, Some(Category::Review));
-        assert_eq!(recorded[0].usd_micros, 15_000 + 37_500);
+        assert_eq!(recorded[0].usd_micros, 10_000 + 25_000);
     }
 
     /// REQ-558 BR-11: a freeform call has a category and no phase, and a
@@ -1273,7 +1273,7 @@ mod tests {
             .record_call(
                 "sess-under-test",
                 "anthropic",
-                &CostAttribution::new("claude-opus-4").with_category(Category::Design),
+                &CostAttribution::new("claude-fable-5").with_category(Category::Design),
                 10,
                 5,
             )
@@ -1409,7 +1409,7 @@ CREATE TRIGGER cost_records_no_delete
             .record_call(
                 "new-session",
                 "anthropic",
-                &CostAttribution::new("claude-opus-4").with_category(Category::Debug),
+                &CostAttribution::new("claude-fable-5").with_category(Category::Debug),
                 10,
                 20,
             )
@@ -1826,7 +1826,7 @@ CREATE TRIGGER cost_records_no_delete
             .record_call(
                 "s1",
                 "anthropic",
-                &CostAttribution::new("claude-opus-4"),
+                &CostAttribution::new("claude-fable-5"),
                 10,
                 20,
             )
@@ -1879,7 +1879,7 @@ CREATE TRIGGER cost_records_no_delete
             response,
             Some(SessionId::from("sess-under-test")),
             ProviderId::from("anthropic"),
-            CostAttribution::new("claude-opus-4").with_phase(Phase::Implement),
+            CostAttribution::new("claude-fable-5").with_phase(Phase::Implement),
         );
         let bytes = drain(metered.body).await;
         // Body passed through unchanged.
@@ -1940,7 +1940,7 @@ CREATE TRIGGER cost_records_no_delete
             response,
             None,
             ProviderId::from("anthropic"),
-            CostAttribution::new("claude-opus-4"),
+            CostAttribution::new("claude-fable-5"),
         );
         drain(metered.body).await;
         assert!(
@@ -1987,7 +1987,7 @@ CREATE TRIGGER cost_records_no_delete
             response,
             Some(SessionId::from("sess-stalled")),
             ProviderId::from("anthropic"),
-            CostAttribution::new("claude-opus-4").with_category(Category::Title),
+            CostAttribution::new("claude-fable-5").with_category(Category::Title),
         );
 
         // Read what the provider did send, then give up on it — the shape a
@@ -2078,7 +2078,7 @@ CREATE TRIGGER cost_records_no_delete
             response,
             Some(SessionId::from("sess-under-test")),
             ProviderId::from("anthropic"),
-            CostAttribution::new("claude-opus-4"),
+            CostAttribution::new("claude-fable-5"),
         );
         // What `stream_turn` does with a >= 400: return an error and drop the
         // response, body unread.
