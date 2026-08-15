@@ -48,8 +48,11 @@ The user experience this is for:
    kind = "openai-compatible"
    endpoint = "https://api.moonshot.ai/v1/chat/completions"
    model = "kimi-k3"
-   api_key = "keychain://teton/provider:kimi"
-   [policy.tiers.think]  provider = "kimi"
+   auth_ref = "keychain://teton/kimi"
+
+   [[tiers]]
+   tier = "think"
+   provider_id = "kimi"
    apply?  [y/N] y
    provider `kimi` registered; `think` now routes to it. Say the word.
 ```
@@ -91,7 +94,7 @@ named `kimi` now exists.
 | | `kind` | enum | as above |
 | | `endpoint` | url? | base URL accepted and composed per REQ-578; absolute URL is what is persisted |
 | | `model` | string | required for remote kinds; never inferred from id (REQ-557 BR-1) |
-| | `key_ref` | string | a keychain reference only — never a key value |
+| | `key_ref` | string | a keychain reference only (`keychain://teton/<id>` — the same account `teton provider add` uses) — never a key value |
 | | `bindings` | `[{tier, provider_id}]` | zero or more tier→id bindings; `think` is the default offer |
 | ProviderSetupPreview (daemon → client) | `toml` | string | the exact bytes that would land in config (providers table + any policy rows) |
 | | `dial_host` | string | rendered by the *same* parser that dials (LESSON-529) |

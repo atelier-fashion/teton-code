@@ -121,11 +121,11 @@ use teton_protocol::methods::{
     AttachConsentOutcome, AttachConsentParams, AttachConsentResult, ConfigGetParams,
     ConfigGetResult, ConfigSetParams, ConfigSetResult, CostQueryParams, ModelConfirmParams,
     ModelListParams, ModelSetParams, ModelStatusParams, PermissionRespondParams,
-    PermissionRespondResult, PromptBlock, PromptTurnParams, RpcMethod, SessionAttachParams,
-    SessionAttachResult, SessionClearParams, SessionCreateParams, SessionCreateResult,
-    SessionListParams, SessionListResult, SessionPermissionsParams, SessionSummary,
-    WebOverrideParams, WebRefreshParams, WebSetupCommitParams, WebSetupPlanParams,
-    WebSetupPreviewParams,
+    PermissionRespondResult, PromptBlock, PromptTurnParams, ProviderSetupPlanParams,
+    ProviderSetupPreviewParams, RpcMethod, SessionAttachParams, SessionAttachResult,
+    SessionClearParams, SessionCreateParams, SessionCreateResult, SessionListParams,
+    SessionListResult, SessionPermissionsParams, SessionSummary, WebOverrideParams,
+    WebRefreshParams, WebSetupCommitParams, WebSetupPlanParams, WebSetupPreviewParams,
 };
 use teton_protocol::{RequestId, SessionId};
 
@@ -2214,6 +2214,17 @@ fn dispatch(
         // and adds presence on top.
         WebSetupPlanParams::METHOD => Some(handle_web_setup_plan(daemon, conn, id, params)),
         WebSetupPreviewParams::METHOD => Some(handle_web_setup_preview(daemon, conn, id, params)),
+        // REQ-579: the provider trio's two reads, beside the web trio's for the
+        // same reason and under the same gate. `provider/setup_commit` is NOT
+        // here either — it is a BR-10(b) commitment that may park on a human, so
+        // it runs on its own task in `handle_client`'s `blocks_on_a_human` path
+        // (TASK-154).
+        ProviderSetupPlanParams::METHOD => {
+            Some(handle_provider_setup_plan(daemon, conn, id, params))
+        }
+        ProviderSetupPreviewParams::METHOD => {
+            Some(handle_provider_setup_preview(daemon, conn, id, params))
+        }
         SessionPermissionsParams::METHOD => {
             Some(handle_session_permissions(daemon, conn, id, params))
         }
@@ -2455,6 +2466,75 @@ fn handle_web_setup_preview(daemon: &Daemon, conn: &ConnState, id: Id, params: V
         return error_string(id, error_code::NOT_ATTACHED, NOT_ATTACHED_MESSAGE);
     }
     match daemon.runtime.web_setup_preview(&params) {
+        Ok(result) => ok_string(id, &result),
+        Err(err) => error_from(id, err),
+    }
+}
+
+/// Answer what registering a provider would involve (`provider/setup_plan`,
+/// REQ-579 BR-3/BR-4/BR-7).
+///
+/// [`handle_web_setup_plan`]'s twin, gate for gate, and deliberately a copy of
+/// it rather than a generalisation (ADR-1): read-only, session-scoped, and
+/// **silent on refusal**.
+///
+/// The silence is the same argument, and it applies here at least as strongly.
+/// A foreign connection is answered [`error_code::NOT_ATTACHED`] — the code the
+/// web reads already use for a caller without session access; there is no
+/// separate "rejected non-user" wire code, and REQ-579's own
+/// `provider_setup_rejected_nonuser` is an **event**, published by the commit
+/// alone (BR-12, LESSON-513). Publishing one here would hand any same-UID peer a
+/// way to write lines into a stranger's session on demand, at whatever rate it
+/// liked, which is how a notice that matters stops being read.
+///
+/// [`DaemonRuntime::provider_setup_plan`] takes no session id because it reads
+/// nothing per-session. The id in the params exists for this gate, which is
+/// where "may this connection ask" belongs.
+fn handle_provider_setup_plan(daemon: &Daemon, conn: &ConnState, id: Id, params: Value) -> String {
+    let params: ProviderSetupPlanParams = match serde_json::from_value(params) {
+        Ok(params) => params,
+        Err(_) => return error_string(id, error_code::INVALID_PARAMS, "invalid params"),
+    };
+    if let Some(refusal) = refuse_unmintable_session_id(&id, &params.session_id) {
+        return refusal;
+    }
+    if !conn.may_drive(&params.session_id) {
+        return error_string(id, error_code::NOT_ATTACHED, NOT_ATTACHED_MESSAGE);
+    }
+    ok_string(id, &daemon.runtime.provider_setup_plan())
+}
+
+/// Render the rows a registration would write, without writing them
+/// (`provider/setup_preview`, REQ-579 BR-9).
+///
+/// [`handle_web_setup_preview`]'s twin: gated like the commit and silent like
+/// the plan. A preview *writes nothing*, so an announcement would be the only
+/// effect an unattached caller could produce — and with session ids readable
+/// from `session/list`, that makes a refused preview a same-UID
+/// transcript-injection primitive callable at will. LESSON-513 is the standing
+/// form of the rule this follows: the event belongs to the commit, whose refusal
+/// is about something trying to **change** the configuration.
+///
+/// A candidate the daemon refuses comes back as the runtime's own
+/// `PROVIDER_SETUP_INVALID` carrying the refusal's sentence — never as a preview
+/// with a note attached, which is what the warnings are for.
+fn handle_provider_setup_preview(
+    daemon: &Daemon,
+    conn: &ConnState,
+    id: Id,
+    params: Value,
+) -> String {
+    let params: ProviderSetupPreviewParams = match serde_json::from_value(params) {
+        Ok(params) => params,
+        Err(_) => return error_string(id, error_code::INVALID_PARAMS, "invalid params"),
+    };
+    if let Some(refusal) = refuse_unmintable_session_id(&id, &params.session_id) {
+        return refusal;
+    }
+    if !conn.may_drive(&params.session_id) {
+        return error_string(id, error_code::NOT_ATTACHED, NOT_ATTACHED_MESSAGE);
+    }
+    match daemon.runtime.provider_setup_preview(&params.candidate) {
         Ok(result) => ok_string(id, &result),
         Err(err) => error_from(id, err),
     }
@@ -7272,6 +7352,185 @@ mod tests {
             "the session's own client must be shown what would be written: {served}"
         );
         assert!(drain_rejections(&mut sub).is_empty());
+    }
+
+    /// A `provider/setup_preview` candidate a bare test daemon accepts as far as
+    /// its own gates: the recipe's own endpoint and model, a keychain reference,
+    /// and no bindings — so a refusal below is this seam's answer and never
+    /// `PROVIDER_SETUP_INVALID` wearing its shape.
+    fn provider_setup_params(session: &SessionId) -> Value {
+        serde_json::json!({
+            "session_id": session.to_string(),
+            "candidate": {
+                "id": "kimi",
+                "kind": "openai-compatible",
+                "endpoint": "https://api.moonshot.ai/v1/chat/completions",
+                "model": "kimi-k3",
+                "key_ref": "keychain://teton/kimi",
+            },
+        })
+    }
+
+    /// Every event queued on `sub` right now, whatever it is.
+    ///
+    /// [`drain_rejections`] filters to one variant, which is the right question
+    /// for the web trio and the wrong one for REQ-579's reads: their claim is
+    /// that a refused read publishes **nothing at all**, and a filter would let
+    /// a differently-named notice through.
+    fn drain_everything(sub: &mut Subscription) -> Vec<EventEnvelope> {
+        let mut seen = Vec::new();
+        while let Some(envelope) = sub.try_recv() {
+            seen.push(envelope);
+        }
+        seen
+    }
+
+    /// **REQ-579 AC-5, the plan seam.** The session's own connection is
+    /// answered; a foreign one gets [`error_code::NOT_ATTACHED`] and the session
+    /// is told nothing.
+    ///
+    /// Asserted at this seam separately from the preview's below, per
+    /// LESSON-502: the two gates are separate lines a future edit drops one at a
+    /// time, and a single representative test stays green with either deleted.
+    ///
+    /// The silence is LESSON-513's rule and REQ-572's hard-won one: `plan` and
+    /// `preview` write nothing, so an announcement would be the *only* effect an
+    /// unattached caller could produce — and with session ids readable from
+    /// `session/list`, a notice that fires on demand is a transcript-injection
+    /// primitive. REQ-579's `provider_setup_rejected_nonuser` event belongs to
+    /// the commit, which is about something trying to **change** the config.
+    ///
+    /// Note the code: there is no `SETUP_REJECTED_NONUSER` wire code in this
+    /// codebase, and the architecture's entity table said otherwise before
+    /// TASK-152 corrected it. A foreign caller draws the same `NOT_ATTACHED` the
+    /// web reads draw.
+    #[test]
+    fn a_provider_setup_plan_answers_its_own_session_and_refuses_a_foreign_one_silently() {
+        let daemon = Daemon::new();
+        let owner = unattached(&daemon);
+        let session = a_session_owned_by(&daemon, &owner);
+        let intruder = unattached(&daemon);
+        let mut sub = daemon.events.subscribe(16);
+
+        let refused = dispatch(
+            &daemon,
+            &intruder,
+            Id::Number(2),
+            ProviderSetupPlanParams::METHOD,
+            serde_json::json!({"session_id": session.to_string()}),
+        )
+        .unwrap();
+        assert!(
+            refused.contains(&error_code::NOT_ATTACHED.to_string()),
+            "a plan for a session this connection may not drive is refused: {refused}"
+        );
+        assert!(
+            drain_everything(&mut sub).is_empty(),
+            "a refused *read* must put nothing in the user's session (BR-12, \
+             LESSON-513)"
+        );
+
+        let served = dispatch(
+            &daemon,
+            &owner,
+            Id::Number(3),
+            ProviderSetupPlanParams::METHOD,
+            serde_json::json!({"session_id": session.to_string()}),
+        )
+        .unwrap();
+        assert!(
+            served.contains("\"catalog\"") && served.contains("\"kimi\""),
+            "the session's own client must be served the recipe catalog: {served}"
+        );
+        assert!(
+            served.contains("\"tiers\"") && served.contains("\"think\""),
+            "and every routable tier: {served}"
+        );
+        assert!(
+            drain_everything(&mut sub).is_empty(),
+            "a served read announces nothing either: it changed nothing"
+        );
+    }
+
+    /// **REQ-579 AC-5, the preview seam** — the same gate, asserted separately
+    /// (LESSON-502), and equally silent.
+    ///
+    /// A preview is where a walkthrough a user is being led through would be
+    /// hijacked, one step before the write, which is why its gate gets its own
+    /// test rather than resting on the plan's.
+    #[test]
+    fn a_provider_setup_preview_answers_its_own_session_and_refuses_a_foreign_one_silently() {
+        let daemon = Daemon::new();
+        let owner = unattached(&daemon);
+        let session = a_session_owned_by(&daemon, &owner);
+        let intruder = unattached(&daemon);
+        let mut sub = daemon.events.subscribe(16);
+
+        let refused = dispatch(
+            &daemon,
+            &intruder,
+            Id::Number(2),
+            ProviderSetupPreviewParams::METHOD,
+            provider_setup_params(&session),
+        )
+        .unwrap();
+        assert!(
+            refused.contains(&error_code::NOT_ATTACHED.to_string()),
+            "a preview renders a session's would-be configuration, so a \
+             connection that may not drive it is refused: {refused}"
+        );
+        assert!(
+            drain_everything(&mut sub).is_empty(),
+            "a refused preview writes nothing, so announcing it would hand an \
+             unattached peer a line in a stranger's transcript on demand"
+        );
+
+        let served = dispatch(
+            &daemon,
+            &owner,
+            Id::Number(3),
+            ProviderSetupPreviewParams::METHOD,
+            provider_setup_params(&session),
+        )
+        .unwrap();
+        assert!(
+            served.contains("\"toml\"") && served.contains("\"dial_host\""),
+            "the session's own client must be shown what would be written: {served}"
+        );
+        assert!(drain_everything(&mut sub).is_empty());
+    }
+
+    /// A candidate the daemon refuses comes back as `PROVIDER_SETUP_INVALID` —
+    /// **not** as the gate's `NOT_ATTACHED`, and not as a preview with a note
+    /// attached.
+    ///
+    /// "You may not do this" and "this config would not load" are different
+    /// answers, and folding them would tell an unattached connection its
+    /// endpoint was the problem (the wire code's own doc says so).
+    #[test]
+    fn a_refused_provider_candidate_answers_with_the_setup_code_not_the_gate() {
+        let daemon = Daemon::new();
+        let owner = unattached(&daemon);
+        let session = a_session_owned_by(&daemon, &owner);
+        let mut params = provider_setup_params(&session);
+        params["candidate"]["key_ref"] = serde_json::json!("sk-live-not-a-reference");
+
+        let refused = dispatch(
+            &daemon,
+            &owner,
+            Id::Number(2),
+            ProviderSetupPreviewParams::METHOD,
+            params,
+        )
+        .unwrap();
+        assert!(
+            refused.contains(&error_code::PROVIDER_SETUP_INVALID.to_string()),
+            "a raw key is a refused candidate, not a refused caller: {refused}"
+        );
+        assert!(
+            !refused.contains("sk-live-not-a-reference"),
+            "and the refusal must not echo the credential: {refused}"
+        );
     }
 
     /// **One notice per (connection, session), however many commits it

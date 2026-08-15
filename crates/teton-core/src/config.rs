@@ -2222,7 +2222,18 @@ pub enum LoadError {
 /// containing a `:`/`/` slipped past — letting a raw key be persisted to a
 /// plaintext config (REQ-544 MED-3). The reference body after the scheme must be
 /// non-empty (a bare `keychain:` or `env:` is not a valid reference).
-fn is_recognized_auth_ref(value: &str) -> bool {
+///
+/// **Public since REQ-579**, for a second consumer with a stronger need than
+/// convenience: `provider/setup_preview` refuses a candidate whose `key_ref` is
+/// not a reference **before** it builds a candidate `Config` at all, so a raw
+/// key that reached the wire is never cloned into a config, never serialized by
+/// the delta engine, and never present in a document any refusal path could
+/// quote. Deferring to [`Config::validate`] would refuse the same candidate one
+/// step later, with the secret already inside the value being validated. One
+/// definition either way: the daemon asks this function rather than carrying a
+/// second opinion about what a reference is.
+#[must_use]
+pub fn is_recognized_auth_ref(value: &str) -> bool {
     // `keychain:` also matches the `keychain://` form, so listing it once covers
     // both. Order does not matter — a value has at most one of these schemes.
     const RECOGNIZED_SCHEMES: &[&str] = &["keychain:", "env:", "op://"];

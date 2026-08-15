@@ -291,6 +291,66 @@ pub fn table_section(doc_text: &str, key: &str) -> Option<String> {
     Some(strip_leading_blank_lines(&section.to_string()))
 }
 
+/// One element of a named **array of tables**, as it appears in `doc_text`,
+/// selected by the value it carries at that array's identity key — or `None`
+/// when the document names no such row.
+///
+/// The array sibling of [`table_section`], and it exists for the same seam one
+/// REQ later: `/provider setup`'s preview shows the `[[providers]]` row and the
+/// `[[tiers]]` rows its commit would write (REQ-579 BR-9), sliced out of the
+/// document that commit will write, so the user's own comments on those rows
+/// appear in the preview they confirm. A second renderer would agree with the
+/// writer only until one of them changed.
+///
+/// # The identity key is not the caller's to choose
+///
+/// It is read from [`identity_field`] — the table the delta engine already
+/// matches array elements by, and through it the key `apply_update` already does
+/// replace-or-insert on. A caller naming its own key could slice one row while
+/// the write edited another, which is LESSON-522's by-position edit wearing a
+/// different disguise: the question asked of the document has to be the question
+/// the mutation asked of memory.
+///
+/// The row is re-rendered at a single shared position ([`place_at`]) for the
+/// reason a replaced array is: a nested sub-table (`[providers.capabilities]`)
+/// carries a position from the *source* document, and left alone it renders
+/// wherever that document happened to put it rather than under the row it
+/// belongs to.
+///
+/// `None` covers every way there is nothing to show: an unparseable document, an
+/// array this schema declares no identity for, an absent array, and an identity
+/// no row carries. Callers that need to *report* a parse failure go through
+/// [`apply_config_delta`], which does.
+#[must_use]
+pub fn array_element_section(doc_text: &str, key: &str, identity: &str) -> Option<String> {
+    let field = identity_field(key)?;
+    let document: DocumentMut = doc_text.parse().ok()?;
+    let array = present(document.as_table(), key)?.as_array_of_tables()?;
+    let mut element = array
+        .iter()
+        .find(|row| row_identity(row, field) == Some(identity))?
+        .clone();
+    place_at(&mut element, 0);
+    let mut only = ArrayOfTables::new();
+    only.push(element);
+    let mut section = DocumentMut::new();
+    let _ = section
+        .as_table_mut()
+        .insert(key, Item::ArrayOfTables(only));
+    Some(strip_leading_blank_lines(&section.to_string()))
+}
+
+/// What one array row spells at its identity key, or `None` when it carries no
+/// such key or something other than a string there.
+///
+/// A non-string identity is "no identity" rather than a stringified guess: every
+/// identity key this schema declares is a string on the wire and in the file, so
+/// anything else is a document this reader does not recognize — and "does not
+/// recognize" must not read as "matches" ([`elements_share_identity`]'s rule).
+fn row_identity<'row>(row: &'row Table, field: &str) -> Option<&'row str> {
+    present(row, field)?.as_value()?.as_str()
+}
+
 /// A config's canonical TOML, parsed as an editable document.
 ///
 /// The parse of freshly serialized TOML cannot realistically fail; it is still
@@ -2155,5 +2215,107 @@ mood = "curious"
             section.contains("# A reference, never a raw key"),
             "{section}"
         );
+    }
+
+    /// A hand-written document with two `[[providers]]` rows and two `[[tiers]]`
+    /// rows, so "the slicer picks the row by its identity" is a claim with
+    /// something to pick *wrong* — and with a comment on each row, so "the
+    /// user's own notes survive into the preview" has something to lose.
+    const TWO_PROVIDERS: &str = r#"# my providers
+
+# the one I use for reasoning
+[[providers]]
+id = "kimi"
+kind = "openai-compatible"
+endpoint = "https://api.moonshot.ai/v1/chat/completions"
+model = "kimi-k3"
+auth_ref = "keychain://teton/kimi"
+
+# and the cheap one
+[[providers]]
+id = "deepseek"
+kind = "openai-compatible"
+endpoint = "https://api.deepseek.com/chat/completions"
+model = "deepseek-v4-pro"
+auth_ref = "keychain://teton/deepseek"
+[providers.capabilities]
+max_context = 128000
+
+[[tiers]]
+tier = "think"
+provider_id = "kimi"
+
+[[tiers]]
+tier = "scan"
+provider_id = "deepseek"
+"#;
+
+    /// **The row is selected by its identity, not by its position** (REQ-579,
+    /// LESSON-522) — and it is the document's own bytes, comment included.
+    #[test]
+    fn an_array_element_is_sliced_by_identity_with_its_own_decor() {
+        let section = array_element_section(TWO_PROVIDERS, "providers", "deepseek")
+            .expect("the document names a `deepseek` provider");
+
+        assert!(section.contains(r#"id = "deepseek""#), "{section}");
+        assert!(!section.contains(r#"id = "kimi""#), "{section}");
+        assert!(section.contains("# and the cheap one"), "{section}");
+        // A nested sub-table renders under the row it belongs to rather than
+        // wherever the source document's positions put it (`place_at`).
+        assert!(
+            section.contains("[providers.capabilities]") && section.contains("max_context"),
+            "{section}"
+        );
+        // The `tiers` array is keyed on `tier`, which is the key `apply_update`
+        // does replace-or-insert on — the slicer reads that from the same table.
+        let think = array_element_section(TWO_PROVIDERS, "tiers", "think")
+            .expect("the document names a `think` row");
+        assert!(think.contains(r#"provider_id = "kimi""#), "{think}");
+        assert!(!think.contains(r#"tier = "scan""#), "{think}");
+    }
+
+    /// Every way there is nothing to show is `None` — never a half-slice and
+    /// never a panic.
+    #[test]
+    fn an_absent_array_element_is_none() {
+        // No such identity in an array the document does name.
+        assert!(array_element_section(TWO_PROVIDERS, "providers", "grok").is_none());
+        // An array the document does not name at all.
+        assert!(array_element_section(TWO_PROVIDERS, "boundaries", "src/**").is_none());
+        // An array this schema declares no identity for, so there is no
+        // question to ask of it.
+        assert!(array_element_section(TWO_PROVIDERS, "unknown_rows", "x").is_none());
+        // A key that is a *table*, not an array of tables.
+        assert!(array_element_section(HAND_WRITTEN_CONFIG, "web", "anything").is_none());
+        // An unparseable document has no sections at all.
+        assert!(array_element_section("[[providers\n", "providers", "kimi").is_none());
+    }
+
+    /// The slice is of the **edited** document, so a preview built from it
+    /// cannot disagree with what the write lands (REQ-579 BR-9) — the
+    /// `table_section` property above, for a row.
+    #[test]
+    fn the_edited_provider_row_is_the_one_the_write_lands() {
+        let current = Config::load(TWO_PROVIDERS).expect("the fixture loads");
+        let mut candidate = current.clone();
+        // By identity, exactly as `apply_update` mutates it.
+        let row = candidate
+            .providers
+            .iter_mut()
+            .find(|p| p.id == "kimi")
+            .expect("the fixture registers kimi");
+        row.model = Some("kimi-k4".to_owned());
+
+        let edited = apply_config_delta(TWO_PROVIDERS, &current, &candidate).expect("edit applies");
+        let section = array_element_section(&edited, "providers", "kimi")
+            .expect("the edited document names the row");
+
+        assert!(section.contains(r#"model = "kimi-k4""#), "{section}");
+        assert!(
+            section.contains("# the one I use for reasoning"),
+            "{section}"
+        );
+        // And the neighbour is untouched in the document the write would leave.
+        assert!(edited.contains(r#"model = "deepseek-v4-pro""#), "{edited}");
     }
 }

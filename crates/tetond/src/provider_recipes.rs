@@ -79,6 +79,7 @@
 //! guarantee; the sweep in the tests below is the second net.
 
 use teton_core::entities::ProviderKind;
+use teton_protocol::methods::ProviderRecipeEntry;
 
 /// One vendor's `teton provider add` recipe: everything the command needs and
 /// nothing it does not.
@@ -294,6 +295,45 @@ pub fn recipe_catalog() -> Vec<ProviderRecipe> {
             notes: None,
         },
     ]
+}
+
+/// The same catalog, in the wire vocabulary a client reads it in (REQ-579 BR-4,
+/// ADR-4).
+///
+/// A **projection, not a second list.** `provider/setup_plan` answers with this,
+/// and the point of ADR-4 is that what the flow offers a user is the entry the
+/// model would have named out of the bundled guide — so it is
+/// [`recipe_catalog`] mapped field-for-field, in the same order, with no entry
+/// added, dropped, reordered or reworded on the way out. The existing
+/// guide↔catalog and README↔catalog gates (REQ-577 ADR-2) therefore now pin the
+/// client's view transitively, and
+/// `every_recipe_maps_onto_a_wire_entry_field_for_field` below is what makes
+/// that inheritance a fact rather than an intention.
+///
+/// The one field that is not carried across as-is is
+/// [`ProviderRecipe::kind`], because the two enums are different types — the
+/// domain kind the recipe is written against and the wire kind the socket
+/// speaks. It goes through [`crate::runtime::to_proto_kind`], the daemon's one
+/// mapping, rather than a match spelled again here: a second opinion about which
+/// wire kind an `anthropic` recipe is would compose the Messages API recipe onto
+/// the OpenAI-compatible adapter at the far end.
+///
+/// Pure for [`recipe_catalog`]'s reason, and pure *because* it is — it reads
+/// nothing this module does not already have in hand (LESSON-481).
+#[must_use]
+pub fn recipe_entries() -> Vec<ProviderRecipeEntry> {
+    recipe_catalog()
+        .into_iter()
+        .map(|recipe| ProviderRecipeEntry {
+            id_suggestion: recipe.id_suggestion,
+            label: recipe.label,
+            guide_spelling: recipe.guide_spelling,
+            kind: crate::runtime::to_proto_kind(recipe.kind),
+            endpoint: recipe.endpoint,
+            example_model: recipe.example_model,
+            notes: recipe.notes,
+        })
+        .collect()
 }
 
 #[cfg(test)]
@@ -903,6 +943,94 @@ mod tests {
         let after = text.split_once("://").map_or(text, |(_, after)| after);
         let authority = after.split(['/', '?', '#']).next().unwrap_or("");
         matches!(authority.split_once('@'), Some((userinfo, _)) if !userinfo.is_empty())
+    }
+
+    /// **The mapping is total: every recipe, every field** (REQ-579 ADR-4).
+    ///
+    /// The claim `provider/setup_plan` rests on is that the catalog a client
+    /// renders *is* the catalog the guide is gated against — so this walks the
+    /// two lists in lockstep and compares every field, and it does it by
+    /// **destructuring** `ProviderRecipe`, which is what makes it total rather
+    /// than merely thorough: a seventh field added to the recipe breaks this
+    /// build until somebody decides whether the wire carries it. A hand-picked
+    /// field list would have gone on passing while the new fact never reached a
+    /// user.
+    ///
+    /// The kind is checked in the *reverse* direction, through
+    /// [`teton_core::entities::ProviderKind`]'s own `From<teton_protocol::ProviderKind>`.
+    /// Asserting `entry.kind == to_proto_kind(kind)` would re-run the mapping
+    /// under test and agree with itself; reading the wire kind back as a domain
+    /// kind through the other crate's conversion is a second, independent
+    /// opinion, and the two only agree when the mapping is right.
+    ///
+    /// Order is asserted too, and deliberately: `ProviderSetupPlanResult::catalog`
+    /// documents itself as "in the order a client should show them", and that
+    /// order is [`recipe_catalog`]'s — the one every prose surface renders.
+    #[test]
+    fn every_recipe_maps_onto_a_wire_entry_field_for_field() {
+        let catalog = recipe_catalog();
+        let entries = recipe_entries();
+
+        assert_eq!(
+            entries.len(),
+            catalog.len(),
+            "the wire projection ships {} entries for {} recipes, so a vendor this build \
+             knows about reaches no client",
+            entries.len(),
+            catalog.len()
+        );
+        assert!(
+            !entries.is_empty(),
+            "`ProviderSetupPlanResult::catalog` is required precisely because no daemon that \
+             has a catalog may answer with an empty one"
+        );
+
+        for (recipe, entry) in catalog.into_iter().zip(entries) {
+            // Destructured, not field-picked: a new recipe field stops
+            // compiling here rather than silently staying daemon-side.
+            let ProviderRecipe {
+                id_suggestion,
+                label,
+                guide_spelling,
+                kind,
+                endpoint,
+                example_model,
+                notes,
+            } = recipe;
+
+            assert_eq!(entry.id_suggestion, id_suggestion);
+            assert_eq!(entry.label, label, "`{id_suggestion}`'s label");
+            assert_eq!(
+                entry.guide_spelling, guide_spelling,
+                "`{id_suggestion}`'s guide spelling — the lenient vendor resolver (ADR-2) \
+                 matches against it, so a client that never receives it cannot resolve the \
+                 spelling the model taught the user"
+            );
+            assert_eq!(
+                ProviderKind::from(entry.kind),
+                kind,
+                "`{id_suggestion}`'s kind does not survive the round trip through the wire \
+                 enum, so the flow would ask the wrong questions and compose the wrong \
+                 request path"
+            );
+            assert_eq!(
+                entry.endpoint, endpoint,
+                "`{id_suggestion}`'s endpoint — the absolute request URL, verbatim"
+            );
+            assert_eq!(
+                entry.example_model, example_model,
+                "`{id_suggestion}`'s example model"
+            );
+            assert_eq!(entry.notes, notes, "`{id_suggestion}`'s note");
+        }
+    }
+
+    /// The projection is as pure as the catalog it projects, and answers the
+    /// same every time — the [`recipe_catalog`] pin, applied to the surface a
+    /// client actually reads (LESSON-481).
+    #[test]
+    fn the_wire_projection_needs_no_setup_and_answers_the_same_every_time() {
+        assert_eq!(recipe_entries(), recipe_entries());
     }
 
     /// **The purity pin (LESSON-481).**

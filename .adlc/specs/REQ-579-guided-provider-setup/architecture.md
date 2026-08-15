@@ -33,9 +33,13 @@ nothing; it still never sees a key.
 
 ## Data model changes
 
-**Config on disk** — none. The commit writes the same `[[providers]]` table and
-`[policy.tiers.<tier>]` rows `teton provider add` and `teton policy set-tier`
-write today, through the same comment-preserving writer (REQ-574).
+**Config on disk** — none. The commit writes the same `[[providers]]` row
+(`auth_ref = "keychain://teton/<id>"`) and `[[tiers]]` rows (`tier`,
+`provider_id`) that `teton provider add` and `teton policy set-tier` write
+today, through the same comment-preserving writer (REQ-574). (An earlier draft
+of the spec's mock spelled these `[policy.tiers.<tier>]` / `api_key`; the
+schema has no `[policy]` table — TASK-153 built against the real one, and the
+spec's example was corrected to match.)
 
 **Protocol (teton-protocol/src/methods.rs, events.rs)** — additive:
 

@@ -1,7 +1,7 @@
 ---
 id: TASK-153
 title: "Daemon: provider_setup_plan + provider_setup_preview runtime fns and handlers, gated like web/setup_*"
-status: draft
+status: complete
 parent: REQ-579
 created: 2026-08-15
 updated: 2026-08-15
