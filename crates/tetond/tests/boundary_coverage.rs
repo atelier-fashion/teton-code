@@ -315,15 +315,21 @@ fn source(sources: &[(&str, &'static str)], file: &str) -> &'static str {
         })
 }
 
-/// Everything in `text` before its `#[cfg(test)]` line.
+/// Everything in `text` before its `#[cfg(test)] mod …` test module.
 ///
 /// A test-only fake (`mod.rs`'s `StubTool`) is not a tool the product ships, so
-/// the universe is built from the production half only. A file that loses its
-/// marker is scanned whole, which can only make the universe *wider* — the
-/// fail-safe direction: the suite goes red naming the extra type rather than
-/// quietly shrinking what it looks at.
+/// the universe is built from the production half only. The anchor is the
+/// attribute *and* the `mod` line together, never the bare attribute: a lone
+/// `#[cfg(test)]` item (a const, a helper fn) above a file's `impl Tool` block
+/// would otherwise truncate the scan before the impl and silently drop the tool
+/// from the universe — the one direction this suite must never fail in, and one
+/// REQ-577 actually hit (`docs.rs`'s `MAX_DESCRIPTION_CHARS`).
+/// [`a_cfg_test_item_above_the_impl_does_not_hide_the_tool_from_the_scan`] pins
+/// the distinction. A file that loses the marker pair is scanned whole, which
+/// can only make the universe *wider* — the fail-safe direction: the suite goes
+/// red naming the extra type rather than quietly shrinking what it looks at.
 fn production_half(text: &str) -> &str {
-    match text.find("\n#[cfg(test)]\n") {
+    match text.find("\n#[cfg(test)]\nmod ") {
         Some(at) => &text[..at],
         None => text,
     }
@@ -584,6 +590,58 @@ fn every_tool_source_file_is_scanned() {
         "a tool source file is declared in `mod.rs` but not embedded here (or the \
          reverse). An unscanned file is a tool the AC-12 enumeration cannot see: add \
          its `include_str!` to `TOOL_SOURCES`."
+    );
+}
+
+/// **REQ-571 AC-12, the truncation anchor.** A `#[cfg(test)]` *item* above a
+/// file's `impl Tool` block does not hide the tool from the scan.
+///
+/// [`production_half`] must cut at the test *module*, not at the first
+/// `#[cfg(test)]` line. When it anchored on the bare attribute, a single
+/// `#[cfg(test)] const` near the top of a tool file truncated the scan before
+/// the impl, the tool vanished from the derived universe, and
+/// [`every_content_surfacing_tool_has_a_boundary_test`] would agree with a
+/// claim that never mentioned it — the silent-shrink direction, the exact
+/// LESSON-432 shape this suite exists to stop. REQ-577 hit this for real
+/// (`docs.rs`'s `MAX_DESCRIPTION_CHARS`) and worked around it by moving the
+/// constant into the test module; this pins the fix so the workaround is no
+/// longer load-bearing.
+#[test]
+fn a_cfg_test_item_above_the_impl_does_not_hide_the_tool_from_the_scan() {
+    // The doc line above the item matters: it puts a newline before the
+    // attribute, the position every real file's items occupy. Without it the
+    // item sits at byte zero, where a newline-anchored marker could never
+    // match, and this test would pass against the exact bug it exists to stop.
+    let file = "\
+//! A hypothetical tool module.
+
+#[cfg(test)]
+const CEILING: usize = 120;
+
+pub struct HypotheticalTool;
+
+impl Tool for HypotheticalTool {
+}
+
+#[cfg(test)]
+mod tests {
+    struct TestOnlyFake;
+
+    impl Tool for TestOnlyFake {
+    }
+}
+";
+    let found = tool_impl_types(production_half(file));
+    assert!(
+        found.contains("HypotheticalTool"),
+        "a `#[cfg(test)]` item above the impl truncated the scan and hid the \
+         tool — the universe shrank silently, which is the failure direction \
+         `production_half` exists to rule out: {found:?}"
+    );
+    assert!(
+        !found.contains("TestOnlyFake"),
+        "the scan crossed into the `#[cfg(test)] mod` test module; a test-only \
+         fake is not a tool the product ships: {found:?}"
     );
 }
 
