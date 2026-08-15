@@ -12,6 +12,8 @@ dependencies: []
 
 Add the wire types for the `provider/setup_*` trio to `teton-protocol`, mirroring the `WebSetup*` declarations byte-for-byte in style: `RpcMethod` impls binding each params type to its method name, result types, the shared candidate/entry structs, two events, and the error code. Purely additive; no daemon or CLI logic. This is the foundation both the daemon (TASK-153/154) and the CLI (TASK-155) build against in parallel.
 
+**Covers:** AC-5 (types the contract test pins), AC-10/AC-11 (wire codes and events the daemon returns)
+
 ## Files to Create/Modify
 
 - `crates/teton-protocol/src/methods.rs` — add `ProviderSetupPlanParams/Result`, `ProviderSetupPreviewParams/Result`, `ProviderSetupCommitParams/Result`, `ProviderSetupCandidate`, `ProviderRecipeEntry`, `ExistingProvider`, `TierSummary`, `TierBinding`; `impl RpcMethod` with `METHOD = "provider/setup_plan" | "provider/setup_preview" | "provider/setup_commit"`; add `PROVIDER_SETUP_INVALID` beside `WEB_SETUP_INVALID` in `error_code`; serde round-trip tests beside the WebSetup ones

@@ -12,6 +12,8 @@ dependencies: ["TASK-154", "TASK-155"]
 
 The end-to-end evidence (LESSON-523: at least one real registration through the real seam). A `tetond` integration suite mirroring `web_setup_flow.rs`: spawn a daemon with a temp config, drive plan → preview → commit over the socket as the session's own connection, assert the config file bytes equal the preview's TOML, assert the next `think` route resolves to the new id without restart, and assert every refusal path leaves the file byte-identical. Plus the CLI e2e for BR-11: piped stdin `/provider setup kimi` prints the instruction lines and consumes no further stdin.
 
+**Covers:** AC-2, AC-4 (config bytes hold only keychain://), AC-7, AC-9 (cli_e2e), AC-10, AC-11, AC-12 — all asserted on file bytes
+
 ## Files to Create/Modify
 
 - `crates/tetond/tests/provider_setup_flow.rs` — new; using the `tests/e2e/harness.rs` fixtures (`Daemon`, `Client`, temp `TETON_CONFIG`): (1) happy path: plan → preview(kimi, kimi-k3, key_ref keychain://teton/kimi, [think]) → commit(expect_digest) → file bytes == preview toml; `provider_setup_completed` received; `teton policy show`-equivalent RPC reports think→kimi; (2) stale digest → refused, bytes unchanged; (3) second connection (did not open the session) → `SETUP_REJECTED_NONUSER`, bytes unchanged, `provider_setup_rejected_nonuser` event; (4) replace existing `kimi`: preview `replaces` populated, commit keeps other providers and comments byte-identical (seed the temp config with a comment); (5) `TETON_PRESENCE_ACCEPT=fail` (under `TETON_TEST_SEAMS`) → commit refused, bytes unchanged — skip with a printed reason if the build lacks the presence feature, exactly as the web suite does; (6) unchanged candidate → `applied: false`, file mtime/bytes unchanged

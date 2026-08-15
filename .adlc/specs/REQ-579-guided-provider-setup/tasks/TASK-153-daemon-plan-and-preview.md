@@ -12,6 +12,8 @@ dependencies: ["TASK-152"]
 
 Implement the two read-only halves of the trio in the daemon. `plan` returns the recipe catalog (mapped 1:1 from `provider_recipes::recipe_catalog()`), the ids of providers already registered, and every routable tier with its current binding. `preview` takes a candidate, builds candidate `Config` = current + provider row (by identity, replacing an existing id if present) + one tier binding per requested tier, composes the endpoint via `teton_core::compose_endpoint`, validates, renders the exact TOML delta through the REQ-574 writer in memory, digests it, computes `dial_host` with the dial-time authority parser, and collects warnings (`replaces existing provider <id> (model a → b)`, unpriced model, cleartext endpoint). Both handlers take `refuse_unmintable_session_id` + `may_drive` and refuse foreign callers in-response only (no event — LESSON-513).
 
+**Covers:** AC-5, AC-6 (compose + URL-shape refusal on the daemon side), AC-12 (replaces + warning)
+
 ## Files to Create/Modify
 
 - `crates/tetond/src/runtime.rs` — `pub fn provider_setup_plan(&self) -> ProviderSetupPlanResult`; `pub fn provider_setup_preview(&self, c: &ProviderSetupCandidate) -> Result<RenderedProviderSetup, RpcError>` (a private struct carrying `toml, digest, dial_host, warnings, replaces, candidate_config`) — factor the candidate-build + validate + render into `fn derive_provider_setup(&self, c) -> Result<RenderedProviderSetup, RpcError>` so TASK-154's commit calls the same fn (BR-3, BR-9); reject a `key_ref` that does not parse as a keychain reference with `PROVIDER_SETUP_INVALID`

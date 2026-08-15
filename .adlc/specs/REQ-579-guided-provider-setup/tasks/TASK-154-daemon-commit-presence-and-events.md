@@ -12,6 +12,8 @@ dependencies: ["TASK-153"]
 
 Implement the commit. It calls TASK-153's `derive_provider_setup` again, compares the digest to `expect_digest`, and if equal hands the digested bytes to the writer as-is (not `persist_config` — see the `web_setup_commit` comment block on why a digest-checked write must not re-read the file). Then it re-runs the startup load/validate/derive path so routing is live in the committing session with no restart (REQ-572 BR-8). Returns `applied: false` when the current config already equals the candidate. The handler is async-spawned like `web/setup_commit`, sits behind `refuse_unattested_commitment` after `may_drive`, is added to `COMMITMENT_METHODS`, and emits `ProviderSetupCompleted` on success and `ProviderSetupRejected` (wire `provider_setup_rejected_nonuser`) when a model tool call or foreign connection reaches it.
 
+**Covers:** AC-2 (live re-derive), AC-4 (event payload carries no key), AC-10, AC-11, AC-12 (comment-preserving replace)
+
 ## Files to Create/Modify
 
 - `crates/tetond/src/runtime.rs` — `pub fn provider_setup_commit(&self, c: &ProviderSetupCandidate, expect_digest: Option<&str>) -> Result<ProviderSetupCommitResult, RpcError>`; digest mismatch → `PROVIDER_SETUP_INVALID` with a sentence naming "the preview you confirmed no longer matches"; single write of the digested bytes; live re-derive

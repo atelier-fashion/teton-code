@@ -12,6 +12,8 @@ dependencies: ["TASK-153"]
 
 Teach the model to hand off. Edit `self_config.md` line 2 so the first thing it names for connecting a provider is `/provider setup <vendor> [tier]` (in a session) and the second is `teton provider add` (from a shell); keep the recipe list on line 5 verbatim (it is the BR-11 answer and the vendor spellings the model uses). Update `harness/docs/providers.md` to lead with the same hand-off. Add the contract test that pins the daemon's `plan.catalog` to `recipe_catalog()` (ADR-4). Prove the prompt-size ceiling still clears.
 
+**Covers:** AC-1 (the guide sentence), AC-5 (catalog↔plan contract)
+
 ## Files to Create/Modify
 
 - `crates/tetond/src/harness/self_config.md` — line 2: replace "point them at `teton provider add` or `/web setup`, which read it echo-off into the keychain" with wording that names `/provider setup <vendor> [tier]` first, then `teton provider add` from a shell, then `/web setup` for web; byte count must not exceed the current line by more than the ceiling test's margin — aim for neutral or smaller

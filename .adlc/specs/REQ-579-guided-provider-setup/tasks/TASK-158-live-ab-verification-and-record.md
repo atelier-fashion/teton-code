@@ -12,6 +12,8 @@ dependencies: ["TASK-156", "TASK-157"]
 
 AC-1 is a claim about what the local model *says*, and only a live run can make it. Mirror REQ-577's verification: build with `--features tetond/llama`, run an isolated daemon (short `XDG_RUNTIME_DIR`, weights symlinked — see the project memory "Testing a Teton daemon in isolation"), and in a fresh session ask "set up Kimi for deep reasoning" three times against the new build and three against the pre-REQ binary (`main`). Record verbatim replies. Pass = every new-build reply names `/provider setup` (any accepted vendor spelling — ADR-2) and none contains `teton provider add`/`teton policy set-tier` as the primary instruction. Write `.adlc/specs/REQ-579-*/verification.md` with the transcript excerpts, the build SHAs, and the pass/fail per round. If the local model or weights are unreachable in the pipeline environment, record **unrun** with the reason — never assume.
 
+**Covers:** AC-1 (live A/B) and the AC-1..14 accounting table
+
 ## Files to Create/Modify
 
 - `.adlc/specs/REQ-579-guided-provider-setup/verification.md` — new; the A/B record (3+3 rounds, verbatim), build SHAs, environment, and the AC checklist (AC-1 through AC-14) with each marked pass / covered-by-test `<test name>` / unrun-with-reason
