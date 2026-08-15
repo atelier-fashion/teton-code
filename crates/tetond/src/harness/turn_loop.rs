@@ -1027,6 +1027,16 @@ pub async fn run_routed_session_turn(
 /// `teton_docs` `providers` topic, which is a tool result and pays no resident
 /// cost.
 ///
+/// REQ-579 turns the prohibition into a **hand-off** (BR-1, ADR-3): it names
+/// `/provider setup <vendor> [tier]` before `teton provider add`, so the first
+/// thing a key question resolves to is a flow the user can run without leaving
+/// the session. It is a line edit rather than a new capability clause because
+/// "connect Kimi" is a front-door question, not a refusal — the web clause
+/// exists to explain an off/partial/unavailable state mid-turn, and provider
+/// setup has no such state. The recipe line is untouched: it is what the
+/// vendor argument is spelled from, and the client resolves that spelling
+/// leniently (ADR-2) so the guide never has to spend bytes teaching ids.
+///
 /// Sized to stay resident in every turn: the whole system prompt must clear
 /// `REDACT_BODY_OVERHEAD_BYTES` with escaping headroom, and clear it by at least
 /// `MIN_PROMPT_HEADROOM_BYTES` — `the_total_cap_clears_the_harness_context_budget_with_margin`
@@ -2347,12 +2357,30 @@ mod tests {
     /// in-line edit alike. What it cannot catch is a contradicting sentence
     /// added elsewhere in the guide; no content pin can, and pretending
     /// otherwise is how the last set went vacuous.
+    ///
+    /// **REQ-579 BR-1 makes the same sentence the hand-off.** The prohibition
+    /// always had to name somewhere else for the key to go, and what it named
+    /// was a shell command — so a model that knew the rule still answered "run
+    /// `teton provider add …`" and left the user to do the work Teton can now
+    /// do for them. It now names `/provider setup <vendor> [tier]` first, which
+    /// is a command the user types *in this session*, and keeps
+    /// `teton provider add` after it because BR-11's non-interactive answer is
+    /// still that one. Presence and **order** are both asserted: a line naming
+    /// them the other way round reads as "recite the shell command; there is
+    /// also a slash command", which is the answer this REQ exists to stop.
+    ///
+    /// The last paragraph closes the hole the one above admits, for the one
+    /// contradiction that matters here: the guide's *only* sentence mentioning
+    /// asking is this one. A second sentence anywhere in the file that told the
+    /// model to ask for a key would sail past whole-line equality, and it is the
+    /// exact regression a future edit to a guide that discusses keys on four
+    /// lines could introduce.
     #[test]
     fn the_system_prompt_forbids_asking_for_a_credential_in_the_conversation() {
         const PROHIBITION: &str =
-            "Never ask the user to type an API key or credential into the conversation: point \
-             them at `teton provider add` or `/web setup`, which read it echo-off into the \
-             keychain.";
+            "Never ask the user to type an API key or credential in chat: point them at \
+             `/provider setup <vendor> [tier]`, `teton provider add` in a shell, or \
+             `/web setup`, which read it echo-off into the keychain.";
         for config in [HarnessConfig::default(), HarnessConfig::for_strong_model()] {
             let system = build_system_prompt(&ToolRegistry::with_builtins(), &config);
             let Some(line) = system
@@ -2365,15 +2393,73 @@ mod tests {
                      key, and it puts the secret in the transcript.\n{system}"
                 );
             };
+            let line = line.trim();
+
+            // The three destinations, checked before the equality below so a
+            // reword fails on the clause it dropped rather than on a whole-line
+            // diff a reader has to spot the difference in.
+            let guided = line.find("/provider setup").unwrap_or_else(|| {
+                panic!(
+                    "the guide's credential sentence no longer names `/provider setup`, so \
+                     the only place it can send a user for a key is a shell — which is the \
+                     REQ-579 BR-1 defect, restored.\nline: {line}"
+                )
+            });
+            let shell = line.find("teton provider add").unwrap_or_else(|| {
+                panic!(
+                    "the guide's credential sentence no longer names `teton provider add`. \
+                     It is BR-11's answer — the non-interactive surface has no slash \
+                     command — and the guide is the only copy a turn sees without a tool \
+                     call.\nline: {line}"
+                )
+            });
+            assert!(
+                guided < shell,
+                "the guide names `teton provider add` before `/provider setup`, so the \
+                 first thing the model reads for a key question is still the command the \
+                 user has to go elsewhere to run (REQ-579 BR-1). Order is the \
+                 assertion.\nline: {line}"
+            );
+            assert!(
+                line.contains("/web setup"),
+                "the guide's credential sentence no longer names `/web setup`, so a search \
+                 key has nowhere to go: `/provider setup` does not write `[web]` (REQ-572 \
+                 BR-6).\nline: {line}"
+            );
+
             assert_eq!(
-                line.trim(),
-                PROHIBITION,
+                line, PROHIBITION,
                 "the prohibition sentence was edited. If the wording was changed \
                  deliberately, update this expectation to the new wording — an in-line \
                  weakening (`unless ...`) is exactly what whole-line equality exists to \
-                 catch; do not just delete the assertion."
+                 catch; do not just delete the assertion. Mind the two prompt-margin \
+                 tests: this line is resident in every turn."
             );
         }
+
+        // And the contradiction whole-line equality cannot catch, for the one
+        // word that would carry it: nothing else in the guide talks about
+        // asking. A sentence added below that told the model to ask the user for
+        // a key would leave the prohibition above untouched and still be the
+        // last thing the model read on the subject.
+        let asking: Vec<&str> = SELF_CONFIG_GUIDE
+            .lines()
+            .filter(|line| line.to_ascii_lowercase().contains("ask"))
+            .collect();
+        assert_eq!(
+            asking.len(),
+            1,
+            "the guide has {} lines that mention asking, and exactly one may: the \
+             prohibition. If a new sentence legitimately needs the word, it is a decision \
+             — make it here, deliberately, rather than letting a second instruction about \
+             asking for a credential arrive unnoticed.\nlines: {asking:?}",
+            asking.len()
+        );
+        assert_eq!(
+            asking[0].trim(),
+            PROHIBITION,
+            "the guide's one sentence about asking is not the prohibition"
+        );
     }
 
     /// A stand-in for the real [`WebTool`](super::tools::WebTool), registered

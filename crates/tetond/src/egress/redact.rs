@@ -1973,6 +1973,17 @@ mod tests {
     /// (recipes move into the `providers` topic, which is a tool result rather
     /// than resident prompt) is what the next sentence buys itself with, and 93
     /// bytes is close enough to the floor that the next one probably has to.
+    ///
+    /// **Recorded headroom at REQ-579 (TASK-156):** the worst prompt is 5,880
+    /// bytes, `spent` is 9,156, and the margin is **60**. The guide's credential
+    /// sentence became the `/provider setup` hand-off (BR-1, ADR-3) and grew 33
+    /// bytes doing it — 168 → 201 on the line, 2,369 → 2,402 on the file. It was
+    /// paid the way the paragraph above says it must be: out of the margin, with
+    /// the sentence shortened until it fit (`into the conversation` → `in chat`,
+    /// and `/web setup`'s trailing gloss dropped) rather than out of the 9,216.
+    /// The opted-in web shape moved the same 33, 140 → 107, and stays the looser
+    /// of the two. Twelve bytes above the floor now: the ADR-2 fallback is no
+    /// longer a prediction about the next sentence, it is the only room left.
     #[test]
     fn the_total_cap_clears_the_harness_context_budget_with_margin() {
         use teton_core::capability::{SearchGap, WebCapabilityState};
