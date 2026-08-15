@@ -1,7 +1,8 @@
 //! The `shell` tool: run a command under a timeout, a cwd jail, and a scrubbed
 //! environment.
 //!
-//! Three hard constraints, each a security property (AC):
+//! Three hard constraints, each a security property (AC) — plus one usability
+//! guarantee about `PATH` that the security constraints do not imply:
 //!
 //! - **cwd jail** — the command runs with the repo root as its working
 //!   directory. (Absolute paths a command constructs itself are outside the
@@ -10,8 +11,13 @@
 //!   (`SECRET`, `PASSWORD`, `PASSWD`, `TOKEN`, `KEY`, `CREDENTIAL`, or a `PAT`
 //!   token) or whose *value* is a credential-bearing URL (`scheme://user:pass@…`)
 //!   is removed before the child starts, so a secret in the daemon's environment
-//!   can never leak into a model-driven `env`/`printenv` (BR-7). `PATH`, `HOME`,
-//!   and the rest pass through so ordinary commands still work.
+//!   can never leak into a model-driven `env`/`printenv` (BR-7). `HOME` and the
+//!   rest pass through so ordinary commands still work.
+//! - **PATH floor** — `PATH` passes through *and is then floored* with the
+//!   package-manager prefixes in [`PATH_FLOOR`]. Inheriting it unmodified was
+//!   the BUG-174 defect: the daemon's `PATH` is only as good as whatever started
+//!   it, and under launchd that is `/usr/bin:/bin:/usr/sbin:/sbin`, in which no
+//!   Homebrew binary — `teton` included — can be found.
 //! - **timeout** — a runaway command is `SIGKILL`ed after the deadline and the
 //!   timeout is reported to the model, so a bad command can never hang the loop.
 //!   The child is spawned as its own process-group leader and the whole group is
@@ -48,6 +54,7 @@
 
 use std::io::Result as IoResult;
 use std::os::unix::process::CommandExt;
+use std::path::Path;
 use std::process::{Command, Output, Stdio};
 use std::sync::mpsc::{self, RecvTimeoutError};
 use std::time::Duration;
@@ -148,7 +155,11 @@ impl Tool for ShellTool {
             .unwrap_or(self.default_timeout_ms)
             .min(self.max_timeout_ms);
 
-        let scrubbed = scrub(std::env::vars());
+        let mut scrubbed = scrub(std::env::vars());
+        // BUG-174: the daemon's own `PATH` is only as good as whatever started
+        // it, and launchd starts it with a bare one. Floor it before the child
+        // inherits it, or every user-installed command is unreachable.
+        apply_path_floor(&mut scrubbed);
 
         let mut cmd = Command::new("sh");
         cmd.arg("-c")
@@ -384,6 +395,64 @@ where
         .collect()
 }
 
+/// Directories holding user-installed binaries that a *supervisor*-started
+/// daemon's `PATH` routinely lacks (BUG-174).
+///
+/// A daemon the CLI spawned inherits the user's login-shell `PATH` and needs
+/// none of this. A daemon launchd started inherits launchd's default —
+/// `/usr/bin:/bin:/usr/sbin:/sbin` — which names no package-manager prefix at
+/// all. Every Homebrew-installed binary then vanishes from the `shell` tool:
+/// `gh`, `rg`, `jq`, brew's `python3`, and `teton` itself. The model sees exit
+/// 127 and reports the tool as uninstalled, which is how this was found.
+const PATH_FLOOR: &[&str] = &[
+    "/opt/homebrew/bin", // Homebrew, Apple Silicon
+    "/opt/homebrew/sbin",
+    "/usr/local/bin", // Homebrew on Intel, and the conventional local prefix
+    "/usr/local/sbin",
+    "/home/linuxbrew/.linuxbrew/bin", // Linuxbrew (the Linux CI leg, and Linux users)
+];
+
+/// The `PATH` handed to the `shell` child: whatever was inherited, plus any
+/// [`PATH_FLOOR`] directory that exists here and is not already named.
+///
+/// Floor entries are **appended, never prepended**. Where a directory already
+/// appears in the inherited `PATH`, the inherited position is kept, so this can
+/// only make more commands resolvable — it can never change which binary an
+/// already-working `PATH` selects. That ordering is the whole safety argument:
+/// a daemon started from a real login shell gets byte-identical behaviour.
+///
+/// `exists` is injected so the choice is testable without depending on what
+/// happens to be installed on the machine running the test.
+fn floored_path(inherited: Option<&str>, floor: &[&str], exists: &dyn Fn(&str) -> bool) -> String {
+    let mut entries: Vec<&str> = inherited
+        .unwrap_or_default()
+        .split(':')
+        .filter(|e| !e.is_empty())
+        .collect();
+    for dir in floor {
+        if !entries.contains(dir) && exists(dir) {
+            entries.push(dir);
+        }
+    }
+    // An empty result would hand the child no `PATH` at all, which is a worse
+    // failure than the one being fixed. Fall back to the POSIX default.
+    if entries.is_empty() {
+        return "/usr/bin:/bin:/usr/sbin:/sbin".to_owned();
+    }
+    entries.join(":")
+}
+
+/// Apply [`floored_path`] to a scrubbed environment, in place.
+fn apply_path_floor(env: &mut Vec<(String, String)>) {
+    let inherited = env
+        .iter()
+        .find(|(k, _)| k == "PATH")
+        .map(|(_, v)| v.as_str());
+    let floored = floored_path(inherited, PATH_FLOOR, &|dir| Path::new(dir).is_dir());
+    env.retain(|(k, _)| k != "PATH");
+    env.push(("PATH".to_owned(), floored));
+}
+
 /// Whether an environment entry carries a credential and must be scrubbed before
 /// the model-driven `shell` child sees it (BR-7). Two signals: a secret-shaped
 /// *name*, or a credential-bearing *value* (a `scheme://user:pass@host` URL).
@@ -549,6 +618,88 @@ mod tests {
         assert!(!is_secret_key("COMPATIBLE"));
         // A benign name with no secret substring survives.
         assert!(!is_secret_key("EDITOR"));
+    }
+
+    // -----------------------------------------------------------------------
+    // PATH floor — BUG-174
+    // -----------------------------------------------------------------------
+
+    /// Everything exists, so the floor is purely additive.
+    fn all_exist(_: &str) -> bool {
+        true
+    }
+
+    /// The reported failure: launchd's default `PATH` names no package-manager
+    /// prefix, so a Homebrew `teton` cannot be found from inside a session.
+    #[test]
+    fn a_launchd_path_gains_the_package_manager_prefixes() {
+        let floored = floored_path(
+            Some("/usr/bin:/bin:/usr/sbin:/sbin"),
+            &["/opt/homebrew/bin", "/usr/local/bin"],
+            &all_exist,
+        );
+        assert!(floored.contains("/opt/homebrew/bin"), "{floored}");
+        assert!(floored.contains("/usr/local/bin"), "{floored}");
+        // The inherited entries are still there, and still first.
+        assert!(
+            floored.starts_with("/usr/bin:/bin:/usr/sbin:/sbin"),
+            "{floored}"
+        );
+    }
+
+    /// The safety property: a daemon started from a real login shell must get
+    /// byte-identical behaviour. Floor entries already present are not moved,
+    /// so the floor can never change which binary an existing `PATH` selects.
+    #[test]
+    fn an_inherited_entry_keeps_its_position_and_is_not_duplicated() {
+        let floored = floored_path(
+            Some("/opt/homebrew/bin:/usr/bin"),
+            &["/usr/local/bin", "/opt/homebrew/bin"],
+            &all_exist,
+        );
+        assert_eq!(floored, "/opt/homebrew/bin:/usr/bin:/usr/local/bin");
+        assert_eq!(
+            floored.matches("/opt/homebrew/bin").count(),
+            1,
+            "no duplicate entry: {floored}"
+        );
+    }
+
+    /// A floor directory that does not exist on this machine is not added —
+    /// an Apple Silicon prefix must not be pasted onto a Linux box's `PATH`.
+    #[test]
+    fn a_missing_floor_directory_is_not_added() {
+        let floored = floored_path(Some("/usr/bin"), &["/opt/homebrew/bin"], &|_| false);
+        assert_eq!(floored, "/usr/bin");
+    }
+
+    /// Handing the child an empty `PATH` would be a worse break than the one
+    /// being fixed, so the POSIX default is the floor of the floor.
+    #[test]
+    fn an_absent_path_falls_back_to_the_posix_default() {
+        assert_eq!(
+            floored_path(None, &["/opt/homebrew/bin"], &|_| false),
+            "/usr/bin:/bin:/usr/sbin:/sbin"
+        );
+        assert_eq!(
+            floored_path(Some(""), &[], &all_exist),
+            "/usr/bin:/bin:/usr/sbin:/sbin"
+        );
+    }
+
+    /// The floor is applied to the scrubbed pairs the child actually receives,
+    /// and leaves exactly one `PATH` behind.
+    #[test]
+    fn apply_path_floor_replaces_rather_than_appends_a_second_path() {
+        let mut env = vec![
+            ("PATH".to_owned(), "/usr/bin".to_owned()),
+            ("EDITOR".to_owned(), "vi".to_owned()),
+        ];
+        apply_path_floor(&mut env);
+        assert_eq!(env.iter().filter(|(k, _)| k == "PATH").count(), 1);
+        assert!(env.iter().any(|(k, v)| k == "EDITOR" && v == "vi"));
+        let path = env.iter().find(|(k, _)| k == "PATH").unwrap().1.clone();
+        assert!(path.starts_with("/usr/bin"), "{path}");
     }
 
     #[test]

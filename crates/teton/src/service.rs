@@ -194,7 +194,7 @@ fn record_decline(state_dir: &Path, surface: &mut dyn Surface) {
 /// Does brew itself report the service as running? Parsed defensively from
 /// `brew services info teton --json`; any failure to run or parse is `false`
 /// (the offer's other gates carry the decision).
-fn brew_reports_service_running() -> bool {
+pub(crate) fn brew_reports_service_running() -> bool {
     let Ok(out) = Command::new("brew")
         .args(["services", "info", "teton", "--json"])
         .output()
