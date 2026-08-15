@@ -3167,3 +3167,125 @@ fn the_walkthrough_collects_every_answer_and_the_daemon_announces_the_write() {
     // REQ-555, and the reason the walk is a client command at all).
     assert_no_turn_ran(&session, "the /web setup walkthrough");
 }
+
+// ---------------------------------------------------------------------------
+// REQ-579 — the `/provider setup` walkthrough, at the client (TASK-157)
+// ---------------------------------------------------------------------------
+//
+// AC → test map for this section:
+//
+//   AC-9 (piped stdin prints the recipe, exits 0, consumes no further stdin)
+//   + BR-11
+//       → `a_piped_provider_setup_prints_the_recipe_and_asks_nothing`
+//
+// What this section deliberately does **not** hold:
+//
+//   * the walk itself (AC-2/AC-6/AC-7/AC-8/AC-12) — every branch of it reaches
+//     the credential step, and the shipped CLI writes credentials to the **real
+//     OS keychain** (`keychain::default_keychain`) with no test seam to redirect
+//     it, so a walk driven here would create — and on a refused commit delete —
+//     a `teton/kimi` entry in whoever's login keychain ran the suite. Unlike
+//     `/web setup`, this flow has no keyless branch to walk instead: a provider
+//     registration without a credential reference is refused by construction
+//     (the protocol type carries no `Default` for exactly that reason). Those
+//     legs are `provider_setup_ui`'s own suite, against a fake keychain.
+//   * the daemon-side flow (AC-2/AC-4/AC-7/AC-10/AC-11/AC-12) — `tetond`'s
+//     `provider_setup_flow.rs` drives it against a spawned daemon that owns a
+//     config file, which is where the write and the live routing can be seen.
+//   * the echo-off sweep (AC-4's transcript half) — a pipe cannot observe echo.
+//     It is `pty_e2e.rs`'s, and for `/provider setup` it is not added: the pty
+//     harness has no fake-keychain seam (see its own note above
+//     `the_setup_walk_stops_before_the_keychain_write`).
+
+/// **AC-9 / BR-11: on a pipe the command prints the exact CLI recipe, asks
+/// nothing, exits 0, and the line after it still reaches the model.**
+///
+/// The degradation is the requirement, not a fallback. A walkthrough that drew
+/// a prompt at a pipe would read the next line of the *session's* input as a
+/// model name — and the line after that as an API key, which is how a secret
+/// ends up in a transcript. So the assertions are in four parts: what was
+/// printed, what was **not** asked, that nothing was written, and that the
+/// following line reached the model instead of being eaten.
+///
+/// The recipe lines are asserted **verbatim**, because AC-9's claim is that a
+/// user can copy them into a shell. `instructions_are_commands_the_cli_itself_parses`
+/// pins that they parse; this pins that the shipped binary actually emits them,
+/// composed from the daemon's own catalog rather than from a CLI-side list
+/// (BR-4) — this session's `kimi` endpoint and `--model kimi-k3` came over the
+/// socket from `provider/setup_plan`.
+#[test]
+fn a_piped_provider_setup_prints_the_recipe_and_asks_nothing() {
+    let daemon_path = daemon_bin();
+    let daemon = TestDaemon::spawn_scripted(&daemon_path, TURN_REPLIES);
+    let teton = teton_bin();
+    let config_path = daemon.root.join("config.toml");
+    let before = std::fs::read(&config_path).expect("the fixture config exists");
+
+    // No `run_cli_seamed`: this is the shipped posture, with the test seam off.
+    let (session, status) =
+        daemon.run_cli_capture(&teton, &[], "/provider setup kimi\nhello there\n");
+
+    // (1) It degraded to instructions, and said why.
+    assert!(
+        session.contains("which needs a terminal"),
+        "AC-9: the piped branch must say why it is not asking; output:\n{session}"
+    );
+
+    // (2) The recipe, verbatim — the two commands the user can paste.
+    assert!(
+        session.contains(
+            "teton provider add kimi --kind openai-compatible --endpoint \
+             https://api.moonshot.ai/v1/chat/completions --model kimi-k3"
+        ),
+        "AC-9: the registration command must be printed exactly as the shell \
+         takes it; output:\n{session}\ndaemon log:\n{}",
+        daemon.log()
+    );
+    assert!(
+        session.contains("teton policy set-tier think kimi"),
+        "AC-9: and the routing command, defaulting to `think` (ADR-6); \
+         output:\n{session}"
+    );
+    assert!(
+        session.contains("keychain"),
+        "and it must still name where the key goes, which is the part a user \
+         running these by hand most needs; output:\n{session}"
+    );
+
+    // (3) It asked nothing. A drawn prompt is the defect this branch exists to
+    // avoid, and each prompt's bytes are unmistakable.
+    for prompt in [
+        "vendor [number or name",
+        "model [Enter for",
+        "API key (not shown",
+        "route [Enter for",
+        "write this to your config?",
+    ] {
+        assert!(
+            !session.contains(prompt),
+            "AC-9: no prompt may be drawn on a pipe ({prompt:?}); output:\n{session}"
+        );
+    }
+
+    // (4) Nothing was written, and nothing was previewed into the file.
+    assert_eq!(
+        std::fs::read(&config_path).ok().as_deref(),
+        Some(before.as_slice()),
+        "AC-9: the degraded path must leave the config untouched"
+    );
+
+    // (5) AC-9 claims an exit code, so this looks at one.
+    assert!(
+        status.success(),
+        "AC-9: the piped session must exit 0; status {status:?}; output:\n{session}"
+    );
+
+    // (6) BR-11's "without consuming stdin": the line after the command reached
+    // the model, so no session input was eaten by a prompt that was not drawn.
+    assert!(
+        session.contains(TURN_REPLIES[0]),
+        "the next typed line must still reach the model; output:\n{session}\n\
+         daemon log:\n{}",
+        daemon.log()
+    );
+}
