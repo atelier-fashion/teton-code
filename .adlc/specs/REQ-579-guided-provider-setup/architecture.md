@@ -82,8 +82,11 @@ No change to `config/set`, `RegisterProvider`, or `SetTierBinding`; the commit
 - `provider_setup_commit(&self, candidate, expect_digest) -> Result<…, RpcError>`
   — re-derives exactly as preview, compares digest, writes the digested bytes
   as-is (not `persist_config`, per the `web_setup_commit` comment block), then
-  runs the startup load/validate/derive path so routing is live in-session
-  (REQ-572 BR-8). Returns `applied: false` when the config already matches.
+  swaps the already-validated `candidate_config` into memory — not a re-load
+  from disk, which would be a second read that can disagree with the bytes
+  just validated (LESSON-451); `build_router` clones the config per turn, so
+  the next routing decision sees it with no restart (REQ-572 BR-8). Returns
+  `applied: false` when the config already matches.
 
 **tetond/src/server.rs** — `handle_provider_setup_{plan,preview,commit}`; the
 commit is added to the async-spawn router and to `COMMITMENT_METHODS`.

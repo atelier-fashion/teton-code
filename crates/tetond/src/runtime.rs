@@ -122,12 +122,12 @@ use teton_protocol::methods::{
     CategoryRouteView, ConfigSnapshot, ConfigUpdate, ContentClass, CostGroupView, CostQueryResult,
     CostReportView, ExistingProvider, ModelConfirmOutcome, ModelConfirmParams, ModelConfirmResult,
     ModelListResult, ModelSetResult, ModelStatusResult, PrivacyBoundaryConfig, PromptTurnResult,
-    ProviderConfig, ProviderSetupCandidate, ProviderSetupPlanResult, ProviderSetupPreviewResult,
-    SessionClearParams, SessionClearResult, SessionPermissionsParams, SessionPermissionsResult,
-    TierBinding as WireTierBinding, TierBindingConfig, TierRouteView, TierSummary,
-    WebOverrideParams, WebOverrideResult, WebRefreshOutcome, WebRefreshParams, WebRefreshResult,
-    WebSetupCommitParams, WebSetupCommitResult, WebSetupPlanResult, WebSetupPreviewParams,
-    WebSetupPreviewResult, WebTableSummary, WebTotalsView,
+    ProviderConfig, ProviderSetupCandidate, ProviderSetupCommitResult, ProviderSetupPlanResult,
+    ProviderSetupPreviewResult, SessionClearParams, SessionClearResult, SessionPermissionsParams,
+    SessionPermissionsResult, TierBinding as WireTierBinding, TierBindingConfig, TierRouteView,
+    TierSummary, WebOverrideParams, WebOverrideResult, WebRefreshOutcome, WebRefreshParams,
+    WebRefreshResult, WebSetupCommitParams, WebSetupCommitResult, WebSetupPlanResult,
+    WebSetupPreviewParams, WebSetupPreviewResult, WebTableSummary, WebTotalsView,
 };
 use teton_protocol::permissions::PermissionLevel;
 use teton_protocol::{
@@ -1397,6 +1397,37 @@ impl DaemonRuntime {
             provider_health: Mutex::new(BTreeMap::new()),
             secret_resolver: SecretResolver::with_default_backend(),
         }
+    }
+
+    /// [`Self::minimal`] with a **real config file** behind it, loaded (REQ-579
+    /// TASK-154).
+    ///
+    /// The fixture the *server*'s commit tests need and `minimal()` deliberately
+    /// has not got: "this refusal wrote nothing" is a claim about bytes on disk,
+    /// and a runtime with no `config_path` answers `CONFIG_REJECTED` before ever
+    /// reaching a writer — so a gate test standing on `minimal()` would be
+    /// asserting the absence of a write that had no path to happen (LESSON-519).
+    /// The config fields it sets are private to this module, which is why this
+    /// lives here rather than in `crate::server`'s test module.
+    ///
+    /// Test-only, and gated so it cannot be reached from a shipped build: a
+    /// constructor that pointed the daemon's one writer at an arbitrary path is
+    /// not something production should be able to call.
+    ///
+    /// # Panics
+    /// If the document at `path` does not load — a fixture that seeded an invalid
+    /// config is a broken fixture, and failing here names it.
+    #[cfg(test)]
+    #[must_use]
+    pub(crate) fn minimal_with_config_file(path: &Path) -> Self {
+        let mut runtime = Self::minimal();
+        *runtime.config.lock().expect("config mutex poisoned") =
+            load_config(Some(path)).expect("the seeded config loads");
+        runtime.config_path = Some(path.to_path_buf());
+        runtime.data_dir = path
+            .parent()
+            .map_or_else(std::env::temp_dir, Path::to_path_buf);
+        runtime
     }
 
     /// Build the runtime from configuration and the environment, wiring the cost
@@ -4372,6 +4403,163 @@ impl DaemonRuntime {
         })
     }
 
+    /// Write the candidate provider and its bindings, and make routing live
+    /// (`provider/setup_commit`, REQ-579 BR-10/BR-15, AC-2).
+    ///
+    /// [`Self::web_setup_commit`]'s twin, and deliberately its copy rather than a
+    /// generalisation of it (ADR-1): the **single commit point** for this flow,
+    /// and three things in one critical section, holding the config mutex
+    /// throughout so two commits serialize rather than interleave:
+    ///
+    /// 1. the candidate is rebuilt **from the same answers** the preview was
+    ///    given — never from a blob the client kept, which is what stops a client
+    ///    committing something this daemon never validated (BR-9, LESSON-501) —
+    ///    through the one [`Self::derive_provider_setup`] the preview used, and,
+    ///    when the caller sent one, checked against the preview's
+    ///    [`digest`](ProviderSetupPreviewResult::digest), so re-deriving cannot
+    ///    quietly pick up a change another session made in between;
+    /// 2. **that derived text** is written atomically — the provider row and
+    ///    every tier binding in one write, which is the whole of ADR-1: two
+    ///    writes would leave a window in which the provider exists unrouted, and
+    ///    a crash leaves it so. Since REQ-574 the write edits the on-disk
+    ///    document rather than replacing it, so a comment the user wrote above
+    ///    their own `[[providers]]` row survives a registration (AC-11);
+    /// 3. only then is the in-memory config replaced. `build_tools` and
+    ///    `build_router` clone that config per turn, so the very next routing
+    ///    decision of **every** session resolves against the new `[[tiers]]` rows
+    ///    with no restart (BR-15, AC-2) — the "live re-derive" is that swap, and
+    ///    it is a swap of the config the derivation already built rather than a
+    ///    second load of the file it just wrote.
+    ///
+    /// # What counts as a no-op
+    ///
+    /// [`Self::web_setup_commit`]'s rule, unchanged and for its reasons: both
+    /// halves have to be already true — the derived document is byte-identical to
+    /// the file, **and** the candidate config matches the live one. Only then
+    /// does the commit write nothing, swap nothing, and report `applied: false`,
+    /// which is a truthful answer and not a failure. The whole `Config` is
+    /// compared rather than the provider table alone because the whole `Config`
+    /// is what the swap would install; the derivation only ever edits the rows
+    /// this flow writes, so nothing else can differ anyway.
+    ///
+    /// The byte half is a claim about bytes, line endings included — see
+    /// [`EditedDocument::unchanged`]: the first commit over a CRLF-authored
+    /// document reports `applied: true` even for a registration the document
+    /// already agrees with, because the write normalizes its line endings. Once.
+    ///
+    /// # Errors
+    /// - [`error_code::PROVIDER_SETUP_INVALID`] — the candidate is refused (see
+    ///   [`Self::derive_provider_setup`] for the order and why), the **edited
+    ///   document** would not load, or the derivation no longer digests to what
+    ///   the caller confirmed. Nothing is written and the in-memory config is
+    ///   untouched in every one of those.
+    /// - [`error_code::CONFIG_REJECTED`] — this daemon has no config file, so
+    ///   there is nowhere for the registration to land.
+    /// - [`error_code::INTERNAL_ERROR`] — the write itself failed, or the
+    ///   document could not be derived at all (an unparseable or unreadable
+    ///   file, REQ-574 BR-6). The in-memory config is untouched in both: the swap
+    ///   happens after the file lands, never before.
+    pub fn provider_setup_commit(
+        &self,
+        candidate: &ProviderSetupCandidate,
+        expect_digest: Option<&str>,
+    ) -> Result<ProviderSetupCommitResult, RpcError> {
+        // Held across derive → digest check → write → swap, which is why
+        // `derive_provider_setup` takes `current` rather than locking itself: a
+        // derivation that took the lock would open a window between the base it
+        // read and the bytes that land.
+        let mut config = self.config.lock().expect("config mutex poisoned");
+        // The one derivation, and the text the write below actually takes. It
+        // runs unconditionally — before the digest check that needs it, and so
+        // before the no-op short-circuit — because a second derivation inside the
+        // writer would digest one document and write another the moment the file
+        // moved between the two reads (ADR-1, LESSON-451).
+        let rendered = self.derive_provider_setup(candidate, &config)?;
+        // The guard on the outcome, never a substitute for re-deriving it: the
+        // candidate above was already rebuilt and re-validated, so a forged
+        // digest buys nothing the answers had not already earned (BR-9,
+        // LESSON-501). It sits **before** the no-op short-circuit deliberately —
+        // a document that moved under the preview is a refusal whether or not
+        // this candidate would have changed anything.
+        if let Some(expected) = expect_digest {
+            if rendered.digest != expected {
+                return Err(RpcError::new(
+                    error_code::PROVIDER_SETUP_INVALID,
+                    PROVIDER_SETUP_DIGEST_STALE,
+                ));
+            }
+        }
+        // Read back off the config the swap would install, never echoed from the
+        // request (the reason `SessionPermissionsResult::level` is read from the
+        // gate): what the caller is told is registered is what this daemon holds
+        // registered. Past `derive_provider_setup` the row is there by that
+        // function's own construction, so this arm is defensive rather than live
+        // — and an internal error rather than a refusal, because nothing about
+        // the user's answers would be the thing to fix.
+        let id = candidate.id.0.trim();
+        let Some(provider_id) = rendered
+            .candidate_config
+            .providers
+            .iter()
+            .find(|provider| provider.id == id)
+            .map(|provider| ProviderId::from(provider.id.as_str()))
+        else {
+            return Err(RpcError::new(
+                error_code::INTERNAL_ERROR,
+                "the candidate this daemon derived does not hold the provider it was asked to \
+                 register",
+            ));
+        };
+        // Both halves — see "What counts as a no-op". `rendered.unchanged` is the
+        // file's answer, taken over the same read the digest was taken over, so
+        // there is no second read to disagree with it.
+        if rendered.unchanged && rendered.candidate_config == *config {
+            return Ok(ProviderSetupCommitResult {
+                applied: false,
+                provider_id,
+                bindings: rendered.bindings,
+            });
+        }
+        let Some(path) = &self.config_path else {
+            return Err(RpcError::new(
+                error_code::CONFIG_REJECTED,
+                "this daemon has no configuration file to write, so the provider could not be \
+                 registered",
+            ));
+        };
+        // The text the digest above was taken over, handed to the writer as-is.
+        // Not `persist_config`: that would re-read and re-edit the file, which is
+        // the one thing a digest-checked write must not do. The validation
+        // `persist_config` performs happened inside the derivation, so the bytes
+        // that land are still the bytes that were validated (REQ-574 BR-4).
+        write_config_atomically(path, &rendered.full_text).map_err(|err| {
+            // Names the failure class and never the path (REQ-572 BR-11). The
+            // parenthesis carries the *inner* reason, because a user who has to
+            // fix something needs to be told what is wrong (LESSON-456).
+            RpcError::new(
+                error_code::INTERNAL_ERROR,
+                format!("the configuration could not be saved ({err})"),
+            )
+        })?;
+        // The live re-derive: routing is a function of this config, and the next
+        // turn of every session builds its router from it (BR-15).
+        *config = rendered.candidate_config;
+        // The lock is released before the caller announces anything, for
+        // `web_setup_commit`'s reason: a subscriber runs on the publishing
+        // thread, and holding the config mutex across arbitrary subscriber work
+        // is a lock-ordering hazard for a notice that needs nothing from the
+        // config. (This flow's `provider_setup_completed` is published by the
+        // handler, which holds no lock at all — REQ-579 BR-12's rejection event
+        // is published there too, and one publisher is easier to reason about
+        // than two.)
+        drop(config);
+        Ok(ProviderSetupCommitResult {
+            applied: true,
+            provider_id,
+            bindings: rendered.bindings,
+        })
+    }
+
     /// The candidate `Config` a registration describes, the document it would
     /// write, and everything both seams of the flow read off that derivation
     /// (REQ-579 BR-3, BR-9, ADR-1).
@@ -5573,23 +5761,18 @@ fn render_persisted_document(
 /// property of the code path rather than of two functions agreeing (LESSON-451).
 ///
 /// [`DaemonRuntime::provider_setup_preview`] projects `toml`, `digest`,
-/// `dial_host`, `warnings` and `replaces` onto the wire. The commit (TASK-154)
-/// checks `digest`, decides its no-op on `unchanged` **and** on
-/// `candidate_config`, hands `full_text` to the writer unchanged, swaps
-/// `candidate_config` into memory, and reports `bindings`.
+/// `dial_host`, `warnings` and `replaces` onto the wire.
+/// [`DaemonRuntime::provider_setup_commit`] checks `digest`, decides its no-op
+/// on `unchanged` **and** on `candidate_config`, hands `full_text` to the writer
+/// unchanged, swaps `candidate_config` into memory, and reports `bindings`.
 ///
-/// # Why four fields are `allow(dead_code)` today
-///
-/// `full_text`, `unchanged`, `bindings` and `candidate_config` are the commit's
-/// half of that contract, and TASK-153 ships the read half alone — so on this
-/// commit they are produced and not yet consumed. They are *stated here* rather
-/// than added by TASK-154 because the whole point of the shared derivation is
-/// that the commit performs no derivation of its own: a commit that had to
-/// extend this struct to get its bytes would be one derivation away from
-/// deriving them itself, which is the drift ADR-1 and LESSON-451 exist to
-/// prevent. The allowance is scoped to this struct and is expected to be deleted
-/// with TASK-154's first read.
-#[allow(dead_code)]
+/// Every field is therefore read by one seam or the other — TASK-153 shipped
+/// four of them ahead of the commit that consumes them, under an
+/// `allow(dead_code)` this task deleted. They were *stated there* rather than
+/// added here because the whole point of the shared derivation is that the
+/// commit performs no derivation of its own: a commit that had to extend this
+/// struct to get its bytes would be one derivation away from deriving them
+/// itself, which is the drift ADR-1 and LESSON-451 exist to prevent.
 pub(crate) struct RenderedProviderSetup {
     /// The `[[providers]]` row and the `[[tiers]]` rows this candidate writes,
     /// sliced out of `full_text` — what the preview shows, and therefore what
@@ -7766,6 +7949,19 @@ impl<'a> WebSetupAnswers<'a> {
 const SETUP_DIGEST_STALE: &str =
     "the configuration changed since the preview, so this would write bytes you did not \
      confirm — run `/web setup` again";
+
+/// What a provider-setup commit is told when the document moved under its
+/// preview (REQ-579 BR-9).
+///
+/// [`SETUP_DIGEST_STALE`]'s sibling rather than a share of it, because the
+/// remedy is a different command and the remedy is the half of this sentence
+/// that does any work. It **echoes nothing** for that constant's reason — not
+/// the digests, not the field that changed, not the document, and above all not
+/// the candidate: the thing that moved may be another session's answer, and the
+/// candidate carries a credential reference.
+const PROVIDER_SETUP_DIGEST_STALE: &str =
+    "the preview you confirmed no longer matches what this daemon would write, so committing \
+     would write bytes you did not see — run `/provider setup` again";
 
 /// One setup answer, trimmed, with blank read as absent — see
 /// [`WebSetupAnswers`] for why.
@@ -19936,6 +20132,352 @@ provider_id = \"deepseek\"
             assert_eq!(preview.dial_host, rendered.dial_host);
             assert_eq!(preview.warnings, rendered.warnings);
             assert_eq!(preview.replaces, rendered.replaces);
+        }
+
+        // -- the commit --------------------------------------------------------
+
+        /// What a `think`-tier turn would route to right now, asked of the
+        /// **same** [`Router`] the turn path builds from the runtime's live
+        /// config.
+        ///
+        /// A routing *decision*, not a table read: `Category::Review` is a
+        /// `think` category, and `resolve` is the call `run_prompt_turn` makes.
+        /// Asserting on the `[[tiers]]` row instead would prove the bytes landed
+        /// and say nothing about the daemon having noticed (BR-15, AC-2).
+        fn think_provider(runtime: &DaemonRuntime) -> Option<String> {
+            let config = runtime.config.lock().expect("config mutex").clone();
+            build_router(&config, runtime.local_tier_available(), &BTreeMap::new())
+                .resolve(Category::Review)
+                .provider_id
+                .map(|id| id.0)
+        }
+
+        /// The file's inode — a write's fingerprint, however the bytes come out.
+        ///
+        /// [`write_config_atomically`] lands every write by `rename`, so a
+        /// committed write always installs a new inode. Byte equality alone
+        /// cannot tell "nothing was written" from "the same bytes were written
+        /// again", and the claim these tests make is the first one (LESSON-519).
+        fn inode(path: &Path) -> u64 {
+            use std::os::unix::fs::MetadataExt as _;
+            std::fs::metadata(path)
+                .expect("the config file exists")
+                .ino()
+        }
+
+        /// **The bytes the user confirmed are the bytes on disk, and the very
+        /// next routing decision is made against them** (BR-10, BR-15, AC-2).
+        ///
+        /// The digest is the whole assertion about the write: the preview's
+        /// digest is `sha256` of the document a commit would leave, so a file
+        /// that hashes to it *is* the previewed document — a substring check
+        /// would pass for a write that also mangled something the preview never
+        /// showed.
+        ///
+        /// The routing half is the one that would fail on an implementation that
+        /// wrote correctly and forgot the swap: the config in memory would still
+        /// be the pre-commit one, `think` would resolve where it always did, and
+        /// only a daemon restart would fix it — the "no restart" clause of BR-15,
+        /// asserted against the same `runtime` object throughout.
+        #[test]
+        fn a_commit_writes_the_previewed_bytes_and_routing_is_live_without_a_restart() {
+            let (runtime, config_path) = runtime_seeded("provider-setup-commit", SEEDED);
+            let preview = runtime
+                .provider_setup_preview(&kimi())
+                .expect("the candidate previews");
+
+            // The contrast that makes the assertion below a change rather than a
+            // coincidence: nothing routes `think` at `kimi` yet.
+            assert_ne!(
+                think_provider(&runtime),
+                Some("kimi".to_owned()),
+                "the fixture already routed think at kimi, so nothing below is evidence"
+            );
+
+            let result = runtime
+                .provider_setup_commit(&kimi(), Some(&preview.digest))
+                .expect("the digest matches, so the commit lands");
+
+            assert!(result.applied);
+            assert_eq!(result.provider_id.0, "kimi");
+            assert_eq!(result.bindings.len(), 1, "{:?}", result.bindings);
+            assert_eq!(result.bindings[0].tier, WireTier::Think);
+            assert_eq!(result.bindings[0].provider_id.0, "kimi");
+
+            let written = std::fs::read_to_string(&config_path).expect("read");
+            assert_eq!(
+                teton_inference::sha256_hex(written.as_bytes()),
+                preview.digest,
+                "the file is not the document the user confirmed:\n{written}"
+            );
+            for section in preview.toml.split("\n\n") {
+                assert!(
+                    written.contains(section.trim_end()),
+                    "the preview showed bytes the write did not leave:\n{section}"
+                );
+            }
+
+            // Live, in this process, with no reload: the router built from the
+            // runtime's own config now answers `kimi` for a think-tier turn.
+            assert_eq!(think_provider(&runtime), Some("kimi".to_owned()));
+            let config = runtime.config.lock().expect("config mutex").clone();
+            let report = build_router(&config, runtime.local_tier_available(), &BTreeMap::new())
+                .tier_report(Tier::Think);
+            assert_eq!(report.origin, TierOrigin::Configured, "{report:?}");
+            assert_eq!(report.provider_id.as_deref(), Some("kimi"));
+            // And the neighbour's routing is exactly what it was.
+            assert_eq!(
+                config
+                    .tiers
+                    .iter()
+                    .find(|row| row.tier == Tier::Scan)
+                    .map(|row| row.provider_id.as_str()),
+                Some("deepseek")
+            );
+        }
+
+        /// **A preview the document has outgrown is refused, and the refusal has
+        /// no write path** (BR-9, LESSON-519).
+        ///
+        /// The drift is a comment appended at a key this flow never touches,
+        /// which is the point: the digest covers the **whole document**, because
+        /// the whole document is what a commit writes — everything the flow does
+        /// not collect rides along from the file. A digest over the rendered rows
+        /// alone would call this document unchanged and write away the user's
+        /// edit.
+        ///
+        /// "Nothing was written" is asserted against the **file's own bytes and
+        /// inode**, never against the absence of an error (LESSON-519), and
+        /// against memory too: a refusal that had already swapped would leave a
+        /// daemon routing to a provider its config file has never heard of.
+        #[test]
+        fn a_commit_whose_digest_no_longer_matches_refuses_and_writes_nothing() {
+            let (runtime, config_path) = runtime_seeded("provider-setup-stale", SEEDED);
+            let preview = runtime
+                .provider_setup_preview(&kimi())
+                .expect("the candidate previews");
+
+            let drifted =
+                format!("{SEEDED}\n# added while the user was still reading the preview\n");
+            std::fs::write(&config_path, &drifted).expect("hand-edit the config");
+            let before = inode(&config_path);
+
+            let err = runtime
+                .provider_setup_commit(&kimi(), Some(&preview.digest))
+                .expect_err("the document moved, so the preview is stale");
+            assert_eq!(err.code, error_code::PROVIDER_SETUP_INVALID);
+            assert!(
+                err.message.contains("no longer matches"),
+                "the refusal must name what went stale: {}",
+                err.message
+            );
+            assert!(
+                err.message.contains("/provider setup"),
+                "and the remedy is the half that does the work: {}",
+                err.message
+            );
+            assert!(
+                !err.message.contains(&preview.digest),
+                "the refusal echoes no digest, no field and no document: {}",
+                err.message
+            );
+
+            assert_eq!(
+                std::fs::read_to_string(&config_path).expect("read"),
+                drifted,
+                "a refused commit wrote to the file"
+            );
+            assert_eq!(
+                before,
+                inode(&config_path),
+                "a refused commit rewrote the file"
+            );
+            assert!(
+                !runtime
+                    .config
+                    .lock()
+                    .expect("config mutex")
+                    .providers
+                    .iter()
+                    .any(|provider| provider.id == "kimi"),
+                "a refused commit swapped the candidate into memory anyway"
+            );
+
+            // Non-vacuity: the same candidate against a digest taken over the
+            // *drifted* document lands, so what was refused above is the staleness
+            // and not the candidate.
+            let fresh = runtime
+                .provider_setup_preview(&kimi())
+                .expect("previews against the document as it now is");
+            assert!(
+                runtime
+                    .provider_setup_commit(&kimi(), Some(&fresh.digest))
+                    .expect("a fresh digest commits")
+                    .applied
+            );
+        }
+
+        /// **A commit whose candidate is already the configuration writes
+        /// nothing and says so** (BR-10) — `applied: false` is a truthful answer,
+        /// not a failure and not an error response.
+        ///
+        /// Both halves of the no-op rule are live here: the second commit's
+        /// document is byte-identical to the file **and** its candidate config
+        /// equals the live one. The rows in force are still reported, because the
+        /// client's completion line is read off the daemon's answer either way.
+        #[test]
+        fn a_commit_of_an_unchanged_candidate_applies_nothing_and_writes_nothing() {
+            let (runtime, config_path) = runtime_seeded("provider-setup-noop", SEEDED);
+            let first = runtime.provider_setup_preview(&kimi()).expect("previews");
+            assert!(
+                runtime
+                    .provider_setup_commit(&kimi(), Some(&first.digest))
+                    .expect("the first commit lands")
+                    .applied
+            );
+            let after_first = std::fs::read_to_string(&config_path).expect("read");
+            let before = inode(&config_path);
+
+            let second = runtime
+                .provider_setup_preview(&kimi())
+                .expect("previews the same candidate again");
+            let result = runtime
+                .provider_setup_commit(&kimi(), Some(&second.digest))
+                .expect("a no-op commit is not a failure");
+
+            assert!(
+                !result.applied,
+                "the config already said exactly this, so nothing was applied"
+            );
+            assert_eq!(result.provider_id.0, "kimi");
+            assert_eq!(
+                result.bindings.len(),
+                1,
+                "the rows in force are still reported: {:?}",
+                result.bindings
+            );
+            assert_eq!(
+                std::fs::read_to_string(&config_path).expect("read"),
+                after_first,
+                "a no-op commit changed the file"
+            );
+            assert_eq!(
+                before,
+                inode(&config_path),
+                "a no-op commit rewrote the file with identical bytes — `applied: \
+                 false` and a write are not the same answer"
+            );
+        }
+
+        /// A hand-written config that already registers `kimi`, so a
+        /// re-registration has something of the user's to preserve: a comment
+        /// above the row, a hand-authored `[providers.capabilities]` on it, a
+        /// neighbouring provider, and a tier row nobody is going to name.
+        const SEEDED_WITH_KIMI: &str = "\
+# my teton config, written by hand
+effort = \"high\"
+
+# the cheap one, for reading
+[[providers]]
+id = \"deepseek\"
+kind = \"openai-compatible\"
+endpoint = \"https://api.deepseek.com/chat/completions\"
+model = \"deepseek-v4-pro\"
+auth_ref = \"keychain://teton/deepseek\"
+[providers.capabilities]
+max_context = 128000
+
+# the one I registered last month, before the price changed
+[[providers]]
+id = \"kimi\"
+kind = \"openai-compatible\"
+endpoint = \"https://api.moonshot.ai/v1/chat/completions\"
+model = \"kimi-k2\"
+auth_ref = \"keychain://teton/kimi\"
+[providers.capabilities]
+max_context = 200000
+
+[[tiers]]
+tier = \"scan\"
+provider_id = \"deepseek\"
+";
+
+        /// **Re-registering an existing id edits that row and nothing else**
+        /// (REQ-574, BR-14, AC-11, BUG-155's class).
+        ///
+        /// The assertion is on **bytes of the file after a real commit**, which is
+        /// the only reading that covers the writer: the preview's own
+        /// neighbour test (`a_new_registration_leaves_the_existing_rows_byte_identical`)
+        /// asserts the same property of a derivation nobody wrote. Every block
+        /// here is quoted out of the seed rather than retyped, so a change to the
+        /// fixture cannot quietly weaken what is compared.
+        #[test]
+        fn a_commit_that_replaces_a_provider_leaves_every_other_byte_alone() {
+            let (runtime, config_path) =
+                runtime_seeded("provider-setup-commit-replace", SEEDED_WITH_KIMI);
+            let candidate = ProviderSetupCandidate {
+                model: "kimi-k3".to_owned(),
+                ..kimi()
+            };
+            let preview = runtime
+                .provider_setup_preview(&candidate)
+                .expect("the candidate previews");
+            assert_eq!(
+                preview
+                    .replaces
+                    .as_ref()
+                    .and_then(|existing| existing.model.as_deref()),
+                Some("kimi-k2"),
+                "the fixture is only meaningful if this replaces something"
+            );
+
+            let result = runtime
+                .provider_setup_commit(&candidate, Some(&preview.digest))
+                .expect("the commit lands");
+            assert!(result.applied);
+
+            let written = std::fs::read_to_string(&config_path).expect("read");
+            for surviving in [
+                "# my teton config, written by hand",
+                "effort = \"high\"",
+                "# the cheap one, for reading",
+                "id = \"deepseek\"",
+                "model = \"deepseek-v4-pro\"",
+                "auth_ref = \"keychain://teton/deepseek\"",
+                "max_context = 128000",
+                // The replaced row's own comment and its hand-authored
+                // capability table: a replace is a matched edit, not a rewrite.
+                "# the one I registered last month, before the price changed",
+                "max_context = 200000",
+                "[[tiers]]\ntier = \"scan\"\nprovider_id = \"deepseek\"",
+            ] {
+                assert!(
+                    written.contains(surviving),
+                    "registering `kimi` was collateral for `{surviving}`:\n{written}"
+                );
+            }
+            // The whole neighbouring provider block, byte for byte, rather than
+            // key by key.
+            let neighbour = SEEDED_WITH_KIMI
+                .split_once("# the cheap one, for reading")
+                .and_then(|(_, rest)| rest.split_once("\n\n"))
+                .map(|(block, _)| block)
+                .expect("the seed carries a neighbour block");
+            assert!(written.contains(neighbour), "{written}");
+
+            // What did change: the one row, once. Anchored at a line start,
+            // because `provider_id = "kimi"` on the tier row below ends in the
+            // same eight characters.
+            assert_eq!(written.matches("\nid = \"kimi\"").count(), 1, "{written}");
+            assert!(written.contains("model = \"kimi-k3\""), "{written}");
+            assert!(!written.contains("model = \"kimi-k2\""), "{written}");
+            // And the tier the answers named is now a row of its own, with the
+            // one nobody named untouched.
+            assert!(
+                written.contains("tier = \"think\"") && written.contains("provider_id = \"kimi\""),
+                "{written}"
+            );
+            assert_eq!(think_provider(&runtime), Some("kimi".to_owned()));
         }
     }
 
