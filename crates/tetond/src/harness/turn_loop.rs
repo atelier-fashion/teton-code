@@ -2252,8 +2252,12 @@ mod tests {
     /// better than the local tier doing it, and worse at being noticed.
     #[test]
     fn the_system_prompt_tells_the_model_to_refer_setup_commands_not_run_them() {
-        const REFERRAL: &str = "You cannot run these commands yourself: give the user the exact \
-                                commands to run, filled in from the recipes here.";
+        // Shortened under REQ-579: "give the user the exact commands to run"
+        // was the sentence the model obeyed in the live A/B (verification.md
+        // A1–A3), reciting `teton provider add` in a session where the guided
+        // command exists. The ban on running them stays, imperative and
+        // outright (BUG-168); which command to hand over is step 1's job now.
+        const REFERRAL: &str = "You cannot run these commands yourself; hand them to the user.";
         for config in [HarnessConfig::default(), HarnessConfig::for_strong_model()] {
             let system = build_system_prompt(&ToolRegistry::with_builtins(), &config);
             let Some(line) = system
@@ -2377,10 +2381,17 @@ mod tests {
     /// lines could introduce.
     #[test]
     fn the_system_prompt_forbids_asking_for_a_credential_in_the_conversation() {
+        // The wording moved twice under REQ-579. The first draft named
+        // `/provider setup` here and left step 1 of the guide leading with
+        // `teton provider add`; the live A/B (verification.md, round A1–A3)
+        // showed the model following the numbered step, not this preamble —
+        // 0/3 hand-offs. The hand-off now lives INSIDE step 1 (the same fix
+        // REQ-577 needed), and this line is the shorter prohibition it was
+        // always meant to be. Its job is the ban and the three doors; the
+        // ordering claim is asserted on step 1 below.
         const PROHIBITION: &str =
-            "Never ask the user to type an API key or credential in chat: point them at \
-             `/provider setup <vendor> [tier]`, `teton provider add` in a shell, or \
-             `/web setup`, which read it echo-off into the keychain.";
+            "Never ask for an API key or credential in chat: `/provider setup`, \
+             `teton provider add` and `/web setup` read it echo-off into the keychain.";
         for config in [HarnessConfig::default(), HarnessConfig::for_strong_model()] {
             let system = build_system_prompt(&ToolRegistry::with_builtins(), &config);
             let Some(line) = system
@@ -2436,6 +2447,34 @@ mod tests {
                  tests: this line is resident in every turn."
             );
         }
+
+        // REQ-579 verification.md, rounds A1–A3: with the hand-off only in the
+        // preamble and step 1 leading with the shell command, the model followed
+        // the numbered step 3/3. The hand-off has to be the first thing step 1
+        // says, and the shell command has to be marked as the shell-only
+        // alternative — order inside the step is the assertion, exactly as it
+        // is for the prohibition line above.
+        let step_one = SELF_CONFIG_GUIDE
+            .lines()
+            .find(|line| line.starts_with("1. "))
+            .expect("the guide has a numbered step 1");
+        let guided = step_one
+            .find("/provider setup")
+            .expect("step 1 names `/provider setup`");
+        let shell = step_one
+            .find("teton provider add")
+            .expect("step 1 still names `teton provider add` — it is the shell path");
+        assert!(
+            guided < shell,
+            "step 1 leads with `teton provider add` again; the live A/B showed the model \
+             follows the numbered step, so the hand-off must come first (REQ-579 BR-1, \
+             verification.md A1–A3).\nstep 1: {step_one}"
+        );
+        assert!(
+            step_one.to_ascii_lowercase().contains("shell only"),
+            "step 1 no longer marks the CLI as the shell-only alternative, so a session \
+             reader has two equal instructions again.\nstep 1: {step_one}"
+        );
 
         // And the contradiction whole-line equality cannot catch, for the one
         // word that would carry it: nothing else in the guide talks about
