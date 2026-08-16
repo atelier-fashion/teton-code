@@ -4,7 +4,7 @@ title: "Guided in-session provider setup: `/provider setup` collects, the daemon
 status: approved
 deployable: true
 created: 2026-08-15
-updated: 2026-08-15
+updated: 2026-08-16
 component: "cli"
 domain: "providers"
 stack: ["rust", "cli", "daemon", "json-rpc", "keychain", "llm-providers"]
@@ -121,7 +121,7 @@ named `kimi` now exists.
 
 ## Business Rules
 
-- [ ] BR-1: **The model hands off; it does not collect.** When a turn asks to add, connect, register, or route to a remote provider, and a guided flow exists, the model's answer names `/provider setup <vendor>` (with the vendor id from the recipe catalog when it can tell which) rather than reciting `teton provider add …` / `teton policy set-tier …`. The CLI recipes remain the *non-interactive* answer and are named only when the surface is non-TTY (BR-11). *(informed by REQ-572, REQ-577)*
+- [ ] BR-1: **The session hands off; the model does not collect.** When a turn asks to add, connect, register, or route to a remote provider, and a guided flow exists, the *session's* answer names `/provider setup <vendor> [tier]` — by the model volunteering it (the resident guide says so first, ADR-3) **or, when the model recites `teton provider add …` / `teton policy set-tier …` instead, by the interactive surface appending one harness-voiced line naming the command** (ADR-9). The CLI recipes remain the *non-interactive* answer (BR-11). *(informed by REQ-572, REQ-577; amended after verification.md rounds 1–3 — the local model recited the CLI 9/9 across three guide revisions)*
 - [ ] BR-2: **The key never enters the transcript, model context, config, logs, events, or cost ledger.** It is read echo-off by the client, stored in the OS keychain, and only the reference travels to the daemon. The model learns that a provider with a given id exists — nothing else. *(informed by REQ-572, REQ-563)*
 - [ ] BR-3: **Collection at the edge, commitment at the core.** The client owns step state and asks the questions; the daemon is stateless across the flow and exposes `plan` / `preview` / `commit`. Preview returns the exact bytes; commit is keyed to that preview's digest and refuses if the candidate no longer matches. *(informed by REQ-572)*
 - [ ] BR-4: **The recipe catalog is served to the client from the daemon, from the same typed source the model reads.** No second copy in the CLI; the entry the client renders is the entry the model would have named. If the catalog and the model's inline guide can drift, a contract test pins them. *(informed by REQ-573, REQ-577, LESSON-517)*
@@ -139,7 +139,7 @@ named `kimi` now exists.
 
 ## Acceptance Criteria
 
-- [ ] AC-1: In an interactive session with no remote providers, "set up Kimi for deep reasoning" yields a model reply that names `/provider setup kimi` and does **not** contain `teton provider add` or `teton policy set-tier`. Verified live on the local tier (A/B against the pre-REQ binary, three rounds, recorded).
+- [ ] AC-1: In an interactive (TTY, typed-input) session with no remote providers, "set up Kimi for deep reasoning" leaves the user looking at `/provider setup <vendor> [tier]` on screen before the next prompt — either in the model's reply, or as the harness line the surface appends when the reply recited `teton provider add` / `teton policy set-tier`. The line is (a) printed at most once per turn, (b) never printed on a non-TTY surface (BR-11 already prints the recipe there), (c) never printed for the user's own typed text or for `/help` output — only for the model's reply. Deterministic; covered by a unit test over the render seam and a pty walk if the harness supports a scripted reply. The model-volunteers half is recorded live (verification.md, three rounds: 0/9) and is not what this AC's pass depends on.
 - [ ] AC-2: `/provider setup kimi` in a TTY session walks vendor → model (default `kimi-k3`, labeled example) → key (echo-off) → routing (default `think`) → preview → confirm, and on `y` the same session's next `think`-classified turn routes to `kimi`. No restart, no re-attach.
 - [ ] AC-3: `/provider setup` with no vendor lists every vendor in the catalog and accepts a selection by number or id.
 - [ ] AC-4: The key is absent from: the session transcript, every event payload, the daemon log, the cost ledger, and the written config. Asserted by inspection of the real artifacts, not by absence of error (LESSON-519). The config carries only `api_key = "keychain://…"`.

@@ -199,6 +199,32 @@ URL logic; `settle_endpoint`'s echo-before-key ordering is reused by making its
 pure core `pub(crate)`. LESSON-528/529 are the reason this is an ADR and not a
 note.
 
+### ADR-9 — The hand-off is guaranteed by the surface, not begged from the model (added after verification.md rounds 1–3)
+
+**Decision.** At the end of every typed-prompt turn on a TTY surface, if the
+model's reply text for that turn contains `teton provider add` or
+`teton policy set-tier`, the CLI appends exactly one `LineKind::Notice`:
+*"in this session, `/provider setup <vendor> [tier]` does this without leaving
+it — no key in chat."* Deterministic string match on the model's own output;
+zero model calls; visibly the harness's voice (`>>`), not the model's.
+
+**Why.** Three live rounds against the shipped local model (verification.md):
+hand-off in the preamble, hand-off inside the numbered step, and the competing
+recipe removed entirely — 0/9 replies volunteered the command, while the
+endpoint and model transferred exactly every time. The data crosses; the
+instruction does not, and round 3 showed that pushing further on the prompt
+regresses other behaviour (shell probes, doubled model calls, hallucinated
+command). REQ-572 already established that a dead-end is answered by the
+*product* naming the enablement path; this is that rule applied to a
+front-door answer the model got wrong. It fires only when the model reached
+for the CLI, so a session that never mentions providers never sees it, and a
+model that one day volunteers the command makes it dormant without a code
+change.
+
+**Cost.** One prose match on the model's output. Accepted: the strings matched
+are Teton's own command names, which the model can only have got from the
+guide, and a false positive costs one true sentence.
+
 ## Proposed additions to `.adlc/context/architecture.md`
 
 Under "Enablement is collection at the edge, commitment at the core", add one
