@@ -52,15 +52,17 @@
     "teton-code"
   ],
   "phase4": {
-    "currentTask": "TASK-158",
+    "currentTask": null,
     "completedTasks": [
       "TASK-152",
       "TASK-155",
       "TASK-153",
       "TASK-156",
       "TASK-154",
-      "TASK-157"
+      "TASK-157",
+      "TASK-158"
     ],
-    "failedTasks": []
+    "failedTasks": [],
+    "notes": "AC-1 unmet after 3 live rounds; paused for owner decision before closing Phase 4"
   }
 }
