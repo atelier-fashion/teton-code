@@ -31,9 +31,10 @@ use teton_protocol::events::{
     ModelSelectionProposed, PermissionOption, PermissionOptionKind, PermissionRequest,
     PhaseTransition, PrefixCache, PrefixCacheMiss, PrefixCacheOutcome, PrivacyAction, PrivacyBlock,
     ProvenanceRejected, ProvenanceRejection, ProviderDegraded, ProviderSetupCompleted,
-    ProviderSetupRejected, RouteDecided, SessionGrantMinted, SessionUpdatePayload, ToolCallStatus,
-    WebCapabilityState, WebConsentDecided, WebConsentScope, WebLookup, WebLookupKind,
-    WebLookupOutcome, WebSetupCompleted, WebSetupRejected, WebTier, OPTION_ID_ENABLE_PERMANENT,
+    ProviderSetupRejected, RouteDecided, SessionGrantMinted, SessionUpdatePayload, TierWarming,
+    ToolCallStatus, TurnQueued, WebCapabilityState, WebConsentDecided, WebConsentScope, WebLookup,
+    WebLookupKind, WebLookupOutcome, WebSetupCompleted, WebSetupRejected, WebTier,
+    OPTION_ID_ENABLE_PERMANENT,
 };
 use teton_protocol::methods::{
     AttachConsentOutcome, AttachConsentParams, PermissionOutcome, PermissionRespondParams,
@@ -671,7 +672,38 @@ pub fn render_event(
             }
             EventOutcome::Rendered
         }
+        // REQ-580 BR-2/BR-5: the user's message is being held for the local
+        // tier, and the screen would otherwise sit still until the tier opened.
+        // Never verbose-gated — this is the answer to "did my message go?" —
+        // and a notice rather than an error, the class of the startup lifecycle
+        // lines it continues (BUG-152's `TIER_WARMING` precedent): nothing
+        // broke, nothing needs fixing, and the state ends by itself.
+        Event::TurnQueued(queued) => {
+            surface.line(LineKind::Notice, &format_turn_queued(queued));
+            EventOutcome::Rendered
+        }
     }
+}
+
+/// The line a held turn renders (REQ-580 BR-5).
+///
+/// It says three things: the message is queued rather than lost or refused,
+/// what it is waiting on — the model by name, and *which* of its two transient
+/// states, branched on the event's typed value and never on a sentence — and
+/// that nothing more is asked of the user: the turn runs by itself when the
+/// tier opens. No countdown and no ETA (REQ-556 BR-5's rule, for the same
+/// reason: the load window publishes nothing to derive one from, and a figure
+/// would be fabricated). The lifecycle stream's own `benchmark` and `ready`
+/// lines follow this one as they happen, and then the reply.
+fn format_turn_queued(queued: &TurnQueued) -> String {
+    let doing = match queued.waiting_on {
+        TierWarming::Installing => "installing",
+        TierWarming::Loading => "loading",
+    };
+    format!(
+        "message queued until {} finishes {doing} — it will run as soon as the local tier opens.",
+        queued.model_id
+    )
 }
 
 /// The line a completed `/web setup` renders (REQ-572 BR-14, OQ-2).
@@ -3755,6 +3787,61 @@ mod tests {
             "{:?}",
             later.calls
         );
+    }
+
+    /// REQ-580 BR-5: a held turn renders as a **notice** — not an error, and
+    /// not verbose-gated — that says the message is queued, names the model,
+    /// says which of the two transient states it is waiting out (branched on
+    /// the typed value, so the two spellings differ exactly there), and
+    /// promises nothing more of the user. And it never invents an ETA.
+    #[test]
+    fn a_held_turn_renders_as_a_queued_notice_naming_the_model_and_the_wait() {
+        let queued = |waiting_on| {
+            envelope(Event::TurnQueued(TurnQueued {
+                turn_id: teton_protocol::TurnId::from("turn-3"),
+                model_id: "qwen3-coder-30b-a3b".to_owned(),
+                waiting_on,
+            }))
+        };
+
+        let mut state = SessionState::new();
+        assert!(!state.verbose, "the premise: a default, quiet session");
+        let mut surface = RecordingSurface::new();
+        render_event(&queued(TierWarming::Loading), &mut surface, &mut state);
+        assert!(
+            surface.lines_of(LineKind::Error).is_empty(),
+            "nothing broke, so nothing renders as an error: {:?}",
+            surface.calls
+        );
+        let notice = surface.lines_of(LineKind::Notice).join("\n");
+        assert!(notice.starts_with("message queued"), "{notice}");
+        assert!(
+            notice.contains("qwen3-coder-30b-a3b"),
+            "names the model: {notice}"
+        );
+        assert!(notice.contains("finishes loading"), "{notice}");
+        assert!(
+            notice.contains("as soon as the local tier opens"),
+            "says the turn runs by itself: {notice}"
+        );
+        assert!(
+            !notice.contains("retry") && !notice.contains("Retry"),
+            "a held turn asks nothing of the user: {notice}"
+        );
+        assert!(
+            !notice.contains("second") && !notice.contains("minute") && !notice.contains('%'),
+            "no countdown, no ETA, no percentage (REQ-556 BR-5's rule): {notice}"
+        );
+
+        let mut installing = RecordingSurface::new();
+        render_event(
+            &queued(TierWarming::Installing),
+            &mut installing,
+            &mut state,
+        );
+        let notice = installing.lines_of(LineKind::Notice).join("\n");
+        assert!(notice.contains("finishes installing"), "{notice}");
+        assert!(!notice.contains("finishes loading"), "{notice}");
     }
 
     // -----------------------------------------------------------------------

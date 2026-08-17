@@ -1430,3 +1430,71 @@ Approved change applied and live (no restart) : yes / no
 Cancelled change refused, config byte-identical (nothing written) : yes / no
 Notes / findings :
 ```
+
+# Manual verification runbook — REQ-580 (a prompt during the real load)
+
+**Status: OUTSTANDING.** REQ-580 holds a prompt that arrives while the local
+tier is still coming up and runs it the moment the tier opens, instead of
+refusing it with "retry in a moment". CI proves the whole arc on the real
+daemon binary — but only against the seam loader
+(`TETON_FAKE_ENGINE_LOADER` + `TETON_FAKE_ENGINE_LOADER_DELAY_MS`), whose
+"load" is a sleep. What no CI run exercises is the shape the report came from:
+a **real GGUF** deep-verifying, mapping and benchmarking on a **`--features
+llama` build**, with the user typing into that window. Leave this outstanding in
+`.adlc/specs/REQ-580-hold-turns-for-a-warming-local-tier/requirement.md` until a
+person runs the procedure below.
+
+## What this proves that CI does not
+
+That across a real multi-second load, the held turn's notice appears at once,
+the lifecycle's own `benchmark` and `ready` lines land under it as they happen,
+and the reply follows with **no retyping** — and that a Ctrl-C during the hold
+leaves no ghost turn behind (the next `teton` session's first prompt is not
+queued behind an abandoned one on the engine).
+
+## Procedure
+
+1. Build with the real engine: `cargo build --release --features tetond/llama`.
+   Confirm `TETON_TEST_SEAMS` is **unset**. Use a machine with a recorded
+   decision and verified weights (`teton model status` → `verified`), so the
+   daemon's start goes straight to the load.
+2. Stop any running daemon (`brew services stop teton` if it is the launchd
+   one), then start a fresh session: `teton`. Watch for
+   `local tier disabled: <model>'s weights are installed and verified; the
+   daemon is loading and benchmarking them now …`.
+3. **Immediately** type a prompt (`hi`) and press Enter — inside the load,
+   before `benchmark` prints. Expect, in order:
+   - `>> message queued until <model> finishes loading — it will run as soon
+     as the local tier opens.` (a notice, at once);
+   - `>> benchmark <model>: …` and `>> local model <model> ready` as the load
+     completes;
+   - the model's reply, with no second prompt from you.
+   The wait should be exactly the load's remaining time — no longer.
+4. Ctrl-D. Restart the daemon (so it loads again), start `teton`, type a
+   prompt inside the load window as in step 3, and while the `message queued`
+   notice is showing press **Ctrl-C**. Then start `teton` again and, once
+   `ready` has printed, type a prompt. Expect: it is served promptly, with no
+   sign of the abandoned prompt (no reply to `hi` streams into the new session,
+   and the new prompt is not delayed by a turn you did not send).
+5. Optional, remote-configured machine: with a remote provider bound as
+   `default_provider` and a category whose fallback is that provider, repeat
+   step 3. Expect **no** `message queued` — the turn routes to the remote
+   provider while the tier loads (REQ-547 D-3), exactly as before.
+
+## Sign-off
+
+```
+REQ-580 sign-off
+----------------
+Verified by      :
+Date             :
+Platform / OS    :               (e.g. macOS 26.6, Apple M-series)
+Build            :               (cargo build --release --features tetond/llama)
+TETON_TEST_SEAMS confirmed unset : yes / no
+Model / load duration observed :
+Step 3 — notice appeared at once, before `benchmark` : yes / no
+Step 3 — reply followed `ready` with no retyping : yes / no
+Step 4 — no ghost turn after Ctrl-C mid-hold : yes / no
+Step 5 (if run) — remote-bound turn was NOT held : yes / no / not run
+Notes / findings :
+```

@@ -222,6 +222,20 @@
   would be the drift risk — the crate's manifest states the widened
   consumer set, and the thin-client rule is preserved by the purity, not by
   the dependency direction (REQ-578 ADR-1).
+- **A transient refusal becomes a wait, at the classifier — not a retry, at
+  the client** — when a refusal's own code says "this ends by itself"
+  (BUG-152's `TIER_WARMING`), the daemon holds the request on the state
+  transition that ends it and announces the hold as a typed event, rather
+  than the client re-sending on a heuristic. The hold reads the *same* typed
+  classification the refusal renders (`LocalTierState`), sits before anything
+  the request would otherwise spend (tools, head, conversation, title claim),
+  wakes on every gate transition and re-reads rather than trusting the wake,
+  and ends early when the issuing client leaves — a held request has no
+  paid-for work to protect, unlike a started one (REQ-565's drain rule holds
+  past the hold). Corollary: a shared claim reused by two phases (the M-2
+  install claim, taken by both the download and the load) is read *with* the
+  state that tells the phases apart, or every reader calls the second phase
+  by the first one's name (REQ-580 ADR-1..4).
 
 ## ADRs
 

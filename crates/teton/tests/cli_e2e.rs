@@ -751,12 +751,14 @@ const TURN_REPLIES: &[&str] = &[
 /// absence of everything a turn produces. Which markers carry that weight
 /// depends on the session, and it is worth being exact about it:
 ///
-///   * [`TURN_REPLIES`], `prompt failed` and `model still loading` are the
-///     **load-bearing** guards in every session, quiet or verbose. A turn that
-///     the scripted engine served prints its reply; a turn the daemon refused
-///     prints the failure, or — when the local tier was still coming up
-///     (BUG-152) — the waiting notice that replaced it. One of the three
-///     happens for any line that reached `prompt/turn`.
+///   * [`TURN_REPLIES`], `prompt failed`, `model still loading` and
+///     `message queued` are the **load-bearing** guards in every session,
+///     quiet or verbose. A turn that the scripted engine served prints its
+///     reply; a turn the daemon refused prints the failure, or — when the
+///     local tier was still coming up (BUG-152) — the waiting notice that
+///     replaced it; a turn the daemon *held* for a warming tier (REQ-580)
+///     prints the queued notice before anything else. One of the four happens
+///     for any line that reached `prompt/turn`.
 ///   * `does not execute prompt turns yet` covers a daemon too old to run turns
 ///     at all — also unconditional.
 ///   * `route [` and `turn ended` only ever render in a **verbose** session
@@ -780,6 +782,10 @@ fn assert_no_turn_ran(output: &str, what: &str) {
         // the BUG-152 path renders this instead of `prompt failed`, and a guard
         // that only knew the old string would go quiet exactly there.
         "model still loading",
+        // The head of `session_ui`'s `turn_queued` notice (REQ-580): a turn the
+        // daemon held for a warming tier prints this before it prints anything
+        // else, and it may print nothing else for a while.
+        "message queued",
         "does not execute prompt turns yet",
     ] {
         assert!(

@@ -876,6 +876,171 @@ fn a_restart_with_verified_weights_and_a_loader_reopens_the_tier_without_repromp
 }
 
 // ===========================================================================
+// REQ-580 — a prompt that arrives while the tier is loading is held, not
+// refused: announced as `turn_queued`, then served the moment the tier opens.
+// ===========================================================================
+
+/// How long the seam loader is told to take, so the prompt below lands
+/// *inside* the load rather than racing it. Generous against a loaded runner:
+/// the client has to connect, create a session and send one frame in that
+/// window, which is milliseconds; the test then waits it out once.
+const HELD_LOAD_MS: u64 = 3_000;
+
+/// **BR-1 / BR-2 / BR-3 / AC-1, over the socket, on the real daemon.** The
+/// exact shape the report came from: a daemon starting with verified weights,
+/// a user typing before the load finishes. Before REQ-580 that prompt came back
+/// `TIER_WARMING` — "retry in a moment" — and the user retried it. Now:
+///
+/// 1. the daemon announces `turn_queued`, session-scoped, typed `loading`,
+///    naming the model — **before** the tier has opened;
+/// 2. the turn stays pending while the load runs;
+/// 3. `ready` arrives, and then the reply — served by the engine the loader
+///    committed, with the same `turn_id` the announcement named, and no
+///    second prompt from the client.
+///
+/// The load is the second run of a workspace whose first run accepted and
+/// installed (as `a_restart_with_verified_weights_…` does), so the startup
+/// flow finds a recorded decision and verified bytes and goes straight to the
+/// load — which the `TETON_FAKE_ENGINE_LOADER_DELAY_MS` seam stretches to
+/// [`HELD_LOAD_MS`].
+#[test]
+fn req580_a_prompt_during_the_load_is_held_and_served_when_the_tier_opens() {
+    let models = fixture_models();
+    let hf = MockHf::serving(&models);
+
+    let ws = Workspace::new("c-held-turn");
+    let catalog = ws.write_catalog(&fixture_catalog_toml(&models));
+    ws.write_config(&local_model_block(&hf.base_url(), false));
+
+    // First run: accept and reach `ready`, leaving verified weights and a
+    // recorded decision behind.
+    {
+        let daemon = Daemon::spawn(
+            &ws,
+            consent_env(&catalog).env("TETON_FAKE_ENGINE_LOADER", "1"),
+        );
+        let mut client = daemon.connect();
+        let id = client.await_pending_proposal(PROPOSAL_WINDOW);
+        client.confirm_model(&id, json!({ "outcome": "accept" }));
+        assert!(
+            wait_for_lifecycle(&mut client, "ready", None, INSTALL_WINDOW),
+            "the first run must reach `ready`; saw {:?} (reasons: {})",
+            lifecycle_stages(&client),
+            lifecycle_reasons(&client)
+        );
+    }
+
+    // Second run, slow load.
+    let daemon = Daemon::spawn(
+        &ws,
+        consent_env(&catalog)
+            .env("TETON_FAKE_ENGINE_LOADER", "1")
+            .env(
+                "TETON_FAKE_ENGINE_LOADER_DELAY_MS",
+                HELD_LOAD_MS.to_string(),
+            ),
+    );
+    let mut client = daemon.connect();
+
+    // The precondition, stated so a timing failure reads as one: at attach the
+    // replay says the tier is loading — the exact line the report's screen
+    // showed — and not `ready`.
+    assert!(
+        wait_for_replayed_lifecycle(
+            &mut client,
+            "disabled",
+            Some("loading and benchmarking"),
+            Duration::from_secs(5),
+        ),
+        "precondition: the tier must still be loading when the client attaches; \
+         saw {:?} (reasons: {})",
+        lifecycle_stages(&client),
+        lifecycle_reasons(&client)
+    );
+
+    let session = client.create_session("freeform", None);
+    let sent = client.prompt_no_wait(&session, "Classify the intent of this request.");
+
+    // 1. The hold is announced — session-scoped, typed, naming the model.
+    let queued = client
+        .wait_for_event("turn_queued", INSTALL_WINDOW)
+        .unwrap_or_else(|| {
+            panic!(
+                "a prompt during the load must be announced as held (turn_queued); \
+                 events so far: {:?}",
+                client
+                    .events()
+                    .iter()
+                    .map(|e| e["event"].clone())
+                    .collect::<Vec<_>>()
+            )
+        });
+    assert_eq!(
+        queued["session_id"].as_str(),
+        Some(session.as_str()),
+        "{queued}"
+    );
+    assert_eq!(queued["waiting_on"].as_str(), Some("loading"), "{queued}");
+    assert_eq!(
+        queued["model_id"].as_str(),
+        Some(models[0].name),
+        "the announcement names the model being loaded: {queued}"
+    );
+    let announced_turn = queued["turn_id"]
+        .as_str()
+        .expect("the announcement names its turn")
+        .to_owned();
+    // And it came BEFORE the tier opened: nothing this connection has seen yet
+    // says `ready`. The stream is per-connection ordered, so this is publish
+    // order — the hold was taken on a tier that was genuinely still loading.
+    assert!(
+        !lifecycle_stages(&client).contains(&"ready".to_owned()),
+        "the hold must be announced before the tier opens; saw {:?}",
+        lifecycle_stages(&client)
+    );
+
+    // 2./3. The reply arrives on its own — no second prompt — after `ready`,
+    // served by the committed engine, and it is the held turn's.
+    let turn = client.await_response(sent);
+    assert_eq!(
+        turn["result"]["stop_reason"].as_str(),
+        Some("end_turn"),
+        "the held turn must be served once the tier opens, not refused: {turn}"
+    );
+    assert_eq!(
+        turn["result"]["turn_id"].as_str(),
+        Some(announced_turn.as_str()),
+        "the reply is the announced turn's: {turn}"
+    );
+    assert!(
+        lifecycle_stages(&client).contains(&"ready".to_owned()),
+        "the reply followed the tier opening; saw {:?}",
+        lifecycle_stages(&client)
+    );
+    client.drain_events(Duration::from_millis(200));
+    assert!(
+        client
+            .events_named("route_decided")
+            .iter()
+            .any(|e| e["provider_id"].as_str() == Some("local")),
+        "the held turn must be routed to the local tier once it is up; events: {:?}",
+        client.events_named("route_decided")
+    );
+    let answer = agent_message_text(&client);
+    assert!(
+        answer.contains("via tiny-small"),
+        "the held turn must be served by the committed engine, which names its \
+         model in the reply; saw {answer:?}"
+    );
+    assert_eq!(
+        client.events_named("turn_queued").len(),
+        1,
+        "one hold, announced once: {:?}",
+        client.events_named("turn_queued")
+    );
+}
+
+// ===========================================================================
 // AC-3 — overriding installs the chosen entry; above the RAM floor needs two.
 // ===========================================================================
 
