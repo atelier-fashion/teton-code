@@ -365,7 +365,12 @@ pub fn render_event(
 ) -> EventOutcome {
     match &env.event {
         Event::SessionUpdate(su) => {
-            render_session_update(&su.update, surface, state);
+            // The envelope's session travels with the update because one thing
+            // downstream keeps a *record* of it rather than merely drawing it
+            // (the ADR-9 accumulator), and a record is where "whose session was
+            // this" starts to matter — the same reason `context_cleared` reads
+            // it below.
+            render_session_update(&su.update, env.session_id.as_ref(), surface, state);
             EventOutcome::Rendered
         }
         Event::RouteDecided(rd) => {
@@ -628,7 +633,10 @@ pub fn render_event(
         Event::ProviderSetupCompleted(completed) => {
             surface.line(
                 LineKind::Notice,
-                &format_provider_setup_completed(completed),
+                &format_provider_setup_completed(
+                    completed,
+                    other_session(state.session_id.as_ref(), env.session_id.as_ref()),
+                ),
             );
             EventOutcome::Rendered
         }
@@ -637,7 +645,13 @@ pub fn render_event(
         // and was refused. The user is the only one who can act on that, so it
         // is never verbose-gated either.
         Event::ProviderSetupRejected(rejected) => {
-            surface.line(LineKind::Notice, &format_provider_setup_rejected(rejected));
+            surface.line(
+                LineKind::Notice,
+                &format_provider_setup_rejected(
+                    rejected,
+                    other_session(state.session_id.as_ref(), env.session_id.as_ref()),
+                ),
+            );
             EventOutcome::Rendered
         }
         // Diagnostic chrome, and deliberately thin. The turn that dead-ended
@@ -702,16 +716,32 @@ fn format_web_setup_rejected(rejected: &WebSetupRejected) -> String {
 
 /// The line a completed `/provider setup` renders (REQ-579 BR-15).
 ///
-/// Three facts and no more: which id was registered, which model it is pinned
-/// to, and what now routes to it — including the honest "nothing yet" for the
-/// registered-but-unrouted outcome BR-7 permits, which a line that simply
-/// omitted the tiers would leave a user guessing about.
+/// Four facts and no more: which id was registered, which model it is pinned
+/// to, **where it will be dialed**, and what now routes to it — including the
+/// honest "nothing yet" for the registered-but-unrouted outcome BR-7 permits,
+/// which a line that simply omitted the tiers would leave a user guessing about.
 ///
-/// It names **no endpoint and no key reference**. The event carries neither
-/// (BR-2), and this notice reaches every session attached to the one that ran
-/// the walkthrough — the same audience reason `format_web_setup_completed` keeps
-/// the config path off screen.
-fn format_provider_setup_completed(completed: &ProviderSetupCompleted) -> String {
+/// The host is the fourth because the other three cannot answer the question a
+/// bystander actually has. "`kimi` registered; `think` now routes to it" names
+/// the id and never the destination, so a second client attached to this session
+/// — the audience this event exists for — watched routing move and could not
+/// tell where turns now go. It is the daemon's dial-time reading, a host and
+/// never the endpoint, so it carries no userinfo, path or query into a
+/// transcript (LESSON-529). Empty means an older daemon did not say, and the
+/// clause is dropped rather than rendered blank.
+///
+/// It still names **no key reference**. The event carries none (BR-2), and this
+/// notice reaches every session attached to the one that ran the walkthrough —
+/// the same audience reason `format_web_setup_completed` keeps the config path
+/// off screen.
+///
+/// `elsewhere` names the session when the registration was not this client's:
+/// the bus is daemon-wide, and "your session's routing just changed" and "some
+/// other session's did" are not the same news (`format_context_cleared`'s rule).
+fn format_provider_setup_completed(
+    completed: &ProviderSetupCompleted,
+    elsewhere: Option<&SessionId>,
+) -> String {
     let routing = if completed.bindings.is_empty() {
         "nothing routes to it yet".to_owned()
     } else {
@@ -722,8 +752,17 @@ fn format_provider_setup_completed(completed: &ProviderSetupCompleted) -> String
             .collect();
         format!("`{}` now routes to it", tiers.join("`, `"))
     };
+    let dialed = if completed.dial_host.is_empty() {
+        String::new()
+    } else {
+        format!(", dialed at `{}`", completed.dial_host)
+    };
+    let whose = match elsewhere {
+        Some(session) => format!(" in another session ({session})"),
+        None => String::new(),
+    };
     format!(
-        "provider `{}` registered (model `{}`) — {routing}.",
+        "provider `{}` registered{whose} (model `{}`{dialed}) — {routing}.",
         completed.provider_id, completed.model,
     )
 }
@@ -733,12 +772,28 @@ fn format_provider_setup_completed(completed: &ProviderSetupCompleted) -> String
 /// The daemon names the *method* and never the caller, and it is rendered rather
 /// than branched on. What this adds is the part the user cares about: nothing
 /// was written, and no key was stored.
-fn format_provider_setup_rejected(rejected: &ProviderSetupRejected) -> String {
-    format!(
-        "provider setup refused: something that is not this session's user tried to run `{}`, \
-         and was not allowed to. Nothing was written and no key was stored.",
-        rejected.method
-    )
+///
+/// `elsewhere` for [`format_provider_setup_completed`]'s reason, with a sharper
+/// edge: this line accuses something of trying to change the machine's
+/// configuration, and an unqualified copy of it on every attached client tells
+/// each of them that *their* session was the target.
+fn format_provider_setup_rejected(
+    rejected: &ProviderSetupRejected,
+    elsewhere: Option<&SessionId>,
+) -> String {
+    match elsewhere {
+        Some(session) => format!(
+            "provider setup refused in another session ({session}): something that is not that \
+             session's user tried to run `{}`, and was not allowed to. Nothing was written and no \
+             key was stored.",
+            rejected.method
+        ),
+        None => format!(
+            "provider setup refused: something that is not this session's user tried to run `{}`, \
+             and was not allowed to. Nothing was written and no key was stored.",
+            rejected.method
+        ),
+    }
 }
 
 /// The verbose line a capability dead end renders (REQ-572, architecture ADR-4).
@@ -1175,8 +1230,12 @@ pub(crate) fn web_tier_name(tier: WebTier) -> &'static str {
 }
 
 /// Render a streaming turn update.
+///
+/// `session` is the envelope's — whose turn this chunk belongs to. The bus is
+/// daemon-wide, so it is not necessarily this client's.
 fn render_session_update(
     update: &SessionUpdatePayload,
+    session: Option<&SessionId>,
     surface: &mut dyn Surface,
     state: &mut SessionState,
 ) {
@@ -1186,7 +1245,19 @@ fn render_session_update(
             // from the same chunk that reaches the screen, so what the hand-off
             // check reads is exactly what the user was shown — not a second
             // reading of the turn taken somewhere else.
-            state.turn_reply.push_str(text);
+            //
+            // ...but only for **this** session's turn. The accumulator is read
+            // once per typed prompt of ours, so a chunk from another session
+            // would not be a line drawn in the wrong place: it would be another
+            // session's words deciding whether our next prompt earns a notice,
+            // and words we never showed this user at that. `other_session`'s
+            // "unknown counts as ours" is deliberate and is the same reading
+            // `context_cleared` takes — a client that has not yet learned its
+            // own id has no evidence a chunk came from elsewhere, and the
+            // single-session case is the common one.
+            if other_session(state.session_id.as_ref(), session).is_none() {
+                state.turn_reply.push_str(text);
+            }
             surface.fragment(text);
         }
         SessionUpdatePayload::ToolCall {
@@ -1262,9 +1333,16 @@ const PROVIDER_CLI_RECIPES: [&str; 2] = ["teton provider add", "teton policy set
 
 /// The in-session command the hand-off names.
 ///
-/// Its presence anywhere in the reply makes the hand-off **dormant**: the model
-/// volunteered the command, so repeating it would be the harness talking over
-/// an answer that was already right (ADR-9).
+/// A reply that names it **and recites no shell recipe** makes the hand-off
+/// dormant: the model volunteered the command, so repeating it would be the
+/// harness talking over an answer that was already right (ADR-9).
+///
+/// The "and" is load-bearing, and was not there at first. Presence alone made
+/// the line suppressible by a reply that named the command *and* told the user
+/// to paste their key into the chat — one sentence that mentions
+/// `/provider setup` and the harness's only correction goes quiet, on the exact
+/// turn it is most needed. A reply that offers both paths has still pointed at
+/// the CLI and still earns the correction.
 const GUIDED_COMMAND: &str = "/provider setup";
 
 /// ADR-9's sentence, and the only thing this module prints for it.
@@ -1277,18 +1355,47 @@ const GUIDED_COMMAND: &str = "/provider setup";
 const HAND_OFF_LINE: &str =
     "in this session, /provider setup <vendor> [tier] does this without leaving it; no key in chat.";
 
-/// True when `reply` reached for one of the shell recipes.
+/// The reply with its markdown fences taken out.
 ///
-/// Backtick-agnostic, because a model that has read the guide reproduces the
-/// command inside markdown and does not always put the fence around the whole
-/// of it — `` `teton` provider add `` and `` `teton provider add` `` are the
-/// same answer, and only one of them survives a naive `contains`. Stripping the
-/// character is cheaper and more predictable than teaching the matcher markdown.
-pub(crate) fn recites_provider_cli(reply: &str) -> bool {
-    let plain: String = reply.chars().filter(|c| *c != '`').collect();
+/// A model that has read the guide reproduces the command inside markdown and
+/// does not always put the fence around the whole of it — `` `teton` provider
+/// add `` and `` `teton provider add` `` are the same answer, and only one of
+/// them survives a naive `contains`. Stripping the character is cheaper and
+/// more predictable than teaching the matcher markdown.
+///
+/// It exists as its own function because **both** halves of ADR-9's predicate
+/// have to be asked of the same characters. When only the recital half stripped
+/// backticks, `` `/provider setup` `` and `/provider setup` were two different
+/// answers to the dormancy question, which is precisely the kind of asymmetry
+/// nobody notices until a reply lands in the gap.
+fn without_backticks(text: &str) -> String {
+    text.chars().filter(|c| *c != '`').collect()
+}
+
+/// True when the reply reached for one of the shell recipes.
+///
+/// Takes text whose backticks are **already gone** — see [`without_backticks`]
+/// for why that is the caller's job and not this function's: the stripping
+/// happens once, above, so that this half and the dormancy half below cannot be
+/// asked about different characters.
+fn recites_provider_cli(plain: &str) -> bool {
     PROVIDER_CLI_RECIPES
         .iter()
         .any(|recipe| plain.contains(recipe))
+}
+
+/// ADR-9's predicate, over one backtick-stripped reading of the turn.
+///
+/// Stated as the ADR states it, in two named terms rather than as the one term
+/// they reduce to. The reduction is real — dormancy can only fire on a reply
+/// that recites nothing, and such a reply never passes `recites` — and that
+/// *is* the fix: dormancy is the complement of the recital, not a second,
+/// independent veto over it. Writing it out is what keeps a later edit to
+/// either half from restoring the veto by accident.
+fn earns_hand_off(plain: &str) -> bool {
+    let recites = recites_provider_cli(plain);
+    let dormant = plain.contains(GUIDED_COMMAND) && !recites;
+    recites && !dormant
 }
 
 /// The one sentence the hand-off prints.
@@ -1313,7 +1420,9 @@ pub(crate) fn hand_off_after_turn(state: &mut SessionState, surface: &mut dyn Su
     // this turn's words are finished with, and a `return` that left them behind
     // would hand them to the next turn.
     let reply = std::mem::take(&mut state.turn_reply);
-    if !tty || !recites_provider_cli(&reply) || reply.contains(GUIDED_COMMAND) {
+    // One reading of the turn, stripped once, asked twice — see
+    // [`without_backticks`].
+    if !tty || !earns_hand_off(&without_backticks(&reply)) {
         return;
     }
     surface.line(LineKind::Notice, hand_off_line());
@@ -3430,9 +3539,9 @@ mod tests {
     }
 
     /// REQ-579 BR-15's client leg: a committed registration is announced to
-    /// every session attached, naming the id, the model, and what now routes to
-    /// it — and naming neither the endpoint nor the key reference, neither of
-    /// which the event carries (BR-2).
+    /// every session attached, naming the id, the model, **where it will be
+    /// dialed**, and what now routes to it — and naming no key reference, which
+    /// the event does not carry (BR-2).
     #[test]
     fn a_completed_provider_setup_is_announced_with_what_now_routes_to_it() {
         let mut surface = RecordingSurface::new();
@@ -3447,6 +3556,7 @@ mod tests {
                     tier: Tier::Think,
                     provider_id: ProviderId::from("kimi"),
                 }],
+                dial_host: "api.moonshot.ai".to_owned(),
             })),
             &mut surface,
             &mut state,
@@ -3456,6 +3566,9 @@ mod tests {
         assert!(notice.contains("provider `kimi` registered"), "{notice}");
         assert!(notice.contains("`kimi-k2-turbo-preview`"), "{notice}");
         assert!(notice.contains("`think` now routes to it"), "{notice}");
+        // The destination, so a client that watched routing move under it can
+        // tell where turns now go (the audience this event exists for).
+        assert!(notice.contains("dialed at `api.moonshot.ai`"), "{notice}");
         assert!(
             surface.lines_of(LineKind::Error).is_empty(),
             "a registration is not an error"
@@ -3470,12 +3583,34 @@ mod tests {
                 kind: ProviderKind::OpenaiCompatible,
                 model: "kimi-k2-turbo-preview".to_owned(),
                 bindings: vec![],
+                dial_host: "api.moonshot.ai".to_owned(),
             })),
             &mut surface,
             &mut state,
         );
         let notice = surface.lines_of(LineKind::Notice).join("\n");
         assert!(notice.contains("nothing routes to it yet"), "{notice}");
+
+        // A daemon built before the field says nothing, and the line renders no
+        // empty clause for it.
+        let mut surface = RecordingSurface::new();
+        render_event(
+            &envelope(Event::ProviderSetupCompleted(ProviderSetupCompleted {
+                provider_id: ProviderId::from("kimi"),
+                kind: ProviderKind::OpenaiCompatible,
+                model: "kimi-k2-turbo-preview".to_owned(),
+                bindings: vec![],
+                dial_host: String::new(),
+            })),
+            &mut surface,
+            &mut state,
+        );
+        let notice = surface.lines_of(LineKind::Notice).join("\n");
+        assert!(
+            notice.contains("provider `kimi` registered (model `kimi-k2-turbo-preview`)"),
+            "{notice}"
+        );
+        assert!(!notice.contains("dialed at"), "{notice}");
     }
 
     /// REQ-579 BR-12's client leg: a refused commit is announced to the
@@ -3499,6 +3634,82 @@ mod tests {
         assert!(notice.contains("provider/setup_commit"), "{notice}");
         assert!(notice.contains("Nothing was written"), "{notice}");
         assert!(notice.contains("no key was stored"), "{notice}");
+        assert!(
+            !notice.contains("another session"),
+            "an unqualified event is this session's: {notice}"
+        );
+    }
+
+    /// The bus is daemon-wide, so both provider-setup notices say *whose*
+    /// session they are about when it is not this one.
+    ///
+    /// `context_cleared`'s rule, applied to the two events that change what the
+    /// machine will dial: an unqualified copy on every attached client tells
+    /// each of them that their own session's routing just moved, or that their
+    /// own session was the target of a refused write. Neither is a nuance the
+    /// reader can recover from the line.
+    #[test]
+    fn provider_setup_notices_name_the_other_session_when_it_is_not_ours() {
+        let mut state = SessionState::new();
+        state.session_id = Some(SessionId::from("ours"));
+        let theirs = |event| EventEnvelope::new(7, Some(SessionId::from("theirs")), event);
+
+        let mut surface = RecordingSurface::new();
+        render_event(
+            &theirs(Event::ProviderSetupCompleted(ProviderSetupCompleted {
+                provider_id: ProviderId::from("kimi"),
+                kind: ProviderKind::OpenaiCompatible,
+                model: "kimi-k3".to_owned(),
+                bindings: vec![TierBinding {
+                    tier: Tier::Think,
+                    provider_id: ProviderId::from("kimi"),
+                }],
+                dial_host: "api.moonshot.ai".to_owned(),
+            })),
+            &mut surface,
+            &mut state,
+        );
+        let notice = surface.lines_of(LineKind::Notice).join("\n");
+        assert!(notice.contains("in another session (theirs)"), "{notice}");
+        assert!(notice.contains("dialed at `api.moonshot.ai`"), "{notice}");
+
+        let mut surface = RecordingSurface::new();
+        render_event(
+            &theirs(Event::ProviderSetupRejected(ProviderSetupRejected {
+                method: "provider/setup_commit".to_owned(),
+            })),
+            &mut surface,
+            &mut state,
+        );
+        let notice = surface.lines_of(LineKind::Notice).join("\n");
+        assert!(
+            notice.contains("refused in another session (theirs)"),
+            "{notice}"
+        );
+        assert!(notice.contains("Nothing was written"), "{notice}");
+
+        // Our own session is unqualified — the qualification is news, and news
+        // on every line is noise.
+        let mut surface = RecordingSurface::new();
+        render_event(
+            &EventEnvelope::new(
+                8,
+                Some(SessionId::from("ours")),
+                Event::ProviderSetupRejected(ProviderSetupRejected {
+                    method: "provider/setup_commit".to_owned(),
+                }),
+            ),
+            &mut surface,
+            &mut state,
+        );
+        assert!(
+            !surface
+                .lines_of(LineKind::Notice)
+                .join("\n")
+                .contains("another session"),
+            "{:?}",
+            surface.calls
+        );
     }
 
     /// A dead end is chrome: the turn that hit it already said what it could not
@@ -3610,24 +3821,30 @@ mod tests {
         }
     }
 
-    /// The model volunteered the command, so the surface stays quiet.
+    /// The model volunteered the command **and nothing else**, so the surface
+    /// stays quiet.
     ///
     /// ADR-9's nudge exists because the model will not name `/provider setup`.
     /// A model that one day does makes it dormant with no code change, and this
     /// is the test that says so — repeating the command over an answer that was
     /// already right is the harness talking over the model.
     #[test]
-    fn a_reply_that_names_the_command_earns_nothing() {
+    fn a_reply_that_names_only_the_command_earns_nothing() {
         for (case, reply) in [
             (
                 "it named the command instead",
                 "run `/provider setup kimi think` and it will walk you through it.",
             ),
-            // Dormancy wins over recital: a reply that offers both paths has
-            // already told the user about the in-session one.
+            // Backtick-agnostic on this half too, since the verify pass: the
+            // dormancy question is asked of the same stripped characters the
+            // recital question is.
             (
-                "it offered both paths",
-                "in-session: `/provider setup kimi think`. From a shell: `teton provider add kimi`.",
+                "unfenced, as prose",
+                "type /provider setup kimi think at the prompt.",
+            ),
+            (
+                "fenced whole",
+                "type `/provider setup kimi think` at the prompt.",
             ),
         ] {
             let surface = hand_off_turn(&[reply], true);
@@ -3637,6 +3854,145 @@ mod tests {
                 surface.calls
             );
         }
+    }
+
+    /// **The dormancy hole.** A reply that names the command *and* recites the
+    /// CLI still earns the line.
+    ///
+    /// Naming `/provider setup` used to silence the harness outright, whatever
+    /// else the reply said — so one sentence containing the command was enough
+    /// to suppress the only line that says "no key in chat", on the exact turn a
+    /// reply was steering the user toward pasting one. A reply that offers both
+    /// paths has still pointed at the CLI, and the correction is still true.
+    #[test]
+    fn a_reply_that_names_the_command_but_still_recites_the_cli_earns_the_line() {
+        for (case, reply) in [
+            (
+                "it offered both paths",
+                "in-session: `/provider setup kimi think`. From a shell: `teton provider add kimi`.",
+            ),
+            // The shape the suppression was worth having: the command named as
+            // cover, and the actually-dangerous instruction alongside it.
+            (
+                "it named the command and then asked for the key in chat",
+                "you can use /provider setup, but it is easier if you paste your API key here and \
+                 I will run teton provider add kimi for you.",
+            ),
+        ] {
+            let surface = hand_off_turn(&[reply], true);
+            assert_eq!(
+                surface.lines_of(LineKind::Notice),
+                vec![hand_off_line()],
+                "{case}: {:?}",
+                surface.calls
+            );
+        }
+    }
+
+    /// Both halves of the predicate read the **same** characters.
+    ///
+    /// Before the verify pass the recital half stripped backticks and the
+    /// dormancy half did not, so `` `/provider setup` `` and `/provider setup`
+    /// were two different answers to one question. Fencing is a markdown
+    /// accident, and a matcher that treats it as meaning is a matcher whose
+    /// behaviour depends on how the model felt about code spans.
+    #[test]
+    fn dormancy_and_recital_read_the_same_backtick_stripped_text() {
+        // One reply, written four ways: fenced or not, on either half. Every
+        // spelling recites the CLI, so every spelling earns the line.
+        for reply in [
+            "use `/provider setup`, or run `teton provider add kimi`.",
+            "use /provider setup, or run teton provider add kimi.",
+            "use `/provider setup`, or run teton provider add kimi.",
+            "use /provider setup, or run `teton provider add kimi`.",
+            // And the fence landing mid-command, which is the case that made
+            // stripping necessary in the first place.
+            "use `/provider` setup, or run `teton` provider add kimi.",
+        ] {
+            let surface = hand_off_turn(&[reply], true);
+            assert_eq!(
+                surface.lines_of(LineKind::Notice),
+                vec![hand_off_line()],
+                "{reply:?} earned nothing; got {:?}",
+                surface.calls
+            );
+        }
+
+        // The dormant reply, likewise written both ways, earns nothing either
+        // way. Together the two loops are the symmetry claim: fencing changes
+        // no answer on either half.
+        for reply in [
+            "use `/provider setup` — it does the whole thing.",
+            "use /provider setup — it does the whole thing.",
+        ] {
+            let surface = hand_off_turn(&[reply], true);
+            assert!(
+                surface.lines_of(LineKind::Notice).is_empty(),
+                "{reply:?} must stay dormant; got {:?}",
+                surface.calls
+            );
+        }
+    }
+
+    /// The accumulator is fed by **this** session's chunks only.
+    ///
+    /// The bus is daemon-wide: every attached client receives every session's
+    /// updates. An accumulator that took them all would let another session's
+    /// turn decide whether this user's next prompt earns a notice — a line
+    /// drawn about words this user was never shown, and one that fires on a
+    /// prompt that reached for nothing.
+    #[test]
+    fn another_sessions_chunks_do_not_feed_the_hand_off() {
+        let recital = "run teton provider add kimi --kind openai-compatible.";
+        let elsewhere =
+            |text: &str| EventEnvelope::new(3, Some(SessionId::from("theirs")), chunk(text));
+
+        let mut surface = RecordingSurface::new();
+        let mut state = SessionState::new();
+        state.session_id = Some(SessionId::from("ours"));
+        state.begin_turn();
+        render_event(&elsewhere(recital), &mut surface, &mut state);
+        hand_off_after_turn(&mut state, &mut surface, true);
+        assert!(
+            surface.lines_of(LineKind::Notice).is_empty(),
+            "another session's reply may not arm this session's hand-off; got {:?}",
+            surface.calls
+        );
+
+        // The control, so this is a test about the *session* and not about the
+        // text: the same words on our own envelope do earn the line.
+        let mut surface = RecordingSurface::new();
+        state.begin_turn();
+        render_event(
+            &EventEnvelope::new(4, Some(SessionId::from("ours")), chunk(recital)),
+            &mut surface,
+            &mut state,
+        );
+        hand_off_after_turn(&mut state, &mut surface, true);
+        assert_eq!(
+            surface.lines_of(LineKind::Notice),
+            vec![hand_off_line()],
+            "{:?}",
+            surface.calls
+        );
+
+        // And an event that names no session, or a client that has not yet
+        // learned its own id, still counts as ours — `other_session`'s reading,
+        // and the one a single-session client depends on.
+        let mut surface = RecordingSurface::new();
+        state.begin_turn();
+        render_event(
+            &EventEnvelope::new(5, None, chunk(recital)),
+            &mut surface,
+            &mut state,
+        );
+        hand_off_after_turn(&mut state, &mut surface, true);
+        assert_eq!(
+            surface.lines_of(LineKind::Notice),
+            vec![hand_off_line()],
+            "{:?}",
+            surface.calls
+        );
     }
 
     /// A session that never reached for the CLI never sees the line.
@@ -3791,6 +4147,57 @@ mod tests {
             "only an assistant chunk may arm the hand-off; got {:?}",
             surface.calls
         );
+    }
+
+    /// **The recipes have to be real commands.** Each matched string is built
+    /// out of the CLI's own clap tree rather than compared against a second
+    /// hand-written copy of it.
+    ///
+    /// Without this the array is two literals with nothing tying them to
+    /// anything: rename `provider add`, and the hand-off quietly stops firing on
+    /// the recipe the model now recites, with every existing test still green
+    /// because they all feed it the same stale strings. Walking the tree makes
+    /// the rename fail here.
+    #[test]
+    fn every_matched_recipe_is_a_path_through_the_cli_itself() {
+        use clap::CommandFactory as _;
+
+        /// `teton provider add`, spelled by clap from the derive.
+        fn path(root: &clap::Command, steps: &[&str]) -> String {
+            let mut node = root;
+            let mut rendered = root.get_name().to_owned();
+            for step in steps {
+                node = node
+                    .get_subcommands()
+                    .find(|sub| sub.get_name() == *step)
+                    .unwrap_or_else(|| {
+                        panic!(
+                            "`{}` has no subcommand `{step}` — the recipe names a command this \
+                             binary does not have",
+                            node.get_name()
+                        )
+                    });
+                rendered.push(' ');
+                rendered.push_str(node.get_name());
+            }
+            rendered
+        }
+
+        let cli = crate::Cli::command();
+        assert_eq!(
+            PROVIDER_CLI_RECIPES.to_vec(),
+            vec![
+                path(&cli, &["provider", "add"]),
+                path(&cli, &["policy", "set-tier"]),
+            ],
+            "the strings the hand-off matches on are no longer the commands the CLI parses"
+        );
+
+        // The match is case-sensitive on purpose, and the tree agrees: these are
+        // typed in lowercase, so a capitalised prose mention is not a recipe.
+        for recipe in PROVIDER_CLI_RECIPES {
+            assert_eq!(recipe.to_ascii_lowercase(), recipe, "{recipe}");
+        }
     }
 
     /// The sentence itself: plain, imperative, and it names the command.

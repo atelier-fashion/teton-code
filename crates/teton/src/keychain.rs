@@ -146,6 +146,28 @@ pub trait Keychain {
     /// is a state, not a failure — the caller has nothing left to clean up) and
     /// a [`KeychainError::Backend`] when the store refuses the removal.
     fn delete(&self, account: &str) -> Result<(), KeychainError>;
+
+    /// Whether this platform has a credential store at all.
+    ///
+    /// A **platform** fact, not a health check: it answers "is there a backend
+    /// here", never "is the keychain currently unlocked". A locked or refusing
+    /// store is still available, and its failure is the caller's to report.
+    ///
+    /// It exists so a flow that is about to *ask a human for a secret* can find
+    /// out first. Every other way to learn this costs the user the question:
+    /// [`Self::store`] answers it only after the key has been typed, and
+    /// probing with a [`Self::read`] of some invented account would mean a
+    /// collection flow touching an entry that is not its own. A walkthrough
+    /// that asks for a credential and only then says it has nowhere to put it
+    /// is the dead end REQ-579's degradation rule exists to prevent
+    /// (requirement Assumptions): the honest answer is the out-of-band recipe,
+    /// printed before the first question.
+    ///
+    /// Defaulted to `true` because every backend that exists is a backend: only
+    /// [`UnsupportedKeychain`] — the platform that has none — overrides it.
+    fn is_available(&self) -> bool {
+        true
+    }
 }
 
 /// Returns the platform's default keychain implementation.
@@ -231,6 +253,12 @@ impl Keychain for UnsupportedKeychain {
 
     fn delete(&self, _account: &str) -> Result<(), KeychainError> {
         Err(KeychainError::Unsupported)
+    }
+
+    /// The one implementation that says no — this is the platform the flag
+    /// exists to name.
+    fn is_available(&self) -> bool {
+        false
     }
 }
 
@@ -370,12 +398,37 @@ pub(crate) struct MockKeychain {
     /// is about to displace must neither delete nor restore, and that third
     /// branch is only reachable through a read that fails.
     read_failure: std::cell::RefCell<Option<String>>,
+    /// When set, this mock stands in for [`UnsupportedKeychain`] — a platform
+    /// with no backend at all.
+    ///
+    /// Spelled as the *negative* so `Default` still produces the ordinary,
+    /// working store every other test wants.
+    ///
+    /// It exists because the real thing cannot be constructed here:
+    /// `UnsupportedKeychain` is `#[cfg(not(target_os = "macos"))]`, so on the
+    /// platform this project is developed and tested on, the no-keychain
+    /// degradation would otherwise be reachable only from CI on another target
+    /// — which is to say, not covered where it is written.
+    unavailable: bool,
 }
 
 #[cfg(test)]
 impl MockKeychain {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// A store that stands in for a platform with no keychain backend.
+    ///
+    /// Every operation fails with [`KeychainError::Unsupported`], exactly as
+    /// [`UnsupportedKeychain`]'s do — so a flow that ignored
+    /// [`Keychain::is_available`] and asked for a key anyway still cannot
+    /// pretend it stored one.
+    pub fn unavailable() -> Self {
+        Self {
+            unavailable: true,
+            ..Self::default()
+        }
     }
 
     /// Make every subsequent [`Keychain::delete`] fail with `message`.
@@ -409,6 +462,9 @@ impl MockKeychain {
 #[cfg(test)]
 impl Keychain for MockKeychain {
     fn store(&self, account: &str, secret: &str) -> Result<String, KeychainError> {
+        if self.unavailable {
+            return Err(KeychainError::Unsupported);
+        }
         self.entries
             .borrow_mut()
             .insert(account.to_owned(), secret.to_owned());
@@ -416,10 +472,17 @@ impl Keychain for MockKeychain {
     }
 
     fn read(&self, account: &str) -> Result<Option<String>, KeychainError> {
+        if self.unavailable {
+            return Err(KeychainError::Unsupported);
+        }
         if let Some(message) = self.read_failure.borrow().as_deref() {
             return Err(KeychainError::Backend(message.to_owned()));
         }
         Ok(self.entries.borrow().get(account).cloned())
+    }
+
+    fn is_available(&self) -> bool {
+        !self.unavailable
     }
 
     fn delete(&self, account: &str) -> Result<(), KeychainError> {
@@ -428,6 +491,9 @@ impl Keychain for MockKeychain {
         // distinguishes "the flow never tried" from "the flow tried and the
         // store said no".
         self.deletes.borrow_mut().push(account.to_owned());
+        if self.unavailable {
+            return Err(KeychainError::Unsupported);
+        }
         if let Some(message) = self.delete_failure.borrow().as_deref() {
             return Err(KeychainError::Backend(message.to_owned()));
         }
@@ -628,6 +694,39 @@ mod tests {
             kc.deletes(),
             vec!["web-search".to_owned()],
             "an attempted-and-refused delete is still an attempt"
+        );
+    }
+
+    /// Availability is a **platform** fact, and the mock's two constructors are
+    /// the two platforms: a store that works, and one that has no backend at
+    /// all. A locked store is still available — its failure is a different
+    /// event, and a flow that conflated them would print the out-of-band recipe
+    /// to a macOS user whose keychain was merely locked.
+    #[test]
+    fn an_unavailable_keychain_says_so_and_refuses_every_operation() {
+        let working = MockKeychain::new();
+        assert!(working.is_available());
+        working.fail_read_with("the keychain is locked");
+        working.fail_delete_with("the keychain is locked");
+        assert!(
+            working.is_available(),
+            "a store that refuses an operation still exists"
+        );
+
+        let none = MockKeychain::unavailable();
+        assert!(!none.is_available());
+        assert!(matches!(
+            none.store("kimi", "sk-typed-this-run"),
+            Err(KeychainError::Unsupported)
+        ));
+        assert!(matches!(none.read("kimi"), Err(KeychainError::Unsupported)));
+        assert!(matches!(
+            none.delete("kimi"),
+            Err(KeychainError::Unsupported)
+        ));
+        assert!(
+            none.is_empty(),
+            "a refused store keeps nothing, so a flow cannot believe it stored one"
         );
     }
 }

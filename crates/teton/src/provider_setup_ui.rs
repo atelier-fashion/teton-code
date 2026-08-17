@@ -122,6 +122,19 @@ const NOT_A_TERMINAL: &str =
     "`/provider setup` reads an API key without echoing it, which needs a terminal — this \
      session's input is not one, so nothing was read and nothing was changed.";
 
+/// What a session on a platform with **no OS keychain** is told, above the same
+/// recipe a non-TTY session gets (requirement Assumptions, BR-11).
+///
+/// The posture is inherited from `teton provider add`: this flow does not invent
+/// a fallback store, and it does not walk a user through five questions and a
+/// typed credential before admitting there is nowhere to put it. Availability is
+/// asked at the gate, next to the TTY question, because both are the same kind of
+/// fact — a property of the world this session is running in, known before the
+/// first prompt.
+const NO_KEYCHAIN: &str =
+    "`/provider setup` files the API key in your OS keychain, and this build has no keychain \
+     backend for this platform — so nothing was read and nothing was changed.";
+
 /// What the flow says when the daemon served an empty catalog.
 ///
 /// Structurally impossible per the protocol (`catalog` is required and the
@@ -363,10 +376,40 @@ pub(crate) fn drive(
         }
     };
 
-    if gate == Gate::Instructions {
-        io.surface().line(LineKind::Notice, NOT_A_TERMINAL);
+    // Two world-facts, one degradation. A session that cannot be asked a
+    // question and a platform with nowhere to put the answer both end in BR-11's
+    // recipe, and both are settled **here** — before a vendor menu, before a
+    // model, and above all before a credential is typed.
+    let degraded = if gate == Gate::Instructions {
+        Some(NOT_A_TERMINAL)
+    } else if keychain.is_available() {
+        None
+    } else {
+        Some(NO_KEYCHAIN)
+    };
+    if let Some(reason) = degraded {
+        io.surface().line(LineKind::Notice, reason);
+        // What was silently normalised on the way to the recipe, said out loud.
+        // The walk reports both of these (`unknown_vendor_line`,
+        // `unknown_tier_argument_line`) because the user is about to act on the
+        // answer; on this path they are about to *run* it, which is the stronger
+        // reason, not a weaker one.
+        for line in argument_notices(&plan, vendor_arg, tier_arg) {
+            io.surface().line(LineKind::Notice, &line);
+        }
         for line in instruction_lines(&plan.catalog, vendor_arg, tier_arg) {
             io.surface().line(LineKind::Info, &line);
+        }
+        // Last, because it corrects the line above it: the recipe says
+        // `teton provider add` files the key in the OS keychain, which is the
+        // one sentence in it that is not true here.
+        //
+        // Asked of the keychain rather than of `reason`, so a *piped* session on
+        // a platform with no backend gets the correction too. It reached this
+        // block by the other door, and the recipe it is being handed is just as
+        // wrong about where the key goes.
+        if !keychain.is_available() {
+            io.surface().line(LineKind::Notice, &out_of_band_key_line());
         }
         return Ok(());
     }
@@ -388,7 +431,7 @@ pub(crate) fn drive(
             return Ok(());
         }
     };
-    for line in render_preview(&preview) {
+    for line in render_preview(&preview, &answers.model) {
         io.surface().line(LineKind::Info, &line);
     }
     // The daemon's own sentences, rendered verbatim and in its own order —
@@ -447,8 +490,15 @@ pub(crate) fn drive(
             // that event does not carry — that the config was already exactly
             // this, and the remedy for the unrouted outcome.
             if !result.applied {
-                io.surface()
-                    .line(LineKind::Notice, &unchanged_line(&result.provider_id));
+                // The daemon publishes `provider_setup_completed` only for a
+                // commit that *changed* something, so on this path there is no
+                // event line naming the host — which makes this the one place
+                // the unchanged outcome can say where the registration that
+                // stands will be dialed.
+                io.surface().line(
+                    LineKind::Notice,
+                    &unchanged_line(&result.provider_id, &result.dial_host),
+                );
             }
             if result.bindings.is_empty() {
                 io.surface()
@@ -1077,7 +1127,13 @@ fn tier_names(tiers: &[Tier]) -> String {
 /// The daemon's `warnings` are deliberately not folded in here. They are its own
 /// sentences and ride the `Notice` class, which this `Vec<String>` cannot carry;
 /// [`drive`] renders them immediately after these lines, in the daemon's order.
-pub(crate) fn render_preview(preview: &ProviderSetupPreviewResult) -> Vec<String> {
+/// `model` is the candidate's — the one fact in the replace line that the
+/// preview result does not carry. The daemon reports what is being *replaced*
+/// (`replaces`), and AC-12 asks the user to be shown the transition, which is
+/// two models: the one on disk and the one they just typed. Passed in rather
+/// than parsed back out of `toml`, because reading the answer out of the bytes
+/// would be this file forming an opinion about the daemon's document.
+pub(crate) fn render_preview(preview: &ProviderSetupPreviewResult, model: &str) -> Vec<String> {
     let mut lines = vec!["this is what would be written to your config:".to_owned()];
     for line in preview.toml.lines() {
         lines.push(format!("  {line}"));
@@ -1087,14 +1143,36 @@ pub(crate) fn render_preview(preview: &ProviderSetupPreviewResult) -> Vec<String
         preview.dial_host
     ));
     if let Some(replaced) = &preview.replaces {
-        lines.push(format!(
-            "this replaces the provider already registered as `{}` (kind `{}`, model `{}`).",
-            replaced.id,
-            kind_flag(replaced.kind),
-            replaced.model.as_deref().unwrap_or("none"),
-        ));
+        lines.push(replace_line(replaced, model));
     }
     lines
+}
+
+/// AC-12's sentence: which provider is being replaced, and the model change it
+/// amounts to, old on the left.
+///
+/// The **transition** is the point. Rendering only the model already on disk
+/// left the user reading a line about the thing they were replacing with no
+/// statement of what it was becoming — the one number they are here to change,
+/// and the one a rotation gets wrong silently. The kind is deliberately not
+/// repeated: the previewed TOML directly above names the new one, and the
+/// early warning before the key prompt named the old one.
+///
+/// A prior registration with no model is a real state (a row written by hand),
+/// and `none → kimi-k3` reads as a model called "none", so it gets its own
+/// phrasing rather than a placeholder.
+fn replace_line(replaced: &ExistingProvider, model: &str) -> String {
+    match replaced.model.as_deref() {
+        Some(prior) => format!(
+            "this replaces existing provider `{}` (model `{prior}` → `{model}`).",
+            replaced.id
+        ),
+        None => format!(
+            "this replaces existing provider `{}`, which names no model, with one pinned to \
+             `{model}`.",
+            replaced.id
+        ),
+    }
 }
 
 /// One line for a call the daemon refused, carrying its own sentence.
@@ -1147,10 +1225,22 @@ fn cleanup_line(id: &str, cleanup: &Cleanup) -> String {
 /// "Nothing changed" is true of the config and **false of the keychain**: this
 /// run always stores a key, so a user rotating a credential against an otherwise
 /// identical registration would otherwise be told their rotation did not happen.
-fn unchanged_line(id: &ProviderId) -> String {
+///
+/// It names the host for a reason the applied path does not need: the daemon
+/// announces `provider_setup_completed` — the event that carries `dial_host` —
+/// only for a commit that changed something, so this is the sole line an
+/// unchanged commit prints and the only chance to say where the registration
+/// that stands will be dialed. Empty means an older daemon did not say, and the
+/// clause is dropped rather than rendered as a blank.
+fn unchanged_line(id: &ProviderId, dial_host: &str) -> String {
+    let dialed = if dial_host.is_empty() {
+        String::new()
+    } else {
+        format!(" (dialed at `{dial_host}`)")
+    };
     format!(
-        "`{id}` was already registered exactly this way, so your config is unchanged — the key in \
-         your keychain as `{id}` was updated to the one you just typed."
+        "`{id}` was already registered exactly this way{dialed}, so your config is unchanged — the \
+         key in your keychain as `{id}` was updated to the one you just typed."
     )
 }
 
@@ -1222,6 +1312,71 @@ pub(crate) fn instruction_lines(
         Resolution::Many(entries) => bare_recipe_lines(&entries, tier),
         Resolution::None => bare_recipe_lines(&catalog.iter().collect::<Vec<_>>(), tier),
     }
+}
+
+/// What the recipe quietly did with an argument it could not use (BR-11).
+///
+/// [`instruction_lines`] is total by construction: a vendor it cannot resolve
+/// becomes the whole catalog and a tier it does not recognise becomes `think`.
+/// Both are the right *output* and the wrong silence — the walk says each of
+/// these out loud before it acts on them, and a user who is about to paste a
+/// command has more need of the correction, not less, because nothing further
+/// will ask them to confirm.
+///
+/// Pure, and asked of the same authorities the recipe itself consults: the
+/// plan's catalog for the vendor, [`offered_tier_name`] for the tier.
+fn argument_notices(
+    plan: &ProviderSetupPlanResult,
+    vendor: Option<&str>,
+    tier: Option<&str>,
+) -> Vec<String> {
+    let mut lines = Vec::new();
+    if let Some(typed) = vendor.map(str::trim).filter(|typed| !typed.is_empty()) {
+        match resolve_vendor(&plan.catalog, Some(typed)) {
+            Resolution::One(_) => {}
+            // Both sentences end in "pick one from the list", and on this path
+            // the list is the recipe printed directly below — every vendor with
+            // its own runnable line.
+            Resolution::Many(_) => lines.push(ambiguous_vendor_line(typed)),
+            Resolution::None => lines.push(unknown_vendor_line(typed)),
+        }
+    }
+    if let Some(typed) = tier.map(str::trim).filter(|typed| !typed.is_empty()) {
+        let offered = offered_tier_name(tier);
+        if !typed.eq_ignore_ascii_case(offered) {
+            lines.push(unknown_tier_recipe_line(typed, offered));
+        }
+    }
+    lines
+}
+
+/// The tier notice for the recipe path.
+///
+/// Distinct from [`unknown_tier_argument_line`] in one respect that matters:
+/// there is no routing question here to offer a default *to*, so the sentence
+/// names the command the user is about to run instead of a prompt they will
+/// never see.
+fn unknown_tier_recipe_line(typed: &str, offered: &str) -> String {
+    format!(
+        "`{}` is not a tier, so the commands below route `{offered}` instead.",
+        crate::slash::echoed(typed)
+    )
+}
+
+/// The one line a platform with no keychain gets that a piped session does not:
+/// where the key goes instead (requirement Assumptions, BR-11).
+///
+/// The `env:<VAR>` form is not invented here — it is one of the three reference
+/// schemes `teton_core::is_recognized_auth_ref` accepts and `Config::validate`
+/// names in its own refusal, so a config written this way loads. The opening
+/// clause is [`crate::keychain::KeychainError::Unsupported`]'s own words rather
+/// than a second phrasing of them (LESSON-528).
+fn out_of_band_key_line() -> String {
+    format!(
+        "{}; supply the key out of band instead — put `auth_ref = \"env:<VAR>\"` on the provider \
+         in your config and export that variable in the daemon's environment.",
+        crate::keychain::KeychainError::Unsupported
+    )
 }
 
 /// The recipe list for a session that did not name one vendor: every entry's
@@ -1473,14 +1628,20 @@ mod tests {
             TierSummary {
                 tier: Tier::Scan,
                 provider_id: None,
+                fallback_id: None,
             },
+            // The one row with both a binding and a fallback — the shape the
+            // daemon now preserves across a re-bind, and therefore the shape a
+            // renderer has to survive being handed.
             TierSummary {
                 tier: Tier::Build,
                 provider_id: Some(ProviderId::from("opus")),
+                fallback_id: Some(ProviderId::from("deepseek")),
             },
             TierSummary {
                 tier: Tier::Think,
                 provider_id: None,
+                fallback_id: None,
             },
         ]
     }
@@ -1495,14 +1656,25 @@ mod tests {
         }
     }
 
+    /// The host the canned preview and commit both report — the dial-time
+    /// parser's reading, never the endpoint.
+    const DIAL_HOST: &str = "api.moonshot.ai";
+
+    /// The daemon's document, in the shape this project's config actually has:
+    /// a `[[providers]]` row keyed by `auth_ref`, and a `[[tiers]]` row with
+    /// `tier`/`provider_id`.
+    ///
+    /// It is rendered verbatim by [`render_preview`], so a fixture in a schema
+    /// the daemon does not write would put an invented config on screen in the
+    /// one test that claims to show the user what will be written.
     fn preview_result() -> ProviderSetupPreviewResult {
         ProviderSetupPreviewResult {
             toml: "[[providers]]\nid = \"kimi\"\nkind = \"openai-compatible\"\n\
                    endpoint = \"https://api.moonshot.ai/v1/chat/completions\"\n\
-                   model = \"kimi-k3\"\napi_key = \"keychain://teton/kimi\"\n\
-                   \n[policy.tiers.think]\nprovider = \"kimi\"\n"
+                   model = \"kimi-k3\"\nauth_ref = \"keychain://teton/kimi\"\n\
+                   \n[[tiers]]\ntier = \"think\"\nprovider_id = \"kimi\"\n"
                 .to_owned(),
-            dial_host: "api.moonshot.ai".to_owned(),
+            dial_host: DIAL_HOST.to_owned(),
             warnings: vec!["the price table does not know `kimi-k3`.".to_owned()],
             digest: PREVIEW_DIGEST.to_owned(),
             replaces: None,
@@ -1520,12 +1692,16 @@ mod tests {
                     provider_id: ProviderId::from("kimi"),
                 })
                 .collect(),
+            dial_host: DIAL_HOST.to_owned(),
         }
     }
 
+    /// The daemon's refusal at the validator, carrying the code it actually
+    /// answers with — a fixture that invented one would let a client that
+    /// branched on the wrong number keep passing.
     fn refusal() -> RpcError {
         RpcError {
-            code: -32011,
+            code: error_code::PROVIDER_SETUP_INVALID,
             message: "the candidate provider would not validate: `kimi` has no model".to_owned(),
             data: None,
         }
@@ -1737,7 +1913,7 @@ mod tests {
     /// sequence somewhere the sanitizer is not.
     #[test]
     fn nothing_this_module_composes_carries_an_escape_sequence() {
-        let mut composed: Vec<String> = render_preview(&preview_result());
+        let mut composed: Vec<String> = render_preview(&preview_result(), "kimi-k3");
         composed.extend(instruction_lines(
             &shipped_catalog(),
             Some("kimi"),
@@ -1746,8 +1922,10 @@ mod tests {
         composed.extend(instruction_lines(&shipped_catalog(), None, None));
         composed.extend(catalog_lines(&shipped_catalog().iter().collect::<Vec<_>>()));
         composed.extend(routing_lines(&fresh_plan(), "kimi", Tier::Think));
+        composed.extend(argument_notices(&fresh_plan(), Some("nope"), Some("nope")));
+        composed.push(out_of_band_key_line());
         composed.push(unrouted_line(&ProviderId::from("kimi")));
-        composed.push(unchanged_line(&ProviderId::from("kimi")));
+        composed.push(unchanged_line(&ProviderId::from("kimi"), DIAL_HOST));
         for line in composed {
             assert!(
                 !line.chars().any(|c| c.is_control()),
@@ -1766,17 +1944,65 @@ mod tests {
             kind: ProviderKind::OpenaiCompatible,
             model: Some("kimi-k2".to_owned()),
         });
-        let rendered = render_preview(&preview).join("\n");
+        let rendered = render_preview(&preview, "kimi-k3").join("\n");
         for line in preview.toml.lines().filter(|line| !line.is_empty()) {
             assert!(rendered.contains(line), "{rendered}");
         }
         assert!(rendered.contains("api.moonshot.ai"), "{rendered}");
         // BR-14: the replace is stated, never silent.
         assert!(
-            rendered.contains("replaces the provider already registered as `kimi`")
-                && rendered.contains("kimi-k2"),
+            rendered.contains("replaces existing provider `kimi`") && rendered.contains("kimi-k2"),
             "{rendered}"
         );
+    }
+
+    /// **AC-12's literal.** The replace line is the *transition*, old to new.
+    ///
+    /// Pinned as an exact string rather than by two `contains`: the criterion is
+    /// about what a user reads before they confirm a rotation, and "both model
+    /// names appear somewhere in the output" is satisfied by a line that says
+    /// neither which is which nor which direction it goes.
+    #[test]
+    fn the_replace_line_names_both_models_old_to_new() {
+        let mut preview = preview_result();
+        preview.replaces = Some(ExistingProvider {
+            id: ProviderId::from("kimi"),
+            kind: ProviderKind::OpenaiCompatible,
+            model: Some("kimi-k2".to_owned()),
+        });
+        let rendered = render_preview(&preview, "kimi-k3");
+        let expected = "this replaces existing provider `kimi` (model `kimi-k2` → `kimi-k3`).";
+        assert!(
+            rendered.iter().any(|line| line == expected),
+            "AC-12's line is not on screen: {rendered:#?}"
+        );
+
+        // The new model is the candidate's — the one the user just typed — and
+        // not whatever the daemon's document happens to spell, which is what a
+        // line built by parsing `toml` back out would have rendered.
+        let renamed = render_preview(&preview, "kimi-k3-turbo").join("\n");
+        assert!(
+            renamed.contains("(model `kimi-k2` → `kimi-k3-turbo`)"),
+            "{renamed}"
+        );
+
+        // A prior row with no model of its own is a real state, and `none →
+        // kimi-k3` would read as a model called "none".
+        preview.replaces = Some(ExistingProvider {
+            id: ProviderId::from("kimi"),
+            kind: ProviderKind::OpenaiCompatible,
+            model: None,
+        });
+        let modelless = render_preview(&preview, "kimi-k3").join("\n");
+        assert!(
+            modelless.contains("which names no model") && modelless.contains("`kimi-k3`"),
+            "{modelless}"
+        );
+        assert!(!modelless.contains("`none`"), "{modelless}");
+
+        // And a preview that replaces nothing says nothing about a replacement.
+        let fresh = render_preview(&preview_result(), "kimi-k3").join("\n");
+        assert!(!fresh.contains("replaces"), "{fresh}");
     }
 
     // -------------------------------------------------------------------
@@ -2060,6 +2286,103 @@ mod tests {
             "{rendered}"
         );
         assert!(!rendered.contains(PREVIOUS_KEY), "{rendered}");
+    }
+
+    /// AC-8's unhappy half, fresh key: the daemon refuses **and** the cleanup
+    /// the refusal triggers fails too.
+    ///
+    /// Both facts are the user's, and only the second comes with something they
+    /// can do about it: they are the only one who can remove an entry this
+    /// process could not, and an unreferenced credential they were never told
+    /// about is exactly the residue the store-late ordering exists to avoid.
+    #[test]
+    fn a_refused_commit_whose_own_cleanup_also_fails_reports_both_failures() {
+        let mut io = FakeIo::new(FULL_WALK);
+        io.commit = Err(refusal());
+        let keychain = MockKeychain::new();
+        keychain.fail_delete_with("the keychain is locked");
+
+        drive(
+            &mut io,
+            &keychain,
+            &session(),
+            Gate::Walk,
+            Some("kimi"),
+            Some("think"),
+        )
+        .unwrap();
+
+        // The attempt was made and refused, so the entry is still there — which
+        // is precisely why the user has to be told.
+        assert_eq!(keychain.deletes(), vec!["kimi".to_owned()]);
+        assert_eq!(keychain.stored_secret("kimi").as_deref(), Some(PLANTED_KEY));
+
+        let rendered = io.rendered();
+        assert!(
+            rendered.contains(&refusal().message),
+            "the daemon's own refusal must still reach the user: {rendered}"
+        );
+        assert!(
+            rendered.contains("could not be removed from your keychain")
+                && rendered.contains("the keychain is locked"),
+            "the cleanup failure must be reported, not swallowed: {rendered}"
+        );
+        assert!(
+            rendered.contains("security delete-generic-password -s teton -a kimi"),
+            "the user is the only one who can finish this, so they get the command and the \
+             account: {rendered}"
+        );
+        assert!(!rendered.contains(PLANTED_KEY), "{rendered}");
+    }
+
+    /// AC-8's unhappy half, rotation: the store could not find out what it was
+    /// displacing, so a refused commit does **neither** undo and says which two
+    /// it declined to guess between.
+    ///
+    /// A delete here might take out a credential the live config still uses, and
+    /// there is nothing to restore — so the entry stays, and the sentence that
+    /// says so carries the account and the command that shows what is in it.
+    #[test]
+    fn a_refused_commit_after_an_unreadable_keychain_leaves_the_entry_alone() {
+        let mut io = FakeIo::new(FULL_WALK);
+        io.commit = Err(refusal());
+        let keychain = MockKeychain::new();
+        keychain.store("kimi", PREVIOUS_KEY).unwrap();
+        keychain.fail_read_with("the keychain is locked");
+
+        drive(
+            &mut io,
+            &keychain,
+            &session(),
+            Gate::Walk,
+            Some("kimi"),
+            Some("think"),
+        )
+        .unwrap();
+
+        assert!(
+            keychain.deletes().is_empty(),
+            "a delete against an unknown prior state is the destructive guess"
+        );
+        assert_eq!(
+            keychain.stored_secret("kimi").as_deref(),
+            Some(PLANTED_KEY),
+            "the store still happened; it is the undo that was declined"
+        );
+
+        let rendered = io.rendered();
+        assert!(
+            rendered.contains("could not be read") && rendered.contains("the keychain is locked"),
+            "the reason must reach the user: {rendered}"
+        );
+        assert!(
+            rendered.contains("security find-generic-password -s teton -a kimi"),
+            "and so must the way to look, naming the account: {rendered}"
+        );
+        assert!(
+            !rendered.contains(PLANTED_KEY) && !rendered.contains(PREVIOUS_KEY),
+            "{rendered}"
+        );
     }
 
     /// BR-8's third state: a commit the daemon never answered licenses neither
@@ -2477,6 +2800,36 @@ mod tests {
             rendered.contains("was updated to the one you just typed"),
             "{rendered}"
         );
+        // The daemon announces a completed setup only when the commit *changed*
+        // something, so this line is the whole of what an unchanged commit
+        // prints — and the destination belongs in it.
+        assert!(
+            rendered.contains("(dialed at `api.moonshot.ai`)"),
+            "{rendered}"
+        );
+
+        // An older daemon that does not report a host renders no empty clause.
+        let mut io = FakeIo::new(FULL_WALK);
+        io.commit = Ok(ProviderSetupCommitResult {
+            dial_host: String::new(),
+            ..commit_result(false, &[Tier::Think])
+        });
+        let keychain = MockKeychain::new();
+        drive(
+            &mut io,
+            &keychain,
+            &session(),
+            Gate::Walk,
+            Some("kimi"),
+            Some("think"),
+        )
+        .unwrap();
+        let rendered = io.rendered();
+        assert!(
+            rendered.contains("already registered exactly this way, so your config is unchanged"),
+            "{rendered}"
+        );
+        assert!(!rendered.contains("dialed at"), "{rendered}");
     }
 
     /// BR-14's early warning: an id that already exists is named before a key is
@@ -2592,6 +2945,211 @@ mod tests {
             rendered.contains("teton policy set-tier think kimi"),
             "{rendered}"
         );
+    }
+
+    /// The recipe path normalises what it cannot use — and says so.
+    ///
+    /// A vendor that resolves to nothing becomes the whole catalog and a tier
+    /// that names no tier becomes `think`; both are the right commands and the
+    /// wrong silence, because the user is about to *run* the answer with nothing
+    /// further to confirm. The walk has always said both; this is the same two
+    /// sentences on the path that has no prompt.
+    #[test]
+    fn a_piped_session_is_told_what_its_arguments_were_read_as() {
+        let mut io = FakeIo::new(&[]);
+        let keychain = MockKeychain::new();
+        drive(
+            &mut io,
+            &keychain,
+            &session(),
+            Gate::Instructions,
+            Some("kimmi"),
+            Some("thonk"),
+        )
+        .unwrap();
+
+        let rendered = io.rendered();
+        assert_eq!(io.prompter.asked, 0);
+        assert!(
+            rendered.contains("`kimmi` is not a vendor this build knows"),
+            "{rendered}"
+        );
+        assert!(
+            rendered
+                .contains("`thonk` is not a tier, so the commands below route `think` instead."),
+            "{rendered}"
+        );
+        // Having said so, it still prints the recipe it settled on — every
+        // vendor, and `think` in the routing line.
+        assert!(
+            rendered.contains("teton provider add kimi")
+                && rendered.contains("teton provider add deepseek"),
+            "{rendered}"
+        );
+        assert!(
+            rendered.contains("teton policy set-tier think"),
+            "{rendered}"
+        );
+
+        // A spelling that answers to two entries is the third case, and it is
+        // reported rather than resolved to whichever came first.
+        let mut io = FakeIo::new(&[]);
+        io.plan = Ok(ProviderSetupPlanResult {
+            catalog: colliding_catalog(),
+            ..fresh_plan()
+        });
+        drive(
+            &mut io,
+            &keychain,
+            &session(),
+            Gate::Instructions,
+            Some("sentinel"),
+            Some("think"),
+        )
+        .unwrap();
+        assert!(
+            io.rendered()
+                .contains("`sentinel` names more than one vendor"),
+            "{}",
+            io.rendered()
+        );
+
+        // And arguments the recipe *can* use draw no correction at all, or the
+        // notice becomes noise on the path that prints it every time.
+        let mut io = FakeIo::new(&[]);
+        drive(
+            &mut io,
+            &keychain,
+            &session(),
+            Gate::Instructions,
+            Some("Moonshot/Kimi"),
+            Some("BUILD"),
+        )
+        .unwrap();
+        let rendered = io.rendered();
+        assert!(!rendered.contains("is not a tier"), "{rendered}");
+        assert!(!rendered.contains("is not a vendor"), "{rendered}");
+        assert!(
+            rendered.contains("teton policy set-tier build kimi"),
+            "{rendered}"
+        );
+    }
+
+    /// **The requirement's keychain-availability posture.** A platform with no
+    /// credential store is told so *before* the first question, gets the same
+    /// CLI recipe a pipe gets, and is told the one thing the recipe cannot be
+    /// true about: where the key goes instead.
+    ///
+    /// The order this is asked in is the whole fix. Availability was previously
+    /// discovered by `store` failing — which is after the vendor, the model, the
+    /// endpoint, the key and the confirm — so a Linux user typed a credential
+    /// into a flow that could never have kept it. Asked at the gate, the walk
+    /// never starts.
+    #[test]
+    fn a_platform_without_a_keychain_gets_the_recipe_and_the_env_form_and_is_asked_nothing() {
+        let mut io = FakeIo::new(FULL_WALK);
+        let keychain = MockKeychain::unavailable();
+        drive(
+            &mut io,
+            &keychain,
+            &session(),
+            // The walk gate: this session *is* a terminal. The degradation is
+            // the platform's, not the surface's.
+            Gate::Walk,
+            Some("kimi"),
+            Some("think"),
+        )
+        .unwrap();
+
+        assert_eq!(
+            io.prompter.asked, 0,
+            "no question may be put to a user whose answer has nowhere to go"
+        );
+        assert!(
+            io.prompter.secrets.is_empty(),
+            "and above all not the one that reads a credential"
+        );
+        assert!(io.previews.is_empty() && io.commits.is_empty());
+        assert!(keychain.is_empty() && keychain.deletes().is_empty());
+
+        let rendered = io.rendered();
+        assert!(rendered.contains(NO_KEYCHAIN), "{rendered}");
+        // BR-11's recipe, unchanged: the way this provider is registered on a
+        // machine like this one.
+        assert!(
+            rendered.contains(
+                "teton provider add kimi --kind openai-compatible --endpoint \
+                 https://api.moonshot.ai/v1/chat/completions --model kimi-k3"
+            ),
+            "{rendered}"
+        );
+        assert!(
+            rendered.contains("teton policy set-tier think kimi"),
+            "{rendered}"
+        );
+        // And the correction the recipe needs here, in the reference form the
+        // daemon's own validator accepts.
+        assert!(
+            rendered.contains("no OS keychain is available on this platform"),
+            "{rendered}"
+        );
+        assert!(
+            rendered.contains("auth_ref = \"env:<VAR>\""),
+            "the out-of-band form must be spelled the way a config file takes it: {rendered}"
+        );
+
+        // The gate is a gate, not a ceiling: an available keychain still walks.
+        let mut io = FakeIo::new(FULL_WALK);
+        let keychain = MockKeychain::new();
+        drive(
+            &mut io,
+            &keychain,
+            &session(),
+            Gate::Walk,
+            Some("kimi"),
+            Some("think"),
+        )
+        .unwrap();
+        assert_eq!(io.commits.len(), 1, "an available keychain still commits");
+        let rendered = io.rendered();
+        assert!(!rendered.contains(NO_KEYCHAIN));
+        assert!(
+            !rendered.contains("env:<VAR>"),
+            "a machine with a keychain is not told to work around one: {rendered}"
+        );
+
+        // A *piped* session on the same platform reaches the recipe by the other
+        // door and is just as badly served by a line promising the key goes in a
+        // keychain, so it gets the correction too.
+        let mut io = FakeIo::new(&[]);
+        let keychain = MockKeychain::unavailable();
+        drive(
+            &mut io,
+            &keychain,
+            &session(),
+            Gate::Instructions,
+            Some("kimi"),
+            Some("think"),
+        )
+        .unwrap();
+        let rendered = io.rendered();
+        assert!(rendered.contains(NOT_A_TERMINAL), "{rendered}");
+        assert!(rendered.contains("auth_ref = \"env:<VAR>\""), "{rendered}");
+
+        // And a piped session on a machine that *has* one is unchanged from
+        // before this fix — BR-11's output is a script's output.
+        let mut io = FakeIo::new(&[]);
+        let keychain = MockKeychain::new();
+        drive(
+            &mut io,
+            &keychain,
+            &session(),
+            Gate::Instructions,
+            Some("kimi"),
+            Some("think"),
+        )
+        .unwrap();
+        assert!(!io.rendered().contains("env:<VAR>"), "{}", io.rendered());
     }
 
     /// A daemon that predates the method says so and asks nothing, rather than

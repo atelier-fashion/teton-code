@@ -841,10 +841,23 @@ fn slash_help_lists_every_command_and_no_turn_is_attempted() {
             "/verbose",
             "Toggle the routing and turn-end notices for this session.",
         ),
-        // REQ-563's two web controls. A command a user cannot find in `/help`
-        // is a command they do not have (BUG-153), and `/web allow` is the only
-        // way out of a taint restriction — so its absence here would be a dead
-        // end, not just a discoverability gap.
+        (
+            "/effort",
+            "Show or set the global reasoning effort: /effort [low|medium|high|xhigh|max].",
+        ),
+        (
+            "/permissions",
+            "Show or set this session's permission level: /permissions [level].",
+        ),
+        // REQ-572's enablement walkthrough, and REQ-563's two web controls. A
+        // command a user cannot find in `/help` is a command they do not have
+        // (BUG-153), and `/web allow` is the only way out of a taint
+        // restriction — so its absence here would be a dead end, not just a
+        // discoverability gap.
+        (
+            "/web setup",
+            "Set up web lookup: pick a tier, name a backend, confirm before anything is written.",
+        ),
         (
             "/web allow",
             "Lift this session's web taint restriction (grants no new tier).",
@@ -852,6 +865,15 @@ fn slash_help_lists_every_command_and_no_turn_is_attempted() {
         (
             "/web refresh",
             "Drop a URL's cached copy so the next lookup re-fetches: /web refresh <url>.",
+        ),
+        // REQ-579 AC-14: `/help` lists `/provider setup` from the same table
+        // that dispatches it. The unit tests pin that the row is generated
+        // rather than hand-written; this pins that the **shipped binary** prints
+        // it, which is the half a user meets.
+        (
+            "/provider setup",
+            "Register a provider and route a tier to it: /provider setup [vendor] [tier] — \
+             confirm before anything is written.",
         ),
         ("/quit", "End the session, exactly as Ctrl-D does."),
     ] {
