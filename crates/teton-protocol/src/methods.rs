@@ -1987,9 +1987,15 @@ pub struct ProviderSetupPreviewResult {
     /// confirm step is the destination the request builder would actually
     /// reach, not a separately-parsed lookalike.
     ///
-    /// Carries the host alone — never userinfo, path, or query — for the reason
-    /// the whole web event family does: a pasted URL can carry a credential in
-    /// its authority, and a surface that echoed it back would put one on screen.
+    /// Carries the host, **plus `:port` when the endpoint states one
+    /// explicitly** — and never userinfo, path, or query. The exclusions are
+    /// the reason the whole web event family excludes them: a pasted URL can
+    /// carry a credential in its authority, and a surface that echoed it back
+    /// would put one on screen. The port is on the other side of that line
+    /// because it is destination and not secret — `evil.example:8443` rendered
+    /// as `evil.example` names a different socket in the familiar socket's
+    /// words. A scheme-default port is not "explicit" to the parser that dials,
+    /// so `https://x.example/` and `https://x.example:443/` render alike.
     pub dial_host: String,
     /// Non-fatal notes about the candidate — replacing an existing provider, a
     /// model the price table does not know, a cleartext endpoint.
@@ -2097,8 +2103,9 @@ pub struct ProviderSetupCommitResult {
     /// and never the destination, so a user who confirmed one host and had
     /// another written could not tell from the confirmation. Read off the
     /// derivation, **never** echoed from
-    /// [`ProviderSetupCandidate::endpoint`] — the host alone is userinfo-,
-    /// path- and query-free by construction, and the endpoint is not.
+    /// [`ProviderSetupCandidate::endpoint`] — this string is host, plus `:port`
+    /// when the endpoint states one explicitly, and never userinfo, path or
+    /// query, all by construction; the endpoint is none of those things.
     ///
     /// `#[serde(default)]` so a client built after this field still parses an
     /// older daemon's answer; empty then means "this daemon did not say", which

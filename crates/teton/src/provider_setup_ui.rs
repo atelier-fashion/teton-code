@@ -1061,9 +1061,18 @@ fn already_registered_line(existing: &ExistingProvider) -> String {
 fn routing_lines(plan: &ProviderSetupPlanResult, id: &str, default: Tier) -> Vec<String> {
     let mut lines = vec![format!("which tiers should route to `{id}`?")];
     for (index, summary) in plan.tiers.iter().enumerate() {
-        let bound = match &summary.provider_id {
-            Some(provider) => format!("now `{provider}`"),
-            None => "unbound".to_owned(),
+        // The fallback is rendered because the daemon now *carries* it across a
+        // re-bind (ADR-6, wave 1): a row this walk rewrites keeps the backup the
+        // user set with `--fallback`, and a menu that showed only the primary
+        // would let a user pick a tier without seeing the second half of the
+        // routing decision they are about to edit.
+        let bound = match (&summary.provider_id, &summary.fallback_id) {
+            (Some(provider), Some(fallback)) => {
+                format!("now `{provider}` (fallback `{fallback}`)")
+            }
+            (Some(provider), None) => format!("now `{provider}`"),
+            (None, Some(fallback)) => format!("unbound (fallback `{fallback}`)"),
+            (None, None) => "unbound".to_owned(),
         };
         let marker = if summary.tier == default {
             "  (Enter takes this one)"
@@ -1077,10 +1086,12 @@ fn routing_lines(plan: &ProviderSetupPlanResult, id: &str, default: Tier) -> Vec
         ));
     }
     // ADR-6: a fallback binding is a real capability and is not a sixth
-    // question, so the flow names where it lives instead of asking.
+    // question, so the flow names where it lives instead of asking — and says
+    // what happens to one that already exists, because "not asked" and "removed"
+    // are the two readings of silence and only one of them is true.
     lines.push(
         "  a backup provider is `teton policy set-tier <tier> <id> --fallback <other>`, and is \
-         not asked here."
+         not asked here — a fallback a tier already has is kept."
             .to_owned(),
     );
     lines
@@ -1934,6 +1945,61 @@ mod tests {
         }
     }
 
+    /// **The routing menu shows each tier's fallback, and says what happens to
+    /// it** (BR-7, ADR-6, REQ-579 verify wave 3 FIX 6).
+    ///
+    /// `TierSummary::fallback_id` reaches this client because the daemon now
+    /// *preserves* a fallback across a re-bind (wave 1). A menu that received
+    /// that fact and dropped it would ask the user to pick a tier while showing
+    /// half of the routing decision they are about to edit — and the ADR-6
+    /// sentence beneath it, which previously said only that fallbacks are "not
+    /// asked here", reads as "and are therefore removed" to anyone who has one.
+    ///
+    /// Every row shape the daemon can send is asserted, because they render
+    /// differently and only one of them is in the happy-path fixture.
+    #[test]
+    fn the_routing_menu_names_each_tiers_fallback_and_what_happens_to_it() {
+        let lines = routing_lines(&fresh_plan(), "kimi", Tier::Think).join("\n");
+
+        // Bound, with a fallback — the shape a re-bind carries across.
+        assert!(
+            lines.contains("build   now `opus` (fallback `deepseek`)"),
+            "{lines}"
+        );
+        // Unbound, no fallback: still just "unbound", with no empty parenthesis.
+        assert!(lines.contains("scan    unbound"), "{lines}");
+        assert!(!lines.contains("(fallback ``)"), "{lines}");
+        assert!(
+            lines.matches("fallback `").count() == 1,
+            "only the one row that has a fallback names one: {lines}"
+        );
+        // And the sentence under the menu says the fallback survives, rather
+        // than only that it is not asked about.
+        assert!(
+            lines.contains("--fallback <other>") && lines.contains("is kept"),
+            "the ADR-6 sentence must say a configured fallback survives: {lines}"
+        );
+
+        // The two remaining shapes, which the shipped fixture does not carry.
+        let mut plan = fresh_plan();
+        plan.tiers = vec![
+            TierSummary {
+                tier: Tier::Scan,
+                provider_id: None,
+                fallback_id: Some(ProviderId::from("local")),
+            },
+            TierSummary {
+                tier: Tier::Think,
+                provider_id: Some(ProviderId::from("kimi")),
+                fallback_id: None,
+            },
+        ];
+        let odd = routing_lines(&plan, "kimi", Tier::Think).join("\n");
+        assert!(odd.contains("scan    unbound (fallback `local`)"), "{odd}");
+        assert!(odd.contains("think   now `kimi`"), "{odd}");
+        assert!(!odd.contains("now `kimi` ("), "{odd}");
+    }
+
     /// The preview is the daemon's bytes and the daemon's host, laid out and
     /// otherwise untouched (BR-9, LESSON-529).
     #[test]
@@ -2069,8 +2135,13 @@ mod tests {
             assert!(rendered.contains(warning.as_str()), "{rendered}");
         }
         // BR-7: the routing question is asked against the truth the daemon
-        // reported, so a tier that already points somewhere says where.
-        assert!(rendered.contains("build   now `opus`"), "{rendered}");
+        // reported, so a tier that already points somewhere says where — both
+        // halves of where, since the daemon carries the fallback across a
+        // re-bind (ADR-6).
+        assert!(
+            rendered.contains("build   now `opus` (fallback `deepseek`)"),
+            "{rendered}"
+        );
         assert!(rendered.contains("Enter takes this one"), "{rendered}");
     }
 

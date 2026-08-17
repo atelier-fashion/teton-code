@@ -4699,7 +4699,15 @@ impl DaemonRuntime {
         // and *this flow's* reference, not any reference `Config::validate`
         // would take. See `keychain_auth_ref_for` for why this seam is the
         // narrow one.
-        let key_ref = candidate.key_ref.trim();
+        // Compared **untrimmed**. Trimming here would make
+        // `"keychain://teton/kimi "` equal to the expected form and then write
+        // the trimmed string — so the config would name a keychain row the
+        // client never stored under, and the first turn would fail to resolve a
+        // credential the user watched themselves type. The CLI composes this
+        // string from `keychain::auth_ref_for` and never emits surrounding
+        // whitespace, so there is no client whose legitimate answer this
+        // refuses; a reference with whitespace in it is a different reference.
+        let key_ref = candidate.key_ref.as_str();
         let expected_key_ref = keychain_auth_ref_for(id);
         if key_ref != expected_key_ref {
             return Err(RpcError::new(
@@ -4767,15 +4775,16 @@ impl DaemonRuntime {
         );
         for binding in &candidate.bindings {
             let tier = to_core_tier(binding.tier);
+            // Trimmed at the same seam the id and the model are: a binding
+            // naming ` kimi ` and one naming `kimi` are the same answer, and
+            // only one of them matches a provider row. (The credential
+            // reference above is deliberately *not* in this list — see there.)
+            let bound = binding.provider_id.0.trim();
             apply_update(
                 &mut config,
                 ConfigUpdate::SetTierBinding(TierBindingConfig {
                     tier: binding.tier,
-                    // Trimmed at the same seam the id, the model and the
-                    // credential reference are: a binding naming ` kimi ` and
-                    // one naming `kimi` are the same answer, and only one of
-                    // them matches a provider row.
-                    provider_id: ProviderId::from(binding.provider_id.0.trim()),
+                    provider_id: ProviderId::from(bound),
                     // ADR-6: v1 asks no fallback question, so it *contributes*
                     // none — but `SetTierBinding` replaces the whole row, so
                     // writing `None` here would DELETE a fallback the user
@@ -4783,11 +4792,25 @@ impl DaemonRuntime {
                     // never asked about. A question this flow does not ask is
                     // not an answer of "no": the row's own value is carried
                     // across the replace (BUG-155's class, at the tier table).
+                    //
+                    // Except when the fallback IS the new primary. Re-binding
+                    // `think` onto the provider that was its fallback would
+                    // otherwise carry that id into both columns, and a row whose
+                    // fallback is its own primary is not a backup — it is a
+                    // second attempt at the provider that just failed, written
+                    // by a flow that never asked. `Config::validate` accepts it
+                    // (it checks only that the id is registered), so nothing
+                    // downstream would report it. Dropped rather than kept,
+                    // because "carry the value the user set" and "the user set
+                    // this tier's backup to a provider it does not route to"
+                    // are the same instruction, and only one of them survives
+                    // the re-bind.
                     fallback_id: current
                         .tiers
                         .iter()
                         .find(|row| row.tier == tier)
                         .and_then(|row| row.fallback_id.as_deref())
+                        .filter(|fallback| *fallback != bound)
                         .map(ProviderId::from),
                 }),
             );
@@ -4812,7 +4835,13 @@ impl DaemonRuntime {
         // `reqwest::Url` reading the request builder and the egress origin check
         // make — so the string at the confirm step is the destination a turn
         // would actually reach, not a separately-parsed lookalike.
-        let Some(dial_host) = crate::web::canonical_host_of(&endpoint) else {
+        //
+        // The port-bearing sibling, not `canonical_host_of`: this string exists
+        // to tell a user which machine their API key is about to be sent to, and
+        // `https://evil.example:8443/…` rendered as `evil.example` is a
+        // different socket wearing the familiar name. The web gates keep the
+        // bare host, where the unit of consent is a domain.
+        let Some(dial_host) = crate::web::canonical_host_and_port_of(&endpoint) else {
             return Err(RpcError::new(
                 error_code::PROVIDER_SETUP_INVALID,
                 format!(
@@ -4849,7 +4878,15 @@ impl DaemonRuntime {
         // is the only case in which the document's own values reached neither
         // the derivation nor the answer.
         if edited.unchanged {
-            document_agrees_with_candidate(&edited.text, id, model, &endpoint, &bindings)?;
+            document_agrees_with_candidate(
+                &edited.text,
+                id,
+                candidate.kind,
+                model,
+                &endpoint,
+                key_ref,
+                &bindings,
+            )?;
         }
         let replaces = current
             .providers
@@ -6048,10 +6085,21 @@ fn config_drifted(what: String) -> RpcError {
 /// this flow is about are the derivation's own.
 ///
 /// The comparison is between **parsed configs**, never between the rendered text
-/// and the document's bytes: `model='kimi-k2'`, `model = "kimi-k2"` and an
-/// `anthropic` row with no `endpoint` key at all (the default [`Config::load`]
-/// fills) are the same configuration written three ways, and a byte comparison
-/// would refuse two of them for having been hand-authored.
+/// and the document's bytes: `model='kimi-k2'` and `model = "kimi-k2"` are one
+/// value written two ways, and an `anthropic` row with no `endpoint` key at all
+/// is compared against the endpoint [`compose_endpoint`] supplies for that kind
+/// — the same default the derivation itself ran through. A byte comparison would
+/// refuse all three for having been hand-authored.
+///
+/// **Every field the answer reports is compared**, not only the two the
+/// walkthrough asks about last. `auth_ref` and `kind` are on that list because a
+/// document that has drifted at either is a document this daemon would describe
+/// wrongly in the direction that matters: a `kimi` row whose credential the user
+/// hand-edited to `env:SOME_TOKEN` would be reported as registered under
+/// `keychain://teton/kimi` and then dialed with the *other* secret, and a row
+/// whose `kind` was hand-edited speaks a different request path than the
+/// preview's `[[providers]]` block says. Both are the confident-and-wrong answer
+/// the whole function exists to refuse.
 ///
 /// # Errors
 /// [`error_code::PROVIDER_SETUP_INVALID`] carrying [`config_drifted`]'s sentence
@@ -6062,8 +6110,10 @@ fn config_drifted(what: String) -> RpcError {
 fn document_agrees_with_candidate(
     document: &str,
     id: &str,
+    kind: ProtoProviderKind,
     model: &str,
     endpoint: &str,
+    key_ref: &str,
     bindings: &[WireTierBinding],
 ) -> Result<(), RpcError> {
     let on_disk = Config::load(document).map_err(|err| {
@@ -6079,7 +6129,18 @@ fn document_agrees_with_candidate(
         .ok_or_else(|| config_drifted(format!("`{id}` provider row")))?;
     // `declared_model` rather than the raw field, so a row carrying `model = " "`
     // is "has none" here exactly as it is everywhere else (BUG-155).
-    if row.declared_model() != Some(model) || row.endpoint.as_deref() != Some(endpoint) {
+    //
+    // `auth_ref` and `kind` are compared for the reason in the doc above: they
+    // are fields the answer *reports*, and a document that drifted at either
+    // would be described by a preview that read memory and a commit that said
+    // "already registered". The credential comparison is against the reference
+    // this seam already pinned to `keychain://teton/<id>`, so a `None` on disk
+    // and any other reference are both refusals.
+    if row.declared_model() != Some(model)
+        || row.endpoint.as_deref() != Some(endpoint)
+        || row.auth_ref.as_deref() != Some(key_ref)
+        || to_proto_kind(row.kind) != kind
+    {
         return Err(config_drifted(format!("`{id}` provider row")));
     }
     for binding in bindings {
@@ -6103,10 +6164,17 @@ fn document_agrees_with_candidate(
 /// daemon's [`crate::keychain`] resolves it back with the same service name. It
 /// is spelled once here because that constructor lives in the **binary** crate:
 /// a library may not depend on it, and inventing a second public home for one
-/// format string is a worse trade than one named constant with this comment. A
-/// change to the CLI's service name fails
-/// `a_raw_key_in_place_of_a_reference_is_refused_and_not_echoed` and the
-/// end-to-end flow, which is the coupling being relied on.
+/// format string is a worse trade than one named constant with this comment.
+///
+/// What catches a rename is therefore on the **CLI side**, not this one: this
+/// module's own tests would pass a daemon that had drifted away from the client,
+/// because they compose both halves from this constant. The pins are
+/// `keychain::auth_ref_matches_the_protocol_shape` (which asserts
+/// `auth_ref_for("anthropic") == "keychain://teton/anthropic"` against the
+/// literal) and `provider_setup_ui`'s `the_key_reaches_the_keychain_and_nothing_else`
+/// (which asserts the reference the walk puts on the wire is
+/// `keychain://teton/kimi`), plus `crates/tetond/tests/provider_setup_flow.rs`,
+/// where a real daemon is handed the literal a real client would send.
 const KEYCHAIN_AUTH_REF_PREFIX: &str = "keychain://teton/";
 
 /// The **one** credential reference `/provider setup` accepts for `id` — the
@@ -6130,9 +6198,31 @@ const KEYCHAIN_AUTH_REF_PREFIX: &str = "keychain://teton/";
 /// caller did not have to possess: `env:<a secret the daemon's environment
 /// holds>` resolves at dial time and is sent to the endpoint in the same
 /// candidate. Accepting only the row this flow itself writes makes that
-/// composition unexpressible rather than merely unlikely (BR-2, REQ-579 System
-/// Model: "a keychain reference only … the same account `teton provider add`
-/// uses").
+/// composition unexpressible **on this seam, for a reference the caller does not
+/// already own** (BR-2, REQ-579 System Model: "a keychain reference only … the
+/// same account `teton provider add` uses").
+///
+/// # What this does *not* close
+///
+/// The claim is deliberately narrow, because two neighbouring compositions
+/// survive it and a comment that said "unexpressible" would be read as covering
+/// them:
+///
+/// 1. **Redirecting a key the caller already has.** A commit naming an
+///    *already-registered* id with a new endpoint passes this rule — the
+///    reference is that id's own — and repoints the existing
+///    `keychain://teton/<id>` credential at the new host. That is a real
+///    capability of this flow, not a hole in it: it is how a user moves a
+///    provider to a new address. What makes it safe to allow is that it is
+///    **stated**: the preview carries `replaces` (the id, kind and prior model)
+///    and `dial_host` (the destination), the client renders both before the
+///    confirm, and the completion event repeats the host to every client on the
+///    session (BR-14, BR-15, AC-12).
+/// 2. **`config/set`.** [`ConfigUpdate::RegisterProvider`] over that method
+///    still admits every reference [`teton_core::is_recognized_auth_ref`] does,
+///    `env:` and `op://` included. That is pre-existing and out of this REQ's
+///    scope — it is REQ-576/BR-10(b) territory, where the presence gate on
+///    config writes lives.
 ///
 /// A user who *wants* `env:` for a provider still has `teton provider add` and
 /// their own config file. What they cannot do is reach them through a
@@ -20443,6 +20533,17 @@ fallback_id = \"local\"
                 "keychain://other/kimi",
                 "keychain://teton/otherid",
                 "",
+                // Whitespace around the reference. Refused rather than trimmed:
+                // trimming would accept this and then write
+                // `keychain://teton/kimi`, which is a keychain row the client
+                // did not store under — `keychain://teton/kimi ` is a
+                // *different account* to the store, so the credential the user
+                // watched themselves type would be unresolvable on the first
+                // turn. The CLI composes this string and emits no surrounding
+                // whitespace, so nothing legitimate is being refused.
+                "keychain://teton/kimi ",
+                " keychain://teton/kimi",
+                "keychain://teton/kimi\n",
             ] {
                 let err = refusal(
                     &runtime,
@@ -20482,17 +20583,16 @@ fallback_id = \"local\"
             // loop above refuses is the value and not the gate refusing
             // everything.
             assert_eq!(kimi().key_ref, "keychain://teton/kimi");
-            assert!(derive(&runtime, &kimi()).is_ok());
-            // And surrounding whitespace is trimmed rather than refused: a
-            // client that sent ` keychain://teton/kimi\n` sent this answer.
-            assert!(derive(
-                &runtime,
-                &ProviderSetupCandidate {
-                    key_ref: "  keychain://teton/kimi\n".to_owned(),
-                    ..kimi()
-                }
-            )
-            .is_ok());
+            let clean = derive(&runtime, &kimi()).expect("the exact reference is accepted");
+            // And the accepted reference reaches the document byte-for-byte —
+            // the other half of refusing the whitespace forms. A seam that
+            // trimmed would pass the refusals above *and* land a row naming an
+            // account the client never wrote to.
+            assert!(
+                clean.toml.contains(r#"auth_ref = "keychain://teton/kimi""#),
+                "the reference landed altered: {}",
+                clean.toml
+            );
         }
 
         /// **A remote provider with no model is refused before anything else
@@ -20837,6 +20937,250 @@ fallback_id = \"local\"
                 !healed.unchanged,
                 "and it really is a change to the document"
             );
+        }
+
+        /// **The drift comparison covers every field the answer reports — the
+        /// credential reference and the kind included** (REQ-574 BR-5/BR-6,
+        /// REQ-579 verify wave 3 FIX 1).
+        ///
+        /// `model` and `endpoint` are the two the walkthrough asks about last
+        /// and therefore the two a comparison naturally reaches for, and they
+        /// are not the two that matter most. The `auth_ref` case is the point:
+        /// the user hand-edits their `kimi` row's credential to a reference this
+        /// flow would never accept as an *answer* (`env:OTHER`) while the daemon
+        /// is running, then re-runs the walkthrough and answers exactly what
+        /// memory holds. The delta is empty, the document is untouched, and a
+        /// comparison that looked only at model and endpoint would report the
+        /// registration as already in place under `keychain://teton/kimi` — a
+        /// provider the daemon would then dial with a completely different
+        /// secret, on the one surface whose entire subject is which credential
+        /// goes where.
+        ///
+        /// The `kind` case is the same shape at the request path: a row
+        /// hand-edited to `anthropic` speaks a different wire protocol than the
+        /// `openai-compatible` block the preview would show.
+        ///
+        /// The non-vacuity control is the same file with nothing hand-edited:
+        /// it still derives, and still answers `unchanged: true`. Without it
+        /// this test would pass against a function that refused everything.
+        #[test]
+        fn a_row_whose_credential_or_kind_drifted_is_refused_rather_than_called_unchanged() {
+            // Exactly what memory holds — including the one tier row the
+            // fixture already has — so the delta names nothing at all and the
+            // document is the only thing that can disagree.
+            let as_memory_holds_it = || ProviderSetupCandidate {
+                model: "kimi-k2".to_owned(),
+                bindings: vec![WireTierBinding {
+                    tier: WireTier::Scan,
+                    provider_id: ProviderId::from("deepseek"),
+                }],
+                ..kimi()
+            };
+
+            // The control, first: an untouched file derives and is *unchanged*.
+            // Everything below differs from this by one hand edit.
+            let (clean, _clean_path) =
+                runtime_seeded("provider-setup-drift-control", SEEDED_WITH_KIMI);
+            let rendered =
+                derive(&clean, &as_memory_holds_it()).expect("the undrifted file describes itself");
+            assert!(
+                rendered.unchanged,
+                "non-vacuity: the same answers against an unedited file must \
+                 reach the `unchanged` branch, or nothing below is evidence:\n{}",
+                rendered.full_text
+            );
+
+            for (tag, hand_edit) in [
+                // A credential the walkthrough would refuse as an answer,
+                // reached by editing the file instead.
+                (
+                    "credential",
+                    SEEDED_WITH_KIMI.replace(
+                        "auth_ref = \"keychain://teton/kimi\"",
+                        "auth_ref = \"env:OTHER\"",
+                    ),
+                ),
+                // A different adapter behind the same id.
+                (
+                    "kind",
+                    SEEDED_WITH_KIMI.replacen(
+                        "id = \"kimi\"\nkind = \"openai-compatible\"",
+                        "id = \"kimi\"\nkind = \"anthropic\"",
+                        1,
+                    ),
+                ),
+            ] {
+                assert_ne!(
+                    hand_edit, SEEDED_WITH_KIMI,
+                    "the {tag} fixture must actually drift"
+                );
+                let (runtime, config_path) =
+                    runtime_seeded(&format!("provider-setup-drift-{tag}"), SEEDED_WITH_KIMI);
+                std::fs::write(&config_path, &hand_edit).expect("hand-edit the config");
+
+                let err = refusal(&runtime, &as_memory_holds_it());
+                assert_eq!(err.code, error_code::PROVIDER_SETUP_INVALID, "{tag}");
+                assert!(
+                    err.message.contains("kimi") && err.message.contains("hand-edited"),
+                    "the {tag} refusal must name the row and the cause: {}",
+                    err.message
+                );
+                assert!(
+                    !err.message.contains("env:OTHER"),
+                    "the refusal echoed the drifted credential reference: {}",
+                    err.message
+                );
+                // And the commit is refused by the same check, before it can
+                // answer `applied: false` about a file that says something else.
+                let commit_err = runtime
+                    .provider_setup_commit(&as_memory_holds_it(), None)
+                    .expect_err("a commit cannot call this configuration unchanged either");
+                assert_eq!(commit_err.code, error_code::PROVIDER_SETUP_INVALID, "{tag}");
+                assert_eq!(
+                    std::fs::read_to_string(&config_path).expect("read"),
+                    hand_edit,
+                    "a refused {tag} preview/commit wrote to the file"
+                );
+            }
+        }
+
+        /// **A tier's fallback that becomes its primary is dropped, not written
+        /// into both columns** (ADR-6, REQ-579 verify wave 3 FIX 2).
+        ///
+        /// The carried-fallback fix has a corner: `scan` falls back to `local`,
+        /// and the user then binds `scan` to `local`. Carrying the old value
+        /// unconditionally writes `provider_id = "local"` and
+        /// `fallback_id = "local"` — a backup that is a second attempt at the
+        /// provider that just failed. `Config::validate` accepts it (it checks
+        /// only that the id is registered), so nothing downstream reports it.
+        ///
+        /// The non-vacuity control is the neighbouring row: `think`'s fallback
+        /// is a *different* provider from what `think` is being bound to, and it
+        /// survives untouched in the same derivation. So this is a rule about
+        /// the two columns colliding, not a quiet return of the dropped-fallback
+        /// bug wave 1 fixed.
+        #[test]
+        fn a_fallback_that_becomes_the_primary_is_dropped_not_duplicated() {
+            let (runtime, _path) =
+                runtime_seeded("provider-setup-fallback-collision", SEEDED_WITH_FALLBACKS);
+
+            let rendered = derive(
+                &runtime,
+                &ProviderSetupCandidate {
+                    bindings: vec![
+                        // `scan` falls back to `local` in the fixture, and is
+                        // now bound to `local`.
+                        WireTierBinding {
+                            tier: WireTier::Scan,
+                            provider_id: ProviderId::from("local"),
+                        },
+                        // `think` falls back to `deepseek` and is bound to
+                        // `kimi` — the control.
+                        WireTierBinding {
+                            tier: WireTier::Think,
+                            provider_id: ProviderId::from("kimi"),
+                        },
+                    ],
+                    ..kimi()
+                },
+            )
+            .expect("previews");
+
+            let row = |tier: Tier| {
+                rendered
+                    .candidate_config
+                    .tiers
+                    .iter()
+                    .find(|row| row.tier == tier)
+                    .map(|row| (row.provider_id.as_str(), row.fallback_id.as_deref()))
+            };
+            assert_eq!(
+                row(Tier::Scan),
+                Some(("local", None)),
+                "the row names one provider twice"
+            );
+            assert_eq!(
+                row(Tier::Think),
+                Some(("kimi", Some("deepseek"))),
+                "non-vacuity: a fallback that is not the new primary is still carried"
+            );
+            assert!(
+                !rendered.full_text.contains("fallback_id = \"local\""),
+                "the collapsed fallback survived into the bytes:\n{}",
+                rendered.full_text
+            );
+            assert!(
+                rendered.full_text.contains("fallback_id = \"deepseek\""),
+                "and the untouched one did not survive:\n{}",
+                rendered.full_text
+            );
+        }
+
+        /// **An explicit port is part of the destination the confirm step
+        /// names** (BR-5, LESSON-529, REQ-579 verify wave 3 FIX 4).
+        ///
+        /// `dial_host` exists to tell a user which machine their API key is
+        /// about to be sent to. Rendering `https://evil.example:8443/…` as
+        /// `evil.example` answers that question with a *different socket* — one
+        /// a user reading the confirm step has no way to distinguish from the
+        /// service on 443. The port is the one piece of the authority that is
+        /// destination and not credential, so it travels and userinfo, path and
+        /// query still do not.
+        ///
+        /// The default-port control is what keeps this from being a cosmetic
+        /// change: the happy path still reads `api.moonshot.ai`, and every
+        /// surface pinned to that string stays pinned.
+        #[test]
+        fn an_explicit_port_travels_with_the_dial_host_and_a_default_one_does_not() {
+            let (runtime, _path) = runtime_seeded("provider-setup-port", SEEDED);
+            let on = |endpoint: &str| {
+                derive(
+                    &runtime,
+                    &ProviderSetupCandidate {
+                        endpoint: Some(endpoint.to_owned()),
+                        ..kimi()
+                    },
+                )
+                .unwrap_or_else(|err| panic!("`{endpoint}` previews: {}", err.message))
+                .dial_host
+            };
+
+            assert_eq!(
+                on("https://evil.example:8443/v1/chat/completions"),
+                "evil.example:8443"
+            );
+            // A credential in the authority does not join it — the port is the
+            // only part of the authority that is destination rather than secret.
+            assert_eq!(
+                on("https://tok@evil.example:8443/v1/chat/completions"),
+                "evil.example:8443"
+            );
+            // The control, and the string the happy path and the e2e suite pin:
+            // a scheme-default port is not explicit to the parser that dials.
+            assert_eq!(
+                on("https://api.moonshot.ai/v1/chat/completions"),
+                "api.moonshot.ai"
+            );
+            assert_eq!(
+                on("https://api.moonshot.ai:443/v1/chat/completions"),
+                "api.moonshot.ai"
+            );
+
+            // And it survives the wire projection and the commit, which is where
+            // a user actually reads it.
+            let candidate = ProviderSetupCandidate {
+                endpoint: Some("https://evil.example:8443/v1/chat/completions".to_owned()),
+                ..kimi()
+            };
+            let preview = runtime
+                .provider_setup_preview(&candidate)
+                .expect("the wire seam previews");
+            assert_eq!(preview.dial_host, "evil.example:8443");
+            let committed = runtime
+                .provider_setup_commit(&candidate, Some(&preview.digest))
+                .expect("the commit lands");
+            assert!(committed.applied);
+            assert_eq!(committed.dial_host, "evil.example:8443");
         }
 
         /// The wire projection is the derivation's own answer — nothing is

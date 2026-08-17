@@ -1075,3 +1075,107 @@ by finding so the document and the code move together.
   only; wave 2 makes the CLI render `(model kimi-k2 → kimi-k3)` so the AC's
   literal string is what the user sees and is pinned by a test. *Applied — see
   commit.* (§9's AC-12 row records the gap this closes.)
+
+**Wave 3 (re-verify residuals)**
+
+A re-verify pass over waves 1 and 2 — the fixes are read as new code, not as
+patches — returned six items. All six are applied, each with a test except the
+doc-only one.
+
+1. **Major — the drift comparison did not cover the credential or the kind.**
+   `document_agrees_with_candidate` (the `unchanged`-branch half of the
+   `DeltaBase::InMemory` drift refusal) compared `declared_model()` and
+   `endpoint` only. A user who hand-edits their `kimi` row's `auth_ref` to
+   `env:OTHER` while the daemon is running, then re-runs the walk and answers
+   what memory holds, got "already registered under `keychain://teton/kimi`"
+   about a row that would be dialed with a different secret — on the one surface
+   whose entire subject is which credential goes where. `auth_ref` and `kind`
+   now join the comparison, refusing through the existing `config_drifted`
+   sentence. Test:
+   `a_row_whose_credential_or_kind_drifted_is_refused_rather_than_called_unchanged`
+   (`crates/tetond/src/runtime.rs`), with the non-vacuity control an unedited
+   file that still derives `unchanged: true`.
+2. **Minor — a carried fallback could become its own primary.** Wave 1's
+   preservation copied the row's `fallback_id` unconditionally, so re-binding a
+   tier onto the provider that *was* its fallback wrote that id into both
+   columns — a backup that is a second attempt at the provider that just failed,
+   which `Config::validate` accepts (it checks only that the id is registered).
+   The carried value is now dropped when it equals the new `provider_id`. Test:
+   `a_fallback_that_becomes_the_primary_is_dropped_not_duplicated`, whose control
+   is the neighbouring row whose fallback is a different provider and survives.
+3. **Minor — `key_ref` was trimmed before it was compared.** `candidate.key_ref
+   .trim()` made `"keychain://teton/kimi "` equal to the expected form and then
+   wrote the *trimmed* string, so the config named a keychain account the client
+   never stored under and the first turn could not resolve the key the user had
+   just watched themselves type. Compared untrimmed now; the CLI composes this
+   string from `keychain::auth_ref_for` and emits no surrounding whitespace, so
+   no legitimate client answer is refused. Covered by the whitespace forms added
+   to `a_raw_key_in_place_of_a_reference_is_refused_and_not_echoed` (which
+   previously asserted the opposite).
+4. **Minor — `dial_host` dropped an explicit port.** `https://evil.example:8443/…`
+   previewed as `evil.example`: a different socket wearing the familiar
+   socket's name, on the string whose job is to say where the key is about to be
+   sent. Added `crate::web::canonical_host_and_port_of` as a **sibling** of
+   `canonical_host_of` rather than changing it — the web gates consent to a
+   *domain*, and adding a port there would make `example.com:8443` a second
+   allowlist entry a user who allowed `example.com` never wrote — and used the
+   sibling in `derive_provider_setup`. Userinfo, path and query are still
+   excluded; a scheme-default port is not explicit to the parser that dials, so
+   the happy path still reads `api.moonshot.ai` and the e2e pins are unchanged.
+   Field docs updated in `methods.rs` (both results) and `events.rs`. Tests:
+   `the_port_bearing_host_names_an_explicit_port_and_nothing_else`
+   (`crates/tetond/src/web/mod.rs`) and
+   `an_explicit_port_travels_with_the_dial_host_and_a_default_one_does_not`
+   (preview, wire projection and commit).
+5. **Doc corrections in `runtime.rs`** (no behaviour change, no test):
+   - `KEYCHAIN_AUTH_REF_PREFIX` claimed a CLI service rename would fail
+     `a_raw_key_in_place_of_a_reference_is_refused_and_not_echoed`. It would
+     not: that test composes both sides from this constant. The comment now
+     names the pins that *do* catch it —
+     `keychain::auth_ref_matches_the_protocol_shape`,
+     `provider_setup_ui`'s `the_key_reaches_the_keychain_and_nothing_else`, and
+     `crates/tetond/tests/provider_setup_flow.rs`, which now builds its request
+     and its file assertions from one `KIMI_AUTH_REF` const instead of two
+     literals.
+   - `keychain_auth_ref_for` said the attacker composition is now
+     "unexpressible". Narrowed to what is true: unexpressible **on this seam,
+     for a reference the caller does not already own**. A commit naming an
+     already-registered id with a new endpoint still redirects that id's
+     existing key — a real capability, made safe by being *stated* (`replaces`
+     and `dial_host` in the preview, `dial_host` again on the completion event)
+     — and `config/set` still admits `env:`/`op://` refs.
+   - `document_agrees_with_candidate` said the `anthropic` endpoint default is
+     one "the default `Config::load` fills". It is `compose_endpoint` that fills
+     it, on the derivation path. Reworded.
+6. **Nit — `TierSummary::fallback_id` arrived and was not rendered.** Wave 1
+   put the fallback on the wire; the CLI's routing menu showed only the primary,
+   so a user picked a tier while seeing half the routing decision they were
+   about to edit, under a sentence saying fallbacks are "not asked here" —
+   which reads as "and are therefore removed" to anyone who has one. The menu
+   now renders `` n) think   now `deepseek` (fallback `kimi`) `` and the ADR-6
+   sentence ends "— a fallback a tier already has is kept." Test:
+   `the_routing_menu_names_each_tiers_fallback_and_what_happens_to_it`, plus a
+   strengthened assertion in the full-walk drive test.
+
+### Residuals — accepted and recorded, not fixed
+
+Two findings from this pass are deliberately left standing. Recorded so a later
+reader knows they were seen and priced, rather than missed:
+
+- **`config/set` + `ConfigUpdate::RegisterProvider` still admits `env:` and
+  `op://` references.** The narrowing in wave 1 is a rule about *this* seam.
+  Anyone who can reach `config/set` can still register a provider whose
+  credential is an environment variable the daemon holds. This is **pre-existing
+  and out of REQ-579's scope**: it is the general question of who may author a
+  config write, which is REQ-576 / BR-10(b) territory (and per the standing note
+  on BR-10(b), the presence gate is inert on release builds, so that is where
+  the real fix has to land). REQ-579 does not widen it and does not close it.
+- **`recites_provider_cli` is an exact substring match.** The ADR-9 dormancy
+  predicate looks for the literal CLI recitation in the reply; a sentence-initial
+  `Teton provider add`, a doubled space, or a unicode lookalike evades it. Left
+  as-is because the failure mode is *the pre-fix baseline*: an evading reply
+  simply does not get the harness line, which is exactly where AC-1 stood before
+  ADR-9. It is not a bypass that gains an attacker anything either — a reply
+  that wants the key typed into chat has the strictly easier option of not
+  reciting the CLI at all, which no matcher can catch. Hardening the string
+  match would buy nothing against that.

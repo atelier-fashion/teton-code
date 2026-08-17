@@ -155,6 +155,18 @@ tier = \"scan\"
 provider_id = \"deepseek\"
 ";
 
+/// The credential reference the CLI half of this flow composes for `kimi` —
+/// `keychain::auth_ref_for("kimi")`, which is `keychain://teton/<id>`.
+///
+/// Spelled **once** for this suite, and deliberately: the daemon's own
+/// `KEYCHAIN_AUTH_REF_PREFIX` composes both sides of every in-crate test, so
+/// nothing in `crates/tetond` can notice the client and the daemon disagreeing
+/// about this string. This file is where a real daemon is handed the literal a
+/// real client would send, so one const here has to serve the request *and*
+/// every assertion about what landed in the file — otherwise a rename could
+/// still be "fixed" by editing one of two literals.
+const KIMI_AUTH_REF: &str = "keychain://teton/kimi";
+
 /// The REQ's own worked example, as the client would send it: the recipe's
 /// endpoint, a keychain **reference** (never a value, BR-2), and `think`.
 ///
@@ -166,9 +178,15 @@ fn kimi(model: &str) -> Value {
         "kind": "openai-compatible",
         "endpoint": "https://api.moonshot.ai/v1/chat/completions",
         "model": model,
-        "key_ref": "keychain://teton/kimi",
+        "key_ref": KIMI_AUTH_REF,
         "bindings": [{ "tier": "think", "provider_id": "kimi" }],
     })
+}
+
+/// The `auth_ref` line [`KIMI_AUTH_REF`] becomes in the document — the form the
+/// file assertions look for.
+fn kimi_auth_ref_line() -> String {
+    format!("auth_ref = \"{KIMI_AUTH_REF}\"")
 }
 
 /// `provider/setup_plan` for `session`.
@@ -316,11 +334,12 @@ fn the_committed_provider_routes_the_next_decision_in_the_same_session() {
     let toml = previewed["result"]["toml"]
         .as_str()
         .unwrap_or_else(|| panic!("the preview must render the candidate rows: {previewed}"));
+    let auth_ref_line = kimi_auth_ref_line();
     for needle in [
         "[[providers]]",
         "id = \"kimi\"",
         "model = \"kimi-k3\"",
-        "auth_ref = \"keychain://teton/kimi\"",
+        auth_ref_line.as_str(),
         "[[tiers]]",
         "tier = \"think\"",
         "provider_id = \"kimi\"",
@@ -387,9 +406,11 @@ fn the_committed_provider_routes_the_next_decision_in_the_same_session() {
         "the routing answer must land as a `[[tiers]]` row of its own:\n{written}"
     );
 
-    // (4) AC-4: a reference, and nothing a key could be hiding in.
+    // (4) AC-4: a reference, and nothing a key could be hiding in. The same
+    // const the request above carried, so this asserts the client's string
+    // reached the file rather than that two literals agree.
     assert!(
-        written.contains("auth_ref = \"keychain://teton/kimi\""),
+        written.contains(&auth_ref_line),
         "AC-4: the config carries only the keychain reference:\n{written}"
     );
     assert!(
@@ -691,6 +712,13 @@ fn a_commit_from_a_connection_that_did_not_open_the_session_is_refused_and_the_s
 #[test]
 fn a_replacement_is_previewed_as_one_and_leaves_every_other_byte_alone() {
     let ws = Workspace::new("provider-setup-replace");
+    // The fixture's own `kimi` row carries the reference the client sends, tied
+    // to the one const rather than retyped: a replace that registered a *second*
+    // credential would still pass every byte assertion below.
+    assert!(
+        SEEDED_WITH_KIMI.contains(&kimi_auth_ref_line()),
+        "the seed's `kimi` row must name `{KIMI_AUTH_REF}`"
+    );
     ws.write_config(SEEDED_WITH_KIMI);
     let script = ws.write_script(NO_TURNS);
     let daemon = Daemon::spawn(&ws, probe().script(script));

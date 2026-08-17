@@ -1660,7 +1660,8 @@ pub struct WebSetupRejected {
 /// rule and not a softening of it: a host is not an endpoint. It is read from
 /// the parser that dials, so it carries no userinfo, no path and no query by
 /// construction (LESSON-529) — which is exactly why the *endpoint* may not
-/// travel here and the host may.
+/// travel here and the host may. An explicit `:port` rides with it, being part
+/// of the destination rather than part of what a credential could hide in.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ProviderSetupCompleted {
     /// The id now registered — the one fact the model legitimately learns from
@@ -1685,8 +1686,11 @@ pub struct ProviderSetupCompleted {
     /// The announcement is otherwise silent about where turns will now go: a
     /// second client attached to this session watched routing move under it
     /// (the reason this event exists at all) and is owed the destination, not
-    /// only the id. A host and never the endpoint, for the type's own reason
-    /// above.
+    /// only the id. Host, plus `:port` when the endpoint states one explicitly;
+    /// never userinfo, path or query — and never the endpoint, for the type's
+    /// own reason above. The port is on the destination side of that line: a
+    /// registration on `:8443` announced as the bare host names a different
+    /// socket in the familiar socket's words.
     ///
     /// `#[serde(default)]` so a client built after this field still reads an
     /// older daemon's frame; empty means "this daemon did not say".
