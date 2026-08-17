@@ -1,7 +1,7 @@
 ---
 id: ASSUME-008
 title: "Front-door setup questions reach the docs tool when the guide thins"
-status: open
+status: invalidated
 component: "tetond/harness"
 domain: "harness"
 made_during: REQ-577

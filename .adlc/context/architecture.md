@@ -164,7 +164,15 @@
   confirmed is what is written, and the commit point is the config swap every
   consumer already reads per turn. Secrets are written by the surface that
   collected them, by reference everywhere else, with a displaced-state-aware
-  undo (REQ-572 ADR-1/ADR-2/ADR-3, LESSON-514).
+  undo (REQ-572 ADR-1/ADR-2/ADR-3, LESSON-514). The pattern now has two
+  instances — `/web setup` (REQ-572) and `/provider setup` (REQ-579) — and a
+  third should be built by copying the trio, not by generalising `config/set`:
+  the preview-then-digest-bound-commit is what makes the flow safe, and
+  `config/set` has neither a preview nor a digest, and persists one update per
+  call, so a multi-row change through it is not atomic (REQ-579 ADR-1). When
+  the flow's success depends on the *model* saying something, guarantee it at
+  the surface instead — a small local model transfers data reliably and
+  directives unreliably (REQ-579 ADR-9, LESSON-532).
 - **A pre-authorization publish is attacker-paced** — any event published
   before an authorization gate answers needs the caller-chosen-id length
   bound AND a per-connection budget, and read-only endpoints prefer silent
