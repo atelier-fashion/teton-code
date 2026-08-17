@@ -3,12 +3,13 @@
   "branch": "feat/REQ-579-guided-provider-setup",
   "startedAt": "2026-08-15T20:33:42Z",
   "completed": false,
-  "currentPhase": 4,
+  "currentPhase": 5,
   "completedPhases": [
     0,
     1,
     2,
-    3
+    3,
+    4
   ],
   "phaseHistory": [
     {
@@ -30,6 +31,11 @@
       "phase": 3,
       "name": "Validate Architecture & Tasks",
       "completedAt": "2026-08-15T20:43:59Z"
+    },
+    {
+      "phase": 4,
+      "name": "Implement",
+      "completedAt": "2026-08-17T00:03:09Z"
     }
   ],
   "integrationBranch": "main",
@@ -60,9 +66,10 @@
       "TASK-156",
       "TASK-154",
       "TASK-157",
-      "TASK-158"
+      "TASK-158",
+      "TASK-159"
     ],
     "failedTasks": [],
-    "notes": "AC-1 unmet after 3 live rounds; paused for owner decision before closing Phase 4"
+    "notes": "8 tasks complete; AC-1 closed via ADR-9 surface nudge"
   }
 }

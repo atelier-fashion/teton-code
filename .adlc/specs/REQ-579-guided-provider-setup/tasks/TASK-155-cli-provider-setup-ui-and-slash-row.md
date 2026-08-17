@@ -1,7 +1,7 @@
 ---
 id: TASK-155
 title: "CLI: provider_setup_ui walkthrough + `provider setup` COMMANDS row"
-status: draft
+status: complete
 parent: REQ-579
 created: 2026-08-15
 updated: 2026-08-15

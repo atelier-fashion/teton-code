@@ -1,7 +1,7 @@
 ---
 id: TASK-154
 title: "Daemon: provider_setup_commit — one digest-bound write, live re-derive, presence gate, events"
-status: draft
+status: complete
 parent: REQ-579
 created: 2026-08-15
 updated: 2026-08-15

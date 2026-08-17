@@ -1,7 +1,7 @@
 ---
 id: TASK-158
 title: "Verification record: live A/B for the model hand-off (AC-1) + REQ verification.md"
-status: draft
+status: complete
 parent: REQ-579
 created: 2026-08-15
 updated: 2026-08-15

@@ -1,7 +1,7 @@
 ---
 id: TASK-159
 title: "CLI: append the /provider setup hand-off line when the model recites the CLI (ADR-9)"
-status: draft
+status: complete
 parent: REQ-579
 created: 2026-08-16
 updated: 2026-08-16

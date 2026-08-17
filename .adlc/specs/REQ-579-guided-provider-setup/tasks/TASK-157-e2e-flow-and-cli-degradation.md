@@ -1,7 +1,7 @@
 ---
 id: TASK-157
 title: "E2E: provider_setup_flow.rs against a spawned daemon; CLI piped degradation"
-status: draft
+status: complete
 parent: REQ-579
 created: 2026-08-15
 updated: 2026-08-15
