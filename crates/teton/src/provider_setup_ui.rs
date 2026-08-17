@@ -1,8 +1,8 @@
 //! The `/provider setup` walkthrough — collect at the edge, commit at the core
 //! (REQ-579 ADR-1/ADR-3, mirroring REQ-572's `/web setup`).
 //!
-//! The daemon holds no step state. This module asks the four questions a
-//! provider registration needs — vendor, model, key, and which tier(s) to route
+//! The daemon holds no step state. This module asks the questions a provider
+//! registration needs — vendor, id, model, key, and which tier(s) to route
 //! — and the daemon answers three stateless RPCs: `provider/setup_plan`,
 //! `provider/setup_preview`, `provider/setup_commit`. Until the commit lands
 //! nothing durable exists anywhere (BR-8), so an abort is not an operation: it
@@ -636,6 +636,16 @@ const ENDPOINT_QUESTION_BARE: &str = "  endpoint [Enter to cancel]: ";
 /// The one confirmation, default-**no** (LESSON-470).
 const CONFIRM_QUESTION: &str = "  write this to your config? [y/N] ";
 
+/// The id question, naming the recipe's suggestion as what Enter takes.
+///
+/// The walk offered no way to type one before, so a machine that already held
+/// `kimi` could not register a second Moonshot provider without leaving the
+/// session — the id was the recipe's suggestion and the recipe has exactly one
+/// per vendor (owner decision after Phase 5).
+fn id_question(suggested: &str) -> String {
+    format!("  provider id [{suggested}]: ")
+}
+
 /// The model question, naming what Enter would take — and naming it as an
 /// *example* rather than a recommendation (BR-6).
 fn model_question(example: &str) -> String {
@@ -677,11 +687,18 @@ fn collect(
     tier_arg: Option<&str>,
 ) -> Option<Answers> {
     let entry = choose_vendor(plan, io, vendor_arg)?;
-    let id = entry.id_suggestion.clone();
     io.surface().line(LineKind::Info, &vendor_line(entry));
+    // Asked immediately after the vendor and before everything else, because
+    // every question below it is *about* this id: the model is pinned to it, the
+    // key prompt names the keychain account it will be filed under, and the
+    // routing menu asks which tiers should call it.
+    let id = choose_id(entry, io)?;
     // BR-14: an id that is already taken is said out loud *before* a key is
-    // typed for it. What actually changes is the daemon's `replaces`, shown at
-    // the preview — this is the early warning, not the authority.
+    // typed for it — and it keys off the id that was **chosen**, not the one the
+    // recipe suggested, or a user who typed over a colliding suggestion would be
+    // warned about a provider they are not replacing. What actually changes is
+    // the daemon's `replaces`, shown at the preview; this is the early warning,
+    // not the authority.
     if let Some(existing) = plan.existing.iter().find(|held| held.id.0 == id) {
         io.surface()
             .line(LineKind::Notice, &already_registered_line(existing));
@@ -700,7 +717,7 @@ fn collect(
     }
     let model = model.to_owned();
 
-    let endpoint = settle(entry, io)?;
+    let endpoint = settle(entry, &id, io)?;
 
     // REQ-578 BR-5 / AC-6: the composed URL has been echoed by `settle` above,
     // so what the user is about to type a key for is on screen first.
@@ -722,6 +739,79 @@ fn collect(
     })
 }
 
+/// Settle the id this registration lands under: the recipe's suggestion, or
+/// whatever the user typed over it (owner decision after Phase 5).
+///
+/// **The typed answer is trimmed exactly once, here**, and every downstream use
+/// — the keychain account, `candidate.id`, and the `key_ref` [`Answers::key_ref`]
+/// composes — reads that one string. The daemon's `derive_provider_setup` trims
+/// `candidate.id` and then compares `key_ref` against
+/// `keychain://teton/<trimmed id>` **untrimmed**, on purpose: a reference with
+/// whitespace in it is a different reference. So an id trimmed on one side of
+/// this flow and not the other composes a credential reference the daemon
+/// refuses — and would, if it did not, name a keychain row nothing stored.
+///
+/// Returns `None` for a cancel and for an id that cannot be one, which is the
+/// same shape every other question's refusal has here: the sentence is rendered
+/// where the rule lives, and the caller reports that nothing was written.
+fn choose_id(entry: &ProviderRecipeEntry, io: &mut dyn SetupIo) -> Option<String> {
+    let typed = io.prompter().ask(&id_question(&entry.id_suggestion))?;
+    // Empty is an answer — "take what was offered" — and the question says so by
+    // naming the suggestion in the brackets.
+    let chosen = match typed.trim() {
+        "" => entry.id_suggestion.trim(),
+        answered => answered,
+    };
+    // A blank *default* is a daemon that served a recipe with no suggestion,
+    // not a user's answer: there is nothing to quote back, so this ends the walk
+    // silently the way the model question's empty case does.
+    if chosen.is_empty() {
+        return None;
+    }
+    if !is_usable_id(chosen) {
+        io.surface()
+            .line(LineKind::Error, &unusable_id_line(chosen));
+        return None;
+    }
+    Some(chosen.to_owned())
+}
+
+/// Whether a typed id can be all three of the things this flow makes it.
+///
+/// `teton provider add <id>` exports no predicate to call: its `<id>` is a bare
+/// `String` clap hands straight through, and nothing in `teton_core` narrows it
+/// — so this is the simplest rule that keeps the three places the id lands from
+/// disagreeing, rather than a mirrored copy of a rule that does not exist
+/// (LESSON-528 would have this *call* one if one were exported).
+///
+/// * `keychain://teton/<id>`, the reference the daemon reconstructs and compares
+///   byte for byte — whose two structural characters are `:` and `/`, so an id
+///   carrying either composes a reference that reads back as a different service
+///   or account;
+/// * the OS keychain **account**, written under the bare id;
+/// * a `[[providers]]` id in the user's config, which a whitespace-bearing value
+///   makes impossible to name on the `teton policy set-tier` command line this
+///   flow itself prints.
+///
+/// Deliberately a short denylist rather than a character allowlist: ids are the
+/// user's own namespace (the protocol's own words for `id_suggestion`), and a
+/// stricter rule invented here would refuse ids `teton provider add` accepts.
+fn is_usable_id(id: &str) -> bool {
+    !id.is_empty() && !id.contains([':', '/']) && !id.chars().any(char::is_whitespace)
+}
+
+/// What an id that cannot be a keychain account and a config id gets back,
+/// quoting what was typed through the same bounded, sanitised echo every other
+/// rejection here uses.
+fn unusable_id_line(typed: &str) -> String {
+    format!(
+        "`{}` cannot be a provider id: it names the keychain entry your key is filed under and \
+         the row written to your config, so it may not contain spaces, `/` or `:`. Nothing was \
+         changed.",
+        crate::slash::echoed(typed)
+    )
+}
+
 /// Settle the endpoint through `teton provider add`'s own core (ADR-8), asking
 /// for one unless the kind carries its own address (ADR-7).
 ///
@@ -732,7 +822,12 @@ fn collect(
 /// `anthropic` is asked nothing: the composed default is settled with `None` and
 /// echoed, so the address is still on screen before the key prompt even though
 /// there was no question.
-fn settle(entry: &ProviderRecipeEntry, io: &mut dyn SetupIo) -> Option<Option<String>> {
+///
+/// `id` is the **chosen** one rather than the recipe's suggestion, because the
+/// seam puts it in its own sentences (`provider \`{id}\`: …`, and the cleartext
+/// warning): a user registering `kimi-prod` who pastes a bad URL is owed a
+/// refusal naming the provider they are registering.
+fn settle(entry: &ProviderRecipeEntry, id: &str, io: &mut dyn SetupIo) -> Option<Option<String>> {
     let supplied = if matches!(entry.kind, ProviderKind::Anthropic) {
         None
     } else {
@@ -749,7 +844,7 @@ fn settle(entry: &ProviderRecipeEntry, io: &mut dyn SetupIo) -> Option<Option<St
         })
     };
 
-    match settle_endpoint_text(&entry.id_suggestion, entry.kind, supplied.as_deref()) {
+    match settle_endpoint_text(id, entry.kind, supplied.as_deref()) {
         Ok(settled) => {
             if let Some(echo) = &settled.echo {
                 io.surface().line(LineKind::Info, echo);
@@ -1302,6 +1397,12 @@ fn ambiguous_commit_line(id: &str, prior: &PriorKey) -> String {
 /// is not. `instructions_are_commands_the_cli_itself_parses` puts every runnable
 /// line through the binary's own argument parser, which is what keeps this from
 /// becoming a recipe that no longer exists.
+///
+/// These lines name the recipe's `id_suggestion` and are unchanged by the walk's
+/// id question: there is no prompt on this path, so no id can be typed on it.
+/// The `<id>` on a `teton provider add` line the user is about to edit anyway is
+/// theirs to change in the shell — which is exactly the thing the walk's own
+/// question now offers in-session.
 pub(crate) fn instruction_lines(
     catalog: &[ProviderRecipeEntry],
     vendor: Option<&str>,
@@ -1718,9 +1819,13 @@ mod tests {
         }
     }
 
-    /// The answers of a complete walk on a vendor the argument resolved: model,
-    /// endpoint, key, routing, confirm. Five prompts, in that order.
-    const FULL_WALK: &[&str] = &["", "", PLANTED_KEY, "", "y"];
+    /// The answers of a complete walk on a vendor the argument resolved: id,
+    /// model, endpoint, key, routing, confirm. Six prompts, in that order.
+    ///
+    /// The three empties before the key are Enter at the id, the model and the
+    /// endpoint — each "take what was offered", which is `kimi`, `kimi-k3` and
+    /// the recipe's request URL.
+    const FULL_WALK: &[&str] = &["", "", "", PLANTED_KEY, "", "y"];
 
     // -------------------------------------------------------------------
     // Vendor resolution (ADR-2)
@@ -1935,6 +2040,10 @@ mod tests {
         composed.extend(routing_lines(&fresh_plan(), "kimi", Tier::Think));
         composed.extend(argument_notices(&fresh_plan(), Some("nope"), Some("nope")));
         composed.push(out_of_band_key_line());
+        // The id rejection quotes arbitrary typed bytes, so it is swept with a
+        // control character in the input: `slash::echoed` is what defuses it,
+        // and this is the assertion that this line goes through it.
+        composed.push(unusable_id_line("kimi\tprod"));
         composed.push(unrouted_line(&ProviderId::from("kimi")));
         composed.push(unchanged_line(&ProviderId::from("kimi"), DIAL_HOST));
         for line in composed {
@@ -2234,7 +2343,7 @@ mod tests {
 
         // The prompts an empty answer *cancels*, rather than answering: the
         // model with no example to fall back on, and the key.
-        for (stop, script) in [(0usize, vec![""]), (2, vec!["", "", ""])] {
+        for (stop, script) in [(1usize, vec!["", ""]), (3, vec!["", "", "", ""])] {
             let mut io = FakeIo::new(&script);
             let mut plan = fresh_plan();
             // Blank the example so Enter has nothing to take at the model step.
@@ -2268,7 +2377,7 @@ mod tests {
             ("", false),
             ("sure", false),
         ] {
-            let script: Vec<&str> = vec!["", "", PLANTED_KEY, "", answer];
+            let script: Vec<&str> = vec!["", "", "", PLANTED_KEY, "", answer];
             let mut io = FakeIo::new(&script);
             let keychain = MockKeychain::new();
             drive(
@@ -2518,7 +2627,7 @@ mod tests {
     /// composed default still reaches the candidate and the screen.
     #[test]
     fn an_anthropic_vendor_is_not_asked_for_an_endpoint() {
-        let mut io = FakeIo::new(&["", PLANTED_KEY, "", "y"]);
+        let mut io = FakeIo::new(&["", "", PLANTED_KEY, "", "y"]);
         let keychain = MockKeychain::new();
         drive(
             &mut io,
@@ -2531,8 +2640,8 @@ mod tests {
         .unwrap();
 
         assert_eq!(
-            io.prompter.asked, 4,
-            "an anthropic walk asks four questions, not five: {:?}",
+            io.prompter.asked, 5,
+            "an anthropic walk asks five questions, not six: {:?}",
             io.prompter.questions
         );
         assert!(
@@ -2568,14 +2677,14 @@ mod tests {
             Some("think"),
         )
         .unwrap();
-        assert_eq!(io.prompter.asked, 5);
+        assert_eq!(io.prompter.asked, 6);
     }
 
     /// REQ-578 BR-5 / AC-6: a pasted base URL is composed, echoed **before** the
     /// key prompt, and it is the composed value that is registered.
     #[test]
     fn a_pasted_base_url_is_composed_and_echoed_before_the_key_is_asked_for() {
-        let mut io = FakeIo::new(&["", "https://api.moonshot.ai/v1", PLANTED_KEY, "", "y"]);
+        let mut io = FakeIo::new(&["", "", "https://api.moonshot.ai/v1", PLANTED_KEY, "", "y"]);
         let keychain = MockKeychain::new();
         drive(
             &mut io,
@@ -2612,7 +2721,7 @@ mod tests {
         // The echo is content this flow got from the shared seam, and it lands
         // before the key question — which is the whole of BR-5's ordering claim.
         assert!(
-            io.prompter.questions[..2]
+            io.prompter.questions[..3]
                 .iter()
                 .all(|question| !question.contains("API key")),
             "{:?}",
@@ -2626,7 +2735,7 @@ mod tests {
     /// add` gives, and the key is never asked for.
     #[test]
     fn a_backslash_authority_is_refused_with_the_shell_commands_own_sentence() {
-        let mut io = FakeIo::new(&["", "https://evil.example\\@127.0.0.1/v1", PLANTED_KEY]);
+        let mut io = FakeIo::new(&["", "", "https://evil.example\\@127.0.0.1/v1", PLANTED_KEY]);
         let keychain = MockKeychain::new();
         drive(
             &mut io,
@@ -2771,7 +2880,7 @@ mod tests {
             // A repeat is one binding, not two.
             ("think,3", vec![Tier::Think]),
         ] {
-            let script: Vec<&str> = vec!["", "", PLANTED_KEY, answer, "y"];
+            let script: Vec<&str> = vec!["", "", "", PLANTED_KEY, answer, "y"];
             let mut io = FakeIo::new(&script);
             let keychain = MockKeychain::new();
             drive(
@@ -2794,7 +2903,7 @@ mod tests {
 
         // A tier nobody listed is refused, and refusing it aborts rather than
         // registering an unrouted provider the user did not ask for.
-        let script: Vec<&str> = vec!["", "", PLANTED_KEY, "reflex", "y"];
+        let script: Vec<&str> = vec!["", "", "", PLANTED_KEY, "reflex", "y"];
         let mut io = FakeIo::new(&script);
         let keychain = MockKeychain::new();
         drive(
@@ -2818,7 +2927,7 @@ mod tests {
     /// line about it names both ways to route it later.
     #[test]
     fn declining_every_tier_registers_the_provider_and_says_it_is_unrouted() {
-        let script: Vec<&str> = vec!["", "", PLANTED_KEY, "none", "y"];
+        let script: Vec<&str> = vec!["", "", "", PLANTED_KEY, "none", "y"];
         let mut io = FakeIo::new(&script);
         io.commit = Ok(commit_result(true, &[]));
         let keychain = MockKeychain::new();
@@ -2937,6 +3046,254 @@ mod tests {
             rendered.contains("Nothing is written until you confirm"),
             "{rendered}"
         );
+    }
+
+    /// **The id question, typed over.** A second provider for a vendor the
+    /// machine already holds is reachable in-session, and the id the user typed
+    /// is the *one* string the keychain account, the candidate and the
+    /// credential reference are all built from.
+    ///
+    /// That single derivation is the whole point: the daemon trims
+    /// `candidate.id` and then compares `key_ref` against
+    /// `keychain://teton/<trimmed id>` untrimmed, so three values built from
+    /// three readings of one answer is a commit it refuses.
+    #[test]
+    fn a_typed_id_is_the_account_the_candidate_and_the_reference_alike() {
+        let mut io = FakeIo::new(&["kimi-prod", "", "", PLANTED_KEY, "", "y"]);
+        let keychain = MockKeychain::new();
+        drive(
+            &mut io,
+            &keychain,
+            &session(),
+            Gate::Walk,
+            Some("kimi"),
+            Some("think"),
+        )
+        .unwrap();
+
+        // The question came first and named what Enter would have taken.
+        assert_eq!(
+            io.prompter.questions[0], "  provider id [kimi]: ",
+            "{:?}",
+            io.prompter.questions
+        );
+
+        assert_eq!(
+            keychain.stored_secret("kimi-prod").as_deref(),
+            Some(PLANTED_KEY),
+            "the account is the id the user chose"
+        );
+        assert!(
+            keychain.stored_secret("kimi").is_none(),
+            "and nothing was filed under the suggestion they typed over"
+        );
+        let committed = &io.commits[0].candidate;
+        assert_eq!(committed.id, ProviderId::from("kimi-prod"));
+        assert_eq!(committed.key_ref, "keychain://teton/kimi-prod");
+        // The routing binding names it too, or the tier would point at a
+        // provider id nothing registered.
+        assert_eq!(
+            committed.bindings,
+            vec![TierBinding {
+                tier: Tier::Think,
+                provider_id: ProviderId::from("kimi-prod"),
+            }]
+        );
+        // And the preview the user confirmed carried the same reference.
+        assert_eq!(io.previews[0].candidate.key_ref, committed.key_ref);
+        // The key prompt names the account it is about to write, which is the
+        // part the user is agreeing to.
+        assert!(
+            io.prompter.secrets[0].contains("kimi-prod"),
+            "{:?}",
+            io.prompter.secrets
+        );
+    }
+
+    /// The same walk with the same id typed with surrounding spaces: trimmed
+    /// **once**, and the three derived values are byte-identical to the untyped
+    /// case above.
+    ///
+    /// A separate test rather than a case in the one above because the failure
+    /// it guards is asymmetric: an id trimmed for the keychain and not for the
+    /// reference stores the key correctly and then hands the daemon
+    /// `keychain://teton/ kimi-prod `, which `derive_provider_setup` refuses on
+    /// purpose — and a flow that had already written the key would have to undo
+    /// it. The pass condition is that nothing gets that far.
+    #[test]
+    fn a_typed_id_is_trimmed_once_and_every_derived_value_agrees() {
+        let mut io = FakeIo::new(&["  kimi-prod  ", "", "", PLANTED_KEY, "", "y"]);
+        let keychain = MockKeychain::new();
+        drive(
+            &mut io,
+            &keychain,
+            &session(),
+            Gate::Walk,
+            Some("kimi"),
+            Some("think"),
+        )
+        .unwrap();
+
+        assert_eq!(
+            keychain.stored_secret("kimi-prod").as_deref(),
+            Some(PLANTED_KEY)
+        );
+        let committed = &io.commits[0].candidate;
+        assert_eq!(committed.id, ProviderId::from("kimi-prod"));
+        assert_eq!(
+            committed.key_ref,
+            auth_ref_for("kimi-prod"),
+            "the reference is composed from the trimmed id and from nothing else"
+        );
+        assert_eq!(committed.key_ref, "keychain://teton/kimi-prod");
+    }
+
+    /// BR-14, at the id the user actually chose: a typed id that is already
+    /// registered is named **before the model prompt**, and the walk goes on to
+    /// the replace-with-confirm it always did.
+    ///
+    /// The ordering claim is proved by stopping the script *at* the model
+    /// question: the walk aborts there with the notice already on screen, so a
+    /// warning keyed off anything the user answers later than the id could not
+    /// have been printed in this run at all.
+    #[test]
+    fn a_typed_id_that_already_exists_is_named_before_the_model_prompt() {
+        let taken = || ProviderSetupPlanResult {
+            existing: vec![ExistingProvider {
+                id: ProviderId::from("kimi-prod"),
+                kind: ProviderKind::OpenaiCompatible,
+                model: Some("kimi-k2".to_owned()),
+            }],
+            ..fresh_plan()
+        };
+
+        let mut io = FakeIo::new(&["kimi-prod"]);
+        io.plan = Ok(taken());
+        let keychain = MockKeychain::new();
+        drive(
+            &mut io,
+            &keychain,
+            &session(),
+            Gate::Walk,
+            Some("kimi"),
+            Some("think"),
+        )
+        .unwrap();
+        assert_eq!(
+            io.prompter.asked, 2,
+            "the script ran out at the model question: {:?}",
+            io.prompter.questions
+        );
+        assert!(
+            io.prompter.questions[1].contains("model"),
+            "{:?}",
+            io.prompter.questions
+        );
+        assert!(io.commits.is_empty() && keychain.is_empty());
+        let rendered = io.rendered();
+        assert!(
+            rendered.contains("`kimi-prod` is already registered"),
+            "the warning must be on screen before the model is answered: {rendered}"
+        );
+        assert!(rendered.contains("kimi-k2"), "{rendered}");
+
+        // And it is the *chosen* id the notice keys off: the suggestion this
+        // user typed over is not registered, and saying it was would be a
+        // warning about a provider they are not replacing.
+        let mut io = FakeIo::new(&["kimi", "", "", PLANTED_KEY, "", "y"]);
+        io.plan = Ok(taken());
+        let keychain = MockKeychain::new();
+        drive(
+            &mut io,
+            &keychain,
+            &session(),
+            Gate::Walk,
+            Some("kimi"),
+            Some("think"),
+        )
+        .unwrap();
+        assert!(
+            !io.rendered().contains("is already registered"),
+            "{}",
+            io.rendered()
+        );
+
+        // The full walk on the taken id continues to the confirm and commits —
+        // the notice is an early warning, not a refusal.
+        let mut io = FakeIo::new(&["kimi-prod", "", "", PLANTED_KEY, "", "y"]);
+        io.plan = Ok(taken());
+        let keychain = MockKeychain::new();
+        drive(
+            &mut io,
+            &keychain,
+            &session(),
+            Gate::Walk,
+            Some("kimi"),
+            Some("think"),
+        )
+        .unwrap();
+        assert!(
+            io.rendered().contains("`kimi-prod` is already registered"),
+            "{}",
+            io.rendered()
+        );
+        assert_eq!(io.commits.len(), 1, "the flow continues to the commit");
+        assert_eq!(
+            io.commits[0].candidate.id,
+            ProviderId::from("kimi-prod"),
+            "and it is the replacement the user asked for"
+        );
+    }
+
+    /// An id that cannot be both a keychain account and a config row is refused
+    /// where it is typed — before the model, and long before the key.
+    ///
+    /// `:` and `/` are the two characters `keychain://teton/<id>` is *made* of,
+    /// and whitespace is what makes an id unnameable on the
+    /// `teton policy set-tier` line this flow itself prints. The refusal ends
+    /// the walk rather than re-asking, which is what every other bad answer here
+    /// does (an unknown vendor, an unknown tier, a URL the composer rejects).
+    #[test]
+    fn an_id_that_cannot_be_a_keychain_account_is_refused_before_the_key_prompt() {
+        for bad in ["kimi prod", "kimi/prod", "kimi:prod", "keychain://teton/x"] {
+            let mut io = FakeIo::new(&[bad, "", "", PLANTED_KEY, "", "y"]);
+            let keychain = MockKeychain::new();
+            drive(
+                &mut io,
+                &keychain,
+                &session(),
+                Gate::Walk,
+                Some("kimi"),
+                Some("think"),
+            )
+            .unwrap();
+
+            assert!(
+                keychain.is_empty() && io.previews.is_empty() && io.commits.is_empty(),
+                "`{bad}` was accepted as an id"
+            );
+            assert!(
+                io.prompter.secrets.is_empty(),
+                "`{bad}`: no credential may be read for an id nothing can be filed under"
+            );
+            assert_eq!(
+                io.prompter.asked, 1,
+                "`{bad}`: the walk ends at the id question: {:?}",
+                io.prompter.questions
+            );
+            let rendered = io.rendered();
+            assert!(
+                rendered.contains("cannot be a provider id"),
+                "`{bad}`: {rendered}"
+            );
+            assert!(rendered.contains(SETUP_ABORTED), "`{bad}`: {rendered}");
+        }
+
+        // The ids this rule must **not** refuse: the shipped suggestions, and
+        // the hyphenated second-provider spelling the question exists for.
+        for good in ["kimi", "kimi-prod", "kimi_prod", "kimi.2", "moonshot-eu"] {
+            assert!(is_usable_id(good), "`{good}` is a legal provider id");
+        }
     }
 
     /// BR-9's guard is only real if the previewed digest actually rides the

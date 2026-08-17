@@ -3278,6 +3278,7 @@ fn a_piped_provider_setup_prints_the_recipe_and_asks_nothing() {
     // avoid, and each prompt's bytes are unmistakable.
     for prompt in [
         "vendor [number or name",
+        "provider id [",
         "model [Enter for",
         "API key (not shown",
         "route [Enter for",

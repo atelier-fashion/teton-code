@@ -4,7 +4,7 @@ In a session it is one line the user types:
 
     /provider setup <vendor> [tier]
 
-It asks vendor, model, key (never typed in chat — read echo-off into the
+It asks vendor, id, model, key (never typed in chat — read echo-off into the
 keychain) and routing, previews the config, and writes provider and tier
 together. "Kimi for deep reasoning" is `/provider setup kimi think`; with no
 vendor it lists the ones below. Name it first; the commands here are the shell

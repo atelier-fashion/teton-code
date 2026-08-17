@@ -1157,6 +1157,9 @@ doc-only one.
    `the_routing_menu_names_each_tiers_fallback_and_what_happens_to_it`, plus a
    strengthened assertion in the full-walk drive test.
 
+**Owner decision after Phase 5: id prompt added (this commit); AC-2's walk is
+now six prompts.**
+
 ### Residuals — accepted and recorded, not fixed
 
 Two findings from this pass are deliberately left standing. Recorded so a later
