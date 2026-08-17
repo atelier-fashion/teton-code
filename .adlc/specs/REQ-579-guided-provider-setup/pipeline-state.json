@@ -2,7 +2,7 @@
   "req": "REQ-579",
   "branch": "feat/REQ-579-guided-provider-setup",
   "startedAt": "2026-08-15T20:33:42Z",
-  "completed": false,
+  "completed": true,
   "currentPhase": 8,
   "completedPhases": [
     0,
@@ -12,7 +12,8 @@
     4,
     5,
     6,
-    7
+    7,
+    8
   ],
   "phaseHistory": [
     {
@@ -54,6 +55,11 @@
       "phase": 7,
       "name": "PR Cleanup & CI",
       "completedAt": "2026-08-17T02:13:34Z"
+    },
+    {
+      "phase": 8,
+      "name": "Wrapup",
+      "completedAt": "2026-08-17T02:23:21Z"
     }
   ],
   "integrationBranch": "main",
@@ -92,5 +98,6 @@
   },
   "phase5": {
     "summary": "6 agents; 25 advisory candidates (17 refuted); 1 High + 4 Major + 9 Minor fixed in 3 waves; re-verify (correctness+security) all CONFIRMED FIXED; 2 residuals recorded; halted on reflector Q (id prompt); owner: id prompt added"
-  }
+  },
+  "mergedAt": "2026-08-17T02:23:21Z"
 }

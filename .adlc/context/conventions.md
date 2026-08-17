@@ -28,7 +28,12 @@ teton-code/
 
 ## Testing
 
-- `cargo test` per crate; workspace-wide in CI.
+- `cargo test` per crate; workspace-wide in CI. Locally, always
+  `cargo test --workspace --no-fail-fast` and grep the output for `FAILED` —
+  cargo's default fail-fast stops at the first failing *target*, so a summed
+  "N passed, 0 failed" from an interrupted run is a floor, not a total
+  (LESSON-533; a summed count also under-counts because `; ` splits into an
+  empty field).
 - Privacy boundary (BR-1) claims require egress-capture integration tests
   (mock transport asserting no boundary content in any remote payload) — code
   inspection is not acceptance.
