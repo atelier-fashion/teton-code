@@ -148,6 +148,21 @@ pub struct SessionState {
     /// the other session, following `client.rs`'s "in another session" precedent
     /// for a permission request that is not ours to answer.
     pub session_id: Option<SessionId>,
+    /// The assistant text of the turn in flight, kept so the surface can
+    /// guarantee the `/provider setup` hand-off (REQ-579 ADR-9).
+    ///
+    /// Only [`SessionUpdatePayload::AgentMessageChunk`] appends here, and that
+    /// is the whole point: the check downstream is a match on **the model's own
+    /// words**, so the user's typed prompt, a tool title, a plan entry and
+    /// `/help`'s output are all structurally incapable of triggering it. A
+    /// second writer would turn a deterministic nudge into a line that fires
+    /// when the user themselves mentions a shell command.
+    ///
+    /// Cleared by [`SessionState::begin_turn`] when the *next* prompt is sent
+    /// rather than when a turn ends, so a turn that never reached
+    /// [`hand_off_after_turn`] — an interrupted one, or one the daemon
+    /// refused — cannot leak its text into the turn after it.
+    turn_reply: String,
 }
 
 /// What the session's web capability currently is, for the status row.
@@ -292,6 +307,16 @@ impl SessionState {
     #[must_use]
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Open a new turn: the accumulated reply text belongs to the turn about to
+    /// start, not the one before it (REQ-579 ADR-9).
+    ///
+    /// Called from the entry loop immediately before the prompt goes on the
+    /// wire. Clearing here rather than at turn end is deliberate — see
+    /// [`SessionState::turn_reply`].
+    pub(crate) fn begin_turn(&mut self) {
+        self.turn_reply.clear();
     }
 
     /// Claim a model proposal, returning `true` the first time only.
@@ -1156,7 +1181,14 @@ fn render_session_update(
     state: &mut SessionState,
 ) {
     match update {
-        SessionUpdatePayload::AgentMessageChunk { text } => surface.fragment(text),
+        SessionUpdatePayload::AgentMessageChunk { text } => {
+            // The one writer of the turn accumulator (REQ-579 ADR-9). It is fed
+            // from the same chunk that reaches the screen, so what the hand-off
+            // check reads is exactly what the user was shown — not a second
+            // reading of the turn taken somewhere else.
+            state.turn_reply.push_str(text);
+            surface.fragment(text);
+        }
         SessionUpdatePayload::ToolCall {
             tool_call_id,
             title,
@@ -1199,6 +1231,92 @@ fn render_session_update(
             }
         }
     }
+}
+
+// ---------------------------------------------------------------------------
+// The `/provider setup` hand-off (REQ-579 ADR-9)
+// ---------------------------------------------------------------------------
+//
+// Three live rounds against the shipped local model proved it will not
+// volunteer the in-session command from the guide (verification.md §1–§24):
+// 0/9 replies named it, while the endpoint and model transferred every time.
+// So the guarantee moves off the prompt and onto the surface. When a turn's
+// reply reached for the *shell* recipe, the harness — in its own voice, not the
+// model's — says the session has a command for it.
+//
+// Everything here is deliberately dumb: a substring match on text the model
+// already emitted, no model call, no daemon round-trip, no state beyond the
+// turn. It fires only when the model reached for the CLI, so a session that
+// never discusses providers never sees it, and a model that one day volunteers
+// the command makes it dormant with no code change.
+
+/// The shell recipes whose appearance means the model answered with the
+/// out-of-session path.
+///
+/// These are Teton's own command names, which a reply can only have got from
+/// the bundled guide or the recipe catalog — which is what keeps the match
+/// honest rather than a guess at intent. Case-sensitive: the commands are typed
+/// in lowercase and a capitalised prose mention ("Teton Provider Add") is not a
+/// recipe.
+const PROVIDER_CLI_RECIPES: [&str; 2] = ["teton provider add", "teton policy set-tier"];
+
+/// The in-session command the hand-off names.
+///
+/// Its presence anywhere in the reply makes the hand-off **dormant**: the model
+/// volunteered the command, so repeating it would be the harness talking over
+/// an answer that was already right (ADR-9).
+const GUIDED_COMMAND: &str = "/provider setup";
+
+/// ADR-9's sentence, and the only thing this module prints for it.
+///
+/// Plain text with no escape of its own (LESSON-517: styling belongs to
+/// [`LineKind`], never to the caller's string), and shaped by BUG-168's rules —
+/// stated outright, imperative, one sentence, no em-dash aside. The model may
+/// quote it back verbatim, which is a further reason it has to read as an
+/// instruction rather than as an aside about one.
+const HAND_OFF_LINE: &str =
+    "in this session, /provider setup <vendor> [tier] does this without leaving it; no key in chat.";
+
+/// True when `reply` reached for one of the shell recipes.
+///
+/// Backtick-agnostic, because a model that has read the guide reproduces the
+/// command inside markdown and does not always put the fence around the whole
+/// of it — `` `teton` provider add `` and `` `teton provider add` `` are the
+/// same answer, and only one of them survives a naive `contains`. Stripping the
+/// character is cheaper and more predictable than teaching the matcher markdown.
+pub(crate) fn recites_provider_cli(reply: &str) -> bool {
+    let plain: String = reply.chars().filter(|c| *c != '`').collect();
+    PROVIDER_CLI_RECIPES
+        .iter()
+        .any(|recipe| plain.contains(recipe))
+}
+
+/// The one sentence the hand-off prints.
+pub(crate) fn hand_off_line() -> &'static str {
+    HAND_OFF_LINE
+}
+
+/// End a typed-prompt turn: print the hand-off if this turn earned it.
+///
+/// Called once per turn from the entry loop, and it **consumes** the turn's
+/// accumulated text — so a second call in the same turn reads an empty reply
+/// and prints nothing. That is the "at most once" guarantee expressed as data
+/// rather than as a flag somebody has to remember to reset, and it doubles as
+/// the reset on every path that reaches here.
+///
+/// `tty` is the session's `typed_input`, the same world-fact
+/// [`crate::web_setup_ui::gate`] turns on. A piped session prints nothing at
+/// all: BR-11 already gives a script the shell recipe, and a script's output has
+/// to stay byte-identical to what it was before this REQ.
+pub(crate) fn hand_off_after_turn(state: &mut SessionState, surface: &mut dyn Surface, tty: bool) {
+    // Taken unconditionally, before any gate: whether the line prints or not,
+    // this turn's words are finished with, and a `return` that left them behind
+    // would hand them to the next turn.
+    let reply = std::mem::take(&mut state.turn_reply);
+    if !tty || !recites_provider_cli(&reply) || reply.contains(GUIDED_COMMAND) {
+        return;
+    }
+    surface.line(LineKind::Notice, hand_off_line());
 }
 
 /// Render a compact preview of a proposed file change.
@@ -3426,5 +3544,289 @@ mod tests {
             "{:?}",
             later.calls
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // The `/provider setup` hand-off (REQ-579 ADR-9)
+    // -----------------------------------------------------------------------
+
+    /// Drive one whole turn: open it, stream `chunks` as assistant text, end it.
+    ///
+    /// The turn is driven through `render_event` rather than by writing the
+    /// accumulator directly, so what these tests assert on is the real path —
+    /// including that the chunk actually reaches the accumulator on its way to
+    /// the screen.
+    fn hand_off_turn(chunks: &[&str], tty: bool) -> RecordingSurface {
+        let mut surface = RecordingSurface::new();
+        let mut state = SessionState::new();
+        state.begin_turn();
+        for text in chunks {
+            render_event(&envelope(chunk(text)), &mut surface, &mut state);
+        }
+        hand_off_after_turn(&mut state, &mut surface, tty);
+        surface
+    }
+
+    /// **AC-1, the deterministic half.** A reply that reached for the shell
+    /// recipe is followed by exactly one Notice naming the in-session command.
+    ///
+    /// This is the criterion three live rounds could not obtain from the model
+    /// itself (verification.md §1–§24): the guarantee is the surface's now.
+    #[test]
+    fn a_reply_that_recites_the_cli_earns_exactly_one_hand_off_line() {
+        for (case, chunks) in [
+            (
+                "the registration command",
+                &["run `teton provider add kimi --kind openai-compatible`."][..],
+            ),
+            (
+                "the routing command on its own",
+                &["you would then run teton policy set-tier think kimi."][..],
+            ),
+            // The chunk boundary is the daemon's, not the sentence's. A check
+            // that read one chunk at a time would miss a command split across
+            // two frames, which is why the accumulator exists at all.
+            (
+                "a command split across two chunks",
+                &[
+                    "to register it, run teton prov",
+                    "ider add kimi from a shell.",
+                ][..],
+            ),
+            // Backtick-agnostic: a model that has read the guide reproduces the
+            // command inside markdown and does not always fence the whole of it.
+            (
+                "markdown that fences only part of the command",
+                &["run `teton` provider add kimi."][..],
+            ),
+        ] {
+            let surface = hand_off_turn(chunks, true);
+            assert_eq!(
+                surface.lines_of(LineKind::Notice),
+                vec![hand_off_line()],
+                "{case}: exactly one hand-off, and it is ADR-9's sentence; got {:?}",
+                surface.calls
+            );
+        }
+    }
+
+    /// The model volunteered the command, so the surface stays quiet.
+    ///
+    /// ADR-9's nudge exists because the model will not name `/provider setup`.
+    /// A model that one day does makes it dormant with no code change, and this
+    /// is the test that says so — repeating the command over an answer that was
+    /// already right is the harness talking over the model.
+    #[test]
+    fn a_reply_that_names_the_command_earns_nothing() {
+        for (case, reply) in [
+            (
+                "it named the command instead",
+                "run `/provider setup kimi think` and it will walk you through it.",
+            ),
+            // Dormancy wins over recital: a reply that offers both paths has
+            // already told the user about the in-session one.
+            (
+                "it offered both paths",
+                "in-session: `/provider setup kimi think`. From a shell: `teton provider add kimi`.",
+            ),
+        ] {
+            let surface = hand_off_turn(&[reply], true);
+            assert!(
+                surface.lines_of(LineKind::Notice).is_empty(),
+                "{case}: {:?}",
+                surface.calls
+            );
+        }
+    }
+
+    /// A session that never reached for the CLI never sees the line.
+    ///
+    /// The match is on the **command**, not on the topic — prose about
+    /// providers is not something a user can paste, so it earns nothing.
+    #[test]
+    fn a_reply_about_anything_else_earns_nothing() {
+        for reply in [
+            "the file you want is crates/teton/src/main.rs.",
+            "teton supports several providers, and you can add one.",
+            // Case-sensitive by design: this is prose, not a command line.
+            "Teton Provider Add is not how it is spelled.",
+            "",
+        ] {
+            let surface = hand_off_turn(&[reply], true);
+            assert!(
+                surface.lines_of(LineKind::Notice).is_empty(),
+                "{reply:?} must earn nothing; got {:?}",
+                surface.calls
+            );
+        }
+    }
+
+    /// Once per turn: two recitals are one turn, and the line does not repeat.
+    ///
+    /// Three claims in the order they can be established — both commands in one
+    /// reply print one line; a second call inside the same turn prints nothing,
+    /// because the first consumed the turn's words; and the next turn does not
+    /// inherit them.
+    #[test]
+    fn the_hand_off_is_once_per_turn_even_when_both_commands_appear() {
+        let mut surface = RecordingSurface::new();
+        let mut state = SessionState::new();
+        state.begin_turn();
+        for text in [
+            "first, teton provider add kimi --kind openai-compatible.\n",
+            "then, teton policy set-tier think kimi.\n",
+        ] {
+            render_event(&envelope(chunk(text)), &mut surface, &mut state);
+        }
+
+        hand_off_after_turn(&mut state, &mut surface, true);
+        assert_eq!(
+            surface.lines_of(LineKind::Notice),
+            vec![hand_off_line()],
+            "two recitals are still one turn; got {:?}",
+            surface.calls
+        );
+
+        hand_off_after_turn(&mut state, &mut surface, true);
+        assert_eq!(
+            surface.lines_of(LineKind::Notice),
+            vec![hand_off_line()],
+            "a second call in the same turn adds nothing; got {:?}",
+            surface.calls
+        );
+
+        // The turn after it recites nothing, and must not inherit the line.
+        state.begin_turn();
+        render_event(&envelope(chunk("done.")), &mut surface, &mut state);
+        hand_off_after_turn(&mut state, &mut surface, true);
+        assert_eq!(
+            surface.lines_of(LineKind::Notice),
+            vec![hand_off_line()],
+            "a quiet turn must not reprint the previous turn's line; got {:?}",
+            surface.calls
+        );
+    }
+
+    /// **BR-11's byte-identity.** A piped session gets nothing.
+    ///
+    /// A script already receives the shell recipe, and its output has to be
+    /// what it was before this REQ. The second half is the part worth pinning:
+    /// the gate does not skip the reset, so a turn whose line was suppressed
+    /// still leaves no words behind.
+    #[test]
+    fn the_hand_off_never_prints_on_a_non_tty_surface() {
+        let mut surface = RecordingSurface::new();
+        let mut state = SessionState::new();
+        state.begin_turn();
+        render_event(
+            &envelope(chunk(
+                "run teton provider add kimi --kind openai-compatible.",
+            )),
+            &mut surface,
+            &mut state,
+        );
+
+        hand_off_after_turn(&mut state, &mut surface, false);
+        assert!(
+            surface.lines_of(LineKind::Notice).is_empty(),
+            "a pipe must see no hand-off; got {:?}",
+            surface.calls
+        );
+
+        hand_off_after_turn(&mut state, &mut surface, true);
+        assert!(
+            surface.lines_of(LineKind::Notice).is_empty(),
+            "the suppressed turn's words must not survive the gate; got {:?}",
+            surface.calls
+        );
+    }
+
+    /// Only the model's own output arms it.
+    ///
+    /// The user's typed line, a tool title and a plan entry all reach the same
+    /// screen, and any of them can carry the command's characters — a user
+    /// pasting the recipe to ask about it, a shell tool call that runs it. None
+    /// of them is the model answering, so none may trigger the nudge. This is
+    /// what makes "do not match the user's prompt" structural rather than a
+    /// rule somebody has to keep obeying.
+    #[test]
+    fn the_users_own_text_and_help_output_do_not_trigger_it() {
+        let mut surface = RecordingSurface::new();
+        let mut state = SessionState::new();
+        state.begin_turn();
+
+        // A line on the surface — what `/help`, a command's output, and the
+        // echo of a typed prompt all are.
+        surface.line(
+            LineKind::Info,
+            "teton provider add kimi --kind openai-compatible",
+        );
+        render_event(
+            &envelope(Event::SessionUpdate(SessionUpdate {
+                update: SessionUpdatePayload::ToolCall {
+                    tool_call_id: "c1".to_owned(),
+                    title: "shell: teton policy set-tier think kimi".to_owned(),
+                    status: ToolCallStatus::Pending,
+                },
+            })),
+            &mut surface,
+            &mut state,
+        );
+        render_event(
+            &envelope(Event::SessionUpdate(SessionUpdate {
+                update: SessionUpdatePayload::Plan {
+                    entries: vec![PlanEntry {
+                        content: "run teton provider add kimi".to_owned(),
+                        status: PlanEntryStatus::InProgress,
+                    }],
+                },
+            })),
+            &mut surface,
+            &mut state,
+        );
+
+        hand_off_after_turn(&mut state, &mut surface, true);
+        assert!(
+            surface.lines_of(LineKind::Notice).is_empty(),
+            "only an assistant chunk may arm the hand-off; got {:?}",
+            surface.calls
+        );
+    }
+
+    /// The sentence itself: plain, imperative, and it names the command.
+    ///
+    /// LESSON-517 puts styling in [`LineKind`] and never in the caller's
+    /// string, and BUG-168 asks for the thing stated outright — one sentence,
+    /// no em-dash aside. The model may quote this back, which is a further
+    /// reason it has to read as an instruction rather than as an aside.
+    #[test]
+    fn the_hand_off_line_carries_no_ansi_and_names_the_command_verbatim() {
+        let line = hand_off_line();
+        assert!(
+            line.contains("/provider setup <vendor> [tier]"),
+            "it must name the command with its arguments: {line}"
+        );
+        assert!(
+            !line.contains('\u{1b}'),
+            "no escape may be baked into the text (LESSON-517): {line:?}"
+        );
+        assert!(
+            !line.contains('\u{2014}'),
+            "BUG-168: no em-dash aside: {line}"
+        );
+        assert_eq!(
+            line.matches('.').count(),
+            1,
+            "one sentence, stated outright: {line}"
+        );
+        assert!(
+            line.contains("no key in chat"),
+            "it must say the part that makes it safe to take: {line}"
+        );
+
+        // And it is exactly what reaches the surface — the constant and the
+        // rendered line cannot drift.
+        let surface = hand_off_turn(&["teton provider add kimi"], true);
+        assert_eq!(surface.lines_of(LineKind::Notice), vec![line]);
     }
 }

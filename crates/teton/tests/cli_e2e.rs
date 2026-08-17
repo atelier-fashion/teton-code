@@ -3289,3 +3289,59 @@ fn a_piped_provider_setup_prints_the_recipe_and_asks_nothing() {
         daemon.log()
     );
 }
+
+/// **ADR-9 / AC-1's non-TTY half: a script's bytes do not move.**
+///
+/// The hand-off nudge is a terminal affordance — it names an in-session command
+/// nobody at a pipe can type. So the gate is `typed_input`, and this is the leg
+/// that proves the gate is real rather than asserted: the scripted engine
+/// answers with a reply that recites `teton provider add`, which is exactly the
+/// condition that arms the line at a terminal, and a piped session must still
+/// see nothing added.
+///
+/// The negative is worth an e2e rather than only a unit test because the unit
+/// test can only pin the function's own gate; what a script actually receives
+/// depends on the flag `main` passes it, and that wiring is unobservable from
+/// inside the module. BR-11 already gives a script the shell recipe, which is
+/// the copy-pasteable answer at a pipe; a second line naming a command it
+/// cannot run would be noise in whatever is parsing the output.
+#[test]
+fn a_piped_session_whose_reply_recites_the_cli_gets_no_hand_off_line() {
+    let daemon_path = daemon_bin();
+    // The reply the guide actually produces at the front door — the recital
+    // three live rounds recorded (verification.md §1–§24).
+    let reply = "register it from a shell: teton provider add kimi --kind \
+                 openai-compatible, then teton policy set-tier think kimi.";
+    let daemon = TestDaemon::spawn_scripted(&daemon_path, &[reply]);
+    let teton = teton_bin();
+
+    let (session, status) = daemon.run_cli_capture(&teton, &[], "how do I add kimi?\n");
+
+    // The precondition: the turn ran and the reply really did recite the CLI.
+    // Without this the assertion below would pass on a session that never
+    // reached the model at all.
+    assert!(
+        session.contains("teton provider add kimi"),
+        "the scripted reply must have reached the transcript, or this test \
+         proves nothing; output:\n{session}\ndaemon log:\n{}",
+        daemon.log()
+    );
+
+    // And the nudge is absent. Asserted on the sentence's distinctive halves
+    // rather than the whole line, so a future rewording of it cannot make this
+    // pass by accident.
+    for absent in [
+        "does this without leaving it",
+        "no key in chat",
+        "/provider setup <vendor> [tier]",
+    ] {
+        assert!(
+            !session.contains(absent),
+            "ADR-9: a pipe must see no hand-off ({absent:?}); output:\n{session}"
+        );
+    }
+    assert!(
+        status.success(),
+        "the piped session must still exit 0; status {status:?}; output:\n{session}"
+    );
+}

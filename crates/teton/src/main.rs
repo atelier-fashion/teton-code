@@ -789,8 +789,20 @@ fn run_session(paths: &DaemonPaths, auto_accept: bool, verbose: bool) -> anyhow:
             // the bytes it classified (AC-7 / AC-7b) rather than a second
             // reading of the line taken here.
             let params = slash::prompt_turn_params(&session_id, prompt_text);
+            // REQ-579 ADR-9: the hand-off check reads *this* turn's reply, so
+            // the accumulator opens here — at the send — rather than closing at
+            // the previous turn's end. A turn that was interrupted or refused
+            // never reached `hand_off_after_turn`, and without this its words
+            // would still be sitting there when the next reply arrived.
+            ctx.state.begin_turn();
             match conn.call(params, &mut ctx)? {
                 Ok(res) => {
+                    // REQ-579 ADR-9. Before the turn's closing line, because
+                    // the hand-off is about the reply that just finished and
+                    // belongs beside it rather than after the gap that ends the
+                    // turn. Gated on `typed_input`: a piped session already got
+                    // the shell recipe from BR-11 and its bytes must not move.
+                    session_ui::hand_off_after_turn(ctx.state, ctx.surface, ctx.typed_input);
                     // Gated on session state, not on the `--verbose` flag, so
                     // `/verbose` governs this line and the routing notices from
                     // one source of truth (D-5); the flag only initialises it.

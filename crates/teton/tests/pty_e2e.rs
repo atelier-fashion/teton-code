@@ -833,3 +833,127 @@ fn the_key_step_does_not_echo_and_the_key_reaches_nothing() {
         "AC-5 VIOLATION: the API key reached the daemon's log:\n{log}"
     );
 }
+
+/// **REQ-579 ADR-9 / AC-1's deterministic half, at a real terminal.**
+///
+/// Three live rounds proved the shipped local model will not volunteer
+/// `/provider setup` from the guide (verification.md §1–§24): 0/9 replies named
+/// it, while the endpoint and model transferred every time. ADR-9 moves the
+/// guarantee off the prompt and onto the surface — when the reply reaches for
+/// the shell recipe, the harness says the session has a command for it.
+///
+/// This belongs in the pty suite and nowhere else. The nudge is gated on
+/// `typed_input`, so `cli_e2e` is *structurally blind* to the positive case the
+/// same way it is blind to the loading indicator; the piped suite can only hold
+/// the negative (`a_piped_session_whose_reply_recites_the_cli_gets_no_hand_off_line`).
+/// And the unit tests can only pin the function's own gate — that `main` passes
+/// it the session's real terminal flag, at the one place a typed turn ends, is
+/// visible only from outside the process.
+///
+/// The reply is scripted rather than solicited, which is the point: the trigger
+/// is a deterministic match on text the model already emitted, so a fixture that
+/// emits that text is the honest test of it. What the *live* model says is the
+/// recorded result in verification.md, not something a test can pin.
+#[test]
+fn a_reply_reciting_the_cli_earns_the_hand_off_line_at_a_terminal() {
+    let daemon_path = daemon_bin();
+    // Every tier bound to the scripted local tier, for the REQ-558 reason the
+    // other typed-turn tests here bind them: otherwise the turn resolves to an
+    // unreachable remote provider and fails before it can produce a reply.
+    let tiers: String = ["reflex", "scan", "build", "think"]
+        .iter()
+        .map(|t| format!("[[tiers]]\ntier = \"{t}\"\nprovider_id = \"local\"\n\n"))
+        .collect();
+    let config = format!("[[providers]]\nid = \"local\"\nkind = \"local\"\n\n{tiers}");
+    // The answer the guide actually produces at the front door: the shell
+    // recipe, with no mention of the in-session command.
+    let reply = "register it from a shell: teton provider add kimi --kind \
+                 openai-compatible.";
+    let daemon = TestDaemon::spawn_with(&daemon_path, &config, &[reply]);
+
+    // Wide enough that the terminal cannot hard-wrap the sentence under test —
+    // a wrapped line is still correct output, but it would split the marker and
+    // fail an assertion about wording rather than about behaviour.
+    let pty = native_pty_system()
+        .openpty(PtySize {
+            rows: 40,
+            cols: 200,
+            pixel_width: 0,
+            pixel_height: 0,
+        })
+        .expect("openpty");
+
+    let mut cmd = CommandBuilder::new(teton_bin());
+    cmd.env("XDG_RUNTIME_DIR", &daemon.runtime_dir);
+    cmd.env("TETON_CONFIG", daemon.root.join("config.toml"));
+    cmd.env("TETON_REPO_ROOT", &daemon.root);
+    let mut session = pty.slave.spawn_command(cmd).expect("spawn teton under pty");
+    drop(pty.slave);
+    let transcript = spawn_reader(pty.master.try_clone_reader().expect("pty reader"));
+    let mut writer = pty.master.take_writer().expect("pty writer");
+
+    assert!(
+        wait_for(&transcript, "ready (freeform)"),
+        "the session never reached the entry prompt; transcript:\n{}",
+        snapshot(&transcript)
+    );
+
+    writer
+        .write_all(b"how do I add kimi?\r")
+        .expect("type the prompt");
+    writer.flush().ok();
+
+    // (1) The precondition: the turn ran and the reply really did recite the
+    // CLI. Without this the assertion below could pass on a session that never
+    // reached the model.
+    assert!(
+        wait_for(&transcript, "teton provider add kimi"),
+        "the scripted reply never arrived, so nothing armed the hand-off; \
+         transcript:\n{}",
+        snapshot(&transcript)
+    );
+
+    // (2) The hand-off followed it.
+    const HAND_OFF: &str =
+        "in this session, /provider setup <vendor> [tier] does this without leaving it; \
+         no key in chat.";
+    assert!(
+        wait_for(&transcript, HAND_OFF),
+        "ADR-9: a recital at a terminal must be followed by the hand-off; \
+         transcript:\n{}",
+        snapshot(&transcript)
+    );
+
+    let seen = snapshot(&transcript);
+    let _ = session.kill();
+    let _ = session.wait();
+
+    // (3) Once, not once per matched command and not once per redraw.
+    assert_eq!(
+        seen.matches(HAND_OFF).count(),
+        1,
+        "the hand-off is once per turn; transcript:\n{seen}"
+    );
+
+    // (4) In the harness's voice, not the model's — it is a `>>` notice, which
+    // is the whole reason a user can tell it apart from the answer it follows.
+    let line = seen
+        .lines()
+        .find(|line| line.contains(HAND_OFF))
+        .expect("just asserted present");
+    assert!(
+        line.contains(">>"),
+        "the hand-off must render as a harness notice; line: {line:?}"
+    );
+
+    // (5) After the reply, not before it: it is a hand-off from an answer the
+    // user has already read.
+    let reply_at = seen
+        .find("teton provider add kimi")
+        .expect("asserted present");
+    let hand_off_at = seen.find(HAND_OFF).expect("asserted present");
+    assert!(
+        reply_at < hand_off_at,
+        "the hand-off must follow the reply it is about; transcript:\n{seen}"
+    );
+}
