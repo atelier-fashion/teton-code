@@ -18,6 +18,26 @@ unchanged. What belongs here is what an *upgrade* does to a machine that was
 already running — above all, anything that changes where data goes without the
 user having asked for it.
 
+## [Unreleased]
+
+### Changed
+
+- **A prompt typed while the local model is still loading now waits for it
+  instead of being refused (REQ-580).** Start `teton`, type before the tier
+  opens, and the session says `message queued until <model> finishes loading —
+  it will run as soon as the local tier opens.`; the `benchmark` and `ready`
+  lines land under it as they happen, and then the reply — no retyping. The
+  same holds while an accepted download is still installing. Only the two
+  states that end by themselves are waited for: a declined tier, a machine
+  below the floor, a failed load, or an unanswered proposal still refuse at
+  once with the sentence that names the fix, and a turn routed to a remote
+  provider is never held for the local one. A Ctrl-C while the message is
+  queued abandons it cleanly — nothing runs on the model later on its behalf.
+
+  Additive on the wire: one new `turn_queued` event. An older `teton` against
+  a newer daemon simply sees the reply arrive; a newer `teton` against an older
+  daemon still gets the `model still loading` notice it always did.
+
 ## [0.1.18] - 2026-08-17
 
 ### Added

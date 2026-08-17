@@ -78,6 +78,9 @@
 //!   chain over the socket in a build without the `llama` feature. Gated
 //!   because it fabricates the one fact `ready` exists to prove — that an
 //!   engine actually loaded the installed weights and met the BR-8 duty.
+//!   `TETON_FAKE_ENGINE_LOADER_DELAY_MS` makes that stand-in load *take* that
+//!   long (REQ-580), so a suite can put a prompt inside the load window on
+//!   purpose; read only by the fake loader, so it inherits its gate.
 //!
 //! `TETON_LOCAL_SCRIPT` stays ungated: it supplies an engine rather than
 //! *describing* the machine, changes no safety decision, and is how the offline
@@ -114,8 +117,9 @@ use teton_inference::{ChatFormat, Completion, Engine, EngineError, GenParams, Mo
 
 use teton_protocol::events::{
     BlockCause, CapabilityDeadEnd, ContextCleared, Event, ModelLifecycle, ModelLifecycleStage,
-    PrivacyAction, SessionTitled, WebCapabilityState as WireWebCapabilityState, WebLookup,
-    WebSetupCompleted, WebTaintOverridden, WebTier as WireWebTier,
+    PrivacyAction, SessionTitled, TierWarming, TurnQueued,
+    WebCapabilityState as WireWebCapabilityState, WebLookup, WebSetupCompleted, WebTaintOverridden,
+    WebTier as WireWebTier,
 };
 use teton_protocol::jsonrpc::{error_code, RpcError};
 use teton_protocol::methods::{
@@ -1202,6 +1206,215 @@ fn refused_claim_error(err: &TurnClaimError) -> RpcError {
     RpcError::new(code, err.to_string())
 }
 
+/// Why the local tier is not serving a turn — the typed reading behind
+/// [`DaemonRuntime::unserved_turn_error`]'s sentences and behind the REQ-580
+/// hold ([`DaemonRuntime::local_tier_hold`]).
+///
+/// Seven states, one precedence, read once by [`DaemonRuntime::local_tier_state`].
+/// It exists as a value rather than as the branches of the sentence builder so
+/// that "should this turn wait?" and "what does a refused turn say?" are two
+/// renderings of one classification and cannot drift into two classifiers of
+/// one machine (LESSON-456 — the same reason BUG-152's `TIER_WARMING` split was
+/// made beside the sentences rather than by a client re-reading them).
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum LocalTierState {
+    /// Below the hardware floor: there is no local tier to wait for. Carries
+    /// the probe's own reason.
+    BelowFloor {
+        /// The probe's sentence.
+        reason: String,
+    },
+    /// The user declined the local tier (REQ-547 BR-4). Settled.
+    Declined,
+    /// Accepted, and the download/install is running right now. **Transient**:
+    /// it ends by itself.
+    Installing {
+        /// The model being installed.
+        model_id: String,
+    },
+    /// Proposed and unanswered. Settled — waiting does not answer it, the user
+    /// does.
+    AwaitingDecision {
+        /// The proposed model.
+        model_id: String,
+    },
+    /// Decided and installed, and the load already failed. Settled: retrying
+    /// meets the same dead engine.
+    LoadFailed {
+        /// The load's own failure sentence.
+        reason: String,
+    },
+    /// Decided and installed; this build can load the weights and is doing so.
+    /// **Transient**: it ends by itself.
+    Loading {
+        /// The model being loaded.
+        model_id: String,
+    },
+    /// Decided and installed, and nothing in this build can load the weights.
+    /// Settled.
+    NoEngine {
+        /// The installed model.
+        model_id: String,
+    },
+}
+
+impl LocalTierState {
+    /// The two states a turn may be held for (REQ-580 BR-1), with the model
+    /// they concern — or `None` for every settled absence.
+    fn warming(self) -> Option<(TierWarming, String)> {
+        match self {
+            Self::Installing { model_id } => Some((TierWarming::Installing, model_id)),
+            Self::Loading { model_id } => Some((TierWarming::Loading, model_id)),
+            Self::BelowFloor { .. }
+            | Self::Declined
+            | Self::AwaitingDecision { .. }
+            | Self::LoadFailed { .. }
+            | Self::NoEngine { .. } => None,
+        }
+    }
+}
+
+/// Whether the client that issued a turn is still connected to receive it
+/// (REQ-580 ADR-3).
+///
+/// Read at exactly one point: while a turn is **held** for a warming tier. A
+/// held turn has spent nothing — no classifier call, no tools, no conversation
+/// begun, no cost row — so a client that leaves while it waits is owed nothing,
+/// and running the turn anyway would put a ghost on the local engine ahead of
+/// whatever session that user opens next. A turn that has *started* keeps
+/// REQ-565's drain semantics unchanged; this type is never consulted past the
+/// hold.
+///
+/// One consequence is accepted rather than hidden: a second client attached to
+/// the same session, which would have watched the reply stream, sees nothing
+/// further when the issuing client leaves mid-hold. The turn was the issuing
+/// client's, and a ghost is the worse outcome.
+///
+/// The server hands each turn a receiver on its connection's liveness channel;
+/// callers with no connection to watch (tests, in-process drivers) pass
+/// [`ClientPresence::unwatched`], under which a hold ends only when the tier
+/// settles.
+#[derive(Debug, Clone)]
+pub struct ClientPresence(Option<tokio::sync::watch::Receiver<bool>>);
+
+impl ClientPresence {
+    /// A caller with no connection to watch: the turn is never abandoned for
+    /// its client's absence.
+    #[must_use]
+    pub fn unwatched() -> Self {
+        Self(None)
+    }
+
+    /// Watch `connected`: a `false`, or the sender being dropped, means the
+    /// client is gone.
+    #[must_use]
+    pub fn watching(connected: tokio::sync::watch::Receiver<bool>) -> Self {
+        Self(Some(connected))
+    }
+
+    /// Resolves once the client is gone. Pends forever when unwatched.
+    async fn gone(&mut self) {
+        match self.0.as_mut() {
+            None => std::future::pending().await,
+            // `wait_for` reads the current value first, so a client that left
+            // before this was polled is seen immediately; `Err` is the sender
+            // dropping, which is the connection ending — gone either way.
+            Some(connected) => {
+                let _ = connected.wait_for(|connected| !*connected).await;
+            }
+        }
+    }
+}
+
+/// What a route resolves to for one attempt on this machine.
+///
+/// The one place "can this route be attempted right now?" is answered
+/// ([`attempt_source`]): [`DaemonRuntime::run_one_attempt`] runs whichever arm
+/// it gets, and the REQ-580 hold asks the same function *before* the turn's
+/// tools and head are built, so a turn is held on exactly the reading the
+/// attempt would have refused it on.
+enum AttemptSource<'a> {
+    /// The local tier: the engine in the slot, and its chat format.
+    Local(Arc<Mutex<dyn Engine>>, ChatFormat),
+    /// A remote provider, and the model it declares.
+    Remote {
+        /// The `[[providers]]` entry the route named.
+        provider: &'a ModelProvider,
+        /// The model the route carries for it.
+        model: String,
+    },
+}
+
+/// Why [`attempt_source`] found nothing to run a route on.
+///
+/// Both arms reach a client as [`HarnessError::NoTierAvailable`] — one code,
+/// classified from state by `unserved_turn_error` (BUG-146) — but they are not
+/// the same fact, and REQ-580 needs the difference: a turn is held only for
+/// the first, never for a misconfiguration the tier's arrival would not fix.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Unservable {
+    /// The route wants the local tier and the slot is empty — the tier is
+    /// loading, failed, or was never opened.
+    LocalTierDown,
+    /// The route names a remote provider that carries no model (REQ-557 BR-1):
+    /// a provider registered without one was selected, and there is nothing to
+    /// put on the wire.
+    RemoteWithoutModel,
+}
+
+impl From<Unservable> for HarnessError {
+    fn from(_: Unservable) -> Self {
+        HarnessError::NoTierAvailable
+    }
+}
+
+/// Resolve `route` to the source one attempt would run on, or say why nothing
+/// on this machine can serve it.
+///
+/// Three ways to be unservable, and each is a state the caller classifies from
+/// the machine rather than an engine fault (BUG-146):
+///
+/// - the route names a `kind = "local"` provider and the slot is empty
+///   ([`Unservable::LocalTierDown`]);
+/// - the route names no registered provider at all (a fresh install's
+///   self-named local tier, or the taint pin) and the slot is empty — nothing
+///   is configured and the tier is not live (also `LocalTierDown`);
+/// - the route names a remote provider but carries no model
+///   ([`Unservable::RemoteWithoutModel`]).
+///
+/// `local_engine` is the caller's **one** read of the slot for the attempt
+/// (LESSON-448): the engine a turn runs on is the engine that was live when
+/// the attempt began, even if a consent outcome swaps the slot mid-turn.
+fn attempt_source<'a>(
+    config: &'a Config,
+    route: &crate::router::Route,
+    local_engine: Option<(Arc<Mutex<dyn Engine>>, ChatFormat)>,
+) -> Result<AttemptSource<'a>, Unservable> {
+    let provider = route
+        .provider_id
+        .as_ref()
+        .and_then(|pid| config.providers.iter().find(|p| p.id == pid.0));
+    let local = |engine: Option<(Arc<Mutex<dyn Engine>>, ChatFormat)>| {
+        engine
+            .map(|(engine, format)| AttemptSource::Local(engine, format))
+            .ok_or(Unservable::LocalTierDown)
+    };
+    match provider {
+        Some(p) if matches!(p.kind, ProviderKind::Local) => local(local_engine),
+        // No provider selected: fall back to the local tier if present.
+        None => local(local_engine),
+        Some(remote) => {
+            // BUG-155 / REQ-557 BR-1: a remote route with no model does NOT
+            // fall back to the provider id (see `run_one_attempt`).
+            let model = route.model.clone().ok_or(Unservable::RemoteWithoutModel)?;
+            Ok(AttemptSource::Remote {
+                provider: remote,
+                model,
+            })
+        }
+    }
+}
+
 /// The assembled daemon runtime shared by every client task.
 pub struct DaemonRuntime {
     /// The live configuration (providers, routing, boundaries). Mutated by
@@ -1240,6 +1453,17 @@ pub struct DaemonRuntime {
     /// The gate withholds the **tier**, never the session: while it is set,
     /// sessions still run — they route remote-only (BR-1).
     local_gated: AtomicBool,
+    /// Bumped on **every** consent outcome the runtime applies — every
+    /// transition of the local tier's gate (REQ-580 ADR-2).
+    ///
+    /// A turn held for a warming tier awaits it ([`Self::await_local_tier`])
+    /// and re-reads the tier's state on each wake rather than trusting the
+    /// wake: the value carries no meaning beyond "something changed, look
+    /// again". A `watch` rather than a `Notify` because a waiter that
+    /// subscribes, checks the state, and *then* waits cannot miss a transition
+    /// that lands between the check and the wait — the version it will compare
+    /// against was fixed at `subscribe`.
+    tier_transitions: tokio::sync::watch::Sender<u64>,
     /// Whether this daemon's local engine was supplied out of band by
     /// `TETON_LOCAL_SCRIPT` — canned replies from a file, downloading nothing.
     ///
@@ -1377,6 +1601,7 @@ impl DaemonRuntime {
             weights_loader_present: false,
             consent,
             local_gated: AtomicBool::new(false),
+            tier_transitions: tokio::sync::watch::channel(0).0,
             scripted_engine: false,
             ledger,
             pending: Arc::new(PendingPermissions::new()),
@@ -1558,6 +1783,7 @@ impl DaemonRuntime {
             weights_loader_present,
             consent,
             local_gated,
+            tier_transitions: tokio::sync::watch::channel(0).0,
             scripted_engine,
             ledger,
             pending: Arc::new(PendingPermissions::new()),
@@ -1644,6 +1870,11 @@ impl DaemonRuntime {
     /// builders it borrows, [`loading_local_engine_reason`] and
     /// [`no_local_engine_reason`], are the same ones the lifecycle stream
     /// already publishes.
+    ///
+    /// Since REQ-580 the state read is [`Self::local_tier_state`] and this is
+    /// its renderer: the same reading decides whether a turn is *held* rather
+    /// than refused ([`Self::local_tier_hold`]), so the two consumers cannot come
+    /// to read the machine in two orders.
     fn unserved_turn_error(&self, config: &Config, category: Option<Category>) -> RpcError {
         // Every settled cause codes the same way; only the two transient ones
         // below override it, and each says so at the `return`.
@@ -1741,14 +1972,73 @@ impl DaemonRuntime {
                 .to_owned()
         };
 
-        // A machine below the hardware floor has no local tier to wait for.
+        match self.local_tier_state() {
+            // A machine below the hardware floor has no local tier to wait for.
+            LocalTierState::BelowFloor { reason } => settled(format!("{reason}{add_provider}")),
+            // BR-4: a settled, deliberate absence — not something to wait for.
+            LocalTierState::Declined => settled(format!(
+                "the local tier was declined, so it will not serve turns; \
+                 `teton model set <name>` changes that.{add_provider}"
+            )),
+            // Transient (BUG-152): the download finishing is the only thing this
+            // turn was waiting for.
+            LocalTierState::Installing { model_id } => RpcError::new(
+                error_code::TIER_WARMING,
+                format!("{}{add_provider}", installing_local_model_reason(&model_id)),
+            ),
+            // BR-1: proposed and unanswered. The session runs, the tier does not.
+            LocalTierState::AwaitingDecision { model_id } => settled(format!(
+                "{model_id} is proposed for this machine but has not been \
+                 answered yet, so the local tier is withheld — answer the \
+                 prompt (or `teton model list`) to open it.{add_provider}"
+            )),
+            // A load that already failed is settled: retrying the turn meets
+            // the same dead engine, so this is not a "wait" state.
+            LocalTierState::LoadFailed { reason } => settled(format!("{reason}{add_provider}")),
+            // Transient (BUG-152): the load completing is the only thing this
+            // turn was waiting for. Since REQ-580 a turn in this state is held
+            // rather than refused, so this sentence reaches a user only from
+            // the paths the hold does not cover (a fallback that landed on the
+            // warming tier after a remote primary failed) — where "retry" is
+            // still the honest advice.
+            LocalTierState::Loading { model_id } => RpcError::new(
+                error_code::TIER_WARMING,
+                format!(
+                    "{} Retry in a moment.{add_provider}",
+                    loading_local_engine_reason(&model_id)
+                ),
+            ),
+            LocalTierState::NoEngine { model_id } => settled(format!(
+                "{}{add_provider}",
+                no_local_engine_reason(&model_id)
+            )),
+        }
+    }
+
+    /// Why the local tier is not serving right now — **one** reading of the
+    /// machine, in one precedence.
+    ///
+    /// The precedence is [`startup_lifecycle`]'s, deliberately: a turn failure,
+    /// the lifecycle replay, and (since REQ-580) the decision to hold a turn all
+    /// describe the same machine at the same moment and must not tell the user
+    /// three different stories. Two of the seven states end **without the user
+    /// doing anything** and are the only two a turn is ever held for
+    /// ([`LocalTierState::warming`]); the other five need an answer, a command,
+    /// or different hardware.
+    ///
+    /// Meaningful only while the tier is not serving. It is asked from the
+    /// unserved-turn path (where that is given) and from the hold predicate
+    /// (which checks `local_tier_available()` first): asked of a live tier it
+    /// would answer `Loading` for a build with a loader, because it reads the
+    /// load's *outcome* and not the slot.
+    fn local_tier_state(&self) -> LocalTierState {
         if let Some(probe) = &self.probe {
             if probe.disabled {
-                let reason = probe
-                    .disabled_reason
-                    .clone()
-                    .unwrap_or_else(|| "the local tier is unavailable on this machine".to_owned());
-                return settled(format!("{reason}{add_provider}"));
+                return LocalTierState::BelowFloor {
+                    reason: probe.disabled_reason.clone().unwrap_or_else(|| {
+                        "the local tier is unavailable on this machine".to_owned()
+                    }),
+                };
             }
         }
 
@@ -1759,64 +2049,80 @@ impl DaemonRuntime {
             .or_else(|| self.probe.as_ref().and_then(|p| p.model.clone()))
             .unwrap_or_else(|| "the local model".to_owned());
 
-        // BR-4: a settled, deliberate absence — not something to wait for.
         if selection.as_ref().is_some_and(|s| s.declined_local) {
-            return settled(format!(
-                "the local tier was declined, so it will not serve turns; \
-                 `teton model set <name>` changes that.{add_provider}"
-            ));
+            return LocalTierState::Declined;
         }
 
+        // `consent_required()` stays true until the weights verify, so while it
+        // holds the question is only whether the accept is being acted on.
         // Accepted, and the install is in flight right now (M-2's claim is
-        // held). Read BEFORE `consent_required()`, which stays true until the
-        // weights verify — so during the whole download the fall-through
-        // branch would tell the user their accept did nothing.
-        //
-        // Transient (BUG-152): the download finishing is the only thing this
-        // turn was waiting for.
-        if selection
-            .as_ref()
-            .and_then(|s| s.model_name.as_deref())
-            .is_some_and(|name| self.consent.install_in_flight(name))
-        {
-            return RpcError::new(
-                error_code::TIER_WARMING,
-                format!("{}{add_provider}", installing_local_model_reason(&model_id)),
-            );
-        }
-
-        // BR-1: proposed and unanswered. The session runs, the tier does not.
+        // held) — read together with the verify state rather than ahead of it,
+        // because the *load* phase takes the same claim (`activate_engine`) and
+        // must not be reported as a download that is not happening: installed,
+        // verified, and claimed is the load, and lands below.
         if self.consent.consent_required() {
-            return settled(format!(
-                "{model_id} is proposed for this machine but has not been \
-                 answered yet, so the local tier is withheld — answer the \
-                 prompt (or `teton model list`) to open it.{add_provider}"
-            ));
-        }
-
-        // Decided and installed. Either the load is in flight — the window this
-        // bug was reported from — or it already failed and left its reason.
-        if self.weights_loader_present {
-            return match self.engine.load_failure() {
-                // A load that already failed is settled: retrying the turn
-                // meets the same dead engine, so this is not a "wait" state.
-                Some(reason) => settled(format!("{reason}{add_provider}")),
-                // Transient (BUG-152): the load completing is the only thing
-                // this turn was waiting for.
-                None => RpcError::new(
-                    error_code::TIER_WARMING,
-                    format!(
-                        "{} Retry in a moment.{add_provider}",
-                        loading_local_engine_reason(&model_id)
-                    ),
-                ),
+            let installing = selection
+                .as_ref()
+                .and_then(|s| s.model_name.as_deref())
+                .is_some_and(|name| self.consent.install_in_flight(name));
+            return if installing {
+                LocalTierState::Installing { model_id }
+            } else {
+                LocalTierState::AwaitingDecision { model_id }
             };
         }
 
-        settled(format!(
-            "{}{add_provider}",
-            no_local_engine_reason(&model_id)
-        ))
+        // Decided and installed. Either the load is in flight — the window
+        // BUG-152 was reported from — or it already failed and left its reason.
+        if self.weights_loader_present {
+            return match self.engine.load_failure() {
+                Some(reason) => LocalTierState::LoadFailed { reason },
+                None => LocalTierState::Loading { model_id },
+            };
+        }
+
+        LocalTierState::NoEngine { model_id }
+    }
+
+    /// Whether a turn that cannot be served right now should be **held** for
+    /// the local tier rather than refused (REQ-580 BR-1) — and if so, what the
+    /// tier is doing and which model it is doing it to.
+    ///
+    /// `Some` only when both halves hold. The tier is not serving —
+    /// [`Self::local_tier_available`], the same reading the router was built
+    /// from, so a hold is only ever taken on a turn the router routed *around*
+    /// the local tier. And the reason it is not serving is one of the two that
+    /// end on their own. Every settled absence answers `None` and the turn is
+    /// refused with the sentence that names its remedy, exactly as before.
+    ///
+    /// The availability check comes first and is load-bearing, not an
+    /// optimisation: [`Self::local_tier_state`] reads the load's *outcome*, not
+    /// the slot, so asked of a live tier it says `Loading` — and a hold taken on
+    /// that answer would wait for a transition that has already happened.
+    fn local_tier_hold(&self) -> Option<(TierWarming, String)> {
+        if self.local_tier_available() {
+            return None;
+        }
+        self.local_tier_state().warming()
+    }
+
+    /// Wait until the local tier stops warming — until it opens, or settles
+    /// into a state that waiting cannot change (REQ-580 BR-3).
+    ///
+    /// Re-reads [`Self::local_tier_hold`] on every wake and returns the moment
+    /// it answers `None`; a wake for an outcome that changed nothing (a
+    /// superseded flow, a deferred duplicate install) simply goes back to
+    /// waiting. Subscribing *before* the first read is what closes the race
+    /// with a transition landing between the read and the wait (see
+    /// [`Self::tier_transitions`]). Returns early if the runtime is being torn
+    /// down (the sender is gone), so a held turn can never outlive its daemon.
+    async fn await_local_tier(&self) {
+        let mut transitions = self.tier_transitions.subscribe();
+        while self.local_tier_hold().is_some() {
+            if transitions.changed().await.is_err() {
+                return;
+            }
+        }
     }
 
     /// [`Self::unserved_turn_error`], plus the one dead end the daemon can
@@ -1921,7 +2227,22 @@ impl DaemonRuntime {
     /// abandoned flow leaves the gate exactly as it found it rather than racing
     /// the authoritative decision (an `AlreadyInstalling` no-op that re-gated the
     /// tier would fight the running install that is about to un-gate it).
+    ///
+    /// REQ-580 ADR-2: **every** call, including the two no-ops above, wakes the
+    /// turns held for the tier ([`Self::await_local_tier`]) once the gate has
+    /// been written. Unconditional on purpose — the waiter re-reads the state
+    /// and decides for itself, so a spurious wake costs one read, while a wake
+    /// withheld on a judgement made here would be a second place that has to
+    /// know which outcomes matter to a held turn.
     fn apply_consent_outcome(&self, outcome: &ConsentOutcome) {
+        self.apply_consent_outcome_to_gate(outcome);
+        self.tier_transitions
+            .send_modify(|generation| *generation += 1);
+    }
+
+    /// [`Self::apply_consent_outcome`]'s gate write, split out so the wake that
+    /// follows it cannot be skipped by any of the early returns here.
+    fn apply_consent_outcome_to_gate(&self, outcome: &ConsentOutcome) {
         if matches!(
             outcome,
             ConsentOutcome::Superseded | ConsentOutcome::AlreadyInstalling { .. }
@@ -2266,6 +2587,58 @@ impl DaemonRuntime {
             .insert(provider_id.to_owned(), record);
     }
 
+    /// The router a prompt turn resolves by, built from the tier and health as
+    /// they stand *right now*.
+    ///
+    /// Called once per turn — twice for a turn that was held (REQ-580), because
+    /// the whole point of the hold is that the tier's availability changed
+    /// underneath the first reading. Both readings are this one function so
+    /// they cannot disagree about anything but the tier.
+    fn turn_router(&self, config: &Config, session_id: &SessionId) -> Router {
+        // REQ-544 M-5: seed the router from the daemon-wide health map so a
+        // provider marked Unavailable on an earlier turn stays Unavailable here —
+        // UNLESS its half-open cooldown has elapsed, in which case it is offered as
+        // Healthy so this turn re-probes it (the recovery path that keeps a single
+        // transient failure from stranding a provider daemon-wide until restart).
+        let health_snapshot = self.health_snapshot();
+        build_router(
+            config,
+            // REQ-547 BR-1/D-3: a tier awaiting a consent decision is withheld
+            // here, so this turn routes remote-only instead of blocking on the
+            // answer.
+            self.local_tier_available(),
+            &health_snapshot,
+        )
+        // REQ-559 BR-12 / ADR-F: a provider that refused the effort field
+        // earlier in THIS session resolves to `Omit(RefusedThisSession)` rather
+        // than being asked again. Seeded per turn from the session-scoped memo,
+        // so it is honoured by the route, the `route_decided` event, the request
+        // and the `teton effort` surface alike — one resolution, every reader.
+        .with_effort_refusals(self.effort_refusals.for_session(session_id))
+    }
+
+    /// Whether `route` should be held for the local tier rather than attempted
+    /// (REQ-580 BR-1), and if so what the tier is doing and to which model.
+    ///
+    /// Two readings, both borrowed rather than re-derived: the tier's
+    /// ([`Self::local_tier_hold`]) and the attempt's ([`attempt_source`], with
+    /// its own one read of the slot). `Some` only when the tier is genuinely
+    /// warming **and** this route has nowhere else to run — a route the router
+    /// resolved to a servable remote is attempted, whatever the tier is doing.
+    fn hold_for(
+        &self,
+        config: &Config,
+        route: &crate::router::Route,
+    ) -> Option<(TierWarming, String)> {
+        let hold = self.local_tier_hold()?;
+        match attempt_source(config, route, self.engine.get_with_format()) {
+            Err(Unservable::LocalTierDown) => Some(hold),
+            // Servable now (a remote), or unservable for a reason the tier's
+            // arrival would not fix — neither is a wait.
+            Ok(_) | Err(Unservable::RemoteWithoutModel) => None,
+        }
+    }
+
     /// Run one prompt turn for `session`, streaming events over `events` and
     /// returning the turn result.
     ///
@@ -2274,6 +2647,18 @@ impl DaemonRuntime {
     /// [`crate::harness::CompletionSource`] (local engine or a remote provider
     /// through the egress choke point), runs the unified turn loop, and — on a
     /// remote failure — falls back per the router (AC-7).
+    ///
+    /// ## A turn that meets a warming tier waits for it (REQ-580)
+    ///
+    /// A turn whose route has nowhere to run **only** because the local tier is
+    /// still coming up — its weights downloading, or installed and mid-load —
+    /// is held here until the tier settles, then routed afresh and run exactly
+    /// as if it had been sent that moment. The hold is announced on the bus as
+    /// `turn_queued` and taken *before* the turn's tools, head or conversation
+    /// exist, so a held turn has spent nothing; a settled absence is refused
+    /// immediately, exactly as before. `presence` is what ends a hold early: a
+    /// client that disconnects while its turn waits gets no ghost turn run on
+    /// its behalf once the tier opens (see [`ClientPresence`]).
     ///
     /// # Errors
     /// Returns a [`RpcError`] when no provider can serve the turn or an
@@ -2291,6 +2676,7 @@ impl DaemonRuntime {
         phase: Option<ProtoPhase>,
         session_cwd: Option<PathBuf>,
         prompt: String,
+        mut presence: ClientPresence,
     ) -> Result<PromptTurnResult, RpcError> {
         let turn_id = teton_protocol::TurnId::from(format!(
             "turn-{}",
@@ -2318,45 +2704,94 @@ impl DaemonRuntime {
             .map_err(|err| refused_claim_error(&err))?;
 
         let config = self.config.lock().expect("config mutex poisoned").clone();
-        // REQ-544 M-5: seed the router from the daemon-wide health map so a
-        // provider marked Unavailable on an earlier turn stays Unavailable here —
-        // UNLESS its half-open cooldown has elapsed, in which case it is offered as
-        // Healthy so this turn re-probes it (the recovery path that keeps a single
-        // transient failure from stranding a provider daemon-wide until restart).
-        let health_snapshot = self.health_snapshot();
-        let router = build_router(
-            &config,
-            // REQ-547 BR-1/D-3: a tier awaiting a consent decision is withheld
-            // here, so this turn routes remote-only instead of blocking on the
-            // answer.
-            self.local_tier_available(),
-            &health_snapshot,
-        )
-        // REQ-559 BR-12 / ADR-F: a provider that refused the effort field
-        // earlier in THIS session resolves to `Omit(RefusedThisSession)` rather
-        // than being asked again. Seeded per turn from the session-scoped memo,
-        // so it is honoured by the route, the `route_decided` event, the request
-        // and the `teton effort` surface alike — one resolution, every reader.
-        .with_effort_refusals(self.effort_refusals.for_session(&session_id));
-
-        // REQ-561 TASK-062: name the session, at most once for its whole life.
-        // Ahead of the turn rather than after it, for two reasons: the name is
-        // derived from the prompt, which is already in hand, so a client can
-        // label the session the moment the user hits enter rather than a whole
-        // answer later; and this is the one point on the path that every turn
-        // reaches, where the turn's own maze of early returns is still ahead.
-        //
-        // **Started here, not awaited here.** The turn proceeds into
-        // `dispatch_route` on the next line while the naming runs on its own
-        // task; the handle is dropped because nothing below reads a title, and a
-        // session that is not named yet is a session with no title — BR-3's
-        // degraded state. It cannot fail the turn — see `spawn_title_session`.
-        let _ = self.spawn_title_session(events, sessions, &router, &config, &session_id, &prompt);
+        let router = self.turn_router(&config, &session_id);
 
         let core_phase = phase.map(to_core_phase);
         let mut route = self
             .dispatch_route(&router, &session_id, mode, core_phase, &prompt)
             .await;
+
+        // REQ-580 BR-1/BR-3: a turn with nowhere to run *only* because the
+        // local tier is still coming up is held here, and then routed afresh.
+        //
+        // Here and not at the `NoTierAvailable` arm below, because everything
+        // between — the tools, the system head, the carried conversation — is
+        // built from the route, and a turn served after the wait must be
+        // built from the route it is served *by* (REQ-567 BR-7 for a single
+        // turn: the head is this turn's, not a stale one's). Nothing above this
+        // line has spent anything a held turn should not spend: the session
+        // claim (which is the point — a second prompt on this session while
+        // this one waits is `SESSION_BUSY`, naming it), and a `dispatch_route`
+        // that the warming tier caused to bypass its classifier.
+        //
+        // The predicate is the attempt's own (`attempt_source`, the reading
+        // `run_one_attempt` refuses on) crossed with the tier's state
+        // (`local_tier_hold`, the reading `unserved_turn_error` codes
+        // `TIER_WARMING` on) — so a turn is held on exactly the two facts that
+        // would otherwise have refused it with "retry in a moment", and no
+        // other. A route the router sent somewhere that can serve (a remote
+        // provider) is not held: the tier's state is not that turn's concern
+        // (REQ-547 D-3 — the gate withholds the tier, never the session).
+        let router = match self.hold_for(&config, &route) {
+            Some((waiting_on, model_id)) => {
+                events.publish(
+                    Some(session_id.clone()),
+                    Event::TurnQueued(TurnQueued {
+                        turn_id: turn_id.clone(),
+                        model_id,
+                        waiting_on,
+                    }),
+                );
+                tokio::select! {
+                    () = self.await_local_tier() => {}
+                    // The client left while the turn was still held. Nothing
+                    // was spent and nobody is listening: end the turn with the
+                    // refusal it would have carried without the hold — the same
+                    // classifier, the same sentence — rather than run a ghost
+                    // turn on the tier when it opens (ADR-3).
+                    () = presence.gone() => {
+                        let category = route.resolution.as_ref().map(|r| r.category);
+                        return Err(unserved_turn_sentence(
+                            &route,
+                            self.unserved_turn_error(&config, category),
+                        ));
+                    }
+                }
+                // Fresh, from the tier's settled state: the router now sees the
+                // tier as it is, and the classifier — bypassed while the tier
+                // was down — runs for real. If the tier failed instead of
+                // opening, this route lands on the `NoTierAvailable` arm below,
+                // where the classifier now says something settled.
+                let router = self.turn_router(&config, &session_id);
+                route = self
+                    .dispatch_route(&router, &session_id, mode, core_phase, &prompt)
+                    .await;
+                router
+            }
+            None => router,
+        };
+
+        // REQ-561 TASK-062: name the session, at most once for its whole life.
+        // Ahead of the turn rather than after it, for two reasons: the name is
+        // derived from the prompt, which is already in hand, so a client can
+        // label the session the moment the user hits enter rather than a whole
+        // answer later; and this is a point on the path that every turn
+        // reaches, where the turn's own maze of early returns is still ahead.
+        //
+        // After the hold rather than before it (REQ-580): the title's route
+        // reads the same tier state the turn's does, and a title requested of a
+        // tier that is still loading spends the session's one naming attempt on
+        // a duty that cannot run — the first prompt of every session that
+        // started during a load stayed untitled for its whole life. One
+        // classification's latency later is the price, and it is paid on the
+        // local model.
+        //
+        // **Started here, not awaited here.** The turn proceeds while the
+        // naming runs on its own task; the handle is dropped because nothing
+        // below reads a title, and a session that is not named yet is a session
+        // with no title — BR-3's degraded state. It cannot fail the turn — see
+        // `spawn_title_session`.
+        let _ = self.spawn_title_session(events, sessions, &router, &config, &session_id, &prompt);
 
         // Assemble the harness context, tools, and the permission gate once; a
         // fallback re-runs the loop against the same accumulated context.
@@ -3006,10 +3441,6 @@ impl DaemonRuntime {
         ctx: &mut ContextManager,
     ) -> Result<crate::harness::TurnOutcome, HarnessError> {
         let mut hook = NoopProvenanceHook;
-        let provider_cfg = route
-            .provider_id
-            .as_ref()
-            .and_then(|pid| config.providers.iter().find(|p| p.id == pid.0));
 
         // One read of the slot for the whole attempt: the engine this turn runs
         // on is the engine that was live when the turn started, even if a
@@ -3018,11 +3449,6 @@ impl DaemonRuntime {
         // at install time, so no engine lock is needed on this async path
         // (LESSON-448, REQ-554 verify).
         let local_engine = self.engine.get_with_format();
-        let is_local = match provider_cfg {
-            Some(p) => matches!(p.kind, ProviderKind::Local),
-            // No provider selected: fall back to the local tier if present.
-            None => local_engine.is_some(),
-        };
 
         // REQ-558 TASK-054: the `digest` duty resolves through its **own**
         // category, independently of the turn's. A turn on a frontier `think`
@@ -3050,54 +3476,46 @@ impl DaemonRuntime {
             shell: &shell,
         };
 
-        if is_local {
-            let Some((engine, format)) = local_engine.as_ref() else {
-                // The route named a Local-kind provider but the slot is empty —
-                // the tier is loading, failed, or was never opened. Not an
-                // engine failure (BUG-146); the caller classifies from state.
-                return Err(HarnessError::NoTierAvailable);
-            };
-            let mut source =
-                LocalEngineSource::new(Arc::clone(engine), *format, session_id.clone())
+        // Which source this attempt runs on — or `NoTierAvailable`, which the
+        // caller classifies from state rather than reporting as an engine fault
+        // (BUG-146). The three unservable shapes are spelled out on
+        // `attempt_source`; the REQ-580 hold asks it the same question ahead of
+        // the turn, which is why the decision lives there and not here.
+        let (provider_cfg, model) = match attempt_source(config, route, local_engine)? {
+            AttemptSource::Local(engine, format) => {
+                let mut source = LocalEngineSource::new(engine, format, session_id.clone())
                     .metered(Arc::new(self.ledger.clone()));
-            return run_session_turn_with_source(
-                &mut source,
-                tools,
-                tool_ctx,
-                gate,
-                stream_events,
-                ctx,
-                &route.harness,
-                &mut hook,
-                &digest,
-                &compact,
-                &duties,
-            )
-            .await;
-        }
+                return run_session_turn_with_source(
+                    &mut source,
+                    tools,
+                    tool_ctx,
+                    gate,
+                    stream_events,
+                    ctx,
+                    &route.harness,
+                    &mut hook,
+                    &digest,
+                    &compact,
+                    &duties,
+                )
+                .await;
+            }
+            // BUG-155 / REQ-557 BR-1: a remote route with no model does NOT
+            // fall back to the provider id. That fallback was `billing_model`'s,
+            // it was supposed to be deleted rather than relocated, and it was
+            // live: a provider the router deliberately refused to register
+            // could still be reached through `default_provider`, through a
+            // policy `fallback_id`, or through `config/set register_provider` —
+            // and this then put the provider's own id on the wire as the model,
+            // billed it, and named it in `teton cost` as a model needing a
+            // price. The route not carrying a model means no usable provider
+            // was selected, which is exactly `NoTierAvailable`'s meaning — so
+            // `attempt_source` refuses it and the user gets the sentence naming
+            // the unusable provider and the `--model` remedy (BR-5).
+            AttemptSource::Remote { provider, model } => (provider, model),
+        };
 
         // Remote: build the adapter + egress choke point, then drive it.
-        // The route named a provider this daemon does not have. On a fresh
-        // install that is the literal "local" fallback `build_router` invents
-        // when no providers are registered — so this is "nothing is configured
-        // and the tier is not live", never an engine fault (BUG-146).
-        let provider_cfg = provider_cfg.ok_or(HarnessError::NoTierAvailable)?;
-        // BUG-155 / REQ-557 BR-1: a remote route with no model does NOT fall back
-        // to the provider id. That fallback was `billing_model`'s, it was
-        // supposed to be deleted rather than relocated, and it was live: a
-        // provider the router deliberately refused to register could still be
-        // reached through `default_provider`, through a policy `fallback_id`, or
-        // through `config/set register_provider` — and this line then put the
-        // provider's own id on the wire as the model, billed it, and named it in
-        // `teton cost` as a model needing a price.
-        //
-        // The route not carrying a model means no usable provider was selected,
-        // which is exactly `NoTierAvailable`'s meaning — so this reuses
-        // `unserved_turn_error`'s existing classifier (BR-5) and the user gets
-        // the sentence naming the unusable provider and the `--model` remedy.
-        let Some(model) = route.model.clone() else {
-            return Err(HarnessError::NoTierAvailable);
-        };
         let caps = CapabilityProfile::from_core(provider_cfg.capabilities);
         let provider: Box<dyn Provider> = build_provider(provider_cfg, caps);
 
@@ -6988,6 +7406,7 @@ fn probe_local_tier(
 /// | a proposal is open, or weights are missing | `awaiting_decision` |
 /// | accepted, download/install in flight | `disabled`, saying it is running |
 /// | the tier was declined (BR-4) | `disabled`, saying so |
+/// | weights installed and verified, load in flight or failed | `disabled`, saying which |
 /// | weights installed, nothing in this build can load them | `disabled`, saying so |
 /// | an engine is loaded and serving | `ready` |
 ///
@@ -7088,10 +7507,14 @@ fn startup_lifecycle(
                      `teton model set <name>` changes that."
                 .to_owned(),
         }
-    } else if installing {
-        // Accepted, bytes in flight. Read BEFORE `consent_required()`, which
-        // stays true until the weights verify: a client attaching mid-download
-        // must not be told the proposal is still unanswered. The stage is the
+    } else if installing && consent.consent_required() {
+        // Accepted, bytes in flight: `consent_required()` stays true until the
+        // weights verify, so a client attaching mid-download must not be told
+        // the proposal is still unanswered. Read *with* the verify state rather
+        // than ahead of it (REQ-580): the load phase takes the same claim
+        // (`activate_engine`), and installed-verified-and-claimed is the load
+        // below, not a download that is not happening — the same precedence
+        // `DaemonRuntime::local_tier_state` reads by. The stage is the
         // `disabled`-with-reason shape the in-flight *load* below already
         // uses; the live byte counts arrive separately as `download` events
         // from the installer's own progress stream.
@@ -7520,6 +7943,14 @@ struct FakeEngineLoader {
 
 impl crate::model_consent::LocalEngineLoader for FakeEngineLoader {
     fn load(&self, model_name: &str) -> Result<crate::model_consent::EngineLoadReport, String> {
+        // REQ-580: a real load takes tens of seconds; this one takes none, and a
+        // suite that wants a prompt to land *inside* the load has no window to
+        // land it in. The delay is opt-in, honest work on the blocking pool
+        // (this is where `activate_engine` runs the loader), and gated by the
+        // fake loader's own gate — nothing constructs this type outside it.
+        if let Some(ms) = env_u64("TETON_FAKE_ENGINE_LOADER_DELAY_MS") {
+            std::thread::sleep(Duration::from_millis(ms));
+        }
         let benchmark = BenchmarkResult {
             first_token_ms: FAKE_LOADER_FIRST_TOKEN_MS,
             tokens_per_sec: FAKE_LOADER_TOKENS_PER_SEC,
@@ -15636,6 +16067,7 @@ permission_allow = [\"fetch_user_url\"]
                         None,
                         None,
                         format!("please summarize {SENTINEL} for me"),
+                        ClientPresence::unwatched(),
                     )
                     .await
                     .expect_err("a scan that cannot run must fail the turn closed");
@@ -15694,6 +16126,7 @@ permission_allow = [\"fetch_user_url\"]
                         None,
                         None,
                         "please summarize src/main.rs for me".to_owned(),
+                        ClientPresence::unwatched(),
                     )
                     .await
                     .expect_err("the fixture endpoint answers nothing");
@@ -15755,6 +16188,7 @@ permission_allow = [\"fetch_user_url\"]
                         None,
                         None,
                         format!("please summarize {SENTINEL} for me"),
+                        ClientPresence::unwatched(),
                     )
                     .await;
 
@@ -15828,6 +16262,7 @@ permission_allow = [\"fetch_user_url\"]
                         None,
                         None,
                         "please summarize src/main.rs for me".to_owned(),
+                        ClientPresence::unwatched(),
                     )
                     .await
                     .expect_err("a scan that cannot run must fail the turn closed");
@@ -15889,6 +16324,7 @@ permission_allow = [\"fetch_user_url\"]
                         None,
                         None,
                         "please summarize sk-ABCDEFGHIJKLMNOPQRSTUVWX for me".to_owned(),
+                        ClientPresence::unwatched(),
                     )
                     .await;
 
@@ -17418,6 +17854,7 @@ permission_allow = [\"fetch_user_url\"]
                             None,
                             None,
                             "what does the tokio page say about task pinning?".to_owned(),
+                            ClientPresence::unwatched(),
                         )
                         .await
                         .unwrap_or_else(|e| panic!("turn {turn} failed: {e:?}"));
@@ -21772,6 +22209,7 @@ provider_id = \"deepseek\"
                     None,
                     cwd,
                     text.to_owned(),
+                    ClientPresence::unwatched(),
                 )
                 .await
         }
@@ -23269,6 +23707,638 @@ provider_id = \"deepseek\"
                 !asked_again,
                 "the clear dropped the session grant and the user was asked again"
             );
+        }
+    }
+
+    /// REQ-580: a turn that meets a warming local tier is **held** for it, not
+    /// refused — and every way the hold can end is pinned here.
+    ///
+    /// The fixtures are the classifier's own: a decided machine whose verified
+    /// weights are mid-load (`weights_loader_present`, no failure, an empty
+    /// slot) is BUG-152's `Loading` state, reached through the same
+    /// `ModelConsentGate` the daemon reads, so what is being driven is
+    /// `run_prompt_turn` deciding to wait on the reading it would otherwise
+    /// have refused on.
+    mod held_turns {
+        use super::*;
+        use crate::classify::test_support::CountingEngine;
+        use crate::model_consent::{InstallError, WeightsInstaller};
+        use crate::sessions::SessionRegistry;
+        use std::time::Duration;
+        use teton_core::entities::{ModelSelection, SelectionSource};
+        use teton_inference::catalog::ModelEntry;
+        use teton_protocol::methods::InstallStatus;
+
+        /// An installer that reports the weights already verified on disk —
+        /// the state a machine is in once the download has completed, which is
+        /// what makes `consent_required()` false and lets the classifier reach
+        /// its load-state branches at all.
+        struct VerifiedInstaller;
+        impl WeightsInstaller for VerifiedInstaller {
+            fn install(&self, _entry: &ModelEntry) -> Result<(), InstallError> {
+                Ok(())
+            }
+            fn status(&self, _entry: &ModelEntry) -> InstallStatus {
+                InstallStatus::Verified
+            }
+        }
+
+        /// The bundled catalog's first entry — a real name, because
+        /// `consent_required()` re-checks the recorded name against the catalog.
+        fn model() -> String {
+            Catalog::bundled()
+                .models
+                .first()
+                .expect("the bundled catalog is non-empty")
+                .name
+                .clone()
+        }
+
+        /// A decided machine mid-load: the tier is not serving, and the reason
+        /// is the one that ends on its own. Slot empty, no failure recorded.
+        fn loading_runtime() -> Arc<DaemonRuntime> {
+            let model = model();
+            let store = Arc::new(SelectionStore::in_memory());
+            store
+                .record(&ModelSelection::accepted(&model, SelectionSource::Probe, 1))
+                .expect("in-memory record");
+            let gate = ModelConsentGate::new(
+                HardwareProfile {
+                    ram_bytes: 48 * GIB,
+                    free_disk_bytes: 500 * GIB,
+                    gpu: GpuClass::AppleSilicon,
+                },
+                Catalog::bundled(),
+                LocalModelConfig::default(),
+                Arc::new(EventBus::new()),
+                Arc::new(PendingModelDecisions::new()),
+                store,
+                Arc::new(VerifiedInstaller),
+            );
+            let mut runtime = DaemonRuntime {
+                consent: Arc::new(gate),
+                ..DaemonRuntime::minimal()
+            };
+            runtime.weights_loader_present = true;
+            runtime.probe = Some(ProbeResult {
+                model: Some(model.clone()),
+                probed_model: Some(model),
+                disabled: false,
+                disabled_reason: None,
+                ram_bytes: 48 * GIB,
+                above_floor: true,
+                forced_bench: None,
+            });
+            Arc::new(runtime)
+        }
+
+        /// The load completing: the loader commits `engine` into the slot and
+        /// the flow applies `Ready` — the same two steps, in the same order, as
+        /// the real consent flow (LESSON-450: `ready` is published before the
+        /// runtime flips availability, and the flip is what a held turn waits
+        /// on).
+        fn tier_opens(runtime: &DaemonRuntime, engine: &CountingEngine) {
+            runtime
+                .engine
+                .install("counting".to_owned(), engine.handle());
+            runtime.apply_consent_outcome(&ConsentOutcome::Ready {
+                selection: ModelSelection::accepted(model(), SelectionSource::Probe, 1),
+            });
+        }
+
+        /// Start a freeform turn on its own task and hand back what the test
+        /// needs to steer it: the task, the bus subscription that will see the
+        /// `turn_queued`, and the session it runs on.
+        fn start_turn(
+            runtime: &Arc<DaemonRuntime>,
+            presence: ClientPresence,
+        ) -> (
+            tokio::task::JoinHandle<Result<PromptTurnResult, RpcError>>,
+            crate::broadcast::Subscription,
+            SessionId,
+        ) {
+            let events = Arc::new(EventBus::new());
+            let sub = events.subscribe(64);
+            let sessions = SessionRegistry::new();
+            let session = sessions
+                .create(SessionMode::Freeform, None, None)
+                .expect("a freeform session needs no phase");
+            let session_id = session.session_id.clone();
+            let runtime = Arc::clone(runtime);
+            let task = tokio::spawn(async move {
+                runtime
+                    .run_prompt_turn(
+                        &events,
+                        &sessions,
+                        session.session_id.clone(),
+                        session.mode,
+                        None,
+                        None,
+                        "hi".to_owned(),
+                        presence,
+                    )
+                    .await
+            });
+            (task, sub, session_id)
+        }
+
+        /// The first `turn_queued` on `sub`, or a panic if none arrives in time.
+        async fn queued(
+            sub: &mut crate::broadcast::Subscription,
+        ) -> (Option<SessionId>, TurnQueued) {
+            let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+            loop {
+                let next = tokio::time::timeout_at(deadline, sub.recv())
+                    .await
+                    .expect("a turn_queued event within the window")
+                    .expect("the bus is open");
+                if let Event::TurnQueued(queued) = next.event {
+                    return (next.session_id, queued);
+                }
+            }
+        }
+
+        /// Every `turn_queued` still on `sub` right now.
+        fn queued_so_far(sub: &mut crate::broadcast::Subscription) -> usize {
+            std::iter::from_fn(|| sub.try_recv())
+                .filter(|env| matches!(env.event, Event::TurnQueued(_)))
+                .count()
+        }
+
+        /// **BR-1 / BR-2 / BR-3, the whole arc.** A prompt that lands while
+        /// the weights are loading is not refused: the daemon announces the
+        /// hold once, session-scoped and typed `loading` for the model in
+        /// question; the turn stays pending while nothing changes; and when
+        /// the tier opens the turn runs on the engine that arrived and returns
+        /// its ordinary result — the same `turn_id` the announcement named.
+        #[tokio::test]
+        async fn a_turn_that_meets_a_loading_tier_is_held_and_then_served() {
+            let runtime = loading_runtime();
+            let engine = CountingEngine::answering("edit");
+            let (task, mut sub, session_id) = start_turn(&runtime, ClientPresence::unwatched());
+
+            let (scoped_to, announced) = queued(&mut sub).await;
+            assert_eq!(scoped_to.as_ref(), Some(&session_id), "session-scoped");
+            assert_eq!(announced.waiting_on, TierWarming::Loading);
+            assert_eq!(announced.model_id, model(), "names the model, never a path");
+
+            // Held: nothing changed, so nothing moves.
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            assert!(
+                !task.is_finished(),
+                "a held turn waits for the tier, not a timer"
+            );
+            assert_eq!(engine.calls(), 0, "nothing was spent while held");
+
+            tier_opens(&runtime, &engine);
+
+            let result = tokio::time::timeout(Duration::from_secs(5), task)
+                .await
+                .expect("the held turn runs once the tier opens")
+                .expect("the task did not panic")
+                .expect("the turn is served, not refused");
+            assert_eq!(
+                result.turn_id, announced.turn_id,
+                "the reply is the held turn's"
+            );
+            assert!(
+                engine.calls() >= 1,
+                "the turn ran on the engine that arrived (calls: {})",
+                engine.calls()
+            );
+            assert_eq!(
+                queued_so_far(&mut sub),
+                0,
+                "announced once, not once per wake"
+            );
+        }
+
+        /// **BR-3, the other ending.** The tier can also *settle without
+        /// opening*: the load fails. Then the hold ends the same instant and
+        /// the turn is refused — with the settled code and the load's own
+        /// reason, exactly as a turn arriving after the failure would be. It
+        /// does not wait on, and it does not say "retry".
+        #[tokio::test]
+        async fn a_held_turn_is_refused_with_the_settled_reason_when_the_load_fails() {
+            let runtime = loading_runtime();
+            let (task, mut sub, _) = start_turn(&runtime, ClientPresence::unwatched());
+            let _ = queued(&mut sub).await;
+
+            runtime.apply_consent_outcome(&ConsentOutcome::EngineLoadFailed {
+                model_name: model(),
+                reason: format!("{}'s weights could not be loaded: fixture failure", model()),
+            });
+
+            let err = tokio::time::timeout(Duration::from_secs(5), task)
+                .await
+                .expect("the hold ends when the tier settles, opened or not")
+                .expect("the task did not panic")
+                .expect_err("a failed load is a refusal");
+            assert_eq!(err.code, error_code::UNKNOWN_PROVIDER, "{}", err.message);
+            assert!(
+                err.message.contains("could not be loaded"),
+                "the refusal carries the load's own reason: {}",
+                err.message
+            );
+            assert!(
+                !err.message.contains("Retry in a moment"),
+                "a settled failure must not tell the user to wait: {}",
+                err.message
+            );
+        }
+
+        /// **ADR-2, the wake itself.** A consent outcome that touches nothing
+        /// (a superseded flow) still wakes a waiter — which re-reads the state
+        /// and keeps waiting — so the wake needs no judgement about which
+        /// outcomes matter. And a real outcome ends the wait.
+        #[tokio::test]
+        async fn every_applied_outcome_wakes_the_wait_and_only_a_settled_tier_ends_it() {
+            let runtime = loading_runtime();
+            let waiter = {
+                let runtime = Arc::clone(&runtime);
+                tokio::spawn(async move { runtime.await_local_tier().await })
+            };
+            tokio::time::sleep(Duration::from_millis(20)).await;
+            assert!(!waiter.is_finished());
+
+            // A no-op outcome wakes and re-waits: still loading.
+            runtime.apply_consent_outcome(&ConsentOutcome::Superseded);
+            tokio::time::sleep(Duration::from_millis(20)).await;
+            assert!(
+                !waiter.is_finished(),
+                "a wake for an outcome that changed nothing goes back to waiting"
+            );
+
+            let engine = CountingEngine::answering("x");
+            tier_opens(&runtime, &engine);
+            tokio::time::timeout(Duration::from_secs(5), waiter)
+                .await
+                .expect("the wait ends when the tier opens")
+                .expect("no panic");
+        }
+
+        /// **ADR-3.** A client that disconnects while its turn is held gets no
+        /// ghost: the turn ends at once with the refusal it would have carried
+        /// without the hold, and when the tier later opens **nothing runs** —
+        /// the engine sees no call from it.
+        #[tokio::test]
+        async fn a_held_turn_ends_without_running_when_its_client_disconnects() {
+            let runtime = loading_runtime();
+            let engine = CountingEngine::answering("edit");
+            let (connected, presence) = tokio::sync::watch::channel(true);
+            let (task, mut sub, _) = start_turn(&runtime, ClientPresence::watching(presence));
+            let _ = queued(&mut sub).await;
+
+            drop(connected);
+
+            let err = tokio::time::timeout(Duration::from_secs(5), task)
+                .await
+                .expect("a held turn ends the moment its client is gone")
+                .expect("no panic")
+                .expect_err("nothing was served");
+            assert_eq!(
+                err.code,
+                error_code::TIER_WARMING,
+                "the refusal is the one the hold replaced: {}",
+                err.message
+            );
+
+            // The tier opens afterwards; the abandoned turn must not come back
+            // to life on it.
+            tier_opens(&runtime, &engine);
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            assert_eq!(engine.calls(), 0, "no ghost turn ran on the opened tier");
+        }
+
+        /// The other direction of ADR-3: a presence that says `false` (rather
+        /// than the sender dropping) is also "gone", and a client that was
+        /// already gone before the hold began is seen without waiting.
+        #[tokio::test]
+        async fn a_client_already_gone_ends_the_hold_immediately() {
+            let runtime = loading_runtime();
+            let (connected, presence) = tokio::sync::watch::channel(false);
+            let (task, _sub, _) = start_turn(&runtime, ClientPresence::watching(presence));
+            let err = tokio::time::timeout(Duration::from_secs(5), task)
+                .await
+                .expect("no wait for a client that already left")
+                .expect("no panic")
+                .expect_err("nothing was served");
+            assert_eq!(err.code, error_code::TIER_WARMING);
+            drop(connected);
+        }
+
+        /// **BR-1's boundary, settled side.** A tier that is *not* coming up —
+        /// here a load that already failed — is not waited for: the turn is
+        /// refused at once, with the settled code, and no `turn_queued` is
+        /// announced. Waiting would be waiting for nothing.
+        #[tokio::test]
+        async fn a_settled_absence_is_refused_at_once_and_announces_no_hold() {
+            let runtime = loading_runtime();
+            runtime
+                .engine
+                .record_load_failure(format!("{}'s weights could not be loaded", model()));
+            let (task, mut sub, _) = start_turn(&runtime, ClientPresence::unwatched());
+            let err = tokio::time::timeout(Duration::from_secs(5), task)
+                .await
+                .expect("a settled absence does not wait")
+                .expect("no panic")
+                .expect_err("nothing can serve it");
+            assert_eq!(err.code, error_code::UNKNOWN_PROVIDER, "{}", err.message);
+            assert_eq!(queued_so_far(&mut sub), 0, "no hold was announced");
+        }
+
+        /// **BR-1's boundary, the other axis.** A tier that IS coming up does
+        /// not hold a turn the router sent somewhere that can serve it: with a
+        /// remote provider bound, the turn is attempted there (and fails as a
+        /// provider problem — nothing answers at the fixture endpoint), no hold
+        /// is announced, and the tier's state never enters into it (REQ-547
+        /// D-3: the gate withholds the tier, never the session).
+        #[tokio::test]
+        async fn a_turn_with_a_servable_remote_route_is_not_held() {
+            let runtime = loading_runtime();
+            *runtime.config.lock().expect("config mutex") = Config {
+                providers: vec![ModelProvider {
+                    id: "cheap".to_owned(),
+                    kind: ProviderKind::OpenaiCompatible,
+                    // A closed port: the attempt is real and fails fast.
+                    endpoint: Some("http://127.0.0.1:9/v1/chat/completions".to_owned()),
+                    model: Some("deepseek-chat".to_owned()),
+                    auth_ref: None,
+                    capabilities: ProviderCapabilities::default(),
+                }],
+                default_provider: Some("cheap".to_owned()),
+                ..Config::default()
+            };
+            let (task, mut sub, _) = start_turn(&runtime, ClientPresence::unwatched());
+            let err = tokio::time::timeout(Duration::from_secs(20), task)
+                .await
+                .expect("a remote attempt against a closed port ends")
+                .expect("no panic")
+                .expect_err("nothing answers at the fixture endpoint");
+            assert_ne!(
+                err.code,
+                error_code::TIER_WARMING,
+                "the remote route was attempted, not the tier waited for: {}",
+                err.message
+            );
+            assert_eq!(queued_so_far(&mut sub), 0, "no hold was announced");
+        }
+
+        /// The predicate the hold and the attempt share, swept over every shape
+        /// `run_one_attempt` distinguishes — so the hold cannot be taken on a
+        /// reading the attempt would not have refused on, and vice versa.
+        #[test]
+        fn attempt_source_names_the_local_tier_only_when_the_slot_is_what_stops_the_turn() {
+            use crate::router::Route;
+            use teton_core::RouteOutcome;
+
+            fn route(provider: Option<&str>, model: Option<&str>) -> Route {
+                Route {
+                    provider_id: provider.map(ProviderId::from),
+                    model: model.map(str::to_owned),
+                    phase: None,
+                    reason: String::new(),
+                    outcome: RouteOutcome::Primary,
+                    harness: Default::default(),
+                    effort: None,
+                    resolution: None,
+                }
+            }
+            let config = Config {
+                providers: vec![
+                    ModelProvider {
+                        id: "on-device".to_owned(),
+                        kind: ProviderKind::Local,
+                        endpoint: None,
+                        model: None,
+                        auth_ref: None,
+                        capabilities: ProviderCapabilities::default(),
+                    },
+                    ModelProvider {
+                        id: "cheap".to_owned(),
+                        kind: ProviderKind::OpenaiCompatible,
+                        endpoint: Some("https://api.example.com/v1/chat/completions".to_owned()),
+                        model: Some("deepseek-chat".to_owned()),
+                        auth_ref: None,
+                        capabilities: ProviderCapabilities::default(),
+                    },
+                ],
+                ..Config::default()
+            };
+            let engine = CountingEngine::answering("x");
+            let slot = || Some((engine.handle(), ChatFormat::Flat));
+
+            // Local-kind provider: the slot decides.
+            assert!(matches!(
+                attempt_source(&config, &route(Some("on-device"), None), slot()),
+                Ok(AttemptSource::Local(..))
+            ));
+            assert_eq!(
+                attempt_source(&config, &route(Some("on-device"), None), None).err(),
+                Some(Unservable::LocalTierDown)
+            );
+            // No registered entry (the self-named tier, the taint pin): the
+            // slot decides.
+            assert!(matches!(
+                attempt_source(&config, &route(Some("local"), None), slot()),
+                Ok(AttemptSource::Local(..))
+            ));
+            assert_eq!(
+                attempt_source(&config, &route(Some("local"), None), None).err(),
+                Some(Unservable::LocalTierDown)
+            );
+            assert_eq!(
+                attempt_source(&config, &route(None, None), None).err(),
+                Some(Unservable::LocalTierDown)
+            );
+            // A remote with a model is servable whatever the slot holds.
+            assert!(matches!(
+                attempt_source(&config, &route(Some("cheap"), Some("deepseek-chat")), None),
+                Ok(AttemptSource::Remote { .. })
+            ));
+            // A remote without one is unservable for a reason the tier's
+            // arrival would not fix — the one `NoTierAvailable` the hold must
+            // NOT be taken on.
+            assert_eq!(
+                attempt_source(&config, &route(Some("cheap"), None), None).err(),
+                Some(Unservable::RemoteWithoutModel)
+            );
+        }
+
+        /// **The load phase is `loading`, not `installing`.** The load takes
+        /// the same M-2 claim the download does (`activate_engine`), so a
+        /// reader that checked `install_in_flight` ahead of the verify state
+        /// reported a running *load* as a running *download* — and a held turn
+        /// would have been announced "until it finishes installing" for weights
+        /// that were installed and verified minutes ago. Both readers of the
+        /// state — the hold's and the lifecycle replay's — must call it the
+        /// load, and they are asserted together so they cannot part.
+        ///
+        /// Driven through the real gate: a verified installer, a loader that
+        /// parks inside `load`, and `install_selected_model` — the path a
+        /// `model/set` (and, via `resolve`, a restart) takes to the load.
+        #[tokio::test]
+        async fn a_load_in_flight_reads_as_loading_in_the_hold_and_the_lifecycle_alike() {
+            use crate::model_consent::{EngineLoadReport, LocalEngineLoader};
+            use std::sync::atomic::AtomicBool;
+
+            struct ParkedLoader {
+                entered: AtomicBool,
+                release: Mutex<Option<std::sync::mpsc::Receiver<()>>>,
+            }
+            impl LocalEngineLoader for ParkedLoader {
+                fn load(&self, _model_name: &str) -> Result<EngineLoadReport, String> {
+                    self.entered.store(true, Ordering::SeqCst);
+                    let rx = self
+                        .release
+                        .lock()
+                        .expect("release slot")
+                        .take()
+                        .expect("a single load");
+                    let _ = rx.recv();
+                    Err("released by the test".to_owned())
+                }
+                fn commit(&self, _model_name: &str) {}
+                fn abandon(&self, _model_name: &str) {}
+            }
+
+            let model = model();
+            let store = Arc::new(SelectionStore::in_memory());
+            store
+                .record(&ModelSelection::accepted(&model, SelectionSource::Probe, 1))
+                .expect("in-memory record");
+            let (release, parked) = std::sync::mpsc::channel::<()>();
+            let loader = Arc::new(ParkedLoader {
+                entered: AtomicBool::new(false),
+                release: Mutex::new(Some(parked)),
+            });
+            let gate = ModelConsentGate::new(
+                HardwareProfile {
+                    ram_bytes: 48 * GIB,
+                    free_disk_bytes: 500 * GIB,
+                    gpu: GpuClass::AppleSilicon,
+                },
+                Catalog::bundled(),
+                LocalModelConfig::default(),
+                Arc::new(EventBus::new()),
+                Arc::new(PendingModelDecisions::new()),
+                store,
+                Arc::new(VerifiedInstaller),
+            )
+            .with_engine_loader(Arc::clone(&loader) as Arc<dyn LocalEngineLoader>);
+            let mut runtime = DaemonRuntime {
+                consent: Arc::new(gate),
+                ..DaemonRuntime::minimal()
+            };
+            runtime.weights_loader_present = true;
+            runtime.probe = Some(ProbeResult {
+                model: Some(model.clone()),
+                probed_model: Some(model.clone()),
+                disabled: false,
+                disabled_reason: None,
+                ram_bytes: 48 * GIB,
+                above_floor: true,
+                forced_bench: None,
+            });
+            let runtime = Arc::new(runtime);
+
+            let install = {
+                let runtime = Arc::clone(&runtime);
+                tokio::spawn(async move { runtime.install_selected_model().await })
+            };
+            // Wait for the LOAD's claim: the loader has been entered, and the
+            // claim `install_in_flight` reads is the one it holds.
+            let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+            while !(loader.entered.load(Ordering::SeqCst)
+                && runtime.consent.install_in_flight(&model))
+            {
+                assert!(
+                    tokio::time::Instant::now() < deadline,
+                    "the parked load was never entered"
+                );
+                tokio::time::sleep(Duration::from_millis(2)).await;
+            }
+
+            // The hold's reading.
+            assert_eq!(
+                runtime.local_tier_hold(),
+                Some((TierWarming::Loading, model.clone())),
+                "a load in flight is `loading`, whatever claim it holds"
+            );
+            // The refusal's reading.
+            let refusal = runtime.unserved_turn_error(&Config::default(), None);
+            assert!(
+                refusal.message.contains("loading and benchmarking"),
+                "{}",
+                refusal.message
+            );
+            assert!(
+                !refusal.message.contains("download/install is running"),
+                "a load must not be reported as a download: {}",
+                refusal.message
+            );
+            // The lifecycle replay's reading — the same precedence, or an
+            // attaching client and a held turn describe two different machines.
+            let replay = runtime.lifecycle_events();
+            let last = replay.last().expect("the replay ends in a state");
+            match &last.stage {
+                ModelLifecycleStage::Disabled { reason } => {
+                    assert!(reason.contains("loading and benchmarking"), "{reason}");
+                    assert!(!reason.contains("download/install is running"), "{reason}");
+                }
+                other => panic!("a tier mid-load replays as `disabled` with a reason: {other:?}"),
+            }
+
+            drop(release);
+            let outcome = tokio::time::timeout(Duration::from_secs(5), install)
+                .await
+                .expect("the parked load ends on release")
+                .expect("no panic");
+            assert!(
+                matches!(outcome, ConsentOutcome::EngineLoadFailed { .. }),
+                "{outcome:?}"
+            );
+        }
+
+        /// The typed state and the sentence are one classification: for every
+        /// state, the code `unserved_turn_error` renders agrees with whether
+        /// `LocalTierState::warming` names it transient. A branch added to one
+        /// and not the other fails here.
+        #[test]
+        fn the_typed_state_and_the_rendered_code_agree_on_what_is_transient() {
+            let runtime = loading_runtime();
+            let config = Config::default();
+
+            let loading = runtime.local_tier_state();
+            assert!(
+                matches!(loading, LocalTierState::Loading { .. }),
+                "{loading:?}"
+            );
+            assert_eq!(
+                runtime.unserved_turn_error(&config, None).code,
+                error_code::TIER_WARMING
+            );
+            assert!(runtime.local_tier_hold().is_some());
+
+            runtime.engine.record_load_failure("dead".to_owned());
+            let failed = runtime.local_tier_state();
+            assert!(
+                matches!(failed, LocalTierState::LoadFailed { .. }),
+                "{failed:?}"
+            );
+            assert_eq!(
+                runtime.unserved_turn_error(&config, None).code,
+                error_code::UNKNOWN_PROVIDER
+            );
+            assert!(runtime.local_tier_hold().is_none());
+
+            // And a tier that IS serving is never held for, whatever the
+            // outcome-based reading would have said (the availability guard).
+            let live = loading_runtime();
+            let engine = CountingEngine::answering("x");
+            tier_opens(&live, &engine);
+            assert!(live.local_tier_available());
+            assert!(live.local_tier_hold().is_none());
         }
     }
 }

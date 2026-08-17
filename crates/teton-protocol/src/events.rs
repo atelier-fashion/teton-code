@@ -22,7 +22,9 @@
 //! retained conversation was dropped on the user's say-so. REQ-579 adds
 //! `provider_setup_completed` (BR-15) and `provider_setup_rejected_nonuser`
 //! (BR-12), the guided provider-setup flow's two announcements — a commit that
-//! landed, and a commit refused for not coming from the user.
+//! landed, and a commit refused for not coming from the user. REQ-580 adds
+//! `turn_queued` (BR-2), which says a prompt turn is being held for a local tier
+//! that is still coming up rather than refused.
 //!
 //! This list is an index, not decoration: a new variant of [`Event`] that is not
 //! named here makes the paragraph above wrong.
@@ -33,7 +35,7 @@ use crate::effort::ResolvedEffort;
 use crate::methods::TierBinding;
 use crate::{
     Category, ClientKind, Phase, ProtocolVersion, ProviderId, ProviderKind, RequestId, SessionId,
-    Tier,
+    Tier, TurnId,
 };
 
 /// JSON-RPC notification method every broadcast event is delivered under. Its
@@ -166,6 +168,9 @@ pub enum Event {
     /// A turn dead-ended on a capability that is off or unconfigured
     /// (REQ-572 AC-2, architecture ADR-4).
     CapabilityDeadEnd(CapabilityDeadEnd),
+    /// A prompt turn is being held for the local tier it needs, which is still
+    /// coming up, rather than refused (REQ-580 BR-2).
+    TurnQueued(TurnQueued),
 }
 
 impl Event {
@@ -200,6 +205,7 @@ impl Event {
             Event::ProviderSetupCompleted(_) => "provider_setup_completed",
             Event::ProviderSetupRejected(_) => "provider_setup_rejected_nonuser",
             Event::CapabilityDeadEnd(_) => "capability_dead_end",
+            Event::TurnQueued(_) => "turn_queued",
         }
     }
 }
@@ -1782,6 +1788,59 @@ impl CapabilityDeadEnd {
 }
 
 // ---------------------------------------------------------------------------
+// turn_queued (REQ-580)
+// ---------------------------------------------------------------------------
+
+/// A prompt turn is being **held**, not refused (spec: `turn_queued`; REQ-580
+/// BR-2).
+///
+/// Before REQ-580 a turn that resolved to the local tier while that tier was
+/// still coming up was refused with `TIER_WARMING` and a sentence ending
+/// "Retry in a moment" — a retry the user then had to type. Now the daemon does
+/// the waiting: the turn is held until the tier settles, and then run exactly
+/// as if it had been sent that moment. This event is the hold being announced,
+/// so the client can say so instead of showing a silent gap.
+///
+/// Emitted **once per held turn**, at the moment the hold begins, and only when
+/// there is genuinely something to wait for — the two transient states BUG-152
+/// named (see [`TierWarming`]). A settled absence (declined, below the floor,
+/// a failed load, an unanswered proposal) still refuses immediately with the
+/// sentence that names its remedy; nothing about that changed. There is no
+/// paired "released" event: the turn's own progress — its `route_decided`, its
+/// streamed reply, or its refusal — is what follows.
+///
+/// Session-scoped, like every event a user's own turn produces.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TurnQueued {
+    /// The turn being held — the same id the eventual `session/prompt` result
+    /// carries, so a client can pair the notice with the reply it precedes.
+    pub turn_id: TurnId,
+    /// The model whose tier the turn is waiting on. A catalog name, never a
+    /// path (REQ-547 BR-11).
+    pub model_id: String,
+    /// What the tier is doing while the turn waits.
+    pub waiting_on: TierWarming,
+}
+
+/// The two states of the local tier that **end on their own** — the only two a
+/// turn is ever held for (REQ-580 BR-1; BUG-152's transient pair).
+///
+/// **Distinct values, not distinguishing prose**: a client branches on the
+/// variant to say "finishes installing" or "finishes loading" and never on a
+/// sentence. The daemon derives the value from the same classification that
+/// codes a refusal `TIER_WARMING`, so the two surfaces cannot disagree about
+/// which state the tier is in (LESSON-456).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TierWarming {
+    /// The model was accepted and its download/install is running.
+    Installing,
+    /// The weights are installed and verified; the daemon is loading and
+    /// benchmarking them.
+    Loading,
+}
+
+// ---------------------------------------------------------------------------
 // prefix_cache
 // ---------------------------------------------------------------------------
 
@@ -2374,6 +2433,14 @@ mod tests {
                     method: "provider/setup_commit".to_owned(),
                 }),
                 "provider_setup_rejected_nonuser",
+            ),
+            (
+                Event::TurnQueued(TurnQueued {
+                    turn_id: TurnId::from("turn-1"),
+                    model_id: "qwen".to_owned(),
+                    waiting_on: TierWarming::Loading,
+                }),
+                "turn_queued",
             ),
         ];
 
@@ -3530,6 +3597,49 @@ mod tests {
             wire.as_object().unwrap().keys().collect::<Vec<_>>(),
             ["event", "method", "seq", "session_id"]
         );
+    }
+
+    /// REQ-580 BR-2's wire half: a held turn reaches a client as a flat
+    /// `turn_queued` object naming its session, its turn, the model it waits
+    /// on, and — as a **value**, not a sentence — which of the two transient
+    /// states the tier is in. Both `TierWarming` variants ride the wire under
+    /// their snake_case spellings, so a renderer that branches on them is
+    /// branching on the same literals the daemon wrote.
+    ///
+    /// The key set is asserted whole: the payload names a catalog model and
+    /// nothing else about the install — no path, no URL, no digest (REQ-547
+    /// BR-11) — and a field added later turns this red rather than riding into
+    /// a transcript.
+    #[test]
+    fn a_held_turn_is_announced_session_scoped_with_a_typed_cause() {
+        for (waiting_on, spelled) in [
+            (TierWarming::Installing, "installing"),
+            (TierWarming::Loading, "loading"),
+        ] {
+            let queued = TurnQueued {
+                turn_id: TurnId::from("turn-7"),
+                model_id: "qwen3-coder-30b-a3b".to_owned(),
+                waiting_on,
+            };
+            round_trip(&queued);
+            let wire = envelope_wire(Event::TurnQueued(queued));
+            assert_eq!(wire["event"], "turn_queued");
+            assert_eq!(wire["session_id"], "s1");
+            assert_eq!(wire["turn_id"], "turn-7");
+            assert_eq!(wire["model_id"], "qwen3-coder-30b-a3b");
+            assert_eq!(wire["waiting_on"], spelled, "{wire}");
+            assert_eq!(
+                wire.as_object().unwrap().keys().collect::<Vec<_>>(),
+                [
+                    "event",
+                    "model_id",
+                    "seq",
+                    "session_id",
+                    "turn_id",
+                    "waiting_on"
+                ]
+            );
+        }
     }
 
     /// BR-2's event half: **neither provider-setup event has anywhere to put a

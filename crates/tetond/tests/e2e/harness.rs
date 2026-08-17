@@ -892,14 +892,19 @@ impl Client {
     /// The suite needs a turn that is genuinely still executing when its client
     /// disconnects, which `prompt` cannot produce — it waits for the response,
     /// by which time the turn is over and there is nothing left to defer.
-    pub fn prompt_no_wait(&mut self, session_id: &str, text: &str) {
+    ///
+    /// Returns the request id, so a caller that wants the answer *later* — after
+    /// watching what happens in between (REQ-580: a turn held for a warming
+    /// tier announces the hold, then the tier opens, then the reply lands) —
+    /// can collect it with [`Self::await_response`].
+    pub fn prompt_no_wait(&mut self, session_id: &str, text: &str) -> i64 {
         self.send(
             "session/prompt",
             json!({
                 "session_id": session_id,
                 "prompt": [{ "type": "text", "text": text }],
             }),
-        );
+        )
     }
 
     /// Close this connection the way a departing client does.
@@ -915,7 +920,10 @@ impl Client {
         let _ = self.writer.shutdown(std::net::Shutdown::Both);
     }
 
-    fn await_response(&mut self, id: i64) -> Value {
+    /// Pump (and auto-answer) events until the response to request `id`
+    /// arrives, and return it. Every event seen on the way is recorded, so a
+    /// caller can read what happened between the send and the reply.
+    pub fn await_response(&mut self, id: i64) -> Value {
         let deadline = Instant::now() + Duration::from_secs(20);
         loop {
             let remaining = deadline

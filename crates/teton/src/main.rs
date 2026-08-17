@@ -587,6 +587,12 @@ fn paint_indicator(ctx: &mut UiContext<'_>, tick: u64) -> usize {
 /// how far along it is, and what someone who does not want to wait can do
 /// instead. This says only the part that decides whether to read the rest: no
 /// action is required, and the tier is on its way.
+///
+/// Since REQ-580 the daemon **holds** such a turn rather than refusing it —
+/// the client sees a `turn_queued` notice ([`session_ui`]'s renderer) and then
+/// the reply — so this headline reaches a session only from the paths the hold
+/// does not cover: a fallback that landed on the warming tier after a remote
+/// primary failed, or a daemon older than the hold. It stays for both.
 const TIER_WARMING_HEADLINE: &str = "model still loading —";
 
 /// The headline a prompt refused because its session is already running a turn

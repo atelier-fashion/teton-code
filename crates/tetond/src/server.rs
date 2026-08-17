@@ -143,7 +143,7 @@ use crate::consent::{
 use crate::grants::{monitor_witness, ConnectionId, Grant, GrantRegistry};
 use crate::lifetime::LifetimeSupervisor;
 use crate::peer::{is_descendant_of, Ancestry, KernelParentOf, MAX_ANCESTRY_DEPTH};
-use crate::runtime::DaemonRuntime;
+use crate::runtime::{ClientPresence, DaemonRuntime};
 use crate::sessions::{self, SessionCreateError, SessionRegistry};
 
 /// Depth of a client's outbound message queue (responses + events).
@@ -1401,6 +1401,14 @@ async fn handle_client(stream: UnixStream, daemon: Arc<Daemon>, peer: PeerIdenti
     // unblocks the harness permission gate mid-turn (otherwise the loop would
     // deadlock awaiting a reply it cannot read).
     let mut prompt_tasks: Vec<JoinHandle<()>> = Vec::new();
+    // This connection's liveness, as seen by the turns it spawns (REQ-580
+    // ADR-3). Held open for the reader loop's whole life and dropped at
+    // teardown, *before* the drain below — so a turn still **held** for a
+    // warming tier ends there and then, rather than sitting out the drain
+    // window and running as a ghost when the tier opens. A turn that has
+    // started ignores it and keeps REQ-565's drain semantics.
+    let (connected, presence) = watch::channel(true);
+    let presence = ClientPresence::watching(presence);
     // In-flight `session/attach` calls, for exactly the same reason (REQ-569
     // BR-6): an attach that needs consent awaits an `attach/consent` that may
     // arrive on *this* connection, so running it here would deadlock the loop
@@ -1559,9 +1567,15 @@ async fn handle_client(stream: UnixStream, daemon: Arc<Daemon>, peer: PeerIdenti
         // `session/prompt` runs on its own task (see `prompt_tasks`); every other
         // method dispatches synchronously and replies immediately.
         if method == PromptTurnParams::METHOD {
-            if let Some(handle) =
-                spawn_prompt_turn(&daemon, conn, id, params, &out_tx, fence.clone())
-            {
+            if let Some(handle) = spawn_prompt_turn(
+                &daemon,
+                conn,
+                id,
+                params,
+                &out_tx,
+                fence.clone(),
+                presence.clone(),
+            ) {
                 // Prune completed turns before tracking a new one so the vector
                 // does not grow unbounded across a long-lived connection's turns
                 // (REQ-544 minor). Only still-running handles are kept, to be
@@ -1708,7 +1722,15 @@ async fn handle_client(stream: UnixStream, daemon: Arc<Daemon>, peer: PeerIdenti
     // terminal mid-turn is exactly AC-3's scenario, and "the ledger row for that
     // turn is intact" was false. The turn's *output* still goes nowhere (the
     // writer half is gone by now); the durable row is the point.
+    //
+    // REQ-580 ADR-3: the one exception is a turn that has not started — one
+    // still held for a warming tier. It has no cost row to protect and nobody
+    // to answer, so the connection's liveness is withdrawn *first*, and any
+    // held turn ends on it before the drain even looks. Dropped rather than
+    // sent, so a turn that subscribed late sees the closed channel and not a
+    // stale `true`.
     drop(client_guard);
+    drop(connected);
     for task in prompt_tasks {
         if task.is_finished() {
             continue;
@@ -1757,6 +1779,7 @@ fn spawn_prompt_turn(
     params: Value,
     out_tx: &mpsc::Sender<String>,
     fence: Option<EventFence>,
+    presence: ClientPresence,
 ) -> Option<JoinHandle<()>> {
     let params: PromptTurnParams = match serde_json::from_value(params) {
         Ok(params) => params,
@@ -1835,6 +1858,7 @@ fn spawn_prompt_turn(
                 summary.phase,
                 summary.cwd.clone(),
                 prompt,
+                presence,
             )
             .await;
         let response = match result {
@@ -6985,8 +7009,15 @@ mod tests {
         let (tx, mut rx) = mpsc::channel::<String>(4);
 
         let stranger = unattached(&daemon);
-        let handle =
-            spawn_prompt_turn(&daemon, &stranger, Id::Number(2), prompt.clone(), &tx, None);
+        let handle = spawn_prompt_turn(
+            &daemon,
+            &stranger,
+            Id::Number(2),
+            prompt.clone(),
+            &tx,
+            None,
+            ClientPresence::unwatched(),
+        );
         assert!(
             handle.is_none(),
             "a refused prompt must not spawn a turn task"
@@ -7002,7 +7033,15 @@ mod tests {
         );
 
         // The creator is attached, so the same call is accepted and run.
-        let accepted = spawn_prompt_turn(&daemon, &creator, Id::Number(3), prompt, &tx, None);
+        let accepted = spawn_prompt_turn(
+            &daemon,
+            &creator,
+            Id::Number(3),
+            prompt,
+            &tx,
+            None,
+            ClientPresence::unwatched(),
+        );
         let accepted = accepted.expect("an attached prompt must start its turn");
         accepted.await.unwrap();
         let response = rx.try_recv().expect("the turn answered");
@@ -7084,7 +7123,15 @@ mod tests {
             "prompt": [{"type": "text", "text": "drive this session"}],
         });
         let (tx, mut rx) = mpsc::channel::<String>(4);
-        let handle = spawn_prompt_turn(&daemon, &monitor, Id::Number(2), prompt, &tx, None);
+        let handle = spawn_prompt_turn(
+            &daemon,
+            &monitor,
+            Id::Number(2),
+            prompt,
+            &tx,
+            None,
+            ClientPresence::unwatched(),
+        );
         assert!(handle.is_none(), "a monitor's prompt must spawn no turn");
         let refused = rx.try_recv().expect("a refusal is queued for the monitor");
         assert!(
@@ -8653,7 +8700,15 @@ mod tests {
         });
         let (tx, mut rx) = mpsc::channel::<String>(4);
 
-        let handle = spawn_prompt_turn(&daemon, &conn, Id::Number(1), prompt, &tx, None);
+        let handle = spawn_prompt_turn(
+            &daemon,
+            &conn,
+            Id::Number(1),
+            prompt,
+            &tx,
+            None,
+            ClientPresence::unwatched(),
+        );
         assert!(
             handle.is_none(),
             "an unmintable id must not spawn a turn task"
