@@ -18,6 +18,63 @@ unchanged. What belongs here is what an *upgrade* does to a machine that was
 already running — above all, anything that changes where data goes without the
 user having asked for it.
 
+## [0.1.18] - 2026-08-17
+
+### Added
+
+- **`/provider setup` — connect a remote provider without leaving the session
+  (REQ-579).** Say "set up Kimi for deep reasoning" and the session hands you
+  one command:
+
+  ```
+  /provider setup kimi think
+  ```
+
+  It asks the six things a registration needs — vendor (from the built-in
+  recipe catalog: Anthropic, OpenAI, Moonshot/Kimi, DeepSeek, Grok, Ollama),
+  provider id, model, API key, which tiers to route, and a yes to the exact
+  TOML it is about to write — then commits it in one write and routes to it on
+  your very next turn. No restart, no second terminal.
+
+  The API key is read echo-off and goes straight into the OS keychain; the
+  daemon only ever sees `keychain://teton/<id>`. It is never in the transcript,
+  never in the model's context, never in config, events, the log, or the cost
+  ledger. Cancel at any prompt and nothing was written; a refused commit puts
+  the keychain back the way it was.
+
+  On a pipe, or on a platform with no OS keychain, the command prints the
+  equivalent `teton provider add …` recipe instead of asking anything.
+
+- **The session tells you about it even when the model doesn't.** The local
+  model is good at repeating a vendor's endpoint and poor at volunteering a
+  new command — three live rounds against qwen3-coder-30b never got it to say
+  `/provider setup` unprompted. So when a reply in a terminal session recites
+  `teton provider add`, the session appends one line of its own:
+
+  ```
+  >> in this session, /provider setup <vendor> [tier] does this without leaving it; no key in chat.
+  ```
+
+  It is the harness speaking, not the model, and it cannot be talked off by
+  a reply that names the command and then asks you to paste the key anyway.
+
+### Fixed
+
+- **The bundled guide no longer suggests putting a live API key on the
+  command line (BUG-176).** On 0.1.17, asked to connect a provider, the local
+  model's reply could end with "replace `kimi` with the actual API key" — a
+  key in your shell history. The guide now leads with the in-session command
+  and marks the shell path as `key via TETON_PROVIDER_KEY or a prompt`. If
+  you followed that older advice, treat the key as exposed and rotate it.
+
+### Upgrade notes
+
+Nothing to do. There is no wire-shape change, so a 0.1.17 daemon still
+running under `brew services` will keep serving until you stop it — the
+0.1.18 CLI will tell you the exact command if that is your setup (0.1.17's
+own fix). `/provider setup` needs the 0.1.18 daemon; against an older one it
+says so and asks nothing.
+
 ## [0.1.17] - 2026-08-15
 
 ### Fixed
