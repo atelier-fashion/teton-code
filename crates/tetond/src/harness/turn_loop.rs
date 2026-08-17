@@ -1027,6 +1027,16 @@ pub async fn run_routed_session_turn(
 /// `teton_docs` `providers` topic, which is a tool result and pays no resident
 /// cost.
 ///
+/// REQ-579 turns the prohibition into a **hand-off** (BR-1, ADR-3): it names
+/// `/provider setup <vendor> [tier]` before `teton provider add`, so the first
+/// thing a key question resolves to is a flow the user can run without leaving
+/// the session. It is a line edit rather than a new capability clause because
+/// "connect Kimi" is a front-door question, not a refusal — the web clause
+/// exists to explain an off/partial/unavailable state mid-turn, and provider
+/// setup has no such state. The recipe line is untouched: it is what the
+/// vendor argument is spelled from, and the client resolves that spelling
+/// leniently (ADR-2) so the guide never has to spend bytes teaching ids.
+///
 /// Sized to stay resident in every turn: the whole system prompt must clear
 /// `REDACT_BODY_OVERHEAD_BYTES` with escaping headroom, and clear it by at least
 /// `MIN_PROMPT_HEADROOM_BYTES` — `the_total_cap_clears_the_harness_context_budget_with_margin`
@@ -2242,8 +2252,12 @@ mod tests {
     /// better than the local tier doing it, and worse at being noticed.
     #[test]
     fn the_system_prompt_tells_the_model_to_refer_setup_commands_not_run_them() {
-        const REFERRAL: &str = "You cannot run these commands yourself: give the user the exact \
-                                commands to run, filled in from the recipes here.";
+        // Shortened under REQ-579: "give the user the exact commands to run"
+        // was the sentence the model obeyed in the live A/B (verification.md
+        // A1–A3), reciting `teton provider add` in a session where the guided
+        // command exists. The ban on running them stays, imperative and
+        // outright (BUG-168); which command to hand over is step 1's job now.
+        const REFERRAL: &str = "You cannot run these commands yourself; hand them to the user.";
         for config in [HarnessConfig::default(), HarnessConfig::for_strong_model()] {
             let system = build_system_prompt(&ToolRegistry::with_builtins(), &config);
             let Some(line) = system
@@ -2347,12 +2361,37 @@ mod tests {
     /// in-line edit alike. What it cannot catch is a contradicting sentence
     /// added elsewhere in the guide; no content pin can, and pretending
     /// otherwise is how the last set went vacuous.
+    ///
+    /// **REQ-579 BR-1 makes the same sentence the hand-off.** The prohibition
+    /// always had to name somewhere else for the key to go, and what it named
+    /// was a shell command — so a model that knew the rule still answered "run
+    /// `teton provider add …`" and left the user to do the work Teton can now
+    /// do for them. It now names `/provider setup <vendor> [tier]` first, which
+    /// is a command the user types *in this session*, and keeps
+    /// `teton provider add` after it because BR-11's non-interactive answer is
+    /// still that one. Presence and **order** are both asserted: a line naming
+    /// them the other way round reads as "recite the shell command; there is
+    /// also a slash command", which is the answer this REQ exists to stop.
+    ///
+    /// The last paragraph closes the hole the one above admits, for the one
+    /// contradiction that matters here: the guide's *only* sentence mentioning
+    /// asking is this one. A second sentence anywhere in the file that told the
+    /// model to ask for a key would sail past whole-line equality, and it is the
+    /// exact regression a future edit to a guide that discusses keys on four
+    /// lines could introduce.
     #[test]
     fn the_system_prompt_forbids_asking_for_a_credential_in_the_conversation() {
+        // The wording moved twice under REQ-579. The first draft named
+        // `/provider setup` here and left step 1 of the guide leading with
+        // `teton provider add`; the live A/B (verification.md, round A1–A3)
+        // showed the model following the numbered step, not this preamble —
+        // 0/3 hand-offs. The hand-off now lives INSIDE step 1 (the same fix
+        // REQ-577 needed), and this line is the shorter prohibition it was
+        // always meant to be. Its job is the ban and the three doors; the
+        // ordering claim is asserted on step 1 below.
         const PROHIBITION: &str =
-            "Never ask the user to type an API key or credential into the conversation: point \
-             them at `teton provider add` or `/web setup`, which read it echo-off into the \
-             keychain.";
+            "Never ask for an API key or credential in chat: `/provider setup`, \
+             `teton provider add` and `/web setup` read it echo-off into the keychain.";
         for config in [HarnessConfig::default(), HarnessConfig::for_strong_model()] {
             let system = build_system_prompt(&ToolRegistry::with_builtins(), &config);
             let Some(line) = system
@@ -2365,15 +2404,101 @@ mod tests {
                      key, and it puts the secret in the transcript.\n{system}"
                 );
             };
+            let line = line.trim();
+
+            // The three destinations, checked before the equality below so a
+            // reword fails on the clause it dropped rather than on a whole-line
+            // diff a reader has to spot the difference in.
+            let guided = line.find("/provider setup").unwrap_or_else(|| {
+                panic!(
+                    "the guide's credential sentence no longer names `/provider setup`, so \
+                     the only place it can send a user for a key is a shell — which is the \
+                     REQ-579 BR-1 defect, restored.\nline: {line}"
+                )
+            });
+            let shell = line.find("teton provider add").unwrap_or_else(|| {
+                panic!(
+                    "the guide's credential sentence no longer names `teton provider add`. \
+                     It is BR-11's answer — the non-interactive surface has no slash \
+                     command — and the guide is the only copy a turn sees without a tool \
+                     call.\nline: {line}"
+                )
+            });
+            assert!(
+                guided < shell,
+                "the guide names `teton provider add` before `/provider setup`, so the \
+                 first thing the model reads for a key question is still the command the \
+                 user has to go elsewhere to run (REQ-579 BR-1). Order is the \
+                 assertion.\nline: {line}"
+            );
+            assert!(
+                line.contains("/web setup"),
+                "the guide's credential sentence no longer names `/web setup`, so a search \
+                 key has nowhere to go: `/provider setup` does not write `[web]` (REQ-572 \
+                 BR-6).\nline: {line}"
+            );
+
             assert_eq!(
-                line.trim(),
-                PROHIBITION,
+                line, PROHIBITION,
                 "the prohibition sentence was edited. If the wording was changed \
                  deliberately, update this expectation to the new wording — an in-line \
                  weakening (`unless ...`) is exactly what whole-line equality exists to \
-                 catch; do not just delete the assertion."
+                 catch; do not just delete the assertion. Mind the two prompt-margin \
+                 tests: this line is resident in every turn."
             );
         }
+
+        // REQ-579 verification.md, rounds A1–A3: with the hand-off only in the
+        // preamble and step 1 leading with the shell command, the model followed
+        // the numbered step 3/3. The hand-off has to be the first thing step 1
+        // says, and the shell command has to be marked as the shell-only
+        // alternative — order inside the step is the assertion, exactly as it
+        // is for the prohibition line above.
+        let step_one = SELF_CONFIG_GUIDE
+            .lines()
+            .find(|line| line.starts_with("1. "))
+            .expect("the guide has a numbered step 1");
+        let guided = step_one
+            .find("/provider setup")
+            .expect("step 1 names `/provider setup`");
+        let shell = step_one
+            .find("teton provider add")
+            .expect("step 1 still names `teton provider add` — it is the shell path");
+        assert!(
+            guided < shell,
+            "step 1 leads with `teton provider add` again; the live A/B showed the model \
+             follows the numbered step, so the hand-off must come first (REQ-579 BR-1, \
+             verification.md A1–A3).\nstep 1: {step_one}"
+        );
+        assert!(
+            step_one.to_ascii_lowercase().contains("shell only"),
+            "step 1 no longer marks the CLI as the shell-only alternative, so a session \
+             reader has two equal instructions again.\nstep 1: {step_one}"
+        );
+
+        // And the contradiction whole-line equality cannot catch, for the one
+        // word that would carry it: nothing else in the guide talks about
+        // asking. A sentence added below that told the model to ask the user for
+        // a key would leave the prohibition above untouched and still be the
+        // last thing the model read on the subject.
+        let asking: Vec<&str> = SELF_CONFIG_GUIDE
+            .lines()
+            .filter(|line| line.to_ascii_lowercase().contains("ask"))
+            .collect();
+        assert_eq!(
+            asking.len(),
+            1,
+            "the guide has {} lines that mention asking, and exactly one may: the \
+             prohibition. If a new sentence legitimately needs the word, it is a decision \
+             — make it here, deliberately, rather than letting a second instruction about \
+             asking for a credential arrive unnoticed.\nlines: {asking:?}",
+            asking.len()
+        );
+        assert_eq!(
+            asking[0].trim(),
+            PROHIBITION,
+            "the guide's one sentence about asking is not the prohibition"
+        );
     }
 
     /// A stand-in for the real [`WebTool`](super::tools::WebTool), registered

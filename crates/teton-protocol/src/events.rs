@@ -19,7 +19,10 @@
 //! spec's ten-row Events table is deliberately folded onto three variants
 //! (architecture D-8; the fold is spelled out above [`WebLookupOutcome`]).
 //! REQ-567 adds `context_cleared` (BR-8), which announces that a session's
-//! retained conversation was dropped on the user's say-so.
+//! retained conversation was dropped on the user's say-so. REQ-579 adds
+//! `provider_setup_completed` (BR-15) and `provider_setup_rejected_nonuser`
+//! (BR-12), the guided provider-setup flow's two announcements — a commit that
+//! landed, and a commit refused for not coming from the user.
 //!
 //! This list is an index, not decoration: a new variant of [`Event`] that is not
 //! named here makes the paragraph above wrong.
@@ -27,7 +30,11 @@
 use serde::{Deserialize, Serialize};
 
 use crate::effort::ResolvedEffort;
-use crate::{Category, ClientKind, Phase, ProtocolVersion, ProviderId, RequestId, SessionId, Tier};
+use crate::methods::TierBinding;
+use crate::{
+    Category, ClientKind, Phase, ProtocolVersion, ProviderId, ProviderKind, RequestId, SessionId,
+    Tier,
+};
 
 /// JSON-RPC notification method every broadcast event is delivered under. Its
 /// params are an [`EventEnvelope`].
@@ -143,6 +150,19 @@ pub enum Event {
     /// A setup call was refused because it did not come from the user
     /// (REQ-572 BR-4).
     WebSetupRejected(WebSetupRejected),
+    /// A guided provider-setup flow committed a registration (REQ-579 BR-15).
+    ProviderSetupCompleted(ProviderSetupCompleted),
+    /// A provider-setup **commit** was refused because it did not come from the
+    /// user (REQ-579 BR-12).
+    ///
+    /// The wire name is `provider_setup_rejected_nonuser`, which the derived
+    /// snake_case spelling does not produce — hence the explicit rename. It is
+    /// the spec's own name for the event and says what the refusal *was*, not
+    /// merely that there was one: a client that logs it is logging an attempt
+    /// by something other than the user, which is a different security fact
+    /// from a malformed candidate.
+    #[serde(rename = "provider_setup_rejected_nonuser")]
+    ProviderSetupRejected(ProviderSetupRejected),
     /// A turn dead-ended on a capability that is off or unconfigured
     /// (REQ-572 AC-2, architecture ADR-4).
     CapabilityDeadEnd(CapabilityDeadEnd),
@@ -177,6 +197,8 @@ impl Event {
             Event::SessionGrantMinted(_) => "session_grant_minted",
             Event::WebSetupCompleted(_) => "web_setup_completed",
             Event::WebSetupRejected(_) => "web_setup_rejected",
+            Event::ProviderSetupCompleted(_) => "provider_setup_completed",
+            Event::ProviderSetupRejected(_) => "provider_setup_rejected_nonuser",
             Event::CapabilityDeadEnd(_) => "capability_dead_end",
         }
     }
@@ -1612,6 +1634,100 @@ pub struct WebSetupRejected {
     pub origin: String,
 }
 
+/// A guided provider-setup flow committed a registration (spec:
+/// `provider_setup_completed`; REQ-579 BR-15).
+///
+/// Session-scoped through the [`EventEnvelope`], like every other event a
+/// user's own command produces — the payload carries no `session_id` of its own
+/// for [`WebSetupCompleted`]'s structural reason: the envelope flattens over the
+/// payload, so a second `session_id` here would be a duplicate key on the wire.
+///
+/// It exists as an event and not only as the commit RPC's answer because the
+/// interactive surface has to be able to print "registered; `think` now routes
+/// to it" without polling (BR-15), and because a second client attached to the
+/// same session watched routing change under it and is owed the news
+/// (LESSON-505).
+///
+/// **What it deliberately does not carry**: the key, obviously (BR-2, and there
+/// is nowhere here to put one), and also the endpoint — whose authority can
+/// carry userinfo a pasted URL smuggled in. A client that wants the address
+/// reads it from config; an event that repeated it would put a credential-shaped
+/// string into a transcript for no gain. The config path is not carried either:
+/// unlike [`WebSetupCompleted`], nothing about a provider registration needs the
+/// user sent to the file to understand what changed.
+///
+/// [`dial_host`](Self::dial_host) is the deliberate exception to that second
+/// rule and not a softening of it: a host is not an endpoint. It is read from
+/// the parser that dials, so it carries no userinfo, no path and no query by
+/// construction (LESSON-529) — which is exactly why the *endpoint* may not
+/// travel here and the host may. An explicit `:port` rides with it, being part
+/// of the destination rather than part of what a credential could hide in.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ProviderSetupCompleted {
+    /// The id now registered — the one fact the model legitimately learns from
+    /// this flow (BR-2): that a provider with this id exists, and nothing else.
+    pub provider_id: ProviderId,
+    /// Which adapter it speaks.
+    pub kind: ProviderKind,
+    /// The model it is pinned to. Present, not optional: a commit that landed
+    /// registered a candidate whose model was required (REQ-579 BR-6), so there
+    /// is no completed setup with nothing to name here.
+    pub model: String,
+    /// The tier bindings that landed with it. Empty is a legitimate and stated
+    /// outcome — the registered-but-unrouted provider BR-7 permits — so a
+    /// renderer must read an empty list as "nothing routes to it yet" rather
+    /// than as a missing field.
+    #[serde(default)]
+    pub bindings: Vec<TierBinding>,
+    /// The host this provider will be dialed at — the **dial-time** parser's
+    /// reading of the endpoint that was written (BR-5, LESSON-529), and the
+    /// same string the confirm step showed.
+    ///
+    /// The announcement is otherwise silent about where turns will now go: a
+    /// second client attached to this session watched routing move under it
+    /// (the reason this event exists at all) and is owed the destination, not
+    /// only the id. Host, plus `:port` when the endpoint states one explicitly;
+    /// never userinfo, path or query — and never the endpoint, for the type's
+    /// own reason above. The port is on the destination side of that line: a
+    /// registration on `:8443` announced as the bare host names a different
+    /// socket in the familiar socket's words.
+    ///
+    /// `#[serde(default)]` so a client built after this field still reads an
+    /// older daemon's frame; empty means "this daemon did not say".
+    #[serde(default)]
+    pub dial_host: String,
+}
+
+/// A provider-setup **commit** was refused because it did not come from the
+/// user (spec: `provider_setup_rejected_nonuser`; REQ-579 BR-12).
+///
+/// Defense in depth, announced rather than logged: the gate answers the caller
+/// in the response, and this event is what tells the **session's own user** that
+/// something else tried, which a log line an adversary can rotate away does not
+/// (LESSON-505).
+///
+/// **The commit arm only.** `provider/setup_plan` and `provider/setup_preview`
+/// refuse in-response and publish nothing (BR-12, LESSON-513): they are
+/// read-only and attacker-paced, so publishing on them would hand an
+/// unauthorized caller a way to fill a user's transcript at will.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ProviderSetupRejected {
+    /// Which method was refused, by its wire name — e.g.
+    /// `provider/setup_commit`.
+    ///
+    /// It names a **method**, never an identity: no pid, no socket peer, no
+    /// credential, and not the candidate the caller sent. A refusal notice that
+    /// fingerprinted the caller — or echoed what it tried to register — would
+    /// put data in a transcript that the refusal itself exists to keep out
+    /// ([`WebSetupRejected::origin`]'s rule, applied to this flow rather than
+    /// assumed inherited from it: LESSON-525).
+    ///
+    /// A `String` rather than an enum, for [`CapabilityDeadEnd::capability`]'s
+    /// reason: a client built before a method existed must be able to report a
+    /// refusal it has never heard of rather than fail to parse the frame.
+    pub method: String,
+}
+
 /// A turn dead-ended on a capability that is off or unconfigured (spec:
 /// `capability_dead_end`).
 ///
@@ -2239,6 +2355,25 @@ mod tests {
             (
                 Event::ContextCleared(ContextCleared { blocks_dropped: 6 }),
                 "context_cleared",
+            ),
+            (
+                Event::ProviderSetupCompleted(ProviderSetupCompleted {
+                    provider_id: ProviderId::from("p"),
+                    kind: ProviderKind::OpenaiCompatible,
+                    model: "m".to_owned(),
+                    bindings: vec![],
+                    dial_host: "api.example".to_owned(),
+                }),
+                "provider_setup_completed",
+            ),
+            (
+                // REQ-579's one variant whose wire name is *not* its derived
+                // snake_case spelling — the row exists so the `#[serde(rename)]`
+                // and `name()` are checked against the same literal.
+                Event::ProviderSetupRejected(ProviderSetupRejected {
+                    method: "provider/setup_commit".to_owned(),
+                }),
+                "provider_setup_rejected_nonuser",
             ),
         ];
 
@@ -3329,6 +3464,122 @@ mod tests {
         ))
         .unwrap();
         assert!(wire.get("session_id").is_none(), "{wire}");
+    }
+
+    /// REQ-579 BR-15 / BR-12's wire half: both provider-setup events reach a
+    /// client as flat objects naming the session they belong to, and the
+    /// rejection lands under the `_nonuser` spelling the spec names rather than
+    /// the snake_case one the derive would have produced.
+    ///
+    /// The scoping is asserted on the wire object rather than on the payloads
+    /// because the envelope is what carries it — and `envelope_wire`
+    /// round-trips before returning, so a `session_id` field added to either
+    /// payload fails here on the duplicate key rather than reaching a client.
+    #[test]
+    fn the_provider_setup_events_are_session_scoped_under_their_wire_names() {
+        let completed = ProviderSetupCompleted {
+            provider_id: ProviderId::from("kimi"),
+            kind: ProviderKind::OpenaiCompatible,
+            model: "kimi-k2-turbo-preview".to_owned(),
+            bindings: vec![TierBinding {
+                tier: Tier::Think,
+                provider_id: ProviderId::from("kimi"),
+            }],
+            dial_host: "api.moonshot.ai".to_owned(),
+        };
+        round_trip(&completed);
+        let wire = envelope_wire(Event::ProviderSetupCompleted(completed));
+        assert_eq!(wire["event"], "provider_setup_completed");
+        assert_eq!(wire["session_id"], "s1");
+        assert_eq!(wire["provider_id"], "kimi");
+        assert_eq!(wire["kind"], "openai-compatible");
+        assert_eq!(wire["model"], "kimi-k2-turbo-preview");
+        assert_eq!(wire["bindings"][0]["tier"], "think");
+        assert_eq!(wire["bindings"][0]["provider_id"], "kimi");
+        assert_eq!(
+            wire["dial_host"], "api.moonshot.ai",
+            "the announcement names where turns will now go — a host, and only a \
+             host: {wire}"
+        );
+
+        // BR-7's unrouted outcome is a distinct, legible answer — an empty list
+        // rather than an absent key, so a renderer says "nothing routes to it
+        // yet" instead of reading a missing field as an error.
+        let unrouted = ProviderSetupCompleted {
+            provider_id: ProviderId::from("kimi"),
+            kind: ProviderKind::Anthropic,
+            model: "claude-x".to_owned(),
+            bindings: vec![],
+            dial_host: "api.anthropic.com".to_owned(),
+        };
+        round_trip(&unrouted);
+        let wire = envelope_wire(Event::ProviderSetupCompleted(unrouted));
+        assert_eq!(wire["bindings"].as_array().unwrap().len(), 0);
+
+        let rejected = ProviderSetupRejected {
+            method: "provider/setup_commit".to_owned(),
+        };
+        round_trip(&rejected);
+        let wire = envelope_wire(Event::ProviderSetupRejected(rejected));
+        assert_eq!(wire["event"], "provider_setup_rejected_nonuser");
+        assert_eq!(wire["session_id"], "s1");
+        assert_eq!(wire["method"], "provider/setup_commit");
+        // The refusal names the method and nothing else: no caller identity,
+        // and no echo of the candidate it tried to register (BR-12, BR-2).
+        assert_eq!(
+            wire.as_object().unwrap().keys().collect::<Vec<_>>(),
+            ["event", "method", "seq", "session_id"]
+        );
+    }
+
+    /// BR-2's event half: **neither provider-setup event has anywhere to put a
+    /// key**, and neither repeats the endpoint whose authority could carry one.
+    ///
+    /// Asserted on the serialized key sets rather than on a reading of the
+    /// structs, so a `key_ref` or `endpoint` field added later turns this red
+    /// instead of riding along into a transcript. The rule is re-applied at this
+    /// second surface rather than assumed inherited from the web family
+    /// (LESSON-525).
+    #[test]
+    fn no_provider_setup_event_can_carry_the_key_or_the_endpoint() {
+        let planted = "sk-live-do-not-log-me";
+        let wire = serde_json::to_string(&ProviderSetupCompleted {
+            provider_id: ProviderId::from("kimi"),
+            kind: ProviderKind::OpenaiCompatible,
+            model: "kimi-k2-turbo-preview".to_owned(),
+            bindings: vec![TierBinding {
+                tier: Tier::Think,
+                provider_id: ProviderId::from("kimi"),
+            }],
+            // A host, which is what `dial_host` is — the userinfo, path and
+            // query a whole endpoint would carry are exactly what the field is
+            // defined to have already dropped.
+            dial_host: "api.moonshot.ai".to_owned(),
+        })
+        .unwrap();
+        assert!(!wire.contains(planted), "{wire}");
+        assert!(
+            !wire.contains("://") && !wire.contains('@'),
+            "the completion carries a host, never an endpoint that could hide \
+             userinfo in its authority: {wire}"
+        );
+
+        // Every field name the completion can carry, spelled out (sorted, which
+        // is how `serde_json` hands back an object's keys): a key- or
+        // URL-carrying field would have to be added to this list to be added to
+        // the type.
+        let keys: Vec<String> = serde_json::from_str::<serde_json::Value>(&wire)
+            .unwrap()
+            .as_object()
+            .unwrap()
+            .keys()
+            .cloned()
+            .collect();
+        assert_eq!(
+            keys,
+            ["bindings", "dial_host", "kind", "model", "provider_id"],
+            "{wire}"
+        );
     }
 
     /// BR-10: the three states are distinguished on the wire by a **tag**, not

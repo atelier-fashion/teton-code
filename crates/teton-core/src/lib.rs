@@ -79,8 +79,8 @@ pub use category::{
 // cleartext condition — one spelling each, so the CLI and the validator cannot
 // come to different conclusions about the same string.
 pub use config::{
-    is_absolute_http_url, is_cleartext_to_a_remote_host, url_host, Config, ConfigError,
-    LegacyRoutingRule, LifetimeConfig, LoadError, LocalModelConfig, MigratedPhase,
+    is_absolute_http_url, is_cleartext_to_a_remote_host, is_recognized_auth_ref, url_host, Config,
+    ConfigError, LegacyRoutingRule, LifetimeConfig, LoadError, LocalModelConfig, MigratedPhase,
     PermissionsConfig, PrivacyConfig, RoutingMigration, ShutdownPolicyKind, SkippedRule, WebConfig,
     WebTier,
 };
@@ -88,7 +88,7 @@ pub use config::{
 // is — the daemon's one config-write body and the `/web setup` preview both
 // name these, and `teton_core::apply_config_delta` is the single path to the
 // only code that may edit a user's config document.
-pub use config_doc::{apply_config_delta, table_section, DeltaError};
+pub use config_doc::{apply_config_delta, array_element_section, table_section, DeltaError};
 // REQ-559: the effort vocabulary is re-exported at the crate root so
 // `teton_core::EffortLevel` is the stable path for the daemon, the adapters and
 // the CLI alike — one ladder, one clamp, one resolver (BR-3, BR-9).

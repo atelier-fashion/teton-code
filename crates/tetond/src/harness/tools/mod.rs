@@ -1279,4 +1279,97 @@ mod tests {
             }
         }
     }
+
+    /// **REQ-579 BR-12, the structural half: the model cannot register a
+    /// provider.**
+    ///
+    /// `provider/setup_*` are **client** RPCs, and that placement is the
+    /// enforcement rather than a convention: tool dispatch and the client socket
+    /// are structurally distinct channels, so a model emitting a tool call named
+    /// `provider/setup_commit` reaches this registry, finds no such tool, and is
+    /// told so. That is the same argument `web/setup_commit` rests on
+    /// (`teton-protocol`'s guided-setup module header states it), asserted here
+    /// for this flow rather than assumed inherited from that one (LESSON-525).
+    ///
+    /// **Absence is the mechanism, so nothing is added to make this pass.** A
+    /// name-matching refusal inside dispatch would turn "the model may not
+    /// register a provider" into a runtime branch — one more thing to delete —
+    /// where today it is a fact about which channel the handler hangs off. The
+    /// registry has no allowlist and must not grow one for this.
+    ///
+    /// Two halves, for [`no_tool_can_clear_a_session_and_no_mcp_wiring_path_could`]'s
+    /// reasons. No tool is named for it, spelled however a model might spell it —
+    /// asserted against the full built-in set, so the claim is about the registry
+    /// a real session runs with. And no source under `harness/` — where every
+    /// `impl Tool` lives, MCP wiring included — so much as names the runtime's
+    /// commit or its params type. Wire one in and this fails, which is the point:
+    /// the next person to try has to answer for it here rather than ship a tool
+    /// that registers an egress endpoint on the model's say-so.
+    #[test]
+    fn no_tool_can_commit_a_provider_setup_and_no_harness_source_names_it() {
+        let reg = ToolRegistry::with_builtins();
+        // Non-vacuity: the registry under test is the populated one.
+        assert!(
+            reg.get("read").is_some() && reg.names().len() == 6,
+            "the built-in set is missing, so the sweep below proves nothing: {:?}",
+            reg.names()
+        );
+
+        let ctx = ToolContext::new(std::env::temp_dir());
+        for forbidden in [
+            "provider/setup_commit",
+            "provider/setup_preview",
+            "provider/setup_plan",
+            "provider_setup_commit",
+            "provider_setup",
+            "register_provider",
+            "add_provider",
+        ] {
+            assert!(
+                reg.get(forbidden).is_none(),
+                "`{forbidden}` is reachable from tool dispatch, so a model could issue it"
+            );
+            let outcome = reg.dispatch(forbidden, &ctx, &serde_json::json!({}));
+            assert!(
+                outcome.is_error && outcome.content.contains("unknown tool"),
+                "a model that emits `{forbidden}` must be told there is no such tool, \
+                 not served: {}",
+                outcome.content
+            );
+        }
+        // Belt and braces over the whole namespace: no registered tool is named
+        // for provider registration, whatever it is spelled.
+        for name in reg.names() {
+            assert!(
+                !name.contains("provider"),
+                "`{name}` is a tool the model can call, and it names a user-only action"
+            );
+        }
+
+        // The MCP half, and every other tool this crate might grow: nothing a
+        // tool call reaches names the runtime's commit or its params type.
+        // Whole-line comments are stripped, so a doc comment that *discusses*
+        // the flow is not a second implementation of it.
+        let harness: Vec<_> = crate::call_sites::scan::production_sources()
+            .into_iter()
+            .filter(|(path, _)| path.starts_with("harness/"))
+            .collect();
+        assert!(
+            harness
+                .iter()
+                .any(|(path, _)| path.contains("tools/mcp.rs")),
+            "the scan missed the MCP wiring it is about: {:?}",
+            harness.iter().map(|(p, _)| p).collect::<Vec<_>>()
+        );
+        for (path, source) in &harness {
+            let code = crate::call_sites::scan::code_only(source);
+            for named in ["provider_setup_commit", "ProviderSetupCommitParams"] {
+                assert!(
+                    !code.contains(named),
+                    "{path} names `{named}`, so tool dispatch has a path to registering \
+                     a provider — BR-12's by-construction claim is false"
+                );
+            }
+        }
+    }
 }

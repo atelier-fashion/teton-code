@@ -841,10 +841,23 @@ fn slash_help_lists_every_command_and_no_turn_is_attempted() {
             "/verbose",
             "Toggle the routing and turn-end notices for this session.",
         ),
-        // REQ-563's two web controls. A command a user cannot find in `/help`
-        // is a command they do not have (BUG-153), and `/web allow` is the only
-        // way out of a taint restriction — so its absence here would be a dead
-        // end, not just a discoverability gap.
+        (
+            "/effort",
+            "Show or set the global reasoning effort: /effort [low|medium|high|xhigh|max].",
+        ),
+        (
+            "/permissions",
+            "Show or set this session's permission level: /permissions [level].",
+        ),
+        // REQ-572's enablement walkthrough, and REQ-563's two web controls. A
+        // command a user cannot find in `/help` is a command they do not have
+        // (BUG-153), and `/web allow` is the only way out of a taint
+        // restriction — so its absence here would be a dead end, not just a
+        // discoverability gap.
+        (
+            "/web setup",
+            "Set up web lookup: pick a tier, name a backend, confirm before anything is written.",
+        ),
         (
             "/web allow",
             "Lift this session's web taint restriction (grants no new tier).",
@@ -852,6 +865,15 @@ fn slash_help_lists_every_command_and_no_turn_is_attempted() {
         (
             "/web refresh",
             "Drop a URL's cached copy so the next lookup re-fetches: /web refresh <url>.",
+        ),
+        // REQ-579 AC-14: `/help` lists `/provider setup` from the same table
+        // that dispatches it. The unit tests pin that the row is generated
+        // rather than hand-written; this pins that the **shipped binary** prints
+        // it, which is the half a user meets.
+        (
+            "/provider setup",
+            "Register a provider and route a tier to it: /provider setup [vendor] [tier] — \
+             confirm before anything is written.",
         ),
         ("/quit", "End the session, exactly as Ctrl-D does."),
     ] {
@@ -3166,4 +3188,183 @@ fn the_walkthrough_collects_every_answer_and_the_daemon_announces_the_write() {
     // And none of it spent a model call — a command is not a prompt (BR-7 of
     // REQ-555, and the reason the walk is a client command at all).
     assert_no_turn_ran(&session, "the /web setup walkthrough");
+}
+
+// ---------------------------------------------------------------------------
+// REQ-579 — the `/provider setup` walkthrough, at the client (TASK-157)
+// ---------------------------------------------------------------------------
+//
+// AC → test map for this section:
+//
+//   AC-9 (piped stdin prints the recipe, exits 0, consumes no further stdin)
+//   + BR-11
+//       → `a_piped_provider_setup_prints_the_recipe_and_asks_nothing`
+//
+// What this section deliberately does **not** hold:
+//
+//   * the walk itself (AC-2/AC-6/AC-7/AC-8/AC-12) — every branch of it reaches
+//     the credential step, and the shipped CLI writes credentials to the **real
+//     OS keychain** (`keychain::default_keychain`) with no test seam to redirect
+//     it, so a walk driven here would create — and on a refused commit delete —
+//     a `teton/kimi` entry in whoever's login keychain ran the suite. Unlike
+//     `/web setup`, this flow has no keyless branch to walk instead: a provider
+//     registration without a credential reference is refused by construction
+//     (the protocol type carries no `Default` for exactly that reason). Those
+//     legs are `provider_setup_ui`'s own suite, against a fake keychain.
+//   * the daemon-side flow (AC-2/AC-4/AC-7/AC-10/AC-11/AC-12) — `tetond`'s
+//     `provider_setup_flow.rs` drives it against a spawned daemon that owns a
+//     config file, which is where the write and the live routing can be seen.
+//   * the echo-off sweep (AC-4's transcript half) — a pipe cannot observe echo.
+//     It is `pty_e2e.rs`'s, and for `/provider setup` it is not added: the pty
+//     harness has no fake-keychain seam (see its own note above
+//     `the_setup_walk_stops_before_the_keychain_write`).
+
+/// **AC-9 / BR-11: on a pipe the command prints the exact CLI recipe, asks
+/// nothing, exits 0, and the line after it still reaches the model.**
+///
+/// The degradation is the requirement, not a fallback. A walkthrough that drew
+/// a prompt at a pipe would read the next line of the *session's* input as a
+/// model name — and the line after that as an API key, which is how a secret
+/// ends up in a transcript. So the assertions are in four parts: what was
+/// printed, what was **not** asked, that nothing was written, and that the
+/// following line reached the model instead of being eaten.
+///
+/// The recipe lines are asserted **verbatim**, because AC-9's claim is that a
+/// user can copy them into a shell. `instructions_are_commands_the_cli_itself_parses`
+/// pins that they parse; this pins that the shipped binary actually emits them,
+/// composed from the daemon's own catalog rather than from a CLI-side list
+/// (BR-4) — this session's `kimi` endpoint and `--model kimi-k3` came over the
+/// socket from `provider/setup_plan`.
+#[test]
+fn a_piped_provider_setup_prints_the_recipe_and_asks_nothing() {
+    let daemon_path = daemon_bin();
+    let daemon = TestDaemon::spawn_scripted(&daemon_path, TURN_REPLIES);
+    let teton = teton_bin();
+    let config_path = daemon.root.join("config.toml");
+    let before = std::fs::read(&config_path).expect("the fixture config exists");
+
+    // No `run_cli_seamed`: this is the shipped posture, with the test seam off.
+    let (session, status) =
+        daemon.run_cli_capture(&teton, &[], "/provider setup kimi\nhello there\n");
+
+    // (1) It degraded to instructions, and said why.
+    assert!(
+        session.contains("which needs a terminal"),
+        "AC-9: the piped branch must say why it is not asking; output:\n{session}"
+    );
+
+    // (2) The recipe, verbatim — the two commands the user can paste.
+    assert!(
+        session.contains(
+            "teton provider add kimi --kind openai-compatible --endpoint \
+             https://api.moonshot.ai/v1/chat/completions --model kimi-k3"
+        ),
+        "AC-9: the registration command must be printed exactly as the shell \
+         takes it; output:\n{session}\ndaemon log:\n{}",
+        daemon.log()
+    );
+    assert!(
+        session.contains("teton policy set-tier think kimi"),
+        "AC-9: and the routing command, defaulting to `think` (ADR-6); \
+         output:\n{session}"
+    );
+    assert!(
+        session.contains("keychain"),
+        "and it must still name where the key goes, which is the part a user \
+         running these by hand most needs; output:\n{session}"
+    );
+
+    // (3) It asked nothing. A drawn prompt is the defect this branch exists to
+    // avoid, and each prompt's bytes are unmistakable.
+    for prompt in [
+        "vendor [number or name",
+        "provider id [",
+        "model [Enter for",
+        "API key (not shown",
+        "route [Enter for",
+        "write this to your config?",
+    ] {
+        assert!(
+            !session.contains(prompt),
+            "AC-9: no prompt may be drawn on a pipe ({prompt:?}); output:\n{session}"
+        );
+    }
+
+    // (4) Nothing was written, and nothing was previewed into the file.
+    assert_eq!(
+        std::fs::read(&config_path).ok().as_deref(),
+        Some(before.as_slice()),
+        "AC-9: the degraded path must leave the config untouched"
+    );
+
+    // (5) AC-9 claims an exit code, so this looks at one.
+    assert!(
+        status.success(),
+        "AC-9: the piped session must exit 0; status {status:?}; output:\n{session}"
+    );
+
+    // (6) BR-11's "without consuming stdin": the line after the command reached
+    // the model, so no session input was eaten by a prompt that was not drawn.
+    assert!(
+        session.contains(TURN_REPLIES[0]),
+        "the next typed line must still reach the model; output:\n{session}\n\
+         daemon log:\n{}",
+        daemon.log()
+    );
+}
+
+/// **ADR-9 / AC-1's non-TTY half: a script's bytes do not move.**
+///
+/// The hand-off nudge is a terminal affordance — it names an in-session command
+/// nobody at a pipe can type. So the gate is `typed_input`, and this is the leg
+/// that proves the gate is real rather than asserted: the scripted engine
+/// answers with a reply that recites `teton provider add`, which is exactly the
+/// condition that arms the line at a terminal, and a piped session must still
+/// see nothing added.
+///
+/// The negative is worth an e2e rather than only a unit test because the unit
+/// test can only pin the function's own gate; what a script actually receives
+/// depends on the flag `main` passes it, and that wiring is unobservable from
+/// inside the module. BR-11 already gives a script the shell recipe, which is
+/// the copy-pasteable answer at a pipe; a second line naming a command it
+/// cannot run would be noise in whatever is parsing the output.
+#[test]
+fn a_piped_session_whose_reply_recites_the_cli_gets_no_hand_off_line() {
+    let daemon_path = daemon_bin();
+    // The reply the guide actually produces at the front door — the recital
+    // three live rounds recorded (verification.md §1–§24).
+    let reply = "register it from a shell: teton provider add kimi --kind \
+                 openai-compatible, then teton policy set-tier think kimi.";
+    let daemon = TestDaemon::spawn_scripted(&daemon_path, &[reply]);
+    let teton = teton_bin();
+
+    let (session, status) = daemon.run_cli_capture(&teton, &[], "how do I add kimi?\n");
+
+    // The precondition: the turn ran and the reply really did recite the CLI.
+    // Without this the assertion below would pass on a session that never
+    // reached the model at all.
+    assert!(
+        session.contains("teton provider add kimi"),
+        "the scripted reply must have reached the transcript, or this test \
+         proves nothing; output:\n{session}\ndaemon log:\n{}",
+        daemon.log()
+    );
+
+    // And the nudge is absent. Asserted on the sentence's distinctive halves
+    // rather than the whole line, so a future rewording of it cannot make this
+    // pass by accident.
+    for absent in [
+        "does this without leaving it",
+        "no key in chat",
+        "/provider setup <vendor> [tier]",
+    ] {
+        assert!(
+            !session.contains(absent),
+            "ADR-9: a pipe must see no hand-off ({absent:?}); output:\n{session}"
+        );
+    }
+    assert!(
+        status.success(),
+        "the piped session must still exit 0; status {status:?}; output:\n{session}"
+    );
 }

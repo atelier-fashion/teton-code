@@ -1973,6 +1973,27 @@ mod tests {
     /// (recipes move into the `providers` topic, which is a tool result rather
     /// than resident prompt) is what the next sentence buys itself with, and 93
     /// bytes is close enough to the floor that the next one probably has to.
+    ///
+    /// **Recorded headroom at REQ-579:** the worst prompt is 5,868 bytes,
+    /// `spent` is 9,144, and the margin is **72**. The guide gained the
+    /// `/provider setup` hand-off (BR-1, ADR-3) and grew **21** bytes net doing
+    /// it, 2,369 → 2,390 on the file: the credential sentence shrank (168 →
+    /// 140), the "you cannot run these commands" line shrank (113 → 62), and
+    /// step 1 took the hand-off and grew (737 → 837). It was paid the way the
+    /// paragraph above says it must be — out of the margin, with every sentence
+    /// shortened until it fit — rather than out of the 9,216. The opted-in web
+    /// shape moved the same 21, 140 → 119, and stays the looser of the two.
+    /// Twenty-four bytes above the floor now: the ADR-2 fallback is no longer a
+    /// prediction about the next sentence, it is nearly the only room left.
+    ///
+    /// The figures are the guide **as it ships** — round 2's wording,
+    /// `verification.md` §24 — not TASK-156's intermediate 2,402-byte draft, on
+    /// which an earlier version of this note was measured. And what the extra
+    /// bytes did *not* buy is on the record too: three live A/B rounds, 0/9
+    /// replies volunteering the command (`verification.md` §4/§14/§19). ADR-9
+    /// moved that guarantee onto the CLI surface, where it costs zero prompt
+    /// bytes — the reason the next person here should not expect to buy
+    /// behaviour with this margin.
     #[test]
     fn the_total_cap_clears_the_harness_context_budget_with_margin() {
         use teton_core::capability::{SearchGap, WebCapabilityState};

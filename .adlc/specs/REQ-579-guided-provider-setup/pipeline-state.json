@@ -1,0 +1,96 @@
+{
+  "req": "REQ-579",
+  "branch": "feat/REQ-579-guided-provider-setup",
+  "startedAt": "2026-08-15T20:33:42Z",
+  "completed": false,
+  "currentPhase": 8,
+  "completedPhases": [
+    0,
+    1,
+    2,
+    3,
+    4,
+    5,
+    6,
+    7
+  ],
+  "phaseHistory": [
+    {
+      "phase": 0,
+      "name": "Create Worktree",
+      "completedAt": "2026-08-15T20:33:53Z"
+    },
+    {
+      "phase": 1,
+      "name": "Validate Spec",
+      "completedAt": "2026-08-15T20:34:11Z"
+    },
+    {
+      "phase": 2,
+      "name": "Architect",
+      "completedAt": "2026-08-15T20:42:58Z"
+    },
+    {
+      "phase": 3,
+      "name": "Validate Architecture & Tasks",
+      "completedAt": "2026-08-15T20:43:59Z"
+    },
+    {
+      "phase": 4,
+      "name": "Implement",
+      "completedAt": "2026-08-17T00:03:09Z"
+    },
+    {
+      "phase": 5,
+      "name": "Verify",
+      "completedAt": "2026-08-17T02:09:09Z"
+    },
+    {
+      "phase": 6,
+      "name": "Create PR",
+      "completedAt": "2026-08-17T02:10:00Z"
+    },
+    {
+      "phase": 7,
+      "name": "PR Cleanup & CI",
+      "completedAt": "2026-08-17T02:13:34Z"
+    }
+  ],
+  "integrationBranch": "main",
+  "repos": {
+    "teton-code": {
+      "primary": true,
+      "path": "/Users/brettluelling/Documents/GitHub/teton-code",
+      "worktree": "/Users/brettluelling/Documents/GitHub/teton-code/.worktrees/REQ-579",
+      "branch": "feat/REQ-579-guided-provider-setup",
+      "touched": true,
+      "prUrl": "https://github.com/atelier-fashion/teton-code/pull/161",
+      "prNumber": 161,
+      "prCreatedAt": "2026-08-15T20:33:44Z",
+      "merged": false,
+      "snapshotBranch": null,
+      "snapshotPR": null
+    }
+  },
+  "mergeOrder": [
+    "teton-code"
+  ],
+  "phase4": {
+    "currentTask": null,
+    "completedTasks": [
+      "TASK-152",
+      "TASK-155",
+      "TASK-153",
+      "TASK-156",
+      "TASK-154",
+      "TASK-157",
+      "TASK-158",
+      "TASK-159"
+    ],
+    "failedTasks": [],
+    "notes": "8 tasks complete; AC-1 closed via ADR-9 surface nudge"
+  },
+  "phase5": {
+    "summary": "6 agents; 25 advisory candidates (17 refuted); 1 High + 4 Major + 9 Minor fixed in 3 waves; re-verify (correctness+security) all CONFIRMED FIXED; 2 residuals recorded; halted on reflector Q (id prompt); owner: id prompt added"
+  }
+}

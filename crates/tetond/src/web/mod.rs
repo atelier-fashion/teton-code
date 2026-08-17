@@ -252,6 +252,39 @@ pub fn canonical_host_of(url: &str) -> Option<String> {
     canonical_lookup_url(url).map(|(_, host)| host)
 }
 
+/// The same host **plus its explicit port**, for callers that must name the one
+/// socket rather than the domain.
+///
+/// A sibling of [`canonical_host_of`] rather than a change to it, deliberately.
+/// That function's callers are the *web* gates — the allowlist, the consent
+/// prompt, the ledger row — where the unit of consent is a domain and
+/// `example.com:8443` would be a second entry a user who allowed
+/// `example.com` never wrote. This function's caller is
+/// `/provider setup`, where the string exists to tell a user which machine
+/// their API key is about to be sent to, and `evil.example` for
+/// `https://evil.example:8443/…` is a *different destination* rendered as the
+/// familiar one.
+///
+/// The port comes from the transport's own parser, so a scheme-default port is
+/// absent by that parser's rule (`https://x.example:443/` and
+/// `https://x.example/` are one destination and render alike) and a
+/// non-default one is present. Everything else `canonical_host_of` excludes is
+/// still excluded: no userinfo, no path, no query — the pasted-credential
+/// hiding places (LESSON-528/529). An IPv6 literal keeps the brackets its
+/// serialization carries, so `[::1]:8443` stays unambiguous.
+#[must_use]
+pub fn canonical_host_and_port_of(url: &str) -> Option<String> {
+    let parsed = reqwest::Url::parse(url.trim()).ok()?;
+    let host = parsed.host_str()?;
+    if host.is_empty() {
+        return None;
+    }
+    Some(match parsed.port() {
+        Some(port) => format!("{host}:{port}"),
+        None => host.to_owned(),
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -441,6 +474,52 @@ mod tests {
         // A scheme with no host to send to is not a lookup destination; the
         // *scheme* filter is the caller's, but there is nothing here to answer.
         assert_eq!(canonical_lookup_url("file:///etc/passwd"), None);
+    }
+
+    /// The port-bearing sibling renders the **socket**, and only when the port
+    /// is one the transport would not have supplied itself.
+    ///
+    /// `canonical_host_of` is asserted alongside every case, because the two
+    /// answers differing exactly where a port is explicit is the whole reason
+    /// there are two functions: the web gates consent to a *domain*, and
+    /// `/provider setup` names the *destination* a credential is about to be
+    /// sent to.
+    #[test]
+    fn the_port_bearing_host_names_an_explicit_port_and_nothing_else() {
+        for (raw, with_port) in [
+            ("https://evil.example:8443/v1/chat", "evil.example:8443"),
+            // A scheme-default port is not explicit to the parser that dials,
+            // so the two spellings of one destination render alike.
+            ("https://api.moonshot.ai:443/v1/chat", "api.moonshot.ai"),
+            ("https://api.moonshot.ai/v1/chat", "api.moonshot.ai"),
+            // Default for `https` is not default for `http`.
+            ("http://api.moonshot.ai:443/v1/chat", "api.moonshot.ai:443"),
+            // An IPv6 literal keeps its brackets, so host and port stay
+            // separable.
+            ("http://[::1]:8080/x", "[::1]:8080"),
+            ("http://[::1]/x", "[::1]"),
+            // Userinfo, path and query are still excluded — the credential
+            // hiding places this string exists to not echo.
+            ("https://tok@evil.example:8443/v1?k=v", "evil.example:8443"),
+            // The transport's reading of the disagreeing spelling, unchanged.
+            ("https://evil.example\\@allowed.example/x", "evil.example"),
+        ] {
+            assert_eq!(
+                canonical_host_and_port_of(raw).as_deref(),
+                Some(with_port),
+                "{raw}"
+            );
+            // Non-vacuity for the split: the domain-level answer drops the port
+            // that the socket-level one keeps.
+            let bare = canonical_host_of(raw).expect("the same string parses");
+            assert!(
+                !bare.contains(':') || bare.starts_with('['),
+                "`canonical_host_of` grew a port and the two functions collapsed: {bare}"
+            );
+            assert!(with_port.starts_with(&bare), "{raw}: {with_port} / {bare}");
+        }
+        assert_eq!(canonical_host_and_port_of("not a url"), None);
+        assert_eq!(canonical_host_and_port_of("file:///etc/passwd"), None);
     }
 
     #[test]

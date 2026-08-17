@@ -697,7 +697,12 @@ fn the_readme_backend_rows_and_the_catalog_agree() {
 /// file, so an endpoint that survives only somewhere else in the guide — in a
 /// `[web]` example, in a sentence about something adjacent — does not answer for
 /// the step a model actually reads when it is composing a `provider add`.
-const GUIDE_RECIPE_ANCHOR: &str = "1. `teton provider add";
+///
+/// Since REQ-579 the step opens with the guided command and names the shell
+/// command second (`the_system_prompt_forbids_asking_for_a_credential_in_the_conversation`
+/// pins that order); the recipes still live on the same line, so the anchor is
+/// the step number and the shell command is asserted inside it below.
+const GUIDE_RECIPE_ANCHOR: &str = "1. ";
 
 /// The bundled guide's recipe step, as one line.
 ///
@@ -707,7 +712,10 @@ const GUIDE_RECIPE_ANCHOR: &str = "1. `teton provider add";
 fn guide_recipe_line() -> &'static str {
     BUNDLED_GUIDE
         .lines()
-        .find(|line| line.trim_start().starts_with(GUIDE_RECIPE_ANCHOR))
+        .find(|line| {
+            line.trim_start().starts_with(GUIDE_RECIPE_ANCHOR)
+                && line.contains("`teton provider add")
+        })
         .unwrap_or_else(|| {
             panic!(
                 "the bundled guide (crates/tetond/src/harness/self_config.md) no longer \

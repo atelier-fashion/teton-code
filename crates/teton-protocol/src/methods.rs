@@ -1705,6 +1705,420 @@ impl RpcMethod for WebSetupCommitParams {
     type Result = WebSetupCommitResult;
 }
 
+// ---------------------------------------------------------------------------
+// guided provider setup (REQ-579)
+// ---------------------------------------------------------------------------
+//
+// The second instance of the shape above, and deliberately a *copy* of it
+// rather than a generalisation (REQ-579 ADR-1). Three stateless endpoints —
+// plan, preview, commit — with no flow state on this wire, for the reason the
+// web trio has none: the client collects answers locally and the daemon stays
+// the sole authority on validation, on what the preview says, and on the write.
+//
+// A dedicated trio rather than riding `config/set`, because registering a
+// provider and routing a tier to it is **one** durable write or it is a window
+// in which the provider exists unrouted (BR-3, ADR-1) — and because a preview
+// has to return the exact bytes a digest was taken over, which a general
+// mutation RPC has nowhere to put.
+//
+// Like the web trio these are **client** RPCs and never harness tools, which is
+// BR-12's structural half: tool dispatch and the client socket are distinct
+// channels, so a model emitting a tool call named `provider/setup_commit`
+// reaches nothing at all.
+//
+// Types only — the catalog, the candidate `Config`, the validator, the
+// comment-preserving write and the routing re-derivation land with the daemon
+// (TASK-153/154), and the walkthrough with the CLI (TASK-155).
+
+/// One vendor recipe, served to a client as **data** (REQ-579 BR-4).
+///
+/// 1:1 with the daemon's `provider_recipes::ProviderRecipe` — same field names,
+/// same types, same optionality — because the entry a client renders has to be
+/// the entry the model would have named (ADR-4). The mapping is asserted total
+/// on the daemon side, where both types are in scope; this crate depends on no
+/// other teton crate (see the manifest test in [`crate`]), so what is pinned
+/// here is the field set itself.
+///
+/// No `Default`, for [`WebBackendSuggestion`]'s reason: a recipe built out of
+/// nothing is one a client could render as if a daemon had shipped it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ProviderRecipeEntry {
+    /// The id to offer as the default answer — the `<id>` of
+    /// `teton provider add <id>`, and the name the routing step then binds a
+    /// tier to. A suggestion, not a reservation: ids are the user's namespace.
+    pub id_suggestion: String,
+    /// The vendor's display name, spelled the way the vendor spells it.
+    pub label: String,
+    /// The same vendor, spelled the way the **bundled guide's** recipe line
+    /// spells it — `Moonshot/Kimi` where [`Self::label`] is `Moonshot (Kimi)`.
+    ///
+    /// Carried onto the wire because the lenient vendor resolver matches
+    /// against it (ADR-2): the model teaches a user the guide's spelling, so
+    /// `/provider setup Moonshot/Kimi` has to land on this entry without the
+    /// client keeping a second spelling table of its own (BR-4).
+    pub guide_spelling: String,
+    /// Which adapter the vendor speaks, and therefore which questions the flow
+    /// asks — `anthropic` composes its own address and skips the endpoint
+    /// prompt (ADR-7).
+    pub kind: ProviderKind,
+    /// The **absolute request URL** to offer, character for character, with no
+    /// path joined on — not a base URL, which is the BUG-170 registration that
+    /// 404s on first use.
+    ///
+    /// `Option` because [`ProviderKind`] is wider than this catalog and admits
+    /// a kind carrying its own address; absent from the wire when there is
+    /// none.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub endpoint: Option<String>,
+    /// A model the vendor serves today, offered as the default answer to the
+    /// model question (BR-6) and labeled as an example — never as a
+    /// recommendation and never as "the current best".
+    pub example_model: String,
+    /// One bounded clause for a fact the recipe alone does not say, or `None`
+    /// when it says everything. Absent from the wire when `None`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub notes: Option<String>,
+}
+
+/// A provider the config already holds, for the flow to show before it offers
+/// to replace one (REQ-579 BR-14).
+///
+/// Three non-secret fields and nothing else: no `auth_ref`, no endpoint. The
+/// question this answers is "does the id you just typed already exist, and as
+/// what" — the BUG-155 silent replace-or-insert is what naming it prevents —
+/// and neither a reference nor a URL is needed to answer it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ExistingProvider {
+    /// The configured id.
+    pub id: ProviderId,
+    /// Which adapter it speaks.
+    pub kind: ProviderKind,
+    /// The model it is pinned to, or `None` for a record that has none.
+    ///
+    /// `Option` because the config's own field is one: a provider missing its
+    /// model is **incomplete, not invalid** — `Config::validate` is structural
+    /// and lets it load, a separate pass marks it unusable, and the point of
+    /// use refuses it (conventions.md; REQ-557 ADR-E, LESSON-506). A required
+    /// `String` here would make this call unable to describe the very record a
+    /// user is most likely to be fixing.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
+}
+
+/// What one routable tier is bound to today, for the routing question to show
+/// (REQ-579 BR-7).
+///
+/// Distinct from [`TierBinding`] by exactly its `Option`: this is an *answer*
+/// about the current world, in which "nothing is bound to `scan`" is a real and
+/// common state, where a binding is a *request* and always names a provider.
+/// Folding them into one type would make the unbound tier and the bound-to-
+/// nothing binding the same value.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TierSummary {
+    /// The tier.
+    pub tier: Tier,
+    /// What it currently routes to, or `None` when nothing is bound. Absent
+    /// from the wire when `None`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provider_id: Option<ProviderId>,
+    /// The row's configured fallback, when it carries one (REQ-579 OQ-2).
+    ///
+    /// Reported even though this flow asks no fallback question, because the
+    /// flow **rewrites whole rows**: a `[[tiers]]` row this walkthrough re-binds
+    /// keeps the fallback the user configured elsewhere (`teton policy
+    /// set-tier --fallback`), and a routing question asked against a summary
+    /// that omitted it would describe a row the file does not have.
+    ///
+    /// `#[serde(default)]` for [`provider_id`](Self::provider_id)'s reason and
+    /// one more: a client built after this field existed still has to read a
+    /// daemon built before it, and "the daemon did not say" and "no fallback"
+    /// are the same actionable fact for a surface that only renders it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fallback_id: Option<ProviderId>,
+}
+
+/// One tier→provider binding the candidate would write (REQ-579 BR-7).
+///
+/// Carries its own `provider_id` rather than being implied by the candidate's
+/// id: the commit writes `[policy.tiers.<tier>]` rows, and a row that named its
+/// provider only by position in a list is the by-index edit LESSON-522 exists
+/// about. It is also what lets the commit result report what actually landed
+/// rather than what was asked for.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TierBinding {
+    /// The tier being routed.
+    pub tier: Tier,
+    /// The provider it routes to — normally the candidate's own id, and
+    /// spelled out anyway so the row is readable on its own.
+    pub provider_id: ProviderId,
+}
+
+/// Ask what registering a provider would involve (REQ-579 BR-3, BR-4).
+///
+/// Read-only, and the flow's first step: the vendor recipes this build ships,
+/// the providers already configured, and what each routable tier points at
+/// today. A client can render all of it as instructions and stop there, which is
+/// BR-11's degradation path — the walkthrough is an enhancement over this
+/// answer, never the only way to reach it.
+///
+/// It carries a `session_id` for [`WebSetupPlanParams`]'s reason: the gate that
+/// admits it is session attachment, so the call has to name the session it
+/// claims.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ProviderSetupPlanParams {
+    /// The session asking.
+    pub session_id: SessionId,
+}
+
+/// Result of [`ProviderSetupPlanParams`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ProviderSetupPlanResult {
+    /// The vendor recipes this build ships, in the order a client should show
+    /// them, from the same typed source the model's guide is gated against
+    /// (BR-4, ADR-4).
+    ///
+    /// Required, unlike [`WebSetupPlanResult::suggestion_catalog`]: the catalog
+    /// and this method ship together, so there is no daemon that can answer
+    /// `provider/setup_plan` and have no catalog. A `#[serde(default)]` here
+    /// would let a malformed answer read as "this build knows no vendors",
+    /// which is a sentence no daemon has any way to mean.
+    pub catalog: Vec<ProviderRecipeEntry>,
+    /// The providers already configured, so the flow can say "that id already
+    /// exists" before the user types a key for it (BR-14).
+    ///
+    /// Empty is the fresh-install truth this REQ exists for, and the field
+    /// defaults to it rather than being an `Option` — "no providers" and "the
+    /// daemon did not say" are the same actionable fact here, unlike a missing
+    /// catalog.
+    #[serde(default)]
+    pub existing: Vec<ExistingProvider>,
+    /// What each routable tier points at today — the current state the routing
+    /// question is asked against (BR-7).
+    #[serde(default)]
+    pub tiers: Vec<TierSummary>,
+}
+
+impl RpcMethod for ProviderSetupPlanParams {
+    const METHOD: &'static str = "provider/setup_plan";
+    type Result = ProviderSetupPlanResult;
+}
+
+/// A candidate provider registration, as the client collected it (REQ-579
+/// BR-3).
+///
+/// Sent to both [`ProviderSetupPreviewParams`] and
+/// [`ProviderSetupCommitParams`], so the commit re-derives from the same
+/// answers rather than trusting a blob the preview handed back (BR-9,
+/// LESSON-501).
+///
+/// No `Default`, deliberately and specifically: an empty candidate would be
+/// constructible without a [`key_ref`](Self::key_ref), and a missing credential
+/// reference must be a compile-visible omission at every call site rather than
+/// an empty string that reaches the validator.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ProviderSetupCandidate {
+    /// The id to register under — the user's namespace, and the keychain
+    /// account name (ADR-5).
+    pub id: ProviderId,
+    /// Which adapter the provider speaks.
+    pub kind: ProviderKind,
+    /// The **absolute request URL**, already composed from whatever the user
+    /// typed by `teton_core::compose_endpoint` and already echoed back to them
+    /// (BR-5, ADR-8). `None` for a kind that carries its own address, which is
+    /// the `anthropic` case ADR-7 skips the prompt for.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub endpoint: Option<String>,
+    /// The model to pin. Required, never inferred from the id (BR-6, REQ-557
+    /// BR-1) — a `String` rather than an `Option` because a candidate without
+    /// one is refused before the key is ever asked for, so there is no legal
+    /// value of this field to be absent.
+    pub model: String,
+    /// A **keychain reference, never a key value** — e.g.
+    /// `keychain://teton/kimi` (BR-2, ADR-5).
+    ///
+    /// The secret's whole lifecycle stays in the client process: it is read
+    /// echo-off, written to the OS keychain, and what crosses this socket is
+    /// the name of the row. The daemon refuses any candidate whose `key_ref`
+    /// does not parse as a reference — the same structural rule
+    /// `Config::validate` already applies to `auth_ref` — so the rule is
+    /// enforced rather than requested.
+    ///
+    /// Required, and required for the reason the type carries no `Default`: a
+    /// provider registered with no way to authenticate is a row that fails on
+    /// first use, and the omission should be visible where it is made.
+    pub key_ref: String,
+    /// The tiers to route to this provider, zero or more (BR-7).
+    ///
+    /// Empty is legal and is a stated outcome, not a degenerate one: a user may
+    /// decline every binding and end with a registered-but-unrouted provider,
+    /// which the flow then says plainly. A list rather than an `Option` so
+    /// "route nothing" has one spelling.
+    #[serde(default)]
+    pub bindings: Vec<TierBinding>,
+}
+
+/// Show exactly what registering the candidate would write, without writing it
+/// (REQ-579 BR-9).
+///
+/// The daemon builds the candidate `Config`, runs the **same** `Config::validate`
+/// startup runs, and renders the delta through the same comment-preserving
+/// writer the commit uses — so the preview is the bytes, not a description of
+/// them. Nothing is written and nothing is remembered: a preview the user
+/// abandons leaves the daemon exactly as it found it, and no key has been stored
+/// yet either (BR-8).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ProviderSetupPreviewParams {
+    /// The session previewing.
+    pub session_id: SessionId,
+    /// The candidate to render.
+    pub candidate: ProviderSetupCandidate,
+}
+
+/// Result of [`ProviderSetupPreviewParams`] — what the commit would write.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ProviderSetupPreviewResult {
+    /// The `[[providers]]` table and any `[policy.tiers.<tier>]` rows,
+    /// serialized exactly as they would be written (BR-9). The user confirms
+    /// these bytes, and the commit re-derives them from the same candidate — so
+    /// what was agreed to is what lands.
+    pub toml: String,
+    /// The host the endpoint parsed to, from the **dial-time** parser rather
+    /// than a second one (BR-5, LESSON-528/529): the string shown at the
+    /// confirm step is the destination the request builder would actually
+    /// reach, not a separately-parsed lookalike.
+    ///
+    /// Carries the host, **plus `:port` when the endpoint states one
+    /// explicitly** — and never userinfo, path, or query. The exclusions are
+    /// the reason the whole web event family excludes them: a pasted URL can
+    /// carry a credential in its authority, and a surface that echoed it back
+    /// would put one on screen. The port is on the other side of that line
+    /// because it is destination and not secret — `evil.example:8443` rendered
+    /// as `evil.example` names a different socket in the familiar socket's
+    /// words. A scheme-default port is not "explicit" to the parser that dials,
+    /// so `https://x.example/` and `https://x.example:443/` render alike.
+    pub dial_host: String,
+    /// Non-fatal notes about the candidate — replacing an existing provider, a
+    /// model the price table does not know, a cleartext endpoint.
+    ///
+    /// Warnings, never errors: a candidate the validator **refuses** is not a
+    /// preview with a note attached, it is a
+    /// [`PROVIDER_SETUP_INVALID`](crate::jsonrpc::error_code::PROVIDER_SETUP_INVALID)
+    /// response carrying the validator's own sentence. Empty for a clean
+    /// candidate, and a list rather than an `Option` so "nothing to say" has one
+    /// spelling.
+    #[serde(default)]
+    pub warnings: Vec<String>,
+    /// A digest of the **whole document** this preview's candidate would write
+    /// — what the client hands back as
+    /// [`ProviderSetupCommitParams::expect_digest`] so the commit can refuse to
+    /// write bytes the user never saw (BR-9).
+    ///
+    /// It covers the whole config rather than the rendered delta, for
+    /// [`WebSetupPreviewResult::digest`]'s reason: the whole config is what the
+    /// commit writes, and every field the flow does not collect rides along from
+    /// whatever the live config held when the candidate was built. Another
+    /// session editing any of it moves the file underneath a preview the user is
+    /// still reading.
+    ///
+    /// Opaque to the client: it round-trips it and never parses it.
+    #[serde(default)]
+    pub digest: String,
+    /// The provider this candidate would replace, when its id is already taken
+    /// (BR-14), and absent from the wire otherwise.
+    ///
+    /// Stated by the daemon rather than re-derived by the client from
+    /// [`ProviderSetupPlanResult::existing`]: the plan's snapshot can be several
+    /// answers old by the time the preview is built, and the surface that knows
+    /// whether the write replaces something is the one that built the candidate
+    /// config. A silent replace-or-insert is the BUG-155 class.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub replaces: Option<ExistingProvider>,
+}
+
+impl RpcMethod for ProviderSetupPreviewParams {
+    const METHOD: &'static str = "provider/setup_preview";
+    type Result = ProviderSetupPreviewResult;
+}
+
+/// Write the candidate provider and its bindings, and make routing live
+/// (REQ-579 BR-10, BR-15).
+///
+/// The **single commit point**: before this call nothing durable exists, and
+/// this call either writes the file and re-derives routing or changes nothing at
+/// all. Provider row and tier bindings land in one write, which is the whole of
+/// ADR-1 — two writes would leave a window in which the provider exists unrouted
+/// and a crash leaves it so.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ProviderSetupCommitParams {
+    /// The session committing.
+    pub session_id: SessionId,
+    /// The candidate to write — the same one the preview rendered, re-derived
+    /// here rather than accepted as rendered bytes (BR-9, LESSON-501).
+    pub candidate: ProviderSetupCandidate,
+    /// [`ProviderSetupPreviewResult::digest`], handed back — the daemon writes
+    /// only if the candidate it rebuilds still digests to this (BR-9).
+    ///
+    /// **Not a substitute for re-deriving**, exactly as
+    /// [`WebSetupCommitParams::expect_digest`] is not: the candidate is still
+    /// rebuilt and put through the same validator, and this is a *guard on the
+    /// outcome*, so the worst a forged digest buys is a write the candidate
+    /// already earned.
+    ///
+    /// `None` means "do not check", which is what a caller with no preview to
+    /// compare against sends. The check is opt-in for that reason, not because
+    /// it is optional in the flow: `/provider setup` always sends it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expect_digest: Option<String>,
+}
+
+/// Result of [`ProviderSetupCommitParams`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ProviderSetupCommitResult {
+    /// Whether the config changed.
+    ///
+    /// `false` is not a failure and not an error response: it is a commit whose
+    /// candidate matched what was already configured, and the distinction keeps
+    /// the client's confirmation honest — [`WebSetupCommitResult::applied`]'s
+    /// reason. A failed commit is an error response, never `applied: false`.
+    pub applied: bool,
+    /// The id now registered. Read back rather than assumed, like
+    /// [`SessionPermissionsResult::level`]: a client that rendered the id it
+    /// *sent* could confirm a state the daemon does not hold.
+    pub provider_id: ProviderId,
+    /// The bindings now in force — what actually landed, not what was asked
+    /// for, so the completion line ("`think` now routes to it") is read off the
+    /// daemon's answer rather than off the request.
+    ///
+    /// Empty is a legitimate answer: the registered-but-unrouted outcome BR-7
+    /// permits.
+    #[serde(default)]
+    pub bindings: Vec<TierBinding>,
+    /// The host this registration will be dialed at, from the **dial-time**
+    /// parser (BR-5, LESSON-529) — the same reading
+    /// [`ProviderSetupPreviewResult::dial_host`] showed at the confirm step,
+    /// carried through to the answer that says the write landed.
+    ///
+    /// Completion is otherwise silent about where the key will now be sent: a
+    /// surface that printed "registered; `think` now routes to it" named the id
+    /// and never the destination, so a user who confirmed one host and had
+    /// another written could not tell from the confirmation. Read off the
+    /// derivation, **never** echoed from
+    /// [`ProviderSetupCandidate::endpoint`] — this string is host, plus `:port`
+    /// when the endpoint states one explicitly, and never userinfo, path or
+    /// query, all by construction; the endpoint is none of those things.
+    ///
+    /// `#[serde(default)]` so a client built after this field still parses an
+    /// older daemon's answer; empty then means "this daemon did not say", which
+    /// a renderer shows as nothing rather than as a host.
+    #[serde(default)]
+    pub dial_host: String,
+}
+
+impl RpcMethod for ProviderSetupCommitParams {
+    const METHOD: &'static str = "provider/setup_commit";
+    type Result = ProviderSetupCommitResult;
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2673,6 +3087,13 @@ mod tests {
         assert_eq!(WebSetupPlanParams::METHOD, "web/setup_plan");
         assert_eq!(WebSetupPreviewParams::METHOD, "web/setup_preview");
         assert_eq!(WebSetupCommitParams::METHOD, "web/setup_commit");
+        // REQ-579's trio, pinned literally beside REQ-572's: these three strings
+        // are the contract the daemon's dispatch match and the CLI's calls are
+        // written against, and a rename that edited only one side would be a
+        // `METHOD_NOT_FOUND` at the user's prompt.
+        assert_eq!(ProviderSetupPlanParams::METHOD, "provider/setup_plan");
+        assert_eq!(ProviderSetupPreviewParams::METHOD, "provider/setup_preview");
+        assert_eq!(ProviderSetupCommitParams::METHOD, "provider/setup_commit");
         assert_eq!(
             request(Id::Number(2), ModelStatusParams::default()).method,
             "model/status"
@@ -3001,6 +3422,363 @@ mod tests {
                 "session_id",
                 "tier"
             ]
+        );
+    }
+
+    /// A sentinel candidate, so the provider-setup tests below differ only in
+    /// the thing each is about.
+    fn sentinel_candidate() -> ProviderSetupCandidate {
+        ProviderSetupCandidate {
+            id: ProviderId::from("kimi"),
+            kind: ProviderKind::OpenaiCompatible,
+            endpoint: Some("https://api.moonshot.ai/v1/chat/completions".to_owned()),
+            model: "kimi-k2-turbo-preview".to_owned(),
+            key_ref: "keychain://teton/kimi".to_owned(),
+            bindings: vec![TierBinding {
+                tier: Tier::Think,
+                provider_id: ProviderId::from("kimi"),
+            }],
+        }
+    }
+
+    /// REQ-579's three setup endpoints round-trip, including the answers whose
+    /// *absence* is a distinct fact: no providers configured yet, no tier bound,
+    /// no replacement, no bindings requested.
+    ///
+    /// Each is exercised at both ends of its own question — a fresh machine with
+    /// nothing configured, and a full registration that replaces an existing
+    /// provider — because the empty side is the state this REQ exists for and
+    /// the one a default would quietly manufacture.
+    #[test]
+    fn the_provider_setup_methods_round_trip() {
+        round_trip(&ProviderSetupPlanParams {
+            session_id: SessionId::from("s1"),
+        });
+
+        // The fresh-install answer: recipes to offer, nothing registered, and
+        // every routable tier unbound.
+        let fresh = ProviderSetupPlanResult {
+            catalog: vec![
+                ProviderRecipeEntry {
+                    id_suggestion: "sentinel".to_owned(),
+                    label: "Sentinel (Vendor)".to_owned(),
+                    guide_spelling: "Sentinel/Vendor".to_owned(),
+                    kind: ProviderKind::OpenaiCompatible,
+                    endpoint: Some("https://api.sentinel.example/v1/chat/completions".to_owned()),
+                    example_model: "sentinel-1".to_owned(),
+                    notes: Some("a sentinel note".to_owned()),
+                },
+                // The kind that carries its own address (ADR-7) and has nothing
+                // to add: two of its keys are the ones that *aren't* there.
+                ProviderRecipeEntry {
+                    id_suggestion: "sentinel-native".to_owned(),
+                    label: "Sentinel Native".to_owned(),
+                    guide_spelling: "Sentinel Native".to_owned(),
+                    kind: ProviderKind::Anthropic,
+                    endpoint: None,
+                    example_model: "sentinel-native-1".to_owned(),
+                    notes: None,
+                },
+            ],
+            existing: vec![],
+            tiers: vec![
+                TierSummary {
+                    tier: Tier::Think,
+                    provider_id: None,
+                    fallback_id: None,
+                },
+                TierSummary {
+                    tier: Tier::Build,
+                    provider_id: None,
+                    fallback_id: None,
+                },
+            ],
+        };
+        round_trip(&fresh);
+        let wire = serde_json::to_value(&fresh).unwrap();
+        assert_eq!(wire["catalog"][0]["kind"], "openai-compatible");
+        assert_eq!(wire["catalog"][0]["guide_spelling"], "Sentinel/Vendor");
+        assert_eq!(
+            wire["catalog"][1]
+                .as_object()
+                .unwrap()
+                .keys()
+                .collect::<Vec<_>>(),
+            [
+                "example_model",
+                "guide_spelling",
+                "id_suggestion",
+                "kind",
+                "label"
+            ],
+            "a recipe with no endpoint and no notes drops both keys: {wire}"
+        );
+        assert!(
+            wire["tiers"][0].get("provider_id").is_none(),
+            "an unbound tier is an absent id, not an empty string: {wire}"
+        );
+        assert!(
+            wire["tiers"][0].get("fallback_id").is_none(),
+            "and a row with no fallback drops the key rather than sending null: {wire}"
+        );
+        assert_eq!(wire["existing"].as_array().unwrap().len(), 0);
+
+        // The configured answer: something is registered, something is routed,
+        // and the incomplete record (a provider with no model) is describable
+        // rather than unrepresentable.
+        let configured = ProviderSetupPlanResult {
+            catalog: vec![],
+            existing: vec![
+                ExistingProvider {
+                    id: ProviderId::from("kimi"),
+                    kind: ProviderKind::OpenaiCompatible,
+                    model: Some("kimi-k2-turbo-preview".to_owned()),
+                },
+                ExistingProvider {
+                    id: ProviderId::from("half-done"),
+                    kind: ProviderKind::OpenaiCompatible,
+                    model: None,
+                },
+            ],
+            tiers: vec![TierSummary {
+                tier: Tier::Think,
+                provider_id: Some(ProviderId::from("kimi")),
+                fallback_id: Some(ProviderId::from("deepseek")),
+            }],
+        };
+        round_trip(&configured);
+        let wire = serde_json::to_value(&configured).unwrap();
+        assert_eq!(wire["existing"][0]["model"], "kimi-k2-turbo-preview");
+        assert!(
+            wire["existing"][1].get("model").is_none(),
+            "a provider that is incomplete, not invalid, says so by absence: {wire}"
+        );
+        assert_eq!(wire["tiers"][0]["provider_id"], "kimi");
+        assert_eq!(
+            wire["tiers"][0]["fallback_id"], "deepseek",
+            "a configured fallback reaches the client, because this flow rewrites \
+             whole rows and keeps it: {wire}"
+        );
+
+        // Preview and commit take the same candidate, deliberately — the commit
+        // re-derives from the answers rather than from bytes the preview handed
+        // back.
+        round_trip(&ProviderSetupPreviewParams {
+            session_id: SessionId::from("s1"),
+            candidate: sentinel_candidate(),
+        });
+        // And the other end of the candidate: a native kind with no endpoint to
+        // send, routed to nothing at all (BR-7's declined-every-binding case).
+        round_trip(&ProviderSetupPreviewParams {
+            session_id: SessionId::from("s1"),
+            candidate: ProviderSetupCandidate {
+                id: ProviderId::from("native"),
+                kind: ProviderKind::Anthropic,
+                endpoint: None,
+                model: "claude-x".to_owned(),
+                key_ref: "keychain://teton/native".to_owned(),
+                bindings: vec![],
+            },
+        });
+
+        round_trip(&ProviderSetupPreviewResult {
+            toml: "[[providers]]\nid = \"kimi\"\n".to_owned(),
+            dial_host: "api.moonshot.ai".to_owned(),
+            warnings: vec!["replaces existing provider `kimi`".to_owned()],
+            digest: "a".repeat(64),
+            replaces: Some(ExistingProvider {
+                id: ProviderId::from("kimi"),
+                kind: ProviderKind::OpenaiCompatible,
+                model: Some("kimi-k2".to_owned()),
+            }),
+        });
+        // A clean candidate replacing nothing: an empty warning list rather than
+        // an absent one, and no `replaces` key at all.
+        let clean = ProviderSetupPreviewResult {
+            toml: "[[providers]]\nid = \"fresh\"\n".to_owned(),
+            dial_host: "api.sentinel.example".to_owned(),
+            warnings: vec![],
+            digest: "b".repeat(64),
+            replaces: None,
+        };
+        round_trip(&clean);
+        let wire = serde_json::to_value(&clean).unwrap();
+        assert!(
+            wire.get("replaces").is_none(),
+            "replacing nothing is an absent key, not an empty provider: {wire}"
+        );
+
+        round_trip(&ProviderSetupCommitParams {
+            session_id: SessionId::from("s1"),
+            candidate: sentinel_candidate(),
+            expect_digest: Some("c".repeat(64)),
+        });
+        // A commit with no digest to check — legal, and what a caller with no
+        // preview to compare against sends.
+        round_trip(&ProviderSetupCommitParams {
+            session_id: SessionId::from("s1"),
+            candidate: sentinel_candidate(),
+            expect_digest: None,
+        });
+
+        // Both answers: a commit that changed the config, and one whose
+        // candidate matched what was already there. Neither is an error.
+        let applied = ProviderSetupCommitResult {
+            applied: true,
+            provider_id: ProviderId::from("kimi"),
+            bindings: vec![TierBinding {
+                tier: Tier::Think,
+                provider_id: ProviderId::from("kimi"),
+            }],
+            dial_host: "api.moonshot.ai".to_owned(),
+        };
+        round_trip(&applied);
+        assert_eq!(
+            serde_json::to_value(&applied).unwrap()["dial_host"],
+            "api.moonshot.ai",
+            "the answer names where the registration will be dialed, and names a \
+             host — never the endpoint it was parsed out of"
+        );
+        let unrouted = ProviderSetupCommitResult {
+            applied: false,
+            provider_id: ProviderId::from("kimi"),
+            bindings: vec![],
+            dial_host: "api.moonshot.ai".to_owned(),
+        };
+        round_trip(&unrouted);
+        assert_eq!(
+            serde_json::to_value(&unrouted).unwrap()["bindings"]
+                .as_array()
+                .unwrap()
+                .len(),
+            0,
+            "registered-but-unrouted is an empty list, which is an answer"
+        );
+
+        // A daemon built before `dial_host` existed answers without the key, and
+        // a client built after it still reads that answer (`#[serde(default)]`)
+        // — the mixed-version skew ADR-007 endorses, at this field.
+        let older: ProviderSetupCommitResult =
+            serde_json::from_str(r#"{"applied":true,"provider_id":"kimi","bindings":[]}"#)
+                .expect("an older daemon's commit answer still parses");
+        assert!(
+            older.dial_host.is_empty(),
+            "and the absence reads as `this daemon did not say`, never as a host"
+        );
+    }
+
+    /// AC-2's protocol half: [`ProviderRecipeEntry`] carries **exactly** the
+    /// seven fields of the daemon's `provider_recipes::ProviderRecipe`.
+    ///
+    /// The 1:1 mapping itself is asserted on the daemon side, where both types
+    /// are in scope; it cannot be checked here, because this crate depends on no
+    /// other teton crate and must not start (see
+    /// `the_protocol_crate_depends_on_no_other_teton_crate`). What is pinned
+    /// here is the field set — spelled out, sorted, and with every optional
+    /// field present — so a field added to the recipe without being added here
+    /// fails on *this* side too, rather than only where the mapping is written.
+    #[test]
+    fn a_recipe_entry_carries_every_field_of_a_daemon_recipe() {
+        let wire = serde_json::to_value(ProviderRecipeEntry {
+            id_suggestion: "sentinel".to_owned(),
+            label: "Sentinel (Vendor)".to_owned(),
+            guide_spelling: "Sentinel/Vendor".to_owned(),
+            kind: ProviderKind::OpenaiCompatible,
+            endpoint: Some("https://api.sentinel.example/v1/chat/completions".to_owned()),
+            example_model: "sentinel-1".to_owned(),
+            notes: Some("a sentinel note".to_owned()),
+        })
+        .unwrap();
+        assert_eq!(
+            wire.as_object().unwrap().keys().collect::<Vec<_>>(),
+            [
+                "endpoint",
+                "example_model",
+                "guide_spelling",
+                "id_suggestion",
+                "kind",
+                "label",
+                "notes"
+            ],
+            "{wire}"
+        );
+    }
+
+    /// BR-2's wire half, re-applied at this second flow rather than assumed
+    /// inherited from the first (LESSON-525): **no provider-setup type can carry
+    /// the key**, in either direction. The secret's whole lifecycle stays in the
+    /// client process, and what travels is a reference.
+    ///
+    /// Asserted on the serialized key sets rather than on a reading of the
+    /// structs, so an `api_key` field added later turns this red instead of
+    /// riding along with the reference that was supposed to replace it.
+    #[test]
+    fn no_provider_setup_payload_has_anywhere_to_put_the_key() {
+        let planted = "sk-live-do-not-log-me";
+        let preview = serde_json::to_string(&ProviderSetupPreviewParams {
+            session_id: SessionId::from("s1"),
+            candidate: sentinel_candidate(),
+        })
+        .unwrap();
+        let commit = serde_json::to_string(&ProviderSetupCommitParams {
+            session_id: SessionId::from("s1"),
+            candidate: sentinel_candidate(),
+            expect_digest: Some("d".repeat(64)),
+        })
+        .unwrap();
+
+        for wire in [&preview, &commit] {
+            assert!(!wire.contains(planted), "{wire}");
+            // The only credential-shaped string is the reference.
+            assert!(wire.contains("keychain://teton/kimi"), "{wire}");
+        }
+
+        // Every field name the candidate can carry, spelled out (sorted, which
+        // is how `serde_json` hands back an object's keys): a key-carrying field
+        // would have to be added to this list to be added to the type.
+        let candidate_keys: Vec<String> = serde_json::from_str::<serde_json::Value>(&commit)
+            .unwrap()["candidate"]
+            .as_object()
+            .unwrap()
+            .keys()
+            .cloned()
+            .collect();
+        assert_eq!(
+            candidate_keys,
+            ["bindings", "endpoint", "id", "key_ref", "kind", "model"]
+        );
+
+        // And the params wrapping it carry only the session, the candidate, and
+        // the digest guard.
+        let commit_keys: Vec<String> = serde_json::from_str::<serde_json::Value>(&commit)
+            .unwrap()
+            .as_object()
+            .unwrap()
+            .keys()
+            .cloned()
+            .collect();
+        assert_eq!(commit_keys, ["candidate", "expect_digest", "session_id"]);
+    }
+
+    /// The plan's two list fields default to empty, and its catalog does not.
+    ///
+    /// The asymmetry is the point (and the reason it is tested rather than
+    /// merely documented): "no providers configured" and "no tiers bound" are
+    /// facts a daemon can truthfully mean, so absence reads as empty; a plan
+    /// answer with no `catalog` key is a *malformed* answer, because the catalog
+    /// and this method ship together, and reading it as "this build knows no
+    /// vendors" would send a user to a walkthrough with nothing to offer.
+    #[test]
+    fn a_plan_answer_may_omit_its_lists_but_never_its_catalog() {
+        let bare = r#"{"catalog":[]}"#;
+        let parsed: ProviderSetupPlanResult = serde_json::from_str(bare).unwrap();
+        assert!(parsed.existing.is_empty());
+        assert!(parsed.tiers.is_empty());
+
+        assert!(
+            serde_json::from_str::<ProviderSetupPlanResult>(r#"{"existing":[],"tiers":[]}"#)
+                .is_err(),
+            "a plan answer with no catalog is malformed, not an empty catalog"
         );
     }
 

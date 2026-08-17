@@ -313,6 +313,20 @@ const COMMANDS: &[CommandSpec] = &[
         args: Args::Required("a URL — `/web refresh <url>`"),
         handler: handle_web_refresh,
     },
+    // REQ-579: the second instance of the guided-enablement pattern `/web setup`
+    // opened, and it sits beside it for that reason. `Args::Optional` because
+    // every form is a real command: the bare line lists the vendors the daemon
+    // knows (AC-3), one argument names the vendor, and two carry the tier the
+    // model's hand-off was asked for (BR-7). The handler splits them; the table
+    // is not the place to police an argument whose vocabulary is the daemon's.
+    CommandSpec {
+        name: "provider setup",
+        aliases: &[],
+        summary: "Register a provider and route a tier to it: /provider setup [vendor] [tier] — \
+                  confirm before anything is written.",
+        args: Args::Optional,
+        handler: handle_provider_setup,
+    },
     CommandSpec {
         name: "quit",
         // BUG-153: `/exit` is the same command under the name most other REPLs
@@ -859,6 +873,54 @@ fn handle_web_setup(
     // `&dyn Keychain` and its tests can hand it one that touches no OS store.
     let keychain = crate::keychain::default_keychain();
     crate::web_setup_ui::run(conn, ctx, keychain.as_ref())?;
+    Ok(CommandOutcome::Continue)
+}
+
+/// What `/provider setup` says to a line carrying more than a vendor and a tier
+/// (REQ-579).
+///
+/// A third word is a typo, and reading it as anything would mean guessing which
+/// of two arguments the user meant — the same reason `Args::None` rejects a
+/// stray argument rather than ignoring it (BR-2).
+const PROVIDER_SETUP_USAGE: &str =
+    "`/provider setup` takes at most a vendor and a tier — `/provider setup kimi think`. Nothing \
+     was changed.";
+
+/// The `/provider setup [vendor] [tier]` handler: the guided registration
+/// walkthrough (REQ-579 BR-3, ADR-1).
+///
+/// User-only by construction, exactly as `/web setup` is: it is a slash command,
+/// and tool dispatch has no path to this table — a model that emits a tool call
+/// named `provider setup` reaches the tool registry and finds no such tool. The
+/// daemon does not take that on trust and gates all three RPCs anyway (BR-12).
+///
+/// Everything it does lives in [`crate::provider_setup_ui`]: the vendor
+/// resolution, the collection, the preview render, the default-no confirm, the
+/// keychain write and its undo. The handler's whole job is to split the argument
+/// and hand that flow the session's connection, the session's context and the
+/// platform keychain — the same division `/web setup` has, and for the same
+/// reason (LESSON-441: one consent gate, one implementation).
+///
+/// It is **not** refused on a pipe the way `/model set` is. The flow's own gate
+/// degrades a non-typed session to the CLI recipe and reads no stdin (BR-11),
+/// which is a better answer than a refusal for a command whose whole purpose is
+/// to tell a user how to get a provider registered.
+fn handle_provider_setup(
+    conn: &mut Connection,
+    ctx: &mut UiContext<'_>,
+    args: &str,
+) -> anyhow::Result<CommandOutcome> {
+    let mut words = args.split_whitespace();
+    let vendor = words.next();
+    let tier = words.next();
+    if words.next().is_some() {
+        ctx.surface.line(LineKind::Error, PROVIDER_SETUP_USAGE);
+        return Ok(CommandOutcome::Continue);
+    }
+    // Constructed here rather than inside the flow so the flow takes a
+    // `&dyn Keychain` and its tests can hand it one that touches no OS store.
+    let keychain = crate::keychain::default_keychain();
+    crate::provider_setup_ui::run(conn, ctx, keychain.as_ref(), vendor, tier)?;
     Ok(CommandOutcome::Continue)
 }
 
@@ -1565,6 +1627,13 @@ mod tests {
             // renders both values without either REQ growing a second way to
             // type the other's command.
             "permissions",
+            // REQ-579 BR-3 / AC-14: the guided provider registration, declared
+            // here for the reason every row above it was. It is the second
+            // instance of `/web setup`'s pattern and the first `/provider` row —
+            // REQ-555 deferred the namespace ("stays shell-only in v1 … if
+            // promoted later"), and this is that promotion, so the spelling is a
+            // spec decision and not a drive-by.
+            "provider setup",
         ];
         for expected in promised {
             assert!(
@@ -2026,6 +2095,87 @@ mod tests {
             listing.contains("confirm before anything is written"),
             "the summary must promise the confirm step: {listing}"
         );
+    }
+
+    // ------------------------------------------------------------------
+    // REQ-579: the guided provider registration (AC-3, AC-9, AC-14)
+    // ------------------------------------------------------------------
+
+    /// AC-14 / REQ-555 BR-7: `/help` is generated from `COMMANDS`, so this row
+    /// reaches it without a second edit. Its summary must also promise the
+    /// confirmation — a command that writes config and takes a key is one users
+    /// should be able to try.
+    #[test]
+    fn help_lists_the_provider_setup_row_and_promises_the_confirmation() {
+        let mut surface = RecordingSurface::new();
+        render_help(&mut surface);
+        let listing = surface.lines_of(LineKind::Info).join("\n");
+
+        assert!(listing.contains("/provider setup"), "{listing}");
+        assert!(
+            listing.contains("[vendor] [tier]"),
+            "the row must show what it takes, or the arguments are a secret: {listing}"
+        );
+        assert!(
+            listing.contains("confirm before anything is written"),
+            "the summary must promise the confirm step: {listing}"
+        );
+    }
+
+    /// Every form the spec names is a real command line: bare (AC-3), one
+    /// argument, and two. The longest-match rule keeps `provider setup` apart
+    /// from any future `provider` row, and a third word is a typo rather than a
+    /// silently ignored argument.
+    #[test]
+    fn the_provider_setup_command_parses_up_to_two_arguments() {
+        for (line, expected) in [
+            ("/provider setup", ""),
+            ("/provider setup kimi", "kimi"),
+            ("/provider setup kimi think", "kimi think"),
+            ("/provider  setup  kimi  think", "kimi  think"),
+        ] {
+            let Input::Command { name, args } = classify(line) else {
+                panic!("`{line}` did not classify as a command");
+            };
+            assert_eq!(name, "provider setup", "{line}");
+            assert_eq!(args, expected, "{line}");
+            assert!(
+                matches!(resolve(name, args), Resolution::Run(..)),
+                "`{line}` must dispatch, not be rejected"
+            );
+        }
+
+        // The handler's own split is what turns those bytes into two arguments,
+        // and it rejects a third rather than guessing.
+        assert!(PROVIDER_SETUP_USAGE.contains("/provider setup kimi think"));
+        let mut words = "kimi think spare".split_whitespace();
+        assert_eq!(words.next(), Some("kimi"));
+        assert_eq!(words.next(), Some("think"));
+        assert!(
+            words.next().is_some(),
+            "a third word must be visible to the handler"
+        );
+    }
+
+    /// AC-9 / BR-11 at the dispatch level: `/provider setup` is governed by the
+    /// **same** typed-input gate `/web setup` is, so a piped session degrades to
+    /// printed instructions and reads no stdin. The gate is pure, so the branch a
+    /// test process with a piped stdin cannot otherwise reach on purpose is
+    /// pinned here; what the degraded path *renders* is pinned in
+    /// `provider_setup_ui`, where the seam lives.
+    #[test]
+    fn provider_setup_degrades_on_a_pipe_through_the_same_gate_web_setup_uses() {
+        use crate::web_setup_ui::{gate, Gate};
+        assert_eq!(gate(true, false), Gate::Walk);
+        // The e2e suite's allowance, and nothing else in the wild.
+        assert_eq!(gate(false, true), Gate::Walk);
+        // The shape that matters: piped input, no seam, no question asked.
+        assert_eq!(gate(false, false), Gate::Instructions);
+        // And it is a degradation, not the `/model set` refusal: nothing here
+        // routes a non-typed `/provider setup` to `MODEL_SET_TYPED_ONLY`.
+        assert!(COMMANDS
+            .iter()
+            .any(|spec| spec.name == "provider setup" && matches!(spec.args, Args::Optional)));
     }
 
     /// The longest-match rule keeps the third `/web` row apart from the other
