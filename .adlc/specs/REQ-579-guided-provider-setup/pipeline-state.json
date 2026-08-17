@@ -71,5 +71,8 @@
     ],
     "failedTasks": [],
     "notes": "8 tasks complete; AC-1 closed via ADR-9 surface nudge"
+  },
+  "phase5": {
+    "summary": "6 agents; 25 advisory candidates (17 refuted); 1 High + 4 Major + 9 Minor fixed in 3 waves; re-verify (correctness+security) all CONFIRMED FIXED; 2 residuals recorded; halted on reflector Q (id prompt)"
   }
 }
