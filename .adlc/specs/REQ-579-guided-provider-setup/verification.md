@@ -5,11 +5,17 @@ symlinkable and both daemons loaded and benchmarked the GGUF, so this is a real
 A/B against two isolated real-weights daemons — not the `unrun` fallback the
 task file licenses.
 
-> **Final state: AC-1 FAILS, 3/3, in both rounds.** Round 1 (§4) is the
-> TASK-156 wording; round 2 (§13) is the restructured guide that moved the
-> hand-off *inside* step 1 in response to round 1's diagnosis. Neither produces
-> a reply that names `/provider setup` on the AC-1 prompt. Both are
-> deterministic 3/3.
+> **Final state: the *model-volunteers* half of AC-1 FAILS — 0/9, live, across
+> three guide revisions. The criterion is met by the surface instead (ADR-9,
+> recorded in §25).** Round 1 (§4) is the TASK-156 wording; round 2 (§13) is the
+> restructured guide that moved the hand-off *inside* step 1 in response to
+> round 1's diagnosis; round 3 (§19) deleted the competing CLI recipe outright.
+> None produces a reply that names `/provider setup` on the AC-1 prompt. All
+> three are deterministic 3/3. After round 3 the REQ owner took §16 F-1's
+> option 2 — a deterministic surface affordance — and BR-1/AC-1 were amended to
+> match (requirement.md, ADR-9); TASK-159 shipped it. **§25 is what this
+> document concludes; §1–§24 are the evidence that produced that conclusion and
+> are unchanged.**
 >
 > Round 1 and round 2 are kept whole rather than the first being rewritten:
 > round 1 is the evidence for why the restructure exists, and the pair is the
@@ -26,11 +32,14 @@ task file licenses.
 > one line the user types: `/provider setup <vendor> [tier]`" — and then
 > answered with `teton provider add` anyway** (§13).
 >
-> The rest of the REQ is in better shape than AC-1 is: `/help` lists the command
-> live (AC-14), the piped degradation prints the exact recipe and asks nothing
-> live (AC-9), and AC-2..AC-13 are covered by named tests. AC-1 is the one
-> claim only a live run could make, and it is recorded here as failed rather
-> than reworded into a pass.
+> The rest of the REQ is in better shape than AC-1's live half is: `/help` lists
+> the command live (AC-14), the piped degradation prints the exact recipe and
+> asks nothing live (AC-9), and AC-2..AC-13 are covered by named tests. The
+> model-volunteers half of AC-1 is the one claim only a live run could make, and
+> it is recorded here as failed — 0/9, in full — rather than reworded into a
+> pass. What the amended criterion rests on instead is the surface line ADR-9
+> added: deterministic, in the harness's own voice, and covered by seven unit
+> tests, a pty walk, and a piped e2e (§25).
 
 ---
 
@@ -373,34 +382,38 @@ it; "unrun" means neither.
 
 | AC | Status | Evidence |
 |---|---|---|
-| **AC-1** — reply names `/provider setup kimi`, no CLI recitation; live A/B, 3 rounds, baseline recorded | **FAIL — live, three times** | §4 (round 1, TASK-156 wording): 0/3 name `/provider setup`; 3/3 recite the CLI. §14 (round 2, hand-off moved inside step 1): 0/3, *after* fetching and reading the topic that names the command in its first five lines. §19 (round 3, CLI recipe removed from the guide entirely): 0/3, with the `shell` regression back and model calls doubled. Baseline recorded (§5). Structural halves covered by `harness::turn_loop::tests::the_system_prompt_forbids_asking_for_a_credential_in_the_conversation`, `harness::turn_loop::tests::the_system_prompt_bundles_tetons_own_provider_setup` and (round 3) `the_bundled_guide_carries_no_vendor_recipe_and_refers_to_the_topic` (`crates/tetond/src/harness/turn_loop.rs`) — all green across all three rounds, and all asserting the clause is *in the prompt*, which is exactly the claim these runs confirm is insufficient |
+| **AC-1** *(scored against the criterion as amended for ADR-9 — the user is left looking at `/provider setup <vendor> [tier]` either from the model's reply **or** from the harness line the TTY surface appends when the reply recited the CLI)* | **model-volunteers half: FAIL, live, 0/9 across rounds 1–3 (recorded); surface half: PASS** | **Model-volunteers half — FAIL, live, three rounds, 3/3 each.** §4 (round 1, TASK-156 wording): 0/3 name `/provider setup`; 3/3 recite the CLI. §14 (round 2, hand-off moved inside step 1): 0/3, *after* fetching and reading the topic that names the command in its first five lines. §19 (round 3, CLI recipe removed from the guide entirely): 0/3, with the `shell` regression back and model calls doubled. Baseline recorded (§5). The prompt-side structural tests — `harness::turn_loop::tests::the_system_prompt_forbids_asking_for_a_credential_in_the_conversation`, `harness::turn_loop::tests::the_system_prompt_bundles_tetons_own_provider_setup` (`crates/tetond/src/harness/turn_loop.rs`) — are green across all three rounds and assert only that the clause is *in the prompt*, which is exactly the claim these runs confirm is insufficient. **Surface half — PASS, deterministic, covered by test (ADR-9 / TASK-159, §25):** `session_ui::tests::a_reply_that_recites_the_cli_earns_exactly_one_hand_off_line`; `session_ui::tests::a_reply_that_names_the_command_earns_nothing`; `session_ui::tests::a_reply_about_anything_else_earns_nothing`; `session_ui::tests::the_hand_off_is_once_per_turn_even_when_both_commands_appear`; `session_ui::tests::the_hand_off_never_prints_on_a_non_tty_surface`; `session_ui::tests::the_users_own_text_and_help_output_do_not_trigger_it`; `session_ui::tests::the_hand_off_line_carries_no_ansi_and_names_the_command_verbatim` (all `crates/teton/src/session_ui.rs`); `a_reply_reciting_the_cli_earns_the_hand_off_line_at_a_terminal` (`crates/teton/tests/pty_e2e.rs`, a real terminal, mutation-checked against the `main.rs` wiring); `a_piped_session_whose_reply_recites_the_cli_gets_no_hand_off_line` (`crates/teton/tests/cli_e2e.rs`, the non-TTY negative). **Not exercised live** — TASK-158's matrix predates TASK-159 and was piped, so the surface half has not been A/B'd against the local model; its inputs are the model replies rounds 1–3 recorded verbatim, every one of which recites the CLI and would fire it |
 | **AC-2** — TTY walk vendor→model→key→routing→preview→confirm; same session routes `think`→`kimi`, no restart | covered by test | `the_committed_provider_routes_the_next_decision_in_the_same_session` (`crates/tetond/tests/provider_setup_flow.rs`); `provider_setup_ui::tests::a_full_walk_stores_the_key_after_the_confirm_and_sends_only_its_reference` (`crates/teton/src/provider_setup_ui.rs`); `runtime::tests::provider_setup_flow::a_commit_writes_the_previewed_bytes_and_routing_is_live_without_a_restart` (`crates/tetond/src/runtime.rs`). **Not exercised live** — this run had no TTY (piped stdin) |
 | **AC-3** — bare `/provider setup` lists the catalog, accepts number or id | covered by test | `provider_setup_ui::tests::a_walk_without_a_vendor_lists_the_catalog_and_takes_a_number_or_a_name`; `provider_setup_ui::tests::an_unresolvable_vendor_argument_falls_back_to_the_catalog`; `provider_setup_ui::tests::no_vendor_argument_resolves_to_none_so_the_caller_lists_the_catalog`; `provider_setup_ui::tests::the_recipe_without_a_vendor_names_every_vendor_the_daemon_sent` (all `crates/teton/src/provider_setup_ui.rs`); `slash::tests::the_provider_setup_command_parses_up_to_two_arguments` (`crates/teton/src/slash.rs`) |
 | **AC-4** — key absent from transcript, events, daemon log, cost ledger, config; config carries only `keychain://…` | covered by test **with a named gap** | `provider_setup_ui::tests::the_key_reaches_the_keychain_and_nothing_else`; `provider_setup_ui::tests::a_full_walk_stores_the_key_after_the_confirm_and_sends_only_its_reference` (`crates/teton/src/provider_setup_ui.rs`); `the_committed_provider_routes_the_next_decision_in_the_same_session` (`crates/tetond/tests/provider_setup_flow.rs`, asserts `auth_ref = "keychain://teton/kimi"` in the written bytes); `server::tests::a_provider_setup_commit_announces_only_what_it_applied`; `runtime::tests::provider_setup_flow::a_raw_key_in_place_of_a_reference_is_refused_and_not_echoed`. **Gap: the daemon-log and cost-ledger sweeps are asserted nowhere** — LESSON-519's "assert on the real artifact" is met for transcript/events/config and unmet for those two |
 | **AC-5** — client entry and model guide both from one typed catalog, gated both directions | covered by test | `every_recipe_reaches_the_plan_field_for_field` and `the_plan_offers_the_whole_roster_over_a_configured_daemon` (`crates/tetond/tests/provider_setup_contracts.rs`); `provider_recipes::tests::every_recipe_maps_onto_a_wire_entry_field_for_field` (`crates/tetond/src/provider_recipes.rs`); `runtime::tests::provider_setup_flow::the_plan_serves_the_shipped_recipe_catalog_unaltered`; `the_bundled_guide_and_the_recipe_catalog_agree` and `the_providers_topic_and_the_recipe_catalog_agree` (`crates/tetond/tests/web_setup_contracts.rs`). Corroborated live: the endpoint and model in every round of both arms are the catalog's exact values |
 | **AC-6** — base URL composed and echoed *before* the key prompt; composed URL persisted; backslash authority refused at the same seam | covered by test | `provider_setup_ui::tests::a_pasted_base_url_is_composed_and_echoed_before_the_key_is_asked_for`; `provider_setup_ui::tests::a_backslash_authority_is_refused_with_the_shell_commands_own_sentence`; `provider_setup_ui::tests::an_anthropic_vendor_is_not_asked_for_an_endpoint` (`crates/teton/src/provider_setup_ui.rs`); `runtime::tests::provider_setup_flow::a_vendor_base_url_is_composed_into_the_url_the_adapter_posts`; `runtime::tests::provider_setup_flow::an_endpoint_whose_authority_carries_a_backslash_is_refused`; `runtime::tests::provider_setup_flow::the_previewed_host_is_the_one_the_request_would_be_dialed_at` (`crates/tetond/src/runtime.rs`) |
-| **AC-7** — cancel at each of the five prompts: config byte-identical, no keychain entry | covered by test | `provider_setup_ui::tests::an_abort_at_every_prompt_stores_nothing_and_commits_nothing`; `provider_setup_ui::tests::the_confirm_defaults_to_no_and_only_an_explicit_yes_writes`; `provider_setup_ui::tests::a_refused_preview_asks_for_no_confirmation_and_stores_nothing`; `provider_setup_ui::tests::a_keychain_that_cannot_store_the_key_writes_no_config` (`crates/teton/src/provider_setup_ui.rs`); `a_commit_whose_digest_went_stale_is_refused_and_the_file_is_untouched` (`crates/tetond/tests/provider_setup_flow.rs`, asserts bytes *and* inode) |
+| **AC-7** — cancel at each of the five prompts: config byte-identical, no keychain entry | covered by test **by composition, not by a config byte read** | **Precisely what is asserted:** the client-side abort tests do *not* read a config file — they assert that no commit RPC was sent (`io.commits.is_empty()`) and that the `MockKeychain` is empty. That composes into AC-7 because the commit is the only path that writes config, and the daemon e2e proves a preview alone writes nothing; it is not the same evidence as reading the file's bytes back. The byte-and-inode read exists on the daemon side only, in the stale-digest test named below. Tests: `provider_setup_ui::tests::an_abort_at_every_prompt_stores_nothing_and_commits_nothing`; `provider_setup_ui::tests::the_confirm_defaults_to_no_and_only_an_explicit_yes_writes`; `provider_setup_ui::tests::a_refused_preview_asks_for_no_confirmation_and_stores_nothing`; `provider_setup_ui::tests::a_keychain_that_cannot_store_the_key_writes_no_config` (`crates/teton/src/provider_setup_ui.rs`); `a_commit_whose_digest_went_stale_is_refused_and_the_file_is_untouched` (`crates/tetond/tests/provider_setup_flow.rs`, asserts bytes *and* inode) |
 | **AC-8** — refused commit deletes a fresh key / restores a rotated one; both reported | covered by test | `provider_setup_ui::tests::a_refused_commit_on_a_fresh_key_deletes_it_and_says_so`; `provider_setup_ui::tests::a_refused_commit_after_a_rotation_puts_the_previous_key_back`; `provider_setup_ui::tests::a_commit_that_never_answered_leaves_the_keychain_alone_and_says_so`; `provider_setup_ui::tests::a_commit_that_applied_nothing_says_the_key_was_still_rotated` (all `crates/teton/src/provider_setup_ui.rs`) |
 | **AC-9** — piped `/provider setup kimi` prints the recipe, exits 0, consumes no further stdin | **PASS — live** + covered by test | §7 D2: exit 0, exact recipe printed, next piped line reached the session as an ordinary turn rather than being eaten as a flow answer. Tests: `a_piped_provider_setup_prints_the_recipe_and_asks_nothing` (`crates/teton/tests/cli_e2e.rs`); `provider_setup_ui::tests::a_piped_session_is_told_what_to_type_and_asked_nothing`; `provider_setup_ui::tests::instructions_are_commands_the_cli_itself_parses`; `provider_setup_ui::tests::the_recipe_for_a_named_vendor_is_the_two_commands_that_do_the_job`; `provider_setup_ui::tests::every_kind_spells_itself_the_way_the_cli_parses_it`; `slash::tests::provider_setup_degrades_on_a_pipe_through_the_same_gate_web_setup_uses` (`crates/teton/src/slash.rs`) |
-| **AC-10** — model tool call and foreign-connection commit both refused, no config/keychain change | covered by test | `a_commit_from_a_connection_that_did_not_open_the_session_is_refused_and_the_session_is_told` (`crates/tetond/tests/provider_setup_flow.rs`); `server::tests::a_provider_setup_commit_without_session_access_is_refused_and_the_session_is_told`; `server::tests::the_provider_setup_methods_are_session_scoped_and_never_daemon_wide`; `server::tests::a_provider_setup_plan_answers_its_own_session_and_refuses_a_foreign_one_silently`; `server::tests::a_provider_setup_preview_answers_its_own_session_and_refuses_a_foreign_one_silently`; `server::tests::a_web_setup_rejection_does_not_spend_the_provider_setup_notice`; `server::tests::a_provider_setup_commit_answers_the_earlier_gates_before_the_presence_gate` (`crates/tetond/src/server.rs`); `harness::tools::tests::no_tool_can_commit_a_provider_setup_and_no_harness_source_names_it` (`crates/tetond/src/harness/tools/mod.rs`); `session_ui::tests::a_refused_provider_setup_commit_says_nothing_was_written_or_stored` (`crates/teton/src/session_ui.rs`). **Wording note:** the refusal *wire code* is the existing `NOT_ATTACHED`; `provider_setup_rejected_nonuser` is the *event*. The AC's letter conflates them; the tests document the split deliberately |
+| **AC-10** — model tool call and foreign-connection commit both refused, no config/keychain change | covered by test | `a_commit_from_a_connection_that_did_not_open_the_session_is_refused_and_the_session_is_told` (`crates/tetond/tests/provider_setup_flow.rs`); `server::tests::a_provider_setup_commit_without_session_access_is_refused_and_the_session_is_told`; `server::tests::the_provider_setup_methods_are_session_scoped_and_never_daemon_wide`; `server::tests::a_provider_setup_plan_answers_its_own_session_and_refuses_a_foreign_one_silently`; `server::tests::a_provider_setup_preview_answers_its_own_session_and_refuses_a_foreign_one_silently`; `server::tests::a_web_setup_rejection_does_not_spend_the_provider_setup_notice`; `server::tests::a_provider_setup_commit_answers_the_earlier_gates_before_the_presence_gate` (`crates/tetond/src/server.rs`); `harness::tools::tests::no_tool_can_commit_a_provider_setup_and_no_harness_source_names_it` (`crates/tetond/src/harness/tools/mod.rs`); `session_ui::tests::a_refused_provider_setup_commit_says_nothing_was_written_or_stored` (`crates/teton/src/session_ui.rs`). **Wording note (now resolved):** the refusal *wire code* is the existing `NOT_ATTACHED`; `provider_setup_rejected_nonuser` is the *event*. The AC's original letter conflated them; BR-12 and AC-10 have since been amended to state the split precisely (requirement.md, `(amended: …)` notes), matching what `web/setup_*` does and what architecture.md's wire table already recorded. The tests document the split |
 | **AC-11** — presence-capable build prompts as `web/setup_commit` does; `TETON_PRESENCE_ACCEPT=fail` refuses and BR-8 cleanup runs, asserted on the real keychain | covered by test **with a named gap** | `a_presence_refused_commit_writes_nothing_and_swaps_nothing` (`crates/tetond/tests/provider_setup_flow.rs`); `server::tests::a_provider_setup_commit_refuses_when_the_presence_check_fails`; `server::tests::a_provider_setup_commit_answers_the_earlier_gates_before_the_presence_gate` (`crates/tetond/src/server.rs`). **Gap: "asserted on the real keychain" is not met** — the cleanup assertions run against `MockKeychain`; `crates/teton/tests/cli_e2e.rs` states in-source that no real-keychain walk exists because the shipped CLI has no keychain test seam. Also inherits the REQ-576 posture: presence is **inert on the shipped non-`--features presence` build**, which is the build this run used |
-| **AC-12** — existing id previews the replacement and requires the confirm; declining leaves the original intact | covered by test **with a named gap** | `a_replacement_is_previewed_as_one_and_leaves_every_other_byte_alone` (`crates/tetond/tests/provider_setup_flow.rs`); `runtime::tests::provider_setup_flow::replacing_an_existing_provider_is_named_and_leaves_its_neighbours_alone`; `runtime::tests::provider_setup_flow::a_commit_that_replaces_a_provider_leaves_every_other_byte_alone`; `runtime::tests::provider_setup_flow::a_new_registration_leaves_the_existing_rows_byte_identical` (`crates/tetond/src/runtime.rs`); `provider_setup_ui::tests::an_id_that_already_exists_is_named_before_the_key_prompt` (`crates/teton/src/provider_setup_ui.rs`). **Gap: the AC's literal string** ``(model `kimi-k2` → `kimi-k3`)`` **is not pinned anywhere** — the typed `replaces` field is covered instead of that exact old→new rendering |
+| **AC-12** — existing id previews the replacement and requires the confirm; declining leaves the original intact | covered by test **with a named gap** | `a_replacement_is_previewed_as_one_and_leaves_every_other_byte_alone` (`crates/tetond/tests/provider_setup_flow.rs`); `runtime::tests::provider_setup_flow::replacing_an_existing_provider_is_named_and_leaves_its_neighbours_alone`; `runtime::tests::provider_setup_flow::a_commit_that_replaces_a_provider_leaves_every_other_byte_alone`; `runtime::tests::provider_setup_flow::a_new_registration_leaves_the_existing_rows_byte_identical` (`crates/tetond/src/runtime.rs`); `provider_setup_ui::tests::an_id_that_already_exists_is_named_before_the_key_prompt` (`crates/teton/src/provider_setup_ui.rs`). **Gap: the preview renders the *prior* model only** — `provider_setup_ui.rs` prints "this replaces the provider already registered as `kimi` (kind `openai-compatible`, model `kimi-k2`)", so the AC's ``(model `kimi-k2` → `kimi-k3`)`` transition is never shown to the user and is pinned nowhere. The old→new transition is being added in the verify fix pass (see wave 2, §26) |
 | **AC-13** — declining every binding registers the provider, says unrouted, names both routes back | covered by test | `provider_setup_ui::tests::declining_every_tier_registers_the_provider_and_says_it_is_unrouted` (`crates/teton/src/provider_setup_ui.rs`, pins the `unrouted_line` helper); `runtime::tests::provider_setup_flow::a_candidate_with_no_bindings_previews_the_provider_row_alone` (`crates/tetond/src/runtime.rs`); `session_ui::tests::a_completed_provider_setup_is_announced_with_what_now_routes_to_it` (`crates/teton/src/session_ui.rs`) |
-| **AC-14** — `/help` lists `/provider setup` from the dispatching table; no hand-maintained help text | **PASS — live** + covered by test | §7 D1, live from the shipped binary. Tests: `slash::tests::help_lists_the_provider_setup_row_and_promises_the_confirmation`; `slash::tests::help_renders_every_table_row_and_the_escape_footer`; `slash::tests::every_table_row_is_reachable_from_a_typed_command_line` (`crates/teton/src/slash.rs`). **Minor note:** the e2e `slash_help_lists_every_command_and_no_turn_is_attempted` (`crates/teton/tests/cli_e2e.rs`) was not extended with the row; its explicit `(name, summary)` list stops at `/web refresh` and `/quit`, so e2e coverage of AC-14 is unit-level only |
+| **AC-14** — `/help` lists `/provider setup` from the dispatching table; no hand-maintained help text | **PASS — live** + covered by test | §7 D1, live from the shipped binary. Tests: `slash::tests::help_lists_the_provider_setup_row_and_promises_the_confirmation`; `slash::tests::help_renders_every_table_row_and_the_escape_footer`; `slash::tests::every_table_row_is_reachable_from_a_typed_command_line` (`crates/teton/src/slash.rs`). **Minor note:** the e2e `slash_help_lists_every_command_and_no_turn_is_attempted` (`crates/teton/tests/cli_e2e.rs`) was not extended with the row; its explicit `(name, summary)` list stops at `/web refresh` and `/quit`, so e2e coverage of AC-14 was unit-level only. **Closed in the verify pass** — the row was added to that list (§26, wave 1) |
 
-**Summary: 1 live FAIL (AC-1 — failed in all three rounds, 3/3 each), 2 live
-PASS (AC-9, AC-14), 11 covered by named tests, 0 unrun.** Four coverage gaps
-are named above rather than papered over (AC-4 log/ledger sweeps, AC-11
-real-keychain cleanup, AC-12 literal preview string, AC-14 e2e row).
+**Summary: 1 live FAIL that is now half a criterion (AC-1's model-volunteers
+half — failed in all three rounds, 3/3 each), 2 live PASS (AC-9, AC-14), 12
+covered by named tests including AC-1's surface half, 0 unrun.** Four coverage
+gaps are named above rather than papered over (AC-4 log/ledger sweeps, AC-11
+real-keychain cleanup, AC-12 old→new preview string, AC-14 e2e row), and AC-7's
+evidence is a composition rather than a config byte read, said so above.
 
-**REQ-579's acceptance state: AC-1 is not met on this build, after three
-independent attempts to meet it.** Everything the REQ builds works and is
-tested — the flow, the daemon trio, the presence gate, the degradation, the
-help row. What does not work is the one thing that makes any of it discoverable
-to a user who does not already know it exists: the model will not hand off.
-Three guide revisions (reworded clause → moved inside step 1 → competing recipe
-deleted) produced 0/9 hand-offs. That is now a product-level decision (§22
-F-1), not a wording problem and not a rescoring.
+**REQ-579's acceptance state, after ADR-9: AC-1 is met by the surface and not
+by the model.** Everything the REQ builds works and is tested — the flow, the
+daemon trio, the presence gate, the degradation, the help row. What does not
+work, and is recorded here in full rather than rescored, is the model
+volunteering the hand-off: three guide revisions (reworded clause → moved
+inside step 1 → competing recipe deleted) produced 0/9. That was escalated as a
+product-level decision (§22 F-1); the owner's answer is §16 F-1's option 2, and
+what shipped for it is §25. The discoverability hole this section originally
+named — the feature reachable only by a user who already knows it exists — is
+what the surface line closes.
 
 ## 10. Findings
 
@@ -457,12 +470,21 @@ reachable today only by a user who already knows it exists.
 2. Decide whether F-2 (the `shell` attempt) is in scope for the same fix or its
    own bug. *(Cleared by round 2's line-3 rewording — see §15.)*
 3. File F-3 against the shipped build; it is a live credential-hygiene defect
-   on `main`, not a REQ-579 regression.
+   on `main`, not a REQ-579 regression. **Still open as of the verify pass: no
+   BUG id has been allocated for it** — allocating one is its own ceremony
+   (numbers race across sessions), so it remains to be filed at wrapup, against
+   the shipped 0.1.17 model telling users to put a live API key on the command
+   line.
 4. Close the four named coverage gaps in §9, or record each as accepted.
 
 **After round 2, the live list is: item 3, item 4, and §16 F-1's three-way
 choice** (thin the guide further / add a deterministic surface affordance /
 amend AC-1). Items 1 and 2 are closed by §13–§16.
+
+**After round 3 and the owner's decision, the live list is item 3 alone.** The
+three-way choice was answered — surface affordance, plus an open amendment to
+BR-1/AC-1 (§25) — and item 4's four gaps are being closed or accepted in the
+verify pass (§26).
 
 ## 12. Reproduction
 
@@ -912,8 +934,144 @@ failure under rounds 2 and 3 was hidden behind an earlier target — the
 workspace was re-run with `--no-fail-fast` before this commit
 (`cargo-test-fail-fast-hides-targets`).
 
-**AC-1 status at commit: unmet, three rounds of live evidence.** The product
-half of the REQ (AC-2..AC-14) is covered by 2705 passing tests including six
-daemon e2e scenarios and the piped-CLI degradation. What is not achieved is the
-local model *volunteering* the hand-off at the front door. Decision on how to
-close that gap is with the REQ owner (§16 F-1, §23).
+**AC-1 status at this commit (`1ae48b7`, before TASK-159): unmet, three rounds
+of live evidence.** The product half of the REQ (AC-2..AC-14) is covered by 2705
+passing tests including six daemon e2e scenarios and the piped-CLI degradation.
+What is not achieved is the local model *volunteering* the hand-off at the front
+door. Decision on how to close that gap is with the REQ owner (§16 F-1, §23).
+
+**That decision has since been made and shipped — see §25.** The owner took
+§16 F-1's option 2 (a deterministic surface affordance), BR-1 and AC-1 were
+amended to name it, and ADR-9 / TASK-159 implemented it. This section's
+"unmet" is the state at `1ae48b7` and is left standing as the record of what
+the guide alone could do; it is not REQ-579's closing state.
+
+## 25. ADR-9: the surface guarantees the hand-off
+
+Sections 1–24 are a live record of one hypothesis being tested three ways and
+failing three times. This section is what was decided as a result, and what
+ships. **Nothing above is retracted** — the 0/9 stands, and it is the reason
+this section exists.
+
+### The decision
+
+After round 3 (§22 F-1: "stop iterating on the prompt"), the REQ owner chose
+§16 F-1's **option 2** — a deterministic surface affordance — over option 1
+(thin the guide further) and option 3 (amend AC-1 down to accept a CLI-only
+reply). Options 2 and 3 were not exclusive in practice: the affordance was
+built, *and* BR-1/AC-1 were amended to say plainly that either half may satisfy
+the criterion, so that no later reader mistakes a passing AC-1 for the model
+having learned to volunteer the command. The amendment carries an explicit
+`(amended: …)` note in requirement.md with the 9/9 recitation as its stated
+reason (LESSON-521: an AC is amended in the open, with the evidence attached,
+or not at all). The architecture record is **ADR-9 — "The hand-off is
+guaranteed by the surface, not begged from the model"**; the implementation is
+**TASK-159**, commit `79084e7`.
+
+### What shipped
+
+At the end of a typed-prompt turn, if that turn's assistant reply contained
+`teton provider add` or `teton policy set-tier`, the CLI appends exactly one
+harness-voiced `Notice`:
+
+    in this session, /provider setup <vendor> [tier] does this without leaving it; no key in chat.
+
+Its properties, each one a test below rather than a claim here:
+
+- **Deterministic.** A substring match on text the model already emitted. Zero
+  model calls, zero daemon round-trips, no state beyond the turn.
+- **TTY-only.** Never printed on a pipe — BR-11 already prints the full recipe
+  there, and a script's output stays byte-identical to what it was before this
+  REQ.
+- **Once per turn.** The turn's accumulated reply is consumed (`mem::take`) at
+  the seam, so "at most once" is a property of the data rather than a flag
+  somebody has to remember to reset; the same take is the reset for the next
+  turn.
+- **Model-output-only.** The user's own typed text and `/help` output never
+  reach the accumulator, so neither can trigger it.
+- **Dormant when the model volunteers the command.** A reply that already names
+  `/provider setup` prints nothing — the harness does not talk over an answer
+  that was already right. If a future model learns the hand-off, this line
+  disappears with no code change.
+- **Harness's voice, not the model's.** It renders as a `Notice` (`>>`), so a
+  user can tell who is speaking.
+
+### The tests, by name
+
+Seven unit tests over the render seam, in `crates/teton/src/session_ui.rs`:
+
+- `session_ui::tests::a_reply_that_recites_the_cli_earns_exactly_one_hand_off_line`
+- `session_ui::tests::a_reply_that_names_the_command_earns_nothing`
+- `session_ui::tests::a_reply_about_anything_else_earns_nothing`
+- `session_ui::tests::the_hand_off_is_once_per_turn_even_when_both_commands_appear`
+- `session_ui::tests::the_hand_off_never_prints_on_a_non_tty_surface`
+- `session_ui::tests::the_users_own_text_and_help_output_do_not_trigger_it`
+- `session_ui::tests::the_hand_off_line_carries_no_ansi_and_names_the_command_verbatim`
+
+Plus the two that exercise it through a real surface:
+
+- `a_reply_reciting_the_cli_earns_the_hand_off_line_at_a_terminal`
+  (`crates/teton/tests/pty_e2e.rs`) — a scripted reply reciting the CLI at an
+  actual terminal produces the `>>` line exactly once, after the reply;
+  mutation-checked against the `main.rs` wiring, so deleting the call fails the
+  test rather than passing vacuously.
+- `a_piped_session_whose_reply_recites_the_cli_gets_no_hand_off_line`
+  (`crates/teton/tests/cli_e2e.rs`) — the non-TTY negative.
+
+### What this does and does not claim
+
+It claims: a user who asks the AC-1 question at a terminal is left looking at
+`/provider setup <vendor> [tier]` before the next prompt, whatever the model
+says. Every reply recorded in §4, §14 and §19 recites the CLI, so every one of
+them fires it.
+
+It does not claim: that the model learned anything. §4/§14/§19 are the standing
+record that it did not, and ASSUME-008 carries the general lesson. Nor has the
+surface half been A/B'd live — TASK-158's matrix predates TASK-159 and ran
+piped, where by design nothing prints. The live evidence for the surface half
+is the transcripts above (every one an input that fires it) plus the pty walk;
+a live TTY re-run is the honest way to close that, and is worth doing at
+wrapup if a terminal session is cheap.
+
+## 26. Verify pass — findings fixed after the record above
+
+The reflect/review pass over the implementation returned findings that are
+being applied in two waves; the orchestrator commits after each. Recorded here
+by finding so the document and the code move together.
+
+**Wave 1**
+
+- **High — `key_ref` was accepted too broadly.** Narrowed to
+  `keychain://teton/<id>`, so a reference naming some other service's item
+  cannot be committed. *Applied — see commit.*
+- **Major — `fallback_id` was dropped on re-bind.** A tier's existing fallback
+  is now preserved when the tier is re-bound to the new provider. *Applied —
+  see commit.*
+- `dial_host` is reported on completion, not only in the preview. *Applied —
+  see commit.*
+- A userinfo (`user:pass@`) authority in a pasted endpoint now warns. *Applied
+  — see commit.*
+- `derive` refuses when there is no config path rather than proceeding against
+  a phantom file. *Applied — see commit.*
+- **Hand-off dormancy tightened (ADR-9).** Dormant only when the reply names
+  the command **and** does not also recite the CLI — a reply that does both is
+  a reply that still needs the line — with backtick handling symmetric across
+  both halves of the predicate, so `` `/provider setup` `` and
+  `/provider setup` are the same answer to the matcher exactly as
+  `` `teton provider add` `` already was. *Applied — see commit.*
+- Cross-session chunk gating on the streamed reply accumulator. *Applied — see
+  commit.*
+- Keychain-cleanup-failure tests (the undo itself failing). *Applied — see
+  commit.*
+- Malformed-JSON tests at the wire seam. *Applied — see commit.*
+- The non-macOS keychain probe runs at the gate rather than after collection.
+  *Applied — see commit.*
+- The help table gains its row in the e2e list, closing §9's AC-14 note.
+  *Applied — see commit.*
+
+**Wave 2**
+
+- **AC-12's old→new transition.** The replace preview renders the prior model
+  only; wave 2 makes the CLI render `(model kimi-k2 → kimi-k3)` so the AC's
+  literal string is what the user sees and is pinned by a test. *Applied — see
+  commit.* (§9's AC-12 row records the gap this closes.)

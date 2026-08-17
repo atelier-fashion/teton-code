@@ -4343,13 +4343,21 @@ impl DaemonRuntime {
             // own roster (LESSON-456 — one definition of the set).
             tiers: Tier::ALL
                 .iter()
-                .map(|tier| TierSummary {
-                    tier: to_protocol_tier(*tier),
-                    provider_id: config
-                        .tiers
-                        .iter()
-                        .find(|row| row.tier == *tier)
-                        .map(|row| ProviderId::from(row.provider_id.as_str())),
+                .map(|tier| {
+                    let row = config.tiers.iter().find(|row| row.tier == *tier);
+                    TierSummary {
+                        tier: to_protocol_tier(*tier),
+                        provider_id: row.map(|row| ProviderId::from(row.provider_id.as_str())),
+                        // Reported although this flow asks no fallback question
+                        // (ADR-6 / OQ-2), because it *rewrites whole rows*: a
+                        // re-bound tier keeps the fallback the user configured
+                        // with `teton policy set-tier --fallback`, and the
+                        // routing question is asked against what the table says
+                        // today (BR-7) — fallback included.
+                        fallback_id: row
+                            .and_then(|row| row.fallback_id.as_deref())
+                            .map(ProviderId::from),
+                    }
                 })
                 .collect(),
         }
@@ -4380,9 +4388,13 @@ impl DaemonRuntime {
     /// # Errors
     /// [`error_code::PROVIDER_SETUP_INVALID`] when the candidate is refused —
     /// see [`Self::derive_provider_setup`] for the order the refusals are made
-    /// in and why. [`error_code::INTERNAL_ERROR`] when the document cannot be
-    /// derived at all. Nothing is written in any of those cases: this method has
-    /// no write path.
+    /// in and why. [`error_code::CONFIG_REJECTED`] when this daemon has no
+    /// config file: the preview refuses it rather than describing a write that
+    /// cannot land, because the client stores the key *after* the confirm
+    /// (ADR-5) and a preview that succeeded here would cost a keychain write for
+    /// a commit that then refuses. [`error_code::INTERNAL_ERROR`] when the
+    /// document cannot be derived at all. Nothing is written in any of those
+    /// cases: this method has no write path.
     pub fn provider_setup_preview(
         &self,
         candidate: &ProviderSetupCandidate,
@@ -4454,7 +4466,9 @@ impl DaemonRuntime {
     ///   the caller confirmed. Nothing is written and the in-memory config is
     ///   untouched in every one of those.
     /// - [`error_code::CONFIG_REJECTED`] — this daemon has no config file, so
-    ///   there is nowhere for the registration to land.
+    ///   there is nowhere for the registration to land. Raised by the derivation
+    ///   now, which means the *preview* refuses it too: a caller reaches this
+    ///   arm only by committing without having previewed.
     /// - [`error_code::INTERNAL_ERROR`] — the write itself failed, or the
     ///   document could not be derived at all (an unparseable or unreadable
     ///   file, REQ-574 BR-6). The in-memory config is untouched in both: the swap
@@ -4518,8 +4532,19 @@ impl DaemonRuntime {
                 applied: false,
                 provider_id,
                 bindings: rendered.bindings,
+                // The same derivation's host, on both answers: "nothing changed"
+                // is still a statement about where this provider is dialed, and
+                // a client that only prints the destination when something was
+                // written tells the user least when they are most likely to be
+                // re-running the flow because they doubt it.
+                dial_host: rendered.dial_host,
             });
         }
+        // Defensive rather than live since REQ-579's verify pass:
+        // `derive_provider_setup` refuses a daemon with no config file *before*
+        // it describes anything, so a preview can no longer succeed for a commit
+        // that would answer this. Kept because the borrow is needed anyway and a
+        // second write path must never grow past it silently.
         let Some(path) = &self.config_path else {
             return Err(RpcError::new(
                 error_code::CONFIG_REJECTED,
@@ -4557,6 +4582,12 @@ impl DaemonRuntime {
             applied: true,
             provider_id,
             bindings: rendered.bindings,
+            // Read off the derivation that produced the bytes just written —
+            // never from `candidate.endpoint`, which is the string a user
+            // pasted and can carry userinfo in its authority (LESSON-529). The
+            // host is the parser-that-dials' own answer, and it is the same one
+            // the preview showed at the confirm step.
+            dial_host: rendered.dial_host,
         })
     }
 
@@ -4583,14 +4614,20 @@ impl DaemonRuntime {
     ///
     /// # The order of the refusals is the point
     ///
-    /// 1. **The credential reference, first and before any config exists.**
-    ///    `key_ref` is a reference or the candidate is refused
-    ///    ([`teton_core::is_recognized_auth_ref`], the same rule
-    ///    [`Config::validate`] applies to `auth_ref` — asked here so a raw key
-    ///    that reached the wire is never cloned into a `Config`, never
-    ///    serialized by the delta engine, and never inside a document a refusal
-    ///    path could quote). The refusal names the provider id and **never the
-    ///    value**, for [`ConfigError::UnrecognizedAuthRef`]'s reason.
+    /// 0. **Somewhere to write, before anything is asked of the answers.** A
+    ///    daemon with no config file can never land this registration, and the
+    ///    client stores the key *after* the confirm (ADR-5) — so a preview that
+    ///    succeeded here would walk the user through typing a credential into
+    ///    their keychain for a commit that refuses. It reads no field of the
+    ///    candidate, which is why it can come first without echoing anything.
+    /// 1. **The credential reference, first among the answers and before any
+    ///    config exists.** `key_ref` is *the* keychain reference for this
+    ///    candidate's own id ([`keychain_auth_ref_for`]) or the candidate is
+    ///    refused — asked here so a raw key that reached the wire is never
+    ///    cloned into a `Config`, never serialized by the delta engine, and
+    ///    never inside a document a refusal path could quote. The refusal names
+    ///    the provider id and the expected form, and **never the value**, for
+    ///    [`ConfigError::UnrecognizedAuthRef`]'s reason.
     /// 2. **The answers that have no valid absence.** A blank id, a blank model
     ///    on a kind that has to call one, and the local kind — whose model
     ///    belongs to the REQ-547 consent flow and which has no endpoint to dial,
@@ -4621,19 +4658,34 @@ impl DaemonRuntime {
     /// durable writes is a window in which the provider exists unrouted.
     ///
     /// # Errors
-    /// [`error_code::PROVIDER_SETUP_INVALID`] for every refusal above and for an
+    /// [`error_code::PROVIDER_SETUP_INVALID`] for every refusal above, for an
     /// edited document that would not load — a hand edit this daemon has not
-    /// seen can fail validation in a key this flow never touches (REQ-574 BR-4).
-    /// [`error_code::INTERNAL_ERROR`] when the document could not be derived at
-    /// all, or when the document this write derived does not name the row it was
-    /// told to write.
+    /// seen can fail validation in a key this flow never touches (REQ-574 BR-4)
+    /// — and for a document that has drifted out from under this daemon's
+    /// memory ([`provider_setup_section`] and [`document_agrees_with_candidate`],
+    /// the two halves of that drift). [`error_code::CONFIG_REJECTED`] when this
+    /// daemon has no config file at all. [`error_code::INTERNAL_ERROR`] when the
+    /// document could not be derived at all, or when the document this write
+    /// derived does not name the row it was told to write.
     pub(crate) fn derive_provider_setup(
         &self,
         candidate: &ProviderSetupCandidate,
         current: &Config,
     ) -> Result<RenderedProviderSetup, RpcError> {
+        // (0) Somewhere for the registration to land, asked before the answers
+        // are read at all — see the section above. `CONFIG_REJECTED` rather than
+        // `PROVIDER_SETUP_INVALID` because nothing about the candidate is the
+        // thing to fix, and it is the code the commit already answered with when
+        // it discovered this one keychain write too late.
+        if self.config_path.is_none() {
+            return Err(RpcError::new(
+                error_code::CONFIG_REJECTED,
+                "this daemon has no configuration file, so there is nowhere for a provider \
+                 registration to land. Nothing was stored and nothing was written.",
+            ));
+        }
         let id = candidate.id.0.trim();
-        // Ahead of everything, including the credential rule below: the id is
+        // Ahead of the rest, including the credential rule below: the id is
         // what every refusal from here on names, and a message about "the
         // credential for ``" would be worse than the one it replaced. It reads
         // no field that could hold a secret.
@@ -4643,18 +4695,23 @@ impl DaemonRuntime {
                 "a provider needs an id to be registered under, and the candidate names none",
             ));
         }
-        // (1) The credential reference, before a `Config` holding it exists.
+        // (1) The credential reference, before a `Config` holding it exists —
+        // and *this flow's* reference, not any reference `Config::validate`
+        // would take. See `keychain_auth_ref_for` for why this seam is the
+        // narrow one.
         let key_ref = candidate.key_ref.trim();
-        if !teton_core::is_recognized_auth_ref(key_ref) {
+        let expected_key_ref = keychain_auth_ref_for(id);
+        if key_ref != expected_key_ref {
             return Err(RpcError::new(
                 error_code::PROVIDER_SETUP_INVALID,
-                // The id, never the value: this message reaches a client, a
-                // transcript and the daemon log, and the value it is refusing is
-                // most likely the credential itself.
+                // The id and the shape wanted, never the value: this message
+                // reaches a client, a transcript and the daemon log, and the
+                // value it is refusing is most likely the credential itself.
                 format!(
-                    "the credential for `{id}` must be a reference — `keychain://<service>/<account>`, \
-                     `keychain:<account>`, `env:<VAR>` or `op://<vault>/<item>` — and not a key \
-                     value. Nothing was stored and nothing was written."
+                    "the credential for `{id}` must be the keychain reference this flow writes \
+                     — `{expected_key_ref}` — and nothing else: not a key value, not an \
+                     `env:`/`op://` reference, and not another account's keychain row. Nothing \
+                     was stored and nothing was written."
                 ),
             ));
         }
@@ -4709,15 +4766,29 @@ impl DaemonRuntime {
             }),
         );
         for binding in &candidate.bindings {
+            let tier = to_core_tier(binding.tier);
             apply_update(
                 &mut config,
                 ConfigUpdate::SetTierBinding(TierBindingConfig {
                     tier: binding.tier,
-                    provider_id: binding.provider_id.clone(),
-                    // ADR-6: v1 asks no fallback question, so it writes none —
-                    // and a row this flow rewrites keeps no fallback it did not
-                    // ask about, which is the honest reading of a replace.
-                    fallback_id: None,
+                    // Trimmed at the same seam the id, the model and the
+                    // credential reference are: a binding naming ` kimi ` and
+                    // one naming `kimi` are the same answer, and only one of
+                    // them matches a provider row.
+                    provider_id: ProviderId::from(binding.provider_id.0.trim()),
+                    // ADR-6: v1 asks no fallback question, so it *contributes*
+                    // none — but `SetTierBinding` replaces the whole row, so
+                    // writing `None` here would DELETE a fallback the user
+                    // configured with `teton policy set-tier --fallback` and was
+                    // never asked about. A question this flow does not ask is
+                    // not an answer of "no": the row's own value is carried
+                    // across the replace (BUG-155's class, at the tier table).
+                    fallback_id: current
+                        .tiers
+                        .iter()
+                        .find(|row| row.tier == tier)
+                        .and_then(|row| row.fallback_id.as_deref())
+                        .map(ProviderId::from),
                 }),
             );
         }
@@ -4772,6 +4843,14 @@ impl DaemonRuntime {
         // the row that exists is the one to report and the one to show.
         let bindings = landed_bindings(&config, &candidate.bindings);
         let toml = provider_setup_section(&edited.text, id, &bindings)?;
+        // The other half of that same drift: a document the delta had no reason
+        // to touch can still disagree with what this daemon is about to report
+        // as registered. Asked only when the delta wrote nothing, because that
+        // is the only case in which the document's own values reached neither
+        // the derivation nor the answer.
+        if edited.unchanged {
+            document_agrees_with_candidate(&edited.text, id, model, &endpoint, &bindings)?;
+        }
         let replaces = current
             .providers
             .iter()
@@ -4820,6 +4899,24 @@ impl DaemonRuntime {
         // warnings are composed still sees it, should a warning ever depend on
         // it (e.g. a kind change on replace).
         let _ = replaces;
+        // A credential in the authority, said before the bytes land: `auth_ref`
+        // is the field for a secret, and it resolves out of the keychain at dial
+        // time — a userinfo the user pasted into the endpoint is written to the
+        // config file in **cleartext** instead, where every later reader of that
+        // file (a backup, a dotfile repo, a `teton config get`) has it. It is a
+        // warning and not a refusal because the URL is a legal one the transport
+        // will happily dial; what it must not be is silent.
+        //
+        // The value is never echoed, for the reason it is being warned about,
+        // and the split is the dial-time parser's own (`reqwest::Url`,
+        // LESSON-528/529) rather than a second reading of the authority.
+        if endpoint_carries_userinfo(endpoint) {
+            warnings.push(
+                "this URL carries a credential in its authority; it will be stored in cleartext \
+                 in your config — `auth_ref` is the field for secrets"
+                    .to_owned(),
+            );
+        }
         // The cost meter's own table, asked the way the meter asks it — keyed on
         // the model alone (REQ-557 ADR-A). A model it does not know is not an
         // error: `teton cost` reports such calls as unpriced rather than guessing
@@ -5899,27 +5996,166 @@ fn provider_setup_section(
     id: &str,
     bindings: &[WireTierBinding],
 ) -> Result<String, RpcError> {
-    let missing = |what: String| {
-        RpcError::new(
-            error_code::PROVIDER_SETUP_INVALID,
-            format!(
-                "this daemon's configuration and the file on disk disagree about the {what}, so \
-                 there is nothing truthful to preview. Nothing was written. The file has been \
-                 hand-edited since this daemon read it — restart it, or change one of your \
-                 answers so the row is rewritten."
-            ),
-        )
-    };
     let mut sections = vec![teton_core::array_element_section(document, "providers", id)
-        .ok_or_else(|| missing(format!("`{id}` provider row")))?];
+        .ok_or_else(|| config_drifted(format!("`{id}` provider row")))?];
     for binding in bindings {
         let tier = to_core_tier(binding.tier);
         sections.push(
             teton_core::array_element_section(document, "tiers", tier.as_str())
-                .ok_or_else(|| missing(format!("`{}` tier row", tier.as_str())))?,
+                .ok_or_else(|| config_drifted(format!("`{}` tier row", tier.as_str())))?,
         );
     }
     Ok(sections.join("\n"))
+}
+
+/// The one sentence both halves of the [`DeltaBase::InMemory`] drift are refused
+/// with (REQ-579 BR-6, REQ-574 BR-5).
+///
+/// Spelled once and shared rather than written twice: the *cause* a user has to
+/// act on is identical whether the document lost the row or changed it, and two
+/// wordings of one remedy is the drift LESSON-456 is about — at the level of the
+/// message rather than the code.
+fn config_drifted(what: String) -> RpcError {
+    RpcError::new(
+        error_code::PROVIDER_SETUP_INVALID,
+        format!(
+            "this daemon's configuration and the file on disk disagree about the {what}, so \
+             there is nothing truthful to preview. Nothing was written. The file has been \
+             hand-edited since this daemon read it — restart it, or change one of your \
+             answers so the row is rewritten."
+        ),
+    )
+}
+
+/// The **second** shape of the drift [`provider_setup_section`] records, refused
+/// for the same reason and with the same sentence (REQ-579 BR-6).
+///
+/// That function catches the row the document has *lost*. This catches the row
+/// the document still has and has **changed**: the user hand-edits `model` on
+/// their `kimi` row while this daemon is running (it stays blind to the file
+/// until restart, REQ-574 BR-5) and then answers with exactly what memory still
+/// holds. `diff(current, candidate)` is empty, the document is not edited, and
+/// the two seams would otherwise report:
+///
+/// - a **preview** slicing the document's own row — so the user reads
+///   `model = "kimi-k5"` under a walkthrough in which they answered `kimi-k2`;
+/// - a **commit** answering `applied: false`, "the config already says exactly
+///   this", which is true of memory and false of the file the daemon is about to
+///   leave in place.
+///
+/// Both are worse than a refusal, because both are confident. Asked only when
+/// [`EditedDocument::unchanged`] holds: once the delta writes anything, the rows
+/// this flow is about are the derivation's own.
+///
+/// The comparison is between **parsed configs**, never between the rendered text
+/// and the document's bytes: `model='kimi-k2'`, `model = "kimi-k2"` and an
+/// `anthropic` row with no `endpoint` key at all (the default [`Config::load`]
+/// fills) are the same configuration written three ways, and a byte comparison
+/// would refuse two of them for having been hand-authored.
+///
+/// # Errors
+/// [`error_code::PROVIDER_SETUP_INVALID`] carrying [`config_drifted`]'s sentence
+/// when the document names a different provider row or a different tier row than
+/// the candidate does. [`error_code::INTERNAL_ERROR`] if the derived document
+/// does not load, which [`render_config_document`] has already established it
+/// does.
+fn document_agrees_with_candidate(
+    document: &str,
+    id: &str,
+    model: &str,
+    endpoint: &str,
+    bindings: &[WireTierBinding],
+) -> Result<(), RpcError> {
+    let on_disk = Config::load(document).map_err(|err| {
+        RpcError::new(
+            error_code::INTERNAL_ERROR,
+            format!("the configuration this daemon derived would not load ({err})"),
+        )
+    })?;
+    let row = on_disk
+        .providers
+        .iter()
+        .find(|provider| provider.id == id)
+        .ok_or_else(|| config_drifted(format!("`{id}` provider row")))?;
+    // `declared_model` rather than the raw field, so a row carrying `model = " "`
+    // is "has none" here exactly as it is everywhere else (BUG-155).
+    if row.declared_model() != Some(model) || row.endpoint.as_deref() != Some(endpoint) {
+        return Err(config_drifted(format!("`{id}` provider row")));
+    }
+    for binding in bindings {
+        let tier = to_core_tier(binding.tier);
+        let agrees = on_disk
+            .tiers
+            .iter()
+            .find(|row| row.tier == tier)
+            .is_some_and(|row| row.provider_id == binding.provider_id.0);
+        if !agrees {
+            return Err(config_drifted(format!("`{}` tier row", tier.as_str())));
+        }
+    }
+    Ok(())
+}
+
+/// The keychain service prefix every Teton credential reference carries.
+///
+/// The CLI composes this string from its own `keychain::SERVICE` and
+/// `AUTH_REF_SCHEME` (`crates/teton/src/keychain.rs`, `auth_ref_for`), and this
+/// daemon's [`crate::keychain`] resolves it back with the same service name. It
+/// is spelled once here because that constructor lives in the **binary** crate:
+/// a library may not depend on it, and inventing a second public home for one
+/// format string is a worse trade than one named constant with this comment. A
+/// change to the CLI's service name fails
+/// `a_raw_key_in_place_of_a_reference_is_refused_and_not_echoed` and the
+/// end-to-end flow, which is the coupling being relied on.
+const KEYCHAIN_AUTH_REF_PREFIX: &str = "keychain://teton/";
+
+/// The **one** credential reference `/provider setup` accepts for `id` — the
+/// keychain row the CLI half of this flow writes the key into (REQ-579 BR-2,
+/// ADR-5).
+///
+/// # Why this seam is narrower than [`Config::validate`]
+///
+/// [`teton_core::is_recognized_auth_ref`] admits `env:VAR`, `op://vault/item`,
+/// `keychain:<account>` and any `keychain://<service>/<account>`, and it is
+/// right to: it validates **hand-written configs**, where a user who keeps their
+/// key in an environment variable or a 1Password vault is doing something
+/// legitimate that Teton supports.
+///
+/// This is not that seam. Here the reference is not something a user wrote in a
+/// file this daemon merely loads — it is a field on an RPC whose *whole flow*
+/// consists of a client reading a key echo-off and writing it to
+/// `keychain://teton/<the id being registered>`. Any other value means the
+/// candidate names a secret this flow did not collect, and one commit composes
+/// an attacker-chosen endpoint, a tier binding, and a credential reference the
+/// caller did not have to possess: `env:<a secret the daemon's environment
+/// holds>` resolves at dial time and is sent to the endpoint in the same
+/// candidate. Accepting only the row this flow itself writes makes that
+/// composition unexpressible rather than merely unlikely (BR-2, REQ-579 System
+/// Model: "a keychain reference only … the same account `teton provider add`
+/// uses").
+///
+/// A user who *wants* `env:` for a provider still has `teton provider add` and
+/// their own config file. What they cannot do is reach them through a
+/// walkthrough that never asked.
+fn keychain_auth_ref_for(id: &str) -> String {
+    format!("{KEYCHAIN_AUTH_REF_PREFIX}{id}")
+}
+
+/// Whether `url`'s authority carries userinfo — a credential pasted into the
+/// endpoint (REQ-579 BR-9, LESSON-528/529).
+///
+/// Asked of the **dial-time** parser, which is the whole point: `reqwest::Url`
+/// is what the request builder and the egress origin check read this string
+/// with, so "there is userinfo here" is a fact about the request that will be
+/// made and not about a second reading of the same characters. A hand-written
+/// authority splitter is exactly the mirrored predicate LESSON-528 is about.
+///
+/// A URL that does not parse is not warned about: it has already been refused by
+/// [`is_absolute_http_url`] before any warning is composed, and a `false` here
+/// cannot make a refused candidate land.
+fn endpoint_carries_userinfo(url: &str) -> bool {
+    reqwest::Url::parse(url.trim())
+        .is_ok_and(|parsed| !parsed.username().is_empty() || parsed.password().is_some())
 }
 
 /// Replace `path` with `text` **atomically** — a sibling temp file, flushed to
@@ -19692,6 +19928,368 @@ provider_id = \"deepseek\"
             assert_eq!(bound(Tier::Reflex), None);
         }
 
+        /// A hand-written config whose tier rows carry **fallbacks** — the
+        /// question this flow does not ask (ADR-6, OQ-2) and therefore must not
+        /// answer on the user's behalf.
+        ///
+        /// Two rows, because the two halves of the claim are different edits:
+        /// `think` is already exactly what the candidate would write, so its
+        /// fallback has to survive a derivation that changes *nothing*; `scan`
+        /// is re-bound, so its fallback has to survive a row being **rewritten**.
+        /// Each carries a comment of the user's, for the same reason
+        /// `SEEDED_WITH_KIMI` does.
+        const SEEDED_WITH_FALLBACKS: &str = "\
+# my teton config, written by hand
+
+[[providers]]
+id = \"deepseek\"
+kind = \"openai-compatible\"
+endpoint = \"https://api.deepseek.com/chat/completions\"
+model = \"deepseek-v4-pro\"
+auth_ref = \"keychain://teton/deepseek\"
+
+[[providers]]
+id = \"kimi\"
+kind = \"openai-compatible\"
+endpoint = \"https://api.moonshot.ai/v1/chat/completions\"
+model = \"kimi-k3\"
+auth_ref = \"keychain://teton/kimi\"
+
+[[providers]]
+id = \"local\"
+kind = \"local\"
+
+# when kimi is down, think falls back to the cheap one
+[[tiers]]
+tier = \"think\"
+provider_id = \"kimi\"
+fallback_id = \"deepseek\"
+
+# and scan falls back to the model on this machine
+[[tiers]]
+tier = \"scan\"
+provider_id = \"deepseek\"
+fallback_id = \"local\"
+";
+
+        /// **A tier this flow re-binds keeps the fallback it was never asked
+        /// about** (ADR-6/OQ-2 read correctly; REQ-579 verify FIX 2).
+        ///
+        /// `SetTierBinding` replaces the **whole row**, so a derivation that
+        /// wrote `fallback_id: None` deleted a routing decision the user made
+        /// with `teton policy set-tier --fallback` — silently, in a walkthrough
+        /// that never mentioned fallbacks. "v1 asks no fallback question" is a
+        /// statement about what this flow *collects*, not a licence to answer
+        /// the question with "none".
+        ///
+        /// Both halves are asserted because they fail differently:
+        ///
+        ///   - the **unchanged** half is the strongest form of the claim — the
+        ///     derived document is byte-identical to the file, which it can only
+        ///     be if the fallback line is still in it, and the commit therefore
+        ///     answers `applied: false` rather than rewriting the row;
+        ///   - the **rewritten** half is the one a "preserve only when nothing
+        ///     changes" patch would still fail: `scan` is re-bound to a
+        ///     different provider, and the fallback and the comment above it
+        ///     both survive that edit.
+        #[test]
+        fn re_binding_a_tier_keeps_its_fallback_and_its_comment() {
+            let (runtime, config_path) =
+                runtime_seeded("provider-setup-fallback", SEEDED_WITH_FALLBACKS);
+
+            // The plan reports what the routing question is asked against —
+            // fallbacks included, since they are what a re-bind would carry.
+            let plan = runtime.provider_setup_plan();
+            let summary = |tier: WireTier| {
+                plan.tiers
+                    .iter()
+                    .find(|summary| summary.tier == tier)
+                    .unwrap_or_else(|| panic!("the plan reports {tier:?}"))
+            };
+            assert_eq!(
+                summary(WireTier::Think)
+                    .fallback_id
+                    .as_ref()
+                    .map(|id| &id.0),
+                Some(&"deepseek".to_owned())
+            );
+            assert_eq!(
+                summary(WireTier::Scan).fallback_id.as_ref().map(|id| &id.0),
+                Some(&"local".to_owned())
+            );
+            assert_eq!(
+                summary(WireTier::Build).fallback_id,
+                None,
+                "a row that carries no fallback reports none, not an empty id"
+            );
+
+            // (a) The candidate is exactly what the file already says — except
+            // that a row-replacing derivation would drop `fallback_id`.
+            let rendered = derive(&runtime, &kimi()).expect("previews");
+            assert!(
+                rendered.unchanged,
+                "the derivation rewrote a document it had nothing to change; the \
+                 fallback line is the only thing that could differ:\n{}",
+                rendered.full_text
+            );
+            assert_eq!(
+                rendered.full_text, SEEDED_WITH_FALLBACKS,
+                "byte-identical is the claim, and the fallback line is inside it"
+            );
+            assert!(
+                rendered.toml.contains("fallback_id = \"deepseek\""),
+                "the row the user confirms still carries its fallback: {}",
+                rendered.toml
+            );
+            assert_eq!(
+                rendered
+                    .candidate_config
+                    .tiers
+                    .iter()
+                    .find(|row| row.tier == Tier::Think)
+                    .and_then(|row| row.fallback_id.as_deref()),
+                Some("deepseek"),
+                "and so does the config the commit would swap into memory"
+            );
+
+            let preview = runtime
+                .provider_setup_preview(&kimi())
+                .expect("the wire seam previews");
+            let before = inode(&config_path);
+            let result = runtime
+                .provider_setup_commit(&kimi(), Some(&preview.digest))
+                .expect("a no-op commit is not a failure");
+            assert!(
+                !result.applied,
+                "the config already said exactly this — a rewrite here is the \
+                 fallback being deleted and written back"
+            );
+            assert_eq!(
+                std::fs::read_to_string(&config_path).expect("read"),
+                SEEDED_WITH_FALLBACKS,
+                "a no-op commit changed the file"
+            );
+            assert_eq!(
+                before,
+                inode(&config_path),
+                "a no-op commit rewrote the file"
+            );
+
+            // (b) The rewritten row: `scan` moves to `kimi`, and everything the
+            // user wrote about that row that this flow did not ask about stays.
+            let rebound = derive(
+                &runtime,
+                &ProviderSetupCandidate {
+                    bindings: vec![WireTierBinding {
+                        tier: WireTier::Scan,
+                        provider_id: ProviderId::from("kimi"),
+                    }],
+                    ..kimi()
+                },
+            )
+            .expect("previews");
+            assert!(
+                !rendered.full_text.is_empty() && !rebound.unchanged,
+                "non-vacuity: re-binding scan really does edit the document"
+            );
+            assert_eq!(
+                rebound
+                    .candidate_config
+                    .tiers
+                    .iter()
+                    .find(|row| row.tier == Tier::Scan)
+                    .map(|row| (row.provider_id.as_str(), row.fallback_id.as_deref())),
+                Some(("kimi", Some("local"))),
+                "the row was re-bound and kept the fallback it was not asked about"
+            );
+            assert!(
+                rebound.full_text.contains("fallback_id = \"local\""),
+                "the fallback survives in the bytes that would be written:\n{}",
+                rebound.full_text
+            );
+            assert!(
+                rebound
+                    .full_text
+                    .contains("# and scan falls back to the model on this machine"),
+                "and so does the comment the user wrote above it:\n{}",
+                rebound.full_text
+            );
+            assert!(
+                rebound.toml.contains("fallback_id = \"local\""),
+                "the row the user confirms is the row that lands: {}",
+                rebound.toml
+            );
+        }
+
+        /// **An endpoint carrying a credential in its authority is named before
+        /// it is written** (BR-9, REQ-579 verify FIX 4).
+        ///
+        /// `https://tok@api.moonshot.ai/…` passes every shape check this flow
+        /// makes — it is an absolute `http(s)` URL that one parser reads the way
+        /// another does — and is then persisted **verbatim** into the config
+        /// file, in cleartext, where `auth_ref` exists precisely so credentials
+        /// do not go. Silence there is the worst answer available: the user is
+        /// looking at a preview at the time.
+        ///
+        /// The warning never echoes the URL, for the reason it is warning about.
+        #[test]
+        fn a_userinfo_bearing_endpoint_is_warned_about_before_it_is_written() {
+            let (runtime, config_path) = runtime_seeded("provider-setup-userinfo", SEEDED);
+            let before = std::fs::read_to_string(&config_path).expect("read");
+            const TOKEN: &str = "a1b2c3-secret-token";
+
+            for endpoint in [
+                format!("https://{TOKEN}@api.moonshot.ai/v1/chat/completions"),
+                format!("https://user:{TOKEN}@api.moonshot.ai/v1/chat/completions"),
+            ] {
+                let rendered = derive(
+                    &runtime,
+                    &ProviderSetupCandidate {
+                        endpoint: Some(endpoint.clone()),
+                        ..kimi()
+                    },
+                )
+                .expect("a URL with userinfo is legal — and warned about");
+                let note = rendered
+                    .warnings
+                    .iter()
+                    .find(|note| note.contains("credential in its authority"))
+                    .unwrap_or_else(|| {
+                        panic!("no userinfo note for `{endpoint}`: {:?}", rendered.warnings)
+                    });
+                assert!(
+                    note.contains("auth_ref"),
+                    "the note names the field that exists for secrets: {note}"
+                );
+                assert!(
+                    !note.contains(TOKEN) && !note.contains(&endpoint),
+                    "the note echoed the credential it is warning about: {note}"
+                );
+                // And the preview is still honest about the destination: the
+                // host, never the authority the token is hiding in.
+                assert_eq!(rendered.dial_host, "api.moonshot.ai");
+            }
+
+            // Non-vacuity: the same endpoint without userinfo draws no such
+            // note, so this is a userinfo check and not a "has an endpoint" one.
+            assert!(
+                !derive(&runtime, &kimi())
+                    .expect("previews")
+                    .warnings
+                    .iter()
+                    .any(|note| note.contains("credential in its authority")),
+                "a clean endpoint must draw no credential note"
+            );
+            assert_eq!(
+                std::fs::read_to_string(&config_path).expect("read"),
+                before,
+                "a preview has no write path at all"
+            );
+        }
+
+        /// **A daemon with nowhere to write refuses at the preview, not one
+        /// keychain write later** (BR-8, REQ-579 verify FIX 5).
+        ///
+        /// The client stores the key *after* the confirm (ADR-5), so a preview
+        /// that answered here would walk a user through typing a credential into
+        /// their OS keychain for a commit that then answers `CONFIG_REJECTED`,
+        /// leaving BR-8's undo to clean up a write that never needed to happen.
+        #[test]
+        fn a_daemon_with_no_config_file_refuses_before_a_key_is_stored() {
+            let runtime = DaemonRuntime::minimal();
+            assert!(
+                runtime.config_path.is_none(),
+                "the fixture is only meaningful with no file behind it"
+            );
+
+            let err = runtime
+                .provider_setup_preview(&kimi())
+                .expect_err("there is nowhere for this registration to land");
+            assert_eq!(err.code, error_code::CONFIG_REJECTED);
+            assert!(
+                err.message.contains("nowhere"),
+                "the refusal must say what is missing: {}",
+                err.message
+            );
+            assert!(
+                !err.message.contains("keychain://teton/kimi"),
+                "and it is not about the candidate, so it names none of it: {}",
+                err.message
+            );
+            // The commit answers the same way, from the same check.
+            assert_eq!(
+                runtime
+                    .provider_setup_commit(&kimi(), None)
+                    .expect_err("and so does the commit")
+                    .code,
+                error_code::CONFIG_REJECTED
+            );
+
+            // Non-vacuity: the same candidate against a daemon that *has* a file
+            // previews, so what was refused is the missing file.
+            let (seeded, _path) = runtime_seeded("provider-setup-nowhere", SEEDED);
+            assert!(seeded.provider_setup_preview(&kimi()).is_ok());
+        }
+
+        /// **A config file that is there and cannot be read refuses the preview
+        /// and names the failure class** (REQ-574 BR-6, REQ-579 verify FIX 7).
+        ///
+        /// [`super::super::web_setup_flow`]'s
+        /// `an_unreadable_file_refuses_the_write_and_names_the_failure_class`
+        /// for this flow's derivation: the `RenderError::Read` arm is an
+        /// **internal error**, not a refused candidate — nothing about the
+        /// user's answers is the thing to fix — and it must not be swallowed
+        /// into "there is no document", which would derive a fresh config from
+        /// an empty base and preview a document that would erase a file this
+        /// daemon could not even look at.
+        #[test]
+        fn an_unreadable_config_refuses_the_preview_and_names_the_failure_class() {
+            use std::os::unix::fs::PermissionsExt as _;
+
+            let (runtime, config_path) = runtime_seeded("provider-setup-unreadable", SEEDED);
+            std::fs::set_permissions(&config_path, std::fs::Permissions::from_mode(0o000))
+                .expect("close the file");
+
+            // Root reads everything, and so do some filesystems. Ask rather than
+            // assume: a test that silently passes for the wrong reason is worse
+            // than one that says it did not run.
+            if std::fs::read_to_string(&config_path).is_ok() {
+                let _ =
+                    std::fs::set_permissions(&config_path, std::fs::Permissions::from_mode(0o600));
+                return;
+            }
+
+            let err = runtime
+                .provider_setup_preview(&kimi())
+                .expect_err("a file that cannot be read has no truthful preview");
+            assert_eq!(
+                err.code,
+                error_code::INTERNAL_ERROR,
+                "an unreadable file is not a refused candidate: {}",
+                err.message
+            );
+            assert!(
+                err.message.contains("permission denied"),
+                "the refusal must name the failure class: {}",
+                err.message
+            );
+            assert!(
+                !err.message.contains("os error")
+                    && !err.message.contains(&*config_path.to_string_lossy()),
+                "the message carries the error's kind and neither the path nor \
+                 anything finer (REQ-572 BR-11): {}",
+                err.message
+            );
+
+            std::fs::set_permissions(&config_path, std::fs::Permissions::from_mode(0o600))
+                .expect("reopen the file");
+            assert_eq!(
+                std::fs::read_to_string(&config_path).expect("read"),
+                SEEDED,
+                "a refused preview reached the file"
+            );
+        }
+
         /// A registration that adds a provider leaves every other provider's row
         /// exactly where it was — the identity rule, seen from the document
         /// rather than from memory.
@@ -19809,49 +20407,88 @@ provider_id = \"deepseek\"
 
         // -- the refusals ------------------------------------------------------
 
-        /// **A raw key in `key_ref` is refused, and never echoed back**
-        /// (BR-2, ADR-5).
+        /// **Only this flow's own keychain row is accepted, and a refusal never
+        /// echoes what it refused** (BR-2, ADR-5, REQ-579 verify FIX 1).
         ///
         /// The refusal is the daemon's own, taken before a candidate `Config`
         /// carrying the value exists — so the secret is never cloned into a
         /// config, never serialized by the delta engine, and never inside a
-        /// document a refusal path could quote. The second assertion is the one
-        /// that matters: this message reaches a client, a transcript and the
-        /// daemon log.
+        /// document a refusal path could quote.
+        ///
+        /// The list is what the gate is *for*. This seam once asked
+        /// `teton_core::is_recognized_auth_ref`, the rule that validates
+        /// **hand-written configs**, where `env:` and `op://` are legitimate
+        /// things a user chose. Reached through this flow they are not a choice
+        /// anybody made: the walkthrough's entire credential story is "the
+        /// client read a key echo-off and wrote it to `keychain://teton/<id>`",
+        /// so any other value names a secret this flow never collected — and one
+        /// commit composes an attacker's endpoint, a `think` binding, and
+        /// `env:<a secret this daemon's environment holds>`, which resolves at
+        /// dial time and is sent to that endpoint. `keychain://teton/otherid`
+        /// and `keychain://other/kimi` are in the list for the same reason at
+        /// closer range: they are references to rows this flow did not write.
         #[test]
         fn a_raw_key_in_place_of_a_reference_is_refused_and_not_echoed() {
             let (runtime, config_path) = runtime_seeded("provider-setup-raw-key", SEEDED);
             const RAW: &str = "sk-live-4f9a1c2b7e6d8a3f5b0c9e1d";
-            let candidate = ProviderSetupCandidate {
-                key_ref: RAW.to_owned(),
-                ..kimi()
-            };
+            let before = std::fs::read_to_string(&config_path).expect("read");
 
-            let err = refusal(&runtime, &candidate);
-            assert_eq!(err.code, error_code::PROVIDER_SETUP_INVALID);
+            for offered in [
+                RAW,
+                // The forms `Config::validate` accepts and this seam does not.
+                "env:MOONSHOT_API_KEY",
+                "op://vault/moonshot/credential",
+                "keychain:kimi",
+                // Another service's row, and another account's.
+                "keychain://other/kimi",
+                "keychain://teton/otherid",
+                "",
+            ] {
+                let err = refusal(
+                    &runtime,
+                    &ProviderSetupCandidate {
+                        key_ref: offered.to_owned(),
+                        ..kimi()
+                    },
+                );
+                assert_eq!(
+                    err.code,
+                    error_code::PROVIDER_SETUP_INVALID,
+                    "`{offered}` drew {}: {}",
+                    err.code,
+                    err.message
+                );
+                assert!(
+                    offered.is_empty() || !err.message.contains(offered),
+                    "the refusal echoed the value it refused, which is most likely \
+                     the credential itself: {}",
+                    err.message
+                );
+                assert!(
+                    err.message.contains("keychain://teton/kimi"),
+                    "and it has to say which reference is wanted: {}",
+                    err.message
+                );
+            }
+            let after = std::fs::read_to_string(&config_path).expect("read");
             assert!(
-                !err.message.contains(RAW) && !err.message.contains("sk-live"),
-                "the refusal echoed the credential it refused: {}",
-                err.message
-            );
-            assert!(
-                err.message.contains("keychain://"),
-                "and it has to say what shape is wanted: {}",
-                err.message
-            );
-            assert!(
-                !std::fs::read_to_string(&config_path)
-                    .expect("read")
-                    .contains(RAW),
+                !after.contains(RAW),
                 "a refused preview wrote a credential to disk"
             );
-            // The env and 1Password reference forms `Config::validate` accepts
-            // are accepted here too: this asks that one rule, not a narrower one
-            // of its own.
+            assert_eq!(after, before, "a refused preview has no write path at all");
+
+            // Non-vacuity: the row this flow itself writes — the one the CLI's
+            // `keychain::auth_ref_for(id)` composes — is accepted, so what the
+            // loop above refuses is the value and not the gate refusing
+            // everything.
+            assert_eq!(kimi().key_ref, "keychain://teton/kimi");
+            assert!(derive(&runtime, &kimi()).is_ok());
+            // And surrounding whitespace is trimmed rather than refused: a
+            // client that sent ` keychain://teton/kimi\n` sent this answer.
             assert!(derive(
                 &runtime,
                 &ProviderSetupCandidate {
-                    key_ref: "env:MOONSHOT_API_KEY".to_owned(),
+                    key_ref: "  keychain://teton/kimi\n".to_owned(),
                     ..kimi()
                 }
             )
@@ -20115,6 +20752,93 @@ provider_id = \"deepseek\"
             );
         }
 
+        /// **The other half of that drift: a row the document has *changed* is
+        /// refused, not reported as already registered** (REQ-574 BR-5/BR-6,
+        /// REQ-579 verify FIX 8).
+        ///
+        /// Same blind spot, opposite symptom. The user hand-edits the `model` on
+        /// their `kimi` row while the daemon is running and then answers with
+        /// exactly what memory still holds: `diff(current, candidate)` is empty,
+        /// the document is untouched, and both seams would speak confidently and
+        /// wrongly — the preview slicing a row that says `kimi-k5` under a
+        /// walkthrough in which the user answered `kimi-k2`, and the commit
+        /// answering "the config already says exactly this", which is true of
+        /// memory and false of the file it is leaving in place.
+        ///
+        /// The refusal carries the *same* sentence the missing-row case does,
+        /// because the cause and the remedy are the same one.
+        #[test]
+        fn a_row_the_document_has_changed_is_refused_rather_than_called_unchanged() {
+            let (runtime, config_path) =
+                runtime_seeded("provider-setup-drifted-row", SEEDED_WITH_KIMI);
+            // The hand edit this daemon has not seen: the file's `kimi` row now
+            // names a model memory has never heard of.
+            let hand_edited = SEEDED_WITH_KIMI.replace("kimi-k2", "kimi-k5");
+            assert_ne!(hand_edited, SEEDED_WITH_KIMI, "the fixture must drift");
+            std::fs::write(&config_path, &hand_edited).expect("hand-edit the config");
+
+            // Exactly what memory holds — model, endpoint, key and the one tier
+            // row the file already has — so the delta names nothing at all.
+            let as_memory_holds_it = ProviderSetupCandidate {
+                model: "kimi-k2".to_owned(),
+                bindings: vec![WireTierBinding {
+                    tier: WireTier::Scan,
+                    provider_id: ProviderId::from("deepseek"),
+                }],
+                ..kimi()
+            };
+            let err = refusal(&runtime, &as_memory_holds_it);
+            assert_eq!(err.code, error_code::PROVIDER_SETUP_INVALID);
+            assert!(
+                err.message.contains("kimi") && err.message.contains("hand-edited"),
+                "the refusal must name the row and the cause: {}",
+                err.message
+            );
+            assert_eq!(
+                std::fs::read_to_string(&config_path).expect("read"),
+                hand_edited,
+                "and a refused preview has no write path at all"
+            );
+
+            // The commit is refused by the same check, before it can answer
+            // `applied: false` about a file that says something else.
+            let commit_err = runtime
+                .provider_setup_commit(&as_memory_holds_it, None)
+                .expect_err("a commit cannot call this configuration unchanged either");
+            assert_eq!(commit_err.code, error_code::PROVIDER_SETUP_INVALID);
+            assert_eq!(
+                std::fs::read_to_string(&config_path).expect("read"),
+                hand_edited,
+                "a refused commit wrote to the file"
+            );
+
+            // Non-vacuity: the same drifted document with an answer that *does*
+            // change the row derives cleanly and shows the answer, so what was
+            // refused above is the empty delta over a changed row and not the
+            // file having been edited at all.
+            let healed = derive(
+                &runtime,
+                &ProviderSetupCandidate {
+                    model: "kimi-k4".to_owned(),
+                    bindings: vec![WireTierBinding {
+                        tier: WireTier::Scan,
+                        provider_id: ProviderId::from("deepseek"),
+                    }],
+                    ..kimi()
+                },
+            )
+            .expect("an answer that rewrites the row is describable");
+            assert!(
+                healed.toml.contains("model = \"kimi-k4\""),
+                "{}",
+                healed.toml
+            );
+            assert!(
+                !healed.unchanged,
+                "and it really is a change to the document"
+            );
+        }
+
         /// The wire projection is the derivation's own answer — nothing is
         /// recomputed on the way onto the socket, so a client and the commit
         /// cannot be shown two different candidates.
@@ -20203,6 +20927,11 @@ provider_id = \"deepseek\"
             assert_eq!(result.bindings.len(), 1, "{:?}", result.bindings);
             assert_eq!(result.bindings[0].tier, WireTier::Think);
             assert_eq!(result.bindings[0].provider_id.0, "kimi");
+            // The completion names where this provider is now dialed, and names
+            // the *same* host the confirm step showed — one derivation, one
+            // reading of the endpoint (BR-5, LESSON-529).
+            assert_eq!(result.dial_host, "api.moonshot.ai");
+            assert_eq!(result.dial_host, preview.dial_host);
 
             let written = std::fs::read_to_string(&config_path).expect("read");
             assert_eq!(

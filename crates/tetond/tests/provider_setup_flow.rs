@@ -361,6 +361,13 @@ fn the_committed_provider_routes_the_next_decision_in_the_same_session() {
         Some("think"),
         "the bindings reported are what landed: {committed}"
     );
+    assert_eq!(
+        committed["result"]["dial_host"].as_str(),
+        Some("api.moonshot.ai"),
+        "the answer that says the write landed also says where this provider is \
+         now dialed — the same host the confirm step showed, from the same \
+         derivation (BR-5, LESSON-529): {committed}"
+    );
 
     let written = std::fs::read_to_string(&ws.config_path).expect("the config was written");
     assert_eq!(
@@ -411,6 +418,19 @@ fn the_committed_provider_routes_the_next_decision_in_the_same_session() {
     assert_eq!(
         completion["bindings"][0]["provider_id"].as_str(),
         Some("kimi")
+    );
+    assert_eq!(
+        completion["dial_host"].as_str(),
+        Some("api.moonshot.ai"),
+        "a second client attached to this session watched routing move under it \
+         and is owed the destination, not only the id: {completion}"
+    );
+    // And it is a **host**: the endpoint whose authority could hide a pasted
+    // credential does not travel on this event (BR-2, AC-4).
+    let frame = completion.to_string();
+    assert!(
+        !frame.contains("://") && !frame.contains('@') && !frame.contains("chat/completions"),
+        "the completion carried an endpoint, not a host: {frame}"
     );
 
     // (6) Live, in this daemon, with no restart: a `think`-tier routing decision

@@ -208,6 +208,15 @@ model's reply text for that turn contains `teton provider add` or
 it — no key in chat."* Deterministic string match on the model's own output;
 zero model calls; visibly the harness's voice (`>>`), not the model's.
 
+**Dormancy, precisely.** The line is suppressed when the reply names
+`/provider setup` **and** does not also recite a shell recipe — a reply that
+does both has still pointed the user at the CLI and still earns the correction.
+Backticks are stripped on both halves of that predicate, so `` `/provider
+setup` `` and `/provider setup` are one answer to the matcher exactly as
+`` `teton provider add` `` already was. *(Refined during the verify pass; the
+original decision suppressed on the command's mere presence, which a reply
+carrying both would have exploited.)*
+
 **Why.** Three live rounds against the shipped local model (verification.md):
 hand-off in the preamble, hand-off inside the numbered step, and the competing
 recipe removed entirely — 0/9 replies volunteered the command, while the

@@ -1655,6 +1655,12 @@ pub struct WebSetupRejected {
 /// string into a transcript for no gain. The config path is not carried either:
 /// unlike [`WebSetupCompleted`], nothing about a provider registration needs the
 /// user sent to the file to understand what changed.
+///
+/// [`dial_host`](Self::dial_host) is the deliberate exception to that second
+/// rule and not a softening of it: a host is not an endpoint. It is read from
+/// the parser that dials, so it carries no userinfo, no path and no query by
+/// construction (LESSON-529) — which is exactly why the *endpoint* may not
+/// travel here and the host may.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ProviderSetupCompleted {
     /// The id now registered — the one fact the model legitimately learns from
@@ -1672,6 +1678,20 @@ pub struct ProviderSetupCompleted {
     /// than as a missing field.
     #[serde(default)]
     pub bindings: Vec<TierBinding>,
+    /// The host this provider will be dialed at — the **dial-time** parser's
+    /// reading of the endpoint that was written (BR-5, LESSON-529), and the
+    /// same string the confirm step showed.
+    ///
+    /// The announcement is otherwise silent about where turns will now go: a
+    /// second client attached to this session watched routing move under it
+    /// (the reason this event exists at all) and is owed the destination, not
+    /// only the id. A host and never the endpoint, for the type's own reason
+    /// above.
+    ///
+    /// `#[serde(default)]` so a client built after this field still reads an
+    /// older daemon's frame; empty means "this daemon did not say".
+    #[serde(default)]
+    pub dial_host: String,
 }
 
 /// A provider-setup **commit** was refused because it did not come from the
@@ -2338,6 +2358,7 @@ mod tests {
                     kind: ProviderKind::OpenaiCompatible,
                     model: "m".to_owned(),
                     bindings: vec![],
+                    dial_host: "api.example".to_owned(),
                 }),
                 "provider_setup_completed",
             ),
@@ -3460,6 +3481,7 @@ mod tests {
                 tier: Tier::Think,
                 provider_id: ProviderId::from("kimi"),
             }],
+            dial_host: "api.moonshot.ai".to_owned(),
         };
         round_trip(&completed);
         let wire = envelope_wire(Event::ProviderSetupCompleted(completed));
@@ -3470,6 +3492,11 @@ mod tests {
         assert_eq!(wire["model"], "kimi-k2-turbo-preview");
         assert_eq!(wire["bindings"][0]["tier"], "think");
         assert_eq!(wire["bindings"][0]["provider_id"], "kimi");
+        assert_eq!(
+            wire["dial_host"], "api.moonshot.ai",
+            "the announcement names where turns will now go — a host, and only a \
+             host: {wire}"
+        );
 
         // BR-7's unrouted outcome is a distinct, legible answer — an empty list
         // rather than an absent key, so a renderer says "nothing routes to it
@@ -3479,6 +3506,7 @@ mod tests {
             kind: ProviderKind::Anthropic,
             model: "claude-x".to_owned(),
             bindings: vec![],
+            dial_host: "api.anthropic.com".to_owned(),
         };
         round_trip(&unrouted);
         let wire = envelope_wire(Event::ProviderSetupCompleted(unrouted));
@@ -3519,9 +3547,18 @@ mod tests {
                 tier: Tier::Think,
                 provider_id: ProviderId::from("kimi"),
             }],
+            // A host, which is what `dial_host` is — the userinfo, path and
+            // query a whole endpoint would carry are exactly what the field is
+            // defined to have already dropped.
+            dial_host: "api.moonshot.ai".to_owned(),
         })
         .unwrap();
         assert!(!wire.contains(planted), "{wire}");
+        assert!(
+            !wire.contains("://") && !wire.contains('@'),
+            "the completion carries a host, never an endpoint that could hide \
+             userinfo in its authority: {wire}"
+        );
 
         // Every field name the completion can carry, spelled out (sorted, which
         // is how `serde_json` hands back an object's keys): a key- or
@@ -3534,7 +3571,11 @@ mod tests {
             .keys()
             .cloned()
             .collect();
-        assert_eq!(keys, ["bindings", "kind", "model", "provider_id"], "{wire}");
+        assert_eq!(
+            keys,
+            ["bindings", "dial_host", "kind", "model", "provider_id"],
+            "{wire}"
+        );
     }
 
     /// BR-10: the three states are distinguished on the wire by a **tag**, not

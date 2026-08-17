@@ -2706,6 +2706,12 @@ async fn handle_provider_setup_commit(
                         kind: params.candidate.kind,
                         model: params.candidate.model.trim().to_owned(),
                         bindings: result.bindings.clone(),
+                        // The daemon's answer again, and specifically **not**
+                        // `params.candidate.endpoint`: the commit result's host
+                        // is the dial-time parser's reading of the endpoint that
+                        // was actually written, so it carries no userinfo, path
+                        // or query for a transcript to keep (LESSON-529).
+                        dial_host: result.dial_host.clone(),
                     }),
                 );
             }
@@ -7660,7 +7666,12 @@ mod tests {
     /// test rather than resting on the plan's.
     #[test]
     fn a_provider_setup_preview_answers_its_own_session_and_refuses_a_foreign_one_silently() {
-        let daemon = Daemon::new();
+        // A real file behind the runtime: since REQ-579's verify pass a preview
+        // on a daemon with nowhere to write is refused outright (BR-8 — the key
+        // is stored after the confirm, so a preview that answered would cost a
+        // keychain write for a commit that then refuses), and this test is about
+        // the *gate*, not about that refusal.
+        let (daemon, _path) = daemon_with_a_config_file("provider-preview-gate", Daemon::new());
         let owner = unattached(&daemon);
         let session = a_session_owned_by(&daemon, &owner);
         let intruder = unattached(&daemon);
@@ -7709,7 +7720,10 @@ mod tests {
     /// endpoint was the problem (the wire code's own doc says so).
     #[test]
     fn a_refused_provider_candidate_answers_with_the_setup_code_not_the_gate() {
-        let daemon = Daemon::new();
+        // With a file behind it, so the refusal below is the *candidate's* and
+        // not the "nowhere to write" `CONFIG_REJECTED` a config-less daemon
+        // answers first.
+        let (daemon, _path) = daemon_with_a_config_file("provider-candidate-code", Daemon::new());
         let owner = unattached(&daemon);
         let session = a_session_owned_by(&daemon, &owner);
         let mut params = provider_setup_params(&session);
@@ -8111,12 +8125,19 @@ mod tests {
         assert_eq!(completed.provider_id.0, "kimi");
         assert_eq!(completed.model, "kimi-k3");
         assert!(completed.bindings.is_empty(), "{:?}", completed.bindings);
+        // The destination, read off the daemon's own commit answer rather than
+        // echoed from the request's endpoint (REQ-579 verify FIX 3).
+        assert_eq!(completed.dial_host, "api.moonshot.ai");
 
         // AC-4: no key, and no endpoint either — asserted on the *wire*, which is
-        // where a field would have to appear to leak.
+        // where a field would have to appear to leak. The **host** is now
+        // carried deliberately and is not the same fact: it is the dial-time
+        // parser's answer, so it has no scheme, no path, no query and — the
+        // reason the endpoint itself may not travel — no userinfo.
         let wire = serde_json::to_string(&announced[0]).expect("the envelope serializes");
         assert!(!wire.contains("keychain"), "{wire}");
-        assert!(!wire.contains("api.moonshot.ai"), "{wire}");
+        assert!(!wire.contains("://") && !wire.contains('@'), "{wire}");
+        assert!(!wire.contains("/v1/chat/completions"), "{wire}");
 
         // The same commit again: the config already says exactly this.
         let unchanged = route_setup(
@@ -8134,6 +8155,44 @@ mod tests {
                 .all(|envelope| !matches!(envelope.event, Event::ProviderSetupCompleted(_))),
             "a commit that registered nothing announced a completed registration"
         );
+    }
+
+    /// **Params that are not a provider-setup request are an invalid-params
+    /// error at all three seams** — not a panic, not a silent no-op, and not a
+    /// refusal wearing another code (REQ-579 verify FIX 6).
+    ///
+    /// [`dispatch_rejects_a_malformed_web_refresh`] for this flow's trio, and
+    /// asserted as three iterations rather than one representative call
+    /// (LESSON-502): each handler opens with its own `from_value` line, and a
+    /// future edit that folds one of them into an `unwrap_or_default` — turning
+    /// a malformed frame into a **default candidate** with a blank id and a
+    /// blank credential reference — fails only its own iteration.
+    ///
+    /// The commit is driven through [`route_setup`] because it left the reader
+    /// loop's `dispatch` (it may park on a presence prompt); the two reads are
+    /// served by the same helper, which delegates to the one routing authority.
+    #[test]
+    fn dispatch_rejects_a_malformed_provider_setup_at_every_seam() {
+        let daemon = Daemon::new();
+        let owner = unattached(&daemon);
+        for method in [
+            ProviderSetupPlanParams::METHOD,
+            ProviderSetupPreviewParams::METHOD,
+            ProviderSetupCommitParams::METHOD,
+        ] {
+            let refused = route_setup(
+                &daemon,
+                &owner,
+                Id::Number(1),
+                method,
+                serde_json::json!({"not": "a candidate"}),
+            )
+            .unwrap();
+            assert!(
+                refused.contains(&error_code::INVALID_PARAMS.to_string()),
+                "`{method}` must answer -32602 for params it cannot read: {refused}"
+            );
+        }
     }
 
     /// **The provider trio is session-scoped, so none of it joins
@@ -8461,10 +8520,39 @@ mod tests {
             );
         }
 
+        // REQ-579's three, at the same seam and for the same reason. They are a
+        // separate loop because they need a *well-formed* candidate: params the
+        // handler cannot read would answer `INVALID_PARAMS` from the parse and
+        // make every assertion above true of a method with no length check at
+        // all (LESSON-502 — the vacuity is the failure mode).
+        for method in [
+            ProviderSetupPlanParams::METHOD,
+            ProviderSetupPreviewParams::METHOD,
+            ProviderSetupCommitParams::METHOD,
+        ] {
+            let refused = route_setup(
+                &daemon,
+                &intruder,
+                Id::Number(1),
+                method,
+                provider_setup_params(&oversized),
+            )
+            .unwrap();
+            assert!(
+                refused.contains(&error_code::INVALID_PARAMS.to_string()),
+                "`{method}` accepted an id no daemon could have minted: {refused}"
+            );
+        }
+
         assert!(
             drain_rejections(&mut sub).is_empty(),
             "the length check must come before the publish, or a 4 MiB id still \
              buys a 4 MiB event envelope in every subscriber's queue"
+        );
+        assert!(
+            drain_provider_rejections(&mut sub).is_empty(),
+            "and the provider commit's own notice is budgeted by the same rule — \
+             an oversized id must not buy the publish a plausible one would"
         );
 
         // Non-vacuity: the same call with a *mintable* id gets past this check
@@ -8482,6 +8570,19 @@ mod tests {
         assert!(
             gated.contains(&error_code::NOT_ATTACHED.to_string()),
             "a plausible id must reach the session gate: {gated}"
+        );
+        let gated = route_setup(
+            &daemon,
+            &intruder,
+            Id::Number(3),
+            ProviderSetupCommitParams::METHOD,
+            provider_setup_params(&session),
+        )
+        .unwrap();
+        assert!(
+            gated.contains(&error_code::NOT_ATTACHED.to_string()),
+            "and so must a provider commit's, or its loop above proves nothing \
+             about a length check either: {gated}"
         );
     }
 

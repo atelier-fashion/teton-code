@@ -7,7 +7,7 @@ domain: "harness"
 made_during: REQ-577
 observed_again_during: REQ-579
 created: 2026-08-15
-updated: 2026-08-15
+updated: 2026-08-16
 ---
 
 ## Assumption
@@ -103,8 +103,10 @@ measure. The growth path in BR-10 survives for facts and does not survive for
 behaviour.
 
 The growth-path premise is unexercised in exactly the case it exists for.
-The prompt margins are now thin (93/141 bytes over the floor), so the
-pressure to move guide content into topics is real and will arrive.
+The prompt margins are now thin — **72 bytes** on the opted-out shape and
+**119** on the opted-in one, against a floor of 48 (the shipped guide is round
+2's, 2,390 bytes; `crates/tetond/src/egress/redact.rs`) — so the pressure to
+move guide content into topics is real and will arrive.
 
 ## Implication
 
@@ -143,3 +145,12 @@ Concretely, for the next person here:
   calls per turn.
 - **Prefer** a deterministic surface affordance for anything that must happen
   every time.
+
+**The last bullet was taken, not just written.** REQ-579 shipped it: ADR-9 /
+TASK-159 append the `/provider setup` hand-off from the CLI surface when the
+model's reply reaches for the shell recipe — deterministic, TTY-only, once per
+turn, dormant if the model ever volunteers the command — and BR-1/AC-1 were
+amended in the open to say that either half may satisfy the criterion
+(`verification.md` §25). So this assumption now has a worked example of its own
+recommendation, including the shape of the amendment that goes with it: the
+0/9 stays on the record rather than being rescored.

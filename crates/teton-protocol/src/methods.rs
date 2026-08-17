@@ -1821,6 +1821,20 @@ pub struct TierSummary {
     /// from the wire when `None`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub provider_id: Option<ProviderId>,
+    /// The row's configured fallback, when it carries one (REQ-579 OQ-2).
+    ///
+    /// Reported even though this flow asks no fallback question, because the
+    /// flow **rewrites whole rows**: a `[[tiers]]` row this walkthrough re-binds
+    /// keeps the fallback the user configured elsewhere (`teton policy
+    /// set-tier --fallback`), and a routing question asked against a summary
+    /// that omitted it would describe a row the file does not have.
+    ///
+    /// `#[serde(default)]` for [`provider_id`](Self::provider_id)'s reason and
+    /// one more: a client built after this field existed still has to read a
+    /// daemon built before it, and "the daemon did not say" and "no fallback"
+    /// are the same actionable fact for a surface that only renders it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fallback_id: Option<ProviderId>,
 }
 
 /// One tier→provider binding the candidate would write (REQ-579 BR-7).
@@ -2073,6 +2087,24 @@ pub struct ProviderSetupCommitResult {
     /// permits.
     #[serde(default)]
     pub bindings: Vec<TierBinding>,
+    /// The host this registration will be dialed at, from the **dial-time**
+    /// parser (BR-5, LESSON-529) — the same reading
+    /// [`ProviderSetupPreviewResult::dial_host`] showed at the confirm step,
+    /// carried through to the answer that says the write landed.
+    ///
+    /// Completion is otherwise silent about where the key will now be sent: a
+    /// surface that printed "registered; `think` now routes to it" named the id
+    /// and never the destination, so a user who confirmed one host and had
+    /// another written could not tell from the confirmation. Read off the
+    /// derivation, **never** echoed from
+    /// [`ProviderSetupCandidate::endpoint`] — the host alone is userinfo-,
+    /// path- and query-free by construction, and the endpoint is not.
+    ///
+    /// `#[serde(default)]` so a client built after this field still parses an
+    /// older daemon's answer; empty then means "this daemon did not say", which
+    /// a renderer shows as nothing rather than as a host.
+    #[serde(default)]
+    pub dial_host: String,
 }
 
 impl RpcMethod for ProviderSetupCommitParams {
@@ -3446,10 +3478,12 @@ mod tests {
                 TierSummary {
                     tier: Tier::Think,
                     provider_id: None,
+                    fallback_id: None,
                 },
                 TierSummary {
                     tier: Tier::Build,
                     provider_id: None,
+                    fallback_id: None,
                 },
             ],
         };
@@ -3476,6 +3510,10 @@ mod tests {
             wire["tiers"][0].get("provider_id").is_none(),
             "an unbound tier is an absent id, not an empty string: {wire}"
         );
+        assert!(
+            wire["tiers"][0].get("fallback_id").is_none(),
+            "and a row with no fallback drops the key rather than sending null: {wire}"
+        );
         assert_eq!(wire["existing"].as_array().unwrap().len(), 0);
 
         // The configured answer: something is registered, something is routed,
@@ -3498,6 +3536,7 @@ mod tests {
             tiers: vec![TierSummary {
                 tier: Tier::Think,
                 provider_id: Some(ProviderId::from("kimi")),
+                fallback_id: Some(ProviderId::from("deepseek")),
             }],
         };
         round_trip(&configured);
@@ -3508,6 +3547,11 @@ mod tests {
             "a provider that is incomplete, not invalid, says so by absence: {wire}"
         );
         assert_eq!(wire["tiers"][0]["provider_id"], "kimi");
+        assert_eq!(
+            wire["tiers"][0]["fallback_id"], "deepseek",
+            "a configured fallback reaches the client, because this flow rewrites \
+             whole rows and keeps it: {wire}"
+        );
 
         // Preview and commit take the same candidate, deliberately — the commit
         // re-derives from the answers rather than from bytes the preview handed
@@ -3572,18 +3616,27 @@ mod tests {
 
         // Both answers: a commit that changed the config, and one whose
         // candidate matched what was already there. Neither is an error.
-        round_trip(&ProviderSetupCommitResult {
+        let applied = ProviderSetupCommitResult {
             applied: true,
             provider_id: ProviderId::from("kimi"),
             bindings: vec![TierBinding {
                 tier: Tier::Think,
                 provider_id: ProviderId::from("kimi"),
             }],
-        });
+            dial_host: "api.moonshot.ai".to_owned(),
+        };
+        round_trip(&applied);
+        assert_eq!(
+            serde_json::to_value(&applied).unwrap()["dial_host"],
+            "api.moonshot.ai",
+            "the answer names where the registration will be dialed, and names a \
+             host — never the endpoint it was parsed out of"
+        );
         let unrouted = ProviderSetupCommitResult {
             applied: false,
             provider_id: ProviderId::from("kimi"),
             bindings: vec![],
+            dial_host: "api.moonshot.ai".to_owned(),
         };
         round_trip(&unrouted);
         assert_eq!(
@@ -3593,6 +3646,17 @@ mod tests {
                 .len(),
             0,
             "registered-but-unrouted is an empty list, which is an answer"
+        );
+
+        // A daemon built before `dial_host` existed answers without the key, and
+        // a client built after it still reads that answer (`#[serde(default)]`)
+        // — the mixed-version skew ADR-007 endorses, at this field.
+        let older: ProviderSetupCommitResult =
+            serde_json::from_str(r#"{"applied":true,"provider_id":"kimi","bindings":[]}"#)
+                .expect("an older daemon's commit answer still parses");
+        assert!(
+            older.dial_host.is_empty(),
+            "and the absence reads as `this daemon did not say`, never as a host"
         );
     }
 
