@@ -289,11 +289,13 @@ None. No daemon change: every row is a new call site of an existing method
 
 ## Open Questions
 
-- [ ] OQ-1: Should `/teton provider list` (a leading slash on the CLI form)
-      also be recognized, or stay an unknown command that names `/help`
-      (REQ-555 BR-2)? Proposal: recognize it — it costs one line in the
-      classifier and matches what a user who has learned "commands start
-      with `/`" will type.
+- [x] OQ-1: **RESOLVED (TASK-170) — recognized.** `/teton provider list` runs
+      the same row `teton provider list` does. It cost the one line the
+      proposal predicted: recognition is a single function, offered both the
+      plain line and the post-`/` remainder, so the two spellings cannot
+      diverge. BR-1 is untouched — a `/teton …` line that names no subcommand
+      path is still an unknown command rejected with the `/help` hint, and
+      never a prompt.
 - [ ] OQ-2: Should the generic hand-off line (BR-8) subsume the REQ-579 and
       REQ-581 sentences into one renderer with per-command reasons, or keep
       three sentences? Proposal: one renderer, per-row optional reason

@@ -809,6 +809,22 @@ fn render_turn_failure(err: &RpcError, surface: &mut dyn Surface) {
     }
 }
 
+/// The one notice a recognized `teton …` line prints before its row runs
+/// (REQ-582 BR-4 / AC-5).
+///
+/// `teton provider list → /provider list`: what was typed, and the spelling this
+/// session uses for it. It is a [`LineKind::Notice`] because that is the class
+/// for "a control decision was made and here it is" — the surface draws it as
+/// `>> …` — and it is one line because the answer the user actually asked for
+/// follows it immediately.
+///
+/// Both halves come from the row name, which *is* the subcommand path clap
+/// walked to (ADR-1), so the line cannot name a `/` spelling that does not
+/// dispatch or a `teton` spelling the user did not type.
+fn cli_line_note(name: &str) -> String {
+    format!("teton {name} → /{name}")
+}
+
 /// The default experience: an interactive freeform session (AC-1).
 ///
 /// This is the client that owns the first-run model prompt: it answers permission
@@ -962,6 +978,32 @@ fn run_session(paths: &DaemonPaths, auto_accept: bool, verbose: bool) -> anyhow:
                         // and no parallel shutdown to drift from it (BR-6).
                         slash::CommandOutcome::Quit => break,
                     }
+                }
+                // REQ-582 BR-4/BR-5: a typed `teton …` line whose subcommand
+                // path names a row runs **that row**, through the same
+                // `dispatch` a `/` line reaches — no `std::process::Command`,
+                // no second `Connection`, no prompt turn. The invariant is
+                // structural rather than checked: recognition ends in a table
+                // lookup, so it can only run what the table lists, on the
+                // connection this session already holds (D-4). Spawning the
+                // binary instead would announce an attach into the very session
+                // that typed the line (BUG-177's shape).
+                slash::Input::CliLine { name, args } => {
+                    // First, and always: the line the user typed is not the
+                    // spelling this session uses, and one notice is how they
+                    // learn the one that is (AC-5).
+                    ctx.surface.line(LineKind::Notice, &cli_line_note(name));
+                    match slash::dispatch(name, args, &mut conn, &mut ctx)? {
+                        slash::CommandOutcome::Continue => continue,
+                        slash::CommandOutcome::Quit => break,
+                    }
+                }
+                // A real command with no session form: one line saying why and
+                // where to go instead, composed by the classifier from the same
+                // clap tree that recognized the path (BR-4). No RPC, no turn.
+                slash::Input::CliRefused(refusal) => {
+                    ctx.surface.line(LineKind::Error, &refusal);
+                    continue;
                 }
                 // The escape hatch has already collapsed its leading pair
                 // (BR-1b); a plain prompt is the trimmed line's own bytes.

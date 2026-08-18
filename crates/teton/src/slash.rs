@@ -50,6 +50,19 @@
 //! typed `teton provider list` be recognized by walking clap's tree rather than
 //! by a second matcher (ADR-1).
 //!
+//! That recognition is [`cli_line`], and it is why [`Input`] has five variants
+//! rather than three (REQ-582 BR-4): a line whose first word is `teton` and
+//! whose following words name a subcommand path runs that path's row
+//! ([`Input::CliLine`]) after one notice naming the `/` spelling, and a path
+//! with no session form — `teton uninstall`, a family typed bare — is one
+//! refusing line ([`Input::CliRefused`]). Neither ever reaches the model, and
+//! neither spawns a `teton` process or opens a second connection: a recognized
+//! line dispatches through this table, on the session's own connection, so
+//! BR-5 holds by construction rather than by a check (BUG-177's shape is what a
+//! subprocess would cost). Everything else that opens with `teton` is a
+//! question about the product — "teton is slow today" — and reaches the model
+//! byte-identically to today.
+//!
 //! Five commands are deliberately narrower than BR-9's "identical on a TTY and
 //! on piped stdin": the four mirrored rows that write and `/model set` are
 //! **refused when the session's stdin is not a terminal** (spec Permissions;
@@ -98,7 +111,43 @@ const ARGUMENT_FOOTER: &str =
 
 /// The tail every rejected command line carries, so an unknown command and a
 /// misused one point at the same place (BR-2).
-const HELP_HINT: &str = "type /help for the commands this session knows.";
+///
+/// `pub(crate)` since REQ-582: a refused `teton …` line ends in the same
+/// pointer, and it is composed in [`cli_rows`] because the *reason* it carries
+/// is read off clap's tree. One pointer sentence, one place to change it.
+pub(crate) const HELP_HINT: &str = "type /help for the commands this session knows.";
+
+/// The binary's own name: the first token that makes a typed line a candidate
+/// `teton …` command (REQ-582 BR-4).
+const TETON: &str = "teton";
+
+/// The binary's own flags — the tokens that name no subcommand and yet are
+/// plainly not a question (ADR-1).
+///
+/// Deliberately only the flags. `teton help me read this backtrace` opens with a
+/// word that *is* a subcommand at runtime (clap generates one) and is also an
+/// ordinary English sentence, so refusing on it would take a legitimate prompt
+/// away from the model — the failure BR-4's "teton is slow today" clause exists
+/// to prevent. No sentence opens `--help`.
+const CLI_FLAGS: &[&str] = &["--help", "-h", "--version", "-V"];
+
+/// What a bare `teton` typed at the prompt gets back (BR-4).
+///
+/// It is the line that opens a session, and the person typing it is in one. The
+/// answer says that rather than "unknown command", because the user did not
+/// mistype anything — they asked for something they already have.
+const ALREADY_IN_A_SESSION: &str =
+    "`teton` on its own opens a session, and you are already in one — type /help for the commands \
+     it knows.";
+
+/// What `teton --help` / `teton --version` typed at the prompt get back (BR-4).
+///
+/// Both are answerable — one by `/help`, one by a shell — and neither is a
+/// question for the model, which is the whole of why they are intercepted: the
+/// harness was asked and something else answering is the BUG-146 shape.
+const CLI_FLAGS_ARE_SHELL_ONLY: &str =
+    "`teton --help` and `teton --version` are the binary's own flags, and this session is already \
+     running — type /help for the commands it knows, or run `teton --version` from a shell.";
 
 /// The one line a piped `/model set` gets back (spec Permissions, security
 /// review 2026-08-04).
@@ -127,6 +176,28 @@ pub enum Input<'a> {
         /// Everything after the name, trimmed.
         args: &'a str,
     },
+    /// A typed `teton …` line whose subcommand path names a table row (REQ-582
+    /// BR-4, ADR-1): the row's name, and the text after the path words.
+    ///
+    /// Carried apart from [`Self::Command`] because the entry loop owes it one
+    /// extra line — the notice naming the `/` spelling that just ran — and
+    /// because "how a line was typed" is the classifier's fact to report rather
+    /// than something the loop re-derives.
+    CliLine {
+        /// The row name, which is also the subcommand path clap walked to.
+        name: &'a str,
+        /// Everything after the path words, trimmed; the row's own grammar
+        /// judges it (BR-3).
+        args: &'a str,
+    },
+    /// A typed `teton …` line naming a real command with no session form
+    /// (REQ-582 BR-4): the one line saying why, and where to go instead.
+    ///
+    /// Owned rather than borrowed because the reason is *composed* — from
+    /// [`cli_rows::SHELL_ONLY`], or from the subcommands clap's tree lists under
+    /// the family that was typed bare — and a classifier that returned a
+    /// `&'static str` here could only carry reasons written in advance.
+    CliRefused(String),
     /// A prompt that opened with the `//` escape, with exactly the leading pair
     /// collapsed to one `/` (BR-1b).
     EscapedPrompt(&'a str),
@@ -547,10 +618,18 @@ const COMMANDS: &[CommandSpec] = &[
 /// with the unknown-command hint and never dispatched and never prompted. Being
 /// lenient here would mean two spellings reach one handler, and the one the user
 /// did not intend is the one nobody tests.
+///
+/// A line that is not a command line is offered to [`cli_line`] before it
+/// becomes a prompt (REQ-582 BR-4, ADR-1): a typed `teton provider list` runs
+/// the row it names instead of being answered by the model with "that one's for
+/// you to run", which is the failure this REQ exists to remove. Recognition is
+/// the parser's own — clap's tree decides which words are a subcommand path —
+/// and everything it does not recognize reaches the model with its bytes
+/// unchanged.
 #[must_use]
 pub fn classify(input: &str) -> Input<'_> {
     let Some(rest) = input.strip_prefix('/') else {
-        return Input::Prompt(input);
+        return cli_line(input).unwrap_or(Input::Prompt(input));
     };
     // Checked after exactly one `/` has been stripped, so `rest` is the input's
     // own bytes minus that one character: the leading pair collapses and every
@@ -568,8 +647,127 @@ pub fn classify(input: &str) -> Input<'_> {
             args: "",
         };
     }
+    // OQ-1, resolved here: `/teton provider list` is the line a user who has
+    // learned "commands start with `/`" types for the command they read in a
+    // shell recipe, and it names one thing unambiguously. It costs this one
+    // line, because a `teton …` line is recognized by the same function either
+    // way. What it does *not* do is widen BR-1: a `/teton …` line that is not a
+    // recognized command falls through to the table below and is rejected as an
+    // unknown command, exactly as it was — a line opening with `/` still never
+    // reaches the model.
+    if let Some(recognized) = cli_line(rest) {
+        return recognized;
+    }
     let (name, args) = split_name(rest, COMMANDS);
     Input::Command { name, args }
+}
+
+/// Sort a line whose first word may be `teton` into its CLI bucket, or `None`
+/// when it is not one of ours to answer (REQ-582 BR-4 / ADR-1).
+///
+/// The whole decision table, in one place, in the order the ADR states it:
+///
+/// | the line | bucket |
+/// |---|---|
+/// | first word is not `teton` (`tetonx …`, `Teton …`, `teton-code`) | `None` — never ours |
+/// | a subcommand path that names a row | [`Input::CliLine`] |
+/// | a subcommand path with no row (`uninstall`, a bare family) | [`Input::CliRefused`] |
+/// | no path, and the next token is one of [`CLI_FLAGS`] | [`Input::CliRefused`] |
+/// | no path, and nothing follows | [`Input::CliRefused`] — bare `teton` |
+/// | no path, and something else follows (`teton is slow today`) | `None` — a question about the product |
+///
+/// `None` is the caller's decision to make, and the two callers make it
+/// differently: a plain line becomes [`Input::Prompt`] with its own bytes, and a
+/// `/`-prefixed one goes on to the table (OQ-1). That is why this returns an
+/// `Option` rather than a bucket — "not a CLI line" is not the same statement as
+/// "a prompt".
+///
+/// **Which words are the command is clap's answer, not this function's**
+/// ([`cli_rows::cli_path`]). A hand-written matcher here would be a second
+/// parser of one string, drifting out of agreement with the binary's own the
+/// first time a subcommand is renamed (LESSON-529). Which words are the
+/// *argument* follows from the same answer: whatever the path did not consume,
+/// judged by the row's own grammar (BR-3).
+///
+/// Pure and total, like the classifier it serves.
+fn cli_line(line: &str) -> Option<Input<'_>> {
+    // `match_name_words` is the table's own word matcher, so `teton` is matched
+    // on a word boundary exactly as a row name is: `tetonx provider list` and
+    // `teton-code` are not this, and neither is `Teton provider list` — a
+    // command is lowercase, and a capitalised mention is prose (REQ-581's
+    // reply-side rule, applied to the entry line).
+    let rest = match_name_words(line, TETON)?;
+    let tokens: Vec<&str> = rest.split_whitespace().collect();
+    let path = cli_rows::cli_path(&tokens);
+    if path.is_empty() {
+        return match tokens.first() {
+            None => Some(Input::CliRefused(ALREADY_IN_A_SESSION.to_owned())),
+            Some(token) if CLI_FLAGS.contains(token) => {
+                Some(Input::CliRefused(CLI_FLAGS_ARE_SHELL_ONLY.to_owned()))
+            }
+            // "teton is slow today" — a legitimate question about the product,
+            // and the model is who answers it (BR-4).
+            Some(_) => None,
+        };
+    }
+    // Word-wise against the path rather than against a joined string: the
+    // comparison a row name and a subcommand path are equal *by* is their words,
+    // and doing it this way costs no allocation on a line typed every prompt.
+    let matched = COMMANDS
+        .iter()
+        .find(|spec| spec.name.split_whitespace().eq(path.iter().copied()));
+    let Some(spec) = matched else {
+        return Some(Input::CliRefused(cli_rows::refusal_for_path(&path)));
+    };
+    Some(Input::CliLine {
+        name: spec.name,
+        args: after_words(rest, path.len()),
+    })
+}
+
+/// Every row sitting **under** `prefix` — the rows a family typed bare should
+/// point at (REQ-582 BR-4).
+///
+/// Generated from [`COMMANDS`] for BR-7's reason, one surface further along: a
+/// row added to the `/provider` family is named by the refusal without a second
+/// list to maintain. It is deliberately the *table's* rows rather than clap's
+/// subcommands, because what a user can type here is what the table lists —
+/// `/provider setup` is a session row with no CLI subcommand at all, and it is
+/// the most likely thing someone typing `teton provider …` actually wants.
+///
+/// Word-wise, so `policy set` does not claim the `policy set-tier` row.
+pub(crate) fn rows_under(prefix: &[&str]) -> Vec<&'static str> {
+    COMMANDS
+        .iter()
+        .filter(|spec| {
+            let mut words = spec.name.split_whitespace();
+            prefix.iter().all(|word| words.next() == Some(*word)) && words.next().is_some()
+        })
+        .map(|spec| spec.name)
+        .collect()
+}
+
+/// `line` with its first `count` whitespace-separated words dropped, trimmed.
+///
+/// The argument of a recognized CLI line: what the subcommand path did not
+/// consume. Counted rather than matched against the row's name, because the two
+/// are the same words only when the user typed the canonical spelling —
+/// [`cli_rows::cli_path`] honours clap's aliases, so `teton p list kimi` (were
+/// `p` ever an alias of `provider`) resolves to the `provider list` row while
+/// the line itself says something else. Matching the row's name against the line
+/// would silently drop that line's argument; counting the words the walk
+/// consumed cannot.
+///
+/// Whitespace runs collapse, exactly as they do between a two-word row's words
+/// in [`match_name_words`].
+fn after_words(line: &str, count: usize) -> &str {
+    let mut rest = line;
+    for _ in 0..count {
+        rest = rest.trim_start();
+        let end = rest.find(char::is_whitespace).unwrap_or(rest.len());
+        rest = &rest[end..];
+    }
+    rest.trim()
 }
 
 /// Build the `prompt/turn` request a classified prompt line becomes.
@@ -1693,6 +1891,10 @@ mod tests {
     use crate::prompt::ScriptedPrompter;
     use crate::render::RecordingSurface;
     use crate::session_ui::SessionState;
+    // REQ-582: the recognition tests compare against what the **binary's** own
+    // parser says about the same argv, which is the only ground truth for
+    // "the same error the shell prints" (BR-3, AC-6).
+    use clap::Parser;
     // Only the tests name a tier now: the tier vocabulary itself moved to
     // `session_ui`, so the production code here never mentions the type.
     use teton_protocol::events::WebTier;
@@ -3222,5 +3424,335 @@ mod tests {
                 "`{shell_only}` is both shell-only and a session row"
             );
         }
+    }
+
+    // ------------------------------------------------------------------
+    // REQ-582 TASK-170 — recognizing a typed `teton …` line (BR-4, ADR-1)
+    // ------------------------------------------------------------------
+
+    /// **ADR-8, forward direction, for the CLI line.** Every row is reachable
+    /// from `teton <row>` exactly as it is from `/<row>`, and reaches the same
+    /// resolution.
+    ///
+    /// Scoped to the rows whose names are subcommand paths — the mirrored ten
+    /// plus the older rows that predate this REQ and share their twin's spelling
+    /// (`cost`, `effort`, `model`, `model set`, `provider test`). The
+    /// session-only rows (`/help`, `/clear`, `/web setup`, …) are *deliberately*
+    /// unreachable this way: they have no `teton` form, so `teton help` is a
+    /// prompt and BR-4 says so.
+    ///
+    /// The membership itself is asserted from clap's tree rather than from a
+    /// list here: a row is reachable iff its name is a path in the parser, which
+    /// is the whole of ADR-1's rule.
+    #[test]
+    fn every_row_that_names_a_subcommand_is_reachable_from_a_typed_teton_line() {
+        let mut reachable = 0;
+        for spec in COMMANDS {
+            let words: Vec<&str> = spec.name.split_whitespace().collect();
+            let is_subcommand = cli_rows::cli_path(&words).len() == words.len();
+            // A row that requires an argument is only reachable *with* one, the
+            // same way it is from a `/` line — the resolve-time rejection is the
+            // row's, not the recognition's.
+            let expected_args = match spec.args {
+                Args::Required(_) => "qwen2.5-coder-3b",
+                Args::None | Args::Optional | Args::Cli => "",
+            };
+            let typed = format!("teton {} {expected_args}", spec.name);
+            let typed = typed.trim_end();
+            if !is_subcommand {
+                // The session-only rows — `/help`, `/clear`, `/web setup`,
+                // `/provider setup` — have no `teton` form (BR-4). The ones
+                // whose first word *is* a family are refused with that family's
+                // session rows; the rest are prompts.
+                assert!(
+                    !matches!(classify(typed), Input::CliLine { .. }),
+                    "`{typed}` names no subcommand path and must not be recognized"
+                );
+                continue;
+            }
+            reachable += 1;
+            assert_eq!(
+                classify(typed),
+                Input::CliLine {
+                    name: spec.name,
+                    args: expected_args
+                },
+                "`{typed}` did not reach its row"
+            );
+            // And the row it reaches dispatches, which is what makes the notice
+            // line's `/<name>` a spelling that works (AC-5).
+            let Input::CliLine { name, args } = classify(typed) else {
+                unreachable!("just asserted");
+            };
+            let Resolution::Run(resolved, run_args) = resolve(name, args) else {
+                panic!("`{typed}` was recognized but did not dispatch");
+            };
+            assert_eq!(resolved.name, spec.name);
+            assert_eq!(run_args, expected_args);
+        }
+        // Every mirrored row is in that set by construction (a mirror's `shell`
+        // is `teton ` + its name), so the count cannot silently fall to zero.
+        assert!(
+            reachable >= COMMANDS.iter().filter(|spec| spec.mirror.is_some()).count(),
+            "only {reachable} rows were reachable from a `teton …` line"
+        );
+    }
+
+    /// `teton model` is **not** a refusal, and that is the table's rule working
+    /// rather than an exception to it: `model` names a row (`/model`, REQ-555's
+    /// one-line current-model answer), so ADR-1's first arm applies and the row
+    /// runs. A shell prints the family's help for the same words because a shell
+    /// has no `/model`; the session has one, and answering the question is
+    /// better than describing the family.
+    #[test]
+    fn a_family_word_that_is_itself_a_row_runs_that_row() {
+        assert_eq!(
+            classify("teton model"),
+            Input::CliLine {
+                name: "model",
+                args: ""
+            }
+        );
+        // And the families that are *not* rows still refuse.
+        assert!(matches!(classify("teton provider"), Input::CliRefused(_)));
+    }
+
+    /// The argument is whatever the subcommand path did not consume, and the
+    /// row's own grammar judges it (BR-3). The spec's own examples, plus the two
+    /// pre-REQ rows whose twins take an argument (LESSON-512).
+    #[test]
+    fn a_typed_teton_line_carries_the_words_the_path_did_not_consume() {
+        for (typed, name, args) in [
+            (
+                "teton policy set-tier build kimi --fallback local",
+                "policy set-tier",
+                "build kimi --fallback local",
+            ),
+            ("teton model set qwen", "model set", "qwen"),
+            ("teton provider test kimi", "provider test", "kimi"),
+            (
+                "teton boundary add src/** --mode local-only",
+                "boundary add",
+                "src/** --mode local-only",
+            ),
+            // ADR-1's amendment: a stray word does not un-recognize a command.
+            // The path is still `provider list`, and clap says what it thinks of
+            // `please` (AC-6).
+            ("teton provider list please", "provider list", "please"),
+            // Whitespace between the words is normalised the same way a two-word
+            // row's is, and the argument keeps its own spacing after trimming.
+            ("teton  policy   show", "policy show", ""),
+        ] {
+            assert_eq!(classify(typed), Input::CliLine { name, args }, "`{typed}`");
+        }
+    }
+
+    /// BR-4's refusals: a real command with no session form, the bare binary,
+    /// and its own flags. One line each, and never the model.
+    #[test]
+    fn a_teton_line_with_no_session_form_is_refused_with_the_reason() {
+        let refusal = |line: &str| match classify(line) {
+            Input::CliRefused(text) => text,
+            other => panic!("`{line}` classified as {other:?} rather than a refusal"),
+        };
+
+        // `teton uninstall` — the one `SHELL_ONLY` command. It names itself as
+        // the shell command to run, because the reason it cannot run here (it
+        // stops this session's daemon) is not a reason to leave the user stuck.
+        let uninstall = refusal("teton uninstall");
+        assert_eq!(uninstall.lines().count(), 1, "{uninstall}");
+        assert!(uninstall.contains("teton uninstall"), "{uninstall}");
+        assert!(uninstall.contains("shell"), "{uninstall}");
+
+        // A family typed bare names the session's rows under it — generated
+        // from the table, so a row added to the family is named here without a
+        // second list to maintain (BR-7's rule, one surface further along).
+        let family = refusal("teton provider");
+        assert_eq!(family.lines().count(), 1, "{family}");
+        for row in ["/provider add", "/provider list", "/provider test"] {
+            assert!(
+                family.contains(row),
+                "`teton provider` omits `{row}`: {family}"
+            );
+        }
+        // Including the row the CLI has no subcommand for at all, which is the
+        // one a user typing `teton provider …` most likely wants (REQ-579).
+        assert!(family.contains("/provider setup"), "{family}");
+        for bare in ["teton policy", "teton boundary"] {
+            let line = refusal(bare);
+            assert_eq!(line.lines().count(), 1, "{line}");
+            assert!(line.contains("family"), "{line}");
+            assert!(line.contains("in this session"), "{line}");
+        }
+        // A family plus a word that names no subcommand leaves the walk on the
+        // family, and gets the same answer — which is how `teton provider
+        // setup`, a session-only command with no CLI form, is answered with its
+        // own `/` spelling instead of being sent to the model (BR-4).
+        let setup = refusal("teton provider setup");
+        assert!(setup.contains("/provider setup"), "{setup}");
+
+        // A leaf with no session row and no rows under it says so and points at
+        // the shell: `policy set` is REQ-558's retired phase form, hidden from
+        // the CLI's own listing.
+        let retired = refusal("teton policy set build kimi");
+        assert!(retired.contains("no session form"), "{retired}");
+        assert!(retired.contains(HELP_HINT), "{retired}");
+
+        // The bare binary opens a session, and the user is in one.
+        assert_eq!(refusal("teton"), ALREADY_IN_A_SESSION);
+        // Its own flags: `/help` answers one, a shell answers the other.
+        for flag in ["teton --help", "teton -h", "teton --version", "teton -V"] {
+            assert_eq!(refusal(flag), CLI_FLAGS_ARE_SHELL_ONLY, "`{flag}`");
+        }
+    }
+
+    /// The uninstall sentence is written for the one entry `SHELL_ONLY` has, and
+    /// says why *that* command cannot run here. A second entry would inherit a
+    /// reason that is not its own, so it has to fail here first.
+    #[test]
+    fn shell_only_still_names_exactly_the_command_its_refusal_explains() {
+        assert_eq!(
+            cli_rows::SHELL_ONLY,
+            ["uninstall"],
+            "a second shell-only command needs its own reason in `refusal_for_path`"
+        );
+    }
+
+    /// **ADR-8, reverse direction.** A line that opens with `teton` but names no
+    /// subcommand is a prompt, byte-identical to today — and so is anything that
+    /// merely looks like the binary's name.
+    ///
+    /// "teton is slow today" is the case the ADR names: it is a legitimate
+    /// question about the product, and answering it with a parser error would be
+    /// the mirror image of the failure this REQ removes.
+    #[test]
+    fn a_teton_line_that_names_no_subcommand_is_a_byte_identical_prompt() {
+        for line in [
+            "teton is slow today",
+            "teton keeps asking me about providers",
+            // The word must be the whole first token.
+            "tetonx provider list",
+            "teton-code provider list",
+            "tetonprovider list",
+            // A command is lowercase; a capitalised mention is prose.
+            "Teton provider list",
+            // And `teton` anywhere but the front is just a word.
+            "why is teton provider list so slow?",
+            // Clap generates a `help` subcommand at runtime and this tree does
+            // not carry it — which is what keeps `teton help me read this` a
+            // question rather than a refusal.
+            "teton help me read this backtrace",
+        ] {
+            assert_eq!(classify(line), Input::Prompt(line), "`{line}`");
+        }
+    }
+
+    /// BR-11 / REQ-555 BR-1b: recognition is checked **after** the escape hatch,
+    /// so `//teton …` still reaches the model with exactly the leading pair
+    /// collapsed. A `teton` line needs no escape of its own — only a strict
+    /// parse intercepts — but a user who escapes one anyway must get what the
+    /// escape promises.
+    #[test]
+    fn the_double_slash_escape_still_outranks_recognition() {
+        assert_eq!(
+            classify("//teton provider list"),
+            Input::EscapedPrompt("/teton provider list")
+        );
+        assert_eq!(
+            classify("//teton uninstall"),
+            Input::EscapedPrompt("/teton uninstall")
+        );
+    }
+
+    /// **OQ-1, resolved.** `/teton provider list` is the same command with the
+    /// slash a user has learned to type, and it runs the same row.
+    ///
+    /// What it does not do is turn a `/` line into a prompt: a `/teton …` line
+    /// that names no subcommand is still an unknown command, rejected with the
+    /// hint, exactly as it was before this REQ (BR-1).
+    #[test]
+    fn a_slashed_cli_line_runs_the_same_row_and_an_unrecognized_one_still_rejects() {
+        assert_eq!(
+            classify("/teton provider list"),
+            Input::CliLine {
+                name: "provider list",
+                args: ""
+            }
+        );
+        assert_eq!(
+            classify("/teton policy set-tier build kimi"),
+            Input::CliLine {
+                name: "policy set-tier",
+                args: "build kimi"
+            }
+        );
+        assert!(matches!(classify("/teton"), Input::CliRefused(_)));
+
+        let Input::Command { name, args } = classify("/teton frobnicate") else {
+            panic!("a `/` line that names no subcommand is still a command line");
+        };
+        assert_eq!((name, args), ("teton", "frobnicate"));
+        let Resolution::Rejected(hint) = resolve(name, args) else {
+            panic!("`/teton frobnicate` must be rejected as an unknown command");
+        };
+        assert!(hint.contains("unknown command: `/teton`"), "{hint}");
+    }
+
+    /// The argument split, as the rule it is: drop the words the walk consumed,
+    /// whatever they were spelled. Counting rather than matching the row's name
+    /// is what keeps an aliased spelling's argument (`teton p list kimi`, were
+    /// `p` ever an alias) from being silently dropped.
+    #[test]
+    fn after_words_drops_exactly_the_words_the_path_consumed() {
+        assert_eq!(after_words("provider list please", 2), "please");
+        assert_eq!(after_words("p list kimi", 2), "kimi");
+        assert_eq!(after_words("doctor", 1), "");
+        assert_eq!(
+            after_words("  policy   set-tier   build kimi ", 2),
+            "build kimi"
+        );
+        assert_eq!(after_words("provider list", 2), "");
+        assert_eq!(after_words("anything", 0), "anything");
+    }
+
+    /// AC-6's third clause, at the seam that produces it: a recognized line with
+    /// a stray word dispatches, and the row's clap parse prints the parser's own
+    /// `unexpected argument` — the same text the shell prints for that argv.
+    ///
+    /// Driven through [`dispatch`] rather than asserted on the classifier alone,
+    /// because "recognized" is only half the claim: the other half is that the
+    /// row it reaches judges the argument (BR-3).
+    #[test]
+    fn a_recognized_line_with_a_stray_word_prints_the_parsers_own_error() {
+        let Input::CliLine { name, args } = classify("teton provider list please") else {
+            panic!("a stray word does not un-recognize a command (ADR-1)");
+        };
+
+        let (mut conn, _peer) = Connection::scripted(&[]);
+        let mut surface = RecordingSurface::new();
+        let mut state = SessionState::new();
+        let mut prompter = ScriptedPrompter::new(&[]);
+        {
+            let mut ctx = session_ctx(&mut surface, &mut state, &mut prompter);
+            let outcome = dispatch(name, args, &mut conn, &mut ctx)
+                .expect("a parse error never fails the command");
+            assert_eq!(outcome, CommandOutcome::Continue);
+        }
+
+        let expected = crate::Cli::try_parse_from(["teton", "provider", "list", "please"])
+            .expect_err("the shell rejects it too")
+            .render()
+            .to_string();
+        let first = expected
+            .lines()
+            .find(|line| !line.trim().is_empty())
+            .expect("clap says something")
+            .strip_prefix("error: ")
+            .expect("clap leads with its own error: prefix");
+        assert_eq!(surface.lines_of(LineKind::Error), vec![first]);
+        assert!(
+            first.contains("unexpected argument 'please'"),
+            "AC-6 names this text: {first}"
+        );
     }
 }

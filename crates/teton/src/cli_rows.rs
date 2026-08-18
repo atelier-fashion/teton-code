@@ -132,10 +132,11 @@ pub(crate) const DOCTOR: Mirror = Mirror {
 /// completeness test walks clap's tree and requires every visible leaf to be
 /// either a row name or listed here, so a subcommand added later cannot ship
 /// without someone deciding which of the two it is.
-// Read by TASK-170's classifier, which answers a typed `teton uninstall` with
-// the reason rather than sending it to the model; the allowance goes with that
-// commit, as TASK-168's did with this one.
-#[allow(dead_code)]
+///
+/// The classifier reads it too: a typed `teton uninstall` is answered with
+/// [`refusal_for_path`]'s reason rather than sent to the model (ADR-1), so the
+/// same list that exempts a command from having a row is what tells a user why
+/// it has none.
 pub(crate) const SHELL_ONLY: &[&str] = &["uninstall"];
 
 /// What [`write_gate`] decides.
@@ -474,9 +475,6 @@ fn tree() -> &'static clap::Command {
 /// parser which subcommand a line names instead of matching words itself, so a
 /// subcommand renamed in `main.rs` is renamed here too and a hand-written matcher
 /// cannot drift out of agreement with the parser (LESSON-529).
-// Written here, beside the table it walks, one task ahead of the classifier that
-// calls it (TASK-170); the allowance goes with that commit.
-#[allow(dead_code)]
 #[must_use]
 pub(crate) fn cli_path(tokens: &[&str]) -> Vec<&'static str> {
     let mut node = tree();
@@ -489,6 +487,67 @@ pub(crate) fn cli_path(tokens: &[&str]) -> Vec<&'static str> {
         node = sub;
     }
     path
+}
+
+/// The one line a recognized `teton …` path with **no** session row gets back
+/// (REQ-582 ADR-1, BR-4).
+///
+/// `path` is [`cli_path`]'s output, so it is a real subcommand path in canonical
+/// spelling — this function's job is only to say why that path has no session
+/// form, in one line, and where the user can go instead. Three shapes:
+///
+/// * a [`SHELL_ONLY`] command — `teton uninstall`, and the reason is the one
+///   recorded there: it stops the daemon this session is attached to;
+/// * a **family** — `teton provider`, and also `teton provider setup`, whose
+///   second word names no subcommand and leaves the walk on the family. The line
+///   names the session's rows *under* that family, from the table
+///   ([`crate::slash::rows_under`]), because those are what the user can
+///   actually type here: for `provider` that includes `/provider setup`, which
+///   the CLI has no subcommand for at all;
+/// * anything else with no rows below it — a leaf clap hides (`policy set`,
+///   REQ-558's retired form), which has no session row for the same reason it
+///   has no listing.
+///
+/// **One line, and why it is not clap's own message.** ADR-1 wrote the family
+/// arm as "clap's own error for that path, rendered", on the reading that
+/// `Cli::try_parse_from(["teton", "provider"])` produces the short "requires a
+/// subcommand" error that names them. It does not: the derive marks a required
+/// subcommand `arg_required_else_help`, so clap answers with the **whole help
+/// page** for that family — a screen of text whose longest line is the global
+/// `--yes` description, and whose `Usage:` and "try '--help'" tail are a shell's
+/// instructions, not a session's. A [`Surface`] line owns exactly one row
+/// (newlines in it are flattened on the way out), and BR-4 and ADR-1 both say
+/// one refusing line. So the sentence is composed, and from the table rather
+/// than from the tree: the anti-drift property BR-3 is about is that no list is
+/// maintained twice, and the table is the list that decides what runs here.
+#[must_use]
+pub(crate) fn refusal_for_path(path: &[&str]) -> String {
+    let spelling = path.join(" ");
+    if SHELL_ONLY.contains(&spelling.as_str()) {
+        // The reason is `SHELL_ONLY`'s single entry's reason, and a unit test
+        // pins that it is still the only entry: a second shell-only command
+        // would need a reason of its own rather than this one.
+        return format!(
+            "`teton {spelling}` is shell-only: it stops the daemon this session is attached to \
+             and removes its data, so nothing was run — run `teton {spelling}` from a shell \
+             instead."
+        );
+    }
+    let rows = crate::slash::rows_under(path);
+    if rows.is_empty() {
+        format!(
+            "`teton {spelling}` has no session form — run it from a shell. {}",
+            crate::slash::HELP_HINT
+        )
+    } else {
+        format!(
+            "`teton {spelling}` is a family rather than a command — in this session: {}.",
+            rows.iter()
+                .map(|row| format!("/{row}"))
+                .collect::<Vec<_>>()
+                .join(", ")
+        )
+    }
 }
 
 /// Every leaf subcommand path in the CLI's tree, with whether clap hides it.

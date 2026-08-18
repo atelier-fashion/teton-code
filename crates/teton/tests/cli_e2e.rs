@@ -3540,3 +3540,171 @@ fn a_piped_session_whose_reply_recites_the_cli_gets_no_hand_off_line() {
         "the piped session must still exit 0; status {status:?}; output:\n{session}"
     );
 }
+
+// ---------------------------------------------------------------------------
+// REQ-582 — a `teton …` line typed at the session prompt (BR-4, ADR-1)
+// ---------------------------------------------------------------------------
+
+/// The tail of the line every session announces itself with.
+const READY_MARKER: &str = "ready (freeform)";
+
+/// Everything a piped session printed between its ready line and its
+/// session-end cost summary — the part the typed lines are responsible for.
+///
+/// Anchored at both ends rather than sliced from the start because the head of a
+/// session (the attach, the lifecycle replay) and its tail (the cost report,
+/// which quotes figures) carry text that is not about the command under test,
+/// and the session id in the ready line differs between two runs by
+/// construction.
+fn session_body<'a>(output: &'a str, what: &str) -> &'a str {
+    let start = output
+        .find(READY_MARKER)
+        .and_then(|at| output[at..].find('\n').map(|nl| at + nl + 1))
+        .unwrap_or_else(|| panic!("{what} never opened a session; output:\n{output}"));
+    let end = output[start..]
+        .find(COST_MARKER)
+        .unwrap_or_else(|| panic!("{what} printed no session-end summary; output:\n{output}"));
+    &output[start..start + end]
+}
+
+/// The notice a recognized CLI line prints, as the surface draws it.
+const PROVIDER_LIST_NOTE: &str = ">> teton provider list → /provider list";
+
+/// **AC-5: typing `teton provider list` runs the row, and costs no turn.**
+///
+/// Two claims, and they need different evidence.
+///
+/// *The same command ran.* Both spellings are driven against one daemon and the
+/// bodies of the two sessions are diffed — everything between the ready line and
+/// the session-end summary, byte for byte, with the notice line removed from the
+/// typed one. A `contains` of some phrase from the listing would pass on a
+/// recognition that reached a *different* row, or one that rendered half the
+/// report; the diff is the only statement that says "the same command, the same
+/// renderer" (LESSON-517).
+///
+/// *No model call was made.* Asserted by the scripted engine's reply queue
+/// rather than by a timer or by the absence of a word: the daemon replays one
+/// canned reply per turn, so a turn taken by the typed line would put
+/// `TURN_REPLIES[0]` in the transcript. [`assert_no_turn_ran`] checks that and
+/// every other marker a turn leaves behind, so the claim is deterministic —
+/// there is nothing to wait for and nothing to race.
+#[test]
+fn a_typed_teton_line_runs_the_row_it_names_and_costs_no_turn() {
+    let daemon_path = daemon_bin();
+    let daemon = TestDaemon::spawn_scripted(&daemon_path, TURN_REPLIES);
+    let teton = teton_bin();
+
+    let slashed = daemon.run_cli_with_stdin(&teton, &[], "/provider list\n");
+    let typed = daemon.run_cli_with_stdin(&teton, &[], "teton provider list\n");
+
+    // The one line the recognized spelling adds: what was typed, and the
+    // spelling this session uses for it.
+    assert!(
+        typed.contains(PROVIDER_LIST_NOTE),
+        "a recognized line must name the session spelling; output:\n{typed}"
+    );
+    assert!(
+        !slashed.contains(PROVIDER_LIST_NOTE),
+        "the `/` spelling has nothing to translate; output:\n{slashed}"
+    );
+
+    let slashed_body = session_body(&slashed, "`/provider list`");
+    let typed_body = session_body(&typed, "`teton provider list`");
+    // The precondition: the listing really rendered, so the diff below is
+    // between two reports rather than between two empty strings.
+    assert!(
+        slashed_body.contains("deepseek"),
+        "`/provider list` printed no providers; output:\n{slashed}"
+    );
+    assert_eq!(
+        typed_body.replacen(&format!("{PROVIDER_LIST_NOTE}\n"), "", 1),
+        slashed_body,
+        "`teton provider list` and `/provider list` printed different sessions;\n\
+         typed:\n{typed}\nslashed:\n{slashed}"
+    );
+
+    // AC-5's load-bearing half, on both spellings.
+    assert_no_turn_ran(&typed, "a typed `teton provider list`");
+    assert_no_turn_ran(&slashed, "`/provider list`");
+}
+
+/// **AC-6: what a `teton …` line gets when it is not a command this session can
+/// run — and what it still gets when it is not a command at all.**
+///
+/// Four lines through one session, because the four outcomes are one decision
+/// table and a session that answered three of them correctly while dropping the
+/// fourth would be the bug (BR-4's totality):
+///
+/// * `teton uninstall` — a real command with no session form. One refusing line
+///   naming the shell, and no turn.
+/// * `teton provider list please` — recognized (its path is a row), answered by
+///   the CLI parser's **own** `unexpected argument`, and no turn (ADR-1's
+///   amendment to AC-6).
+/// * `//teton provider list` — the escape hatch still outranks recognition
+///   (REQ-555 BR-1b), so this one *is* a turn and the model sees the line with
+///   its leading pair collapsed.
+/// * `teton is slow today` — a question about the product, unchanged: a turn,
+///   and the model's answer.
+///
+/// The reply queue is the arithmetic that ties them together: three of the four
+/// lines must spend nothing, so the two turns take the first two scripted
+/// replies. A regression that sent a refused line to the model would shift
+/// them.
+#[test]
+fn a_teton_line_with_no_session_form_is_refused_and_a_question_still_reaches_the_model() {
+    let daemon_path = daemon_bin();
+    let daemon = TestDaemon::spawn_scripted(&daemon_path, TURN_REPLIES);
+    let teton = teton_bin();
+
+    let session = daemon.run_cli_with_stdin(
+        &teton,
+        &[],
+        "teton uninstall\n\
+         teton provider list please\n\
+         //teton provider list\n\
+         teton is slow today\n",
+    );
+
+    // The refusal names the command, the reason, and the shell.
+    assert!(
+        session.contains("`teton uninstall` is shell-only"),
+        "`teton uninstall` must be refused by name; output:\n{session}"
+    );
+    assert!(
+        session.contains("from a shell instead"),
+        "the refusal must point at the shell; output:\n{session}"
+    );
+
+    // The parser's own error for the stray word — the same text the shell
+    // prints for that argv (BR-3), and the row's clap parse rather than a
+    // second reading of the line.
+    assert!(
+        session.contains("unexpected argument 'please'"),
+        "a recognized line's stray word is a parser error; output:\n{session}"
+    );
+
+    // Neither refused line reached a listing: no provider table was rendered by
+    // either of them, so the only thing they cost was a line of text.
+    assert!(
+        !session.contains("deepseek-v4-pro"),
+        "a refused or rejected line still ran the command; output:\n{session}"
+    );
+
+    // Exactly two turns ran, and they are the escaped line and the question —
+    // in that order, from the head of the reply queue.
+    assert!(
+        session.contains(TURN_REPLIES[0]),
+        "`//teton provider list` never reached the model; output:\n{session}\n\
+         daemon log:\n{}",
+        daemon.log()
+    );
+    assert!(
+        session.contains(TURN_REPLIES[1]),
+        "`teton is slow today` never reached the model; output:\n{session}"
+    );
+    assert!(
+        !session.contains(TURN_REPLIES[2]),
+        "a refused line spent a turn: the reply queue moved three times; \
+         output:\n{session}"
+    );
+}

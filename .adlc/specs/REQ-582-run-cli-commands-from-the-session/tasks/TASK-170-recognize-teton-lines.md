@@ -1,7 +1,7 @@
 ---
 id: TASK-170
 title: "Recognize a `teton …` line typed at the prompt: `Input::{CliLine, CliRefused}`, entry-loop arms, totality tests"
-status: draft
+status: complete
 parent: REQ-582
 created: 2026-08-18
 updated: 2026-08-18
@@ -30,14 +30,56 @@ for `CliRefused` — never a prompt turn, never a subprocess (BR-5).
 
 ## Acceptance Criteria
 
-- [ ] `classify` remains pure and total; the extended both-directions tests pass; every existing classify test unchanged.
-- [ ] `cli_e2e` AC-5/AC-6 tests as listed; assert absence of a model call by the scripted-reply-queue argument (deterministic), not a timer.
-- [ ] `//teton provider list` still prompts the model with `/teton provider list` (REQ-555 BR-1b unaffected).
-- [ ] The Notice line reads `teton provider list → /provider list` (rendered by the surface as `>> …`).
-- [ ] No `std::process::Command` and no second `Connection` anywhere in the recognition path (grep test or review note).
+- [x] `classify` remains pure and total; the extended both-directions tests pass; every existing classify test unchanged.
+      — `classify` gained one call (`cli_line`, itself pure and total) and no state; every REQ-555 classify test is byte-unchanged. Ten new unit tests in `slash.rs`: every row whose name is a subcommand path is reachable from `teton <row>` and resolves to the same row a `/` line does; the argument is what the path did not consume (the spec's four examples plus `model set`/`provider test`); `teton uninstall`, bare `teton`, `--help`/`-h`/`--version`/`-V`, `teton provider`/`policy`/`boundary`, `teton policy set …` → `CliRefused`; `teton is slow today`, `tetonx …`, `teton-code …`, `Teton …`, `teton help me read this backtrace` → byte-identical `Prompt`.
+- [x] `cli_e2e` AC-5/AC-6 tests as listed; assert absence of a model call by the scripted-reply-queue argument (deterministic), not a timer.
+      — `a_typed_teton_line_runs_the_row_it_names_and_costs_no_turn` diffs the two sessions' bodies and calls `assert_no_turn_ran` on both; `a_teton_line_with_no_session_form_is_refused_and_a_question_still_reaches_the_model` drives four lines through one session and pins the reply queue at exactly two turns (replies 1 and 2 present, reply 3 absent).
+- [x] `//teton provider list` still prompts the model with `/teton provider list` (REQ-555 BR-1b unaffected).
+      — unit (`the_double_slash_escape_still_outranks_recognition`) and e2e (the escaped line is one of the two turns that ran).
+- [x] The Notice line reads `teton provider list → /provider list` (rendered by the surface as `>> …`).
+      — `main::cli_line_note`; the e2e asserts the rendered `>> teton provider list → /provider list` and that the `/` spelling prints no such line.
+- [x] No `std::process::Command` and no second `Connection` anywhere in the recognition path (grep test or review note).
+      — review note: recognition ends in `slash::dispatch`, the same table lookup a `/` line reaches, on the session's own `Connection`; the arm in `main.rs` carries the invariant as a comment. `slash.rs` and `cli_rows.rs` name neither `std::process` nor `Connection::connect`.
 
 ## Technical Notes
 
 - Aliases: `cli_path` uses `find_subcommand`, which honours clap aliases/`visible_alias`; the row name is the canonical subcommand name (`get_name()`), so an aliased spelling still maps to the row.
 - Bare family (`teton policy`): clap's `try_parse_from(["teton","policy"])` errors with "requires a subcommand" and lists them — reuse that text (BR-3: same error as the shell).
 - OQ-1 (`/teton provider list`) is NOT implemented unless it is a one-line addition in `classify` (`/teton …` → treat as `teton …`); if added, test it; if not, leave OQ-1 open.
+
+## Deviations from the plan (recorded at implementation, LESSON-533)
+
+1. **A bare family does not get clap's rendered error.** The plan assumed
+   `Cli::try_parse_from(["teton","provider"])` produces the short "requires a
+   subcommand … [subcommands: …]" error. It does not: clap's derive marks a
+   required subcommand `arg_required_else_help`, so the result is
+   `DisplayHelpOnMissingArgumentOrSubcommand` — the **whole help page** for that
+   family, whose longest line is the global `--yes` description and whose
+   `Usage:`/"try '--help'" tail is a shell's instruction. BR-4 and ADR-1 both
+   say *one* refusing line, and `Surface::line` owns exactly one row (it
+   flattens newlines). So `cli_rows::refusal_for_path` composes one line —
+   and composes it from the **table** (`slash::rows_under`) rather than the
+   tree: `` `teton provider` is a family rather than a command — in this
+   session: /provider setup, /provider test, /provider list, /provider add. ``
+   That names the session-only `/provider setup`, which the CLI has no
+   subcommand for at all and which is the likeliest thing a user typing
+   `teton provider …` wants (BR-4's own note about it), and it keeps BR-3's
+   real property: no list maintained twice.
+2. **`teton model` is a `CliLine`, not a refusal.** The task listed `model`
+   among the bare families, but `model` *is* a row (`/model`, REQ-555's
+   one-line current-model answer), so ADR-1's first arm applies and the row
+   runs. A shell prints the family's help for those words because a shell has
+   no `/model`. Pinned by `a_family_word_that_is_itself_a_row_runs_that_row`.
+3. **`teton provider setup` is refused, not prompted.** BR-4 says a session-only
+   command "is a plain prompt". Under ADR-1's amended rule the walk stops on the
+   real family `provider`, so the line is intercepted — and the refusal names
+   `/provider setup`, which is strictly better than sending it to a model whose
+   guide tells it to say "run that yourself" (the failure this REQ removes).
+4. **The argument is taken by counting the path's words, not by
+   `match_name_words(rest, name)`.** `cli_path` honours clap aliases, so an
+   aliased spelling resolves to a row whose name does not prefix the typed line;
+   matching the row's name would silently drop that line's argument.
+   `after_words(rest, path.len())` cannot. No alias exists in the tree today, so
+   the two agree on every current input; the unit test pins the mechanism.
+5. **OQ-1 implemented** (it was one line) and marked RESOLVED in the
+   requirement.
