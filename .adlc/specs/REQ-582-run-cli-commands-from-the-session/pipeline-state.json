@@ -3,15 +3,21 @@
   "branch": "feat/REQ-582-run-cli-commands-from-the-session",
   "startedAt": "2026-08-18T13:12:46Z",
   "completed": false,
-  "currentPhase": 1,
+  "currentPhase": 2,
   "completedPhases": [
-    0
+    0,
+    1
   ],
   "phaseHistory": [
     {
       "phase": 0,
       "name": "Create Worktree",
       "completedAt": "2026-08-18T13:12:58Z"
+    },
+    {
+      "phase": 1,
+      "name": "Validate Spec",
+      "completedAt": "2026-08-18T13:14:20Z"
     }
   ],
   "integrationBranch": "main",

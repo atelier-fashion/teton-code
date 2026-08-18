@@ -1,7 +1,7 @@
 ---
 id: REQ-582
 title: "Every session-meaningful `teton` command runs from the session — no shell round-trip"
-status: draft
+status: approved
 deployable: true
 created: 2026-08-18
 updated: 2026-08-18
@@ -60,6 +60,11 @@ operate Teton:
    row exists, the session prints one line naming the `/` spelling. The
    surface nudge is the guarantee; the guide edit is the improvement
    (LESSON-532 — presence in context is not instruction-following).
+
+REQ-555, which built the slash table, deferred exactly this in its Out of
+Scope: "in-session management commands (`/provider`, `/boundary`, `/policy`)
+… follow the same shared-flow pattern if promoted later." This is that
+promotion, on the same pattern.
 
 This is about **user-typed** commands. It does not make the model run `teton`
 through its shell tool — REQ-581 / LESSON-535 established that the product
@@ -140,7 +145,10 @@ None. No daemon change: every row is a new call site of an existing method
       directions: a test proves every CLI subcommand with a row is reachable
       from a `teton …` line, that every subcommand without a row is refused,
       and that non-parsing `teton…` lines reach the prompt path unchanged
-      (informed by REQ-555 BR-8, LESSON-479 via it).
+      (informed by REQ-555 BR-8, LESSON-479 via it). Session-only
+      commands have no `teton` form, so `teton provider setup …` typed at
+      the prompt is a plain prompt — the model's own hand-off names
+      `/provider setup` (REQ-579 ADR-9).
 - [ ] BR-5: **A `CliLine` runs the row, not a subprocess.** Recognition never
       spawns the `teton` binary and never opens a second connection: it
       dispatches to the same handler `/<row>` dispatches to, over the
