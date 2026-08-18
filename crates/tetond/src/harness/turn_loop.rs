@@ -54,7 +54,7 @@ use super::context::{summarize_if_large, ContextManager, ProvenanceHook, APPROX_
 use super::digest::DIGEST_DUTY;
 use super::duty::DutyRoute;
 use super::permissions::{PermissionDecision, PermissionGate};
-use super::reply::StreamGate;
+use super::reply::{append_tool_call, StreamGate};
 use super::shell_duty::SHELL_DUTY;
 use super::tools::docs::bounded_topic_echo;
 use super::tools::{
@@ -736,17 +736,30 @@ pub async fn run_session_turn_with_source(
             TurnDecision::ToolCall { name, arguments } => {
                 // REQ-567 OQ-1: the block is pushed here and the permission gate
                 // is awaited below, so this is where a cancellation finds it.
-                // Whether the harness may later cut a call out of this text is
-                // decided by the source that produced it — the local tier parsed
-                // the call *from* the text, a remote provider delivered it
-                // beside the text — and is recorded now, while the answer is
-                // known. Re-deriving it at commit time would read a remote
-                // turn's ordinary JSON-quoting prose as a call and truncate it.
-                if call_in_text {
-                    ctx.push_model_call(text.clone());
+                //
+                // BUG-178: whichever source produced it, the block a tool-call
+                // turn pushes **ends with the call**. The local tier's reply
+                // already does — the call was parsed out of that text and kept
+                // through `clean_len`. A remote provider delivers the call as a
+                // structured event beside prose that is usually empty, and a
+                // block pushed as that prose alone was two defects at once: an
+                // empty assistant turn, which every remote provider refuses on
+                // the next request (Moonshot and Anthropic both answer 400 to
+                // it — the turn died as "invalid response"), and a transcript
+                // in which the model cannot see what it called. So the loop
+                // renders the call onto the prose, in the one grammar the
+                // system prompt teaches and `parse_reply` reads. `call_in_text`
+                // still says who put it there; what no longer varies is that it
+                // is there. Both shapes end with the call, which is exactly what
+                // lets a cancellation cut it — and only it — back out
+                // (`prose_before_tool_call`), leaving prose that merely quotes
+                // something call-shaped untouched.
+                let block = if call_in_text {
+                    text
                 } else {
-                    ctx.push_model(text.clone());
-                }
+                    append_tool_call(&text, &name, &arguments)
+                };
+                ctx.push_model_call(block);
                 let call = ToolCall {
                     id: format!("call-{turns}"),
                     name: name.clone(),
@@ -1493,6 +1506,137 @@ mod tests {
         }
     }
 
+    /// The remote provider's shape of `ToolThenEndSource`: the call arrives as a
+    /// structured decision beside **no prose at all** — what a native-tool
+    /// model most often sends — and `call_in_text` says so.
+    struct RemoteToolThenEndSource {
+        calls: usize,
+    }
+
+    #[async_trait]
+    impl CompletionSource for RemoteToolThenEndSource {
+        fn chat_format(&self) -> ChatFormat {
+            ChatFormat::Flat
+        }
+
+        async fn produce_turn(
+            &mut self,
+            _prompt: &PreparedPrompt,
+            _provenance: &EgressProvenance,
+            _config: &HarnessConfig,
+            _tools: &ToolRegistry,
+            _exposed: &[&str],
+            _on_token: &mut (dyn for<'s> FnMut(&'s str) + Send),
+        ) -> Result<SourceTurn, HarnessError> {
+            self.calls += 1;
+            let (text, decision) = if self.calls == 1 {
+                (
+                    String::new(),
+                    TurnDecision::ToolCall {
+                        name: "read".to_owned(),
+                        arguments: serde_json::json!({ "path": "nope.txt" }),
+                    },
+                )
+            } else {
+                (
+                    "Done.".to_owned(),
+                    TurnDecision::EndTurn {
+                        final_text: "Done.".to_owned(),
+                    },
+                )
+            };
+            Ok(SourceTurn {
+                text,
+                decision,
+                usage: TokenUsage::default(),
+                dropped_calls: 0,
+                cache: None,
+                call_in_text: false,
+            })
+        }
+    }
+
+    /// **BUG-178, through the loop.** A remote provider answered with a native
+    /// tool call and no prose; the tool ran; the next request to that provider
+    /// carried `{"role":"assistant","content":""}` and was refused with a 400
+    /// (Moonshot: "the message … with role 'assistant' must not be empty";
+    /// Anthropic has the same rule), which the session surfaced as
+    /// `degraded: kimi (invalid response) — no fallback configured`. The
+    /// transcript also held no record of what the model had called.
+    ///
+    /// After the fix, the assistant block for that turn is the call itself,
+    /// rendered in the reply grammar, and the prompt the next request is built
+    /// from has no empty message in it.
+    #[tokio::test]
+    async fn a_remote_tool_call_with_no_prose_is_recorded_as_the_call_not_a_blank_turn() {
+        use crate::harness::context::BlockRole;
+
+        let session_id = SessionId::from("bug178");
+        let bus = Arc::new(EventBus::new());
+        let gate = PermissionGate::new(
+            session_id.clone(),
+            PermissionConfig::permissive(),
+            Arc::clone(&bus),
+            Arc::new(PendingPermissions::new()),
+        );
+        let events = SessionEvents::new(Arc::clone(&bus), session_id);
+        let config = HarnessConfig::default();
+        let tools = ToolRegistry::with_builtins();
+        let tool_ctx = ToolContext::new(std::env::temp_dir());
+        let mut hook = NoopProvenanceHook;
+        let mut ctx = ContextManager::new("sys", config.context_budget_tokens);
+        ctx.push_user("what is in nope.txt");
+
+        let mut source = RemoteToolThenEndSource { calls: 0 };
+        let outcome = run_session_turn_with_source(
+            &mut source,
+            &tools,
+            &tool_ctx,
+            &gate,
+            &events,
+            &mut ctx,
+            &config,
+            &mut hook,
+            &DutyRoute::unresolved("no digest route in this test"),
+            &DutyRoute::unresolved("no compact route in this test"),
+            &ToolDuties {
+                triage: &DutyRoute::unresolved("no triage route in this test"),
+                shell: &DutyRoute::unresolved("no shell route in this test"),
+            },
+        )
+        .await
+        .expect("the turn completes");
+        assert_eq!(outcome.stop_reason, StopReason::EndTurn);
+        assert_eq!(
+            source.calls, 2,
+            "non-vacuity: the tool result was folded and the model called again"
+        );
+
+        let assistant: Vec<&str> = ctx
+            .blocks()
+            .iter()
+            .filter(|b| b.role == BlockRole::Assistant)
+            .map(|b| b.text.as_str())
+            .collect();
+        assert_eq!(
+            assistant,
+            [
+                r#"{"tool":"read","arguments":{"path":"nope.txt"}}"#,
+                "Done."
+            ],
+            "the tool-call turn must be recorded as the call it made"
+        );
+
+        // What the second request was built from — the exact prompt shape the
+        // remote source maps onto the wire.
+        let prepared = ctx.prepare(&mut hook);
+        assert!(
+            prepared.messages.iter().all(|m| !m.text.trim().is_empty()),
+            "an empty message reached the request: {:?}",
+            prepared.messages
+        );
+    }
+
     /// **REQ-561 ADR-4, through the loop itself.** The thing that keeps a
     /// context under budget is the loop's own unconditional
     /// `truncate_to_budget()`, not the `compact` duty that runs ahead of it.
@@ -1727,17 +1871,21 @@ mod tests {
         }
     }
 
-    /// A source that calls a tool once, whose reply text is the same prose
-    /// either way and whose `call_in_text` says where the call came from.
+    /// A source that calls a tool once, in one of the two shapes a source can
+    /// deliver a call in: embedded in its text the way the local tier's reply
+    /// is (`call_in_text: true` — prose then the call), or beside the text the
+    /// way a remote provider's structured event is (`false` — prose only, and
+    /// the loop renders the call on).
     ///
-    /// The text quotes tool-call-*shaped* JSON on purpose: it is what a model
-    /// naming a crate writes, and it is what a trim that re-derived "is there a
-    /// call here" from the text would cut the block at.
+    /// The prose quotes tool-call-*shaped* JSON on purpose: it is what a model
+    /// naming a crate writes, and it is what a trim that took the *first*
+    /// call-shaped object for the call would cut the block at.
     struct ParkingSource {
         call_in_text: bool,
     }
 
     const PARKED_PROSE: &str = r#"The manifest pins {"name": "serde", "version": "1"}."#;
+    const PARKED_CALL: &str = r#"{"tool":"read","arguments":{"path":"Cargo.toml"}}"#;
 
     #[async_trait]
     impl CompletionSource for ParkingSource {
@@ -1754,8 +1902,13 @@ mod tests {
             _exposed: &[&str],
             _on_token: &mut (dyn for<'s> FnMut(&'s str) + Send),
         ) -> Result<SourceTurn, HarnessError> {
+            let text = if self.call_in_text {
+                format!("{PARKED_PROSE} {PARKED_CALL}")
+            } else {
+                PARKED_PROSE.to_owned()
+            };
             Ok(SourceTurn {
-                text: PARKED_PROSE.to_owned(),
+                text,
                 decision: TurnDecision::ToolCall {
                     name: "read".to_owned(),
                     arguments: serde_json::json!({ "path": "Cargo.toml" }),
@@ -1770,13 +1923,13 @@ mod tests {
 
     /// Drive the loop until it parks at an unanswered permission prompt, drop it
     /// there, and report whether the context is left holding an undispatched
-    /// call.
+    /// call, together with the text of the block it pushed.
     ///
     /// Polled by hand rather than raced against a timer: everything before the
     /// gate is ready on the first poll, so one poll returning `Pending` *is* the
     /// state "parked at the gate" — no wall-clock window to go flaky under CI
     /// scheduler pressure (LESSON-450).
-    fn pending_call_when_dropped_at_the_gate(call_in_text: bool) -> bool {
+    fn parked_at_the_gate(call_in_text: bool) -> (bool, String) {
         let session_id = SessionId::from("oq1-park");
         let bus = Arc::new(EventBus::new());
         let gate = PermissionGate::new(
@@ -1826,34 +1979,56 @@ mod tests {
             // The client disconnected: the turn is dropped where it stands.
         }
 
-        assert_eq!(
-            ctx.blocks().last().map(|b| b.text.as_str()),
-            Some(PARKED_PROSE),
-            "non-vacuity: the parked turn must have pushed its reply"
-        );
-        ctx.pending_tool_call()
+        let last = ctx
+            .blocks()
+            .last()
+            .map(|b| b.text.clone())
+            .expect("non-vacuity: the parked turn must have pushed its reply");
+        (ctx.pending_tool_call(), last)
     }
 
-    /// **REQ-567 OQ-1's scope, at the wiring.** Whether a cancellation may cut a
-    /// call out of the trailing block is decided by the *source*, not by
-    /// re-reading the text — and the loop is what carries that answer across.
+    /// **REQ-567 OQ-1's scope, at the wiring — as BUG-178 left it.** A
+    /// tool-call turn parked at the gate leaves its call pending *whichever
+    /// source produced it*, and the block it pushed **ends with the call** in
+    /// both shapes: the local tier's reply carried it already, and the loop
+    /// rendered the remote provider's structured call onto its prose. That
+    /// trailing position is what lets the cancellation trim cut the call — and
+    /// only the call — out of prose that quotes something call-shaped.
     ///
-    /// Two turns that are byte-identical in context differ only in where their
-    /// call came from: the local tier parsed it out of the text (so the text
-    /// holds it, and OQ-1 trims it), a remote provider delivered it as a
-    /// structured event (so the text is prose, and there is nothing to trim).
-    /// Hard-wiring either answer turns exactly one of these red.
+    /// Before BUG-178 the remote shape was pushed as its bare prose with nothing
+    /// pending, and a model that said nothing before calling (the common case)
+    /// left an *empty* assistant turn in the transcript — which every remote
+    /// provider refuses on the next request, and which a cancellation would
+    /// have committed into every later prompt of the session.
     #[tokio::test]
-    async fn only_a_call_the_source_found_in_the_text_is_left_pending_at_the_gate() {
+    async fn a_parked_tool_call_is_pending_and_its_block_ends_with_the_call() {
+        let (pending, block) = parked_at_the_gate(true);
         assert!(
-            pending_call_when_dropped_at_the_gate(true),
+            pending,
             "a local turn parked at the gate must leave its call pending, or the \
              cancellation commits a call the transcript never answers"
         );
+        assert_eq!(
+            block,
+            format!("{PARKED_PROSE} {PARKED_CALL}"),
+            "the local tier's block is its reply text, unaltered"
+        );
+
+        let (pending, block) = parked_at_the_gate(false);
         assert!(
-            !pending_call_when_dropped_at_the_gate(false),
-            "a remote turn's prose was marked as holding a call: the cancellation \
-             trim would truncate it at the JSON it merely quotes"
+            pending,
+            "a remote turn parked at the gate must leave its call pending, or the \
+             cancellation commits the call it never ran"
+        );
+        assert_eq!(
+            block,
+            format!("{PARKED_PROSE}\n{PARKED_CALL}"),
+            "a remote turn's block is its prose with the structured call rendered on"
+        );
+        assert_eq!(
+            crate::harness::reply::prose_before_tool_call(&block),
+            Some(&*format!("{PARKED_PROSE}\n")),
+            "the trim must find the rendered call, not the JSON the prose quotes"
         );
     }
 

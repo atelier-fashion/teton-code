@@ -195,14 +195,17 @@ impl CarriedTurn {
     /// [`ContextManager::pending_tool_call`](crate::harness::context::ContextManager::pending_tool_call),
     /// which the turn loop sets when it pushes a block whose text embeds an
     /// undispatched call and clears the moment the tool returns. It is
-    /// deliberately **not** re-derived here by asking whether the trailing text
-    /// parses as a call, because that question has two wrong answers:
+    /// deliberately **not** re-derived here by asking whether the text contains
+    /// something call-shaped, because that question has two wrong answers:
     ///
-    /// - A *remote* turn's call arrives as a structured `TurnEvent::ToolCall`
-    ///   and is never in the text, so a cancelled remote turn whose prose
-    ///   happens to quote `{"name": "serde", "version": "1"}` would be truncated
-    ///   at that JSON — discarding it and everything after, content the user
-    ///   watched stream.
+    /// - A turn's prose may *quote* something call-shaped —
+    ///   `{"name": "serde", "version": "1"}` — and a remote provider's real
+    ///   call is rendered onto the end of exactly such prose (BUG-178). Reading
+    ///   the first call-shaped object as "the call" would truncate a cancelled
+    ///   remote turn at the quote, discarding it and everything after — content
+    ///   the user watched stream. The trim therefore cuts only the **trailing**
+    ///   call ([`prose_before_tool_call`]), which is where the loop puts it for
+    ///   every source.
     /// - A call whose tool **already ran** is not incomplete work. A
     ///   cancellation landing in the refine or digest awaits that follow
     ///   dispatch commits the call block as it stands: an `edit` that reached
@@ -450,11 +453,12 @@ mod tests {
     }
 
     /// **The remote path, at the same gate — the regression this gate exists
-    /// for.** A remote provider delivers its call as a structured event, so the
-    /// loop pushes the prose through `push_model` and nothing is pending. That
-    /// prose may itself quote tool-call-*shaped* JSON, and it is ordinary
-    /// content the user watched stream: a trim that re-derived "is this a call"
-    /// from the text would truncate the block there and discard the rest.
+    /// for.** A remote provider delivers its call as a structured event; the
+    /// loop renders it onto the end of the prose and pushes that as the
+    /// pending block (BUG-178). The prose may itself quote tool-call-*shaped*
+    /// JSON, and it is ordinary content the user watched stream: a trim that
+    /// took the *first* call-shaped object for "the call" would truncate the
+    /// block at the quote and discard the rest. The trailing call is what goes.
     #[test]
     fn a_cancelled_remote_turn_keeps_prose_that_merely_looks_like_a_call() {
         let (sessions, session_id) = one_session();
@@ -463,13 +467,47 @@ mod tests {
         {
             let mut turn = begin_turn(&sessions, &session_id);
             // Exactly what the loop does for `call_in_text == false`.
-            turn.ctx_mut().push_model(PROSE);
+            turn.ctx_mut()
+                .push_model_call(crate::harness::reply::append_tool_call(
+                    PROSE,
+                    "read",
+                    &serde_json::json!({ "path": "Cargo.toml" }),
+                ));
         }
         let conversation = sessions.conversation_snapshot(&session_id);
         assert_eq!(
             texts(conversation.blocks()),
             ["do the thing", PROSE],
-            "a cancelled remote turn's prose was mutilated at the JSON it quoted"
+            "a cancelled remote turn's prose was mutilated at the JSON it quoted, or \
+             committed with the call it never ran"
+        );
+    }
+
+    /// **BUG-178, at the gate.** The commonest remote tool-call turn has no
+    /// prose at all. Its pending block is the bare rendered call, and a
+    /// cancellation drops that block whole — never a blank assistant turn,
+    /// which the next request would carry to a provider that refuses it.
+    #[test]
+    fn a_cancelled_remote_call_with_no_prose_leaves_no_blank_turn_behind() {
+        let (sessions, session_id) = one_session();
+        {
+            let mut turn = begin_turn(&sessions, &session_id);
+            turn.ctx_mut()
+                .push_model_call(crate::harness::reply::append_tool_call(
+                    "",
+                    "shell",
+                    &serde_json::json!({ "command": "ls" }),
+                ));
+        }
+        let conversation = sessions.conversation_snapshot(&session_id);
+        assert_eq!(
+            texts(conversation.blocks()),
+            ["do the thing"],
+            "the cancelled call left an assistant turn behind"
+        );
+        assert!(
+            conversation.blocks().iter().all(|b| !b.text.is_empty()),
+            "no committed block may be empty"
         );
     }
 
