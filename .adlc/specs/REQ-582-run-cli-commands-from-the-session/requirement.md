@@ -130,22 +130,28 @@ None. No daemon change: every row is a new call site of an existing method
       parser of `teton …` lines anywhere in the client (informed by
       LESSON-529 — a display helper is a second parser; two parsers of one
       string drift into a lie on screen).
-- [ ] BR-4: **Recognition is strict and total.** A prompt line is a
-      `CliLine` iff its first shell-split token is `teton` **and** the rest
-      parses under the CLI parser as a complete subcommand with valid
-      arguments and nothing trailing. Then: a row exists → run it and print
-      one line `>> teton <sub> → /<row>` first; no row (`uninstall`, bare
-      `teton`, `--version`, `--help`) → one refusing line naming why and the
-      shell pointer, never forwarded to the model (the BUG-146 shape: the
-      harness was asked and something else answered — REQ-555 BR-2). Any
-      other `teton…` line ("teton is slow today", "teton provider list shows
-      nothing, why?") is a plain prompt, byte-identical to today. REQ-555
-      BR-8's totality is amended from three buckets to four (command, CLI
-      line, escaped prompt, plain prompt) and stays pinned in both
-      directions: a test proves every CLI subcommand with a row is reachable
-      from a `teton …` line, that every subcommand without a row is refused,
-      and that non-parsing `teton…` lines reach the prompt path unchanged
-      (informed by REQ-555 BR-8, LESSON-479 via it). Session-only
+- [ ] BR-4: **Recognition is strict and total.** A prompt line is a CLI
+      line iff its first whitespace token is `teton` **and** the following
+      tokens name a subcommand path in the CLI parser's own tree (`provider
+      list`, `policy set-tier`, `doctor` …). Then: the path names a row → run
+      it and print one line `>> teton <sub> → /<row>` first, the row's own
+      grammar (clap) validating whatever follows the path — a stray or bad
+      argument prints the parser's own error, never a prompt; the path names
+      no row (`uninstall`, a bare family such as `teton provider`) or the
+      line is `teton` alone / `teton --help` / `teton --version` → one
+      refusing line naming why and the shell pointer, never forwarded to the
+      model (the BUG-146 shape: the harness was asked and something else
+      answered — REQ-555 BR-2). Any `teton…` line whose next token is not a
+      subcommand ("teton is slow today") is a plain prompt, byte-identical to
+      today. REQ-555 BR-8's totality is amended — the classifier gains the
+      recognized and refused CLI-line outcomes beside command, escaped
+      prompt and plain prompt — and stays pinned in both directions: a test
+      proves every CLI subcommand with a row is reachable from a `teton …`
+      line, that every subcommand without a row is refused, and that
+      non-subcommand `teton…` lines reach the prompt path unchanged; a
+      completeness test walks the parser's tree so every leaf subcommand is
+      either a row or an explicit shell-only exception (informed by REQ-555
+      BR-8, LESSON-479 via it; amended at architecture, ADR-1/ADR-8). Session-only
       commands have no `teton` form, so `teton provider setup …` typed at
       the prompt is a plain prompt — the model's own hand-off names
       `/provider setup` (REQ-579 ADR-9).
@@ -230,7 +236,12 @@ None. No daemon change: every row is a new call site of an existing method
 - [ ] AC-6: Typing `teton uninstall` prints one refusing line naming the
       shell pointer and makes no call; typing `teton is slow today` reaches
       the model as a prompt with the bytes unchanged; typing `teton provider
-      list please` reaches the model as a prompt (strict parse).
+      list please` is recognized (its subcommand path is a row) and prints
+      the CLI parser's own `unexpected argument 'please'` — never a prompt.
+      *(Amended at architecture, ADR-1: a recognisable command with a stray
+      word sent to the model reproduces the failure this REQ removes; the
+      subcommand path is decided by clap's tree, the arguments by clap's
+      grammar.)*
 - [ ] AC-7: `/policy set-tier build` (missing arg) and `/policy set-tier
       summit kimi` (bad enum) print the CLI parser's own error for that
       subcommand — the same text `teton policy set-tier build` prints — and
@@ -292,6 +303,11 @@ None. No daemon change: every row is a new call site of an existing method
       set` writes; adding `/model list` and `/model status` — should bare
       `/model` stay concise or become `model status`? Proposal: stay concise
       (REQ-555 BR-4 chose it deliberately); `status` is the full form.
+- [ ] OQ-5: Quoted arguments. Session-side tokenization is whitespace only
+      (ADR-2) — no quote or backslash processing — because no mirrored
+      subcommand takes a whitespace-bearing value and a shell-words
+      dependency was not budgeted. Revisit if a `boundary add` glob with a
+      space is ever asked for.
 - [ ] OQ-4: Should `teton --version` typed in-session print the client and
       daemon versions (cheap and useful after an upgrade) rather than be
       refused? Proposal: yes, as a `/version` row — but only if it costs no
