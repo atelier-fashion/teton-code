@@ -349,7 +349,9 @@ pub(crate) fn run(
         | ProviderTestOutcome::UnknownModel { .. }
         | ProviderTestOutcome::RateLimited { .. }
         | ProviderTestOutcome::ServerError { .. }
-        | ProviderTestOutcome::Unreachable { .. } => snapshot,
+        | ProviderTestOutcome::Unreachable { .. }
+        | ProviderTestOutcome::NotACompletion { .. }
+        | ProviderTestOutcome::TimedOut { .. } => snapshot,
     };
 
     for line in report_lines(&result, &snapshot) {
@@ -440,14 +442,29 @@ fn preview_lines(provider: &ProviderConfig) -> Vec<String> {
 ///
 /// Exhaustive rather than a lookup, so a new [`ProviderTestOutcome`] variant
 /// cannot reach a surface without somebody deciding what it is called.
-fn outcome_verb(outcome: &ProviderTestOutcome) -> &'static str {
+///
+/// A `String` rather than a `&'static str` for exactly one variant's sake:
+/// [`ProviderTestOutcome::TimedOut`]'s verdict *is* the bound it stopped at, and
+/// that figure is a typed field on the outcome. Composing it here is the
+/// opposite of the prose-reading BR-3 forbids — the number travelled as a
+/// number, and this is the one place it becomes words.
+fn outcome_verb(outcome: &ProviderTestOutcome) -> String {
     match outcome {
-        ProviderTestOutcome::Reached { .. } => "reachable",
-        ProviderTestOutcome::Refused { .. } => "refused",
-        ProviderTestOutcome::UnknownModel { .. } => "model unknown",
-        ProviderTestOutcome::RateLimited { .. } => "rate limited",
-        ProviderTestOutcome::ServerError { .. } => "server error",
-        ProviderTestOutcome::Unreachable { .. } => "unreachable",
+        ProviderTestOutcome::Reached { .. } => "reachable".to_owned(),
+        ProviderTestOutcome::Refused { .. } => "refused".to_owned(),
+        ProviderTestOutcome::UnknownModel { .. } => "model unknown".to_owned(),
+        ProviderTestOutcome::RateLimited { .. } => "rate limited".to_owned(),
+        ProviderTestOutcome::ServerError { .. } => "server error".to_owned(),
+        ProviderTestOutcome::Unreachable { .. } => "unreachable".to_owned(),
+        // Three verdicts where there used to be one, because they are three
+        // different next moves: check the address, check the path, wait or
+        // check whether the vendor is up.
+        ProviderTestOutcome::NotACompletion { .. } => {
+            "answered, but not with a completion".to_owned()
+        }
+        ProviderTestOutcome::TimedOut { after_secs, .. } => {
+            format!("no answer within {after_secs} s")
+        }
     }
 }
 
@@ -487,7 +504,9 @@ pub(crate) fn outcome_sentence(outcome: &ProviderTestOutcome) -> String {
         ProviderTestOutcome::Refused { reason, .. }
         | ProviderTestOutcome::UnknownModel { reason, .. }
         | ProviderTestOutcome::ServerError { reason, .. }
-        | ProviderTestOutcome::Unreachable { reason } => {
+        | ProviderTestOutcome::Unreachable { reason }
+        | ProviderTestOutcome::NotACompletion { reason }
+        | ProviderTestOutcome::TimedOut { reason, .. } => {
             format!("{verb} — {reason}. Nothing else was sent")
         }
         ProviderTestOutcome::RateLimited { retry_after_secs } => {
@@ -554,7 +573,9 @@ fn report_lines(result: &ProviderTestResult, snapshot: &ConfigSnapshot) -> Vec<S
         ProviderTestOutcome::UnknownModel { .. }
         | ProviderTestOutcome::RateLimited { .. }
         | ProviderTestOutcome::ServerError { .. }
-        | ProviderTestOutcome::Unreachable { .. } => {}
+        | ProviderTestOutcome::Unreachable { .. }
+        | ProviderTestOutcome::NotACompletion { .. }
+        | ProviderTestOutcome::TimedOut { .. } => {}
     }
     lines
 }
@@ -1040,7 +1061,7 @@ mod tests {
     /// is carried verbatim. Asserted by variant, never by parsing prose.
     #[test]
     fn every_outcome_variant_renders_its_own_line() {
-        let cases: [(ProviderTestOutcome, &str, &str); 6] = [
+        let cases: [(ProviderTestOutcome, &str, &str); 8] = [
             (
                 reached(),
                 "reachable",
@@ -1081,10 +1102,32 @@ mod tests {
             ),
             (
                 ProviderTestOutcome::Unreachable {
-                    reason: "could not reach api.moonshot.ai: timeout".to_owned(),
+                    reason: "could not reach api.moonshot.ai: a transport failure".to_owned(),
                 },
                 "unreachable",
-                "could not reach api.moonshot.ai: timeout",
+                "could not reach api.moonshot.ai: a transport failure",
+            ),
+            (
+                ProviderTestOutcome::NotACompletion {
+                    reason: "api.moonshot.ai answered, but not with a completion (no tokens, no \
+                             text)"
+                        .to_owned(),
+                },
+                "answered, but not with a completion",
+                "api.moonshot.ai answered, but not with a completion",
+            ),
+            (
+                ProviderTestOutcome::TimedOut {
+                    after_secs: 30,
+                    // The figure the verdict states comes from `after_secs`, not
+                    // from this sentence — which is why the sentence does not
+                    // carry one (BR-3).
+                    reason: "nothing came back from api.moonshot.ai before the test stopped \
+                             waiting"
+                        .to_owned(),
+                },
+                "no answer within 30 s",
+                "nothing came back from api.moonshot.ai",
             ),
         ];
 
@@ -1105,8 +1148,11 @@ mod tests {
             verdicts.push(verb);
         }
 
-        // Distinct, which is the claim: six outcomes must not collapse into one
-        // word a reader cannot act on differently.
+        // Distinct, which is the claim: eight outcomes must not collapse into one
+        // word a reader cannot act on differently. The last three are the point
+        // of the split — "nothing answered", "something answered wrongly" and
+        // "nothing answered in time" are three different next moves, and one
+        // verdict word covering them would put the reader back to parsing prose.
         let mut unique = verdicts.clone();
         unique.sort_unstable();
         unique.dedup();
@@ -1257,6 +1303,13 @@ mod tests {
             },
             ProviderTestOutcome::RateLimited {
                 retry_after_secs: None,
+            },
+            ProviderTestOutcome::NotACompletion {
+                reason: "api.moonshot.ai answered, but not with a completion".to_owned(),
+            },
+            ProviderTestOutcome::TimedOut {
+                after_secs: 30,
+                reason: "nothing came back from api.moonshot.ai".to_owned(),
             },
         ] {
             let mut io = FakeIo::new(&[]);

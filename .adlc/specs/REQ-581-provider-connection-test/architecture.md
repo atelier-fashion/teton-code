@@ -75,7 +75,7 @@ COLUMN`, DDL, no row rewritten, append-only trigger untouched — REQ-564's
 | Type | Direction | Fields |
 |---|---|---|
 | `ProviderTestParams` | C→D | `session_id`, `provider_id` |
-| `ProviderTestOutcome` | D→C | `reached { latency_ms, input_tokens, output_tokens, usd_micros: Option<i64> }` \| `refused { status, reason }` \| `unknown_model { status, reason }` \| `rate_limited { retry_after_secs: Option<u64> }` \| `server_error { status, reason }` \| `unreachable { reason }` — `#[serde(tag = "outcome", rename_all = "snake_case")]` |
+| `ProviderTestOutcome` | D→C | `reached { latency_ms, input_tokens, output_tokens, usd_micros: Option<i64> }` \| `refused { status, reason }` \| `unknown_model { status, reason }` \| `rate_limited { retry_after_secs: Option<u64> }` \| `server_error { status, reason }` \| `unreachable { reason }` \| `not_a_completion { reason }` \| `timed_out { after_secs: u64, reason }` — `#[serde(tag = "outcome", rename_all = "snake_case")]` (*amended at verify: the last two split out of `unreachable`, which now carries only "nothing answered"*) |
 | `ProviderTestResult` | D→C | `provider_id`, `model`, `dial_host` (the dial-time reading, LESSON-529), `outcome`, `health_after: ProviderHealth` |
 | `Event::ProviderTested` | D→clients | `provider_id`, `outcome`, `health_after` — session scope from the envelope (the ProviderSetupCompleted precedent: no payload `session_id`) |
 | `CostRecord.probe` | D→C | `bool`, `#[serde(default, skip_serializing_if = "not")]` — an old client reads the same bytes it always did |
@@ -151,6 +151,8 @@ already draws these lines for retry/fallback; this names them for a person):
 | other 4xx | `refused { status }` |
 | 5xx | `server_error { status }` — the vendor answered and is failing |
 | Timeout / Transport / MalformedResponse | `unreachable` — "could not reach `<host>`: <class>" |
+| a 2xx/3xx that completed nothing | `not_a_completion` — a host is listening and the *path* is the suspect (*amended at verify*) |
+| the probe's own deadline elapsed | `timed_out { after_secs }` — the bound is a typed field, not a figure inside the sentence (*amended at verify*) |
 | `EffortRefused` | cannot occur — the probe sends no effort field (`ResolvedEffort` omitted) |
 | `PrivacyBlocked` | cannot occur — empty provenance, constant payload |
 
@@ -203,10 +205,20 @@ grant or awaits a human, wrong for a billed request whose only durable record
 is the row and event written when the stream ends (REQ-565's exact hole for
 turns). The probe's task now joins the drained list. And because the turn
 path's "no timeout" posture does not transfer to a fixed 8-token request, the
-probe carries `PROBE_DEADLINE`; elapse is `unreachable` and moves health as a
-`Timeout` would. A 2xx/3xx that is not a completion (a redirect not followed,
-a non-streaming or non-chat endpoint — the adapters synthesize a terminal
-`Completed` for those) is `unreachable`, not `reached`, and touches no health.
+probe carries `PROBE_DEADLINE`; elapse is `timed_out { after_secs }` and moves
+health as a `Timeout` would. A 2xx/3xx that is not a completion (a redirect not
+followed, a non-streaming or non-chat endpoint — the adapters synthesize a
+terminal `Completed` for those) is `not_a_completion`, not `reached`, and
+touches no health.
+
+*Amended at verify*: both of those endings were first reported as `unreachable`
+with a distinguishing `reason`, which is the prose-reading BR-3 exists to
+prevent. They are now their own outcomes, so `unreachable` means "nothing
+answered" and the three send a reader to three different places: check the
+address, check the path, wait or check whether the vendor is up. `after_secs` is
+the bound the call actually waited out (the deadline parameter, not the
+compiled-in constant), typed, so the surface renders "no answer within 30 s"
+from a value rather than from a duration inside a sentence.
 
 ### ADR-5 — The shell subcommand opens a session
 

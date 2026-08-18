@@ -2276,11 +2276,51 @@ pub enum ProviderTestOutcome {
         /// The daemon's sentence for it.
         reason: String,
     },
-    /// Nothing answered — DNS, TCP, TLS, a timeout, or a response that could
-    /// not be parsed as one. The bytes may never have left; what is known is
-    /// that the host did not complete a conversation.
+    /// **Nothing answered** — DNS, TCP, TLS, a closed port, or bytes that could
+    /// not be read as a response at all. The request may never have left; what
+    /// is known is that no conversation happened.
+    ///
+    /// The two facts this variant used to carry in prose are their own variants
+    /// now, because a client that had to read a sentence to tell them apart is
+    /// the thing BR-3 exists to prevent (LESSON-456): something *did* answer, and
+    /// not with a completion, is [`Self::NotACompletion`]; nothing answered
+    /// *within the deadline* is [`Self::TimedOut`]. Each of the three sends the
+    /// user somewhere different — check the address, check the path, check
+    /// whether the vendor is up.
     Unreachable {
         /// The daemon's sentence, naming the host and the failure class.
+        reason: String,
+    },
+    /// **Something answered, and it was not a completion.** The status was one a
+    /// turn would have accepted (a 2xx or a 3xx) and what came back carried no
+    /// text, no tool call and no tokens.
+    ///
+    /// A redirect that is deliberately not followed, an endpoint that does not
+    /// stream, an endpoint that is not a chat-completions endpoint at all: a
+    /// host is listening and the *path* is the suspect. Distinct from
+    /// [`Self::Unreachable`] because the remedy is a different one: the address
+    /// resolved and something is up, so there is nothing wrong with the address.
+    ///
+    /// It is emphatically not [`Self::Reached`]: a green answer for an endpoint
+    /// no turn can use is this test's worst possible failure.
+    NotACompletion {
+        /// The daemon's sentence, naming the host that answered wrongly.
+        reason: String,
+    },
+    /// **Nothing answered within the test's own deadline.** The connection may
+    /// have been accepted; no completion arrived before the probe stopped
+    /// waiting.
+    ///
+    /// Separate from [`Self::Unreachable`] because "did not answer *yet*" and
+    /// "could not be reached" are different facts about a provider — the first
+    /// is a host that is up and slow — and separate from a transport-level
+    /// timeout, which is the transport's own verdict rather than this test's.
+    TimedOut {
+        /// The bound the test stopped at, in whole seconds — a *typed* figure
+        /// rather than a number a client has to find in prose, since telling
+        /// "slow" from "not answering" is the whole reason this variant exists.
+        after_secs: u64,
+        /// The daemon's sentence, naming the host that did not answer.
         reason: String,
     },
 }
@@ -4113,6 +4153,26 @@ mod tests {
                 },
                 "unreachable",
             ),
+            (
+                // The three facts `unreachable` used to carry between them, now
+                // one variant each: nothing answered, something answered wrongly,
+                // and nothing answered in time.
+                ProviderTestOutcome::NotACompletion {
+                    reason: "api.moonshot.ai answered, but not with a completion (no tokens, no \
+                             text)"
+                        .to_owned(),
+                },
+                "not_a_completion",
+            ),
+            (
+                ProviderTestOutcome::TimedOut {
+                    after_secs: 30,
+                    reason: "nothing came back from api.moonshot.ai before the test stopped \
+                             waiting"
+                        .to_owned(),
+                },
+                "timed_out",
+            ),
         ];
 
         for (outcome, expected) in cases {
@@ -4141,6 +4201,16 @@ mod tests {
             ["outcome"],
             "a v1 rate-limit answer is the tag and nothing else: {limited}"
         );
+
+        // The deadline the test stopped at rides as a **number** beside its tag.
+        // A client renders "no answer within 30 s" from this field; finding the
+        // figure inside `reason` would be the prose-reading BR-3 forbids.
+        let timed_out = serde_json::to_value(ProviderTestOutcome::TimedOut {
+            after_secs: 30,
+            reason: "nothing came back before the test stopped waiting".to_owned(),
+        })
+        .unwrap();
+        assert_eq!(timed_out["after_secs"], 30, "{timed_out}");
     }
 
     /// The `provider/test` call and its answer round-trip, and the answer names

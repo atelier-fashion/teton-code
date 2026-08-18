@@ -52,9 +52,16 @@ user having asked for it.
   naming the credential **reference**, `keychain://teton/kimi`, never the key
   itself), *model unknown* (404, naming the model string your config declares),
   *rate limited* (429), *server error* (5xx — the vendor answered and is
-  failing, so your configuration is not the suspect), or *unreachable* (DNS,
-  TCP, TLS, a timeout). No response body and no header is ever echoed into
-  your transcript.
+  failing, so your configuration is not the suspect), *unreachable* (nothing
+  answered at all: DNS, TCP, TLS, a closed port), *answered, but not with a
+  completion* (something is listening and it is not a chat endpoint — a
+  redirect, a non-streaming endpoint, an address pasted without its
+  `/v1/chat/completions` path), or *no answer within 30 s* (the connection was
+  taken and nothing came back before the test stopped waiting). Those last
+  three are three different next moves — check the address, check the path,
+  check whether the vendor is up — so they are three different answers rather
+  than one word with three sentences. No response body and no header is ever
+  echoed into your transcript.
 
   A test moves the same health the router reads, so a provider an earlier
   failure had pushed aside is routable again on your very next turn once it

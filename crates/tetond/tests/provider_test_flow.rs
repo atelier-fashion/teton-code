@@ -29,7 +29,7 @@
 //! |---------|------|
 //! | AC-1 (reached: latency, tokens, recorded cost; one probe row in `teton cost`), AC-5 (health, and the next turn routes there), BR-1, BR-4, BR-5 | [`a_reached_test_reports_what_came_back_bills_one_probe_and_leaves_the_provider_routable`] |
 //! | AC-2 (401 names the credential *reference*, never its value; no ledger row), AC-3 (404 / 429 / 5xx / closed port are four distinct typed outcomes), BR-3 | [`every_way_the_call_can_fail_is_its_own_typed_outcome_and_bills_nothing`] |
-//! | verify F1 (a 2xx/3xx that completed nothing is `unreachable`, never a green `reached`) | [`an_endpoint_that_answers_without_completing_is_unreachable_not_reached`] |
+//! | verify F1 (a 2xx/3xx that completed nothing is `not_a_completion`, never a green `reached`) | [`an_endpoint_that_answers_without_completing_is_its_own_outcome_not_reached`] |
 //! | AC-6 (a connection that did not attach the session is refused and nothing is dialed) | [`a_connection_that_did_not_attach_the_session_is_refused_before_anything_is_dialed`] |
 //! | AC-7 (a `kind = "local"` provider is refused with the tier's state, not tested), BR-8 | [`a_local_provider_is_refused_with_its_own_state_and_nothing_is_dialed`] |
 //!
@@ -697,7 +697,8 @@ fn every_way_the_call_can_fail_is_its_own_typed_outcome_and_bills_nothing() {
 // ---------------------------------------------------------------------------
 
 /// **Verify F1, over the socket.** A `200` that is not a completion stream, and
-/// a `301` that is not followed, are both `unreachable` — never `reached`.
+/// a `301` that is not followed, are both `not_a_completion` — never `reached`,
+/// and never the `unreachable` a host that answered nothing at all earns.
 ///
 /// This is the connection test's worst possible failure and the reason it is
 /// worth a leg of its own: a *green* answer for an endpoint no turn can use.
@@ -710,7 +711,13 @@ fn every_way_the_call_can_fail_is_its_own_typed_outcome_and_bills_nothing() {
 ///
 /// Both legs are asserted on the typed tag, and the pair is asserted *identical*
 /// on purpose: these are two routes to one fact — something is listening, and it
-/// is not a chat endpoint — so they earn the same variant rather than two.
+/// is not a chat endpoint — so they earn the same variant rather than two. That
+/// variant is its own, `not_a_completion`, and not the `unreachable` the closed
+/// port earns in
+/// [`every_way_the_call_can_fail_is_its_own_typed_outcome_and_bills_nothing`]:
+/// "the address is wrong" and "the path is wrong" are different next moves for
+/// the reader, so they are different values rather than one value with two
+/// sentences (BR-3, LESSON-456).
 ///
 /// The ledger assertion is the deliberate, honest half. Each of these answers
 /// carries a status < 400 whose body the daemon polled, which is the cost
@@ -720,7 +727,7 @@ fn every_way_the_call_can_fail_is_its_own_typed_outcome_and_bills_nothing() {
 /// egress that happened. The row and the outcome disagree about *usefulness*,
 /// not about facts.
 #[test]
-fn an_endpoint_that_answers_without_completing_is_unreachable_not_reached() {
+fn an_endpoint_that_answers_without_completing_is_its_own_outcome_not_reached() {
     let not_a_stream = MockProvider::start(
         Vec::new(),
         MockResponse::status_with_body(200, r#"{"object":"list","data":[]}"#),
@@ -744,10 +751,11 @@ fn an_endpoint_that_answers_without_completing_is_unreachable_not_reached() {
     let answered = test_provider(&mut client, &session, "notastream");
     assert_eq!(
         outcome_tag(&answered),
-        "unreachable",
+        "not_a_completion",
         "a 200 carrying ordinary JSON completed nothing — reporting it as \
          `reached` would hand the user a green light for an endpoint no turn can \
-         use. daemon log:\n{}",
+         use, and reporting it as `unreachable` would send them to check an \
+         address that resolved. daemon log:\n{}",
         daemon.log()
     );
     assert!(
@@ -766,11 +774,17 @@ fn an_endpoint_that_answers_without_completing_is_unreachable_not_reached() {
     let redirected = test_provider(&mut client, &session, "redirector");
     assert_eq!(
         outcome_tag(&redirected),
-        "unreachable",
+        "not_a_completion",
         "redirects are deliberately not followed (a credential header must not \
          be carried to a host the vendor chose), so a 301 asks the chat endpoint \
          nothing at all. daemon log:\n{}",
         daemon.log()
+    );
+    assert_eq!(
+        outcome_tag(&redirected),
+        outcome_tag(&answered),
+        "two routes to one fact — something is listening and it is not a chat \
+         endpoint — earn one variant, not two"
     );
     assert_eq!(redirector.request_count(), 1);
 

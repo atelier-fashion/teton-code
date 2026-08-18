@@ -5458,8 +5458,12 @@ impl DaemonRuntime {
     /// Production has exactly one caller and it passes [`PROBE_DEADLINE`]. The
     /// parameter exists because a thirty-second bound is one no test can afford
     /// to reach, and a bound nothing reaches is a bound nothing checks — which
-    /// is how ADR-2's `Timeout → Unreachable` row came to be written against a
-    /// transport that could not produce a timeout at all.
+    /// is how ADR-2's timeout row came to be written against a transport that
+    /// could not produce a timeout at all.
+    ///
+    /// The deadline it names is the one the answer reports: an elapse is
+    /// [`ProviderTestOutcome::TimedOut`] carrying *this* bound in whole seconds,
+    /// not the compiled-in constant.
     async fn provider_test_within(
         &self,
         events: &Arc<EventBus>,
@@ -5625,8 +5629,8 @@ impl DaemonRuntime {
         // `build_remote_transport` sets no timeouts on purpose — the turn
         // posture, where a model may legitimately think for minutes — so
         // without this bound a vendor that accepts the connection and then says
-        // nothing parks the user's terminal for as long as it likes, and ADR-2's
-        // `Timeout → Unreachable` row is a table entry nothing can ever produce.
+        // nothing parks the user's terminal for as long as it likes, and
+        // `timed_out` is an outcome nothing can ever produce.
         //
         // Cancellation-safe by construction rather than by care: `timeout`
         // *drops* the future it stops waiting on, which drops the metered
@@ -5641,13 +5645,18 @@ impl DaemonRuntime {
         // because they read the same value.
         let (outcome, record) = match streamed {
             Err(_elapsed) => (
-                ProviderTestOutcome::Unreachable {
-                    // `Duration`'s own rendering carries its unit (`30s`,
-                    // `200ms`), which is the half of this sentence a person
-                    // needs in order to tell "slow" from "not answering".
+                ProviderTestOutcome::TimedOut {
+                    // The bound the test stopped at, **typed**: telling "slow"
+                    // from "not answering" is the whole point of this outcome,
+                    // and a client that had to find a duration inside a sentence
+                    // to do it would be the prose-reading BR-3 forbids
+                    // (LESSON-456). It is `deadline` and not [`PROBE_DEADLINE`]
+                    // because the figure has to be the bound this call actually
+                    // waited out, and the seam this function exists for runs a
+                    // shorter one.
+                    after_secs: deadline.as_secs(),
                     reason: format!(
-                        "`{dial_host}` did not answer within {deadline:?}, so the test \
-                         stopped waiting"
+                        "nothing came back from `{dial_host}` before the test stopped waiting"
                     ),
                 },
                 // The verdict a turn's own timeout earns, through the turn
@@ -5683,7 +5692,12 @@ impl DaemonRuntime {
                 Some(HealthRecord::healthy()),
             ),
             Ok(Ok(ProbeAnswer::NotACompletion)) => (
-                ProviderTestOutcome::Unreachable {
+                // Its own outcome rather than an `unreachable` with a
+                // distinguishing sentence: the host resolved, something is
+                // listening, and the suspect is the *path* — which is a
+                // different next move for the user than "nothing answered"
+                // (BR-3, LESSON-456).
+                ProviderTestOutcome::NotACompletion {
                     reason: format!(
                         "`{dial_host}` answered, but not with a completion (no tokens, no \
                          text) — an endpoint that redirects, does not stream, or is not a \
@@ -8632,6 +8646,11 @@ const PROBE_DEADLINE: Duration = Duration::from_secs(30);
 /// completion of zero tokens. Reporting those as `Reached { 0 in / 0 out }` and
 /// stamping the provider healthy would be the connection test's worst possible
 /// failure: a green answer for an endpoint no turn can use.
+///
+/// [`Self::NotACompletion`] is reported as
+/// [`ProviderTestOutcome::NotACompletion`] and not as an `unreachable`: a host
+/// that answered is a different fact, and a different next move, from one that
+/// never did (BR-3).
 enum ProbeAnswer {
     /// The vendor streamed a completion — text, a tool call, or a non-zero
     /// usage reading. The token counts it reported, which may be zero when a
@@ -8698,6 +8717,13 @@ async fn stream_probe(
 /// | other 4xx | `Refused { status }` |
 /// | 5xx | `ServerError { status }` |
 /// | timeout / transport / malformed | `Unreachable` |
+///
+/// The two outcomes this function does **not** produce are the two that are not
+/// errors at all: [`ProviderTestOutcome::NotACompletion`] (the vendor answered
+/// with a status below 400 and completed nothing — [`ProbeAnswer`]'s job) and
+/// [`ProviderTestOutcome::TimedOut`] (the probe's own deadline elapsed, so no
+/// [`ProviderError`] was ever raised). `ProviderError::Timeout` is a *different*
+/// fact — the transport's own verdict — and stays on the `Unreachable` row.
 ///
 /// # Every `reason` is composed from facts this daemon owns (ADR-3)
 ///
@@ -23336,7 +23362,7 @@ provider_id = \"deepseek\"
 
         // -- verify F1: an answer that is not a completion ------------------
 
-        /// **A 200 that is not a completion stream is `unreachable`, not
+        /// **A 200 that is not a completion stream is `not_a_completion`, not
         /// `reached`** (verify F1).
         ///
         /// The defect this pins is the connection test's worst possible
@@ -23350,8 +23376,12 @@ provider_id = \"deepseek\"
         ///
         /// The seeded `Degraded` is what makes the health half discriminating:
         /// a test against an unseeded provider would read `Healthy` either way.
+        ///
+        /// It is its **own** outcome rather than an `unreachable` wearing a
+        /// distinguishing sentence: a host that answered and a host that never
+        /// did send the user to two different places (BR-3, LESSON-456).
         #[tokio::test]
-        async fn a_200_that_is_not_a_completion_stream_is_unreachable() {
+        async fn a_200_that_is_not_a_completion_stream_is_not_a_completion() {
             let server = ProbeServer::answering(
                 "200 OK",
                 "application/json",
@@ -23369,9 +23399,10 @@ provider_id = \"deepseek\"
                 .await
                 .expect("something answered, so this is an outcome");
 
-            let ProviderTestOutcome::Unreachable { reason } = &result.outcome else {
+            let ProviderTestOutcome::NotACompletion { reason } = &result.outcome else {
                 panic!(
-                    "a 200 with no completion in it is NOT `reached`: {:?}",
+                    "a 200 with no completion in it is NOT `reached`, and NOT the \
+                     `unreachable` a dead host earns: {:?}",
                     result.outcome
                 );
             };
@@ -23408,7 +23439,7 @@ provider_id = \"deepseek\"
             assert_announced_once(&mut sub, &session, &result);
         }
 
-        /// **A redirect is `unreachable` too** (verify F1).
+        /// **A redirect is `not_a_completion` too** (verify F1).
         ///
         /// Redirects are not followed (`Policy::none()`, so a credential header
         /// cannot be carried to an attacker-chosen host), which means a 301 does
@@ -23417,7 +23448,7 @@ provider_id = \"deepseek\"
         /// route — an endpoint pasted without its `/v1` path, or one a vendor
         /// has since moved.
         #[tokio::test]
-        async fn a_redirect_is_unreachable_rather_than_a_silent_success() {
+        async fn a_redirect_is_not_a_completion_rather_than_a_silent_success() {
             let server =
                 ProbeServer::answering("301 Moved Permanently", "text/html", String::new()).await;
             let runtime = runtime_dialing(&server.endpoint(), "kimi-k3");
@@ -23430,7 +23461,7 @@ provider_id = \"deepseek\"
                 .expect("a redirect is an outcome");
 
             assert!(
-                matches!(result.outcome, ProviderTestOutcome::Unreachable { .. }),
+                matches!(result.outcome, ProviderTestOutcome::NotACompletion { .. }),
                 "a 301 is not a completion — the daemon does not follow it, so \
                  nothing was ever asked of a chat endpoint: {:?}",
                 result.outcome
@@ -23440,16 +23471,20 @@ provider_id = \"deepseek\"
 
         // -- verify F3: the deadline ----------------------------------------
 
-        /// **A vendor that never answers ends as `unreachable`, on the
-        /// daemon's own clock** (verify F3).
+        /// **A vendor that never answers ends as `timed_out`, on the daemon's
+        /// own clock** (verify F3).
         ///
         /// The transport carries no timeout by design (a long completion is not
         /// a stalled one), so without [`PROBE_DEADLINE`] this call never
-        /// returns: the CLI parks forever, and ADR-2's `Timeout → Unreachable`
-        /// row is a table entry nothing can produce.
+        /// returns: the CLI parks forever, and `timed_out` is an outcome nothing
+        /// can produce.
         ///
-        /// Driven through [`DaemonRuntime::provider_test_within`] at 200 ms —
-        /// the production constant is thirty seconds, which no test may spend.
+        /// Driven through [`DaemonRuntime::provider_test_within`] at one second
+        /// — the production constant is thirty, which no test may spend. A whole
+        /// second rather than something tighter because the outcome reports its
+        /// bound in whole seconds, and a sub-second deadline would pin the test
+        /// to a `0` no user can ever be shown.
+        ///
         /// The elapsed assertion is the non-vacuous half: it fails if the
         /// deadline is not the thing that ended the call.
         #[tokio::test]
@@ -23470,19 +23505,29 @@ provider_id = \"deepseek\"
                     &bus,
                     &session,
                     &ProviderId::from("kimi"),
-                    Duration::from_millis(200),
+                    Duration::from_secs(1),
                 )
                 .await
                 .expect("a deadline is an outcome, not an error");
             let waited = started.elapsed();
 
-            let ProviderTestOutcome::Unreachable { reason } = &result.outcome else {
-                panic!("a hung vendor is unreachable: {:?}", result.outcome);
+            let ProviderTestOutcome::TimedOut { after_secs, reason } = &result.outcome else {
+                panic!(
+                    "a hung vendor timed out — which is a different fact from the \
+                     `unreachable` a host that never answered at all earns: {:?}",
+                    result.outcome
+                );
             };
+            assert_eq!(
+                *after_secs, 1,
+                "the outcome carries the bound **this call** waited out, typed — \
+                 which is how a user tells `slow` from `not answering`, and a \
+                 value reading 30 here would be the compiled-in constant standing \
+                 in for the deadline that actually ran: {result:?}"
+            );
             assert!(
-                reason.contains("200ms"),
-                "the sentence names the bound the test stopped at, which is how a \
-                 user tells `slow` from `not answering`: {reason}"
+                reason.contains(&format!("127.0.0.1:{}", server.port)),
+                "and the sentence names the host that did not answer: {reason}"
             );
             assert!(
                 waited < Duration::from_secs(5),
