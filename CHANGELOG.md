@@ -18,7 +18,7 @@ unchanged. What belongs here is what an *upgrade* does to a machine that was
 already running — above all, anything that changes where data goes without the
 user having asked for it.
 
-## [Unreleased]
+## [0.1.22] - 2026-08-18
 
 ### Fixed
 
