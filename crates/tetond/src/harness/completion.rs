@@ -37,7 +37,7 @@ use teton_inference::{ChatFormat, Completion, Engine, EngineError, MissReason};
 use teton_protocol::events::{PrefixCache, PrefixCacheMiss, PrefixCacheOutcome};
 use teton_protocol::{Category, Phase, ProviderId, SessionId};
 use teton_providers::{
-    Message, Provider, Role, TokenUsage, ToolSpec, Transport, TurnEvent, TurnRequest,
+    Message, Provider, ProviderError, Role, TokenUsage, ToolSpec, Transport, TurnEvent, TurnRequest,
 };
 
 use crate::cost::{CostAttribution, LocalUsageMeter};
@@ -103,23 +103,27 @@ pub struct SourceTurn {
     /// source has no event bus: the turn loop owns session-scoped emission, so
     /// it emits this, exactly once, from the async side.
     pub cache: Option<PrefixCache>,
-    /// Whether a [`TurnDecision::ToolCall`] on this turn is **embedded in
-    /// [`text`](Self::text)** rather than arriving beside it (REQ-567 OQ-1).
+    /// Whether a [`TurnDecision::ToolCall`] on this turn is **already embedded
+    /// in [`text`](Self::text)** rather than arriving beside it (REQ-567 OQ-1).
     ///
     /// The two sources answer differently and the difference is structural, not
     /// stylistic:
     ///
     /// - [`LocalEngineSource`] parses the call **out of the reply text**, so the
-    ///   assistant block the loop pushes literally contains the call's JSON.
+    ///   text literally ends with the call's JSON.
     /// - [`RemoteProviderSource`] receives the call as a structured
-    ///   [`TurnEvent::ToolCall`]; the text is prose only, and any JSON in it is
-    ///   something the model was *talking about*.
+    ///   [`TurnEvent::ToolCall`]; the text is prose only — often none at all —
+    ///   and any JSON in it is something the model was *talking about*.
     ///
-    /// The loop needs the answer because OQ-1's cancellation trim edits that
-    /// block's text. Re-deriving it later by re-parsing the text is what this
-    /// field exists to prevent: a cancelled remote turn whose prose mentions
-    /// `{"name": "serde", "version": "1"}` is tool-call-*shaped* and would be
-    /// truncated at that JSON, discarding content the user watched stream.
+    /// Either way the block the loop pushes **ends with the call**: the loop
+    /// renders a remote call onto the prose in the reply grammar before it
+    /// pushes (BUG-178 — an assistant turn pushed as the bare prose was empty
+    /// whenever the model said nothing first, and every remote provider refuses
+    /// an empty assistant turn on the next request). This flag says who put the
+    /// call there, so the loop knows whether it still has to; the trailing
+    /// position is what lets OQ-1's cancellation trim cut the call — and only
+    /// the call — back out of prose that may itself quote something call-shaped
+    /// like `{"name": "serde", "version": "1"}`.
     ///
     /// Always `false` when the decision is not a tool call — there is no call to
     /// be embedded.
@@ -479,6 +483,30 @@ impl<'a, T: Transport> RemoteProviderSource<'a, T> {
         self.category = Some(category);
         self
     }
+
+    /// Say on the daemon's stderr that this provider failed the turn, and how.
+    ///
+    /// BUG-178 was diagnosed by replaying the request by hand, because the one
+    /// thing that would have named it — the provider answering HTTP 400 to the
+    /// request Teton built — reached the user only as `invalid response` and
+    /// reached the daemon log not at all. This line is that fact, next to the
+    /// provider and the moment (`when`): "before it answered" is the request
+    /// itself being refused, "mid-stream" is a body that stopped parsing.
+    ///
+    /// Provider-side failures only — the ones that carry a
+    /// [`FailureClass`](teton_providers::FailureClass). A privacy block, an
+    /// effort refusal and a build error already announce themselves on their
+    /// own paths and would only be repeated here. Content-free by construction:
+    /// [`ProviderError`]'s `Display` is a class and a status, never a body,
+    /// prompt text, or path (BR-11).
+    fn note_failure(&self, when: &str, err: &ProviderError) {
+        if err.failure_class().is_some() {
+            eprintln!(
+                "teton: provider `{}` failed the turn {when}: {err}",
+                self.provider_id
+            );
+        }
+    }
 }
 
 #[async_trait]
@@ -591,7 +619,10 @@ impl<T: Transport> CompletionSource for RemoteProviderSource<'_, T> {
                 let transport = self.egress.scoped(provenance.clone(), egress_ctx());
                 self.provider.stream_turn(fallback, &transport).await?
             }
-            Err(err) => return Err(err.into()),
+            Err(err) => {
+                self.note_failure("before it answered", &err);
+                return Err(err.into());
+            }
         };
 
         let mut text = String::new();
@@ -599,7 +630,14 @@ impl<T: Transport> CompletionSource for RemoteProviderSource<'_, T> {
         let mut dropped_calls = 0u32;
         let mut usage = TokenUsage::default();
         while let Some(event) = stream.next().await {
-            match event? {
+            let event = match event {
+                Ok(event) => event,
+                Err(err) => {
+                    self.note_failure("mid-stream", &err);
+                    return Err(err.into());
+                }
+            };
+            match event {
                 TurnEvent::TextDelta(delta) => {
                     on_token(&delta);
                     text.push_str(&delta);
@@ -636,8 +674,12 @@ impl<T: Transport> CompletionSource for RemoteProviderSource<'_, T> {
             // REQ-567 OQ-1: never. A remote call arrives as a structured
             // `TurnEvent::ToolCall` and is assembled above from *that*, not from
             // the stream's `TextDelta`s — so `text` is prose the user watched
-            // stream and holds no call for a cancellation to trim, however
-            // tool-call-shaped some JSON in it may look.
+            // stream, however tool-call-shaped some JSON in it may look. The
+            // loop renders the call onto it before the block is pushed
+            // (BUG-178), which is why this stays an honest `false` rather than
+            // this source doing the rendering: the guarantee that a tool-call
+            // block carries its call belongs at the one seam every source
+            // passes through, not in each source's own report.
             call_in_text: false,
         })
     }

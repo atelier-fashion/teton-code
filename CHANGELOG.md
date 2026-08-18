@@ -18,6 +18,31 @@ unchanged. What belongs here is what an *upgrade* does to a machine that was
 already running — above all, anything that changes where data goes without the
 user having asked for it.
 
+## [Unreleased]
+
+### Fixed
+
+- **A remote provider that calls tools natively can finish a task again
+  (BUG-178).** With a provider at `tool_call_tier = "native"` — Kimi through
+  Moonshot reproduces it — the model's first tool call ran, and the very next
+  request died with `degraded: kimi (invalid response) — no fallback
+  configured`, on every tool-using turn. The model had answered with a
+  structured call and no prose, Teton recorded that turn as an empty assistant
+  message, and the provider refused the follow-up request that carried it
+  (Moonshot: "the message … with role 'assistant' must not be empty";
+  Anthropic has the same rule). The turn is now recorded as the call the model
+  made, in the same `{"tool": …, "arguments": …}` form the system prompt
+  teaches — so the request is never empty and the model can see what it asked
+  for. A turn cancelled while its call waited at the permission prompt drops
+  the call and keeps the prose, as it does on the local tier. And an assistant
+  turn that genuinely has no text — a thinking model that spent its whole
+  output budget on reasoning — is no longer sent to the provider as an empty
+  message either; the request skips it. When a provider
+  refuses or breaks off a turn, the daemon's log now says which provider and
+  what happened (`teton: provider `kimi` failed the turn before it answered:
+  provider returned client error status 400`) instead of leaving only
+  "invalid response" on screen. No wire-format change.
+
 ## [0.1.21] - 2026-08-18
 
 ### Added

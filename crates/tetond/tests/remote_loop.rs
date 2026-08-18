@@ -66,6 +66,10 @@ use tetond::harness::{
 struct ScriptedSseTransport {
     bodies: Arc<Mutex<VecDeque<String>>>,
     calls: Arc<AtomicUsize>,
+    /// Every request body handed to `execute`, parsed — the bytes the real
+    /// adapter built, which is the only place a wire-shape claim can be
+    /// discharged (conventions.md: code inspection is not acceptance).
+    requests: Arc<Mutex<Vec<serde_json::Value>>>,
 }
 
 impl ScriptedSseTransport {
@@ -73,7 +77,13 @@ impl ScriptedSseTransport {
         Self {
             bodies: Arc::new(Mutex::new(bodies.into_iter().collect())),
             calls: Arc::new(AtomicUsize::new(0)),
+            requests: Arc::new(Mutex::new(Vec::new())),
         }
+    }
+
+    /// The request bodies sent so far, in order.
+    fn requests(&self) -> Vec<serde_json::Value> {
+        self.requests.lock().unwrap().clone()
     }
 }
 
@@ -81,9 +91,13 @@ impl ScriptedSseTransport {
 impl Transport for ScriptedSseTransport {
     async fn execute(
         &self,
-        _request: TransportRequest,
+        request: TransportRequest,
     ) -> Result<TransportResponse, TransportError> {
         self.calls.fetch_add(1, Ordering::SeqCst);
+        self.requests
+            .lock()
+            .unwrap()
+            .push(serde_json::from_slice(&request.body).expect("the adapter sends a JSON body"));
         let body = self
             .bodies
             .lock()
@@ -468,6 +482,201 @@ async fn remote_turn_over_boundary_context_is_blocked_and_never_billed() {
         blocks[0].provider_id,
         teton_protocol::ProviderId::from("deepseek")
     );
+
+    std::fs::remove_dir_all(&repo).ok();
+}
+
+// --------------------------------------------------------------------------
+// 3. BUG-178: a native tool call with no prose never replays an empty
+//    assistant turn.
+// --------------------------------------------------------------------------
+
+/// One OpenAI-compatible streaming turn in the **kimi-k3 shape** (BUG-178): the
+/// model streams `reasoning_content`, then a `tool_calls` fragment, and every
+/// `content` delta is the empty string — there is no prose at all. Moonshot
+/// answers the harness's *next* request with HTTP 400 when that turn is
+/// replayed as `{"role":"assistant","content":""}`.
+fn kimi_reasoning_only_tool_call_turn(id: &str, name: &str, args: &str) -> String {
+    let mut s = String::new();
+    let role = serde_json::json!({
+        "choices": [{ "delta": { "role": "assistant", "content": "" } }]
+    });
+    s.push_str(&format!("data: {role}\n\n"));
+    for thought in ["I should look at ", "the file first."] {
+        let chunk = serde_json::json!({
+            "choices": [{ "delta": { "content": "", "reasoning_content": thought } }]
+        });
+        s.push_str(&format!("data: {chunk}\n\n"));
+    }
+    let call = serde_json::json!({
+        "choices": [{
+            "delta": { "content": "", "tool_calls": [{
+                "index": 0,
+                "id": id,
+                "type": "function",
+                "function": { "name": name, "arguments": args }
+            }]}
+        }]
+    });
+    s.push_str(&format!("data: {call}\n\n"));
+    let finish = serde_json::json!({ "choices": [{ "delta": {}, "finish_reason": "tool_calls" }] });
+    s.push_str(&format!("data: {finish}\n\n"));
+    let usage = serde_json::json!({
+        "usage": {
+            "prompt_tokens": 100,
+            "completion_tokens": 30,
+            "completion_tokens_details": { "reasoning_tokens": 20 }
+        }
+    });
+    s.push_str(&format!("data: {usage}\n\n"));
+    s.push_str("data: [DONE]\n\n");
+    s
+}
+
+#[tokio::test]
+async fn a_native_tool_call_with_no_prose_never_replays_an_empty_assistant_turn() {
+    let repo = temp_repo();
+
+    // Turn 1: kimi-k3 answers with reasoning + a native `read` call and no
+    // prose. Turn 2: having seen the file, it answers in prose. Before the fix,
+    // turn 2's request carried an empty assistant message for turn 1 and
+    // Moonshot refused it — every kimi tool-using turn died there.
+    let bodies = vec![
+        kimi_reasoning_only_tool_call_turn("call_1", "read", r#"{"path":"src/lib.rs"}"#),
+        sse_turn(&["src/lib.rs defines ANSWER = 1."], None, 180, 12),
+    ];
+    let transport = ScriptedSseTransport::with_bodies(bodies);
+    let sent = transport.clone();
+    let cost = ledger();
+    let egress = Egress::new(transport, Vec::new(), Arc::new(tetond::egress::NoopSink))
+        .with_cost_meter(cost.clone());
+
+    let provider = OpenAiCompatAdapter::new(OpenAiCompatConfig::new(
+        "kimi",
+        "https://api.moonshot.ai/v1/chat/completions",
+    ));
+
+    let session_id = SessionId::from("remote-kimi");
+    let mut source = RemoteProviderSource::new(
+        &provider,
+        &egress,
+        "kimi",
+        "kimi-k3",
+        session_id.clone(),
+        ResolvedEffort::effort(EffortLevel::High),
+    )
+    .with_phase(Phase::Implement);
+
+    let config = HarnessConfig::default();
+    let tools = ToolRegistry::with_builtins();
+    let tool_ctx = ToolContext::new(&repo);
+
+    let system = build_system_prompt(&tools, &config);
+    let mut ctx = ContextManager::new(system, config.context_budget_tokens);
+    ctx.push_user("What does src/lib.rs define?");
+
+    let bus = Arc::new(EventBus::new());
+    let pending = Arc::new(PendingPermissions::new());
+    let gate = PermissionGate::new(
+        session_id.clone(),
+        PermissionConfig::permissive(),
+        Arc::clone(&bus),
+        Arc::clone(&pending),
+    );
+    let events = SessionEvents::new(Arc::clone(&bus), session_id.clone());
+    let mut hook = NoopProvenanceHook;
+    let mut sub = bus.subscribe(256);
+
+    let outcome = run_session_turn_with_source(
+        &mut source,
+        &tools,
+        &tool_ctx,
+        &gate,
+        &events,
+        &mut ctx,
+        &config,
+        &mut hook,
+        &DutyRoute::unresolved("no digest route in this test"),
+        &DutyRoute::unresolved("no compact route in this test"),
+        &ToolDuties {
+            triage: &DutyRoute::unresolved("no triage route in this test"),
+            shell: &DutyRoute::unresolved("no shell route in this test"),
+        },
+    )
+    .await
+    .expect("the turn completes: the read runs and the model answers");
+
+    assert_eq!(outcome.stop_reason, StopReason::EndTurn);
+    assert_eq!(outcome.final_text, "src/lib.rs defines ANSWER = 1.");
+
+    // The wire: two requests left through the real adapter. The SECOND is the
+    // one that used to fail — it replays turn 1.
+    let requests = sent.requests();
+    assert_eq!(requests.len(), 2, "one request per remote turn");
+    let follow_up = requests[1]["messages"]
+        .as_array()
+        .expect("chat/completions messages array");
+
+    // (a) No assistant message anywhere in it is empty — the shape Moonshot
+    //     rejects with `must not be empty` never leaves the machine.
+    for m in follow_up {
+        if m["role"] == "assistant" {
+            let content = m["content"].as_str().unwrap_or_default();
+            assert!(
+                !content.trim().is_empty(),
+                "an empty assistant message reached the wire: {follow_up:#?}"
+            );
+        }
+    }
+    // (b) Turn 1 is recorded as the call the model made — the transcript says
+    //     what happened, in the tool-call shape the system prompt teaches.
+    let assistant_turns: Vec<&str> = follow_up
+        .iter()
+        .filter(|m| m["role"] == "assistant")
+        .filter_map(|m| m["content"].as_str())
+        .collect();
+    assert_eq!(assistant_turns.len(), 1, "{follow_up:#?}");
+    assert_eq!(
+        assistant_turns[0],
+        r#"{"tool":"read","arguments":{"path":"src/lib.rs"}}"#
+    );
+    // (c) …and the tool result folds in as the user turn after it, so the
+    //     provider sees call → result → (its answer), strictly alternating.
+    let roles: Vec<&str> = follow_up
+        .iter()
+        .filter_map(|m| m["role"].as_str())
+        .collect();
+    assert_eq!(
+        roles,
+        ["system", "user", "assistant", "user"],
+        "{follow_up:#?}"
+    );
+    let folded = follow_up[3]["content"].as_str().unwrap();
+    assert!(folded.contains("Tool result (read):"), "{folded}");
+    assert!(folded.contains("pub const ANSWER: u32 = 1;"), "{folded}");
+
+    // The stand-in is transcript, not display: the user never saw raw JSON.
+    let evs = collect_events(&mut sub).await;
+    let streamed: String = evs
+        .iter()
+        .filter_map(|e| match &e.event {
+            Event::SessionUpdate(su) => match &su.update {
+                SessionUpdatePayload::AgentMessageChunk { text } => Some(text.as_str()),
+                _ => None,
+            },
+            _ => None,
+        })
+        .collect();
+    assert!(
+        !streamed.contains("\"tool\""),
+        "the recorded call must not stream to the user: {streamed}"
+    );
+    assert!(streamed.contains("src/lib.rs defines ANSWER = 1."));
+
+    // Both turns billed, with the reasoning split the kimi shape reports.
+    let rows = cost.all_records().expect("read ledger");
+    assert_eq!(rows.len(), 2, "one CostRecord per remote turn");
+    assert_eq!(rows[0].reasoning_tokens, Some(20));
 
     std::fs::remove_dir_all(&repo).ok();
 }

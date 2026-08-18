@@ -134,41 +134,58 @@ pub(crate) struct ParsedReply {
     /// Byte length of the reply prefix that should be folded into context —
     /// for a tool call, through the end of the dispatched object; everything
     /// after it (further calls, trailing chatter) is noise.
-    pub clean_len: usize,
-    /// Byte offset where the dispatched call's JSON object *begins*, for a
-    /// tool-call-shaped reply — so `text[..call_start]` is the prose the model
-    /// wrote ahead of the call, and `text[call_start..clean_len]` is the call.
     ///
-    /// `None` for an end-of-turn reply, which has no call to separate from.
-    /// Recorded here rather than re-found by a second scan because a caller
-    /// that located the call its own way would be a second parser, free to
-    /// disagree with this one about where a call starts (LESSON-494).
-    pub call_start: Option<usize>,
+    /// This is also what makes the dispatched call the **trailing** object of
+    /// the text the loop pushes — the shape [`prose_before_tool_call`] relies
+    /// on to find it again without a second parser (LESSON-494).
+    pub clean_len: usize,
     /// Tool-call-shaped objects after the first — present in the reply but
     /// not executed by the one-tool-per-turn harness.
     pub dropped_calls: u32,
 }
 
-/// The prose a tool-call-shaped reply carries **ahead** of its call, or `None`
-/// when the reply is not tool-call-shaped at all (REQ-567 OQ-1).
+/// The prose an assistant block carries **ahead** of the tool call it ends
+/// with, or `None` when the block does not end with a call (REQ-567 OQ-1).
 ///
 /// Used to trim a *dangling* call — an assistant block whose call was never
 /// answered because the turn was cancelled at the permission gate. What the
 /// model said before the call is completed prose the user saw and OQ-1 retains;
 /// the call itself is incomplete tool work OQ-1 drops.
 ///
-/// The tool list is deliberately empty: this asks only "is this text tool-call
-/// shaped", which [`parse_reply`] answers identically for a known and an
-/// unknown tool ([`ParsedTurn::ToolCall`] versus [`ParsedTurn::Malformed`] —
-/// both are a call, neither is an end of turn). Threading a registry in would
-/// make the answer depend on which tools happened to be exposed to the turn
-/// that produced the text, which is not a property of the text.
+/// The call is looked for at the **tail** of the text, because that is where
+/// the turn loop puts it for every source: the local tier's reply is cut right
+/// after the first call it parsed, and a remote provider's structured call is
+/// rendered onto the end of its prose (BUG-178). Reading "the first
+/// call-shaped object" instead would cut a remote turn whose prose *quotes*
+/// something call-shaped — `{"name": "serde", "version": "1"}` — at the
+/// quote, discarding content the user watched stream; the trailing object is
+/// the call by construction, and everything ahead of it is prose whatever it
+/// looks like. Text whose last object is followed by anything but whitespace
+/// is not in the shape the loop pushes and is left alone: there is nothing to
+/// cut around, and guessing would edit prose.
+///
+/// The tool list is deliberately absent: this asks only "does this text end
+/// with something call-shaped", which is a property of the text and not of
+/// which tools happened to be exposed to the turn that produced it. The key
+/// rule is [`parse_reply`]'s own ([`tool_call_name`]), so a call the loop
+/// dispatched and a call this trims are recognized by one grammar (LESSON-494).
 pub(crate) fn prose_before_tool_call(text: &str) -> Option<&str> {
-    let parsed = parse_reply(text, &[]);
-    if matches!(parsed.turn, ParsedTurn::EndTurn(_)) {
+    let (start, end) = json_object_spans(text).pop()?;
+    if !text[end..].trim().is_empty() {
         return None;
     }
-    Some(&text[..parsed.call_start.unwrap_or(0)])
+    let value = serde_json::from_str::<Value>(&text[start..end]).ok()?;
+    tool_call_name(&value)?;
+    Some(&text[..start])
+}
+
+/// The tool a call-shaped JSON object names — its `tool` (or `name`) key — or
+/// `None` for an object that is not a call. The one place that rule lives.
+fn tool_call_name(value: &Value) -> Option<&str> {
+    value
+        .get("tool")
+        .or_else(|| value.get("name"))
+        .and_then(Value::as_str)
 }
 
 /// Parse a model reply into a tool call, an end-of-turn answer, or a malformed
@@ -184,11 +201,7 @@ pub(crate) fn parse_reply(text: &str, known_tools: &[&str]) -> ParsedReply {
         let Ok(value) = serde_json::from_str::<Value>(candidate) else {
             continue;
         };
-        let name = value
-            .get("tool")
-            .or_else(|| value.get("name"))
-            .and_then(Value::as_str);
-        let Some(name) = name else {
+        let Some(name) = tool_call_name(&value) else {
             // JSON without a tool key: not a tool call. Keep scanning in case a
             // real call follows; if none is found this becomes an end-of-turn.
             continue;
@@ -220,18 +233,47 @@ pub(crate) fn parse_reply(text: &str, known_tools: &[&str]) -> ParsedReply {
     }
 
     match first_call {
-        Some((start, end, turn)) => ParsedReply {
+        Some((_, end, turn)) => ParsedReply {
             turn,
             clean_len: end,
-            call_start: Some(start),
             dropped_calls,
         },
         None => ParsedReply {
             turn: ParsedTurn::EndTurn(text.trim().to_owned()),
             clean_len: text.len(),
-            call_start: None,
             dropped_calls: 0,
         },
+    }
+}
+
+/// Render a structured tool call onto the end of `prose`, in the reply grammar
+/// — the `{"tool": …, "arguments": …}` object the system prompt teaches and
+/// [`parse_reply`] reads — so the block built from it has the shape of a local
+/// tier's reply: prose, then the call, then nothing (BUG-178).
+///
+/// This is how a **remote** provider's call, which arrives as a structured
+/// event beside its prose, gets into the transcript at all. Pushing the prose
+/// alone was two defects in one block: an assistant turn that is empty whenever
+/// the model said nothing before calling (which every remote provider refuses
+/// on the next request — Moonshot and Anthropic both answer 400 to it), and a
+/// conversation in which the model cannot see what it asked for.
+///
+/// Empty prose yields the bare call. Non-empty prose keeps its text, loses its
+/// trailing whitespace, and is separated from the call by exactly one newline
+/// — so [`prose_before_tool_call`] hands back the prose and nothing else.
+pub(crate) fn append_tool_call(prose: &str, name: &str, arguments: &Value) -> String {
+    // Written out rather than built with `json!`, so the keys keep the order
+    // the system prompt teaches (`tool` first — `serde_json` sorts object
+    // keys). `Value`'s `Display` is compact JSON and escapes the name.
+    let call = format!(
+        "{{\"tool\":{},\"arguments\":{arguments}}}",
+        Value::String(name.to_owned())
+    );
+    let prose = prose.trim_end();
+    if prose.is_empty() {
+        call
+    } else {
+        format!("{prose}\n{call}")
     }
 }
 
@@ -1050,5 +1092,84 @@ mod tests {
             parse_reply(text, &["teleport"]).turn,
             ParsedTurn::ToolCall { .. }
         ));
+    }
+
+    /// **BUG-178.** A remote turn's block is its prose with the structured call
+    /// rendered onto the end — and prose is free to *quote* something
+    /// call-shaped. The trim finds the call at the tail, so the quote ahead of
+    /// it is kept whole; reading "the first call-shaped object" would cut the
+    /// block at the quote and discard content the user watched stream.
+    #[test]
+    fn prose_that_quotes_a_call_shaped_object_ahead_of_the_call_is_kept() {
+        let text = "The manifest pins {\"name\": \"serde\", \"version\": \"1\"}.\n\
+                    {\"tool\":\"read\",\"arguments\":{\"path\":\"Cargo.toml\"}}";
+        assert_eq!(
+            prose_before_tool_call(text),
+            Some("The manifest pins {\"name\": \"serde\", \"version\": \"1\"}.\n")
+        );
+    }
+
+    /// Text whose last object is followed by anything but whitespace is not
+    /// the shape the loop pushes (a local reply is cut at the call, a remote
+    /// call is rendered last), so there is nothing to cut around and the trim
+    /// declines rather than guessing at prose.
+    #[test]
+    fn a_call_followed_by_chatter_is_not_a_trailing_call() {
+        assert_eq!(
+            prose_before_tool_call(r#"{"tool":"read","arguments":{}} and then I will"#),
+            None
+        );
+    }
+
+    // -- BUG-178: rendering a structured call into the reply grammar ---------
+
+    /// What `append_tool_call` writes is what `parse_reply` reads: the same
+    /// tool, the same arguments, in the key order the system prompt teaches.
+    /// One grammar for a call the model wrote and a call the loop rendered.
+    #[test]
+    fn a_rendered_call_round_trips_through_the_reply_parser() {
+        let arguments = serde_json::json!({ "command": "ls ~ && echo \"---\"" });
+        let text = append_tool_call("", "shell", &arguments);
+        assert!(
+            text.starts_with(r#"{"tool":"shell","arguments":"#),
+            "{text}"
+        );
+        assert_eq!(
+            parse_reply(&text, &["shell"]).turn,
+            ParsedTurn::ToolCall {
+                name: "shell".to_owned(),
+                arguments,
+            }
+        );
+        // A bare rendered call has no prose ahead of it, so a cancellation at
+        // the gate drops the block whole rather than committing a blank turn.
+        assert_eq!(prose_before_tool_call(&text), Some(""));
+    }
+
+    /// Prose keeps its text and loses only its trailing whitespace; the call
+    /// follows after exactly one newline, so the trim hands back the prose.
+    #[test]
+    fn a_rendered_call_follows_the_prose_on_its_own_line() {
+        let text = append_tool_call(
+            "Let me look.  \n",
+            "read",
+            &serde_json::json!({ "path": "Cargo.toml" }),
+        );
+        assert_eq!(
+            text,
+            "Let me look.\n{\"tool\":\"read\",\"arguments\":{\"path\":\"Cargo.toml\"}}"
+        );
+        assert_eq!(prose_before_tool_call(&text), Some("Let me look.\n"));
+    }
+
+    /// The name is JSON-escaped, so a tool name that carries a quote cannot
+    /// break the object the parser has to read back.
+    #[test]
+    fn a_rendered_call_escapes_the_tool_name() {
+        let text = append_tool_call("", "we\"ird", &serde_json::json!({}));
+        assert!(
+            matches!(parse_reply(&text, &["we\"ird"]).turn, ParsedTurn::ToolCall { name, .. } if name == "we\"ird"),
+            "{text}"
+        );
     }
 }

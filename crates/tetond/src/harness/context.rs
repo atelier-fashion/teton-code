@@ -649,11 +649,12 @@ impl ContextManager {
     /// [`Self::resolve_pending_call`], and pushing anything else clears the flag
     /// too — a block with a result after it is answered work.
     ///
-    /// **Only a call the loop found in the text.** A remote provider's call
-    /// arrives as a structured event and is not in this text
-    /// ([`SourceTurn::call_in_text`](super::completion::SourceTurn::call_in_text)),
-    /// so such a turn is pushed through [`Self::push_model`]: nothing in it is
-    /// the harness's to cut.
+    /// **The text ends with the call.** The local tier's reply does because the
+    /// call was parsed out of it; a remote provider's call arrives as a
+    /// structured event and the loop renders it onto the prose before pushing
+    /// ([`SourceTurn::call_in_text`](super::completion::SourceTurn::call_in_text),
+    /// BUG-178). Either way the trailing object is the harness's to cut, and
+    /// nothing ahead of it is.
     pub fn push_model_call(&mut self, text: impl Into<String>) {
         self.push_model(text);
         self.pending_tool_call = true;
@@ -1339,6 +1340,17 @@ impl ContextManager {
     /// user turn — the shape Anthropic requires and every OpenAI-compatible
     /// endpoint accepts. This replaces the single-`User`-blob request that
     /// collapsed system, history, and tool results together.
+    ///
+    /// **No message is empty** (BUG-178). A block with nothing in it — an
+    /// assistant turn that ended with no text, which a thinking model that spent
+    /// its whole budget on reasoning produces — is not a message: it contributes
+    /// nothing the model can read and is a hard 400 at every remote provider
+    /// (Moonshot: "the message … with role 'assistant' must not be empty";
+    /// Anthropic: "all messages must have non-empty content"). Such a block is
+    /// skipped here, at the seam that shapes the wire sequence, and its
+    /// neighbours merge as same-role blocks always do. The block itself and the
+    /// flat rendering are untouched: this is a wire-shape rule, like the
+    /// user-first rule below, not an edit to the conversation.
     #[must_use]
     pub fn prepare(&self, hook: &mut dyn ProvenanceHook) -> PreparedPrompt {
         // Reuse assemble for the flat rendering AND the hook invocations, so the
@@ -1379,6 +1391,13 @@ impl ContextManager {
                 }
                 _ => content.into_owned(),
             };
+            // BUG-178: an empty block is not a message. (A tool result is never
+            // empty here — its label is part of the text — so this is the
+            // assistant turn that ended with no text, and a user turn with
+            // nothing in it.)
+            if text.trim().is_empty() {
+                continue;
+            }
             // Merge into the previous message when the role repeats, guaranteeing
             // strict user/assistant alternation regardless of block order.
             if let Some(last) = messages.last_mut() {
@@ -1842,6 +1861,45 @@ mod tests {
             !prepared.messages[0].text.is_empty(),
             "the synthetic leading user turn must be non-empty"
         );
+    }
+
+    /// **BUG-178.** An assistant turn that ended with no text — a thinking
+    /// model that spent its whole budget on reasoning, or the pre-fix record of
+    /// a native tool call — must not reach the wire as
+    /// `{"role":"assistant","content":""}`: every remote provider answers 400
+    /// to it, and the session then dies on that block in every later prompt.
+    /// The block is skipped and its neighbours merge; the flat rendering and
+    /// the block itself are untouched.
+    #[test]
+    fn prepare_skips_an_empty_assistant_turn_rather_than_sending_it() {
+        let mut ctx = ContextManager::new("SYS", 10_000);
+        ctx.push_user("first question");
+        ctx.push_model("");
+        ctx.push_user("second question");
+        ctx.push_model("   \n");
+        ctx.push_tool_result("shell", None, "");
+
+        let mut hook = NoopProvenanceHook;
+        let prepared = ctx.prepare(&mut hook);
+        assert!(
+            prepared.messages.iter().all(|m| !m.text.trim().is_empty()),
+            "an empty message reached the request: {:?}",
+            prepared.messages
+        );
+        // Both user turns and the (labelled, so non-empty) tool result merged
+        // into one user message, with no assistant turn between them.
+        assert_eq!(prepared.messages.len(), 1);
+        assert_eq!(prepared.messages[0].role, MessageRole::User);
+        assert!(prepared.messages[0].text.contains("first question"));
+        assert!(prepared.messages[0].text.contains("second question"));
+        assert!(prepared.messages[0]
+            .text
+            .contains(&format!("{TOOL_RESULT_LABEL_PREFIX}shell):")));
+        // The conversation itself still holds the empty blocks: this is a
+        // wire-shape rule, not an edit.
+        assert_eq!(ctx.blocks().len(), 5);
+        let mut hook = NoopProvenanceHook;
+        assert_eq!(prepared.flat, ctx.assemble(&mut hook));
     }
 
     #[test]

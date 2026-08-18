@@ -1638,6 +1638,76 @@ Replay lines absent from the first session       : yes / no
 Notes / findings :
 ```
 
+# Manual verification runbook — BUG-178 (a native tool call no longer kills the next request)
+
+**Status: OUTSTANDING.** CI pins the mechanism
+(`turn_loop::tests::a_remote_tool_call_with_no_prose_is_recorded_as_the_call_not_a_blank_turn`
+— the loop records a remote call as the call, and the prompt the next request
+is built from has no empty message; `carry::tests::a_cancelled_remote_*` — a
+cancellation drops the call, keeps the prose, leaves no blank turn). What CI
+cannot make is the claim that opened this bug: a **real** native-tool
+provider accepts the follow-up request Teton now builds and the turn goes on to
+finish. The defect was found by dogfooding 0.1.21 against Kimi, and the same
+prompt should now complete.
+
+## Prerequisites
+
+- A remote provider at `tool_call_tier = "native"` bound to a tier with **no
+  fallback** — the configuration in which the defect was fatal. Kimi
+  (`kimi-k3` at `https://api.moonshot.ai/v1/chat/completions`) is the one that
+  reproduced it; Anthropic's rule is the same.
+- `/provider test <id>` passes (that probe never exercised this path — a
+  single-message request has no assistant turn to be empty).
+
+## Procedure
+
+1. Start a session with `teton`, on the shipped build.
+2. Ask something that needs a tool and that the model will call **without a
+   preamble** — the shape that produced the empty turn: `list the files in
+   this directory` (→ `shell` or `glob`), or the original prompt, `In the
+   development folder on this machine, I have repos. Find it and look for the
+   Teton repo`.
+3. Allow the tool. On 0.1.21 the tool line went `[running]` → `[failed]`/`[done]`
+   and the next line was `degraded: <id> (invalid response) — no fallback
+   configured`, then `error: prompt failed: provider failed and no fallback is
+   configured`. Expect instead: the tool result is folded and the model
+   **continues** — a second tool call or a final answer — with no `degraded`
+   line.
+4. Let it run to a final answer. A failing first command (the original
+   `ls -d ~/development …` exited 1) is fine and is the more interesting case:
+   the model should react to the failure, not the session to the provider.
+5. Two exits from the permission prompt, both of which left the empty turn on
+   0.1.21:
+   - **Deny**: ask for another tool-using step and answer `n`. The model is
+     told the user declined and takes another turn — expect that next model
+     call to be served (on 0.1.21 it was the one that died).
+   - **Cancel**: ask for another tool-using step and press Esc at the prompt.
+     Then ask a plain follow-up question. Expect it to be answered — on 0.1.21
+     the cancelled turn committed an empty assistant message and every later
+     prompt in the session would have died on the same 400.
+6. Check the daemon log (`~/Library/Application Support/teton/tetond.log`) for
+   `teton: provider `<id>` failed the turn`. Expect **none** for the runs above.
+   Optionally provoke one — misconfigure the model name and prompt once — and
+   expect a line naming the provider and the status
+   (`… failed the turn before it answered: provider returned client error
+   status 404`), and nothing from the request or the response body in it.
+
+## Sign-off
+
+```
+BUG-178 sign-off
+----------------
+Verified by      :
+Date             :
+Build            :               (shipped version, `teton --version`)
+Provider / model :               (native tier, no fallback)
+Tool-using turn completed after the first call    : yes / no
+No `degraded: … (invalid response)` on the turn   : yes / no
+Cancelled-at-gate turn, later prompt still served : yes / no
+Provoked failure named provider + status, no content : yes / no / not run
+Notes / findings :
+```
+
 # Manual verification runbook — REQ-582 (the session runs `teton`'s own commands)
 
 **Status: OUTSTANDING.** CI pins the mechanism at every seam it can reach: the
