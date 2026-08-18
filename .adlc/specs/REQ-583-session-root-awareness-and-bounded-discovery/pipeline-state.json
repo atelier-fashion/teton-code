@@ -1,0 +1,31 @@
+{
+  "req": "REQ-583",
+  "branch": "feat/REQ-583-session-root-awareness",
+  "startedAt": "2026-08-18T23:55:55Z",
+  "completed": false,
+  "currentPhase": 0,
+  "completedPhases": [],
+  "phaseHistory": [],
+  "integrationBranch": "main",
+  "repos": {
+    "teton-code": {
+      "primary": true,
+      "path": "/Users/brettluelling/Documents/GitHub/teton-code",
+      "worktree": "/Users/brettluelling/Documents/GitHub/teton-code/.worktrees/REQ-583",
+      "branch": "feat/REQ-583-session-root-awareness",
+      "touched": true,
+      "prUrl": null,
+      "prNumber": null,
+      "prCreatedAt": null,
+      "merged": false,
+      "snapshotBranch": null,
+      "snapshotPR": null
+    }
+  },
+  "mergeOrder": ["teton-code"],
+  "phase4": {
+    "currentTask": null,
+    "completedTasks": [],
+    "failedTasks": []
+  }
+}
