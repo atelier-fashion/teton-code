@@ -13,21 +13,31 @@
 //! branches on the **variant**, never on the sentence inside it (BR-3,
 //! LESSON-456) — a client that read "401" out of a `reason` to decide what
 //! happened would be a second classifier drifting from the daemon's. Every
-//! `reason` is rendered verbatim and composed nowhere but the daemon, which is
-//! also why no line here can leak a credential: the only vendor-adjacent text
-//! that reaches the surface is a sentence the daemon built from the status, the
-//! dial host, the configured model and the credential *reference* (ADR-3).
+//! `reason` is rendered verbatim and composed nowhere but the daemon: the only
+//! vendor-adjacent text that reaches the surface is a sentence built from the
+//! status, the dial host, the configured model and the credential *reference*
+//! (ADR-3), so no *report* line can carry a credential value.
 //!
-//! ## The preview echoes, it does not parse (LESSON-529)
+//! ## The preview echoes, and redacts exactly one thing (LESSON-529)
 //!
 //! The preview line carries the endpoint **as the config snapshot stores it**,
-//! byte for byte, and the confirm question says "that endpoint" rather than
-//! naming a host of its own. A display helper that extracted an authority here
-//! would be a second parser of the string the daemon is about to POST to, and
-//! every divergence between the two would be a lie on the one line a user reads
-//! before consenting to spend. The *report*'s host is the daemon's own
-//! dial-time reading ([`ProviderTestResult::dial_host`]) for the same reason,
-//! travelling as data rather than being re-derived.
+//! and the confirm question says "that endpoint" rather than naming a host of
+//! its own. A display helper that extracted an authority here would be a second
+//! parser of the string the daemon is about to POST to, and every divergence
+//! between the two would be a lie on the one line a user reads before consenting
+//! to spend. The *report*'s host is the daemon's own dial-time reading
+//! ([`ProviderTestResult::dial_host`]) for the same reason, travelling as data
+//! rather than being re-derived.
+//!
+//! The one exception is [`crate::displayed_endpoint`], which replaces a
+//! `user:password@` with `***@`. A stored endpoint may carry userinfo — the
+//! product permits it and dials it as typed (REQ-578) — so an endpoint echoed
+//! byte for byte is a password in the scrollback, the session recording and
+//! whatever the user pastes into a bug report. That is not a second parser: it
+//! is *the* renderer, the same one the registration echo, `provider list` and
+//! doctor go through, and it is written to end the authority where the request
+//! builder ends it, backslash included. The redaction is visible rather than
+//! silent, so the line still says a credential was there.
 //!
 //! ## Everything but the bytes is testable without a terminal
 //!
@@ -46,7 +56,7 @@ use teton_protocol::{ProviderKind, SessionId};
 
 use crate::client::{Connection, UiContext};
 use crate::cost_ui::format_usd;
-use crate::prompt::Prompter;
+use crate::prompt::{is_yes, Prompter};
 use crate::render::{LineKind, Surface};
 
 /// What `/provider test` says when there is no session to act on.
@@ -64,6 +74,17 @@ const TEST_NEEDS_A_SESSION: &str =
 const TEST_UNAVAILABLE: &str =
     "this daemon build does not serve provider connection tests — restart it after upgrading. \
      Nothing was sent.";
+
+/// What the flow says to a daemon that does not serve `config/get`.
+///
+/// Distinct from [`TEST_UNAVAILABLE`] because it names a **different missing
+/// method**, and a line that reported the wrong one would send a user looking
+/// for a feature that may well be there. The two are far apart in age: this one
+/// means a daemon older than the config snapshot itself, which is old enough
+/// that nothing else in the session works either.
+const CONFIG_UNAVAILABLE: &str =
+    "this daemon build does not serve `config/get`, so there is no provider list to check the id \
+     against — restart it after upgrading. Nothing was sent.";
 
 /// What a session whose input is not a terminal is told when it did not consent
 /// up front (BR-2 / AC-4).
@@ -86,10 +107,26 @@ const TEST_DECLINED: &str = "nothing was sent — the provider was not called an
 /// The confirm question (BR-2, LESSON-470's default-no).
 ///
 /// It says "that endpoint" and names no host of its own: the address is on the
-/// preview line directly above, verbatim from the snapshot, and a second reading
-/// of it here would be the display-vs-dial divergence LESSON-529 is about.
+/// preview line directly above, from the snapshot, and a second reading of it
+/// here would be the display-vs-dial divergence LESSON-529 is about.
+///
+/// The size is stated as the two facts the product actually owns rather than as
+/// one round number. The probe is a single fixed sentence in — a handful of
+/// tokens, and the exact count is the vendor's tokenizer's business, not this
+/// binary's — and asks for at most 8 back, which is the daemon's own
+/// `PROBE_MAX_TOKENS`. The "≈ 20 tokens" this line used to claim was a guess:
+/// the one figure on screen that no measurement backed, on the line whose whole
+/// job is to be true before a user consents to spend.
+///
+/// The 8 is quoted rather than imported — it is a constant in a crate this one
+/// does not depend on, and putting a number on the wire to render one sentence
+/// would be the wrong trade. It stays honest because it is a *ceiling* the
+/// report measures against: a `reached` line prints the tokens the vendor
+/// actually billed, so a daemon that raised its budget shows up in the output
+/// rather than only in this comment.
 const CONFIRM_QUESTION: &str =
-    "  this sends one minimal request (≈ 20 tokens) to that endpoint. proceed?  [y/N] ";
+    "  this sends one minimal request (a few tokens in, at most 8 out) to that endpoint. \
+     proceed?  [y/N] ";
 
 // ---------------------------------------------------------------------------
 // The world seam
@@ -177,10 +214,13 @@ impl TestIo for DaemonIo<'_, '_> {
 /// all. Between them they decide the gate; nothing here reads stdin or a
 /// terminal itself.
 ///
-/// The **order** is load-bearing. Every path that would reach
-/// [`TestIo::provider_test`] passes the gate first, so "a decline sends nothing"
-/// is a property of the control flow rather than of four separate branches
-/// remembering to check (AC-4).
+/// The **order** is load-bearing. There is exactly one call to
+/// [`TestIo::provider_test`] in this function and the gate is above it, so "a
+/// decline sends nothing" is a property of the control flow rather than of
+/// several branches remembering to check (AC-4). The local-tier answer sits
+/// *above* the gate on purpose: it makes no call, so there is nothing for a
+/// pipe to consent to, and answering a question about a provider that dials
+/// nothing does not need a terminal.
 ///
 /// # Errors
 ///
@@ -197,7 +237,7 @@ pub(crate) fn run(
     let snapshot = match io.config_get(ConfigGetParams::default())? {
         Ok(result) => result.snapshot,
         Err(err) if err.code == error_code::METHOD_NOT_FOUND => {
-            io.surface().line(LineKind::Notice, TEST_UNAVAILABLE);
+            io.surface().line(LineKind::Notice, CONFIG_UNAVAILABLE);
             return Ok(());
         }
         Err(err) => {
@@ -225,26 +265,33 @@ pub(crate) fn run(
     // snapshot again for its routing line, after `io` has been borrowed mutably.
     let provider = provider.clone();
 
+    // BR-8 / AC-7, and it sends nothing — so it is answered before the gate.
+    //
+    // A `kind = "local"` provider has no host, so there is no preview to show,
+    // no question to ask and no call to make; asking the daemon in order to be
+    // told that would spend a round trip to learn a fact this snapshot already
+    // carries, and — on a pipe — would print the `--yes` remedy for a request
+    // that was never going to be made. What this line deliberately does *not*
+    // do is describe the tier: `teton doctor` owns that state (REQ-580's
+    // classification), and a sentence composed here would be this module
+    // forming an opinion about a tier it cannot see.
+    //
+    // AC-7's guarantee does not rest on this branch. The daemon refuses a local
+    // provider whatever the client thinks, which is what covers a config edited
+    // between the snapshot and a call — there simply is no call here to race
+    // with, so the refusal is the tetond-side test's to prove.
+    if provider.kind == ProviderKind::Local {
+        io.surface()
+            .line(LineKind::Notice, &local_tier_line(provider_id));
+        return Ok(());
+    }
+
     // The gate, ahead of everything that could reach the wire. A session that
     // cannot be asked and did not consent in advance is answered here and
     // nowhere else, so no later branch can send on its behalf.
     if !typed_input && !auto_yes {
         io.surface().line(LineKind::Error, NOT_A_TERMINAL);
         return Ok(());
-    }
-
-    if provider.kind == ProviderKind::Local {
-        // BR-8: there is no host to dial and therefore nothing to preview or
-        // consent to. The *refusal* is the daemon's — it carries the local
-        // tier's current state (REQ-580's classification), which is the actual
-        // answer to "does it work", and inventing a sentence for it here would
-        // be this module forming an opinion about a tier it cannot see.
-        //
-        // The branch is a client-side reading of the snapshot, so it decides
-        // only which sentence comes first: the daemon refuses a `kind = local`
-        // provider whatever this thinks, and a config edited between the two
-        // calls is bounded by that refusal rather than by this check.
-        return report_refusal(io, &provider, session_id);
     }
 
     for line in preview_lines(&provider) {
@@ -284,52 +331,62 @@ pub(crate) fn run(
         }
     };
 
+    // The routing line is read from a snapshot taken **before** the call, and a
+    // `reached` outcome is exactly the ending that can have invalidated it: the
+    // daemon screens an `Unavailable` provider out of its routing resolution
+    // (`teton_core::category`), so a provider the health map had written off
+    // shows up in the pre-test snapshot with nothing dispatching to it — and
+    // this test is what just restored it (BR-4, AC-5). Re-read on that one
+    // outcome, so the "what now routes here" sentence describes the machine the
+    // user is left with rather than the one they started with.
+    //
+    // Only on `reached`: a failure changed no routing, and a second `config/get`
+    // after every outcome would be a round trip spent to re-read an unchanged
+    // answer.
+    let snapshot = match &result.outcome {
+        ProviderTestOutcome::Reached { .. } => refreshed_snapshot(io, snapshot),
+        ProviderTestOutcome::Refused { .. }
+        | ProviderTestOutcome::UnknownModel { .. }
+        | ProviderTestOutcome::RateLimited { .. }
+        | ProviderTestOutcome::ServerError { .. }
+        | ProviderTestOutcome::Unreachable { .. } => snapshot,
+    };
+
     for line in report_lines(&result, &snapshot) {
         io.surface().line(LineKind::Notice, &line);
     }
     Ok(())
 }
 
-/// Ask the daemon about a `kind = "local"` provider and render whatever it says
-/// (BR-8 / AC-7).
+/// The config as it is **after** a test that moved health, falling back to the
+/// reading taken before it.
 ///
-/// Split out so the "no preview, no question, still one RPC" shape is one
-/// readable thing rather than an early-return tangle in the middle of [`run`].
-fn report_refusal(
-    io: &mut dyn TestIo,
-    provider: &ProviderConfig,
-    session_id: &SessionId,
-) -> anyhow::Result<()> {
-    match io.provider_test(ProviderTestParams {
-        session_id: session_id.clone(),
-        provider_id: provider.id.clone(),
-    })? {
-        // Structurally unreachable — the daemon refuses a local provider — and
-        // rendered rather than asserted, because a client that panicked on a
-        // daemon's legitimate answer would be the worse of the two bugs.
-        Ok(result) => {
-            for line in report_lines(&result, &ConfigSnapshot::default()) {
-                io.surface().line(LineKind::Notice, &line);
-            }
-        }
-        Err(err) if err.code == error_code::METHOD_NOT_FOUND => {
-            io.surface().line(LineKind::Notice, TEST_UNAVAILABLE);
-        }
-        Err(err) => {
-            io.surface().line(LineKind::Notice, &err.message);
-        }
+/// A failed re-read is not worth a word on screen: `before` is a true reading of
+/// the routing table a moment ago, and a report that dropped its routing line
+/// because a follow-up round trip hiccuped would lose more than it saved. The
+/// call that mattered already happened and is already reported.
+fn refreshed_snapshot(io: &mut dyn TestIo, before: ConfigSnapshot) -> ConfigSnapshot {
+    match io.config_get(ConfigGetParams::default()) {
+        Ok(Ok(result)) => result.snapshot,
+        Ok(Err(_)) | Err(_) => before,
     }
-    Ok(())
-}
-
-/// An explicit yes, and nothing else (LESSON-470). Empty and EOF are both no.
-fn is_yes(answer: &str) -> bool {
-    matches!(answer.trim().to_lowercase().as_str(), "y" | "yes")
 }
 
 // ---------------------------------------------------------------------------
 // Content (pure)
 // ---------------------------------------------------------------------------
+
+/// What `/provider test <id>` says about a provider that dials nothing (BR-8).
+///
+/// Two sentences and no third: what the id *is*, and where its state is
+/// reported. It says nothing about whether the local tier is ready, because this
+/// module cannot see that and `teton doctor` can.
+fn local_tier_line(id: &str) -> String {
+    format!(
+        "`{id}` is the local tier: a connection test dials nothing. `teton doctor` reports its \
+         state."
+    )
+}
 
 /// What a typo is answered with: the ids that would have worked.
 fn unknown_id_line(typed: &str, snapshot: &ConfigSnapshot) -> String {
@@ -358,10 +415,18 @@ fn unknown_id_line(typed: &str, snapshot: &ConfigSnapshot) -> String {
 /// row taking the vendor's default — says so instead of showing a URL this
 /// module composed, because a composed address is a claim about what will be
 /// dialed that only the daemon can make.
+///
+/// The endpoint goes through [`crate::displayed_endpoint`] on the way out, which
+/// is the single thing between the stored bytes and the screen: a stored
+/// endpoint may carry `user:password@` (REQ-578 stores and dials one as typed),
+/// and this line is printed to a terminal, a scrollback and a pasted bug report.
+/// Every other CLI line that prints an endpoint goes through the same helper —
+/// the registration echo, `provider list`, doctor's advisory — and this was the
+/// one that did not.
 fn preview_lines(provider: &ProviderConfig) -> Vec<String> {
     let model = provider.model.as_deref().unwrap_or("no model configured");
     let endpoint = match provider.endpoint.as_deref() {
-        Some(endpoint) if !endpoint.trim().is_empty() => endpoint.to_owned(),
+        Some(endpoint) if !endpoint.trim().is_empty() => crate::displayed_endpoint(endpoint),
         _ => "no endpoint stored; this kind composes its own".to_owned(),
     };
     vec![format!(
@@ -579,7 +644,24 @@ mod tests {
 
     /// The credential value that must never reach a rendered line. Distinctive
     /// enough that a sweep over the surface means something (LESSON-519).
+    ///
+    /// It is **planted in the fixture's own endpoint** rather than merely being
+    /// absent from it, because a "never the key" assertion over a fixture that
+    /// holds no key is a test of nothing: it passed on a preview that printed
+    /// the stored endpoint byte for byte, which is precisely how a userinfo
+    /// credential reached the screen. A stored `user:password@` is a shape the
+    /// product permits and dials as typed (REQ-578), so the fixture carries one
+    /// and every sweep below is answering a real question.
     const PLANTED_KEY: &str = "sk-planted-provider-test-key";
+
+    /// The fixture endpoint, credential and all — as `config/get` would report a
+    /// provider registered with userinfo in its URL.
+    const ENDPOINT_WITH_KEY: &str =
+        "https://u:sk-planted-provider-test-key@api.moonshot.ai/v1/chat/completions";
+
+    /// The same endpoint as it may be **shown**: the authority's userinfo
+    /// replaced, the rest untouched (`crate::displayed_endpoint`).
+    const ENDPOINT_SHOWN: &str = "https://***@api.moonshot.ai/v1/chat/completions";
 
     /// The credential *reference*, which the daemon's own `refused` sentence
     /// does name — and which AC-2 asserts is what prints in its place.
@@ -590,6 +672,14 @@ mod tests {
         surface: RecordingSurface,
         prompter: ScriptedPrompter,
         snapshot: Result<ConfigSnapshot, RpcError>,
+        /// What the **second** `config/get` answers, when the flow re-reads the
+        /// config after a `reached` outcome. `None` means "the same as the
+        /// first", which is every test that is not about the re-read.
+        snapshot_after: Option<Result<ConfigSnapshot, RpcError>>,
+        /// How many `config/get` calls the flow made. The re-read is a round
+        /// trip on a user's daemon, so "only after `reached`" is asserted as a
+        /// count rather than inferred from a rendered line.
+        snapshots_read: usize,
         outcome: Result<ProviderTestResult, RpcError>,
         /// Every `provider/test` this flow sent, as sent. The whole of AC-4 is
         /// an assertion that this is empty.
@@ -602,6 +692,8 @@ mod tests {
                 surface: RecordingSurface::new(),
                 prompter: ScriptedPrompter::new(answers),
                 snapshot: Ok(snapshot()),
+                snapshot_after: None,
+                snapshots_read: 0,
                 outcome: Ok(result(reached())),
                 tests: Vec::new(),
             }
@@ -634,6 +726,12 @@ mod tests {
             &mut self,
             _params: ConfigGetParams,
         ) -> anyhow::Result<Result<ConfigGetResult, RpcError>> {
+            self.snapshots_read += 1;
+            if self.snapshots_read > 1 {
+                if let Some(after) = self.snapshot_after.clone() {
+                    return Ok(after.map(|snapshot| ConfigGetResult { snapshot }));
+                }
+            }
             Ok(self
                 .snapshot
                 .clone()
@@ -672,7 +770,7 @@ mod tests {
                 provider(
                     "kimi",
                     ProviderKind::OpenaiCompatible,
-                    Some("https://api.moonshot.ai/v1/chat/completions"),
+                    Some(ENDPOINT_WITH_KEY),
                 ),
                 ProviderConfig {
                     model: None,
@@ -746,11 +844,15 @@ mod tests {
     /// follows says what it will cost in shape.
     ///
     /// The endpoint is asserted whole rather than by its host: the claim the
-    /// preview makes is "this exact string is what Teton POSTs to" (REQ-578),
-    /// and a test that checked only a substring would pass for a helper that had
-    /// started parsing the URL (LESSON-529).
+    /// preview makes is "this is the string Teton POSTs to" (REQ-578), and a
+    /// test that checked only a substring would pass for a helper that had
+    /// started parsing the URL (LESSON-529). Whole, with exactly one difference
+    /// — the userinfo is `***@`, through the same `displayed_endpoint` every
+    /// other endpoint-bearing line in this CLI goes through. Path, query and
+    /// host are untouched, which is what makes this a redaction rather than a
+    /// second reading of the address.
     #[test]
-    fn the_preview_names_the_provider_and_the_stored_endpoint_verbatim() {
+    fn the_preview_names_the_provider_and_the_stored_endpoint_with_userinfo_masked() {
         let mut io = FakeIo::new(&["y"]);
         run(&mut io, &session(), "kimi", false, true).expect("the flow renders");
 
@@ -760,13 +862,24 @@ mod tests {
             "{rendered}"
         );
         assert!(
-            rendered.contains("— https://api.moonshot.ai/v1/chat/completions"),
-            "the stored endpoint must be echoed whole: {rendered}"
+            rendered.contains(&format!("— {ENDPOINT_SHOWN}")),
+            "the stored endpoint must be echoed whole but for its userinfo: {rendered}"
         );
         assert!(
-            io.prompter
-                .any_question_contains("one minimal request (≈ 20 tokens) to that endpoint"),
-            "{:?}",
+            rendered.contains("***@"),
+            "the redaction has to be visible, or the line hides that a credential is stored: \
+             {rendered}"
+        );
+        assert!(
+            !rendered.contains(PLANTED_KEY),
+            "a credential value reached the preview: {rendered}"
+        );
+        assert!(
+            io.prompter.any_question_contains(
+                "one minimal request (a few tokens in, at most 8 out) to that endpoint"
+            ),
+            "the question must state the size honestly — the daemon's own budget, not a \
+             guessed total: {:?}",
             io.prompter.questions
         );
         assert!(
@@ -873,29 +986,50 @@ mod tests {
         assert!(io.rendered().contains("none at all"), "{}", io.rendered());
     }
 
-    /// BR-8 / AC-7: a local provider is refused with the **daemon's** sentence,
-    /// and the flow neither previews an endpoint it does not have nor asks a
-    /// question about a request that will not be made.
+    /// BR-8 / AC-7: a local provider is answered from the snapshot and **no
+    /// call is made at all** — no preview, no question, and no `provider/test`.
+    ///
+    /// The RPC used to be sent anyway, so that the daemon's own refusal could be
+    /// rendered. Two things were wrong with that. It relied on the daemon still
+    /// reading `kind = local` at the moment it answered, which is a race the
+    /// client has no need to enter: nothing here needs the daemon's opinion to
+    /// know that a provider with no host has no connection to test. And it sat
+    /// *below* the non-terminal gate, so a piped session was told to re-run with
+    /// `--yes` — consent advice for a call that was never going to be made.
+    ///
+    /// AC-7's own claim (the daemon refuses `kind = local`) is unaffected and is
+    /// tested where it lives, in `tetond`.
     #[test]
-    fn a_local_provider_renders_the_daemons_own_refusal() {
-        let mut io = FakeIo::new(&["y"]);
-        io.outcome = Err(RpcError {
-            code: error_code::INVALID_PARAMS,
-            message: "`onlocal` is the local tier and has nothing to dial — it is still \
-                      downloading qwen2.5-coder-7b; `teton doctor` reports its state."
-                .to_owned(),
-            data: None,
-        });
-        run(&mut io, &session(), "onlocal", false, true).expect("the flow renders");
+    fn a_local_provider_is_answered_without_a_call() {
+        for typed_input in [true, false] {
+            let mut io = FakeIo::new(&["y"]);
+            run(&mut io, &session(), "onlocal", false, typed_input).expect("the flow renders");
 
-        assert_eq!(io.prompter.asked, 0, "there is nothing to consent to");
-        let rendered = io.rendered();
-        assert!(rendered.contains("nothing to dial"), "{rendered}");
-        assert!(rendered.contains("teton doctor"), "{rendered}");
-        assert!(
-            !rendered.contains("one minimal request"),
-            "a provider with no host must not be previewed as one that has: {rendered}"
-        );
+            assert!(
+                io.tests.is_empty(),
+                "a local provider must reach provider/test not at all (typed_input={typed_input}): \
+                 {:?}",
+                io.tests
+            );
+            assert_eq!(io.prompter.asked, 0, "there is nothing to consent to");
+            let rendered = io.rendered();
+            assert!(
+                rendered.contains("`onlocal` is the local tier: a connection test dials nothing."),
+                "{rendered}"
+            );
+            assert!(
+                rendered.contains("teton doctor"),
+                "the answer to \"does it work\" for a local tier is doctor's: {rendered}"
+            );
+            assert!(
+                !rendered.contains("one minimal request"),
+                "a provider with no host must not be previewed as one that has: {rendered}"
+            );
+            assert!(
+                !rendered.contains("--yes"),
+                "a call that will not be made must not ask for consent to make it: {rendered}"
+            );
+        }
     }
 
     // -------------------------------------------------------------------
@@ -979,9 +1113,15 @@ mod tests {
         assert_eq!(unique.len(), verdicts.len(), "{verdicts:?}");
     }
 
-    /// AC-2: the report can name the credential's **reference** and can never
-    /// name its value — because the only vendor-adjacent text on screen is the
-    /// daemon's own `reason`, rendered.
+    /// AC-2: the flow can name the credential's **reference** and can never name
+    /// its value — over the *whole* run, preview included.
+    ///
+    /// Non-vacuous by construction: the fixture provider's endpoint carries
+    /// [`PLANTED_KEY`] as userinfo, this run renders the preview (`--yes` skips
+    /// the question, not the preview) and then the report, and the sweep is over
+    /// every line both produced. Before the preview went through
+    /// `displayed_endpoint` this assertion failed on the preview line — which is
+    /// the only reason it is worth writing down.
     #[test]
     fn the_report_names_the_key_reference_and_never_the_key() {
         let mut io = FakeIo::new(&[]);
@@ -1064,6 +1204,99 @@ mod tests {
         assert!(rendered.contains("teton policy set-tier"), "{rendered}");
     }
 
+    /// **BR-4 / AC-5: the routing line describes the machine the test left.**
+    ///
+    /// The snapshot the preview was read from is a reading taken *before* the
+    /// call, and a `reached` outcome is the one ending that can invalidate it:
+    /// the daemon screens an `Unavailable` provider out of its routing
+    /// resolution, so a provider the health map had written off comes back with
+    /// no categories dispatching to it — and a `reached` test is what restores
+    /// it. Reporting the stale reading would tell a user whose connection just
+    /// came back that nothing routes to it.
+    ///
+    /// Asserted on both halves: the second `config/get` happens, and the line is
+    /// composed from *its* answer rather than the first's.
+    #[test]
+    fn a_reached_report_re_reads_the_config_before_naming_what_routes_there() {
+        let mut io = FakeIo::new(&[]);
+        // Before: `kimi` was unavailable, so the resolver routed nothing to it.
+        io.snapshot = Ok(ConfigSnapshot {
+            routing: Vec::new(),
+            ..snapshot()
+        });
+        // After: the test restored it, and the categories are back.
+        io.snapshot_after = Some(Ok(snapshot()));
+        run(&mut io, &session(), "kimi", true, true).expect("the flow renders");
+
+        assert_eq!(
+            io.snapshots_read, 2,
+            "a reached test must re-read the config it is about to report on"
+        );
+        let rendered = io.rendered();
+        assert!(
+            rendered.contains("`build` routes here (edit, shell)"),
+            "the routing line must come from the reading taken *after* the test: {rendered}"
+        );
+        assert!(
+            !rendered.contains("no category dispatches on it yet"),
+            "the pre-test reading must not be what the user is left with: {rendered}"
+        );
+    }
+
+    /// And **only** on `reached`: a failure changed no routing, so a second
+    /// round trip would buy an unchanged answer.
+    #[test]
+    fn a_failed_report_does_not_re_read_the_config() {
+        for outcome in [
+            ProviderTestOutcome::Unreachable {
+                reason: "could not reach api.moonshot.ai: timeout".to_owned(),
+            },
+            ProviderTestOutcome::Refused {
+                status: 401,
+                reason: "HTTP 401 from api.moonshot.ai".to_owned(),
+            },
+            ProviderTestOutcome::RateLimited {
+                retry_after_secs: None,
+            },
+        ] {
+            let mut io = FakeIo::new(&[]);
+            io.outcome = Ok(result(outcome));
+            run(&mut io, &session(), "kimi", true, true).expect("the flow renders");
+            assert_eq!(
+                io.snapshots_read,
+                1,
+                "a failed test must not spend a second config/get: {}",
+                io.rendered()
+            );
+        }
+    }
+
+    /// A re-read that **fails** costs the report nothing: the pre-test snapshot
+    /// is still a true reading of the routing table a moment ago, the call this
+    /// report is about already happened, and a dropped routing line would lose
+    /// more than the staleness it avoided.
+    #[test]
+    fn a_failed_re_read_falls_back_to_the_reading_it_had() {
+        let mut io = FakeIo::new(&[]);
+        io.snapshot_after = Some(Err(RpcError {
+            code: error_code::INTERNAL_ERROR,
+            message: "the config could not be read".to_owned(),
+            data: None,
+        }));
+        run(&mut io, &session(), "kimi", true, true).expect("the flow renders");
+
+        assert_eq!(io.snapshots_read, 2);
+        let rendered = io.rendered();
+        assert!(
+            rendered.contains("`build` routes here (edit, shell)"),
+            "the first reading must still be reported: {rendered}"
+        );
+        assert!(
+            !rendered.contains("could not read your config"),
+            "a failed re-read is not news the user can act on: {rendered}"
+        );
+    }
+
     /// A failure renders no routing line: what routes there did not change, and
     /// the reader's next move is the remedy, not the routing table.
     #[test]
@@ -1080,30 +1313,45 @@ mod tests {
     // Version skew and refusals
     // -------------------------------------------------------------------
 
-    /// A daemon that never heard of the method says so as a version fact, not as
-    /// an error, and neither call is retried into a second line.
+    /// A daemon that never heard of a method says so as a version fact, not as
+    /// an error — and names the method it actually lacks.
+    ///
+    /// The two are separate lines because they are separate facts: a daemon
+    /// without `config/get` predates the config snapshot itself, and telling its
+    /// user that "provider connection tests" are unavailable would send them
+    /// looking for a feature while the older, larger problem went unnamed.
     #[test]
-    fn a_daemon_without_the_method_reports_a_version_fact() {
-        for missing in ["config", "test"] {
-            let mut io = FakeIo::new(&[]);
-            let absent = RpcError {
-                code: error_code::METHOD_NOT_FOUND,
-                message: "no such method".to_owned(),
-                data: None,
-            };
-            if missing == "config" {
-                io.snapshot = Err(absent);
-            } else {
-                io.outcome = Err(absent);
-            }
-            run(&mut io, &session(), "kimi", true, true).expect("the flow renders");
-            assert!(
-                io.rendered()
-                    .contains("does not serve provider connection tests"),
-                "{missing}: {}",
-                io.rendered()
-            );
-        }
+    fn a_daemon_without_a_method_names_the_method_it_lacks() {
+        let absent = || RpcError {
+            code: error_code::METHOD_NOT_FOUND,
+            message: "no such method".to_owned(),
+            data: None,
+        };
+
+        let mut io = FakeIo::new(&[]);
+        io.snapshot = Err(absent());
+        run(&mut io, &session(), "kimi", true, true).expect("the flow renders");
+        let rendered = io.rendered();
+        assert!(
+            rendered.contains("does not serve `config/get`"),
+            "{rendered}"
+        );
+        assert!(
+            !rendered.contains("provider connection tests"),
+            "a missing config/get must not be reported as a missing provider/test: {rendered}"
+        );
+        assert!(rendered.contains("Nothing was sent"), "{rendered}");
+        assert!(io.tests.is_empty(), "{:?}", io.tests);
+
+        let mut io = FakeIo::new(&[]);
+        io.outcome = Err(absent());
+        run(&mut io, &session(), "kimi", true, true).expect("the flow renders");
+        let rendered = io.rendered();
+        assert!(
+            rendered.contains("does not serve provider connection tests"),
+            "{rendered}"
+        );
+        assert!(!rendered.contains("`config/get`"), "{rendered}");
     }
 
     /// A daemon that answers "no" — an unresolvable credential reference, a
@@ -1160,16 +1408,18 @@ mod tests {
         let mut composed = vec![
             TEST_NEEDS_A_SESSION.to_owned(),
             TEST_UNAVAILABLE.to_owned(),
+            CONFIG_UNAVAILABLE.to_owned(),
             NOT_A_TERMINAL.to_owned(),
             TEST_DECLINED.to_owned(),
             CONFIRM_QUESTION.to_owned(),
             unknown_id_line("x", &snapshot()),
             routing_line(&snapshot(), "kimi"),
+            local_tier_line("onlocal"),
         ];
         composed.extend(preview_lines(&provider(
             "kimi",
             ProviderKind::OpenaiCompatible,
-            Some("https://api.moonshot.ai/v1/chat/completions"),
+            Some(ENDPOINT_WITH_KEY),
         )));
         composed.extend(report_lines(&result(reached()), &snapshot()));
         for line in composed {

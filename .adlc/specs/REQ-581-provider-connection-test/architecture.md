@@ -195,12 +195,29 @@ heuristic and is labelled one: AC-8b is claimed only after a live A/B
 provider ids come from the `config/get` snapshot the CLI already caches
 (REQ-560), so "kimi" in the prompt counts without a hard-coded vendor list.
 
+### ADR-6 (verify) — A probe drains at teardown like a turn, and has a deadline
+
+The first cut spawned `provider/test` beside the consent/attach methods, whose
+teardown `abort()`s unconditionally — right for a flow that mints a tracked
+grant or awaits a human, wrong for a billed request whose only durable record
+is the row and event written when the stream ends (REQ-565's exact hole for
+turns). The probe's task now joins the drained list. And because the turn
+path's "no timeout" posture does not transfer to a fixed 8-token request, the
+probe carries `PROBE_DEADLINE`; elapse is `unreachable` and moves health as a
+`Timeout` would. A 2xx/3xx that is not a completion (a redirect not followed,
+a non-streaming or non-chat endpoint — the adapters synthesize a terminal
+`Completed` for those) is `unreachable`, not `reached`, and touches no health.
+
 ### ADR-5 — The shell subcommand opens a session
 
-`provider/test` is session-gated (`may_drive`) so a foreign connection or a
-tool-spawned `teton provider test … --yes` (a daemon descendant, excluded from
-session access by REQ-569's ancestry gate) cannot make the user's provider
-spend on their behalf. `teton provider test <id>` therefore creates a
+`provider/test` is session-gated (`may_drive`) so a foreign connection cannot
+make the user's provider spend on their behalf, and a tool-spawned
+`teton provider test … --yes` is stopped at `session/create` by REQ-569's
+ancestry gate — with REQ-569 ADR-A's own caveat, which holds here too: a
+detached spawn (`setsid`/`nohup … &`) is `NotDescendant`, so the gate buys
+what REQ-569 bought and no more; that path already needs a `full` permission
+level or an approved `shell` call, at which point larger capabilities are in
+hand. `teton provider test <id>` therefore creates a
 freeform session, runs the same flow, and lets the session end with the
 connection — which is also what gives the cost row a `session_id`. This is
 the one place a "read-ish" subcommand opens a session, and it is because the

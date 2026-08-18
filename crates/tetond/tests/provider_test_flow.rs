@@ -29,6 +29,7 @@
 //! |---------|------|
 //! | AC-1 (reached: latency, tokens, recorded cost; one probe row in `teton cost`), AC-5 (health, and the next turn routes there), BR-1, BR-4, BR-5 | [`a_reached_test_reports_what_came_back_bills_one_probe_and_leaves_the_provider_routable`] |
 //! | AC-2 (401 names the credential *reference*, never its value; no ledger row), AC-3 (404 / 429 / 5xx / closed port are four distinct typed outcomes), BR-3 | [`every_way_the_call_can_fail_is_its_own_typed_outcome_and_bills_nothing`] |
+//! | verify F1 (a 2xx/3xx that completed nothing is `unreachable`, never a green `reached`) | [`an_endpoint_that_answers_without_completing_is_unreachable_not_reached`] |
 //! | AC-6 (a connection that did not attach the session is refused and nothing is dialed) | [`a_connection_that_did_not_attach_the_session_is_refused_before_anything_is_dialed`] |
 //! | AC-7 (a `kind = "local"` provider is refused with the tier's state, not tested), BR-8 | [`a_local_provider_is_refused_with_its_own_state_and_nothing_is_dialed`] |
 //!
@@ -74,7 +75,9 @@ use serde_json::{json, Value};
 #[path = "e2e/harness.rs"]
 mod harness;
 
-use harness::{openai_turn, tier_block, Client, Daemon, DaemonOptions, MockProvider, Workspace};
+use harness::{
+    openai_turn, tier_block, Client, Daemon, DaemonOptions, MockProvider, MockResponse, Workspace,
+};
 
 const INVALID_PARAMS: i64 = teton_protocol::jsonrpc::error_code::INVALID_PARAMS;
 const NOT_ATTACHED: i64 = teton_protocol::jsonrpc::error_code::NOT_ATTACHED;
@@ -470,7 +473,20 @@ fn a_reached_test_reports_what_came_back_bills_one_probe_and_leaves_the_provider
 /// resolved would have been `CONFIG_REJECTED` with nothing sent at all.
 #[test]
 fn every_way_the_call_can_fail_is_its_own_typed_outcome_and_bills_nothing() {
-    let refuser = MockProvider::always_status(401);
+    // The 401's body **echoes the planted key back** (LESSON-519). A vendor
+    // error body routinely quotes the credential it rejected, and ADR-3's whole
+    // claim is that the daemon composes its own sentence from its own facts
+    // rather than forwarding that prose. Against a mock whose body never
+    // contained the key, `assert_key_never_said` below would be asserting about
+    // a string that was never on this side of the wire — true, and about
+    // nothing.
+    let refuser = MockProvider::start(
+        Vec::new(),
+        MockResponse::status_with_body(
+            401,
+            format!("{{\"error\":\"bad key: {PROBE_KEY_VALUE}\"}}"),
+        ),
+    );
     let unknown = MockProvider::always_status(404);
     let limiter = MockProvider::always_status(429);
     let failer = MockProvider::always_status(503);
@@ -674,6 +690,129 @@ fn every_way_the_call_can_fail_is_its_own_typed_outcome_and_bills_nothing() {
     ] {
         assert_key_never_said(response, &client, &daemon, "a failed connection test");
     }
+}
+
+// ---------------------------------------------------------------------------
+// (f2) verify F1 — an endpoint that answers without completing is not a success
+// ---------------------------------------------------------------------------
+
+/// **Verify F1, over the socket.** A `200` that is not a completion stream, and
+/// a `301` that is not followed, are both `unreachable` — never `reached`.
+///
+/// This is the connection test's worst possible failure and the reason it is
+/// worth a leg of its own: a *green* answer for an endpoint no turn can use.
+/// The shipped adapters raise a `ProviderError` only at status >= 400, and the
+/// SSE reader synthesizes a terminal completion even for a body that carried no
+/// `data:` lines — so an endpoint pasted without its `/v1/chat/completions`
+/// path (which is what both of these mocks stand in for: a `/models`-shaped JSON
+/// answer, and a redirect the daemon deliberately does not follow) used to come
+/// back as `reached { 0 in / 0 out }` and leave the provider stamped healthy.
+///
+/// Both legs are asserted on the typed tag, and the pair is asserted *identical*
+/// on purpose: these are two routes to one fact — something is listening, and it
+/// is not a chat endpoint — so they earn the same variant rather than two.
+///
+/// The ledger assertion is the deliberate, honest half. Each of these answers
+/// carries a status < 400 whose body the daemon polled, which is the cost
+/// meter's whole definition of a billable call, so each writes a zero-token
+/// probe row. The rows are not suppressed: a request really was made, and a
+/// vendor really may charge for one — a ledger that hid it would be lying about
+/// egress that happened. The row and the outcome disagree about *usefulness*,
+/// not about facts.
+#[test]
+fn an_endpoint_that_answers_without_completing_is_unreachable_not_reached() {
+    let not_a_stream = MockProvider::start(
+        Vec::new(),
+        MockResponse::status_with_body(200, r#"{"object":"list","data":[]}"#),
+    );
+    let redirector = MockProvider::always_status(301);
+
+    let mut config = provider_block("notastream", &not_a_stream.openai_endpoint(), PRICED_MODEL);
+    config.push_str(&provider_block(
+        "redirector",
+        &redirector.openai_endpoint(),
+        PRICED_MODEL,
+    ));
+
+    let ws = Workspace::new("provider-test-noncompletion");
+    ws.write_config(&config);
+    let script = ws.write_script(NO_LOCAL_TURNS);
+    let daemon = Daemon::spawn(&ws, probe_machine().script(script));
+    let mut client = daemon.connect();
+    let session = client.create_session("freeform", None);
+
+    let answered = test_provider(&mut client, &session, "notastream");
+    assert_eq!(
+        outcome_tag(&answered),
+        "unreachable",
+        "a 200 carrying ordinary JSON completed nothing — reporting it as \
+         `reached` would hand the user a green light for an endpoint no turn can \
+         use. daemon log:\n{}",
+        daemon.log()
+    );
+    assert!(
+        answered["result"]["outcome"]["reason"]
+            .as_str()
+            .is_some_and(|r| r.contains("127.0.0.1")),
+        "the sentence names the endpoint that answered wrongly: {answered}"
+    );
+    assert_eq!(
+        not_a_stream.request_count(),
+        1,
+        "non-vacuity: the call really was made, so this is a verdict about an \
+         answer rather than about a dial that never happened"
+    );
+
+    let redirected = test_provider(&mut client, &session, "redirector");
+    assert_eq!(
+        outcome_tag(&redirected),
+        "unreachable",
+        "redirects are deliberately not followed (a credential header must not \
+         be carried to a host the vendor chose), so a 301 asks the chat endpoint \
+         nothing at all. daemon log:\n{}",
+        daemon.log()
+    );
+    assert_eq!(redirector.request_count(), 1);
+
+    // Neither provider may be left looking healthy *because* of this call: the
+    // outcome carries a health reading, and it must not be a clearance earned by
+    // an answer that served nothing.
+    for response in [&answered, &redirected] {
+        assert!(
+            response["result"]["health_after"].as_str().is_some(),
+            "every outcome says where it left routing health: {response}"
+        );
+    }
+
+    // The rows: written, counted, and zero — see the doc comment.
+    let report = client.cost_query();
+    assert_eq!(
+        report["probe_calls"].as_u64(),
+        Some(2),
+        "a status < 400 whose body was polled is a billable call, and the ledger \
+         records it rather than pretending the request never left: {report}"
+    );
+    let per_provider = report["per_provider"]
+        .as_array()
+        .unwrap_or_else(|| panic!("the report rolls up per provider: {report}"));
+    assert_eq!(per_provider.len(), 2, "{report}");
+    for row in per_provider {
+        assert_eq!(row["calls"].as_u64(), Some(1), "{report}");
+        assert_eq!(
+            (row["input_tokens"].as_u64(), row["output_tokens"].as_u64()),
+            (Some(0), Some(0)),
+            "and it records what it actually saw — no tokens — rather than a \
+             completion it never received: {report}"
+        );
+    }
+
+    client.drain_events(EVENT_WINDOW);
+    assert_eq!(
+        tested_events(&client).len(),
+        2,
+        "both outcomes are announced (LESSON-505): {:?}",
+        tested_events(&client)
+    );
 }
 
 // ---------------------------------------------------------------------------

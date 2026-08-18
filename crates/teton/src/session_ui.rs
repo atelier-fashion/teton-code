@@ -677,12 +677,28 @@ pub fn render_event(
         // client attached to the same session watched that happen and is owed
         // the news (LESSON-505).
         Event::ProviderSetupCompleted(completed) => {
+            let elsewhere = other_session(state.session_id.as_ref(), env.session_id.as_ref());
+            // REQ-581 ADR-4's cache, kept current. `provider_ids` is filled once
+            // by `read_config_view` at session start, so a provider registered
+            // *during* the session — which is REQ-579's whole flow, and the
+            // motivating one for this REQ — was invisible to the connection
+            // predicate until the next run of the CLI. "is kimi working?" one
+            // minute after registering `kimi` is the exact turn the hand-off
+            // exists for.
+            //
+            // Only for this session's own registration: the ids are this user's
+            // vocabulary for the providers *they* just set up, and another
+            // session's registration is news (the notice below says so) rather
+            // than a word to start reading their prompts for.
+            if elsewhere.is_none() {
+                let id = completed.provider_id.0.as_str();
+                if !state.provider_ids.iter().any(|known| known == id) {
+                    state.provider_ids.push(id.to_owned());
+                }
+            }
             surface.line(
                 LineKind::Notice,
-                &format_provider_setup_completed(
-                    completed,
-                    other_session(state.session_id.as_ref(), env.session_id.as_ref()),
-                ),
+                &format_provider_setup_completed(completed, elsewhere),
             );
             EventOutcome::Rendered
         }
@@ -723,20 +739,25 @@ pub fn render_event(
         // and a notice rather than an error, the class of the startup lifecycle
         // lines it continues (BUG-152's `TIER_WARMING` precedent): nothing
         // broke, nothing needs fixing, and the state ends by itself.
-        // REQ-581 BR-3/BR-4, and the provider-setup pair's arrangement applied
-        // to the flow beside it: never verbose-gated, because the health map the
-        // router reads at decision time just moved and a second client attached
-        // to the session watched that happen (LESSON-505). Published on every
-        // outcome, not only the good one — the test either spent or failed, and
-        // either way the next turn's routing changed.
+        // REQ-581 BR-3/BR-4: the health map the router reads at decision time
+        // just moved, and a second client attached to the session watched that
+        // happen (LESSON-505). Published on every outcome, not only the good one
+        // — the test either spent or failed, and either way the next turn's
+        // routing changed.
+        //
+        // Rendered **only for another session's test**, which is the audience
+        // the notice was written for (see `format_provider_tested`). The client
+        // that ran the test has the whole `ProviderTestResult` and prints the
+        // report — model, dial host, remedy, routing — so a notice here would be
+        // the same news twice on the one surface that already said it at length,
+        // in two different wordings a reader has to reconcile. The spec's own
+        // example transcript and the CHANGELOG show the report alone.
         Event::ProviderTested(tested) => {
-            surface.line(
-                LineKind::Notice,
-                &format_provider_tested(
-                    tested,
-                    other_session(state.session_id.as_ref(), env.session_id.as_ref()),
-                ),
-            );
+            if let Some(elsewhere) =
+                other_session(state.session_id.as_ref(), env.session_id.as_ref())
+            {
+                surface.line(LineKind::Notice, &format_provider_tested(tested, elsewhere));
+            }
             EventOutcome::Rendered
         }
         Event::TurnQueued(queued) => {
@@ -746,7 +767,7 @@ pub fn render_event(
     }
 }
 
-/// The line a finished connection test renders (REQ-581 BR-3).
+/// The line a connection test run in **another** session renders (REQ-581 BR-3).
 ///
 /// Deliberately **terse**, and that is the difference between this and the
 /// report [`crate::provider_test_ui`] prints. The client that ran the test
@@ -754,7 +775,8 @@ pub fn render_event(
 /// model, the dial host, the routing that follows — and renders it; this notice
 /// is for the *other* clients attached to the session, whose news is only what
 /// came back and where health landed. A full second copy of the report would be
-/// the same facts twice on the surface that ran the command.
+/// the same facts twice on the surface that ran the command, which is why the
+/// caller renders this one only when `elsewhere` exists at all.
 ///
 /// The outcome is worded by [`crate::provider_test_ui::outcome_sentence`], the
 /// same function the report uses, because the event's `outcome` is byte-identical
@@ -767,16 +789,13 @@ pub fn render_event(
 /// the credential **reference**, inside a `reason` the daemon composed, which is
 /// exactly what AC-2 asserts is safe to show.
 ///
-/// `elsewhere` names the session when the test was not this client's: the bus is
-/// daemon-wide, and "the provider your turns use just came back healthy" and
-/// "some other session's did" are not the same news.
-fn format_provider_tested(tested: &ProviderTested, elsewhere: Option<&SessionId>) -> String {
-    let whose = match elsewhere {
-        Some(session) => format!(" in another session ({session})"),
-        None => String::new(),
-    };
+/// `elsewhere` names the session the test ran in, and is not optional: the bus
+/// is daemon-wide, and "the provider your turns use just came back healthy" and
+/// "some other session's did" are not the same news — so the one the reader
+/// meets here is always the second.
+fn format_provider_tested(tested: &ProviderTested, elsewhere: &SessionId) -> String {
     format!(
-        "provider `{}` tested{whose}: {}; provider health: {}.",
+        "provider `{}` tested in another session ({elsewhere}): {}; provider health: {}.",
         tested.provider_id,
         crate::provider_test_ui::outcome_sentence(&tested.outcome),
         crate::provider_test_ui::health_name(tested.health_after),
@@ -1569,12 +1588,24 @@ pub(crate) fn hand_off_line() -> &'static str {
 
 /// The verbs a connection question is asked with — half of ADR-4's predicate.
 ///
-/// Matched case-insensitively, and as substrings on purpose: `working` covers
-/// "is it working", `reach` covers "reachable" and "can it reach". A v1 word
-/// list, not a classifier — the cost of a miss is one line that does not print,
-/// and the cost of a hit on prose that merely contains a verb is nothing at all,
-/// because the other three conditions still have to hold.
-const CONNECTION_VERBS: [&str; 6] = ["test", "check", "verify", "working", "connected", "reach"];
+/// Matched case-insensitively and **as whole words** ([`contains_word`]). The
+/// substring reading this list started with was too wide to mean anything: it
+/// fired on "the la*test* run", "con*test*", "*reach*" inside "research". Whole
+/// words cost the inflections a substring got for free, so the ones that were
+/// being relied on are listed rather than implied — `reachable` beside `reach`.
+///
+/// A v1 word list, not a classifier: the cost of a miss is one line that does
+/// not print, and the cost of a hit on prose that merely uses a verb is nothing
+/// at all, because the other three conditions still have to hold.
+const CONNECTION_VERBS: [&str; 7] = [
+    "test",
+    "check",
+    "verify",
+    "working",
+    "connected",
+    "reach",
+    "reachable",
+];
 
 /// The subjects that make such a question about a *provider* — the other half.
 ///
@@ -1594,10 +1625,21 @@ const CONNECTION_SUBJECTS: [&str; 4] = ["provider", "connection", "connectivity"
 /// mention are the same mistake.
 const PROVIDER_DIAGNOSTICS: [&str; 3] = ["teton provider", "teton policy", "teton doctor"];
 
-/// The in-session command this hand-off names. A reply that already named it has
-/// answered the question, and the harness stays quiet — [`HAND_OFF_LINE`]'s
-/// dormancy rule, applied to the same effect.
-const CONNECTION_COMMAND: &str = "/provider test";
+/// The two spellings of the **right** answer (BR-6): the in-session command and
+/// its shell form.
+///
+/// A reply that named either has answered the question, and the harness stays
+/// quiet — [`HAND_OFF_LINE`]'s dormancy rule. Both are needed because both are
+/// correct: `/provider test kimi` is what a user types here, and `teton provider
+/// test kimi` is the non-interactive answer this REQ shipped alongside it. A
+/// list that knew only the slash form printed the nudge at a reply that had
+/// already given the user the right command, which is the shape of correction a
+/// reader learns to ignore.
+///
+/// The shell form is also why [`improvised_a_probe`] cannot read
+/// [`PROVIDER_DIAGNOSTICS`] naively: `teton provider test` starts with `teton
+/// provider`, so the correct answer looked exactly like the mistake.
+const CONNECTION_COMMANDS: [&str; 2] = ["/provider test", "teton provider test"];
 
 /// ADR-4's sentence, and the only thing this half prints.
 ///
@@ -1614,6 +1656,40 @@ pub(crate) fn connection_test_line() -> &'static str {
     CONNECTION_TEST_LINE
 }
 
+/// True when `needle` occurs in `haystack` as a whole word.
+///
+/// "Whole" means the byte on each side is not ASCII alphanumeric, so `test`
+/// matches "test the connection" and "test?" and not "latest" or "contest", and
+/// a short provider id cannot match the middle of a longer word. Both arguments
+/// are expected lowercase; the caller lowercases once rather than per candidate.
+///
+/// A hand-rolled scan rather than a regex, and rather than a token set, for two
+/// reasons: this crate has no regex dependency and one word list does not earn
+/// it, and the needles are not all single tokens — `teton provider` is a needle
+/// with a space in it, which a token set cannot express. Non-ASCII neighbours
+/// count as boundaries, which is the right answer for the only case that arises
+/// (a provider id beside punctuation or CJK text) and costs nothing elsewhere.
+fn contains_word(haystack: &str, needle: &str) -> bool {
+    if needle.is_empty() {
+        return false;
+    }
+    let bytes = haystack.as_bytes();
+    let mut from = 0;
+    while let Some(offset) = haystack[from..].find(needle) {
+        let start = from + offset;
+        let end = start + needle.len();
+        let open = start == 0 || !bytes[start - 1].is_ascii_alphanumeric();
+        let close = end == bytes.len() || !bytes[end].is_ascii_alphanumeric();
+        if open && close {
+            return true;
+        }
+        // Past the first *character* of this match, so the walk stays on a UTF-8
+        // boundary even for a needle that is not ASCII.
+        from = start + needle.chars().next().map_or(1, char::len_utf8);
+    }
+    false
+}
+
 /// True when the user's prompt reads as a question about whether a provider
 /// works (ADR-4).
 ///
@@ -1623,42 +1699,102 @@ pub(crate) fn connection_test_line() -> &'static str {
 /// "which provider is on think?" carries a subject and no verb; neither is this
 /// question.
 ///
+/// Every match is on a whole word ([`contains_word`]). Substring matching made
+/// both halves fire on prose that was not about a connection at all — "run the
+/// la**test** provider **test**s" carried a verb twice over — and it made an id
+/// dangerous in proportion to how short it was: a two-character id matched
+/// inside any word containing those two letters. Hence the length floor as well:
+/// an id of one or two characters is not distinctive enough to be read as the
+/// subject of a sentence, so it contributes nothing rather than everything.
+///
 /// Case-insensitive, because a typed prompt is prose — unlike the reply-side
-/// match above, which is case-sensitive precisely because a *command* is
+/// match below, which is case-sensitive precisely because a *command* is
 /// lowercase and a capitalised mention of one is not a command.
 fn asks_about_a_connection(prompt: &str, provider_ids: &[String]) -> bool {
     let asked = prompt.to_lowercase();
-    let verb = CONNECTION_VERBS.iter().any(|word| asked.contains(word));
-    let subject = CONNECTION_SUBJECTS.iter().any(|word| asked.contains(word))
+    let verb = CONNECTION_VERBS
+        .iter()
+        .any(|word| contains_word(&asked, word));
+    let subject = CONNECTION_SUBJECTS
+        .iter()
+        .any(|word| contains_word(&asked, word))
         || provider_ids
             .iter()
-            .any(|id| !id.is_empty() && asked.contains(&id.to_lowercase()));
+            .filter(|id| id.chars().count() >= MIN_ID_SUBJECT_CHARS)
+            .any(|id| contains_word(&asked, &id.to_lowercase()));
     verb && subject
 }
+
+/// How short a provider id may be and still count as a prompt's subject.
+///
+/// Three characters, because the ids this reads are arbitrary user strings and a
+/// one- or two-letter one ("k", "ds") appears inside ordinary English constantly.
+/// The whole-word match makes that far less likely than a substring did; the
+/// floor is the second guard, and the cost of it is that a user with a
+/// two-letter id says "provider" or "connection" like everybody else.
+const MIN_ID_SUBJECT_CHARS: usize = 3;
 
 /// True when the turn answered that question by inspecting rather than dialling
 /// (ADR-4).
 ///
 /// Two readings, because the observed failure came in two shapes and only one of
 /// them is in the reply: the model *recites* a diagnostic, or it *ran* one
-/// through the shell tool and reported what it made of the output. The tool half
-/// reads the `<tool>: <command>` title the renderer already drew, and requires
-/// the tool to be `shell` — a `read` of a file whose path contains `teton` is
-/// not a probe.
+/// through the shell tool and reported what it made of the output.
+///
+/// Both readings first take out every mention of the **right** answer, and that
+/// is the fix this predicate most needed: `teton provider test kimi` contains
+/// `teton provider`, so a reply that gave the user exactly the command BR-6
+/// names — or a turn that *ran* it — read as a provider diagnostic and drew a
+/// line correcting a correction.
+///
+/// The tool half reads the `<tool>: <command>` title the renderer already drew.
+/// It requires the tool to be `shell` — a `read` of a file whose path contains
+/// `teton` is not a probe — and requires `teton` to be the command's **first
+/// word**: `cargo test -p tetond` is a build, not a probe of the user's
+/// provider, and a substring match on "teton" called it one.
 ///
 /// `plain_reply` arrives backtick-stripped, for [`without_backticks`]'s reason:
 /// every question this module asks of a turn is asked of the same characters.
 fn improvised_a_probe(plain_reply: &str, turn_tools: &[String]) -> bool {
+    let recited = without_the_connection_test(plain_reply);
     if PROVIDER_DIAGNOSTICS
         .iter()
-        .any(|command| plain_reply.contains(command))
+        .any(|command| recited.contains(command))
     {
         return true;
     }
-    turn_tools.iter().any(|title| match title.split_once(':') {
-        Some((tool, command)) => tool.trim() == "shell" && command.contains("teton"),
-        None => false,
-    })
+    turn_tools.iter().any(|title| shell_probed_teton(title))
+}
+
+/// `text` with every mention of the connection test itself removed.
+///
+/// So that the right answer cannot be counted as the mistake it corrects: the
+/// shell form of this REQ's own command is a prefix-match for `teton provider`,
+/// which is the first entry in [`PROVIDER_DIAGNOSTICS`].
+fn without_the_connection_test(text: &str) -> String {
+    CONNECTION_COMMANDS
+        .iter()
+        .fold(text.to_owned(), |stripped, command| {
+            stripped.replace(command, " ")
+        })
+}
+
+/// True when one tool-call title is a `shell` call whose command **starts** with
+/// `teton` and is not the connection test.
+fn shell_probed_teton(title: &str) -> bool {
+    let Some((tool, command)) = title.split_once(':') else {
+        return false;
+    };
+    if tool.trim() != "shell" {
+        return false;
+    }
+    let mut words = command.split_whitespace();
+    if words.next() != Some("teton") {
+        return false;
+    }
+    // `teton provider test <id>` is the command this hand-off would have named:
+    // a turn that ran it dialled, and has nothing to be corrected about.
+    !(words.next() == Some("provider") && words.next() == Some("test"))
 }
 
 /// End a typed-prompt turn: print the hand-off if this turn earned one.
@@ -1701,7 +1837,9 @@ pub(crate) fn hand_off_after_turn(state: &mut SessionState, surface: &mut dyn Su
     }
     if asks_about_a_connection(&prompt, &state.provider_ids)
         && improvised_a_probe(&plain, &tools)
-        && !plain.contains(CONNECTION_COMMAND)
+        && !CONNECTION_COMMANDS
+            .iter()
+            .any(|command| plain.contains(command))
     {
         surface.line(LineKind::Notice, connection_test_line());
     }
@@ -3992,37 +4130,47 @@ mod tests {
         );
     }
 
-    /// REQ-581 BR-3/BR-4's client leg: a finished connection test is announced
-    /// to every session attached, naming what came back and where health landed
-    /// — including on the outcomes that failed, because the health map moved
-    /// under a second client either way.
+    /// REQ-581 BR-3/BR-4's client leg: a connection test run **elsewhere** is
+    /// announced here, naming what came back and where health landed — including
+    /// on the outcomes that failed, because the health map this session's router
+    /// reads moved either way.
     ///
     /// It is asserted against the *same* wording the report uses, which is the
     /// point of sharing `outcome_sentence`: an event that spelled `reachable`
     /// differently from the command that produced it would read as two different
     /// facts.
     #[test]
-    fn a_finished_provider_test_is_announced_with_its_outcome_and_health() {
-        let mut surface = RecordingSurface::new();
+    fn a_provider_test_run_elsewhere_is_announced_with_its_outcome_and_health() {
         let mut state = SessionState::new();
+        state.session_id = Some(SessionId::from("ours"));
+        let theirs = |seq: u64, event: Event| {
+            EventEnvelope::new(seq, Some(SessionId::from("theirs")), event)
+        };
 
+        let mut surface = RecordingSurface::new();
         render_event(
-            &envelope(Event::ProviderTested(ProviderTested {
-                provider_id: ProviderId::from("kimi"),
-                outcome: ProviderTestOutcome::Reached {
-                    latency_ms: 1_400,
-                    input_tokens: 2_040,
-                    output_tokens: 21,
-                    usd_micros: Some(6_400),
-                },
-                health_after: ProviderHealth::Healthy,
-            })),
+            &theirs(
+                7,
+                Event::ProviderTested(ProviderTested {
+                    provider_id: ProviderId::from("kimi"),
+                    outcome: ProviderTestOutcome::Reached {
+                        latency_ms: 1_400,
+                        input_tokens: 2_040,
+                        output_tokens: 21,
+                        usd_micros: Some(6_400),
+                    },
+                    health_after: ProviderHealth::Healthy,
+                }),
+            ),
             &mut surface,
             &mut state,
         );
 
         let notice = surface.lines_of(LineKind::Notice).join("\n");
-        assert!(notice.contains("provider `kimi` tested:"), "{notice}");
+        assert!(
+            notice.contains("provider `kimi` tested in another session (theirs):"),
+            "{notice}"
+        );
         assert!(notice.contains("reachable — answered in 1.4 s"), "{notice}");
         assert!(notice.contains("provider health: healthy."), "{notice}");
         assert!(
@@ -4034,16 +4182,19 @@ mod tests {
         // sentence — is carried verbatim, credential *reference* and all (AC-2).
         let mut surface = RecordingSurface::new();
         render_event(
-            &envelope(Event::ProviderTested(ProviderTested {
-                provider_id: ProviderId::from("kimi"),
-                outcome: ProviderTestOutcome::Refused {
-                    status: 401,
-                    reason: "HTTP 401 from api.moonshot.ai — the vendor did not accept the \
-                             credential at keychain://teton/kimi"
-                        .to_owned(),
-                },
-                health_after: ProviderHealth::Unavailable,
-            })),
+            &theirs(
+                8,
+                Event::ProviderTested(ProviderTested {
+                    provider_id: ProviderId::from("kimi"),
+                    outcome: ProviderTestOutcome::Refused {
+                        status: 401,
+                        reason: "HTTP 401 from api.moonshot.ai — the vendor did not accept the \
+                                 credential at keychain://teton/kimi"
+                            .to_owned(),
+                    },
+                    health_after: ProviderHealth::Unavailable,
+                }),
+            ),
             &mut surface,
             &mut state,
         );
@@ -4053,13 +4204,20 @@ mod tests {
         assert!(notice.contains("provider health: unavailable."), "{notice}");
     }
 
-    /// The bus is daemon-wide, so this notice says *whose* session it is about
-    /// when it is not this one — `format_context_cleared`'s rule, applied to the
-    /// event that says which provider the next turn can use.
+    /// **The session that ran the test renders nothing here.**
+    ///
+    /// This notice exists for the *other* clients attached to the session — its
+    /// own doc says so — and the client that ran the command already printed the
+    /// full report: the outcome, the model, the dial host's sentence, the remedy
+    /// and what now routes there. Rendering both put the same news on one screen
+    /// twice, in two wordings a reader has to reconcile, and neither the spec's
+    /// example transcript nor the CHANGELOG shows the second one.
+    ///
+    /// Asserted as "no line at all" rather than as "no `another session` clause",
+    /// because the previous shape passed that weaker check while printing a
+    /// duplicate.
     #[test]
-    fn a_provider_test_notice_names_the_other_session_when_it_is_not_ours() {
-        let mut state = SessionState::new();
-        state.session_id = Some(SessionId::from("ours"));
+    fn our_own_provider_test_renders_no_second_line() {
         let tested = || {
             Event::ProviderTested(ProviderTested {
                 provider_id: ProviderId::from("kimi"),
@@ -4070,20 +4228,8 @@ mod tests {
             })
         };
 
-        let mut surface = RecordingSurface::new();
-        render_event(
-            &EventEnvelope::new(7, Some(SessionId::from("theirs")), tested()),
-            &mut surface,
-            &mut state,
-        );
-        let notice = surface.lines_of(LineKind::Notice).join("\n");
-        assert!(
-            notice.contains("tested in another session (theirs)"),
-            "{notice}"
-        );
-
-        // Our own session is unqualified — the qualification is news, and news
-        // on every line is noise.
+        let mut state = SessionState::new();
+        state.session_id = Some(SessionId::from("ours"));
         let mut surface = RecordingSurface::new();
         render_event(
             &EventEnvelope::new(8, Some(SessionId::from("ours")), tested()),
@@ -4091,10 +4237,24 @@ mod tests {
             &mut state,
         );
         assert!(
-            !surface
+            surface.calls.is_empty(),
+            "the surface that printed the report must not print the notice too: {:?}",
+            surface.calls
+        );
+
+        // The control: the same event from another session does render, so this
+        // is a test about whose test it was and not about the event.
+        let mut surface = RecordingSurface::new();
+        render_event(
+            &EventEnvelope::new(9, Some(SessionId::from("theirs")), tested()),
+            &mut surface,
+            &mut state,
+        );
+        assert!(
+            surface
                 .lines_of(LineKind::Notice)
                 .join("\n")
-                .contains("another session"),
+                .contains("tested in another session (theirs)"),
             "{:?}",
             surface.calls
         );
@@ -4830,6 +4990,42 @@ mod tests {
                 true,
                 Some(hand_off_line()),
             ),
+            // BR-6's *other* correct answer. `teton provider test kimi` is the
+            // non-interactive form of the very command this line would name, and
+            // it begins with `teton provider` — so the reply-side diagnostic
+            // scan read the right answer as the mistake and corrected a model
+            // that had just told the user exactly what to run.
+            (
+                "the reply named the shell form of the command",
+                asked,
+                &[probe][..],
+                "registration looks right; run teton provider test kimi to actually dial it.",
+                true,
+                None,
+            ),
+            // The same command, *run* rather than recited: the turn dialled, so
+            // there is nothing to correct. Before the tool half matched on a
+            // first-word `teton`, this was a probe like any other.
+            (
+                "the turn ran the connection test itself",
+                asked,
+                &["shell: teton provider test kimi"][..],
+                "kimi answered in 1.4 s.",
+                true,
+                None,
+            ),
+            // C10's width: `test` inside "latest", `teton` inside "tetond", and
+            // a build command that mentions neither the user's providers nor
+            // their configuration. Every substring reading of this turn found
+            // something; no word-boundary reading does.
+            (
+                "a cargo run over the daemon's own tests is not a probe",
+                "run the latest provider tests",
+                &["shell: cargo test -p tetond"][..],
+                "all green.",
+                true,
+                None,
+            ),
         ] {
             let surface = connection_turn(prompt, tools, &[reply], &[], tty);
             let expected: Vec<&str> = expected.into_iter().collect();
@@ -4840,6 +5036,71 @@ mod tests {
                 surface.calls
             );
         }
+    }
+
+    /// **A provider registered mid-session joins the vocabulary at once.**
+    ///
+    /// `provider_ids` is filled by `read_config_view` when the session opens and
+    /// never again, so a provider registered *during* the session — REQ-579's
+    /// `/provider setup`, which is the flow this REQ was written to follow — was
+    /// invisible to the connection predicate until the next run of the CLI. "is
+    /// kimi working?" a minute after registering `kimi` is the exact turn the
+    /// hand-off exists for, and it was the one turn that could not earn it.
+    ///
+    /// Another session's registration deliberately does *not* join: the ids are
+    /// this user's words for the providers they just set up.
+    #[test]
+    fn a_provider_registered_this_session_becomes_a_connection_subject() {
+        let completed = |id: &str| {
+            Event::ProviderSetupCompleted(ProviderSetupCompleted {
+                provider_id: ProviderId::from(id),
+                kind: ProviderKind::OpenaiCompatible,
+                model: "kimi-k3".to_owned(),
+                bindings: Vec::new(),
+                dial_host: "api.moonshot.ai".to_owned(),
+            })
+        };
+
+        let mut surface = RecordingSurface::new();
+        let mut state = SessionState::new();
+        state.session_id = Some(SessionId::from("s1"));
+        assert!(
+            state.provider_ids.is_empty(),
+            "the session opened with none"
+        );
+
+        render_event(&envelope(completed("kimi")), &mut surface, &mut state);
+        assert_eq!(state.provider_ids, vec!["kimi".to_owned()]);
+
+        // Twice is once: the daemon may replay, and a list that grew a duplicate
+        // per attach would be a longer list saying the same thing.
+        render_event(&envelope(completed("kimi")), &mut surface, &mut state);
+        assert_eq!(state.provider_ids, vec!["kimi".to_owned()]);
+
+        // Another session's registration is news, not vocabulary.
+        render_event(
+            &EventEnvelope::new(9, Some(SessionId::from("theirs")), completed("deepseek")),
+            &mut surface,
+            &mut state,
+        );
+        assert_eq!(state.provider_ids, vec!["kimi".to_owned()]);
+
+        // And the point of all of it: the very next turn's question counts.
+        state.begin_turn("is kimi working?");
+        render_event(
+            &envelope(tool_call("c1", "shell: teton provider list")),
+            &mut surface,
+            &mut state,
+        );
+        let mut turn = RecordingSurface::new();
+        render_event(&envelope(chunk("it is registered.")), &mut turn, &mut state);
+        hand_off_after_turn(&mut state, &mut turn, true);
+        assert_eq!(
+            turn.lines_of(LineKind::Notice),
+            vec![connection_test_line()],
+            "{:?}",
+            turn.calls
+        );
     }
 
     /// The registered ids are the user's own vocabulary for their providers.
@@ -4877,6 +5138,72 @@ mod tests {
             "with no snapshot the vendor word is not a subject; got {:?}",
             surface.calls
         );
+    }
+
+    /// **Words, not substrings — the reading every half of the predicate uses.**
+    ///
+    /// The failures this closes were all one bug wearing different clothes: a
+    /// verb found inside "la*test*" and "con*test*", `reach` inside "research",
+    /// and — worst, because it scales with how short the id is — a registered id
+    /// found inside any word containing its letters. The floor on id length is
+    /// the second guard for the same class.
+    #[test]
+    fn the_connection_predicate_matches_whole_words_only() {
+        // The helper itself, at its edges.
+        assert!(contains_word("test the connection", "test"));
+        assert!(contains_word("is it working?", "working"));
+        assert!(contains_word("kimi, is it up", "kimi"));
+        assert!(contains_word("test", "test"));
+        assert!(!contains_word("the latest run", "test"));
+        assert!(!contains_word("a contest", "test"));
+        assert!(!contains_word("some research", "reach"));
+        assert!(!contains_word("tetond is building", "teton"));
+        assert!(!contains_word("anything", ""));
+
+        // And through the predicate: a prompt that only *contains* the letters
+        // is not a connection question.
+        assert!(!asks_about_a_connection(
+            "run the latest provider tests",
+            &[]
+        ));
+        assert!(asks_about_a_connection("test the provider", &[]));
+
+        // A short id contributes nothing rather than everything: `ds` inside
+        // "roads" would otherwise make any sentence a provider question.
+        let short = vec!["ds".to_owned()];
+        assert!(!asks_about_a_connection("check the roads", &short));
+        let long = vec!["deep".to_owned()];
+        assert!(asks_about_a_connection("check deep", &long));
+        assert!(
+            !asks_about_a_connection("check deeply", &long),
+            "an id must not match the head of a longer word"
+        );
+    }
+
+    /// The tool half reads a `shell` call whose command **starts** with `teton`,
+    /// and never the connection test itself.
+    #[test]
+    fn only_a_teton_shell_command_counts_as_a_probe() {
+        for (title, expected) in [
+            ("shell: teton provider list", true),
+            ("shell: teton doctor", true),
+            ("shell: teton policy show", true),
+            // The right answer, run.
+            ("shell: teton provider test kimi", false),
+            // Not a shell call at all.
+            ("read crates/teton/src/main.rs", false),
+            ("read: crates/teton/src/main.rs", false),
+            // `teton` somewhere in the middle of somebody else's command.
+            ("shell: cargo test -p tetond", false),
+            ("shell: grep -r teton .", false),
+            ("shell: ls ~/.teton", false),
+        ] {
+            assert_eq!(
+                shell_probed_teton(title),
+                expected,
+                "{title:?} was read wrongly"
+            );
+        }
     }
 
     /// Once per turn, and the turn's record does not outlive it.

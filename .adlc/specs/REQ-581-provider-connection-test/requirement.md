@@ -118,7 +118,7 @@ choke point; the CLI has no network path of its own).
 - [ ] AC-4: `n` at the preview sends nothing — the mock records zero requests — and the ledger is unchanged. Piped stdin without `--yes` sends nothing and says why.
 - [ ] AC-5: A `reached` test on a provider the health map holds as `Unavailable` returns it to `healthy`, and the next turn's `route_decided` selects it (asserted through `run_prompt_turn` after the test).
 - [ ] AC-6: `provider/test` from a connection not attached to the session, and from a model tool call naming the method, are refused `NOT_ATTACHED` in the response, and no request leaves the machine.
-- [ ] AC-7: `/provider test onlocal` (a `kind = "local"` provider) refuses in-response with the local tier's current state sentence and makes no call.
+- [ ] AC-7: `/provider test onlocal` (a `kind = "local"` provider) refuses in-response with the local tier's current state sentence and makes no call. *(amended at verify: the daemon method refuses so — tested in tetond for direct callers — and the interactive surface short-circuits **before any RPC** for a snapshot that says local, printing that a connection test dials nothing and pointing at `teton doctor` for the tier's state; that closes a preview-then-call race a reviewer found, and it means the CLI's line does not itself carry the tier-state sentence.)*
 - [ ] AC-8a: The resident guide names `/provider test <id>` for the "does my provider work" question, pinned by the same contract test that gates the guide against the recipe catalog (REQ-579 AC-5's shape).
 - [ ] AC-8b: The surface nudge fires for a reply that recites `teton provider` (or shell-probes `teton …`) in answer to a connection question — trigger as settled by OQ-3 — printed at most once per turn and never on a non-TTY surface; unit-tested over the render seam with a scripted reply, and A/B'd live before the guarantee is claimed (LESSON-532).
 - [ ] AC-9: `/help` lists `/provider test` from the same command table that dispatches it (REQ-555 BR-7).
@@ -135,11 +135,29 @@ choke point; the CLI has no network path of its own).
 
 ## Open Questions
 
-- [ ] OQ-1: **Should the preview show an estimated cost** from the price table when the model is priced ("≈ $0.01")? Lean: yes, labelled estimate, `unpriced` otherwise — it is the same figure `teton cost` would report.
+- [x] OQ-1: **Should the preview show an estimated cost?** Resolved at verify: **no** in v1. REQ-544 M-7 has the CLI compute no spend, so an estimate before the call would need a new daemon RPC for one line; the preview names the shape of the request instead (a few tokens in, at most 8 out) and the report shows the *recorded* figure the moment it exists. Revisit with OQ-2 if a `doctor --probe` surface wants an up-front budget.
 - [ ] OQ-2: **`teton doctor --probe`** as a third surface that tests every remote provider in turn? Lean: not in v1 — `doctor` is the passive, no-egress diagnostic and its line saying so is load-bearing (BR-1 of the project); a `--probe` flag that runs the same method N times with N previews is a follow-up once v1 is dogfooded.
 - [ ] OQ-3: **What is the hand-off trigger for the nudge?** REQ-579's nudge keys on the reply reciting `teton provider add` / `policy set-tier`. A connection question's bad answers look like shell probing (`teton provider list`, `ls ~/.teton`) rather than a recognisable recipe. Lean: key on the *user's* turn text ("test|check|verify … (connection|provider|kimi|…)") plus the reply containing `teton provider` or a `shell:` call naming `teton` — and A/B it live before trusting it (REQ-579's lesson: 0/9 on prompt steering alone).
 - [x] OQ-4: **Ledger tagging.** Resolved at architect: a nullable `probe INTEGER` column through the existing `ADDITIVE_COLUMNS` migration and a `CostRecord.probe: bool` wire field; the routing `Category` enum is left alone (a probe is addressed to a provider, not routed by category).
 - [ ] OQ-5: **`Retry-After` on `rate_limited`.** Deferred from AC-3 (ADR-2). Revisit if a second consumer wants a response header — the fix is a second *named* field on `TransportResponse`, not a header bag.
+- [ ] OQ-6: **A cap on the paid method.** `provider/test` has no in-flight cap or per-session rate limit — the same posture as `session/prompt`, and consented per call by the user's own client. Recorded at verify as accepted for v1; a small minimum interval per (session, provider) would be the defence-in-depth if a scripted caller ever matters.
+
+## Verify record (Phase 5)
+
+Six reviewers, 15 advisory candidates (9 refuted). Fixed in one pass: a
+**Critical** (the consent preview echoed a stored endpoint's userinfo — every
+other CLI line masks it; now it does too, and the "never the key" fixture
+plants the key in the endpoint so it can fail); six **Major** (a redirect /
+non-SSE 2xx read as `reached` — now `unreachable`, health untouched; an
+in-flight probe was `abort()`ed at teardown like an attach rather than
+drained like a turn — now drained, so a billed request keeps its row; no
+deadline — now `PROBE_DEADLINE`, so `Timeout → unreachable` is live; the
+local-kind branch reached the RPC without a confirm — now RPC-free; the
+calling client rendered the notice *and* the report — the notice is for other
+clients only; the shell entry point had no test — a `cli_e2e` leg); and the
+minors listed in the PR. Deferred: OQ-5, OQ-6, an Anthropic-shaped fixture
+pinning the reported `usd_micros` against the ledger row (the OpenAI shape is
+pinned), and a "health unchanged" phrasing for transient failures.
 
 ## Out of Scope
 

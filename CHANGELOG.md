@@ -32,7 +32,7 @@ user having asked for it.
   ```
   /provider test kimi
     provider:  kimi (openai-compatible, kimi-k3) — https://api.moonshot.ai/v1/chat/completions
-    this sends one minimal request (≈ 20 tokens) to that endpoint. proceed?  [y/N] y
+    this sends one minimal request (a few tokens in, at most 8 out) to that endpoint. proceed?  [y/N] y
     kimi kimi-k3: reachable — answered in 1.4 s (2040 in / 21 out, $0.006400 recorded); provider health: healthy.
     `build` routes here (edit, shell).
   ```

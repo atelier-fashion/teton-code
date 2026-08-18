@@ -31,6 +31,21 @@ pub trait Prompter {
     fn ask_secret(&mut self, question: &str) -> Option<String>;
 }
 
+/// An explicit yes, and nothing else (LESSON-470). Empty and EOF are both no.
+///
+/// It lives beside [`Prompter`] because it is the other half of the same seam:
+/// every default-no confirmation in this crate asks through the trait above and
+/// reads the answer through this function. It was written out three times —
+/// `/web setup`, `/provider setup`, `/provider test` — byte for byte, which is
+/// three chances for one of them to grow a "sure" or an "ok" the other two do
+/// not have, and no test that could see the drift. LESSON-528's rule, applied to
+/// a predicate small enough to look harmless: a predicate worth copying is worth
+/// exposing, and consent is the last thing that may be spelled differently in
+/// different rooms.
+pub(crate) fn is_yes(answer: &str) -> bool {
+    matches!(answer.trim().to_lowercase().as_str(), "y" | "yes")
+}
+
 /// The real prompter: writes the question to stdout and reads a line from stdin.
 ///
 /// **Every question is [`defused`] on the way out** (REQ-573). A question is not
@@ -583,6 +598,23 @@ mod tests {
     // what `draw_bytes`/`advance_bytes` exist to expose. A real terminal is
     // AC-10's job; what is checked here is that the two counts stay a matched
     // pair, because a mismatch is exactly what strands a row.
+
+    /// The one spelling of yes every default-no confirmation in this crate
+    /// reads (LESSON-470), now that there is only one of it.
+    ///
+    /// The negative half is the load-bearing one: empty is the Enter a user
+    /// presses to get out of a question, and every other word — including the
+    /// ones that read as agreement — is a no, because the flows this gates
+    /// spend money, write config, or send.
+    #[test]
+    fn only_an_explicit_yes_is_a_yes() {
+        for yes in ["y", "Y", "yes", "YES", " y ", "Yes\n"] {
+            assert!(is_yes(yes), "{yes:?} must consent");
+        }
+        for no in ["", " ", "n", "N", "no", "sure", "ok", "yes please", "yep"] {
+            assert!(!is_yes(no), "{no:?} must not consent");
+        }
+    }
 
     /// Without a status row the frame is byte-identical to the pre-REQ-560 one.
     ///

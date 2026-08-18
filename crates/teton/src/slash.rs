@@ -972,19 +972,31 @@ fn handle_provider_test(
     ctx: &mut UiContext<'_>,
     args: &str,
 ) -> anyhow::Result<CommandOutcome> {
-    let mut words = args.split_whitespace();
-    // `Args::Required` already rejected the bare line, so the first word is
-    // present by the time a handler runs.
-    let Some(id) = words.next() else {
+    let Some(id) = provider_test_id(args) else {
         ctx.surface.line(LineKind::Error, PROVIDER_TEST_USAGE);
         return Ok(CommandOutcome::Continue);
     };
-    if words.next().is_some() {
-        ctx.surface.line(LineKind::Error, PROVIDER_TEST_USAGE);
-        return Ok(CommandOutcome::Continue);
-    }
     crate::provider_test_ui::run_in_session(conn, ctx, id)?;
     Ok(CommandOutcome::Continue)
+}
+
+/// The argument line of `/provider test`, read: exactly one word, or nothing.
+///
+/// Pure and separate from [`handle_provider_test`] so the rule can be *tested*
+/// rather than restated. Its unit test used to re-run `split_whitespace` over a
+/// fixture and assert on what that produced, which pins `split_whitespace` and
+/// says nothing about the command — the handler itself needs a live
+/// [`Connection`] and cannot be called from a unit test, so the parse had to
+/// come out to be reachable at all.
+///
+/// `None` covers both ways of getting it wrong, because they have one answer:
+/// no word at all (`Args::Required` catches this first, so it is defence in
+/// depth) and a second word, which is a typo. Reading either as an id would mean
+/// guessing which provider a user meant for a command that spends.
+fn provider_test_id(args: &str) -> Option<&str> {
+    let mut words = args.split_whitespace();
+    let id = words.next()?;
+    words.next().is_none().then_some(id)
 }
 
 /// What `/permissions` says when there is no session to read a level from.
@@ -2301,16 +2313,34 @@ mod tests {
         };
         assert_eq!(name, "provider setup");
 
-        // A second word reaches the handler, which rejects it rather than
-        // guessing which id was meant.
         assert!(PROVIDER_TEST_USAGE.contains("/provider test kimi"));
         assert!(PROVIDER_TEST_USAGE.contains("Nothing was sent"));
-        let mut words = "kimi deepseek".split_whitespace();
-        assert_eq!(words.next(), Some("kimi"));
-        assert!(
-            words.next().is_some(),
-            "a second word must be visible to the handler"
-        );
+    }
+
+    /// The handler's own argument rule, exercised rather than re-derived.
+    ///
+    /// One id is taken; nothing and two words are both refused, and the refusal
+    /// is the same because the answer is: this command spends, so it may not
+    /// guess which of two ids was meant, and it may not test "whatever was
+    /// registered first" for a line that named none.
+    #[test]
+    fn provider_test_takes_one_id_and_refuses_none_or_two() {
+        for (args, expected) in [
+            ("kimi", Some("kimi")),
+            ("  kimi  ", Some("kimi")),
+            ("deepseek", Some("deepseek")),
+            ("", None),
+            ("   ", None),
+            ("kimi deepseek", None),
+            ("kimi --yes", None),
+            ("kimi deepseek anthropic", None),
+        ] {
+            assert_eq!(
+                provider_test_id(args),
+                expected,
+                "`/provider test {args}` parsed wrongly"
+            );
+        }
     }
 
     /// The longest-match rule keeps the third `/web` row apart from the other

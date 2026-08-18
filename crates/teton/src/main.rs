@@ -79,6 +79,13 @@ struct Cli {
     /// `/model set <name>` (REQ-555 BR-4b — one flow, so the session inherits
     /// the flag as the explicit unattended stand-in and consumes no input line
     /// for the question), and the deletion confirmation of `teton uninstall`.
+    ///
+    /// And it answers the send-this? question of `/provider test <id>` /
+    /// `teton provider test <id>` (REQ-581 BR-2) — the first thing this flag
+    /// authorises that puts bytes on the network and money on a user's account.
+    /// Everything above it changes this machine; that one calls a vendor. It is
+    /// still the same consent, given in advance instead of at a prompt, which is
+    /// what a pipe has instead of a terminal.
     #[arg(long, short = 'y', global = true)]
     yes: bool,
 
@@ -1270,10 +1277,16 @@ fn run_doctor(paths: &DaemonPaths) -> anyhow::Result<()> {
         "model: the local-tier lifecycle is event-driven — start a session to observe \
          probe/download/benchmark.",
     );
+    // Doctor stays passive (REQ-581 BR-7 / OQ-2): it names the command that
+    // sends and does not become it. The clause is here because this is the line
+    // a user reads when they came to `doctor` with "is my provider working?" —
+    // the question doctor cannot answer, and now the one place that says which
+    // command can.
     surface.line(
         LineKind::Notice,
         "providers: reachability is probed by the daemon at call time; the CLI has no network \
-         path of its own (BR-1).",
+         path of its own (BR-1). `teton provider test <id>` makes one consented call and reports \
+         what came back.",
     );
     Ok(())
 }
@@ -1984,7 +1997,13 @@ fn binding_source_label(source: BindingSource) -> &'static str {
 /// [`teton_core::is_absolute_http_url`] before anything is stored), but doctor
 /// renders whatever a hand-edited config holds, so the reading has to be right
 /// here as well. `\` is the only code point where the two readings diverge.
-fn displayed_endpoint(url: &str) -> String {
+///
+/// `pub(crate)` because "every such line" includes lines outside this module:
+/// [`provider_test_ui`]'s preview echoes the same stored endpoint back before
+/// the user consents to a call (REQ-581 BR-2). A second masker over there would
+/// be a second reading of the authority, which is the specific failure the
+/// backslash paragraph above is about.
+pub(crate) fn displayed_endpoint(url: &str) -> String {
     let Some((scheme, rest)) = url.split_once("://") else {
         return url.to_owned();
     };

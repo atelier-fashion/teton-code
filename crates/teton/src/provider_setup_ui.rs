@@ -65,7 +65,7 @@ use teton_protocol::{ProviderId, ProviderKind, SessionId, Tier};
 
 use crate::client::{Connection, UiContext};
 use crate::keychain::{auth_ref_for, Cleanup, Keychain, PriorKey};
-use crate::prompt::Prompter;
+use crate::prompt::{is_yes, Prompter};
 use crate::render::{LineKind, Surface};
 use crate::settle_endpoint_text;
 // The gate is `/web setup`'s, imported rather than restated: "may this command
@@ -1032,11 +1032,6 @@ fn read_tier(tiers: &[Tier], token: &str) -> Option<Tier> {
         .iter()
         .copied()
         .find(|tier| tier.as_str().eq_ignore_ascii_case(token))
-}
-
-/// An explicit yes, and nothing else (LESSON-470). Empty and EOF are both no.
-fn is_yes(answer: &str) -> bool {
-    matches!(answer.trim().to_lowercase().as_str(), "y" | "yes")
 }
 
 // ---------------------------------------------------------------------------

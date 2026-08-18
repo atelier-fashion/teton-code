@@ -72,7 +72,7 @@ use teton_protocol::{SessionId, GENERIC_SEARCH_AUTH_TEMPLATE};
 
 use crate::client::{Connection, UiContext};
 use crate::keychain::{auth_ref_for, Cleanup, Keychain, PriorKey};
-use crate::prompt::Prompter;
+use crate::prompt::{is_yes, Prompter};
 use crate::render::{LineKind, Surface};
 use crate::session_ui::web_tier_name;
 
@@ -664,11 +664,6 @@ fn parse_tier(answer: &str) -> TierChoice {
         "off" | "0" => TierChoice::Off,
         _ => TierChoice::Unknown,
     }
-}
-
-/// An explicit yes, and nothing else (LESSON-470). Empty and EOF are both no.
-fn is_yes(answer: &str) -> bool {
-    matches!(answer.trim().to_lowercase().as_str(), "y" | "yes")
 }
 
 /// A yes unless the user actually said no — for the one question where the

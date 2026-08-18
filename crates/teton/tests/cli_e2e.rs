@@ -3319,6 +3319,172 @@ fn a_piped_provider_setup_prints_the_recipe_and_asks_nothing() {
     );
 }
 
+// ---------------------------------------------------------------------------
+// REQ-581 — `teton provider test <id>`, the shell surface (BR-2 / BR-7, ADR-5)
+// ---------------------------------------------------------------------------
+//
+// What this section holds is the **wiring** of the subcommand, which is the one
+// thing no unit test can see: `run_provider_test` opens a session of its own
+// (ADR-5 — the method is session-gated and the cost row needs a session), hands
+// the flow that session and the process's `--yes`, and renders through the same
+// module `/provider test` does. `provider_test_ui`'s own suite proves what the
+// flow decides; this proves the shipped binary reaches it, both ways.
+//
+// The provider under test points at a **closed loopback port**, so the whole
+// path — session, gate, consent, `provider/test`, adapter, transport, egress —
+// runs to the end against a socket that answers `ECONNREFUSED` immediately. No
+// mock server, no key, no vendor: `unreachable` is a real outcome produced by a
+// real dial, and it is the only one that can be asserted hermetically.
+//
+// Not held here: the outcome table (401/404/429/5xx), which is `tetond`'s
+// `provider_test_flow.rs` against its `MockProvider`, and the preview/decline
+// legs, which are unit assertions on a call counter rather than proofs of a
+// negative over a socket.
+
+/// The fixture provider `teton provider test` is pointed at: a remote id whose
+/// endpoint is a port nobody is listening on.
+///
+/// It carries a `model`, because a remote provider without one is refused before
+/// anything is dialled (BUG-155), and **no** `auth_ref`, because a credential
+/// reference would have to resolve against the real OS keychain — which this
+/// suite must never touch (see the `/provider setup` section's note).
+fn unreachable_provider_config(port: u16) -> String {
+    format!(
+        "[[providers]]\nid = \"probe\"\nkind = \"openai-compatible\"\n\
+         endpoint = \"http://127.0.0.1:{port}/v1/chat/completions\"\n\
+         model = \"probe-model\"\n\n"
+    )
+}
+
+/// **BR-2 / AC-4 at the shell: a pipe without `--yes` sends nothing and says
+/// what would have let it.**
+///
+/// The subcommand's gate is the *flow's* gate, reached through a session this
+/// command opened — so a piped run has to answer at the gate and stop, without
+/// the session it just created having spent anything. The negative is what the
+/// leg is for: the report line the `--yes` run below prints must be absent here,
+/// which is the observable form of "nothing left the machine".
+#[test]
+fn a_piped_provider_test_without_yes_sends_nothing_and_names_the_flag() {
+    let daemon_path = daemon_bin();
+    let daemon = TestDaemon::spawn_scripted_with_config(
+        &daemon_path,
+        TURN_REPLIES,
+        &unreachable_provider_config(closed_port()),
+    );
+    let teton = teton_bin();
+
+    let (output, status) = daemon.run_cli_capture(&teton, &["provider", "test", "probe"], "");
+
+    assert!(
+        output.contains("asks before it sends"),
+        "the refusal must say why it did not ask; output:\n{output}\ndaemon log:\n{}",
+        daemon.log()
+    );
+    assert!(
+        output.contains("--yes"),
+        "and name the flag that consents in advance; output:\n{output}"
+    );
+    assert!(
+        output.contains("Nothing was sent"),
+        "and say that nothing left the machine; output:\n{output}"
+    );
+
+    // The observable half of "nothing was sent": no dial happened, so no report
+    // line exists. Asserted on the fragments the renderers own — the verdict
+    // word and the trailing clause every failed outcome carries.
+    assert!(
+        !output.contains("unreachable") && !output.contains("Nothing else was sent"),
+        "a refused run must produce no report at all; output:\n{output}"
+    );
+    assert!(
+        !output.contains("proceed?"),
+        "no question may be drawn at a pipe; output:\n{output}"
+    );
+    assert!(
+        status.success(),
+        "a refusal ends the command, not the process's exit code; status {status:?}; \
+         output:\n{output}"
+    );
+}
+
+/// **BR-7 / ADR-5: `teton -y provider test <id>` runs the whole flow and reports
+/// what came back.**
+///
+/// End to end through the shipped binary: the subcommand opens a session, the
+/// `--yes` stands in for the confirm, `provider/test` dials the closed port, and
+/// the typed `unreachable` outcome comes back and is rendered by the same
+/// `provider_test_ui` the slash command uses. That chain is exactly what a unit
+/// test cannot reach — the session-opening half of ADR-5 lives in `main`.
+///
+/// Asserted on the fixed fragments the two renderers own (the preview's shape,
+/// the verdict word, the health clause), never on the daemon's `reason`: that
+/// sentence is composed from the dial host and belongs to `tetond`'s tests.
+#[test]
+fn a_consented_provider_test_runs_end_to_end_and_reports_unreachable() {
+    let daemon_path = daemon_bin();
+    let port = closed_port();
+    let daemon = TestDaemon::spawn_scripted_with_config(
+        &daemon_path,
+        TURN_REPLIES,
+        &unreachable_provider_config(port),
+    );
+    let teton = teton_bin();
+
+    let (output, status) = daemon.run_cli_capture(&teton, &["-y", "provider", "test", "probe"], "");
+    let log = daemon.log();
+
+    // (1) The preview ran, naming the provider and the endpoint it will dial —
+    // the line BR-2 requires before anything leaves the machine, printed even
+    // when the consent came from the flag.
+    assert!(
+        output.contains("provider:  probe (openai-compatible, probe-model)"),
+        "the preview must name the provider, its kind and its model; output:\n{output}\n\
+         daemon log:\n{log}"
+    );
+    assert!(
+        output.contains(&format!("http://127.0.0.1:{port}/v1/chat/completions")),
+        "and the endpoint as stored; output:\n{output}"
+    );
+
+    // (2) `--yes` is the consent, so no question was drawn.
+    assert!(
+        !output.contains("proceed?"),
+        "--yes must consume no prompt; output:\n{output}"
+    );
+
+    // (3) The report: the session was opened, the method was served, and the
+    // typed outcome came back. `unreachable` is the honest ending for a closed
+    // port, and it proves the dial actually happened.
+    assert!(
+        output.contains("probe probe-model: unreachable —"),
+        "the report must name the provider, the model and the verdict; output:\n{output}\n\
+         daemon log:\n{log}"
+    );
+    assert!(
+        output.contains("Nothing else was sent"),
+        "a failed outcome says the call stopped there; output:\n{output}"
+    );
+    assert!(
+        output.contains("provider health:"),
+        "BR-4: the report says what the next turn will do; output:\n{output}"
+    );
+
+    // (4) Nothing about the session it opened leaked into the report, and the
+    // command exited cleanly: a provider that cannot be reached is an answer,
+    // not a CLI failure.
+    assert!(
+        !output.contains("could not start a session"),
+        "the subcommand must have opened its own session (ADR-5); output:\n{output}\n\
+         daemon log:\n{log}"
+    );
+    assert!(
+        status.success(),
+        "an unreachable provider is a report, not an error exit; status {status:?}; \
+         output:\n{output}"
+    );
+}
+
 /// **ADR-9 / AC-1's non-TTY half: a script's bytes do not move.**
 ///
 /// The hand-off nudge is a terminal affordance — it names an in-session command
