@@ -38,7 +38,7 @@ None on the wire. Client-side only:
 |---|---|
 | `slash::CommandSpec` | gains `mirror: Option<Mirror>`; `Mirror { shell: &'static str /* e.g. "teton policy set-tier" */, writes: bool }` — `None` for the session-only rows |
 | `slash::Args` | gains `Cli` — "the shell twin's grammar; the handler parses with clap and rejects nothing at resolve time" (behaves like `Optional` in `resolve`) |
-| `slash::Input` | gains `CliLine { name: &str, args: &str }` and `CliRefused(String)` |
+| `slash::Input` | gains `CliLine { name: &str, args: &str, shell_flags: &str }` (`shell_flags` — the global flags typed ahead of the path, `teton -y policy …`, verify m5), `CliRefused(String)` (the composed one-line refusal), and `CliHelp(String)` (clap's own page for `teton <family> --help`, verify T6) |
 | `SessionState` | unchanged — the generic hand-off reads the same `turn_reply` the two existing lines read |
 
 ## API changes
@@ -53,8 +53,8 @@ holds, then the same `config/get` `run_doctor` makes).
 | Module | Role after REQ-582 |
 |---|---|
 | `crates/teton/src/main.rs` | still owns the clap tree (`Cli`, `Command`, `*Action`) — made `pub(crate)`; each `run_<sub>(paths, …)` becomes `ensure_connected` + `passive_ctx` + `<sub>_on(conn, ctx, …)`; new `run_mirrored_command(cmd: Command, conn, ctx)` matches the ten mirrored variants onto the `*_on` functions |
-| `crates/teton/src/cli_rows.rs` (new) | `Mirror`, the ten mirrored handlers, `run_mirrored(twin, args, conn, ctx)` (typed-input gate → tokens → `Cli::try_parse_from` → error rendering or `run_mirrored_command`), `cli_path(tokens) -> Vec<&str>` (clap-tree walk used by the classifier), `SHELL_ONLY` (`uninstall`) |
-| `crates/teton/src/slash.rs` | table rows + `Args::Cli` + `Input::{CliLine, CliRefused}` + `classify` recognition arm + `/help` grouping |
+| `crates/teton/src/cli_rows.rs` (new) | `Mirror`, the ten mirrored handlers, `run_mirrored(twin, args, conn, ctx)` in the shipped order (verify M3): tokens → `Cli::try_parse_from` → a parse failure **or a `--help`/`--version` outcome** rendered by `render_clap_error`/`render_clap_text` (bounded, blank lines kept) → typed-input `write_gate` for a write row → the ignored-shell-flags note (`shell_flags_line`) → `run_mirrored_command`; `cli_path(tokens) -> Vec<&str>` (clap-tree walk used by the classifier), `is_leaf_path`, `family_help` (a family's own page), `refusal_for_path` (the composed refusal), `SHELL_ONLY` (`uninstall`) |
+| `crates/teton/src/slash.rs` | table rows + `Args::Cli` + `Input::{CliLine, CliRefused, CliHelp}` + `classify` recognition arm (`cli_line`, `LEADING_GLOBAL_FLAGS` — pinned to the tree's `global` args by a unit test) + `run_cli_line` (the entry loop's `CliLine` arm: mirrored rows dispatch with the flags spliced on; a pre-REQ leaf's whole argv is judged by the tree first, with an exhaustive no-wildcard derive-match; the pre-REQ family `model` answers `--help` with its page and drops reported flags) + `/help` grouping |
 | `crates/teton/src/session_ui.rs` | generic hand-off (BR-8), fed by the mirrored rows' `shell` twins |
 | `crates/tetond/src/harness/self_config.md` | `/` spellings first (BR-9) |
 
@@ -233,8 +233,10 @@ beside it would re-open the ambiguity the live A/B closed).
 
 ### ADR-8: Totality and completeness are pinned in both directions, against clap's tree
 
-**Decision.** `Input` has five variants (`Command`, `CliLine`, `CliRefused`,
-`EscapedPrompt`, `Prompt`); the REQ-555 BR-8 tests are extended: every
+**Decision.** `Input` has six variants (`Command`, `CliLine`, `CliRefused`,
+`CliHelp`, `EscapedPrompt`, `Prompt` — five as designed, the sixth added at
+the verify pass; see the Deviations section below, "BR-4's four buckets");
+the REQ-555 BR-8 tests are extended: every
 mirrored row is reachable from `teton <row>` (→ `CliLine`), `teton uninstall`
 / bare `teton` / `--version` → `CliRefused`, `teton is slow today` and
 `tetonx provider list` → `Prompt` unchanged, and `//` unaffected. A
@@ -302,8 +304,9 @@ that dispatches it (REQ-555 BR-4 → REQ-582 ADR-1/2/6, LESSON-529/517).
   surface, blank lines as `Info ""` (byte parity with the shell), and each line
   is bounded and defused through `slash::echoed_within` at
   `CLAP_LINE_MAX_CHARS` (640 — clap does not wrap help in this build, and the
-  global `--yes` doc is one 509-character line; a tree-walk test asserts the
-  binary's own text clears the bound). One renderer, `render_clap_text`, for
+  global `--yes` doc is one long line — 612 characters as rendered, after the
+  closing round named the `/provider add` confirmation in it; a tree-walk test
+  over every leaf *and* family asserts the binary's own text clears the bound). One renderer, `render_clap_text`, for
   a row's parse failure, a pre-REQ row's full-argv failure, and the family
   help page.
 - **ADR-3 error taxonomy (m7).** A **transport** failure propagates out of a
@@ -352,6 +355,26 @@ that dispatches it (REQ-555 BR-4 → REQ-582 ADR-1/2/6, LESSON-529/517).
   model). D2: near-miss lines carrying a pasted key reach the model as any
   prompt does — spec Assumptions/Out of Scope. D3: `main.rs` size / extracting
   the clap tree to a `cli.rs` — a follow-up, not this REQ's change.
+
+### Re-verify residue (2026-08-18, closing round)
+
+- **`run_cli_line`, the pre-REQ family (`model`).** `teton model --help` /
+  `-h` renders the family's own page (`family_help` → `render_clap_text`)
+  instead of `/model`'s "takes no arguments"; `teton -y model` judges the
+  flags alone with `Cli::try_parse_from(["teton", "-y"])` (legal argv — a
+  session with `--yes`), prints `shell_flags_line`, and dispatches `/model`
+  on its argument alone. The derive-match over `cli.command` is exhaustive
+  with no wildcard (mirroring `run_mirrored_command`).
+- **`LEADING_GLOBAL_FLAGS` / `CLI_FLAGS`** are pinned both ways to the clap
+  tree's `global` arguments and the built root's `Help`/`Version` actions.
+- **`--yes`'s doc** names the in-session `/provider add` confirmation it
+  pre-answers; a *typed* `--yes` on that row does not (unit-tested — the
+  consent is `ctx.auto_accept_model`'s, never the line's).
+- **Test safety.** No test on the shipped `provider add` dispatcher path
+  (real keychain) scripts a non-empty key; the line-bound test also walks
+  family nodes; the piped hand-off negative recites a non-recipe row on a
+  second turn; the parity test's multiset assertion is stated as the
+  construction it was; `teton provider --help` has an e2e leg.
 
 ## Test strategy summary
 

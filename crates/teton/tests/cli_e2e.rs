@@ -3532,34 +3532,57 @@ fn a_consented_provider_test_runs_end_to_end_and_reports_unreachable() {
 /// inside the module. BR-11 already gives a script the shell recipe, which is
 /// the copy-pasteable answer at a pipe; a second line naming a command it
 /// cannot run would be noise in whatever is parsing the output.
+///
+/// Two turns, because the two hand-off lines are armed by different replies
+/// (verify T14, tightened at the re-verify): the first reply recites the
+/// REQ-579 setup recipe (`teton provider add`, `teton policy set-tier`), which
+/// at a terminal earns the *setup* line and — since that line goes first and
+/// at most one prints — could never have earned the REQ-582 generic line, so
+/// asserting the generic prefix absent on that turn alone proved nothing about
+/// the generic gate. The second reply recites two mirrored rows that are **not**
+/// setup recipes (`teton provider list`, `teton doctor`), which is exactly what
+/// arms the generic line at a terminal; a pipe must see it on neither turn.
 #[test]
 fn a_piped_session_whose_reply_recites_the_cli_gets_no_hand_off_line() {
     let daemon_path = daemon_bin();
-    // The reply the guide actually produces at the front door — the recital
-    // three live rounds recorded (verification.md §1–§24).
-    let reply = "register it from a shell: teton provider add kimi --kind \
-                 openai-compatible, then teton policy set-tier think kimi.";
-    let daemon = TestDaemon::spawn_scripted(&daemon_path, &[reply]);
+    // Turn one: the reply the guide actually produces at the front door — the
+    // recital three live rounds recorded (verification.md §1–§24).
+    let setup_reply = "register it from a shell: teton provider add kimi --kind \
+                       openai-compatible, then teton policy set-tier think kimi.";
+    // Turn two: an inspect answer that names two mirrored rows by their shell
+    // spelling and neither by its `/` form — the generic line's arming shape.
+    let inspect_reply = "run teton provider list to see what is registered, and \
+                         teton doctor for the daemon.";
+    let daemon = TestDaemon::spawn_scripted(&daemon_path, &[setup_reply, inspect_reply]);
     let teton = teton_bin();
 
-    let (session, status) = daemon.run_cli_capture(&teton, &[], "how do I add kimi?\n");
+    let (session, status) = daemon.run_cli_capture(
+        &teton,
+        &[],
+        "how do I add kimi?\n\
+         what is configured?\n",
+    );
 
-    // The precondition: the turn ran and the reply really did recite the CLI.
-    // Without this the assertion below would pass on a session that never
-    // reached the model at all.
+    // The precondition: both turns ran and each reply really did recite the
+    // CLI. Without this the assertions below would pass on a session that
+    // never reached the model at all.
     assert!(
         session.contains("teton provider add kimi"),
-        "the scripted reply must have reached the transcript, or this test \
+        "the setup reply must have reached the transcript, or this test \
          proves nothing; output:\n{session}\ndaemon log:\n{}",
         daemon.log()
     );
+    assert!(
+        session.contains("teton provider list") && session.contains("teton doctor"),
+        "the inspect reply must have reached the transcript, or the generic \
+         line's negative proves nothing; output:\n{session}\ndaemon log:\n{}",
+        daemon.log()
+    );
 
-    // And the nudge is absent. Asserted on the sentence's distinctive halves
-    // rather than the whole line, so a future rewording of it cannot make this
-    // pass by accident. The REQ-582 generic line's prefix is in the list too
-    // (verify T14): the reply recites two mirrored rows (`teton provider add`,
-    // `teton policy set-tier`), which is exactly what arms that line at a
-    // terminal, and a pipe must see neither sentence.
+    // And every hand-off is absent. Asserted on the sentences' distinctive
+    // halves rather than the whole lines, so a future rewording cannot make
+    // this pass by accident: the REQ-579 setup line's three halves (armed by
+    // turn one), and the REQ-582 generic line's prefix (armed by turn two).
     for absent in [
         "does this without leaving it",
         "no key in chat",
@@ -3743,6 +3766,59 @@ fn a_teton_line_with_no_session_form_is_refused_and_a_question_still_reaches_the
         "a refused line spent a turn: the reply queue moved three times; \
          output:\n{session}"
     );
+}
+
+/// **`teton provider --help` typed at the prompt is the family's own help page
+/// (verify T6; the entry loop's `Input::CliHelp` arm, re-verify Q1).**
+///
+/// The classifier's unit tests pin what the line classifies *to*; this is the
+/// leg that proves the entry loop renders that outcome — the shipped binary,
+/// piped, printing clap's page for the family as information: the `Usage:`
+/// clause is there, no line of it is an error, no `→ /…` notice was printed
+/// (a help page is not a row that ran), and no turn was spent on it.
+#[test]
+fn a_typed_family_help_request_prints_the_familys_own_page_and_costs_no_turn() {
+    let daemon_path = daemon_bin();
+    let daemon = TestDaemon::spawn_scripted(&daemon_path, TURN_REPLIES);
+    let teton = teton_bin();
+
+    let session = daemon.run_cli_with_stdin(&teton, &[], "teton provider --help\n");
+    let body = session_body(&session, "`teton provider --help`");
+    let printed = typed_output(body, "`teton provider --help`");
+
+    assert!(
+        printed
+            .iter()
+            .any(|line| line.starts_with("Usage: teton provider")),
+        "the family's page must carry the shell's own Usage clause; printed:\n{}\n\
+         output:\n{session}",
+        printed.join("\n")
+    );
+    // The page's lines are the shell's, and the shell lists the family's
+    // subcommands under it.
+    for sub in ["add", "list", "test"] {
+        assert!(
+            printed
+                .iter()
+                .any(|line| line.trim_start().starts_with(sub)),
+            "the page must list `{sub}`; printed:\n{}",
+            printed.join("\n")
+        );
+    }
+    assert!(
+        !printed.iter().any(|line| line.starts_with("error:")),
+        "asking for help is not an error; printed:\n{}",
+        printed.join("\n")
+    );
+    assert!(
+        !session.contains("→ /"),
+        "a help page is not a row that ran, so no notice; output:\n{session}"
+    );
+    assert!(
+        !session.contains("names a family rather than a command"),
+        "an explicit --help must not get the bare-family refusal; output:\n{session}"
+    );
+    assert_no_turn_ran(&session, "`teton provider --help`");
 }
 
 /// **A recognized `teton …` line meets the same gates its `/` spelling meets
@@ -4104,28 +4180,23 @@ fn every_read_row_prints_exactly_what_its_shell_twin_prints() {
                 None => true,
             })
             .collect();
-        // Multiset equality, both directions. Containment one way is the
-        // leftovers being empty; the other way is the report diff below — an
-        // extra replay line on the shell side (a lifecycle event fired between
-        // the two runs) has nowhere to hide but the shell's report, where the
-        // diff fails on it. Stated here as the equality it is, so a reader does
-        // not have to derive it from the two assertions.
+        // Multiset equality, both directions — and only **one** of them is an
+        // assertion, because the other holds by construction. Session ⊆ shell
+        // is the leftovers being empty (below). Shell ⊆ session needs no
+        // `sorted_shell == sorted_session` check: a shell line is only ever
+        // moved into `shell_attach` by matching a `replay` line, so
+        // `shell_attach` is a sub-multiset of `session_attach` before anything
+        // is asserted — an equality on the two after `replay.is_empty()` passed
+        // would be a tautology, not a second guard (verify residue). What
+        // *does* catch an extra replay line on the shell side (a lifecycle
+        // event fired between the two runs) is the report diff below: it has
+        // nowhere to hide but the shell's report, where the diff fails on it.
         assert!(
             replay.is_empty(),
             "`teton {}` did not replay every line the session's attach did \
              ({replay:?}), so the two runs are not in the same daemon state and \
              the diff below would be about that; session:\n{session}\n\
              shell:\n{shell}",
-            argv.join(" ")
-        );
-        let mut sorted_shell = shell_attach.clone();
-        sorted_shell.sort_unstable();
-        let mut sorted_session = session_attach.clone();
-        sorted_session.sort_unstable();
-        assert_eq!(
-            sorted_shell,
-            sorted_session,
-            "`teton {}` and `/{row}` received different attach replays",
             argv.join(" ")
         );
         assert_eq!(

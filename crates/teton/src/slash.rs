@@ -76,7 +76,12 @@
 //! are the table's, and this module renders `session_ui`'s tier vocabulary. The
 //! alternative — a third module owning the row table — would move the one list
 //! that dispatches away from the handlers it dispatches to, for the sake of a
-//! dependency graph no reader of either file has to hold in their head.
+//! dependency graph no reader of either file has to hold in their head. The
+//! same holds one module over: [`crate::cli_rows`] is the handler module for
+//! the mirrored rows (the table names its handlers, and it reads the table's
+//! [`rows_under`], [`HELP_HINT`] and [`test_seams_allowed`] to compose its
+//! refusals), so the slash↔cli_rows dependency is deliberate for the same
+//! reason.
 //!
 //! Five commands are deliberately narrower than BR-9's "identical on a TTY and
 //! on piped stdin": the four mirrored rows that write and `/model set` are
@@ -912,18 +917,24 @@ pub fn dispatch(
 /// * a pre-REQ row whose name is a **leaf** in the tree (`cost`, `effort`,
 ///   `model set`, `provider test`) reads a plain string, so its whole typed argv
 ///   is validated by [`crate::Cli::try_parse_from`] first. `Err` renders the
-///   parser's own message and dispatches nothing — `teton effort bogus`, `teton
-///   cost extra`. `Ok` derives the row's argument from the parsed
-///   [`crate::Command`] — the level, the model name, the provider id — and
-///   dispatches that, so `teton model set qwen --yes` reaches `/model set` as
-///   `qwen` and the `--yes` is reported as ignored ([`cli_rows::shell_flags_line`])
-///   rather than forwarded as part of a model name; the row's handler still
-///   validates the value against its own vocabulary, exactly as it does for a
-///   `/` line;
+///   parser's own message and dispatches nothing — `teton effort low extra`,
+///   `teton cost extra` (clap takes `effort`'s level as a free `Option<String>`,
+///   so `teton effort bogus` *parses* and the row's own vocabulary rejects
+///   `bogus` one step later, exactly as the shell does). `Ok` derives the row's
+///   argument from the parsed [`crate::Command`] — the level, the model name,
+///   the provider id — and dispatches that, so `teton model set qwen --yes`
+///   reaches `/model set` as `qwen` and the `--yes` is reported as ignored
+///   ([`cli_rows::shell_flags_line`]) rather than forwarded as part of a model
+///   name; the row's handler still validates the value against its own
+///   vocabulary, exactly as it does for a `/` line;
 /// * a pre-REQ row whose name is a **family** — `model`, whose bare form is
 ///   REQ-555's one-line answer — cannot be parsed to a command (clap answers
 ///   `teton model` with the family's help page), so it dispatches directly, as
-///   TASK-170 had it.
+///   TASK-170 had it — after two decisions: `teton model --help` / `-h` gets the
+///   family's own page ([`cli_rows::family_help`]), and any leading global
+///   flags (`teton -y model`) are judged by the binary's tree on their own,
+///   reported as ignored, and dropped, so the row is dispatched on its argument
+///   alone.
 ///
 /// This is not a second parser of the line (BR-3): the argv is the classifier's
 /// tokens, the judge is the binary's own clap tree, and what the row receives is
@@ -951,13 +962,51 @@ pub fn run_cli_line(
         return Ok(CommandOutcome::Continue);
     };
     let words: Vec<&str> = name.split_whitespace().collect();
-    if spec.mirror.is_some() || !cli_rows::is_leaf_path(&words) {
-        // The row parses for itself, or takes no argument clap could judge.
+    if spec.mirror.is_some() {
+        // The row parses for itself: any leading global flags are spliced onto
+        // the argument so its own clap parse meets them and says they were
+        // ignored (m5).
         if shell_flags.is_empty() {
             return dispatch(name, args, conn, ctx);
         }
         let with_flags = format!("{shell_flags} {args}");
         return dispatch(name, with_flags.trim(), conn, ctx);
+    }
+    if !cli_rows::is_leaf_path(&words) {
+        // A pre-REQ row whose name is a **family** — `model`, whose bare form
+        // is REQ-555's one-line answer. Clap cannot parse `teton model` to a
+        // command (it answers with the family's help page), so the row is
+        // dispatched directly (TASK-170) — with two things decided first
+        // (verify residue, correctness Minor 3):
+        //
+        // * `teton model --help` / `-h` asked for the family's page, and gets
+        //   the parser's own (T6's shape, on the family that is also a row);
+        // * `teton -y model` carried the shell's global flags, which the row
+        //   has no grammar to meet: they are judged by the binary's own tree
+        //   (`teton -y` is legal argv — a session with `--yes` — so a bare
+        //   `Cli::try_parse_from` over the flags alone is what the shell
+        //   would accept or refuse), reported as ignored, and dropped, so the
+        //   row runs on `args` alone rather than being handed `-y` as an
+        //   argument it takes none of.
+        if matches!(args, "--help" | "-h") {
+            if let Some(page) = cli_rows::family_help(&words, args) {
+                cli_rows::render_clap_text(&page, false, ctx.surface);
+                return Ok(CommandOutcome::Continue);
+            }
+        }
+        if !shell_flags.is_empty() {
+            let flags_only = std::iter::once(TETON).chain(shell_flags.split_whitespace());
+            match crate::Cli::try_parse_from(flags_only) {
+                Err(err) => {
+                    cli_rows::render_clap_error(&err, ctx.surface);
+                    return Ok(CommandOutcome::Continue);
+                }
+                Ok(cli) => ctx
+                    .surface
+                    .line(LineKind::Info, &cli_rows::shell_flags_line(name, cli.yes)),
+            }
+        }
+        return dispatch(name, args, conn, ctx);
     }
     let argv: Vec<&str> = std::iter::once(TETON)
         .chain(shell_flags.split_whitespace())
@@ -972,6 +1021,17 @@ pub fn run_cli_line(
         Ok(cli) => cli,
     };
     // The row's argument, read off what clap parsed rather than off the line.
+    //
+    // The match is **exhaustive with no wildcard**, mirroring
+    // `run_mirrored_command`'s (verify residue, arch Minor): the leaves that
+    // are pre-REQ rows are exactly the four named first, and every other
+    // variant is a mirrored row (dispatched before this parse), a shell-only
+    // or retired command (refused by the classifier before any row runs), or
+    // `None` (a leaf path always parses to a command). Those arms are
+    // unreachable from every caller — but they are *named*, so a subcommand
+    // added later cannot ship without a decision about what its typed line
+    // does here. One sentence for all of them rather than a panic, for the
+    // reason every other unreachable arm in this client gives.
     let row_args = match cli.command {
         Some(crate::Command::Cost) => String::new(),
         Some(crate::Command::Effort { level }) => level.unwrap_or_default(),
@@ -981,12 +1041,27 @@ pub fn run_cli_line(
         Some(crate::Command::Provider {
             action: crate::ProviderAction::Test { id },
         }) => id,
-        // Unreachable: the leaves that are pre-REQ rows are exactly the four
-        // above, and every other leaf is a mirrored row (dispatched before the
-        // parse) or has no row at all (refused by the classifier). One
-        // sentence rather than a panic, for the reason every other unreachable
-        // arm in this client gives.
-        _ => {
+        None
+        | Some(
+            crate::Command::Provider {
+                action: crate::ProviderAction::Add { .. } | crate::ProviderAction::List,
+            }
+            | crate::Command::Boundary {
+                action: crate::BoundaryAction::Add { .. } | crate::BoundaryAction::List,
+            }
+            | crate::Command::Policy {
+                action:
+                    crate::PolicyAction::SetTier { .. }
+                    | crate::PolicyAction::SetCategory { .. }
+                    | crate::PolicyAction::Show
+                    | crate::PolicyAction::Set { .. },
+            }
+            | crate::Command::Model {
+                action: crate::ModelAction::List | crate::ModelAction::Status,
+            }
+            | crate::Command::Doctor
+            | crate::Command::Uninstall { .. },
+        ) => {
             render_rejection(
                 &format!(
                     "`teton {name}` parsed as a command this session has no row for — {HELP_HINT}"
@@ -4107,7 +4182,10 @@ mod tests {
     ///
     /// The four leaves in question: `model set`, `provider test`, `effort`,
     /// `cost`. Each case states what reached the row (or that nothing did) and
-    /// what was rendered about the shell flags.
+    /// what was rendered about the shell flags. The tail of the test is the one
+    /// pre-REQ **family** row, `model`: dispatched directly, but with a leading
+    /// flag reported and dropped, and with `--help` answered by the family's
+    /// own page.
     #[test]
     fn a_pre_req_row_has_its_whole_argv_validated_before_it_runs() {
         /// Run `run_cli_line` over what `classify(line)` produced.
@@ -4298,6 +4376,163 @@ mod tests {
             surface.lines_of(LineKind::Error).is_empty(),
             "{:?}",
             surface.calls
+        );
+
+        // `teton -y model` (verify residue, correctness Minor): the family that
+        // is a row is still `/model` — one `model/status` — and the flag is
+        // reported as ignored rather than handed to a row that takes no
+        // argument. Before this the line was rejected with "takes no
+        // arguments" and ran nothing.
+        let (surface, methods) = run(
+            "teton -y model",
+            &[
+                serde_json::to_value(teton_protocol::methods::ModelStatusResult::default())
+                    .unwrap(),
+            ],
+            true,
+        );
+        assert_eq!(methods, vec!["model/status"], "{:?}", surface.calls);
+        assert!(
+            surface.lines_of(LineKind::Error).is_empty(),
+            "{:?}",
+            surface.calls
+        );
+        assert!(
+            surface
+                .lines_of(LineKind::Info)
+                .contains(&cli_rows::shell_flags_line("model", true).as_str()),
+            "the dropped flag must be reported: {:?}",
+            surface.calls
+        );
+        // `--verbose` ahead of it takes the general sentence (`yes` is false).
+        let (surface, methods) = run(
+            "teton --verbose model",
+            &[
+                serde_json::to_value(teton_protocol::methods::ModelStatusResult::default())
+                    .unwrap(),
+            ],
+            true,
+        );
+        assert_eq!(methods, vec!["model/status"], "{:?}", surface.calls);
+        assert!(
+            surface
+                .lines_of(LineKind::Info)
+                .contains(&cli_rows::shell_flags_line("model", false).as_str()),
+            "{:?}",
+            surface.calls
+        );
+
+        // `teton model --help` / `-h`: the family's own page, as the shell
+        // prints it — Info lines, no error, no RPC, and no "takes no
+        // arguments" rejection for a question the user asked (T6, on the
+        // family that is also a row).
+        for flag in ["--help", "-h"] {
+            let (surface, methods) = run(&format!("teton model {flag}"), &[], true);
+            assert!(methods.is_empty(), "{:?}", surface.calls);
+            let expected = crate::Cli::try_parse_from(["teton", "model", flag])
+                .expect_err("clap reports help as an Err")
+                .render()
+                .to_string();
+            assert_eq!(
+                surface.lines_of(LineKind::Info),
+                expected.lines().collect::<Vec<_>>(),
+                "`teton model {flag}` did not render the family's own page: {:?}",
+                surface.calls
+            );
+            assert!(
+                surface.lines_of(LineKind::Error).is_empty(),
+                "asking for help is not an error: {:?}",
+                surface.calls
+            );
+            assert!(
+                surface
+                    .lines_of(LineKind::Info)
+                    .iter()
+                    .any(|line| line.starts_with("Usage: teton model")),
+                "{:?}",
+                surface.calls
+            );
+        }
+    }
+
+    /// **The classifier's flag spellings are the parser's** (verify residue,
+    /// arch Minor). [`LEADING_GLOBAL_FLAGS`] is the set of spellings the
+    /// classifier steps over ahead of a subcommand, and it is only right while
+    /// it equals the set of `global = true` arguments the clap tree declares —
+    /// a global flag added to `Cli` without an entry here would send `teton
+    /// --new-flag doctor` to the model. So the set is derived from the tree
+    /// and pinned both ways. [`CLI_FLAGS`] likewise: the help and version
+    /// flags clap builds into the root, read off the built tree's own
+    /// `Help`/`Version` actions.
+    #[test]
+    fn the_leading_global_flags_and_cli_flags_are_the_clap_trees_own() {
+        use clap::CommandFactory;
+        use std::collections::BTreeSet;
+
+        fn spellings(arg: &clap::Arg) -> Vec<String> {
+            let mut out = Vec::new();
+            if let Some(long) = arg.get_long() {
+                out.push(format!("--{long}"));
+            }
+            if let Some(short) = arg.get_short() {
+                out.push(format!("-{short}"));
+            }
+            out
+        }
+
+        let mut root = crate::Cli::command();
+        // `build` is what attaches clap's own `--help`/`--version` arguments to
+        // the root; the derived arguments are there either way.
+        root.build();
+
+        let global_from_tree: BTreeSet<String> = root
+            .get_arguments()
+            .filter(|arg| arg.is_global_set())
+            .flat_map(spellings)
+            .collect();
+        let global_pinned: BTreeSet<String> = LEADING_GLOBAL_FLAGS
+            .iter()
+            .map(|s| (*s).to_owned())
+            .collect();
+        assert_eq!(
+            global_from_tree, global_pinned,
+            "LEADING_GLOBAL_FLAGS must equal the clap tree's global arguments' spellings \
+             (both directions): tree {global_from_tree:?} vs pinned {global_pinned:?}"
+        );
+        assert_eq!(
+            LEADING_GLOBAL_FLAGS.len(),
+            global_pinned.len(),
+            "LEADING_GLOBAL_FLAGS carries a duplicate spelling"
+        );
+
+        let is_help_or_version = |arg: &&clap::Arg| {
+            matches!(
+                arg.get_action(),
+                clap::ArgAction::Help
+                    | clap::ArgAction::HelpShort
+                    | clap::ArgAction::HelpLong
+                    | clap::ArgAction::Version
+            )
+        };
+        let cli_from_tree: BTreeSet<String> = root
+            .get_arguments()
+            .filter(is_help_or_version)
+            .flat_map(spellings)
+            .collect();
+        let cli_pinned: BTreeSet<String> = CLI_FLAGS.iter().map(|s| (*s).to_owned()).collect();
+        assert!(
+            !cli_from_tree.is_empty(),
+            "the built root declares no help/version arguments, so this pin holds over nothing"
+        );
+        assert_eq!(
+            cli_from_tree, cli_pinned,
+            "CLI_FLAGS must equal the root's own help/version spellings (both directions): \
+             tree {cli_from_tree:?} vs pinned {cli_pinned:?}"
+        );
+        assert_eq!(
+            CLI_FLAGS.len(),
+            cli_pinned.len(),
+            "CLI_FLAGS carries a duplicate spelling"
         );
     }
 }

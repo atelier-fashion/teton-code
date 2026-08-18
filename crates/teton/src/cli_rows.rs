@@ -218,12 +218,12 @@ const CLAP_ERROR_LEAD: &str = "error: ";
 ///
 /// The cap is wide because clap does **not** wrap help text in this build (no
 /// `wrap_help` feature), so a long doc comment is one long line — the global
-/// `--yes` flag's is over five hundred characters — and the binary's own text
+/// `--yes` flag's is over six hundred characters — and the binary's own text
 /// must reach the surface whole (AC-7's parity with the shell). A unit test
-/// walks every leaf's `--help` and `-h` page and asserts every line clears
-/// this bound, so a doc comment that grows past it fails there rather than
-/// being silently truncated in a session. Only a user's own long token ever
-/// meets the ellipsis.
+/// walks every leaf's and every family's `--help` and `-h` page and asserts
+/// every line clears this bound, so a doc comment that grows past it fails
+/// there rather than being silently truncated in a session. Only a user's own
+/// long token ever meets the ellipsis.
 const CLAP_LINE_MAX_CHARS: usize = 640;
 
 /// Render a clap parse failure — or a `--help` request, which clap also reports
@@ -738,6 +738,31 @@ pub(crate) fn leaf_command_paths() -> Vec<(String, bool)> {
     out
 }
 
+/// Every **family** subcommand path in the CLI's tree — a node with subcommands
+/// of its own (`provider`, `policy`, `model`, `boundary`), the root excluded.
+///
+/// The complement of [`leaf_command_paths`], for the tests that walk what a
+/// family answers with: `--help` on a family is [`family_help`]'s page (verify
+/// T6), and it is composed by the same parser under the same line bound as a
+/// leaf's, so the bound test walks both.
+#[cfg(test)]
+pub(crate) fn family_command_paths() -> Vec<String> {
+    fn walk(node: &clap::Command, prefix: &[&str], out: &mut Vec<String>) {
+        for sub in node.get_subcommands() {
+            if sub.get_subcommands().next().is_none() {
+                continue;
+            }
+            let mut path = prefix.to_vec();
+            path.push(sub.get_name());
+            out.push(path.join(" "));
+            walk(sub, &path, out);
+        }
+    }
+    let mut out = Vec::new();
+    walk(tree(), &[], &mut out);
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -776,6 +801,22 @@ mod tests {
     /// AC-7 are actually about.
     fn methods_sent(peer: &UnixStream) -> Vec<String> {
         crate::client::methods_written(peer)
+    }
+
+    /// Whether `TETON_PROVIDER_KEY` is exported in this process — the same
+    /// guard `main.rs`'s `provider_add_on` tests take, for a sharper reason
+    /// here: the `/provider add` tests below run through the shipped
+    /// dispatcher, whose keychain is the **real** one, and `read_secret` takes
+    /// the environment's key ahead of the prompter. A test that confirms "y"
+    /// on that path with the variable exported would store a developer's real
+    /// key into their login keychain, so those tests skip — out loud — rather
+    /// than run.
+    fn provider_key_exported() -> bool {
+        let exported = std::env::var("TETON_PROVIDER_KEY").is_ok_and(|key| !key.trim().is_empty());
+        if exported {
+            eprintln!("skipped: TETON_PROVIDER_KEY is exported");
+        }
+        exported
     }
 
     /// A `config/get` answer with nothing configured — enough for the read rows
@@ -1073,13 +1114,21 @@ mod tests {
     }
 
     /// **m2's precondition.** The bound clears every line the binary's own
-    /// parser composes — every leaf's long and short help — so nothing but a
-    /// user's own token ever meets the ellipsis. A doc comment that grows past
-    /// the bound fails here, by name, rather than being truncated in a session.
+    /// parser composes — every leaf's long and short help, and every family's
+    /// (the page [`family_help`] renders for `teton provider --help`, verify
+    /// T6) — so nothing but a user's own token ever meets the ellipsis. A doc
+    /// comment that grows past the bound fails here, by name, rather than
+    /// being truncated in a session.
     #[test]
     fn every_help_line_the_binary_composes_clears_the_line_bound() {
         let mut checked = 0;
-        for (path, _) in leaf_command_paths() {
+        let leaves = leaf_command_paths().into_iter().map(|(path, _)| path);
+        let families = family_command_paths();
+        assert!(
+            families.iter().any(|path| path == "provider") && families.len() >= 4,
+            "the family walk found too little: {families:?}"
+        );
+        for path in leaves.chain(families) {
             for flag in ["--help", "-h"] {
                 let argv: Vec<&str> = std::iter::once("teton")
                     .chain(path.split_whitespace())
@@ -1167,7 +1216,12 @@ mod tests {
             let (mut conn, peer) = Connection::scripted(&[]);
             let mut surface = RecordingSurface::new();
             let mut state = SessionState::new();
-            let mut prompter = ScriptedPrompter::new(&["a-key"]);
+            // One answer that must never be read, and it is a decline rather
+            // than a key: `provider add` runs through the shipped dispatcher,
+            // whose keychain is the real one, so no test on this path may
+            // script a key-shaped value (see
+            // `a_duplicate_id_is_refused_through_the_session_row_before_any_question`).
+            let mut prompter = ScriptedPrompter::new(&["n"]);
             {
                 let mut ctx = session_ctx(&mut surface, &mut state, &mut prompter, false);
                 let outcome = run_mirrored_seamed(row, args, &mut conn, &mut ctx, false)
@@ -1342,7 +1396,10 @@ mod tests {
         let (mut conn, peer) = Connection::scripted(&[]);
         let mut surface = RecordingSurface::new();
         let mut state = SessionState::new();
-        let mut prompter = ScriptedPrompter::new(&["a-key"]);
+        // A decline, not a key: the real keychain sits behind this dispatcher
+        // path (see the duplicate-id test below), so the one answer scripted
+        // for a question that must never be asked is one that stores nothing.
+        let mut prompter = ScriptedPrompter::new(&["n"]);
         {
             let mut ctx = session_ctx(&mut surface, &mut state, &mut prompter, true);
             let outcome = run_mirrored_seamed(
@@ -1397,6 +1454,9 @@ mod tests {
     /// `MockKeychain` (M4). The terminal's echo bit is `pty_e2e.rs`'s.
     #[test]
     fn provider_add_reads_its_key_through_the_hiding_prompt_and_never_as_a_flag() {
+        if provider_key_exported() {
+            return;
+        }
         // A `--key` flag does not exist and must not: the credential would be in
         // the session's scrollback, in any recording of it, and — for a typed
         // `teton provider add … --key …` — in a shell history file.
@@ -1492,6 +1552,9 @@ mod tests {
     /// for a registration that was never going to happen (BUG-155).
     #[test]
     fn a_duplicate_id_is_refused_through_the_session_row_before_any_question() {
+        if provider_key_exported() {
+            return;
+        }
         let existing = teton_protocol::methods::ConfigGetResult {
             snapshot: teton_protocol::methods::ConfigSnapshot {
                 providers: vec![teton_protocol::methods::ProviderConfig {
@@ -1507,7 +1570,18 @@ mod tests {
         let (mut conn, peer) = Connection::scripted(&[serde_json::to_value(existing).unwrap()]);
         let mut surface = RecordingSurface::new();
         let mut state = SessionState::new();
-        let mut prompter = ScriptedPrompter::new(&["y", "sk-would-not-be-read"]);
+        // "y" for a confirmation that must never be asked, and **no key answer**
+        // (see the test above): this row runs through the shipped dispatcher,
+        // which hands `provider_add_on` the REAL keychain, so under the very
+        // mutation this test guards — the probe not refusing — a scripted key
+        // would be stored into whoever ran `cargo test`'s login keychain as
+        // `teton/kimi`, and the `config/set` that follows would meet an
+        // exhausted scripted connection: a transport failure, which leaves the
+        // stored key in place (BUG-171's undo is for a daemon that answered
+        // no). An unexpected key read therefore gets an empty answer, which
+        // refuses before any store. No test on this dispatcher path may script
+        // a non-empty key.
+        let mut prompter = ScriptedPrompter::new(&["y"]);
         {
             let mut ctx = session_ctx(&mut surface, &mut state, &mut prompter, true);
             let outcome = run_mirrored_seamed(
@@ -1543,10 +1617,17 @@ mod tests {
     /// be stored.
     #[test]
     fn a_refused_endpoint_renders_the_seams_sentence_and_keeps_the_session() {
+        if provider_key_exported() {
+            return;
+        }
         let (mut conn, peer) = Connection::scripted(&[empty_config()]);
         let mut surface = RecordingSurface::new();
         let mut state = SessionState::new();
-        let mut prompter = ScriptedPrompter::new(&["y", "sk-would-not-be-read"]);
+        // "y" only, no key answer — the real keychain is behind this dispatcher
+        // path (see the duplicate-id test above for the full reason): if the
+        // seam ever stopped refusing, the key read gets an empty answer and
+        // refuses before any store.
+        let mut prompter = ScriptedPrompter::new(&["y"]);
         {
             let mut ctx = session_ctx(&mut surface, &mut state, &mut prompter, true);
             let outcome = run_mirrored_seamed(
@@ -1577,6 +1658,80 @@ mod tests {
             prompter.asked, 0,
             "a refused endpoint asks nothing: {:?}",
             prompter.questions
+        );
+        conn.assert_all_consumed();
+    }
+
+    /// A typed `--yes` on `/provider add` does **not** pre-answer the
+    /// register-this? confirmation: the flag is the shell's, the row drops it
+    /// and says so ([`shell_flags_line`]), and the consent the confirmation
+    /// stands for stays the session's own `--yes` (`ctx.auto_accept_model`) —
+    /// a line typed inside a session cannot grant itself the consent the
+    /// session's flag governs.
+    ///
+    /// Scripted "n" **by necessity**: the real keychain is behind this
+    /// dispatcher path, so the confirmation must decline — a "y" here would
+    /// be a test that reads a key toward whoever ran `cargo test`'s keychain.
+    /// The declined flow is what proves the question was asked at all.
+    #[test]
+    fn a_typed_yes_on_provider_add_is_ignored_and_the_confirmation_is_still_asked() {
+        let (mut conn, peer) = Connection::scripted(&[empty_config()]);
+        let mut surface = RecordingSurface::new();
+        let mut state = SessionState::new();
+        let mut prompter = ScriptedPrompter::new(&["n"]);
+        {
+            let mut ctx = session_ctx(&mut surface, &mut state, &mut prompter, true);
+            assert!(
+                !ctx.auto_accept_model,
+                "the session's own --yes must be off, or the confirm is pre-answered \
+                 for the right reason and this test proves nothing"
+            );
+            let outcome = run_mirrored_seamed(
+                PROVIDER_ADD,
+                "kimi2 --kind openai-compatible --endpoint https://x/v1/chat/completions \
+                 --model kimi-k3 --yes",
+                &mut conn,
+                &mut ctx,
+                false,
+            )
+            .expect("a declined confirmation is not a failure of the command");
+            assert_eq!(outcome, CommandOutcome::Continue);
+        }
+        assert_eq!(
+            prompter.asked, 1,
+            "the confirmation must still be asked under a typed --yes: {:?}",
+            prompter.questions
+        );
+        assert!(
+            prompter.questions[0].contains("[y/N]"),
+            "the one question is the default-no confirmation: {:?}",
+            prompter.questions
+        );
+        assert!(
+            prompter.secrets.is_empty(),
+            "a declined confirmation reads no key: {:?}",
+            prompter.secrets
+        );
+        assert_eq!(
+            methods_sent(&peer),
+            vec!["config/get"],
+            "the duplicate probe is the only RPC; no registration was sent"
+        );
+        let infos = surface.lines_of(LineKind::Info);
+        assert!(
+            infos.contains(&shell_flags_line("provider add", true).as_str()),
+            "the dropped flag must be reported: {:?}",
+            surface.calls
+        );
+        assert!(
+            infos.contains(&crate::provider_add_declined_line("kimi2").as_str()),
+            "the decline must be said: {:?}",
+            surface.calls
+        );
+        assert!(
+            surface.lines_of(LineKind::Error).is_empty(),
+            "a decline is not an error: {:?}",
+            surface.calls
         );
         conn.assert_all_consumed();
     }

@@ -87,7 +87,9 @@ pub(crate) struct Cli {
     /// machine's RAM floor (BR-3), the same confirmation for the in-session
     /// `/model set <name>` (REQ-555 BR-4b — one flow, so the session inherits
     /// the flag as the explicit unattended stand-in and consumes no input line
-    /// for the question), and the deletion confirmation of `teton uninstall`.
+    /// for the question), the register-this? confirmation the in-session
+    /// `/provider add` asks before it reads a key (REQ-582), and the deletion
+    /// confirmation of `teton uninstall`.
     ///
     /// And it answers the send-this? question of `/provider test <id>` /
     /// `teton provider test <id>` (REQ-581 BR-2) — the first thing this flag
@@ -4492,6 +4494,7 @@ mod tests {
         // environment; a developer who exports it must still run the test CI
         // runs, so the prompter leg is only meaningful with it unset.
         if std::env::var("TETON_PROVIDER_KEY").is_ok_and(|key| !key.trim().is_empty()) {
+            eprintln!("skipped: TETON_PROVIDER_KEY is exported");
             return;
         }
         let mut prompter = ScriptedPrompter::new(&["sk-session-secret"]);
@@ -4860,7 +4863,8 @@ mod tests {
     /// child's environment; a developer who exports it must still run the tests
     /// CI runs, so the tests that read a key return early rather than fail
     /// (the same guard `read_secret_asks_the_callers_prompter_and_never_echoes`
-    /// takes).
+    /// takes) — saying so on stderr first, so a green run with the key exported
+    /// reads as the skip it is under `--nocapture` rather than as proof.
     fn provider_key_exported() -> bool {
         std::env::var("TETON_PROVIDER_KEY").is_ok_and(|key| !key.trim().is_empty())
     }
@@ -4952,6 +4956,7 @@ mod tests {
     #[test]
     fn a_confirmed_session_provider_add_stores_the_key_and_registers_by_reference() {
         if provider_key_exported() {
+            eprintln!("skipped: TETON_PROVIDER_KEY is exported");
             return;
         }
         let kc = MockKeychain::new();
@@ -5021,6 +5026,7 @@ mod tests {
     #[test]
     fn the_sessions_yes_pre_answers_the_provider_add_confirmation() {
         if provider_key_exported() {
+            eprintln!("skipped: TETON_PROVIDER_KEY is exported");
             return;
         }
         let kc = MockKeychain::new();
@@ -5044,6 +5050,7 @@ mod tests {
     #[test]
     fn a_refused_session_registration_takes_its_stored_key_back_out() {
         if provider_key_exported() {
+            eprintln!("skipped: TETON_PROVIDER_KEY is exported");
             return;
         }
         let kc = MockKeychain::new();
@@ -5099,6 +5106,7 @@ mod tests {
     #[test]
     fn a_refused_session_registration_restores_the_key_it_displaced() {
         if provider_key_exported() {
+            eprintln!("skipped: TETON_PROVIDER_KEY is exported");
             return;
         }
         let kc = MockKeychain::new();
@@ -5130,6 +5138,7 @@ mod tests {
     #[test]
     fn a_keychain_that_will_not_store_is_a_refusal_and_registers_nothing() {
         if provider_key_exported() {
+            eprintln!("skipped: TETON_PROVIDER_KEY is exported");
             return;
         }
         let kc = MockKeychain::unavailable();
@@ -5156,6 +5165,7 @@ mod tests {
     #[test]
     fn the_shell_consent_mode_asks_no_confirmation() {
         if provider_key_exported() {
+            eprintln!("skipped: TETON_PROVIDER_KEY is exported");
             return;
         }
         let kc = MockKeychain::new();
