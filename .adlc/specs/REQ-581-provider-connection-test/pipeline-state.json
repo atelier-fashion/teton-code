@@ -1,0 +1,95 @@
+{
+  "req": "REQ-581",
+  "branch": "feat/REQ-581-provider-connection-test",
+  "startedAt": "2026-08-18T00:43:17Z",
+  "completed": false,
+  "currentPhase": 8,
+  "completedPhases": [
+    0,
+    1,
+    2,
+    3,
+    4,
+    5,
+    6,
+    7
+  ],
+  "phaseHistory": [
+    {
+      "phase": 0,
+      "name": "Create Worktree",
+      "completedAt": "2026-08-18T00:43:28Z"
+    },
+    {
+      "phase": 1,
+      "name": "Validate Spec",
+      "completedAt": "2026-08-18T00:44:35Z"
+    },
+    {
+      "phase": 2,
+      "name": "Architect",
+      "completedAt": "2026-08-18T01:00:09Z"
+    },
+    {
+      "phase": 3,
+      "name": "Validate Architecture & Tasks",
+      "completedAt": "2026-08-18T01:17:05Z"
+    },
+    {
+      "phase": 4,
+      "name": "Implement",
+      "completedAt": "2026-08-18T02:36:39Z"
+    },
+    {
+      "phase": 5,
+      "name": "Verify",
+      "completedAt": "2026-08-18T04:15:26Z"
+    },
+    {
+      "phase": 6,
+      "name": "Create PR",
+      "completedAt": "2026-08-18T04:16:21Z"
+    },
+    {
+      "phase": 7,
+      "name": "PR Cleanup & CI",
+      "completedAt": "2026-08-18T04:19:59Z"
+    }
+  ],
+  "integrationBranch": "main",
+  "repos": {
+    "teton-code": {
+      "primary": true,
+      "path": "/Users/brettluelling/Documents/GitHub/teton-code",
+      "worktree": "/Users/brettluelling/Documents/GitHub/teton-code/.worktrees/REQ-581",
+      "branch": "feat/REQ-581-provider-connection-test",
+      "touched": true,
+      "prUrl": "https://github.com/atelier-fashion/teton-code/pull/168",
+      "prNumber": 168,
+      "prCreatedAt": "2026-08-18T00:43:20Z",
+      "merged": false,
+      "snapshotBranch": null,
+      "snapshotPR": null
+    }
+  },
+  "mergeOrder": [
+    "teton-code"
+  ],
+  "phase4": {
+    "currentTask": null,
+    "completedTasks": [
+      "TASK-160",
+      "TASK-161",
+      "TASK-166",
+      "TASK-163",
+      "TASK-165",
+      "TASK-164",
+      "TASK-162",
+      "TASK-167"
+    ],
+    "failedTasks": []
+  },
+  "phase5": {
+    "summary": "6 agents; 15 advisory candidates (9 refuted, 6 confirmed); 1 Critical + 6 Major + ~14 Minor fixed in pass 1 (2 commits) + typed-outcome split; re-verify (5 reviewers) confirmed all fixed, found 1 Major (probe lifetime claim) + 4 Minor + 1 Low \u2014 fixed in pass 2 with mutation evidence; workspace 2831 passed / 0 failed; 3 reflector product questions answered from the spec/code record (OQ-1 no preview estimate per M-7; notice for other clients only; doctor points at the test) \u2014 no halt"
+  }
+}

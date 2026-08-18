@@ -73,7 +73,8 @@ CREATE TABLE IF NOT EXISTS cost_records (
     output_tokens  INTEGER NOT NULL,
     usd_micros     INTEGER,
     cached_tokens  INTEGER,
-    reasoning_tokens INTEGER
+    reasoning_tokens INTEGER,
+    probe          INTEGER
 );
 CREATE TRIGGER IF NOT EXISTS cost_records_no_update
     BEFORE UPDATE ON cost_records
@@ -129,7 +130,7 @@ CREATE TRIGGER IF NOT EXISTS web_overrides_no_delete
 /// does reach an existing file, which is how REQ-563's `web_lookups` arrives on
 /// a `cost.db` written before it existed. Only a new column on a table that is
 /// already there is invisible to the schema batch.
-const ADDITIVE_COLUMNS: [(&str, &str); 3] = [
+const ADDITIVE_COLUMNS: [(&str, &str); 4] = [
     (
         // REQ-558: the routing category the call was made for.
         "category",
@@ -150,6 +151,15 @@ const ADDITIVE_COLUMNS: [(&str, &str); 3] = [
         // is the truth about both, and a `0` would be an invented attribution.
         "reasoning_tokens",
         "ALTER TABLE cost_records ADD COLUMN reasoning_tokens INTEGER",
+    ),
+    (
+        // REQ-581: `1` on a connection-test row, NULL on every turn and on
+        // every row written before this column existed. Nullable and never
+        // backfilled for the reason the two above are: a pre-REQ daemon had no
+        // `provider/test` to run, so those rows predate the concept — NULL is
+        // the truth about them, and the read maps it to "not a probe".
+        "probe",
+        "ALTER TABLE cost_records ADD COLUMN probe INTEGER",
     ),
 ];
 
@@ -243,6 +253,18 @@ pub struct LedgerRow {
     /// of** `output_tokens`, never an addition: the completion is that many
     /// tokens whether or not the provider broke out the thinking share.
     pub reasoning_tokens: Option<u64>,
+    /// Whether this row is a **connection test** rather than a turn (REQ-581
+    /// BR-5).
+    ///
+    /// A `bool` here over the column's `Option<i64>` because, unlike
+    /// `cached_tokens` and `reasoning_tokens`, the absent value carries no
+    /// distinct meaning: a row that predates the column was written by a daemon
+    /// with no `provider/test` to run, so "we do not know" and "not a probe"
+    /// are the same fact. Stored as `1` / NULL, read back as `true` / `false`.
+    ///
+    /// A probe is billed like any other call — the flag counts it apart, it
+    /// does not exempt it.
+    pub probe: bool,
 }
 
 impl LedgerRow {
@@ -265,6 +287,7 @@ impl LedgerRow {
             usd_micros: self.usd_micros.unwrap_or(0),
             cached_tokens: self.cached_tokens,
             reasoning_tokens: self.reasoning_tokens,
+            probe: self.probe,
         }
     }
 }
@@ -439,6 +462,10 @@ impl CostLedger {
             // A remote provider has no local KV: "no cache" rather than
             // "nothing reused".
             cached_tokens: None,
+            // Carried from the attribution rather than defaulted: the caller is
+            // the only layer that knows whether it asked a question or tested a
+            // connection (REQ-581 BR-5).
+            probe: attribution.probe,
         })
     }
 
@@ -482,6 +509,7 @@ impl CostLedger {
             cached_tokens: Some(cached_tokens),
             // The local engine reports no reasoning split (BR-6).
             reasoning_tokens: None,
+            probe: attribution.probe,
         })
     }
 
@@ -494,7 +522,7 @@ impl CostLedger {
         let mut stmt = guard.prepare(
             "SELECT session_id, phase, category, provider_id, model,
                     input_tokens, output_tokens, usd_micros, cached_tokens,
-                    reasoning_tokens
+                    reasoning_tokens, probe
              FROM cost_records ORDER BY id",
         )?;
         let rows = stmt
@@ -512,6 +540,12 @@ impl CostLedger {
                     usd_micros: r.get(7)?,
                     cached_tokens: r.get::<_, Option<i64>>(8)?.map(to_u64),
                     reasoning_tokens: r.get::<_, Option<i64>>(9)?.map(to_u64),
+                    // Only the `1` this build writes means "probe". A NULL (a
+                    // turn, or a row from before the column existed) and a `0`
+                    // both read as false — the same posture
+                    // `category_from_wire` takes toward a value it does not
+                    // recognize: read what was recorded, never guess past it.
+                    probe: r.get::<_, Option<i64>>(10)? == Some(1),
                 })
             })?
             .collect::<Result<Vec<_>, _>>()?;
@@ -811,6 +845,10 @@ impl MeteredBody {
             // computed from `usage.output` alone, exactly as before this field
             // existed, so totals are byte-identical (BR-10).
             reasoning_tokens: usage.reasoning,
+            // REQ-581 BR-5: the connection test goes out through this same
+            // choke point and is billed by this same code — the attribution is
+            // the only thing that differs, and it says so here.
+            probe: self.attribution.probe,
         };
         // Best-effort: never let a ledger hiccup break the response stream.
         let _ = insert_and_emit(&self.conn, self.sink.as_ref(), &row);
@@ -1004,8 +1042,8 @@ fn insert_and_emit(
             "INSERT INTO cost_records
                (recorded_at_ms, session_id, phase, category, provider_id, model,
                 input_tokens, output_tokens, usd_micros, cached_tokens,
-                reasoning_tokens)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
+                reasoning_tokens, probe)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
             rusqlite::params![
                 now_ms(),
                 row.session_id,
@@ -1018,6 +1056,10 @@ fn insert_and_emit(
                 row.usd_micros,
                 row.cached_tokens.map(to_i64),
                 row.reasoning_tokens.map(to_i64),
+                // NULL rather than `0` for a turn, so a row this build writes is
+                // indistinguishable from one written before the column existed
+                // — which is the truth: neither is a probe.
+                row.probe.then_some(1_i64),
             ],
         )?;
     }
@@ -1400,6 +1442,12 @@ CREATE TRIGGER cost_records_no_delete
             "REQ-559: and it predates the reasoning split too. Never backfilled — \
              a row written before the column has no thinking share to report, and \
              a 0 would invent one",
+        );
+        assert!(
+            !rows[0].probe,
+            "REQ-581: and it predates the connection test. A daemon with no \
+             `provider/test` recorded no probes, so `false` is the truth about \
+             the row, read off the NULL the migration left it",
         );
         assert_eq!(rows[0].input_tokens, 900);
         assert_eq!(rows[0].usd_micros, Some(42));
@@ -1832,6 +1880,116 @@ CREATE TRIGGER cost_records_no_delete
             )
             .expect("record a remote call");
         assert_eq!(ledger.all_records().expect("read")[0].cached_tokens, None);
+    }
+
+    /// REQ-581 BR-5: a `cost.db` written before the connection test existed
+    /// gains the `probe` column on the next open, keeps every historical row as
+    /// it was, and is still append-only afterwards.
+    ///
+    /// The `cached_tokens` precedent in full: the migration is DDL, so it
+    /// neither reads nor rewrites a row, and the `ALTER TABLE` cannot have
+    /// dropped the trigger that makes that guarantee enforceable rather than
+    /// merely intended.
+    #[test]
+    fn a_pre_req_ledger_gains_the_probe_column_and_stays_append_only() {
+        let path = scratch_db("pre-probe");
+        let _ = std::fs::remove_file(&path);
+        {
+            let old = Connection::open(&path).expect("create pre-REQ-581 ledger");
+            old.execute_batch(PRE_REQ_SCHEMA).expect("pre-REQ schema");
+            old.execute(
+                "INSERT INTO cost_records
+                   (recorded_at_ms, session_id, phase, provider_id, model,
+                    input_tokens, output_tokens, usd_micros)
+                 VALUES (1, 'old-session', 'review', 'anthropic', 'claude-opus-4', 900, 100, 42)",
+                [],
+            )
+            .expect("historical row");
+        }
+
+        let sink = Arc::new(CapturingSink::default());
+        let ledger = CostLedger::open(&path, PriceTable::bundled(), sink.clone())
+            .expect("open a pre-REQ-581 file");
+
+        {
+            let guard = ledger.conn.lock().unwrap();
+            assert!(
+                has_column(&guard, "probe").expect("pragma"),
+                "the migration must add the column an older file lacks"
+            );
+            // The append-only trigger survived the ALTER TABLE.
+            assert!(
+                guard
+                    .execute("UPDATE cost_records SET model = 'x'", [])
+                    .is_err(),
+                "UPDATE must still be rejected after the migration"
+            );
+        }
+
+        let rows = ledger.all_records().expect("read");
+        assert_eq!(rows.len(), 1, "the migration must not drop or rewrite rows");
+        assert!(!rows[0].probe, "a historical row is not a probe");
+        assert_eq!(rows[0].input_tokens, 900);
+        assert_eq!(rows[0].usd_micros, Some(42));
+        assert_eq!(
+            ledger.report().expect("report").probe_calls,
+            0,
+            "a ledger that predates the concept reports no probes"
+        );
+
+        // Re-opening is idempotent: the migration sees the column and does
+        // nothing rather than failing on a duplicate ADD COLUMN.
+        let reopened = CostLedger::open(&path, PriceTable::bundled(), sink)
+            .expect("re-open a migrated ledger");
+        assert_eq!(reopened.all_records().expect("read").len(), 1);
+        {
+            let guard = reopened.conn.lock().unwrap();
+            assert!(has_column(&guard, "probe").expect("pragma"));
+        }
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// REQ-581 BR-5: a probe row round-trips as a probe, a turn round-trips as a
+    /// turn, and the report counts only the first — while both stay in the call
+    /// total, because a connection test really did spend.
+    #[test]
+    fn a_probe_row_round_trips_and_the_report_counts_only_probes() {
+        let (ledger, sink) = ledger();
+        ledger
+            .record_call(
+                "s1",
+                "anthropic",
+                &CostAttribution::new("claude-fable-5").with_category(Category::Review),
+                1000,
+                500,
+            )
+            .expect("record a turn");
+        ledger
+            .record_call("s1", "kimi", &CostAttribution::new("kimi-k2").probe(), 8, 4)
+            .expect("record a probe");
+
+        let rows = ledger.all_records().expect("read");
+        assert_eq!(rows.len(), 2);
+        assert!(!rows[0].probe, "a turn is stored as a turn");
+        assert!(rows[1].probe, "and the probe reads back as one");
+        assert_eq!(
+            rows[1].input_tokens, 8,
+            "a probe is an ordinary row: it carries its real token counts"
+        );
+
+        // The flag reaches the client on the live event too, not only the store.
+        let emitted = sink.records.lock().unwrap();
+        assert!(!emitted[0].probe);
+        assert!(emitted[1].probe);
+        drop(emitted);
+
+        let report = ledger.report().expect("report");
+        assert_eq!(report.probe_calls, 1, "only the probe is counted as one");
+        assert_eq!(
+            report.total.calls, 2,
+            "and it is still a call — the count is a subset, not a deduction"
+        );
     }
 
     #[test]

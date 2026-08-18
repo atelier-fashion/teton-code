@@ -327,6 +327,20 @@ const COMMANDS: &[CommandSpec] = &[
         args: Args::Optional,
         handler: handle_provider_setup,
     },
+    // REQ-581 BR-7: the second `/provider` row, beside the one that registers.
+    // `Args::Required` because there is nothing useful a bare form could do —
+    // testing *every* provider would be N previews and N outbound calls from one
+    // line, which is OQ-2's deferred `teton doctor --probe` and not this row.
+    CommandSpec {
+        name: "provider test",
+        aliases: &[],
+        summary: "Test a registered provider with one consented call: /provider test <id>",
+        args: Args::Required(
+            "a provider id — `/provider test <id>`, and `/provider setup` \
+                             registers one",
+        ),
+        handler: handle_provider_test,
+    },
     CommandSpec {
         name: "quit",
         // BUG-153: `/exit` is the same command under the name most other REPLs
@@ -922,6 +936,67 @@ fn handle_provider_setup(
     let keychain = crate::keychain::default_keychain();
     crate::provider_setup_ui::run(conn, ctx, keychain.as_ref(), vendor, tier)?;
     Ok(CommandOutcome::Continue)
+}
+
+/// What `/provider test` says to a line carrying more than an id (REQ-581).
+///
+/// A second word is a typo, and reading it as anything would mean guessing which
+/// provider the user meant — for a command that spends. The same reason
+/// [`PROVIDER_SETUP_USAGE`] exists, with a sharper edge.
+const PROVIDER_TEST_USAGE: &str =
+    "`/provider test` takes one provider id — `/provider test kimi`. Nothing was sent.";
+
+/// The `/provider test <id>` handler: one consented call to a registered
+/// provider (REQ-581 BR-2/BR-7).
+///
+/// User-only by construction, exactly as `/provider setup` is: it is a slash
+/// command, and tool dispatch has no path to this table — a model that emits a
+/// tool call named `provider test` reaches the tool registry and finds no such
+/// tool. The daemon does not take that on trust and gates the method on session
+/// attachment anyway (architecture ADR-5), which is also what stops a
+/// `teton provider test … --yes` spawned through the shell tool.
+///
+/// Everything it does lives in [`crate::provider_test_ui`]: the preview, the
+/// default-no confirm, the call and the typed report. The handler's whole job is
+/// to check the argument and hand that flow the session's connection and
+/// context — the same division `/provider setup` has, and for the same reason
+/// (LESSON-441: one consent gate, one implementation).
+///
+/// It is **not** refused on a pipe the way `/model set` is, and it does not
+/// degrade the way `/provider setup` does either: the flow's own gate answers a
+/// non-typed session with the `--yes` remedy and sends nothing (BR-2), because a
+/// command whose entire body is an outbound request has no reduced form to
+/// offer.
+fn handle_provider_test(
+    conn: &mut Connection,
+    ctx: &mut UiContext<'_>,
+    args: &str,
+) -> anyhow::Result<CommandOutcome> {
+    let Some(id) = provider_test_id(args) else {
+        ctx.surface.line(LineKind::Error, PROVIDER_TEST_USAGE);
+        return Ok(CommandOutcome::Continue);
+    };
+    crate::provider_test_ui::run_in_session(conn, ctx, id)?;
+    Ok(CommandOutcome::Continue)
+}
+
+/// The argument line of `/provider test`, read: exactly one word, or nothing.
+///
+/// Pure and separate from [`handle_provider_test`] so the rule can be *tested*
+/// rather than restated. Its unit test used to re-run `split_whitespace` over a
+/// fixture and assert on what that produced, which pins `split_whitespace` and
+/// says nothing about the command — the handler itself needs a live
+/// [`Connection`] and cannot be called from a unit test, so the parse had to
+/// come out to be reachable at all.
+///
+/// `None` covers both ways of getting it wrong, because they have one answer:
+/// no word at all (`Args::Required` catches this first, so it is defence in
+/// depth) and a second word, which is a typo. Reading either as an id would mean
+/// guessing which provider a user meant for a command that spends.
+fn provider_test_id(args: &str) -> Option<&str> {
+    let mut words = args.split_whitespace();
+    let id = words.next()?;
+    words.next().is_none().then_some(id)
 }
 
 /// What `/permissions` says when there is no session to read a level from.
@@ -1634,6 +1709,11 @@ mod tests {
             // promoted later"), and this is that promotion, so the spelling is a
             // spec decision and not a drive-by.
             "provider setup",
+            // REQ-581 BR-7 / AC-9: the connection test, declared here for the
+            // reason every row above it was. It is the second `/provider` row
+            // and the first command in the table whose body is an outbound
+            // request, so the spelling is a spec decision and not a drive-by.
+            "provider test",
         ];
         for expected in promised {
             assert!(
@@ -2176,6 +2256,91 @@ mod tests {
         assert!(COMMANDS
             .iter()
             .any(|spec| spec.name == "provider setup" && matches!(spec.args, Args::Optional)));
+    }
+
+    // ------------------------------------------------------------------
+    // REQ-581: the provider connection test (AC-9)
+    // ------------------------------------------------------------------
+
+    /// AC-9 / REQ-555 BR-7: `/help` is generated from `COMMANDS`, so this row
+    /// reaches it without a second edit. Its summary must say what the command
+    /// *does* — one call, consented — because "test" alone reads as a local
+    /// diagnostic and this one spends.
+    #[test]
+    fn help_lists_the_provider_test_row_and_says_it_sends() {
+        let mut surface = RecordingSurface::new();
+        render_help(&mut surface);
+        let listing = surface.lines_of(LineKind::Info).join("\n");
+
+        assert!(listing.contains("/provider test"), "{listing}");
+        assert!(
+            listing.contains("<id>"),
+            "the row must show what it takes, or the argument is a secret: {listing}"
+        );
+        assert!(
+            listing.contains("one consented call"),
+            "the summary must say the command sends: {listing}"
+        );
+    }
+
+    /// The longest-match rule keeps the two `/provider` rows apart, and this one
+    /// takes exactly one id: a bare line is rejected before any handler runs
+    /// (there is nothing useful to test without a name), and a second word is a
+    /// typo rather than a silently ignored argument — for a command that spends,
+    /// guessing which of two ids was meant is the one thing it must not do.
+    #[test]
+    fn the_provider_test_command_takes_exactly_one_id() {
+        let Input::Command { name, args } = classify("/provider test kimi") else {
+            panic!("`/provider test kimi` did not classify as a command");
+        };
+        assert_eq!((name, args), ("provider test", "kimi"));
+        assert!(matches!(resolve(name, args), Resolution::Run(_, "kimi")));
+
+        // The bare form is rejected at `resolve`, so no RPC is issued and the
+        // hint says what to type.
+        let Input::Command { name, args } = classify("/provider test") else {
+            panic!("`/provider test` did not classify as a command");
+        };
+        let Resolution::Rejected(hint) = resolve(name, args) else {
+            panic!("a bare `/provider test` reached the handler");
+        };
+        assert!(hint.contains("/provider test <id>"), "{hint}");
+
+        // The two rows are distinct: `/provider setup kimi` must never be read
+        // as the test row, nor the reverse.
+        let Input::Command { name, .. } = classify("/provider setup kimi") else {
+            panic!("`/provider setup kimi` did not classify as a command");
+        };
+        assert_eq!(name, "provider setup");
+
+        assert!(PROVIDER_TEST_USAGE.contains("/provider test kimi"));
+        assert!(PROVIDER_TEST_USAGE.contains("Nothing was sent"));
+    }
+
+    /// The handler's own argument rule, exercised rather than re-derived.
+    ///
+    /// One id is taken; nothing and two words are both refused, and the refusal
+    /// is the same because the answer is: this command spends, so it may not
+    /// guess which of two ids was meant, and it may not test "whatever was
+    /// registered first" for a line that named none.
+    #[test]
+    fn provider_test_takes_one_id_and_refuses_none_or_two() {
+        for (args, expected) in [
+            ("kimi", Some("kimi")),
+            ("  kimi  ", Some("kimi")),
+            ("deepseek", Some("deepseek")),
+            ("", None),
+            ("   ", None),
+            ("kimi deepseek", None),
+            ("kimi --yes", None),
+            ("kimi deepseek anthropic", None),
+        ] {
+            assert_eq!(
+                provider_test_id(args),
+                expected,
+                "`/provider test {args}` parsed wrongly"
+            );
+        }
     }
 
     /// The longest-match rule keeps the third `/web` row apart from the other

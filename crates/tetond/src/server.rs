@@ -122,10 +122,10 @@ use teton_protocol::methods::{
     ConfigGetResult, ConfigSetParams, ConfigSetResult, CostQueryParams, ModelConfirmParams,
     ModelListParams, ModelSetParams, ModelStatusParams, PermissionRespondParams,
     PermissionRespondResult, PromptBlock, PromptTurnParams, ProviderSetupCommitParams,
-    ProviderSetupPlanParams, ProviderSetupPreviewParams, RpcMethod, SessionAttachParams,
-    SessionAttachResult, SessionClearParams, SessionCreateParams, SessionCreateResult,
-    SessionListParams, SessionListResult, SessionPermissionsParams, SessionSummary,
-    WebOverrideParams, WebRefreshParams, WebSetupCommitParams, WebSetupPlanParams,
+    ProviderSetupPlanParams, ProviderSetupPreviewParams, ProviderTestParams, RpcMethod,
+    SessionAttachParams, SessionAttachResult, SessionClearParams, SessionCreateParams,
+    SessionCreateResult, SessionListParams, SessionListResult, SessionPermissionsParams,
+    SessionSummary, WebOverrideParams, WebRefreshParams, WebSetupCommitParams, WebSetupPlanParams,
     WebSetupPreviewParams,
 };
 use teton_protocol::{RequestId, SessionId};
@@ -1606,6 +1606,21 @@ async fn handle_client(stream: UnixStream, daemon: Arc<Daemon>, peer: PeerIdenti
         // table, which is the same blast radius `config/set` has by another
         // route. Each moved off the reader-loop `dispatch` to here rather than
         // parking every other RPC on this connection behind a Touch ID prompt.
+        //
+        // `provider/test` (REQ-581) is the one member that blocks on **the
+        // network** rather than on a human: it makes one real completion request
+        // to a vendor, which can take as long as a person deciding, and it
+        // attests nothing (it changes no config). What it shares with the seven
+        // above is the only thing this list is about — a method that waits on
+        // something outside this process must not wait on the reader loop, or
+        // every other RPC on the connection waits with it (LESSON-518). So the
+        // name reads "a human *or* the network"; the branch chain below is the
+        // routing.
+        //
+        // Membership in this list decides where the work *runs*. It does not
+        // decide what teardown does with it: `provider/test` ends up on
+        // `prompt_tasks` (drained) rather than `attach_tasks` (aborted), for the
+        // reason spelled out at the push below.
         let blocks_on_a_human = matches!(
             method,
             m if m == SessionAttachParams::METHOD
@@ -1615,15 +1630,66 @@ async fn handle_client(stream: UnixStream, daemon: Arc<Daemon>, peer: PeerIdenti
                 || m == WebSetupCommitParams::METHOD
                 || m == ProviderSetupCommitParams::METHOD
                 || m == ConfigSetParams::METHOD
+                || m == ProviderTestParams::METHOD
         );
         if blocks_on_a_human {
             let daemon = Arc::clone(&daemon);
             let conn = conn.clone();
             let out_tx = out_tx.clone();
             let fence = fence.clone();
+            // REQ-581 verify F2 — **which teardown list this task joins**, and
+            // it is not the one the branch is named after.
+            //
+            // Seven of the eight members are waiting on a *person*, and what
+            // each can still do when its client vanishes is mint a grant. So
+            // teardown `abort()`s them: a decision nobody is left to make is
+            // better killed than completed, and killing it is what bounds the
+            // grant release that follows (see the teardown comment).
+            //
+            // `provider/test` is none of that. It is a **billed call with a
+            // durable row**: the vendor is charging for it whether or not
+            // anyone is still on the socket, and aborting it at its await point
+            // loses the ledger row, the health record and the `provider_tested`
+            // event for money already spent — REQ-565's exact hole for turns,
+            // arriving by another route and widest in the TTFB window, where the
+            // request is out and nothing has come back yet. It also mints no
+            // grant, so nothing in the release ordering below needs it dead
+            // first.
+            //
+            // So it rides `prompt_tasks`, which teardown *drains* rather than
+            // aborts — bounded by `TURN_DRAIN_TIMEOUT` on that side and by
+            // `PROBE_DEADLINE` on the probe's own.
+            let is_probe = method == ProviderTestParams::METHOD;
+            // …and the drain alone is not enough to make that true.
+            //
+            // Teardown drops `client_guard` *before* it drains (the ordering is
+            // deliberate and documented there), so if the disconnecting client
+            // was the last one, `LifetimeState::on_disconnect` asks
+            // `commit_or_defer` what to do while this probe is still awaiting
+            // the vendor. With no activity claimed, that sees an idle daemon,
+            // commits under the default `on-last-disconnect` policy, and `serve`
+            // returns — `main` then reaches `_exit` with the drain still running,
+            // and the ledger row, the health record and the `provider_tested`
+            // event for a billed request are lost anyway. A drain nothing defers
+            // to is a drain the process does not wait for.
+            //
+            // [`BlockingActivity::Turn`] rather than a variant of its own: a
+            // probe is a billed call against a vendor with a durable row on the
+            // far side of it, which is exactly what `Turn` means to the
+            // lifetime — and a ninth variant would be new wire vocabulary every
+            // client has to learn for a distinction none of them acts on.
+            //
+            // Taken here rather than inside the task so the claim exists before
+            // `spawn` returns ([`spawn_prompt_turn`]'s reason, verbatim): a
+            // client that disconnects in the gap between the two would otherwise
+            // see an idle daemon and commit to exiting while this probe was
+            // still starting. Moved into the task, so `Drop` releases it on
+            // every exit path — completion, error, panic, or the drain's
+            // timeout abort.
+            let probe_guard = is_probe.then(|| daemon.lifetime.activity(BlockingActivity::Turn));
             let method = method.to_owned();
-            attach_tasks.retain(|h| !h.is_finished());
-            attach_tasks.push(tokio::spawn(async move {
+            let task = tokio::spawn(async move {
+                let _probe_guard = probe_guard;
                 let response = if method == SessionAttachParams::METHOD {
                     handle_session_attach(&daemon, &conn, id, params).await
                 } else if method == AttachConsentParams::METHOD {
@@ -1638,10 +1704,12 @@ async fn handle_client(stream: UnixStream, daemon: Arc<Daemon>, peer: PeerIdenti
                     handle_provider_setup_commit(&daemon, &conn, id, params).await
                 } else if method == ConfigSetParams::METHOD {
                     handle_config_set(&daemon, &conn, id, params).await
+                } else if method == ProviderTestParams::METHOD {
+                    handle_provider_test(&daemon, &conn, id, params).await
                 } else {
                     // Unreachable: the `blocks_on_a_human` `matches!` guard admits
-                    // exactly the seven methods branched above. Made explicit rather
-                    // than a catch-all so a future eighth member that updates the
+                    // exactly the eight methods branched above. Made explicit rather
+                    // than a catch-all so a future ninth member that updates the
                     // guard but forgets a branch fails loudly here instead of being
                     // silently misrouted into the last handler.
                     unreachable!("blocks_on_a_human admitted an unrouted method: {method}")
@@ -1653,7 +1721,14 @@ async fn handle_client(stream: UnixStream, daemon: Arc<Daemon>, peer: PeerIdenti
                     fence.sync().await;
                 }
                 let _ = out_tx.send(response).await;
-            }));
+            });
+            if is_probe {
+                prompt_tasks.retain(|h| !h.is_finished());
+                prompt_tasks.push(task);
+            } else {
+                attach_tasks.retain(|h| !h.is_finished());
+                attach_tasks.push(task);
+            }
             continue;
         }
 
@@ -1695,6 +1770,12 @@ async fn handle_client(stream: UnixStream, daemon: Arc<Daemon>, peer: PeerIdenti
     // Unconditional: most connections were never granted anything, and
     // `release` on a connection holding nothing is a no-op. A connection that
     // never handshaked has no id, so it has neither surface nor grants.
+    //
+    // REQ-581 verify F2: `provider/test` shares the spawn branch with these but
+    // deliberately not this list. It mints no grant, so it does not belong to
+    // step 2 — and it has already spent the user's money, so the abort that is
+    // right for an undecided consent is exactly wrong for it. It is drained
+    // below with the turns.
     if let Some(state) = conn.as_ref() {
         daemon.surfaces.release(state.id);
     }
@@ -1729,6 +1810,15 @@ async fn handle_client(stream: UnixStream, daemon: Arc<Daemon>, peer: PeerIdenti
     // held turn ends on it before the drain even looks. Dropped rather than
     // sent, so a turn that subscribed late sees the closed channel and not a
     // stale `true`.
+    //
+    // REQ-581 verify F2: an in-flight `provider/test` is drained here too, and
+    // for the identical reason rather than a related one. A probe is a billed
+    // call against a vendor with a durable row, a health record and an event on
+    // the far side of it; a client that closed its terminal during the TTFB
+    // window has changed nothing about the fact that the money is spent. What
+    // it is *not* is a consent: it mints no grant, so it does not need the
+    // abort-then-await treatment the attaches above get. Its own
+    // `PROBE_DEADLINE` bounds it well inside `TURN_DRAIN_TIMEOUT`.
     drop(client_guard);
     drop(connected);
     for task in prompt_tasks {
@@ -2265,6 +2355,10 @@ fn dispatch(
         // same reason and under the same gate. `provider/setup_commit` is NOT
         // here either — it is a BR-10(b) commitment that may park on a human, so
         // it runs on its own task in `handle_client`'s `blocks_on_a_human` path.
+        // Nor is REQ-581's `provider/test`, for the other half of that path's
+        // reason: it takes the same `may_drive` gate these reads take and adds no
+        // presence check, but it *sends* — one completion request to a vendor —
+        // so serving it here would park the reader loop for a round trip.
         ProviderSetupPlanParams::METHOD => {
             Some(handle_provider_setup_plan(daemon, conn, id, params))
         }
@@ -2741,6 +2835,63 @@ async fn handle_provider_setup_commit(
             }
             ok_string(id, &result)
         }
+        Err(err) => error_from(id, err),
+    }
+}
+
+/// Make one real call to a configured provider and report what came back
+/// (`provider/test`, REQ-581 BR-1/AC-6).
+///
+/// Gated like the setup trio's **reads**, and deliberately not like their
+/// commit:
+///
+/// 1. [`refuse_unmintable_session_id`] — a `session_id` no daemon could have
+///    minted is refused before anything hashes it, as at every other
+///    `may_drive` seam;
+/// 2. `may_drive` → a **silent** [`error_code::NOT_ATTACHED`].
+///    [`refuse_commit_without_session_access`] is not what runs here, and the
+///    difference is the announcement: a probe that published its own refusal
+///    would hand any same-UID peer a line in a stranger's transcript on demand,
+///    at whatever rate it liked (LESSON-513, and
+///    [`handle_provider_setup_plan`]'s cry-wolf argument word for word). The
+///    notice belongs to the flows that try to **change** the configuration;
+///    this one changes nothing.
+///
+/// There is no presence attestation, and the omission is a decision rather than
+/// an oversight (BR-2): BR-10(b) is about a daemon-wide *commitment*, and this
+/// method writes no config — the consent that matters is the client-side
+/// confirm the user answers before the request is issued at all. What the gate
+/// above buys is AC-6: a foreign connection, and a daemon-spawned descendant the
+/// REQ-569 ancestry gate bars from session access, cannot make the user's
+/// provider spend on their behalf. The refusal lands *before* the runtime is
+/// touched, so nothing is dialed and nothing is billed.
+///
+/// It runs on `handle_client`'s own-task path rather than in [`dispatch`]
+/// because it blocks on the network: one completion request to a vendor, which
+/// can take as long as a Touch ID prompt does. Served inline it would park every
+/// other RPC on this connection for the length of that round trip (LESSON-518).
+///
+/// The `provider_tested` announcement is [`DaemonRuntime::provider_test`]'s to
+/// publish, on every outcome, because a call that *happened* is news the
+/// session's other clients are owed — including where it left the health the
+/// next turn routes by. A refusal here made no call, so it announces nothing.
+async fn handle_provider_test(daemon: &Daemon, conn: &ConnState, id: Id, params: Value) -> String {
+    let params: ProviderTestParams = match serde_json::from_value(params) {
+        Ok(params) => params,
+        Err(_) => return error_string(id, error_code::INVALID_PARAMS, "invalid params"),
+    };
+    if let Some(refusal) = refuse_unmintable_session_id(&id, &params.session_id) {
+        return refusal;
+    }
+    if !conn.may_drive(&params.session_id) {
+        return error_string(id, error_code::NOT_ATTACHED, NOT_ATTACHED_MESSAGE);
+    }
+    match daemon
+        .runtime
+        .provider_test(&daemon.events, &params.session_id, &params.provider_id)
+        .await
+    {
+        Ok(result) => ok_string(id, &result),
         Err(err) => error_from(id, err),
     }
 }
@@ -4494,13 +4645,16 @@ mod tests {
     /// off the reader loop" (the sync `#[test]` bridge [`route_setup`] delegates
     /// here rather than deciding it a second time).
     ///
-    /// Seven methods run on their own task because they may park on a human, so
-    /// they are absent from [`dispatch`]: `session/attach`, `attach/consent`,
-    /// `model/confirm`, `model/set`, (REQ-575) `web/setup_commit`, (REQ-576)
-    /// `config/set`, and (REQ-579) `provider/setup_commit`. A test that reached
-    /// only for `dispatch` would get `METHOD_NOT_FOUND` for those and could
-    /// report a security gate as "passing" while never invoking it — so the
-    /// routing is mirrored here rather than duplicated per test.
+    /// Eight methods run on their own task and are therefore absent from
+    /// [`dispatch`]. Seven because they may park on a *human*:
+    /// `session/attach`, `attach/consent`, `model/confirm`, `model/set`,
+    /// (REQ-575) `web/setup_commit`, (REQ-576) `config/set`, and (REQ-579)
+    /// `provider/setup_commit`. The eighth, (REQ-581) `provider/test`, because
+    /// it parks on the *network* — one real completion request — which stalls
+    /// the reader loop exactly as a prompt would. A test that reached only for
+    /// `dispatch` would get `METHOD_NOT_FOUND` for those and could report a
+    /// security gate as "passing" while never invoking it — so the routing is
+    /// mirrored here rather than duplicated per test.
     ///
     /// The two setup commits are the odd ones out: their **layer (a)** gate is
     /// session-scoped (`may_drive`, via `refuse_commit_without_session_access`),
@@ -4531,6 +4685,8 @@ mod tests {
             handle_provider_setup_commit(daemon, conn, id, params).await
         } else if method == ConfigSetParams::METHOD {
             handle_config_set(daemon, conn, id, params).await
+        } else if method == ProviderTestParams::METHOD {
+            handle_provider_test(daemon, conn, id, params).await
         } else {
             dispatch(daemon, conn, id, method, params).expect("a routed method answers")
         }
@@ -8340,6 +8496,888 @@ mod tests {
                  synchronous dispatch: {served}"
             );
         }
+    }
+
+    // ------------------------------------------------------------------
+    // REQ-581 BR-1/AC-6: `provider/test` — the session gate, and the reader
+    // loop it must not park
+    // ------------------------------------------------------------------
+
+    /// The provider id and model the REQ-581 fixtures register. Named once so a
+    /// report assertion and the config that produced it cannot drift.
+    const TEST_PROVIDER: &str = "kimi";
+    const TEST_MODEL: &str = "kimi-k2";
+
+    /// A loopback listener standing in for a provider endpoint, **counting**
+    /// every connection it is dialed on.
+    ///
+    /// The count is what makes AC-6's "no request leaves the machine" checkable
+    /// by inspection rather than inferred from an error code (LESSON-519): a
+    /// gate that refuses before the runtime is touched leaves this at zero, and
+    /// a refactor that dialed first fills it. Both ends are `127.0.0.1`, and
+    /// the listener answers nothing at all — the probe fails fast as
+    /// `unreachable`, which is the right *shape* of answer for a gate test and
+    /// costs no scripted vendor response.
+    struct DialCounter {
+        port: u16,
+        dials: Arc<AtomicU64>,
+    }
+
+    impl DialCounter {
+        async fn bound() -> Self {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+                .await
+                .expect("a loopback port");
+            let port = listener.local_addr().expect("local addr").port();
+            let dials = Arc::new(AtomicU64::new(0));
+            let counted = Arc::clone(&dials);
+            tokio::spawn(async move {
+                while let Ok((socket, _)) = listener.accept().await {
+                    counted.fetch_add(1, Ordering::SeqCst);
+                    // Counted *before* the drop, so a client that observes the
+                    // reset observes a count that already includes it.
+                    drop(socket);
+                }
+            });
+            Self { port, dials }
+        }
+
+        fn endpoint(&self) -> String {
+            format!("http://127.0.0.1:{}/v1/chat/completions", self.port)
+        }
+
+        fn dials(&self) -> u64 {
+            self.dials.load(Ordering::SeqCst)
+        }
+    }
+
+    /// A free loopback port with **nothing** behind it: bound only to learn a
+    /// number the OS is not using, then released, so a probe's connect is
+    /// refused immediately rather than waiting out a timeout.
+    async fn closed_loopback_endpoint() -> String {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("a loopback port");
+        let port = listener.local_addr().expect("local addr").port();
+        drop(listener);
+        format!("http://127.0.0.1:{port}/v1/chat/completions")
+    }
+
+    /// A daemon whose one registered provider dials `endpoint`.
+    ///
+    /// Through a **real config file**, like [`daemon_with_a_config_file`], and
+    /// for the same reason plus one more: `DaemonRuntime`'s config is private to
+    /// its own module, so a server-level fixture registers a provider the way a
+    /// user does — by writing the rows and letting the loader validate them.
+    fn daemon_dialing(tag: &str, endpoint: &str) -> Arc<Daemon> {
+        let dir = temp_socket(tag).with_extension("d");
+        std::fs::create_dir_all(&dir).expect("a scratch directory");
+        let path = dir.join("config.toml");
+        std::fs::write(
+            &path,
+            format!(
+                "[[providers]]\nid = \"{TEST_PROVIDER}\"\nkind = \"openai-compatible\"\n\
+                 endpoint = \"{endpoint}\"\nmodel = \"{TEST_MODEL}\"\n"
+            ),
+        )
+        .expect("seed a config");
+        Arc::new(Daemon {
+            runtime: Arc::new(crate::runtime::DaemonRuntime::minimal_with_config_file(
+                &path,
+            )),
+            ..Daemon::new()
+        })
+    }
+
+    /// [`daemon_dialing`], under the **production default** shutdown policy.
+    ///
+    /// `Daemon::new()`'s fixture policy is [`ShutdownPolicy::Never`], which is
+    /// right for a fixture — a daemon that could decide to exit would make
+    /// unrelated tests race a shutdown they never asked for — and exactly wrong
+    /// for a test *about* that decision: under `Never` a disconnect neither
+    /// commits nor defers, so an assertion made against it holds for every
+    /// implementation, guard or no guard.
+    ///
+    /// The supervisor is given the daemon's own bus, so its lifetime stages and
+    /// the probe's `provider_tested` are numbered by one counter and can be put
+    /// in order against each other.
+    fn daemon_dialing_that_exits_with_its_last_client(
+        tag: &str,
+        endpoint: &str,
+    ) -> (Arc<Daemon>, Arc<LifetimeSupervisor>) {
+        let base = daemon_dialing(tag, endpoint);
+        let lifetime = Arc::new(LifetimeSupervisor::new(
+            ShutdownPolicy::OnLastDisconnect,
+            PolicySource::Default,
+            Arc::clone(&base.events),
+        ));
+        let daemon = Arc::new(Daemon {
+            runtime: Arc::clone(&base.runtime),
+            events: Arc::clone(&base.events),
+            lifetime: Arc::clone(&lifetime),
+            ..Daemon::new()
+        });
+        (daemon, lifetime)
+    }
+
+    /// A vendor that accepts, reads the whole request head, signals, and only
+    /// **then** — half a second later — answers with [`PROBE_COMPLETION_SSE`].
+    ///
+    /// The two facts it manufactures are what both probe-teardown tests rest on:
+    /// the probe is genuinely past the send and inside the TTFB window when the
+    /// client leaves, and the window stays open long enough that teardown's
+    /// decision is made first. An abort lands in microseconds, so neither test
+    /// can pass on a race it merely won.
+    ///
+    /// Returns the port to dial, a receiver that fires once the vendor holds the
+    /// request, and the vendor's task handle to abort at the end.
+    async fn a_vendor_that_answers_slowly() -> (u16, mpsc::Receiver<()>, JoinHandle<()>) {
+        use tokio::io::AsyncReadExt;
+
+        let (entered_tx, entered_rx) = mpsc::channel::<()>(1);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("a loopback port");
+        let port = listener.local_addr().expect("local addr").port();
+        let vendor = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.expect("the probe dials");
+            // Read the request head, so "the call was in flight" is a fact about
+            // bytes the vendor holds rather than about a connect that happened.
+            let mut head = Vec::new();
+            let mut chunk = [0_u8; 1024];
+            while let Ok(n) = socket.read(&mut chunk).await {
+                if n == 0 {
+                    break;
+                }
+                head.extend_from_slice(&chunk[..n]);
+                if head.windows(4).any(|w| w == b"\r\n\r\n") {
+                    break;
+                }
+            }
+            let _ = entered_tx.send(()).await;
+            // A slow vendor, not a hung one.
+            tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\n\
+                 Content-Length: {}\r\nConnection: close\r\n\r\n{PROBE_COMPLETION_SSE}",
+                PROBE_COMPLETION_SSE.len(),
+            );
+            let _ = socket.write_all(response.as_bytes()).await;
+            let _ = socket.flush().await;
+        });
+        (port, entered_rx, vendor)
+    }
+
+    /// A `provider/test` request naming the fixture provider.
+    fn provider_test_params(session: &SessionId) -> Value {
+        serde_json::json!({
+            "session_id": session.to_string(),
+            "provider_id": TEST_PROVIDER,
+        })
+    }
+
+    /// The `provider_tested` envelopes queued on `sub` right now.
+    fn drain_provider_tests(sub: &mut Subscription) -> Vec<EventEnvelope> {
+        drain_everything(sub)
+            .into_iter()
+            .filter(|envelope| matches!(envelope.event, Event::ProviderTested(_)))
+            .collect()
+    }
+
+    /// **REQ-581 AC-6: a connection that did not open the session is refused
+    /// `NOT_ATTACHED`, the session is told nothing, and the provider is never
+    /// dialed.**
+    ///
+    /// Three claims, because a plausible bug satisfies any two:
+    ///
+    ///   - the caller gets [`error_code::NOT_ATTACHED`] — the code every other
+    ///     `may_drive` seam answers with, so a refused probe cannot be told apart
+    ///     from a refused read (ADR-B);
+    ///   - **nothing was dialed**, asserted by counting connections at the
+    ///     endpoint rather than by the absence of a cost row (LESSON-519). This
+    ///     is what fails if the gate is moved below the runtime call — a probe
+    ///     that refused *after* sending has already spent the user's money;
+    ///   - **nothing was announced.** Unlike `provider/setup_commit`, this
+    ///     refusal is silent: a probe writes nothing, so a notice would be the
+    ///     only effect an unattached caller could produce, at whatever rate it
+    ///     liked (LESSON-513).
+    ///
+    /// The owner's own call is the non-vacuity control on the middle claim: the
+    /// same params against the same fixture *do* reach the wire, so the zero
+    /// above is the gate and not a fixture that could never have dialed.
+    #[tokio::test]
+    async fn a_provider_test_without_session_access_is_refused_silently_and_never_dials() {
+        let provider = DialCounter::bound().await;
+        let daemon = daemon_dialing("provider-test-gate", &provider.endpoint());
+        let owner = unattached(&daemon);
+        let session = a_session_owned_by(&daemon, &owner);
+        let intruder = unattached(&daemon);
+        let mut sub = daemon.events.subscribe(16);
+
+        let refused = handle_provider_test(
+            &daemon,
+            &intruder,
+            Id::Number(2),
+            provider_test_params(&session),
+        )
+        .await;
+        assert!(
+            refused.contains(&error_code::NOT_ATTACHED.to_string()),
+            "a connection that may not drive this session must not spend its \
+             provider's money: {refused}"
+        );
+        assert_eq!(
+            provider.dials(),
+            0,
+            "the refusal must land before anything is dialed — a probe refused \
+             after sending has already cost the user (AC-6)"
+        );
+        assert!(
+            drain_everything(&mut sub).is_empty(),
+            "a refused probe writes nothing, so announcing it would hand an \
+             unattached peer a line in a stranger's transcript on demand \
+             (LESSON-513)"
+        );
+
+        let served = handle_provider_test(
+            &daemon,
+            &owner,
+            Id::Number(3),
+            provider_test_params(&session),
+        )
+        .await;
+        assert!(
+            !served.contains(&error_code::NOT_ATTACHED.to_string()),
+            "the session's own client must reach the runtime: {served}"
+        );
+        assert!(
+            provider.dials() >= 1,
+            "the fixture must be one that genuinely dials, or the zero above \
+             proves nothing about the gate"
+        );
+    }
+
+    /// **REQ-581 BR-3/BR-4: the session's creator gets a typed result, and the
+    /// session hears about the call exactly once.**
+    ///
+    /// The endpoint is a closed port, so the outcome is `unreachable` — which is
+    /// the point: what this seam owes is the *shape* of the answer (the report
+    /// names what was tested, and one session-scoped announcement carries it),
+    /// while every row of the outcome mapping table is the runtime's own test.
+    ///
+    /// "Exactly one, scoped to this session" is the claim worth pinning here: a
+    /// second client attached to this session is owed the news and the health it
+    /// left behind (LESSON-505), and a *daemon-scoped* publish would put an
+    /// unrelated session's transcript in the path of it.
+    #[tokio::test]
+    async fn a_provider_test_from_the_sessions_creator_answers_and_announces_once() {
+        use teton_protocol::methods::{ProviderTestOutcome, ProviderTestResult};
+
+        let daemon = daemon_dialing("provider-test-owner", &closed_loopback_endpoint().await);
+        let owner = unattached(&daemon);
+        let session = a_session_owned_by(&daemon, &owner);
+        let mut sub = daemon.events.subscribe(16);
+
+        let answered = handle_provider_test(
+            &daemon,
+            &owner,
+            Id::Number(2),
+            provider_test_params(&session),
+        )
+        .await;
+        let parsed: Value = serde_json::from_str(&answered)
+            .unwrap_or_else(|e| panic!("provider/test answered with non-JSON ({e}): {answered}"));
+        let result: ProviderTestResult = serde_json::from_value(parsed["result"].clone())
+            .unwrap_or_else(|e| panic!("provider/test must answer a result ({e}): {answered}"));
+        assert_eq!(result.provider_id.0, TEST_PROVIDER);
+        assert_eq!(
+            result.model, TEST_MODEL,
+            "the report names the model that was actually asked for"
+        );
+        assert!(
+            result.dial_host.contains("127.0.0.1"),
+            "and the host it was asked of: {}",
+            result.dial_host
+        );
+        assert!(
+            matches!(result.outcome, ProviderTestOutcome::Unreachable { .. }),
+            "nothing is listening on that port: {:?}",
+            result.outcome
+        );
+
+        let announced = drain_provider_tests(&mut sub);
+        assert_eq!(
+            announced.len(),
+            1,
+            "one test announces exactly one `provider_tested`: {announced:?}"
+        );
+        assert_eq!(
+            announced[0].session_id.as_ref(),
+            Some(&session),
+            "and it is scoped to the session that asked, never broadcast \
+             daemon-wide: {:?}",
+            announced[0]
+        );
+    }
+
+    /// **REQ-581 AC-6, the two callers that are *not* the user.**
+    ///
+    /// A monitor sees every session's events and may drive none of them, and a
+    /// daemon descendant — a tool-spawned `teton provider test … --yes`, the
+    /// case architecture ADR-5 is written against — is barred from session
+    /// access altogether. Both must be refused *before* the dial, or the model
+    /// has found a way to make the user's provider spend on its behalf.
+    ///
+    /// The monitor half is the mutation this pins: `may_receive` is `true` for
+    /// this session, so a gate read off the receive policy would send.
+    #[tokio::test]
+    async fn a_monitor_or_a_daemon_descendant_may_not_test_a_provider() {
+        let provider = DialCounter::bound().await;
+        let daemon = daemon_dialing("provider-test-others", &provider.endpoint());
+        let owner = unattached(&daemon);
+        let session = a_session_owned_by(&daemon, &owner);
+        let mut sub = daemon.events.subscribe(16);
+
+        let monitor = monitoring(&daemon);
+        assert!(
+            monitor.may_receive(Some(&session)),
+            "a monitor sees the session's events — the receive side is not the gate"
+        );
+
+        let mut callers = vec![("monitor", monitor)];
+        for ancestry in [Ancestry::Descendant, Ancestry::Indeterminate] {
+            callers.push(("daemon child", conn_with_ancestry(&daemon, ancestry)));
+        }
+        for (what, caller) in callers {
+            let refused = handle_provider_test(
+                &daemon,
+                &caller,
+                Id::Number(2),
+                provider_test_params(&session),
+            )
+            .await;
+            assert!(
+                refused.contains(&error_code::NOT_ATTACHED.to_string()),
+                "a {what} must be answered by the session gate — not served, and \
+                 not `method not found`: {refused}"
+            );
+        }
+        assert_eq!(
+            provider.dials(),
+            0,
+            "and none of them reached the wire (AC-6)"
+        );
+        assert!(
+            drain_everything(&mut sub).is_empty(),
+            "nor put anything in the user's session"
+        );
+    }
+
+    /// **`provider/test` is not served inline by [`dispatch`]** — the membership
+    /// half of its reader-loop claim.
+    ///
+    /// [`the_provider_commit_left_the_reader_loop_dispatch_while_the_reads_stayed`]'s
+    /// twin, for the other reason a method leaves the synchronous path: this one
+    /// waits on a vendor rather than on a human. Membership is not liveness
+    /// (LESSON-518), which is why
+    /// [`a_parked_provider_test_does_not_stall_the_connection`] exists as well —
+    /// but a future edit that moves the branch back into `dispatch` fails here
+    /// first, and says exactly what it broke.
+    #[test]
+    fn the_provider_test_never_joined_the_reader_loop_dispatch() {
+        let daemon = Daemon::new();
+        let owner = unattached(&daemon);
+        let session = a_session_owned_by(&daemon, &owner);
+
+        let served = dispatch(
+            &daemon,
+            &owner,
+            Id::Number(2),
+            ProviderTestParams::METHOD,
+            provider_test_params(&session),
+        )
+        .unwrap();
+        assert!(
+            served.contains(&error_code::METHOD_NOT_FOUND.to_string()),
+            "provider/test must not be served inline by `dispatch` — it runs on \
+             the blocks_on_a_human task so a round trip to a vendor cannot park \
+             the reader loop: {served}"
+        );
+    }
+
+    /// A raw JSON-RPC client on one end of a [`UnixStream::pair`], for the tests
+    /// that need [`handle_client`] itself rather than a handler.
+    ///
+    /// A pair rather than a bound socket: what is under test is the reader
+    /// loop's routing, not `serve`'s accept path, and a pair needs no path, no
+    /// `bind`, and no cleanup on a failing assertion.
+    struct PairedClient {
+        reader: BufReader<tokio::net::unix::OwnedReadHalf>,
+        writer: tokio::net::unix::OwnedWriteHalf,
+    }
+
+    impl PairedClient {
+        /// Attach a client to `daemon` through a live [`handle_client`], and
+        /// return it with the connection's task handle.
+        fn attached_to(daemon: &Arc<Daemon>) -> (Self, JoinHandle<()>) {
+            let (client, server) = UnixStream::pair().expect("a socket pair");
+            let connection = tokio::spawn(handle_client(
+                server,
+                Arc::clone(daemon),
+                // The uid is never read past `serve`'s accept check, which a
+                // pair does not go through; the pid is, and any pid is
+                // `NotDescendant` of a fixture daemon's `Embedded` process.
+                PeerIdentity {
+                    uid: 0,
+                    pid: Some(1),
+                },
+            ));
+            let (read_half, write_half) = client.into_split();
+            (
+                Self {
+                    reader: BufReader::new(read_half),
+                    writer: write_half,
+                },
+                connection,
+            )
+        }
+
+        async fn send(&mut self, id: i64, method: &str, params: Value) {
+            let mut frame = serde_json::to_string(&serde_json::json!({
+                "jsonrpc": "2.0",
+                "id": id,
+                "method": method,
+                "params": params,
+            }))
+            .expect("a request serializes");
+            frame.push('\n');
+            self.writer
+                .write_all(frame.as_bytes())
+                .await
+                .expect("the daemon is reading");
+            self.writer.flush().await.expect("flush");
+        }
+
+        /// Read frames until the response to `id` arrives, failing if the
+        /// response to `forbidden` shows up first.
+        ///
+        /// Events share this wire with responses, so "the next frame" is not the
+        /// answer to anything in particular — the loop is what makes the claim
+        /// about *responses* rather than about traffic.
+        async fn response_to(&mut self, id: i64, forbidden: i64) -> Value {
+            loop {
+                let mut line = String::new();
+                let read = tokio::time::timeout(
+                    std::time::Duration::from_secs(5),
+                    self.reader.read_line(&mut line),
+                )
+                .await
+                .unwrap_or_else(|_| panic!("timed out waiting for the response to {id}"))
+                .expect("the connection stays open");
+                assert!(read > 0, "the daemon closed the connection");
+                let frame: Value = serde_json::from_str(&line).expect("a daemon frame is JSON");
+                let answered = frame.get("id").and_then(Value::as_i64);
+                assert_ne!(
+                    answered,
+                    Some(forbidden),
+                    "request {forbidden} answered before {id}: {line}"
+                );
+                if answered == Some(id) {
+                    return frame;
+                }
+            }
+        }
+    }
+
+    /// The handshake every [`PairedClient`] opens with.
+    fn handshake_params() -> Value {
+        serde_json::json!({
+            "client_kind": "cli",
+            "client_name": "server-unit-test",
+            "client_version": "0",
+            "protocol_min": teton_protocol::PROTOCOL_VERSION_MIN,
+            "protocol_max": teton_protocol::PROTOCOL_VERSION_MAX,
+        })
+    }
+
+    /// **REQ-581 AC-3 / LESSON-518: a `provider/test` waiting on a vendor does
+    /// not stall the connection's reader loop.**
+    ///
+    /// This is the reason the method is on `handle_client`'s own-task path
+    /// rather than in the synchronous `dispatch`, and the reason a *membership*
+    /// test ([`the_provider_test_never_joined_the_reader_loop_dispatch`]) is not
+    /// enough on its own: membership proves where the branch is, liveness proves
+    /// what the branch buys.
+    ///
+    /// The loopback provider accepts the connection and then says **nothing at
+    /// all**, which is a vendor taking its time — the provider transport carries
+    /// no timeout by design (a long completion is not a stalled one), so the
+    /// probe is genuinely parked for as long as this test wants it. While it is
+    /// parked, a `session/list` on the *same* connection must be answered.
+    ///
+    /// The `entered` channel is what makes it non-vacuous: it proves the
+    /// concurrent RPC was served *after* the probe had actually reached the wire
+    /// and stopped there, not before it got going. On a multi-thread runtime for
+    /// the REQ-575 precedent's reason — it is the production flavour, and a
+    /// single worker could serve the second RPC only by the first having yielded
+    /// anyway.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_parked_provider_test_does_not_stall_the_connection() {
+        let (entered_tx, mut entered_rx) = mpsc::channel::<()>(1);
+        let (release_tx, release_rx) = tokio::sync::oneshot::channel::<()>();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("a loopback port");
+        let port = listener.local_addr().expect("local addr").port();
+        let parked = tokio::spawn(async move {
+            let (socket, _) = listener.accept().await.expect("the probe dials");
+            let _ = entered_tx.send(()).await;
+            // Hold the connection — and the socket — open until released, so
+            // the probe has nothing to complete on.
+            let _ = release_rx.await;
+            drop(socket);
+        });
+
+        let daemon = daemon_dialing(
+            "provider-test-parked",
+            &format!("http://127.0.0.1:{port}/v1/chat/completions"),
+        );
+        let (mut client, connection) = PairedClient::attached_to(&daemon);
+        client
+            .send(1, HandshakeParams::METHOD, handshake_params())
+            .await;
+        client.response_to(1, 3).await;
+        client
+            .send(
+                2,
+                SessionCreateParams::METHOD,
+                serde_json::json!({"mode": "freeform"}),
+            )
+            .await;
+        let created = client.response_to(2, 3).await;
+        let session = created["result"]["session_id"]
+            .as_str()
+            .expect("session/create returns an id")
+            .to_owned();
+
+        // Fire the probe and do NOT await its response: it is parked at the
+        // vendor and will not answer until this test lets it.
+        client
+            .send(
+                3,
+                ProviderTestParams::METHOD,
+                serde_json::json!({"session_id": session, "provider_id": TEST_PROVIDER}),
+            )
+            .await;
+        tokio::time::timeout(std::time::Duration::from_secs(5), entered_rx.recv())
+            .await
+            .expect("the probe must actually reach the provider and park there")
+            .expect("the parked server signals on accept");
+
+        // The reader loop is free: a second RPC on the SAME connection is
+        // answered while the probe is still waiting.
+        client
+            .send(4, SessionListParams::METHOD, serde_json::json!({}))
+            .await;
+        let listed = client.response_to(4, 3).await;
+        assert!(
+            listed["result"]["sessions"].is_array(),
+            "the concurrent session/list must return a normal result while the \
+             probe is parked off the reader loop: {listed}"
+        );
+
+        // Release the parked provider and end the connection, so neither task
+        // outlives the test.
+        let _ = release_tx.send(());
+        connection.abort();
+        parked.abort();
+    }
+
+    /// The SSE one scripted vendor answers a probe with: a delta, a usage chunk
+    /// and the terminator — the shape both the adapter's parser and the cost
+    /// meter's byte scan read, so one fixture proves the row and the outcome.
+    const PROBE_COMPLETION_SSE: &str = concat!(
+        "data: {\"choices\":[{\"delta\":{\"content\":\"OK\"},\"finish_reason\":\"stop\"}]}\n\n",
+        "data: {\"choices\":[],\"usage\":{\"prompt_tokens\":9,\"completion_tokens\":2}}\n\n",
+        "data: [DONE]\n\n",
+    );
+
+    /// **REQ-581 verify F2: a client that disconnects mid-probe does not lose
+    /// the call it has already paid for.**
+    ///
+    /// A `provider/test` runs on the same own-task branch as the seven consent
+    /// methods, and teardown `abort()`s that branch's list unconditionally — so
+    /// with the probe filed there, a user who closed their terminal while the
+    /// request was in flight lost the ledger row, the health record and the
+    /// `provider_tested` event for a call the vendor will still bill. That is
+    /// REQ-565's hole for turns, arriving by a second route, and the window it
+    /// is widest in (request out, nothing back) is the one a person is most
+    /// likely to give up during.
+    ///
+    /// The fixture is built so that the *order* is the mechanism:
+    ///
+    ///   1. the vendor accepts, reads the whole request, and only then signals —
+    ///      so the probe is genuinely past the send and inside the TTFB window;
+    ///   2. the client's socket is dropped, which ends the reader loop and
+    ///      starts teardown;
+    ///   3. the vendor answers, half a second later.
+    ///
+    /// Filed under `attach_tasks`, step 2 kills the probe long before step 3 and
+    /// both assertions below read zero. Filed under `prompt_tasks`, teardown
+    /// waits, the completion lands, and the row and the event survive a client
+    /// that is already gone. Neither assertion can be satisfied by the socket:
+    /// the ledger and the event bus are daemon-scoped, which is the point — they
+    /// outlive the connection that caused them.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_probe_survives_its_clients_disconnect_and_keeps_its_row() {
+        let (port, mut entered_rx, vendor) = a_vendor_that_answers_slowly().await;
+
+        let daemon = daemon_dialing(
+            "provider-test-disconnect",
+            &format!("http://127.0.0.1:{port}/v1/chat/completions"),
+        );
+        // Subscribed before the probe, so "the event landed" is read off the
+        // daemon's own bus rather than off the socket the test is about to close.
+        let mut sub = daemon.events.subscribe(16);
+        let (mut client, connection) = PairedClient::attached_to(&daemon);
+        client
+            .send(1, HandshakeParams::METHOD, handshake_params())
+            .await;
+        client.response_to(1, 3).await;
+        client
+            .send(
+                2,
+                SessionCreateParams::METHOD,
+                serde_json::json!({"mode": "freeform"}),
+            )
+            .await;
+        let created = client.response_to(2, 3).await;
+        let session = created["result"]["session_id"]
+            .as_str()
+            .expect("session/create returns an id")
+            .to_owned();
+
+        assert_eq!(
+            daemon
+                .runtime
+                .cost_report()
+                .expect("a report")
+                .report
+                .probe_calls,
+            0,
+            "the ledger must start empty, or `the row survived` is unfalsifiable"
+        );
+
+        client
+            .send(
+                3,
+                ProviderTestParams::METHOD,
+                serde_json::json!({"session_id": session, "provider_id": TEST_PROVIDER}),
+            )
+            .await;
+        tokio::time::timeout(std::time::Duration::from_secs(5), entered_rx.recv())
+            .await
+            .expect("the probe must reach the vendor before the client leaves")
+            .expect("the vendor signals once it holds the request");
+
+        // The user closes their terminal. Both halves go, so the reader loop
+        // ends and teardown begins.
+        drop(client);
+
+        // Teardown must finish on its own — which, for a drained task, means
+        // waiting out the vendor. Bounded so a regression to `abort()` cannot
+        // hang the suite; generous so a loaded machine cannot fail it.
+        tokio::time::timeout(std::time::Duration::from_secs(30), connection)
+            .await
+            .expect("the connection task must finish once the probe does")
+            .expect("handle_client does not panic");
+
+        let report = daemon.runtime.cost_report().expect("a report").report;
+        assert_eq!(
+            report.probe_calls, 1,
+            "the vendor billed this call whether or not anyone was still on the \
+             socket; aborting the task at its await point loses the row for money \
+             already spent (REQ-565's hole, by another route)"
+        );
+        assert_eq!(
+            report.total_calls, 1,
+            "and it is one call, counted once: {report:?}"
+        );
+
+        let announced = drain_provider_tests(&mut sub);
+        assert_eq!(
+            announced.len(),
+            1,
+            "the outcome is still published: a second client attached to this \
+             session is owed the news and the health it routes by, and it did not \
+             disconnect. Saw: {announced:?}"
+        );
+        let Event::ProviderTested(tested) = &announced[0].event else {
+            unreachable!("filtered by `drain_provider_tests`")
+        };
+        assert!(
+            matches!(
+                tested.outcome,
+                teton_protocol::methods::ProviderTestOutcome::Reached { .. }
+            ),
+            "and it is the outcome the vendor actually produced, not a synthetic \
+             failure minted by the teardown: {tested:?}"
+        );
+
+        vendor.abort();
+    }
+
+    /// **REQ-581 verify G1: an in-flight probe *defers* the shutdown its
+    /// client's disconnect arms.**
+    ///
+    /// [`a_probe_survives_its_clients_disconnect_and_keeps_its_row`]'s other
+    /// half, and the one that makes the first true on a daemon that is its own
+    /// process. Filing the probe under `prompt_tasks` makes [`handle_client`]
+    /// wait for it. It does not make the *daemon* wait: teardown drops the
+    /// client guard **before** it drains, so a last client leaving asks the
+    /// supervisor to decide while the probe is still inside the TTFB window.
+    /// With no activity claimed, [`teton_core::lifetime::LifetimeState`] sees an
+    /// idle daemon, commits under the default `on-last-disconnect` policy,
+    /// `serve` returns, and `main` reaches its `_exit` — the drain then runs
+    /// exactly as far as the process lets it, and the ledger row, the health
+    /// record and the `provider_tested` event for money already spent are lost
+    /// anyway, by the route the drain was added to close.
+    ///
+    /// So the claim here is a **sequence**, not a state: `client_disconnected`,
+    /// then `daemon_shutdown_deferred` naming the blocker, and only then the
+    /// probe's `provider_tested`. Read off the bus's own sequence numbers rather
+    /// than off a phase sampled by a poll loop, so no assertion depends on this
+    /// test out-running a 500 ms vendor.
+    ///
+    /// Non-vacuous by the mutation it was written against: delete the guard and
+    /// the disconnect *commits* instead of deferring, so no
+    /// `daemon_shutdown_deferred` is ever published and the first assertion
+    /// fails. The two ordering assertions fail on the weaker mutations — a guard
+    /// taken inside the task (the claim may not exist when the disconnect lands)
+    /// or one held past the answer.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_probe_in_flight_defers_the_shutdown_rather_than_letting_it_commit() {
+        use teton_core::lifetime::LifetimePhase;
+        use teton_protocol::events::{DaemonLifetime, DaemonLifetimeStage};
+
+        let (port, mut entered_rx, vendor) = a_vendor_that_answers_slowly().await;
+        let (daemon, lifetime) = daemon_dialing_that_exits_with_its_last_client(
+            "provider-test-defer",
+            &format!("http://127.0.0.1:{port}/v1/chat/completions"),
+        );
+        // Generous, and drained once at the end: every assertion below is about
+        // the *order* events were published in, so an eviction for lagging would
+        // not weaken the test, it would delete it.
+        let mut sub = daemon.events.subscribe(256);
+
+        let (mut client, connection) = PairedClient::attached_to(&daemon);
+        client
+            .send(1, HandshakeParams::METHOD, handshake_params())
+            .await;
+        client.response_to(1, 3).await;
+        client
+            .send(
+                2,
+                SessionCreateParams::METHOD,
+                serde_json::json!({"mode": "freeform"}),
+            )
+            .await;
+        let created = client.response_to(2, 3).await;
+        let session = created["result"]["session_id"]
+            .as_str()
+            .expect("session/create returns an id")
+            .to_owned();
+        assert_eq!(
+            lifetime.client_count(),
+            1,
+            "the premise: this connection is the daemon's only client, so its \
+             disconnect is the one that arms a shutdown"
+        );
+
+        client
+            .send(
+                3,
+                ProviderTestParams::METHOD,
+                serde_json::json!({"session_id": session, "provider_id": TEST_PROVIDER}),
+            )
+            .await;
+        tokio::time::timeout(std::time::Duration::from_secs(5), entered_rx.recv())
+            .await
+            .expect("the probe must reach the vendor before the client leaves")
+            .expect("the vendor signals once it holds the request");
+
+        // The user closes their terminal, with the request out and nothing back.
+        drop(client);
+
+        tokio::time::timeout(std::time::Duration::from_secs(30), connection)
+            .await
+            .expect("the connection task must finish once the probe does")
+            .expect("handle_client does not panic");
+
+        let seen = drain_everything(&mut sub);
+        let disconnected = seen.iter().find_map(|envelope| match &envelope.event {
+            Event::DaemonLifetime(DaemonLifetime {
+                stage: DaemonLifetimeStage::ClientDisconnected { .. },
+            }) => Some(envelope.seq),
+            _ => None,
+        });
+        let deferred = seen.iter().find_map(|envelope| match &envelope.event {
+            Event::DaemonLifetime(DaemonLifetime {
+                stage: DaemonLifetimeStage::ShutdownDeferred { blocking_activity },
+            }) => Some((envelope.seq, *blocking_activity)),
+            _ => None,
+        });
+        let tested = seen.iter().find_map(|envelope| match &envelope.event {
+            Event::ProviderTested(_) => Some(envelope.seq),
+            _ => None,
+        });
+
+        let (deferred_seq, blocker) = deferred.unwrap_or_else(|| {
+            panic!(
+                "the last client's disconnect must DEFER, not commit: an \
+                 unclaimed probe leaves the supervisor looking at an idle \
+                 daemon, so `serve` returns and `main` _exit()s out from under \
+                 the very drain that is supposed to keep this call's row. Saw: \
+                 {seen:?}"
+            )
+        });
+        assert_eq!(
+            blocker,
+            BlockingActivity::Turn,
+            "and the blocker it names is the probe's claim — a probe is a billed \
+             call with a durable row, which is what `Turn` means to the lifetime"
+        );
+
+        let disconnected_seq =
+            disconnected.unwrap_or_else(|| panic!("the client disconnected: {seen:?}"));
+        let tested_seq =
+            tested.unwrap_or_else(|| panic!("the probe still published its outcome: {seen:?}"));
+        assert!(
+            disconnected_seq < deferred_seq,
+            "the deferral is the answer to *this* disconnect, and answers come \
+             after their question: disconnected@{disconnected_seq}, \
+             deferred@{deferred_seq}"
+        );
+        assert!(
+            deferred_seq < tested_seq,
+            "and it was published while the probe was still in flight — a \
+             deferral that only appeared after the outcome would be a claim taken \
+             too late to protect anything: deferred@{deferred_seq}, \
+             tested@{tested_seq}"
+        );
+
+        // The other end of the same claim: the guard is released when the probe
+        // finishes, and *that* is what finally commits the shutdown. A claim
+        // that outlived its task would wedge the daemon alive instead — the
+        // standing-resident harm REQ-565 exists to remove, by this route.
+        assert!(
+            lifetime.is_committed(),
+            "the probe finished, so its claim is gone and the deferred shutdown \
+             must commit — a guard that leaked would hold the daemon open forever"
+        );
+        assert_eq!(lifetime.phase(), LifetimePhase::Committed);
+
+        vendor.abort();
     }
 
     /// **One notice per (connection, session), however many commits it

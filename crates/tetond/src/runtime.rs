@@ -117,7 +117,7 @@ use teton_inference::{ChatFormat, Completion, Engine, EngineError, GenParams, Mo
 
 use teton_protocol::events::{
     BlockCause, CapabilityDeadEnd, ContextCleared, Event, ModelLifecycle, ModelLifecycleStage,
-    PrivacyAction, SessionTitled, TierWarming, TurnQueued,
+    PrivacyAction, ProviderTested, SessionTitled, TierWarming, TurnQueued,
     WebCapabilityState as WireWebCapabilityState, WebLookup, WebSetupCompleted, WebTaintOverridden,
     WebTier as WireWebTier,
 };
@@ -126,12 +126,14 @@ use teton_protocol::methods::{
     CategoryRouteView, ConfigSnapshot, ConfigUpdate, ContentClass, CostGroupView, CostQueryResult,
     CostReportView, ExistingProvider, ModelConfirmOutcome, ModelConfirmParams, ModelConfirmResult,
     ModelListResult, ModelSetResult, ModelStatusResult, PrivacyBoundaryConfig, PromptTurnResult,
-    ProviderConfig, ProviderSetupCandidate, ProviderSetupCommitResult, ProviderSetupPlanResult,
-    ProviderSetupPreviewResult, SessionClearParams, SessionClearResult, SessionPermissionsParams,
-    SessionPermissionsResult, TierBinding as WireTierBinding, TierBindingConfig, TierRouteView,
-    TierSummary, WebOverrideParams, WebOverrideResult, WebRefreshOutcome, WebRefreshParams,
-    WebRefreshResult, WebSetupCommitParams, WebSetupCommitResult, WebSetupPlanResult,
-    WebSetupPreviewParams, WebSetupPreviewResult, WebTableSummary, WebTotalsView,
+    ProviderConfig, ProviderHealth as WireProviderHealth, ProviderSetupCandidate,
+    ProviderSetupCommitResult, ProviderSetupPlanResult, ProviderSetupPreviewResult,
+    ProviderTestOutcome, ProviderTestResult, SessionClearParams, SessionClearResult,
+    SessionPermissionsParams, SessionPermissionsResult, TierBinding as WireTierBinding,
+    TierBindingConfig, TierRouteView, TierSummary, WebOverrideParams, WebOverrideResult,
+    WebRefreshOutcome, WebRefreshParams, WebRefreshResult, WebSetupCommitParams,
+    WebSetupCommitResult, WebSetupPlanResult, WebSetupPreviewParams, WebSetupPreviewResult,
+    WebTableSummary, WebTotalsView,
 };
 use teton_protocol::permissions::PermissionLevel;
 use teton_protocol::{
@@ -142,20 +144,23 @@ use teton_protocol::{
 
 use teton_providers::transport::Transport;
 use teton_providers::{
-    classify, AnthropicAdapter, BlockDetail, CapabilityProfile, FailureAction, FailureClass,
-    OpenAiCompatAdapter, OpenAiCompatConfig, Provider,
+    classify, AnthropicAdapter, BlockDetail, CapabilityProfile, EffortOmission, FailureAction,
+    FailureClass, Message, OpenAiCompatAdapter, OpenAiCompatConfig, Provider, ProviderError,
+    ResolvedEffort, Role, TurnEvent, TurnRequest,
 };
 
 use crate::broadcast::EventBus;
 use crate::call_sites::has_call_site;
 use crate::carry::CarriedTurn;
 use crate::classify::Classification;
-use crate::cost::{CostLedger, CostReport, GroupTotals, PriceTable, WebLookupRow, WebOverrideRow};
+use crate::cost::{
+    CostAttribution, CostLedger, CostReport, GroupTotals, PriceTable, WebLookupRow, WebOverrideRow,
+};
 use crate::download::{HttpRangeFetcher, RetryPolicy};
 use crate::egress::{
-    from_protocol_web_tier, inspect, origin_of, to_protocol_web_tier, Egress, EgressError,
-    HttpTransport, LookupContext, LookupOutcome, LookupRecord, LookupRecorder, LookupRequest,
-    Provenance, RedactionGate, RedactionVerdict, TaintView,
+    from_protocol_web_tier, inspect, origin_of, to_protocol_web_tier, Egress, EgressContext,
+    EgressError, HttpTransport, LookupContext, LookupOutcome, LookupRecord, LookupRecorder,
+    LookupRequest, Provenance, RedactionGate, RedactionVerdict, TaintView,
 };
 use crate::harness::completion::{context_provenance, RemoteProviderSource};
 use crate::harness::context::NoopProvenanceHook;
@@ -5397,6 +5402,374 @@ impl DaemonRuntime {
         warnings
     }
 
+    /// Test one registered provider by making the smallest **real** call it
+    /// serves (`provider/test`, REQ-581 BR-1..BR-5, BR-8).
+    ///
+    /// # The real path, minimal (BR-1, ADR-1)
+    ///
+    /// The same four constructors [`Self::run_one_attempt`] uses, in the same
+    /// order — [`build_provider`], [`build_remote_transport`], [`Egress::new`]
+    /// with the ledger as its meter, and [`Egress::scoped`] — carrying one
+    /// fixed user message ([`PROBE_PROMPT`]), no system prompt, no tools, no
+    /// conversation, and [`PROBE_MAX_TOKENS`] of budget. A `GET /v1/models`
+    /// shortcut would prove an endpoint reachable that a turn never POSTs to,
+    /// which is the reachability question nobody asked.
+    ///
+    /// What it deliberately does **not** do (ADR-1): run the turn loop, retry,
+    /// or fall back. A test that fell back to another provider would report on
+    /// the wrong one, which is the single most expensive thing this command
+    /// could get wrong.
+    ///
+    /// # Two refusals that never dial
+    ///
+    /// An unknown id and a `kind = "local"` provider are [`error_code::INVALID_PARAMS`]
+    /// *before* anything is built. The local refusal carries the local tier's
+    /// own state (BR-8), borrowed from [`Self::unserved_turn_error`] rather than
+    /// re-rendered here: the turn path, the lifecycle stream and this command
+    /// describe one machine, and a second renderer is a second story
+    /// (LESSON-456).
+    ///
+    /// # Errors
+    /// - [`error_code::INVALID_PARAMS`] — no such provider (the message names
+    ///   the registered ids), a `kind = "local"` provider (BR-8), a remote
+    ///   provider declaring no `model` (BUG-155: the id is never stood in for
+    ///   one), or an endpoint with no host the transport could dial.
+    /// - [`error_code::CONFIG_REJECTED`] — the `auth_ref` could not be resolved
+    ///   locally. **Nothing was sent**: that is a configuration problem, not an
+    ///   outcome, so it is an error rather than a `refused`.
+    /// - [`error_code::INTERNAL_ERROR`] — the HTTP transport itself could not be
+    ///   built. Nothing was sent here either.
+    ///
+    /// Every other ending — including every way the vendor can say no — is a
+    /// [`ProviderTestOutcome`] in an `Ok`, because the call *happened* and what
+    /// came back is the answer (BR-3).
+    pub async fn provider_test(
+        &self,
+        events: &Arc<EventBus>,
+        session_id: &SessionId,
+        provider_id: &ProviderId,
+    ) -> Result<ProviderTestResult, RpcError> {
+        self.provider_test_within(events, session_id, provider_id, PROBE_DEADLINE)
+            .await
+    }
+
+    /// [`Self::provider_test`] with its deadline named.
+    ///
+    /// Production has exactly one caller and it passes [`PROBE_DEADLINE`]. The
+    /// parameter exists because a thirty-second bound is one no test can afford
+    /// to reach, and a bound nothing reaches is a bound nothing checks — which
+    /// is how ADR-2's timeout row came to be written against a transport that
+    /// could not produce a timeout at all.
+    ///
+    /// The deadline it names is the one the answer reports: an elapse is
+    /// [`ProviderTestOutcome::TimedOut`] carrying *this* bound in whole seconds,
+    /// not the compiled-in constant.
+    async fn provider_test_within(
+        &self,
+        events: &Arc<EventBus>,
+        session_id: &SessionId,
+        provider_id: &ProviderId,
+        deadline: Duration,
+    ) -> Result<ProviderTestResult, RpcError> {
+        // (1) The provider, read out of the live config under the same mutex
+        // every other reader takes, and the refusals that make no call at all.
+        // Everything the send needs is cloned out here so the lock is not held
+        // across an await.
+        let (provider, model, boundaries) = {
+            let config = self.config.lock().expect("config mutex poisoned");
+            let Some(provider) = config.providers.iter().find(|p| p.id == provider_id.0) else {
+                let registered: Vec<&str> =
+                    config.providers.iter().map(|p| p.id.as_str()).collect();
+                return Err(RpcError::new(
+                    error_code::INVALID_PARAMS,
+                    if registered.is_empty() {
+                        format!(
+                            "no provider `{}` is registered — this daemon has no providers at \
+                             all. `teton provider add <id> --model <name>` registers one.",
+                            provider_id.0
+                        )
+                    } else {
+                        format!(
+                            "no provider `{}` is registered; the registered ids are: {}.",
+                            provider_id.0,
+                            registered.join(", ")
+                        )
+                    },
+                ));
+            };
+            if !provider.kind.is_remote() {
+                // BR-8: there is no host to dial, so "does it work" is a
+                // question about the local tier's state — and the daemon
+                // already has exactly one classifier and one renderer for that.
+                return Err(RpcError::new(
+                    error_code::INVALID_PARAMS,
+                    format!(
+                        "`{}` is a local provider: nothing is dialed to serve it, so there is no \
+                         connection to test. The local tier's state right now — {} — is what \
+                         `teton doctor` reports.",
+                        provider_id.0,
+                        self.unserved_turn_error(&config, None).message
+                    ),
+                ));
+            }
+            // BUG-155 / REQ-557 BR-1: a remote provider with no declared model
+            // has nothing to ask for, and the id is **never** stood in for one.
+            let Some(model) = provider
+                .model
+                .clone()
+                .map(|m| m.trim().to_owned())
+                .filter(|m| !m.is_empty())
+            else {
+                return Err(RpcError::new(
+                    error_code::INVALID_PARAMS,
+                    format!(
+                        "`{id}` is registered with no `model`, so there is nothing to ask it for \
+                         — re-register it with `teton provider add {id} --model <name>`.",
+                        id = provider_id.0
+                    ),
+                ));
+            };
+            (provider.clone(), model, config.boundaries.clone())
+        };
+
+        // (7) The dial host, read by the parser that **dials** (LESSON-529), so
+        // the host in the report and in every reason is the destination the
+        // request builder actually reached. The port-bearing reading, for
+        // `provider_setup_preview`'s reason: `evil.example:8443` rendered as
+        // `evil.example` is a different socket wearing a familiar name.
+        let endpoint = provider.endpoint.clone().unwrap_or_default();
+        // One reading, not two. The `or_else(origin_of)` fallback this line used
+        // to carry could never fire — a URL with a tuple origin always has a
+        // non-empty `host_str`, so `origin_of` is `Some` only where
+        // `canonical_host_and_port_of` already was — and if it ever had, it
+        // would have put a differently *shaped* string
+        // (`https://host:port`, scheme and all) into the report and into every
+        // reason. A second spelling of the destination is a second story about
+        // where the user's key went (LESSON-529).
+        let Some(dial_host) = crate::web::canonical_host_and_port_of(&endpoint) else {
+            return Err(RpcError::new(
+                error_code::INVALID_PARAMS,
+                format!(
+                    "`{}`'s endpoint has no host the transport could dial, so there is nothing \
+                     to test. The URL is deliberately not echoed back: an endpoint can carry a \
+                     credential.",
+                    provider_id.0
+                ),
+            ));
+        };
+
+        // (2) The adapter and the credential-bound transport — the turn path's
+        // own two constructors, so the credential is resolved, turned into
+        // headers and bound to this endpoint's origin exactly once, inside
+        // `build_remote_transport`, and never formatted anywhere up here.
+        let caps = CapabilityProfile::from_core(provider.capabilities);
+        let adapter = build_provider(&provider, caps);
+        let transport =
+            build_remote_transport(&provider, &self.secret_resolver).map_err(|err| {
+                match err {
+                    // A reference that will not resolve is a config problem the
+                    // user fixes, not an outcome the vendor produced — so it is an
+                    // error, and it says that nothing left the machine. The
+                    // *reference* is named, never the value (BR-7).
+                    HarnessError::Credential(reason) => RpcError::new(
+                        error_code::CONFIG_REJECTED,
+                        format!(
+                            "the credential reference `{}` could not be resolved: {reason}. \
+                         Nothing was sent.",
+                            provider.auth_ref.as_deref().unwrap_or("(none)")
+                        ),
+                    ),
+                    other => RpcError::new(
+                        error_code::INTERNAL_ERROR,
+                        format!(
+                        "the transport for `{}` could not be built ({other}). Nothing was sent.",
+                        provider_id.0
+                    ),
+                    ),
+                }
+            })?;
+
+        // (3) The choke point, with the meter and **without** a redaction gate.
+        // The omission is a decision, not an oversight (ADR-1): the payload is
+        // one constant sentence this daemon wrote, with no user content, no
+        // file provenance and no conversation in it — there is nothing for a
+        // scanner to find, and running one would spend a local model call on a
+        // string that is compiled in. The boundary inspection still runs, over
+        // `Provenance::empty()`, which is the same guard a system prompt gets.
+        let egress = Egress::new(transport, boundaries, events.clone())
+            .with_cost_meter(Arc::new(self.ledger.clone()));
+
+        // (4) One request, the smallest the provider serves.
+        let request = TurnRequest {
+            model: model.clone(),
+            system: None,
+            messages: vec![Message {
+                role: Role::User,
+                content: PROBE_PROMPT.to_owned(),
+            }],
+            tools: Vec::new(),
+            max_tokens: PROBE_MAX_TOKENS,
+            // The declared no-op, spelled as `TurnRoute::new` spells it: a
+            // probe states no reasoning field, so no `ResolvedEffort` can be
+            // refused and `ProviderError::EffortRefused` cannot arise (ADR-2).
+            effort: ResolvedEffort::omit(EffortOmission::ShapeNone),
+        };
+        // BR-5: billed as the model call it is, tagged so `teton cost` can
+        // count it apart from the turns the user asked questions with.
+        let attribution = CostAttribution::new(model.clone()).probe();
+        let ctx = EgressContext::new(provider_id.clone())
+            .with_session(session_id.clone())
+            .with_cost(attribution);
+        let scoped = egress.scoped(Provenance::empty(), ctx);
+
+        // Wall time from the request leaving to the stream ending — what the
+        // user actually waited, not a header timing.
+        let started = Instant::now();
+        // The request **and** its stream under one deadline (verify F3).
+        // `build_remote_transport` sets no timeouts on purpose — the turn
+        // posture, where a model may legitimately think for minutes — so
+        // without this bound a vendor that accepts the connection and then says
+        // nothing parks the user's terminal for as long as it likes, and
+        // `timed_out` is an outcome nothing can ever produce.
+        //
+        // Cancellation-safe by construction rather than by care: `timeout`
+        // *drops* the future it stops waiting on, which drops the metered
+        // response body — and `MeteredBody`'s `Drop` is precisely where a call
+        // that did leave the machine still writes its row. A probe cut short is
+        // billed, not forgotten.
+        let streamed =
+            tokio::time::timeout(deadline, stream_probe(adapter.as_ref(), request, &scoped)).await;
+        let latency_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
+
+        // (5) and (6): the outcome and the health movement, decided together
+        // because they read the same value.
+        let (outcome, record) = match streamed {
+            Err(_elapsed) => (
+                ProviderTestOutcome::TimedOut {
+                    // The bound the test stopped at, **typed**: telling "slow"
+                    // from "not answering" is the whole point of this outcome,
+                    // and a client that had to find a duration inside a sentence
+                    // to do it would be the prose-reading BR-3 forbids
+                    // (LESSON-456). It is `deadline` and not [`PROBE_DEADLINE`]
+                    // because the figure has to be the bound this call actually
+                    // waited out, and the seam this function exists for runs a
+                    // shorter one.
+                    //
+                    // Floored at 1: `as_secs` truncates, so a sub-second
+                    // deadline — which the injectable seam makes reachable —
+                    // would report "no answer within 0 s", a bound that reads as
+                    // a bug rather than as a wait.
+                    after_secs: deadline.as_secs().max(1),
+                    reason: format!(
+                        "nothing came back from `{dial_host}` before the test stopped waiting"
+                    ),
+                },
+                // The verdict a turn's own timeout earns, through the turn
+                // path's own function: a probe that hung is the same evidence
+                // about this provider that a hung turn is, and a second reading
+                // invented here would move routing by a rule the router does
+                // not have (LESSON-456).
+                health_record_after_failure(FailureClass::Timeout, Instant::now()),
+            ),
+            Ok(Ok(ProbeAnswer::Completion(usage))) => (
+                ProviderTestOutcome::Reached {
+                    latency_ms,
+                    input_tokens: usage.input_tokens,
+                    output_tokens: usage.output_tokens,
+                    // BR-5 / REQ-544 BR-2: priced by the ledger's **own** table,
+                    // through the same `price(model, in, out)` call
+                    // `MeteredBody::finalize` makes. The two token readings are
+                    // independent, though — the adapter's `Completed` here, the
+                    // meter's byte scan there — so what holds is what a test
+                    // pins, not an identity:
+                    // `a_reached_test_reports_usage_clears_health_and_records_one_probe`
+                    // asserts the two figures equal for the **OpenAI SSE
+                    // shape**. The Anthropic shape is untested at this seam.
+                    // `None` is "unpriced", never a guessed zero.
+                    usd_micros: self.ledger.prices().price(
+                        &model,
+                        usage.input_tokens,
+                        usage.output_tokens,
+                    ),
+                },
+                // REQ-544 M-5: a provider that just served clears any earlier
+                // downgrade, exactly as a served turn does (BR-4, AC-5).
+                Some(HealthRecord::healthy()),
+            ),
+            Ok(Ok(ProbeAnswer::NotACompletion)) => (
+                // Its own outcome rather than an `unreachable` with a
+                // distinguishing sentence: the host resolved, something is
+                // listening, and the suspect is the *path* — which is a
+                // different next move for the user than "nothing answered"
+                // (BR-3, LESSON-456).
+                ProviderTestOutcome::NotACompletion {
+                    reason: format!(
+                        "`{dial_host}` answered, but not with a completion (no tokens, no \
+                         text) — an endpoint that redirects, does not stream, or is not a \
+                         chat-completions endpoint looks like this"
+                    ),
+                },
+                // Health is left **exactly** where it stood, and that is the
+                // decision rather than an omission. There is no `FailureClass`
+                // for "answered with the wrong thing", and both available
+                // readings would be false: `healthy()` would clear a real
+                // downgrade on the strength of a 301, and a fabricated class
+                // would strand a provider on a verdict the router's own
+                // classifier never reached.
+                //
+                // The ledger may still hold a zero-token row for this answer —
+                // the status was < 400 and the body was polled, which is
+                // `MeteredBody`'s whole definition of a billable call. That is
+                // left alone deliberately: a request really was made, and a
+                // vendor really may charge for it, so a suppressed row would be
+                // the ledger lying about egress that happened.
+                None,
+            ),
+            Ok(Err(err)) => (
+                probe_outcome(&err, &dial_host, &model, provider.auth_ref.as_deref()),
+                // The turn path's own two calls, in its own order: a persistent
+                // failure stamps the half-open cooldown, a weak-tool-calling
+                // one degrades, and a transient one (a 429, a timeout) records
+                // nothing rather than stranding a provider that is simply busy.
+                err.failure_class()
+                    .and_then(|class| health_record_after_failure(class, Instant::now())),
+            ),
+        };
+        if let Some(record) = record {
+            self.record_health(&provider_id.0, record);
+        }
+        let health_after = to_protocol_health(
+            self.health_snapshot()
+                .get(&provider_id.0)
+                .copied()
+                // `build_router`'s own default for a provider it has never seen
+                // fail — read from the same absence rather than invented here,
+                // so the report and the next routing decision agree.
+                .unwrap_or(ProviderHealth::Healthy),
+        );
+
+        // (8) Announced on **every** outcome, session-scoped: the test either
+        // spent or failed, and either way a second client attached to this
+        // session is owed both the news and where the test left the health the
+        // next turn will route by (LESSON-505). The refusals above announce
+        // nothing, because they made no call.
+        events.publish(
+            Some(session_id.clone()),
+            Event::ProviderTested(ProviderTested {
+                provider_id: provider_id.clone(),
+                outcome: outcome.clone(),
+                health_after,
+            }),
+        );
+        Ok(ProviderTestResult {
+            provider_id: provider_id.clone(),
+            model,
+            dial_host,
+            outcome,
+            health_after,
+        })
+    }
+
     /// Name this session after `prompt`, at most once for its whole life
     /// (REQ-561 BR-9a, TASK-062).
     ///
@@ -8224,6 +8597,267 @@ fn build_provider(provider: &ModelProvider, caps: CapabilityProfile) -> Box<dyn 
     }
 }
 
+// ---------------------------------------------------------------------------
+// The connection test's own pieces (REQ-581)
+//
+// They live here, beside `build_provider` and `build_remote_transport`, because
+// that is what the probe *is*: the turn path's constructors, one fixed request,
+// and a classifier that keeps the failure typed instead of flattening it to a
+// string (ADR-1).
+// ---------------------------------------------------------------------------
+
+/// The one sentence a connection test sends (REQ-581 BR-1).
+///
+/// A constant, and a boring one on purpose: it carries no user content, no file
+/// provenance and no conversation, which is what lets the probe's choke point
+/// run without a redaction gate (ADR-1) and what makes the *cost* of a test
+/// predictable enough to preview before the user consents (BR-2). It asks for
+/// one word so that the reply is worthless and the fact of a reply is the whole
+/// signal.
+const PROBE_PROMPT: &str = "Reply with the single word OK.";
+
+/// The generation budget one connection test asks for (REQ-581 BR-1).
+///
+/// The floor rather than a default: the test is billed like a turn (BR-5), so
+/// the smallest budget that can still produce a completion is the honest one to
+/// spend on a user's key. `max_tokens` is a request and not a guarantee — a
+/// provider that overruns it is billed for what it sent, which the ledger row
+/// and the reported token counts both say.
+const PROBE_MAX_TOKENS: u32 = 8;
+
+/// How long one connection test waits for the vendor before it stops (REQ-581
+/// verify F3).
+///
+/// The provider transport carries no timeout at all, and that is right for a
+/// *turn*: a model reasoning through a hard request is not a stalled one, and a
+/// deadline there would cut real work off mid-thought. A probe is not a turn. It
+/// is [`PROBE_MAX_TOKENS`] of budget spent on [`PROBE_PROMPT`], so an endpoint
+/// that has produced nothing in thirty seconds is not thinking — it is not
+/// answering, which is exactly the fact the user ran the command to learn.
+///
+/// Thirty seconds rather than something tighter because the figure has to clear
+/// a cold TLS handshake to a distant region on a slow link and still be a bound
+/// a person will wait out; and because the cost of being wrong is asymmetric —
+/// a deadline hit early reports `unreachable` about a provider that works.
+const PROBE_DEADLINE: Duration = Duration::from_secs(30);
+
+/// What draining one probe stream turned out to have been (REQ-581 verify F1).
+///
+/// The distinction exists because "the transport did not error" is a much weaker
+/// fact than it looks. Both adapters raise a [`ProviderError`] only at a status
+/// of 400 or above, and `event_stream`'s tail synthesizes a terminal `Completed`
+/// even for a body that held no `data:` lines at all — so a 301 (redirects are
+/// not followed), a 204, or a 200 carrying ordinary JSON all arrive here as a
+/// completion of zero tokens. Reporting those as `Reached { 0 in / 0 out }` and
+/// stamping the provider healthy would be the connection test's worst possible
+/// failure: a green answer for an endpoint no turn can use.
+///
+/// [`Self::NotACompletion`] is reported as
+/// [`ProviderTestOutcome::NotACompletion`] and not as an `unreachable`: a host
+/// that answered is a different fact, and a different next move, from one that
+/// never did (BR-3).
+enum ProbeAnswer {
+    /// The vendor streamed a completion — text, a tool call, or a non-zero
+    /// usage reading. The token counts it reported, which may be zero when a
+    /// provider streams text and declines to say what it billed.
+    Completion(teton_providers::TokenUsage),
+    /// Something answered with a status the adapters accept, and then produced
+    /// no completion: no text, no tool call, and no tokens.
+    NotACompletion,
+}
+
+/// Drive one probe request to the end of its stream and report what came back
+/// (REQ-581 BR-1).
+///
+/// The stream is **drained**, not read: the text is thrown away and only the
+/// *fact* of it is kept, a tool call is a provider ignoring a request that
+/// offered no tools, and `Completed` carries the token counts. Draining is also
+/// what drives the cost meter's wrapped body to write its row, so a probe that
+/// returned early would reach the vendor and bill nothing.
+///
+/// A mid-stream error ends the drain. There is no retry here (ADR-1): a stream
+/// that broke has already told the test what it asked.
+async fn stream_probe(
+    adapter: &dyn Provider,
+    request: TurnRequest,
+    transport: &dyn Transport,
+) -> Result<ProbeAnswer, ProviderError> {
+    use futures::StreamExt;
+
+    let mut stream = adapter.stream_turn(request, transport).await?;
+    let mut usage = None;
+    // Whether anything on this stream was the vendor *generating*. A tool call
+    // counts even though the probe offered no tools: it is still a completion
+    // being streamed, and reading it as "not a completion" would report an
+    // over-eager provider as an unreachable one.
+    let mut generated = false;
+    while let Some(event) = stream.next().await {
+        match event? {
+            TurnEvent::TextDelta(text) => generated |= !text.is_empty(),
+            TurnEvent::ToolCall(_) => generated = true,
+            TurnEvent::Completed(completion) => usage = Some(completion.usage),
+        }
+    }
+    // The `unwrap_or_default` is defensive rather than live — both adapters
+    // guarantee a terminal `Completed` — and it is the *zero* case below that
+    // this function exists to separate out.
+    let usage = usage.unwrap_or_default();
+    if !generated && usage.input_tokens == 0 && usage.output_tokens == 0 {
+        return Ok(ProbeAnswer::NotACompletion);
+    }
+    Ok(ProbeAnswer::Completion(usage))
+}
+
+/// The typed outcome one failed probe earns (REQ-581 BR-3, architecture ADR-2).
+///
+/// The whole mapping table, and the whole of what a client needs to branch on:
+/// the daemon classifies once, here, and a surface renders the variant rather
+/// than re-reading a sentence to work out what happened (LESSON-456).
+///
+/// | Signal | Outcome |
+/// |---|---|
+/// | 401, 403 | `Refused`, naming the credential *reference* |
+/// | 404 | `UnknownModel`, naming the model the config declares |
+/// | 429 | `RateLimited { retry_after_secs: None }` |
+/// | other 4xx | `Refused { status }` |
+/// | 5xx | `ServerError { status }` |
+/// | timeout / transport / malformed | `Unreachable` |
+///
+/// The two outcomes this function does **not** produce are the two that are not
+/// errors at all: [`ProviderTestOutcome::NotACompletion`] (the vendor answered
+/// with a status below 400 and completed nothing — [`ProbeAnswer`]'s job) and
+/// [`ProviderTestOutcome::TimedOut`] (the probe's own deadline elapsed, so no
+/// [`ProviderError`] was ever raised). `ProviderError::Timeout` is a *different*
+/// fact — the transport's own verdict — and stays on the `Unreachable` row.
+///
+/// # Every `reason` is composed from facts this daemon owns (ADR-3)
+///
+/// The status, the dial host, the model out of the config, and the credential
+/// *reference*. Never a response body — a vendor's error body can echo the
+/// request back, so pasting one into the transcript would put a third party's
+/// prose, and possibly the user's own bytes, where neither belongs. Never a
+/// header. Never the credential value: it exists only inside the headers
+/// `build_remote_transport` built, and nothing up here has ever seen it.
+///
+/// # The three arms that cannot occur, and why they are still written
+///
+/// `EffortRefused` (the probe sends no reasoning field), `PrivacyBlocked`
+/// (empty provenance, constant payload, no redaction gate) and `Build` (a local
+/// serialization failure) are unreachable through this call path. They are
+/// classified anyway rather than swept into a `_` arm: a `_ => fixed_string` is
+/// a decision to discard evidence, and the day one of them *does* arrive the
+/// fixed string would be actively false rather than merely vague (LESSON-456).
+fn probe_outcome(
+    err: &ProviderError,
+    host: &str,
+    model: &str,
+    auth_ref: Option<&str>,
+) -> ProviderTestOutcome {
+    // How the refusal names what the request authenticated with. A provider
+    // with no `auth_ref` sends no credential at all, and saying so is the
+    // actionable half of a 401 for exactly that configuration.
+    let credential = match auth_ref {
+        Some(reference) => format!("the vendor did not accept the credential at `{reference}`"),
+        None => {
+            "this provider declares no `auth_ref`, so the request carried no credential".to_owned()
+        }
+    };
+    match err {
+        ProviderError::ClientError { status } => match status {
+            401 | 403 => ProviderTestOutcome::Refused {
+                status: *status,
+                reason: format!("HTTP {status} from `{host}` — {credential}"),
+            },
+            // The endpoint exists — registration validated its shape and
+            // something answered on it — so the missing thing is the model the
+            // config declares. A 400 is deliberately NOT read this way: guessing
+            // "that was about the model" from a bare 400 is the re-reading of a
+            // vendor's prose this classifier exists to avoid.
+            404 => ProviderTestOutcome::UnknownModel {
+                status: *status,
+                reason: format!("`{model}` is not a model `{host}` serves (HTTP 404)"),
+            },
+            // `retry_after_secs` is `None` in v1 by design: the transport
+            // surfaces exactly one named header and a probe does not earn a
+            // second (ADR-2, OQ-5 — deferred, not dropped).
+            429 => ProviderTestOutcome::RateLimited {
+                retry_after_secs: None,
+            },
+            _ => ProviderTestOutcome::Refused {
+                status: *status,
+                reason: format!(
+                    "HTTP {status} from `{host}` — the vendor answered and would not serve the \
+                     call"
+                ),
+            },
+        },
+        ProviderError::ServerError { status } => ProviderTestOutcome::ServerError {
+            status: *status,
+            reason: format!(
+                "HTTP {status} from `{host}` — the vendor answered and is failing; the \
+                 configuration is not the suspect"
+            ),
+        },
+        ProviderError::Timeout => ProviderTestOutcome::Unreachable {
+            reason: format!("could not reach `{host}`: the request timed out"),
+        },
+        ProviderError::Transport => ProviderTestOutcome::Unreachable {
+            reason: format!("could not reach `{host}`: a transport failure (DNS, TCP or TLS)"),
+        },
+        ProviderError::MalformedResponse => ProviderTestOutcome::Unreachable {
+            reason: format!(
+                "could not reach `{host}`: a malformed response — something answered, and not \
+                 with a completion stream"
+            ),
+        },
+        // Cannot occur: the probe offers no tools. If it ever does, the vendor
+        // answered with something this daemon could not read, which is the same
+        // fact a malformed response carries.
+        ProviderError::MalformedToolCall { .. } => ProviderTestOutcome::Unreachable {
+            reason: format!(
+                "could not reach `{host}`: a malformed response — the reply carried a tool call \
+                 the probe never offered"
+            ),
+        },
+        // Cannot occur: the probe sends no reasoning field, so nothing can be
+        // refused for naming one. The status is not invented — this error is
+        // only ever minted from a 400 whose body names the field.
+        ProviderError::EffortRefused { .. } => ProviderTestOutcome::Refused {
+            status: 400,
+            reason: format!(
+                "HTTP 400 from `{host}` — the vendor refused the reasoning-effort field, which \
+                 this test does not send"
+            ),
+        },
+        // Cannot occur: empty provenance and a constant payload, with no
+        // redaction gate installed. Nothing left the machine if it does.
+        ProviderError::PrivacyBlocked(_) => ProviderTestOutcome::Unreachable {
+            reason: format!(
+                "nothing was sent to `{host}`: the egress choke point refused the call"
+            ),
+        },
+        // A local failure, not the vendor's: the request never became bytes.
+        ProviderError::Build(_) => ProviderTestOutcome::Unreachable {
+            reason: format!(
+                "nothing was sent to `{host}`: the request could not be built on this machine"
+            ),
+        },
+    }
+}
+
+/// The wire spelling of the daemon's own [`ProviderHealth`] (REQ-581 BR-4).
+///
+/// Declared here rather than as a `From` on either type for the reason the two
+/// enums are two types at all: `teton-protocol` depends on no other teton
+/// crate, so the daemon owns the mapping, exhaustively and in one place.
+fn to_protocol_health(health: ProviderHealth) -> WireProviderHealth {
+    match health {
+        ProviderHealth::Healthy => WireProviderHealth::Healthy,
+        ProviderHealth::Degraded => WireProviderHealth::Degraded,
+        ProviderHealth::Unavailable => WireProviderHealth::Unavailable,
+    }
+}
+
 /// The turn-failure sentence, with the **resolver's own answer in front of it**
 /// when the resolver is what declined (REQ-558 AC-11, BR-6).
 ///
@@ -9224,6 +9858,11 @@ fn cost_report_view(report: &CostReport) -> CostReportView {
         total_calls: report.total.calls,
         priced_calls: report.total.priced_calls,
         unpriced_calls: report.total.unpriced_calls,
+        // REQ-581 BR-5: a subset of `total_calls`, carried so `teton cost` can
+        // name the connection tests instead of showing them as turns. It sits
+        // beside the priced/unpriced split rather than inside it — a probe is
+        // priced or unpriced like anything else.
+        probe_calls: report.probe_calls,
         reasoning_tokens: report.total.reasoning_tokens,
         calls_reporting_reasoning: report.total.calls_reporting_reasoning,
         // REQ-557 AC-7b: the models the meter could not price travel to the
@@ -21988,6 +22627,1029 @@ provider_id = \"deepseek\"
                 "{written}"
             );
             assert_eq!(think_provider(&runtime), Some("kimi".to_owned()));
+        }
+    }
+
+    /// REQ-581 TASK-163 — the connection test: one real call, typed on the way
+    /// back, with the health map and the ledger moved by it.
+    ///
+    /// # What each layer here is for
+    ///
+    /// [`probe_outcome`] is a pure function, so ADR-2's mapping table is a
+    /// *table test* — every row asserted, including the rows that say a
+    /// credential reference may appear and a secret may not.
+    ///
+    /// The rest drive [`DaemonRuntime::provider_test`] itself against a
+    /// loopback HTTP server, because the method builds its own
+    /// [`HttpTransport`] out of the config and a fake `Transport` cannot be
+    /// injected into it — substituting one would replace the very object whose
+    /// credential binding, status handling and metering are the claims. Both
+    /// ends are `127.0.0.1`; nothing leaves the machine.
+    mod provider_test {
+        use super::*;
+        use crate::keychain::{BackendError, KeychainBackend};
+        use teton_protocol::events::EventEnvelope;
+
+        /// A secret **planted** in the resolver, so "no reason ever carries the
+        /// key" is a claim about a string that genuinely exists on this path
+        /// rather than about an empty credential.
+        const PLANTED_SECRET: &str = "sk-planted-never-print-9f3a2b";
+
+        /// The reference the config names — which every 401 reason *must*
+        /// carry (AC-2).
+        const AUTH_REF: &str = "keychain://teton/kimi";
+
+        /// A keychain that answers exactly the one reference the config names.
+        struct FakeKeychain;
+
+        impl KeychainBackend for FakeKeychain {
+            fn get(&self, service: &str, account: &str) -> Result<String, BackendError> {
+                if service == "teton" && account == "kimi" {
+                    Ok(PLANTED_SECRET.to_owned())
+                } else {
+                    Err(BackendError::NotFound)
+                }
+            }
+        }
+
+        /// A completed OpenAI-compatible stream: one delta, a usage chunk, and
+        /// the terminator — the shape both the adapter's parser and the cost
+        /// meter's scanner read, which is why one fixture can prove they agree.
+        const REACHED_SSE: &str = concat!(
+            "data: {\"choices\":[{\"delta\":{\"content\":\"OK\"},\"finish_reason\":\"stop\"}]}\n\n",
+            "data: {\"choices\":[],\"usage\":{\"prompt_tokens\":12,\"completion_tokens\":3}}\n\n",
+            "data: [DONE]\n\n",
+        );
+
+        /// The token counts [`REACHED_SSE`] reports, named once so the
+        /// assertions and the price lookup cannot drift from the fixture.
+        const REACHED_INPUT: u64 = 12;
+        const REACHED_OUTPUT: u64 = 3;
+
+        /// A loopback HTTP server that answers every request with one scripted
+        /// response and keeps the head of each request it was sent.
+        ///
+        /// The request log is what makes "nothing was sent" checkable by
+        /// inspection rather than inferred from an error code (LESSON-519): a
+        /// refusal that returns before dialing leaves this empty, and a
+        /// refactor that dialed first would fill it.
+        struct ProbeServer {
+            port: u16,
+            heads: Arc<std::sync::Mutex<Vec<String>>>,
+        }
+
+        impl ProbeServer {
+            /// Bind a port answering `status`/`body` to every request.
+            async fn answering(status: &'static str, content_type: &str, body: String) -> Self {
+                use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+                let response = Arc::new(format!(
+                    "HTTP/1.1 {status}\r\nContent-Type: {content_type}\r\n\
+                     Content-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len(),
+                ));
+                let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+                    .await
+                    .expect("bind a loopback port");
+                let port = listener.local_addr().expect("local addr").port();
+                let heads = Arc::new(std::sync::Mutex::new(Vec::new()));
+                let sink = Arc::clone(&heads);
+                tokio::spawn(async move {
+                    while let Ok((mut socket, _)) = listener.accept().await {
+                        let mut head = Vec::new();
+                        let mut chunk = [0_u8; 1024];
+                        loop {
+                            match socket.read(&mut chunk).await {
+                                Ok(0) | Err(_) => break,
+                                Ok(n) => head.extend_from_slice(&chunk[..n]),
+                            }
+                            if head.windows(4).any(|w| w == b"\r\n\r\n") {
+                                break;
+                            }
+                        }
+                        sink.lock()
+                            .expect("capture mutex")
+                            .push(String::from_utf8_lossy(&head).into_owned());
+                        let _ = socket.write_all(response.as_bytes()).await;
+                        let _ = socket.flush().await;
+                    }
+                });
+                Self { port, heads }
+            }
+
+            /// A server that completes a turn (200 + usage).
+            async fn reached() -> Self {
+                Self::answering("200 OK", "text/event-stream", REACHED_SSE.to_owned()).await
+            }
+
+            /// A loopback port that **accepts and then says nothing**, holding
+            /// every connection open for the life of the fixture.
+            ///
+            /// The honest shape of a hung vendor, and the one a closed port
+            /// cannot stand in for: the connect succeeds, the request goes out,
+            /// and the response never starts. Nothing here answers, so the only
+            /// thing that can end a probe against it is the deadline.
+            async fn parked() -> Self {
+                let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+                    .await
+                    .expect("bind a loopback port");
+                let port = listener.local_addr().expect("local addr").port();
+                let heads = Arc::new(std::sync::Mutex::new(Vec::new()));
+                tokio::spawn(async move {
+                    let mut held = Vec::new();
+                    while let Ok((socket, _)) = listener.accept().await {
+                        // Held rather than dropped: a dropped socket is a reset,
+                        // which is `Transport`, which is the outcome this
+                        // fixture must NOT be able to produce.
+                        held.push(socket);
+                    }
+                });
+                Self { port, heads }
+            }
+
+            /// A server that answers `status` with a body that **echoes the
+            /// planted secret** — the vendor-body-echoes-the-request case ADR-3
+            /// exists for.
+            async fn refusing(status: &'static str) -> Self {
+                Self::answering(
+                    status,
+                    "application/json",
+                    format!("{{\"error\":\"bad key: {PLANTED_SECRET}\"}}"),
+                )
+                .await
+            }
+
+            fn endpoint(&self) -> String {
+                format!("http://127.0.0.1:{}/v1/chat/completions", self.port)
+            }
+
+            fn requests(&self) -> Vec<String> {
+                self.heads.lock().expect("capture mutex").clone()
+            }
+        }
+
+        /// A runtime whose one remote provider dials `endpoint` for `model`,
+        /// with [`AUTH_REF`] resolvable through the fake keychain.
+        fn runtime_dialing(endpoint: &str, model: &str) -> DaemonRuntime {
+            let mut runtime = DaemonRuntime::minimal();
+            {
+                let mut config = runtime.config.lock().expect("config mutex");
+                config.providers = vec![ModelProvider {
+                    id: "kimi".to_owned(),
+                    kind: ProviderKind::OpenaiCompatible,
+                    endpoint: Some(endpoint.to_owned()),
+                    model: Some(model.to_owned()),
+                    auth_ref: Some(AUTH_REF.to_owned()),
+                    capabilities: ProviderCapabilities::default(),
+                }];
+            }
+            runtime.secret_resolver = SecretResolver::with_backend(Box::new(FakeKeychain));
+            runtime
+        }
+
+        /// The `provider_tested` envelopes a subscription saw.
+        fn tested_events(sub: &mut crate::broadcast::Subscription) -> Vec<EventEnvelope> {
+            std::iter::from_fn(|| sub.try_recv())
+                .filter(|env| matches!(env.event, Event::ProviderTested(_)))
+                .collect()
+        }
+
+        /// Exactly one `provider_tested`, scoped to `session`, carrying the
+        /// same outcome the caller was handed (BR-3: one value, two readers).
+        ///
+        /// It **returns** the envelope rather than only asserting on it,
+        /// because reading a subscription drains it: a caller that wanted to
+        /// inspect the payload afterwards would be inspecting an empty vector
+        /// and asserting nothing.
+        fn assert_announced_once(
+            sub: &mut crate::broadcast::Subscription,
+            session: &SessionId,
+            result: &ProviderTestResult,
+        ) -> EventEnvelope {
+            let events = tested_events(sub);
+            assert_eq!(
+                events.len(),
+                1,
+                "one test announces exactly one `provider_tested`: {events:?}"
+            );
+            assert_eq!(
+                events[0].session_id.as_ref(),
+                Some(session),
+                "the announcement is session-scoped, so a second client attached \
+                 to this session sees routing health change: {:?}",
+                events[0]
+            );
+            let Event::ProviderTested(tested) = &events[0].event else {
+                unreachable!("filtered above")
+            };
+            assert_eq!(tested.outcome, result.outcome);
+            assert_eq!(tested.health_after, result.health_after);
+            assert_eq!(tested.provider_id, result.provider_id);
+            events.into_iter().next().expect("asserted non-empty above")
+        }
+
+        // -- ADR-2's table, on the pure classifier ---------------------------
+
+        /// **Every row of ADR-2's mapping table** (AC-2, AC-3, AC-7's typing).
+        ///
+        /// The classifier is pure, so the table is asserted directly rather
+        /// than through nine sockets — and the rows that "cannot occur" are
+        /// asserted too, because an unreachable arm that silently became a
+        /// `refused { 0 }` would be exactly the discarded evidence LESSON-456
+        /// is about.
+        #[test]
+        fn the_outcome_table_is_the_daemons_own_classification() {
+            let host = "api.moonshot.ai";
+            let model = "kimi-k3";
+            let outcome = |err: ProviderError| probe_outcome(&err, host, model, Some(AUTH_REF));
+
+            for status in [401_u16, 403] {
+                let refused = outcome(ProviderError::ClientError { status });
+                let ProviderTestOutcome::Refused {
+                    status: reported,
+                    reason,
+                } = &refused
+                else {
+                    panic!("{status} is a refusal, not {refused:?}");
+                };
+                assert_eq!(*reported, status);
+                assert!(reason.contains(host), "{reason}");
+                assert!(
+                    reason.contains(AUTH_REF),
+                    "AC-2: a 401 names the credential *reference* the request \
+                     authenticated with: {reason}"
+                );
+                assert!(
+                    !reason.contains(PLANTED_SECRET),
+                    "and never the value: {reason}"
+                );
+            }
+
+            // 404: the endpoint answered, so the missing thing is the model.
+            let unknown = outcome(ProviderError::ClientError { status: 404 });
+            let ProviderTestOutcome::UnknownModel { status, reason } = &unknown else {
+                panic!("404 is the unknown-model outcome, not {unknown:?}");
+            };
+            assert_eq!(*status, 404);
+            assert!(
+                reason.contains(model) && reason.contains(host),
+                "the sentence names the model that needs fixing and where it was \
+                 asked: {reason}"
+            );
+
+            // 429: typed, and carrying no `Retry-After` in v1 by design.
+            assert_eq!(
+                outcome(ProviderError::ClientError { status: 429 }),
+                ProviderTestOutcome::RateLimited {
+                    retry_after_secs: None
+                },
+                "ADR-2 / OQ-5: the header is deferred, not dropped — and a \
+                 rate limit is never collapsed into a generic refusal"
+            );
+
+            // A 400 stays `refused`, deliberately: reading "that was about the
+            // model" out of a bare 400 is the guessing this enum exists to
+            // avoid.
+            for status in [400_u16, 402, 418] {
+                let other = outcome(ProviderError::ClientError { status });
+                let ProviderTestOutcome::Refused {
+                    status: reported, ..
+                } = other
+                else {
+                    panic!("{status} is a refusal, not {other:?}");
+                };
+                assert_eq!(reported, status);
+            }
+
+            for status in [500_u16, 502, 503] {
+                let server = outcome(ProviderError::ServerError { status });
+                let ProviderTestOutcome::ServerError {
+                    status: reported,
+                    reason,
+                } = &server
+                else {
+                    panic!("{status} is a server error, not {server:?}");
+                };
+                assert_eq!(*reported, status);
+                assert!(reason.contains(host), "{reason}");
+            }
+
+            for err in [
+                ProviderError::Timeout,
+                ProviderError::Transport,
+                ProviderError::MalformedResponse,
+            ] {
+                let described = err.to_string();
+                let unreachable = outcome(err);
+                let ProviderTestOutcome::Unreachable { reason } = &unreachable else {
+                    panic!("{described} is unreachable, not {unreachable:?}");
+                };
+                assert!(reason.contains(host), "{reason}");
+            }
+
+            // The three that cannot occur on this path are still classified,
+            // and none of them collapses onto another row's meaning.
+            assert!(matches!(
+                outcome(ProviderError::MalformedToolCall {
+                    tool: "shell".to_owned()
+                }),
+                ProviderTestOutcome::Unreachable { .. }
+            ));
+            assert!(matches!(
+                outcome(ProviderError::EffortRefused {
+                    provider_id: "kimi".to_owned(),
+                    requested: teton_core::EffortLevel::High,
+                    clamped: teton_core::EffortLevel::High,
+                }),
+                ProviderTestOutcome::Refused { status: 400, .. }
+            ));
+            assert!(matches!(
+                outcome(ProviderError::Build("serde".to_owned())),
+                ProviderTestOutcome::Unreachable { .. }
+            ));
+        }
+
+        /// A provider with no `auth_ref` sends no credential, and its refusal
+        /// says *that* rather than naming a reference it has not got — the
+        /// `_ => fixed_string` this classifier does not have.
+        #[test]
+        fn a_keyless_providers_refusal_says_no_credential_was_sent() {
+            let refused = probe_outcome(
+                &ProviderError::ClientError { status: 401 },
+                "127.0.0.1:8080",
+                "local-mock",
+                None,
+            );
+            let ProviderTestOutcome::Refused { reason, .. } = &refused else {
+                panic!("{refused:?}");
+            };
+            assert!(reason.contains("auth_ref"), "{reason}");
+            assert!(!reason.contains("credential at"), "{reason}");
+        }
+
+        // -- the two refusals that never dial -------------------------------
+
+        /// **AC-7.** A `kind = "local"` provider is refused with the local
+        /// tier's own state, and nothing is dialed, metered or announced.
+        ///
+        /// The sentence is compared against [`DaemonRuntime::unserved_turn_error`]'s
+        /// — the daemon's one classifier for what the tier is doing — because
+        /// the failure this guards against is a *second* renderer drifting from
+        /// the first (LESSON-456), not a typo.
+        #[tokio::test]
+        async fn a_local_provider_is_refused_with_the_tiers_state_and_never_dialed() {
+            let runtime = DaemonRuntime::minimal();
+            {
+                let mut config = runtime.config.lock().expect("config mutex");
+                config.providers = vec![ModelProvider {
+                    id: "onlocal".to_owned(),
+                    kind: ProviderKind::Local,
+                    endpoint: None,
+                    model: None,
+                    auth_ref: None,
+                    capabilities: ProviderCapabilities::default(),
+                }];
+            }
+            let bus = Arc::new(EventBus::new());
+            let mut sub = bus.subscribe(16);
+            let session = SessionId::from("sess");
+
+            let err = runtime
+                .provider_test(&bus, &session, &ProviderId::from("onlocal"))
+                .await
+                .expect_err("a local provider has nothing to dial");
+
+            assert_eq!(err.code, error_code::INVALID_PARAMS);
+            let state = {
+                let config = runtime.config.lock().expect("config mutex");
+                runtime.unserved_turn_error(&config, None).message
+            };
+            assert!(
+                err.message.contains(&state),
+                "BR-8: the refusal carries the tier's own state sentence, from \
+                 the one classifier that owns it.\ngot:  {}\nstate: {state}",
+                err.message
+            );
+            assert!(
+                err.message.contains("teton doctor"),
+                "and points at the diagnostic that reports it: {}",
+                err.message
+            );
+
+            // Inspected, not inferred: no call was made and nothing was said.
+            assert_eq!(
+                runtime.ledger.report().expect("report").total.calls,
+                0,
+                "a refusal that never dialed must bill nothing"
+            );
+            assert!(
+                tested_events(&mut sub).is_empty(),
+                "a refusal that made no call announces nothing (LESSON-513)"
+            );
+        }
+
+        /// An unknown id names what *is* registered, so the user can see the
+        /// spelling rather than guess at it.
+        #[tokio::test]
+        async fn an_unknown_provider_id_names_the_registered_ids() {
+            let runtime = runtime_dialing("https://api.moonshot.ai/v1/chat/completions", "kimi-k3");
+            let bus = Arc::new(EventBus::new());
+            let session = SessionId::from("sess");
+
+            let err = runtime
+                .provider_test(&bus, &session, &ProviderId::from("kimmi"))
+                .await
+                .expect_err("no such provider");
+
+            assert_eq!(err.code, error_code::INVALID_PARAMS);
+            assert!(err.message.contains("kimmi"), "{}", err.message);
+            assert!(
+                err.message.contains("kimi"),
+                "the registered ids are what makes this actionable: {}",
+                err.message
+            );
+        }
+
+        /// A credential that will not resolve is a config problem, not an
+        /// outcome — and it is caught before a byte is sent.
+        #[tokio::test]
+        async fn an_unresolvable_credential_is_refused_before_anything_is_sent() {
+            let server = ProbeServer::reached().await;
+            let runtime = runtime_dialing(&server.endpoint(), "kimi-k3");
+            {
+                let mut config = runtime.config.lock().expect("config mutex");
+                config.providers[0].auth_ref = Some("keychain://teton/absent".to_owned());
+            }
+            let bus = Arc::new(EventBus::new());
+            let mut sub = bus.subscribe(16);
+            let session = SessionId::from("sess");
+
+            let err = runtime
+                .provider_test(&bus, &session, &ProviderId::from("kimi"))
+                .await
+                .expect_err("an unresolvable reference is not an outcome");
+
+            assert_eq!(err.code, error_code::CONFIG_REJECTED);
+            assert!(
+                err.message.contains("keychain://teton/absent")
+                    && err.message.contains("Nothing was sent"),
+                "{}",
+                err.message
+            );
+            assert!(
+                server.requests().is_empty(),
+                "inspected, not inferred: the server saw {:?}",
+                server.requests()
+            );
+            assert!(tested_events(&mut sub).is_empty());
+        }
+
+        // -- through the real method, over a real socket ---------------------
+
+        /// **AC-1 and AC-5 at the unit level.** A completed call reports what
+        /// came back, returns an `Unavailable` provider to `Healthy`, writes
+        /// exactly one probe row the report counts, and announces once.
+        ///
+        /// The `usd_micros` assertion is the load-bearing one: it is compared
+        /// against the row the **meter** wrote, not against a second price
+        /// lookup, so the figure the report shows and the figure `teton cost`
+        /// reads back cannot disagree (BR-5).
+        #[tokio::test]
+        async fn a_reached_test_reports_usage_clears_health_and_records_one_probe() {
+            let server = ProbeServer::reached().await;
+            let runtime = runtime_dialing(&server.endpoint(), "kimi-k3");
+            // The discriminating seed for AC-5: routing holds this provider
+            // down right now, and only a successful call may lift it.
+            runtime.record_health(
+                "kimi",
+                HealthRecord::unavailable(Instant::now(), PROVIDER_UNAVAILABLE_COOLDOWN),
+            );
+            let bus = Arc::new(EventBus::new());
+            let mut sub = bus.subscribe(16);
+            let session = SessionId::from("sess");
+
+            let result = runtime
+                .provider_test(&bus, &session, &ProviderId::from("kimi"))
+                .await
+                .expect("a completed call is an outcome, not an error");
+
+            assert_eq!(result.provider_id.0, "kimi");
+            assert_eq!(result.model, "kimi-k3");
+            assert_eq!(
+                result.dial_host,
+                format!("127.0.0.1:{}", server.port),
+                "the dial host is the parser-that-dials' reading, port included"
+            );
+            let ProviderTestOutcome::Reached {
+                input_tokens,
+                output_tokens,
+                usd_micros,
+                ..
+            } = result.outcome
+            else {
+                panic!("a 200 with usage is `reached`: {:?}", result.outcome);
+            };
+            assert_eq!(
+                (input_tokens, output_tokens),
+                (REACHED_INPUT, REACHED_OUTPUT)
+            );
+
+            // AC-5's daemon half.
+            assert_eq!(result.health_after, WireProviderHealth::Healthy);
+            assert_eq!(
+                runtime.health_snapshot().get("kimi").copied(),
+                Some(ProviderHealth::Healthy),
+                "the report and the map the router reads are one value"
+            );
+
+            // BR-5: one ordinary row, counted apart.
+            let report = runtime.ledger.report().expect("report");
+            assert_eq!(report.probe_calls, 1);
+            assert_eq!(report.total.calls, 1);
+            let rows = runtime.ledger.all_records().expect("rows");
+            assert_eq!(rows.len(), 1);
+            assert!(rows[0].probe, "the row says it was a test");
+            assert_eq!(rows[0].provider_id, "kimi");
+            assert_eq!(rows[0].model, "kimi-k3");
+            assert_eq!(rows[0].session_id, session.0);
+            assert_eq!(
+                (rows[0].input_tokens, rows[0].output_tokens),
+                (REACHED_INPUT, REACHED_OUTPUT)
+            );
+            assert_eq!(
+                usd_micros, rows[0].usd_micros,
+                "the reported cost is the ledger's own, so `teton cost` cannot \
+                 disagree with the report"
+            );
+            assert!(
+                usd_micros.is_some(),
+                "`kimi-k3` is in the bundled price table, so this leg is not \
+                 vacuously comparing two `None`s"
+            );
+
+            assert_announced_once(&mut sub, &session, &result);
+
+            // Non-vacuity: the credential really did ride the request, so the
+            // 401 test below is testing a request that carried one.
+            let requests = server.requests();
+            assert_eq!(requests.len(), 1, "one test is one call: {requests:?}");
+            assert!(
+                requests[0]
+                    .to_ascii_lowercase()
+                    .contains("\r\nauthorization:"),
+                "the endpoint-bound transport attached the credential: {}",
+                requests[0]
+            );
+        }
+
+        /// **AC-2.** A 401 is `refused`, names the reference, never the key —
+        /// including when the vendor's own body echoes it back — writes no
+        /// ledger row, and stamps the health a failed turn would.
+        #[tokio::test]
+        async fn a_refused_test_bills_nothing_and_names_only_the_reference() {
+            let server = ProbeServer::refusing("401 Unauthorized").await;
+            let runtime = runtime_dialing(&server.endpoint(), "kimi-k3");
+            let bus = Arc::new(EventBus::new());
+            let mut sub = bus.subscribe(16);
+            let session = SessionId::from("sess");
+
+            let result = runtime
+                .provider_test(&bus, &session, &ProviderId::from("kimi"))
+                .await
+                .expect("a refusal is an outcome, not an error");
+
+            let ProviderTestOutcome::Refused { status, reason } = &result.outcome else {
+                panic!("a 401 is `refused`: {:?}", result.outcome);
+            };
+            assert_eq!(*status, 401);
+            assert!(reason.contains(AUTH_REF), "{reason}");
+            assert!(
+                !reason.contains(PLANTED_SECRET),
+                "ADR-3: the vendor's body echoed the key and the daemon's \
+                 sentence still does not carry it: {reason}"
+            );
+            assert!(
+                !reason.contains("bad key"),
+                "and carries no part of the vendor's prose at all: {reason}"
+            );
+
+            // BR-5: a refusal buys nothing, so it is not a call.
+            let report = runtime.ledger.report().expect("report");
+            assert_eq!(report.total.calls, 0);
+            assert_eq!(report.probe_calls, 0);
+
+            // BR-4: the same verdict a failed turn's 401 earns.
+            assert_eq!(result.health_after, WireProviderHealth::Unavailable);
+            assert_eq!(
+                runtime.health_snapshot().get("kimi").copied(),
+                Some(ProviderHealth::Unavailable)
+            );
+
+            // The event payload is checked for the key too: AC-2 asserts it on
+            // the rendered line *and* on every event payload. Read off the
+            // envelope the assertion returns, because the subscription it came
+            // from is drained by then.
+            let announced = format!("{:?}", assert_announced_once(&mut sub, &session, &result));
+            assert!(announced.contains(AUTH_REF), "{announced}");
+            assert!(!announced.contains(PLANTED_SECRET), "{announced}");
+        }
+
+        /// **AC-3, the 404 leg.** The endpoint answered, so the model is what
+        /// the sentence names — through the real method, not only the table.
+        #[tokio::test]
+        async fn a_404_names_the_model_the_config_declares() {
+            let server = ProbeServer::refusing("404 Not Found").await;
+            let runtime = runtime_dialing(&server.endpoint(), "kimi-k3");
+            let bus = Arc::new(EventBus::new());
+            let session = SessionId::from("sess");
+
+            let result = runtime
+                .provider_test(&bus, &session, &ProviderId::from("kimi"))
+                .await
+                .expect("a 404 is an outcome");
+
+            let ProviderTestOutcome::UnknownModel { status, reason } = &result.outcome else {
+                panic!("{:?}", result.outcome);
+            };
+            assert_eq!(*status, 404);
+            assert!(reason.contains("kimi-k3"), "{reason}");
+        }
+
+        /// **AC-3, the 429 leg.** A rate limit is transient, so it is typed as
+        /// one and — like a failed turn's 429 — leaves health alone rather than
+        /// stranding a provider that is merely busy.
+        #[tokio::test]
+        async fn a_rate_limited_test_leaves_health_where_it_stood() {
+            let server = ProbeServer::refusing("429 Too Many Requests").await;
+            let runtime = runtime_dialing(&server.endpoint(), "kimi-k3");
+            runtime.record_health("kimi", HealthRecord::degraded());
+            let bus = Arc::new(EventBus::new());
+            let mut sub = bus.subscribe(16);
+            let session = SessionId::from("sess");
+
+            let result = runtime
+                .provider_test(&bus, &session, &ProviderId::from("kimi"))
+                .await
+                .expect("a 429 is an outcome");
+
+            assert_eq!(
+                result.outcome,
+                ProviderTestOutcome::RateLimited {
+                    retry_after_secs: None
+                }
+            );
+            assert_eq!(
+                result.health_after,
+                WireProviderHealth::Degraded,
+                "a transient failure records nothing, so the standing verdict \
+                 is what the report says"
+            );
+            assert_eq!(runtime.ledger.report().expect("report").total.calls, 0);
+            assert_announced_once(&mut sub, &session, &result);
+        }
+
+        /// **AC-3, the closed-port leg.** Nothing answered, so the outcome is
+        /// `unreachable` and names the host that did not.
+        #[tokio::test]
+        async fn a_closed_port_is_unreachable() {
+            // Port 1 on the loopback refuses instantly and resolves nothing —
+            // no DNS lookup inside a unit test, and nothing leaves the machine.
+            let runtime = runtime_dialing("http://127.0.0.1:1/v1/chat/completions", "kimi-k3");
+            let bus = Arc::new(EventBus::new());
+            let mut sub = bus.subscribe(16);
+            let session = SessionId::from("sess");
+
+            let result = runtime
+                .provider_test(&bus, &session, &ProviderId::from("kimi"))
+                .await
+                .expect("a dead port is an outcome");
+
+            let ProviderTestOutcome::Unreachable { reason } = &result.outcome else {
+                panic!("{:?}", result.outcome);
+            };
+            assert!(reason.contains("127.0.0.1:1"), "{reason}");
+            assert!(!reason.contains(PLANTED_SECRET), "{reason}");
+            assert_eq!(runtime.ledger.report().expect("report").total.calls, 0);
+            assert_announced_once(&mut sub, &session, &result);
+        }
+
+        /// The probe's request is the minimal one BR-1 describes, asserted on
+        /// the bytes rather than on the struct: one user message, no system
+        /// prompt, no tools, the floor budget, and **no reasoning field** —
+        /// which is what makes `EffortRefused` unreachable (ADR-2).
+        #[tokio::test]
+        async fn the_probe_sends_one_fixed_message_no_tools_and_no_effort_field() {
+            let server = ProbeServer::reached().await;
+            let runtime = runtime_dialing(&server.endpoint(), "kimi-k3");
+            let bus = Arc::new(EventBus::new());
+            let session = SessionId::from("sess");
+
+            runtime
+                .provider_test(&bus, &session, &ProviderId::from("kimi"))
+                .await
+                .expect("reached");
+
+            // The head capture stops at the header terminator, so the body is
+            // read off the same buffer's tail.
+            let sent = server.requests().remove(0);
+            assert!(sent.contains(PROBE_PROMPT), "{sent}");
+            assert!(
+                sent.contains(&format!("\"max_tokens\":{PROBE_MAX_TOKENS}")),
+                "{sent}"
+            );
+            assert!(!sent.contains("\"tools\""), "{sent}");
+            assert!(!sent.contains("\"system\""), "{sent}");
+            assert!(
+                !sent.contains("reasoning_effort") && !sent.contains("\"thinking\""),
+                "a probe states no reasoning field: {sent}"
+            );
+        }
+
+        // -- verify F1: an answer that is not a completion ------------------
+
+        /// **A 200 that is not a completion stream is `not_a_completion`, not
+        /// `reached`** (verify F1).
+        ///
+        /// The defect this pins is the connection test's worst possible
+        /// failure: a *green* answer for an endpoint no turn can use. Both
+        /// adapters raise a [`ProviderError`] only at status >= 400, and
+        /// `event_stream`'s tail synthesizes a terminal `Completed` even when
+        /// the body held no `data:` lines — so before this, an endpoint that
+        /// answered `200 {}` produced `Reached { 0 in / 0 out }` **and**
+        /// `HealthRecord::healthy()`, which cleared a real downgrade and told
+        /// the user their configuration was fine.
+        ///
+        /// The seeded `Degraded` is what makes the health half discriminating:
+        /// a test against an unseeded provider would read `Healthy` either way.
+        ///
+        /// It is its **own** outcome rather than an `unreachable` wearing a
+        /// distinguishing sentence: a host that answered and a host that never
+        /// did send the user to two different places (BR-3, LESSON-456).
+        #[tokio::test]
+        async fn a_200_that_is_not_a_completion_stream_is_not_a_completion() {
+            let server = ProbeServer::answering(
+                "200 OK",
+                "application/json",
+                "{\"object\":\"list\",\"data\":[]}".to_owned(),
+            )
+            .await;
+            let runtime = runtime_dialing(&server.endpoint(), "kimi-k3");
+            runtime.record_health("kimi", HealthRecord::degraded());
+            let bus = Arc::new(EventBus::new());
+            let mut sub = bus.subscribe(16);
+            let session = SessionId::from("sess");
+
+            let result = runtime
+                .provider_test(&bus, &session, &ProviderId::from("kimi"))
+                .await
+                .expect("something answered, so this is an outcome");
+
+            let ProviderTestOutcome::NotACompletion { reason } = &result.outcome else {
+                panic!(
+                    "a 200 with no completion in it is NOT `reached`, and NOT the \
+                     `unreachable` a dead host earns: {:?}",
+                    result.outcome
+                );
+            };
+            assert!(
+                reason.contains(&format!("127.0.0.1:{}", server.port)),
+                "the sentence names the endpoint that answered wrongly: {reason}"
+            );
+
+            // The health half: untouched, in both directions.
+            assert_eq!(
+                result.health_after,
+                WireProviderHealth::Degraded,
+                "an answer that is not a completion must not clear a standing \
+                 downgrade — there is no `FailureClass` for it and no evidence \
+                 the provider served anything: {result:?}"
+            );
+            assert_eq!(
+                runtime.health_snapshot().get("kimi").copied(),
+                Some(ProviderHealth::Degraded),
+                "and the map the router reads agrees with the report"
+            );
+
+            // Non-vacuity: the request really did go out, which is also why the
+            // ledger row below is honest rather than a bug.
+            assert_eq!(server.requests().len(), 1, "{:?}", server.requests());
+            assert_eq!(
+                runtime.ledger.report().expect("report").probe_calls,
+                1,
+                "the meter bills a status < 400 whose body it polled, and that is \
+                 left alone deliberately: a request was made and a vendor may \
+                 charge for it, so suppressing the row would be the ledger lying \
+                 about egress that happened"
+            );
+            assert_announced_once(&mut sub, &session, &result);
+        }
+
+        /// **A redirect is `not_a_completion` too** (verify F1).
+        ///
+        /// Redirects are not followed (`Policy::none()`, so a credential header
+        /// cannot be carried to an attacker-chosen host), which means a 301 does
+        /// not error and does not stream: it is the *same* zero-token
+        /// `Completed` a non-SSE 200 produces, arriving by the likeliest real
+        /// route — an endpoint pasted without its `/v1` path, or one a vendor
+        /// has since moved.
+        #[tokio::test]
+        async fn a_redirect_is_not_a_completion_rather_than_a_silent_success() {
+            let server =
+                ProbeServer::answering("301 Moved Permanently", "text/html", String::new()).await;
+            let runtime = runtime_dialing(&server.endpoint(), "kimi-k3");
+            let bus = Arc::new(EventBus::new());
+            let session = SessionId::from("sess");
+
+            let result = runtime
+                .provider_test(&bus, &session, &ProviderId::from("kimi"))
+                .await
+                .expect("a redirect is an outcome");
+
+            assert!(
+                matches!(result.outcome, ProviderTestOutcome::NotACompletion { .. }),
+                "a 301 is not a completion — the daemon does not follow it, so \
+                 nothing was ever asked of a chat endpoint: {:?}",
+                result.outcome
+            );
+            assert_eq!(server.requests().len(), 1, "{:?}", server.requests());
+        }
+
+        // -- verify F3: the deadline ----------------------------------------
+
+        /// **A vendor that never answers ends as `timed_out`, on the daemon's
+        /// own clock** (verify F3).
+        ///
+        /// The transport carries no timeout by design (a long completion is not
+        /// a stalled one), so without [`PROBE_DEADLINE`] this call never
+        /// returns: the CLI parks forever, and `timed_out` is an outcome nothing
+        /// can produce.
+        ///
+        /// Driven through [`DaemonRuntime::provider_test_within`] at one second
+        /// — the production constant is thirty, which no test may spend. A whole
+        /// second rather than something tighter because the outcome reports its
+        /// bound in whole seconds, so a sub-second deadline would be reported by
+        /// the `max(1)` floor rather than by the value under test, and this
+        /// assertion would stop discriminating.
+        ///
+        /// The elapsed assertion is the non-vacuous half: it fails if the
+        /// deadline is not the thing that ended the call.
+        #[tokio::test]
+        async fn a_vendor_that_never_answers_is_ended_by_the_deadline() {
+            let server = ProbeServer::parked().await;
+            let runtime = runtime_dialing(&server.endpoint(), "kimi-k3");
+            // Seeded so the health claim below is discriminating: an
+            // implementation that read the deadline as a persistent failure
+            // would move this to `Unavailable`.
+            runtime.record_health("kimi", HealthRecord::degraded());
+            let bus = Arc::new(EventBus::new());
+            let mut sub = bus.subscribe(16);
+            let session = SessionId::from("sess");
+
+            let started = Instant::now();
+            let result = runtime
+                .provider_test_within(
+                    &bus,
+                    &session,
+                    &ProviderId::from("kimi"),
+                    Duration::from_secs(1),
+                )
+                .await
+                .expect("a deadline is an outcome, not an error");
+            let waited = started.elapsed();
+
+            let ProviderTestOutcome::TimedOut { after_secs, reason } = &result.outcome else {
+                panic!(
+                    "a hung vendor timed out — which is a different fact from the \
+                     `unreachable` a host that never answered at all earns: {:?}",
+                    result.outcome
+                );
+            };
+            assert_eq!(
+                *after_secs, 1,
+                "the outcome carries the bound **this call** waited out, typed — \
+                 which is how a user tells `slow` from `not answering`, and a \
+                 value reading 30 here would be the compiled-in constant standing \
+                 in for the deadline that actually ran: {result:?}"
+            );
+            assert!(
+                reason.contains(&format!("127.0.0.1:{}", server.port)),
+                "and the sentence names the host that did not answer: {reason}"
+            );
+            assert!(
+                waited < Duration::from_secs(5),
+                "the deadline is what ended this call, not a transport error \
+                 arriving on its own: waited {waited:?}"
+            );
+
+            // BR-4: the verdict a turn's own timeout earns, through the turn
+            // path's own function — and for a timeout that verdict is *nothing*
+            // (`FailureClass::Timeout` is `Retry`, so `health_after_failure`
+            // records no downgrade). A provider that is merely slow today is not
+            // stranded out of tomorrow's routing.
+            assert!(
+                health_after_failure(FailureClass::Timeout).is_none(),
+                "the premise of the assertion below: a timeout is transient"
+            );
+            assert_eq!(
+                result.health_after,
+                WireProviderHealth::Degraded,
+                "a probe that hung is the same evidence about this provider that \
+                 a hung turn is — which is to say, none: the standing verdict is \
+                 what the report carries: {result:?}"
+            );
+            assert_announced_once(&mut sub, &session, &result);
+        }
+
+        // -- verify F4: two refusals that were classified but never driven ---
+
+        /// **A remote provider with no `model` is refused, and nothing is
+        /// dialed** (BUG-155's rule, verify F4).
+        ///
+        /// The branch existed and was unexercised. What it guards is the failure
+        /// where a provider id gets stood in for a model name and the vendor is
+        /// asked for a model called `kimi` — so the refusal has to name the
+        /// remedy (`--model`) rather than guess.
+        #[tokio::test]
+        async fn a_remote_provider_with_no_model_is_refused_before_anything_is_dialed() {
+            let server = ProbeServer::reached().await;
+            let runtime = runtime_dialing(&server.endpoint(), "kimi-k3");
+            {
+                let mut config = runtime.config.lock().expect("config mutex");
+                config.providers[0].model = None;
+            }
+            let bus = Arc::new(EventBus::new());
+            let mut sub = bus.subscribe(16);
+            let session = SessionId::from("sess");
+
+            let err = runtime
+                .provider_test(&bus, &session, &ProviderId::from("kimi"))
+                .await
+                .expect_err("there is nothing to ask for");
+
+            assert_eq!(err.code, error_code::INVALID_PARAMS);
+            assert!(
+                err.message.contains("--model"),
+                "BUG-155: the refusal hands over the remedy rather than \
+                 substituting the id for a model name: {}",
+                err.message
+            );
+            assert!(
+                server.requests().is_empty(),
+                "inspected, not inferred — the server saw {:?}",
+                server.requests()
+            );
+            assert_eq!(runtime.ledger.report().expect("report").total.calls, 0);
+            assert!(tested_events(&mut sub).is_empty());
+        }
+
+        /// **An endpoint with no dialable host is refused, and the URL is not
+        /// echoed back** (verify F4).
+        ///
+        /// `"not-a-url"` does not parse, so `canonical_host_and_port_of` has no
+        /// destination to name — and this branch is reached *before* the
+        /// transport is built, which is what keeps the refusal an
+        /// `INVALID_PARAMS` about the config rather than a credential error
+        /// about a binding that could never have happened.
+        ///
+        /// The reachable [`ProbeServer`] is the only socket this test owns; its
+        /// silence, the empty ledger and the absent event are together the
+        /// evidence that no transport was made.
+        #[tokio::test]
+        async fn an_unparseable_endpoint_is_refused_without_echoing_the_url() {
+            let server = ProbeServer::reached().await;
+            let runtime = runtime_dialing(&server.endpoint(), "kimi-k3");
+            {
+                let mut config = runtime.config.lock().expect("config mutex");
+                config.providers[0].endpoint = Some("not-a-url".to_owned());
+            }
+            let bus = Arc::new(EventBus::new());
+            let mut sub = bus.subscribe(16);
+            let session = SessionId::from("sess");
+
+            let err = runtime
+                .provider_test(&bus, &session, &ProviderId::from("kimi"))
+                .await
+                .expect_err("there is no host to dial");
+
+            assert_eq!(err.code, error_code::INVALID_PARAMS);
+            assert!(
+                err.message.contains("kimi"),
+                "the refusal names the provider that was asked for: {}",
+                err.message
+            );
+            assert!(
+                !err.message.contains("not-a-url"),
+                "ADR-3: the endpoint is not echoed back — a URL can carry a \
+                 credential in its userinfo or its query: {}",
+                err.message
+            );
+            assert!(
+                server.requests().is_empty(),
+                "no transport was built, so nothing was dialed: {:?}",
+                server.requests()
+            );
+            assert_eq!(runtime.ledger.report().expect("report").total.calls, 0);
+            assert!(tested_events(&mut sub).is_empty());
         }
     }
 

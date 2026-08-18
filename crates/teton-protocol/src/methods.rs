@@ -1140,6 +1140,20 @@ pub struct CostReportView {
     pub priced_calls: u64,
     /// Calls with no price-table entry (never guessed a cost).
     pub unpriced_calls: u64,
+    /// Of [`Self::total_calls`], how many were connection tests (REQ-581 BR-5).
+    ///
+    /// A **subset** of the total, never a separate tally added to it: a probe is
+    /// an ordinary model call, sent down the same path and priced from the same
+    /// table, and the ledger counts it as one. What this field buys is the
+    /// sentence `teton cost` can then print — "1 probe" — so a user reading a
+    /// call they never asked a question for does not read it as a turn.
+    ///
+    /// `#[serde(default)]`, like [`Self::unpriced_models`]: a daemon built
+    /// before REQ-581 sends no such key, and `0` is the honest reading of that
+    /// silence rather than a guess — a daemon with no `provider/test` recorded
+    /// no probes because it could not make one.
+    #[serde(default)]
+    pub probe_calls: u64,
     /// Reasoning tokens summed over the calls that **reported** a split, or
     /// `None` when none did (REQ-559 BR-11).
     ///
@@ -2119,6 +2133,250 @@ impl RpcMethod for ProviderSetupCommitParams {
     type Result = ProviderSetupCommitResult;
 }
 
+// ---------------------------------------------------------------------------
+// provider connection test (REQ-581)
+// ---------------------------------------------------------------------------
+
+/// Test one registered provider by making the smallest **real** call it serves
+/// (REQ-581 BR-1).
+///
+/// The real path, minimal: the same adapter, the same credential-bound
+/// transport and the same egress choke point a turn takes, carrying one fixed
+/// message with no tools, no conversation context, and `max_tokens` at the
+/// floor. Never a `GET /v1/models` shortcut — that would prove an endpoint
+/// reachable that a turn never POSTs to, which is the reachability question
+/// nobody asked (architecture ADR-1).
+///
+/// It carries a `session_id` for [`ProviderSetupPlanParams`]'s reason: the gate
+/// that admits it is session attachment, so the call has to name the session it
+/// claims. Here that gate is also the *spending* boundary — a connection that
+/// may not drive this session, or a `teton provider test` the model spawned
+/// through a tool, cannot make the user's provider bill them (architecture
+/// ADR-5) — and it is what gives the resulting ledger row a session to belong
+/// to (BR-5).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ProviderTestParams {
+    /// The session asking.
+    pub session_id: SessionId,
+    /// The provider to test, by its configured id.
+    ///
+    /// A `kind = "local"` provider is **refused rather than tested** (BR-8):
+    /// there is no host to dial, and the answer to "does it work" there is the
+    /// local tier's own state, which the refusal carries.
+    pub provider_id: ProviderId,
+}
+
+/// A provider's routing health, in the words the router holds it in
+/// (REQ-544 M-5).
+///
+/// The wire spelling of the daemon's own `ProviderHealth`, declared here rather
+/// than imported for the reason every other shared word is: this crate depends
+/// on no other teton crate (`the_protocol_crate_depends_on_no_other_teton_crate`
+/// in [`crate`]), so the two are kept in step by their spellings and by the
+/// daemon's own mapping, not by a dependency edge.
+///
+/// It rides here because a connection test **moves** health (BR-4) and a report
+/// that said what came back without saying what the next turn will therefore do
+/// would leave the user to guess the interesting half.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ProviderHealth {
+    /// Up and reliable — eligible for the full loop.
+    Healthy,
+    /// Up but with weak tool-calling — used with a reduced profile, still the
+    /// primary choice.
+    Degraded,
+    /// Down, erroring or timing out — routing falls back past it until its
+    /// half-open cooldown expires.
+    Unavailable,
+}
+
+/// What one connection test found — the daemon's classification, **typed**
+/// (REQ-581 BR-3).
+///
+/// A client branches on the variant and renders the `reason` verbatim; it never
+/// re-reads a sentence to work out what happened (LESSON-456). The variants are
+/// drawn from the status the vendor answered with and the transport's failure
+/// class and from nothing else — architecture ADR-2 is the whole mapping table,
+/// and it draws the same lines the retry/fallback classifier already draws,
+/// named here for a person.
+///
+/// Every `reason` is **the daemon's own sentence**, composed from facts the
+/// product owns: the status, the dial host, the model the config declares, and
+/// the credential *reference* (`keychain://teton/kimi`). Never a response body,
+/// never a header, and never the credential value (ADR-3) — a vendor's error
+/// body can echo the request back, and a test that pasted one into the
+/// transcript would put a third party's prose, and possibly the user's own
+/// bytes, where neither belongs. A user who wants the vendor's exact words has
+/// the status to look them up.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "outcome", rename_all = "snake_case")]
+pub enum ProviderTestOutcome {
+    /// The call completed: the credential was accepted, the model answered, and
+    /// what came back is what a turn would have got.
+    Reached {
+        /// Wall time from the request leaving to the stream ending. The whole
+        /// round trip, not a header timing — it is what the user waited.
+        latency_ms: u64,
+        /// Prompt tokens the provider billed the probe for.
+        input_tokens: u64,
+        /// Completion tokens the provider billed the probe for.
+        output_tokens: u64,
+        /// What this call cost, in integer micro-USD, or `None` when the price
+        /// table knows no entry for the model.
+        ///
+        /// Priced from the daemon's own table — the same one the ledger row is
+        /// priced from — applied to the usage the *adapter* reported. The
+        /// **ledger row is the record of spend**; this is the report's reading
+        /// of the same call, and the two token readings behind them are taken
+        /// independently (the adapter's completion here, the cost meter's byte
+        /// scan there). They are pinned equal for the OpenAI SSE shape by a
+        /// daemon-side test and are not guaranteed identical in general, so a
+        /// consumer that needs the recorded figure asks the ledger for it.
+        ///
+        /// `None` is "unpriced", never `0`: a cost is recorded or it is not,
+        /// and standing a zero in for "we have no price for this model" is
+        /// displaying an estimate as an actual (REQ-544 BR-2).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        usd_micros: Option<i64>,
+    },
+    /// The vendor answered and would not serve the call — 401 and 403, and
+    /// every other 4xx that is not one of the two below.
+    ///
+    /// The credential is the thing this outcome is usually about, so its
+    /// `reason` names the *reference* the request authenticated with (AC-2).
+    Refused {
+        /// The HTTP status the vendor answered with.
+        status: u16,
+        /// The daemon's sentence for it (ADR-3).
+        reason: String,
+    },
+    /// A 404: the endpoint exists — registration validated it and something
+    /// answered — so the missing thing is the model the config declares.
+    ///
+    /// A 400 is deliberately **not** read this way and stays [`Self::Refused`]:
+    /// guessing "that was about the model" from a bare 400 is exactly the
+    /// re-reading of a vendor's prose this enum exists to avoid.
+    UnknownModel {
+        /// The HTTP status the vendor answered with (404).
+        status: u16,
+        /// The daemon's sentence for it, naming the model that was asked for.
+        reason: String,
+    },
+    /// A 429: the vendor is up and holding the call off.
+    RateLimited {
+        /// How long the vendor asked the caller to wait, when it said so.
+        ///
+        /// Always `None` in v1, and the field is here anyway: the transport
+        /// surfaces exactly one named header by design and this REQ does not
+        /// grow that surface for a probe (architecture ADR-2, OQ-5 —
+        /// **deferred, not dropped**). A client renders "try again shortly"
+        /// when it is absent, and the day a second consumer earns the header
+        /// this field carries it without a wire change.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        retry_after_secs: Option<u64>,
+    },
+    /// A 5xx: the vendor answered and is failing. The configuration is not the
+    /// suspect here, which is the whole reason it is a separate variant from
+    /// [`Self::Refused`].
+    ServerError {
+        /// The HTTP status the vendor answered with.
+        status: u16,
+        /// The daemon's sentence for it.
+        reason: String,
+    },
+    /// **Nothing answered** — DNS, TCP, TLS, a closed port, or bytes that could
+    /// not be read as a response at all. The request may never have left; what
+    /// is known is that no conversation happened.
+    ///
+    /// The two facts this variant used to carry in prose are their own variants
+    /// now, because a client that had to read a sentence to tell them apart is
+    /// the thing BR-3 exists to prevent (LESSON-456): something *did* answer, and
+    /// not with a completion, is [`Self::NotACompletion`]; nothing answered
+    /// *within the deadline* is [`Self::TimedOut`]. Each of the three sends the
+    /// user somewhere different — check the address, check the path, check
+    /// whether the vendor is up.
+    Unreachable {
+        /// The daemon's sentence, naming the host and the failure class.
+        reason: String,
+    },
+    /// **Something answered, and it was not a completion.** The status was one a
+    /// turn would have accepted (a 2xx or a 3xx) and what came back carried no
+    /// text, no tool call and no tokens.
+    ///
+    /// A redirect that is deliberately not followed, an endpoint that does not
+    /// stream, an endpoint that is not a chat-completions endpoint at all: a
+    /// host is listening and the *path* is the suspect. Distinct from
+    /// [`Self::Unreachable`] because the remedy is a different one: the address
+    /// resolved and something is up, so there is nothing wrong with the address.
+    ///
+    /// It is emphatically not [`Self::Reached`]: a green answer for an endpoint
+    /// no turn can use is this test's worst possible failure.
+    NotACompletion {
+        /// The daemon's sentence, naming the host that answered wrongly.
+        reason: String,
+    },
+    /// **Nothing answered within the test's own deadline.** The connection may
+    /// have been accepted; no completion arrived before the probe stopped
+    /// waiting.
+    ///
+    /// Separate from [`Self::Unreachable`] because "did not answer *yet*" and
+    /// "could not be reached" are different facts about a provider — the first
+    /// is a host that is up and slow — and separate from a transport-level
+    /// timeout, which is the transport's own verdict rather than this test's.
+    TimedOut {
+        /// The bound the test stopped at, in whole seconds — a *typed* figure
+        /// rather than a number a client has to find in prose, since telling
+        /// "slow" from "not answering" is the whole reason this variant exists.
+        after_secs: u64,
+        /// The daemon's sentence, naming the host that did not answer.
+        reason: String,
+    },
+}
+
+/// Result of [`ProviderTestParams`] — one real call, reported.
+///
+/// It names what was tested as well as what came back, because the answer to
+/// "does my provider work" is only useful if the user can see it was asked of
+/// the provider, model and host they meant (BR-2's preview, confirmed by the
+/// report).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ProviderTestResult {
+    /// The provider that was tested. Read back from the daemon rather than
+    /// assumed by the client, like [`ProviderSetupCommitResult::provider_id`]:
+    /// a report rendered from the id it *sent* could confirm a state the daemon
+    /// does not hold.
+    pub provider_id: ProviderId,
+    /// The model the config pins that provider to — the one actually asked, so
+    /// an `unknown_model` outcome names the string that needs fixing.
+    pub model: String,
+    /// The host the request was dialed at, from the **dial-time** parser
+    /// (LESSON-529) — the destination the request builder actually reached, not
+    /// a separately-parsed lookalike, and the same reading
+    /// [`ProviderSetupPreviewResult::dial_host`] shows at a confirm step.
+    ///
+    /// Host, plus `:port` when the endpoint states one explicitly; never
+    /// userinfo, path or query, all by construction. The endpoint itself does
+    /// not travel here for [`crate::events::ProviderSetupCompleted`]'s reason:
+    /// a pasted URL's authority can hide a credential.
+    pub dial_host: String,
+    /// What came back.
+    pub outcome: ProviderTestOutcome,
+    /// The health this test left the provider in — the same map the router
+    /// reads at decision time (BR-4).
+    ///
+    /// A `reached` test clears a downgrade exactly as a served turn does, and a
+    /// failure stamps the cooldown a failed turn would; this field is what lets
+    /// the report say what the *next* turn will do rather than only what this
+    /// call did.
+    pub health_after: ProviderHealth,
+}
+
+impl RpcMethod for ProviderTestParams {
+    const METHOD: &'static str = "provider/test";
+    type Result = ProviderTestResult;
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -3015,6 +3273,7 @@ mod tests {
                 total_calls: 3,
                 priced_calls: 2,
                 unpriced_calls: 1,
+                probe_calls: 1,
                 unpriced_models: vec!["llama-3-70b".to_owned()],
                 savings_usd_micros: 500_000,
                 baseline_usd_micros: 548_100,
@@ -3069,6 +3328,46 @@ mod tests {
         assert!(decoded.web_per_session.is_empty());
     }
 
+    /// The same skew at REQ-581's field: a report from a daemon that predates
+    /// `provider/test` carries no `probe_calls` key, and must read as **no
+    /// probes** rather than fail the whole report.
+    ///
+    /// `0` is the honest reading of that silence — a daemon with no connection
+    /// test recorded none — which is what makes the default safe here, unlike a
+    /// field whose absence would have to be guessed at.
+    #[test]
+    fn a_cost_report_without_the_probe_count_still_deserializes() {
+        let pre_581 = serde_json::json!({
+            "total_usd_micros": 48_100,
+            "total_calls": 3,
+            "priced_calls": 2,
+            "unpriced_calls": 1,
+            "savings_usd_micros": 0,
+            "baseline_usd_micros": 0,
+            "baseline_model": "anthropic/claude-opus-4",
+            "methodology": "Estimate, not a measurement.",
+            "per_phase": [],
+            "per_provider": [],
+        });
+        let decoded: CostReportView =
+            serde_json::from_value(pre_581).expect("an older report still decodes");
+        assert_eq!(decoded.probe_calls, 0);
+        assert_eq!(decoded.total_calls, 3, "and the rest of it still arrives");
+
+        // Non-vacuity: a report from *this* build carries its own count, so the
+        // default above is reached by absence rather than by a field nothing
+        // fills.
+        let current = serde_json::to_value(CostReportView {
+            total_calls: 3,
+            probe_calls: 1,
+            ..CostReportView::default()
+        })
+        .expect("serializes");
+        assert_eq!(current["probe_calls"], 1, "{current}");
+        let back: CostReportView = serde_json::from_value(current).expect("round-trips");
+        assert_eq!(back.probe_calls, 1);
+    }
+
     #[test]
     fn request_helper_fills_method_from_trait() {
         let req = request(Id::Number(1), SessionListParams::default());
@@ -3094,6 +3393,10 @@ mod tests {
         assert_eq!(ProviderSetupPlanParams::METHOD, "provider/setup_plan");
         assert_eq!(ProviderSetupPreviewParams::METHOD, "provider/setup_preview");
         assert_eq!(ProviderSetupCommitParams::METHOD, "provider/setup_commit");
+        // REQ-581's one method, pinned for the same reason: the daemon's
+        // dispatch match and both CLI call sites (`/provider test <id>` and
+        // `teton provider test <id>`) are written against this literal.
+        assert_eq!(ProviderTestParams::METHOD, "provider/test");
         assert_eq!(
             request(Id::Number(2), ModelStatusParams::default()).method,
             "model/status"
@@ -3779,6 +4082,218 @@ mod tests {
             serde_json::from_str::<ProviderSetupPlanResult>(r#"{"existing":[],"tiers":[]}"#)
                 .is_err(),
             "a plan answer with no catalog is malformed, not an empty catalog"
+        );
+    }
+
+    /// REQ-581 BR-3's wire half: **every** outcome the classifier can produce
+    /// rides under its own snake_case tag and survives the round trip.
+    ///
+    /// The tags are spelled as literals rather than derived in the test, because
+    /// they are the contract a client's `match` is written against: a variant
+    /// renamed on one side only is a report that renders nothing, and the point
+    /// of a typed outcome is that no client has to read a sentence to find out
+    /// what happened (LESSON-456).
+    #[test]
+    fn every_provider_test_outcome_round_trips_under_its_wire_tag() {
+        let cases: Vec<(ProviderTestOutcome, &str)> = vec![
+            (
+                ProviderTestOutcome::Reached {
+                    latency_ms: 412,
+                    input_tokens: 11,
+                    output_tokens: 1,
+                    usd_micros: Some(37),
+                },
+                "reached",
+            ),
+            (
+                // The unpriced model: reached, billed by the vendor, and no
+                // cost recorded because none is known.
+                ProviderTestOutcome::Reached {
+                    latency_ms: 412,
+                    input_tokens: 11,
+                    output_tokens: 1,
+                    usd_micros: None,
+                },
+                "reached",
+            ),
+            (
+                ProviderTestOutcome::Refused {
+                    status: 401,
+                    reason: "HTTP 401 from api.moonshot.ai — the vendor did not accept the \
+                             credential at keychain://teton/kimi"
+                        .to_owned(),
+                },
+                "refused",
+            ),
+            (
+                ProviderTestOutcome::UnknownModel {
+                    status: 404,
+                    reason: "HTTP 404 from api.moonshot.ai — it does not know the model \
+                             `kimi-k2-turbo-preview`"
+                        .to_owned(),
+                },
+                "unknown_model",
+            ),
+            (
+                ProviderTestOutcome::RateLimited {
+                    retry_after_secs: None,
+                },
+                "rate_limited",
+            ),
+            (
+                // Not what v1 sends (ADR-2 / OQ-5), and the shape is here so the
+                // day it does is a value change and not a wire change.
+                ProviderTestOutcome::RateLimited {
+                    retry_after_secs: Some(7),
+                },
+                "rate_limited",
+            ),
+            (
+                ProviderTestOutcome::ServerError {
+                    status: 503,
+                    reason: "HTTP 503 from api.moonshot.ai — the vendor answered and is failing"
+                        .to_owned(),
+                },
+                "server_error",
+            ),
+            (
+                ProviderTestOutcome::Unreachable {
+                    reason: "could not reach api.moonshot.ai: connection error".to_owned(),
+                },
+                "unreachable",
+            ),
+            (
+                // The three facts `unreachable` used to carry between them, now
+                // one variant each: nothing answered, something answered wrongly,
+                // and nothing answered in time.
+                ProviderTestOutcome::NotACompletion {
+                    reason: "api.moonshot.ai answered, but not with a completion (no tokens, no \
+                             text)"
+                        .to_owned(),
+                },
+                "not_a_completion",
+            ),
+            (
+                ProviderTestOutcome::TimedOut {
+                    after_secs: 30,
+                    reason: "nothing came back from api.moonshot.ai before the test stopped \
+                             waiting"
+                        .to_owned(),
+                },
+                "timed_out",
+            ),
+        ];
+
+        for (outcome, expected) in cases {
+            round_trip(&outcome);
+            let wire = serde_json::to_value(&outcome).unwrap();
+            assert_eq!(wire["outcome"], expected, "{wire}");
+        }
+
+        // The two optionals are absent from the wire rather than `null`, and
+        // both read back as `None` — "unpriced" and "the vendor said nothing
+        // about when to retry", neither of which is a number.
+        let unpriced = serde_json::to_value(ProviderTestOutcome::Reached {
+            latency_ms: 1,
+            input_tokens: 1,
+            output_tokens: 1,
+            usd_micros: None,
+        })
+        .unwrap();
+        assert!(unpriced.get("usd_micros").is_none(), "{unpriced}");
+        let limited = serde_json::to_value(ProviderTestOutcome::RateLimited {
+            retry_after_secs: None,
+        })
+        .unwrap();
+        assert_eq!(
+            limited.as_object().unwrap().keys().collect::<Vec<_>>(),
+            ["outcome"],
+            "a v1 rate-limit answer is the tag and nothing else: {limited}"
+        );
+
+        // The deadline the test stopped at rides as a **number** beside its tag.
+        // A client renders "no answer within 30 s" from this field; finding the
+        // figure inside `reason` would be the prose-reading BR-3 forbids.
+        let timed_out = serde_json::to_value(ProviderTestOutcome::TimedOut {
+            after_secs: 30,
+            reason: "nothing came back before the test stopped waiting".to_owned(),
+        })
+        .unwrap();
+        assert_eq!(timed_out["after_secs"], 30, "{timed_out}");
+    }
+
+    /// The `provider/test` call and its answer round-trip, and the answer names
+    /// what was tested as well as what came back (BR-2/BR-4).
+    #[test]
+    fn the_provider_test_method_round_trips() {
+        round_trip(&ProviderTestParams {
+            session_id: SessionId::from("s1"),
+            provider_id: ProviderId::from("kimi"),
+        });
+
+        let reached = ProviderTestResult {
+            provider_id: ProviderId::from("kimi"),
+            model: "kimi-k2-turbo-preview".to_owned(),
+            dial_host: "api.moonshot.ai".to_owned(),
+            outcome: ProviderTestOutcome::Reached {
+                latency_ms: 412,
+                input_tokens: 11,
+                output_tokens: 1,
+                usd_micros: Some(37),
+            },
+            health_after: ProviderHealth::Healthy,
+        };
+        round_trip(&reached);
+        let wire = serde_json::to_value(&reached).unwrap();
+        assert_eq!(wire["provider_id"], "kimi");
+        assert_eq!(wire["model"], "kimi-k2-turbo-preview");
+        assert_eq!(
+            wire["dial_host"], "api.moonshot.ai",
+            "the report names the destination that was dialed — a host, and only \
+             a host: {wire}"
+        );
+        assert_eq!(wire["outcome"]["outcome"], "reached");
+        assert_eq!(wire["outcome"]["latency_ms"], 412);
+        assert_eq!(
+            wire["health_after"], "healthy",
+            "health is a value the client branches on, not a sentence: {wire}"
+        );
+
+        // A failing test still moves health, and the answer still says where it
+        // landed — the half a report that only named the failure would omit.
+        let unreachable = ProviderTestResult {
+            provider_id: ProviderId::from("kimi"),
+            model: "kimi-k2-turbo-preview".to_owned(),
+            dial_host: "api.moonshot.ai".to_owned(),
+            outcome: ProviderTestOutcome::Unreachable {
+                reason: "could not reach api.moonshot.ai: timeout".to_owned(),
+            },
+            health_after: ProviderHealth::Unavailable,
+        };
+        round_trip(&unreachable);
+        let wire = serde_json::to_value(&unreachable).unwrap();
+        assert_eq!(wire["health_after"], "unavailable");
+        assert_eq!(wire["outcome"]["outcome"], "unreachable");
+
+        // The remaining health word, spelled on the wire so all three are
+        // pinned against the daemon's own vocabulary.
+        assert_eq!(
+            serde_json::to_value(ProviderHealth::Degraded).unwrap(),
+            "degraded"
+        );
+
+        // The request carries a session and a provider id and nothing else: no
+        // model to override, no endpoint to redirect, no key. What is tested is
+        // what the config says, which is the whole point of testing it.
+        let asked = serde_json::to_value(ProviderTestParams {
+            session_id: SessionId::from("s1"),
+            provider_id: ProviderId::from("kimi"),
+        })
+        .unwrap();
+        assert_eq!(
+            asked.as_object().unwrap().keys().collect::<Vec<_>>(),
+            ["provider_id", "session_id"],
+            "{asked}"
         );
     }
 

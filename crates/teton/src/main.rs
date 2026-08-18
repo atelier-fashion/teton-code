@@ -47,6 +47,7 @@ mod loading;
 mod model_ui;
 mod prompt;
 mod provider_setup_ui;
+mod provider_test_ui;
 mod render;
 mod service;
 mod session_ui;
@@ -78,6 +79,13 @@ struct Cli {
     /// `/model set <name>` (REQ-555 BR-4b — one flow, so the session inherits
     /// the flag as the explicit unattended stand-in and consumes no input line
     /// for the question), and the deletion confirmation of `teton uninstall`.
+    ///
+    /// And it answers the send-this? question of `/provider test <id>` /
+    /// `teton provider test <id>` (REQ-581 BR-2) — the first thing this flag
+    /// authorises that puts bytes on the network and money on a user's account.
+    /// Everything above it changes this machine; that one calls a vendor. It is
+    /// still the same consent, given in advance instead of at a prompt, which is
+    /// what a pipe has instead of a terminal.
     #[arg(long, short = 'y', global = true)]
     yes: bool,
 
@@ -183,6 +191,19 @@ enum ProviderAction {
     },
     /// List configured providers.
     List,
+    /// Test a registered provider by making one minimal, consented call to it
+    /// (REQ-581 BR-7).
+    ///
+    /// It asks before it sends; `--yes` consents up front, which is what a
+    /// script or a piped shell needs. Unlike every other `teton provider`
+    /// subcommand this one opens a session, because it is not a read: the method
+    /// is session-gated so a tool-spawned copy cannot spend the user's provider
+    /// budget, and the ledger row it writes needs a session to belong to
+    /// (architecture ADR-5).
+    Test {
+        /// Provider id, as `teton provider list` names it.
+        id: String,
+    },
 }
 
 /// `teton boundary …`
@@ -357,6 +378,7 @@ fn main() -> ExitCode {
                 model,
             } => run_provider_add(&paths, &id, kind.into(), endpoint, model),
             ProviderAction::List => run_provider_list(&paths),
+            ProviderAction::Test { id } => run_provider_test(&paths, &id, cli.yes),
         },
         Some(Command::Boundary { action }) => match action {
             BoundaryAction::Add { glob, mode } => run_boundary_add(&paths, glob, mode.into()),
@@ -540,6 +562,17 @@ fn read_config_view(conn: &mut Connection, ctx: &mut UiContext<'_>) {
         // The daemon's own derivation, from the predicate that also governs tool
         // exposure — never a second reading of `[web] tier` here (REQ-572 BR-3).
         ctx.state.web.capability = cfg.snapshot.web_capability;
+        // The registered ids, for REQ-581 ADR-4's connection-question predicate:
+        // "is kimi working?" is a provider question because `kimi` is one of
+        // *this* user's providers, which is a fact only the snapshot has. A
+        // daemon that answers with none leaves the list empty, which the
+        // predicate's fixed subject words already cover.
+        ctx.state.provider_ids = cfg
+            .snapshot
+            .providers
+            .iter()
+            .map(|provider| provider.id.0.clone())
+            .collect();
     }
 }
 
@@ -800,7 +833,12 @@ fn run_session(paths: &DaemonPaths, auto_accept: bool, verbose: bool) -> anyhow:
             // the previous turn's end. A turn that was interrupted or refused
             // never reached `hand_off_after_turn`, and without this its words
             // would still be sitting there when the next reply arrived.
-            ctx.state.begin_turn();
+            //
+            // REQ-581 ADR-4 opens it with the **question** as well: the same
+            // bytes `prompt_turn_params` just put on the wire, so what the
+            // connection predicate reads is what was asked rather than a second
+            // reading of the input line taken here.
+            ctx.state.begin_turn(prompt_text);
             match conn.call(params, &mut ctx)? {
                 Ok(res) => {
                     // REQ-579 ADR-9. Before the turn's closing line, because
@@ -1239,10 +1277,16 @@ fn run_doctor(paths: &DaemonPaths) -> anyhow::Result<()> {
         "model: the local-tier lifecycle is event-driven — start a session to observe \
          probe/download/benchmark.",
     );
+    // Doctor stays passive (REQ-581 BR-7 / OQ-2): it names the command that
+    // sends and does not become it. The clause is here because this is the line
+    // a user reads when they came to `doctor` with "is my provider working?" —
+    // the question doctor cannot answer, and now the one place that says which
+    // command can.
     surface.line(
         LineKind::Notice,
         "providers: reachability is probed by the daemon at call time; the CLI has no network \
-         path of its own (BR-1).",
+         path of its own (BR-1). `teton provider test <id>` makes one consented call and reports \
+         what came back.",
     );
     Ok(())
 }
@@ -1449,6 +1493,64 @@ fn run_provider_add(
             Err(transport)
         }
     }
+}
+
+/// `teton provider test <id>`: one consented call to a registered provider
+/// (REQ-581 BR-7, architecture ADR-5).
+///
+/// The **one** subcommand under `teton provider` that opens a session, and the
+/// reason is that it is not a read: it sends. `provider/test` is gated on
+/// session attachment precisely so a foreign connection — or a `teton provider
+/// test … --yes` the model spawned through the shell tool, which REQ-569's
+/// ancestry gate already keeps out of the user's sessions — cannot make the
+/// user's provider bill them. Creating a session here is also what gives the
+/// resulting ledger row a session to belong to (BR-5). The session ends with the
+/// process, exactly as `teton`'s own does.
+///
+/// Everything after the connection is [`provider_test_ui`]'s, so this subcommand
+/// and the in-session `/provider test` cannot diverge (BR-7, LESSON-441's rule:
+/// one consent gate, one implementation).
+///
+/// # Errors
+///
+/// Propagates a transport error. A daemon that *answers* — including a refusal
+/// to create the session — is reported on the surface and returns `Ok`.
+fn run_provider_test(paths: &DaemonPaths, id: &str, assume_yes: bool) -> anyhow::Result<()> {
+    let mut surface = stdout_surface();
+    let mut conn = client::ensure_connected(paths, &mut surface)?;
+    let mut state = SessionState::new();
+    let mut prompter = StdinPrompter::new();
+    // The passive context reads `typed_input` at the edge exactly as the session
+    // path does, so the gate answers the same question here as it does in a
+    // session and no handler re-derives it.
+    let mut ctx = passive_ctx(&mut surface, &mut state, &mut prompter);
+    let typed_input = ctx.typed_input;
+
+    let created = conn.call(
+        SessionCreateParams {
+            mode: SessionMode::Freeform,
+            phase: None,
+            // BUG-147: the daemon runs under launchd (cwd `/`); a session it
+            // mints must still be anchored to THIS terminal's directory.
+            cwd: std::env::current_dir().ok(),
+        },
+        &mut ctx,
+    )?;
+    let session_id = match created {
+        Ok(res) => res.session_id,
+        Err(err) => {
+            ctx.surface.line(
+                LineKind::Error,
+                &format!("could not start a session for the test: {}", err.message),
+            );
+            return Ok(());
+        }
+    };
+    ctx.session_id = Some(session_id.clone());
+    ctx.state.session_id = Some(session_id.clone());
+
+    let mut io = provider_test_ui::DaemonIo::new(&mut conn, &mut ctx);
+    provider_test_ui::run(&mut io, &session_id, id, assume_yes, typed_input)
 }
 
 /// `teton provider list`.
@@ -1895,7 +1997,13 @@ fn binding_source_label(source: BindingSource) -> &'static str {
 /// [`teton_core::is_absolute_http_url`] before anything is stored), but doctor
 /// renders whatever a hand-edited config holds, so the reading has to be right
 /// here as well. `\` is the only code point where the two readings diverge.
-fn displayed_endpoint(url: &str) -> String {
+///
+/// `pub(crate)` because "every such line" includes lines outside this module:
+/// [`provider_test_ui`]'s preview echoes the same stored endpoint back before
+/// the user consents to a call (REQ-581 BR-2). A second masker over there would
+/// be a second reading of the authority, which is the specific failure the
+/// backslash paragraph above is about.
+pub(crate) fn displayed_endpoint(url: &str) -> String {
     let Some((scheme, rest)) = url.split_once("://") else {
         return url.to_owned();
     };
@@ -2605,7 +2713,12 @@ fn render_config(providers: &[ProviderConfig], surface: &mut dyn Surface) {
 }
 
 /// Wire-name label for a provider kind.
-fn kind_label(kind: ProviderKind) -> &'static str {
+///
+/// `pub(crate)` so [`provider_test_ui`]'s preview reads the same four spellings
+/// `teton provider list` prints. A second table would be the mirrored-predicate
+/// shape LESSON-528 is about — identical today, and identical only until one of
+/// them is edited.
+pub(crate) fn kind_label(kind: ProviderKind) -> &'static str {
     match kind {
         ProviderKind::Local => "local",
         ProviderKind::OpenaiCompatible => "openai-compatible",

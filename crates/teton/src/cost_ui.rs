@@ -114,6 +114,8 @@ pub fn render_report_view(report: &CostReportView, surface: &mut dyn Surface) {
         }
     }
 
+    render_probes(surface, report.probe_calls);
+
     render_group(surface, "per phase", &report.per_phase);
     render_group(surface, "per provider", &report.per_provider);
     render_web_lookups(surface, &report.web_per_session);
@@ -161,6 +163,31 @@ fn render_group(
             ),
         );
     }
+}
+
+/// Render the connection-test count, when there is one (REQ-581 BR-5).
+///
+/// A **subset** of the totals above and drawn immediately under them for that
+/// reason: a probe is an ordinary model call, sent down the same path and priced
+/// from the same table, so the daemon counts it in `total_calls` and this line
+/// only says how many of those calls nobody asked a question for. It is never a
+/// second tally to add on.
+///
+/// Silent at zero, like [`render_web_lookups`] and unlike [`render_group`]: a
+/// user who has never run `/provider test` would otherwise carry a permanent
+/// `probes: 0` on the surface they read for their spending — and `0` is also
+/// what a daemon predating the field reports by default, so a line here would be
+/// asserting something about a build that cannot answer.
+fn render_probes(surface: &mut dyn Surface, probe_calls: u64) {
+    if probe_calls == 0 {
+        return;
+    }
+    surface.line(
+        LineKind::Cost,
+        &format!(
+            "  probes: {probe_calls} connection test(s) — billed like any call, counted apart"
+        ),
+    );
 }
 
 /// Render the reasoning-token split (REQ-559 BR-11 / AC-9).
@@ -246,6 +273,7 @@ mod tests {
             usd_micros,
             cached_tokens: None,
             reasoning_tokens: None,
+            probe: false,
         }
     }
 
@@ -298,6 +326,7 @@ mod tests {
             web_per_session: Vec::new(),
             reasoning_tokens: None,
             calls_reporting_reasoning: 0,
+            probe_calls: 0,
         };
 
         let mut surface = RecordingSurface::new();
@@ -335,6 +364,7 @@ mod tests {
             web_per_session: Vec::new(),
             reasoning_tokens: None,
             calls_reporting_reasoning: 0,
+            probe_calls: 0,
         };
 
         let mut surface = RecordingSurface::new();
@@ -374,6 +404,7 @@ mod tests {
             web_per_session: Vec::new(),
             reasoning_tokens: None,
             calls_reporting_reasoning: 0,
+            probe_calls: 0,
         };
 
         let mut surface = RecordingSurface::new();
@@ -457,7 +488,50 @@ mod tests {
             web_per_session: Vec::new(),
             reasoning_tokens: None,
             calls_reporting_reasoning: 0,
+            probe_calls: 0,
         }
+    }
+
+    // ---- REQ-581: the probe count (BR-5) ----------------------------------
+
+    /// BR-5: a connection test is a model call and is billed as one, so it is
+    /// already inside `total_calls`. What the probe line adds is the sentence
+    /// that keeps a user from reading a call they never asked a question for as
+    /// a turn — and it must say the call *was* billed, not that it sits outside
+    /// the total.
+    #[test]
+    fn a_report_with_probes_counts_them_apart_without_adding_them_on() {
+        let report = CostReportView {
+            probe_calls: 1,
+            ..fully_priced()
+        };
+
+        let mut surface = RecordingSurface::new();
+        render_report_view(&report, &mut surface);
+
+        assert!(
+            surface.any_line_contains(LineKind::Cost, "probes: 1 connection test(s)"),
+            "the probe count must be named: {:?}",
+            surface.lines_of(LineKind::Cost)
+        );
+        // The two halves of BR-5 in one line: billed like any call, and counted
+        // apart from the turns.
+        assert!(surface.any_line_contains(LineKind::Cost, "billed like any call"));
+        assert!(surface.any_line_contains(LineKind::Cost, "counted apart"));
+        // Non-vacuity for the "subset, not an addition" claim: the total still
+        // reads as the daemon reported it, with no probe arithmetic applied.
+        assert!(surface.any_line_contains(LineKind::Cost, "over 1 call(s)"));
+    }
+
+    /// Almost every machine has never run `/provider test`, and `0` is also what
+    /// a daemon predating the field reports by default — so the line is absent
+    /// rather than reporting a zero about a build that cannot answer.
+    #[test]
+    fn a_report_with_no_probes_says_nothing_about_them() {
+        let mut surface = RecordingSurface::new();
+        render_report_view(&fully_priced(), &mut surface);
+        assert!(!surface.any_line_contains(LineKind::Cost, "probes"));
+        assert!(!surface.any_line_contains(LineKind::Cost, "connection test"));
     }
 
     // ---- REQ-559: the thinking split (BR-11, AC-9) ------------------------

@@ -1237,10 +1237,20 @@ mod tests {
     /// **AC-8, points 3 and 4.** One `Egress::scoped(` call on the duty path,
     /// and one ceiling-enforcement site.
     ///
-    /// `.scoped(` occurs twice in the daemon and the two are named here rather
-    /// than counted: the turn path's, in `harness/completion.rs`, and the duty
-    /// path's, here. A *third* is a second way to reach the network, which is
-    /// the thing the single choke point exists to make impossible.
+    /// `.scoped(` is **named** here rather than counted: the turn path's, in
+    /// `harness/completion.rs`; the duty path's, here; and, since REQ-581, the
+    /// connection test's, in `runtime.rs`. A site that is not on this list is a
+    /// second way to reach the network, which is the thing the single choke
+    /// point exists to make impossible — so the list stays exact and a new
+    /// sender is a failing test until someone writes down why it is allowed.
+    ///
+    /// The third one is allowed because it is not a second way to reach the
+    /// network but the *same* way, run deliberately: `provider/test` sends one
+    /// fixed sentence through the same adapter, the same credential-bound
+    /// transport and the same `Egress`, precisely so that what it proves is
+    /// what a turn would meet (REQ-581 BR-1, ADR-1). It is not a duty — it
+    /// serves no harness purpose and keeps its failure typed rather than
+    /// flattening it to a `String` — so it cannot live behind [`DutyRoute`].
     ///
     /// The ceiling is read in exactly one file, enforced by exactly one
     /// function, and **every** implementation of [`Duty`](super::Duty) runs its
@@ -1259,8 +1269,9 @@ mod tests {
     fn the_duty_path_has_one_egress_scoping_call_and_one_ceiling_site() {
         assert_eq!(
             files_with(".scoped("),
-            vec!["harness/completion.rs", "harness/duty.rs"],
-            "the turn path and the duty path, and nothing else, reach a transport"
+            vec!["harness/completion.rs", "harness/duty.rs", "runtime.rs"],
+            "the turn path, the duty path and the connection test, and nothing \
+             else, reach a transport"
         );
         assert_eq!(
             count(&source_of("harness/duty.rs"), ".scoped("),

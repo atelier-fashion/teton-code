@@ -1498,3 +1498,107 @@ Step 4 — no ghost turn after Ctrl-C mid-hold : yes / no
 Step 5 (if run) — remote-bound turn was NOT held : yes / no / not run
 Notes / findings :
 ```
+
+# Manual verification runbook — REQ-581 (the connection-test hand-off, and one real `reached`)
+
+**Status: OUTSTANDING.** Two claims in REQ-581 are not CI's to make.
+
+AC-8b says the session points a user at `/provider test <id>` when a turn asks
+whether a provider works and answers by *inspecting configuration* instead. CI
+pins the deterministic half — `session_ui`'s predicate table drives the exact
+turn shape from the report (prompt, `shell: teton provider list`, a reply that
+names no command) and asserts one line on a TTY and none on a pipe. What CI
+cannot say is whether a **real** local model, asked in a person's own words,
+produces a turn of that shape at all: the predicate could be right and never
+fire, or fire on turns nobody meant. That is a live measurement, and LESSON-532
+is explicit that the guarantee is claimed only after one.
+
+AC-1's `reached` is the other: every automated outcome comes from the e2e
+harness's `MockProvider`. Nothing in CI has put a request on the public
+internet, so "the probe reaches a real vendor, is billed as one call, and moves
+the health map" is unproven until somebody watches it happen once.
+
+Leave both outstanding in
+`.adlc/specs/REQ-581-provider-connection-test/requirement.md` until the
+procedures below are run. **Both need `/provider test` to exist** — it is
+TASK-165's command; run this once TASK-165 has landed, not before.
+
+## What this proves that CI does not
+
+That the phrasings a user actually types reach the predicate; that the harness
+line lands where a person can read it, once, in the turn they asked about; and
+that a `reached` report against a real vendor carries a latency, token counts
+and a cost that are the vendor's rather than a fixture's.
+
+## Procedure — the AC-8b A/B (three phrasings, real local model)
+
+1. Build with the real engine: `cargo build --release --features tetond/llama`.
+   Confirm `TETON_TEST_SEAMS` is **unset**. Register a remote provider
+   (`kimi` is the one the report used) so the config snapshot has an id for the
+   predicate to read, and let the local tier finish loading (`ready`).
+2. **Baseline first**, on the shipped binary (`brew install teton`, or the
+   previous release tag) — the same three prompts, so the model's own behaviour
+   is measured against a build without the line rather than against memory.
+3. For each phrasing, a **fresh session** (`teton`, one prompt, Ctrl-D):
+   - `alright, I followed your instructions. Can you test the Kimi connection?`
+   - `is kimi actually working?`
+   - `can you verify my provider connection is reachable?`
+   Record, per prompt and per build: what the turn *did* (tool calls shown), and
+   whether the reply named `/provider test` **by itself**.
+4. On the REQ-581 build, record whether the harness line
+   `in this session, /provider test <id> makes one consented call and reports
+   what came back; that is the connection test.` printed — and that it printed
+   **once**, after the reply.
+5. The two failure shapes worth writing down, because they are what would send
+   this back to the architecture rather than to the wording:
+   - the line fires on a turn that was **not** a connection question (a false
+     positive is worse than silence: it talks over a correct answer);
+   - the model answers a connection question with no diagnostic at all — no
+     recital, no `shell` call — in which case the predicate's second half is
+     the wrong reading of the failure, not merely a narrow one.
+6. Repeat the first phrasing with stdout piped (`echo '…' | teton`). Expect
+   **nothing** from the hand-off, and output byte-identical to the baseline
+   build's.
+
+## Procedure — one real `reached` against Kimi
+
+7. With `kimi` registered and a live key in the keychain, in a TTY session:
+   `/provider test kimi`. Confirm the preview names the provider, the model and
+   the host it will dial, and that answering `n` sends nothing.
+8. Answer `y`. Record the reported outcome, latency, input/output tokens and
+   cost. Then `teton cost` in the same session: expect the probe to be counted
+   (one probe row/`probe_calls` of 1), and `teton provider list` to show `kimi`
+   healthy.
+9. Confirm what the report does **not** contain: no key value anywhere in the
+   line or in the `provider_tested` event — the credential *reference*
+   (`keychain://teton/kimi`) is the most that may appear (AC-2).
+10. Optional and cheap, if a spare id can be pointed at a bad key: repeat with
+    a deliberately wrong credential and confirm the `refused` line names the
+    status and the reference, and that no ledger row is written.
+
+## Sign-off
+
+```
+REQ-581 sign-off
+----------------
+Verified by      :
+Date             :
+Platform / OS    :               (e.g. macOS 26.6, Apple M-series)
+Build            :               (cargo build --release --features tetond/llama)
+Baseline build   :               (shipped version the A/B compares against)
+Local model      :
+TETON_TEST_SEAMS confirmed unset : yes / no
+A/B — phrasing 1 : harness line printed? yes / no | model named /provider test itself? yes / no
+A/B — phrasing 2 : harness line printed? yes / no | model named /provider test itself? yes / no
+A/B — phrasing 3 : harness line printed? yes / no | model named /provider test itself? yes / no
+A/B — baseline build named /provider test itself (0-3 of 3) :
+A/B — line printed at most once per turn, after the reply : yes / no
+A/B — false positive on a non-connection turn observed : yes / no  (describe below)
+Piped run — nothing printed, output matches baseline : yes / no
+Real test — outcome / latency / tokens / cost :
+Real test — `teton cost` counted the probe : yes / no
+Real test — health after : healthy / other
+Real test — no key value in the line or the event : yes / no
+Refused variant (if run) — names status and credential reference : yes / no / not run
+Notes / findings :
+```

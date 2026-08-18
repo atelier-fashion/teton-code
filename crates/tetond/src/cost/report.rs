@@ -162,6 +162,18 @@ pub struct CostReport {
     /// the honest shape of "this build did no web lookups" rather than a wall of
     /// zeroes.
     pub web_per_session: Vec<WebTotals>,
+    /// How many of [`Totals::calls`] were connection tests (REQ-581 BR-5).
+    ///
+    /// A **subset** of the total, never a tally added to it: a probe is an
+    /// ordinary model call, sent down the same path and priced from the same
+    /// table, and every roll-up above already counts it as one. This field only
+    /// buys the sentence `teton cost` can then print — so a user reading a call
+    /// they asked no question for does not read it as a turn.
+    ///
+    /// A whole-ledger count rather than a column on [`GroupTotals`]: the
+    /// question is "did any of this spend come from testing", which is asked of
+    /// the ledger and not of a session, a phase, or a provider.
+    pub probe_calls: u64,
 }
 
 /// A running accumulator for one grouping key.
@@ -259,9 +271,15 @@ pub fn aggregate(rows: &[LedgerRow], web_rows: &[WebLookupRow], prices: &PriceTa
     let mut actual_micros: i64 = 0;
     let mut baseline_micros: i64 = 0;
     let mut priced_calls: u64 = 0;
+    // REQ-581 BR-5: counted alongside the roll-ups, not instead of them — the
+    // probe is added to every total above as the ordinary call it is.
+    let mut probe_calls: u64 = 0;
 
     for row in rows {
         total.add(row);
+        if row.probe {
+            probe_calls = probe_calls.saturating_add(1);
+        }
         by_session
             .entry(row.session_id.clone())
             .or_default()
@@ -339,6 +357,7 @@ pub fn aggregate(rows: &[LedgerRow], web_rows: &[WebLookupRow], prices: &PriceTa
                 bytes_in: accum.bytes_in,
             })
             .collect(),
+        probe_calls,
     }
 }
 
@@ -390,6 +409,10 @@ mod tests {
             usd_micros,
             cached_tokens: None,
             reasoning_tokens: None,
+            // A turn. The probe rows a test needs are built as
+            // `LedgerRow { probe: true, ..row(..) }`, so the default here stays
+            // the overwhelmingly common case.
+            probe: false,
         }
     }
 
@@ -557,10 +580,47 @@ mod tests {
         );
     }
 
+    /// REQ-581 BR-5: a probe is counted apart and *also* counted as the call it
+    /// is. Both halves matter — a probe missing from the totals would under-report
+    /// real spend, and a probe indistinguishable from a turn is the reading
+    /// problem this REQ exists to fix.
+    #[test]
+    fn a_probe_is_counted_apart_and_still_counted_as_a_call() {
+        let prices = PriceTable::bundled();
+        let cost = prices.price("claude-fable-5", 1000, 500);
+        let turn = row("s1", None, "anthropic", "claude-fable-5", 1000, 500, cost);
+        let probe = LedgerRow {
+            probe: true,
+            ..row("s1", None, "kimi", "kimi-k2", 8, 4, None)
+        };
+        let report = aggregate(&[turn, probe], &[], &prices);
+
+        assert_eq!(report.probe_calls, 1, "one of the two rows was a test");
+        assert_eq!(
+            report.total.calls, 2,
+            "the probe is spend and stays in the total — the count is a subset, \
+             never a deduction"
+        );
+        assert_eq!(
+            report.total.usd_micros,
+            cost.unwrap_or(0),
+            "and it is priced by the same table as any other call"
+        );
+
+        // A ledger of turns reports no probes rather than omitting the figure.
+        let turns_only = aggregate(
+            &[row("s1", None, "anthropic", "claude-fable-5", 10, 5, cost)],
+            &[],
+            &prices,
+        );
+        assert_eq!(turns_only.probe_calls, 0);
+    }
+
     #[test]
     fn empty_ledger_reports_zeros_and_no_savings_signal() {
         let report = aggregate(&[], &[], &PriceTable::bundled());
         assert_eq!(report.total.calls, 0);
+        assert_eq!(report.probe_calls, 0);
         assert_eq!(report.savings.actual_usd_micros, 0);
         assert_eq!(report.savings.baseline_usd_micros, 0);
         assert_eq!(report.savings.savings_usd_micros, 0);

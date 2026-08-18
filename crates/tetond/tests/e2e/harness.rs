@@ -84,6 +84,23 @@ fn contains(haystack: &[u8], needle: &[u8]) -> bool {
 // ---------------------------------------------------------------------------
 
 /// One canned mock-provider response: an HTTP status and a body.
+///
+/// ## Arbitrary statuses (REQ-581)
+///
+/// The connection test needs a provider that answers a *specific* failure —
+/// 401 vs 404 vs 429 vs 503 are four different diagnoses to a user, and the
+/// daemon classifies them from the status code alone. So the status here is a
+/// plain `u16` the server echoes verbatim ([`MockResponse::status`],
+/// [`MockProvider::always_status`]) rather than a fixed set of canned failures,
+/// and every response — whatever its code — is still recorded by
+/// [`MockProvider::requests`], which is what keeps "nothing left the machine"
+/// assertable.
+///
+/// The body is deliberately uninteresting: the daemon must never render a
+/// provider's error prose back to a user, so a connection-test assertion that
+/// depended on it would be asserting a bug. Bodies are always served as
+/// `text/event-stream` regardless of status — no header support (ADR-2), and
+/// the adapters branch on the status code before they look at the body.
 #[derive(Clone)]
 pub struct MockResponse {
     pub status: u16,
@@ -98,12 +115,28 @@ impl MockResponse {
         }
     }
 
+    /// A response with an arbitrary status and a small JSON error body.
+    ///
+    /// The body exists only so the response is not empty; nothing asserts on
+    /// it. Use [`Self::status_with_body`] when the body matters.
+    pub fn status(code: u16) -> Self {
+        Self::status_with_body(
+            code,
+            format!(r#"{{"error":{{"message":"mock provider status {code}"}}}}"#),
+        )
+    }
+
+    /// A response with an arbitrary status and a caller-chosen body.
+    pub fn status_with_body(code: u16, body: impl Into<String>) -> Self {
+        Self {
+            status: code,
+            body: body.into(),
+        }
+    }
+
     /// A hard client error (used to simulate a flaky provider for AC-7).
     pub fn bad_request() -> Self {
-        Self {
-            status: 400,
-            body: String::new(),
-        }
+        Self::status_with_body(400, String::new())
     }
 }
 
@@ -308,6 +341,13 @@ impl MockProvider {
         Self::start(Vec::new(), MockResponse::bad_request())
     }
 
+    /// A provider that always answers `code` — e.g. `401`, `404`, `429`, `503`
+    /// (REQ-581's connection test). Every such request is still recorded by
+    /// [`Self::requests`] / [`Self::request_count`].
+    pub fn always_status(code: u16) -> Self {
+        Self::start(Vec::new(), MockResponse::status(code))
+    }
+
     /// The chat/completions URL for an OpenAI-compatible provider config.
     pub fn openai_endpoint(&self) -> String {
         format!("http://127.0.0.1:{}/v1/chat/completions", self.port)
@@ -348,19 +388,43 @@ fn handle_http(
     record_egress(body.clone());
     requests.lock().unwrap().push(body);
 
-    let status_line = match response.status {
-        200 => "HTTP/1.1 200 OK",
-        400 => "HTTP/1.1 400 Bad Request",
-        500 => "HTTP/1.1 500 Internal Server Error",
-        _ => "HTTP/1.1 200 OK",
-    };
+    let code = response.status;
     let head = format!(
-        "{status_line}\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+        "HTTP/1.1 {code} {}\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+        reason_phrase(code),
         response.body.len()
     );
     let _ = stream.write_all(head.as_bytes());
     let _ = stream.write_all(response.body.as_bytes());
     let _ = stream.flush();
+}
+
+/// The reason phrase for a status line.
+///
+/// A client reads the *code*, not the phrase, so an unlisted code still gets a
+/// well-formed line with its own number — never a substituted one. (The earlier
+/// table answered anything it did not recognise with `200 OK`, which would have
+/// turned REQ-581's 401/404/429 cases into silent successes.)
+fn reason_phrase(status: u16) -> &'static str {
+    match status {
+        200 => "OK",
+        400 => "Bad Request",
+        401 => "Unauthorized",
+        403 => "Forbidden",
+        404 => "Not Found",
+        408 => "Request Timeout",
+        429 => "Too Many Requests",
+        500 => "Internal Server Error",
+        502 => "Bad Gateway",
+        503 => "Service Unavailable",
+        504 => "Gateway Timeout",
+        // Anything unlisted still gets its own code; only the prose is generic.
+        other => match other / 100 {
+            4 => "Client Error",
+            5 => "Server Error",
+            _ => "Status",
+        },
+    }
 }
 
 /// Read an HTTP request's body using its `Content-Length` header.

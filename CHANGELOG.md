@@ -18,6 +18,69 @@ unchanged. What belongs here is what an *upgrade* does to a machine that was
 already running — above all, anything that changes where data goes without the
 user having asked for it.
 
+## [Unreleased]
+
+### Added
+
+- **`/provider test <id>` — ask a provider whether it works, and get the
+  provider's own answer (REQ-581).** Registering a remote model and then asking
+  "is it connected?" used to be a question the product had no answer of its
+  own for: the local model would run `teton provider list`, misread it, guess
+  at a config directory, and tell you to re-export a key that was already in
+  the keychain. Now there is a command that actually asks:
+
+  ```
+  /provider test kimi
+    provider:  kimi (openai-compatible, kimi-k3) — https://api.moonshot.ai/v1/chat/completions
+    this sends one minimal request (a few tokens in, at most 8 out) to that endpoint. proceed?  [y/N] y
+    kimi kimi-k3: reachable — answered in 1.4 s (2040 in / 21 out, $0.006400 recorded); provider health: healthy.
+    `build` routes here (edit, shell).
+  ```
+
+  It sends **one** completion request down the exact path a turn takes — same
+  adapter, same transport, same credential resolution, same egress choke point
+  — with a fixed prompt, no tools, no conversation and the smallest token
+  budget the adapter allows. Never a `GET /v1/models` shortcut: proving an
+  endpoint reachable that a turn never POSTs to answers a question nobody
+  asked. Nothing leaves the machine until the preview names the provider, the
+  model and the endpoint it will dial and you answer `y` — an empty answer is
+  a no, and a piped invocation refuses unless you passed `--yes`.
+
+  What comes back is the daemon's own classification, typed, not a vendor's
+  prose read back to you: *reachable* (with latency, the token counts the
+  vendor billed, and the cost the ledger recorded), *refused* (401/403 —
+  naming the credential **reference**, `keychain://teton/kimi`, never the key
+  itself), *model unknown* (404, naming the model string your config declares),
+  *rate limited* (429), *server error* (5xx — the vendor answered and is
+  failing, so your configuration is not the suspect), *unreachable* (nothing
+  answered at all: DNS, TCP, TLS, a closed port), *answered, but not with a
+  completion* (something is listening and it is not a chat endpoint — a
+  redirect, a non-streaming endpoint, an address pasted without its
+  `/v1/chat/completions` path), or *no answer within 30 s* (the connection was
+  taken and nothing came back before the test stopped waiting). Those last
+  three are three different next moves — check the address, check the path,
+  check whether the vendor is up — so they are three different answers rather
+  than one word with three sentences. No response body and no header is ever
+  echoed into your transcript.
+
+  A test moves the same health the router reads, so a provider an earlier
+  failure had pushed aside is routable again on your very next turn once it
+  answers — and the report says what now routes there. It is a real model call
+  and is billed as one, tagged as a probe so `teton cost` counts it apart
+  (`probes: 1 connection test(s) — billed like any call, counted apart`)
+  instead of folding it into the turns you asked questions with.
+
+  `teton provider test <id> [--yes]` is the same thing from a shell — one
+  daemon method, two call sites, and the CLI still has no network path of its
+  own. And the session hands off to it rather than improvising: ask a turn
+  whether a provider is working and it names `/provider test <id>`.
+
+  Additive on the wire: one new `provider/test` method, one new
+  `provider_tested` event, a `probe` flag on cost records and a `probe_calls`
+  count on the cost report — both defaulted, so a `teton` reading an older
+  daemon's report simply sees no probes, which is the honest reading of a
+  daemon that could not make one.
+
 ## [0.1.19] - 2026-08-17
 
 ### Changed
