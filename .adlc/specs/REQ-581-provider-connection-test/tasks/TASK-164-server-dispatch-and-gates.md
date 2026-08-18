@@ -1,7 +1,7 @@
 ---
 id: TASK-164
 title: "Daemon server: dispatch provider/test on its own task behind the session gates"
-status: draft
+status: complete
 parent: REQ-581
 created: 2026-08-17
 updated: 2026-08-17
