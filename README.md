@@ -70,17 +70,15 @@ prompts:
 | `/web refresh <url>` | Drop a URL's cached copy so the next lookup re-fetches |
 | `/quit` (or `/exit`) | End the session (same as Ctrl-D) |
 
-Everything you would otherwise open a second terminal for is here too. Each of
-these *is* its `teton …` twin — the same arguments, the same error messages, the
-same renderer, the same daemon call — so the two surfaces cannot describe your
-machine differently:
+Everything you would otherwise open a second terminal for is here too. The ten
+commands below that have a `teton …` twin *are* that twin — the same arguments,
+the same error messages, the same renderer, the same daemon call — so the two
+surfaces cannot describe your machine differently:
 
 | Command | Effect |
 |---|---|
-| `/provider setup [vendor] [tier]` | Register a provider and route a tier to it, guided; confirm before anything is written |
 | `/provider list` | The providers registered on this machine, with what each one calls |
-| `/provider add <id> --kind … --endpoint … --model …` | Register one by hand; the key is asked for echo-off, never typed on the line |
-| `/provider test <id>` | One consented call to a provider, and the provider's own answer |
+| `/provider add <id> --kind … --endpoint … --model …` | Register one by hand; the session confirms first, then asks for the key echo-off — never typed on the line |
 | `/boundary list` | The path globs whose content never leaves this machine |
 | `/boundary add <glob> [--mode local-only\|redact-then-remote]` | Add a privacy boundary |
 | `/policy show` | The effective routing table: every tier, every category, where each resolves now |
@@ -90,13 +88,22 @@ machine differently:
 | `/model status` | The recorded model decision and the weights' install state |
 | `/doctor` | Diagnose the daemon, socket, model state and providers, over this session's own connection |
 
+Two more `/provider` commands are session-first rather than twins:
+`/provider setup [vendor] [tier]` registers a provider and routes a tier to it,
+guided, confirming before anything is written (there is no `teton provider
+setup`); and `/provider test <id>` makes one consented call to a provider and
+reports the provider's own answer, exactly as `teton provider test <id>` does
+from a shell.
+
 A line you type that begins with `teton` and names a real subcommand runs the
 session command for it, after one line saying so — `teton provider list` prints
 `>> teton provider list → /provider list` and then the listing. It is the same
-command, not a subprocess: no second connection and no model call. A line that
-is not a command (`teton is slow today`) still reaches the model unchanged, and
-`teton uninstall` is refused with the reason — it would stop the daemon under
-the session running it.
+command, not a subprocess: no second connection and no model call. The binary's
+own `--yes`/`--verbose` flags on such a line are ignored, and the session says
+so; `teton provider --help` prints the family's help. A line that is not a
+command (`teton is slow today`) still reaches the model unchanged, and `teton
+uninstall` is refused with the reason — it would stop the daemon under the
+session running it.
 
 Two limits. Arguments are split on whitespace and quotes are **not**
 interpreted, so a value containing a space has to be given to `teton` in a

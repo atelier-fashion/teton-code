@@ -1720,7 +1720,8 @@ mod guide_tests {
             if !GUIDE.contains(shell) {
                 continue;
             }
-            let session = match SESSION_ANSWERS.iter().find(|(row, _)| *row == name) {
+            let mapped = SESSION_ANSWERS.iter().find(|(row, _)| *row == name);
+            let session = match mapped {
                 Some((_, answer)) => (*answer).to_owned(),
                 None => format!("/{name}"),
             };
@@ -1733,6 +1734,25 @@ mod guide_tests {
                  lead), or add a row to `SESSION_ANSWERS` if this command's session answer \
                  is deliberately spelled differently."
             );
+            // A mapped equivalence is a claim that the guide teaches `session`
+            // *as the answer for* `shell`, and that is only true when the two
+            // sit on the same line (verify T7): `/provider setup` named in step
+            // 1 and `teton provider add` recited three steps later would let
+            // this sweep pass while the guide's actual instruction for a
+            // by-hand registration was the shell one. A row's own `/` spelling
+            // needs no such proximity — it is the same command under the name
+            // the session gives it.
+            if mapped.is_some() {
+                assert!(
+                    GUIDE
+                        .lines()
+                        .any(|line| line.contains(shell) && line.contains(&session)),
+                    "the bundled guide names `{shell}` and `{session}` on different lines, \
+                     so the mapping in `SESSION_ANSWERS` describes a pairing the guide does \
+                     not actually make. Put the session answer beside the shell form (as \
+                     step 1 does), or drop the equivalence and add the row's own spelling."
+                );
+            }
         }
     }
 }

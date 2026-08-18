@@ -3556,11 +3556,15 @@ fn a_piped_session_whose_reply_recites_the_cli_gets_no_hand_off_line() {
 
     // And the nudge is absent. Asserted on the sentence's distinctive halves
     // rather than the whole line, so a future rewording of it cannot make this
-    // pass by accident.
+    // pass by accident. The REQ-582 generic line's prefix is in the list too
+    // (verify T14): the reply recites two mirrored rows (`teton provider add`,
+    // `teton policy set-tier`), which is exactly what arms that line at a
+    // terminal, and a pipe must see neither sentence.
     for absent in [
         "does this without leaving it",
         "no key in chat",
         "/provider setup <vendor> [tier]",
+        "in this session:",
     ] {
         assert!(
             !session.contains(absent),
@@ -3739,6 +3743,153 @@ fn a_teton_line_with_no_session_form_is_refused_and_a_question_still_reaches_the
         "a refused line spent a turn: the reply queue moved three times; \
          output:\n{session}"
     );
+}
+
+/// **A recognized `teton …` line meets the same gates its `/` spelling meets
+/// (verify m15 / T8).** On a pipe, `teton policy set-tier build deepseek` is
+/// refused with the write row's own typed-input line, and `teton model set
+/// <name>` with `/model set`'s — the same sentences the `/` spellings print —
+/// and nothing changes: no `config/set`, no `model/set`, no turn.
+///
+/// The recognized spelling is the one a user pastes out of a shell recipe, so
+/// it is the spelling most likely to arrive over a pipe; a gate that only the
+/// `/` spelling met would be a gate with a second door.
+#[test]
+fn a_recognized_write_line_on_a_pipe_is_refused_exactly_as_its_slash_spelling() {
+    let daemon_path = daemon_bin();
+    let daemon = TestDaemon::spawn_scripted(&daemon_path, TURN_REPLIES);
+    let teton = teton_bin();
+
+    let policy_before = daemon.run_cli_stdout(&teton, &["policy", "show"]);
+    let status_before = daemon.run_cli_stdout(&teton, &["model", "status"]);
+
+    let session = daemon.run_cli_with_stdin(
+        &teton,
+        &[],
+        "teton policy set-tier build deepseek\n\
+         teton model set qwen2.5-coder-3b\n",
+    );
+
+    // Both lines were recognized: the notice names the session spelling.
+    for note in [
+        ">> teton policy set-tier → /policy set-tier",
+        ">> teton model set → /model set",
+    ] {
+        assert!(
+            session.contains(note),
+            "a recognized line must print its notice ({note:?}); output:\n{session}"
+        );
+    }
+    // And each was refused with the row's own sentence — the write row's, and
+    // `/model set`'s richer one that names `--yes`.
+    let policy_refusals: Vec<&str> = session
+        .lines()
+        .filter(|line| line.contains("/policy set-tier is typed-input-only"))
+        .collect();
+    assert_eq!(
+        policy_refusals.len(),
+        1,
+        "`teton policy set-tier` on a pipe must refuse in exactly one line; \
+         output:\n{session}"
+    );
+    assert!(
+        policy_refusals[0].contains("teton policy set-tier"),
+        "{}",
+        policy_refusals[0]
+    );
+    let model_refusals: Vec<&str> = session
+        .lines()
+        .filter(|line| line.contains("/model set is typed-input-only"))
+        .collect();
+    assert_eq!(
+        model_refusals.len(),
+        1,
+        "`teton model set` on a pipe must refuse in exactly one line; output:\n{session}"
+    );
+    assert!(
+        model_refusals[0].contains("--yes") && model_refusals[0].contains("teton model set"),
+        "{}",
+        model_refusals[0]
+    );
+    assert_no_turn_ran(&session, "the recognized write lines");
+
+    // Nothing moved, read back through the twins.
+    assert_eq!(
+        command_lines(&daemon.run_cli_stdout(&teton, &["policy", "show"])),
+        command_lines(&policy_before),
+        "a refused recognized `policy set-tier` changed the routing table"
+    );
+    assert_eq!(
+        command_lines(&daemon.run_cli_stdout(&teton, &["model", "status"])),
+        command_lines(&status_before),
+        "a refused recognized `model set` changed the model selection"
+    );
+}
+
+/// **A recognized line runs end to end on both sides of the gate (verify T10).**
+/// `teton doctor` — a read — answers on a pipe with the same report `/doctor`
+/// prints; and under the test seam `teton policy set-tier build deepseek`
+/// writes, read back through the shell twin. AC-5's parity test covers one read
+/// row; this is the second read row and the one write, so recognition is shown
+/// to reach the row's *body* and not only its refusal.
+#[test]
+fn a_recognized_doctor_reads_and_a_seamed_recognized_set_tier_writes() {
+    let daemon_path = daemon_bin();
+    let daemon = TestDaemon::spawn_scripted(&daemon_path, TURN_REPLIES);
+    let teton = teton_bin();
+
+    // The read: `teton doctor` typed at the prompt is `/doctor`, byte for byte
+    // after the notice line.
+    let slashed = daemon.run_cli_with_stdin(&teton, &[], "/doctor\n");
+    let typed = daemon.run_cli_with_stdin(&teton, &[], "teton doctor\n");
+    let note = ">> teton doctor → /doctor";
+    assert!(typed.contains(note), "output:\n{typed}");
+    let slashed_body = session_body(&slashed, "`/doctor`");
+    let typed_body = session_body(&typed, "`teton doctor`");
+    assert!(
+        slashed_body.contains("(this session's connection)"),
+        "`/doctor` did not render its report; output:\n{slashed}"
+    );
+    assert_eq!(
+        typed_body.replacen(&format!("{note}\n"), "", 1),
+        slashed_body,
+        "`teton doctor` and `/doctor` printed different sessions;\n\
+         typed:\n{typed}\nslashed:\n{slashed}"
+    );
+    assert_no_turn_ran(&typed, "a typed `teton doctor`");
+
+    // The write, under the seam the piped harness needs for a typed-input row.
+    let before = daemon.run_cli_stdout(&teton, &["policy", "show"]);
+    assert!(
+        !before.contains("build    → deepseek"),
+        "the fixture must start with `build` elsewhere; output:\n{before}"
+    );
+    let session = daemon.run_cli_seamed(&teton, &[], "teton policy set-tier build deepseek\n");
+    assert!(
+        session.contains(">> teton policy set-tier → /policy set-tier"),
+        "output:\n{session}"
+    );
+    assert!(
+        session.contains("the 'build' tier now routes to `deepseek`."),
+        "the recognized write did not report its write; output:\n{session}\n\
+         daemon log:\n{}",
+        daemon.log()
+    );
+    assert!(
+        !session.contains("typed-input-only"),
+        "a seamed session must not meet the write gate; output:\n{session}"
+    );
+    let after = daemon.run_cli_stdout(&teton, &["policy", "show"]);
+    let tier_row = after
+        .lines()
+        .find(|line| line.trim_start().starts_with("build "))
+        .unwrap_or_else(|| panic!("`teton policy show` printed no build row:\n{after}"));
+    assert!(
+        tier_row.contains("→ deepseek"),
+        "the recognized `policy set-tier` did not reach the daemon's routing \
+         table; row: {tier_row:?}\nfull:\n{after}"
+    );
+    assert_no_turn_ran(&session, "a recognized `teton policy set-tier`");
 }
 
 // ---------------------------------------------------------------------------
@@ -3922,9 +4073,9 @@ fn every_read_row_prints_exactly_what_its_shell_twin_prints() {
         // trailer is two of them — and each is removed exactly once, with the
         // leftovers asserted empty afterwards so an over- or under-match is a
         // failure rather than a quietly widened comparison.
-        let mut replay = attach_lines(&session);
+        let session_attach = attach_lines(&session);
         assert!(
-            !replay.is_empty(),
+            !session_attach.is_empty(),
             "the session printed nothing before its entry prompt, so the \
              attach-replay filter below holds over nothing; session:\n{session}"
         );
@@ -3933,6 +4084,11 @@ fn every_read_row_prints_exactly_what_its_shell_twin_prints() {
             .into_iter()
             .filter(|line| !is_daemon_line(line))
             .collect();
+        // The shell run's **own** attach lines: each line of its stdout that is
+        // one of the session's replay lines, taken out once, in the order the
+        // shell printed them (verify T15). What is left is the shell's report.
+        let mut replay = session_attach.clone();
+        let mut shell_attach: Vec<&str> = Vec::new();
         let shell_lines: Vec<&str> = shell_all
             .iter()
             .copied()
@@ -3940,17 +4096,34 @@ fn every_read_row_prints_exactly_what_its_shell_twin_prints() {
             .filter(|line| match replay.iter().position(|seen| seen == line) {
                 Some(at) => {
                     replay.remove(at);
+                    shell_attach.push(line);
                     false
                 }
                 None => true,
             })
             .collect();
+        // Multiset equality, both directions. Containment one way is the
+        // leftovers being empty; the other way is the report diff below — an
+        // extra replay line on the shell side (a lifecycle event fired between
+        // the two runs) has nowhere to hide but the shell's report, where the
+        // diff fails on it. Stated here as the equality it is, so a reader does
+        // not have to derive it from the two assertions.
         assert!(
             replay.is_empty(),
             "`teton {}` did not replay every line the session's attach did \
              ({replay:?}), so the two runs are not in the same daemon state and \
              the diff below would be about that; session:\n{session}\n\
              shell:\n{shell}",
+            argv.join(" ")
+        );
+        let mut sorted_shell = shell_attach.clone();
+        sorted_shell.sort_unstable();
+        let mut sorted_session = session_attach.clone();
+        sorted_session.sort_unstable();
+        assert_eq!(
+            sorted_shell,
+            sorted_session,
+            "`teton {}` and `/{row}` received different attach replays",
             argv.join(" ")
         );
         assert_eq!(
@@ -3965,12 +4138,21 @@ fn every_read_row_prints_exactly_what_its_shell_twin_prints() {
             // Only `/doctor` prints the line the filter above removes, so for
             // every other row the filter must have removed nothing — otherwise
             // the diff was run over a report with a line quietly taken out of
-            // it, on both sides, and would not have noticed.
+            // it, on both sides, and would not have noticed. Checked on **both**
+            // sides (verify m12): the session's rendering against its unfiltered
+            // self, and the shell's against its own line count less the replay.
             assert_eq!(
                 session_lines.len(),
                 typed_output(body, &format!("`/{row}`")).len(),
                 "`/{row}` printed a `{DOCTOR_DAEMON_LINE}…` line, so the \
                  `/doctor` carve-out silently applied to it; session:\n{session}"
+            );
+            assert_eq!(
+                shell_lines.len() + shell_attach.len(),
+                shell_all.len(),
+                "`teton {}` printed a `{DOCTOR_DAEMON_LINE}…` line, so the \
+                 `/doctor` carve-out silently applied to it; shell:\n{shell}",
+                argv.join(" ")
             );
             continue;
         }

@@ -5623,6 +5623,20 @@ mod tests {
             "the row the reply spelled only as a shell command is still named; got {:?}",
             surface.calls
         );
+
+        // Dormancy is a **word** match (verify m8): a `/doctor` inside a file
+        // path is not the session spelling, so a reply that named the path and
+        // told the user to run `teton doctor` still gets the nudge.
+        let surface = hand_off_turn(
+            &["the check lives in crates/teton/src/doctor.rs; run `teton doctor` to see it."],
+            true,
+        );
+        assert_eq!(
+            surface.lines_of(LineKind::Notice),
+            vec!["in this session: /doctor"],
+            "a path containing `/doctor` silenced the nudge; got {:?}",
+            surface.calls
+        );
     }
 
     /// A capitalised mention is prose about a command, not a command.
