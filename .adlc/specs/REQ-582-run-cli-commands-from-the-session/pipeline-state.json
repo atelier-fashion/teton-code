@@ -2,7 +2,7 @@
   "req": "REQ-582",
   "branch": "feat/REQ-582-run-cli-commands-from-the-session",
   "startedAt": "2026-08-18T13:12:46Z",
-  "completed": false,
+  "completed": true,
   "currentPhase": 8,
   "completedPhases": [
     0,
@@ -12,7 +12,8 @@
     4,
     5,
     6,
-    7
+    7,
+    8
   ],
   "phaseHistory": [
     {
@@ -54,6 +55,11 @@
       "phase": 7,
       "name": "PR Cleanup & CI",
       "completedAt": "2026-08-18T18:45:26Z"
+    },
+    {
+      "phase": 8,
+      "name": "Wrapup",
+      "completedAt": "2026-08-18T18:50:26Z"
     }
   ],
   "integrationBranch": "main",
@@ -67,7 +73,7 @@
       "prUrl": "https://github.com/atelier-fashion/teton-code/pull/174",
       "prNumber": 174,
       "prCreatedAt": "2026-08-18T13:12:49Z",
-      "merged": false,
+      "merged": true,
       "snapshotBranch": null,
       "snapshotPR": null
     }
