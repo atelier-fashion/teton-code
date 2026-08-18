@@ -883,9 +883,8 @@ fn render_help(surface: &mut dyn Surface) {
 /// row added to the table is nudged for without a second list to maintain, which
 /// is BR-7's rule ("`/help` is generated from the table") applied to the other
 /// surface that names commands.
-// The nudge is TASK-171's; the allowance goes with that commit, as TASK-168's
-// went with this one.
-#[allow(dead_code)]
+///
+/// Its one caller is [`crate::session_ui::hand_off_after_turn`]'s generic arm.
 pub(crate) fn mirrored_rows() -> impl Iterator<Item = (&'static str, &'static str)> {
     COMMANDS
         .iter()
