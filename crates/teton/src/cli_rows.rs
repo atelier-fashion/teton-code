@@ -445,9 +445,13 @@ pub(crate) fn handle_provider_list(
 ///
 /// The key is never an argument of this line: [`crate::provider_add_on`] reads
 /// it through `ctx.prompter.ask_secret` — echo-off, into the keychain — or from
-/// `TETON_PROVIDER_KEY`, exactly as the shell twin does (REQ-579 BR-2). Its three
-/// refusals arrive as a rendered line rather than an `Err`, so a mistyped
-/// registration does not end the session (ADR-3).
+/// `TETON_PROVIDER_KEY`, exactly as the shell twin does (REQ-579 BR-2), and in
+/// a session only after a default-no confirmation that names the settled
+/// registration (verify M1 — a pasted second line answers "no" instead of
+/// becoming the key). Its refusals — the three decisions, an endpoint the seam
+/// refuses, a keychain that will not store — arrive as a rendered line rather
+/// than an `Err`, so a mistyped registration does not end the session (ADR-3,
+/// verify m7); only a lost socket does.
 pub(crate) fn handle_provider_add(
     conn: &mut Connection,
     ctx: &mut UiContext<'_>,

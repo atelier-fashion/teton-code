@@ -3916,7 +3916,9 @@ fn a_recognized_doctor_reads_and_a_seamed_recognized_set_tier_writes() {
 // `a_session_provider_add_asks_for_its_key_echo_off_and_stores_nothing_untyped`,
 // and the seam question that test's doc comment answers — there is no keychain
 // double the shipped binary can be pointed at — is why the walk there stops
-// where it does.
+// where it does. The composed flow against a double — confirm, read, store,
+// `config/set` by reference, and the undo on a refused registration — is
+// `main.rs`'s `provider_add_on` tests over `MockKeychain` (verify M1/M4).
 
 /// A rendering's lines with leading and trailing blank lines removed.
 ///
