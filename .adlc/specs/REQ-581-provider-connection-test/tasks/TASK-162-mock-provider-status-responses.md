@@ -1,7 +1,7 @@
 ---
 id: TASK-162
 title: "e2e harness: MockProvider answers an arbitrary status (401/404/429/5xx)"
-status: draft
+status: complete
 parent: REQ-581
 created: 2026-08-17
 updated: 2026-08-17
