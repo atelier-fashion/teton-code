@@ -18,6 +18,64 @@ unchanged. What belongs here is what an *upgrade* does to a machine that was
 already running — above all, anything that changes where data goes without the
 user having asked for it.
 
+## [Unreleased]
+
+### Added
+
+- **The session runs Teton's own commands — no second terminal (REQ-582).**
+  Asked "I want to test the kimi connection", the model named `/provider test`
+  and then sent you to a shell for `teton provider list`; typed at the session
+  prompt, `teton provider list` went to the model as chat and came back as
+  "That one's for you to run — I can't execute `teton` commands myself. Type it
+  in your shell." That round trip is gone. Ten commands that were shell-only now
+  have a session spelling — `/provider list`, `/provider add`, `/boundary list`,
+  `/boundary add`, `/policy show`, `/policy set-tier`, `/policy set-category`,
+  `/model list`, `/model status`, `/doctor` — and each one *is* its shell twin:
+  the same argument grammar (the CLI's own parser, so `/policy set-tier build
+  kimi --fallback local` and its error messages are the ones you already know),
+  the same renderer, the same daemon call. A test drives both surfaces against
+  one daemon and diffs the lines, so the two cannot describe your machine
+  differently.
+
+  A line you type that *begins* with `teton` and names a real subcommand now
+  runs that command here, after one line saying so:
+
+  ```
+  › teton provider list
+  >> teton provider list → /provider list
+  providers:
+    kimi [openai-compatible]  kimi-k3  https://api.moonshot.ai/v1/chat/completions  auth: keychain
+  ```
+
+  No subprocess, no second connection, no model call — it dispatches to the same
+  row `/provider list` does, over the session's own socket. A line that is *not*
+  a command ("teton is slow today") still reaches the model with its bytes
+  unchanged; `teton uninstall` is refused with the reason (it would stop the
+  daemon under the session running it); a stray word gets the parser's own
+  `unexpected argument`, which is what a shell would have told you.
+
+  `/doctor` reports the connection the session already has rather than dialling
+  the socket again — one line differs from `teton doctor`'s (`(this session's
+  connection)` in place of the protocol version) and nothing else does, because
+  a fresh attach would announce a client into the very session being diagnosed.
+  And when a reply recites a shell command that has a session spelling, the
+  session says so once: `>> in this session: /provider list, /policy show`. The
+  bundled setup guide now names the `/` spellings first, so the model reaches
+  for them too.
+
+  Two limits worth knowing before you upgrade. Command arguments are split on
+  whitespace and **quotes are not interpreted**, so a value with a space in it
+  (a glob like `src/my notes/**`) still has to be given to `teton` in a shell —
+  `/help` says so in its footer. And the four rows that *write* (`/provider
+  add`, `/boundary add`, `/policy set-tier`, `/policy set-category`) are typed
+  input only: on a piped session they change nothing and print one line naming
+  the shell command to use instead. Every daemon-side gate is untouched — a
+  write from the session meets exactly what the shell twin meets, presence
+  attestation included. `/provider add`'s key is still read echo-off into the
+  keychain and is never an argument of the line.
+
+  Nothing new on the wire: no method, no event, no config key, no protocol bump.
+
 ## [0.1.20] - 2026-08-18
 
 ### Added

@@ -1637,3 +1637,87 @@ Second attach printed only `a CLI client attached` : yes / no
 Replay lines absent from the first session       : yes / no
 Notes / findings :
 ```
+
+# Manual verification runbook — REQ-582 (the session runs `teton`'s own commands)
+
+**Status: OUTSTANDING.** CI pins the mechanism at every seam it can reach: the
+read rows are byte-diffed against their shell twins over one daemon
+(`cli_e2e::every_read_row_prints_exactly_what_its_shell_twin_prints`), the write
+rows are read back through those twins, a typed `teton provider list` is diffed
+against `/provider list` and pinned to cost no turn, and the hand-off nudge has
+both a terminal test and a piped negative.
+
+What no CI run can settle is the thing that opened this REQ: a **live model**,
+asked a configuration question in a real session, sending the user to a shell.
+The harness line is the guarantee (LESSON-532 — presence in context is not
+instruction-following), and the guide edit is the improvement; only a real turn
+says whether the improvement landed. This runbook is that turn, and it is
+deliberately the exact flow from the 2026-08-18 dogfood of 0.1.20.
+
+## Procedure
+
+Run on the **shipped** binary, with `TETON_TEST_SEAMS` unset (a release build
+refuses to start when it is set, so a session that opened is already evidence).
+
+1. Start a session with `teton` and wait for `local model … ready`.
+2. Type, verbatim, the question that opened the REQ:
+
+   ```
+   I want to test the kimi connection
+   ```
+
+   Expect **either** the reply itself to name `/provider test <id>` or
+   `/provider list`, **or** the session to print one harness line after it:
+   `>> in this session: /provider list` (or, for a setup-shaped reply, REQ-579's
+   `/provider setup` sentence). Record which of the two happened — a reply that
+   names the `/` spelling by itself is the guide edit working; the harness line
+   is the guarantee behind it. A reply that sends you to a shell **and** no
+   harness line is the finding this REQ exists to prevent.
+3. At the same prompt type the shell spelling:
+
+   ```
+   teton provider list
+   ```
+
+   Expect one notice — `>> teton provider list → /provider list` — followed by
+   the provider listing, and **no** model reply of any kind ("that one's for you
+   to run…" is the 0.1.20 behaviour and must be gone). Confirm from a second
+   terminal that `teton provider list` prints the same lines.
+4. Type `/doctor`. Expect the daemon line to end `(this session's connection)`,
+   and expect **no** `a CLI client attached` line in this session — a fresh
+   attach would be announcing a client into the session being diagnosed.
+5. Type `/policy show`, then in a second terminal run `teton policy show`, and
+   compare. They must agree line for line.
+6. Type a line that is *not* a command — `teton is slow today` — and confirm it
+   reaches the model as an ordinary question, unchanged.
+7. Type `teton uninstall`. Expect one refusing line naming the shell, and
+   confirm the session is still alive and the daemon still running.
+8. A write, at the terminal: `/policy set-tier build <a registered provider>`.
+   Expect the binding line, then confirm `teton policy show` from a shell agrees.
+   Put it back afterwards.
+9. The piped half: `echo '/policy set-tier build local' | teton`. Expect one line
+   naming `teton policy set-tier` and **no** change to `teton policy show`.
+
+## Sign-off
+
+```
+REQ-582 sign-off
+----------------
+Verified by      :
+Date             :
+Platform / OS    :
+Build            :               (shipped version, `teton --version`)
+Local model      :
+TETON_TEST_SEAMS confirmed unset : yes / no
+Step 2 — reply named the / spelling itself : yes / no
+Step 2 — harness hand-off line printed     : yes / no  (which sentence?)
+Step 3 — `teton provider list` ran in-session, no model reply : yes / no
+Step 3 — same lines as the shell twin      : yes / no
+Step 4 — `/doctor` named this session's connection, no attach line : yes / no
+Step 5 — `/policy show` == `teton policy show` : yes / no
+Step 6 — a non-command `teton…` line still reached the model : yes / no
+Step 7 — `teton uninstall` refused, session and daemon alive : yes / no
+Step 8 — a typed write applied and the shell twin agreed : yes / no
+Step 9 — a piped write refused and changed nothing : yes / no
+Notes / findings :
+```

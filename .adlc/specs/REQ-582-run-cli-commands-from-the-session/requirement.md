@@ -155,6 +155,31 @@ None. No daemon change: every row is a new call site of an existing method
       commands have no `teton` form, so `teton provider setup …` typed at
       the prompt is a plain prompt — the model's own hand-off names
       `/provider setup` (REQ-579 ADR-9).
+      *(**Amended at TASK-170.** `teton provider setup` is **not** a plain
+      prompt. `setup` names no subcommand, so the clap walk stops on the
+      **family** `provider` — a recognized path with no row, which is BR-4's
+      own second arm — and the line is refused in one sentence that names the
+      session's rows under that family, `/provider setup` among them. The
+      amendment is an improvement rather than a concession: a user who typed
+      `teton provider setup` is asking for a command this session **has**, and
+      answering them directly beats spending a model turn on a hand-off that
+      says the same thing — the "the harness was asked and something else
+      answered" shape BR-4 exists to close (BUG-146, REQ-555 BR-2). REQ-579's
+      hand-off is untouched for the case it was built for: a **model reply**
+      that recites the shell recipe.)*
+      *(**Recorded deviation, TASK-170.** A bare family gets a sentence
+      composed from the **table** (`slash::rows_under`), not clap's own error
+      for that path as ADR-1 wrote it. `Cli::try_parse_from(["teton",
+      "provider"])` does not produce a short "requires a subcommand" error: the
+      derive marks the required subcommand `arg_required_else_help`, so clap
+      answers with the whole help page for the family — a screen of text whose
+      longest line is the global `--yes` description and whose `Usage:` /
+      "try `--help`" tail is a shell's instructions. A `Surface` line owns one
+      row, and BR-4 and ADR-1 both say one refusing line. Composing from the
+      table keeps the anti-drift property BR-3 is about — the table is the list
+      that decides what runs here — and is what lets the line name
+      `/provider setup`, a session row the CLI has no subcommand for at all.
+      Pinned by `slash.rs::a_teton_line_with_no_session_form_is_refused_with_the_reason`.)*
 - [ ] BR-5: **A `CliLine` runs the row, not a subprocess.** Recognition never
       spawns the `teton` binary and never opens a second connection: it
       dispatches to the same handler `/<row>` dispatches to, over the
@@ -212,28 +237,66 @@ None. No daemon change: every row is a new call site of an existing method
 
 ## Acceptance Criteria
 
-- [ ] AC-1: In a session, `/provider list`, `/boundary list`, `/policy show`,
+- [x] AC-1: In a session, `/provider list`, `/boundary list`, `/policy show`,
       `/model list`, `/model status` and `/doctor` each print exactly the
       lines their `teton …` twin prints against the same daemon (byte-diffed
       by a test that drives both), with `/doctor`'s connect arm replaced per
       BR-7.
-- [ ] AC-2: `/policy set-tier build <id>`, `/policy set-category edit <id>
+      *(`cli_e2e.rs::every_read_row_prints_exactly_what_its_shell_twin_prints`
+      — twelve client runs against one daemon, line-for-line; the `/doctor`
+      carve-out asserted on each side. Unit legs:
+      `cli_rows.rs::every_read_row_sends_its_shell_twins_method_on_the_sessions_connection`,
+      `cli_rows.rs::doctor_reports_the_connection_the_session_already_has`.)*
+- [x] AC-2: `/policy set-tier build <id>`, `/policy set-category edit <id>
       --fallback <id>` and `/boundary add <glob> --mode local-only` change the
       daemon's config exactly as their shell twins do (asserted on
       `config/get` before/after), and the next turn routes accordingly.
-- [ ] AC-3: `/provider add <id> --kind openai-compatible --endpoint <url>
+      *(`cli_e2e.rs::the_write_rows_change_the_config_their_shell_twins_read_back`
+      — before/after through `teton policy show` and `teton boundary list`, so
+      the evidence is the daemon's own resolution and not the writing row's
+      echo. Argument parity:
+      `cli_rows.rs::a_row_parses_its_argument_exactly_as_the_shell_parses_its_argv`.)*
+- [x] AC-3: `/provider add <id> --kind openai-compatible --endpoint <url>
       --model <m>` on a TTY reads the key echo-off, stores it in the keychain,
       registers the provider, and the key appears nowhere in the transcript,
       the session's events, or the model's context (egress-capture assertion,
       REQ-579's harness).
-- [ ] AC-4: On piped stdin every write row (`provider add`, `boundary add`,
+      *(`pty_e2e.rs::a_session_provider_add_asks_for_its_key_echo_off_and_stores_nothing_untyped`
+      + `cli_rows.rs::provider_add_reads_its_key_through_the_hiding_prompt_and_never_as_a_flag`.
+      **Covered with one documented gap**: no test types a credential here,
+      because `provider_add_on` stores through `keychain::default_keychain()`
+      — the real login keychain on macOS — with no seam to redirect it and no
+      confirm step between the read and the store, so a completed walk would
+      write a credential into whoever ran the suite (the rule
+      `pty_e2e.rs`'s REQ-572 test already records). What is asserted instead:
+      the row runs at a TTY, reaches the credential step, asks through
+      `ask_secret` and only through it, takes no `--key` flag (the parser
+      rejects one), refuses on an empty answer with `config.toml`
+      byte-identical and no `config/set` — and the echo bit itself
+      **fail-closed**: under a pty `EchoState::NoTerminal` is unreachable and
+      `EchoState::Failed` refuses to read, so a read that happened without
+      `ECHO_UNAVAILABLE` is a read with echo off. The completed store against a
+      keychain double is `main.rs`'s `MockKeychain` registration tests; the
+      bytes-on-a-screen sweep of a real typed credential is
+      `pty_e2e.rs::the_key_step_does_not_echo_and_the_key_reaches_nothing`,
+      over the same `Prompter::ask_secret` seam this row reads through.)*
+- [x] AC-4: On piped stdin every write row (`provider add`, `boundary add`,
       `policy set-tier`, `policy set-category`) rejects with one line naming
       the shell command; every read row works.
-- [ ] AC-5: Typing `teton provider list` at the session prompt prints
+      *(`cli_e2e.rs::on_a_pipe_every_write_row_names_its_shell_twin_and_changes_nothing`
+      — one refusal line each, the three reads answering on the same pipe, and
+      the twins' readings unchanged afterwards. Unit legs:
+      `cli_rows.rs::a_write_row_on_a_pipe_names_its_shell_twin_and_sends_nothing`,
+      `cli_rows.rs::a_read_row_ignores_the_write_gate`.)*
+- [x] AC-5: Typing `teton provider list` at the session prompt prints
       `>> teton provider list → /provider list` and then the same lines as
       `/provider list`; no model call is made (no `route_decided`, no
       `CostRecord`, no `session_update`) — asserted over the wire.
-- [ ] AC-6: Typing `teton uninstall` prints one refusing line naming the
+      *(`cli_e2e.rs::a_typed_teton_line_runs_the_row_it_names_and_costs_no_turn`
+      — the two spellings' whole session bodies diffed, and the scripted reply
+      queue pinned untouched. Unit:
+      `slash.rs::every_row_that_names_a_subcommand_is_reachable_from_a_typed_teton_line`.)*
+- [x] AC-6: Typing `teton uninstall` prints one refusing line naming the
       shell pointer and makes no call; typing `teton is slow today` reaches
       the model as a prompt with the bytes unchanged; typing `teton provider
       list please` is recognized (its subcommand path is a row) and prints
@@ -242,28 +305,72 @@ None. No daemon change: every row is a new call site of an existing method
       word sent to the model reproduces the failure this REQ removes; the
       subcommand path is decided by clap's tree, the arguments by clap's
       grammar.)*
-- [ ] AC-7: `/policy set-tier build` (missing arg) and `/policy set-tier
+      *(`cli_e2e.rs::a_teton_line_with_no_session_form_is_refused_and_a_question_still_reaches_the_model`
+      — four lines, one session, the reply queue as the arithmetic. Units:
+      `slash.rs::a_teton_line_with_no_session_form_is_refused_with_the_reason`,
+      `slash.rs::a_teton_line_that_names_no_subcommand_is_a_byte_identical_prompt`,
+      `slash.rs::a_recognized_line_with_a_stray_word_prints_the_parsers_own_error`,
+      `slash.rs::the_double_slash_escape_still_outranks_recognition`.)*
+- [x] AC-7: `/policy set-tier build` (missing arg) and `/policy set-tier
       summit kimi` (bad enum) print the CLI parser's own error for that
       subcommand — the same text `teton policy set-tier build` prints — and
       issue no RPC.
-- [ ] AC-8: `/help` lists every new row, grouped by family; the table-vs-help
+      *(`cli_rows.rs::a_bad_argument_renders_claps_own_error_and_sends_nothing`
+      — both spec examples, compared against `Cli::try_parse_from`'s own
+      rendering for the same argv, with the socket asserted silent; and
+      `cli_rows.rs::a_help_request_renders_claps_help_for_that_subcommand`.)*
+- [x] AC-8: `/help` lists every new row, grouped by family; the table-vs-help
       test still holds; `//` footer unchanged.
-- [ ] AC-9: A scripted turn whose reply says "run `teton provider list` and
+      *(`cli_e2e.rs::slash_help_lists_every_mirrored_row_grouped_with_both_footers`
+      — the shipped binary's listing: the ten rows with their summaries, the
+      fourteen that were already there, contiguous families, both footers.
+      Unit: `slash.rs::help_lists_every_mirrored_row_grouped_by_family`,
+      `slash.rs::help_lists_every_alias_that_dispatches`.)*
+- [x] AC-9: A scripted turn whose reply says "run `teton provider list` and
       `teton policy show`" prints exactly one line `>> in this session:
       /provider list, /policy show`; a reply that says "run `/provider list`"
       prints nothing; a reply that names `teton provider add …` prints the
       REQ-579 line and not the generic one; a reply about "the teton binary
       being slow" prints nothing.
-- [ ] AC-10: The guide test pins BR-9: every `teton <sub>` the guide names
+      *(`session_ui.rs::a_reply_that_recites_shell_twins_names_their_session_spellings`,
+      `a_reply_that_already_names_the_session_spelling_earns_nothing`,
+      `the_setup_hand_off_wins_over_the_generic_line`,
+      `the_connection_hand_off_wins_over_the_generic_line`,
+      `a_reply_that_names_no_mirrored_command_earns_nothing`,
+      `a_capitalised_mention_of_a_command_is_not_one`,
+      `the_generic_line_is_tty_only_and_prints_once_per_turn`,
+      `every_mirrored_row_is_a_candidate_of_the_generic_line`. The piped
+      negative at the binary:
+      `cli_e2e.rs::a_piped_session_whose_reply_recites_the_cli_gets_no_hand_off_line`.)*
+- [x] AC-10: The guide test pins BR-9: every `teton <sub>` the guide names
       that has a session row also appears as `/<row>` in the guide.
-- [ ] AC-11: On a `presence`-featured build, `/policy set-tier build kimi`
+      *(`cli_rows.rs::guide_tests::the_guide_names_every_mirrored_command_in_its_session_spelling`
+      — over the guide's own bytes via `include_str!`, with the one recorded
+      equivalence (`provider add` → `/provider setup`) and a non-vacuity check
+      that the guide names at least one mirrored command in `teton …` form.)*
+- [x] AC-11: On a `presence`-featured build, `/policy set-tier build kimi`
       raises the same presence prompt `teton policy set-tier` raises and a
       cancel leaves `config.toml` byte-identical (REQ-576 AC-6 pattern, via
       the `TETON_PRESENCE_ACCEPT=fail` seam — informed by LESSON-519,
       LESSON-520: pair the refused test with an accepted one on a payload
       that would persist).
-- [ ] AC-12: The workspace suite passes; no new protocol types; `git diff
+      *(`cli_e2e.rs::a_presence_refused_session_set_tier_leaves_the_config_untouched`
+      + `cli_e2e.rs::an_attested_session_set_tier_writes` — the refuse/accept
+      pair on one line, with the file read back on both. **Amendment**: the
+      test is not feature-gated and does not need to be. `TETON_PRESENCE_ACCEPT`
+      installs a verifier in place of whatever the build has
+      (`tetond::attest::seam_verifier`), so a default build driven through it
+      takes the same `config/set` path a `--features presence` build takes with
+      a real mechanism — which is how `tetond/tests/config_set_attestation.rs`
+      already drives this gate. The seam rides `TETON_TEST_SEAMS`, and a
+      release build refuses to start when that is set, so none of it exists in
+      a shipped binary. The refusal is also asserted identical to the shell
+      twin's, which is BR-6's claim.)*
+- [x] AC-12: The workspace suite passes; no new protocol types; `git diff
       -- crates/teton-protocol/src/` is empty.
+      *(`git diff origin/main...HEAD -- crates/teton-protocol/src/` printed
+      zero lines at TASK-173; the workspace suite is green under
+      `cargo test --workspace --no-fail-fast` with no `FAILED`.)*
 
 ## External Dependencies
 

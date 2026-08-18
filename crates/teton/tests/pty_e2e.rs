@@ -957,3 +957,212 @@ fn a_reply_reciting_the_cli_earns_the_hand_off_line_at_a_terminal() {
         "the hand-off must follow the reply it is about; transcript:\n{seen}"
     );
 }
+
+// ---------------------------------------------------------------------------
+// REQ-582 AC-3 — `/provider add` at a real terminal (TASK-173)
+// ---------------------------------------------------------------------------
+//
+// ## What this covers, and the one thing no test in this repository can
+//
+// AC-3 asks for a `/provider add` on a TTY that reads the key echo-off, stores
+// it in the keychain, registers the provider, and leaks the key nowhere. Three
+// of those four are here. The keychain store is not, and the reason is the same
+// one `the_key_step_does_not_echo_and_the_key_reaches_nothing` records for
+// `/web setup` one section above: **the shipped `teton` writes credentials to
+// the real OS keychain** (`keychain::default_keychain()`, called inside
+// `provider_add_on`), and there is no seam that redirects it. `provider add`'s
+// order is settle → read key → store → `config/set`, with no confirm step
+// between the read and the store, so any test that types a key here would create
+// — and, on a rejected registration, delete — an entry in whoever's login
+// keychain ran the suite. No test may do that, and adding a redirect seam would
+// mean shipping a build that can be talked into writing a plaintext secret
+// somewhere else.
+//
+// So the key is never typed, and the echo claim is made **fail-closed** instead
+// of by sweeping a transcript for a value:
+//
+//   * `StdinPrompter::ask_secret` clears `ECHO` before it reads and refuses to
+//     read at all if it cannot (`EchoState::Failed` → `ECHO_UNAVAILABLE`,
+//     nothing read, nothing stored).
+//   * Under a pty, stdin *is* a terminal, so `EchoState::NoTerminal` — the one
+//     state that reads unhidden — is unreachable by construction.
+//   * Therefore a run that reached the read (the prompt was answered and the
+//     flow moved on) and did **not** print `ECHO_UNAVAILABLE` is a run in which
+//     echo was actually off for the read.
+//
+// The bytes-on-a-screen half of the same claim — a real credential typed at a
+// real terminal appearing nowhere — is `the_key_step_does_not_echo_and_the_key_
+// reaches_nothing`, over the *same* `Prompter::ask_secret` seam this row reads
+// through (`read_secret(id, prompter)`, ADR-3). What REQ-582 changed is which
+// prompter that seam is handed, not what it does.
+//
+// The rest of AC-3 — the flow completing against a keychain double, and the key
+// crossing the wire only as a `keychain://` reference — is pinned in-process by
+// `main.rs`'s `MockKeychain` registration tests.
+
+/// A credential-shaped sentinel that is **never typed**. It is the name of the
+/// thing this test deliberately does not do, and it is swept out of the
+/// transcript anyway so that a future edit which starts typing a key here fails
+/// loudly rather than quietly writing to somebody's login keychain.
+const NEVER_TYPED_KEY: &str = "sk-provider-NEVER-TYPED-9Fh3xQ";
+
+/// **AC-3 (terminal half): `/provider add` runs at a TTY, asks for its key
+/// through the hiding prompt, and stores nothing when none is typed — while the
+/// one kind that needs no key registers end to end.**
+///
+/// Two rows through one session, because the pair is what makes each half mean
+/// something:
+///
+/// * `--kind openai-compatible` reaches the credential step. The write gate let
+///   it through (this is typed input, ADR-4), clap parsed the four flags, the
+///   duplicate probe and the endpoint settlement passed, and the session's own
+///   prompter asked for the key. An empty answer refuses; nothing is registered
+///   and `config.toml` is byte-identical.
+/// * `--kind local` needs no credential, so it goes all the way: the daemon
+///   applies the registration and the config on disk gains the provider. Without
+///   it, "the config did not change" above would be indistinguishable from a row
+///   that cannot write at all.
+#[test]
+fn a_session_provider_add_asks_for_its_key_echo_off_and_stores_nothing_untyped() {
+    let daemon_path = daemon_bin();
+    // Every tier on the scripted local tier, for the REQ-558 reason the other
+    // typed-turn tests here bind them: a session that cannot serve a turn cannot
+    // reach its entry prompt in the state these steps assume.
+    let tiers: String = ["reflex", "scan", "build", "think"]
+        .iter()
+        .map(|t| format!("[[tiers]]\ntier = \"{t}\"\nprovider_id = \"local\"\n\n"))
+        .collect();
+    let config = format!("[[providers]]\nid = \"local\"\nkind = \"local\"\n\n{tiers}");
+    let daemon = TestDaemon::spawn_with(&daemon_path, &config, &["a scripted reply."]);
+    let config_path = daemon.root.join("config.toml");
+
+    let pty = native_pty_system()
+        .openpty(PtySize {
+            rows: 40,
+            // Wide enough that the command lines below are not hard-wrapped: a
+            // wrapped line is still correct output, but it would split a marker
+            // and fail an assertion about wording rather than about behaviour.
+            cols: 200,
+            pixel_width: 0,
+            pixel_height: 0,
+        })
+        .expect("openpty");
+
+    let mut cmd = CommandBuilder::new(teton_bin());
+    cmd.env("XDG_RUNTIME_DIR", &daemon.runtime_dir);
+    cmd.env("TETON_CONFIG", &config_path);
+    cmd.env("TETON_REPO_ROOT", &daemon.root);
+    // `read_secret` takes this variable ahead of the prompt, so an exported
+    // value in a developer's shell would skip the credential step entirely —
+    // and then store that value in the **real OS keychain**, which is the one
+    // thing this test exists not to do. Removed rather than merely unset.
+    cmd.env_remove("TETON_PROVIDER_KEY");
+    let mut session = pty.slave.spawn_command(cmd).expect("spawn teton under pty");
+    drop(pty.slave);
+    let transcript = spawn_reader(pty.master.try_clone_reader().expect("pty reader"));
+    let mut writer = pty.master.take_writer().expect("pty writer");
+
+    assert!(
+        wait_for(&transcript, "ready (freeform)"),
+        "the session never reached the entry prompt; transcript:\n{}",
+        snapshot(&transcript)
+    );
+
+    // Read the baseline here, not at spawn: a starting daemon normalises its own
+    // config once (the REQ-557 model migration), so bytes read earlier would
+    // report a write this session never made.
+    let before = std::fs::read(&config_path).expect("the fixture config exists");
+
+    let step = |writer: &mut Box<dyn Write + Send>, text: &str, until: &str| {
+        writer
+            .write_all(text.as_bytes())
+            .expect("type into the pty");
+        writer.flush().ok();
+        assert!(
+            wait_for(&transcript, until),
+            "the walk never reached {until:?}; transcript:\n{}",
+            snapshot(&transcript)
+        );
+    };
+
+    // (1) A remote registration reaches the credential step — through the write
+    // gate, through clap's parse of all four flags, through the duplicate probe
+    // and the endpoint settlement. The prompt's own wording is the assertion:
+    // it names the provider and promises the value will not be shown.
+    step(
+        &mut writer,
+        "/provider add kimi2 --kind openai-compatible \
+         --endpoint http://127.0.0.1:1/v1/chat/completions --model kimi-k3\r",
+        "API key for `kimi2` (not shown; stored only in the keychain):",
+    );
+
+    // (2) An empty answer. `prompt_for_secret` treats it as "nothing was typed"
+    // and the row renders `ProviderAddRefusal::NoKey` — one line, and the
+    // session carries on (ADR-3).
+    step(&mut writer, "\r", "no API key provided");
+
+    // (3) The fail-closed echo proof. Reaching (2) means `ask_secret` performed
+    // its read; under a pty `EchoState::NoTerminal` is unreachable, and
+    // `EchoState::Failed` would have printed this sentence *instead of* reading.
+    // So its absence, together with the refusal above, is the statement that
+    // echo was off while the terminal was waiting for a credential.
+    let after_key = snapshot(&transcript);
+    assert!(
+        !after_key.contains("this terminal would not turn echo off"),
+        "the key prompt could not clear ECHO, so the read was refused rather \
+         than hidden and this test proves nothing about echo; \
+         transcript:\n{after_key}"
+    );
+
+    // (4) Nothing was registered, and the file says so.
+    assert_eq!(
+        std::fs::read(&config_path).ok().as_deref(),
+        Some(before.as_slice()),
+        "a `/provider add` that never got a key must leave config.toml \
+         byte-identical; transcript:\n{after_key}"
+    );
+
+    // (5) The non-vacuity half: a registration that needs **no** credential goes
+    // all the way from this session's prompt to the daemon's config. Without it
+    // (4) would also pass on a row that cannot write at all.
+    step(
+        &mut writer,
+        "/provider add localy --kind local\r",
+        "provider `localy` registered",
+    );
+
+    let final_transcript = snapshot(&transcript);
+    let _ = session.kill();
+    let _ = session.wait();
+
+    let after = std::fs::read_to_string(&config_path).expect("the config still exists");
+    assert!(
+        after.contains("localy"),
+        "the local registration never reached config.toml:\n{after}"
+    );
+    assert!(
+        !after.contains("kimi2"),
+        "the refused registration reached config.toml after all:\n{after}"
+    );
+    // A local provider has no credential, so it must never have been asked for
+    // one — the prompt appears exactly once in this whole session, at step (1).
+    assert_eq!(
+        final_transcript.matches("API key for `").count(),
+        1,
+        "the key prompt was drawn for a kind that has no key, or drawn twice; \
+         transcript:\n{final_transcript}"
+    );
+    // And the guard against a future edit that starts typing one here.
+    assert!(
+        !final_transcript.contains(NEVER_TYPED_KEY),
+        "this test types no credential by design (see the section comment): the \
+         shipped binary would put it in the real OS keychain; \
+         transcript:\n{final_transcript}"
+    );
+    // The daemon never saw a credential either — only a registration without one.
+    let log = std::fs::read_to_string(daemon.root.join("tetond.log")).unwrap_or_default();
+    assert!(
+        !log.contains(NEVER_TYPED_KEY),
+        "a credential reached the daemon's log:\n{log}"
+    );
+}

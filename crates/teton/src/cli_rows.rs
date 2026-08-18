@@ -1025,6 +1025,97 @@ mod tests {
         );
     }
 
+    /// AC-3's seam: `/provider add` reads its key through the **hiding** prompt
+    /// and never off the command line.
+    ///
+    /// Three claims, one run:
+    ///
+    /// * the credential question went through [`Prompter::ask_secret`]
+    ///   (`prompter.secrets`) and not [`Prompter::ask`] — the choice REQ-572
+    ///   made and the one a later edit could silently swap back;
+    /// * it was the row's **only** question, so nothing else in this flow reads
+    ///   from the user at a point a key could be mistaken for an answer;
+    /// * an empty answer refuses, and the only method that reached the daemon is
+    ///   the duplicate probe — no `config/set`, so no registration and no
+    ///   reference to a key that does not exist.
+    ///
+    /// The answer is empty **by necessity**, not for convenience: `provider_add_on`
+    /// stores through `keychain::default_keychain()`, which on macOS is the real
+    /// login keychain, and there is no seam that redirects it. A scripted
+    /// prompter that returned a value would therefore write a credential to
+    /// whoever's keychain ran `cargo test`. The completed store is asserted
+    /// where a keychain double *is* injectable — `main.rs`'s
+    /// `registration_params` / `report_registration_outcome` tests over
+    /// `MockKeychain` — and the terminal's echo bit in `pty_e2e.rs`.
+    #[test]
+    fn provider_add_reads_its_key_through_the_hiding_prompt_and_never_as_a_flag() {
+        // A `--key` flag does not exist and must not: the credential would be in
+        // the session's scrollback, in any recording of it, and — for a typed
+        // `teton provider add … --key …` — in a shell history file.
+        let with_flag = Cli::try_parse_from(mirrored_argv(
+            PROVIDER_ADD.shell,
+            "kimi2 --kind openai-compatible --endpoint https://x/v1/chat/completions \
+             --model kimi-k3 --key sk-not-a-thing",
+        ))
+        .expect_err("`--key` must not parse");
+        assert!(
+            with_flag.render().to_string().contains("--key"),
+            "the parser must reject `--key` by name: {with_flag}"
+        );
+
+        let (mut conn, peer) = Connection::scripted(&[empty_config()]);
+        let mut surface = RecordingSurface::new();
+        let mut state = SessionState::new();
+        // Empty: "nothing was typed", the one error `read_secret` has.
+        let mut prompter = ScriptedPrompter::new(&[""]);
+        {
+            let mut ctx = session_ctx(&mut surface, &mut state, &mut prompter, true);
+            let outcome = run_mirrored_seamed(
+                PROVIDER_ADD,
+                "kimi2 --kind openai-compatible --endpoint https://x/v1/chat/completions \
+                 --model kimi-k3",
+                &mut conn,
+                &mut ctx,
+                false,
+            )
+            .expect("a missing key is a refusal, not a failure");
+            assert_eq!(outcome, CommandOutcome::Continue);
+        }
+
+        assert_eq!(
+            prompter.secrets.len(),
+            1,
+            "the key must be read through `ask_secret`, once: {:?}",
+            prompter.secrets
+        );
+        assert!(
+            prompter.secrets[0].contains("API key for `kimi2`")
+                && prompter.secrets[0].contains("not shown"),
+            "the question must name the provider and promise not to show the \
+             value: {:?}",
+            prompter.secrets[0]
+        );
+        assert_eq!(
+            prompter.asked, 1,
+            "the credential is the row's only question: {:?}",
+            prompter.questions
+        );
+        let lines = surface.lines_of(LineKind::Error);
+        assert_eq!(
+            lines.len(),
+            1,
+            "one line, and only one: {:?}",
+            surface.calls
+        );
+        assert!(lines[0].contains("no API key provided"), "{}", lines[0]);
+        assert_eq!(
+            methods_sent(&peer),
+            vec!["config/get"],
+            "a registration that got no key must send nothing but the duplicate \
+             probe"
+        );
+    }
+
     /// ADR-4's polarity, at this module's own gate. The seam only ever
     /// **loosens** — which is what makes ignoring it on a release build
     /// fail-closed (see [`test_seams_allowed`]).

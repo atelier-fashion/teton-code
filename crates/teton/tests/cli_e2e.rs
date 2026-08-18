@@ -103,7 +103,36 @@ impl TestDaemon {
         Self::spawn_with_script(daemon, None, extra)
     }
 
+    /// A scripted daemon whose presence verifier is the REQ-575 seam's — `"fail"`
+    /// for a present-but-refusing mechanism, `"1"` for an accepting one.
+    ///
+    /// The seam rides `TETON_TEST_SEAMS`, which this fixture already sets and
+    /// which a release build refuses to start under, so it cannot exist in a
+    /// shipped binary (`tetond`'s `seam_verifier`). It is also **not** gated on
+    /// the `presence` cargo feature: the seam installs a verifier in place of the
+    /// build's own, so a default build driven through it takes exactly the
+    /// `config/set` path a `presence` build takes with a real mechanism. That is
+    /// what lets REQ-582 AC-11 be a plain e2e rather than a feature-gated one —
+    /// see the two tests that use it.
+    fn spawn_scripted_with_presence(daemon: &Path, replies: &[&str], mode: &str) -> Self {
+        Self::spawn_with_script_env(
+            daemon,
+            Some(replies),
+            "",
+            &[("TETON_PRESENCE_ACCEPT", mode)],
+        )
+    }
+
     fn spawn_with_script(daemon: &Path, replies: Option<&[&str]>, extra_config: &str) -> Self {
+        Self::spawn_with_script_env(daemon, replies, extra_config, &[])
+    }
+
+    fn spawn_with_script_env(
+        daemon: &Path,
+        replies: Option<&[&str]>,
+        extra_config: &str,
+        extra_env: &[(&str, &str)],
+    ) -> Self {
         static SEQ: AtomicUsize = AtomicUsize::new(0);
         let seq = SEQ.fetch_add(1, Ordering::SeqCst);
         // The `-` is load-bearing: without it `tc{pid}{seq}` is ambiguous — pid
@@ -207,6 +236,9 @@ impl TestDaemon {
             .stderr(Stdio::from(log));
         if let Some(script) = &script {
             command.env("TETON_LOCAL_SCRIPT", script);
+        }
+        for (key, value) in extra_env {
+            command.env(key, value);
         }
         let child = command.spawn().expect("spawn teton-code");
 
@@ -3706,5 +3738,717 @@ fn a_teton_line_with_no_session_form_is_refused_and_a_question_still_reaches_the
         !session.contains(TURN_REPLIES[2]),
         "a refused line spent a turn: the reply queue moved three times; \
          output:\n{session}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// REQ-582 — the mirrored rows against their shell twins (AC-1, AC-2, AC-4,
+// AC-8, AC-11)
+// ---------------------------------------------------------------------------
+//
+// AC → test map for this section:
+//
+//   AC-1 (a read row prints what its twin prints)
+//       → `every_read_row_prints_exactly_what_its_shell_twin_prints`
+//   AC-2 (the write rows change the config the twins read back)
+//       → `the_write_rows_change_the_config_their_shell_twins_read_back`
+//   AC-4 (a write row on a pipe refuses; a read row does not)
+//       → `on_a_pipe_every_write_row_names_its_shell_twin_and_changes_nothing`
+//   AC-8 (`/help` lists every new row, grouped, with both footers)
+//       → `slash_help_lists_every_mirrored_row_grouped_with_both_footers`
+//   AC-11 (presence: a refused write leaves config.toml byte-identical)
+//       → `a_presence_refused_session_set_tier_leaves_the_config_untouched`
+//       + `an_attested_session_set_tier_writes` (the non-vacuity anchor)
+//
+// AC-3 (`/provider add`'s echo-off key) is not here and cannot be: a pipe has no
+// echo bit. Its terminal half is `pty_e2e.rs`'s
+// `a_session_provider_add_asks_for_its_key_echo_off_and_stores_nothing_untyped`,
+// and the seam question that test's doc comment answers — there is no keychain
+// double the shipped binary can be pointed at — is why the walk there stops
+// where it does.
+
+/// A rendering's lines with leading and trailing blank lines removed.
+///
+/// The interior is untouched, so a dropped line, a reordered one or a reworded
+/// one all fail; what is discarded is only the padding around the two capture
+/// windows, which differ by construction. A shell command's stdout ends at its
+/// last line; a session body is a slice between two anchors and carries whatever
+/// blank line the session put between the command's last line and its
+/// end-of-session summary. Comparing those two verbatim would be comparing the
+/// harnesses rather than the renderings.
+fn command_lines(text: &str) -> Vec<&str> {
+    let mut lines: Vec<&str> = text.lines().collect();
+    while lines.first().is_some_and(|line| line.trim().is_empty()) {
+        lines.remove(0);
+    }
+    while lines.last().is_some_and(|line| line.trim().is_empty()) {
+        lines.pop();
+    }
+    lines
+}
+
+/// The entry prompt a piped session draws before every line it reads
+/// (`main`'s `entry_prompt`, non-interactive form).
+///
+/// It is written without a newline, so the first line of whatever the session
+/// prints next is *prefixed* with it — and the next prompt opens the line after
+/// the command's last. That makes it exactly the frame [`typed_output`] needs.
+const ENTRY_PROMPT: &str = "› ";
+
+/// What one typed line made a piped session print, taken out of its frame.
+///
+/// A session body opens at an entry prompt, carries the command's rendering, and
+/// then draws the next prompt — on whose line the end-of-session summary lands
+/// when stdin is closed. So the command's own output is everything between the
+/// first prompt and the second, with the first prompt's two characters removed
+/// from the head of the line it shares.
+///
+/// Extracted rather than tolerated, because the alternative is comparing a
+/// shell's output against a slice that carries a prompt on one end and a cost
+/// summary's preamble on the other — a comparison that would have to be loosened
+/// until it stopped being a diff.
+fn typed_output<'a>(body: &'a str, what: &str) -> Vec<&'a str> {
+    let mut lines = body.lines();
+    let first = lines
+        .next()
+        .and_then(|line| line.strip_prefix(ENTRY_PROMPT))
+        .unwrap_or_else(|| panic!("{what} did not open at an entry prompt; body:\n{body}"));
+    let mut out = vec![first];
+    for line in lines {
+        if line.starts_with(ENTRY_PROMPT) {
+            break;
+        }
+        out.push(line);
+    }
+    while out.last().is_some_and(|line| line.trim().is_empty()) {
+        out.pop();
+    }
+    out
+}
+
+/// The complete lines a session printed before its entry prompt — the daemon's
+/// replay of the model lifecycle to the connection that just attached
+/// (BUG-177's routing), which every client run against the same daemon receives.
+///
+/// The final segment is dropped because it is not a complete line: the session
+/// announces itself with `session <id> ready (freeform)…`, and the anchor this
+/// splits on sits in the middle of it.
+fn attach_lines(session: &str) -> Vec<&str> {
+    let head = session
+        .split(READY_MARKER)
+        .next()
+        .expect("split always yields a first segment");
+    let mut lines: Vec<&str> = head.lines().collect();
+    lines.pop();
+    lines.retain(|line| !line.trim().is_empty());
+    lines
+}
+
+/// The six read rows: the session spelling, and the argv its shell twin takes.
+///
+/// Written out rather than derived from the table, deliberately: this suite runs
+/// the **shipped binary** and knows nothing of the crate's internals, so the two
+/// spellings being the same words is a claim under test here rather than an
+/// assumption. (`cli_rows.rs`'s unit tests pin the derivation itself.)
+const READ_ROWS: &[(&str, &[&str])] = &[
+    ("provider list", &["provider", "list"]),
+    ("boundary list", &["boundary", "list"]),
+    ("policy show", &["policy", "show"]),
+    ("model list", &["model", "list"]),
+    ("model status", &["model", "status"]),
+    ("doctor", &["doctor"]),
+];
+
+/// The one line `/doctor` and `teton doctor` are allowed to disagree about
+/// (BR-7, ADR-5): the shell handshakes and can name the protocol version, the
+/// session reports the connection it already has.
+const DOCTOR_DAEMON_LINE: &str = "daemon: running — ";
+
+/// **AC-1: every read row prints exactly what its shell twin prints.**
+///
+/// One daemon, twelve client runs: each row is driven from a shell (`teton
+/// provider list`) and from a piped session (`/provider list`), and the two
+/// renderings are diffed line by line. Not a `contains` of a phrase from each
+/// report — a `contains` passes on half a report, on a report rendered by a
+/// second copy of the renderer that has since drifted, and on a row that reached
+/// a different command with overlapping output. The diff is the only statement
+/// that says "one grammar, one renderer, one daemon method" (BR-2; LESSON-517 —
+/// the seam is the ground truth for parity, so pin the crossing bytes).
+///
+/// Both surfaces are a `PlainSurface` over a pipe with colour off, so the line
+/// classes draw the same prefixes on both (`>> ` for a notice, nothing for
+/// info) and the comparison is on whole lines rather than on text after a
+/// prefix. That is worth stating because it is a property of `render.rs` this
+/// test depends on rather than one it asserts: if the two surfaces ever
+/// diverge, this test is where it shows up.
+///
+/// `/doctor` carries the single documented exception (BR-7): the line naming the
+/// daemon is dropped from both sides before the diff, and then each side's own
+/// version of it is asserted — the shell's from a fresh handshake, the
+/// session's from the connection it is already on.
+#[test]
+fn every_read_row_prints_exactly_what_its_shell_twin_prints() {
+    let daemon_path = daemon_bin();
+    let daemon = TestDaemon::spawn_scripted(&daemon_path, TURN_REPLIES);
+    let teton = teton_bin();
+
+    for (row, argv) in READ_ROWS {
+        let shell = daemon.run_cli_stdout(&teton, argv);
+        let session = daemon.run_cli_with_stdin(&teton, &[], &format!("/{row}\n"));
+        let body = session_body(&session, &format!("`/{row}`"));
+
+        // The precondition for the whole comparison: the shell twin actually
+        // rendered a report. Without it a daemon that answered nothing would
+        // make two empty strings equal and this test would pass on silence.
+        let shell_all = command_lines(&shell);
+        assert!(
+            !shell_all.is_empty(),
+            "`teton {}` printed nothing at all; stdout:\n{shell}",
+            argv.join(" ")
+        );
+
+        // **The shell run attaches too**, and since BUG-177 the daemon replays
+        // the model lifecycle to whichever connection is attaching — so a shell
+        // command's stdout also carries the `>> probe: …` / `>> local model …
+        // ready` lines the session printed before its own entry prompt. They are
+        // part of neither rendering, and they do not sit in one place: `doctor`
+        // prints its header before the `config/get` those frames are drained by,
+        // so they land *inside* its report while `provider list` sees them ahead
+        // of one.
+        //
+        // So they are removed by identity rather than by position or by shape.
+        // The lines are taken from the session's own attach — a shape filter
+        // (`>> `) would also swallow a report's own notices, and `/doctor`'s
+        // trailer is two of them — and each is removed exactly once, with the
+        // leftovers asserted empty afterwards so an over- or under-match is a
+        // failure rather than a quietly widened comparison.
+        let mut replay = attach_lines(&session);
+        assert!(
+            !replay.is_empty(),
+            "the session printed nothing before its entry prompt, so the \
+             attach-replay filter below holds over nothing; session:\n{session}"
+        );
+        let is_daemon_line = |line: &&str| line.starts_with(DOCTOR_DAEMON_LINE);
+        let session_lines: Vec<&str> = typed_output(body, &format!("`/{row}`"))
+            .into_iter()
+            .filter(|line| !is_daemon_line(line))
+            .collect();
+        let shell_lines: Vec<&str> = shell_all
+            .iter()
+            .copied()
+            .filter(|line| !is_daemon_line(line))
+            .filter(|line| match replay.iter().position(|seen| seen == line) {
+                Some(at) => {
+                    replay.remove(at);
+                    false
+                }
+                None => true,
+            })
+            .collect();
+        assert!(
+            replay.is_empty(),
+            "`teton {}` did not replay every line the session's attach did \
+             ({replay:?}), so the two runs are not in the same daemon state and \
+             the diff below would be about that; session:\n{session}\n\
+             shell:\n{shell}",
+            argv.join(" ")
+        );
+        assert_eq!(
+            session_lines,
+            shell_lines,
+            "`/{row}` and `teton {}` printed different reports.\n\
+             session:\n{session}\nshell:\n{shell}",
+            argv.join(" ")
+        );
+
+        if *row != "doctor" {
+            // Only `/doctor` prints the line the filter above removes, so for
+            // every other row the filter must have removed nothing — otherwise
+            // the diff was run over a report with a line quietly taken out of
+            // it, on both sides, and would not have noticed.
+            assert_eq!(
+                session_lines.len(),
+                typed_output(body, &format!("`/{row}`")).len(),
+                "`/{row}` printed a `{DOCTOR_DAEMON_LINE}…` line, so the \
+                 `/doctor` carve-out silently applied to it; session:\n{session}"
+            );
+            continue;
+        }
+
+        // BR-7: the carve-out itself. The session names the attach it already
+        // has; the shell names the protocol it just negotiated. Each is asserted
+        // on its own side, so a build that printed the session's wording from
+        // the shell (or the reverse) fails here rather than passing the diff.
+        let line_of = |text: &str, what: &str| -> String {
+            text.lines()
+                .find(|line| line.starts_with(DOCTOR_DAEMON_LINE))
+                .unwrap_or_else(|| panic!("{what} printed no daemon line; output:\n{text}"))
+                .to_owned()
+        };
+        let session_daemon = line_of(body, "`/doctor`");
+        let shell_daemon = line_of(&shell, "`teton doctor`");
+        assert!(
+            session_daemon.ends_with("(this session's connection)"),
+            "BR-7: `/doctor` must report the connection this session already \
+             has, not a fresh handshake; line: {session_daemon:?}"
+        );
+        assert!(
+            shell_daemon.contains("(protocol "),
+            "`teton doctor` still handshakes, so it still names the protocol; \
+             line: {shell_daemon:?}"
+        );
+        // And they agree about everything a handshake does not decide — the
+        // daemon's name and version — which is what makes the carve-out one
+        // clause rather than one line of a different report.
+        let named = shell_daemon
+            .trim_start_matches(DOCTOR_DAEMON_LINE)
+            .split(" (protocol ")
+            .next()
+            .expect("the shell line names a daemon")
+            .to_owned();
+        assert!(
+            session_daemon.contains(&named),
+            "the two doctor reports name different daemons: {session_daemon:?} \
+             vs {shell_daemon:?}"
+        );
+    }
+}
+
+/// **AC-2: the write rows change the config their shell twins read back.**
+///
+/// Driven under `TETON_TEST_SEAMS=1` (`run_cli_seamed`) because the rows are
+/// typed-input-only and this harness is a pipe (ADR-4) — the refusal that gate
+/// produces without the seam is AC-4's subject, one test below.
+///
+/// The evidence is deliberately **the twin's own reading**, not the writing
+/// row's echo: `/policy set-tier` saying "the 'build' tier now routes to
+/// `deepseek`" is a sentence this client composed, while `teton policy show`
+/// re-deriving that binding from the daemon's resolver is the daemon agreeing.
+/// The before/after pair makes each assertion non-vacuous — the fixture binds
+/// every tier to `local`, so a row that did nothing would leave `build` there.
+#[test]
+fn the_write_rows_change_the_config_their_shell_twins_read_back() {
+    let daemon_path = daemon_bin();
+    let daemon = TestDaemon::spawn_scripted(&daemon_path, TURN_REPLIES);
+    let teton = teton_bin();
+
+    // Before: the fixture's own bindings, read through the twins.
+    let policy_before = daemon.run_cli_stdout(&teton, &["policy", "show"]);
+    let boundary_before = daemon.run_cli_stdout(&teton, &["boundary", "list"]);
+    assert!(
+        policy_before.contains("build") && !policy_before.contains("build    → deepseek"),
+        "the fixture must start with `build` bound somewhere other than \
+         deepseek, or the assertion below proves nothing; output:\n{policy_before}"
+    );
+    assert!(
+        boundary_before.contains("no privacy boundaries configured"),
+        "the fixture must start with no boundaries; output:\n{boundary_before}"
+    );
+
+    let session = daemon.run_cli_seamed(
+        &teton,
+        &[],
+        "/policy set-tier build deepseek\n\
+         /policy set-category edit deepseek --fallback local\n\
+         /boundary add src/** --mode local-only\n",
+    );
+
+    // What each row said it did — the client's half, and the precondition for
+    // reading anything into the config below.
+    for said in [
+        "the 'build' tier now routes to `deepseek`.",
+        "the 'edit' category now routes to `deepseek` (fallback local).",
+        "boundary added: src/** [local-only]",
+    ] {
+        assert!(
+            session.contains(said),
+            "a write row did not report its write ({said:?}); output:\n{session}\n\
+             daemon log:\n{}",
+            daemon.log()
+        );
+    }
+    // And no row met the typed-input gate: the seam is what this test is driven
+    // through, so a refusal here would mean the seam stopped working and every
+    // assertion below would be about a config nothing wrote.
+    assert!(
+        !session.contains("typed-input-only"),
+        "a seamed session must not meet the write gate; output:\n{session}"
+    );
+
+    // After: the twins read the daemon's own resolution back.
+    let policy_after = daemon.run_cli_stdout(&teton, &["policy", "show"]);
+    let boundary_after = daemon.run_cli_stdout(&teton, &["boundary", "list"]);
+    let tier_row = policy_after
+        .lines()
+        .find(|line| line.trim_start().starts_with("build "))
+        .unwrap_or_else(|| panic!("`teton policy show` printed no build row:\n{policy_after}"));
+    assert!(
+        tier_row.contains("→ deepseek"),
+        "`/policy set-tier build deepseek` did not reach the daemon's routing \
+         table; row: {tier_row:?}\nfull:\n{policy_after}"
+    );
+    let category_row = policy_after
+        .lines()
+        .find(|line| line.trim_start().starts_with("edit "))
+        .unwrap_or_else(|| panic!("`teton policy show` printed no edit row:\n{policy_after}"));
+    assert!(
+        category_row.contains("→ deepseek") && category_row.contains("(fallback local)"),
+        "`/policy set-category edit deepseek --fallback local` did not reach the \
+         routing table with its fallback; row: {category_row:?}\nfull:\n{policy_after}"
+    );
+    assert!(
+        boundary_after.contains("  src/** [local-only]"),
+        "`/boundary add src/** --mode local-only` did not reach the privacy \
+         boundaries; output:\n{boundary_after}"
+    );
+}
+
+/// **AC-4: on a pipe every write row refuses by naming its shell twin, and every
+/// read row still answers.**
+///
+/// The same session drives both halves, because the pairing is the rule (BR-11):
+/// a gate that also stopped the reads would make the piped e2e suites — all of
+/// them — blind to the rows this REQ added, and a gate that stopped nothing would
+/// let a CI step reconfigure the machine it runs on.
+///
+/// "Changed nothing" is read back through the shell twins afterwards rather than
+/// inferred from the refusal, for LESSON-519's reason: the error is what the
+/// client said, and the config is what happened.
+#[test]
+fn on_a_pipe_every_write_row_names_its_shell_twin_and_changes_nothing() {
+    let daemon_path = daemon_bin();
+    let daemon = TestDaemon::spawn_scripted(&daemon_path, TURN_REPLIES);
+    let teton = teton_bin();
+
+    let policy_before = daemon.run_cli_stdout(&teton, &["policy", "show"]);
+    let boundary_before = daemon.run_cli_stdout(&teton, &["boundary", "list"]);
+    let providers_before = daemon.run_cli_stdout(&teton, &["provider", "list"]);
+
+    let session = daemon.run_cli_with_stdin(
+        &teton,
+        &[],
+        "/provider add kimi2 --kind openai-compatible \
+         --endpoint http://127.0.0.1:1/v1/chat/completions --model kimi-k3\n\
+         /boundary add src/** --mode local-only\n\
+         /policy set-tier build deepseek\n\
+         /policy set-category edit deepseek --fallback local\n\
+         /provider list\n\
+         /policy show\n\
+         /boundary list\n",
+    );
+
+    // Each write row: exactly one line, naming the row, what was checked, and
+    // the shell command that does the same thing unattended.
+    for (row, twin) in [
+        ("provider add", "teton provider add"),
+        ("boundary add", "teton boundary add"),
+        ("policy set-tier", "teton policy set-tier"),
+        ("policy set-category", "teton policy set-category"),
+    ] {
+        let refusals: Vec<&str> = session
+            .lines()
+            .filter(|line| line.contains(&format!("/{row} is typed-input-only")))
+            .collect();
+        assert_eq!(
+            refusals.len(),
+            1,
+            "`/{row}` on a pipe must refuse in exactly one line; output:\n{session}"
+        );
+        assert!(
+            refusals[0].contains(twin),
+            "`/{row}`'s refusal must name `{twin}`; line: {:?}",
+            refusals[0]
+        );
+        assert!(
+            refusals[0].contains("not a terminal"),
+            "`/{row}`'s refusal must say what was actually checked; line: {:?}",
+            refusals[0]
+        );
+    }
+    // BR-11: the reads on the same pipe answered.
+    for answered in [
+        "providers:",
+        "tiers — the primary surface",
+        "no privacy boundaries configured",
+    ] {
+        assert!(
+            session.contains(answered),
+            "a read row was refused on the same pipe ({answered:?}); \
+             output:\n{session}"
+        );
+    }
+    // A refused row costs no turn either: it never reaches the model.
+    assert_no_turn_ran(&session, "the piped write rows");
+
+    // And nothing moved. Read back through the twins, byte for byte.
+    assert_eq!(
+        command_lines(&daemon.run_cli_stdout(&teton, &["policy", "show"])),
+        command_lines(&policy_before),
+        "a refused write row changed the routing table"
+    );
+    assert_eq!(
+        command_lines(&daemon.run_cli_stdout(&teton, &["boundary", "list"])),
+        command_lines(&boundary_before),
+        "a refused write row changed the privacy boundaries"
+    );
+    assert_eq!(
+        command_lines(&daemon.run_cli_stdout(&teton, &["provider", "list"])),
+        command_lines(&providers_before),
+        "a refused `/provider add` registered a provider"
+    );
+}
+
+/// **AC-8: `/help` lists every mirrored row, grouped, with both footers.**
+///
+/// The unit test in `slash.rs` pins that the listing is *generated* from the
+/// table and that the grouping rule holds over it; this pins that the **shipped
+/// binary** prints the ten rows a user is meant to discover, with the summaries
+/// that tell them what each one takes. A row that dispatches and cannot be found
+/// in `/help` is a row the user does not have (BUG-153) — which for this REQ
+/// would mean shipping the parity and hiding it.
+#[test]
+fn slash_help_lists_every_mirrored_row_grouped_with_both_footers() {
+    let daemon_path = daemon_bin();
+    let daemon = TestDaemon::spawn_scripted(&daemon_path, TURN_REPLIES);
+    let teton = teton_bin();
+
+    let session = daemon.run_cli_with_stdin(&teton, &[], "/help\n");
+    // The listing on its own: the first row line shares its row with the entry
+    // prompt the session drew before reading `/help`, and every check below is
+    // about what the row line says rather than about that frame.
+    let listing = typed_output(session_body(&session, "`/help`"), "`/help`");
+
+    // The ten new rows, each with the head of the summary `/help` generates for
+    // it. Asserted as a `/name … summary` pair on one rendered line, so a row
+    // that lost its summary — or gained a second, hand-written listing — fails.
+    for (name, summary) in [
+        (
+            "/provider list",
+            "List the providers registered on this machine",
+        ),
+        (
+            "/provider add",
+            "Register a provider by hand: /provider add <id>",
+        ),
+        ("/boundary list", "List the privacy boundaries"),
+        ("/boundary add", "Add a privacy boundary over a path glob"),
+        ("/policy show", "Show the effective routing table"),
+        (
+            "/policy set-tier",
+            "Route a tier to a provider: /policy set-tier",
+        ),
+        (
+            "/policy set-category",
+            "Route one category ahead of its tier",
+        ),
+        ("/model list", "Show the model catalog"),
+        ("/model status", "Report the recorded model decision"),
+        (
+            "/doctor",
+            "Diagnose the daemon, socket, model state, and providers",
+        ),
+    ] {
+        assert!(
+            listing
+                .iter()
+                .any(|line| line.contains(name) && line.contains(summary)),
+            "`{name}` is missing from /help with its summary; output:\n{session}"
+        );
+    }
+    // The rows that were already there are still there — a regrouped listing
+    // that dropped one would be a worse `/help` than the one this REQ found.
+    for name in [
+        "/help",
+        "/cost",
+        "/effort",
+        "/model",
+        "/model set",
+        "/clear",
+        "/verbose",
+        "/permissions",
+        "/web setup",
+        "/web allow",
+        "/web refresh",
+        "/provider setup",
+        "/provider test",
+        "/quit",
+    ] {
+        assert!(
+            listing
+                .iter()
+                .any(|line| line.starts_with(&format!("{name} "))),
+            "`{name}` vanished from /help; output:\n{session}"
+        );
+    }
+
+    // The grouping (BR-1): a family's rows are one contiguous run, and a blank
+    // line separates it from the next family. Read off the rendered listing by
+    // its first words rather than assumed from the table.
+    assert!(
+        listing.iter().any(|line| line.trim().is_empty()),
+        "the listing has no blank line, so nothing is grouped; \
+         listing:\n{listing:#?}"
+    );
+    let mut seen: Vec<String> = Vec::new();
+    let mut current: Option<String> = None;
+    for line in &listing {
+        let Some(name) = line.strip_prefix('/') else {
+            current = None;
+            continue;
+        };
+        let family = name
+            .split_whitespace()
+            .next()
+            .expect("a row line names a row")
+            .to_owned();
+        if current.as_deref() != Some(family.as_str()) {
+            assert!(
+                !seen.contains(&family),
+                "the `/{family}` rows are not contiguous in /help — a family \
+                 listed twice is a listing a reader has to scan twice; \
+                 listing:\n{listing:#?}"
+            );
+            seen.push(family.clone());
+            current = Some(family);
+        }
+    }
+
+    // Both footers, and the argument one is where OQ-5's limitation is
+    // documented for the user rather than only for the spec.
+    assert!(
+        session
+            .contains("Command arguments are split on whitespace and quotes are not interpreted"),
+        "/help must document how a mirrored row reads its arguments; \
+         output:\n{session}"
+    );
+    assert!(
+        session.contains("//text sends text as a prompt with one leading slash"),
+        "/help must still document the // escape; output:\n{session}"
+    );
+    assert_no_turn_ran(&session, "`/help`");
+}
+
+// ---------------------------------------------------------------------------
+// REQ-582 AC-11 — a write row meets the daemon's presence gate exactly as its
+// shell twin does
+// ---------------------------------------------------------------------------
+//
+// BR-6's claim is that the write rows send the *same* `config/set` params their
+// twins send, so every daemon-side gate applies to them unchanged. The gate
+// worth proving that against is REQ-576's presence attestation, because it is
+// the one that refuses a payload the client has already accepted — and because
+// "nothing was written" is a claim about a file, which only a real daemon with a
+// real config on disk can settle (LESSON-519: inspect, do not infer).
+//
+// The pair is deliberate (LESSON-520): the refusing test's byte-identical
+// assertion is only worth something because the accepting test proves the very
+// same line does write when presence is satisfied.
+//
+// **Not feature-gated, and why.** `TETON_PRESENCE_ACCEPT` installs a verifier in
+// place of whatever the build has (`tetond`'s `seam_verifier`), so a default
+// build driven through it takes the same `config/set` path a `--features
+// presence` build takes with a real mechanism — which is exactly how
+// `tetond/tests/config_set_attestation.rs` drives the same gate. The seam rides
+// `TETON_TEST_SEAMS`, and a release build refuses to start when that is set, so
+// none of this exists in a shipped binary.
+
+/// The daemon's own sentence for a presence-gated `config/set` it refused,
+/// passed through by the client rather than paraphrased (LESSON-456 — the daemon
+/// classifies, the client renders). The client's own half of the line (`the
+/// 'build' tier was not bound: …`) is asserted beside it.
+const ATTESTATION_REFUSED: &str = "the presence check did not pass";
+
+/// **AC-11 (refused): a presence-refused `/policy set-tier` leaves `config.toml`
+/// byte-identical, and says what the shell twin says.**
+#[test]
+fn a_presence_refused_session_set_tier_leaves_the_config_untouched() {
+    let daemon_path = daemon_bin();
+    let daemon = TestDaemon::spawn_scripted_with_presence(&daemon_path, TURN_REPLIES, "fail");
+    let teton = teton_bin();
+    let config_path = daemon.root.join("config.toml");
+
+    // Read the baseline only after a client round-trip has completed: a starting
+    // daemon normalises its own config once (the REQ-557 model migration), so
+    // bytes read before that would report a write this test never made.
+    let _ = daemon.run_cli_stdout(&teton, &["policy", "show"]);
+    let before = std::fs::read(&config_path).expect("the fixture config exists");
+
+    let session = daemon.run_cli_seamed(&teton, &[], "/policy set-tier build deepseek\n");
+    let shell = daemon.run_cli(&teton, &["policy", "set-tier", "build", "deepseek"]);
+
+    assert!(
+        session.contains("the 'build' tier was not bound"),
+        "a refused `/policy set-tier` must report the refusal in the client's \
+         own sentence; output:\n{session}\ndaemon log:\n{}",
+        daemon.log()
+    );
+    assert!(
+        session.contains(ATTESTATION_REFUSED),
+        "the refusal must be the daemon's attestation refusal, passed through \
+         rather than paraphrased; output:\n{session}"
+    );
+    // The same gate, the same words, from the shell — which is BR-6's whole
+    // claim: the row sends what the twin sends, so it meets what the twin meets.
+    assert!(
+        shell.contains("the 'build' tier was not bound") && shell.contains(ATTESTATION_REFUSED),
+        "`teton policy set-tier` must meet the same gate; output:\n{shell}"
+    );
+
+    // AC-11's load-bearing half: the file, not the error.
+    assert_eq!(
+        std::fs::read(&config_path).ok().as_deref(),
+        Some(before.as_slice()),
+        "a presence-refused `/policy set-tier` must leave config.toml \
+         byte-identical"
+    );
+    // And the running config agrees with the file.
+    let policy = daemon.run_cli_stdout(&teton, &["policy", "show"]);
+    let build_row = policy
+        .lines()
+        .find(|line| line.trim_start().starts_with("build "))
+        .unwrap_or_else(|| panic!("no build row:\n{policy}"));
+    assert!(
+        !build_row.contains("→ deepseek"),
+        "the refused binding reached the running config; row: {build_row:?}"
+    );
+}
+
+/// **AC-11 (attested): the same line writes when presence is satisfied.**
+///
+/// The non-vacuity anchor for the test above — a payload that could never apply
+/// would leave `config.toml` untouched whatever the gate did.
+#[test]
+fn an_attested_session_set_tier_writes() {
+    let daemon_path = daemon_bin();
+    let daemon = TestDaemon::spawn_scripted_with_presence(&daemon_path, TURN_REPLIES, "1");
+    let teton = teton_bin();
+    let config_path = daemon.root.join("config.toml");
+
+    let _ = daemon.run_cli_stdout(&teton, &["policy", "show"]);
+    let before = std::fs::read(&config_path).expect("the fixture config exists");
+
+    let session = daemon.run_cli_seamed(&teton, &[], "/policy set-tier build deepseek\n");
+
+    assert!(
+        session.contains("the 'build' tier now routes to `deepseek`."),
+        "an attested `/policy set-tier` must apply; output:\n{session}\n\
+         daemon log:\n{}",
+        daemon.log()
+    );
+    assert_ne!(
+        std::fs::read(&config_path).ok().as_deref(),
+        Some(before.as_slice()),
+        "the attested `/policy set-tier` must actually change config.toml (so \
+         the refused test's byte-identical assertion means something)"
+    );
+    let policy = daemon.run_cli_stdout(&teton, &["policy", "show"]);
+    let build_row = policy
+        .lines()
+        .find(|line| line.trim_start().starts_with("build "))
+        .unwrap_or_else(|| panic!("no build row:\n{policy}"));
+    assert!(
+        build_row.contains("→ deepseek"),
+        "the attested binding never reached the running config; \
+         row: {build_row:?}"
     );
 }
