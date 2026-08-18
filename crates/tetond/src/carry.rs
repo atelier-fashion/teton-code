@@ -473,6 +473,29 @@ mod tests {
         );
     }
 
+    /// **The remote path with no prose (BUG-179), at the gate.** A native call
+    /// that arrived with no text is recorded as the call itself and pushed
+    /// through `push_model_call`, so a cancellation here drops the block whole:
+    /// no prose to keep, and — the point — no empty assistant turn committed
+    /// for the next prompt to replay as `{"role":"assistant","content":""}`.
+    #[test]
+    fn a_cancelled_remote_turn_with_no_prose_commits_no_assistant_block_at_all() {
+        let (sessions, session_id) = one_session();
+        {
+            let mut turn = begin_turn(&sessions, &session_id);
+            // Exactly what the loop does for the BUG-179 stand-in
+            // (`call_in_text == true`, text == the rendered call).
+            turn.ctx_mut()
+                .push_model_call(r#"{"tool":"read","arguments":{"path":"src/lib.rs"}}"#);
+        }
+        let conversation = sessions.conversation_snapshot(&session_id);
+        assert_eq!(
+            texts(conversation.blocks()),
+            ["do the thing"],
+            "a cancelled no-prose remote turn must leave neither its call nor an empty block"
+        );
+    }
+
     /// **After dispatch.** The tool ran; the cancellation landed in the refine
     /// or digest await that follows. The call block stays as the honest trace of
     /// what happened — an edit that reached the disk is on the disk, and a

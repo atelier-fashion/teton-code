@@ -1338,7 +1338,9 @@ impl ContextManager {
     /// are merged, so the messages always alternate user/assistant starting with a
     /// user turn — the shape Anthropic requires and every OpenAI-compatible
     /// endpoint accepts. This replaces the single-`User`-blob request that
-    /// collapsed system, history, and tool results together.
+    /// collapsed system, history, and tool results together. An assistant block
+    /// with no text contributes **no** message (BUG-179): providers reject an
+    /// empty assistant turn outright, so it never reaches the wire from here.
     #[must_use]
     pub fn prepare(&self, hook: &mut dyn ProvenanceHook) -> PreparedPrompt {
         // Reuse assemble for the flat rendering AND the hook invocations, so the
@@ -1373,6 +1375,23 @@ impl ContextManager {
             // point below the format branch is what keeps the raw arm from
             // becoming the exploit (LESSON-474).
             let content = super::render::neutralize_frame_labels(&block.text);
+            // BUG-179: an assistant block that says nothing contributes no
+            // message. Every provider this shape reaches rejects an empty
+            // assistant turn — Moonshot with `must not be empty`, Anthropic for
+            // any non-final one — and the wire is not where a request shape gets
+            // repaired: `build_request` serializes what it is handed, and this is
+            // the seam that already owns the shape (M-8, just below). The block
+            // itself stays in the context and in the flat rendering — the local
+            // tier's rendering is byte-identical to before (REQ-554) — and only
+            // the structured sequence omits it, so the user-role blocks either
+            // side merge as any same-role neighbours do. The remote source now
+            // records a no-prose native call as the call (`completion.rs`), so
+            // this is the backstop for the other empty-turn shapes: an
+            // `EndTurn` that produced no text and the verification nudge that
+            // pushes it.
+            if role == MessageRole::Assistant && content.trim().is_empty() {
+                continue;
+            }
             let text = match &block.provenance {
                 Provenance::Tool { tool, .. } => {
                     format!("{TOOL_RESULT_LABEL_PREFIX}{tool}):\n{content}")
@@ -1842,6 +1861,67 @@ mod tests {
             !prepared.messages[0].text.is_empty(),
             "the synthetic leading user turn must be non-empty"
         );
+    }
+
+    /// BUG-179: an assistant block that says nothing must never become an
+    /// assistant message that says nothing. Moonshot rejects
+    /// `{"role":"assistant","content":""}` outright (`must not be empty`) and
+    /// Anthropic rejects it anywhere but last; either turns the next remote call
+    /// into a 400 that the router reads as a provider failure. Every empty-turn
+    /// shape the loop can push is covered here: the mid-conversation one (a
+    /// no-prose native call before its result — the reported case), the
+    /// trailing one (an `EndTurn` that produced no text, replayed under the next
+    /// prompt), and a whitespace-only turn, which says nothing too.
+    #[test]
+    fn prepare_never_emits_an_empty_assistant_message() {
+        // Mid-conversation: user → (empty) assistant → tool result → user.
+        let mut ctx = ContextManager::new("SYS", 10_000);
+        ctx.push_user("read a.rs");
+        ctx.push_model("");
+        ctx.push_tool_result("read", Some(fixture_id("a.rs")), "file body");
+        ctx.push_model("   \n");
+        ctx.push_user("now summarize it");
+
+        let mut hook = NoopProvenanceHook;
+        let prepared = ctx.prepare(&mut hook);
+
+        assert!(
+            prepared
+                .messages
+                .iter()
+                .all(|m| !(m.role == MessageRole::Assistant && m.text.trim().is_empty())),
+            "no assistant message may be empty: {:?}",
+            prepared.messages
+        );
+        // The empty turns contribute nothing; the user-role blocks either side
+        // merge exactly as same-role neighbours always do, and nothing the user
+        // or the tools said is lost.
+        assert_eq!(prepared.messages.len(), 1, "{:?}", prepared.messages);
+        assert_eq!(prepared.messages[0].role, MessageRole::User);
+        assert!(prepared.messages[0].text.contains("read a.rs"));
+        assert!(prepared.messages[0].text.contains("Tool result (read):"));
+        assert!(prepared.messages[0].text.contains("file body"));
+        assert!(prepared.messages[0].text.contains("now summarize it"));
+        for pair in prepared.messages.windows(2) {
+            assert_ne!(pair[0].role, pair[1].role, "roles must alternate");
+        }
+
+        // The block itself is untouched — the flat rendering the local tier
+        // consumes still carries the (empty) assistant frame, byte-identical to
+        // `assemble` (REQ-554), and the context still holds all five blocks.
+        assert_eq!(prepared.flat, ctx.assemble(&mut NoopProvenanceHook));
+        assert_eq!(ctx.blocks().len(), 5);
+        assert!(prepared.flat.contains("Assistant:\n"));
+
+        // Trailing: an empty final assistant turn followed by nothing yet is
+        // simply absent, and the sequence still leads with the user.
+        let mut ctx = ContextManager::new("SYS", 10_000);
+        ctx.push_user("hello");
+        ctx.push_model("");
+        let prepared = ctx.prepare(&mut NoopProvenanceHook);
+        assert_eq!(prepared.messages.len(), 1);
+        assert_eq!(prepared.messages[0].role, MessageRole::User);
+        assert_eq!(prepared.messages[0].text, "hello");
     }
 
     #[test]

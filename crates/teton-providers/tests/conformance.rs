@@ -488,9 +488,65 @@ data: [DONE]
 
 ";
 
+/// The kimi-k3 turn shape (BUG-179): `reasoning_content` deltas, then a
+/// `tool_calls` fragment, and every `content` delta the empty string — no
+/// prose at all. Recorded from the failing session; the adapter must yield the
+/// call and nothing text-shaped, which is exactly the turn the harness then has
+/// to record without producing an empty assistant message.
+const OPENAI_REASONING_ONLY_TOOL_CALL: &str = "\
+data: {\"id\":\"c2\",\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\",\"content\":\"\"},\"finish_reason\":null}]}
+
+data: {\"id\":\"c2\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"\",\"reasoning_content\":\"I should read \"},\"finish_reason\":null}]}
+
+data: {\"id\":\"c2\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"\",\"reasoning_content\":\"the file.\"},\"finish_reason\":null}]}
+
+data: {\"id\":\"c2\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"\",\"tool_calls\":[{\"index\":0,\"id\":\"call_9\",\"type\":\"function\",\"function\":{\"name\":\"get_weather\",\"arguments\":\"{\\\"city\\\":\\\"Paris\\\"}\"}}]},\"finish_reason\":null}]}
+
+data: {\"id\":\"c2\",\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"tool_calls\"}]}
+
+data: {\"id\":\"c2\",\"choices\":[],\"usage\":{\"prompt_tokens\":40,\"completion_tokens\":19,\"completion_tokens_details\":{\"reasoning_tokens\":12}}}
+
+data: [DONE]
+
+";
+
 // ---------------------------------------------------------------------------
 // Conformance tests
 // ---------------------------------------------------------------------------
+
+/// BUG-179 at the adapter: a reasoning-only native tool call is exactly one
+/// `ToolCall` and **no** `TextDelta` — an empty `content` delta is not text,
+/// and `reasoning_content` is never surfaced as text either. This is the
+/// legitimate adapter output the harness's transcript then has to record as
+/// the call rather than as an empty assistant turn.
+#[test]
+fn openai_a_reasoning_only_tool_call_yields_the_call_and_no_text() {
+    let transport = MockTransport::ok(chunkify(OPENAI_REASONING_ONLY_TOOL_CALL, 11));
+    let events = run(&openai(), &transport).expect("the turn completes");
+    assert!(
+        !events.iter().any(|e| matches!(e, TurnEvent::TextDelta(_))),
+        "no text event for a turn with no prose: {events:?}"
+    );
+    let calls: Vec<&ToolCall> = events
+        .iter()
+        .filter_map(|e| match e {
+            TurnEvent::ToolCall(tc) => Some(tc),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(calls.len(), 1, "{events:?}");
+    assert_eq!(calls[0].id, "call_9");
+    assert_eq!(calls[0].name, "get_weather");
+    assert_eq!(calls[0].arguments, serde_json::json!({"city": "Paris"}));
+    match events.last() {
+        Some(TurnEvent::Completed(c)) => {
+            assert_eq!(c.stop_reason, StopReason::ToolUse);
+            assert_eq!(c.usage.output_tokens, 19);
+            assert_eq!(c.usage.reasoning_tokens, Some(12));
+        }
+        other => panic!("expected Completed last, got {other:?}"),
+    }
+}
 
 /// One conformance case: an adapter (as a trait object) and its fixture chunks.
 type Case = (Box<dyn Provider>, Vec<Vec<u8>>);

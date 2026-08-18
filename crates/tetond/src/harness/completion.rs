@@ -81,11 +81,18 @@ pub enum TurnDecision {
 /// local tier is free and reports zero).
 #[derive(Debug, Clone)]
 pub struct SourceTurn {
-    /// The assistant's text for this turn (may be empty for a pure tool call).
+    /// The assistant's text for this turn — what the loop records as the
+    /// assistant block.
     ///
     /// Already **cleaned** by the source (BUG-147): a local reply is cut at the
     /// end of its first tool call or at a fabricated transcript frame, so a
     /// weak model's hallucinated continuation never reaches context.
+    ///
+    /// **Never empty for a tool call** (BUG-179). The local tier's call *is*
+    /// its text; a remote native call that arrived with no prose is recorded
+    /// as the call rendered in the same shape. Only an end-of-turn that
+    /// produced no text is empty, and [`ContextManager::prepare`] keeps even
+    /// that off the wire.
     pub text: String,
     /// The model's decision.
     pub decision: TurnDecision,
@@ -113,7 +120,10 @@ pub struct SourceTurn {
     ///   assistant block the loop pushes literally contains the call's JSON.
     /// - [`RemoteProviderSource`] receives the call as a structured
     ///   [`TurnEvent::ToolCall`]; the text is prose only, and any JSON in it is
-    ///   something the model was *talking about*.
+    ///   something the model was *talking about* — **except** when the call
+    ///   arrived with no prose at all, in which case the source records the
+    ///   call itself as the text and answers `true` (BUG-179): that block is
+    ///   the call and nothing else, exactly the local tier's shape.
     ///
     /// The loop needs the answer because OQ-1's cancellation trim edits that
     /// block's text. Re-deriving it later by re-parsing the text is what this
@@ -624,6 +634,28 @@ impl<T: Transport> CompletionSource for RemoteProviderSource<'_, T> {
         let decision = tool_call.unwrap_or_else(|| TurnDecision::EndTurn {
             final_text: text.trim().to_owned(),
         });
+        // BUG-179: a native call that arrived with **no prose** is still a whole
+        // model turn, and the transcript has to say what the model did. Left as
+        // the empty string, the loop pushes an empty assistant block and the
+        // next request replays `{"role":"assistant","content":""}` — a hard 400
+        // on Moonshot (and on Anthropic for any non-final turn), which the
+        // router reads as a provider failure and, with no fallback, ends the
+        // prompt. So the block records the call itself, rendered in the one
+        // tool-call shape the system prompt teaches every model
+        // (`{"tool":…,"arguments":…}`) — which also gives the model back its
+        // memory of what it asked for when the result folds in.
+        //
+        // Only when there is no prose. A turn that carried prose *and* a call
+        // keeps recording the prose alone, as it always has: appending the call
+        // there would hand OQ-1's cancellation trim a block whose first
+        // tool-call-shaped JSON might be something the prose merely quoted —
+        // exactly the truncation `call_in_text` exists to prevent.
+        let (text, call_in_text) = match &decision {
+            TurnDecision::ToolCall { name, arguments } if text.trim().is_empty() => {
+                (render_native_call(name, arguments), true)
+            }
+            _ => (text, false),
+        };
         Ok(SourceTurn {
             text,
             decision,
@@ -633,14 +665,41 @@ impl<T: Transport> CompletionSource for RemoteProviderSource<'_, T> {
             // source has no prefix cache", which is a different fact from a
             // miss and must not be reported as one.
             cache: None,
-            // REQ-567 OQ-1: never. A remote call arrives as a structured
-            // `TurnEvent::ToolCall` and is assembled above from *that*, not from
-            // the stream's `TextDelta`s — so `text` is prose the user watched
-            // stream and holds no call for a cancellation to trim, however
-            // tool-call-shaped some JSON in it may look.
-            call_in_text: false,
+            // REQ-567 OQ-1: `false` whenever the model wrote prose. A remote
+            // call arrives as a structured `TurnEvent::ToolCall` and is
+            // assembled above from *that*, not from the stream's `TextDelta`s
+            // — so `text` is prose the user watched stream and holds no call
+            // for a cancellation to trim, however tool-call-shaped some JSON in
+            // it may look. `true` only for the BUG-179 stand-in above, whose
+            // text IS the call and nothing else: a turn cancelled at the gate
+            // then drops the block whole, which is OQ-1's "incomplete tool work"
+            // outcome with no prose to retain.
+            call_in_text,
         })
     }
+}
+
+/// The transcript rendering of a native tool call that arrived with no prose
+/// (BUG-179): the same `{"tool":…,"arguments":…}` object the system prompt
+/// asks every model to emit, so the model reads its own previous turn in the
+/// one call shape it was taught, and [`prose_before_tool_call`] finds exactly
+/// one call at offset zero when a cancellation has to trim it.
+///
+/// Compact JSON, never pretty-printed, `tool` before `arguments` as the prompt
+/// spells it: the block is what [`ContextManager::prepare`] neutralizes and the
+/// reply scanner re-parses, and one canonical spelling is what keeps both from
+/// disagreeing about where the call starts (LESSON-494). Written out rather
+/// than built with `json!` because that macro's map alphabetizes its keys.
+/// Both interpolations are `serde_json::Value` renderings, so the name is
+/// JSON-escaped and the arguments are the compact object the provider parsed.
+///
+/// [`prose_before_tool_call`]: super::reply::prose_before_tool_call
+fn render_native_call(name: &str, arguments: &Value) -> String {
+    format!(
+        r#"{{"tool":{},"arguments":{}}}"#,
+        Value::String(name.to_owned()),
+        arguments
+    )
 }
 
 /// The egress [`Provenance`] of the context currently assembled in `ctx`: the
@@ -847,6 +906,45 @@ mod tests {
         }
     }
 
+    /// A provider whose single turn is a native tool call and **nothing else** —
+    /// no `TextDelta` at all. This is the kimi-k3 shape (BUG-179): the model
+    /// streams `reasoning_content` and `tool_calls` with `content: ""`, and the
+    /// OpenAI-compatible adapter rightly emits no text event for an empty
+    /// content delta.
+    struct SilentCallProvider;
+
+    #[async_trait]
+    impl Provider for SilentCallProvider {
+        fn id(&self) -> &str {
+            "silent-call"
+        }
+        fn capabilities(&self) -> CapabilityProfile {
+            CapabilityProfile::default()
+        }
+        async fn stream_turn(
+            &self,
+            _request: TurnRequest,
+            _transport: &dyn Transport,
+        ) -> Result<TurnStream, ProviderError> {
+            let events: Vec<Result<TurnEvent, ProviderError>> = vec![
+                Ok(TurnEvent::ToolCall(ToolCall {
+                    id: "call-1".to_owned(),
+                    name: "read".to_owned(),
+                    arguments: json!({ "path": "src/lib.rs" }),
+                })),
+                Ok(TurnEvent::Completed(TurnCompletion {
+                    usage: TokenUsage {
+                        input_tokens: 9,
+                        output_tokens: 3,
+                        reasoning_tokens: Some(2),
+                    },
+                    stop_reason: StopReason::ToolUse,
+                })),
+            ];
+            Ok(Box::pin(futures::stream::iter(events)))
+        }
+    }
+
     /// A `Transport` that is never actually reached (the mock provider ignores it),
     /// present only to satisfy [`Egress`]'s type parameter.
     struct NullTransport;
@@ -919,6 +1017,119 @@ mod tests {
                 output_tokens: 4,
                 reasoning_tokens: None,
             }
+        );
+    }
+
+    /// BUG-179: a native tool call that arrives with no prose is recorded as
+    /// the call it made — a non-empty assistant turn — never as the empty
+    /// string the loop would then replay as `{"role":"assistant","content":""}`
+    /// (a hard 400 on Moonshot, and the reported `provider failed and no
+    /// fallback is configured`).
+    #[tokio::test]
+    async fn a_native_call_with_no_prose_is_recorded_as_the_call_it_made() {
+        let provider = SilentCallProvider;
+        let egress = Egress::new(NullTransport, Vec::new(), Arc::new(NoopSink));
+        let mut source = RemoteProviderSource::new(
+            &provider,
+            &egress,
+            "silent-call",
+            "kimi-k3",
+            "sess-under-test",
+            ResolvedEffort::effort(teton_core::EffortLevel::High),
+        );
+        let tools = ToolRegistry::with_builtins();
+        let exposed = tools.exposed_names(None);
+        let mut streamed = String::new();
+        let turn = source
+            .produce_turn(
+                &flat_prompt("prompt"),
+                &Provenance::empty(),
+                &HarnessConfig::default(),
+                &tools,
+                &exposed,
+                &mut |t| streamed.push_str(t),
+            )
+            .await
+            .expect("remote turn");
+
+        // The decision is the call, exactly as before.
+        assert_eq!(
+            turn.decision,
+            TurnDecision::ToolCall {
+                name: "read".to_owned(),
+                arguments: json!({ "path": "src/lib.rs" }),
+            }
+        );
+        // The transcript text is the call in the one shape the system prompt
+        // teaches — not empty, and not something the user was shown.
+        assert_eq!(
+            turn.text, r#"{"tool":"read","arguments":{"path":"src/lib.rs"}}"#,
+            "a no-prose native call must be recorded as the call itself"
+        );
+        assert!(
+            streamed.is_empty(),
+            "the stand-in is transcript, not display: nothing streams to the user"
+        );
+        // And the block now literally contains the call, so the loop pushes it
+        // as one (`push_model_call`) and OQ-1's trim has something to cut.
+        assert!(turn.call_in_text, "the stand-in text IS the call");
+    }
+
+    /// The unchanged half of BUG-179: a native call that arrived **with** prose
+    /// still records the prose alone, and the call stays beside it. Appending
+    /// the call there would hand OQ-1's cancellation trim a block whose first
+    /// tool-call-shaped JSON might be something the prose merely quoted.
+    #[tokio::test]
+    async fn a_native_call_with_prose_still_records_the_prose_alone() {
+        let provider = TwoToolProvider; // streams "planning two things " then calls
+        let egress = Egress::new(NullTransport, Vec::new(), Arc::new(NoopSink));
+        let mut source = RemoteProviderSource::new(
+            &provider,
+            &egress,
+            "two-tool",
+            "model-x",
+            "sess-under-test",
+            ResolvedEffort::effort(teton_core::EffortLevel::High),
+        );
+        let tools = ToolRegistry::with_builtins();
+        let exposed = tools.exposed_names(None);
+        let turn = source
+            .produce_turn(
+                &flat_prompt("prompt"),
+                &Provenance::empty(),
+                &HarnessConfig::default(),
+                &tools,
+                &exposed,
+                &mut |_| {},
+            )
+            .await
+            .expect("remote turn");
+        assert!(matches!(turn.decision, TurnDecision::ToolCall { .. }));
+        assert_eq!(turn.text, "planning two things ");
+        assert!(
+            !turn.call_in_text,
+            "prose is prose: the structured call is not in this text"
+        );
+    }
+
+    /// The BUG-179 stand-in is a block OQ-1 can trim whole: the reply parser
+    /// finds exactly one call, at offset zero, with no prose ahead of it — so a
+    /// turn cancelled at the permission gate drops the block rather than
+    /// committing a dangling (or, worse, empty) assistant turn.
+    #[test]
+    fn the_native_call_stand_in_is_one_call_with_no_prose_before_it() {
+        let text = render_native_call("edit", &json!({ "path": "a.rs", "old_string": "{" }));
+        assert_eq!(
+            super::super::reply::prose_before_tool_call(&text),
+            Some(""),
+            "the stand-in must parse as a call starting at byte 0"
+        );
+        // Compact, single-line JSON: one canonical spelling for the block the
+        // scanner re-parses (LESSON-494).
+        assert!(!text.contains('\n'));
+        assert_eq!(
+            serde_json::from_str::<Value>(&text).expect("valid JSON"),
+            json!({ "tool": "edit", "arguments": { "path": "a.rs", "old_string": "{" } })
         );
     }
 

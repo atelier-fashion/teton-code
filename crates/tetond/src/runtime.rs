@@ -2976,6 +2976,29 @@ impl DaemonRuntime {
                         self.record_health(&pid.0, record);
                     }
                     let fo = router.on_provider_failure(&route, &pid.0, class);
+                    // BUG-179: say on the daemon's own stderr what the provider
+                    // answered. The `provider_degraded` event the client renders
+                    // carries only the protocol class, and a 4xx maps to
+                    // `invalid response` there — which points at the wrong end
+                    // of the wire when the provider rejected *our request*. The
+                    // typed error is content-free by construction (a status, a
+                    // class name — never a body, never prompt text: REQ-547
+                    // BR-11), so it can be printed as-is; the provider's own
+                    // free-text message deliberately is not, because it is
+                    // provider-authored and may echo request content.
+                    eprintln!(
+                        "tetond: provider `{}` failed the turn ({perr}); {}",
+                        pid.0,
+                        match (
+                            &fo.route,
+                            fo.degraded.as_ref().and_then(|d| d.fallback_id.as_ref())
+                        ) {
+                            (Some(_), Some(fb)) => format!("continuing on the fallback `{}`", fb.0),
+                            (Some(_), None) =>
+                                "retrying or continuing on a reduced profile".to_owned(),
+                            (None, _) => "no fallback is configured".to_owned(),
+                        }
+                    );
                     if let Some(degraded) = fo.degraded {
                         router.emit_provider_degraded(events, Some(session_id.clone()), degraded);
                     }
