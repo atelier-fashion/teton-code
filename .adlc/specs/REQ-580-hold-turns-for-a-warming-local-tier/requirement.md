@@ -1,7 +1,7 @@
 ---
 id: REQ-580
 title: "Hold a turn for a warming local tier instead of refusing it: the daemon waits, the session says so"
-status: in-progress
+status: complete
 deployable: true
 created: 2026-08-17
 updated: 2026-08-17
@@ -141,7 +141,26 @@ Implemented directly on branch `claude/teton-message-queue-startup-5583be`
 (2026-08-17), from a screenshot-and-sentence request, without the `/proceed`
 pipeline. This spec was written alongside the code so the contract is on
 record; `architecture.md` beside it names the four decisions the code
-comments cite as ADR-1..ADR-4. Flip `status` to `complete` at merge.
+comments cite as ADR-1..ADR-4. Merged the same day as
+[PR #164](https://github.com/atelier-fashion/teton-code/pull/164) (squash
+`f2e1bea`), all seven CI checks green; wrapped up via `/wrapup` (LESSON-534).
+Every AC except the manual real-model check has an automated test; that check
+is the OUTSTANDING runbook in `docs/manual-verification.md` (REQ-580 section)
+and is the one item under "Deferred" below.
+
+## Deferred
+
+- **Manual real-model verification** (`docs/manual-verification.md`, REQ-580
+  section): the hold across a real `--features tetond/llama` load, plus the
+  Ctrl-C-mid-hold no-ghost check. CI proves the arc only against the seam
+  loader. Not a code gap; a human sign-off gap.
+- **Entry-area animation during a held turn** — the REQ-556 dots live in the
+  entry frame, which is down during a turn; a queued message shows the notice
+  and the lifecycle's own `benchmark`/`ready` lines, nothing else moving. A
+  spinner in the turn pump would be a small follow-up REQ if it proves to
+  matter in dogfood.
+- **OQ-1** stands as recorded: a held turn ends when its *issuing* client
+  leaves even if another client is attached to the session.
 
 **Mutation record (AC-10).** With `hold_for` forced to `None`, the daemon unit
 suite fails exactly `a_turn_that_meets_a_loading_tier_is_held_and_then_served`,
