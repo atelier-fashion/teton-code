@@ -1,10 +1,10 @@
 ---
 id: BUG-177
 title: "Every client attach replays the model lifecycle into every open session"
-status: open
+status: resolved
 severity: low
 created: 2026-08-17
-updated: 2026-08-17
+updated: 2026-08-18
 component: "daemon/server"
 domain: "events"
 stack: ["rust", "json-rpc", "daemon", "cli"]
@@ -121,3 +121,15 @@ it, which the new test's positive controls (A, B and C each receive their own
 - `CHANGELOG.md` — `[Unreleased]` → Fixed entry.
 - `docs/manual-verification.md` — BUG-177 confirmation runbook (OUTSTANDING
   until the shipped binary is dogfooded).
+
+## Deployment
+
+- Merged to `main` as `eed6928` via
+  [PR #170](https://github.com/atelier-fashion/teton-code/pull/170)
+  (2026-08-18; CI 7/7 green).
+- No CI/CD deploy target — this repo ships through Homebrew releases (plain
+  OSS flow, no staging/production). The fix is in `[Unreleased]` and reaches
+  installs with the next tag; the `docs/manual-verification.md` BUG-177
+  runbook is the dogfood confirmation on the shipped binary.
+- Knowledge: LESSON-536 (`.adlc/knowledge/lessons/`), Key Pattern "A message
+  for one connection is routed, never published" (`.adlc/context/architecture.md`).

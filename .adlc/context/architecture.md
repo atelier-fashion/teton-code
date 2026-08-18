@@ -251,6 +251,15 @@
   and a consent preview renders an endpoint through the one shared masking
   renderer, or it prints the userinfo it exists to protect (REQ-581 ADR-1..6,
   LESSON-535).
+- **A message for one connection is routed, never published** — a catch-up,
+  a replay, a "so this client learns X" is addressed to the connection that
+  attached; it goes out on that connection's own outbound as a routed frame
+  (seq from the bus, behind the response it follows), not through
+  `EventBus::publish`, whose daemon-scoped fan-out passes every subscriber. The
+  bus is for news; a per-connection frame on it is a leak of whatever the
+  frame carries. When a routed path is added, audit every existing publish for
+  an audience of one — the handshake's lifecycle replay stood as a broadcast
+  for fifteen REQs after REQ-569 made routing possible (BUG-177, LESSON-536).
 
 ## ADRs
 
