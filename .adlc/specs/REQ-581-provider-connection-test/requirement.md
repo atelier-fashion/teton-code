@@ -34,8 +34,10 @@ export TETON_PROVIDER_KEY=your_actual_kimi_api_key_here
 The question was classified `think`-class, so it ran on the **local** model,
 which was never going to reach Kimi; the local model then improvised shell
 commands (all of which succeeded and printed the right thing), misread their
-output as a config problem, and invented a config directory, an env var and a
-`teton status` command that do not exist. Meanwhile the connection was fine —
+output as a config problem, guessed at a config directory and a `teton status`
+command that do not exist, and told the user to re-supply the key through
+`TETON_PROVIDER_KEY` — a real variable, but one only `teton provider add` reads,
+useless for a key already in the keychain. Meanwhile the connection was fine —
 one `edit`-class turn later routed `[edit/build] → kimi kimi-k3` and answered.
 
 REQ-579 deliberately left a connection test out of `/provider setup` (BR-13:
@@ -79,7 +81,7 @@ choke point; the CLI has no network path of its own).
 | Entity | Field | Type | Constraints |
 |--------|-------|------|-------------|
 | ProviderTestParams | session_id, provider_id | ids | the provider must be registered; a `kind = "local"` provider is refused (there is nothing to dial) |
-| ProviderTestResult | outcome | `reached { latency_ms, input_tokens, output_tokens, cost_usd: Option<f64> }` \| `refused { status: u16, reason }` \| `unknown_model { status, reason }` \| `rate_limited { retry_after_secs: Option<u64> }` \| `unreachable { reason }` | `reason` is the vendor's sentence **scrubbed** — never the credential, never the request body |
+| ProviderTestResult | outcome | `reached { latency_ms, input_tokens, output_tokens, usd_micros: Option<i64> }` \| `refused { status: u16, reason }` \| `unknown_model { status, reason }` \| `rate_limited { retry_after_secs: Option<u64> }` \| `server_error { status, reason }` \| `unreachable { reason }` | `reason` is the **daemon's** sentence built from the status, the dial host, the configured model and the credential *reference* — never the credential value, never the request body, never the vendor's response body (architecture ADR-3; *amended at architect: `server_error` added for 5xx, `usd_micros` for the ledger's own unit*) |
 | ProviderTestResult | dial_host | string | the host the request went to (REQ-578's reading), for the report line |
 | ProviderTestResult | health_after | Healthy \| Degraded \| Unavailable | what the router will read on the next turn |
 
@@ -95,7 +97,7 @@ choke point; the CLI has no network path of its own).
 | Action | Roles Allowed |
 |--------|---------------|
 | `provider/test` | the session's own user (REQ-568 `may_drive`; a tool call naming the method and a foreign connection are refused with `NOT_ATTACHED`, as `provider/setup_commit` is) |
-| the outbound request | only after the in-session confirmation (BR-2); non-TTY invocation requires `--yes` |
+| the outbound request | only after the in-session confirmation (BR-2); non-TTY invocation requires `--yes`. `teton provider test <id>` opens a freeform session first — the method is session-gated and the cost row needs one (architecture ADR-5) |
 
 ## Business Rules
 
@@ -112,7 +114,7 @@ choke point; the CLI has no network path of its own).
 
 - [ ] AC-1: In a TTY session with `kimi` registered and a valid key, `/provider test kimi` previews provider/model/host, waits for `y`, and reports `reached` with latency, token counts and recorded cost; `teton cost` afterwards shows one probe row for `kimi`; the provider's health is `healthy`. Asserted over the socket against a mock provider (the e2e harness's `MockProvider`), and recorded once live.
 - [ ] AC-2: With the mock provider answering 401, the report is `refused — HTTP 401 …`, names `keychain://teton/kimi` and never the key value (asserted on the rendered line and on every event payload), and no ledger row is written.
-- [ ] AC-3: With the mock answering 404 for the model, `unknown_model`, naming the model the config declares. With 429 + `Retry-After: 7`, `rate_limited` carrying 7. With a closed port, `unreachable`. Each is a distinct typed outcome, not distinguishing prose.
+- [ ] AC-3: With the mock answering 404 for the model, `unknown_model`, naming the model the config declares. With 429, `rate_limited` — carrying `retry_after_secs` only when the transport surfaces the header, which v1's does not by design (architecture ADR-2: `TransportResponse` carries exactly one named header, and this REQ does not grow that); the report says "try again shortly". With 5xx, `server_error { status }`. With a closed port, `unreachable`. Each is a distinct typed outcome, not distinguishing prose. *(amended at architect — the original read "carrying 7"; deferred, not dropped: OQ-5)*
 - [ ] AC-4: `n` at the preview sends nothing — the mock records zero requests — and the ledger is unchanged. Piped stdin without `--yes` sends nothing and says why.
 - [ ] AC-5: A `reached` test on a provider the health map holds as `Unavailable` returns it to `healthy`, and the next turn's `route_decided` selects it (asserted through `run_prompt_turn` after the test).
 - [ ] AC-6: `provider/test` from a connection not attached to the session, and from a model tool call naming the method, are refused `NOT_ATTACHED` in the response, and no request leaves the machine.
@@ -136,7 +138,8 @@ choke point; the CLI has no network path of its own).
 - [ ] OQ-1: **Should the preview show an estimated cost** from the price table when the model is priced ("≈ $0.01")? Lean: yes, labelled estimate, `unpriced` otherwise — it is the same figure `teton cost` would report.
 - [ ] OQ-2: **`teton doctor --probe`** as a third surface that tests every remote provider in turn? Lean: not in v1 — `doctor` is the passive, no-egress diagnostic and its line saying so is load-bearing (BR-1 of the project); a `--probe` flag that runs the same method N times with N previews is a follow-up once v1 is dogfooded.
 - [ ] OQ-3: **What is the hand-off trigger for the nudge?** REQ-579's nudge keys on the reply reciting `teton provider add` / `policy set-tier`. A connection question's bad answers look like shell probing (`teton provider list`, `ls ~/.teton`) rather than a recognisable recipe. Lean: key on the *user's* turn text ("test|check|verify … (connection|provider|kimi|…)") plus the reply containing `teton provider` or a `shell:` call naming `teton` — and A/B it live before trusting it (REQ-579's lesson: 0/9 on prompt steering alone).
-- [ ] OQ-4: **Ledger tagging.** Does the ledger's `phase`/category column carry a `probe` marker today, or is a new column needed? `/architect` decides; the constraint is that `teton cost` can tell a probe from a turn without a second table.
+- [x] OQ-4: **Ledger tagging.** Resolved at architect: a nullable `probe INTEGER` column through the existing `ADDITIVE_COLUMNS` migration and a `CostRecord.probe: bool` wire field; the routing `Category` enum is left alone (a probe is addressed to a provider, not routed by category).
+- [ ] OQ-5: **`Retry-After` on `rate_limited`.** Deferred from AC-3 (ADR-2). Revisit if a second consumer wants a response header — the fix is a second *named* field on `TransportResponse`, not a header bag.
 
 ## Out of Scope
 
