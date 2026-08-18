@@ -236,6 +236,21 @@
   install claim, taken by both the download and the load) is read *with* the
   state that tells the phases apart, or every reader calls the second phase
   by the first one's name (REQ-580 ADR-1..4).
+- **A user-invoked probe reuses the call path it probes, and names its
+  outcome from facts the product owns** — a connection test that took a
+  shortcut (a `/models` list, a HEAD) would prove reachability of an endpoint
+  the product never POSTs to; the test is the real request, minimal, typed on
+  the way back (one value per fact — a redirect that is not a completion and a
+  deadline that elapsed are their own outcomes, not prose inside
+  `unreachable`), and it moves the same health the router reads. Reasons are
+  composed from status, dial host, configured model and the credential
+  *reference*, never a third party's body or header. Corollaries from verify:
+  a probe is a **billed call**, so at teardown it drains like a turn and holds
+  a lifetime claim like a turn (or `_exit` beats the drain and the row is
+  lost); a fixed small request is not a turn, so it carries its own deadline;
+  and a consent preview renders an endpoint through the one shared masking
+  renderer, or it prints the userinfo it exists to protect (REQ-581 ADR-1..6,
+  LESSON-535).
 
 ## ADRs
 

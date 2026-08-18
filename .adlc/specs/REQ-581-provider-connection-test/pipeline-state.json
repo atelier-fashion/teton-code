@@ -2,7 +2,7 @@
   "req": "REQ-581",
   "branch": "feat/REQ-581-provider-connection-test",
   "startedAt": "2026-08-18T00:43:17Z",
-  "completed": false,
+  "completed": true,
   "currentPhase": 8,
   "completedPhases": [
     0,
@@ -12,7 +12,8 @@
     4,
     5,
     6,
-    7
+    7,
+    8
   ],
   "phaseHistory": [
     {
@@ -54,6 +55,11 @@
       "phase": 7,
       "name": "PR Cleanup & CI",
       "completedAt": "2026-08-18T04:19:59Z"
+    },
+    {
+      "phase": 8,
+      "name": "Wrapup",
+      "completedAt": "2026-08-18T04:24:24Z"
     }
   ],
   "integrationBranch": "main",
@@ -67,7 +73,7 @@
       "prUrl": "https://github.com/atelier-fashion/teton-code/pull/168",
       "prNumber": 168,
       "prCreatedAt": "2026-08-18T00:43:20Z",
-      "merged": false,
+      "merged": true,
       "snapshotBranch": null,
       "snapshotPR": null
     }
@@ -91,5 +97,6 @@
   },
   "phase5": {
     "summary": "6 agents; 15 advisory candidates (9 refuted, 6 confirmed); 1 Critical + 6 Major + ~14 Minor fixed in pass 1 (2 commits) + typed-outcome split; re-verify (5 reviewers) confirmed all fixed, found 1 Major (probe lifetime claim) + 4 Minor + 1 Low \u2014 fixed in pass 2 with mutation evidence; workspace 2831 passed / 0 failed; 3 reflector product questions answered from the spec/code record (OQ-1 no preview estimate per M-7; notice for other clients only; doctor points at the test) \u2014 no halt"
-  }
+  },
+  "mergedAt": "2026-08-18T04:23:50Z"
 }
