@@ -9224,6 +9224,11 @@ fn cost_report_view(report: &CostReport) -> CostReportView {
         total_calls: report.total.calls,
         priced_calls: report.total.priced_calls,
         unpriced_calls: report.total.unpriced_calls,
+        // REQ-581 BR-5: a subset of `total_calls`, carried so `teton cost` can
+        // name the connection tests instead of showing them as turns. It sits
+        // beside the priced/unpriced split rather than inside it — a probe is
+        // priced or unpriced like anything else.
+        probe_calls: report.probe_calls,
         reasoning_tokens: report.total.reasoning_tokens,
         calls_reporting_reasoning: report.total.calls_reporting_reasoning,
         // REQ-557 AC-7b: the models the meter could not price travel to the

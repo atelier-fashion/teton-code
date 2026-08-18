@@ -1,7 +1,7 @@
 ---
 id: TASK-161
 title: "Ledger: probe column via ADDITIVE_COLUMNS, CostAttribution.probe, probe_calls in the report"
-status: draft
+status: complete
 parent: REQ-581
 created: 2026-08-17
 updated: 2026-08-17

@@ -76,6 +76,19 @@ pub struct CostAttribution {
     pub category: Option<Category>,
     /// Concrete model the call bills (drives the price-table lookup).
     pub model: String,
+    /// Whether this call is a **connection test** rather than a turn (REQ-581
+    /// BR-5).
+    ///
+    /// A probe is billed exactly like a turn — same egress path, same price
+    /// table, one ordinary ledger row — and this flag only lets the meter
+    /// *count* it apart, so `teton cost` can say "1 probe" rather than show a
+    /// user a call they asked no question for as though it were a turn. It is
+    /// therefore a flag on the attribution and not a second recording path.
+    ///
+    /// `false` for every turn, which is the default [`CostAttribution::new`]
+    /// gives: only the connection test opts in, via
+    /// [`CostAttribution::probe`].
+    pub probe: bool,
 }
 
 impl CostAttribution {
@@ -87,6 +100,7 @@ impl CostAttribution {
             phase: None,
             category: None,
             model: model.into(),
+            probe: false,
         }
     }
 
@@ -104,6 +118,17 @@ impl CostAttribution {
     #[must_use]
     pub fn with_category(mut self, category: Category) -> Self {
         self.category = Some(category);
+        self
+    }
+
+    /// Mark this call a connection test (REQ-581 BR-5).
+    ///
+    /// Changes nothing about how the call is sent or priced — the row is
+    /// written, costed and broadcast exactly as a turn's is. It changes only
+    /// what the row *says it was*, so the report can count probes apart.
+    #[must_use]
+    pub fn probe(mut self) -> Self {
+        self.probe = true;
         self
     }
 }
@@ -204,5 +229,29 @@ mod tests {
         let unrouted = CostAttribution::new("deepseek-chat");
         assert_eq!(unrouted.phase, None);
         assert_eq!(unrouted.category, None);
+    }
+
+    /// REQ-581 BR-5: every turn is attributed as a turn, and only the
+    /// connection test opts into the probe flag. The default matters as much as
+    /// the builder — a flag that defaulted to `true` anywhere would count real
+    /// spend as a test.
+    #[test]
+    fn only_a_connection_test_is_attributed_as_a_probe() {
+        assert!(
+            !CostAttribution::new("claude-fable-5").probe,
+            "a turn is never a probe"
+        );
+        assert!(
+            !CostAttribution::new("claude-fable-5")
+                .with_category(Category::Review)
+                .probe,
+            "and no other builder turns the flag on"
+        );
+
+        let probe = CostAttribution::new("kimi-k2").probe();
+        assert!(probe.probe);
+        // The flag says what the call was for; it does not change what it
+        // bills, so the model still drives the price lookup.
+        assert_eq!(probe.model, "kimi-k2");
     }
 }
