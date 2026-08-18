@@ -273,6 +273,17 @@
   reads a secret confirms before it reads, because the entry loop and the
   dialogue prompter share one stdin buffer and a multi-line paste answers the
   next question (REQ-582 ADR-1/2/6, LESSON-537; REQ-555 BR-4 generalized).
+- **The block a tool-call turn pushes ends with the call, whichever source
+  produced it** — the local tier's reply is cut right after the call it
+  parsed; a remote provider's structured call is rendered by the loop onto
+  the prose in the reply grammar the system prompt teaches
+  (`{"tool": …, "arguments": …}`) before the block is pushed. So the
+  transcript always says what the assistant did, an assistant turn is never
+  empty (every remote provider answers 400 to one), and OQ-1's cancellation
+  trim cuts the *trailing* call and nothing ahead of it. `prepare()` enforces
+  the wire-shape rules — user-first, alternating, **no empty message** — at
+  the seam that builds the sequence, because more than one writer can produce
+  an empty block (BUG-178, LESSON-538).
 
 ## ADRs
 

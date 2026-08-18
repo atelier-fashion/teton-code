@@ -1,7 +1,7 @@
 ---
 id: BUG-178
 title: "A native tool call leaves an empty assistant turn in the transcript, and the next request is refused"
-status: open
+status: resolved
 severity: high
 created: 2026-08-18
 updated: 2026-08-18
@@ -208,3 +208,19 @@ record for the defect.
 - `CHANGELOG.md` — `[Unreleased]` → Fixed entry.
 - `docs/manual-verification.md` — BUG-178 runbook (OUTSTANDING until
   dogfooded on the shipped binary against a real native-tool provider).
+
+## Deployment
+
+- Merged to `main` as `ca585cd` via
+  [PR #178](https://github.com/atelier-fashion/teton-code/pull/178)
+  (2026-08-18; CI 7/7 green on the final head, MERGEABLE/CLEAN). The parallel
+  [PR #177](https://github.com/atelier-fashion/teton-code/pull/177) (BUG-179)
+  was closed unmerged; its wire-level test travelled with #178.
+- No CI/CD deploy target — this repo ships through Homebrew releases (plain
+  OSS flow, no staging/production). The fix is in `[Unreleased]` and reaches
+  installs with the next tag; the `docs/manual-verification.md` BUG-178
+  runbook is the dogfood confirmation on the shipped binary against a real
+  native-tool provider (OUTSTANDING).
+- Knowledge: LESSON-538 (`.adlc/knowledge/lessons/`), Key Pattern "The block
+  a tool-call turn pushes ends with the call, whichever source produced it"
+  (`.adlc/context/architecture.md`).
