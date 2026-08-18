@@ -128,6 +128,14 @@ pub struct Connection {
     /// skew warning belongs to *attaching*, and every command attaches through
     /// `ensure_connected`. `None` until the handshake completes.
     daemon_version: Option<String>,
+    /// The daemon *name* the same handshake reported (REQ-582 BR-7).
+    ///
+    /// Beside the version because `/doctor` renders the daemon line from this
+    /// connection rather than from a second handshake, and the shell twin's line
+    /// names both. Hardcoding `teton-code` in the session's copy of that line
+    /// would be a second source of truth for something the daemon states about
+    /// itself. `None` until the handshake completes.
+    daemon_name: Option<String>,
 }
 
 impl Connection {
@@ -145,6 +153,7 @@ impl Connection {
             .spawn(move || reader_loop(reader_stream, &tx))?;
         Ok(Self {
             daemon_version: None,
+            daemon_name: None,
             writer: stream,
             incoming: rx,
             next_id: 1,
@@ -156,6 +165,16 @@ impl Connection {
     #[must_use]
     pub fn daemon_version(&self) -> Option<&str> {
         self.daemon_version.as_deref()
+    }
+
+    /// The daemon name this connection handshook with, once it has (REQ-582
+    /// BR-7 — the in-session `/doctor` line).
+    // Read by `DoctorAttach::session`, whose only caller is `run_mirrored_command`
+    // — which TASK-169 wires to the `/doctor` row. The allowance goes with it.
+    #[allow(dead_code)]
+    #[must_use]
+    pub fn daemon_name(&self) -> Option<&str> {
+        self.daemon_name.as_deref()
     }
 
     /// Perform the protocol-version handshake. No events precede it (the daemon
@@ -193,6 +212,7 @@ impl Connection {
                             // happened, rather than from a second query that
                             // could reach a different daemon.
                             self.daemon_version = Some(result.daemon_version.clone());
+                            self.daemon_name = Some(result.daemon_name.clone());
                             Ok(result)
                         }
                     };
@@ -1167,8 +1187,9 @@ mod tests {
                 incoming: rx,
                 next_id: 1,
                 // No handshake happened on this fixture, so there is genuinely
-                // no daemon version to report (REQ-565).
+                // no daemon version or name to report (REQ-565, REQ-582).
                 daemon_version: None,
+                daemon_name: None,
             },
             tx,
             peer,

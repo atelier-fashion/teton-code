@@ -1,7 +1,7 @@
 ---
 id: TASK-168
 title: "Extract each mirrored subcommand's body to a shared `<sub>_on(conn, ctx, …)` the session can call"
-status: draft
+status: complete
 parent: REQ-582
 created: 2026-08-18
 updated: 2026-08-18
@@ -32,13 +32,20 @@ the regression net; this task adds no rows and no recognition.
 
 ## Acceptance Criteria
 
-- [ ] `teton provider list`, `teton provider add`, `teton boundary list|add`, `teton policy show|set-tier|set-category`, `teton model list|status`, `teton doctor` print byte-identical output before/after (existing `cli_e2e` tests green; run `cargo test -p teton --test cli_e2e` after `cargo build --workspace` — LESSON-510/BUG-164: a targeted run does not rebuild the daemon).
-- [ ] Every `<sub>_on` takes `&mut Connection, &mut UiContext<'_>` and creates neither a surface nor a connection.
-- [ ] `provider_add_on` returns `Result<(), ProviderAddRefusal>`-shaped outcomes for the three refusals; `run_provider_add` still exits non-zero with the same three sentences (pin with the existing tests that assert them; add one if none does).
-- [ ] `read_secret` prompts through the passed prompter; `TETON_PROVIDER_KEY` still short-circuits; unit test with `ScriptedPrompter` proves the session-side path uses `ask_secret` (echo-off), never `ask`.
-- [ ] `run_mirrored_command` matches all ten mirrored variants exhaustively; every other `Command` variant renders one Error line ("not a session row") rather than panicking.
-- [ ] `doctor_report_on` with `DoctorAttach::Fresh` reproduces `teton doctor`'s bytes; with `DoctorAttach::Session` the only differing line is the `daemon: running — teton-code X (this session's connection)` line (unit test with `RecordingSurface` over both arms).
-- [ ] `cargo clippy --workspace --all-targets -- -D warnings` and `cargo fmt --all -- --check` clean.
+- [x] `teton provider list`, `teton provider add`, `teton boundary list|add`, `teton policy show|set-tier|set-category`, `teton model list|status`, `teton doctor` print byte-identical output before/after (existing `cli_e2e` tests green; run `cargo test -p teton --test cli_e2e` after `cargo build --workspace` — LESSON-510/BUG-164: a targeted run does not rebuild the daemon).
+      → `cargo build --workspace` then `cargo test -p teton --test cli_e2e`: 39 passed, 0 failed.
+- [x] Every `<sub>_on` takes `&mut Connection, &mut UiContext<'_>` and creates neither a surface nor a connection.
+      → all ten bodies take both; `stdout_surface`/`ensure_connected` appear only in the `run_*` wrappers.
+- [x] `provider_add_on` returns `Result<(), ProviderAddRefusal>`-shaped outcomes for the three refusals; `run_provider_add` still exits non-zero with the same three sentences (pin with the existing tests that assert them; add one if none does).
+      → `run_provider_add` maps each back to `anyhow::bail!("{refusal}")`; the two e2e refusal tests stay green and `the_three_provider_add_refusals_keep_their_sentences` now pins all three in full.
+- [x] `read_secret` prompts through the passed prompter; `TETON_PROVIDER_KEY` still short-circuits; unit test with `ScriptedPrompter` proves the session-side path uses `ask_secret` (echo-off), never `ask`.
+      → `read_secret(id, &mut dyn Prompter)`; `read_secret_asks_the_callers_prompter_and_never_echoes` asserts one question and that it went through `ask_secret`.
+- [x] `run_mirrored_command` matches all ten mirrored variants exhaustively; every other `Command` variant renders one Error line ("not a session row") rather than panicking.
+      → no wildcard arm, so exhaustiveness is the compiler's; `Cost`/`Effort`/`model set`/`provider test` name their `/` spelling, `policy set` renders `POLICY_SET_RETIRED`, `uninstall` says shell-only.
+- [x] `doctor_report_on` with `DoctorAttach::Fresh` reproduces `teton doctor`'s bytes; with `DoctorAttach::Session` the only differing line is the `daemon: running — teton-code X (this session's connection)` line (unit test with `RecordingSurface` over both arms).
+      → `the_session_doctor_differs_from_the_shell_one_in_exactly_the_daemon_line` diffs both arms over `doctor_preamble`, the whole surface `attach` is in scope for; `teton_doctor_and_cost_report_against_a_live_daemon` still pins the shell bytes.
+- [x] `cargo clippy --workspace --all-targets -- -D warnings` and `cargo fmt --all -- --check` clean.
+      → both clean; `run_mirrored_command` and `Connection::daemon_name` carry an `#[allow(dead_code)]` naming TASK-169 as the commit that removes it.
 
 ## Technical Notes
 

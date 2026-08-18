@@ -24,6 +24,7 @@ use teton_core::{
     url_host, ProviderKind as CoreProviderKind,
 };
 use teton_protocol::effort::EffortLevel;
+use teton_protocol::handshake::HandshakeResult;
 use teton_protocol::jsonrpc::{error_code, RpcError};
 use teton_protocol::methods::{
     CategoryBindingConfig, ConfigGetParams, ConfigSetParams, ConfigSetResult, ConfigSnapshot,
@@ -64,6 +65,13 @@ use session_ui::SessionState;
 use teton_protocol::socket_path::{self, DaemonPaths};
 
 /// The `teton` command-line interface.
+///
+/// `pub(crate)` since REQ-582 (BR-3, ADR-2): the session parses a mirrored row's
+/// arguments with **this** definition — `Cli::try_parse_from` over the argv its
+/// shell twin would have received — so `/policy set-tier build kimi --fallback
+/// local` and `teton policy set-tier build kimi --fallback local` are one
+/// grammar, one error message, one help text. A second hand-written parser of
+/// `teton …` lines is the shape LESSON-529 is about.
 #[derive(Debug, Parser)]
 #[command(
     name = "teton",
@@ -71,7 +79,7 @@ use teton_protocol::socket_path::{self, DaemonPaths};
     about = "Teton Code — hybrid local/remote AI coding agent with workflow-aware routing",
     long_about = None,
 )]
-struct Cli {
+pub(crate) struct Cli {
     /// Answer the first-run local-model prompt with "accept" and read no input
     /// (REQ-547 BR-5): the explicit opt-in for unattended/CI runs. Also supplies
     /// the second confirmation `teton model set` needs for a model above this
@@ -87,22 +95,22 @@ struct Cli {
     /// still the same consent, given in advance instead of at a prompt, which is
     /// what a pipe has instead of a terminal.
     #[arg(long, short = 'y', global = true)]
-    yes: bool,
+    pub(crate) yes: bool,
 
     /// Show routing and turn-end notices in the interactive session. By default
     /// the transcript is just the conversation — model responses and tool
     /// activity; privacy and degradation warnings always show.
     #[arg(long, short = 'v', global = true)]
-    verbose: bool,
+    pub(crate) verbose: bool,
 
     /// The subcommand to run; omit to open an interactive session.
     #[command(subcommand)]
-    command: Option<Command>,
+    pub(crate) command: Option<Command>,
 }
 
 /// Top-level subcommands.
 #[derive(Debug, Subcommand)]
-enum Command {
+pub(crate) enum Command {
     /// Manage model providers (Anthropic, OpenAI-compatible, local).
     Provider {
         /// The provider action.
@@ -154,7 +162,7 @@ enum Command {
 
 /// `teton model …` (AC-9)
 #[derive(Debug, Subcommand)]
-enum ModelAction {
+pub(crate) enum ModelAction {
     /// Show the catalog, each entry's fit for this machine, and the selection.
     List,
     /// Change the selected model. A model above this machine's RAM floor needs a
@@ -169,7 +177,7 @@ enum ModelAction {
 
 /// `teton provider …`
 #[derive(Debug, Subcommand)]
-enum ProviderAction {
+pub(crate) enum ProviderAction {
     /// Register a provider; its key is stored in the OS keychain (BR-7).
     Add {
         /// Provider id (e.g. `anthropic`, `deepseek`).
@@ -208,7 +216,7 @@ enum ProviderAction {
 
 /// `teton boundary …`
 #[derive(Debug, Subcommand)]
-enum BoundaryAction {
+pub(crate) enum BoundaryAction {
     /// Add a privacy boundary over a repo-relative path glob.
     Add {
         /// Repo-relative glob the boundary applies to.
@@ -223,7 +231,7 @@ enum BoundaryAction {
 
 /// `teton policy …` (REQ-558 ADR-H)
 #[derive(Debug, Subcommand)]
-enum PolicyAction {
+pub(crate) enum PolicyAction {
     /// Route a tier to a provider — the setting most users want. Every category
     /// on that tier follows unless it has its own override.
     SetTier {
@@ -266,7 +274,7 @@ enum PolicyAction {
 
 /// CLI mirror of [`ProviderKind`] (kebab-case wire names).
 #[derive(Debug, Clone, Copy, ValueEnum)]
-enum CliProviderKind {
+pub(crate) enum CliProviderKind {
     /// On-device local tier.
     Local,
     /// Any OpenAI-compatible endpoint.
@@ -290,7 +298,7 @@ impl From<CliProviderKind> for ProviderKind {
 
 /// CLI mirror of [`PrivacyMode`].
 #[derive(Debug, Clone, Copy, ValueEnum)]
-enum CliPrivacyMode {
+pub(crate) enum CliPrivacyMode {
     /// Content never leaves the machine.
     LocalOnly,
     /// Content may go remote after redaction (MVP-optional).
@@ -313,7 +321,7 @@ impl From<CliPrivacyMode> for PrivacyMode {
 
 /// CLI mirror of [`Tier`] — the primary routing surface.
 #[derive(Debug, Clone, Copy, ValueEnum)]
-enum CliTier {
+pub(crate) enum CliTier {
     /// Sub-second, every turn, never leaves the machine.
     Reflex,
     /// Read a lot, emit a little.
@@ -341,7 +349,7 @@ impl From<CliTier> for Tier {
 /// the wire type and from the config schema (ADR-B): the CLI does not offer, and
 /// cannot construct, a binding that BR-4 and BR-5 forbid.
 #[derive(Debug, Clone, Copy)]
-struct CliCategory(ConfigurableCategory);
+pub(crate) struct CliCategory(pub(crate) ConfigurableCategory);
 
 /// Parse a category argument, naming the pin when a user types a pinned one.
 ///
@@ -350,7 +358,7 @@ struct CliCategory(ConfigurableCategory);
 /// like a typo. AC-4's criterion is that a user who names a pinned category
 /// learns it is *forbidden*, and that sentence comes from the protocol's
 /// `FromStr` rather than being written a third time here.
-fn parse_cli_category(name: &str) -> Result<CliCategory, String> {
+pub(crate) fn parse_cli_category(name: &str) -> Result<CliCategory, String> {
     name.parse::<ConfigurableCategory>()
         .map(CliCategory)
         .map_err(|e| e.to_string())
@@ -406,6 +414,144 @@ fn main() -> ExitCode {
         Err(err) => {
             eprintln!("teton: {err:#}");
             ExitCode::FAILURE
+        }
+    }
+}
+
+/// What a `Command` that has a session command of its own, but is not one of the
+/// ten mirrored rows, says when it arrives at [`run_mirrored_command`].
+///
+/// Names the spelling rather than only refusing: a user who reached this line
+/// asked for something the session *can* do, under a name it does not answer to.
+fn session_spelling_line(twin: &str, spelling: &str) -> String {
+    format!(
+        "`teton {twin}` is not one of this session's mirrored commands — `{spelling}` is what \
+         this session calls it."
+    )
+}
+
+/// Why `uninstall` has no session form and never will (REQ-582 BR-4).
+const UNINSTALL_IS_SHELL_ONLY: &str = "`teton uninstall` is shell-only: it stops the daemon this \
+     session is attached to and deletes its data, so it would pull the floor out from under the \
+     session running it — run `teton uninstall` from a shell.";
+
+/// Run a parsed `Command` over a connection and context the caller already has
+/// (REQ-582 ADR-2 step 3).
+///
+/// The session's half of [`main`]'s match: the same `Command` tree, dispatched
+/// onto the same `*_on` bodies the subcommands run, so a mirrored row cannot
+/// send different params or render through a different function than its shell
+/// twin (BR-2/BR-3).
+///
+/// The match is **exhaustive with no wildcard**, which is the compile-time half
+/// of ADR-8's completeness property: a subcommand added later cannot ship
+/// without a decision about its session form. A variant that is not a mirrored
+/// row renders exactly one [`LineKind::Error`] line and returns `Ok` — never a
+/// panic, and never an `Err`, which would end the session that asked.
+///
+/// `DaemonPaths` is re-read here rather than threaded through [`UiContext`]: it
+/// is a pure environment read that `run_session` already made, and a copy on the
+/// context would be a second source of truth for the socket's location (ADR-5).
+///
+/// # Errors
+///
+/// Propagates a transport error from whichever body ran; a daemon that answers
+/// is reported on the surface.
+// Shipped one task ahead of its caller: `cli_rows.rs` (TASK-169) is what parses
+// a row's argv into the `Command` this runs, and this allowance goes with the
+// commit that adds it. Stated here rather than there for the reason the
+// registration seams were (REQ-575 TASK-153): the parser must have nothing left
+// to decide when it arrives, or it will decide it itself.
+#[allow(dead_code)]
+pub(crate) fn run_mirrored_command(
+    cmd: Command,
+    conn: &mut Connection,
+    ctx: &mut UiContext<'_>,
+) -> anyhow::Result<()> {
+    match cmd {
+        Command::Provider { action } => match action {
+            ProviderAction::List => provider_list_on(conn, ctx),
+            ProviderAction::Add {
+                id,
+                kind,
+                endpoint,
+                model,
+            } => {
+                // ADR-3: the three refusals are outcomes here, not `bail!`s —
+                // one Error line, and the session carries on.
+                if let Err(refusal) = provider_add_on(conn, ctx, &id, kind.into(), endpoint, model)?
+                {
+                    ctx.surface.line(LineKind::Error, &refusal.to_string());
+                }
+                Ok(())
+            }
+            // A session row of its own since REQ-581, with its own consent gate.
+            ProviderAction::Test { .. } => {
+                ctx.surface.line(
+                    LineKind::Error,
+                    &session_spelling_line("provider test", "/provider test"),
+                );
+                Ok(())
+            }
+        },
+        Command::Boundary { action } => match action {
+            BoundaryAction::List => boundary_list_on(conn, ctx),
+            BoundaryAction::Add { glob, mode } => boundary_add_on(conn, ctx, &glob, mode.into()),
+        },
+        Command::Policy { action } => match action {
+            PolicyAction::Show => policy_show_on(conn, ctx),
+            PolicyAction::SetTier {
+                tier,
+                provider,
+                fallback,
+            } => policy_set_tier_on(conn, ctx, tier.into(), &provider, fallback.as_deref()),
+            PolicyAction::SetCategory {
+                category,
+                provider,
+                fallback,
+            } => policy_set_category_on(conn, ctx, category.0, &provider, fallback.as_deref()),
+            // Retired, and the existing sentence is the one that explains why —
+            // rendered as a line here for the same reason the `provider add`
+            // refusals are: an `Err` would end the session (AC-9's text, one
+            // copy of it).
+            PolicyAction::Set { .. } => {
+                ctx.surface.line(LineKind::Error, POLICY_SET_RETIRED);
+                Ok(())
+            }
+        },
+        Command::Model { action } => match action {
+            ModelAction::List => model_list_on(conn, ctx),
+            ModelAction::Status => model_status_on(&socket_path::daemon_paths(), conn, ctx),
+            // `/model set` is REQ-555's row, with the typed-input gate and the
+            // above-RAM-floor confirmation the session already owns.
+            ModelAction::Set { .. } => {
+                ctx.surface.line(
+                    LineKind::Error,
+                    &session_spelling_line("model set", "/model set"),
+                );
+                Ok(())
+            }
+        },
+        Command::Doctor => {
+            // BR-7: the facts are read off the connection this session already
+            // has; dialling the socket again would announce an attach into the
+            // very session being diagnosed (BUG-177's shape).
+            let attach = DoctorAttach::session(conn);
+            doctor_report_on(&socket_path::daemon_paths(), conn, ctx, &attach)
+        }
+        Command::Cost => {
+            ctx.surface
+                .line(LineKind::Error, &session_spelling_line("cost", "/cost"));
+            Ok(())
+        }
+        Command::Effort { .. } => {
+            ctx.surface
+                .line(LineKind::Error, &session_spelling_line("effort", "/effort"));
+            Ok(())
+        }
+        Command::Uninstall { .. } => {
+            ctx.surface.line(LineKind::Error, UNINSTALL_IS_SHELL_ONLY);
+            Ok(())
         }
     }
 }
@@ -981,13 +1127,32 @@ fn passive_ctx<'a>(
 }
 
 /// `teton model list`: the catalog, each entry's fit, and the selection (AC-9).
+///
+/// A connection-opening shell around [`model_list_on`], which is also what
+/// `/model list` runs (REQ-582 BR-2, ADR-3).
 fn run_model_list(paths: &DaemonPaths) -> anyhow::Result<()> {
     let mut surface = stdout_surface();
     let mut conn = client::ensure_connected(paths, &mut surface)?;
     let mut state = SessionState::new();
     let mut prompter = StdinPrompter::new();
     let mut ctx = passive_ctx(&mut surface, &mut state, &mut prompter);
-    match conn.call(ModelListParams::default(), &mut ctx)? {
+    model_list_on(&mut conn, &mut ctx)
+}
+
+/// The body of `model list`: one `model/list`, one renderer (REQ-582 BR-2).
+///
+/// Takes the caller's connection and context and creates neither, so the
+/// subcommand runs it under its passive context while `/model list` runs it
+/// under the session's own (REQ-555 D-4) — one call site of `model/list` and
+/// one call site of [`model_ui::render_list`], which is what keeps the two
+/// surfaces from drifting.
+///
+/// # Errors
+///
+/// Propagates a transport error. A daemon that *answers* — with an error, or
+/// with "no such method" — is reported on the surface and returns `Ok`.
+pub(crate) fn model_list_on(conn: &mut Connection, ctx: &mut UiContext<'_>) -> anyhow::Result<()> {
+    match conn.call(ModelListParams::default(), ctx)? {
         Ok(list) => model_ui::render_list(&list, ctx.surface),
         Err(err) if err.code == error_code::METHOD_NOT_FOUND => ctx.surface.line(
             LineKind::Notice,
@@ -1173,7 +1338,27 @@ fn run_model_status(paths: &DaemonPaths) -> anyhow::Result<()> {
     let mut state = SessionState::new();
     let mut prompter = StdinPrompter::new();
     let mut ctx = passive_ctx(&mut surface, &mut state, &mut prompter);
-    let answered = conn.call(ModelStatusParams::default(), &mut ctx)?;
+    model_status_on(paths, &mut conn, &mut ctx)
+}
+
+/// The body of `model status`: one `model/status`, one renderer (REQ-582 BR-2).
+///
+/// `paths` rather than a connection-derived value because the weights directory
+/// is a fact about *this machine's* daemon state directory, which no payload
+/// carries (BR-11 keeps absolute paths off the wire). It is a pure env read
+/// ([`socket_path::daemon_paths`]) that every caller already has or can make,
+/// so it is passed rather than threaded through [`UiContext`] (REQ-582 ADR-5).
+///
+/// # Errors
+///
+/// Propagates a transport error; a daemon that answers is reported on the
+/// surface and returns `Ok`.
+pub(crate) fn model_status_on(
+    paths: &DaemonPaths,
+    conn: &mut Connection,
+    ctx: &mut UiContext<'_>,
+) -> anyhow::Result<()> {
+    let answered = conn.call(ModelStatusParams::default(), ctx)?;
     if let Some(status) = model_status_or_report(answered, ctx.surface) {
         let base_dir = paths.socket.parent();
         let path = match (base_dir, status.install.as_ref()) {
@@ -1219,59 +1404,98 @@ fn model_status_or_report(
     }
 }
 
-/// `teton doctor`: daemon status, socket path, model state, providers.
-fn run_doctor(paths: &DaemonPaths) -> anyhow::Result<()> {
-    let mut surface = stdout_surface();
+/// Which connection the doctor report is describing — the **only** thing that
+/// differs between `teton doctor` and the in-session `/doctor` (REQ-582 BR-7,
+/// ADR-5).
+///
+/// A session must not dial the socket afresh to diagnose itself: a second
+/// `Connection::connect` announces `a CLI client attached` into the very session
+/// running the diagnosis, and calls it "another" client (BUG-177's shape). So
+/// the connect/handshake arm becomes this one line, and every other line of the
+/// report — the header, the config listing, the base-URL advice, the model and
+/// provider notices — is the same code on both paths.
+pub(crate) enum DoctorAttach {
+    /// The shell path: a handshake this command performed itself, which is the
+    /// only place the negotiated protocol version is known.
+    Fresh(HandshakeResult),
+    /// The session path: the facts the session's already-open connection kept
+    /// from its own handshake. Owned rather than borrowed from the `Connection`
+    /// because [`doctor_report_on`] takes that connection mutably to make the
+    /// `config/get` call.
+    Session {
+        /// `conn.daemon_name()` at the time the attach was made.
+        daemon_name: Option<String>,
+        /// `conn.daemon_version()` at the time the attach was made.
+        daemon_version: Option<String>,
+    },
+}
+
+impl DoctorAttach {
+    /// The attach describing a session's own connection (BR-7).
+    ///
+    /// Reads the handshake facts the [`Connection`] already keeps for build-skew
+    /// reporting (REQ-565 BR-6) — no second handshake, no second RPC.
+    pub(crate) fn session(conn: &Connection) -> Self {
+        Self::Session {
+            daemon_name: conn.daemon_name().map(str::to_owned),
+            daemon_version: conn.daemon_version().map(str::to_owned),
+        }
+    }
+
+    /// The one `daemon: running — …` line the two arms disagree about.
+    ///
+    /// The fallbacks are unreachable in practice: a `Session` attach is made
+    /// from a connection that has completed a handshake by construction (every
+    /// command reaches the daemon through `ensure_connected`, which handshakes).
+    /// They exist so the report still renders every other line rather than
+    /// panicking on a state that would mean the connection was never negotiated.
+    fn daemon_line(&self) -> String {
+        match self {
+            Self::Fresh(hs) => format!(
+                "daemon: running — {} {} (protocol {})",
+                hs.daemon_name, hs.daemon_version, hs.protocol_version
+            ),
+            Self::Session {
+                daemon_name,
+                daemon_version,
+            } => format!(
+                "daemon: running — {} {} (this session's connection)",
+                daemon_name.as_deref().unwrap_or("teton-code"),
+                daemon_version.as_deref().unwrap_or("(version unreported)"),
+            ),
+        }
+    }
+}
+
+/// The lines doctor prints before it knows anything about the daemon: what this
+/// command is, and where the daemon's socket and lock live.
+///
+/// Split out because the two arms that cannot produce a report — no daemon, and
+/// a daemon that rejected this CLI — still print them, and a second copy of the
+/// header would be a second answer to "where is the socket?".
+fn doctor_header(paths: &DaemonPaths, surface: &mut dyn Surface) {
     surface.line(LineKind::Info, "teton doctor");
     surface.line(
         LineKind::Info,
         &format!("socket: {}", paths.socket.display()),
     );
     surface.line(LineKind::Info, &format!("lock:   {}", paths.lock.display()));
+}
 
-    match Connection::connect(&paths.socket) {
-        Ok(mut conn) => match conn.handshake() {
-            Ok(hs) => {
-                surface.line(
-                    LineKind::Info,
-                    &format!(
-                        "daemon: running — {} {} (protocol {})",
-                        hs.daemon_name, hs.daemon_version, hs.protocol_version
-                    ),
-                );
-                let mut state = SessionState::new();
-                let mut prompter = StdinPrompter::new();
-                let mut ctx = passive_ctx(&mut surface, &mut state, &mut prompter);
-                match conn.call(ConfigGetParams::default(), &mut ctx)? {
-                    Ok(cfg) => {
-                        render_config(&cfg.snapshot.providers, ctx.surface);
-                        advise_on_base_url_endpoints(&cfg.snapshot.providers, ctx.surface);
-                    }
-                    Err(err) if err.code == error_code::METHOD_NOT_FOUND => ctx.surface.line(
-                        LineKind::Notice,
-                        "config: not exposed by this daemon build yet (config/get pending).",
-                    ),
-                    Err(err) => ctx.surface.line(
-                        LineKind::Error,
-                        &format!("config query failed: {}", err.message),
-                    ),
-                }
-            }
-            // The commonest cause is a daemon left running across an upgrade,
-            // and `handshake` has already turned that into a sentence with the
-            // restart command in it — doctor adds the context that the daemon
-            // is up, which is the part its other arms establish.
-            Err(err) => surface.line(
-                LineKind::Error,
-                &format!("daemon: reachable, but it rejected this CLI — {err}"),
-            ),
-        },
-        Err(_) => surface.line(
-            LineKind::Notice,
-            "daemon: not running (run `teton` to autostart it, or start `teton-code`).",
-        ),
-    }
+/// Everything doctor prints before it asks the daemon anything: the header and
+/// the one line [`DoctorAttach`] decides.
+///
+/// This is the whole surface the two attach arms can differ on — after it, the
+/// report has no `attach` in scope — which is what the unit test over both arms
+/// stands on (REQ-582 AC-1's `/doctor` carve-out).
+fn doctor_preamble(paths: &DaemonPaths, attach: &DoctorAttach, surface: &mut dyn Surface) {
+    doctor_header(paths, surface);
+    surface.line(LineKind::Info, &attach.daemon_line());
+}
 
+/// The two closing notices, printed on every path including the ones that never
+/// reached the daemon.
+fn doctor_trailer(surface: &mut dyn Surface) {
     surface.line(
         LineKind::Notice,
         "model: the local-tier lifecycle is event-driven — start a session to observe \
@@ -1288,6 +1512,84 @@ fn run_doctor(paths: &DaemonPaths) -> anyhow::Result<()> {
          path of its own (BR-1). `teton provider test <id>` makes one consented call and reports \
          what came back.",
     );
+}
+
+/// `teton doctor`: daemon status, socket path, model state, providers.
+///
+/// Keeps the connect/handshake itself — deliberately `Connection::connect` and
+/// not `client::ensure_connected`, because a diagnosis must report a daemon
+/// that is down rather than start one — and hands the handshake to
+/// [`doctor_report_on`] as [`DoctorAttach::Fresh`]. The two arms that have no
+/// daemon to report on stay here: a session can be in neither state (REQ-582
+/// ADR-5).
+fn run_doctor(paths: &DaemonPaths) -> anyhow::Result<()> {
+    let mut surface = stdout_surface();
+    let mut state = SessionState::new();
+    let mut prompter = StdinPrompter::new();
+
+    match Connection::connect(&paths.socket) {
+        Ok(mut conn) => match conn.handshake() {
+            Ok(hs) => {
+                let mut ctx = passive_ctx(&mut surface, &mut state, &mut prompter);
+                doctor_report_on(paths, &mut conn, &mut ctx, &DoctorAttach::Fresh(hs))?;
+            }
+            // The commonest cause is a daemon left running across an upgrade,
+            // and `handshake` has already turned that into a sentence with the
+            // restart command in it — doctor adds the context that the daemon
+            // is up, which is the part its other arms establish.
+            Err(err) => {
+                doctor_header(paths, &mut surface);
+                surface.line(
+                    LineKind::Error,
+                    &format!("daemon: reachable, but it rejected this CLI — {err}"),
+                );
+                doctor_trailer(&mut surface);
+            }
+        },
+        Err(_) => {
+            doctor_header(paths, &mut surface);
+            surface.line(
+                LineKind::Notice,
+                "daemon: not running (run `teton` to autostart it, or start `teton-code`).",
+            );
+            doctor_trailer(&mut surface);
+        }
+    }
+    Ok(())
+}
+
+/// The doctor report over a connection the caller already has (REQ-582 BR-7).
+///
+/// One `config/get` and the same renderers `teton doctor` has always used, so
+/// `/doctor` cannot drift from its shell twin: the only line that knows which
+/// surface it is on is [`DoctorAttach::daemon_line`].
+///
+/// # Errors
+///
+/// Propagates a transport error from `config/get`; a daemon that answers is
+/// reported on the surface and returns `Ok`.
+pub(crate) fn doctor_report_on(
+    paths: &DaemonPaths,
+    conn: &mut Connection,
+    ctx: &mut UiContext<'_>,
+    attach: &DoctorAttach,
+) -> anyhow::Result<()> {
+    doctor_preamble(paths, attach, ctx.surface);
+    match conn.call(ConfigGetParams::default(), ctx)? {
+        Ok(cfg) => {
+            render_config(&cfg.snapshot.providers, ctx.surface);
+            advise_on_base_url_endpoints(&cfg.snapshot.providers, ctx.surface);
+        }
+        Err(err) if err.code == error_code::METHOD_NOT_FOUND => ctx.surface.line(
+            LineKind::Notice,
+            "config: not exposed by this daemon build yet (config/get pending).",
+        ),
+        Err(err) => ctx.surface.line(
+            LineKind::Error,
+            &format!("config query failed: {}", err.message),
+        ),
+    }
+    doctor_trailer(ctx.surface);
     Ok(())
 }
 
@@ -1369,7 +1671,82 @@ fn run_effort(paths: &DaemonPaths, level: Option<&str>) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// A `provider add` the flow declined to make, and the sentence it declines
+/// with (REQ-582 ADR-3).
+///
+/// The three refusals were `anyhow::bail!`s inside [`run_provider_add`], which
+/// is the right channel for a shell (non-zero exit, the message on stderr) and
+/// the wrong one for a session: a handler that returns `Err` ends the session,
+/// because the entry loop propagates it. So the decision travels as a value and
+/// each surface chooses the channel — [`run_provider_add`] maps it straight back
+/// to `bail!` with the same sentence, and the session renders it as one
+/// [`LineKind::Error`] line and carries on. The **text** is identical either
+/// way, which is what AC-1's byte-parity and AC-2/AC-3's effect parity each
+/// assert about a different half of this command.
+#[derive(Debug)]
+pub(crate) enum ProviderAddRefusal {
+    /// A remote provider with no `--model` (REQ-557 BR-1).
+    RemoteWithoutModel {
+        /// The id that was being registered.
+        id: String,
+    },
+    /// An id that is already registered (BUG-155).
+    DuplicateId {
+        /// The id that already exists.
+        id: String,
+    },
+    /// No credential was supplied — an empty answer, or EOF at the prompt.
+    NoKey,
+}
+
+impl std::fmt::Display for ProviderAddRefusal {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::RemoteWithoutModel { id } => write!(
+                f,
+                "provider `{id}` is a remote provider and must declare the model it calls: \
+                 pass `--model <name>` (e.g. `--model claude-opus-5`). The model is never \
+                 inferred from the provider id."
+            ),
+            Self::DuplicateId { id } => write!(
+                f,
+                "provider `{id}` is already registered. Ids are unique — pick a different \
+                 one (e.g. `{id}-2`) if you want a second provider, which is how one vendor \
+                 serves two models. Nothing was changed and no credential was read."
+            ),
+            Self::NoKey => write!(
+                f,
+                "no API key provided; set TETON_PROVIDER_KEY or enter the key"
+            ),
+        }
+    }
+}
+
+/// REQ-557 BR-1 / TASK-046: a remote provider MUST declare its model.
+///
+/// The one decision `provider add` can make before it has a connection, and the
+/// reason it is a function rather than a line inside [`provider_add_on`]: the
+/// shell wrapper asks it *before* `ensure_connected`, exactly as it always has,
+/// so a command that was always going to fail still refuses without autostarting
+/// a daemon. [`provider_add_on`] asks the same function first thing, so the
+/// session — whose connection is already open — refuses on the same grounds.
+/// One implementation, two call sites; a second copy of the predicate is the
+/// mirrored-predicate shape LESSON-528 is about.
+fn remote_provider_needs_model(
+    id: &str,
+    kind: ProviderKind,
+    model: Option<&str>,
+) -> Option<ProviderAddRefusal> {
+    (!matches!(kind, ProviderKind::Local) && model.unwrap_or("").trim().is_empty())
+        .then(|| ProviderAddRefusal::RemoteWithoutModel { id: id.to_owned() })
+}
+
 /// `teton provider add`: store the key in the keychain (BR-7), then register.
+///
+/// A connection-opening shell around [`provider_add_on`] plus the one check that
+/// predates the connection ([`remote_provider_needs_model`]), and the mapping of
+/// a [`ProviderAddRefusal`] back to the `bail!` a shell expects — non-zero exit,
+/// the sentence on stderr (REQ-582 ADR-3).
 fn run_provider_add(
     paths: &DaemonPaths,
     id: &str,
@@ -1377,16 +1754,50 @@ fn run_provider_add(
     endpoint: Option<String>,
     model: Option<String>,
 ) -> anyhow::Result<()> {
+    // Before `ensure_connected`, because it always was: a `provider add` with no
+    // `--model` has never started a daemon in order to refuse.
+    if let Some(refusal) = remote_provider_needs_model(id, kind, model.as_deref()) {
+        anyhow::bail!("{refusal}");
+    }
     let mut surface = stdout_surface();
+    let mut conn = client::ensure_connected(paths, &mut surface)?;
+    let mut state = SessionState::new();
+    let mut prompter = StdinPrompter::new();
+    let mut ctx = passive_ctx(&mut surface, &mut state, &mut prompter);
+    match provider_add_on(&mut conn, &mut ctx, id, kind, endpoint, model)? {
+        Ok(()) => Ok(()),
+        Err(refusal) => anyhow::bail!("{refusal}"),
+    }
+}
+
+/// The body of `provider add`: the refusals, the composition echo, the
+/// credential, and the registration (REQ-582 BR-2, ADR-3).
+///
+/// **The order of the steps is the specification.** Model check → duplicate
+/// probe → endpoint settlement → credential → prior-key read → payload → call →
+/// outcome report. BUG-155, BUG-171 and REQ-578 each pin a different edge of it,
+/// and the comments below say which; nothing here may be reordered without
+/// re-reading them.
+///
+/// # Errors
+///
+/// Propagates a transport failure, an endpoint the registration seam refuses
+/// (REQ-578 BR-5), and a keychain that cannot store — the errors a shell exits
+/// non-zero on. The three *decisions* travel as [`ProviderAddRefusal`] instead,
+/// so the session can render them without ending (ADR-3).
+pub(crate) fn provider_add_on(
+    conn: &mut Connection,
+    ctx: &mut UiContext<'_>,
+    id: &str,
+    kind: ProviderKind,
+    endpoint: Option<String>,
+    model: Option<String>,
+) -> anyhow::Result<Result<(), ProviderAddRefusal>> {
     // REQ-557 BR-1 / TASK-046: a remote provider MUST declare its model, and the
     // check runs BEFORE `read_secret` — otherwise the user types a credential
     // into a command that was always going to fail.
-    if !matches!(kind, ProviderKind::Local) && model.as_deref().unwrap_or("").trim().is_empty() {
-        anyhow::bail!(
-            "provider `{id}` is a remote provider and must declare the model it calls: \
-             pass `--model <name>` (e.g. `--model claude-opus-5`). The model is never \
-             inferred from the provider id."
-        );
+    if let Some(refusal) = remote_provider_needs_model(id, kind, model.as_deref()) {
+        return Ok(Err(refusal));
     }
     // BUG-155 / REQ-557 AC-1: "registering a third with id `opus` fails."
     //
@@ -1401,19 +1812,9 @@ fn run_provider_add(
     // *updated*, and there is no remove op to sequence around. So the refusal
     // lives here, at the `add` verb, which is what the AC is written about — and
     // it runs before `read_secret` for the same reason the `--model` check does.
-    let mut conn = client::ensure_connected(paths, &mut surface)?;
-    {
-        let mut state = SessionState::new();
-        let mut prompter = StdinPrompter::new();
-        let mut probe_ctx = passive_ctx(&mut surface, &mut state, &mut prompter);
-        if let Ok(cfg) = conn.call(ConfigGetParams::default(), &mut probe_ctx)? {
-            if cfg.snapshot.providers.iter().any(|p| p.id.0 == id) {
-                anyhow::bail!(
-                    "provider `{id}` is already registered. Ids are unique — pick a different \
-                     one (e.g. `{id}-2`) if you want a second provider, which is how one vendor \
-                     serves two models. Nothing was changed and no credential was read."
-                );
-            }
+    if let Ok(cfg) = conn.call(ConfigGetParams::default(), ctx)? {
+        if cfg.snapshot.providers.iter().any(|p| p.id.0 == id) {
+            return Ok(Err(ProviderAddRefusal::DuplicateId { id: id.to_owned() }));
         }
     }
 
@@ -1446,14 +1847,24 @@ fn run_provider_add(
     // changing `registration_params`' signature, and
     // `the_endpoint_that_is_echoed_is_the_endpoint_that_is_registered` drives
     // both of these functions, so a mutation inside either one fails.
-    let settled = settle_registration(id, kind, endpoint, model, &mut surface)?;
+    let settled = settle_registration(id, kind, endpoint, model, &mut *ctx.surface)?;
 
     let keychain = keychain::default_keychain();
     // Local providers have no credential; every remote kind requires a key.
+    //
+    // The prompter is the caller's (ADR-3): `StdinPrompter` under the shell's
+    // passive context, and the session's own dialogue prompter under `/provider
+    // add` — echo-off on both, because that is [`read_secret`]'s choice and not
+    // this call site's.
     let secret = if matches!(kind, ProviderKind::Local) {
         None
     } else {
-        Some(read_secret(id)?)
+        // The only error `read_secret` has is "nothing was typed", so it becomes
+        // the refusal rather than an `Err` that would end a session.
+        match read_secret(id, &mut *ctx.prompter) {
+            Ok(secret) => Some(secret),
+            Err(_) => return Ok(Err(ProviderAddRefusal::NoKey)),
+        }
     };
     // What the store inside `build_provider_registration` is about to displace,
     // read in the same breath — the store destroys the answer, and a rejected
@@ -1464,15 +1875,11 @@ fn run_provider_add(
     let prepared = registration_params(&settled, keychain.as_ref(), secret.as_deref())?;
     let PreparedRegistration { params, auth } = prepared;
 
-    let mut state = SessionState::new();
-    let mut prompter = StdinPrompter::new();
-    let mut ctx = passive_ctx(&mut surface, &mut state, &mut prompter);
-
     // Bound rather than `?`-ed past: a transport failure is not the same event
     // as a daemon that answered "no" — the registration may or may not have
     // landed, and a key this run stored must be accounted for out loud on every
     // path (BUG-171).
-    match conn.call(params, &mut ctx) {
+    match conn.call(params, ctx) {
         Ok(outcome) => {
             report_registration_outcome(
                 outcome,
@@ -1483,7 +1890,7 @@ fn run_provider_add(
                 keychain.as_ref(),
                 ctx.surface,
             );
-            Ok(())
+            Ok(Ok(()))
         }
         Err(transport) => {
             if prior.is_some() {
@@ -1560,7 +1967,21 @@ fn run_provider_list(paths: &DaemonPaths) -> anyhow::Result<()> {
     let mut state = SessionState::new();
     let mut prompter = StdinPrompter::new();
     let mut ctx = passive_ctx(&mut surface, &mut state, &mut prompter);
-    match conn.call(ConfigGetParams::default(), &mut ctx)? {
+    provider_list_on(&mut conn, &mut ctx)
+}
+
+/// The body of `provider list`: one `config/get`, one [`render_config`]
+/// (REQ-582 BR-2).
+///
+/// # Errors
+///
+/// Propagates a transport error; a daemon that answers is reported on the
+/// surface and returns `Ok`.
+pub(crate) fn provider_list_on(
+    conn: &mut Connection,
+    ctx: &mut UiContext<'_>,
+) -> anyhow::Result<()> {
+    match conn.call(ConfigGetParams::default(), ctx)? {
         Ok(cfg) => render_config(&cfg.snapshot.providers, ctx.surface),
         Err(err) if err.code == error_code::METHOD_NOT_FOUND => ctx.surface.line(
             LineKind::Notice,
@@ -1581,13 +2002,34 @@ fn run_boundary_add(paths: &DaemonPaths, glob: String, mode: PrivacyMode) -> any
     let mut state = SessionState::new();
     let mut prompter = StdinPrompter::new();
     let mut ctx = passive_ctx(&mut surface, &mut state, &mut prompter);
+    boundary_add_on(&mut conn, &mut ctx, &glob, mode)
+}
+
+/// The body of `boundary add`: one `config/set`, one set of outcomes (REQ-582
+/// BR-2).
+///
+/// The daemon-side gates are the twin's — this sends the same
+/// `SetPrivacyBoundary` params from either surface, so the presence attestation
+/// and the ancestry gate apply to `/boundary add` exactly as they do to
+/// `teton boundary add` (BR-6).
+///
+/// # Errors
+///
+/// Propagates a transport error; a daemon that answers is reported on the
+/// surface and returns `Ok`.
+pub(crate) fn boundary_add_on(
+    conn: &mut Connection,
+    ctx: &mut UiContext<'_>,
+    glob: &str,
+    mode: PrivacyMode,
+) -> anyhow::Result<()> {
     let params = ConfigSetParams {
         update: ConfigUpdate::SetPrivacyBoundary(PrivacyBoundaryConfig {
-            path_glob: glob.clone(),
+            path_glob: glob.to_owned(),
             mode,
         }),
     };
-    match conn.call(params, &mut ctx)? {
+    match conn.call(params, ctx)? {
         Ok(res) if res.applied => ctx.surface.line(
             LineKind::Info,
             &format!("boundary added: {glob} [{}]", privacy_label(mode)),
@@ -1614,7 +2056,20 @@ fn run_boundary_list(paths: &DaemonPaths) -> anyhow::Result<()> {
     let mut state = SessionState::new();
     let mut prompter = StdinPrompter::new();
     let mut ctx = passive_ctx(&mut surface, &mut state, &mut prompter);
-    match conn.call(ConfigGetParams::default(), &mut ctx)? {
+    boundary_list_on(&mut conn, &mut ctx)
+}
+
+/// The body of `boundary list`: one `config/get`, one listing (REQ-582 BR-2).
+///
+/// # Errors
+///
+/// Propagates a transport error; a daemon that answers is reported on the
+/// surface and returns `Ok`.
+pub(crate) fn boundary_list_on(
+    conn: &mut Connection,
+    ctx: &mut UiContext<'_>,
+) -> anyhow::Result<()> {
+    match conn.call(ConfigGetParams::default(), ctx)? {
         Ok(cfg) => {
             if cfg.snapshot.privacy.is_empty() {
                 ctx.surface.line(
@@ -1669,16 +2124,43 @@ fn run_policy_set_tier(
     provider: String,
     fallback: Option<String>,
 ) -> anyhow::Result<()> {
-    run_policy_bind(
-        paths,
+    let mut surface = stdout_surface();
+    let mut conn = client::ensure_connected(paths, &mut surface)?;
+    let mut state = SessionState::new();
+    let mut prompter = StdinPrompter::new();
+    let mut ctx = passive_ctx(&mut surface, &mut state, &mut prompter);
+    policy_set_tier_on(&mut conn, &mut ctx, tier, &provider, fallback.as_deref())
+}
+
+/// The body of `policy set-tier` (REQ-582 BR-2).
+///
+/// The payload is built **here** rather than at each surface, so `/policy
+/// set-tier` and `teton policy set-tier` cannot send different params for the
+/// same words — which is the half of BR-6 the client owns; the gates the daemon
+/// applies to those params are unchanged either way.
+///
+/// # Errors
+///
+/// Propagates a transport error; a daemon that answers is reported on the
+/// surface and returns `Ok`.
+pub(crate) fn policy_set_tier_on(
+    conn: &mut Connection,
+    ctx: &mut UiContext<'_>,
+    tier: Tier,
+    provider: &str,
+    fallback: Option<&str>,
+) -> anyhow::Result<()> {
+    policy_bind_on(
+        conn,
+        ctx,
         ConfigUpdate::SetTierBinding(TierBindingConfig {
             tier,
-            provider_id: ProviderId::from(provider.as_str()),
-            fallback_id: fallback.as_deref().map(ProviderId::from),
+            provider_id: ProviderId::from(provider),
+            fallback_id: fallback.map(ProviderId::from),
         }),
         &format!("the '{tier}' tier"),
-        &provider,
-        fallback.as_deref(),
+        provider,
+        fallback,
     )
 }
 
@@ -1689,35 +2171,69 @@ fn run_policy_set_category(
     provider: String,
     fallback: Option<String>,
 ) -> anyhow::Result<()> {
-    run_policy_bind(
-        paths,
-        ConfigUpdate::SetCategoryBinding(CategoryBindingConfig {
-            name: category,
-            provider_id: ProviderId::from(provider.as_str()),
-            fallback_id: fallback.as_deref().map(ProviderId::from),
-        }),
-        &format!("the '{category}' category"),
-        &provider,
-        fallback.as_deref(),
-    )
-}
-
-/// The shared body of `set-tier` and `set-category`: one round trip, one set of
-/// outcomes, one sentence shape. The two differ only in what they bind.
-fn run_policy_bind(
-    paths: &DaemonPaths,
-    update: ConfigUpdate,
-    what: &str,
-    provider: &str,
-    fallback: Option<&str>,
-) -> anyhow::Result<()> {
     let mut surface = stdout_surface();
     let mut conn = client::ensure_connected(paths, &mut surface)?;
     let mut state = SessionState::new();
     let mut prompter = StdinPrompter::new();
     let mut ctx = passive_ctx(&mut surface, &mut state, &mut prompter);
+    policy_set_category_on(
+        &mut conn,
+        &mut ctx,
+        category,
+        &provider,
+        fallback.as_deref(),
+    )
+}
+
+/// The body of `policy set-category` (REQ-582 BR-2). See
+/// [`policy_set_tier_on`] for why the payload is built here.
+///
+/// # Errors
+///
+/// Propagates a transport error; a daemon that answers is reported on the
+/// surface and returns `Ok`.
+pub(crate) fn policy_set_category_on(
+    conn: &mut Connection,
+    ctx: &mut UiContext<'_>,
+    category: ConfigurableCategory,
+    provider: &str,
+    fallback: Option<&str>,
+) -> anyhow::Result<()> {
+    policy_bind_on(
+        conn,
+        ctx,
+        ConfigUpdate::SetCategoryBinding(CategoryBindingConfig {
+            name: category,
+            provider_id: ProviderId::from(provider),
+            fallback_id: fallback.map(ProviderId::from),
+        }),
+        &format!("the '{category}' category"),
+        provider,
+        fallback,
+    )
+}
+
+/// The shared body of `set-tier` and `set-category`: one round trip, one set of
+/// outcomes, one sentence shape. The two differ only in what they bind.
+///
+/// Takes the caller's connection and context (REQ-582 ADR-3), so the four
+/// call sites — two subcommands and their two session rows — are one
+/// implementation of the write and one of the sentences it renders.
+///
+/// # Errors
+///
+/// Propagates a transport error; a daemon that answers is reported on the
+/// surface and returns `Ok`.
+pub(crate) fn policy_bind_on(
+    conn: &mut Connection,
+    ctx: &mut UiContext<'_>,
+    update: ConfigUpdate,
+    what: &str,
+    provider: &str,
+    fallback: Option<&str>,
+) -> anyhow::Result<()> {
     let fallback_note = fallback.map_or_else(String::new, |f| format!(" (fallback {f})"));
-    match conn.call(ConfigSetParams { update }, &mut ctx)? {
+    match conn.call(ConfigSetParams { update }, ctx)? {
         Ok(res) if res.applied => ctx.surface.line(
             LineKind::Info,
             &format!("{what} now routes to `{provider}`{fallback_note}."),
@@ -1748,7 +2264,18 @@ fn run_policy_show(paths: &DaemonPaths) -> anyhow::Result<()> {
     let mut state = SessionState::new();
     let mut prompter = StdinPrompter::new();
     let mut ctx = passive_ctx(&mut surface, &mut state, &mut prompter);
-    match conn.call(ConfigGetParams::default(), &mut ctx)? {
+    policy_show_on(&mut conn, &mut ctx)
+}
+
+/// The body of `policy show`: one `config/get`, one [`render_policy`] (REQ-582
+/// BR-2).
+///
+/// # Errors
+///
+/// Propagates a transport error; a daemon that answers is reported on the
+/// surface and returns `Ok`.
+pub(crate) fn policy_show_on(conn: &mut Connection, ctx: &mut UiContext<'_>) -> anyhow::Result<()> {
+    match conn.call(ConfigGetParams::default(), ctx)? {
         Ok(cfg) => render_policy(&cfg.snapshot, ctx.surface),
         Err(err) if err.code == error_code::METHOD_NOT_FOUND => ctx.surface.line(
             LineKind::Notice,
@@ -2630,16 +3157,31 @@ fn registration_unanswered_line(id: &str, auth: &str) -> String {
     )
 }
 
-/// Read a provider API key from `TETON_PROVIDER_KEY` or, failing that, stdin.
-/// The key is handed straight to the keychain and never written to a file.
-fn read_secret(id: &str) -> anyhow::Result<String> {
+/// Read a provider API key from `TETON_PROVIDER_KEY` or, failing that, from the
+/// caller's prompter. The key is handed straight to the keychain and never
+/// written to a file.
+///
+/// The prompter is passed rather than made here (REQ-582 ADR-3): the shell's
+/// `provider add` runs under a passive context whose prompter is a
+/// [`StdinPrompter`] — what this function used to build for itself — and the
+/// session's `/provider add` runs under the session's own dialogue prompter, so
+/// the question is asked where the session is having its conversation. Which
+/// *kind* of question it is stays [`prompt_for_secret`]'s decision (`ask_secret`,
+/// echo-off) and is therefore the same on both surfaces.
+///
+/// # Errors
+///
+/// Exactly one: nothing was typed — an empty answer or EOF. Callers that must
+/// not end on it map that single error to their own refusal
+/// ([`ProviderAddRefusal::NoKey`]).
+fn read_secret(id: &str, prompter: &mut dyn Prompter) -> anyhow::Result<String> {
     if let Ok(key) = std::env::var("TETON_PROVIDER_KEY") {
         let key = key.trim().to_owned();
         if !key.is_empty() {
             return Ok(key);
         }
     }
-    prompt_for_secret(id, &mut StdinPrompter::new())
+    prompt_for_secret(id, prompter)
 }
 
 /// Ask for a provider API key through the **hiding** prompt (REQ-572 AC-5).
@@ -3648,6 +4190,215 @@ mod tests {
                 .unwrap();
         assert!(config.auth_ref.is_none());
         assert!(keychain.stored_secret("local").is_none());
+    }
+
+    // -----------------------------------------------------------------------
+    // REQ-582: the shared bodies the session's mirrored rows call.
+    //
+    // What these pin is the part of the split a byte-diff cannot see: the
+    // sentences that stopped being `bail!`s (ADR-3), the seam a credential
+    // question goes through when the caller supplies the prompter, and the one
+    // line `/doctor` is allowed to differ from `teton doctor` in (ADR-5). The
+    // parity itself is `cli_e2e`'s, which drives the real binary.
+    // -----------------------------------------------------------------------
+
+    /// ADR-3: the three refusals kept their exact sentences on the way out of
+    /// `bail!`.
+    ///
+    /// A shell still exits non-zero with these words — `run_provider_add` maps
+    /// the value straight back to `anyhow::bail!("{refusal}")` — and the session
+    /// renders the same words as one Error line. The e2e suite asserts the exit
+    /// status and a fragment of two of them against the real binary; what is
+    /// worth pinning here is the *whole* sentence, because a refusal is the only
+    /// output these paths produce and a paraphrase would pass every other test.
+    #[test]
+    fn the_three_provider_add_refusals_keep_their_sentences() {
+        assert_eq!(
+            ProviderAddRefusal::RemoteWithoutModel {
+                id: "kimi".to_owned()
+            }
+            .to_string(),
+            "provider `kimi` is a remote provider and must declare the model it calls: pass \
+             `--model <name>` (e.g. `--model claude-opus-5`). The model is never inferred from \
+             the provider id."
+        );
+        assert_eq!(
+            ProviderAddRefusal::DuplicateId {
+                id: "kimi".to_owned()
+            }
+            .to_string(),
+            "provider `kimi` is already registered. Ids are unique — pick a different one (e.g. \
+             `kimi-2`) if you want a second provider, which is how one vendor serves two models. \
+             Nothing was changed and no credential was read."
+        );
+        assert_eq!(
+            ProviderAddRefusal::NoKey.to_string(),
+            "no API key provided; set TETON_PROVIDER_KEY or enter the key"
+        );
+    }
+
+    /// REQ-557 BR-1's predicate, now that both surfaces ask it: only a remote
+    /// kind owes a model, and only a blank one is missing.
+    #[test]
+    fn only_a_remote_provider_with_no_model_is_refused_for_it() {
+        let refused = |kind, model| {
+            remote_provider_needs_model("kimi", kind, model)
+                .map(|refusal| refusal.to_string())
+                .is_some()
+        };
+        assert!(refused(ProviderKind::OpenaiCompatible, None));
+        // A model that is only whitespace is no model — the same reading the
+        // shipped check made.
+        assert!(refused(ProviderKind::Anthropic, Some("   ")));
+        assert!(refused(ProviderKind::Custom, Some("")));
+        assert!(!refused(ProviderKind::OpenaiCompatible, Some("kimi-k3")));
+        // The local tier's model belongs to the REQ-547 consent flow, so a local
+        // provider owes this command nothing.
+        assert!(!refused(ProviderKind::Local, None));
+    }
+
+    /// ADR-3: `read_secret` asks through the **caller's** prompter, and asks the
+    /// hiding question.
+    ///
+    /// The session path passes `ctx.prompter`, so this is the assertion that
+    /// `/provider add` will collect a key echo-off through the session's own
+    /// dialogue prompter rather than through a `StdinPrompter` this function
+    /// used to build for itself (REQ-549 BR-5, REQ-572 AC-5).
+    #[test]
+    fn read_secret_asks_the_callers_prompter_and_never_echoes() {
+        // The env shortcut is what the e2e suite removes from every child's
+        // environment; a developer who exports it must still run the test CI
+        // runs, so the prompter leg is only meaningful with it unset.
+        if std::env::var("TETON_PROVIDER_KEY").is_ok_and(|key| !key.trim().is_empty()) {
+            return;
+        }
+        let mut prompter = ScriptedPrompter::new(&["sk-session-secret"]);
+        let key = read_secret("kimi", &mut prompter).unwrap();
+
+        assert_eq!(key, "sk-session-secret");
+        assert_eq!(
+            prompter.secrets.len(),
+            1,
+            "the key question must go through `ask_secret`, not `ask`"
+        );
+        assert_eq!(
+            prompter.questions.len(),
+            1,
+            "exactly one question, and it was the hiding one: {:?}",
+            prompter.questions
+        );
+        assert_eq!(prompter.questions[0], prompter.secrets[0]);
+        // EOF at the prompt is the refusal `provider_add_on` turns into
+        // `ProviderAddRefusal::NoKey` rather than an `Err` that ends a session.
+        let mut eof = ScriptedPrompter::new(&[]);
+        assert!(read_secret("kimi", &mut eof).is_err());
+    }
+
+    fn doctor_paths() -> DaemonPaths {
+        DaemonPaths {
+            socket: std::path::PathBuf::from("/tmp/teton-test/teton.sock"),
+            lock: std::path::PathBuf::from("/tmp/teton-test/teton.lock"),
+            log: std::path::PathBuf::from("/tmp/teton-test/teton.log"),
+        }
+    }
+
+    fn handshook() -> HandshakeResult {
+        HandshakeResult {
+            protocol_version: teton_protocol::ProtocolVersion(2),
+            daemon_name: "teton-code".to_owned(),
+            daemon_version: "0.1.20".to_owned(),
+            capabilities: Vec::new(),
+        }
+    }
+
+    /// ADR-5 / BR-7: the session's `/doctor` differs from `teton doctor` in
+    /// **one** line, and it is the one that says which connection is being
+    /// reported on.
+    ///
+    /// Driven over `doctor_preamble` because that is the whole surface the
+    /// attach is in scope for — after it the report has no `attach` to consult,
+    /// so the config listing, the base-URL advice and the two closing notices
+    /// are the same code by construction rather than by assertion. What a test
+    /// can still get wrong is the header drifting between the arms, and that is
+    /// what this compares.
+    #[test]
+    fn the_session_doctor_differs_from_the_shell_one_in_exactly_the_daemon_line() {
+        let paths = doctor_paths();
+        let mut fresh = RecordingSurface::new();
+        doctor_preamble(&paths, &DoctorAttach::Fresh(handshook()), &mut fresh);
+        let mut session = RecordingSurface::new();
+        doctor_preamble(
+            &paths,
+            &DoctorAttach::Session {
+                daemon_name: Some("teton-code".to_owned()),
+                daemon_version: Some("0.1.20".to_owned()),
+            },
+            &mut session,
+        );
+
+        let fresh_lines = fresh.lines_of(LineKind::Info);
+        let session_lines = session.lines_of(LineKind::Info);
+        assert_eq!(
+            fresh.calls.len(),
+            session.calls.len(),
+            "the two arms render the same number of lines"
+        );
+        let differing: Vec<usize> = fresh_lines
+            .iter()
+            .zip(&session_lines)
+            .enumerate()
+            .filter_map(|(i, (a, b))| (a != b).then_some(i))
+            .collect();
+        assert_eq!(
+            differing,
+            vec![3],
+            "only the daemon line may differ: shell {fresh_lines:?} vs session {session_lines:?}"
+        );
+        assert_eq!(
+            fresh_lines[3],
+            "daemon: running — teton-code 0.1.20 (protocol 2)"
+        );
+        assert_eq!(
+            session_lines[3],
+            "daemon: running — teton-code 0.1.20 (this session's connection)"
+        );
+        // The header is the shell's, byte for byte, on both paths — this is the
+        // half of AC-1 the `/doctor` carve-out does not excuse.
+        assert_eq!(fresh_lines[0], "teton doctor");
+        assert!(fresh_lines[1].ends_with("teton.sock"));
+        assert!(fresh_lines[2].ends_with("teton.lock"));
+    }
+
+    /// A `Session` attach made from a connection that never handshook still
+    /// renders a report rather than panicking — the state is unreachable through
+    /// `ensure_connected`, and an unreachable state is not a reason to lose the
+    /// other fourteen lines of a diagnosis.
+    #[test]
+    fn a_session_attach_with_no_handshake_facts_still_names_the_connection() {
+        let line = DoctorAttach::Session {
+            daemon_name: None,
+            daemon_version: None,
+        }
+        .daemon_line();
+        assert!(line.contains("this session's connection"), "{line}");
+        assert!(line.starts_with("daemon: running — teton-code"), "{line}");
+    }
+
+    /// The lines `run_mirrored_command` renders for a `Command` that is not a
+    /// mirrored row: one line, naming what to type instead, and never a panic.
+    #[test]
+    fn a_command_that_is_not_a_mirrored_row_names_its_session_spelling() {
+        let line = session_spelling_line("cost", "/cost");
+        assert!(line.contains("`teton cost`"), "{line}");
+        assert!(line.contains("`/cost`"), "{line}");
+        // `uninstall` is the one with no session spelling at all, and its line
+        // says why rather than pointing at a command that does not exist.
+        assert!(UNINSTALL_IS_SHELL_ONLY.contains("shell-only"));
+        assert!(UNINSTALL_IS_SHELL_ONLY.contains("teton uninstall"));
+        assert!(
+            !UNINSTALL_IS_SHELL_ONLY.contains("/uninstall"),
+            "there is no session spelling to name"
+        );
     }
 
     // -----------------------------------------------------------------------
