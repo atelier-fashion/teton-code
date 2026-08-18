@@ -1044,6 +1044,15 @@ pub async fn run_routed_session_turn(
 /// (`harness/tools/web.rs`) measure the two real prompt shapes and turn red on
 /// overflow *and* on the margin being spent. A sentence added here is paid for
 /// by shortening another one.
+///
+/// REQ-582 rewrote the guide to say the session spellings first (`/policy
+/// show`, `/provider list`, `/doctor`; BR-9) and — because the client crate owns
+/// the table of those rows — the cross-check that no mirrored command is named
+/// by its shell form alone lives **there**: `crates/teton/src/cli_rows.rs`'s
+/// `guide_tests` reads this same file with `include_str!` across the crate
+/// boundary (compile time, no crate dependency, no source scanning — BUG-159).
+/// So an edit to `self_config.md` rebuilds and re-tests `teton` as well as this
+/// crate; that coupling is the assertion, not an accident.
 const SELF_CONFIG_GUIDE: &str = include_str!("self_config.md");
 
 /// The ending a question that needs the live web must have when the capability
@@ -2451,7 +2460,7 @@ mod tests {
         // REQ-579 verification.md, rounds A1–A3: with the hand-off only in the
         // preamble and step 1 leading with the shell command, the model followed
         // the numbered step 3/3. The hand-off has to be the first thing step 1
-        // says, and the shell command has to be marked as the shell-only
+        // says, and the shell command has to be marked as the shell
         // alternative — order inside the step is the assertion, exactly as it
         // is for the prohibition line above.
         let step_one = SELF_CONFIG_GUIDE
@@ -2470,9 +2479,14 @@ mod tests {
              follows the numbered step, so the hand-off must come first (REQ-579 BR-1, \
              verification.md A1–A3).\nstep 1: {step_one}"
         );
+        // "Shell:" rather than the "shell only" REQ-579 wrote (REQ-582 verify,
+        // m9): since REQ-582 the by-hand registration has a session row too
+        // (`/provider add`), so "only" became false. What this assertion is
+        // *for* is unchanged — the CLI recipe is marked as the alternative and
+        // never reads as the lead — and the marker word is what carries that.
         assert!(
-            step_one.to_ascii_lowercase().contains("shell only"),
-            "step 1 no longer marks the CLI as the shell-only alternative, so a session \
+            step_one.to_ascii_lowercase().contains("shell:"),
+            "step 1 no longer marks the CLI as the shell alternative, so a session \
              reader has two equal instructions again.\nstep 1: {step_one}"
         );
 

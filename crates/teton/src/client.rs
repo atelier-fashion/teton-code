@@ -128,6 +128,14 @@ pub struct Connection {
     /// skew warning belongs to *attaching*, and every command attaches through
     /// `ensure_connected`. `None` until the handshake completes.
     daemon_version: Option<String>,
+    /// The daemon *name* the same handshake reported (REQ-582 BR-7).
+    ///
+    /// Beside the version because `/doctor` renders the daemon line from this
+    /// connection rather than from a second handshake, and the shell twin's line
+    /// names both. Hardcoding `teton-code` in the session's copy of that line
+    /// would be a second source of truth for something the daemon states about
+    /// itself. `None` until the handshake completes.
+    daemon_name: Option<String>,
 }
 
 impl Connection {
@@ -145,6 +153,7 @@ impl Connection {
             .spawn(move || reader_loop(reader_stream, &tx))?;
         Ok(Self {
             daemon_version: None,
+            daemon_name: None,
             writer: stream,
             incoming: rx,
             next_id: 1,
@@ -156,6 +165,13 @@ impl Connection {
     #[must_use]
     pub fn daemon_version(&self) -> Option<&str> {
         self.daemon_version.as_deref()
+    }
+
+    /// The daemon name this connection handshook with, once it has (REQ-582
+    /// BR-7 — the in-session `/doctor` line).
+    #[must_use]
+    pub fn daemon_name(&self) -> Option<&str> {
+        self.daemon_name.as_deref()
     }
 
     /// Perform the protocol-version handshake. No events precede it (the daemon
@@ -193,6 +209,7 @@ impl Connection {
                             // happened, rather than from a second query that
                             // could reach a different daemon.
                             self.daemon_version = Some(result.daemon_version.clone());
+                            self.daemon_name = Some(result.daemon_name.clone());
                             Ok(result)
                         }
                     };
@@ -515,6 +532,142 @@ impl Connection {
             .recv()
             .map_err(|_| anyhow!("connection to the daemon closed"))
     }
+
+    /// A `Connection` with no daemon behind it, answering the *n*th request it
+    /// is sent with the *n*th scripted result (REQ-582 TASK-169).
+    ///
+    /// The command modules test a handler by *running* it — that is the only way
+    /// to assert what a row sends and what it renders in one place — and a
+    /// handler needs a connection. This is that connection: a `UnixStream::pair`
+    /// gives the writer half a real, connected socket, so every request the
+    /// handler makes is readable off `peer` (which is how a test asserts the
+    /// method name, or that nothing was sent at all), and the responses come off
+    /// the same [`mpsc`] channel the reader thread would have fed. No server, no
+    /// thread, no terminal.
+    ///
+    /// The ids are assigned the way [`Self::send`] assigns them — from 1, in
+    /// order — because [`Self::call`] correlates on them. A connection scripted
+    /// with fewer results than the handler makes calls reports "connection to
+    /// the daemon closed" on the extra call, which is the honest failure: the
+    /// test asked for a daemon that stops answering.
+    ///
+    /// No handshake happened, so `daemon_name`/`daemon_version` are `None` —
+    /// what `/doctor`'s session arm renders from an unnegotiated connection is
+    /// its documented fallback, not an invention.
+    #[cfg(test)]
+    pub(crate) fn scripted(results: &[Value]) -> (Self, UnixStream) {
+        Self::scripted_replies(results.iter().cloned().map(Ok).collect())
+    }
+
+    /// [`Self::scripted`] for a daemon that may answer a request with an
+    /// [`RpcError`] (REQ-582 verify, T1/M4).
+    ///
+    /// The success-only fixture cannot reach a handler's error arms — a
+    /// `config/set` the daemon refused, a `config/get` on a build too old to
+    /// serve it — and those arms are where a stored key is taken back out of the
+    /// keychain (BUG-171) and where `/doctor` says "not exposed" rather than
+    /// failing. Each reply is `Ok(result)` or `Err(error)`, matched to the *n*th
+    /// request exactly as [`Self::scripted`] matches its results.
+    #[cfg(test)]
+    pub(crate) fn scripted_replies(replies: Vec<Result<Value, RpcError>>) -> (Self, UnixStream) {
+        let (conn, tx, peer) = paired_for_test();
+        for (index, reply) in replies.into_iter().enumerate() {
+            let id = Id::Number(i64::try_from(index).expect("a test scripts few responses") + 1);
+            let response = match reply {
+                Ok(result) => Response::success(id, result),
+                Err(error) => Response::failure(id, error),
+            };
+            tx.send(Incoming::Response(response))
+                .expect("the receiver is alive: it is inside the connection");
+        }
+        (conn, peer)
+    }
+
+    /// Assert that every scripted reply was consumed by a request (REQ-582
+    /// verify, T4).
+    ///
+    /// A fixture scripted with *more* replies than the handler made calls would
+    /// pass every assertion about what was sent while the test's picture of the
+    /// exchange — "then it asked for X, which the daemon answered with Y" — was
+    /// one call longer than the truth. The scripting sender is dropped when the
+    /// fixture is built, so an empty channel reads as disconnected here and a
+    /// leftover reply reads as `Ok`. Call it at the end of a test that scripted
+    /// anything.
+    ///
+    /// # Panics
+    ///
+    /// When a scripted reply is still queued.
+    #[cfg(test)]
+    pub(crate) fn assert_all_consumed(&self) {
+        assert!(
+            self.incoming.try_recv().is_err(),
+            "a scripted reply was never consumed: the handler made fewer calls than the test \
+             scripted answers for"
+        );
+    }
+}
+
+/// Every JSON-RPC request a handler wrote to a scripted connection's socket, in
+/// order, as parsed frames (REQ-582 TASK-169; shared since the verify pass).
+///
+/// Non-blocking, so "nothing was sent" is an assertion a test can make without
+/// waiting for a daemon that does not exist. `peer` is the other end of the
+/// [`Connection::scripted`] pair. Frames rather than method names because the
+/// keychain tests read the `params` — a registration must carry
+/// `keychain://…` and never the key — and a second reader of the same bytes in
+/// each module would be two fixtures for one socket.
+#[cfg(test)]
+pub(crate) fn requests_written(peer: &UnixStream) -> Vec<Value> {
+    use std::io::Read;
+    peer.set_nonblocking(true).expect("nonblocking");
+    let mut raw = Vec::new();
+    // WouldBlock is the expected end of the stream here; whatever was read
+    // before it is in the buffer.
+    let _ = (&mut { peer }).read_to_end(&mut raw);
+    String::from_utf8_lossy(&raw)
+        .lines()
+        .filter(|line| !line.trim().is_empty())
+        .map(|line| serde_json::from_str(line).expect("a framed JSON-RPC request"))
+        .collect()
+}
+
+/// The method names of [`requests_written`], in order.
+#[cfg(test)]
+pub(crate) fn methods_written(peer: &UnixStream) -> Vec<String> {
+    requests_written(peer)
+        .iter()
+        .map(|request| {
+            request["method"]
+                .as_str()
+                .expect("every request names a method")
+                .to_owned()
+        })
+        .collect()
+}
+
+/// The socket-pair fixture both test constructors are built on.
+///
+/// Separate from [`Connection::scripted`] because the event tests in this module
+/// need the raw [`Sender`] to push [`Incoming::Event`]s, and [`Incoming`] is this
+/// module's own type — handing it out crate-wide to save these five lines would
+/// export the transport's internals for a test's convenience.
+#[cfg(test)]
+fn paired_for_test() -> (Connection, Sender<Incoming>, UnixStream) {
+    let (writer, peer) = UnixStream::pair().expect("socketpair");
+    let (tx, rx) = mpsc::channel();
+    (
+        Connection {
+            writer,
+            incoming: rx,
+            next_id: 1,
+            // No handshake happened on this fixture, so there is genuinely no
+            // daemon version or name to report (REQ-565, REQ-582).
+            daemon_version: None,
+            daemon_name: None,
+        },
+        tx,
+        peer,
+    )
 }
 
 /// How a received [`Response`] correlates against the single in-flight request a
@@ -1159,20 +1312,7 @@ mod tests {
     /// gives the writer half a real, connected socket without a daemon, so
     /// `drain_events` is exercised with no server, no terminal, and no thread.
     fn test_connection() -> (Connection, mpsc::Sender<Incoming>, UnixStream) {
-        let (writer, peer) = UnixStream::pair().expect("socketpair");
-        let (tx, rx) = mpsc::channel();
-        (
-            Connection {
-                writer,
-                incoming: rx,
-                next_id: 1,
-                // No handshake happened on this fixture, so there is genuinely
-                // no daemon version to report (REQ-565).
-                daemon_version: None,
-            },
-            tx,
-            peer,
-        )
+        paired_for_test()
     }
 
     fn lifecycle_envelope(model: &str, stage: ModelLifecycleStage) -> Incoming {

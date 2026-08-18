@@ -45,6 +45,7 @@ use crate::cost_ui::CostMeter;
 use crate::firstrun;
 use crate::prompt::Prompter;
 use crate::render::{LineKind, Surface};
+use crate::slash;
 
 /// Session-scoped permission memory (never written to disk).
 #[derive(Debug, Default)]
@@ -1842,6 +1843,51 @@ fn shell_probed_teton(title: &str) -> bool {
     !(words.next() == Some("provider") && words.next() == Some("test"))
 }
 
+// ---------------------------------------------------------------------------
+// The generic hand-off (REQ-582 ADR-6)
+// ---------------------------------------------------------------------------
+//
+// The two lines above correct a *mistake*: a reply that would have the user
+// paste a key into the chat, and a reply that reports a connection nothing
+// dialled. This one corrects nothing. Ten commands now have a session row
+// (BR-1), and a reply that names one of them by its shell spelling is right —
+// `teton policy show` works, and it is what the bundled guide and every page
+// ever written about a CLI teaches. It is only the longer way round from inside
+// a session that has the same command one slash away.
+//
+// So the line is a spelling, not an argument, and the rest follows from that:
+// it names the `/` forms and says nothing else, it goes last of the three, and
+// it is built from the row table rather than from a list of its own — BR-7's
+// rule ("`/help` is generated from the table") applied to the other surface
+// that names commands. A row added to the table is nudged for with no second
+// list to maintain, and this line cannot name a spelling that dispatches to
+// nothing.
+//
+// Read off the same backtick-stripped text every predicate above reads, with
+// [`contains_word`], **case-sensitively** — REQ-581's reply-side rule: a
+// command is typed in lowercase, so "Teton Provider List" is prose about one
+// and not one.
+
+/// The generic line's opening, and the whole of its editorial content.
+///
+/// The two sentences above each carry a reason — "no key in chat", "makes one
+/// consented call" — because each corrects a belief the reply left the user
+/// with. This one has no belief to correct, so it states the equivalence and
+/// stops. Anything longer would be the harness arguing with an answer that was
+/// already true.
+const GENERIC_HAND_OFF_PREFIX: &str = "in this session: ";
+
+/// ADR-6's line for `names`, in the order given (which is the caller's table
+/// order, never the order the reply happened to mention them in).
+///
+/// Plain text with no escape of its own (LESSON-517) and no em-dash aside
+/// (BUG-168), like the two constants above. It is built rather than declared
+/// only because its subject is whatever the reply recited.
+fn generic_hand_off_line(names: &[&str]) -> String {
+    let spellings: Vec<String> = names.iter().map(|name| format!("/{name}")).collect();
+    format!("{GENERIC_HAND_OFF_PREFIX}{}", spellings.join(", "))
+}
+
 /// End a typed-prompt turn: print the hand-off if this turn earned one.
 ///
 /// Called once per turn from the entry loop, and it **consumes** the turn's
@@ -1850,14 +1896,24 @@ fn shell_probed_teton(title: &str) -> bool {
 /// guarantee expressed as data rather than as a flag somebody has to remember to
 /// reset, and it doubles as the reset on every path that reaches here.
 ///
-/// Two lines can be earned and **at most one prints**: REQ-579's setup hand-off
-/// (the reply reached for the shell recipe) and REQ-581's connection hand-off
-/// (the turn answered a connection question by inspecting configuration). The
-/// setup line goes first because its subject is the more basic one — a reply
-/// steering a user toward pasting a key into the chat is corrected before a
-/// reply that merely tested the wrong thing — and because a setup recipe recites
-/// `teton provider add`, which the connection predicate would otherwise read as
-/// a probe.
+/// Three lines can be earned and **at most one prints**: REQ-579's setup
+/// hand-off (the reply reached for the shell recipe), REQ-581's connection
+/// hand-off (the turn answered a connection question by inspecting
+/// configuration), and REQ-582's generic line (the reply named a mirrored
+/// command by its shell spelling). The setup line goes first because its subject
+/// is the more basic one — a reply steering a user toward pasting a key into the
+/// chat is corrected before a reply that merely tested the wrong thing — and
+/// because a setup recipe recites `teton provider add`, which the connection
+/// predicate would otherwise read as a probe.
+///
+/// The generic line goes last because it is the only one of the three that
+/// carries no reason (BR-8, ADR-6). The older two say "no key in chat" and
+/// "makes one consented call"; those sentences are why the turns that earn them
+/// are worth interrupting, and a bare list of spellings printed in their place
+/// would drop the part that mattered. `teton provider add` and `teton policy
+/// set-tier` are mirrored rows *and* setup recipes, so this ordering is what
+/// decides which of the two lines such a reply gets — and it decides for the one
+/// that says something.
 ///
 /// `tty` is the session's `typed_input`, the same world-fact
 /// [`crate::web_setup_ui::gate`] turns on. A piped session prints nothing at
@@ -1887,6 +1943,28 @@ pub(crate) fn hand_off_after_turn(state: &mut SessionState, surface: &mut dyn Su
             .any(|command| plain.contains(command))
     {
         surface.line(LineKind::Notice, connection_test_line());
+        return;
+    }
+    // Neither correction was earned, so the only thing left to say about a reply
+    // that named a `teton …` command is how this session spells it (ADR-6). The
+    // candidates are the row table's, in table order; one the reply *also* named
+    // in `/` form is dropped, because the model already said it — REQ-579 ADR-9's
+    // dormancy, asked once per command rather than once per turn.
+    //
+    // The dormancy match is a **word** match too (verify m8): a substring
+    // `/doctor` occurs inside `crates/teton/src/doctor.rs`, and a reply that
+    // named that path while telling the user to run `teton doctor` has not
+    // taught the session spelling. `contains_word` reads the byte before the
+    // `/` — a path separator's neighbour is alphanumeric, a command's is a
+    // space or the line's start.
+    let named: Vec<&str> = slash::mirrored_rows()
+        .filter(|(name, shell)| {
+            contains_word(&plain, shell) && !contains_word(&plain, &format!("/{name}"))
+        })
+        .map(|(name, _)| name)
+        .collect();
+    if !named.is_empty() {
+        surface.line(LineKind::Notice, &generic_hand_off_line(&named));
     }
 }
 
@@ -5457,5 +5535,395 @@ mod tests {
             true,
         );
         assert_eq!(surface.lines_of(LineKind::Notice), vec![line]);
+    }
+
+    // -----------------------------------------------------------------------
+    // The generic hand-off (REQ-582 ADR-6)
+    // -----------------------------------------------------------------------
+
+    /// **AC-9's first case.** A reply that recites two shell twins earns exactly
+    /// one line, naming both `/` spellings.
+    ///
+    /// The second half is the ordering claim, and it is the reason the arm reads
+    /// the table instead of the reply: the same two commands mentioned the other
+    /// way round produce the same line. A line whose order came from the prose
+    /// would be a different line each time the model rephrased the same answer,
+    /// and a user who learns "the providers one comes first" would be learning
+    /// something that is not true.
+    #[test]
+    fn a_reply_that_recites_shell_twins_names_their_session_spellings() {
+        for (case, reply) in [
+            (
+                "AC-9's sentence, fenced",
+                "run `teton provider list` and `teton policy show`.",
+            ),
+            (
+                "the same two, in the other order",
+                "start with teton policy show, then teton provider list.",
+            ),
+        ] {
+            let surface = hand_off_turn(&[reply], true);
+            assert_eq!(
+                surface.lines_of(LineKind::Notice),
+                vec!["in this session: /provider list, /policy show"],
+                "{case}: one line, both spellings, table order; got {:?}",
+                surface.calls
+            );
+        }
+
+        // One row is the ordinary case, and the one the line has to read well
+        // as: no list, no comma, just the spelling.
+        let surface = hand_off_turn(&["run `teton doctor` and paste the output."], true);
+        assert_eq!(
+            surface.lines_of(LineKind::Notice),
+            vec!["in this session: /doctor"],
+            "{:?}",
+            surface.calls
+        );
+    }
+
+    /// **AC-9's second case, and dormancy per command.** A reply that already
+    /// names the `/` spelling earns nothing.
+    ///
+    /// REQ-579 ADR-9's rule, asked once per command rather than once per turn:
+    /// the model said it, so the harness has nothing to add *about that command*
+    /// — and still has something to add about the one it spelled only as a shell
+    /// call. A turn-wide dormancy would let one correct mention silence every
+    /// other row in the same reply, which is the shape of suppression the
+    /// REQ-579 line had to have taken back out of it.
+    #[test]
+    fn a_reply_that_already_names_the_session_spelling_earns_nothing() {
+        for (case, reply) in [
+            (
+                "it named the session spelling and nothing else",
+                "run `/provider list` to see what is registered.",
+            ),
+            (
+                "it named both spellings, so it already taught the mapping",
+                "run `/provider list` (from a shell: `teton provider list`).",
+            ),
+            (
+                "unfenced, as prose",
+                "type /doctor at the prompt, or teton doctor from a shell.",
+            ),
+        ] {
+            let surface = hand_off_turn(&[reply], true);
+            assert!(
+                surface.lines_of(LineKind::Notice).is_empty(),
+                "{case}: {:?}",
+                surface.calls
+            );
+        }
+
+        // Per command: one row named correctly does not cover for the other.
+        let surface = hand_off_turn(&["run `/provider list`, then `teton policy show`."], true);
+        assert_eq!(
+            surface.lines_of(LineKind::Notice),
+            vec!["in this session: /policy show"],
+            "the row the reply spelled only as a shell command is still named; got {:?}",
+            surface.calls
+        );
+
+        // Dormancy is a **word** match (verify m8): a `/doctor` inside a file
+        // path is not the session spelling, so a reply that named the path and
+        // told the user to run `teton doctor` still gets the nudge.
+        let surface = hand_off_turn(
+            &["the check lives in crates/teton/src/doctor.rs; run `teton doctor` to see it."],
+            true,
+        );
+        assert_eq!(
+            surface.lines_of(LineKind::Notice),
+            vec!["in this session: /doctor"],
+            "a path containing `/doctor` silenced the nudge; got {:?}",
+            surface.calls
+        );
+    }
+
+    /// A capitalised mention is prose about a command, not a command.
+    ///
+    /// The reply-side rule REQ-581 chose, inherited here rather than re-decided:
+    /// a command is typed in lowercase, so the match is case-sensitive and this
+    /// arm never lowercases the reply. Asserted on [`contains_word`] directly as
+    /// well as through the turn, because the case-sensitivity is a property of
+    /// *this* caller passing untouched text — the prompt-side callers lowercase
+    /// first — and nothing in the helper itself would stop a later edit here.
+    #[test]
+    fn a_capitalised_mention_of_a_command_is_not_one() {
+        assert!(contains_word(
+            "run teton provider list now",
+            "teton provider list"
+        ));
+        assert!(!contains_word(
+            "Teton Provider List is how the marketing page spells it",
+            "teton provider list"
+        ));
+
+        let surface = hand_off_turn(&["Teton Provider List is not how it is spelled."], true);
+        assert!(
+            surface.lines_of(LineKind::Notice).is_empty(),
+            "{:?}",
+            surface.calls
+        );
+    }
+
+    /// **AC-9's fourth case.** Prose that merely contains the word `teton` earns
+    /// nothing, and neither does a command with no session row.
+    ///
+    /// LESSON-535: a false positive on a turn that was not about running a
+    /// command is a finding, so the trigger is the exact `teton <sub>` token
+    /// sequence and not a keyword. The rows without a `mirror` are the other
+    /// half of the same claim — `teton provider test` is a real command, and
+    /// naming its `/` spelling here would be REQ-581's line said badly.
+    #[test]
+    fn a_reply_that_names_no_mirrored_command_earns_nothing() {
+        for reply in [
+            "the teton binary is slow to start on this machine.",
+            "teton is slow today.",
+            // Not a mirrored row: `provider test` and `provider setup` are the
+            // two commands whose session form is its own line above.
+            "registration looks right; run teton provider test kimi to dial it.",
+            // The daemon's crate is not the CLI — `contains_word`'s boundary,
+            // relied on by this arm as much as by REQ-581's.
+            "tetond provider list is not a command anybody can type.",
+            // The subcommand without the binary is prose about output.
+            "the provider list shows what is registered.",
+            "",
+        ] {
+            let surface = hand_off_turn(&[reply], true);
+            assert!(
+                surface.lines_of(LineKind::Notice).is_empty(),
+                "{reply:?} must earn nothing; got {:?}",
+                surface.calls
+            );
+        }
+    }
+
+    /// **AC-9's third case — precedence.** A setup recipe earns REQ-579's
+    /// sentence and not the generic list.
+    ///
+    /// `teton provider add` and `teton policy set-tier` are mirrored rows *and*
+    /// setup recipes, so every reply reciting one could earn either line. It gets
+    /// the older one because that one carries a reason — "no key in chat" — and
+    /// the generic line would replace it with a spelling on the exact turn the
+    /// reason is worth reading (BR-8).
+    #[test]
+    fn the_setup_hand_off_wins_over_the_generic_line() {
+        for (case, reply) in [
+            (
+                "the registration recipe",
+                "run `teton provider add kimi --kind openai-compatible` first.",
+            ),
+            (
+                "the routing recipe",
+                "then run teton policy set-tier build kimi.",
+            ),
+            // Both kinds of row in one reply: still one line, and still the one
+            // that says something.
+            (
+                "a recipe beside a plain mirrored row",
+                "run teton provider add kimi, then teton policy show to check it.",
+            ),
+        ] {
+            let surface = hand_off_turn(&[reply], true);
+            assert_eq!(
+                surface.lines_of(LineKind::Notice),
+                vec![hand_off_line()],
+                "{case}: the setup line, alone; got {:?}",
+                surface.calls
+            );
+        }
+    }
+
+    /// Precedence, the other side: a turn that earned REQ-581's line does not
+    /// also get the generic one.
+    ///
+    /// The observed failure recites `teton provider list`, which is a mirrored
+    /// row — so without the ordering this turn would print the spelling of the
+    /// command that answered the *wrong* question, in place of the sentence
+    /// saying which command answers the right one.
+    #[test]
+    fn the_connection_hand_off_wins_over_the_generic_line() {
+        let surface = connection_turn(
+            "can you test the kimi connection?",
+            &["shell: teton provider list"],
+            &["I ran teton provider list and kimi is registered, so it is working."],
+            &["kimi"],
+            true,
+        );
+        assert_eq!(
+            surface.lines_of(LineKind::Notice),
+            vec![connection_test_line()],
+            "the connection line, alone; got {:?}",
+            surface.calls
+        );
+    }
+
+    /// The two guarantees the older lines have, inherited unchanged: a pipe sees
+    /// nothing, and the turn's record is consumed whether a line printed or not.
+    ///
+    /// BR-11's byte-identity is the reason for the first — a script already has
+    /// the shell command, and its output has to be what it was — and the `take`s
+    /// at the top of [`hand_off_after_turn`] are the reason for the second, which
+    /// is why "at most one line per turn" needs no flag to hold for a third arm.
+    #[test]
+    fn the_generic_line_is_tty_only_and_prints_once_per_turn() {
+        let mut surface = RecordingSurface::new();
+        let mut state = SessionState::new();
+        state.begin_turn("");
+        render_event(
+            &envelope(chunk("run teton policy show to see the routing.")),
+            &mut surface,
+            &mut state,
+        );
+
+        hand_off_after_turn(&mut state, &mut surface, false);
+        assert!(
+            surface.lines_of(LineKind::Notice).is_empty(),
+            "a pipe must see no hand-off; got {:?}",
+            surface.calls
+        );
+        hand_off_after_turn(&mut state, &mut surface, true);
+        assert!(
+            surface.lines_of(LineKind::Notice).is_empty(),
+            "the suppressed turn's words must not survive the gate; got {:?}",
+            surface.calls
+        );
+
+        // On a TTY: one line, and a second call in the same turn adds nothing
+        // because the first consumed the reply.
+        let mut surface = RecordingSurface::new();
+        let mut state = SessionState::new();
+        state.begin_turn("");
+        render_event(
+            &envelope(chunk("run teton policy show to see the routing.")),
+            &mut surface,
+            &mut state,
+        );
+
+        hand_off_after_turn(&mut state, &mut surface, true);
+        assert_eq!(
+            surface.lines_of(LineKind::Notice),
+            vec!["in this session: /policy show"],
+            "{:?}",
+            surface.calls
+        );
+        hand_off_after_turn(&mut state, &mut surface, true);
+        assert_eq!(
+            surface.lines_of(LineKind::Notice),
+            vec!["in this session: /policy show"],
+            "a second call in the same turn adds nothing; got {:?}",
+            surface.calls
+        );
+
+        // And the next turn does not inherit the previous turn's words.
+        state.begin_turn("");
+        render_event(&envelope(chunk("done.")), &mut surface, &mut state);
+        hand_off_after_turn(&mut state, &mut surface, true);
+        assert_eq!(
+            surface.lines_of(LineKind::Notice),
+            vec!["in this session: /policy show"],
+            "a quiet turn must not reprint the previous turn's line; got {:?}",
+            surface.calls
+        );
+    }
+
+    /// **The candidates are the table's mirrored rows.**
+    ///
+    /// Driven from [`slash::mirrored_rows`] itself, so a row added to the table
+    /// is covered here the day it lands rather than the day somebody remembers
+    /// to add a case — which is the whole reason the arm reads the table (BR-7's
+    /// rule extended to the hand-off). The slash module pins the other end of
+    /// the same claim: that `mirrored_rows` is exactly the `mirror` rows of
+    /// `COMMANDS`, each named after the command it mirrors.
+    ///
+    /// Two rows expect the *setup* line rather than the generic one, and that is
+    /// the precedence above stated as a property of the table: a mirrored row
+    /// which is also a `PROVIDER_CLI_RECIPES` entry is answered by the sentence
+    /// with the reason in it.
+    #[test]
+    fn every_mirrored_row_is_a_candidate_of_the_generic_line() {
+        let rows: Vec<(&str, &str)> = slash::mirrored_rows().collect();
+        assert!(
+            !rows.is_empty(),
+            "the table has mirrored rows; a vacuous loop would prove nothing"
+        );
+
+        for (name, shell) in &rows {
+            let recital = format!("run {shell} and read what it prints.");
+            let surface = hand_off_turn(&[recital.as_str()], true);
+            let expected = if PROVIDER_CLI_RECIPES.contains(shell) {
+                hand_off_line().to_owned()
+            } else {
+                format!("in this session: /{name}")
+            };
+            assert_eq!(
+                surface.lines_of(LineKind::Notice),
+                vec![expected],
+                "{shell:?} is a mirrored row and must be nudged for; got {:?}",
+                surface.calls
+            );
+        }
+
+        // All of them at once — minus the setup recipes, which the arm above
+        // never sees — is the ordering claim over the whole table rather than
+        // over the pair AC-9 names.
+        let plain: Vec<(&str, &str)> = rows
+            .iter()
+            .copied()
+            .filter(|(_, shell)| !PROVIDER_CLI_RECIPES.contains(shell))
+            .collect();
+        let reply: String = plain
+            .iter()
+            .map(|(_, shell)| format!("{shell}\n"))
+            .collect();
+        let expected = format!(
+            "in this session: {}",
+            plain
+                .iter()
+                .map(|(name, _)| format!("/{name}"))
+                .collect::<Vec<_>>()
+                .join(", ")
+        );
+        let surface = hand_off_turn(&[reply.as_str()], true);
+        assert_eq!(
+            surface.lines_of(LineKind::Notice),
+            vec![expected],
+            "every mirrored row the arm can reach, once each, in table order; got {:?}",
+            surface.calls
+        );
+    }
+
+    /// The line itself: plain, and it names commands the session can dispatch.
+    ///
+    /// Shaped like the two sentences above and for their reasons — no escape
+    /// baked into the text (LESSON-517), no em-dash aside (BUG-168) — and one
+    /// claim of its own: every spelling it prints is a `/` form of a real row,
+    /// because it is built from the row table and from nothing else.
+    #[test]
+    fn the_generic_line_names_only_spellings_the_session_dispatches() {
+        let names: Vec<&str> = slash::mirrored_rows().map(|(name, _)| name).collect();
+        let line = generic_hand_off_line(&names);
+
+        assert!(
+            line.starts_with(GENERIC_HAND_OFF_PREFIX),
+            "it opens with the phrase that makes it about this session: {line}"
+        );
+        assert!(
+            !line.contains('\u{1b}'),
+            "no escape may be baked into the text (LESSON-517): {line:?}"
+        );
+        assert!(
+            !line.contains('\u{2014}'),
+            "BUG-168: no em-dash aside: {line}"
+        );
+        for spelling in line[GENERIC_HAND_OFF_PREFIX.len()..].split(", ") {
+            let name = spelling.strip_prefix('/').unwrap_or_else(|| {
+                panic!("every spelling is a slash command: {spelling:?} in {line}")
+            });
+            assert!(
+                names.contains(&name),
+                "{spelling:?} is not a row of the table: {line}"
+            );
+        }
     }
 }

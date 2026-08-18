@@ -1,7 +1,7 @@
 ---
 id: REQ-582
 title: "Every session-meaningful `teton` command runs from the session — no shell round-trip"
-status: draft
+status: complete
 deployable: true
 created: 2026-08-18
 updated: 2026-08-18
@@ -61,6 +61,11 @@ operate Teton:
    surface nudge is the guarantee; the guide edit is the improvement
    (LESSON-532 — presence in context is not instruction-following).
 
+REQ-555, which built the slash table, deferred exactly this in its Out of
+Scope: "in-session management commands (`/provider`, `/boundary`, `/policy`)
+… follow the same shared-flow pattern if promoted later." This is that
+promotion, on the same pattern.
+
 This is about **user-typed** commands. It does not make the model run `teton`
 through its shell tool — REQ-581 / LESSON-535 established that the product
 answers such questions first-class rather than the model improvising shell
@@ -96,7 +101,8 @@ None. No daemon change: every row is a new call site of an existing method
 | read rows (`provider list`, `boundary list`, `policy show`, `model list`, `model status`, `doctor`) | any attached session, TTY or pipe |
 | write rows (`provider add`, `boundary add`, `policy set-tier`, `policy set-category`) | typed input only (TTY); on piped stdin the row rejects with the shell pointer — REQ-555 BR-9's rule for the one row that wrote, applied to all rows that write |
 | write rows — daemon side | unchanged: the same `config/set` gate the shell twin meets, including presence attestation on a `presence` build (REQ-576 BR-10(b)) and the ancestry gate |
-| `provider add` key entry | echo-off through the session's prompter, into the keychain; never in the transcript, the model's context, or an event (REQ-579) |
+| `provider add` key entry | echo-off through the session's prompter, into the keychain; never in the transcript, the model's context, or an event (REQ-579). **In a session, a default-no confirmation naming the settled registration comes first** — before the key is read — so a pasted second line answers "no" rather than becoming the key; the session's `--yes` pre-answers it as it does `/model set`'s confirmation; the shell path asks nothing (verify M1) |
+| `effort` set (`/effort <level>`, `teton effort <level>` typed) | **recorded exception**: pipe-friendly, on a TTY and on a pipe. REQ-559 BR-9 made `/effort` identical on both, and a typed `teton effort max` runs that row through the same full-argv validation every pre-REQ leaf row gets (verify M2), so it inherits BR-9 rather than this REQ's write gate. It changes one persisted setting the next turn reads; the shell command `teton effort` is equally unattended-friendly |
 | `uninstall` | refused in-session, always |
 
 ## Business Rules
@@ -125,22 +131,76 @@ None. No daemon change: every row is a new call site of an existing method
       parser of `teton …` lines anywhere in the client (informed by
       LESSON-529 — a display helper is a second parser; two parsers of one
       string drift into a lie on screen).
-- [ ] BR-4: **Recognition is strict and total.** A prompt line is a
-      `CliLine` iff its first shell-split token is `teton` **and** the rest
-      parses under the CLI parser as a complete subcommand with valid
-      arguments and nothing trailing. Then: a row exists → run it and print
-      one line `>> teton <sub> → /<row>` first; no row (`uninstall`, bare
-      `teton`, `--version`, `--help`) → one refusing line naming why and the
-      shell pointer, never forwarded to the model (the BUG-146 shape: the
-      harness was asked and something else answered — REQ-555 BR-2). Any
-      other `teton…` line ("teton is slow today", "teton provider list shows
-      nothing, why?") is a plain prompt, byte-identical to today. REQ-555
-      BR-8's totality is amended from three buckets to four (command, CLI
-      line, escaped prompt, plain prompt) and stays pinned in both
-      directions: a test proves every CLI subcommand with a row is reachable
-      from a `teton …` line, that every subcommand without a row is refused,
-      and that non-parsing `teton…` lines reach the prompt path unchanged
-      (informed by REQ-555 BR-8, LESSON-479 via it).
+- [ ] BR-4: **Recognition is strict and total.** A prompt line is a CLI
+      line iff its first whitespace token is `teton` **and** the following
+      tokens name a subcommand path in the CLI parser's own tree (`provider
+      list`, `policy set-tier`, `doctor` …). Then: the path names a row → run
+      it and print one line `>> teton <sub> → /<row>` first, the row's own
+      grammar (clap) validating whatever follows the path — a stray or bad
+      argument prints the parser's own error, never a prompt; the path names
+      no row (`uninstall`, a bare family such as `teton provider`) or the
+      line is `teton` alone / `teton --help` / `teton --version` → one
+      refusing line naming why and the shell pointer, never forwarded to the
+      model (the BUG-146 shape: the harness was asked and something else
+      answered — REQ-555 BR-2). Any `teton…` line whose next token is not a
+      subcommand ("teton is slow today") is a plain prompt, byte-identical to
+      today. REQ-555 BR-8's totality is amended — the classifier gains the
+      recognized and refused CLI-line outcomes beside command, escaped
+      prompt and plain prompt — and stays pinned in both directions: a test
+      proves every CLI subcommand with a row is reachable from a `teton …`
+      line, that every subcommand without a row is refused, and that
+      non-subcommand `teton…` lines reach the prompt path unchanged; a
+      completeness test walks the parser's tree so every leaf subcommand is
+      either a row or an explicit shell-only exception (informed by REQ-555
+      BR-8, LESSON-479 via it; amended at architecture, ADR-1/ADR-8). Session-only
+      commands have no `teton` form, so `teton provider setup …` typed at
+      the prompt is a plain prompt — the model's own hand-off names
+      `/provider setup` (REQ-579 ADR-9).
+      *(**Amended at TASK-170.** `teton provider setup` is **not** a plain
+      prompt. `setup` names no subcommand, so the clap walk stops on the
+      **family** `provider` — a recognized path with no row, which is BR-4's
+      own second arm — and the line is refused in one sentence that names the
+      session's rows under that family, `/provider setup` among them. The
+      amendment is an improvement rather than a concession: a user who typed
+      `teton provider setup` is asking for a command this session **has**, and
+      answering them directly beats spending a model turn on a hand-off that
+      says the same thing — the "the harness was asked and something else
+      answered" shape BR-4 exists to close (BUG-146, REQ-555 BR-2). REQ-579's
+      hand-off is untouched for the case it was built for: a **model reply**
+      that recites the shell recipe.)*
+      *(**Recorded deviation, TASK-170.** A bare family gets a sentence
+      composed from the **table** (`slash::rows_under`), not clap's own error
+      for that path as ADR-1 wrote it. `Cli::try_parse_from(["teton",
+      "provider"])` does not produce a short "requires a subcommand" error: the
+      derive marks the required subcommand `arg_required_else_help`, so clap
+      answers with the whole help page for the family — a screen of text whose
+      longest line is the global `--yes` description and whose `Usage:` /
+      "try `--help`" tail is a shell's instructions. A `Surface` line owns one
+      row, and BR-4 and ADR-1 both say one refusing line. Composing from the
+      table keeps the anti-drift property BR-3 is about — the table is the list
+      that decides what runs here — and is what lets the line name
+      `/provider setup`, a session row the CLI has no subcommand for at all.
+      Pinned by `slash.rs::a_teton_line_with_no_session_form_is_refused_with_the_reason`.)*
+      *(**Verify-pass notes.** (a) Session-only row names typed after `teton`
+      are **not** recognized — `teton help`, `teton clear`, `teton web setup`
+      stay prompts, or, where the first word is a CLI family, the family's
+      refusal. Deliberately: the strict rule "the first token after `teton` is
+      a subcommand in the parser's tree" is what keeps `teton help me read this
+      backtrace` a prompt, and the model's own hand-off names the `/` spellings
+      for the session-only rows (REQ-579 ADR-9, BR-8's generic line for the
+      mirrored ones). Widening recognition to table names would trade that
+      guarantee for a convenience nobody asked for (Q2). (b) The binary's
+      global flags ahead of the subcommand — `teton -y policy set-tier …`,
+      `teton --verbose doctor` — are stepped over so the line is still
+      recognized, carried to the row, and reported as ignored in one Info line
+      (m5/M2). (c) A family followed by `--help`/`-h` (`teton provider --help`)
+      renders clap's own page for that family as information — the user asked
+      for help — rather than the bare-family refusal (T6). (d) A pre-REQ row
+      reached this way (`cost`, `effort`, `model set`, `provider test`) has its
+      whole typed argv validated by clap first, and the row is handed what the
+      parser derived — `teton model set qwen --yes` reaches `/model set` as
+      `qwen`, never as `qwen --yes` (M2). (e) The retired `teton policy set …`
+      answers with the retirement sentence the shell prints (m6).)*
 - [ ] BR-5: **A `CliLine` runs the row, not a subprocess.** Recognition never
       spawns the `teton` binary and never opens a second connection: it
       dispatches to the same handler `/<row>` dispatches to, over the
@@ -198,53 +258,149 @@ None. No daemon change: every row is a new call site of an existing method
 
 ## Acceptance Criteria
 
-- [ ] AC-1: In a session, `/provider list`, `/boundary list`, `/policy show`,
+- [x] AC-1: In a session, `/provider list`, `/boundary list`, `/policy show`,
       `/model list`, `/model status` and `/doctor` each print exactly the
       lines their `teton …` twin prints against the same daemon (byte-diffed
       by a test that drives both), with `/doctor`'s connect arm replaced per
       BR-7.
-- [ ] AC-2: `/policy set-tier build <id>`, `/policy set-category edit <id>
+      *(`cli_e2e.rs::every_read_row_prints_exactly_what_its_shell_twin_prints`
+      — twelve client runs against one daemon, line-for-line; the `/doctor`
+      carve-out asserted on each side. Unit legs:
+      `cli_rows.rs::every_read_row_sends_its_shell_twins_method_on_the_sessions_connection`,
+      `cli_rows.rs::doctor_reports_the_connection_the_session_already_has`.)*
+- [x] AC-2: `/policy set-tier build <id>`, `/policy set-category edit <id>
       --fallback <id>` and `/boundary add <glob> --mode local-only` change the
       daemon's config exactly as their shell twins do (asserted on
       `config/get` before/after), and the next turn routes accordingly.
-- [ ] AC-3: `/provider add <id> --kind openai-compatible --endpoint <url>
+      *(`cli_e2e.rs::the_write_rows_change_the_config_their_shell_twins_read_back`
+      — before/after through `teton policy show` and `teton boundary list`, so
+      the evidence is the daemon's own resolution and not the writing row's
+      echo. Argument parity:
+      `cli_rows.rs::a_row_parses_its_argument_exactly_as_the_shell_parses_its_argv`.)*
+- [x] AC-3: `/provider add <id> --kind openai-compatible --endpoint <url>
       --model <m>` on a TTY reads the key echo-off, stores it in the keychain,
       registers the provider, and the key appears nowhere in the transcript,
       the session's events, or the model's context (egress-capture assertion,
       REQ-579's harness).
-- [ ] AC-4: On piped stdin every write row (`provider add`, `boundary add`,
+      *(**Amended at verify (M1/M4).** The keychain is now a parameter of
+      `provider_add_on` — both callers pass `keychain::default_keychain()` —
+      and the session confirms, default-no, before it reads. So the composed
+      flow is pinned in-process against a double, in `main.rs`:
+      `a_confirmed_session_provider_add_stores_the_key_and_registers_by_reference`
+      (the key reaches `MockKeychain` under the id; the `config/set` on the
+      socket carries `keychain://teton/<id>` and no raw key; no surface line
+      and no wire byte carries the key),
+      `a_declined_session_provider_add_reads_no_key_and_stores_nothing` ("n",
+      an empty answer, and a pasted second command line all decline before
+      `ask_secret` is called; the keychain is untouched and only the duplicate
+      probe reaches the socket),
+      `the_sessions_yes_pre_answers_the_provider_add_confirmation`,
+      `a_refused_session_registration_takes_its_stored_key_back_out` and
+      `a_refused_session_registration_restores_the_key_it_displaced` (BUG-171's
+      `PriorKey` undo through the composed flow), and
+      `a_keychain_that_will_not_store_is_a_refusal_and_registers_nothing`. The
+      terminal half stays in
+      `pty_e2e.rs::a_session_provider_add_asks_for_its_key_echo_off_and_stores_nothing_untyped`
+      — confirm, then the hiding prompt, an empty key answer, `config.toml`
+      byte-identical — with the echo bit **fail-closed** (under a pty
+      `EchoState::NoTerminal` is unreachable and `EchoState::Failed` refuses to
+      read) and no credential typed, because the shipped binary still writes
+      to the real login keychain. `cli_rows.rs::provider_add_reads_its_key_through_the_hiding_prompt_and_never_as_a_flag`
+      pins the question order through the session row and that no `--key`
+      flag parses. The bytes-on-a-screen sweep of a real typed credential is
+      `pty_e2e.rs::the_key_step_does_not_echo_and_the_key_reaches_nothing`,
+      over the same `Prompter::ask_secret` seam this row reads through.)*
+- [x] AC-4: On piped stdin every write row (`provider add`, `boundary add`,
       `policy set-tier`, `policy set-category`) rejects with one line naming
       the shell command; every read row works.
-- [ ] AC-5: Typing `teton provider list` at the session prompt prints
+      *(`cli_e2e.rs::on_a_pipe_every_write_row_names_its_shell_twin_and_changes_nothing`
+      — one refusal line each, the three reads answering on the same pipe, and
+      the twins' readings unchanged afterwards. Unit legs:
+      `cli_rows.rs::a_write_row_on_a_pipe_names_its_shell_twin_and_sends_nothing`,
+      `cli_rows.rs::a_read_row_ignores_the_write_gate`.)*
+- [x] AC-5: Typing `teton provider list` at the session prompt prints
       `>> teton provider list → /provider list` and then the same lines as
       `/provider list`; no model call is made (no `route_decided`, no
       `CostRecord`, no `session_update`) — asserted over the wire.
-- [ ] AC-6: Typing `teton uninstall` prints one refusing line naming the
+      *(`cli_e2e.rs::a_typed_teton_line_runs_the_row_it_names_and_costs_no_turn`
+      — the two spellings' whole session bodies diffed, and the scripted reply
+      queue pinned untouched. Unit:
+      `slash.rs::every_row_that_names_a_subcommand_is_reachable_from_a_typed_teton_line`.)*
+- [x] AC-6: Typing `teton uninstall` prints one refusing line naming the
       shell pointer and makes no call; typing `teton is slow today` reaches
       the model as a prompt with the bytes unchanged; typing `teton provider
-      list please` reaches the model as a prompt (strict parse).
-- [ ] AC-7: `/policy set-tier build` (missing arg) and `/policy set-tier
+      list please` is recognized (its subcommand path is a row) and prints
+      the CLI parser's own `unexpected argument 'please'` — never a prompt.
+      *(Amended at architecture, ADR-1: a recognisable command with a stray
+      word sent to the model reproduces the failure this REQ removes; the
+      subcommand path is decided by clap's tree, the arguments by clap's
+      grammar.)*
+      *(`cli_e2e.rs::a_teton_line_with_no_session_form_is_refused_and_a_question_still_reaches_the_model`
+      — four lines, one session, the reply queue as the arithmetic. Units:
+      `slash.rs::a_teton_line_with_no_session_form_is_refused_with_the_reason`,
+      `slash.rs::a_teton_line_that_names_no_subcommand_is_a_byte_identical_prompt`,
+      `slash.rs::a_recognized_line_with_a_stray_word_prints_the_parsers_own_error`,
+      `slash.rs::the_double_slash_escape_still_outranks_recognition`.)*
+- [x] AC-7: `/policy set-tier build` (missing arg) and `/policy set-tier
       summit kimi` (bad enum) print the CLI parser's own error for that
       subcommand — the same text `teton policy set-tier build` prints — and
       issue no RPC.
-- [ ] AC-8: `/help` lists every new row, grouped by family; the table-vs-help
+      *(`cli_rows.rs::a_bad_argument_renders_claps_own_error_and_sends_nothing`
+      — both spec examples, compared against `Cli::try_parse_from`'s own
+      rendering for the same argv, with the socket asserted silent; and
+      `cli_rows.rs::a_help_request_renders_claps_help_for_that_subcommand`.)*
+- [x] AC-8: `/help` lists every new row, grouped by family; the table-vs-help
       test still holds; `//` footer unchanged.
-- [ ] AC-9: A scripted turn whose reply says "run `teton provider list` and
+      *(`cli_e2e.rs::slash_help_lists_every_mirrored_row_grouped_with_both_footers`
+      — the shipped binary's listing: the ten rows with their summaries, the
+      fourteen that were already there, contiguous families, both footers.
+      Unit: `slash.rs::help_lists_every_mirrored_row_grouped_by_family`,
+      `slash.rs::help_lists_every_alias_that_dispatches`.)*
+- [x] AC-9: A scripted turn whose reply says "run `teton provider list` and
       `teton policy show`" prints exactly one line `>> in this session:
       /provider list, /policy show`; a reply that says "run `/provider list`"
       prints nothing; a reply that names `teton provider add …` prints the
       REQ-579 line and not the generic one; a reply about "the teton binary
       being slow" prints nothing.
-- [ ] AC-10: The guide test pins BR-9: every `teton <sub>` the guide names
+      *(`session_ui.rs::a_reply_that_recites_shell_twins_names_their_session_spellings`,
+      `a_reply_that_already_names_the_session_spelling_earns_nothing`,
+      `the_setup_hand_off_wins_over_the_generic_line`,
+      `the_connection_hand_off_wins_over_the_generic_line`,
+      `a_reply_that_names_no_mirrored_command_earns_nothing`,
+      `a_capitalised_mention_of_a_command_is_not_one`,
+      `the_generic_line_is_tty_only_and_prints_once_per_turn`,
+      `every_mirrored_row_is_a_candidate_of_the_generic_line`. The piped
+      negative at the binary:
+      `cli_e2e.rs::a_piped_session_whose_reply_recites_the_cli_gets_no_hand_off_line`.)*
+- [x] AC-10: The guide test pins BR-9: every `teton <sub>` the guide names
       that has a session row also appears as `/<row>` in the guide.
-- [ ] AC-11: On a `presence`-featured build, `/policy set-tier build kimi`
+      *(`cli_rows.rs::guide_tests::the_guide_names_every_mirrored_command_in_its_session_spelling`
+      — over the guide's own bytes via `include_str!`, with the one recorded
+      equivalence (`provider add` → `/provider setup`) and a non-vacuity check
+      that the guide names at least one mirrored command in `teton …` form.)*
+- [x] AC-11: On a `presence`-featured build, `/policy set-tier build kimi`
       raises the same presence prompt `teton policy set-tier` raises and a
       cancel leaves `config.toml` byte-identical (REQ-576 AC-6 pattern, via
       the `TETON_PRESENCE_ACCEPT=fail` seam — informed by LESSON-519,
       LESSON-520: pair the refused test with an accepted one on a payload
       that would persist).
-- [ ] AC-12: The workspace suite passes; no new protocol types; `git diff
+      *(`cli_e2e.rs::a_presence_refused_session_set_tier_leaves_the_config_untouched`
+      + `cli_e2e.rs::an_attested_session_set_tier_writes` — the refuse/accept
+      pair on one line, with the file read back on both. **Amendment**: the
+      test is not feature-gated and does not need to be. `TETON_PRESENCE_ACCEPT`
+      installs a verifier in place of whatever the build has
+      (`tetond::attest::seam_verifier`), so a default build driven through it
+      takes the same `config/set` path a `--features presence` build takes with
+      a real mechanism — which is how `tetond/tests/config_set_attestation.rs`
+      already drives this gate. The seam rides `TETON_TEST_SEAMS`, and a
+      release build refuses to start when that is set, so none of it exists in
+      a shipped binary. The refusal is also asserted identical to the shell
+      twin's, which is BR-6's claim.)*
+- [x] AC-12: The workspace suite passes; no new protocol types; `git diff
       -- crates/teton-protocol/src/` is empty.
+      *(`git diff origin/main...HEAD -- crates/teton-protocol/src/` printed
+      zero lines at TASK-173; the workspace suite is green under
+      `cargo test --workspace --no-fail-fast` with no `FAILED`.)*
 
 ## External Dependencies
 
@@ -267,14 +423,23 @@ None. No daemon change: every row is a new call site of an existing method
   a source edit and ships with the release; no daemon restart semantics
   change.
 - id allocated with remote verification (not degraded).
+- **(verify D2)** A near-miss `teton …` line — one whose words after `teton`
+  do not name a subcommand path — reaches the model as a prompt, including
+  one that happens to carry a pasted key (`teton api key is sk-…`). That is
+  BR-4's own rule ("teton is slow today" is a question), and the same is true
+  of any prompt line at all: the session's key-in-chat guard is the guide's
+  prohibition plus the REQ-579 hand-off, not the classifier. Recorded rather
+  than fixed; see Out of Scope.
 
 ## Open Questions
 
-- [ ] OQ-1: Should `/teton provider list` (a leading slash on the CLI form)
-      also be recognized, or stay an unknown command that names `/help`
-      (REQ-555 BR-2)? Proposal: recognize it — it costs one line in the
-      classifier and matches what a user who has learned "commands start
-      with `/`" will type.
+- [x] OQ-1: **RESOLVED (TASK-170) — recognized.** `/teton provider list` runs
+      the same row `teton provider list` does. It cost the one line the
+      proposal predicted: recognition is a single function, offered both the
+      plain line and the post-`/` remainder, so the two spellings cannot
+      diverge. BR-1 is untouched — a `/teton …` line that names no subcommand
+      path is still an unknown command rejected with the `/help` hint, and
+      never a prompt.
 - [ ] OQ-2: Should the generic hand-off line (BR-8) subsume the REQ-579 and
       REQ-581 sentences into one renderer with per-command reasons, or keep
       three sentences? Proposal: one renderer, per-row optional reason
@@ -284,10 +449,31 @@ None. No daemon change: every row is a new call site of an existing method
       set` writes; adding `/model list` and `/model status` — should bare
       `/model` stay concise or become `model status`? Proposal: stay concise
       (REQ-555 BR-4 chose it deliberately); `status` is the full form.
+- [ ] OQ-5: Quoted arguments. Session-side tokenization is whitespace only
+      (ADR-2) — no quote or backslash processing — because no mirrored
+      subcommand takes a whitespace-bearing value and a shell-words
+      dependency was not budgeted. Revisit if a `boundary add` glob with a
+      space is ever asked for.
 - [ ] OQ-4: Should `teton --version` typed in-session print the client and
       daemon versions (cheap and useful after an upgrade) rather than be
       refused? Proposal: yes, as a `/version` row — but only if it costs no
       new RPC (the handshake result already carries the daemon version).
+- [ ] OQ-6 **(verify D1, recorded)**: There is no verbatim escape for a
+      `teton …` line the way `//` escapes a leading slash — a user who wants
+      to *ask the model about* `teton provider list` types exactly the line
+      that runs it. Rationale for shipping without one: recognition intercepts
+      only lines whose words after `teton` are an exact subcommand path in the
+      parser's own tree, so the interception surface is small and enumerable
+      (the ten mirrored rows, the four pre-REQ leaves, `model`, `uninstall`,
+      the families, and the binary's own flags); every write it can reach is
+      typed-input-gated and, for `provider add`, confirmed — the one exception
+      being `effort` set, recorded in Permissions; and a question phrased as a
+      sentence ("why does teton provider list show two kimis?") is not
+      intercepted at all, because `teton` is not its first word. If a user
+      genuinely needs the model to read a bare command line, `//teton …`
+      already works (BR-11: the escape outranks recognition and the model sees
+      `/teton …`), which is a workable spelling for a rare need. Revisit if
+      the interception surface grows.
 
 ## Out of Scope
 
@@ -300,6 +486,11 @@ None. No daemon change: every row is a new call site of an existing method
 - Tab completion / history for slash commands; the VS Code extension.
 - Changing what any mirrored command *prints* — parity is with today's
   output, byte for byte, except `/doctor`'s connect arm (BR-7).
+- **(verify D2)** Intercepting near-miss `teton …` lines that carry a pasted
+  key before they reach the model. The classifier is a command recognizer,
+  not a secret scanner; the guard against a credential in chat is the
+  prompt's prohibition and the REQ-579 hand-off, and a scanner here would be
+  a second, weaker copy of the redactor's job.
 
 ## Retrieved Context
 

@@ -65,9 +65,52 @@ prompts:
 | `/verbose` | Toggle routing and turn-end notices for this session |
 | `/effort [level]` | Show, or change, the global reasoning effort |
 | `/permissions [level]` | Show, or change, what this session may run without asking |
+| `/web setup` | Set up web lookup: pick a tier, name a backend, confirm before anything is written |
 | `/web allow` | Lift this session's web taint restriction (grants no new tier) |
 | `/web refresh <url>` | Drop a URL's cached copy so the next lookup re-fetches |
 | `/quit` (or `/exit`) | End the session (same as Ctrl-D) |
+
+Everything you would otherwise open a second terminal for is here too. The ten
+commands below that have a `teton …` twin *are* that twin — the same arguments,
+the same error messages, the same renderer, the same daemon call — so the two
+surfaces cannot describe your machine differently:
+
+| Command | Effect |
+|---|---|
+| `/provider list` | The providers registered on this machine, with what each one calls |
+| `/provider add <id> --kind … --endpoint … --model …` | Register one by hand; the session confirms first, then asks for the key echo-off — never typed on the line |
+| `/boundary list` | The path globs whose content never leaves this machine |
+| `/boundary add <glob> [--mode local-only\|redact-then-remote]` | Add a privacy boundary |
+| `/policy show` | The effective routing table: every tier, every category, where each resolves now |
+| `/policy set-tier <tier> <provider> [--fallback <id>]` | Route a tier |
+| `/policy set-category <category> <provider> [--fallback <id>]` | Route one category ahead of its tier |
+| `/model list` | The catalog, each entry's fit for this machine, and the selection |
+| `/model status` | The recorded model decision and the weights' install state |
+| `/doctor` | Diagnose the daemon, socket, model state and providers, over this session's own connection |
+
+Two more `/provider` commands are session-first rather than twins:
+`/provider setup [vendor] [tier]` registers a provider and routes a tier to it,
+guided, confirming before anything is written (there is no `teton provider
+setup`); and `/provider test <id>` makes one consented call to a provider and
+reports the provider's own answer, exactly as `teton provider test <id>` does
+from a shell.
+
+A line you type that begins with `teton` and names a real subcommand runs the
+session command for it, after one line saying so — `teton provider list` prints
+`>> teton provider list → /provider list` and then the listing. It is the same
+command, not a subprocess: no second connection and no model call. The binary's
+own `--yes`/`--verbose` flags on such a line are ignored, and the session says
+so; `teton provider --help` prints the family's help. A line that is not a
+command (`teton is slow today`) still reaches the model unchanged, and `teton
+uninstall` is refused with the reason — it would stop the daemon under the
+session running it.
+
+Two limits. Arguments are split on whitespace and quotes are **not**
+interpreted, so a value containing a space has to be given to `teton` in a
+shell. And the four commands that write (`/provider add`, `/boundary add`,
+`/policy set-tier`, `/policy set-category`) are typed-input only: piped into a
+session they change nothing and name the shell command instead. Every
+daemon-side gate is the same one the shell twin meets.
 
 To send a prompt that genuinely starts with a slash — a pasted path, say —
 double it: `//usr/local/bin/x — why?` asks the model about `/usr/local/bin/x`.

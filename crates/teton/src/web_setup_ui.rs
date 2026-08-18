@@ -218,7 +218,7 @@ pub(crate) enum Gate {
 
 /// Whether `/web setup` may put questions to this session's stdin.
 ///
-/// The same shape as `slash::model_set_gate`, and pure for its reason — the
+/// The same shape as `cli_rows::write_gate`, and pure for its reason — the
 /// branch that matters is the one a test process cannot otherwise reach — but a
 /// **different answer** to a refusal: this command degrades rather than refuses
 /// (BR-12/AC-10). A piped session is told what the capability needs and what to
