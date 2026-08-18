@@ -164,6 +164,43 @@ pub struct SessionState {
     /// [`hand_off_after_turn`] — an interrupted one, or one the daemon
     /// refused — cannot leak its text into the turn after it.
     turn_reply: String,
+    /// The user's typed prompt for the turn in flight (REQ-581 ADR-4).
+    ///
+    /// REQ-579's nudge could read the reply alone because the failure it
+    /// corrects is *in* the reply — a recited shell recipe. The connection
+    /// question's failure is not: the model runs `teton provider list` through
+    /// the shell tool, misreads it, and answers in prose that recites nothing.
+    /// What identifies that turn is what the **user asked**, so the question is
+    /// kept beside the answer for the one predicate that needs both.
+    ///
+    /// Written by [`SessionState::begin_turn`] only, from the same bytes the
+    /// prompt RPC carries — never from the event stream — so no model output and
+    /// no other session can put words here.
+    turn_prompt: String,
+    /// The titles of the tool calls this turn made (REQ-581 ADR-4).
+    ///
+    /// The daemon's own `<tool>: <command>` title, exactly as the renderer drew
+    /// it (`shell: teton provider list`). It is the record of what the turn
+    /// *did*, which is the half of the observed failure the reply text does not
+    /// carry.
+    ///
+    /// Scoped to this session's updates for [`Self::turn_reply`]'s reason, and
+    /// cleared at [`SessionState::begin_turn`] beside it: a turn that never
+    /// reached [`hand_off_after_turn`] must not lend its tool calls to the next
+    /// one.
+    turn_tools: Vec<String>,
+    /// The provider ids the daemon's config snapshot reported (REQ-581 ADR-4).
+    ///
+    /// A render cache like [`Self::permission_level`] and [`Self::effort`],
+    /// filled from the same `config/get` the status row reads. It exists so
+    /// "is kimi working?" reads as a connection question without a vendor list
+    /// hard-coded into this crate — the registered ids are the user's own
+    /// vocabulary for their providers.
+    ///
+    /// Empty is a legitimate state (no snapshot yet, or a daemon that answered
+    /// with no providers) and costs only the extra half of the predicate: the
+    /// fixed subject words still recognise "test the connection".
+    pub provider_ids: Vec<String>,
 }
 
 /// What the session's web capability currently is, for the status row.
@@ -316,8 +353,16 @@ impl SessionState {
     /// Called from the entry loop immediately before the prompt goes on the
     /// wire. Clearing here rather than at turn end is deliberate — see
     /// [`SessionState::turn_reply`].
-    pub(crate) fn begin_turn(&mut self) {
+    ///
+    /// `prompt` is the text the RPC is about to carry (REQ-581 ADR-4): the turn
+    /// is opened *with* the question, so the one place that clears the turn's
+    /// record is also the one place that starts it, and the three fields cannot
+    /// come to describe different turns.
+    pub(crate) fn begin_turn(&mut self, prompt: &str) {
         self.turn_reply.clear();
+        self.turn_prompt.clear();
+        self.turn_prompt.push_str(prompt);
+        self.turn_tools.clear();
     }
 
     /// Claim a model proposal, returning `true` the first time only.
@@ -1300,6 +1345,19 @@ fn render_session_update(
             state
                 .tool_titles
                 .insert(tool_call_id.clone(), title.clone());
+            // REQ-581 ADR-4's second reader of the turn. Recorded from the same
+            // payload that reaches the screen, and only for **our** session, for
+            // the reasons the reply accumulator above states: what the predicate
+            // reads must be what the user was shown, and another session's tool
+            // calls must not arm this session's line.
+            //
+            // The title, not the raw arguments, because the title is what the
+            // daemon composed (`shell: <command>`) and what the user read — a
+            // second reading of the arguments here would be a second opinion
+            // about what the turn did (LESSON-456).
+            if other_session(state.session_id.as_ref(), session).is_none() {
+                state.turn_tools.push(title.clone());
+            }
             surface.line(
                 LineKind::Tool,
                 &format!("{title} [{}]", status_label(*status)),
@@ -1435,29 +1493,165 @@ pub(crate) fn hand_off_line() -> &'static str {
     HAND_OFF_LINE
 }
 
-/// End a typed-prompt turn: print the hand-off if this turn earned it.
+// ---------------------------------------------------------------------------
+// The `/provider test` hand-off (REQ-581 ADR-4)
+// ---------------------------------------------------------------------------
+//
+// A second line through the same seam, for a failure the one above cannot see.
+// Asked "can you test the Kimi connection?", the shipped local model does not
+// recite a recipe — it *runs* `teton provider list` and `teton policy show`
+// through the shell tool, reads registration as connectivity, and answers that
+// the provider is fine without a byte having left the machine. The reply text
+// the REQ-579 nudge reads recites nothing, so nothing fires.
+//
+// So this predicate keys on the **turn**: what the user asked, and what the
+// turn did. Everything else is unchanged — a substring match on text the
+// session already has in hand, no model call, no daemon round-trip, at most one
+// line per turn, TTY only.
+//
+// The word lists below are v1 heuristics and are labelled as such deliberately
+// (LESSON-532): the deterministic half of AC-8b is the unit table in this
+// module, and the claim that the line fires on the phrasings a real user types
+// is only made after the live A/B recorded in `docs/manual-verification.md`.
+
+/// The verbs a connection question is asked with — half of ADR-4's predicate.
+///
+/// Matched case-insensitively, and as substrings on purpose: `working` covers
+/// "is it working", `reach` covers "reachable" and "can it reach". A v1 word
+/// list, not a classifier — the cost of a miss is one line that does not print,
+/// and the cost of a hit on prose that merely contains a verb is nothing at all,
+/// because the other three conditions still have to hold.
+const CONNECTION_VERBS: [&str; 6] = ["test", "check", "verify", "working", "connected", "reach"];
+
+/// The subjects that make such a question about a *provider* — the other half.
+///
+/// The registered provider ids join this list at match time
+/// ([`SessionState::provider_ids`]), which is what lets "is kimi working?" count
+/// without a vendor list hard-coded here. These four are the fallback, and they
+/// carry the common phrasings on their own: the screenshot's "test the Kimi
+/// connection" matches on `connection` even when no snapshot has been read.
+const CONNECTION_SUBJECTS: [&str; 4] = ["provider", "connection", "connectivity", "api"];
+
+/// The diagnostics a reply reaches for when it answers the question by
+/// inspecting configuration instead of dialling.
+///
+/// All three report what the machine is *configured* to do; none of them sends
+/// anything. That is precisely the confusion this line exists to correct, and it
+/// is why `teton provider` is listed as a prefix — `list`, `show` and a bare
+/// mention are the same mistake.
+const PROVIDER_DIAGNOSTICS: [&str; 3] = ["teton provider", "teton policy", "teton doctor"];
+
+/// The in-session command this hand-off names. A reply that already named it has
+/// answered the question, and the harness stays quiet — [`HAND_OFF_LINE`]'s
+/// dormancy rule, applied to the same effect.
+const CONNECTION_COMMAND: &str = "/provider test";
+
+/// ADR-4's sentence, and the only thing this half prints.
+///
+/// Shaped like [`HAND_OFF_LINE`] and for the same reasons: plain text with no
+/// escape of its own (LESSON-517), stated outright rather than as an aside about
+/// an instruction (BUG-168), because the model may quote it back. It says what
+/// the command *does* — one call, and what came back — since the failure it
+/// follows is a turn that reported a connection it never made.
+const CONNECTION_TEST_LINE: &str = "in this session, /provider test <id> makes one consented call \
+                                    and reports what came back; that is the connection test.";
+
+/// The one sentence the connection hand-off prints.
+pub(crate) fn connection_test_line() -> &'static str {
+    CONNECTION_TEST_LINE
+}
+
+/// True when the user's prompt reads as a question about whether a provider
+/// works (ADR-4).
+///
+/// Both halves must hold: a verb of testing **and** a provider-shaped subject,
+/// where the subjects are [`CONNECTION_SUBJECTS`] plus whatever ids the config
+/// snapshot reported. "check the tests pass" carries a verb and no subject;
+/// "which provider is on think?" carries a subject and no verb; neither is this
+/// question.
+///
+/// Case-insensitive, because a typed prompt is prose — unlike the reply-side
+/// match above, which is case-sensitive precisely because a *command* is
+/// lowercase and a capitalised mention of one is not a command.
+fn asks_about_a_connection(prompt: &str, provider_ids: &[String]) -> bool {
+    let asked = prompt.to_lowercase();
+    let verb = CONNECTION_VERBS.iter().any(|word| asked.contains(word));
+    let subject = CONNECTION_SUBJECTS.iter().any(|word| asked.contains(word))
+        || provider_ids
+            .iter()
+            .any(|id| !id.is_empty() && asked.contains(&id.to_lowercase()));
+    verb && subject
+}
+
+/// True when the turn answered that question by inspecting rather than dialling
+/// (ADR-4).
+///
+/// Two readings, because the observed failure came in two shapes and only one of
+/// them is in the reply: the model *recites* a diagnostic, or it *ran* one
+/// through the shell tool and reported what it made of the output. The tool half
+/// reads the `<tool>: <command>` title the renderer already drew, and requires
+/// the tool to be `shell` — a `read` of a file whose path contains `teton` is
+/// not a probe.
+///
+/// `plain_reply` arrives backtick-stripped, for [`without_backticks`]'s reason:
+/// every question this module asks of a turn is asked of the same characters.
+fn improvised_a_probe(plain_reply: &str, turn_tools: &[String]) -> bool {
+    if PROVIDER_DIAGNOSTICS
+        .iter()
+        .any(|command| plain_reply.contains(command))
+    {
+        return true;
+    }
+    turn_tools.iter().any(|title| match title.split_once(':') {
+        Some((tool, command)) => tool.trim() == "shell" && command.contains("teton"),
+        None => false,
+    })
+}
+
+/// End a typed-prompt turn: print the hand-off if this turn earned one.
 ///
 /// Called once per turn from the entry loop, and it **consumes** the turn's
-/// accumulated text — so a second call in the same turn reads an empty reply
-/// and prints nothing. That is the "at most once" guarantee expressed as data
-/// rather than as a flag somebody has to remember to reset, and it doubles as
-/// the reset on every path that reaches here.
+/// record — so a second call in the same turn reads an empty reply, an empty
+/// prompt and no tool calls, and prints nothing. That is the "at most once"
+/// guarantee expressed as data rather than as a flag somebody has to remember to
+/// reset, and it doubles as the reset on every path that reaches here.
+///
+/// Two lines can be earned and **at most one prints**: REQ-579's setup hand-off
+/// (the reply reached for the shell recipe) and REQ-581's connection hand-off
+/// (the turn answered a connection question by inspecting configuration). The
+/// setup line goes first because its subject is the more basic one — a reply
+/// steering a user toward pasting a key into the chat is corrected before a
+/// reply that merely tested the wrong thing — and because a setup recipe recites
+/// `teton provider add`, which the connection predicate would otherwise read as
+/// a probe.
 ///
 /// `tty` is the session's `typed_input`, the same world-fact
 /// [`crate::web_setup_ui::gate`] turns on. A piped session prints nothing at
 /// all: BR-11 already gives a script the shell recipe, and a script's output has
-/// to stay byte-identical to what it was before this REQ.
+/// to stay byte-identical to what it was before REQ-579.
 pub(crate) fn hand_off_after_turn(state: &mut SessionState, surface: &mut dyn Surface, tty: bool) {
-    // Taken unconditionally, before any gate: whether the line prints or not,
-    // this turn's words are finished with, and a `return` that left them behind
-    // would hand them to the next turn.
+    // Taken unconditionally, before any gate: whether a line prints or not, this
+    // turn's record is finished with, and a `return` that left it behind would
+    // hand it to the next turn.
     let reply = std::mem::take(&mut state.turn_reply);
-    // One reading of the turn, stripped once, asked twice — see
-    // [`without_backticks`].
-    if !tty || !earns_hand_off(&without_backticks(&reply)) {
+    let prompt = std::mem::take(&mut state.turn_prompt);
+    let tools = std::mem::take(&mut state.turn_tools);
+    if !tty {
         return;
     }
-    surface.line(LineKind::Notice, hand_off_line());
+    // One reading of the turn, stripped once, asked by every predicate below —
+    // see [`without_backticks`].
+    let plain = without_backticks(&reply);
+    if earns_hand_off(&plain) {
+        surface.line(LineKind::Notice, hand_off_line());
+        return;
+    }
+    if asks_about_a_connection(&prompt, &state.provider_ids)
+        && improvised_a_probe(&plain, &tools)
+        && !plain.contains(CONNECTION_COMMAND)
+    {
+        surface.line(LineKind::Notice, connection_test_line());
+    }
 }
 
 /// Render a compact preview of a proposed file change.
@@ -3854,10 +4048,15 @@ mod tests {
     /// accumulator directly, so what these tests assert on is the real path —
     /// including that the chunk actually reaches the accumulator on its way to
     /// the screen.
+    ///
+    /// The turn opens with **no prompt**, which is what keeps every assertion
+    /// below about REQ-579's line alone: a turn nobody asked a connection
+    /// question in cannot earn REQ-581's, so these tests answer the same
+    /// question after ADR-4 as before it.
     fn hand_off_turn(chunks: &[&str], tty: bool) -> RecordingSurface {
         let mut surface = RecordingSurface::new();
         let mut state = SessionState::new();
-        state.begin_turn();
+        state.begin_turn("");
         for text in chunks {
             render_event(&envelope(chunk(text)), &mut surface, &mut state);
         }
@@ -4037,7 +4236,7 @@ mod tests {
         let mut surface = RecordingSurface::new();
         let mut state = SessionState::new();
         state.session_id = Some(SessionId::from("ours"));
-        state.begin_turn();
+        state.begin_turn("");
         render_event(&elsewhere(recital), &mut surface, &mut state);
         hand_off_after_turn(&mut state, &mut surface, true);
         assert!(
@@ -4049,7 +4248,7 @@ mod tests {
         // The control, so this is a test about the *session* and not about the
         // text: the same words on our own envelope do earn the line.
         let mut surface = RecordingSurface::new();
-        state.begin_turn();
+        state.begin_turn("");
         render_event(
             &EventEnvelope::new(4, Some(SessionId::from("ours")), chunk(recital)),
             &mut surface,
@@ -4067,7 +4266,7 @@ mod tests {
         // learned its own id, still counts as ours — `other_session`'s reading,
         // and the one a single-session client depends on.
         let mut surface = RecordingSurface::new();
-        state.begin_turn();
+        state.begin_turn("");
         render_event(
             &EventEnvelope::new(5, None, chunk(recital)),
             &mut surface,
@@ -4114,7 +4313,7 @@ mod tests {
     fn the_hand_off_is_once_per_turn_even_when_both_commands_appear() {
         let mut surface = RecordingSurface::new();
         let mut state = SessionState::new();
-        state.begin_turn();
+        state.begin_turn("");
         for text in [
             "first, teton provider add kimi --kind openai-compatible.\n",
             "then, teton policy set-tier think kimi.\n",
@@ -4139,7 +4338,7 @@ mod tests {
         );
 
         // The turn after it recites nothing, and must not inherit the line.
-        state.begin_turn();
+        state.begin_turn("");
         render_event(&envelope(chunk("done.")), &mut surface, &mut state);
         hand_off_after_turn(&mut state, &mut surface, true);
         assert_eq!(
@@ -4160,7 +4359,7 @@ mod tests {
     fn the_hand_off_never_prints_on_a_non_tty_surface() {
         let mut surface = RecordingSurface::new();
         let mut state = SessionState::new();
-        state.begin_turn();
+        state.begin_turn("");
         render_event(
             &envelope(chunk(
                 "run teton provider add kimi --kind openai-compatible.",
@@ -4196,7 +4395,7 @@ mod tests {
     fn the_users_own_text_and_help_output_do_not_trigger_it() {
         let mut surface = RecordingSurface::new();
         let mut state = SessionState::new();
-        state.begin_turn();
+        state.begin_turn("");
 
         // A line on the surface — what `/help`, a command's output, and the
         // echo of a typed prompt all are.
@@ -4321,6 +4520,350 @@ mod tests {
         // And it is exactly what reaches the surface — the constant and the
         // rendered line cannot drift.
         let surface = hand_off_turn(&["teton provider add kimi"], true);
+        assert_eq!(surface.lines_of(LineKind::Notice), vec![line]);
+    }
+
+    // -----------------------------------------------------------------------
+    // The `/provider test` hand-off (REQ-581 ADR-4)
+    // -----------------------------------------------------------------------
+
+    /// A tool call as the daemon composes it: `<tool>: <command>` for `shell`,
+    /// `<tool> <argument>` for the rest (`harness::turn_loop::describe_call`).
+    fn tool_call(id: &str, title: &str) -> Event {
+        Event::SessionUpdate(SessionUpdate {
+            update: SessionUpdatePayload::ToolCall {
+                tool_call_id: id.to_owned(),
+                title: title.to_owned(),
+                status: ToolCallStatus::Pending,
+            },
+        })
+    }
+
+    /// Drive one whole turn the way the entry loop does: open it **with the
+    /// prompt**, render the tool calls it made, stream its reply, end it.
+    ///
+    /// Everything goes through `begin_turn` and `render_event` rather than being
+    /// written into the state directly, so these tests exercise the real path —
+    /// including that a tool-call title reaches the turn record on its way to
+    /// the screen, which is the half of ADR-4 that the reply text cannot carry.
+    fn connection_turn(
+        prompt: &str,
+        tools: &[&str],
+        chunks: &[&str],
+        provider_ids: &[&str],
+        tty: bool,
+    ) -> RecordingSurface {
+        let mut surface = RecordingSurface::new();
+        let mut state = SessionState::new();
+        state.provider_ids = provider_ids.iter().map(|id| (*id).to_owned()).collect();
+        state.begin_turn(prompt);
+        for (index, title) in tools.iter().enumerate() {
+            render_event(
+                &envelope(tool_call(&format!("c{index}"), title)),
+                &mut surface,
+                &mut state,
+            );
+        }
+        for text in chunks {
+            render_event(&envelope(chunk(text)), &mut surface, &mut state);
+        }
+        hand_off_after_turn(&mut state, &mut surface, tty);
+        surface
+    }
+
+    /// **AC-8b, the deterministic half — the predicate table.**
+    ///
+    /// The positive row is the observed failure, turn for turn: the user's own
+    /// words from the screenshot, the `shell: teton provider list` the model ran
+    /// instead of dialling, and a reply that reports a healthy connection while
+    /// naming no command. Every negative row is one condition of ADR-4's
+    /// predicate withdrawn, so a row that starts passing for the wrong reason
+    /// shows up as the wrong row.
+    #[test]
+    fn the_connection_hand_off_fires_only_on_a_probed_connection_question() {
+        let asked = "alright, I followed your instructions. Can you test the Kimi connection?";
+        let probe = "shell: teton provider list";
+        let improvised =
+            "kimi is registered and routed to think, so the connection is working fine.";
+
+        for (case, prompt, tools, reply, tty, expected) in [
+            (
+                "the screenshot's turn: asked, probed, answered without the command",
+                asked,
+                &[probe][..],
+                improvised,
+                true,
+                Some(connection_test_line()),
+            ),
+            // The model recited the diagnostic rather than running it. Same
+            // mistake, different evidence — which is why the predicate reads
+            // both the reply and the tool calls.
+            (
+                "recited a diagnostic instead of running one",
+                asked,
+                &[][..],
+                "I ran teton provider list and it is all registered correctly.",
+                true,
+                Some(connection_test_line()),
+            ),
+            // Dormancy: the model named the command, so the harness has nothing
+            // to add. The whole line exists to say this sentence once.
+            (
+                "the reply named the command",
+                asked,
+                &[probe][..],
+                "registration looks right; run /provider test kimi to actually dial it.",
+                true,
+                None,
+            ),
+            // The turn ran a Teton diagnostic, but nobody asked about a
+            // connection — a `teton doctor` during a build failure is not this.
+            (
+                "an unrelated prompt that runs a diagnostic",
+                "why is my build failing?",
+                &["shell: teton doctor"][..],
+                "the failure is in crates/teton/src/main.rs; the toolchain is fine.",
+                true,
+                None,
+            ),
+            // A subject with no verb of testing. "which provider is on think?"
+            // is a configuration question and is answered correctly by reading
+            // configuration.
+            (
+                "a provider question that is not a connection question",
+                "which provider is on think?",
+                &[probe][..],
+                "think routes to kimi.",
+                true,
+                None,
+            ),
+            // The tool half is `shell`-only: reading a file whose path contains
+            // `teton` is not probing.
+            (
+                "a read of a Teton file is not a probe",
+                asked,
+                &["read crates/teton/src/main.rs"][..],
+                "your provider list looks right to me.",
+                true,
+                None,
+            ),
+            // BR-11's byte-identity, inherited: a pipe sees nothing.
+            (
+                "the same turn on a pipe",
+                asked,
+                &[probe][..],
+                improvised,
+                false,
+                None,
+            ),
+            // Precedence: a reply that reached for the setup recipe gets the
+            // REQ-579 line and only it, even though the connection predicate
+            // would also have matched (`teton provider add` is a diagnostic
+            // recital as far as the substring is concerned).
+            (
+                "a setup-recipe reply still earns the setup line, not both",
+                asked,
+                &[probe][..],
+                "run teton provider add kimi --kind openai-compatible first.",
+                true,
+                Some(hand_off_line()),
+            ),
+        ] {
+            let surface = connection_turn(prompt, tools, &[reply], &[], tty);
+            let expected: Vec<&str> = expected.into_iter().collect();
+            assert_eq!(
+                surface.lines_of(LineKind::Notice),
+                expected,
+                "{case}: got {:?}",
+                surface.calls
+            );
+        }
+    }
+
+    /// The registered ids are the user's own vocabulary for their providers.
+    ///
+    /// "is kimi working?" names no fixed subject word at all — it is a provider
+    /// question only because `kimi` is a provider *on this machine*, which is a
+    /// fact the config snapshot holds and this crate must not hard-code (ADR-4).
+    /// The second half is the honest cost of an empty snapshot: the same turn
+    /// earns nothing, because the id was the only subject it had.
+    #[test]
+    fn a_registered_provider_id_makes_a_bare_vendor_question_count() {
+        let surface = connection_turn(
+            "is kimi working?",
+            &["shell: teton provider list"],
+            &["it is registered and routed to think."],
+            &["kimi"],
+            true,
+        );
+        assert_eq!(
+            surface.lines_of(LineKind::Notice),
+            vec![connection_test_line()],
+            "{:?}",
+            surface.calls
+        );
+
+        let surface = connection_turn(
+            "is kimi working?",
+            &["shell: teton provider list"],
+            &["it is registered and routed to think."],
+            &[],
+            true,
+        );
+        assert!(
+            surface.lines_of(LineKind::Notice).is_empty(),
+            "with no snapshot the vendor word is not a subject; got {:?}",
+            surface.calls
+        );
+    }
+
+    /// Once per turn, and the turn's record does not outlive it.
+    ///
+    /// The same "consume the record" guarantee REQ-579's line has, asserted over
+    /// the two fields ADR-4 added: a second call in the same turn has no prompt
+    /// and no tool calls left to read, and the turn after it inherits neither.
+    #[test]
+    fn the_connection_hand_off_is_once_per_turn_and_does_not_outlive_it() {
+        let mut surface = RecordingSurface::new();
+        let mut state = SessionState::new();
+        state.begin_turn("can you check the kimi connection?");
+        render_event(
+            &envelope(tool_call("c1", "shell: teton policy show")),
+            &mut surface,
+            &mut state,
+        );
+        render_event(
+            &envelope(chunk("everything is configured correctly.")),
+            &mut surface,
+            &mut state,
+        );
+
+        hand_off_after_turn(&mut state, &mut surface, true);
+        assert_eq!(
+            surface.lines_of(LineKind::Notice),
+            vec![connection_test_line()],
+            "{:?}",
+            surface.calls
+        );
+
+        hand_off_after_turn(&mut state, &mut surface, true);
+        assert_eq!(
+            surface.lines_of(LineKind::Notice),
+            vec![connection_test_line()],
+            "a second call in the same turn adds nothing; got {:?}",
+            surface.calls
+        );
+
+        // The next turn asks nothing and runs nothing, and must not inherit
+        // either half of the previous turn's evidence.
+        state.begin_turn("thanks");
+        render_event(&envelope(chunk("no problem.")), &mut surface, &mut state);
+        hand_off_after_turn(&mut state, &mut surface, true);
+        assert_eq!(
+            surface.lines_of(LineKind::Notice),
+            vec![connection_test_line()],
+            "a quiet turn must not reprint the previous turn's line; got {:?}",
+            surface.calls
+        );
+    }
+
+    /// The tool record is fed by **this** session's updates only.
+    ///
+    /// The bus is daemon-wide, so without the scope check another session's
+    /// `shell: teton …` would arm a line about a turn this user never saw —
+    /// the reason [`SessionState::turn_reply`] is scoped, applied to the second
+    /// reader of the turn.
+    #[test]
+    fn another_sessions_tool_call_does_not_arm_the_connection_hand_off() {
+        let ask = "can you test the provider connection?";
+        let reply = "it looks fine to me.";
+
+        // Every event carries a session id here, ours or theirs, so the only
+        // difference between this half and the control below is *whose* tool
+        // call it was.
+        let ours =
+            |seq: u64, event: Event| EventEnvelope::new(seq, Some(SessionId::from("ours")), event);
+
+        let mut surface = RecordingSurface::new();
+        let mut state = SessionState::new();
+        state.session_id = Some(SessionId::from("ours"));
+        state.begin_turn(ask);
+        render_event(
+            &EventEnvelope::new(
+                7,
+                Some(SessionId::from("theirs")),
+                tool_call("c1", "shell: teton provider list"),
+            ),
+            &mut surface,
+            &mut state,
+        );
+        render_event(&ours(8, chunk(reply)), &mut surface, &mut state);
+        hand_off_after_turn(&mut state, &mut surface, true);
+        assert!(
+            surface.lines_of(LineKind::Notice).is_empty(),
+            "another session's tool call may not arm this session's line; got {:?}",
+            surface.calls
+        );
+
+        // The control: the same tool call on our own envelope does arm it, so
+        // this is a test about the session and not about the title.
+        let mut surface = RecordingSurface::new();
+        state.begin_turn(ask);
+        render_event(
+            &ours(9, tool_call("c2", "shell: teton provider list")),
+            &mut surface,
+            &mut state,
+        );
+        render_event(&ours(10, chunk(reply)), &mut surface, &mut state);
+        hand_off_after_turn(&mut state, &mut surface, true);
+        assert_eq!(
+            surface.lines_of(LineKind::Notice),
+            vec![connection_test_line()],
+            "{:?}",
+            surface.calls
+        );
+    }
+
+    /// The sentence itself: it names the command, says what the command does,
+    /// and carries no styling of its own.
+    ///
+    /// LESSON-517 keeps escapes in [`LineKind`]; BUG-168 asks for the thing
+    /// stated outright rather than in an em-dash aside. It has to say *one call*
+    /// and *what came back*, because the failure it follows is a turn that
+    /// reported a connection nothing had dialled.
+    #[test]
+    fn the_connection_test_line_names_the_command_and_says_what_it_does() {
+        let line = connection_test_line();
+        assert!(
+            line.contains("/provider test <id>"),
+            "it must name the command with its argument: {line}"
+        );
+        assert!(
+            line.contains("one consented call"),
+            "it must say a call is made, and that it is consented: {line}"
+        );
+        assert!(
+            line.contains("reports what came back"),
+            "it must say what the user gets for it: {line}"
+        );
+        assert!(
+            !line.contains('\u{1b}'),
+            "no escape may be baked into the text (LESSON-517): {line:?}"
+        );
+        assert!(
+            !line.contains('\u{2014}'),
+            "BUG-168: no em-dash aside: {line}"
+        );
+
+        // And it is exactly what reaches the surface — the constant and the
+        // rendered line cannot drift.
+        let surface = connection_turn(
+            "can you verify the provider connection?",
+            &["shell: teton doctor"],
+            &["it all looks healthy."],
+            &[],
+            true,
+        );
         assert_eq!(surface.lines_of(LineKind::Notice), vec![line]);
     }
 }

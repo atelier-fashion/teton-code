@@ -540,6 +540,17 @@ fn read_config_view(conn: &mut Connection, ctx: &mut UiContext<'_>) {
         // The daemon's own derivation, from the predicate that also governs tool
         // exposure — never a second reading of `[web] tier` here (REQ-572 BR-3).
         ctx.state.web.capability = cfg.snapshot.web_capability;
+        // The registered ids, for REQ-581 ADR-4's connection-question predicate:
+        // "is kimi working?" is a provider question because `kimi` is one of
+        // *this* user's providers, which is a fact only the snapshot has. A
+        // daemon that answers with none leaves the list empty, which the
+        // predicate's fixed subject words already cover.
+        ctx.state.provider_ids = cfg
+            .snapshot
+            .providers
+            .iter()
+            .map(|provider| provider.id.0.clone())
+            .collect();
     }
 }
 
@@ -800,7 +811,12 @@ fn run_session(paths: &DaemonPaths, auto_accept: bool, verbose: bool) -> anyhow:
             // the previous turn's end. A turn that was interrupted or refused
             // never reached `hand_off_after_turn`, and without this its words
             // would still be sitting there when the next reply arrived.
-            ctx.state.begin_turn();
+            //
+            // REQ-581 ADR-4 opens it with the **question** as well: the same
+            // bytes `prompt_turn_params` just put on the wire, so what the
+            // connection predicate reads is what was asked rather than a second
+            // reading of the input line taken here.
+            ctx.state.begin_turn(prompt_text);
             match conn.call(params, &mut ctx)? {
                 Ok(res) => {
                     // REQ-579 ADR-9. Before the turn's closing line, because

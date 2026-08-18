@@ -829,6 +829,55 @@ mod tests {
         }
     }
 
+    /// **REQ-581 AC-8a: the resident guide names the connection test.**
+    ///
+    /// The bundled guide's own bytes, read from the file that ships (the same
+    /// `include_str!` `build_system_prompt` embeds), so this cannot pass against
+    /// a copy. The sentence is pinned here, beside the catalog gates, for the
+    /// reason those exist: what the guide says is a **product surface**, and a
+    /// surface with no test is one an unrelated edit silently removes.
+    ///
+    /// Two claims. The command has to be spelled the way a user types it — a
+    /// guide that named `provider test` without the leading slash would send a
+    /// session reader to a command that does not exist. And it has to sit in the
+    /// **inspect step**, because that is the step a model reaches for when asked
+    /// whether a provider works: REQ-579's live rounds (LESSON-532) showed the
+    /// model follows the numbered step it is already in, not a sentence added
+    /// elsewhere, and the failure this REQ exists to fix is exactly a turn that
+    /// answered the question out of `teton provider list`.
+    ///
+    /// It is a *presence* check, not whole-line equality: the wording of the
+    /// step is expected to move as the guide is re-tuned under its byte ceiling,
+    /// and only these two facts must survive that.
+    #[test]
+    fn the_bundled_guide_names_the_connection_test_command() {
+        /// The same bytes the daemon embeds in every system prompt.
+        const GUIDE: &str = include_str!("harness/self_config.md");
+
+        const COMMAND: &str = "`/provider test <id>`";
+
+        assert!(
+            GUIDE.contains(COMMAND),
+            "the bundled guide no longer names {COMMAND}, so the resident prompt has no \
+             answer to \"does my provider work\" and the model is back to reading \
+             registration as connectivity (REQ-581 BR-6/AC-8a). If the sentence moved to \
+             a `teton_docs` topic to buy prompt bytes, that is a decision — make it here, \
+             and say where it went. Deleting the assertion is never the fix."
+        );
+
+        let inspect_step = GUIDE
+            .lines()
+            .find(|line| line.starts_with("3. "))
+            .expect("the guide has a numbered step 3 — the inspect step");
+        assert!(
+            inspect_step.contains(COMMAND),
+            "the guide names {COMMAND} somewhere other than the inspect step, which is the \
+             step a model reads when asked whether a provider works. The live evidence \
+             (REQ-579 verification.md, LESSON-532) is that it follows the numbered step it \
+             is in and not a sentence beside it.\nstep 3: {inspect_step}"
+        );
+    }
+
     /// **BR-6, inherited: no field may carry a credential.**
     ///
     /// This catalog has no auth field to begin with, which is the real

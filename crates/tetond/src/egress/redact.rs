@@ -1986,6 +1986,24 @@ mod tests {
     /// Twenty-four bytes above the floor now: the ADR-2 fallback is no longer a
     /// prediction about the next sentence, it is nearly the only room left.
     ///
+    /// **Recorded headroom at REQ-581:** the worst prompt is 5,890 bytes,
+    /// `spent` is 9,166, and the margin is **50** — two bytes above the floor.
+    /// The guide grew **22** bytes net, 2,390 → 2,412, naming
+    /// `/provider test <id>` in the inspect step (BR-6, AC-8a): the step's own
+    /// prose paid most of it back (`Inspect with` → `Inspect:`, `Config is …
+    /// state directory` → `Config: … state dir`), so one clause of new fact
+    /// cost 22 rather than 41. What it does **not** carry is the shell form or
+    /// the "do not probe with shell commands" sentence the task asked for —
+    /// together another 60-odd bytes, which do not exist here. Those live in
+    /// the CLI surface line (`session_ui::CONNECTION_TEST_LINE`, ADR-4), which
+    /// costs no prompt bytes and is where LESSON-532 says the guarantee belongs.
+    ///
+    /// So the paragraph above is now the operative one rather than a warning:
+    /// **the next sentence has to buy itself with the ADR-2 fallback** — depth
+    /// into a `teton_docs` topic, a resident line only for the fact a model must
+    /// have without a tool call. Two bytes is not room for a clause, and neither
+    /// this floor nor the 9,216 is to be moved to make some.
+    ///
     /// The figures are the guide **as it ships** — round 2's wording,
     /// `verification.md` §24 — not TASK-156's intermediate 2,402-byte draft, on
     /// which an earlier version of this note was measured. And what the extra

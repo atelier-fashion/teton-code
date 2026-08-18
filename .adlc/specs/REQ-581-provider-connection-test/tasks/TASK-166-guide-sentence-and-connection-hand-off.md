@@ -1,7 +1,7 @@
 ---
 id: TASK-166
 title: "Hand-off: guide names /provider test; the surface nudge fires on a connection-question turn"
-status: draft
+status: complete
 parent: REQ-581
 created: 2026-08-17
 updated: 2026-08-17
