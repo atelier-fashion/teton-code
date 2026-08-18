@@ -1,7 +1,7 @@
 ---
 id: REQ-582
 title: "Every session-meaningful `teton` command runs from the session — no shell round-trip"
-status: approved
+status: complete
 deployable: true
 created: 2026-08-18
 updated: 2026-08-18
