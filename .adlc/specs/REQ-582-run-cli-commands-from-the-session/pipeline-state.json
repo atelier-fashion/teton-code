@@ -3,9 +3,17 @@
   "branch": "feat/REQ-582-run-cli-commands-from-the-session",
   "startedAt": "2026-08-18T13:12:46Z",
   "completed": false,
-  "currentPhase": 0,
-  "completedPhases": [],
-  "phaseHistory": [],
+  "currentPhase": 1,
+  "completedPhases": [
+    0
+  ],
+  "phaseHistory": [
+    {
+      "phase": 0,
+      "name": "Create Worktree",
+      "completedAt": "2026-08-18T13:12:58Z"
+    }
+  ],
   "integrationBranch": "main",
   "repos": {
     "teton-code": {
@@ -14,14 +22,20 @@
       "worktree": "/Users/brettluelling/Documents/GitHub/teton-code/.worktrees/REQ-582",
       "branch": "feat/REQ-582-run-cli-commands-from-the-session",
       "touched": true,
-      "prUrl": null,
-      "prNumber": null,
-      "prCreatedAt": null,
+      "prUrl": "https://github.com/atelier-fashion/teton-code/pull/174",
+      "prNumber": 174,
+      "prCreatedAt": "2026-08-18T13:12:49Z",
       "merged": false,
       "snapshotBranch": null,
       "snapshotPR": null
     }
   },
-  "mergeOrder": ["teton-code"],
-  "phase4": { "currentTask": null, "completedTasks": [], "failedTasks": [] }
+  "mergeOrder": [
+    "teton-code"
+  ],
+  "phase4": {
+    "currentTask": null,
+    "completedTasks": [],
+    "failedTasks": []
+  }
 }
