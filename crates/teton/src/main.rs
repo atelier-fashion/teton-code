@@ -47,6 +47,7 @@ mod loading;
 mod model_ui;
 mod prompt;
 mod provider_setup_ui;
+mod provider_test_ui;
 mod render;
 mod service;
 mod session_ui;
@@ -183,6 +184,19 @@ enum ProviderAction {
     },
     /// List configured providers.
     List,
+    /// Test a registered provider by making one minimal, consented call to it
+    /// (REQ-581 BR-7).
+    ///
+    /// It asks before it sends; `--yes` consents up front, which is what a
+    /// script or a piped shell needs. Unlike every other `teton provider`
+    /// subcommand this one opens a session, because it is not a read: the method
+    /// is session-gated so a tool-spawned copy cannot spend the user's provider
+    /// budget, and the ledger row it writes needs a session to belong to
+    /// (architecture ADR-5).
+    Test {
+        /// Provider id, as `teton provider list` names it.
+        id: String,
+    },
 }
 
 /// `teton boundary …`
@@ -357,6 +371,7 @@ fn main() -> ExitCode {
                 model,
             } => run_provider_add(&paths, &id, kind.into(), endpoint, model),
             ProviderAction::List => run_provider_list(&paths),
+            ProviderAction::Test { id } => run_provider_test(&paths, &id, cli.yes),
         },
         Some(Command::Boundary { action }) => match action {
             BoundaryAction::Add { glob, mode } => run_boundary_add(&paths, glob, mode.into()),
@@ -1465,6 +1480,64 @@ fn run_provider_add(
             Err(transport)
         }
     }
+}
+
+/// `teton provider test <id>`: one consented call to a registered provider
+/// (REQ-581 BR-7, architecture ADR-5).
+///
+/// The **one** subcommand under `teton provider` that opens a session, and the
+/// reason is that it is not a read: it sends. `provider/test` is gated on
+/// session attachment precisely so a foreign connection — or a `teton provider
+/// test … --yes` the model spawned through the shell tool, which REQ-569's
+/// ancestry gate already keeps out of the user's sessions — cannot make the
+/// user's provider bill them. Creating a session here is also what gives the
+/// resulting ledger row a session to belong to (BR-5). The session ends with the
+/// process, exactly as `teton`'s own does.
+///
+/// Everything after the connection is [`provider_test_ui`]'s, so this subcommand
+/// and the in-session `/provider test` cannot diverge (BR-7, LESSON-441's rule:
+/// one consent gate, one implementation).
+///
+/// # Errors
+///
+/// Propagates a transport error. A daemon that *answers* — including a refusal
+/// to create the session — is reported on the surface and returns `Ok`.
+fn run_provider_test(paths: &DaemonPaths, id: &str, assume_yes: bool) -> anyhow::Result<()> {
+    let mut surface = stdout_surface();
+    let mut conn = client::ensure_connected(paths, &mut surface)?;
+    let mut state = SessionState::new();
+    let mut prompter = StdinPrompter::new();
+    // The passive context reads `typed_input` at the edge exactly as the session
+    // path does, so the gate answers the same question here as it does in a
+    // session and no handler re-derives it.
+    let mut ctx = passive_ctx(&mut surface, &mut state, &mut prompter);
+    let typed_input = ctx.typed_input;
+
+    let created = conn.call(
+        SessionCreateParams {
+            mode: SessionMode::Freeform,
+            phase: None,
+            // BUG-147: the daemon runs under launchd (cwd `/`); a session it
+            // mints must still be anchored to THIS terminal's directory.
+            cwd: std::env::current_dir().ok(),
+        },
+        &mut ctx,
+    )?;
+    let session_id = match created {
+        Ok(res) => res.session_id,
+        Err(err) => {
+            ctx.surface.line(
+                LineKind::Error,
+                &format!("could not start a session for the test: {}", err.message),
+            );
+            return Ok(());
+        }
+    };
+    ctx.session_id = Some(session_id.clone());
+    ctx.state.session_id = Some(session_id.clone());
+
+    let mut io = provider_test_ui::DaemonIo::new(&mut conn, &mut ctx);
+    provider_test_ui::run(&mut io, &session_id, id, assume_yes, typed_input)
 }
 
 /// `teton provider list`.
@@ -2621,7 +2694,12 @@ fn render_config(providers: &[ProviderConfig], surface: &mut dyn Surface) {
 }
 
 /// Wire-name label for a provider kind.
-fn kind_label(kind: ProviderKind) -> &'static str {
+///
+/// `pub(crate)` so [`provider_test_ui`]'s preview reads the same four spellings
+/// `teton provider list` prints. A second table would be the mirrored-predicate
+/// shape LESSON-528 is about — identical today, and identical only until one of
+/// them is edited.
+pub(crate) fn kind_label(kind: ProviderKind) -> &'static str {
     match kind {
         ProviderKind::Local => "local",
         ProviderKind::OpenaiCompatible => "openai-compatible",

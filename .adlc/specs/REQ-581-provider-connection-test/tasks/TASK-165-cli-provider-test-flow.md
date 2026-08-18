@@ -1,7 +1,7 @@
 ---
 id: TASK-165
 title: "CLI: provider_test_ui — preview, confirm, call, typed report; /provider test and teton provider test; teton cost probes"
-status: draft
+status: complete
 parent: REQ-581
 created: 2026-08-17
 updated: 2026-08-17

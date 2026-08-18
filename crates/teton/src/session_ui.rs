@@ -31,10 +31,10 @@ use teton_protocol::events::{
     ModelSelectionProposed, PermissionOption, PermissionOptionKind, PermissionRequest,
     PhaseTransition, PrefixCache, PrefixCacheMiss, PrefixCacheOutcome, PrivacyAction, PrivacyBlock,
     ProvenanceRejected, ProvenanceRejection, ProviderDegraded, ProviderSetupCompleted,
-    ProviderSetupRejected, RouteDecided, SessionGrantMinted, SessionUpdatePayload, TierWarming,
-    ToolCallStatus, TurnQueued, WebCapabilityState, WebConsentDecided, WebConsentScope, WebLookup,
-    WebLookupKind, WebLookupOutcome, WebSetupCompleted, WebSetupRejected, WebTier,
-    OPTION_ID_ENABLE_PERMANENT,
+    ProviderSetupRejected, ProviderTested, RouteDecided, SessionGrantMinted, SessionUpdatePayload,
+    TierWarming, ToolCallStatus, TurnQueued, WebCapabilityState, WebConsentDecided,
+    WebConsentScope, WebLookup, WebLookupKind, WebLookupOutcome, WebSetupCompleted,
+    WebSetupRejected, WebTier, OPTION_ID_ENABLE_PERMANENT,
 };
 use teton_protocol::methods::{
     AttachConsentOutcome, AttachConsentParams, PermissionOutcome, PermissionRespondParams,
@@ -723,11 +723,64 @@ pub fn render_event(
         // and a notice rather than an error, the class of the startup lifecycle
         // lines it continues (BUG-152's `TIER_WARMING` precedent): nothing
         // broke, nothing needs fixing, and the state ends by itself.
+        // REQ-581 BR-3/BR-4, and the provider-setup pair's arrangement applied
+        // to the flow beside it: never verbose-gated, because the health map the
+        // router reads at decision time just moved and a second client attached
+        // to the session watched that happen (LESSON-505). Published on every
+        // outcome, not only the good one — the test either spent or failed, and
+        // either way the next turn's routing changed.
+        Event::ProviderTested(tested) => {
+            surface.line(
+                LineKind::Notice,
+                &format_provider_tested(
+                    tested,
+                    other_session(state.session_id.as_ref(), env.session_id.as_ref()),
+                ),
+            );
+            EventOutcome::Rendered
+        }
         Event::TurnQueued(queued) => {
             surface.line(LineKind::Notice, &format_turn_queued(queued));
             EventOutcome::Rendered
         }
     }
+}
+
+/// The line a finished connection test renders (REQ-581 BR-3).
+///
+/// Deliberately **terse**, and that is the difference between this and the
+/// report [`crate::provider_test_ui`] prints. The client that ran the test
+/// already has the whole [`teton_protocol::methods::ProviderTestResult`] — the
+/// model, the dial host, the routing that follows — and renders it; this notice
+/// is for the *other* clients attached to the session, whose news is only what
+/// came back and where health landed. A full second copy of the report would be
+/// the same facts twice on the surface that ran the command.
+///
+/// The outcome is worded by [`crate::provider_test_ui::outcome_sentence`], the
+/// same function the report uses, because the event's `outcome` is byte-identical
+/// to the RPC answer's: two renderers would be two spellings of one value for a
+/// reader to find subtly different, which is what the protocol's own note on
+/// nesting rather than flattening asks to avoid.
+///
+/// It names no key and no endpoint — the event carries neither (BR-2's rule,
+/// `format_provider_setup_completed`'s audience reason). What it *may* carry is
+/// the credential **reference**, inside a `reason` the daemon composed, which is
+/// exactly what AC-2 asserts is safe to show.
+///
+/// `elsewhere` names the session when the test was not this client's: the bus is
+/// daemon-wide, and "the provider your turns use just came back healthy" and
+/// "some other session's did" are not the same news.
+fn format_provider_tested(tested: &ProviderTested, elsewhere: Option<&SessionId>) -> String {
+    let whose = match elsewhere {
+        Some(session) => format!(" in another session ({session})"),
+        None => String::new(),
+    };
+    format!(
+        "provider `{}` tested{whose}: {}; provider health: {}.",
+        tested.provider_id,
+        crate::provider_test_ui::outcome_sentence(&tested.outcome),
+        crate::provider_test_ui::health_name(tested.health_after),
+    )
 }
 
 /// The line a held turn renders (REQ-580 BR-5).
@@ -2005,7 +2058,7 @@ mod tests {
         ByteSpan, ContextCleared, CostRecord, CostRecorded, FindingKind, ModelSelectionDecided,
         PlanEntry, PlanEntryStatus, SelectionSource, SessionUpdate, WebTaintOverridden,
     };
-    use teton_protocol::methods::TierBinding;
+    use teton_protocol::methods::{ProviderHealth, ProviderTestOutcome, TierBinding};
     use teton_protocol::{ProviderId, ProviderKind, RequestId, SessionId, Tier};
 
     /// A consent request as the daemon would publish it.
@@ -2555,6 +2608,7 @@ mod tests {
                     usd_micros: 45_000,
                     cached_tokens: None,
                     reasoning_tokens: None,
+                    probe: false,
                 },
             })),
             &mut surface,
@@ -3925,6 +3979,114 @@ mod tests {
                     method: "provider/setup_commit".to_owned(),
                 }),
             ),
+            &mut surface,
+            &mut state,
+        );
+        assert!(
+            !surface
+                .lines_of(LineKind::Notice)
+                .join("\n")
+                .contains("another session"),
+            "{:?}",
+            surface.calls
+        );
+    }
+
+    /// REQ-581 BR-3/BR-4's client leg: a finished connection test is announced
+    /// to every session attached, naming what came back and where health landed
+    /// — including on the outcomes that failed, because the health map moved
+    /// under a second client either way.
+    ///
+    /// It is asserted against the *same* wording the report uses, which is the
+    /// point of sharing `outcome_sentence`: an event that spelled `reachable`
+    /// differently from the command that produced it would read as two different
+    /// facts.
+    #[test]
+    fn a_finished_provider_test_is_announced_with_its_outcome_and_health() {
+        let mut surface = RecordingSurface::new();
+        let mut state = SessionState::new();
+
+        render_event(
+            &envelope(Event::ProviderTested(ProviderTested {
+                provider_id: ProviderId::from("kimi"),
+                outcome: ProviderTestOutcome::Reached {
+                    latency_ms: 1_400,
+                    input_tokens: 2_040,
+                    output_tokens: 21,
+                    usd_micros: Some(6_400),
+                },
+                health_after: ProviderHealth::Healthy,
+            })),
+            &mut surface,
+            &mut state,
+        );
+
+        let notice = surface.lines_of(LineKind::Notice).join("\n");
+        assert!(notice.contains("provider `kimi` tested:"), "{notice}");
+        assert!(notice.contains("reachable — answered in 1.4 s"), "{notice}");
+        assert!(notice.contains("provider health: healthy."), "{notice}");
+        assert!(
+            surface.lines_of(LineKind::Error).is_empty(),
+            "a completed test is not an error, whatever it found"
+        );
+
+        // A failure is announced too, and its `reason` — the daemon's own
+        // sentence — is carried verbatim, credential *reference* and all (AC-2).
+        let mut surface = RecordingSurface::new();
+        render_event(
+            &envelope(Event::ProviderTested(ProviderTested {
+                provider_id: ProviderId::from("kimi"),
+                outcome: ProviderTestOutcome::Refused {
+                    status: 401,
+                    reason: "HTTP 401 from api.moonshot.ai — the vendor did not accept the \
+                             credential at keychain://teton/kimi"
+                        .to_owned(),
+                },
+                health_after: ProviderHealth::Unavailable,
+            })),
+            &mut surface,
+            &mut state,
+        );
+        let notice = surface.lines_of(LineKind::Notice).join("\n");
+        assert!(notice.contains("refused — HTTP 401"), "{notice}");
+        assert!(notice.contains("keychain://teton/kimi"), "{notice}");
+        assert!(notice.contains("provider health: unavailable."), "{notice}");
+    }
+
+    /// The bus is daemon-wide, so this notice says *whose* session it is about
+    /// when it is not this one — `format_context_cleared`'s rule, applied to the
+    /// event that says which provider the next turn can use.
+    #[test]
+    fn a_provider_test_notice_names_the_other_session_when_it_is_not_ours() {
+        let mut state = SessionState::new();
+        state.session_id = Some(SessionId::from("ours"));
+        let tested = || {
+            Event::ProviderTested(ProviderTested {
+                provider_id: ProviderId::from("kimi"),
+                outcome: ProviderTestOutcome::Unreachable {
+                    reason: "could not reach api.moonshot.ai: timeout".to_owned(),
+                },
+                health_after: ProviderHealth::Unavailable,
+            })
+        };
+
+        let mut surface = RecordingSurface::new();
+        render_event(
+            &EventEnvelope::new(7, Some(SessionId::from("theirs")), tested()),
+            &mut surface,
+            &mut state,
+        );
+        let notice = surface.lines_of(LineKind::Notice).join("\n");
+        assert!(
+            notice.contains("tested in another session (theirs)"),
+            "{notice}"
+        );
+
+        // Our own session is unqualified — the qualification is news, and news
+        // on every line is noise.
+        let mut surface = RecordingSurface::new();
+        render_event(
+            &EventEnvelope::new(8, Some(SessionId::from("ours")), tested()),
             &mut surface,
             &mut state,
         );
