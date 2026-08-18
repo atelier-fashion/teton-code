@@ -101,7 +101,8 @@ None. No daemon change: every row is a new call site of an existing method
 | read rows (`provider list`, `boundary list`, `policy show`, `model list`, `model status`, `doctor`) | any attached session, TTY or pipe |
 | write rows (`provider add`, `boundary add`, `policy set-tier`, `policy set-category`) | typed input only (TTY); on piped stdin the row rejects with the shell pointer — REQ-555 BR-9's rule for the one row that wrote, applied to all rows that write |
 | write rows — daemon side | unchanged: the same `config/set` gate the shell twin meets, including presence attestation on a `presence` build (REQ-576 BR-10(b)) and the ancestry gate |
-| `provider add` key entry | echo-off through the session's prompter, into the keychain; never in the transcript, the model's context, or an event (REQ-579) |
+| `provider add` key entry | echo-off through the session's prompter, into the keychain; never in the transcript, the model's context, or an event (REQ-579). **In a session, a default-no confirmation naming the settled registration comes first** — before the key is read — so a pasted second line answers "no" rather than becoming the key; the session's `--yes` pre-answers it as it does `/model set`'s confirmation; the shell path asks nothing (verify M1) |
+| `effort` set (`/effort <level>`, `teton effort <level>` typed) | **recorded exception**: pipe-friendly, on a TTY and on a pipe. REQ-559 BR-9 made `/effort` identical on both, and a typed `teton effort max` runs that row through the same full-argv validation every pre-REQ leaf row gets (verify M2), so it inherits BR-9 rather than this REQ's write gate. It changes one persisted setting the next turn reads; the shell command `teton effort` is equally unattended-friendly |
 | `uninstall` | refused in-session, always |
 
 ## Business Rules
@@ -180,6 +181,26 @@ None. No daemon change: every row is a new call site of an existing method
       that decides what runs here — and is what lets the line name
       `/provider setup`, a session row the CLI has no subcommand for at all.
       Pinned by `slash.rs::a_teton_line_with_no_session_form_is_refused_with_the_reason`.)*
+      *(**Verify-pass notes.** (a) Session-only row names typed after `teton`
+      are **not** recognized — `teton help`, `teton clear`, `teton web setup`
+      stay prompts, or, where the first word is a CLI family, the family's
+      refusal. Deliberately: the strict rule "the first token after `teton` is
+      a subcommand in the parser's tree" is what keeps `teton help me read this
+      backtrace` a prompt, and the model's own hand-off names the `/` spellings
+      for the session-only rows (REQ-579 ADR-9, BR-8's generic line for the
+      mirrored ones). Widening recognition to table names would trade that
+      guarantee for a convenience nobody asked for (Q2). (b) The binary's
+      global flags ahead of the subcommand — `teton -y policy set-tier …`,
+      `teton --verbose doctor` — are stepped over so the line is still
+      recognized, carried to the row, and reported as ignored in one Info line
+      (m5/M2). (c) A family followed by `--help`/`-h` (`teton provider --help`)
+      renders clap's own page for that family as information — the user asked
+      for help — rather than the bare-family refusal (T6). (d) A pre-REQ row
+      reached this way (`cost`, `effort`, `model set`, `provider test`) has its
+      whole typed argv validated by clap first, and the row is handed what the
+      parser derived — `teton model set qwen --yes` reaches `/model set` as
+      `qwen`, never as `qwen --yes` (M2). (e) The retired `teton policy set …`
+      answers with the retirement sentence the shell prints (m6).)*
 - [ ] BR-5: **A `CliLine` runs the row, not a subprocess.** Recognition never
       spawns the `teton` binary and never opens a second connection: it
       dispatches to the same handler `/<row>` dispatches to, over the
@@ -261,23 +282,32 @@ None. No daemon change: every row is a new call site of an existing method
       registers the provider, and the key appears nowhere in the transcript,
       the session's events, or the model's context (egress-capture assertion,
       REQ-579's harness).
-      *(`pty_e2e.rs::a_session_provider_add_asks_for_its_key_echo_off_and_stores_nothing_untyped`
-      + `cli_rows.rs::provider_add_reads_its_key_through_the_hiding_prompt_and_never_as_a_flag`.
-      **Covered with one documented gap**: no test types a credential here,
-      because `provider_add_on` stores through `keychain::default_keychain()`
-      — the real login keychain on macOS — with no seam to redirect it and no
-      confirm step between the read and the store, so a completed walk would
-      write a credential into whoever ran the suite (the rule
-      `pty_e2e.rs`'s REQ-572 test already records). What is asserted instead:
-      the row runs at a TTY, reaches the credential step, asks through
-      `ask_secret` and only through it, takes no `--key` flag (the parser
-      rejects one), refuses on an empty answer with `config.toml`
-      byte-identical and no `config/set` — and the echo bit itself
-      **fail-closed**: under a pty `EchoState::NoTerminal` is unreachable and
-      `EchoState::Failed` refuses to read, so a read that happened without
-      `ECHO_UNAVAILABLE` is a read with echo off. The completed store against a
-      keychain double is `main.rs`'s `MockKeychain` registration tests; the
-      bytes-on-a-screen sweep of a real typed credential is
+      *(**Amended at verify (M1/M4).** The keychain is now a parameter of
+      `provider_add_on` — both callers pass `keychain::default_keychain()` —
+      and the session confirms, default-no, before it reads. So the composed
+      flow is pinned in-process against a double, in `main.rs`:
+      `a_confirmed_session_provider_add_stores_the_key_and_registers_by_reference`
+      (the key reaches `MockKeychain` under the id; the `config/set` on the
+      socket carries `keychain://teton/<id>` and no raw key; no surface line
+      and no wire byte carries the key),
+      `a_declined_session_provider_add_reads_no_key_and_stores_nothing` ("n",
+      an empty answer, and a pasted second command line all decline before
+      `ask_secret` is called; the keychain is untouched and only the duplicate
+      probe reaches the socket),
+      `the_sessions_yes_pre_answers_the_provider_add_confirmation`,
+      `a_refused_session_registration_takes_its_stored_key_back_out` and
+      `a_refused_session_registration_restores_the_key_it_displaced` (BUG-171's
+      `PriorKey` undo through the composed flow), and
+      `a_keychain_that_will_not_store_is_a_refusal_and_registers_nothing`. The
+      terminal half stays in
+      `pty_e2e.rs::a_session_provider_add_asks_for_its_key_echo_off_and_stores_nothing_untyped`
+      — confirm, then the hiding prompt, an empty key answer, `config.toml`
+      byte-identical — with the echo bit **fail-closed** (under a pty
+      `EchoState::NoTerminal` is unreachable and `EchoState::Failed` refuses to
+      read) and no credential typed, because the shipped binary still writes
+      to the real login keychain. `cli_rows.rs::provider_add_reads_its_key_through_the_hiding_prompt_and_never_as_a_flag`
+      pins the question order through the session row and that no `--key`
+      flag parses. The bytes-on-a-screen sweep of a real typed credential is
       `pty_e2e.rs::the_key_step_does_not_echo_and_the_key_reaches_nothing`,
       over the same `Prompter::ask_secret` seam this row reads through.)*
 - [x] AC-4: On piped stdin every write row (`provider add`, `boundary add`,
@@ -393,6 +423,13 @@ None. No daemon change: every row is a new call site of an existing method
   a source edit and ships with the release; no daemon restart semantics
   change.
 - id allocated with remote verification (not degraded).
+- **(verify D2)** A near-miss `teton …` line — one whose words after `teton`
+  do not name a subcommand path — reaches the model as a prompt, including
+  one that happens to carry a pasted key (`teton api key is sk-…`). That is
+  BR-4's own rule ("teton is slow today" is a question), and the same is true
+  of any prompt line at all: the session's key-in-chat guard is the guide's
+  prohibition plus the REQ-579 hand-off, not the classifier. Recorded rather
+  than fixed; see Out of Scope.
 
 ## Open Questions
 
@@ -421,6 +458,22 @@ None. No daemon change: every row is a new call site of an existing method
       daemon versions (cheap and useful after an upgrade) rather than be
       refused? Proposal: yes, as a `/version` row — but only if it costs no
       new RPC (the handshake result already carries the daemon version).
+- [ ] OQ-6 **(verify D1, recorded)**: There is no verbatim escape for a
+      `teton …` line the way `//` escapes a leading slash — a user who wants
+      to *ask the model about* `teton provider list` types exactly the line
+      that runs it. Rationale for shipping without one: recognition intercepts
+      only lines whose words after `teton` are an exact subcommand path in the
+      parser's own tree, so the interception surface is small and enumerable
+      (the ten mirrored rows, the four pre-REQ leaves, `model`, `uninstall`,
+      the families, and the binary's own flags); every write it can reach is
+      typed-input-gated and, for `provider add`, confirmed — the one exception
+      being `effort` set, recorded in Permissions; and a question phrased as a
+      sentence ("why does teton provider list show two kimis?") is not
+      intercepted at all, because `teton` is not its first word. If a user
+      genuinely needs the model to read a bare command line, `//teton …`
+      already works (BR-11: the escape outranks recognition and the model sees
+      `/teton …`), which is a workable spelling for a rare need. Revisit if
+      the interception surface grows.
 
 ## Out of Scope
 
@@ -433,6 +486,11 @@ None. No daemon change: every row is a new call site of an existing method
 - Tab completion / history for slash commands; the VS Code extension.
 - Changing what any mirrored command *prints* — parity is with today's
   output, byte for byte, except `/doctor`'s connect arm (BR-7).
+- **(verify D2)** Intercepting near-miss `teton …` lines that carry a pasted
+  key before they reach the model. The classifier is a command recognizer,
+  not a secret scanner; the guard against a credential in chat is the
+  prompt's prohibition and the REQ-579 hand-off, and a scanner here would be
+  a second, weaker copy of the redactor's job.
 
 ## Retrieved Context
 

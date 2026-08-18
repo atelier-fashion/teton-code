@@ -260,8 +260,98 @@ that dispatches it (REQ-555 BR-4 → REQ-582 ADR-1/2/6, LESSON-529/517).
   with clap's "unexpected argument" rather than sent to the model (ADR-1).
 - **BR-4's "four buckets"** — modelled as five `Input` variants (recognized
   vs refused CLI lines are distinct outcomes); the totality property is the
-  same (ADR-8).
+  same (ADR-8). **Six since the verify pass**: `Input::CliHelp(String)`
+  carries clap's own page for a family followed by `--help`/`-h` (`teton
+  provider --help`), rendered as Info lines — a user who asked for help asked
+  for more than one line, which is why it cannot ride `CliRefused` (T6).
 - **Tokenization** — whitespace only, no quotes (ADR-2); OQ-5 added.
+
+### Verify-pass deviations (2026-08-18)
+
+- **ADR-1 recognition, pre-REQ rows (M2).** A recognized line whose row has
+  `mirror: None` and whose name is a *leaf* in clap's tree (`cost`, `effort`,
+  `model set`, `provider test`) is not dispatched straight to the row: the
+  entry loop calls `slash::run_cli_line`, which validates the FULL typed argv
+  with `Cli::try_parse_from(["teton", …tokens])` first — `Err` renders the
+  parser's message and dispatches nothing; `Ok` derives the row's argument
+  from the parsed `Command` (`Cost` → `""`, `Effort{level}` → the level or
+  `""`, `Model{Set{name}}` → the name, `Provider{Test{id}}` → the id) and
+  dispatches that. Global flags (`--yes`, `--verbose`) parse, are dropped,
+  and are reported in one Info line (`cli_rows::shell_flags_line`). Bare
+  `teton model` — a family the table answers — keeps TASK-170's direct
+  dispatch, since clap cannot parse it to a command. Mirrored rows are
+  unchanged: their handlers parse for themselves. Not a second parser (BR-3):
+  the judge is the binary's tree and the row receives what it parsed.
+  `effort` set stays pipe-friendly (REQ-559 BR-9) — recorded in the spec's
+  Permissions table as the one write recognition can reach without the gate.
+- **ADR-1 recognition, leading global flags (m5).** `teton -y policy set-tier
+  …` / `teton --verbose doctor`: the classifier steps over
+  `-y/--yes/-v/--verbose` before the walk and carries them on
+  `Input::CliLine.shell_flags`, so the row's own clap parse still meets them
+  (spliced onto the argument for a mirrored row; part of the full argv for a
+  pre-REQ leaf) and says they were ignored. Without this the walk began at
+  `-y`, found no subcommand, and sent the line to the model.
+- **ADR-2 step order (M3).** `run_mirrored_seamed` parses **first**, then
+  applies the write gate, then runs: `--help` is a parse outcome, and a piped
+  `/policy set-tier --help` is a question the gate has no business refusing.
+  A parse error on a piped write row likewise renders (no RPC, nothing
+  changed). `render_clap_error`'s `DisplayVersion` arm is unreachable —
+  `--version` is not propagated to subcommands and clap reports it as an
+  unexpected argument (T3) — and stays for the reason its doc gives.
+- **ADR-2 step 3 rendering (m1/m2).** Every line of clap's text reaches the
+  surface, blank lines as `Info ""` (byte parity with the shell), and each line
+  is bounded and defused through `slash::echoed_within` at
+  `CLAP_LINE_MAX_CHARS` (640 — clap does not wrap help in this build, and the
+  global `--yes` doc is one 509-character line; a tree-walk test asserts the
+  binary's own text clears the bound). One renderer, `render_clap_text`, for
+  a row's parse failure, a pre-REQ row's full-argv failure, and the family
+  help page.
+- **ADR-3 error taxonomy (m7).** A **transport** failure propagates out of a
+  mirrored row (the session ends as it does when `/cost` meets one; a body
+  that swallowed it would report a dead socket one command later). Every
+  non-transport failure of `provider add` — the endpoint the registration
+  seam refuses (REQ-578 BR-5), a keychain that will not store — travels as a
+  `ProviderAddRefusal` variant (`Endpoint`, `KeychainStore`) beside the three
+  decisions, rendered as one line with the session continuing; the shell
+  `bail!`s with the same sentence.
+- **ADR-3 / BR-6, session-only confirm (M1).** `provider_add_on` takes an
+  `AddConsent`: `Shell` asks nothing (the command line was the consent; bytes
+  unchanged), `Session{assume_yes}` asks a default-no confirmation — after the
+  duplicate probe and endpoint settlement, before the key is read, only when a
+  key is about to be read — naming id, kind, model and the settled endpoint
+  through the masking renderer (LESSON-529/535). Anything but `is_yes`
+  declines with one Info line and no key read; the session's `--yes`
+  pre-answers it as it does `/model set`'s confirmation. Motivation: a
+  multi-line paste's second line was the key.
+- **ADR-3, keychain as a parameter (M4).** `provider_add_on(…, keychain:
+  &dyn Keychain)`; both callers pass `keychain::default_keychain()`. The
+  composed read → store → `config/set` path, the wire bytes, and BUG-171's
+  undo are now unit-tested against `MockKeychain`.
+- **ADR-2 step 3, the dispatcher's unreachable arms (m3).**
+  `run_mirrored_command`'s six non-mirrored arms render one shared sentence
+  (`not_a_mirrored_row`) — unreachable by construction, tested by direct
+  call; the per-arm `session_spelling_line`/`UNINSTALL_IS_SHELL_ONLY` texts
+  are gone. `teton policy set …` typed at the prompt answers with
+  `POLICY_SET_RETIRED` from the classifier (m6); the family refusal reads
+  "`teton provider …` names a family rather than a command — …" (m4).
+- **ADR-6 dormancy (m8).** The "already named the `/` spelling" check is a
+  whole-word match, so `/doctor` inside `crates/teton/src/doctor.rs` does not
+  silence the nudge.
+- **ADR-7 guide (m9).** Step 1's "Shell only:" became "Shell:" — REQ-582 gave
+  the by-hand registration a session row, so "only" was false. The REQ-579
+  step-1 pin reads `shell:` with the reason recorded; margin after the edit:
+  **56 bytes** against the 48 floor (−5 bytes on the guide).
+- **Test-strategy row AC-9 (T14).** The proof of the generic line's TTY-only
+  gate is the unit test `the_generic_line_is_tty_only_and_prints_once_per_turn`;
+  the piped e2e `a_piped_session_whose_reply_recites_the_cli_gets_no_hand_off_line`
+  is the binary-level negative and now also asserts the generic prefix is
+  absent (its reply recites two mirrored rows).
+- **Recorded, not fixed (D1–D3).** D1: no verbatim escape for a `teton …`
+  line — OQ-6 in the spec, with the rationale (small enumerable interception
+  surface; writes gated except `effort`; `//teton …` already reaches the
+  model). D2: near-miss lines carrying a pasted key reach the model as any
+  prompt does — spec Assumptions/Out of Scope. D3: `main.rs` size / extracting
+  the clap tree to a `cli.rs` — a follow-up, not this REQ's change.
 
 ## Test strategy summary
 
@@ -269,13 +359,13 @@ that dispatches it (REQ-555 BR-4 → REQ-582 ADR-1/2/6, LESSON-529/517).
 |---|---|---|
 | AC-1 parity (reads) | `crates/teton/tests/cli_e2e.rs` | drive `teton <sub>` and a piped session `/<sub>` against one scripted daemon; diff the lines after the session-ready line (`/doctor`: diff all but the connect arm) |
 | AC-2 writes | `cli_e2e.rs` under `TETON_TEST_SEAMS=1` (`run_cli_seamed`) | `/policy set-tier`, `/policy set-category`, `/boundary add` then `teton policy show` / `teton boundary list` |
-| AC-3 `/provider add` | `crates/teton/tests/pty_e2e.rs` (echo-off key) + REQ-579's keychain seam | key never in transcript; config carries `keychain://` |
+| AC-3 `/provider add` | `crates/teton/tests/pty_e2e.rs` (confirm, then the echo-off key prompt; no credential typed) + `main.rs` `provider_add_on` tests over `MockKeychain` (M4: the composed store, the wire carrying `keychain://` and never the key, the refused-registration undo, the declined confirm) | key never in transcript or on the wire; config carries `keychain://` |
 | AC-4 piped write refusal | `cli_e2e.rs` | each write row prints the shell pointer; reads work |
 | AC-5 recognized line | `cli_e2e.rs` | note line + `/provider list` output; the scripted engine's reply queue is untouched (no turn consumed) |
 | AC-6 refusals/prompts | `slash.rs` unit + `cli_e2e.rs` | `teton uninstall` refused; `teton is slow today` reaches the model (scripted reply consumed) |
 | AC-7 clap errors | `slash.rs`/`cli_rows.rs` unit (`RecordingSurface`) | rendered text equals `Cli::try_parse_from` error for the same argv |
 | AC-8 `/help` | `slash.rs` unit + `cli_e2e.rs` | every row listed; grouping; footer |
-| AC-9 hand-off | `session_ui.rs` unit (`hand_off_turn` helper) | four cases from the AC |
+| AC-9 hand-off | `session_ui.rs` unit (`hand_off_turn` helper) | four cases from the AC; the TTY-only gate is `the_generic_line_is_tty_only_and_prints_once_per_turn` (unit — the proof); `cli_e2e.rs::a_piped_session_whose_reply_recites_the_cli_gets_no_hand_off_line` is the binary-level negative for both the REQ-579 line and the generic prefix (T14) |
 | AC-10 guide | `crates/teton` unit (include_str) | cross-check with the equivalence |
 | AC-11 presence | `cli_e2e.rs`/`pty_e2e.rs` with `TETON_PRESENCE_ACCEPT=fail` on a `presence` build (feature-gated test) | refused line, config bytes identical; paired with `accept` |
 | AC-12 | workspace suite; `git diff -- crates/teton-protocol/src/` empty | CI |
