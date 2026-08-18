@@ -169,11 +169,11 @@ no-prose case (a prose-bearing remote turn still replays as prose alone),
 adds the same `prepare()` guard, logs at the runtime's failure site, and adds
 an end-to-end regression through the real openai-compatible adapter with
 recorded request bodies (`crates/tetond/tests/remote_loop.rs`) plus a
-conformance fixture. Only one of the two lands; whichever does, the other's
-unique pieces are worth carrying: from #177 the wire-level test; from this
-one the prose-case recording, the trailing-call trim, the CHANGELOG entry and
-the runbook. Merge is deliberately left to the user (see the memory note on
-BUG/LESSON number races).
+conformance fixture. Only one of the two lands. **Decision (user,
+2026-08-18): this one lands; #177's wire-level test and conformance fixture
+were carried over onto it (relabelled BUG-178) before merge, and #177 is
+closed unmerged.** BUG-179 never reached `main`, so `.adlc/bugs/` carries one
+record for the defect.
 
 ## Files Changed
 
@@ -192,6 +192,19 @@ BUG/LESSON number races).
 - `crates/tetond/src/carry.rs` — trim doc; the cancelled-remote-turn test
   now uses the shape the loop pushes; new
   `a_cancelled_remote_call_with_no_prose_leaves_no_blank_turn_behind`.
+- `crates/tetond/tests/remote_loop.rs` — carried over from PR #177
+  (BUG-179, the parallel fix): `ScriptedSseTransport` records every request
+  body; a kimi-shaped turn builder (`reasoning_content` + `tool_calls`,
+  every `content` delta empty); end-to-end regression
+  `a_native_tool_call_with_no_prose_never_replays_an_empty_assistant_turn`
+  through the real openai-compatible adapter — the second request's
+  assistant message is the recorded call, never empty, roles strictly
+  alternate, the call never streams to the user, both turns billed. Red on
+  the unfixed loop arm (0 assistant turns: the `prepare()` guard hides the
+  empty block but cannot record the call), green with the fix.
+- `crates/teton-providers/tests/conformance.rs` — carried over from PR #177:
+  the kimi-shaped fixture; the adapter yields exactly one `ToolCall` and no
+  `TextDelta` — the legitimate adapter output the harness has to record.
 - `CHANGELOG.md` — `[Unreleased]` → Fixed entry.
 - `docs/manual-verification.md` — BUG-178 runbook (OUTSTANDING until
   dogfooded on the shipped binary against a real native-tool provider).
