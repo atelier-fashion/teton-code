@@ -1,7 +1,7 @@
 ---
 id: TASK-163
 title: "Daemon runtime: provider_test — one minimal call through egress, typed outcome, health, ledger, event"
-status: draft
+status: complete
 parent: REQ-581
 created: 2026-08-17
 updated: 2026-08-17
