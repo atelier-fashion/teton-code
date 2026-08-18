@@ -1,0 +1,27 @@
+{
+  "req": "REQ-582",
+  "branch": "feat/REQ-582-run-cli-commands-from-the-session",
+  "startedAt": "2026-08-18T13:12:46Z",
+  "completed": false,
+  "currentPhase": 0,
+  "completedPhases": [],
+  "phaseHistory": [],
+  "integrationBranch": "main",
+  "repos": {
+    "teton-code": {
+      "primary": true,
+      "path": "/Users/brettluelling/Documents/GitHub/teton-code",
+      "worktree": "/Users/brettluelling/Documents/GitHub/teton-code/.worktrees/REQ-582",
+      "branch": "feat/REQ-582-run-cli-commands-from-the-session",
+      "touched": true,
+      "prUrl": null,
+      "prNumber": null,
+      "prCreatedAt": null,
+      "merged": false,
+      "snapshotBranch": null,
+      "snapshotPR": null
+    }
+  },
+  "mergeOrder": ["teton-code"],
+  "phase4": { "currentTask": null, "completedTasks": [], "failedTasks": [] }
+}
