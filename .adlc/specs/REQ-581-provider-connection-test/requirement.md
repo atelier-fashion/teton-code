@@ -1,7 +1,7 @@
 ---
 id: REQ-581
 title: "A first-class provider connection test: `/provider test <id>` makes one consented call and says exactly what came back"
-status: approved
+status: complete
 deployable: true
 created: 2026-08-17
 updated: 2026-08-17
