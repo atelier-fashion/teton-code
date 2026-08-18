@@ -163,6 +163,15 @@ and nothing else. Deferred: OQ-5, OQ-6, an Anthropic-shaped fixture
 pinning the reported `usd_micros` against the ledger row (the OpenAI shape is
 pinned), and a "health unchanged" phrasing for transient failures.
 
+## Deferred
+
+- **Manual verification** (`docs/manual-verification.md`, REQ-581 section — OUTSTANDING): the AC-8b live A/B for the hand-off line on the real local model, and one real `reached` against Kimi.
+- **OQ-5** `Retry-After` on `rate_limited` (ADR-2: the transport surfaces one named header by design).
+- **OQ-6** no in-flight cap / rate limit on `provider/test` (same posture as `session/prompt`; consented per call).
+- An Anthropic-shaped fixture pinning the reported `usd_micros` against the ledger row (the OpenAI SSE shape is pinned).
+- A "provider health unchanged" phrasing for transient failures (`rate_limited` / `server_error` / `timed_out` leave health where it stood, and the line currently reads "…; provider health: healthy." which can read as a contradiction).
+- Two cosmetic nits left open by choice: the hand-wrapped `Args::Required` hint indent in `slash.rs`, and the duplicated closed-port helper across two test crates.
+
 ## Out of Scope
 
 - Testing the *local* tier (that is REQ-580's classification and `teton doctor`).
