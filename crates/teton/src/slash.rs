@@ -39,16 +39,28 @@
 //! here would be the BUG-151 shape — a guard that stays green while half the
 //! invariant drifts (LESSON-479).
 //!
-//! One command is deliberately narrower than BR-9's "identical on a TTY and on
-//! piped stdin": `/model set` is **refused when the session's stdin is not a
-//! terminal** (spec Permissions; security review 2026-08-04). It is the only
-//! command that changes daemon state, so on a pipe it renders one rejection
-//! pointing at `teton model set` and sends nothing. That is what is enforced,
-//! and it is narrower than what it is enforced *for*: the check separates a pipe
-//! from a pty, not a machine from a human — `expect(1)`, a tmux `send-keys` and
-//! a pasted line all present a terminal and pass. The spec records that residual
-//! and names `teton model set` as the auditable surface for the unattended case.
-//! Every other command is pipe-friendly exactly as BR-9 says.
+//! Ten rows are **mirrors** of `teton` subcommands (REQ-582 BR-1): `/provider
+//! list`, `/provider add`, `/boundary list`, `/boundary add`, `/policy show`,
+//! `/policy set-tier`, `/policy set-category`, `/model list`, `/model status`
+//! and `/doctor`. They carry [`Args::Cli`] and a [`Mirror`], and their handlers
+//! live in [`crate::cli_rows`], which parses their arguments with the binary's
+//! own clap tree and runs the same `<sub>_on(conn, ctx, …)` body the subcommand
+//! runs — the pattern above, extended to the namespaces REQ-555 deferred. A
+//! mirrored row's name *is* its twin's subcommand path, which is what lets a
+//! typed `teton provider list` be recognized by walking clap's tree rather than
+//! by a second matcher (ADR-1).
+//!
+//! Five commands are deliberately narrower than BR-9's "identical on a TTY and
+//! on piped stdin": the four mirrored rows that write and `/model set` are
+//! **refused when the session's stdin is not a terminal** (spec Permissions;
+//! security review 2026-08-04; REQ-582 ADR-4). They are the commands that change
+//! daemon or machine state, so on a pipe each renders one rejection pointing at
+//! its `teton` twin and sends nothing. That is what is enforced, and it is
+//! narrower than what it is enforced *for*: the check separates a pipe from a
+//! pty, not a machine from a human — `expect(1)`, a tmux `send-keys` and a
+//! pasted line all present a terminal and pass. The spec records that residual
+//! and names the shell commands as the auditable surface for the unattended
+//! case. Every other command is pipe-friendly exactly as BR-9 says.
 
 use teton_protocol::effort::EffortLevel;
 use teton_protocol::jsonrpc::{error_code, RpcError};
@@ -60,6 +72,7 @@ use teton_protocol::methods::{
 use teton_protocol::permissions::PermissionLevel;
 use teton_protocol::SessionId;
 
+use crate::cli_rows::{self, Mirror, WriteGate};
 use crate::client::{Connection, UiContext};
 use crate::model_ui;
 use crate::render::{LineKind, Surface};
@@ -68,6 +81,20 @@ use crate::session_ui::web_tier_name;
 /// The one line `/help` prints about the `//` escape hatch (BR-1b).
 const ESCAPE_FOOTER: &str =
     "//text sends text as a prompt with one leading slash — //usr/bin/foo asks about /usr/bin/foo.";
+
+/// The one line `/help` prints about how a row's arguments are read (REQ-582
+/// ADR-2 / OQ-5).
+///
+/// The mirrored rows take real CLI arguments — positionals, `--flags`, value
+/// enums — and this is the one place the session's tokenization differs from a
+/// shell's: it splits on whitespace and interprets no quotes. No mirrored
+/// subcommand takes a whitespace-bearing value today, so the limitation costs
+/// nothing in practice; it is documented rather than hidden because the shape it
+/// forbids (a glob with a space) is legal in principle and the shell twin does
+/// accept it.
+const ARGUMENT_FOOTER: &str =
+    "Command arguments are split on whitespace and quotes are not interpreted — a value with a \
+     space in it has to be given to `teton` in a shell.";
 
 /// The tail every rejected command line carries, so an unknown command and a
 /// misused one point at the same place (BR-2).
@@ -156,6 +183,18 @@ enum Args {
     /// time: the handler is entered either way and decides what an empty
     /// argument means.
     Optional,
+    /// The argument grammar is the shell twin's own clap definition (REQ-582
+    /// BR-3): positionals, `--flags` and value enums, parsed by the very code
+    /// the binary parses `teton …` with.
+    ///
+    /// Like [`Args::Optional`] this never rejects at [`resolve`] time, and for a
+    /// stronger reason: there is nothing useful this table could say about a
+    /// mirrored row's argument that clap does not say better. A missing
+    /// positional, an unknown flag and a value outside an enum are all reported
+    /// by the parser, in the parser's own words — which is the whole of AC-7,
+    /// and the reason there is no second hand-written parser of `teton …`
+    /// arguments anywhere in the client (LESSON-529).
+    Cli,
 }
 
 /// One row of the dispatch table.
@@ -179,6 +218,21 @@ struct CommandSpec {
     summary: &'static str,
     /// What the row does with a trailing argument.
     args: Args,
+    /// The `teton …` command this row mirrors, or `None` for a session-only row
+    /// (REQ-582 BR-1).
+    ///
+    /// It is what the typed-input refusal points at, what the hand-off nudge
+    /// translates *from* (BR-8), and — because it is `"teton "` + [`Self::name`]
+    /// — what makes a typed `teton provider list` resolvable to this row by
+    /// walking clap's tree rather than by matching words (ADR-1).
+    ///
+    /// `None` on `/help`, `/clear`, `/verbose`, `/permissions`, `/web …`,
+    /// `/provider setup`, `/provider test`, `/quit` — and on `/cost`, `/effort`
+    /// and `/model set`, which do have `teton` twins but whose session rows
+    /// predate this REQ and carry gates and flows of their own (`/model set`'s
+    /// above-RAM-floor confirmation, `/provider test`'s consent). A `Some` here
+    /// means "this row *is* its twin, parsed and rendered by the twin's code".
+    mirror: Option<Mirror>,
     /// The code that runs the command.
     handler: Handler,
 }
@@ -198,6 +252,7 @@ const COMMANDS: &[CommandSpec] = &[
         aliases: &[],
         summary: "List the commands this session knows.",
         args: Args::None,
+        mirror: None,
         handler: handle_help,
     },
     CommandSpec {
@@ -205,6 +260,7 @@ const COMMANDS: &[CommandSpec] = &[
         aliases: &[],
         summary: "Show the daemon's cost report, exactly as `teton cost` does.",
         args: Args::None,
+        mirror: None,
         handler: handle_cost,
     },
     // REQ-559 BR-9: this REQ owns the `/effort` row, its bare-argument read
@@ -220,6 +276,7 @@ const COMMANDS: &[CommandSpec] = &[
         // BR-9 requires, so an argument-less line must dispatch rather than be
         // rejected as half-typed.
         args: Args::Optional,
+        mirror: None,
         handler: handle_effort,
     },
     CommandSpec {
@@ -231,6 +288,7 @@ const COMMANDS: &[CommandSpec] = &[
         aliases: &[],
         summary: "Show the model the local tier is currently on.",
         args: Args::None,
+        mirror: None,
         handler: handle_model,
     },
     CommandSpec {
@@ -240,7 +298,30 @@ const COMMANDS: &[CommandSpec] = &[
         args: Args::Required(
             "a catalog name — `/model set <name>`, and `teton model list` names them",
         ),
+        mirror: None,
         handler: handle_model_set,
+    },
+    // REQ-582 BR-1: the two `teton model` reads the session had no form for.
+    // They sit with the rows above because `/help` groups by family (first
+    // word), and because the four together are the whole of what a user can ask
+    // or say about the local model from here: `/model` is the one-line answer
+    // REQ-555 chose deliberately (OQ-3), `/model list` is the catalog, `/model
+    // status` is the full report, and `/model set` is the only one that writes.
+    CommandSpec {
+        name: "model list",
+        aliases: &[],
+        summary: "Show the model catalog, each entry's fit for this machine, and the selection.",
+        args: Args::Cli,
+        mirror: Some(cli_rows::MODEL_LIST),
+        handler: cli_rows::handle_model_list,
+    },
+    CommandSpec {
+        name: "model status",
+        aliases: &[],
+        summary: "Report the recorded model decision and the weights' install state.",
+        args: Args::Cli,
+        mirror: Some(cli_rows::MODEL_STATUS),
+        handler: cli_rows::handle_model_status,
     },
     // REQ-567's user-only clear. Placed beside `/verbose` because both are
     // commands about *this session* rather than about the machine's
@@ -252,6 +333,7 @@ const COMMANDS: &[CommandSpec] = &[
         aliases: &[],
         summary: "Drop this session's retained conversation; the next prompt starts fresh.",
         args: Args::None,
+        mirror: None,
         handler: handle_clear,
     },
     CommandSpec {
@@ -259,6 +341,7 @@ const COMMANDS: &[CommandSpec] = &[
         aliases: &[],
         summary: "Toggle the routing and turn-end notices for this session.",
         args: Args::None,
+        mirror: None,
         handler: handle_verbose,
     },
     // REQ-560's permission level. Placed beside `/clear` and `/verbose` because
@@ -278,6 +361,7 @@ const COMMANDS: &[CommandSpec] = &[
         aliases: &[],
         summary: "Show or set this session's permission level: /permissions [level].",
         args: Args::Optional,
+        mirror: None,
         handler: handle_permissions,
     },
     // REQ-563's two user-only web actions. Both are client commands rather than
@@ -297,6 +381,7 @@ const COMMANDS: &[CommandSpec] = &[
         summary: "Set up web lookup: pick a tier, name a backend, confirm before anything is \
                   written.",
         args: Args::None,
+        mirror: None,
         handler: handle_web_setup,
     },
     CommandSpec {
@@ -304,6 +389,7 @@ const COMMANDS: &[CommandSpec] = &[
         aliases: &[],
         summary: "Lift this session's web taint restriction (grants no new tier).",
         args: Args::None,
+        mirror: None,
         handler: handle_web_allow,
     },
     CommandSpec {
@@ -311,6 +397,7 @@ const COMMANDS: &[CommandSpec] = &[
         aliases: &[],
         summary: "Drop a URL's cached copy so the next lookup re-fetches: /web refresh <url>.",
         args: Args::Required("a URL — `/web refresh <url>`"),
+        mirror: None,
         handler: handle_web_refresh,
     },
     // REQ-579: the second instance of the guided-enablement pattern `/web setup`
@@ -325,6 +412,7 @@ const COMMANDS: &[CommandSpec] = &[
         summary: "Register a provider and route a tier to it: /provider setup [vendor] [tier] — \
                   confirm before anything is written.",
         args: Args::Optional,
+        mirror: None,
         handler: handle_provider_setup,
     },
     // REQ-581 BR-7: the second `/provider` row, beside the one that registers.
@@ -339,7 +427,96 @@ const COMMANDS: &[CommandSpec] = &[
             "a provider id — `/provider test <id>`, and `/provider setup` \
                              registers one",
         ),
+        mirror: None,
         handler: handle_provider_test,
+    },
+    // REQ-582 BR-1: the two `teton provider` commands the session had no form
+    // for, beside the two it already had. `/provider setup` stays the guided
+    // answer the live A/B settled on (REQ-579 ADR-9) and this is the by-hand
+    // one — every flag its shell twin takes, none of them a key: the credential
+    // is read echo-off through the session's prompter (BR-6), so
+    // `/provider add … --key` is not a thing and never will be.
+    CommandSpec {
+        name: "provider list",
+        aliases: &[],
+        summary: "List the providers registered on this machine, with what each one calls.",
+        args: Args::Cli,
+        mirror: Some(cli_rows::PROVIDER_LIST),
+        handler: cli_rows::handle_provider_list,
+    },
+    CommandSpec {
+        name: "provider add",
+        aliases: &[],
+        summary: "Register a provider by hand: /provider add <id> --kind <kind> --endpoint <url> \
+                  --model <name>; the key is asked for, never typed on the line.",
+        args: Args::Cli,
+        mirror: Some(cli_rows::PROVIDER_ADD),
+        handler: cli_rows::handle_provider_add,
+    },
+    // REQ-582 BR-1: the `/boundary` family, promoted from shell-only. REQ-555
+    // deferred exactly this namespace ("in-session management commands
+    // (`/provider`, `/boundary`, `/policy`) … follow the same shared-flow
+    // pattern if promoted later"), and this is that promotion, on that pattern.
+    CommandSpec {
+        name: "boundary list",
+        aliases: &[],
+        summary: "List the privacy boundaries: the path globs whose content never leaves this \
+                  machine.",
+        args: Args::Cli,
+        mirror: Some(cli_rows::BOUNDARY_LIST),
+        handler: cli_rows::handle_boundary_list,
+    },
+    CommandSpec {
+        name: "boundary add",
+        aliases: &[],
+        summary: "Add a privacy boundary over a path glob: /boundary add <glob> [--mode \
+                  local-only|redact-then-remote].",
+        args: Args::Cli,
+        mirror: Some(cli_rows::BOUNDARY_ADD),
+        handler: cli_rows::handle_boundary_add,
+    },
+    // REQ-582 BR-1: the `/policy` family. `show` leads it because it is the
+    // command a user reaches for first — the question "where does this session
+    // send my turns?" is the one the routing table answers — and the two set
+    // rows follow in the order the CLI documents them: a tier binding is the
+    // setting most users want, a category override is the exception to it.
+    CommandSpec {
+        name: "policy show",
+        aliases: &[],
+        summary: "Show the effective routing table: every tier, every category, and where each \
+                  one resolves right now.",
+        args: Args::Cli,
+        mirror: Some(cli_rows::POLICY_SHOW),
+        handler: cli_rows::handle_policy_show,
+    },
+    CommandSpec {
+        name: "policy set-tier",
+        aliases: &[],
+        summary: "Route a tier to a provider: /policy set-tier <tier> <provider> [--fallback \
+                  <id>].",
+        args: Args::Cli,
+        mirror: Some(cli_rows::POLICY_SET_TIER),
+        handler: cli_rows::handle_policy_set_tier,
+    },
+    CommandSpec {
+        name: "policy set-category",
+        aliases: &[],
+        summary: "Route one category ahead of its tier: /policy set-category <category> \
+                  <provider> [--fallback <id>].",
+        args: Args::Cli,
+        mirror: Some(cli_rows::POLICY_SET_CATEGORY),
+        handler: cli_rows::handle_policy_set_category,
+    },
+    // REQ-582 BR-1 / BR-7: the diagnosis, over the connection this session
+    // already holds. It is the last mirrored row and a family of one, so it sits
+    // beside `/quit` in the ungrouped block `/help` lists last.
+    CommandSpec {
+        name: "doctor",
+        aliases: &[],
+        summary: "Diagnose the daemon, socket, model state, and providers from this session.",
+        args: Args::Cli,
+        mirror: Some(cli_rows::DOCTOR),
+        handler: cli_rows::handle_doctor,
     },
     CommandSpec {
         name: "quit",
@@ -352,6 +529,7 @@ const COMMANDS: &[CommandSpec] = &[
         aliases: &["exit"],
         summary: "End the session, exactly as Ctrl-D does.",
         args: Args::None,
+        mirror: None,
         handler: handle_quit,
     },
 ];
@@ -615,12 +793,46 @@ fn render_rejection(hint: &str, surface: &mut dyn Surface) {
     surface.line(LineKind::Error, hint);
 }
 
-/// `/help`: the command list, generated from [`COMMANDS`] (BR-7), plus the one
-/// footer line documenting the `//` escape (BR-1b).
+/// The family a row is listed under in `/help` — its first word, when more than
+/// one row shares that word, and `""` otherwise (REQ-582 BR-1).
+///
+/// The rule is deliberately about *sharing* rather than about a name having a
+/// space in it. `/model` is one word and belongs with `/model list`, `/model
+/// set` and `/model status`; `/doctor` is one word and belongs with nothing, and
+/// giving it a group heading of its own would turn a listing into an index.
+/// Every row that shares no first word falls into the unnamed group, and those
+/// list together wherever the table puts them — the plain session commands at
+/// the top, `/doctor` and `/quit` at the bottom.
+fn help_family(name: &'static str) -> &'static str {
+    let first = first_word(name);
+    let shared = COMMANDS
+        .iter()
+        .filter(|spec| first_word(spec.name) == first)
+        .count();
+    if shared > 1 {
+        first
+    } else {
+        ""
+    }
+}
+
+/// A row name's first word.
+fn first_word(name: &'static str) -> &'static str {
+    name.split_whitespace().next().unwrap_or(name)
+}
+
+/// `/help`: the command list, generated from [`COMMANDS`] (BR-7), grouped by
+/// family (REQ-582 BR-1), plus the footer lines documenting how arguments are
+/// read (ADR-2) and the `//` escape (BR-1b).
 ///
 /// Aliases are rendered from the same rows, so BR-7 covers them too: a spelling
 /// that dispatches cannot be absent from `/help`, and `/help` cannot promise one
 /// that does not dispatch.
+///
+/// The grouping is a blank line at each family boundary and nothing else — no
+/// headings, no indentation. At ~25 rows the listing needs air rather than
+/// structure, and a heading would be a second name for a family whose rows
+/// already begin with it.
 fn render_help(surface: &mut dyn Surface) {
     // Names pad to the widest row, so a later two-word row (`model set`)
     // re-aligns the whole list instead of breaking out of it.
@@ -629,7 +841,13 @@ fn render_help(surface: &mut dyn Surface) {
         .map(|spec| spec.name.len())
         .max()
         .unwrap_or(0);
+    let mut previous: Option<&str> = None;
     for spec in COMMANDS {
+        let family = help_family(spec.name);
+        if previous.is_some_and(|prev| prev != family) {
+            surface.line(LineKind::Info, "");
+        }
+        previous = Some(family);
         // The alias is a tail clause rather than a second column: it belongs to
         // one row, and widening the name column for it would push every other
         // summary right for a fact about `/quit`.
@@ -649,7 +867,29 @@ fn render_help(surface: &mut dyn Surface) {
             &format!("/{:<width$}  {}{also}", spec.name, spec.summary),
         );
     }
+    // The footers are not rows, and the same blank line that separates two
+    // families separates them from the last one.
+    surface.line(LineKind::Info, "");
+    surface.line(LineKind::Info, ARGUMENT_FOOTER);
+    // Last, as it has been since REQ-555: the escape hatch is the line a user
+    // scrolling to the bottom of `/help` is looking for.
     surface.line(LineKind::Info, ESCAPE_FOOTER);
+}
+
+/// Every mirrored row, as `(session name, shell twin)`, in table order (REQ-582
+/// BR-8).
+///
+/// The hand-off nudge is built from this rather than from a list of its own: a
+/// row added to the table is nudged for without a second list to maintain, which
+/// is BR-7's rule ("`/help` is generated from the table") applied to the other
+/// surface that names commands.
+// The nudge is TASK-171's; the allowance goes with that commit, as TASK-168's
+// went with this one.
+#[allow(dead_code)]
+pub(crate) fn mirrored_rows() -> impl Iterator<Item = (&'static str, &'static str)> {
+    COMMANDS
+        .iter()
+        .filter_map(|spec| spec.mirror.map(|mirror| (spec.name, mirror.shell)))
 }
 
 /// `/verbose`: flip the session's notice visibility and echo the new state
@@ -808,7 +1048,9 @@ fn handle_model(
 ///
 /// It is also the one command gated on *where the input came from* (spec
 /// Permissions; security review 2026-08-04): a piped session gets one rejection
-/// and no RPC. See [`model_set_gate`] for why that outranks BR-9 here.
+/// and no RPC. See [`cli_rows::write_gate`] for why that outranks BR-9 here —
+/// REQ-582 generalized this gate to the four mirrored write rows, and this row
+/// keeps only its own richer sentence.
 fn handle_model_set(
     conn: &mut Connection,
     ctx: &mut UiContext<'_>,
@@ -819,7 +1061,7 @@ fn handle_model_set(
     // the context like every other world-fact a handler needs (BR-9 — handlers
     // reach the world through the seams or not at all), and the seam switch is a
     // build-time posture, not a runtime interrogation of the terminal.
-    if model_set_gate(ctx.typed_input, test_seams_allowed()) == ModelSetGate::Refuse {
+    if cli_rows::write_gate(ctx.typed_input, test_seams_allowed()) == WriteGate::Refuse {
         ctx.surface.line(LineKind::Error, MODEL_SET_TYPED_ONLY);
         return Ok(CommandOutcome::Continue);
     }
@@ -1403,48 +1645,6 @@ fn report_clear_refusal(err: &RpcError, surface: &mut dyn Surface) {
     }
 }
 
-/// What [`model_set_gate`] decides.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum ModelSetGate {
-    /// Run the shared flow.
-    Run,
-    /// Render [`MODEL_SET_TYPED_ONLY`] and send nothing.
-    Refuse,
-}
-
-/// Whether a `/model set` may run, from where the session's input comes.
-///
-/// `/model set` is the only in-session command that changes daemon state, and
-/// the spec's Permissions table says that change belongs to "the session user
-/// only, via typed input — never inferable from model output or file content".
-/// On a pipe the client cannot tell a human from a heredoc a script wrote, so
-/// the write path refuses and points at `teton model set`, which is the
-/// unattended surface and takes `--yes` explicitly. This is the one documented
-/// exception to BR-9's TTY/pipe parity; every other command is unaffected.
-///
-/// `typed_input` is the honest name for what is actually known: the session's
-/// stdin was a terminal when the process started. It bounds the rule without
-/// implementing it — a pty opened by `expect(1)`, a tmux `send-keys`, or a
-/// paste into a real terminal all satisfy it. The spec's Permissions row records
-/// that residual as accepted: what this buys is that the common unattended
-/// shapes (a heredoc, a `<<<` string, a piped file, a CI step) cannot change the
-/// selection without naming the auditable surface instead.
-///
-/// `seams_allowed` is the escape hatch the e2e suite drives the flow through —
-/// [`test_seams_allowed`], never a plain environment variable, so a shipped
-/// binary cannot be talked out of the gate.
-///
-/// Pure, so both answers are unit-tested without a terminal, a pipe, or a
-/// daemon: the branch that matters is the one a test process cannot otherwise
-/// reach.
-fn model_set_gate(typed_input: bool, seams_allowed: bool) -> ModelSetGate {
-    if typed_input || seams_allowed {
-        ModelSetGate::Run
-    } else {
-        ModelSetGate::Refuse
-    }
-}
-
 /// Whether this binary may honour the `TETON_TEST_SEAMS` master switch.
 ///
 /// The daemon's posture, mirrored (`tetond`'s `test_seams_enabled`): a **debug
@@ -1456,9 +1656,9 @@ fn model_set_gate(typed_input: bool, seams_allowed: bool) -> ModelSetGate {
 /// only keeps the stricter of the two behaviours.
 ///
 /// **Invariant for any future caller.** Silently ignoring the switch is
-/// fail-closed *only because* this function's sole consumer reads it with one
-/// polarity: `seams_allowed` makes [`model_set_gate`] looser, so dropping it on
-/// a release build can only refuse something that would otherwise have run. A
+/// fail-closed *only because* every consumer reads it with one polarity:
+/// `seams_allowed` makes [`cli_rows::write_gate`] looser, so dropping it on a
+/// release build can only refuse something that would otherwise have run. A
 /// consumer that used the switch to make behaviour *stricter* would invert that
 /// — ignoring it would silently loosen the shipped binary — and must mirror the
 /// daemon's posture instead (`tetond`'s `test_seams_enabled`: refuse to run at
@@ -1468,6 +1668,11 @@ fn model_set_gate(typed_input: bool, seams_allowed: bool) -> ModelSetGate {
 /// **same** polarity: the seam lets the walkthrough run on a pipe, so a release
 /// build ignoring the switch can only fall back to printing instructions. The
 /// invariant above is what made that reuse legitimate rather than convenient.
+///
+/// REQ-582 generalizes the first consumer instead of adding a third: the
+/// `/model set` gate became [`cli_rows::write_gate`], which the four mirrored
+/// write rows share with it. Same function, same polarity, one seam — the
+/// invariant is unchanged and now covers five commands.
 pub(crate) fn test_seams_allowed() -> bool {
     cfg!(debug_assertions) && std::env::var("TETON_TEST_SEAMS").ok().as_deref() == Some("1")
 }
@@ -1584,6 +1789,12 @@ mod tests {
                 // case is covered by `an_optional_argument_row_dispatches_both_ways`
                 // below, which asserts the pair rather than only one side.
                 Args::Optional => "",
+                // REQ-582: a mirrored row never rejects at resolve time either —
+                // whatever follows the name is the shell twin's grammar to judge
+                // (BR-3), so the bare form is what proves the row *dispatches*.
+                // What the parser then says about an empty argument is pinned in
+                // `cli_rows`, against clap's own message (AC-7).
+                Args::Cli => "",
             };
             // Every spelling, not just the canonical one: an alias that is in
             // the table but unreachable from typed input is the same defect as
@@ -1714,6 +1925,22 @@ mod tests {
             // and the first command in the table whose body is an outbound
             // request, so the spelling is a spec decision and not a drive-by.
             "provider test",
+            // REQ-582 BR-1: the ten mirrored rows, declared here for the reason
+            // every row above them was. Each name is *also* the subcommand path
+            // its shell twin has, which is not a coincidence but the mechanism —
+            // ADR-1 recognizes a typed `teton …` line by walking clap's tree to
+            // a path and looking that path up here, so a row renamed away from
+            // its twin would silently stop being reachable that way.
+            "model list",
+            "model status",
+            "provider list",
+            "provider add",
+            "boundary list",
+            "boundary add",
+            "policy show",
+            "policy set-tier",
+            "policy set-category",
+            "doctor",
         ];
         for expected in promised {
             assert!(
@@ -1844,13 +2071,13 @@ mod tests {
     // reach on purpose — is pinned here rather than inferred from an e2e run.
     #[test]
     fn model_set_runs_only_from_a_terminal_or_under_the_test_seam() {
-        assert_eq!(model_set_gate(true, false), ModelSetGate::Run);
-        assert_eq!(model_set_gate(true, true), ModelSetGate::Run);
+        assert_eq!(cli_rows::write_gate(true, false), WriteGate::Run);
+        assert_eq!(cli_rows::write_gate(true, true), WriteGate::Run);
         // The e2e suite's allowance, and nothing else in the wild: a release
         // build's `test_seams_allowed` is false whatever the environment says.
-        assert_eq!(model_set_gate(false, true), ModelSetGate::Run);
+        assert_eq!(cli_rows::write_gate(false, true), WriteGate::Run);
         // The shape that matters: piped input, no seam, no write.
-        assert_eq!(model_set_gate(false, false), ModelSetGate::Refuse);
+        assert_eq!(cli_rows::write_gate(false, false), WriteGate::Refuse);
         // The refusal names the surface that does the same thing unattended —
         // and the flag that surface needs, because a script that runs `teton
         // model set` without `--yes` meets the above-floor confirmation on a
@@ -1955,6 +2182,7 @@ mod tests {
                 aliases: &["mo"],
                 summary: "show the current model",
                 args: Args::None,
+                mirror: None,
                 handler: handle_help,
             },
             CommandSpec {
@@ -1962,6 +2190,7 @@ mod tests {
                 aliases: &[],
                 summary: "change the current model",
                 args: Args::Required("a catalog name"),
+                mirror: None,
                 handler: handle_help,
             },
         ];
@@ -1981,16 +2210,26 @@ mod tests {
 
     // AC-1 unit leg: /help is generated from the table (BR-7), so every row
     // appears with its summary, and the escape hatch gets its footer (BR-1b).
+    //
+    // REQ-582 AC-8 adds the grouping, so the row lines are read out from between
+    // the blank separators rather than zipped against every rendered line — the
+    // property is still "one line per command, in table order, and nothing else
+    // but the footers".
     #[test]
     fn help_renders_every_table_row_and_the_escape_footer() {
         let mut surface = RecordingSurface::new();
         render_help(&mut surface);
 
-        let lines = surface.lines_of(LineKind::Info);
+        let all = surface.lines_of(LineKind::Info);
+        let lines: Vec<&str> = all
+            .iter()
+            .copied()
+            .filter(|line| !line.is_empty())
+            .collect();
         assert_eq!(
             lines.len(),
-            COMMANDS.len() + 1,
-            "one line per command plus the escape footer"
+            COMMANDS.len() + 2,
+            "one line per command plus the argument and escape footers"
         );
         for (spec, line) in COMMANDS.iter().zip(&lines) {
             assert!(line.starts_with(&format!("/{}", spec.name)), "{line}");
@@ -2010,6 +2249,10 @@ mod tests {
         }
         assert_eq!(lines.last(), Some(&ESCAPE_FOOTER));
         assert!(ESCAPE_FOOTER.contains("//"));
+        // REQ-582 ADR-2 / OQ-5: the one way a session argument differs from the
+        // shell's, said once, above the escape footer.
+        assert_eq!(lines[lines.len() - 2], ARGUMENT_FOOTER);
+        assert!(ARGUMENT_FOOTER.contains("whitespace"));
     }
 
     // BR-5: the toggle owns one flag and echoes what it just set.
@@ -2760,5 +3003,225 @@ mod tests {
             "a real failure must not be softened into a notice: {:?}",
             surface.calls
         );
+    }
+
+    // ------------------------------------------------------------------
+    // REQ-582: the ten mirrored rows (BR-1, AC-4, AC-8; ADR-8)
+    // ------------------------------------------------------------------
+
+    /// **The mechanism, not a convention.** A mirrored row's name *is* the
+    /// subcommand path of its twin, because ADR-1 recognizes a typed `teton …`
+    /// line by walking clap's tree to a path and looking that path up in this
+    /// table. A row named anything else would still dispatch from `/`, and would
+    /// silently stop being reachable from the line this REQ exists to answer.
+    #[test]
+    fn every_mirror_names_teton_plus_its_own_row() {
+        let mirrored: Vec<&str> = COMMANDS
+            .iter()
+            .filter(|spec| spec.mirror.is_some())
+            .map(|spec| spec.name)
+            .collect();
+        assert_eq!(
+            mirrored.len(),
+            10,
+            "BR-1 names ten mirrored rows; found {mirrored:?}"
+        );
+        for spec in COMMANDS {
+            let Some(mirror) = spec.mirror else { continue };
+            assert_eq!(
+                mirror.shell,
+                format!("teton {}", spec.name),
+                "/{} mirrors a command it is not named after",
+                spec.name
+            );
+        }
+        // And the hand-off's view of the same table agrees with it (BR-8), so
+        // TASK-171's nudge cannot name a spelling that dispatches to nothing.
+        let pairs: Vec<(&str, &str)> = mirrored_rows().collect();
+        assert_eq!(pairs.len(), mirrored.len());
+        for (name, shell) in pairs {
+            assert_eq!(shell, format!("teton {name}"));
+        }
+    }
+
+    /// AC-4's declaration half: exactly four rows write, and they are the four
+    /// the Permissions table names. The *behaviour* — one line, no RPC, naming
+    /// the shell twin — is pinned in `cli_rows`, where the gate runs.
+    #[test]
+    fn exactly_the_four_writing_rows_are_marked_as_writes() {
+        let writes: Vec<&str> = COMMANDS
+            .iter()
+            .filter(|spec| spec.mirror.is_some_and(|mirror| mirror.writes))
+            .map(|spec| spec.name)
+            .collect();
+        assert_eq!(
+            writes,
+            vec![
+                "provider add",
+                "boundary add",
+                "policy set-tier",
+                "policy set-category"
+            ],
+            "the write rows are the ones that change daemon or machine state"
+        );
+    }
+
+    /// AC-8: every mirrored row reaches `/help` — generated from the table, so
+    /// this is a property rather than a second listing — and the listing is
+    /// grouped, with each family's rows in one contiguous run separated by a
+    /// blank line.
+    #[test]
+    fn help_lists_every_mirrored_row_grouped_by_family() {
+        let mut surface = RecordingSurface::new();
+        render_help(&mut surface);
+        let rendered = surface.lines_of(LineKind::Info);
+
+        for spec in COMMANDS {
+            assert!(
+                rendered
+                    .iter()
+                    .any(|line| line.starts_with(&format!("/{}", spec.name))
+                        && line.contains(spec.summary)),
+                "/{} is missing from /help with its summary:\n{}",
+                spec.name,
+                rendered.join("\n")
+            );
+        }
+
+        // The families, read back off the rendered listing: every group of rows
+        // between blank lines shares one family, and no family appears twice.
+        let mut seen: Vec<&str> = Vec::new();
+        let mut group: Vec<&str> = Vec::new();
+        let mut groups: Vec<Vec<&str>> = Vec::new();
+        for line in &rendered {
+            if line.is_empty() {
+                groups.push(std::mem::take(&mut group));
+            } else if let Some(name) = line.strip_prefix('/') {
+                group.push(name.split_whitespace().next().unwrap_or(name));
+            }
+        }
+        groups.push(group);
+        for group in groups {
+            let families: Vec<&str> = group
+                .iter()
+                .map(|first| {
+                    if COMMANDS
+                        .iter()
+                        .filter(|spec| first_word(spec.name) == *first)
+                        .count()
+                        > 1
+                    {
+                        *first
+                    } else {
+                        ""
+                    }
+                })
+                .collect();
+            assert!(
+                families.windows(2).all(|pair| pair[0] == pair[1]),
+                "a rendered group mixes families: {group:?}"
+            );
+            if let Some(family) = families.first().filter(|family| !family.is_empty()) {
+                assert!(
+                    !seen.contains(family),
+                    "the `{family}` family is split across the listing"
+                );
+                seen.push(family);
+            }
+        }
+        // The four families a reader should be able to find as blocks.
+        assert!(seen.contains(&"model"), "{seen:?}");
+        assert!(seen.contains(&"provider"), "{seen:?}");
+        assert!(seen.contains(&"boundary"), "{seen:?}");
+        assert!(seen.contains(&"policy"), "{seen:?}");
+        assert!(seen.contains(&"web"), "{seen:?}");
+    }
+
+    /// A mirrored row's summary says what the command does, in one line, and
+    /// does **not** name the shell twin: the session is where the user is, and
+    /// a listing that spelled every row twice would teach the shell form to a
+    /// user who no longer needs it. The one place a twin *is* named is the
+    /// typed-input refusal, where it is the remedy (ADR-4).
+    ///
+    /// Scoped to the mirrored rows on purpose: `/cost`'s summary names `teton
+    /// cost` and has since REQ-555, where naming the twin was the point ("the
+    /// daemon's cost report, exactly as `teton cost` does").
+    #[test]
+    fn a_mirrored_summary_is_one_line_and_names_no_shell_command() {
+        for spec in COMMANDS {
+            assert_eq!(
+                spec.summary.lines().count(),
+                1,
+                "/{} has a multi-line summary",
+                spec.name
+            );
+            if spec.mirror.is_some() {
+                assert!(
+                    !spec.summary.contains("teton "),
+                    "/{} names its shell twin in the listing: {}",
+                    spec.name,
+                    spec.summary
+                );
+            }
+        }
+    }
+
+    /// **ADR-8's completeness half.** Walk the CLI parser's own tree and require
+    /// every leaf subcommand to be either a row in this table or an explicit
+    /// shell-only exception. The compile-time half is `run_mirrored_command`'s
+    /// wildcard-free match; this is the half that catches a subcommand added
+    /// with no session decision at all — it would land here as a leaf nobody
+    /// listed, rather than as a command users quietly cannot reach.
+    ///
+    /// Hidden leaves are exempt, and `policy set` is the only one: it is the
+    /// retired phase form, kept solely to explain itself to muscle memory
+    /// (REQ-558 AC-9). Requiring a session row for a command the CLI does not
+    /// offer would be requiring a row nobody is told about — and `SHELL_ONLY` is
+    /// for *visible* commands deliberately left in the shell, which is a
+    /// different statement. The exemption is asserted narrowly, so a second
+    /// hidden leaf still surfaces the decision here.
+    #[test]
+    fn every_cli_leaf_is_a_session_row_or_an_explicit_shell_only_exception() {
+        let names: Vec<&str> = COMMANDS.iter().map(|spec| spec.name).collect();
+        let leaves = cli_rows::leaf_command_paths();
+        assert!(
+            leaves.len() > 10,
+            "the tree walk found almost nothing: {leaves:?}"
+        );
+
+        let hidden: Vec<&str> = leaves
+            .iter()
+            .filter(|(_, hidden)| *hidden)
+            .map(|(path, _)| path.as_str())
+            .collect();
+        assert_eq!(
+            hidden,
+            vec!["policy set"],
+            "a new hidden subcommand needs a decision: exempt it here, or list it"
+        );
+
+        for (path, hidden) in &leaves {
+            if *hidden {
+                continue;
+            }
+            assert!(
+                names.contains(&path.as_str()) || cli_rows::SHELL_ONLY.contains(&path.as_str()),
+                "`teton {path}` has no session row and is not listed as shell-only"
+            );
+        }
+
+        // Both directions (LESSON-479): a `SHELL_ONLY` entry that no longer
+        // names a real subcommand is a stale exemption, and would silently
+        // exempt nothing.
+        for shell_only in cli_rows::SHELL_ONLY {
+            assert!(
+                leaves.iter().any(|(path, _)| path == shell_only),
+                "`{shell_only}` is exempted from a subcommand that no longer exists"
+            );
+            assert!(
+                !names.contains(shell_only),
+                "`{shell_only}` is both shell-only and a session row"
+            );
+        }
     }
 }

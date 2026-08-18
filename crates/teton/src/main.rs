@@ -39,6 +39,7 @@ use teton_protocol::{
 };
 
 mod banner;
+mod cli_rows;
 mod client;
 mod cost_ui;
 mod effort_ui;
@@ -456,13 +457,9 @@ const UNINSTALL_IS_SHELL_ONLY: &str = "`teton uninstall` is shell-only: it stops
 /// # Errors
 ///
 /// Propagates a transport error from whichever body ran; a daemon that answers
-/// is reported on the surface.
-// Shipped one task ahead of its caller: `cli_rows.rs` (TASK-169) is what parses
-// a row's argv into the `Command` this runs, and this allowance goes with the
-// commit that adds it. Stated here rather than there for the reason the
-// registration seams were (REQ-575 TASK-153): the parser must have nothing left
-// to decide when it arrives, or it will decide it itself.
-#[allow(dead_code)]
+/// is reported on the surface. [`cli_rows::run_mirrored`], its one caller,
+/// renders that error rather than propagating it — see there for why a session
+/// does not end on it.
 pub(crate) fn run_mirrored_command(
     cmd: Command,
     conn: &mut Connection,

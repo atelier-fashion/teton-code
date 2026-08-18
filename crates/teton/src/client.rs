@@ -169,9 +169,6 @@ impl Connection {
 
     /// The daemon name this connection handshook with, once it has (REQ-582
     /// BR-7 — the in-session `/doctor` line).
-    // Read by `DoctorAttach::session`, whose only caller is `run_mirrored_command`
-    // — which TASK-169 wires to the `/doctor` row. The allowance goes with it.
-    #[allow(dead_code)]
     #[must_use]
     pub fn daemon_name(&self) -> Option<&str> {
         self.daemon_name.as_deref()
@@ -535,6 +532,63 @@ impl Connection {
             .recv()
             .map_err(|_| anyhow!("connection to the daemon closed"))
     }
+
+    /// A `Connection` with no daemon behind it, answering the *n*th request it
+    /// is sent with the *n*th scripted result (REQ-582 TASK-169).
+    ///
+    /// The command modules test a handler by *running* it — that is the only way
+    /// to assert what a row sends and what it renders in one place — and a
+    /// handler needs a connection. This is that connection: a `UnixStream::pair`
+    /// gives the writer half a real, connected socket, so every request the
+    /// handler makes is readable off `peer` (which is how a test asserts the
+    /// method name, or that nothing was sent at all), and the responses come off
+    /// the same [`mpsc`] channel the reader thread would have fed. No server, no
+    /// thread, no terminal.
+    ///
+    /// The ids are assigned the way [`Self::send`] assigns them — from 1, in
+    /// order — because [`Self::call`] correlates on them. A connection scripted
+    /// with fewer results than the handler makes calls reports "connection to
+    /// the daemon closed" on the extra call, which is the honest failure: the
+    /// test asked for a daemon that stops answering.
+    ///
+    /// No handshake happened, so `daemon_name`/`daemon_version` are `None` —
+    /// what `/doctor`'s session arm renders from an unnegotiated connection is
+    /// its documented fallback, not an invention.
+    #[cfg(test)]
+    pub(crate) fn scripted(results: &[Value]) -> (Self, UnixStream) {
+        let (conn, tx, peer) = paired_for_test();
+        for (index, result) in results.iter().enumerate() {
+            let id = Id::Number(i64::try_from(index).expect("a test scripts few responses") + 1);
+            tx.send(Incoming::Response(Response::success(id, result.clone())))
+                .expect("the receiver is alive: it is inside the connection");
+        }
+        (conn, peer)
+    }
+}
+
+/// The socket-pair fixture both test constructors are built on.
+///
+/// Separate from [`Connection::scripted`] because the event tests in this module
+/// need the raw [`Sender`] to push [`Incoming::Event`]s, and [`Incoming`] is this
+/// module's own type — handing it out crate-wide to save these five lines would
+/// export the transport's internals for a test's convenience.
+#[cfg(test)]
+fn paired_for_test() -> (Connection, Sender<Incoming>, UnixStream) {
+    let (writer, peer) = UnixStream::pair().expect("socketpair");
+    let (tx, rx) = mpsc::channel();
+    (
+        Connection {
+            writer,
+            incoming: rx,
+            next_id: 1,
+            // No handshake happened on this fixture, so there is genuinely no
+            // daemon version or name to report (REQ-565, REQ-582).
+            daemon_version: None,
+            daemon_name: None,
+        },
+        tx,
+        peer,
+    )
 }
 
 /// How a received [`Response`] correlates against the single in-flight request a
@@ -1179,21 +1233,7 @@ mod tests {
     /// gives the writer half a real, connected socket without a daemon, so
     /// `drain_events` is exercised with no server, no terminal, and no thread.
     fn test_connection() -> (Connection, mpsc::Sender<Incoming>, UnixStream) {
-        let (writer, peer) = UnixStream::pair().expect("socketpair");
-        let (tx, rx) = mpsc::channel();
-        (
-            Connection {
-                writer,
-                incoming: rx,
-                next_id: 1,
-                // No handshake happened on this fixture, so there is genuinely
-                // no daemon version or name to report (REQ-565, REQ-582).
-                daemon_version: None,
-                daemon_name: None,
-            },
-            tx,
-            peer,
-        )
+        paired_for_test()
     }
 
     fn lifecycle_envelope(model: &str, stage: ModelLifecycleStage) -> Incoming {
