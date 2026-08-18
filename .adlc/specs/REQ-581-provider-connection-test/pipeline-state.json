@@ -3,9 +3,23 @@
   "branch": "feat/REQ-581-provider-connection-test",
   "startedAt": "2026-08-18T00:43:17Z",
   "completed": false,
-  "currentPhase": 0,
-  "completedPhases": [],
-  "phaseHistory": [],
+  "currentPhase": 2,
+  "completedPhases": [
+    0,
+    1
+  ],
+  "phaseHistory": [
+    {
+      "phase": 0,
+      "name": "Create Worktree",
+      "completedAt": "2026-08-18T00:43:28Z"
+    },
+    {
+      "phase": 1,
+      "name": "Validate Spec",
+      "completedAt": "2026-08-18T00:44:35Z"
+    }
+  ],
   "integrationBranch": "main",
   "repos": {
     "teton-code": {
@@ -14,14 +28,20 @@
       "worktree": "/Users/brettluelling/Documents/GitHub/teton-code/.worktrees/REQ-581",
       "branch": "feat/REQ-581-provider-connection-test",
       "touched": true,
-      "prUrl": null,
-      "prNumber": null,
-      "prCreatedAt": null,
+      "prUrl": "https://github.com/atelier-fashion/teton-code/pull/168",
+      "prNumber": 168,
+      "prCreatedAt": "2026-08-18T00:43:20Z",
       "merged": false,
       "snapshotBranch": null,
       "snapshotPR": null
     }
   },
-  "mergeOrder": ["teton-code"],
-  "phase4": { "currentTask": null, "completedTasks": [], "failedTasks": [] }
+  "mergeOrder": [
+    "teton-code"
+  ],
+  "phase4": {
+    "currentTask": null,
+    "completedTasks": [],
+    "failedTasks": []
+  }
 }

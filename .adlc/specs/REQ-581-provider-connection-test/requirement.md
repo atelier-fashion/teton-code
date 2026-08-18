@@ -1,7 +1,7 @@
 ---
 id: REQ-581
 title: "A first-class provider connection test: `/provider test <id>` makes one consented call and says exactly what came back"
-status: draft
+status: approved
 deployable: true
 created: 2026-08-17
 updated: 2026-08-17
@@ -117,7 +117,8 @@ choke point; the CLI has no network path of its own).
 - [ ] AC-5: A `reached` test on a provider the health map holds as `Unavailable` returns it to `healthy`, and the next turn's `route_decided` selects it (asserted through `run_prompt_turn` after the test).
 - [ ] AC-6: `provider/test` from a connection not attached to the session, and from a model tool call naming the method, are refused `NOT_ATTACHED` in the response, and no request leaves the machine.
 - [ ] AC-7: `/provider test onlocal` (a `kind = "local"` provider) refuses in-response with the local tier's current state sentence and makes no call.
-- [ ] AC-8: The resident guide names `/provider test <id>` for the "does my provider work" question, pinned by the same contract test that gates the guide against the recipe catalog (REQ-579 AC-5's shape); and the surface nudge fires for a reply that recites `teton provider` in answer to a connection question, printed at most once per turn and never on a non-TTY surface.
+- [ ] AC-8a: The resident guide names `/provider test <id>` for the "does my provider work" question, pinned by the same contract test that gates the guide against the recipe catalog (REQ-579 AC-5's shape).
+- [ ] AC-8b: The surface nudge fires for a reply that recites `teton provider` (or shell-probes `teton …`) in answer to a connection question — trigger as settled by OQ-3 — printed at most once per turn and never on a non-TTY surface; unit-tested over the render seam with a scripted reply, and A/B'd live before the guarantee is claimed (LESSON-532).
 - [ ] AC-9: `/help` lists `/provider test` from the same command table that dispatches it (REQ-555 BR-7).
 
 ## External Dependencies
