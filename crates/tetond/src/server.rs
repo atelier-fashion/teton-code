@@ -2197,11 +2197,25 @@ async fn do_handshake(
     };
     let _ = out_tx.try_send(ok_string(id, &result));
 
-    // Replay the local-model lifecycle (REQ-544 BR-9 / AC-8) to the just-subscribed
-    // client, so it learns the state of the local tier on this machine: probed,
-    // then awaiting a decision / disabled / ready. Published after the subscribe
-    // above, so this client receives it; a machine with no local tier has an
-    // empty sequence and emits nothing.
+    // Replay the local-model lifecycle (REQ-544 BR-9 / AC-8) to the client that
+    // just attached, so it learns the state of the local tier on this machine:
+    // probed, then awaiting a decision / disabled / ready. A machine with no
+    // local tier has an empty sequence and emits nothing.
+    //
+    // **Routed to this connection, not published on the bus (BUG-177).** The
+    // replay is this client's catch-up, not news: every client already attached
+    // has had its own, and a daemon-scoped publish reaches all of them — so
+    // every `teton doctor` in another terminal, and every `teton …` a session's
+    // own shell tool spawned, re-announced `probe …` / `local model … ready`
+    // into every open session (and reset each one's REQ-556 loading indicator
+    // on the way). Delivery goes on the connection's own outbound instead: the
+    // frames are queued right behind the handshake result on the same FIFO
+    // channel, so the result is on the wire first and the replay precedes
+    // anything this connection is answered next. The REQ-568 fence is not
+    // involved — nothing here was delivered to the subscription — and the seq
+    // numbers come from the bus like every routed frame's do
+    // (`routed_event_frame`), so a replayed frame can never wear the number of
+    // a broadcast one on this connection.
     //
     // Because it is replayed on *every* attach, every stage in it must be true of
     // the machine right now — see `runtime::startup_lifecycle`. A replayed
@@ -2209,9 +2223,11 @@ async fn do_handshake(
     // client that ever connects, which is how a decorative sequence becomes a
     // daemon-wide lie.
     for lifecycle in daemon.runtime.lifecycle_events() {
-        daemon
-            .events
-            .publish(None, Event::ModelLifecycle(lifecycle));
+        let _ = out_tx.try_send(routed_event_frame(
+            daemon,
+            None,
+            Event::ModelLifecycle(lifecycle),
+        ));
     }
 
     // REQ-568 BR-5: a monitor is announced, never inferred from traffic.
@@ -3264,24 +3280,27 @@ fn handle_session_create(daemon: &Daemon, conn: &ConnState, id: Id, params: Valu
 /// Serializes a routed event into the wire frame a connection's outbound
 /// channel carries.
 ///
-/// The consent events are the daemon's only *routed* events (BR-6): every other
-/// event goes on the bus and is filtered per connection by [`forward_events`],
-/// while these two are addressed to named surfaces by
-/// [`crate::consent::ConsentSurfaces`]. They still take their sequence number
-/// from the bus, so a routed frame can never collide with a broadcast one on
-/// the same connection.
+/// A *routed* event is addressed to particular connections rather than
+/// published: every other event goes on the bus and is filtered per connection
+/// by [`forward_events`]. The daemon has three of them — the two consent events
+/// REQ-569 BR-6 addresses to named surfaces through
+/// [`crate::consent::ConsentSurfaces`], and the handshake's lifecycle replay,
+/// which is one connection's catch-up and goes to that connection alone
+/// (BUG-177; see [`do_handshake`]). They still take their sequence number from
+/// the bus, so a routed frame can never collide with a broadcast one on the
+/// same connection.
 ///
 /// The session, when there is one, rides on the envelope rather than in the
 /// payload — [`Event`] is flattened, so a `session_id` field on the payload
 /// would emit the key twice.
 ///
-/// That envelope is session-scoped while one recipient — the requester — is by
-/// definition *not* attached to that session, which looks like a hole in
+/// A consent envelope is session-scoped while one recipient — the requester —
+/// is by definition *not* attached to that session, which looks like a hole in
 /// REQ-568's scoping and is not one. These frames never cross
 /// [`forward_events`], so the delivery policy is not being bypassed; and the id
 /// is not news to anyone who receives it, because the requester is the
 /// connection that named it and the other recipients are attached to it.
-fn consent_event_frame(daemon: &Daemon, session_id: Option<SessionId>, event: Event) -> String {
+fn routed_event_frame(daemon: &Daemon, session_id: Option<SessionId>, event: Event) -> String {
     let envelope = EventEnvelope::new(daemon.events.next_seq(), session_id, event);
     // Infallible for these payloads (plain strings and closed enums); a
     // hypothetical failure costs the prompt a delivery, which the bounded
@@ -3310,7 +3329,7 @@ fn publish_attach_refusal(
     scope: ConsentScope,
     reason: AttachRefusedReason,
 ) {
-    let frame = consent_event_frame(
+    let frame = routed_event_frame(
         daemon,
         session_id,
         Event::AttachRefused(AttachRefused {
@@ -3444,7 +3463,7 @@ async fn seek_consent(
         settled: false,
     };
 
-    let frame = consent_event_frame(
+    let frame = routed_event_frame(
         daemon,
         session_id.clone(),
         Event::AttachConsentRequested(AttachConsentRequested {

@@ -122,11 +122,12 @@ impl EventBus {
 
     /// Reserves the next sequence number without publishing anything.
     ///
-    /// For the one delivery path that is not a fan-out: REQ-569's consent
-    /// frames are *routed* to named connections (BR-6) rather than broadcast,
-    /// so the caller builds and sends the envelope itself — but the number on
-    /// it has to come from this counter, or a routed frame and a broadcast one
-    /// could reach the same client wearing the same `seq`.
+    /// For the delivery paths that are not a fan-out: REQ-569's consent frames
+    /// are *routed* to named connections (BR-6) rather than broadcast, and so
+    /// is the handshake's lifecycle replay, which is one connection's catch-up
+    /// (BUG-177). The caller builds and sends the envelope itself — but the
+    /// number on it has to come from this counter, or a routed frame and a
+    /// broadcast one could reach the same client wearing the same `seq`.
     ///
     /// Reserving a number that no subscriber receives leaves a gap in every
     /// other client's sequence, which is already the norm after REQ-568: the

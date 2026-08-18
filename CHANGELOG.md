@@ -81,6 +81,18 @@ user having asked for it.
   daemon's report simply sees no probes, which is the honest reading of a
   daemon that could not make one.
 
+### Fixed
+
+- **Another client attaching no longer re-announces the local model into
+  your session (BUG-177).** The startup lines a client is caught up with on
+  attach — `>> probe: … clears the local-tier floor`, `>> local model … ready`
+  — were broadcast to every open session, so a `teton doctor` in another
+  terminal, or any `teton …` the model ran through its own shell tool,
+  reprinted them mid-turn as if the tier had restarted (and reset a loading
+  indicator on the way). The catch-up now goes to the client that attached
+  and nobody else; the deliberate `a CLI client attached` announcement is
+  unchanged. No wire-format change.
+
 ## [0.1.19] - 2026-08-17
 
 ### Changed
