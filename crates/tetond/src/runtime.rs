@@ -5654,7 +5654,12 @@ impl DaemonRuntime {
                     // because the figure has to be the bound this call actually
                     // waited out, and the seam this function exists for runs a
                     // shorter one.
-                    after_secs: deadline.as_secs(),
+                    //
+                    // Floored at 1: `as_secs` truncates, so a sub-second
+                    // deadline — which the injectable seam makes reachable —
+                    // would report "no answer within 0 s", a bound that reads as
+                    // a bug rather than as a wait.
+                    after_secs: deadline.as_secs().max(1),
                     reason: format!(
                         "nothing came back from `{dial_host}` before the test stopped waiting"
                     ),
@@ -23482,8 +23487,9 @@ provider_id = \"deepseek\"
         /// Driven through [`DaemonRuntime::provider_test_within`] at one second
         /// — the production constant is thirty, which no test may spend. A whole
         /// second rather than something tighter because the outcome reports its
-        /// bound in whole seconds, and a sub-second deadline would pin the test
-        /// to a `0` no user can ever be shown.
+        /// bound in whole seconds, so a sub-second deadline would be reported by
+        /// the `max(1)` floor rather than by the value under test, and this
+        /// assertion would stop discriminating.
         ///
         /// The elapsed assertion is the non-vacuous half: it fails if the
         /// deadline is not the thing that ended the call.

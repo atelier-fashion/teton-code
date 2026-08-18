@@ -2222,8 +2222,17 @@ pub enum ProviderTestOutcome {
         input_tokens: u64,
         /// Completion tokens the provider billed the probe for.
         output_tokens: u64,
-        /// Recorded spend in integer micro-USD, or `None` when the price table
-        /// knows no entry for the model.
+        /// What this call cost, in integer micro-USD, or `None` when the price
+        /// table knows no entry for the model.
+        ///
+        /// Priced from the daemon's own table — the same one the ledger row is
+        /// priced from — applied to the usage the *adapter* reported. The
+        /// **ledger row is the record of spend**; this is the report's reading
+        /// of the same call, and the two token readings behind them are taken
+        /// independently (the adapter's completion here, the cost meter's byte
+        /// scan there). They are pinned equal for the OpenAI SSE shape by a
+        /// daemon-side test and are not guaranteed identical in general, so a
+        /// consumer that needs the recorded figure asks the ledger for it.
         ///
         /// `None` is "unpriced", never `0`: a cost is recorded or it is not,
         /// and standing a zero in for "we have no price for this model" is

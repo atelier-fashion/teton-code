@@ -197,8 +197,33 @@ impl TestIo for DaemonIo<'_, '_> {
         &mut self,
         params: ProviderTestParams,
     ) -> anyhow::Result<Result<ProviderTestResult, RpcError>> {
-        self.conn.call(params, self.ctx)
+        while_this_clients_probe_is_out(self.ctx, |ctx| self.conn.call(params, ctx))
     }
+}
+
+/// Run `call` with the session's "**my** `provider/test` is out" flag raised,
+/// and lower it whatever the call answers (verify G2).
+///
+/// The one writer of the flag [`crate::session_ui::render_event`]'s
+/// `provider_tested` arm reads. [`Connection::call`] *is* the event pump — it
+/// renders every envelope that arrives while it waits — so the daemon's own
+/// `provider_tested` for this call is drawn from inside `call`, which is why the
+/// flag is raised around it rather than derived from the answer: there is no
+/// answer yet at the moment the event lands.
+///
+/// A helper rather than three lines inline, because the claim worth pinning is
+/// the unhappy path. Lowered on **both** endings — a transport error and a
+/// daemon's `Err` included — and by holding the result rather than returning
+/// early, since a flag left raised silences this session's *next* notice, which
+/// would be about a test some other client ran and this one has no report for.
+fn while_this_clients_probe_is_out<T>(
+    ctx: &mut UiContext,
+    call: impl FnOnce(&mut UiContext) -> T,
+) -> T {
+    ctx.state.provider_test_in_flight = true;
+    let answered = call(ctx);
+    ctx.state.provider_test_in_flight = false;
+    answered
 }
 
 // ---------------------------------------------------------------------------
@@ -283,6 +308,33 @@ pub(crate) fn run(
     if provider.kind == ProviderKind::Local {
         io.surface()
             .line(LineKind::Notice, &local_tier_line(provider_id));
+        return Ok(());
+    }
+
+    // Verify G3, and the local branch's reasoning applied to the second row that
+    // cannot be dialed: a provider with no endpoint has no address, so there is
+    // no preview to show, no question to ask and no call to make.
+    //
+    // Above the gate for the local branch's reason, and answered *client-side*
+    // for the reason the old preview clause got wrong: nothing composes an
+    // address at this point. Composition happens at registration and is written
+    // to config; `provider_test` takes `unwrap_or_default()` and refuses
+    // ("endpoint has no host the transport could dial"). So the round trip buys
+    // a fact this snapshot already carries — and on a pipe it would print the
+    // `--yes` remedy for a call that was never going to be made.
+    //
+    // See [`no_endpoint_line`] on reachability: `Config::validate` refuses this
+    // shape at load, so it is the snapshot this client is *handed* that is being
+    // defended against, not a config a running daemon holds. The daemon's own
+    // refusal is unaffected and stays where it is tested — this is the legible
+    // half, never the enforcing one.
+    if provider
+        .endpoint
+        .as_deref()
+        .is_none_or(|endpoint| endpoint.trim().is_empty())
+    {
+        io.surface()
+            .line(LineKind::Notice, &no_endpoint_line(provider_id));
         return Ok(());
     }
 
@@ -410,13 +462,46 @@ fn unknown_id_line(typed: &str, snapshot: &ConfigSnapshot) -> String {
     )
 }
 
+/// What a provider with no stored endpoint is answered with (verify G3).
+///
+/// This used to be a clause on the preview line — "no endpoint stored; this kind
+/// composes its own" — and it was not true at the moment it was shown.
+/// `teton_core::compose_endpoint` does default an `anthropic` row to the
+/// vendor's address, but it runs at **registration**, and what it composes is
+/// *written to config*; by the time this flow reads the snapshot, an endpoint
+/// either was stored or never will be. Nothing composes one afterwards:
+/// `provider_test`, `build_provider` and `build_remote_transport` all take
+/// `provider.endpoint.clone().unwrap_or_default()`, and the daemon refuses the
+/// empty string with "endpoint has no host the transport could dial". So the old
+/// sentence promised a fill-in that nothing performs, on the one line whose whole
+/// job is to be true before a user consents to spend.
+///
+/// It is answered here instead, [`local_tier_line`]'s way: there is nothing to
+/// dial, so there is nothing to preview, nothing to consent to and no call to
+/// make. It names the command that fixes it, because "no endpoint stored" is a
+/// state the user can leave.
+///
+/// Reachability, stated rather than implied: `Config::validate` refuses a remote
+/// provider with a blank endpoint outright (`ConfigError::MissingEndpoint`), so
+/// a daemon that *started* cannot serve this shape in a snapshot today. The
+/// branch is defence against the snapshot the client is handed — a daemon of
+/// another version, a field that stops being echoed — and its worth is that the
+/// honest answer costs a line, while the old one spent a round trip to be
+/// contradicted by the daemon's own refusal.
+fn no_endpoint_line(id: &str) -> String {
+    format!(
+        "`{id}` has no endpoint stored, so there is nothing to dial. \
+         `teton provider add {id} --endpoint <url> --model <model>` sets one."
+    )
+}
+
 /// The one line the user reads before consenting (BR-2).
 ///
 /// Id, kind, model and the **stored** endpoint, echoed rather than parsed
-/// (LESSON-529). A provider whose config carries no endpoint — an `anthropic`
-/// row taking the vendor's default — says so instead of showing a URL this
-/// module composed, because a composed address is a claim about what will be
-/// dialed that only the daemon can make.
+/// (LESSON-529). A provider with no endpoint at all never reaches here — the
+/// flow answers it with [`no_endpoint_line`] and stops — so the fallback below
+/// is unreachable in production and says only what it can defend: that the
+/// config holds no address.
 ///
 /// The endpoint goes through [`crate::displayed_endpoint`] on the way out, which
 /// is the single thing between the stored bytes and the screen: a stored
@@ -429,7 +514,7 @@ fn preview_lines(provider: &ProviderConfig) -> Vec<String> {
     let model = provider.model.as_deref().unwrap_or("no model configured");
     let endpoint = match provider.endpoint.as_deref() {
         Some(endpoint) if !endpoint.trim().is_empty() => crate::displayed_endpoint(endpoint),
-        _ => "no endpoint stored; this kind composes its own".to_owned(),
+        _ => "no endpoint stored".to_owned(),
     };
     vec![format!(
         "  provider:  {} ({}, {model}) — {endpoint}",
@@ -1441,16 +1526,123 @@ mod tests {
         assert_eq!(format_latency(60_000), "60.0 s");
     }
 
-    /// A provider whose config stores no endpoint says so rather than showing an
-    /// address this module composed: the destination is the daemon's claim to
-    /// make, and a composed one is exactly the display-vs-dial divergence
-    /// LESSON-529 is about.
+    /// **A provider with no stored endpoint is answered without a call, and
+    /// without the claim that something will fill the address in** (verify G3).
+    ///
+    /// The old preview line said "no endpoint stored; this kind composes its
+    /// own", and nothing does. `build_provider` and `build_remote_transport`
+    /// both take `unwrap_or_default()`, so an empty string reaches the adapter
+    /// and the daemon refuses with "endpoint has no host the transport could
+    /// dial" — which means the sentence was false on the one line whose job is
+    /// to be true before a user consents to spend, and the round trip it invited
+    /// bought nothing.
+    ///
+    /// Asserted on the call log, not on the wording: "no call" is the half a
+    /// re-worded preview would have left broken. The blank and whitespace-only
+    /// forms go the same way — a config carrying `endpoint = " "` has no address
+    /// either, and `unwrap_or_default()` cannot tell the two apart.
     #[test]
-    fn a_provider_with_no_stored_endpoint_previews_no_url() {
-        let lines = preview_lines(&provider("anth", ProviderKind::Anthropic, None));
-        let rendered = lines.join("\n");
-        assert!(rendered.contains("no endpoint stored"), "{rendered}");
-        assert!(!rendered.contains("https://"), "{rendered}");
+    fn a_provider_with_no_stored_endpoint_is_answered_without_a_call() {
+        for stored in [None, Some(""), Some("   ")] {
+            for typed_input in [true, false] {
+                let mut io = FakeIo::new(&["y"]);
+                io.snapshot = Ok(ConfigSnapshot {
+                    providers: vec![provider("anth", ProviderKind::Anthropic, stored)],
+                    ..snapshot()
+                });
+                run(&mut io, &session(), "anth", false, typed_input).expect("the flow renders");
+
+                assert!(
+                    io.tests.is_empty(),
+                    "a provider with no address must reach provider/test not at \
+                     all (stored={stored:?}, typed_input={typed_input}): {:?}",
+                    io.tests
+                );
+                assert_eq!(io.prompter.asked, 0, "there is nothing to consent to");
+                let rendered = io.rendered();
+                assert!(
+                    rendered
+                        .contains("`anth` has no endpoint stored, so there is nothing to dial."),
+                    "{rendered}"
+                );
+                assert!(
+                    rendered.contains("teton provider add anth --endpoint <url> --model <model>"),
+                    "the state is one the user can leave, so the line says how: {rendered}"
+                );
+                assert!(
+                    !rendered.contains("composes its own"),
+                    "nothing composes an endpoint — the daemon refuses this row: {rendered}"
+                );
+                assert!(
+                    !rendered.contains("--yes"),
+                    "a call that will not be made must not ask for consent to make it: {rendered}"
+                );
+            }
+        }
+    }
+
+    /// **The flag that suppresses this session's own `provider_tested` notice is
+    /// raised only across the call, and is lowered however the call ends**
+    /// (verify G2).
+    ///
+    /// The notice exists for the *other* clients attached to the session, and the
+    /// only client that must not see it is the one holding the report — which is
+    /// to say, the one whose `provider/test` is out. So the flag is a window,
+    /// and both of its edges are the assertion: raised while the pump can render
+    /// the event (the first row), and down again afterwards on **every** ending
+    /// (the rest). A flag left raised by a failed call would silence the next
+    /// notice this session gets, one some other client's test produced and this
+    /// one has no report for — a silence nobody could account for later.
+    ///
+    /// Asserted on the helper rather than on [`DaemonIo`] because the seam under
+    /// test is the window, not the socket: `Connection::call` is what stands
+    /// between them, and it needs a daemon.
+    #[test]
+    fn the_in_flight_flag_is_raised_only_across_the_call_and_always_lowered() {
+        for ending in ["ok", "rpc-error", "transport-error"] {
+            let mut surface = RecordingSurface::new();
+            let mut state = crate::session_ui::SessionState::new();
+            let mut prompter = ScriptedPrompter::new(&[]);
+            let mut ctx = UiContext {
+                surface: &mut surface,
+                state: &mut state,
+                prompter: &mut prompter,
+                answer_permissions: true,
+                answer_model_proposals: true,
+                auto_accept_model: false,
+                typed_input: true,
+                session_id: Some(session()),
+            };
+            assert!(
+                !ctx.state.provider_test_in_flight,
+                "a fresh session has no probe out"
+            );
+
+            let mut seen_inside = false;
+            let answered: anyhow::Result<Result<ProviderTestResult, RpcError>> =
+                while_this_clients_probe_is_out(&mut ctx, |ctx| {
+                    // Where the pump runs, and therefore where the daemon's
+                    // `provider_tested` for *this* call is rendered.
+                    seen_inside = ctx.state.provider_test_in_flight;
+                    match ending {
+                        "ok" => Ok(Ok(result(reached()))),
+                        "rpc-error" => Ok(Err(RpcError {
+                            code: error_code::INVALID_PARAMS,
+                            message: "no".to_owned(),
+                            data: None,
+                        })),
+                        _ => Err(anyhow::anyhow!("the socket went away")),
+                    }
+                });
+
+            assert!(seen_inside, "the flag must be up while the call is out");
+            assert!(
+                !ctx.state.provider_test_in_flight,
+                "and down again after a `{ending}` ending — a flag left raised \
+                 silences a notice about somebody else's test"
+            );
+            assert_eq!(answered.is_ok(), ending != "transport-error");
+        }
     }
 
     /// Nothing this module composes carries an escape sequence of its own — the
@@ -1468,6 +1660,7 @@ mod tests {
             unknown_id_line("x", &snapshot()),
             routing_line(&snapshot(), "kimi"),
             local_tier_line("onlocal"),
+            no_endpoint_line("anth"),
         ];
         composed.extend(preview_lines(&provider(
             "kimi",

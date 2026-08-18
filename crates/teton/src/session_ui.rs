@@ -201,6 +201,23 @@ pub struct SessionState {
     /// with no providers) and costs only the extra half of the predicate: the
     /// fixed subject words still recognise "test the connection".
     pub provider_ids: Vec<String>,
+    /// True while **this connection's own** `provider/test` call is out
+    /// (REQ-581 verify G2).
+    ///
+    /// The `provider_tested` notice is suppressed for the client that ran the
+    /// command, because that client prints the whole report and the notice would
+    /// be the same news twice. The question the arm has to answer is therefore
+    /// "did *I* ask for this?" — and the session id cannot answer it: a second
+    /// client attached to the same session is precisely the audience the notice
+    /// exists for (LESSON-505), and gating on the session alone silences it for
+    /// them too.
+    ///
+    /// Written by [`crate::provider_test_ui::DaemonIo::provider_test`] around
+    /// its `conn.call`, on both the `Ok` and the `Err` path, because the call is
+    /// where the pump runs and the pump is what renders the event. Nothing else
+    /// sets it: a flag any other flow could raise would be a way to silence a
+    /// notice about a test this client never ran.
+    pub(crate) provider_test_in_flight: bool,
 }
 
 /// What the session's web capability currently is, for the status row.
@@ -690,7 +707,17 @@ pub fn render_event(
             // vocabulary for the providers *they* just set up, and another
             // session's registration is news (the notice below says so) rather
             // than a word to start reading their prompts for.
-            if elsewhere.is_none() {
+            //
+            // "Ours" has to be *known*, not merely unrefuted (verify G6).
+            // `other_session` folds "unknown" into `None` on purpose — a notice
+            // that guessed "in another session" before `session/create` answered
+            // would be wrong in the common case — but that fold is wrong for a
+            // cache: events are pumped during `session/create` itself, and a
+            // foreign session's registration arriving in that window would be
+            // filed as our own vocabulary. So the id is required to exist,
+            // which costs nothing real (the events that matter arrive long
+            // after) and closes the one window where the two readings differ.
+            if state.session_id.is_some() && elsewhere.is_none() {
                 let id = completed.provider_id.0.as_str();
                 if !state.provider_ids.iter().any(|known| known == id) {
                     state.provider_ids.push(id.to_owned());
@@ -745,17 +772,24 @@ pub fn render_event(
         // — the test either spent or failed, and either way the next turn's
         // routing changed.
         //
-        // Rendered **only for another session's test**, which is the audience
-        // the notice was written for (see `format_provider_tested`). The client
-        // that ran the test has the whole `ProviderTestResult` and prints the
-        // report — model, dial host, remedy, routing — so a notice here would be
-        // the same news twice on the one surface that already said it at length,
-        // in two different wordings a reader has to reconcile. The spec's own
+        // Suppressed for **the connection that issued the test**, and for that
+        // one only. That client has the whole `ProviderTestResult` and prints
+        // the report — model, dial host, remedy, routing — so a notice here
+        // would be the same news twice on the one surface that already said it
+        // at length, in two wordings a reader has to reconcile. The spec's
         // example transcript and the CHANGELOG show the report alone.
+        //
+        // The gate is the in-flight flag rather than the session id, and the
+        // difference is a whole audience. `other_session` returns `None` for
+        // *any* event on our own session, which includes the case this notice
+        // was written for: a second client attached to the same session, which
+        // ran no command, has no report, and watched the health its own turns
+        // route by move (LESSON-505). Keyed on the flag, that client renders —
+        // without the "in another session" clause, because the test really was
+        // in theirs.
         Event::ProviderTested(tested) => {
-            if let Some(elsewhere) =
-                other_session(state.session_id.as_ref(), env.session_id.as_ref())
-            {
+            if !state.provider_test_in_flight {
+                let elsewhere = other_session(state.session_id.as_ref(), env.session_id.as_ref());
                 surface.line(LineKind::Notice, &format_provider_tested(tested, elsewhere));
             }
             EventOutcome::Rendered
@@ -767,16 +801,22 @@ pub fn render_event(
     }
 }
 
-/// The line a connection test run in **another** session renders (REQ-581 BR-3).
+/// The line a connection test renders for a client that did **not** run it
+/// (REQ-581 BR-3).
 ///
 /// Deliberately **terse**, and that is the difference between this and the
 /// report [`crate::provider_test_ui`] prints. The client that ran the test
 /// already has the whole [`teton_protocol::methods::ProviderTestResult`] — the
 /// model, the dial host, the routing that follows — and renders it; this notice
-/// is for the *other* clients attached to the session, whose news is only what
-/// came back and where health landed. A full second copy of the report would be
-/// the same facts twice on the surface that ran the command, which is why the
-/// caller renders this one only when `elsewhere` exists at all.
+/// is for the *other* clients, whose news is only what came back and where
+/// health landed. A full second copy of the report would be the same facts twice
+/// on the surface that ran the command, which is why the caller suppresses this
+/// line for exactly one connection: the one whose own `provider/test` call is
+/// out ([`SessionState::provider_test_in_flight`]).
+///
+/// The gate is that flag and **not** the session, which is the correction the
+/// verify pass made: a second client attached to the same session is the reader
+/// this notice was written for, and a session-keyed gate silenced it for them.
 ///
 /// The outcome is worded by [`crate::provider_test_ui::outcome_sentence`], the
 /// same function the report uses, because the event's `outcome` is byte-identical
@@ -789,13 +829,18 @@ pub fn render_event(
 /// the credential **reference**, inside a `reason` the daemon composed, which is
 /// exactly what AC-2 asserts is safe to show.
 ///
-/// `elsewhere` names the session the test ran in, and is not optional: the bus
-/// is daemon-wide, and "the provider your turns use just came back healthy" and
-/// "some other session's did" are not the same news — so the one the reader
-/// meets here is always the second.
-fn format_provider_tested(tested: &ProviderTested, elsewhere: &SessionId) -> String {
+/// `elsewhere` names the session the test ran in when it was not this client's,
+/// and the clause is worth the branch: the bus is daemon-wide, and "the provider
+/// your turns use just came back healthy" and "some other session's did" are not
+/// the same news. `None` is our own session — a sibling client on the very
+/// session that ran the test — where the qualification would be a lie.
+fn format_provider_tested(tested: &ProviderTested, elsewhere: Option<&SessionId>) -> String {
+    let whose = match elsewhere {
+        Some(elsewhere) => format!(" in another session ({elsewhere})"),
+        None => String::new(),
+    };
     format!(
-        "provider `{}` tested in another session ({elsewhere}): {}; provider health: {}.",
+        "provider `{}` tested{whose}: {}; provider health: {}.",
         tested.provider_id,
         crate::provider_test_ui::outcome_sentence(&tested.outcome),
         crate::provider_test_ui::health_name(tested.health_after),
@@ -4204,20 +4249,27 @@ mod tests {
         assert!(notice.contains("provider health: unavailable."), "{notice}");
     }
 
-    /// **The session that ran the test renders nothing here.**
+    /// **The connection that ran the test renders nothing here — and it is the
+    /// only one that renders nothing** (REQ-581 verify G2).
     ///
-    /// This notice exists for the *other* clients attached to the session — its
-    /// own doc says so — and the client that ran the command already printed the
-    /// full report: the outcome, the model, the dial host's sentence, the remedy
-    /// and what now routes there. Rendering both put the same news on one screen
-    /// twice, in two wordings a reader has to reconcile, and neither the spec's
-    /// example transcript nor the CHANGELOG shows the second one.
+    /// Three rows, because the first shape of this gate satisfied one of them by
+    /// silencing all three. The client that ran the command already printed the
+    /// full report — the outcome, the model, the dial host's sentence, the
+    /// remedy and what now routes there — so a notice on that surface is the
+    /// same news twice, in two wordings a reader has to reconcile. But the gate
+    /// was `other_session(...).is_none()`, which is true for *any* event on our
+    /// own session, and that swept up the reader the notice was written for: a
+    /// second client attached to the same session, which ran nothing, holds no
+    /// report, and watched the health its own turns route by move (LESSON-505).
     ///
-    /// Asserted as "no line at all" rather than as "no `another session` clause",
-    /// because the previous shape passed that weaker check while printing a
-    /// duplicate.
+    /// So the discriminator is `provider_test_in_flight` — "this connection
+    /// issued the call" — and the three rows are the whole truth table it
+    /// decides: our session with the flag up (the caller: nothing), our session
+    /// with it down (the sibling: the notice, *unqualified*), another session
+    /// (the notice, qualified). Row two fails against the session-keyed gate,
+    /// which is the only reason it is worth writing down.
     #[test]
-    fn our_own_provider_test_renders_no_second_line() {
+    fn only_the_connection_that_ran_the_test_renders_no_notice() {
         let tested = || {
             Event::ProviderTested(ProviderTested {
                 provider_id: ProviderId::from("kimi"),
@@ -4228,8 +4280,11 @@ mod tests {
             })
         };
 
+        // (a) The caller: its own `provider/test` is out, so the report is on
+        // the way and the notice would duplicate it.
         let mut state = SessionState::new();
         state.session_id = Some(SessionId::from("ours"));
+        state.provider_test_in_flight = true;
         let mut surface = RecordingSurface::new();
         render_event(
             &EventEnvelope::new(8, Some(SessionId::from("ours")), tested()),
@@ -4238,15 +4293,42 @@ mod tests {
         );
         assert!(
             surface.calls.is_empty(),
-            "the surface that printed the report must not print the notice too: {:?}",
+            "the surface that is about to print the report must not print the \
+             notice too: {:?}",
             surface.calls
         );
 
-        // The control: the same event from another session does render, so this
-        // is a test about whose test it was and not about the event.
+        // (b) A second client on the *same* session. Same event, same session
+        // id, no call of its own — the audience this notice exists for. It reads
+        // the news plainly: the test was in this session, so there is no other
+        // one to name.
+        state.provider_test_in_flight = false;
         let mut surface = RecordingSurface::new();
         render_event(
-            &EventEnvelope::new(9, Some(SessionId::from("theirs")), tested()),
+            &EventEnvelope::new(9, Some(SessionId::from("ours")), tested()),
+            &mut surface,
+            &mut state,
+        );
+        let notice = surface.lines_of(LineKind::Notice).join("\n");
+        assert!(
+            notice.contains("provider `kimi` tested:"),
+            "a client attached to the session the test ran in is owed the \
+             outcome and the health it now routes by: {:?}",
+            surface.calls
+        );
+        assert!(
+            !notice.contains("another session"),
+            "…and it was *this* session's test, so the qualification would be \
+             false: {notice}"
+        );
+        assert!(notice.contains("provider health: unavailable."), "{notice}");
+
+        // (c) Another session's test, with the flag down as it always is there:
+        // the same news, qualified, because "the provider your turns use" and
+        // "some other session's" are not the same fact.
+        let mut surface = RecordingSurface::new();
+        render_event(
+            &EventEnvelope::new(10, Some(SessionId::from("theirs")), tested()),
             &mut surface,
             &mut state,
         );
@@ -5084,6 +5166,27 @@ mod tests {
             &mut state,
         );
         assert_eq!(state.provider_ids, vec!["kimi".to_owned()]);
+
+        // …and it is still news before this client knows its own id (verify
+        // G6). Events are pumped during `session/create` itself, so this window
+        // is real: `other_session` folds "unknown" into `None` — the right
+        // reading for a *notice*, which must not guess "in another session" —
+        // and a cache that shared that fold would file a stranger's provider as
+        // this user's own vocabulary, in the one window where nothing can
+        // contradict it.
+        let mut blind = SessionState::new();
+        assert!(blind.session_id.is_none(), "the premise: no id yet");
+        render_event(
+            &EventEnvelope::new(10, Some(SessionId::from("theirs")), completed("deepseek")),
+            &mut surface,
+            &mut blind,
+        );
+        assert!(
+            blind.provider_ids.is_empty(),
+            "a session that does not yet know its own id has no evidence the \
+             registration was its own: {:?}",
+            blind.provider_ids
+        );
 
         // And the point of all of it: the very next turn's question counts.
         state.begin_turn("is kimi working?");
