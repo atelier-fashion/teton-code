@@ -997,3 +997,131 @@ mod tests {
         assert_eq!(row_name("teton doctor"), "doctor");
     }
 }
+
+/// **The bundled guide and this table name the same commands** (REQ-582 BR-9,
+/// AC-10).
+///
+/// The daemon's setup guide is the copy of Teton's own instructions that is
+/// *resident in every turn*: it is what a model answers a setup question from
+/// with no tool call at all. Until this REQ it could only name the shell
+/// spellings, because that was the only place those commands existed — so the
+/// resident prompt's answer to a user who was already in a session was "open a
+/// terminal", which is the failure this REQ exists to remove. Now that ten rows
+/// answer from the session, a guide that still names one of them by its
+/// `teton …` form alone would reintroduce that failure in the one surface no
+/// test of the client can see.
+///
+/// So the check lives here, in the crate that owns the table, and reads the
+/// guide's own bytes across the crate boundary with `include_str!` — the
+/// posture `tetond/tests/web_setup_contracts.rs` and `boundary_coverage.rs`
+/// already use: compile time, no crate dependency, and no scanning of source
+/// text at runtime (BUG-159). The cost is that this crate rebuilds when the
+/// guide changes, which is exactly the coupling being asserted.
+///
+/// What it cannot catch is the guide naming a `/command` in the wrong *place* —
+/// order and step membership are pinned where the prompt is built
+/// (`turn_loop.rs`'s prohibition test, `provider_recipes.rs`'s inspect-step
+/// test). This one answers a narrower question: is there any mirrored command
+/// the guide knows only by its shell name.
+#[cfg(test)]
+mod guide_tests {
+    use crate::slash::mirrored_rows;
+
+    /// The same bytes `build_system_prompt` embeds as `SELF_CONFIG_GUIDE`, not
+    /// a copy of them — a copy is a file that agrees with the prompt until
+    /// somebody edits one of the two.
+    const GUIDE: &str = include_str!("../../tetond/src/harness/self_config.md");
+
+    /// The mirrored rows whose session answer is **not** `/<row name>`.
+    ///
+    /// One entry, and it is a product decision rather than a spelling
+    /// convenience: `/provider setup` is the guided flow REQ-579's live A/B
+    /// chose over a bare registration, and it is what step 1 hands a user for a
+    /// key question. Naming `/provider add` beside it in the guide would re-open
+    /// the ambiguity that A/B closed, so the guide is allowed — required, in
+    /// fact — to answer for `teton provider add` with the guided command.
+    const SESSION_ANSWERS: &[(&str, &str)] = &[("provider add", "/provider setup")];
+
+    /// The three BR-9 names outright, which the guide must carry whether or not
+    /// it happens to spell their shell twins anywhere.
+    ///
+    /// The sweep below is a conditional — it only fires on a command the guide
+    /// mentions in `teton …` form — so on its own it would pass a guide that
+    /// dropped the inspect step altogether. These are the commands a model
+    /// reaches for when asked what is configured, and that question is the one
+    /// most likely to be asked from inside a session.
+    const INSPECT: &[&str] = &["/policy show", "/provider list", "/doctor"];
+
+    /// AC-10: no mirrored command is named by its shell form alone.
+    #[test]
+    fn the_guide_names_every_mirrored_command_in_its_session_spelling() {
+        // BR-9's three, unconditionally.
+        for spelling in INSPECT {
+            assert!(
+                GUIDE.contains(spelling),
+                "the bundled guide (crates/tetond/src/harness/self_config.md) no longer \
+                 names `{spelling}`, so the resident prompt answers an inspect question \
+                 with a command the user has to leave the session to run (REQ-582 BR-9). \
+                 Put it back in the inspect step — the `teton ` → `/` spelling is five \
+                 bytes cheaper, which is what pays for it under the two prompt-margin \
+                 tests."
+            );
+            // And they are rows, not prose: a spelling pinned into the guide
+            // from here that the table does not carry would send a session user
+            // to a command that dispatches to nothing.
+            let name = spelling.trim_start_matches('/');
+            assert!(
+                mirrored_rows().any(|(row, _)| row == name),
+                "`{spelling}` is pinned into the guide by this test and no mirrored row is \
+                 named `{name}`. Either the row was renamed — fix this list and the guide \
+                 together — or the guide is now advertising a command the session does not \
+                 answer."
+            );
+        }
+
+        // Table → equivalences: a mapping for a command the table no longer
+        // mirrors is a rule about nothing, and it would silently excuse the row
+        // it names if that row ever came back.
+        for (row, answer) in SESSION_ANSWERS {
+            assert!(
+                mirrored_rows().any(|(name, _)| name == *row),
+                "`SESSION_ANSWERS` maps `{row}` to `{answer}` and no mirrored row is named \
+                 `{row}`. Remove the entry; do not re-add the row to satisfy it."
+            );
+        }
+
+        // Non-vacuity for the sweep: it is a conditional, so a guide that named
+        // no shell command anywhere would satisfy it by having nothing to check.
+        let named: Vec<&str> = mirrored_rows()
+            .filter(|(_, shell)| GUIDE.contains(shell))
+            .map(|(_, shell)| shell)
+            .collect();
+        assert!(
+            !named.is_empty(),
+            "the guide names no mirrored command in its `teton …` form at all, so the \
+             sweep below holds over nothing. It is expected to name at least `teton \
+             provider add` (step 1's shell-only path) and the example the inspect step's \
+             shell mapping is taught from. If both legitimately went away, re-anchor this \
+             check rather than leaving the guide ungated."
+        );
+
+        for (name, shell) in mirrored_rows() {
+            if !GUIDE.contains(shell) {
+                continue;
+            }
+            let session = match SESSION_ANSWERS.iter().find(|(row, _)| *row == name) {
+                Some((_, answer)) => (*answer).to_owned(),
+                None => format!("/{name}"),
+            };
+            assert!(
+                GUIDE.contains(&session),
+                "the bundled guide names `{shell}` and never names `{session}`, so a model \
+                 reading it hands a user who is already in a session a command they have \
+                 to open a terminal for — the REQ-582 BR-9 defect. Add `{session}` to the \
+                 guide and say it first (the `teton …` form is the shell footnote, not the \
+                 lead), or add a row to `SESSION_ANSWERS` if this command's session answer \
+                 is deliberately spelled differently."
+            );
+        }
+    }
+}
