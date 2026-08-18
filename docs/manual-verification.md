@@ -1602,3 +1602,38 @@ Real test — no key value in the line or the event : yes / no
 Refused variant (if run) — names status and credential reference : yes / no / not run
 Notes / findings :
 ```
+
+# Manual verification runbook — BUG-177 (a second attach is silent in the first session)
+
+**Status: OUTSTANDING.** The fix is pinned in CI at the wire
+(`ac_matrix::bug177_a_replayed_lifecycle_reaches_only_the_client_that_attached`
+— an ordering-decided absence over three real connections), so this is a
+five-minute confirmation on the shipped binary rather than a claim CI cannot
+make. It is here because the symptom was found by dogfooding on 0.1.19 and the
+person who saw it should see it gone.
+
+## Procedure
+
+1. Start a session with `teton` and wait for `local model … ready`.
+2. In a second terminal run `teton doctor` (or, in the session, ask the model
+   to run any `teton …` command through its shell tool — e.g. "run
+   `teton provider list`").
+3. Watch the first session. Expect exactly one new line —
+   `a CLI client attached (protocol 2)` — and **no** `>> probe: …` and **no**
+   `>> local model … ready` re-announcement. On 0.1.19 both reprinted on every
+   attach.
+4. If a load was in progress (a fresh daemon on a cold model), also confirm the
+   loading indicator was not reset/hidden by the second terminal's attach.
+
+## Sign-off
+
+```
+BUG-177 sign-off
+----------------
+Verified by      :
+Date             :
+Build            :               (shipped version, `teton --version`)
+Second attach printed only `a CLI client attached` : yes / no
+Replay lines absent from the first session       : yes / no
+Notes / findings :
+```

@@ -569,6 +569,107 @@ fn ac6_two_clients_share_sessions_daemon_survives_exit() {
 }
 
 // ===========================================================================
+// BUG-177 — the lifecycle replay a handshake delivers (AC-8 / BR-9) reaches
+// the client that attached, and nobody else.
+// ===========================================================================
+
+/// The startup lifecycle is *replayed* to a client that just attached so it
+/// learns the state of the local tier. It is that client's catch-up, not news:
+/// every client already attached has had its own. Until BUG-177 the replay was
+/// published on the daemon-wide bus, so every `teton doctor` in another
+/// terminal — and every `teton …` a session's own shell tool spawned —
+/// re-announced `probe …` / `local model … ready` into every open session.
+///
+/// The absence is decided by **ordering**, not by a timer (the pattern
+/// `multi_client.rs` uses for every "B did not receive X" claim). A's
+/// subscription is FIFO, and each attach publishes `daemon_client_attach` to
+/// the clients already subscribed *before* the newcomer is subscribed and
+/// replayed. So on A's stream B's attach marker precedes anything B's
+/// handshake could leak, and C's marker follows it — a leaked replay has
+/// exactly one place to land, between the two, and an empty gap is a decided
+/// fact. B waiting for its *own* replay before C connects is what closes the
+/// gap on the daemon side too: under the bug the leak and B's copy were one
+/// publish, so once B has its `ready` the leaked frames were already queued to
+/// A ahead of C's marker.
+///
+/// The positive controls sit in the same test: A and B each receive their own
+/// replay ending in `ready` (the AC-8 contract the fix must not break), and A
+/// receives both attach markers (the deliberate daemon-wide announcement, which
+/// is not this bug).
+#[test]
+fn bug177_a_replayed_lifecycle_reaches_only_the_client_that_attached() {
+    let ws = Workspace::new("bug177");
+    ws.write_config("# replay scope\n");
+    // A scripted local engine: the tier is up from the start, so every replay
+    // is exactly `probed` → `ready` and nothing live is still being published
+    // when the second and third clients arrive.
+    let script = ws.write_script(&edit_answer_script());
+    let daemon = Daemon::spawn(&ws, probe_16gb().script(script));
+
+    let is_ready = |e: &Value| e["stage"]["stage"].as_str() == Some("ready");
+
+    let mut a = daemon.connect();
+    a.wait_for_event_where("model_lifecycle", is_ready, Duration::from_secs(5))
+        .expect("A's own replay must end in `ready` (REQ-544 AC-8)");
+
+    let mut b = daemon.connect();
+    b.wait_for_event_where("model_lifecycle", is_ready, Duration::from_secs(5))
+        .expect("B's own replay must reach B and end in `ready` (REQ-544 AC-8)");
+
+    let mut c = daemon.connect();
+    c.wait_for_event_where("model_lifecycle", is_ready, Duration::from_secs(5))
+        .expect("C's own replay must reach C and end in `ready` (REQ-544 AC-8)");
+
+    // A hears both attaches — the second one is the marker that closes the
+    // window B's handshake could have leaked into.
+    let mut attaches_seen = 0usize;
+    a.wait_for_event_where(
+        "daemon_client_attach",
+        |_| {
+            attaches_seen += 1;
+            attaches_seen == 2
+        },
+        Duration::from_secs(5),
+    )
+    .expect("A must be told about both attaches (daemon-wide by design)");
+
+    let events = a.events();
+    let markers: Vec<usize> = events
+        .iter()
+        .enumerate()
+        .filter(|(_, e)| e["event"].as_str() == Some("daemon_client_attach"))
+        .map(|(i, _)| i)
+        .collect();
+    assert!(
+        markers.len() >= 2,
+        "A must hold both attach markers by now: {events:?}"
+    );
+
+    // Everything A has seen since B's attach — its own replay was complete
+    // before B ever connected, so a lifecycle event from here on is somebody
+    // else's catch-up delivered to the wrong connection.
+    let since_first_attach = &events[markers[0]..];
+    let leaked: Vec<&Value> = since_first_attach
+        .iter()
+        .filter(|e| e["event"].as_str() == Some("model_lifecycle"))
+        .collect();
+    assert!(
+        leaked.is_empty(),
+        "BUG-177: another client's attach replayed the lifecycle into A's stream: {leaked:?}"
+    );
+
+    // And A's own replay was exactly one: one probe, one ready.
+    let own: Vec<String> = lifecycle_stages(&a);
+    assert_eq!(
+        own,
+        vec!["probed".to_owned(), "ready".to_owned()],
+        "A must have received its own replay exactly once: {own:?}"
+    );
+
+    assert_no_boundary_bytes();
+}
+
+// ===========================================================================
 // AC-7 — a degraded provider triggers provider_degraded and the session
 // completes via the fallback.
 // ===========================================================================

@@ -67,33 +67,57 @@ tier is not up) on every attach, however many times it has already seen it.
 
 ## Root Cause
 
-(to confirm on fix — the mechanism above is read from the source, not yet
-mutation-tested) The replay is a **broadcast used as a unicast**: the only
-delivery path a handshake has to the just-subscribed client is the bus, and the
-bus has no per-connection scope. Session-scoped events reach only sessions'
-own clients through the REQ-568 filter, but `model_lifecycle` is
-daemon-scoped by definition, so nothing narrows it.
+**Confirmed at the wire (2026-08-17).** The replay is a **broadcast used as a
+unicast**: `do_handshake` (`crates/tetond/src/server.rs`) had no delivery path
+to the just-subscribed client other than the bus, and `EventBus::publish`
+fans out to every subscriber. Session-scoped events reach only their sessions'
+clients through the REQ-568 filter (`should_forward`), but `model_lifecycle` is
+daemon-scoped by definition — `should_forward(None, …)` is `true` for every
+connection — so nothing narrowed it.
 
-Fix directions, in order of preference:
+The regression test
+`ac_matrix::bug177_a_replayed_lifecycle_reaches_only_the_client_that_attached`
+(`crates/tetond/tests/e2e/ac_matrix.rs`) reproduced it before the fix: with A
+attached and quiescent, B's attach put B's `probed` (seq 6) and `ready`
+(seq 7) on A's stream between B's and C's `daemon_client_attach` markers.
+The absence is decided by ordering, not by a timer — the same pattern
+`multi_client.rs` uses for every "B did not receive X" claim.
 
-- Deliver the replay on the new connection's own outbound (`out_tx`), as
-  ordinary event frames with envelope seq numbers, immediately after the
-  handshake result — no bus publish. The comment's own reason for the bus
-  ("so this client receives it") is satisfied more directly. Mind the
-  REQ-568 event fence: the replay must not overtake the handshake result on
-  the wire.
-- Or a bus scope for "this connection only", if one is wanted for other
-  catch-up material later.
-
-Interaction to keep in view: the CLI's REQ-556 `LoadingIndicator::observe`
-folds *every* lifecycle event it renders, so today a foreign attach's replayed
-`ready` also resets/hides another session's indicator mid-load. Delivering to
-the attaching client only removes that side effect too.
+Nothing narrower than a per-connection delivery would do: a bus scope for
+"this connection only" is a second routing mechanism for a case the daemon
+already has one for (REQ-569 BR-6's routed consent frames).
 
 ## Resolution
 
-(filled after fix)
+The replay is now **routed to the attaching connection** instead of published:
+`do_handshake` builds each lifecycle stage into an event frame with
+`routed_event_frame` (the renamed `consent_event_frame` — the seq still comes
+from the bus, so a replayed frame can never wear a broadcast frame's number on
+the same connection) and `try_send`s it on the connection's own `out_tx`,
+right behind the handshake result. The frames sit on the same FIFO channel as
+the result, so the result is on the wire first and the replay precedes anything
+the connection is answered next; the REQ-568 fence is not involved because
+nothing was delivered to the subscription. No bus publish, so no other
+subscriber hears it.
+
+Consequences beyond the noise: a foreign attach can no longer reset another
+session's REQ-556 loading indicator (`LoadingIndicator::observe` folds every
+lifecycle event it renders); and the consent-suite comment "a client attaching
+in the gap … will never see more events on its own connection" is now strictly
+true. The CLI is unchanged — the replay still reaches the client that asked for
+it, which the new test's positive controls (A, B and C each receive their own
+`probed` → `ready`) hold.
 
 ## Files Changed
 
-- (none yet)
+- `crates/tetond/src/server.rs` — `do_handshake`: lifecycle replay goes out on
+  the connection's `out_tx` as routed frames, not `events.publish(None, …)`;
+  `consent_event_frame` → `routed_event_frame`, doc names the three routed
+  deliveries.
+- `crates/tetond/src/broadcast.rs` — `EventBus::next_seq` doc names the replay
+  as a second routed consumer.
+- `crates/tetond/tests/e2e/ac_matrix.rs` — `bug177_…` regression test (fails
+  on the unfixed daemon; ordering-decided absence with positive controls).
+- `CHANGELOG.md` — `[Unreleased]` → Fixed entry.
+- `docs/manual-verification.md` — BUG-177 confirmation runbook (OUTSTANDING
+  until the shipped binary is dogfooded).
