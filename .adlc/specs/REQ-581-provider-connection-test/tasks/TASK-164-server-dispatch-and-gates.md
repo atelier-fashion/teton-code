@@ -21,7 +21,7 @@ answered through the event fence.
 
 ## Acceptance Criteria
 
-- [ ] `provider/test` from a connection that did not attach the session → `NOT_ATTACHED` in-response, no event, zero requests to the provider (AC-6's server half).
+- [ ] `provider/test` from a connection that did not attach the session → `NOT_ATTACHED` in-response, no event, zero requests to the provider (covers AC-6).
 - [ ] From the session's creator → runs, answers `ProviderTestResult`, publishes one `provider_tested` scoped to that session.
 - [ ] The reader loop stays free while the test runs (place the branch in the own-task list; a unit test that issues a second RPC while a slow mock provider holds the first — LESSON-518's shape — is required, not optional).
 - [ ] `cargo test -p tetond --lib server` green.

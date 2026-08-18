@@ -21,9 +21,9 @@ and ADR-5's session requirement.
 
 ## Acceptance Criteria
 
-- [ ] `cargo test -p tetond --lib provider_test` green; every row of ADR-2's mapping table is asserted.
+- [ ] `cargo test -p tetond --lib provider_test` green; every row of ADR-2's mapping table is asserted (covers AC-2, AC-3, AC-7 at the unit level).
 - [ ] After a `Reached` outcome the ledger's `report().probe_calls == 1` and the row's `provider_id`/`model` match; after a `Refused` outcome the ledger is unchanged.
-- [ ] `Unavailable` health becomes `Healthy` after `Reached` (AC-5's daemon half); a 401 leaves health per `health_record_after_failure`'s verdict.
+- [ ] `Unavailable` health becomes `Healthy` after `Reached` (AC-5's daemon half; covers AC-5); a 401 leaves health per `health_record_after_failure`'s verdict.
 - [ ] No test or code path reads a response body or header into a `reason`.
 
 ## Technical Notes

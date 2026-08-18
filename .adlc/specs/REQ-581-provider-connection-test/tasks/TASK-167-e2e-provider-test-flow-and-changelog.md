@@ -20,7 +20,7 @@ provider, and record the change.
 
 ## Acceptance Criteria
 
-- [ ] `cargo test -p tetond --test provider_test_flow` green, all eight cases; each failure case asserts the typed `outcome` tag, not prose.
+- [ ] `cargo test -p tetond --test provider_test_flow` green, all eight cases; each failure case asserts the typed `outcome` tag, not prose (covers AC-1, AC-2, AC-3, AC-6, AC-7 over the socket).
 - [ ] Case (a) also asserts health: a follow-up `session/prompt` on an `edit`-class turn routes to `probe` (`route_decided.provider_id == "probe"`) — AC-5's end-to-end half — or, if a mock-served turn is impractical here, the runtime unit test in TASK-163 is named as the AC-5 evidence and this test asserts `health_after == "healthy"`.
 - [ ] `cargo test --workspace --no-fail-fast` green; clippy + fmt clean.
 

@@ -24,8 +24,8 @@ the typed report (BR-3/BR-5), and the `teton cost` probe line.
 
 ## Acceptance Criteria
 
-- [ ] `cargo test -p teton --bin teton` green with the new tests; `/help` lists `/provider test`.
-- [ ] Decline, EOF, and non-TTY-without-`--yes` each make **zero** `provider/test` calls (asserted on the `TestIo` double).
+- [ ] `cargo test -p teton --bin teton` green with the new tests; `/help` lists `/provider test` (covers AC-9).
+- [ ] Decline, EOF, and non-TTY-without-`--yes` each make **zero** `provider/test` calls (asserted on the `TestIo` double) (covers AC-4).
 - [ ] Every `ProviderTestOutcome` variant renders a distinct line; no line contains a credential value; the reason is printed verbatim.
 - [ ] `teton cost` output gains the probes line only when `probe_calls > 0`.
 
