@@ -969,17 +969,15 @@ fn a_reply_reciting_the_cli_earns_the_hand_off_line_at_a_terminal() {
 // of those four are here. The keychain store is not, and the reason is the same
 // one `the_key_step_does_not_echo_and_the_key_reaches_nothing` records for
 // `/web setup` one section above: **the shipped `teton` writes credentials to
-// the real OS keychain** (`keychain::default_keychain()`, called inside
-// `provider_add_on`), and there is no seam that redirects it. `provider add`'s
-// order is settle → read key → store → `config/set`, with no confirm step
-// between the read and the store, so any test that types a key here would create
-// — and, on a rejected registration, delete — an entry in whoever's login
-// keychain ran the suite. No test may do that, and adding a redirect seam would
-// mean shipping a build that can be talked into writing a plaintext secret
-// somewhere else.
+// the real OS keychain** (`keychain::default_keychain()`, which the session's
+// dispatcher hands to `provider_add_on`), and there is no seam that redirects it
+// in the binary. So any test that types a key at this pty would create — and,
+// on a rejected registration, delete — an entry in whoever's login keychain ran
+// the suite. No test may do that, and adding a redirect seam would mean shipping
+// a build that can be talked into writing a plaintext secret somewhere else.
 //
-// So the key is never typed, and the echo claim is made **fail-closed** instead
-// of by sweeping a transcript for a value:
+// So the key is never typed here, and the echo claim is made **fail-closed**
+// instead of by sweeping a transcript for a value:
 //
 //   * `StdinPrompter::ask_secret` clears `ECHO` before it reads and refuses to
 //     read at all if it cannot (`EchoState::Failed` → `ECHO_UNAVAILABLE`,
@@ -996,32 +994,41 @@ fn a_reply_reciting_the_cli_earns_the_hand_off_line_at_a_terminal() {
 // through (`read_secret(id, prompter)`, ADR-3). What REQ-582 changed is which
 // prompter that seam is handed, not what it does.
 //
-// The rest of AC-3 — the flow completing against a keychain double, and the key
-// crossing the wire only as a `keychain://` reference — is pinned in-process by
-// `main.rs`'s `MockKeychain` registration tests.
+// The rest of AC-3 — the flow completing against a keychain double, the key
+// reaching that double under the id, the `config/set` crossing the wire with a
+// `keychain://` reference and never the key, and a refused registration taking
+// the key back out — is pinned in-process by `main.rs`'s `provider_add_on`
+// tests over `MockKeychain` (REQ-582 verify M4), since the keychain is now a
+// parameter of the body rather than a value it builds for itself.
+//
+// Since the verify pass (M1) the session also **confirms before it reads**: a
+// default-no question naming the settled registration comes first, so a
+// multi-line paste's second line answers "no" instead of becoming the key. The
+// walk below answers it, which is what makes the credential prompt reachable
+// at all.
+//
+// This test types no credential by design (see above): the shipped binary would
+// put it in the real OS keychain. It answers the confirmation and then presses
+// return at the key prompt, and nothing else.
 
-/// A credential-shaped sentinel that is **never typed**. It is the name of the
-/// thing this test deliberately does not do, and it is swept out of the
-/// transcript anyway so that a future edit which starts typing a key here fails
-/// loudly rather than quietly writing to somebody's login keychain.
-const NEVER_TYPED_KEY: &str = "sk-provider-NEVER-TYPED-9Fh3xQ";
-
-/// **AC-3 (terminal half): `/provider add` runs at a TTY, asks for its key
-/// through the hiding prompt, and stores nothing when none is typed — while the
-/// one kind that needs no key registers end to end.**
+/// **AC-3 (terminal half): `/provider add` runs at a TTY, confirms, asks for
+/// its key through the hiding prompt, and stores nothing when none is typed —
+/// while the one kind that needs no key registers end to end.**
 ///
 /// Two rows through one session, because the pair is what makes each half mean
 /// something:
 ///
 /// * `--kind openai-compatible` reaches the credential step. The write gate let
 ///   it through (this is typed input, ADR-4), clap parsed the four flags, the
-///   duplicate probe and the endpoint settlement passed, and the session's own
-///   prompter asked for the key. An empty answer refuses; nothing is registered
-///   and `config.toml` is byte-identical.
-/// * `--kind local` needs no credential, so it goes all the way: the daemon
-///   applies the registration and the config on disk gains the provider. Without
-///   it, "the config did not change" above would be indistinguishable from a row
-///   that cannot write at all.
+///   duplicate probe and the endpoint settlement passed, the session asked its
+///   default-no confirmation and got a `y`, and the session's own prompter asked
+///   for the key. An empty answer refuses; nothing is registered and
+///   `config.toml` is byte-identical.
+/// * `--kind local` needs no credential, so it goes all the way — and asks no
+///   confirmation, since there is no key read to guard: the daemon applies the
+///   registration and the config on disk gains the provider. Without it, "the
+///   config did not change" above would be indistinguishable from a row that
+///   cannot write at all.
 #[test]
 fn a_session_provider_add_asks_for_its_key_echo_off_and_stores_nothing_untyped() {
     let daemon_path = daemon_bin();
@@ -1085,14 +1092,22 @@ fn a_session_provider_add_asks_for_its_key_echo_off_and_stores_nothing_untyped()
         );
     };
 
-    // (1) A remote registration reaches the credential step — through the write
-    // gate, through clap's parse of all four flags, through the duplicate probe
-    // and the endpoint settlement. The prompt's own wording is the assertion:
-    // it names the provider and promises the value will not be shown.
+    // (1) A remote registration reaches the session's confirmation — through
+    // the write gate, through clap's parse of all four flags, through the
+    // duplicate probe and the endpoint settlement. The question is default-no
+    // and names what a `y` consents to (REQ-582 verify M1).
     step(
         &mut writer,
         "/provider add kimi2 --kind openai-compatible \
          --endpoint http://127.0.0.1:1/v1/chat/completions --model kimi-k3\r",
+        "register `kimi2` (openai-compatible, kimi-k3) at http://127.0.0.1:1/v1/chat/completions? \
+         the key is read next, echo-off, into the keychain [y/N]",
+    );
+    // A `y`, and only then the credential step. The prompt's own wording is the
+    // assertion: it names the provider and promises the value will not be shown.
+    step(
+        &mut writer,
+        "y\r",
         "API key for `kimi2` (not shown; stored only in the keychain):",
     );
 
@@ -1145,24 +1160,24 @@ fn a_session_provider_add_asks_for_its_key_echo_off_and_stores_nothing_untyped()
         "the refused registration reached config.toml after all:\n{after}"
     );
     // A local provider has no credential, so it must never have been asked for
-    // one — the prompt appears exactly once in this whole session, at step (1).
+    // one — the prompt appears exactly once in this whole session, at step (1) —
+    // and, having no key read to guard, no confirmation either: the question
+    // was drawn exactly once, for the remote registration.
     assert_eq!(
         final_transcript.matches("API key for `").count(),
         1,
         "the key prompt was drawn for a kind that has no key, or drawn twice; \
          transcript:\n{final_transcript}"
     );
-    // And the guard against a future edit that starts typing one here.
-    assert!(
-        !final_transcript.contains(NEVER_TYPED_KEY),
-        "this test types no credential by design (see the section comment): the \
-         shipped binary would put it in the real OS keychain; \
+    assert_eq!(
+        final_transcript.matches("the key is read next").count(),
+        1,
+        "the confirmation was drawn for a kind that reads no key, or drawn twice; \
          transcript:\n{final_transcript}"
     );
-    // The daemon never saw a credential either — only a registration without one.
-    let log = std::fs::read_to_string(daemon.root.join("tetond.log")).unwrap_or_default();
-    assert!(
-        !log.contains(NEVER_TYPED_KEY),
-        "a credential reached the daemon's log:\n{log}"
-    );
+    // (The former `NEVER_TYPED_KEY` sweep — asserting a value this test never
+    // types is absent from a transcript — was tautological and is gone (verify
+    // m13); the rule it stood for is the section comment above, and the walk's
+    // own steps are what enforce it: nothing here writes anything at the key
+    // prompt but a bare return.)
 }

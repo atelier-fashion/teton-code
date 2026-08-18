@@ -1950,9 +1950,16 @@ pub(crate) fn hand_off_after_turn(state: &mut SessionState, surface: &mut dyn Su
     // candidates are the row table's, in table order; one the reply *also* named
     // in `/` form is dropped, because the model already said it — REQ-579 ADR-9's
     // dormancy, asked once per command rather than once per turn.
+    //
+    // The dormancy match is a **word** match too (verify m8): a substring
+    // `/doctor` occurs inside `crates/teton/src/doctor.rs`, and a reply that
+    // named that path while telling the user to run `teton doctor` has not
+    // taught the session spelling. `contains_word` reads the byte before the
+    // `/` — a path separator's neighbour is alphanumeric, a command's is a
+    // space or the line's start.
     let named: Vec<&str> = slash::mirrored_rows()
         .filter(|(name, shell)| {
-            contains_word(&plain, shell) && !plain.contains(&format!("/{name}"))
+            contains_word(&plain, shell) && !contains_word(&plain, &format!("/{name}"))
         })
         .map(|(name, _)| name)
         .collect();

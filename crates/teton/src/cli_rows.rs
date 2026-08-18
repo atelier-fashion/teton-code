@@ -208,36 +208,116 @@ pub(crate) fn typed_only_line(row: &str, shell: &str) -> String {
 /// supplies the prefix; clap is the one message source that ships with its own.
 const CLAP_ERROR_LEAD: &str = "error: ";
 
-/// Render a clap parse failure — or a `--help`/`--version` request, which clap
-/// also reports as an `Err` — onto the session's surface (ADR-2 step 3).
+/// How much of one rendered clap line reaches the surface (verify m2).
 ///
-/// Every non-empty line of clap's own message reaches the surface, in order,
-/// once: the first as [`LineKind::Error`] (with [`CLAP_ERROR_LEAD`] removed, see
-/// there) and the rest — the `Usage:` clause, the argument list, the
-/// "For more information" tail — as [`LineKind::Info`], which is what they are
-/// and how the shell prints them. A help or version render carries no error line
-/// at all, because a user who asked for help got what they asked for (AC-7).
+/// Clap quotes the offending token back in an "unexpected argument" error and
+/// in the `tip:` line under it, and the token is whatever the user typed — a
+/// pasted paragraph as a stray positional would be replayed in full, into the
+/// scrollback and any recording of it. So every line goes through the same
+/// bound-and-defuse [`crate::slash::echoed`] applies to a quoted command name.
 ///
-/// Blank lines are dropped rather than rendered: a `Surface` emits complete
-/// lines, and an empty one through a class prefix is a stray `error: ` on a row
-/// of its own.
-fn render_clap_error(err: &clap::Error, surface: &mut dyn Surface) {
-    let text = err.render().to_string();
-    let mut lines = text.lines().filter(|line| !line.trim().is_empty());
+/// The cap is wide because clap does **not** wrap help text in this build (no
+/// `wrap_help` feature), so a long doc comment is one long line — the global
+/// `--yes` flag's is over five hundred characters — and the binary's own text
+/// must reach the surface whole (AC-7's parity with the shell). A unit test
+/// walks every leaf's `--help` and `-h` page and asserts every line clears
+/// this bound, so a doc comment that grows past it fails there rather than
+/// being silently truncated in a session. Only a user's own long token ever
+/// meets the ellipsis.
+const CLAP_LINE_MAX_CHARS: usize = 640;
+
+/// Render a clap parse failure — or a `--help` request, which clap also reports
+/// as an `Err` — onto the session's surface (ADR-2 step 3).
+///
+/// The kind decides one thing: whether the first line is an error. A help
+/// render carries no error line at all, because a user who asked for help got
+/// what they asked for (AC-7). `DisplayVersion` is matched beside it for the
+/// same reason but is unreachable from every caller today: `--version` is a
+/// top-level flag the binary does not propagate to its subcommands, so on a
+/// row's argv clap reports it as an unexpected argument (a test pins that,
+/// verify T3), and a bare `teton --version` is refused by the classifier before
+/// any parse. It stays in the match because if a subcommand ever propagated the
+/// version, help-shaped rendering is the right answer and an `error:` line would
+/// be the wrong one.
+pub(crate) fn render_clap_error(err: &clap::Error, surface: &mut dyn Surface) {
     let asked_for = matches!(
         err.kind(),
         clap::error::ErrorKind::DisplayHelp | clap::error::ErrorKind::DisplayVersion
     );
-    if !asked_for {
+    render_clap_text(&err.render().to_string(), !asked_for, surface);
+}
+
+/// Render clap's own text, line by line, onto the surface.
+///
+/// **Every** line reaches the surface, in order, once — blank ones included, as
+/// [`LineKind::Info`] `""` (verify m1): a `PlainSurface` prints an empty Info
+/// line as an empty line, which is exactly the byte the shell prints between
+/// clap's error and its `Usage:` clause, and dropping it made the session's
+/// rendering differ from the shell's by the blank lines. When `first_is_error`,
+/// the first non-blank line renders as [`LineKind::Error`] with
+/// [`CLAP_ERROR_LEAD`] removed (see there); everything else — the `Usage:`
+/// clause, the argument list, the "For more information" tail, a whole help
+/// page — is [`LineKind::Info`], which is what it is and how the shell prints it.
+///
+/// Each line is bounded and defused ([`CLAP_LINE_MAX_CHARS`], verify m2) on the
+/// way out, so a user's own bytes quoted back by clap cannot replay a pasted
+/// paragraph or an escape sequence into the terminal.
+///
+/// `pub(crate)` because two callers render clap text that is not a parse
+/// failure of a row's argv: the classifier's family-help outcome
+/// ([`crate::slash::Input::CliHelp`], verify T6) and [`crate::slash::run_cli_line`]'s
+/// full-argv validation of a pre-REQ row (verify M2). One renderer, so the
+/// blank-line and bounding rules cannot be applied on one path and forgotten on
+/// another.
+pub(crate) fn render_clap_text(text: &str, first_is_error: bool, surface: &mut dyn Surface) {
+    let mut lines = text.lines().peekable();
+    if first_is_error {
+        // Clap opens an error with `error: …` on its first line; the leading
+        // blank lines are skipped only in the theoretical case it did not, so
+        // the class prefix never lands on an empty row.
+        while lines.peek().is_some_and(|line| line.trim().is_empty()) {
+            lines.next();
+        }
         if let Some(first) = lines.next() {
+            let sentence = first.strip_prefix(CLAP_ERROR_LEAD).unwrap_or(first);
             surface.line(
                 LineKind::Error,
-                first.strip_prefix(CLAP_ERROR_LEAD).unwrap_or(first),
+                &crate::slash::echoed_within(sentence, CLAP_LINE_MAX_CHARS),
             );
         }
     }
     for line in lines {
-        surface.line(LineKind::Info, line);
+        surface.line(
+            LineKind::Info,
+            &crate::slash::echoed_within(line, CLAP_LINE_MAX_CHARS),
+        );
+    }
+}
+
+/// The one line a recognized line prints when the binary's global flags were on
+/// it (verify M2).
+///
+/// `--yes` and `--verbose` are the shell's: the first pre-answers confirmations
+/// for an unattended run and the second sets a session's initial verbosity, and
+/// neither is a row's to honour from inside a session — the session already has
+/// its own `--yes` (the one `run_session` was started with) and `/verbose`. A
+/// row that honoured a typed `--yes` would let a line inside a session grant a
+/// consent the session's own flag governs. So the flags parse (they are legal
+/// argv, and clap says so), are dropped, and this line says they were.
+///
+/// `/model set` gets the specific sentence because it is the row whose
+/// confirmation a user typing `--yes` was trying to skip; every other row gets
+/// the general one.
+pub(crate) fn shell_flags_line(name: &str, yes: bool) -> String {
+    if yes && name == "model set" {
+        "`--yes` is a shell flag and was ignored: /model set asks its own confirmation here \
+         (this session's own `--yes` answers it)."
+            .to_owned()
+    } else {
+        format!(
+            "shell flags (`--yes`, `--verbose`) are ignored in a session — /{name} runs under this \
+             session's own `--yes` and `/verbose`."
+        )
     }
 }
 
@@ -267,35 +347,36 @@ fn row_name(twin: &'static str) -> &'static str {
     twin.strip_prefix("teton ").unwrap_or(twin)
 }
 
-/// Run a mirrored row: gate, argv, parse, dispatch (REQ-582 ADR-2).
+/// Run a mirrored row: argv, parse, gate, dispatch (REQ-582 ADR-2; order
+/// amended at verify, M3).
 ///
 /// The whole of what the ten handlers below do, so each of them is one line and
 /// the order of these steps is stated once:
 ///
-/// 1. a row that **writes** meets [`write_gate`] before anything else — the
-///    refusal costs no parse and no RPC (ADR-4);
-/// 2. [`mirrored_argv`] rebuilds the shell's argv;
-/// 3. [`crate::Cli::try_parse_from`] — the binary's own grammar — either reports
-///    what the shell would have reported ([`render_clap_error`]) or yields the
-///    [`crate::Command`] that [`crate::run_mirrored_command`] runs on the
-///    session's connection.
-///
-/// The outcome is always [`CommandOutcome::Continue`], and a failure from the
-/// body becomes one rendered line rather than an `Err`. That is deliberate: the
-/// entry loop propagates a handler's `Err` and ends the session, and the errors
-/// these bodies actually raise are a keychain that would not store, an endpoint
-/// the registration seam refused (REQ-578 BR-5), and a transport failure. Ending
-/// a session over the first two would be plainly wrong; the third re-surfaces on
-/// the very next call — including the next prompt turn, which the loop still
-/// propagates — so nothing is swallowed, it is only reported by the command that
-/// met it instead of by the command's caller. A `Connection` carries no typed
-/// "the socket is gone" error to branch on, and matching the daemon's wording
-/// for one is what LESSON-456 is about.
+/// 1. [`mirrored_argv`] rebuilds the shell's argv and
+///    [`crate::Cli::try_parse_from`] — the binary's own grammar — judges it. A
+///    parse that fails is rendered exactly as the shell would render it
+///    ([`render_clap_error`]) and that is the end: no gate, no RPC. This is
+///    **before** the write gate because `--help` is a parse outcome, and a user
+///    on a pipe asking `/policy set-tier --help` asked a question the gate has no
+///    business refusing — help changes nothing (M3). A bad argument is likewise
+///    a sentence and nothing else, on a pipe or a terminal.
+/// 2. a row that **writes** then meets [`write_gate`] — the refusal costs no RPC
+///    (ADR-4);
+/// 3. the binary's global flags, if the line carried any, are reported as
+///    ignored ([`shell_flags_line`], M2);
+/// 4. the parsed [`crate::Command`] runs through [`crate::run_mirrored_command`]
+///    on the session's connection.
 ///
 /// # Errors
 ///
-/// None today: every failure is rendered. The signature keeps [`anyhow::Result`]
-/// because it is the [`Handler`](crate::slash) contract every other row shares.
+/// A **transport** failure from the body — the socket gone, a frame that will
+/// not parse — is propagated, and the entry loop ends the session on it exactly
+/// as it does when `/cost` meets one (verify m7). Everything else a body can
+/// raise is a rendered line and [`CommandOutcome::Continue`]: `provider add`'s
+/// refusals and its endpoint-seam and keychain failures travel as
+/// [`crate::ProviderAddRefusal`] and never as `Err`, so a mistyped registration
+/// cannot end a session while a dead connection cannot be mistaken for one.
 fn run_mirrored(
     row: Mirror,
     args: &str,
@@ -319,32 +400,34 @@ fn run_mirrored_seamed(
     seams_allowed: bool,
 ) -> anyhow::Result<CommandOutcome> {
     let twin = row.shell;
+    let cli = match Cli::try_parse_from(mirrored_argv(twin, args)) {
+        Err(err) => {
+            render_clap_error(&err, ctx.surface);
+            return Ok(CommandOutcome::Continue);
+        }
+        Ok(cli) => cli,
+    };
     if row.writes && write_gate(ctx.typed_input, seams_allowed) == WriteGate::Refuse {
         ctx.surface
             .line(LineKind::Error, &typed_only_line(row_name(twin), twin));
         return Ok(CommandOutcome::Continue);
     }
-    match Cli::try_parse_from(mirrored_argv(twin, args)) {
-        Err(err) => render_clap_error(&err, ctx.surface),
-        // `yes` and `verbose` are global flags of the parsed `Cli` and are
-        // deliberately dropped: none of the ten rows consults `--yes`, and the
-        // session's verbosity is `/verbose`'s to own. A row that honoured a
-        // typed `--yes` would let a line inside a session grant a consent the
-        // session's own flag governs.
-        Ok(cli) => match cli.command {
-            Some(command) => {
-                if let Err(err) = crate::run_mirrored_command(command, conn, ctx) {
-                    ctx.surface.line(LineKind::Error, &format!("{err:#}"));
-                }
-            }
-            // Unreachable: every twin names a subcommand, so a successful parse
-            // carries one. Reported rather than `unwrap`ed because a panic in a
-            // session is worse than a sentence in it.
-            None => ctx.surface.line(
-                LineKind::Error,
-                &format!("`{twin}` did not parse as a subcommand; nothing was run."),
-            ),
-        },
+    // `yes` and `verbose` are global flags of the parsed `Cli` and are dropped
+    // — none of the ten rows consults `--yes`, and the session's verbosity is
+    // `/verbose`'s to own — and the drop is said out loud (M2).
+    if cli.yes || cli.verbose {
+        ctx.surface
+            .line(LineKind::Info, &shell_flags_line(row_name(twin), cli.yes));
+    }
+    match cli.command {
+        Some(command) => crate::run_mirrored_command(command, conn, ctx)?,
+        // Unreachable: every twin names a subcommand, so a successful parse
+        // carries one. Reported rather than `unwrap`ed because a panic in a
+        // session is worse than a sentence in it.
+        None => ctx.surface.line(
+            LineKind::Error,
+            &format!("`{twin}` did not parse as a subcommand; nothing was run."),
+        ),
     }
     Ok(CommandOutcome::Continue)
 }
@@ -464,12 +547,19 @@ fn tree() -> &'static clap::Command {
 
 /// The subcommand path `tokens` names, as deep as they name one (REQ-582 ADR-1).
 ///
-/// `tokens` are the whitespace-split words **after** `teton`. The walk is clap's
-/// own — [`clap::Command::find_subcommand`], which honours aliases — and each
-/// level contributes the canonical `get_name()`, so a path is spelled the way the
-/// table spells a row whatever spelling was typed. It stops at the first token
-/// that names no subcommand, which is what makes `teton is slow today` an empty
-/// path and therefore a plain prompt rather than a command.
+/// `tokens` are the whitespace-split words **after** `teton` (and after any
+/// leading global flag the classifier stepped over). The walk is clap's own —
+/// [`clap::Command::find_subcommand`] — and each level contributes the canonical
+/// `get_name()`, so a path is spelled the way the table spells a row. It stops
+/// at the first token that names no subcommand, which is what makes `teton is
+/// slow today` an empty path and therefore a plain prompt rather than a command.
+///
+/// No subcommand in this binary declares an alias today, so "canonical" and
+/// "typed" are the same words for every path (verify T2). The walk goes through
+/// `find_subcommand` all the same, because that is the lookup clap's own parser
+/// uses: were an alias ever declared, it would resolve here without a second
+/// matcher learning about it, and the classifier counts the words the walk
+/// consumed rather than re-matching the row's name for exactly that case.
 ///
 /// This is the recognition half of BR-3's "one grammar": the classifier asks the
 /// parser which subcommand a line names instead of matching words itself, so a
@@ -489,6 +579,61 @@ pub(crate) fn cli_path(tokens: &[&str]) -> Vec<&'static str> {
     path
 }
 
+/// The clap node a canonical `path` names, or `None` when it names no
+/// subcommand.
+fn node_at(path: &[&str]) -> Option<&'static clap::Command> {
+    let mut node = tree();
+    for word in path {
+        node = node.find_subcommand(word)?;
+    }
+    Some(node)
+}
+
+/// Whether `path` names a **leaf** — a subcommand with no subcommands of its own,
+/// which is to say one clap can parse to a [`crate::Command`] (verify M2).
+///
+/// The classifier's pre-REQ rows split on this: `cost`, `effort`, `model set`
+/// and `provider test` are leaves, so a typed `teton effort max --yes` can be
+/// validated whole by `Cli::try_parse_from` before its row runs; `model` is a
+/// family, and `Cli::try_parse_from(["teton", "model"])` yields the family's
+/// help page rather than a command — so bare `teton model` dispatches to
+/// `/model` directly, as TASK-170 had it.
+#[must_use]
+pub(crate) fn is_leaf_path(path: &[&str]) -> bool {
+    node_at(path).is_some_and(|node| node.get_subcommands().next().is_none())
+}
+
+/// Clap's own help page for a **family** path — `teton provider --help`,
+/// `teton policy -h` — or `None` when `path` is not a family (verify T6).
+///
+/// Rendered through the same `try_parse_from` the shell would run for that
+/// argv — `help_flag` is the flag as typed, so `-h` gets clap's short page and
+/// `--help` its long one, exactly as a shell would — so the text is the
+/// binary's own and not a second composition of it. A user who typed `--help`
+/// after a family name asked for the family's page, and answering with the
+/// bare-family refusal ([`refusal_for_path`]'s session-rows sentence) would
+/// swallow the ask. `None` for a leaf — a leaf's `--help` is its row's to
+/// render, or its refusal's to explain — and for a path that names nothing.
+#[must_use]
+pub(crate) fn family_help(path: &[&str], help_flag: &str) -> Option<String> {
+    let node = node_at(path)?;
+    // A family has at least one subcommand; a leaf's `?` bails here.
+    node.get_subcommands().next()?;
+    let argv: Vec<&str> = std::iter::once("teton")
+        .chain(path.iter().copied())
+        .chain(std::iter::once(help_flag))
+        .collect();
+    match Cli::try_parse_from(argv) {
+        Err(err) if err.kind() == clap::error::ErrorKind::DisplayHelp => {
+            Some(err.render().to_string())
+        }
+        // A family always answers `--help` with help; anything else here would
+        // mean the tree changed under this walk, and the caller's refusal is
+        // the honest fallback.
+        _ => None,
+    }
+}
+
 /// The one line a recognized `teton …` path with **no** session row gets back
 /// (REQ-582 ADR-1, BR-4).
 ///
@@ -504,9 +649,13 @@ pub(crate) fn cli_path(tokens: &[&str]) -> Vec<&'static str> {
 ///   ([`crate::slash::rows_under`]), because those are what the user can
 ///   actually type here: for `provider` that includes `/provider setup`, which
 ///   the CLI has no subcommand for at all;
-/// * anything else with no rows below it — a leaf clap hides (`policy set`,
-///   REQ-558's retired form), which has no session row for the same reason it
-///   has no listing.
+/// * the retired `policy set` (REQ-558 AC-9): the one leaf clap hides, and the
+///   one path whose reason is a sentence that already exists —
+///   [`crate::POLICY_SET_RETIRED`] explains that the routing axis changed, which
+///   is what a user with muscle memory needs to hear, and "no session form"
+///   would tell them they mistyped (verify m6);
+/// * anything else with no rows below it — a leaf with no session row and no
+///   listing — says so and points at the shell.
 ///
 /// **One line, and why it is not clap's own message.** ADR-1 wrote the family
 /// arm as "clap's own error for that path, rendered", on the reading that
@@ -520,6 +669,8 @@ pub(crate) fn cli_path(tokens: &[&str]) -> Vec<&'static str> {
 /// one refusing line. So the sentence is composed, and from the table rather
 /// than from the tree: the anti-drift property BR-3 is about is that no list is
 /// maintained twice, and the table is the list that decides what runs here.
+/// (A family followed by an explicit `--help` is the one case that *does* get
+/// clap's page — the user asked for it — see [`family_help`].)
 #[must_use]
 pub(crate) fn refusal_for_path(path: &[&str]) -> String {
     let spelling = path.join(" ");
@@ -533,15 +684,21 @@ pub(crate) fn refusal_for_path(path: &[&str]) -> String {
              instead."
         );
     }
+    // The hidden leaf. Matched by spelling because it is the only hidden leaf
+    // (`every_cli_leaf_is_a_session_row_or_an_explicit_shell_only_exception`
+    // pins that), and its sentence is the shell's own for the same argv.
+    if spelling == "policy set" {
+        return crate::POLICY_SET_RETIRED.to_owned();
+    }
     let rows = crate::slash::rows_under(path);
     if rows.is_empty() {
         format!(
-            "`teton {spelling}` has no session form — run it from a shell. {}",
+            "`teton {spelling}` has no session form — run it from a shell; {}",
             crate::slash::HELP_HINT
         )
     } else {
         format!(
-            "`teton {spelling}` is a family rather than a command — in this session: {}.",
+            "`teton {spelling} …` names a family rather than a command — in this session: {}.",
             rows.iter()
                 .map(|row| format!("/{row}"))
                 .collect::<Vec<_>>()
@@ -583,7 +740,6 @@ mod tests {
     use crate::prompt::ScriptedPrompter;
     use crate::render::RecordingSurface;
     use crate::session_ui::SessionState;
-    use std::io::Read;
     use std::os::unix::net::UnixStream;
 
     /// A session context for a mirrored row. `typed_input` defaults to a
@@ -607,29 +763,15 @@ mod tests {
         }
     }
 
-    /// Every JSON-RPC method name written to the connection's socket, in order.
+    /// Every JSON-RPC method name written to the connection's socket, in order
+    /// — the shared fixture reader ([`crate::client::methods_written`]), named
+    /// for what these tests ask of it.
     ///
     /// Non-blocking, so "nothing was sent" is an assertion a test can make
     /// without waiting for a daemon that does not exist — which is what AC-4 and
     /// AC-7 are actually about.
     fn methods_sent(peer: &UnixStream) -> Vec<String> {
-        peer.set_nonblocking(true).expect("nonblocking");
-        let mut raw = Vec::new();
-        // WouldBlock is the expected end of the stream here; whatever was read
-        // before it is in the buffer.
-        let _ = (&mut { peer }).read_to_end(&mut raw);
-        String::from_utf8_lossy(&raw)
-            .lines()
-            .filter(|line| !line.trim().is_empty())
-            .map(|line| {
-                let request: serde_json::Value =
-                    serde_json::from_str(line).expect("a framed JSON-RPC request");
-                request["method"]
-                    .as_str()
-                    .expect("every request names a method")
-                    .to_owned()
-            })
-            .collect()
+        crate::client::methods_written(peer)
     }
 
     /// A `config/get` answer with nothing configured — enough for the read rows
@@ -763,11 +905,12 @@ mod tests {
 
     /// AC-7: a bad line prints the CLI parser's **own** error and issues no RPC.
     ///
-    /// Every non-empty line of clap's message reaches the surface, in order,
-    /// once — the first as the error (minus the `error: ` the surface class
-    /// itself supplies) and the rest as the neutral context lines the shell
-    /// prints under it. Both spec examples are here: a missing positional and a
-    /// value outside the enum.
+    /// **Every** line of clap's message reaches the surface, in order, once —
+    /// the first as the error (minus the `error: ` the surface class itself
+    /// supplies), the rest as the neutral context lines the shell prints under
+    /// it, and the blank lines between them as empty Info lines (verify m1):
+    /// the shell prints those blanks, and byte parity is the claim. Both spec
+    /// examples are here: a missing positional and a value outside the enum.
     #[test]
     fn a_bad_argument_renders_claps_own_error_and_sends_nothing() {
         for (args, argv) in [
@@ -793,7 +936,7 @@ mod tests {
                 .expect_err("the shell rejects it too")
                 .render()
                 .to_string();
-            let mut expected = rendered.lines().filter(|line| !line.trim().is_empty());
+            let mut expected = rendered.lines();
             let first = expected.next().expect("clap says something");
             assert_eq!(
                 surface.lines_of(LineKind::Error),
@@ -802,9 +945,15 @@ mod tests {
                     .expect("clap leads with its own error: prefix")],
                 "`/policy set-tier {args}` did not print the parser's own first line"
             );
+            let context: Vec<&str> = expected.collect();
+            assert!(
+                context.iter().any(|line| line.trim().is_empty()),
+                "clap's own message carries a blank line, or this test proves nothing \
+                 about m1: {rendered:?}"
+            );
             assert_eq!(
                 surface.lines_of(LineKind::Info),
-                expected.collect::<Vec<_>>(),
+                context,
                 "`/policy set-tier {args}` dropped or reworded the parser's context lines"
             );
             assert!(
@@ -815,7 +964,8 @@ mod tests {
     }
 
     /// `--help` on a row is clap's help for that subcommand, and it is not an
-    /// error: a user who asked for help got what they asked for (AC-7).
+    /// error: a user who asked for help got what they asked for (AC-7). Blank
+    /// lines included, as the shell prints them (m1).
     #[test]
     fn a_help_request_renders_claps_help_for_that_subcommand() {
         let (mut conn, peer) = Connection::scripted(&[]);
@@ -834,16 +984,165 @@ mod tests {
             .to_string();
         assert_eq!(
             surface.lines_of(LineKind::Info),
-            rendered
-                .lines()
-                .filter(|line| !line.trim().is_empty())
-                .collect::<Vec<_>>()
+            rendered.lines().collect::<Vec<_>>()
         );
         assert!(
             surface.lines_of(LineKind::Error).is_empty(),
             "asking for help is not an error: {:?}",
             surface.calls
         );
+        assert!(methods_sent(&peer).is_empty());
+    }
+
+    /// **M3.** The parse comes before the write gate, so `--help` on a write
+    /// row answers on a pipe: help changes nothing and the gate has no business
+    /// refusing it. The same pipe still refuses the row's real arguments.
+    #[test]
+    fn help_on_a_piped_write_row_renders_and_the_write_is_still_refused() {
+        let (mut conn, peer) = Connection::scripted(&[]);
+        let mut surface = RecordingSurface::new();
+        let mut state = SessionState::new();
+        let mut prompter = ScriptedPrompter::new(&[]);
+        {
+            let mut ctx = session_ctx(&mut surface, &mut state, &mut prompter, false);
+            run_mirrored_seamed(POLICY_SET_TIER, "--help", &mut conn, &mut ctx, false)
+                .expect("a help request never fails the command");
+        }
+        let expected = Cli::try_parse_from(["teton", "policy", "set-tier", "--help"])
+            .expect_err("clap reports help as an Err")
+            .render()
+            .to_string();
+        assert_eq!(
+            surface.lines_of(LineKind::Info),
+            expected.lines().collect::<Vec<_>>(),
+            "help on a pipe must be the page, not the refusal: {:?}",
+            surface.calls
+        );
+        assert!(
+            surface.lines_of(LineKind::Error).is_empty(),
+            "the gate refused a help request: {:?}",
+            surface.calls
+        );
+        assert!(methods_sent(&peer).is_empty());
+
+        // The gate is intact for a real write on the same pipe.
+        let mut surface = RecordingSurface::new();
+        {
+            let mut ctx = session_ctx(&mut surface, &mut state, &mut prompter, false);
+            run_mirrored_seamed(POLICY_SET_TIER, "build kimi", &mut conn, &mut ctx, false)
+                .expect("a refusal never fails the command");
+        }
+        let errors = surface.lines_of(LineKind::Error);
+        assert_eq!(errors.len(), 1, "{:?}", surface.calls);
+        assert!(errors[0].contains("typed-input-only"), "{}", errors[0]);
+        assert!(methods_sent(&peer).is_empty());
+    }
+
+    /// **T3.** `--version` on a row is an unexpected argument, not a version
+    /// render: the binary's version flag is top-level and is not propagated to
+    /// its subcommands, so `render_clap_error`'s `DisplayVersion` arm is
+    /// unreachable from a row (see its doc for why it stays).
+    #[test]
+    fn version_on_a_row_is_an_unexpected_argument() {
+        let (mut conn, peer) = Connection::scripted(&[]);
+        let mut surface = RecordingSurface::new();
+        let mut state = SessionState::new();
+        let mut prompter = ScriptedPrompter::new(&[]);
+        {
+            let mut ctx = session_ctx(&mut surface, &mut state, &mut prompter, true);
+            run_mirrored_seamed(PROVIDER_LIST, "--version", &mut conn, &mut ctx, false)
+                .expect("a parse error never fails the command");
+        }
+        let errors = surface.lines_of(LineKind::Error);
+        assert_eq!(errors.len(), 1, "{:?}", surface.calls);
+        assert!(
+            errors[0].contains("unexpected argument '--version'"),
+            "{}",
+            errors[0]
+        );
+        // And clap agrees it is not a version request.
+        let kind = Cli::try_parse_from(["teton", "provider", "list", "--version"])
+            .expect_err("rejected")
+            .kind();
+        assert_ne!(kind, clap::error::ErrorKind::DisplayVersion);
+        assert!(methods_sent(&peer).is_empty());
+    }
+
+    /// **m2's precondition.** The bound clears every line the binary's own
+    /// parser composes — every leaf's long and short help — so nothing but a
+    /// user's own token ever meets the ellipsis. A doc comment that grows past
+    /// the bound fails here, by name, rather than being truncated in a session.
+    #[test]
+    fn every_help_line_the_binary_composes_clears_the_line_bound() {
+        let mut checked = 0;
+        for (path, _) in leaf_command_paths() {
+            for flag in ["--help", "-h"] {
+                let argv: Vec<&str> = std::iter::once("teton")
+                    .chain(path.split_whitespace())
+                    .chain(std::iter::once(flag))
+                    .collect();
+                let text = Cli::try_parse_from(&argv)
+                    .expect_err("help is reported as an Err")
+                    .render()
+                    .to_string();
+                for line in text.lines() {
+                    checked += 1;
+                    assert!(
+                        line.chars().count() <= CLAP_LINE_MAX_CHARS,
+                        "`teton {path} {flag}` composes a line of {} chars, over the \
+                         {CLAP_LINE_MAX_CHARS} bound the session renders clap text under; \
+                         shorten the doc comment or raise the bound:\n{line}",
+                        line.chars().count()
+                    );
+                }
+            }
+        }
+        assert!(checked > 100, "the walk found almost nothing: {checked}");
+    }
+
+    /// **m2.** A user's own token quoted back by clap is bounded and defused:
+    /// a pasted paragraph as a stray positional does not come back in full.
+    #[test]
+    fn a_long_stray_token_is_bounded_when_clap_quotes_it_back() {
+        let pasted = format!("sk-{}", "A".repeat(2 * CLAP_LINE_MAX_CHARS));
+        let (mut conn, peer) = Connection::scripted(&[]);
+        let mut surface = RecordingSurface::new();
+        let mut state = SessionState::new();
+        let mut prompter = ScriptedPrompter::new(&[]);
+        {
+            let mut ctx = session_ctx(&mut surface, &mut state, &mut prompter, true);
+            run_mirrored_seamed(PROVIDER_LIST, &pasted, &mut conn, &mut ctx, false)
+                .expect("a parse error never fails the command");
+        }
+        let errors = surface.lines_of(LineKind::Error);
+        assert_eq!(errors.len(), 1, "{:?}", surface.calls);
+        assert!(
+            !errors[0].contains(&pasted),
+            "the whole token was echoed back: {}",
+            errors[0]
+        );
+        assert!(
+            errors[0].chars().count() <= CLAP_LINE_MAX_CHARS + 1,
+            "the line is over the bound: {}",
+            errors[0]
+        );
+        assert!(errors[0].ends_with('…'), "{}", errors[0]);
+        // Control characters in a quoted token are defused too, on every line.
+        let mut surface = RecordingSurface::new();
+        {
+            let mut ctx = session_ctx(&mut surface, &mut state, &mut prompter, true);
+            run_mirrored_seamed(PROVIDER_LIST, "x\x1b[2Jy", &mut conn, &mut ctx, false)
+                .expect("a parse error never fails the command");
+        }
+        for call in &surface.calls {
+            let crate::render::Rendered::Line(_, text) = call else {
+                continue;
+            };
+            assert!(
+                !text.chars().any(char::is_control),
+                "a control character reached the surface: {text:?}"
+            );
+        }
         assert!(methods_sent(&peer).is_empty());
     }
 
@@ -893,41 +1192,10 @@ mod tests {
         }
     }
 
-    /// BR-11: a read row never consults the gate. The same piped session that
-    /// refuses a write answers a read, which is what makes the e2e suites — all
-    /// of which drive a pipe — able to assert AC-1 at all.
-    #[test]
-    fn a_read_row_ignores_the_write_gate() {
-        let (mut conn, peer) = Connection::scripted(&[empty_config()]);
-        let mut surface = RecordingSurface::new();
-        let mut state = SessionState::new();
-        let mut prompter = ScriptedPrompter::new(&[]);
-        {
-            let mut ctx = session_ctx(&mut surface, &mut state, &mut prompter, false);
-            run_mirrored_seamed(PROVIDER_LIST, "", &mut conn, &mut ctx, false)
-                .expect("a read row runs on a pipe");
-        }
-        assert_eq!(methods_sent(&peer), vec!["config/get"]);
-        assert!(
-            !surface
-                .lines_of(LineKind::Error)
-                .iter()
-                .any(|line| line.contains("typed-input-only")),
-            "a read row met the write gate: {:?}",
-            surface.calls
-        );
-    }
-
-    /// AC-1's unit leg: each read row reaches the shared body its shell twin
-    /// runs, over the session's own connection, and sends that body's one method.
-    ///
-    /// The method name is the assertion because it is the thing BR-2 is about —
-    /// "the same daemon method with the same params". What the bodies *render*
-    /// is pinned where those bodies live and, byte for byte against the shell,
-    /// by AC-1's e2e diff.
-    #[test]
-    fn every_read_row_sends_its_shell_twins_method_on_the_sessions_connection() {
-        for (row, method, scripted) in [
+    /// The six read rows, each with the one method its shared body sends and a
+    /// scripted answer that body can render.
+    fn read_rows() -> Vec<(Mirror, &'static str, serde_json::Value)> {
+        vec![
             (PROVIDER_LIST, "config/get", empty_config()),
             (BOUNDARY_LIST, "config/get", empty_config()),
             (POLICY_SHOW, "config/get", empty_config()),
@@ -939,7 +1207,50 @@ mod tests {
                 serde_json::to_value(teton_protocol::methods::ModelStatusResult::default())
                     .expect("a model status serializes"),
             ),
-        ] {
+        ]
+    }
+
+    /// BR-11: a read row never consults the gate. The same piped session that
+    /// refuses a write answers a read, which is what makes the e2e suites — all
+    /// of which drive a pipe — able to assert AC-1 at all. Over all six read
+    /// rows (verify T11), because a `writes: true` slipped onto one of them
+    /// would refuse exactly that row and no other.
+    #[test]
+    fn a_read_row_ignores_the_write_gate() {
+        for (row, method, scripted) in read_rows() {
+            let twin = row.shell;
+            let (mut conn, peer) = Connection::scripted(&[scripted]);
+            let mut surface = RecordingSurface::new();
+            let mut state = SessionState::new();
+            let mut prompter = ScriptedPrompter::new(&[]);
+            {
+                let mut ctx = session_ctx(&mut surface, &mut state, &mut prompter, false);
+                run_mirrored_seamed(row, "", &mut conn, &mut ctx, false)
+                    .unwrap_or_else(|err| panic!("`{twin}` did not run on a pipe: {err:#}"));
+            }
+            assert_eq!(methods_sent(&peer), vec![method], "`{twin}`");
+            assert!(
+                !surface
+                    .lines_of(LineKind::Error)
+                    .iter()
+                    .any(|line| line.contains("typed-input-only")),
+                "`{twin}` met the write gate on a pipe: {:?}",
+                surface.calls
+            );
+            conn.assert_all_consumed();
+        }
+    }
+
+    /// AC-1's unit leg: each read row reaches the shared body its shell twin
+    /// runs, over the session's own connection, and sends that body's one method.
+    ///
+    /// The method name is the assertion because it is the thing BR-2 is about —
+    /// "the same daemon method with the same params". What the bodies *render*
+    /// is pinned where those bodies live and, byte for byte against the shell,
+    /// by AC-1's e2e diff.
+    #[test]
+    fn every_read_row_sends_its_shell_twins_method_on_the_sessions_connection() {
+        for (row, method, scripted) in read_rows() {
             let twin = row.shell;
             let (mut conn, peer) = Connection::scripted(&[scripted]);
             let mut surface = RecordingSurface::new();
@@ -955,6 +1266,36 @@ mod tests {
             assert!(
                 !surface.calls.is_empty(),
                 "`{twin}` rendered nothing at all"
+            );
+            conn.assert_all_consumed();
+        }
+    }
+
+    /// **m7 / T9.** A transport failure is the one thing a mirrored row does
+    /// *not* turn into a sentence: it propagates, and the entry loop ends the
+    /// session on it exactly as it does when `/cost` meets one. A connection
+    /// scripted with no answers is a daemon that hung up mid-call, and every
+    /// read row must return `Err` on it rather than render "connection closed"
+    /// and carry on as though the next command might fare better.
+    #[test]
+    fn a_lost_connection_propagates_out_of_every_read_row() {
+        for (row, _, _) in read_rows() {
+            let twin = row.shell;
+            let (mut conn, _peer) = Connection::scripted(&[]);
+            let mut surface = RecordingSurface::new();
+            let mut state = SessionState::new();
+            let mut prompter = ScriptedPrompter::new(&[]);
+            let result = {
+                let mut ctx = session_ctx(&mut surface, &mut state, &mut prompter, true);
+                run_mirrored_seamed(row, "", &mut conn, &mut ctx, false)
+            };
+            let err = result.expect_err(&format!(
+                "`{twin}` swallowed a lost connection: {:?}",
+                surface.calls
+            ));
+            assert!(
+                format!("{err:#}").contains("connection to the daemon closed"),
+                "`{twin}` failed for another reason: {err:#}"
             );
         }
     }
@@ -1026,27 +1367,30 @@ mod tests {
     }
 
     /// AC-3's seam: `/provider add` reads its key through the **hiding** prompt
-    /// and never off the command line.
+    /// and never off the command line — and, since the verify pass (M1), only
+    /// after the session's own default-no confirmation.
     ///
-    /// Three claims, one run:
+    /// Four claims, one run:
     ///
+    /// * the row's **first** question is the plain-prompt confirmation, and it
+    ///   names the settled registration — the id, the kind, the model and the
+    ///   endpoint — before any key is asked for;
     /// * the credential question went through [`Prompter::ask_secret`]
     ///   (`prompter.secrets`) and not [`Prompter::ask`] — the choice REQ-572
     ///   made and the one a later edit could silently swap back;
-    /// * it was the row's **only** question, so nothing else in this flow reads
-    ///   from the user at a point a key could be mistaken for an answer;
-    /// * an empty answer refuses, and the only method that reached the daemon is
-    ///   the duplicate probe — no `config/set`, so no registration and no
-    ///   reference to a key that does not exist.
+    /// * those two are the row's **only** questions, in that order, so nothing
+    ///   else in this flow reads from the user at a point a key could be
+    ///   mistaken for an answer;
+    /// * an empty key answer refuses, and the only method that reached the
+    ///   daemon is the duplicate probe — no `config/set`, so no registration and
+    ///   no reference to a key that does not exist.
     ///
-    /// The answer is empty **by necessity**, not for convenience: `provider_add_on`
-    /// stores through `keychain::default_keychain()`, which on macOS is the real
-    /// login keychain, and there is no seam that redirects it. A scripted
-    /// prompter that returned a value would therefore write a credential to
-    /// whoever's keychain ran `cargo test`. The completed store is asserted
-    /// where a keychain double *is* injectable — `main.rs`'s
-    /// `registration_params` / `report_registration_outcome` tests over
-    /// `MockKeychain` — and the terminal's echo bit in `pty_e2e.rs`.
+    /// The row is driven through the shipped dispatcher, which hands the body
+    /// the **real** keychain — so the key answer here is empty by necessity: a
+    /// value would go to whoever's login keychain ran `cargo test`. The
+    /// completed store, the wire bytes and the undo are asserted where the
+    /// keychain *is* a double: `main.rs`'s `provider_add_on` tests over
+    /// `MockKeychain` (M4). The terminal's echo bit is `pty_e2e.rs`'s.
     #[test]
     fn provider_add_reads_its_key_through_the_hiding_prompt_and_never_as_a_flag() {
         // A `--key` flag does not exist and must not: the credential would be in
@@ -1066,8 +1410,9 @@ mod tests {
         let (mut conn, peer) = Connection::scripted(&[empty_config()]);
         let mut surface = RecordingSurface::new();
         let mut state = SessionState::new();
-        // Empty: "nothing was typed", the one error `read_secret` has.
-        let mut prompter = ScriptedPrompter::new(&[""]);
+        // "y" to the confirmation, then empty for the key: "nothing was
+        // typed", the one error `read_secret` has.
+        let mut prompter = ScriptedPrompter::new(&["y", ""]);
         {
             let mut ctx = session_ctx(&mut surface, &mut state, &mut prompter, true);
             let outcome = run_mirrored_seamed(
@@ -1083,10 +1428,36 @@ mod tests {
         }
 
         assert_eq!(
+            prompter.asked, 2,
+            "the confirmation and the credential are the row's only questions: {:?}",
+            prompter.questions
+        );
+        let confirm = &prompter.questions[0];
+        assert!(confirm.contains("[y/N]"), "default-no: {confirm}");
+        for named in [
+            "kimi2",
+            "openai-compatible",
+            "kimi-k3",
+            "https://x/v1/chat/completions",
+        ] {
+            assert!(
+                confirm.contains(named),
+                "the confirmation must name `{named}`: {confirm}"
+            );
+        }
+        assert!(
+            confirm.contains("the key is read next"),
+            "the confirmation must say what a `y` consents to: {confirm}"
+        );
+        assert_eq!(
             prompter.secrets.len(),
             1,
             "the key must be read through `ask_secret`, once: {:?}",
             prompter.secrets
+        );
+        assert_eq!(
+            prompter.secrets[0], prompter.questions[1],
+            "the credential is the second question, through the hiding path"
         );
         assert!(
             prompter.secrets[0].contains("API key for `kimi2`")
@@ -1094,11 +1465,6 @@ mod tests {
             "the question must name the provider and promise not to show the \
              value: {:?}",
             prompter.secrets[0]
-        );
-        assert_eq!(
-            prompter.asked, 1,
-            "the credential is the row's only question: {:?}",
-            prompter.questions
         );
         let lines = surface.lines_of(LineKind::Error);
         assert_eq!(
@@ -1114,6 +1480,101 @@ mod tests {
             "a registration that got no key must send nothing but the duplicate \
              probe"
         );
+        conn.assert_all_consumed();
+    }
+
+    /// **T5.** The duplicate-id refusal through the session row: one line, the
+    /// probe is the only RPC, and no question is asked — the key is not read
+    /// for a registration that was never going to happen (BUG-155).
+    #[test]
+    fn a_duplicate_id_is_refused_through_the_session_row_before_any_question() {
+        let existing = teton_protocol::methods::ConfigGetResult {
+            snapshot: teton_protocol::methods::ConfigSnapshot {
+                providers: vec![teton_protocol::methods::ProviderConfig {
+                    id: teton_protocol::ProviderId::from("kimi"),
+                    kind: teton_protocol::ProviderKind::OpenaiCompatible,
+                    endpoint: Some("https://api.moonshot.ai/v1/chat/completions".to_owned()),
+                    model: Some("kimi-k3".to_owned()),
+                    auth_ref: Some("keychain://teton/kimi".to_owned()),
+                }],
+                ..Default::default()
+            },
+        };
+        let (mut conn, peer) = Connection::scripted(&[serde_json::to_value(existing).unwrap()]);
+        let mut surface = RecordingSurface::new();
+        let mut state = SessionState::new();
+        let mut prompter = ScriptedPrompter::new(&["y", "sk-would-not-be-read"]);
+        {
+            let mut ctx = session_ctx(&mut surface, &mut state, &mut prompter, true);
+            let outcome = run_mirrored_seamed(
+                PROVIDER_ADD,
+                "kimi --kind openai-compatible --endpoint https://x/v1/chat/completions \
+                 --model kimi-k3",
+                &mut conn,
+                &mut ctx,
+                false,
+            )
+            .expect("a refusal is not a failure of the command");
+            assert_eq!(outcome, CommandOutcome::Continue);
+        }
+        let lines = surface.lines_of(LineKind::Error);
+        assert_eq!(lines.len(), 1, "{:?}", surface.calls);
+        assert!(
+            lines[0].contains("`kimi` is already registered"),
+            "{}",
+            lines[0]
+        );
+        assert_eq!(methods_sent(&peer), vec!["config/get"]);
+        assert_eq!(
+            prompter.asked, 0,
+            "a duplicate id asks nothing: {:?}",
+            prompter.questions
+        );
+        conn.assert_all_consumed();
+    }
+
+    /// **m7.** An endpoint the registration seam refuses (REQ-578 BR-5) is a
+    /// rendered line and the session continues — the same sentence the shell
+    /// exits with, and no key read for a registration that was never going to
+    /// be stored.
+    #[test]
+    fn a_refused_endpoint_renders_the_seams_sentence_and_keeps_the_session() {
+        let (mut conn, peer) = Connection::scripted(&[empty_config()]);
+        let mut surface = RecordingSurface::new();
+        let mut state = SessionState::new();
+        let mut prompter = ScriptedPrompter::new(&["y", "sk-would-not-be-read"]);
+        {
+            let mut ctx = session_ctx(&mut surface, &mut state, &mut prompter, true);
+            let outcome = run_mirrored_seamed(
+                PROVIDER_ADD,
+                // A relative endpoint: not an absolute http(s) URL, which the
+                // seam refuses before any credential is asked for.
+                "kimi2 --kind openai-compatible --endpoint api.example/v1 --model kimi-k3",
+                &mut conn,
+                &mut ctx,
+                false,
+            )
+            .expect("a seam refusal is not a failure of the command");
+            assert_eq!(outcome, CommandOutcome::Continue);
+        }
+        let lines = surface.lines_of(LineKind::Error);
+        assert_eq!(lines.len(), 1, "{:?}", surface.calls);
+        let expected = match crate::settle_endpoint_text(
+            "kimi2",
+            teton_protocol::ProviderKind::OpenaiCompatible,
+            Some("api.example/v1"),
+        ) {
+            Err(sentence) => sentence,
+            Ok(_) => panic!("the seam refuses a relative endpoint"),
+        };
+        assert_eq!(lines[0], expected, "not the seam's own sentence");
+        assert_eq!(methods_sent(&peer), vec!["config/get"]);
+        assert_eq!(
+            prompter.asked, 0,
+            "a refused endpoint asks nothing: {:?}",
+            prompter.questions
+        );
+        conn.assert_all_consumed();
     }
 
     /// ADR-4's polarity, at this module's own gate. The seam only ever

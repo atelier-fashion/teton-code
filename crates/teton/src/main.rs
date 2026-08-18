@@ -419,22 +419,28 @@ fn main() -> ExitCode {
     }
 }
 
-/// What a `Command` that has a session command of its own, but is not one of the
-/// ten mirrored rows, says when it arrives at [`run_mirrored_command`].
+/// The one line [`run_mirrored_command`] renders for a `Command` that is not one
+/// of the ten mirrored rows (REQ-582 verify, m3/T12).
 ///
-/// Names the spelling rather than only refusing: a user who reached this line
-/// asked for something the session *can* do, under a name it does not answer to.
-fn session_spelling_line(twin: &str, spelling: &str) -> String {
+/// **Unreachable by construction.** The dispatcher's only caller is
+/// [`cli_rows::run_mirrored`], whose argv always opens with a mirrored row's own
+/// twin (`teton policy set-tier …`), so the parsed `Command` is always one of
+/// the ten. `teton cost`, `teton effort`, `teton model set`, `teton provider
+/// test` typed at the prompt run their own session rows through
+/// [`slash::run_cli_line`] without passing through here; `teton uninstall` and
+/// the retired `teton policy set` are refused by the classifier before any row
+/// runs ([`cli_rows::refusal_for_path`]). What is left is the six arms the
+/// exhaustive match still has to name, and one sentence is enough for all of
+/// them: it says nothing was run and points at `/help`, which lists what can be.
+/// A per-arm sentence here would be a second, unreachable copy of what the
+/// classifier already says — and the arms exist for the compiler, not the user.
+fn not_a_mirrored_row(spelling: &str) -> String {
     format!(
-        "`teton {twin}` is not one of this session's mirrored commands — `{spelling}` is what \
-         this session calls it."
+        "`teton {spelling}` is not one of the commands this session runs through its shell twin, \
+         so nothing was run — {}",
+        slash::HELP_HINT
     )
 }
-
-/// Why `uninstall` has no session form and never will (REQ-582 BR-4).
-const UNINSTALL_IS_SHELL_ONLY: &str = "`teton uninstall` is shell-only: it stops the daemon this \
-     session is attached to and deletes its data, so it would pull the floor out from under the \
-     session running it — run `teton uninstall` from a shell.";
 
 /// Run a parsed `Command` over a connection and context the caller already has
 /// (REQ-582 ADR-2 step 3).
@@ -447,8 +453,11 @@ const UNINSTALL_IS_SHELL_ONLY: &str = "`teton uninstall` is shell-only: it stops
 /// The match is **exhaustive with no wildcard**, which is the compile-time half
 /// of ADR-8's completeness property: a subcommand added later cannot ship
 /// without a decision about its session form. A variant that is not a mirrored
-/// row renders exactly one [`LineKind::Error`] line and returns `Ok` — never a
-/// panic, and never an `Err`, which would end the session that asked.
+/// row renders exactly one [`LineKind::Error`] line ([`not_a_mirrored_row`])
+/// and returns `Ok` — never a panic, and never an `Err`, which would end the
+/// session that asked. Those arms are unreachable from every caller that exists;
+/// the test that drives them calls this function directly with hand-built
+/// commands.
 ///
 /// `DaemonPaths` is re-read here rather than threaded through [`UiContext`]: it
 /// is a pure environment read that `run_session` already made, and a copy on the
@@ -458,8 +467,8 @@ const UNINSTALL_IS_SHELL_ONLY: &str = "`teton uninstall` is shell-only: it stops
 ///
 /// Propagates a transport error from whichever body ran; a daemon that answers
 /// is reported on the surface. [`cli_rows::run_mirrored`], its one caller,
-/// renders that error rather than propagating it — see there for why a session
-/// does not end on it.
+/// propagates it in turn, so a lost socket ends the session the way it ends
+/// `/cost`'s (REQ-582 verify, m7).
 pub(crate) fn run_mirrored_command(
     cmd: Command,
     conn: &mut Connection,
@@ -474,20 +483,34 @@ pub(crate) fn run_mirrored_command(
                 endpoint,
                 model,
             } => {
-                // ADR-3: the three refusals are outcomes here, not `bail!`s —
-                // one Error line, and the session carries on.
-                if let Err(refusal) = provider_add_on(conn, ctx, &id, kind.into(), endpoint, model)?
-                {
+                // ADR-3: the refusals are outcomes here, not `bail!`s — one
+                // Error line, and the session carries on. The consent mode is
+                // the session's: a default-no confirmation before the key is
+                // read, pre-answered by the session's own `--yes` exactly as
+                // `/model set`'s second confirmation is (verify M1). The
+                // keychain is the platform's, passed rather than built inside
+                // so the composed flow is drivable against a double (M4).
+                let consent = AddConsent::Session {
+                    assume_yes: ctx.auto_accept_model,
+                };
+                let keychain = keychain::default_keychain();
+                if let Err(refusal) = provider_add_on(
+                    conn,
+                    ctx,
+                    &id,
+                    kind.into(),
+                    endpoint,
+                    model,
+                    consent,
+                    keychain.as_ref(),
+                )? {
                     ctx.surface.line(LineKind::Error, &refusal.to_string());
                 }
                 Ok(())
             }
-            // A session row of its own since REQ-581, with its own consent gate.
             ProviderAction::Test { .. } => {
-                ctx.surface.line(
-                    LineKind::Error,
-                    &session_spelling_line("provider test", "/provider test"),
-                );
+                ctx.surface
+                    .line(LineKind::Error, &not_a_mirrored_row("provider test"));
                 Ok(())
             }
         },
@@ -507,25 +530,18 @@ pub(crate) fn run_mirrored_command(
                 provider,
                 fallback,
             } => policy_set_category_on(conn, ctx, category.0, &provider, fallback.as_deref()),
-            // Retired, and the existing sentence is the one that explains why —
-            // rendered as a line here for the same reason the `provider add`
-            // refusals are: an `Err` would end the session (AC-9's text, one
-            // copy of it).
             PolicyAction::Set { .. } => {
-                ctx.surface.line(LineKind::Error, POLICY_SET_RETIRED);
+                ctx.surface
+                    .line(LineKind::Error, &not_a_mirrored_row("policy set"));
                 Ok(())
             }
         },
         Command::Model { action } => match action {
             ModelAction::List => model_list_on(conn, ctx),
             ModelAction::Status => model_status_on(&socket_path::daemon_paths(), conn, ctx),
-            // `/model set` is REQ-555's row, with the typed-input gate and the
-            // above-RAM-floor confirmation the session already owns.
             ModelAction::Set { .. } => {
-                ctx.surface.line(
-                    LineKind::Error,
-                    &session_spelling_line("model set", "/model set"),
-                );
+                ctx.surface
+                    .line(LineKind::Error, &not_a_mirrored_row("model set"));
                 Ok(())
             }
         },
@@ -538,16 +554,17 @@ pub(crate) fn run_mirrored_command(
         }
         Command::Cost => {
             ctx.surface
-                .line(LineKind::Error, &session_spelling_line("cost", "/cost"));
+                .line(LineKind::Error, &not_a_mirrored_row("cost"));
             Ok(())
         }
         Command::Effort { .. } => {
             ctx.surface
-                .line(LineKind::Error, &session_spelling_line("effort", "/effort"));
+                .line(LineKind::Error, &not_a_mirrored_row("effort"));
             Ok(())
         }
         Command::Uninstall { .. } => {
-            ctx.surface.line(LineKind::Error, UNINSTALL_IS_SHELL_ONLY);
+            ctx.surface
+                .line(LineKind::Error, &not_a_mirrored_row("uninstall"));
             Ok(())
         }
     }
@@ -812,15 +829,19 @@ fn render_turn_failure(err: &RpcError, surface: &mut dyn Surface) {
 /// The one notice a recognized `teton …` line prints before its row runs
 /// (REQ-582 BR-4 / AC-5).
 ///
-/// `teton provider list → /provider list`: what was typed, and the spelling this
-/// session uses for it. It is a [`LineKind::Notice`] because that is the class
-/// for "a control decision was made and here it is" — the surface draws it as
-/// `>> …` — and it is one line because the answer the user actually asked for
-/// follows it immediately.
+/// `teton provider list → /provider list`: the canonical `teton` spelling of the
+/// row that ran, and the `/` spelling this session uses for it. "Canonical"
+/// rather than "as typed" — the row name is what clap's walk resolved the line
+/// to, so extra whitespace, a leading global flag and (were one ever declared)
+/// a subcommand alias all render as the one spelling `/help` lists (verify
+/// m11). It is a [`LineKind::Notice`] because that is the class for "a control
+/// decision was made and here it is" — the surface draws it as `>> …` — and it
+/// is one line because the answer the user actually asked for follows it
+/// immediately.
 ///
 /// Both halves come from the row name, which *is* the subcommand path clap
 /// walked to (ADR-1), so the line cannot name a `/` spelling that does not
-/// dispatch or a `teton` spelling the user did not type.
+/// dispatch.
 fn cli_line_note(name: &str) -> String {
     format!("teton {name} → /{name}")
 }
@@ -988,12 +1009,21 @@ fn run_session(paths: &DaemonPaths, auto_accept: bool, verbose: bool) -> anyhow:
                 // connection this session already holds (D-4). Spawning the
                 // binary instead would announce an attach into the very session
                 // that typed the line (BUG-177's shape).
-                slash::Input::CliLine { name, args } => {
+                slash::Input::CliLine {
+                    name,
+                    args,
+                    shell_flags,
+                } => {
                     // First, and always: the line the user typed is not the
                     // spelling this session uses, and one notice is how they
-                    // learn the one that is (AC-5).
+                    // learn the one that is (AC-5). Then the row, through
+                    // `run_cli_line` rather than `dispatch` directly: a row
+                    // that predates this REQ (`/model set`, `/effort`, …) has
+                    // its whole typed argv validated by the binary's own parser
+                    // first, so `teton model set qwen --yes` cannot hand the
+                    // row "qwen --yes" as a model name (verify M2).
                     ctx.surface.line(LineKind::Notice, &cli_line_note(name));
-                    match slash::dispatch(name, args, &mut conn, &mut ctx)? {
+                    match slash::run_cli_line(name, args, shell_flags, &mut conn, &mut ctx)? {
                         slash::CommandOutcome::Continue => continue,
                         slash::CommandOutcome::Quit => break,
                     }
@@ -1003,6 +1033,14 @@ fn run_session(paths: &DaemonPaths, auto_accept: bool, verbose: bool) -> anyhow:
                 // clap tree that recognized the path (BR-4). No RPC, no turn.
                 slash::Input::CliRefused(refusal) => {
                     ctx.surface.line(LineKind::Error, &refusal);
+                    continue;
+                }
+                // `teton provider --help`: the parser's own help page for that
+                // family, rendered as information — a user who asked for help
+                // got what they asked for, and no line of it is an error
+                // (verify T6). No RPC, no turn.
+                slash::Input::CliHelp(text) => {
+                    cli_rows::render_clap_text(&text, false, &mut *ctx.surface);
                     continue;
                 }
                 // The escape hatch has already collapsed its leading pair
@@ -1722,6 +1760,16 @@ fn run_effort(paths: &DaemonPaths, level: Option<&str>) -> anyhow::Result<()> {
 /// [`LineKind::Error`] line and carries on. The **text** is identical either
 /// way, which is what AC-1's byte-parity and AC-2/AC-3's effect parity each
 /// assert about a different half of this command.
+///
+/// The verify pass (m7) added the two *failures* that are likewise not the
+/// session's to end on: an endpoint the registration seam refuses (REQ-578
+/// BR-5) and a keychain that will not store. Both are "this registration did
+/// not happen, and here is why" — the same shape as the three decisions above,
+/// and the same channel: a shell exits non-zero with the sentence, a session
+/// prints it and carries on. Only a **transport** failure stays an `Err` out of
+/// [`provider_add_on`], because a lost socket ends every command's session the
+/// same way (`/cost`'s included), and a body that swallowed it would report a
+/// dead connection one command later than the loop would.
 #[derive(Debug)]
 pub(crate) enum ProviderAddRefusal {
     /// A remote provider with no `--model` (REQ-557 BR-1).
@@ -1736,6 +1784,13 @@ pub(crate) enum ProviderAddRefusal {
     },
     /// No credential was supplied — an empty answer, or EOF at the prompt.
     NoKey,
+    /// The registration seam refused the endpoint (REQ-578 BR-5): the sentence
+    /// [`settle_endpoint_text`] composed, which already ends by saying nothing
+    /// was changed and no credential was read.
+    Endpoint(String),
+    /// The keychain would not store the credential. Nothing was registered and
+    /// nothing is left in the keychain — the store is what failed.
+    KeychainStore(String),
 }
 
 impl std::fmt::Display for ProviderAddRefusal {
@@ -1757,8 +1812,70 @@ impl std::fmt::Display for ProviderAddRefusal {
                 f,
                 "no API key provided; set TETON_PROVIDER_KEY or enter the key"
             ),
+            // Verbatim: this is the sentence the shell printed for the same
+            // refusal before it travelled as a value, and the e2e suite pins
+            // fragments of it against the real binary.
+            Self::Endpoint(sentence) => f.write_str(sentence),
+            Self::KeychainStore(sentence) => f.write_str(sentence),
         }
     }
+}
+
+/// Who is running `provider add`, and therefore whether the flow asks before it
+/// reads a key (REQ-582 verify, M1).
+///
+/// A shell command line is its own consent: the user typed `teton provider add
+/// … --model …` and pressed return, and the next thing the shell reads is the
+/// key. A session line is not — a multi-line paste that opens with `/provider
+/// add …` hands its **second line** to the credential prompt, echo-off, and the
+/// flow would store whatever it was in the keychain and register a provider
+/// against it before the user saw a question. So the session confirms first,
+/// default-no, with the settled endpoint on screen ([`AddConsent::Session`]),
+/// and a paste answers "no" by not being `y`. The shell's bytes are unchanged
+/// (`cli_e2e` is the net for that).
+///
+/// `assume_yes` is the session's own `--yes` (`ctx.auto_accept_model`), which
+/// pre-answers this question exactly as it pre-answers `/model set`'s
+/// above-RAM-floor confirmation (REQ-555 BR-4b): the flag is the explicit
+/// unattended stand-in for a typed answer, and it consumes no input line.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum AddConsent {
+    /// `teton provider add` from a shell: no confirmation; the command line was
+    /// the consent.
+    Shell,
+    /// `/provider add` in a session: confirm before the key is read.
+    Session {
+        /// The session's `--yes`, pre-answering the confirmation.
+        assume_yes: bool,
+    },
+}
+
+/// The default-no question the session asks before it reads a key.
+///
+/// It names everything the registration will do — the id, the kind, the model,
+/// and the endpoint the request will reach, through the same masking renderer
+/// every other endpoint line uses ([`escaped_endpoint`]; LESSON-529/535: a
+/// preview is a surface, and a display that names a host the request will not
+/// reach is worse than none) — and says what happens next, so a "y" is consent
+/// to the read as well as to the write.
+fn provider_add_question(settled: &SettledRegistration) -> String {
+    let endpoint = settled
+        .endpoint
+        .as_deref()
+        .map_or_else(|| "(no endpoint)".to_owned(), escaped_endpoint);
+    let model = settled.model.as_deref().unwrap_or("(no model)");
+    format!(
+        "  register `{}` ({}, {model}) at {endpoint}? the key is read next, echo-off, into the \
+         keychain [y/N] ",
+        settled.id,
+        kind_label(settled.kind)
+    )
+}
+
+/// What the session says when the confirmation is declined: one line, and it
+/// says exactly what did not happen — no registration, and no key read.
+fn provider_add_declined_line(id: &str) -> String {
+    format!("provider `{id}`: nothing registered; no key read.")
 }
 
 /// REQ-557 BR-1 / TASK-046: a remote provider MUST declare its model.
@@ -1803,27 +1920,47 @@ fn run_provider_add(
     let mut state = SessionState::new();
     let mut prompter = StdinPrompter::new();
     let mut ctx = passive_ctx(&mut surface, &mut state, &mut prompter);
-    match provider_add_on(&mut conn, &mut ctx, id, kind, endpoint, model)? {
+    let keychain = keychain::default_keychain();
+    match provider_add_on(
+        &mut conn,
+        &mut ctx,
+        id,
+        kind,
+        endpoint,
+        model,
+        AddConsent::Shell,
+        keychain.as_ref(),
+    )? {
         Ok(()) => Ok(()),
         Err(refusal) => anyhow::bail!("{refusal}"),
     }
 }
 
 /// The body of `provider add`: the refusals, the composition echo, the
-/// credential, and the registration (REQ-582 BR-2, ADR-3).
+/// consent, the credential, and the registration (REQ-582 BR-2, ADR-3).
 ///
 /// **The order of the steps is the specification.** Model check → duplicate
-/// probe → endpoint settlement → credential → prior-key read → payload → call →
-/// outcome report. BUG-155, BUG-171 and REQ-578 each pin a different edge of it,
-/// and the comments below say which; nothing here may be reordered without
-/// re-reading them.
+/// probe → endpoint settlement → session consent → credential → prior-key read
+/// → payload → call → outcome report. BUG-155, BUG-171 and REQ-578 each pin a
+/// different edge of it, and the comments below say which; nothing here may be
+/// reordered without re-reading them.
+///
+/// `keychain` is the caller's ([`keychain::default_keychain`] from both the
+/// shell wrapper and the session dispatcher) rather than built here, so the
+/// composed read → store → `config/set` path — and the undo a refused
+/// `config/set` owes the machine (BUG-171) — is drivable against
+/// `MockKeychain` without a real login keychain in the loop (verify M4).
 ///
 /// # Errors
 ///
-/// Propagates a transport failure, an endpoint the registration seam refuses
-/// (REQ-578 BR-5), and a keychain that cannot store — the errors a shell exits
-/// non-zero on. The three *decisions* travel as [`ProviderAddRefusal`] instead,
-/// so the session can render them without ending (ADR-3).
+/// Propagates a **transport** failure and nothing else: the socket going away
+/// ends the session the way it ends `/cost`'s. Every decision *and* every
+/// non-transport failure — the model check, the duplicate probe, an endpoint
+/// the registration seam refuses (REQ-578 BR-5), a declined key, a keychain that
+/// cannot store — travels as [`ProviderAddRefusal`], so the shell can `bail!`
+/// with the sentence and the session can render it without ending (ADR-3;
+/// verify m7).
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn provider_add_on(
     conn: &mut Connection,
     ctx: &mut UiContext<'_>,
@@ -1831,6 +1968,8 @@ pub(crate) fn provider_add_on(
     kind: ProviderKind,
     endpoint: Option<String>,
     model: Option<String>,
+    consent: AddConsent,
+    keychain: &dyn Keychain,
 ) -> anyhow::Result<Result<(), ProviderAddRefusal>> {
     // REQ-557 BR-1 / TASK-046: a remote provider MUST declare its model, and the
     // check runs BEFORE `read_secret` — otherwise the user types a credential
@@ -1886,32 +2025,70 @@ pub(crate) fn provider_add_on(
     // changing `registration_params`' signature, and
     // `the_endpoint_that_is_echoed_is_the_endpoint_that_is_registered` drives
     // both of these functions, so a mutation inside either one fails.
-    let settled = settle_registration(id, kind, endpoint, model, &mut *ctx.surface)?;
+    // The seam's refusal is a sentence composed for a user, and it already ends
+    // "nothing was changed and no credential was read" — true here, since the
+    // key is not asked for until the step after this one. A refusal rather than
+    // an `Err` so a mistyped `--endpoint` does not end the session (m7).
+    let settled = match settle_registration(id, kind, endpoint, model, &mut *ctx.surface) {
+        Ok(settled) => settled,
+        Err(refused) => return Ok(Err(ProviderAddRefusal::Endpoint(format!("{refused:#}")))),
+    };
 
-    let keychain = keychain::default_keychain();
     // Local providers have no credential; every remote kind requires a key.
-    //
+    let needs_key = !matches!(kind, ProviderKind::Local);
+
+    // REQ-582 verify M1: the session confirms **before** the key is read, and
+    // only when a key is about to be. Everything the user needs in order to
+    // decide is on screen by now — the echo of the composed endpoint, the
+    // cleartext warning — and the question names the settled registration once
+    // more, so a "y" typed here is consent to exactly what will be stored. A
+    // shell asks nothing: its command line was the consent, and its bytes are
+    // pinned by the e2e suite. A local registration asks nothing either: there
+    // is no key to protect a pasted second line from becoming, and the write
+    // itself already passed the typed-input gate.
+    if needs_key {
+        if let AddConsent::Session { assume_yes } = consent {
+            let confirmed = assume_yes
+                || matches!(
+                    ctx.prompter.ask(&provider_add_question(&settled)),
+                    Some(answer) if prompt::is_yes(&answer)
+                );
+            if !confirmed {
+                ctx.surface
+                    .line(LineKind::Info, &provider_add_declined_line(id));
+                return Ok(Ok(()));
+            }
+        }
+    }
+
     // The prompter is the caller's (ADR-3): `StdinPrompter` under the shell's
     // passive context, and the session's own dialogue prompter under `/provider
     // add` — echo-off on both, because that is [`read_secret`]'s choice and not
     // this call site's.
-    let secret = if matches!(kind, ProviderKind::Local) {
-        None
-    } else {
+    let secret = if needs_key {
         // The only error `read_secret` has is "nothing was typed", so it becomes
         // the refusal rather than an `Err` that would end a session.
         match read_secret(id, &mut *ctx.prompter) {
             Ok(secret) => Some(secret),
             Err(_) => return Ok(Err(ProviderAddRefusal::NoKey)),
         }
+    } else {
+        None
     };
     // What the store inside `build_provider_registration` is about to displace,
     // read in the same breath — the store destroys the answer, and a rejected
     // registration owes the machine an undo decided by exactly this (BUG-171).
-    let prior = secret
-        .as_ref()
-        .map(|_| PriorKey::read(keychain.as_ref(), id));
-    let prepared = registration_params(&settled, keychain.as_ref(), secret.as_deref())?;
+    let prior = secret.as_ref().map(|_| PriorKey::read(keychain, id));
+    // A store the keychain refuses leaves nothing behind — the store is what
+    // failed — so there is nothing to undo, only a sentence to render (m7).
+    let prepared = match registration_params(&settled, keychain, secret.as_deref()) {
+        Ok(prepared) => prepared,
+        Err(failed) => {
+            return Ok(Err(ProviderAddRefusal::KeychainStore(format!(
+                "{failed:#}"
+            ))))
+        }
+    };
     let PreparedRegistration { params, auth } = prepared;
 
     // Bound rather than `?`-ed past: a transport failure is not the same event
@@ -1926,7 +2103,7 @@ pub(crate) fn provider_add_on(
                 kind,
                 &auth,
                 prior.as_ref(),
-                keychain.as_ref(),
+                keychain,
                 ctx.surface,
             );
             Ok(Ok(()))
@@ -2149,7 +2326,13 @@ pub(crate) fn boundary_list_on(
 /// It deliberately does not map their phase to a tier for them: the CLI holds no
 /// routing logic (BR-4), and a phase→tier table written here to be helpful would
 /// be a second copy of `categories_for_phase` (ADR-F).
-const POLICY_SET_RETIRED: &str = "`teton policy set <phase> <provider>` is retired. Routing \
+///
+/// `pub(crate)` since REQ-582's verify pass (m6): a `teton policy set …` typed at
+/// the session prompt walks clap's tree to this hidden leaf, and the classifier
+/// answers with this sentence rather than a generic "no session form" — the
+/// user's mistake is the retired axis, and this is the one text that says so.
+pub(crate) const POLICY_SET_RETIRED: &str =
+    "`teton policy set <phase> <provider>` is retired. Routing \
      dispatches on what a call is *for* — classify, summarize, edit, critique — not on where in \
      the lifecycle it happens, so a phase is no longer something to route. Bind a tier with \
      `teton policy set-tier <reflex|scan|build|think> <provider>`, or one category with \
@@ -4366,10 +4549,13 @@ mod tests {
         let mut fresh = RecordingSurface::new();
         doctor_preamble(&paths, &DoctorAttach::Fresh(handshook()), &mut fresh);
         let mut session = RecordingSurface::new();
+        // A name that is **not** the `daemon_line` fallback literal (verify
+        // T13): a mutation that ignored the field and printed the fallback would
+        // otherwise pass this test by coincidence.
         doctor_preamble(
             &paths,
             &DoctorAttach::Session {
-                daemon_name: Some("teton-code".to_owned()),
+                daemon_name: Some("teton-code-test".to_owned()),
                 daemon_version: Some("0.1.20".to_owned()),
             },
             &mut session,
@@ -4399,7 +4585,7 @@ mod tests {
         );
         assert_eq!(
             session_lines[3],
-            "daemon: running — teton-code 0.1.20 (this session's connection)"
+            "daemon: running — teton-code-test 0.1.20 (this session's connection)"
         );
         // The header is the shell's, byte for byte, on both paths — this is the
         // half of AC-1 the `/doctor` carve-out does not excuse.
@@ -4423,21 +4609,583 @@ mod tests {
         assert!(line.starts_with("daemon: running — teton-code"), "{line}");
     }
 
-    /// The lines `run_mirrored_command` renders for a `Command` that is not a
-    /// mirrored row: one line, naming what to type instead, and never a panic.
+    /// **T1.** `doctor_report_on`'s two `config/get` failure arms, on both
+    /// attach modes: a daemon too old for the method says so as a notice, and
+    /// any other refusal is an error line — with the report's header, daemon
+    /// line and trailer around them either way. The arms are the shell's own
+    /// wording (BR-2), and until this test only the success arm had been driven
+    /// through the session's `/doctor`.
     #[test]
-    fn a_command_that_is_not_a_mirrored_row_names_its_session_spelling() {
-        let line = session_spelling_line("cost", "/cost");
-        assert!(line.contains("`teton cost`"), "{line}");
-        assert!(line.contains("`/cost`"), "{line}");
-        // `uninstall` is the one with no session spelling at all, and its line
-        // says why rather than pointing at a command that does not exist.
-        assert!(UNINSTALL_IS_SHELL_ONLY.contains("shell-only"));
-        assert!(UNINSTALL_IS_SHELL_ONLY.contains("teton uninstall"));
-        assert!(
-            !UNINSTALL_IS_SHELL_ONLY.contains("/uninstall"),
-            "there is no session spelling to name"
+    fn doctor_reports_a_config_query_the_daemon_refused_on_both_attach_modes() {
+        let paths = doctor_paths();
+        let too_old = RpcError {
+            code: error_code::METHOD_NOT_FOUND,
+            message: "no such method".to_owned(),
+            data: None,
+        };
+        let refused = RpcError {
+            code: error_code::INTERNAL_ERROR,
+            message: "config is locked".to_owned(),
+            data: None,
+        };
+        let attaches = || {
+            [
+                DoctorAttach::Fresh(handshook()),
+                DoctorAttach::Session {
+                    daemon_name: Some("teton-code-test".to_owned()),
+                    daemon_version: Some("0.1.20".to_owned()),
+                },
+            ]
+        };
+        for attach in attaches() {
+            let (mut conn, peer) = Connection::scripted_replies(vec![Err(too_old.clone())]);
+            let mut surface = RecordingSurface::new();
+            let mut state = SessionState::new();
+            let mut prompter = ScriptedPrompter::new(&[]);
+            {
+                let mut ctx = passive_ctx(&mut surface, &mut state, &mut prompter);
+                doctor_report_on(&paths, &mut conn, &mut ctx, &attach)
+                    .expect("a daemon that answers is reported, not failed on");
+            }
+            assert_eq!(client::methods_written(&peer), vec!["config/get"]);
+            assert!(
+                surface
+                    .lines_of(LineKind::Notice)
+                    .iter()
+                    .any(|line| line.contains("config: not exposed by this daemon build")),
+                "{:?}",
+                surface.calls
+            );
+            assert!(
+                surface.lines_of(LineKind::Error).is_empty(),
+                "{:?}",
+                surface.calls
+            );
+            // The report is still whole around it: header first, trailer last.
+            assert_eq!(surface.lines_of(LineKind::Info)[0], "teton doctor");
+            assert!(
+                surface
+                    .lines_of(LineKind::Notice)
+                    .last()
+                    .is_some_and(|line| line.starts_with("providers:")),
+                "{:?}",
+                surface.calls
+            );
+            conn.assert_all_consumed();
+        }
+        for attach in attaches() {
+            let (mut conn, peer) = Connection::scripted_replies(vec![Err(refused.clone())]);
+            let mut surface = RecordingSurface::new();
+            let mut state = SessionState::new();
+            let mut prompter = ScriptedPrompter::new(&[]);
+            {
+                let mut ctx = passive_ctx(&mut surface, &mut state, &mut prompter);
+                doctor_report_on(&paths, &mut conn, &mut ctx, &attach)
+                    .expect("a daemon that answers is reported, not failed on");
+            }
+            assert_eq!(client::methods_written(&peer), vec!["config/get"]);
+            assert_eq!(
+                surface.lines_of(LineKind::Error),
+                vec!["config query failed: config is locked"],
+                "{:?}",
+                surface.calls
+            );
+            assert!(
+                surface
+                    .lines_of(LineKind::Info)
+                    .iter()
+                    .any(|line| line.starts_with("daemon: running — ")),
+                "{:?}",
+                surface.calls
+            );
+            conn.assert_all_consumed();
+        }
+    }
+
+    /// **m3 / T12.** The six arms of `run_mirrored_command` that no caller can
+    /// reach — a `Command` that is not one of the ten mirrored rows — each
+    /// render one line, send nothing, and never `Err` or panic. Driven by
+    /// calling the dispatcher directly with hand-built commands, since that is
+    /// the only way to reach them: the classifier refuses `uninstall` and the
+    /// retired `policy set` before any row runs, and the four pre-REQ rows go
+    /// through `run_cli_line` to their own handlers.
+    #[test]
+    fn a_command_that_is_not_a_mirrored_row_renders_one_line_and_runs_nothing() {
+        let unreachable: Vec<(Command, &str)> = vec![
+            (Command::Cost, "cost"),
+            (Command::Effort { level: None }, "effort"),
+            (
+                Command::Model {
+                    action: ModelAction::Set {
+                        name: "qwen".to_owned(),
+                    },
+                },
+                "model set",
+            ),
+            (
+                Command::Provider {
+                    action: ProviderAction::Test {
+                        id: "kimi".to_owned(),
+                    },
+                },
+                "provider test",
+            ),
+            (
+                Command::Policy {
+                    action: PolicyAction::Set { args: Vec::new() },
+                },
+                "policy set",
+            ),
+            (Command::Uninstall { keep_data: false }, "uninstall"),
+        ];
+        for (command, spelling) in unreachable {
+            let (mut conn, peer) = Connection::scripted(&[]);
+            let mut surface = RecordingSurface::new();
+            let mut state = SessionState::new();
+            let mut prompter = ScriptedPrompter::new(&["y"]);
+            {
+                let mut ctx = passive_ctx(&mut surface, &mut state, &mut prompter);
+                run_mirrored_command(command, &mut conn, &mut ctx)
+                    .unwrap_or_else(|err| panic!("`teton {spelling}` failed: {err:#}"));
+            }
+            let lines = surface.lines_of(LineKind::Error);
+            assert_eq!(
+                lines,
+                vec![not_a_mirrored_row(spelling)],
+                "`teton {spelling}`: {:?}",
+                surface.calls
+            );
+            assert_eq!(
+                surface.calls.len(),
+                1,
+                "one line, and only one: {:?}",
+                surface.calls
+            );
+            assert!(
+                lines[0].contains(&format!("`teton {spelling}`")),
+                "{}",
+                lines[0]
+            );
+            assert!(lines[0].contains("/help"), "{}", lines[0]);
+            // No "mirrored" in a user-facing sentence (verify m14).
+            assert!(!lines[0].contains("mirrored"), "{}", lines[0]);
+            assert!(
+                client::methods_written(&peer).is_empty(),
+                "`teton {spelling}` reached the daemon"
+            );
+            assert_eq!(prompter.asked, 0, "`teton {spelling}` asked a question");
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // REQ-582 verify M1/M4: `provider_add_on`, composed, against a keychain
+    // double — the read → store → `config/set` path and the session's consent
+    // before it, which the pty suite cannot walk without writing to a real
+    // login keychain.
+    // -----------------------------------------------------------------------
+
+    /// The credential the composed tests type. Distinctive, so a sweep of the
+    /// wire and the surface for it means something (LESSON-519).
+    const TYPED_KEY: &str = "sk-composed-provider-add-9Qm2vX";
+
+    /// The provider these tests register: id, kind, endpoint, model — the shape
+    /// AC-3 names, with a full request URL so the seam stores it as typed.
+    const ADD_ID: &str = "kimi";
+    const ADD_ENDPOINT: &str = "https://api.moonshot.ai/v1/chat/completions";
+    const ADD_MODEL: &str = "kimi-k3";
+
+    /// A daemon that knows no provider named [`ADD_ID`] — the duplicate probe's
+    /// answer that lets a registration proceed.
+    fn no_such_provider() -> serde_json::Value {
+        serde_json::to_value(teton_protocol::methods::ConfigGetResult::default())
+            .expect("a config snapshot serializes")
+    }
+
+    /// `config/set`'s "applied" answer.
+    fn applied() -> serde_json::Value {
+        serde_json::to_value(ConfigSetResult { applied: true }).expect("a set result serializes")
+    }
+
+    /// Run `provider_add_on` for [`ADD_ID`] under the session's consent mode,
+    /// with `answers` scripted on the session's prompter and `replies` scripted
+    /// on the connection. Returns what was rendered, what was asked, and the
+    /// frames that reached the socket; the keychain is the caller's, so the
+    /// caller can read it afterwards.
+    #[allow(clippy::type_complexity)]
+    fn add_in_session(
+        answers: &[&str],
+        replies: Vec<Result<serde_json::Value, RpcError>>,
+        assume_yes: bool,
+        keychain: &MockKeychain,
+    ) -> (
+        Result<(), ProviderAddRefusal>,
+        RecordingSurface,
+        ScriptedPrompter,
+        Vec<serde_json::Value>,
+    ) {
+        let (mut conn, peer) = Connection::scripted_replies(replies);
+        let mut surface = RecordingSurface::new();
+        let mut state = SessionState::new();
+        let mut prompter = ScriptedPrompter::new(answers);
+        let outcome = {
+            let mut ctx = UiContext {
+                surface: &mut surface,
+                state: &mut state,
+                prompter: &mut prompter,
+                answer_permissions: true,
+                answer_model_proposals: true,
+                auto_accept_model: assume_yes,
+                typed_input: true,
+                session_id: None,
+            };
+            provider_add_on(
+                &mut conn,
+                &mut ctx,
+                ADD_ID,
+                ProviderKind::OpenaiCompatible,
+                Some(ADD_ENDPOINT.to_owned()),
+                Some(ADD_MODEL.to_owned()),
+                AddConsent::Session { assume_yes },
+                keychain,
+            )
+            .expect("no transport failure was scripted")
+        };
+        conn.assert_all_consumed();
+        (outcome, surface, prompter, client::requests_written(&peer))
+    }
+
+    /// Whether `TETON_PROVIDER_KEY` is exported in this process — in which case
+    /// `read_secret` never reaches the prompter and every count of secret
+    /// questions below would be off by one. The e2e suite removes it from every
+    /// child's environment; a developer who exports it must still run the tests
+    /// CI runs, so the tests that read a key return early rather than fail
+    /// (the same guard `read_secret_asks_the_callers_prompter_and_never_echoes`
+    /// takes).
+    fn provider_key_exported() -> bool {
+        std::env::var("TETON_PROVIDER_KEY").is_ok_and(|key| !key.trim().is_empty())
+    }
+
+    /// Every byte the socket saw, as one string — the haystack for "the key
+    /// never crossed the wire".
+    fn wire_text(frames: &[serde_json::Value]) -> String {
+        frames
+            .iter()
+            .map(|frame| frame.to_string())
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    /// **M1.** The session confirms, default-no, **before** the key is read.
+    /// "n", an empty answer, and a second pasted command line all decline:
+    /// `ask_secret` is never called, the keychain is untouched, no `config/set`
+    /// goes on the socket, and the one line says exactly that.
+    #[test]
+    fn a_declined_session_provider_add_reads_no_key_and_stores_nothing() {
+        for (case, answer) in [
+            ("an explicit no", "n"),
+            ("an empty answer", ""),
+            ("the second line of a paste", "teton policy show"),
+        ] {
+            let kc = MockKeychain::new();
+            let (outcome, surface, prompter, frames) =
+                add_in_session(&[answer], vec![Ok(no_such_provider())], false, &kc);
+
+            assert!(
+                outcome.is_ok(),
+                "{case}: a decline is not a refusal: {outcome:?}"
+            );
+            // The confirmation was asked, plainly, once — and nothing after it.
+            assert_eq!(
+                prompter.asked, 1,
+                "{case}: one question, the confirmation: {:?}",
+                prompter.questions
+            );
+            assert!(
+                prompter.secrets.is_empty(),
+                "{case}: `ask_secret` was called after a decline: {:?}",
+                prompter.secrets
+            );
+            let question = &prompter.questions[0];
+            assert!(
+                question.ends_with("[y/N] "),
+                "{case}: default-no: {question}"
+            );
+            for named in [ADD_ID, "openai-compatible", ADD_MODEL, ADD_ENDPOINT] {
+                assert!(
+                    question.contains(named),
+                    "{case}: the question must name `{named}`: {question}"
+                );
+            }
+            // Nothing stored, nothing registered: the probe is the only frame.
+            assert!(kc.is_empty(), "{case}: the keychain gained an entry");
+            assert_eq!(
+                frames.len(),
+                1,
+                "{case}: only the duplicate probe may reach the socket: {frames:?}"
+            );
+            assert_eq!(frames[0]["method"], "config/get");
+            // One Info line, saying what did not happen; no error.
+            assert_eq!(
+                surface.lines_of(LineKind::Info),
+                vec![provider_add_declined_line(ADD_ID)],
+                "{case}: {:?}",
+                surface.calls
+            );
+            assert!(
+                surface.lines_of(LineKind::Info)[0].contains("nothing registered")
+                    && surface.lines_of(LineKind::Info)[0].contains("no key read"),
+                "{case}: {:?}",
+                surface.calls
+            );
+            assert!(
+                surface.lines_of(LineKind::Error).is_empty(),
+                "{case}: {:?}",
+                surface.calls
+            );
+        }
+    }
+
+    /// **M1's other half, and M4.** A "y" proceeds: the key is read through the
+    /// hiding prompt, reaches the mock under the account the shell path uses,
+    /// the `config/set` on the socket carries `keychain://teton/<id>` and no raw
+    /// key, and neither the wire nor any surface line ever contains the key.
+    #[test]
+    fn a_confirmed_session_provider_add_stores_the_key_and_registers_by_reference() {
+        if provider_key_exported() {
+            return;
+        }
+        let kc = MockKeychain::new();
+        let (outcome, surface, prompter, frames) = add_in_session(
+            &["y", TYPED_KEY],
+            vec![Ok(no_such_provider()), Ok(applied())],
+            false,
+            &kc,
         );
+
+        assert!(outcome.is_ok(), "{outcome:?}");
+        // The confirmation first, plainly; the key second, hidden.
+        assert_eq!(prompter.asked, 2, "{:?}", prompter.questions);
+        assert!(prompter.questions[0].contains("[y/N]"));
+        assert_eq!(prompter.secrets, vec![prompter.questions[1].clone()]);
+        assert!(prompter.secrets[0].contains("API key for `kimi`"));
+
+        // The key reached the mock, under the shell path's account (the id).
+        assert_eq!(kc.stored_secret(ADD_ID).as_deref(), Some(TYPED_KEY));
+        assert!(kc.deletes().is_empty(), "nothing was taken back out");
+
+        // The wire: the probe, then the registration — with the reference and
+        // never the key.
+        assert_eq!(frames.len(), 2, "{frames:?}");
+        assert_eq!(frames[0]["method"], "config/get");
+        assert_eq!(frames[1]["method"], "config/set");
+        let params = frames[1]["params"].to_string();
+        assert!(
+            params.contains(&format!("keychain://teton/{ADD_ID}")),
+            "the registration must carry the keychain reference: {params}"
+        );
+        assert!(
+            params.contains(ADD_ENDPOINT) && params.contains(ADD_MODEL),
+            "the registration must carry the settled endpoint and model: {params}"
+        );
+        assert!(
+            !wire_text(&frames).contains(TYPED_KEY),
+            "the key crossed the wire: {}",
+            wire_text(&frames)
+        );
+        // And no surface line — question, echo, report — carries it either.
+        for call in &surface.calls {
+            let text = format!("{call:?}");
+            assert!(
+                !text.contains(TYPED_KEY),
+                "the key reached the surface: {text}"
+            );
+        }
+        for question in &prompter.questions {
+            assert!(
+                !question.contains(TYPED_KEY),
+                "the key was asked back: {question}"
+            );
+        }
+        assert!(
+            surface
+                .lines_of(LineKind::Info)
+                .iter()
+                .any(|line| line.contains("registered") && line.contains("keychain")),
+            "the success line must say the key went to the keychain: {:?}",
+            surface.calls
+        );
+    }
+
+    /// **M1.** The session's own `--yes` pre-answers the confirmation and
+    /// consumes no input line: the key is the first and only thing asked for.
+    #[test]
+    fn the_sessions_yes_pre_answers_the_provider_add_confirmation() {
+        if provider_key_exported() {
+            return;
+        }
+        let kc = MockKeychain::new();
+        let (outcome, _surface, prompter, frames) = add_in_session(
+            &[TYPED_KEY],
+            vec![Ok(no_such_provider()), Ok(applied())],
+            true,
+            &kc,
+        );
+        assert!(outcome.is_ok(), "{outcome:?}");
+        assert_eq!(prompter.asked, 1, "{:?}", prompter.questions);
+        assert_eq!(prompter.secrets.len(), 1);
+        assert_eq!(kc.stored_secret(ADD_ID).as_deref(), Some(TYPED_KEY));
+        assert_eq!(frames.len(), 2);
+        assert!(!wire_text(&frames).contains(TYPED_KEY));
+    }
+
+    /// **M4.** A `config/set` the daemon refuses takes the stored key back out
+    /// of the mock (BUG-171's undo through the composed flow, `PriorKey`
+    /// against a double), and says so.
+    #[test]
+    fn a_refused_session_registration_takes_its_stored_key_back_out() {
+        if provider_key_exported() {
+            return;
+        }
+        let kc = MockKeychain::new();
+        let (outcome, surface, _prompter, frames) = add_in_session(
+            &["y", TYPED_KEY],
+            vec![
+                Ok(no_such_provider()),
+                Err(RpcError::new(
+                    error_code::INVALID_PARAMS,
+                    "provider `kimi` was refused by the daemon",
+                )),
+            ],
+            false,
+            &kc,
+        );
+
+        assert!(
+            outcome.is_ok(),
+            "a refused registration is reported, not an Err: {outcome:?}"
+        );
+        // Stored, then deleted: the record says the undo ran, and the store is
+        // empty afterwards.
+        assert_eq!(kc.deletes(), vec![ADD_ID.to_owned()]);
+        assert!(
+            kc.is_empty(),
+            "the refused registration left its key behind"
+        );
+        assert_eq!(frames.len(), 2);
+        assert!(!wire_text(&frames).contains(TYPED_KEY));
+        assert!(
+            surface
+                .lines_of(LineKind::Error)
+                .iter()
+                .any(|line| line.contains("registration rejected")),
+            "{:?}",
+            surface.calls
+        );
+        assert!(
+            surface
+                .lines_of(LineKind::Notice)
+                .iter()
+                .any(|line| line.contains("has been removed from your keychain")),
+            "{:?}",
+            surface.calls
+        );
+        for call in &surface.calls {
+            assert!(!format!("{call:?}").contains(TYPED_KEY));
+        }
+    }
+
+    /// **M4, the displaced-credential arm.** When the account already held a
+    /// key, a refused registration puts *that* key back rather than deleting.
+    #[test]
+    fn a_refused_session_registration_restores_the_key_it_displaced() {
+        if provider_key_exported() {
+            return;
+        }
+        let kc = MockKeychain::new();
+        kc.store(ADD_ID, "sk-the-old-one").expect("seed the mock");
+        let (outcome, surface, _prompter, _frames) = add_in_session(
+            &["y", TYPED_KEY],
+            vec![
+                Ok(no_such_provider()),
+                Err(RpcError::new(error_code::INVALID_PARAMS, "refused")),
+            ],
+            false,
+            &kc,
+        );
+        assert!(outcome.is_ok(), "{outcome:?}");
+        assert_eq!(kc.stored_secret(ADD_ID).as_deref(), Some("sk-the-old-one"));
+        assert!(kc.deletes().is_empty(), "a restore is not a delete");
+        assert!(
+            surface
+                .lines_of(LineKind::Notice)
+                .iter()
+                .any(|line| line.contains("put back to the credential it held")),
+            "{:?}",
+            surface.calls
+        );
+    }
+
+    /// **m7.** A keychain that will not store is a rendered refusal, not an
+    /// `Err`: nothing is registered, and the sentence is the store's own.
+    #[test]
+    fn a_keychain_that_will_not_store_is_a_refusal_and_registers_nothing() {
+        if provider_key_exported() {
+            return;
+        }
+        let kc = MockKeychain::unavailable();
+        let (outcome, _surface, prompter, frames) =
+            add_in_session(&["y", TYPED_KEY], vec![Ok(no_such_provider())], false, &kc);
+        let refusal = outcome.expect_err("a store failure is a refusal");
+        assert!(
+            matches!(refusal, ProviderAddRefusal::KeychainStore(_)),
+            "{refusal:?}"
+        );
+        assert!(
+            refusal.to_string().contains("no OS keychain is available"),
+            "{refusal}"
+        );
+        // The key was read (the user consented) but nothing was sent: the
+        // probe is the only frame.
+        assert_eq!(prompter.secrets.len(), 1);
+        assert_eq!(frames.len(), 1, "{frames:?}");
+        assert!(!wire_text(&frames).contains(TYPED_KEY));
+    }
+
+    /// The shell asks nothing (`AddConsent::Shell`): its command line was the
+    /// consent, and its first question is the key.
+    #[test]
+    fn the_shell_consent_mode_asks_no_confirmation() {
+        if provider_key_exported() {
+            return;
+        }
+        let kc = MockKeychain::new();
+        let (mut conn, peer) = Connection::scripted(&[no_such_provider(), applied()]);
+        let mut surface = RecordingSurface::new();
+        let mut state = SessionState::new();
+        let mut prompter = ScriptedPrompter::new(&[TYPED_KEY]);
+        {
+            let mut ctx = passive_ctx(&mut surface, &mut state, &mut prompter);
+            provider_add_on(
+                &mut conn,
+                &mut ctx,
+                ADD_ID,
+                ProviderKind::OpenaiCompatible,
+                Some(ADD_ENDPOINT.to_owned()),
+                Some(ADD_MODEL.to_owned()),
+                AddConsent::Shell,
+                &kc,
+            )
+            .expect("no transport failure")
+            .expect("registered");
+        }
+        assert_eq!(prompter.asked, 1, "{:?}", prompter.questions);
+        assert_eq!(prompter.secrets.len(), 1);
+        assert_eq!(kc.stored_secret(ADD_ID).as_deref(), Some(TYPED_KEY));
+        assert_eq!(
+            client::methods_written(&peer),
+            vec!["config/get", "config/set"]
+        );
+        conn.assert_all_consumed();
     }
 
     // -----------------------------------------------------------------------

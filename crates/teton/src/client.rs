@@ -556,14 +556,93 @@ impl Connection {
     /// its documented fallback, not an invention.
     #[cfg(test)]
     pub(crate) fn scripted(results: &[Value]) -> (Self, UnixStream) {
+        Self::scripted_replies(results.iter().cloned().map(Ok).collect())
+    }
+
+    /// [`Self::scripted`] for a daemon that may answer a request with an
+    /// [`RpcError`] (REQ-582 verify, T1/M4).
+    ///
+    /// The success-only fixture cannot reach a handler's error arms — a
+    /// `config/set` the daemon refused, a `config/get` on a build too old to
+    /// serve it — and those arms are where a stored key is taken back out of the
+    /// keychain (BUG-171) and where `/doctor` says "not exposed" rather than
+    /// failing. Each reply is `Ok(result)` or `Err(error)`, matched to the *n*th
+    /// request exactly as [`Self::scripted`] matches its results.
+    #[cfg(test)]
+    pub(crate) fn scripted_replies(replies: Vec<Result<Value, RpcError>>) -> (Self, UnixStream) {
         let (conn, tx, peer) = paired_for_test();
-        for (index, result) in results.iter().enumerate() {
+        for (index, reply) in replies.into_iter().enumerate() {
             let id = Id::Number(i64::try_from(index).expect("a test scripts few responses") + 1);
-            tx.send(Incoming::Response(Response::success(id, result.clone())))
+            let response = match reply {
+                Ok(result) => Response::success(id, result),
+                Err(error) => Response::failure(id, error),
+            };
+            tx.send(Incoming::Response(response))
                 .expect("the receiver is alive: it is inside the connection");
         }
         (conn, peer)
     }
+
+    /// Assert that every scripted reply was consumed by a request (REQ-582
+    /// verify, T4).
+    ///
+    /// A fixture scripted with *more* replies than the handler made calls would
+    /// pass every assertion about what was sent while the test's picture of the
+    /// exchange — "then it asked for X, which the daemon answered with Y" — was
+    /// one call longer than the truth. The scripting sender is dropped when the
+    /// fixture is built, so an empty channel reads as disconnected here and a
+    /// leftover reply reads as `Ok`. Call it at the end of a test that scripted
+    /// anything.
+    ///
+    /// # Panics
+    ///
+    /// When a scripted reply is still queued.
+    #[cfg(test)]
+    pub(crate) fn assert_all_consumed(&self) {
+        assert!(
+            self.incoming.try_recv().is_err(),
+            "a scripted reply was never consumed: the handler made fewer calls than the test \
+             scripted answers for"
+        );
+    }
+}
+
+/// Every JSON-RPC request a handler wrote to a scripted connection's socket, in
+/// order, as parsed frames (REQ-582 TASK-169; shared since the verify pass).
+///
+/// Non-blocking, so "nothing was sent" is an assertion a test can make without
+/// waiting for a daemon that does not exist. `peer` is the other end of the
+/// [`Connection::scripted`] pair. Frames rather than method names because the
+/// keychain tests read the `params` — a registration must carry
+/// `keychain://…` and never the key — and a second reader of the same bytes in
+/// each module would be two fixtures for one socket.
+#[cfg(test)]
+pub(crate) fn requests_written(peer: &UnixStream) -> Vec<Value> {
+    use std::io::Read;
+    peer.set_nonblocking(true).expect("nonblocking");
+    let mut raw = Vec::new();
+    // WouldBlock is the expected end of the stream here; whatever was read
+    // before it is in the buffer.
+    let _ = (&mut { peer }).read_to_end(&mut raw);
+    String::from_utf8_lossy(&raw)
+        .lines()
+        .filter(|line| !line.trim().is_empty())
+        .map(|line| serde_json::from_str(line).expect("a framed JSON-RPC request"))
+        .collect()
+}
+
+/// The method names of [`requests_written`], in order.
+#[cfg(test)]
+pub(crate) fn methods_written(peer: &UnixStream) -> Vec<String> {
+    requests_written(peer)
+        .iter()
+        .map(|request| {
+            request["method"]
+                .as_str()
+                .expect("every request names a method")
+                .to_owned()
+        })
+        .collect()
 }
 
 /// The socket-pair fixture both test constructors are built on.

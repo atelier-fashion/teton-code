@@ -50,18 +50,33 @@
 //! typed `teton provider list` be recognized by walking clap's tree rather than
 //! by a second matcher (ADR-1).
 //!
-//! That recognition is [`cli_line`], and it is why [`Input`] has five variants
-//! rather than three (REQ-582 BR-4): a line whose first word is `teton` and
-//! whose following words name a subcommand path runs that path's row
-//! ([`Input::CliLine`]) after one notice naming the `/` spelling, and a path
-//! with no session form — `teton uninstall`, a family typed bare — is one
-//! refusing line ([`Input::CliRefused`]). Neither ever reaches the model, and
-//! neither spawns a `teton` process or opens a second connection: a recognized
-//! line dispatches through this table, on the session's own connection, so
-//! BR-5 holds by construction rather than by a check (BUG-177's shape is what a
-//! subprocess would cost). Everything else that opens with `teton` is a
-//! question about the product — "teton is slow today" — and reaches the model
-//! byte-identically to today.
+//! That recognition is [`cli_line`], and it is why [`Input`] has six variants
+//! rather than three (REQ-582 BR-4; a sixth since the verify pass): a line
+//! whose first word is `teton` and whose following words name a subcommand path
+//! runs that path's row ([`Input::CliLine`]) after one notice naming the `/`
+//! spelling, a path with no session form — `teton uninstall`, a family typed
+//! bare — is one refusing line ([`Input::CliRefused`]), and a family followed by
+//! `--help` is the parser's own page for it ([`Input::CliHelp`]). None of them
+//! ever reaches the model, and none spawns a `teton` process or opens a second
+//! connection: a recognized line dispatches through this table, on the
+//! session's own connection, so BR-5 holds by construction rather than by a
+//! check (BUG-177's shape is what a subprocess would cost). Everything else
+//! that opens with `teton` is a question about the product — "teton is slow
+//! today" — and reaches the model byte-identically to today.
+//!
+//! A recognized line runs through [`run_cli_line`] rather than straight through
+//! [`dispatch`]: the ten mirrored rows parse their own argument with clap, but
+//! the rows that predate this REQ (`/cost`, `/effort`, `/model set`, `/provider
+//! test`) read a plain string, so their typed argv is validated whole by the
+//! binary's parser first and the row is handed what the parser derived — never
+//! `qwen --yes` as a model name (verify M2).
+//!
+//! This module and [`crate::session_ui`] depend on each other on purpose (verify
+//! m17): the hand-off nudge reads [`mirrored_rows`] so the spellings it names
+//! are the table's, and this module renders `session_ui`'s tier vocabulary. The
+//! alternative — a third module owning the row table — would move the one list
+//! that dispatches away from the handlers it dispatches to, for the sake of a
+//! dependency graph no reader of either file has to hold in their head.
 //!
 //! Five commands are deliberately narrower than BR-9's "identical on a TTY and
 //! on piped stdin": the four mirrored rows that write and `/model set` are
@@ -75,6 +90,9 @@
 //! and names the shell commands as the auditable surface for the unattended
 //! case. Every other command is pipe-friendly exactly as BR-9 says.
 
+// REQ-582 verify M2: `run_cli_line` validates a pre-REQ row's typed argv with
+// the binary's own parser before the row runs.
+use clap::Parser;
 use teton_protocol::effort::EffortLevel;
 use teton_protocol::jsonrpc::{error_code, RpcError};
 use teton_protocol::methods::{
@@ -130,6 +148,20 @@ const TETON: &str = "teton";
 /// away from the model — the failure BR-4's "teton is slow today" clause exists
 /// to prevent. No sentence opens `--help`.
 const CLI_FLAGS: &[&str] = &["--help", "-h", "--version", "-V"];
+
+/// The two flags a `teton …` line may carry **before** its subcommand and still
+/// be that subcommand (verify m5).
+///
+/// `teton -y policy set-tier build kimi` and `teton --verbose doctor` are the
+/// shell's own spellings — both flags are `global`, so clap accepts them ahead
+/// of the subcommand — and a walk that started at `-y` found no subcommand and
+/// sent the line to the model as a question. The classifier steps over them and
+/// carries them on the recognized line ([`Input::CliLine::shell_flags`]) so the
+/// row's own parse still sees them and says they were ignored. Exact spellings
+/// only: a combined short form (`-yv`) is not one anybody types at a prompt, and
+/// widening this to "anything starting with `-`" would turn `teton -whatever`
+/// into a refusal rather than the prompt it is.
+const LEADING_GLOBAL_FLAGS: &[&str] = &["-y", "--yes", "-v", "--verbose"];
 
 /// What a bare `teton` typed at the prompt gets back (BR-4).
 ///
@@ -189,6 +221,16 @@ pub enum Input<'a> {
         /// Everything after the path words, trimmed; the row's own grammar
         /// judges it (BR-3).
         args: &'a str,
+        /// The binary's global flags typed **before** the path (`teton -y policy
+        /// set-tier …`), as they were typed, or `""` (verify m5).
+        ///
+        /// Carried rather than dropped so the row's own parse still meets them:
+        /// they are legal argv the shell accepts, and the row reports them as
+        /// ignored ([`cli_rows::shell_flags_line`]) instead of the classifier
+        /// silently eating a `--yes` the user meant. Kept apart from `args`
+        /// because the two are not adjacent in the line — the path sits between
+        /// them — and a classifier that borrows cannot splice.
+        shell_flags: &'a str,
     },
     /// A typed `teton …` line naming a real command with no session form
     /// (REQ-582 BR-4): the one line saying why, and where to go instead.
@@ -198,6 +240,14 @@ pub enum Input<'a> {
     /// the family that was typed bare — and a classifier that returned a
     /// `&'static str` here could only carry reasons written in advance.
     CliRefused(String),
+    /// A typed `teton <family> --help` (verify T6): clap's own help page for that
+    /// family, ready to render line by line as information.
+    ///
+    /// A variant of its own because it is neither a row to run nor a refusal to
+    /// print — a user who asked for help got what they asked for, and no line
+    /// of a help page is an error. It is the one CLI outcome that renders more
+    /// than a line, which is also why it cannot ride [`Self::CliRefused`].
+    CliHelp(String),
     /// A prompt that opened with the `//` escape, with exactly the leading pair
     /// collapsed to one `/` (BR-1b).
     EscapedPrompt(&'a str),
@@ -670,7 +720,8 @@ pub fn classify(input: &str) -> Input<'_> {
 /// | the line | bucket |
 /// |---|---|
 /// | first word is not `teton` (`tetonx …`, `Teton …`, `teton-code`) | `None` — never ours |
-/// | a subcommand path that names a row | [`Input::CliLine`] |
+/// | a subcommand path that names a row (any [`LEADING_GLOBAL_FLAGS`] ahead of it stepped over) | [`Input::CliLine`] |
+/// | a family path followed by `--help`/`-h` (`teton provider --help`) | [`Input::CliHelp`] |
 /// | a subcommand path with no row (`uninstall`, a bare family) | [`Input::CliRefused`] |
 /// | no path, and the next token is one of [`CLI_FLAGS`] | [`Input::CliRefused`] |
 /// | no path, and nothing follows | [`Input::CliRefused`] — bare `teton` |
@@ -697,6 +748,10 @@ fn cli_line(line: &str) -> Option<Input<'_>> {
     // command is lowercase, and a capitalised mention is prose (REQ-581's
     // reply-side rule, applied to the entry line).
     let rest = match_name_words(line, TETON)?;
+    // The shell's own global flags may precede the subcommand (`teton -y policy
+    // set-tier …`); the walk starts after them and they ride the recognized
+    // line so the row's parse still sees them (m5).
+    let (shell_flags, rest) = split_leading_flags(rest);
     let tokens: Vec<&str> = rest.split_whitespace().collect();
     let path = cli_rows::cli_path(&tokens);
     if path.is_empty() {
@@ -717,12 +772,44 @@ fn cli_line(line: &str) -> Option<Input<'_>> {
         .iter()
         .find(|spec| spec.name.split_whitespace().eq(path.iter().copied()));
     let Some(spec) = matched else {
+        // A family followed by an explicit help request gets the family's own
+        // page (T6); a family typed bare, or with a word that names nothing
+        // under it, gets the session's rows under it (BR-4).
+        if let Some(flag @ ("--help" | "-h")) = tokens.get(path.len()).copied() {
+            if let Some(help) = cli_rows::family_help(&path, flag) {
+                return Some(Input::CliHelp(help));
+            }
+        }
         return Some(Input::CliRefused(cli_rows::refusal_for_path(&path)));
     };
     Some(Input::CliLine {
         name: spec.name,
         args: after_words(rest, path.len()),
+        shell_flags,
     })
+}
+
+/// Split the [`LEADING_GLOBAL_FLAGS`] off the front of `rest` (the text after
+/// `teton`), returning `(flags as typed, the remainder)` — `("", rest)` when
+/// none lead (verify m5).
+///
+/// Word-wise and exact: a leading token that is not one of the four spellings
+/// ends the flag run, so `teton -whatever …` keeps `-whatever` as the first
+/// token of the walk and stays whatever the walk says it is (a prompt).
+fn split_leading_flags(rest: &str) -> (&str, &str) {
+    let mut consumed = 0;
+    let mut remainder = rest;
+    loop {
+        let trimmed = remainder.trim_start();
+        let end = trimmed.find(char::is_whitespace).unwrap_or(trimmed.len());
+        let token = &trimmed[..end];
+        if token.is_empty() || !LEADING_GLOBAL_FLAGS.contains(&token) {
+            break;
+        }
+        consumed = rest.len() - trimmed.len() + end;
+        remainder = &trimmed[end..];
+    }
+    (rest[..consumed].trim(), remainder.trim_start())
 }
 
 /// Every row sitting **under** `prefix` — the rows a family typed bare should
@@ -809,6 +896,111 @@ pub fn dispatch(
             Ok(CommandOutcome::Continue)
         }
     }
+}
+
+/// Run a recognized `teton …` line — the entry loop's [`Input::CliLine`] arm
+/// (REQ-582 verify, M2).
+///
+/// `name`, `args` and `shell_flags` are the classifier's ([`cli_line`]). Three
+/// shapes, decided by the row and by clap's tree, never by matching words:
+///
+/// * a **mirrored** row parses its own argument with clap inside its handler,
+///   so it is dispatched as `/<name> <args>` — with any leading global flags
+///   spliced onto the argument, because clap accepts a global flag after the
+///   subcommand as readily as before it and the row's own parse is then the one
+///   place that sees them and says they were ignored;
+/// * a pre-REQ row whose name is a **leaf** in the tree (`cost`, `effort`,
+///   `model set`, `provider test`) reads a plain string, so its whole typed argv
+///   is validated by [`crate::Cli::try_parse_from`] first. `Err` renders the
+///   parser's own message and dispatches nothing — `teton effort bogus`, `teton
+///   cost extra`. `Ok` derives the row's argument from the parsed
+///   [`crate::Command`] — the level, the model name, the provider id — and
+///   dispatches that, so `teton model set qwen --yes` reaches `/model set` as
+///   `qwen` and the `--yes` is reported as ignored ([`cli_rows::shell_flags_line`])
+///   rather than forwarded as part of a model name; the row's handler still
+///   validates the value against its own vocabulary, exactly as it does for a
+///   `/` line;
+/// * a pre-REQ row whose name is a **family** — `model`, whose bare form is
+///   REQ-555's one-line answer — cannot be parsed to a command (clap answers
+///   `teton model` with the family's help page), so it dispatches directly, as
+///   TASK-170 had it.
+///
+/// This is not a second parser of the line (BR-3): the argv is the classifier's
+/// tokens, the judge is the binary's own clap tree, and what the row receives is
+/// what that tree parsed.
+///
+/// # Errors
+///
+/// Propagates any transport error the row's handler raises, as [`dispatch`]
+/// does.
+pub fn run_cli_line(
+    name: &str,
+    args: &str,
+    shell_flags: &str,
+    conn: &mut Connection,
+    ctx: &mut UiContext<'_>,
+) -> anyhow::Result<CommandOutcome> {
+    let Some(spec) = COMMANDS.iter().find(|spec| spec.name == name) else {
+        // Unreachable: `cli_line` only ever names a table row. Rendered rather
+        // than `unreachable!`ed because a panic in a session is worse than a
+        // sentence in it.
+        render_rejection(
+            &format!("unknown command: `{}` — {HELP_HINT}", typed_token(name)),
+            ctx.surface,
+        );
+        return Ok(CommandOutcome::Continue);
+    };
+    let words: Vec<&str> = name.split_whitespace().collect();
+    if spec.mirror.is_some() || !cli_rows::is_leaf_path(&words) {
+        // The row parses for itself, or takes no argument clap could judge.
+        if shell_flags.is_empty() {
+            return dispatch(name, args, conn, ctx);
+        }
+        let with_flags = format!("{shell_flags} {args}");
+        return dispatch(name, with_flags.trim(), conn, ctx);
+    }
+    let argv: Vec<&str> = std::iter::once(TETON)
+        .chain(shell_flags.split_whitespace())
+        .chain(words.iter().copied())
+        .chain(args.split_whitespace())
+        .collect();
+    let cli = match crate::Cli::try_parse_from(argv) {
+        Err(err) => {
+            cli_rows::render_clap_error(&err, ctx.surface);
+            return Ok(CommandOutcome::Continue);
+        }
+        Ok(cli) => cli,
+    };
+    // The row's argument, read off what clap parsed rather than off the line.
+    let row_args = match cli.command {
+        Some(crate::Command::Cost) => String::new(),
+        Some(crate::Command::Effort { level }) => level.unwrap_or_default(),
+        Some(crate::Command::Model {
+            action: crate::ModelAction::Set { name },
+        }) => name,
+        Some(crate::Command::Provider {
+            action: crate::ProviderAction::Test { id },
+        }) => id,
+        // Unreachable: the leaves that are pre-REQ rows are exactly the four
+        // above, and every other leaf is a mirrored row (dispatched before the
+        // parse) or has no row at all (refused by the classifier). One
+        // sentence rather than a panic, for the reason every other unreachable
+        // arm in this client gives.
+        _ => {
+            render_rejection(
+                &format!(
+                    "`teton {name}` parsed as a command this session has no row for — {HELP_HINT}"
+                ),
+                ctx.surface,
+            );
+            return Ok(CommandOutcome::Continue);
+        }
+    };
+    if cli.yes || cli.verbose {
+        ctx.surface
+            .line(LineKind::Info, &cli_rows::shell_flags_line(name, cli.yes));
+    }
+    dispatch(name, &row_args, conn, ctx)
 }
 
 /// Split a command line into its name and trailing argument. The table name
@@ -966,9 +1158,21 @@ fn typed_token(name: &str) -> String {
 /// copy of the bounding and defusing is a second place for one of them to be
 /// forgotten.
 pub(crate) fn echoed(text: &str) -> String {
+    echoed_within(text, ECHO_MAX_CHARS)
+}
+
+/// [`echoed`] with the bound supplied (verify m2).
+///
+/// The one place a rejection's quoting bound is chosen is [`ECHO_MAX_CHARS`];
+/// clap's rendered lines need the same defusing under a wider bound — a usage
+/// clause or a help line is longer than any command name and is the binary's
+/// own text, while a stray positional inside it is the user's — and a second
+/// copy of the loop for a second number is how the control-character rule gets
+/// applied on one path and forgotten on another.
+pub(crate) fn echoed_within(text: &str, max_chars: usize) -> String {
     let mut out = String::with_capacity(text.len());
     let mut chars = text.chars();
-    for ch in chars.by_ref().take(ECHO_MAX_CHARS) {
+    for ch in chars.by_ref().take(max_chars) {
         out.push(if ch.is_control() {
             ECHO_REPLACEMENT
         } else {
@@ -3475,13 +3679,14 @@ mod tests {
                 classify(typed),
                 Input::CliLine {
                     name: spec.name,
-                    args: expected_args
+                    args: expected_args,
+                    shell_flags: "",
                 },
                 "`{typed}` did not reach its row"
             );
             // And the row it reaches dispatches, which is what makes the notice
             // line's `/<name>` a spelling that works (AC-5).
-            let Input::CliLine { name, args } = classify(typed) else {
+            let Input::CliLine { name, args, .. } = classify(typed) else {
                 unreachable!("just asserted");
             };
             let Resolution::Run(resolved, run_args) = resolve(name, args) else {
@@ -3510,7 +3715,8 @@ mod tests {
             classify("teton model"),
             Input::CliLine {
                 name: "model",
-                args: ""
+                args: "",
+                shell_flags: "",
             }
         );
         // And the families that are *not* rows still refuse.
@@ -3543,7 +3749,15 @@ mod tests {
             // row's is, and the argument keeps its own spacing after trimming.
             ("teton  policy   show", "policy show", ""),
         ] {
-            assert_eq!(classify(typed), Input::CliLine { name, args }, "`{typed}`");
+            assert_eq!(
+                classify(typed),
+                Input::CliLine {
+                    name,
+                    args,
+                    shell_flags: "",
+                },
+                "`{typed}`"
+            );
         }
     }
 
@@ -3591,12 +3805,21 @@ mod tests {
         let setup = refusal("teton provider setup");
         assert!(setup.contains("/provider setup"), "{setup}");
 
-        // A leaf with no session row and no rows under it says so and points at
-        // the shell: `policy set` is REQ-558's retired phase form, hidden from
-        // the CLI's own listing.
+        // The retired phase form (REQ-558 AC-9), hidden from the CLI's own
+        // listing: the answer is the retirement sentence itself — the axis
+        // changed, not the user's typing — and never "no session form" (verify
+        // m6). The same words the shell prints for the same argv.
         let retired = refusal("teton policy set build kimi");
-        assert!(retired.contains("no session form"), "{retired}");
-        assert!(retired.contains(HELP_HINT), "{retired}");
+        assert_eq!(retired, crate::POLICY_SET_RETIRED);
+        assert!(retired.contains("set-tier"), "{retired}");
+
+        // The family wording says what was typed and what it is (verify m4):
+        // the words name a family, and the family's session rows follow.
+        assert!(family.contains("`teton provider …`"), "{family}");
+        assert!(
+            family.contains("names a family rather than a command"),
+            "{family}"
+        );
 
         // The bare binary opens a session, and the user is in one.
         assert_eq!(refusal("teton"), ALREADY_IN_A_SESSION);
@@ -3676,14 +3899,16 @@ mod tests {
             classify("/teton provider list"),
             Input::CliLine {
                 name: "provider list",
-                args: ""
+                args: "",
+                shell_flags: "",
             }
         );
         assert_eq!(
             classify("/teton policy set-tier build kimi"),
             Input::CliLine {
                 name: "policy set-tier",
-                args: "build kimi"
+                args: "build kimi",
+                shell_flags: "",
             }
         );
         assert!(matches!(classify("/teton"), Input::CliRefused(_)));
@@ -3724,7 +3949,7 @@ mod tests {
     /// row it reaches judges the argument (BR-3).
     #[test]
     fn a_recognized_line_with_a_stray_word_prints_the_parsers_own_error() {
-        let Input::CliLine { name, args } = classify("teton provider list please") else {
+        let Input::CliLine { name, args, .. } = classify("teton provider list please") else {
             panic!("a stray word does not un-recognize a command (ADR-1)");
         };
 
@@ -3753,6 +3978,326 @@ mod tests {
         assert!(
             first.contains("unexpected argument 'please'"),
             "AC-6 names this text: {first}"
+        );
+    }
+
+    // ------------------------------------------------------------------
+    // REQ-582 verify — leading global flags (m5), family help (T6), and the
+    // full-argv validation of a pre-REQ row (M2)
+    // ------------------------------------------------------------------
+
+    /// **m5.** The shell's own global flags ahead of the subcommand do not
+    /// un-recognize a line: `teton -y policy set-tier build kimi` is the
+    /// `policy set-tier` row, and the flag rides the recognized line rather
+    /// than sending the whole thing to the model as a question.
+    #[test]
+    fn a_leading_global_flag_is_stepped_over_and_carried() {
+        assert_eq!(
+            classify("teton -y policy set-tier build kimi"),
+            Input::CliLine {
+                name: "policy set-tier",
+                args: "build kimi",
+                shell_flags: "-y",
+            }
+        );
+        assert_eq!(
+            classify("teton --verbose doctor"),
+            Input::CliLine {
+                name: "doctor",
+                args: "",
+                shell_flags: "--verbose",
+            }
+        );
+        // Two flags, both carried as typed.
+        assert_eq!(
+            classify("teton --yes -v model set qwen"),
+            Input::CliLine {
+                name: "model set",
+                args: "qwen",
+                shell_flags: "--yes -v",
+            }
+        );
+        // The bare binary with a flag is still the bare binary: the user is in
+        // the session `teton -y` would have opened.
+        assert_eq!(
+            classify("teton -y"),
+            Input::CliRefused(ALREADY_IN_A_SESSION.to_owned())
+        );
+        assert_eq!(
+            classify("teton -y --help"),
+            Input::CliRefused(CLI_FLAGS_ARE_SHELL_ONLY.to_owned())
+        );
+        // A leading token that merely starts with `-` is not a flag this
+        // classifier knows, so the line is what the walk says: a prompt.
+        assert_eq!(
+            classify("teton -whatever is going on"),
+            Input::Prompt("teton -whatever is going on")
+        );
+        // The split itself, on its edges.
+        assert_eq!(split_leading_flags("-y policy show"), ("-y", "policy show"));
+        assert_eq!(
+            split_leading_flags("  --yes   -v   doctor "),
+            ("--yes   -v", "doctor ")
+        );
+        assert_eq!(split_leading_flags("policy show"), ("", "policy show"));
+        assert_eq!(split_leading_flags(""), ("", ""));
+        assert_eq!(split_leading_flags("-y"), ("-y", ""));
+    }
+
+    /// **T6.** A family followed by an explicit help request gets clap's own
+    /// page for that family, as information — not the bare-family refusal,
+    /// which would swallow the ask. A leaf's help is its row's business, and a
+    /// shell-only command's `--help` is still the shell-only refusal: the
+    /// reason it cannot run here matters more than its usage.
+    #[test]
+    fn a_family_help_request_renders_the_familys_own_help_page() {
+        for line in [
+            "teton provider --help",
+            "teton provider -h",
+            "teton policy -h",
+        ] {
+            let Input::CliHelp(text) = classify(line) else {
+                panic!(
+                    "`{line}` did not classify as a help page: {:?}",
+                    classify(line)
+                );
+            };
+            let words: Vec<&str> = line.split_whitespace().skip(1).collect();
+            let expected =
+                crate::Cli::try_parse_from(std::iter::once("teton").chain(words.iter().copied()))
+                    .expect_err("clap reports help as an Err")
+                    .render()
+                    .to_string();
+            assert_eq!(text, expected, "`{line}` is not clap's own page");
+            assert!(text.contains("Usage:"), "`{line}`: {text}");
+        }
+        // The family's rows are named on the page — it is the page a shell
+        // prints, and it lists the subcommands.
+        let Input::CliHelp(provider) = classify("teton provider --help") else {
+            unreachable!("just asserted");
+        };
+        for sub in ["add", "list", "test"] {
+            assert!(
+                provider.contains(sub),
+                "the provider page omits `{sub}`: {provider}"
+            );
+        }
+        // Not a family: `uninstall --help` is still refused for the reason
+        // `uninstall` is, and `provider setup --help` (a word that names no
+        // subcommand) is still the family's session rows.
+        assert!(
+            matches!(classify("teton uninstall --help"), Input::CliRefused(text) if text.contains("shell-only"))
+        );
+        assert!(
+            matches!(classify("teton provider setup --help"), Input::CliRefused(text) if text.contains("/provider setup"))
+        );
+        // And a family typed bare is unchanged by this: the session's rows.
+        assert!(
+            matches!(classify("teton provider"), Input::CliRefused(text) if text.contains("/provider list"))
+        );
+        // The helper says `None` for anything that is not a family, so a caller
+        // falls back to the refusal rather than to an empty page.
+        assert!(cli_rows::family_help(&["doctor"], "--help").is_none());
+        assert!(cli_rows::family_help(&["nope"], "--help").is_none());
+        assert!(cli_rows::family_help(&["policy"], "--help").is_some());
+    }
+
+    /// **M2.** A recognized line for a row that predates this REQ is validated
+    /// whole by the binary's own parser before its row runs.
+    ///
+    /// The four leaves in question: `model set`, `provider test`, `effort`,
+    /// `cost`. Each case states what reached the row (or that nothing did) and
+    /// what was rendered about the shell flags.
+    #[test]
+    fn a_pre_req_row_has_its_whole_argv_validated_before_it_runs() {
+        /// Run `run_cli_line` over what `classify(line)` produced.
+        fn run(
+            line: &str,
+            scripted: &[serde_json::Value],
+            typed_input: bool,
+        ) -> (RecordingSurface, Vec<String>) {
+            let Input::CliLine {
+                name,
+                args,
+                shell_flags,
+            } = classify(line)
+            else {
+                panic!("`{line}` was not recognized: {:?}", classify(line));
+            };
+            let (mut conn, peer) = Connection::scripted(scripted);
+            let mut surface = RecordingSurface::new();
+            let mut state = SessionState::new();
+            let mut prompter = ScriptedPrompter::new(&[]);
+            {
+                let mut ctx = session_ctx(&mut surface, &mut state, &mut prompter);
+                ctx.typed_input = typed_input;
+                let outcome = run_cli_line(name, args, shell_flags, &mut conn, &mut ctx)
+                    .unwrap_or_else(|err| panic!("`{line}` failed: {err:#}"));
+                assert_eq!(outcome, CommandOutcome::Continue);
+            }
+            conn.assert_all_consumed();
+            (surface, crate::client::methods_written(&peer))
+        }
+
+        // `teton model set qwen --yes` → `/model set qwen`, plus the flag line.
+        // The empty catalog makes the row's own validation the evidence: its one
+        // error names `qwen` — the argument the row was handed — and never
+        // `--yes`, which the parser took as the flag it is.
+        let (surface, methods) = run(
+            "teton model set qwen --yes",
+            &[serde_json::to_value(crate::model_ui::testing::list_result()).unwrap()],
+            true,
+        );
+        assert_eq!(methods, vec!["model/list"], "{:?}", surface.calls);
+        let errors = surface.lines_of(LineKind::Error);
+        assert_eq!(errors.len(), 1, "{:?}", surface.calls);
+        assert!(errors[0].contains("named `qwen`"), "{}", errors[0]);
+        assert!(
+            !errors[0].contains("--yes"),
+            "the flag reached the row as part of the name: {}",
+            errors[0]
+        );
+        let infos = surface.lines_of(LineKind::Info);
+        assert_eq!(
+            infos,
+            vec![cli_rows::shell_flags_line("model set", true)],
+            "{:?}",
+            surface.calls
+        );
+        assert!(
+            infos[0].contains("--yes") && infos[0].contains("/model set"),
+            "{}",
+            infos[0]
+        );
+
+        // The same with the flag ahead of the subcommand (m5 meets M2).
+        let (surface, methods) = run(
+            "teton -y model set qwen",
+            &[serde_json::to_value(crate::model_ui::testing::list_result()).unwrap()],
+            true,
+        );
+        assert_eq!(methods, vec!["model/list"]);
+        assert_eq!(
+            surface.lines_of(LineKind::Info),
+            vec![cli_rows::shell_flags_line("model set", true)]
+        );
+
+        // `teton effort` bare → the read: one `config/get`, no set.
+        let (surface, methods) = run(
+            "teton effort",
+            &[serde_json::to_value(teton_protocol::methods::ConfigGetResult::default()).unwrap()],
+            true,
+        );
+        assert_eq!(methods, vec!["config/get"], "{:?}", surface.calls);
+        assert!(
+            surface.lines_of(LineKind::Error).is_empty(),
+            "{:?}",
+            surface.calls
+        );
+
+        // `teton effort bogus` parses — the level is a free string to clap, and
+        // its vocabulary is the row's (`teton effort bogus` in a shell fails the
+        // same way, one step later) — so the row's own one-line rejection is
+        // what renders, and no RPC is issued.
+        let (surface, methods) = run("teton effort bogus", &[], true);
+        assert!(methods.is_empty(), "{:?}", surface.calls);
+        let errors = surface.lines_of(LineKind::Error);
+        assert_eq!(errors.len(), 1, "{:?}", surface.calls);
+        assert!(
+            errors[0].contains("bogus") && errors[0].contains("max"),
+            "the row's own error names the value and the vocabulary: {}",
+            errors[0]
+        );
+
+        // `teton effort low extra` → clap's own error, and nothing dispatched:
+        // the whole argv was judged before the row saw any of it.
+        let (surface, methods) = run("teton effort low extra", &[], true);
+        assert!(methods.is_empty(), "{:?}", surface.calls);
+        let expected = crate::Cli::try_parse_from(["teton", "effort", "low", "extra"])
+            .expect_err("the shell rejects it too")
+            .render()
+            .to_string();
+        assert_eq!(
+            surface.lines_of(LineKind::Error),
+            vec![expected
+                .lines()
+                .next()
+                .unwrap()
+                .strip_prefix("error: ")
+                .unwrap()],
+            "{:?}",
+            surface.calls
+        );
+        assert!(
+            surface.lines_of(LineKind::Error)[0].contains("unexpected argument 'extra'"),
+            "{:?}",
+            surface.calls
+        );
+
+        // `teton cost extra` → clap's own error, nothing dispatched.
+        let (surface, methods) = run("teton cost extra", &[], true);
+        assert!(methods.is_empty(), "{:?}", surface.calls);
+        assert!(
+            surface.lines_of(LineKind::Error)[0].contains("unexpected argument 'extra'"),
+            "{:?}",
+            surface.calls
+        );
+
+        // `teton provider test kimi --yes` → `/provider test kimi` plus the
+        // generic flag line. The test context owns no session, so the row's own
+        // first line is what proves it was reached; nothing goes on the wire.
+        let (surface, methods) = run("teton provider test kimi --yes", &[], true);
+        assert!(methods.is_empty(), "{:?}", surface.calls);
+        assert!(
+            surface
+                .lines_of(LineKind::Error)
+                .iter()
+                .any(|line| line.contains("`/provider test` needs a session")),
+            "the row did not run: {:?}",
+            surface.calls
+        );
+        assert_eq!(
+            surface.lines_of(LineKind::Info),
+            vec![cli_rows::shell_flags_line("provider test", true)]
+        );
+        assert!(
+            surface.lines_of(LineKind::Info)[0].contains("/provider test"),
+            "{:?}",
+            surface.calls
+        );
+
+        // A mirrored row with a leading flag: the flag reaches the row's own
+        // clap parse (spliced onto the argument) and the row says it was
+        // ignored — one place, one sentence — before running as usual.
+        let (surface, methods) = run(
+            "teton -y provider list",
+            &[serde_json::to_value(teton_protocol::methods::ConfigGetResult::default()).unwrap()],
+            true,
+        );
+        assert_eq!(methods, vec!["config/get"], "{:?}", surface.calls);
+        assert!(
+            surface
+                .lines_of(LineKind::Info)
+                .contains(&cli_rows::shell_flags_line("provider list", true).as_str()),
+            "{:?}",
+            surface.calls
+        );
+
+        // And the family that is itself a row keeps TASK-170's direct dispatch:
+        // `teton model` is `/model`, one `model/status`, no parse to fail.
+        let (surface, methods) = run(
+            "teton model",
+            &[
+                serde_json::to_value(teton_protocol::methods::ModelStatusResult::default())
+                    .unwrap(),
+            ],
+            true,
+        );
+        assert_eq!(methods, vec!["model/status"], "{:?}", surface.calls);
+        assert!(
+            surface.lines_of(LineKind::Error).is_empty(),
+            "{:?}",
+            surface.calls
         );
     }
 }
