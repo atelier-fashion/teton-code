@@ -1,7 +1,7 @@
 ---
 id: TASK-160
 title: "Protocol: provider/test params + typed outcome + provider_tested event + additive probe fields"
-status: draft
+status: complete
 parent: REQ-581
 created: 2026-08-17
 updated: 2026-08-17

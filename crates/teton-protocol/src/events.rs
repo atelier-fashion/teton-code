@@ -24,7 +24,9 @@
 //! (BR-12), the guided provider-setup flow's two announcements — a commit that
 //! landed, and a commit refused for not coming from the user. REQ-580 adds
 //! `turn_queued` (BR-2), which says a prompt turn is being held for a local tier
-//! that is still coming up rather than refused.
+//! that is still coming up rather than refused. REQ-581 adds `provider_tested`
+//! (BR-3), the typed result of the one consented call a user's connection test
+//! makes against a registered provider.
 //!
 //! This list is an index, not decoration: a new variant of [`Event`] that is not
 //! named here makes the paragraph above wrong.
@@ -32,7 +34,7 @@
 use serde::{Deserialize, Serialize};
 
 use crate::effort::ResolvedEffort;
-use crate::methods::TierBinding;
+use crate::methods::{ProviderHealth, ProviderTestOutcome, TierBinding};
 use crate::{
     Category, ClientKind, Phase, ProtocolVersion, ProviderId, ProviderKind, RequestId, SessionId,
     Tier, TurnId,
@@ -171,6 +173,9 @@ pub enum Event {
     /// A prompt turn is being held for the local tier it needs, which is still
     /// coming up, rather than refused (REQ-580 BR-2).
     TurnQueued(TurnQueued),
+    /// A user's connection test finished, with what came back and where it left
+    /// the provider's health (REQ-581 BR-3/BR-4).
+    ProviderTested(ProviderTested),
 }
 
 impl Event {
@@ -206,6 +211,7 @@ impl Event {
             Event::ProviderSetupRejected(_) => "provider_setup_rejected_nonuser",
             Event::CapabilityDeadEnd(_) => "capability_dead_end",
             Event::TurnQueued(_) => "turn_queued",
+            Event::ProviderTested(_) => "provider_tested",
         }
     }
 }
@@ -673,6 +679,26 @@ pub struct CostRecord {
     /// [`crate::PROTOCOL_VERSION`] nor [`crate::PROTOCOL_VERSION_MIN`] moves.
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub reasoning_tokens: Option<u64>,
+    /// Whether this row is a **connection test** rather than a turn (REQ-581
+    /// BR-5).
+    ///
+    /// A probe is a model call and is billed like one: same request path, same
+    /// tokens, same price table, one ordinary row. It is *counted* apart so
+    /// `teton cost` can say "1 probe" instead of showing a user a call they
+    /// asked no question for as though it were a turn.
+    ///
+    /// `false` for every turn, and for every row written before this REQ —
+    /// where the ledger keeps `NULL`, the honest value for a column whose
+    /// concept did not exist yet, and the wire reads that absence as `false`
+    /// because a pre-REQ daemon made no probes to report.
+    ///
+    /// **Omitted from the wire when `false`**, which is
+    /// [`Self::cached_tokens`]'s rule in a `bool`'s spelling: a client built
+    /// against the older shape reads exactly the same bytes it always did, and
+    /// neither [`crate::PROTOCOL_VERSION`] nor [`crate::PROTOCOL_VERSION_MIN`]
+    /// moves.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub probe: bool,
 }
 
 /// Event payload wrapping a [`CostRecord`] (spec Events: `cost_recorded`).
@@ -1841,6 +1867,57 @@ pub enum TierWarming {
 }
 
 // ---------------------------------------------------------------------------
+// provider_tested (REQ-581)
+// ---------------------------------------------------------------------------
+
+/// A user's connection test finished (spec: `provider_tested`; REQ-581 BR-3).
+///
+/// Session-scoped through the [`EventEnvelope`], like every other event a
+/// user's own command produces — the payload carries no `session_id` of its own
+/// for [`ProviderSetupCompleted`]'s structural reason: the envelope flattens
+/// over the payload, so a second one here would be a duplicate key on the wire.
+///
+/// Published on **every** outcome the call reaches, not only the good one: the
+/// test either spent or failed, and either way the health map moved under a
+/// second client attached to the same session, which is owed the news
+/// (LESSON-505). The refusals that never call announce nothing — a connection
+/// that may not drive the session is turned away in the response and publishes
+/// no event, because a probe is read-shaped and attacker-paced and publishing
+/// on it would hand an unauthorized caller a way to fill a user's transcript
+/// (LESSON-513; only commits announce their refusals).
+///
+/// **What it deliberately does not carry**: the credential, obviously, and the
+/// endpoint — whose authority can hide userinfo. It does not repeat the model
+/// or the dial host either, unlike [`ProviderSetupCompleted`], and the
+/// difference is what the two events are for. A setup event announces a *config
+/// change*, so the destination that just became live is news; a test changes no
+/// config, so the model and host are whatever config already said and the
+/// invoking client has them in its [`crate::methods::ProviderTestResult`]. What
+/// is new here is the outcome and where health landed.
+///
+/// The [`outcome`](Self::outcome)'s `reason` is safe to carry for the reason it
+/// exists: it is the daemon's own sentence, built from the status, the dial
+/// host, the configured model and the credential *reference* — never a vendor's
+/// response body, and never a key (architecture ADR-3).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ProviderTested {
+    /// The provider that was tested.
+    pub provider_id: ProviderId,
+    /// What came back, typed (BR-3).
+    ///
+    /// Nested rather than `#[serde(flatten)]`ed — the shape
+    /// [`PrefixCache::outcome`] took — so it is byte-identical to
+    /// [`crate::methods::ProviderTestResult::outcome`]: the client renders the
+    /// event and the RPC answer with one function, and a flattened copy would
+    /// be a second shape of one value for a renderer to get subtly different.
+    pub outcome: ProviderTestOutcome,
+    /// Where the test left the provider's health — the same map the router
+    /// reads at decision time (BR-4), so a listening client learns what the
+    /// next turn will do and not only what this call did.
+    pub health_after: ProviderHealth,
+}
+
+// ---------------------------------------------------------------------------
 // prefix_cache
 // ---------------------------------------------------------------------------
 
@@ -2325,6 +2402,7 @@ mod tests {
                         usd_micros: 1234,
                         cached_tokens: None,
                         reasoning_tokens: None,
+                        probe: false,
                     },
                 }),
                 "cost_recorded",
@@ -2441,6 +2519,19 @@ mod tests {
                     waiting_on: TierWarming::Loading,
                 }),
                 "turn_queued",
+            ),
+            (
+                Event::ProviderTested(ProviderTested {
+                    provider_id: ProviderId::from("p"),
+                    outcome: ProviderTestOutcome::Reached {
+                        latency_ms: 412,
+                        input_tokens: 11,
+                        output_tokens: 1,
+                        usd_micros: Some(37),
+                    },
+                    health_after: ProviderHealth::Healthy,
+                }),
+                "provider_tested",
             ),
         ];
 
@@ -2896,8 +2987,74 @@ mod tests {
                 usd_micros: 45_000,
                 cached_tokens: None,
                 reasoning_tokens: None,
+                probe: false,
             },
         });
+    }
+
+    /// REQ-581 BR-5's ledger half on the wire: a probe row says so, an ordinary
+    /// turn's row says nothing at all, and a record from a daemon that predates
+    /// the flag reads as a turn.
+    ///
+    /// The absent-when-false shape is asserted on the serialized keys rather
+    /// than on a reading of the struct, because it is the compatibility claim:
+    /// a client built against the older `cost_recorded` reads exactly the bytes
+    /// it always did, which is why this field moves no protocol version.
+    #[test]
+    fn a_probe_row_is_marked_and_every_other_row_is_unchanged() {
+        let turn = CostRecord {
+            session_id: SessionId::from("s1"),
+            phase: None,
+            category: Some(Category::Edit),
+            provider_id: ProviderId::from("kimi"),
+            model: "kimi-k2-turbo-preview".to_owned(),
+            input_tokens: 1000,
+            output_tokens: 500,
+            usd_micros: 45_000,
+            cached_tokens: None,
+            reasoning_tokens: None,
+            probe: false,
+        };
+        round_trip(&turn);
+        let wire = serde_json::to_value(&turn).unwrap();
+        assert!(
+            wire.get("probe").is_none(),
+            "a turn's row carries no probe key at all: {wire}"
+        );
+
+        // The probe's own row: the same call shape, billed the same way, and
+        // attributed to no routing category — nothing routed it, the user asked
+        // for it by name.
+        let probe = CostRecord {
+            category: None,
+            probe: true,
+            ..turn.clone()
+        };
+        round_trip(&probe);
+        let wire = serde_json::to_value(&probe).unwrap();
+        assert_eq!(wire["probe"], true, "{wire}");
+        assert_eq!(
+            wire["usd_micros"], 45_000,
+            "a probe is billed like any other call — the flag counts it apart, \
+             it does not price it apart: {wire}"
+        );
+
+        // A row from a daemon built before REQ-581 has no `probe` key, and the
+        // ledger keeps `NULL` there rather than a backfilled guess. Both read
+        // as `false`: that daemon made no probes, so "not a probe" is the
+        // honest reading of its silence.
+        let pre_581 = serde_json::json!({
+            "session_id": "s1",
+            "provider_id": "kimi",
+            "model": "kimi-k2-turbo-preview",
+            "input_tokens": 1000,
+            "output_tokens": 500,
+            "usd_micros": 45_000,
+        });
+        let decoded: CostRecord =
+            serde_json::from_value(pre_581).expect("an older daemon's row must still parse");
+        assert!(!decoded.probe);
+        assert_eq!(decoded.usd_micros, 45_000);
     }
 
     #[test]
@@ -3640,6 +3797,98 @@ mod tests {
                 ]
             );
         }
+    }
+
+    /// REQ-581 BR-3/BR-4's wire half: a finished connection test reaches a
+    /// client as a flat `provider_tested` object naming its session, the
+    /// provider, what came back **as a value**, and where health landed.
+    ///
+    /// The scoping is asserted on the wire object rather than on the payload,
+    /// for [`ProviderSetupCompleted`]'s reason — the envelope is what carries
+    /// it, and `envelope_wire` round-trips before returning, so a `session_id`
+    /// added to the payload fails here on the duplicate key rather than
+    /// reaching a client.
+    ///
+    /// The key set is asserted whole, and a failing outcome is put through the
+    /// same assertion as a reaching one: the announcement names an id, an
+    /// outcome and a health word, and never the endpoint, the key, or the
+    /// vendor's own prose (architecture ADR-3). A field added later turns this
+    /// red rather than riding into a transcript.
+    #[test]
+    fn a_finished_connection_test_is_announced_session_scoped_with_a_typed_outcome() {
+        let reached = ProviderTested {
+            provider_id: ProviderId::from("kimi"),
+            outcome: ProviderTestOutcome::Reached {
+                latency_ms: 412,
+                input_tokens: 11,
+                output_tokens: 1,
+                usd_micros: Some(37),
+            },
+            health_after: ProviderHealth::Healthy,
+        };
+        round_trip(&reached);
+        let wire = envelope_wire(Event::ProviderTested(reached));
+        assert_eq!(wire["event"], "provider_tested");
+        assert_eq!(wire["session_id"], "s1");
+        assert_eq!(wire["provider_id"], "kimi");
+        assert_eq!(wire["outcome"]["outcome"], "reached");
+        assert_eq!(wire["outcome"]["latency_ms"], 412);
+        assert_eq!(wire["outcome"]["usd_micros"], 37);
+        assert_eq!(
+            wire["health_after"], "healthy",
+            "a reached test says the provider is routable again, as a value the \
+             client branches on: {wire}"
+        );
+        assert_eq!(
+            wire.as_object().unwrap().keys().collect::<Vec<_>>(),
+            [
+                "event",
+                "health_after",
+                "outcome",
+                "provider_id",
+                "seq",
+                "session_id"
+            ],
+            "{wire}"
+        );
+
+        // A refusal is announced too — the call was made and it failed, which
+        // is exactly the news a second client attached to this session needs.
+        // Its `reason` names the credential *reference* and never a key value
+        // (AC-2), and the payload's key set does not grow to hold one.
+        let refused = ProviderTested {
+            provider_id: ProviderId::from("kimi"),
+            outcome: ProviderTestOutcome::Refused {
+                status: 401,
+                reason: "HTTP 401 from api.moonshot.ai — the vendor did not accept the \
+                         credential at keychain://teton/kimi"
+                    .to_owned(),
+            },
+            health_after: ProviderHealth::Unavailable,
+        };
+        round_trip(&refused);
+        let wire = envelope_wire(Event::ProviderTested(refused));
+        assert_eq!(wire["outcome"]["outcome"], "refused");
+        assert_eq!(wire["outcome"]["status"], 401);
+        assert_eq!(wire["health_after"], "unavailable");
+        assert_eq!(
+            wire.as_object().unwrap().keys().collect::<Vec<_>>(),
+            [
+                "event",
+                "health_after",
+                "outcome",
+                "provider_id",
+                "seq",
+                "session_id"
+            ],
+            "{wire}"
+        );
+        let rendered = serde_json::to_string(&wire).unwrap();
+        assert!(
+            rendered.contains("keychain://teton/kimi") && !rendered.contains("sk-"),
+            "the refusal names the reference the request authenticated with, \
+             never the value behind it: {rendered}"
+        );
     }
 
     /// BR-2's event half: **neither provider-setup event has anywhere to put a
