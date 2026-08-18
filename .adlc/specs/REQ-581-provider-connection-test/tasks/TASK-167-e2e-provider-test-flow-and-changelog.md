@@ -1,7 +1,7 @@
 ---
 id: TASK-167
 title: "e2e: provider_test_flow over the socket (reached / 401 / 404 / 429 / 5xx / closed port / NOT_ATTACHED); CHANGELOG"
-status: draft
+status: complete
 parent: REQ-581
 created: 2026-08-17
 updated: 2026-08-17
