@@ -260,6 +260,19 @@
   frame carries. When a routed path is added, audit every existing publish for
   an audience of one — the handshake's lifecycle replay stood as a broadcast
   for fifteen REQs after REQ-569 made routing possible (BUG-177, LESSON-536).
+- **A second surface for a command is a second call site of one grammar and
+  one renderer** — a session command that mirrors a shell command rebuilds
+  the shell's argv and parses it with the shell's own parser, then runs the
+  same `<sub>_on(conn, ctx)` body the shell wrapper runs; recognition of a
+  typed shell line walks the parser's own tree to the subcommand path and
+  dispatches through the same table; the nudge that points a model's shell
+  recipe at the session spelling is derived from that table. Corollaries from
+  verify: parse *before* any gate so `--help` is never refused; a classifier
+  that resolves to every row inherits every row's argument grammar and gate
+  posture, so validate with the one grammar first; and a session command that
+  reads a secret confirms before it reads, because the entry loop and the
+  dialogue prompter share one stdin buffer and a multi-line paste answers the
+  next question (REQ-582 ADR-1/2/6, LESSON-537; REQ-555 BR-4 generalized).
 
 ## ADRs
 

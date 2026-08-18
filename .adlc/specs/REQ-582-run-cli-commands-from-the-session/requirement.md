@@ -440,15 +440,14 @@ None. No daemon change: every row is a new call site of an existing method
       diverge. BR-1 is untouched — a `/teton …` line that names no subcommand
       path is still an unknown command rejected with the `/help` hint, and
       never a prompt.
-- [ ] OQ-2: Should the generic hand-off line (BR-8) subsume the REQ-579 and
-      REQ-581 sentences into one renderer with per-command reasons, or keep
-      three sentences? Proposal: one renderer, per-row optional reason
-      string — the row table already owns the spelling, it can own the
-      reason too; decide at architecture.
-- [ ] OQ-3: `/model` today is the concise current-model line and `/model
-      set` writes; adding `/model list` and `/model status` — should bare
-      `/model` stay concise or become `model status`? Proposal: stay concise
-      (REQ-555 BR-4 chose it deliberately); `status` is the full form.
+- [x] OQ-2: ~~Should the generic hand-off line (BR-8) subsume the REQ-579 and
+      REQ-581 sentences into one renderer?~~ **RESOLVED at wrapup (2026-08-18):
+      three sentences kept** — the two older ones carry reasons the generic
+      line does not ("no key in chat", "makes one consented call"); the generic
+      line is table-driven and third in precedence (ADR-6, TASK-171).
+- [x] OQ-3: ~~Should bare `/model` stay concise once `/model list` and
+      `/model status` exist?~~ **RESOLVED at wrapup (2026-08-18): stays
+      concise** (REQ-555 BR-4); `/model status` is the full form (TASK-169).
 - [ ] OQ-5: Quoted arguments. Session-side tokenization is whitespace only
       (ADR-2) — no quote or backslash processing — because no mirrored
       subcommand takes a whitespace-bearing value and a shell-words
@@ -491,6 +490,16 @@ None. No daemon change: every row is a new call site of an existing method
   not a secret scanner; the guard against a credential in chat is the
   prompt's prohibition and the REQ-579 hand-off, and a scanner here would be
   a second, weaker copy of the redactor's job.
+
+## Deferred
+
+- OQ-6 — a verbatim escape for a `teton …` line (recognition intercepts exact
+  subcommand paths only; writes are gated; `effort` set is the recorded
+  REQ-559 BR-9 exception). Revisit if a user hits it.
+- Quoted/whitespace-bearing arguments in session rows (OQ-5, ADR-2).
+- Extracting the clap tree from `main.rs` into its own module (verify D3).
+- `docs/manual-verification.md` REQ-582 runbook — OUTSTANDING until the
+  shipped binary is dogfooded (needs a release + `brew upgrade`).
 
 ## Retrieved Context
 
