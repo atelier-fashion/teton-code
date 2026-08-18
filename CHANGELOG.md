@@ -18,6 +18,27 @@ unchanged. What belongs here is what an *upgrade* does to a machine that was
 already running — above all, anything that changes where data goes without the
 user having asked for it.
 
+## [Unreleased]
+
+### Fixed
+
+- **A tool-using turn on Kimi (or any provider that answers with a native
+  tool call and no prose) no longer dies on its next request (BUG-179).**
+  kimi-k3 streams its reasoning and a `tool_calls` entry with an empty
+  `content`; Teton recorded that turn as an empty assistant message and
+  replayed it, and Moonshot refused the follow-up (`the message … with role
+  'assistant' must not be empty`), so every tool-using turn ended in
+  `degraded: kimi (invalid response) — no fallback configured` and `prompt
+  failed`. The transcript now records the call the model made — in the same
+  `{"tool":…,"arguments":…}` shape the system prompt teaches, so the model also
+  sees what it asked for when the result comes back — and no request ever
+  carries an empty assistant message, whichever path produced it. The daemon
+  additionally prints one line on its own stderr naming the provider and the
+  HTTP status when a remote call fails, so a rejected request is no longer
+  invisible behind the client's `invalid response`. No wire-format change; no
+  change to what leaves the machine beyond the previously-empty turn now
+  carrying the call.
+
 ## [0.1.21] - 2026-08-18
 
 ### Added

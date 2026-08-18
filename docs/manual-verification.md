@@ -1721,3 +1721,56 @@ Step 8 — a typed write applied and the shell twin agreed : yes / no
 Step 9 — a piped write refused and changed nothing : yes / no
 Notes / findings :
 ```
+
+# Manual verification runbook — BUG-179 (a Kimi tool-using turn completes)
+
+**Status: OUTSTANDING.** CI pins the fix at the wire
+(`remote_loop::a_native_tool_call_with_no_prose_never_replays_an_empty_assistant_turn`
+— the follow-up request body through the real OpenAI-compatible adapter carries
+no empty assistant message and records the call the model made), so this is a
+two-minute confirmation on the shipped binary against the **real** provider
+that refused the request. It is here because the symptom was found by
+dogfooding kimi-k3 on 0.1.21 and the person who saw it should see it gone.
+
+## Procedure
+
+Needs a registered `kimi` provider (`/provider setup kimi`, or `teton provider
+add kimi --model kimi-k3 …`) with `tool_call_tier = "native"`, routed to a tier
+with **no fallback** — the exact 0.1.21 setup, so a regression cannot hide
+behind a fallback provider.
+
+1. Start a session with `teton`, then `/policy set-tier build kimi` (put it back
+   afterwards) and confirm with `/policy show`.
+2. Ask for something that needs one tool and one answer, e.g.
+   `Read README.md and tell me its first heading.`
+3. Expect: the tool status line for the `read`, then a plain-text answer, and
+   **no** `degraded: kimi (invalid response) — no fallback configured` and no
+   `prompt failed: provider failed and no fallback is configured`. On 0.1.21 the
+   read ran and the very next provider call failed with exactly those two lines.
+4. Ask a follow-up that needs a second tool in the same session (e.g. `Now
+   list the files under docs/`) — the transcript being replayed now holds the
+   earlier call as `{"tool":"read","arguments":{…}}`; the turn must complete the
+   same way.
+5. Negative control for the new stderr line: point the provider at a wrong
+   model name (`teton provider add kimi-bad --model kimi-does-not-exist …`),
+   route to it, ask anything, and confirm the daemon's log
+   (`~/Library/Application Support/teton/tetond.log`, or the terminal a
+   foreground `teton-code` runs in) shows one line of the form
+   ``tetond: provider `kimi-bad` failed the turn (provider returned client
+   error status 4xx); no fallback is configured`` — a status and nothing from
+   the request or the provider's message body. Remove the provider afterwards.
+
+## Sign-off
+
+```
+BUG-179 sign-off
+----------------
+Verified by      :
+Date             :
+Build            :               (shipped version, `teton --version`)
+kimi model / tool_call_tier :
+Step 3 — tool ran AND the turn answered, no degraded/prompt-failed lines : yes / no
+Step 4 — second tool-using turn in the same session completed : yes / no
+Step 5 — stderr line names provider + status only, no body/prompt text : yes / no / not run
+Notes / findings :
+```
