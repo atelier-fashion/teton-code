@@ -425,12 +425,24 @@ impl TestDaemon {
         let mut child = command
             .spawn()
             .unwrap_or_else(|e| panic!("spawn teton {args:?}: {e}"));
-        child
+        // A CLI that exits before it reads anything — a `--cwd` refused on the
+        // spot (REQ-583 BR-6) — may already have closed its end of the pipe
+        // when this write lands; `EPIPE` is then the expected shape of that
+        // early exit, not a fixture failure (the ubuntu CI leg hit the race).
+        // Every other write error still fails the test, and a process that
+        // wrongly read nothing fails its own output assertions.
+        if let Err(err) = child
             .stdin
             .take()
             .expect("piped stdin")
             .write_all(stdin.as_bytes())
-            .expect("write teton stdin");
+        {
+            assert_eq!(
+                err.kind(),
+                std::io::ErrorKind::BrokenPipe,
+                "write teton stdin {args:?}: {err}"
+            );
+        }
         let output = child
             .wait_with_output()
             .unwrap_or_else(|e| panic!("run teton {args:?}: {e}"));
@@ -5102,12 +5114,23 @@ fn a_missing_cwd_is_refused_by_the_cli_itself_with_no_daemon_to_reach() {
             .stderr(Stdio::piped())
             .spawn()
             .expect("spawn teton");
-        child
+        // A CLI that refuses `--cwd` before it reads anything may already have
+        // exited — and closed its end of the pipe — by the time this write
+        // lands. `EPIPE` is then the expected shape of "refused before reading
+        // stdin", not a failure of the fixture (the ubuntu CI leg hit exactly
+        // that race); any other write error still fails the test.
+        if let Err(err) = child
             .stdin
             .take()
             .expect("piped stdin")
             .write_all(b"hello\n")
-            .expect("write teton stdin");
+        {
+            assert_eq!(
+                err.kind(),
+                std::io::ErrorKind::BrokenPipe,
+                "write teton stdin: {err}"
+            );
+        }
         let output = child.wait_with_output().expect("run teton");
         (
             String::from_utf8_lossy(&output.stdout).into_owned(),
