@@ -1,7 +1,7 @@
 ---
 id: TASK-178
 title: "Daemon wiring: create/set_cwd return the root, the per-turn probe feeds jail and prompt, session/set_cwd moves a live session and clears it"
-status: draft
+status: complete
 parent: REQ-583
 created: 2026-08-18
 updated: 2026-08-18
@@ -30,11 +30,11 @@ identifiers there), nothing in `crates/teton`.
 
 ## Acceptance Criteria
 
-- [ ] `cargo test -p tetond` for `server`, `runtime`, `sessions` and `--test e2e session_root` green; the unmintable-id sweep and the dispatch-routing test cover `session/set_cwd`.
-- [ ] `SessionCreateResult.root` populated for a cwd'd session and for a no-cwd (fallback) session.
-- [ ] Every turn's `HarnessConfig.session_root` is `Some(...)` derived from the session's current cwd (assert via an e2e that reads the prompt through the existing capture seam, or a unit test on the assembled `route.harness`).
-- [ ] `no_tool_can_clear_a_session_and_no_mcp_wiring_path_could` still green (no new identifiers under `harness/`).
-- [ ] Refusal messages name the path (BR-6); events precede the response.
+- [x] `cargo test -p tetond` for `server`, `runtime`, `sessions` and `--test e2e session_root` green; the unmintable-id sweep and the dispatch-routing test cover `session/set_cwd`.
+- [x] `SessionCreateResult.root` populated for a cwd'd session and for a no-cwd (fallback) session.
+- [x] Every turn's `HarnessConfig.session_root` is `Some(...)` derived from the session's current cwd (assert via an e2e that reads the prompt through the existing capture seam, or a unit test on the assembled `route.harness`).
+- [x] `no_tool_can_clear_a_session_and_no_mcp_wiring_path_could` still green (no new identifiers under `harness/`).
+- [x] Refusal messages name the path (BR-6); events precede the response.
 
 ## Technical Notes
 

@@ -33,6 +33,13 @@
 //!   the local tier however they are bound, asserted by the bytes a mock
 //!   provider received rather than by reading the resolved route, and paired
 //!   with an untainted session on the same daemon that genuinely sends them.
+//! - [`session_root`] — REQ-583: the session root over the socket. `session/create`
+//!   answers with the derived root and refuses a bad cwd naming the path (AC-9's
+//!   daemon half); `session/set_cwd` moves a live session's jail, clears its
+//!   conversation and announces both ahead of its answer, at **every**
+//!   permission level (AC-10's daemon half) — asserted by what a `read` under
+//!   the old and the new root hands the model, in the bytes a mock provider
+//!   received.
 
 // The suite lives under `tests/e2e/`; `#[path]` keeps that layout while this
 // top-level file remains the integration-test binary Cargo compiles.
@@ -54,3 +61,5 @@ mod model_identity;
 mod privacy_fixes;
 #[path = "e2e/routing_categories.rs"]
 mod routing_categories;
+#[path = "e2e/session_root.rs"]
+mod session_root;

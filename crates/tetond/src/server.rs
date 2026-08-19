@@ -33,14 +33,14 @@
 //! wait forever on an event this connection was never going to receive.
 //!
 //! The same attachment set gates the *mutating* methods: `session/prompt`,
-//! `session/clear`, `web/override` and `permission/respond` against a session
-//! this connection never attached are refused with `NOT_ATTACHED` (REQ-568 BR-4,
-//! REQ-569 BR-9). The write gates sit at the seams every client crosses —
-//! [`forward_events`] for reads, and [`handle_session_clear`],
-//! [`spawn_prompt_turn`], [`handle_web_override`],
-//! [`handle_permission_respond`] for writes — never in a client, and never in
-//! the reader loop above them, so the direct-RPC tests exercise the real gate
-//! (LESSON-484).
+//! `session/clear`, `session/set_cwd` (REQ-583), `web/override` and
+//! `permission/respond` against a session this connection never attached are
+//! refused with `NOT_ATTACHED` (REQ-568 BR-4, REQ-569 BR-9). The write gates
+//! sit at the seams every client crosses — [`forward_events`] for reads, and
+//! [`handle_session_clear`], [`handle_session_set_cwd`], [`spawn_prompt_turn`],
+//! [`handle_web_override`], [`handle_permission_respond`] for writes — never in
+//! a client, and never in the reader loop above them, so the direct-RPC tests
+//! exercise the real gate (LESSON-484).
 //!
 //! REQ-572 adds the `web/setup_*` family to that list ([`handle_web_setup_plan`],
 //! [`handle_web_setup_preview`], [`handle_web_setup_commit`]): enabling a
@@ -125,8 +125,8 @@ use teton_protocol::methods::{
     ProviderSetupPlanParams, ProviderSetupPreviewParams, ProviderTestParams, RpcMethod,
     SessionAttachParams, SessionAttachResult, SessionClearParams, SessionCreateParams,
     SessionCreateResult, SessionListParams, SessionListResult, SessionPermissionsParams,
-    SessionSummary, WebOverrideParams, WebRefreshParams, WebSetupCommitParams, WebSetupPlanParams,
-    WebSetupPreviewParams,
+    SessionSetCwdParams, SessionSummary, WebOverrideParams, WebRefreshParams, WebSetupCommitParams,
+    WebSetupPlanParams, WebSetupPreviewParams,
 };
 use teton_protocol::{RequestId, SessionId};
 
@@ -144,7 +144,7 @@ use crate::grants::{monitor_witness, ConnectionId, Grant, GrantRegistry};
 use crate::lifetime::LifetimeSupervisor;
 use crate::peer::{is_descendant_of, Ancestry, KernelParentOf, MAX_ANCESTRY_DEPTH};
 use crate::runtime::{ClientPresence, DaemonRuntime};
-use crate::sessions::{self, SessionCreateError, SessionRegistry};
+use crate::sessions::{self, validate_session_cwd, SessionCreateError, SessionRegistry};
 
 /// Depth of a client's outbound message queue (responses + events).
 const OUTBOUND_CAPACITY: usize = 1024;
@@ -2341,6 +2341,12 @@ fn dispatch(
         // is: both run on their own task (see `handle_client`), because both
         // await something this reader loop has to stay free to read.
         SessionClearParams::METHOD => Some(handle_session_clear(daemon, conn, id, params)),
+        // REQ-583 ADR-4: `session/set_cwd` sits beside `session/clear` for the
+        // same reason it is modelled on it — no human, no network; it takes the
+        // turn claim, rewrites one path, clears, publishes, and answers — so it
+        // stays on the synchronous path and its two events ride the fence
+        // ahead of its response.
+        SessionSetCwdParams::METHOD => Some(handle_session_set_cwd(daemon, conn, id, params)),
         // `attach/consent` is deliberately absent alongside `session/attach`:
         // since REQ-570 it may run an OS presence prompt that parks on a human,
         // so it runs on its own task (see `handle_client`).
@@ -3207,21 +3213,12 @@ fn handle_session_create(daemon: &Daemon, conn: &ConnState, id: Id, params: Valu
 
     // BUG-147: the cwd becomes this session's tool jail. Refuse a relative or
     // nonexistent one up front — jailing tools to a directory that isn't there
-    // reproduces the every-tool-fails session this validates against.
+    // reproduces the every-tool-fails session this validates against. The
+    // validator is the one `session/set_cwd` uses too (REQ-583 BR-6/BR-7: one
+    // grammar, two spellings), and its refusal names the path.
     if let Some(cwd) = &params.cwd {
-        if !cwd.is_absolute() {
-            return error_string(
-                id,
-                error_code::INVALID_PARAMS,
-                "cwd must be an absolute path",
-            );
-        }
-        if !cwd.is_dir() {
-            return error_string(
-                id,
-                error_code::INVALID_PARAMS,
-                "cwd does not exist or is not a directory",
-            );
+        if let Err(reason) = validate_session_cwd(cwd) {
+            return error_string(id, error_code::INVALID_PARAMS, &reason);
         }
     }
 
@@ -3257,11 +3254,16 @@ fn handle_session_create(daemon: &Daemon, conn: &ConnState, id: Id, params: Valu
                     }),
                 );
             }
+            // REQ-583 BR-6: the root the daemon settled on, probed from the
+            // same path — or the same fallback — every turn will jail to, so
+            // what the CLI's banner and launch notice render is what the tools
+            // will enforce (ADR-1: one derivation, on the side that enforces).
+            let root = daemon.runtime.session_root_for(summary.cwd.as_deref());
             ok_string(
                 id,
                 &SessionCreateResult {
                     session_id: summary.session_id,
-                    root: None, // TASK-178 fills this from the probe
+                    root: Some(root),
                 },
             )
         }
@@ -4062,6 +4064,41 @@ fn handle_session_clear(daemon: &Daemon, conn: &ConnState, id: Id, params: Value
     match daemon
         .runtime
         .clear_session(&params, &daemon.sessions, &daemon.events)
+    {
+        Ok(result) => ok_string(id, &result),
+        Err(err) => error_from(id, err),
+    }
+}
+
+/// Move a live session's root and clear its conversation (`session/set_cwd`,
+/// REQ-583 BR-7 / ADR-4).
+///
+/// [`handle_session_clear`]'s shape, line for line, and for its reasons: parse,
+/// bound the id ([`refuse_unmintable_session_id`]), decide the one thing this
+/// layer decides — whether this connection may drive the session (REQ-568
+/// BR-4; a monitor watches and drives nothing) — and hand the rest to the
+/// runtime's single claim, which classifies unknown, busy, and (here) an
+/// invalid path. Dispatched from the synchronous path, so the fence puts both
+/// events — `context_cleared`, then `session_root_changed` — on the wire ahead
+/// of this response: a client learns the conversation went and where the
+/// session now stands before it is told how much went.
+///
+/// The gate comes before the runtime, so an unattached caller cannot read a
+/// session's existence out of which refusal it got (ADR-B).
+fn handle_session_set_cwd(daemon: &Daemon, conn: &ConnState, id: Id, params: Value) -> String {
+    let params: SessionSetCwdParams = match serde_json::from_value(params) {
+        Ok(params) => params,
+        Err(_) => return error_string(id, error_code::INVALID_PARAMS, "invalid params"),
+    };
+    if let Some(refusal) = refuse_unmintable_session_id(&id, &params.session_id) {
+        return refusal;
+    }
+    if !conn.may_drive(&params.session_id) {
+        return error_string(id, error_code::NOT_ATTACHED, NOT_ATTACHED_MESSAGE);
+    }
+    match daemon
+        .runtime
+        .set_session_cwd(&params, &daemon.sessions, &daemon.events)
     {
         Ok(result) => ok_string(id, &result),
         Err(err) => error_from(id, err),
@@ -7156,6 +7193,296 @@ mod tests {
         );
     }
 
+    /// A unique, existing scratch directory for a session-root fixture; the
+    /// caller removes it. Holds a project marker when `project` is set, so the
+    /// probe classifies it as one.
+    fn scratch_root(tag: &str, project: bool) -> std::path::PathBuf {
+        let dir = temp_socket(tag).with_extension("dir");
+        std::fs::create_dir_all(&dir).unwrap();
+        if project {
+            std::fs::write(dir.join("Cargo.toml"), "[package]\n").unwrap();
+        }
+        dir
+    }
+
+    /// REQ-583 BR-7 / ADR-4 at the dispatch seam: `session/set_cwd` is routed,
+    /// gated on `may_drive` exactly as `session/clear` is (unattached and
+    /// monitor connections are refused identically for a session that exists
+    /// and one that does not — no existence oracle, ADR-B), and an attached
+    /// caller naming a session the registry never had is told so by the
+    /// runtime's classifier, not by the gate.
+    ///
+    /// The success arm reads the answer's `root` — kind and display are the
+    /// probe's, over the path just set — and its `blocks_dropped`, and pins the
+    /// wire order the fence guarantees on the socket: `context_cleared` then
+    /// `session_root_changed`, both session-scoped.
+    #[test]
+    fn dispatch_routes_session_set_cwd_and_tells_attached_from_unattached() {
+        let daemon = Daemon::new();
+        let conn = unattached(&daemon);
+        let start = scratch_root("cd-start", true);
+        let target = scratch_root("cd-target", false);
+        let created = handle_session_create(
+            &daemon,
+            &conn,
+            Id::Number(1),
+            serde_json::json!({"mode": "freeform", "cwd": start}),
+        );
+        let session = created_session_id(&created);
+        let mut sub = daemon.events.subscribe(16);
+
+        // Attached and live: moves, clears (nothing yet), and says where it now
+        // stands.
+        let moved = dispatch(
+            &daemon,
+            &conn,
+            Id::Number(2),
+            SessionSetCwdParams::METHOD,
+            serde_json::json!({"session_id": session.to_string(), "cwd": target}),
+        )
+        .unwrap();
+        assert!(
+            !moved.contains("-32601"),
+            "the method must be routed, not rejected as unknown: {moved}"
+        );
+        let parsed: Value = serde_json::from_str(&moved).unwrap();
+        assert_eq!(
+            parsed["result"]["blocks_dropped"].as_u64(),
+            Some(0),
+            "a session that has said nothing clears to zero, and says so: {moved}"
+        );
+        assert_eq!(
+            parsed["result"]["root"]["kind"].as_str(),
+            Some("plain"),
+            "the answer carries the probe's kind for the new path: {moved}"
+        );
+        let expected = crate::session_root::probe(
+            &target,
+            std::env::var_os("HOME")
+                .map(std::path::PathBuf::from)
+                .as_deref(),
+        );
+        assert_eq!(
+            parsed["result"]["root"]["display"].as_str(),
+            Some(expected.display.as_str()),
+            "the answer's display is the probe's spelling of the new path: {moved}"
+        );
+        assert_eq!(
+            daemon.sessions.get(&session).unwrap().cwd.as_deref(),
+            Some(target.as_path()),
+            "the registry's one stored fact moved"
+        );
+
+        // The two events, in order, both scoped to the session.
+        let first = sub.try_recv().expect("context_cleared is published first");
+        assert_eq!(first.session_id.as_ref(), Some(&session));
+        assert!(
+            matches!(first.event, Event::ContextCleared(_)),
+            "the clear is announced first: {:?}",
+            first.event
+        );
+        let second = sub.try_recv().expect("session_root_changed follows");
+        assert_eq!(second.session_id.as_ref(), Some(&session));
+        match second.event {
+            Event::SessionRootChanged(changed) => {
+                assert_eq!(changed.root, expected);
+                let was = crate::session_root::probe(
+                    &start,
+                    std::env::var_os("HOME")
+                        .map(std::path::PathBuf::from)
+                        .as_deref(),
+                );
+                assert_eq!(
+                    changed.previous_display, was.display,
+                    "`previous_display` is the old root's spelling — what \
+                     the CLI prints as \"moved from\""
+                );
+            }
+            other => panic!("expected session_root_changed, got {other:?}"),
+        }
+        assert!(sub.try_recv().is_none(), "exactly two events per move");
+
+        // Not attached: refused before the runtime, and refused *identically*
+        // for a session that exists and one that does not — the pair is the
+        // assertion (ADR-B). A monitor is refused the same way: watching a
+        // session is not driving it (REQ-568 BR-4).
+        for stranger in [unattached(&daemon), monitoring(&daemon)] {
+            for target_id in [session.to_string(), "sess-nonexistent".to_owned()] {
+                let refused = dispatch(
+                    &daemon,
+                    &stranger,
+                    Id::Number(3),
+                    SessionSetCwdParams::METHOD,
+                    serde_json::json!({"session_id": target_id, "cwd": start}),
+                )
+                .unwrap();
+                assert!(
+                    refused.contains(&error_code::NOT_ATTACHED.to_string()),
+                    "moving `{target_id}` unattached must be refused: {refused}"
+                );
+                assert!(
+                    !refused.contains("blocks_dropped") && !refused.contains("\"display\""),
+                    "a refused move must report neither a count nor a root: {refused}"
+                );
+            }
+        }
+        assert_eq!(
+            daemon.sessions.get(&session).unwrap().cwd.as_deref(),
+            Some(target.as_path()),
+            "a refused move leaves the root where it was"
+        );
+        assert!(sub.try_recv().is_none(), "a refused move announces nothing");
+
+        // Attached to a name the registry never had: the runtime still
+        // classifies it, and the gate did not take that answer away.
+        conn.attach(SessionId::from("sess-nonexistent"));
+        let ghost = dispatch(
+            &daemon,
+            &conn,
+            Id::Number(4),
+            SessionSetCwdParams::METHOD,
+            serde_json::json!({"session_id": "sess-nonexistent", "cwd": start}),
+        )
+        .unwrap();
+        assert!(
+            ghost.contains(&error_code::UNKNOWN_SESSION.to_string()),
+            "an unknown session must not move cheerfully: {ghost}"
+        );
+
+        // A bad path is refused by the same validator `session/create` uses,
+        // naming the path (BR-6), and the root does not move.
+        let bad = dispatch(
+            &daemon,
+            &conn,
+            Id::Number(5),
+            SessionSetCwdParams::METHOD,
+            serde_json::json!({"session_id": session.to_string(), "cwd": "/nope/teton-cd"}),
+        )
+        .unwrap();
+        assert!(
+            bad.contains(&error_code::INVALID_PARAMS.to_string())
+                && bad.contains("/nope/teton-cd")
+                && bad.contains("does not exist or is not a directory"),
+            "the refusal names the path and the reason: {bad}"
+        );
+        assert_eq!(
+            daemon.sessions.get(&session).unwrap().cwd.as_deref(),
+            Some(target.as_path()),
+            "a refused move leaves the root where it was"
+        );
+
+        let _ = std::fs::remove_dir_all(&start);
+        let _ = std::fs::remove_dir_all(&target);
+    }
+
+    /// REQ-583 BR-6 / ADR-1: `session/create` answers with the root the daemon
+    /// settled on — probed from the cwd the client sent, or from the daemon's
+    /// own fallback root when it sent none — and that fallback is the very
+    /// value a turn without a cwd jails to (`DaemonRuntime::minimal`'s
+    /// `repo_root` is the temp dir), so the banner renders what the tools will
+    /// enforce.
+    #[test]
+    fn session_create_returns_the_probed_root_for_a_cwd_and_for_the_fallback() {
+        let daemon = Daemon::new();
+        let conn = unattached(&daemon);
+        let home = std::env::var_os("HOME").map(std::path::PathBuf::from);
+
+        let project = scratch_root("create-root", true);
+        let created = handle_session_create(
+            &daemon,
+            &conn,
+            Id::Number(1),
+            serde_json::json!({"mode": "freeform", "cwd": project}),
+        );
+        let parsed: Value = serde_json::from_str(&created).unwrap();
+        let expected = crate::session_root::probe(&project, home.as_deref());
+        assert_eq!(expected.kind, teton_protocol::methods::RootKind::Project);
+        assert_eq!(
+            parsed["result"]["root"]["kind"].as_str(),
+            Some("project"),
+            "a cwd holding a marker is a project root: {created}"
+        );
+        assert_eq!(
+            parsed["result"]["root"]["display"].as_str(),
+            Some(expected.display.as_str()),
+            "{created}"
+        );
+        assert_eq!(
+            parsed["result"]["root"]["project_name"].as_str(),
+            expected.project_name.as_deref(),
+            "{created}"
+        );
+
+        // No cwd: the fallback root, which is what the turn will jail to.
+        let bare = handle_session_create(
+            &daemon,
+            &conn,
+            Id::Number(2),
+            serde_json::json!({"mode": "freeform"}),
+        );
+        let parsed: Value = serde_json::from_str(&bare).unwrap();
+        let fallback = crate::session_root::probe(&std::env::temp_dir(), home.as_deref());
+        assert_eq!(
+            parsed["result"]["root"]["display"].as_str(),
+            Some(fallback.display.as_str()),
+            "a session that sent no cwd is told the daemon's fallback root: {bare}"
+        );
+        assert_eq!(
+            parsed["result"]["root"]["kind"].as_str(),
+            Some(match fallback.kind {
+                teton_protocol::methods::RootKind::Project => "project",
+                teton_protocol::methods::RootKind::Home => "home",
+                teton_protocol::methods::RootKind::FilesystemRoot => "filesystem_root",
+                teton_protocol::methods::RootKind::Plain => "plain",
+            }),
+            "{bare}"
+        );
+
+        let _ = std::fs::remove_dir_all(&project);
+    }
+
+    /// REQ-583 BR-6 (AC-9's daemon half): a `session/create` whose cwd is
+    /// relative, missing, or not a directory is refused with `INVALID_PARAMS`
+    /// **naming the path** and the reason, and no session is created — never a
+    /// session that starts and then fails on every tool (BUG-147).
+    #[test]
+    fn session_create_refuses_a_bad_cwd_naming_the_path() {
+        let daemon = Daemon::new();
+        let conn = unattached(&daemon);
+
+        let missing = handle_session_create(
+            &daemon,
+            &conn,
+            Id::Number(1),
+            serde_json::json!({"mode": "freeform", "cwd": "/nope/teton-create"}),
+        );
+        assert!(
+            missing.contains(&error_code::INVALID_PARAMS.to_string())
+                && missing.contains("/nope/teton-create")
+                && missing.contains("does not exist or is not a directory"),
+            "the refusal names the path and the reason: {missing}"
+        );
+
+        let relative = handle_session_create(
+            &daemon,
+            &conn,
+            Id::Number(2),
+            serde_json::json!({"mode": "freeform", "cwd": "relative/dir"}),
+        );
+        assert!(
+            relative.contains(&error_code::INVALID_PARAMS.to_string())
+                && relative.contains("relative/dir")
+                && relative.contains("must be an absolute path"),
+            "the refusal names the path and the reason: {relative}"
+        );
+
+        assert_eq!(
+            daemon.sessions.count(),
+            0,
+            "a refused create must leave no session behind"
+        );
+    }
+
     /// REQ-568 BR-4: an unattached `session/prompt` is refused before any turn
     /// work starts.
     ///
@@ -9710,17 +10037,30 @@ mod tests {
         let intruder = unattached(&daemon);
         let oversized = SessionId::from(format!("sess-{}", "a".repeat(4096)).as_str());
 
+        // REQ-583: `session/set_cwd` joins the sweep. Its params carry a `cwd`
+        // beside the id — a well-formed, existing one, so the only thing that
+        // can refuse the plausible-id control is the gate and not the parser
+        // (a parse failure would answer INVALID_PARAMS too and make the first
+        // assertion vacuous for this method).
+        let params_for = |method: &str, session_id: String| -> Value {
+            if method == SessionSetCwdParams::METHOD {
+                serde_json::json!({"session_id": session_id, "cwd": std::env::temp_dir()})
+            } else {
+                serde_json::json!({"session_id": session_id})
+            }
+        };
         for method in [
             WebOverrideParams::METHOD,
             SessionPermissionsParams::METHOD,
             SessionClearParams::METHOD,
+            SessionSetCwdParams::METHOD,
         ] {
             let refused = dispatch(
                 &daemon,
                 &intruder,
                 Id::Number(1),
                 method,
-                serde_json::json!({"session_id": oversized.to_string()}),
+                params_for(method, oversized.to_string()),
             )
             .unwrap();
             assert!(
@@ -9733,7 +10073,7 @@ mod tests {
                 &intruder,
                 Id::Number(2),
                 method,
-                serde_json::json!({"session_id": "sess-plausible"}),
+                params_for(method, "sess-plausible".to_owned()),
             )
             .unwrap();
             assert!(

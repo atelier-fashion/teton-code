@@ -25,7 +25,7 @@
 //!   BR-2's isolation is structural rather than checked.
 
 use std::fmt;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
 use teton_protocol::methods::SessionSummary;
@@ -303,6 +303,44 @@ pub fn within_minted_length(session_id: &SessionId) -> bool {
     session_id.0.len() <= SESSION_ID_PREFIX.len() + SESSION_ID_BODY_LEN
 }
 
+/// Whether `cwd` may be a session's root — the **one** validator behind
+/// `session/create`'s `cwd` and `session/set_cwd` (REQ-583 BR-6/BR-7, ADR-4).
+///
+/// The cwd becomes the session's tool jail (BUG-147), so a relative or
+/// nonexistent one is refused up front — jailing tools to a directory that is
+/// not there reproduces the every-tool-fails session BUG-147 fixed. Absolute
+/// after the client's own resolution (`~` expansion, relative-to-shell joining),
+/// exists, is a directory; nothing is canonicalized here (the jail canonicalizes
+/// per call).
+///
+/// A refusal **names the path** (BR-6): the sentence is what the CLI prints
+/// before any session output, and "cwd must be an absolute path" without the
+/// path sends the user back to guess which of their spellings the daemon saw.
+/// The path is the caller's own argument echoed back to that caller alone,
+/// never published.
+///
+/// It lives here — with the registry that stores the path — rather than in the
+/// server or the runtime because both of them call it: the server validates a
+/// `session/create` before the registry is touched, and the runtime validates a
+/// `session/set_cwd` *after* it holds the turn claim, so a busy session says
+/// `SESSION_BUSY` before it says anything about the path.
+///
+/// # Errors
+///
+/// The reason, as the wire message.
+pub fn validate_session_cwd(cwd: &Path) -> Result<(), String> {
+    if !cwd.is_absolute() {
+        return Err(format!("cwd `{}` must be an absolute path", cwd.display()));
+    }
+    if !cwd.is_dir() {
+        return Err(format!(
+            "cwd `{}` does not exist or is not a directory",
+            cwd.display()
+        ));
+    }
+    Ok(())
+}
+
 /// Why [`SessionRegistry::create`] refused (REQ-569 verify, F9).
 ///
 /// Two failures with **opposite owners**, which is why they stopped being one
@@ -564,6 +602,35 @@ impl SessionRegistry {
             return false;
         }
         record.summary.title = Some(title.to_owned());
+        true
+    }
+
+    /// Move this session's root to `cwd` (`session/set_cwd`, REQ-583 BR-7).
+    ///
+    /// The path is the **only** stored fact about a session's root (ADR-1):
+    /// kind, display, project name and branch are re-derived from it at every
+    /// use, so rewriting it here moves every consumer — the next turn's jail,
+    /// its environment block, the `/cd` line — with no second source of truth to
+    /// keep in step. Stored as given, like [`Self::create`]'s `cwd`: the caller
+    /// has already validated it ([`validate_session_cwd`]) and the jail
+    /// canonicalizes per call.
+    ///
+    /// Unconditional, unlike [`Self::set_title`]'s once-only guard: a root moves
+    /// as often as the user asks. `false` only for a session the registry does
+    /// not have. The caller holds the turn claim across this and the clear that
+    /// follows it, so a turn in flight cannot see its jail move underneath it.
+    pub fn set_cwd(&self, id: &SessionId, cwd: PathBuf) -> bool {
+        let mut sessions = self
+            .sessions
+            .lock()
+            .expect("session registry mutex poisoned");
+        let Some(record) = sessions
+            .iter_mut()
+            .find(|record| &record.summary.session_id == id)
+        else {
+            return false;
+        };
+        record.summary.cwd = Some(cwd);
         true
     }
 
@@ -839,6 +906,95 @@ mod tests {
         // A client that sends none stores none (daemon-root fallback applies).
         let bare = reg.create(SessionMode::Freeform, None, None).unwrap();
         assert_eq!(bare.cwd, None);
+    }
+
+    /// REQ-583 BR-7: `set_cwd` rewrites the one stored root fact in place, for
+    /// a session that had one and for one that was on the daemon fallback, and
+    /// refuses a session the registry does not have.
+    #[test]
+    fn a_session_cwd_can_be_moved_and_a_ghost_cannot() {
+        let reg = SessionRegistry::new();
+        let s = reg
+            .create(
+                SessionMode::Freeform,
+                None,
+                Some(PathBuf::from("/Users/dev/my-repo")),
+            )
+            .unwrap();
+        assert!(reg.set_cwd(&s.session_id, PathBuf::from("/Users/dev/other")));
+        assert_eq!(
+            reg.get(&s.session_id).unwrap().cwd,
+            Some(PathBuf::from("/Users/dev/other")),
+            "the stored path must be the new one — the next turn's probe reads it"
+        );
+        // Unconditional: a second move lands too (unlike a title, a root moves
+        // as often as the user asks).
+        assert!(reg.set_cwd(&s.session_id, PathBuf::from("/Users/dev/third")));
+        assert_eq!(
+            reg.get(&s.session_id).unwrap().cwd,
+            Some(PathBuf::from("/Users/dev/third"))
+        );
+
+        // A session that sent no cwd (fallback root) acquires one.
+        let bare = reg.create(SessionMode::Freeform, None, None).unwrap();
+        assert!(reg.set_cwd(&bare.session_id, PathBuf::from("/Users/dev/late")));
+        assert_eq!(
+            reg.get(&bare.session_id).unwrap().cwd,
+            Some(PathBuf::from("/Users/dev/late"))
+        );
+
+        // The other session is untouched — the move is keyed by id.
+        assert_eq!(
+            reg.get(&s.session_id).unwrap().cwd,
+            Some(PathBuf::from("/Users/dev/third"))
+        );
+        assert!(
+            !reg.set_cwd(&SessionId::from("sess-ghost"), PathBuf::from("/x")),
+            "a session the registry never had cannot be moved"
+        );
+    }
+
+    /// REQ-583 BR-6: the one cwd validator refuses a relative path and a
+    /// missing or non-directory path, **naming the path** in each refusal, and
+    /// accepts a real directory.
+    #[test]
+    fn the_cwd_validator_names_the_path_in_every_refusal() {
+        let relative = validate_session_cwd(std::path::Path::new("relative/dir"))
+            .expect_err("a relative cwd is refused");
+        assert!(
+            relative.contains("`relative/dir`") && relative.contains("must be an absolute path"),
+            "the refusal names the path and the reason: {relative}"
+        );
+
+        let missing = validate_session_cwd(std::path::Path::new("/nope-teton-sessions-test"))
+            .expect_err("a nonexistent cwd is refused");
+        assert!(
+            missing.contains("`/nope-teton-sessions-test`")
+                && missing.contains("does not exist or is not a directory"),
+            "the refusal names the path and the reason: {missing}"
+        );
+
+        // A file, not a directory: same refusal, same shape.
+        let dir = std::env::temp_dir().join(format!(
+            "teton-sessions-cwd-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("a-file");
+        std::fs::write(&file, b"x").unwrap();
+        let not_dir = validate_session_cwd(&file).expect_err("a file is not a directory");
+        assert!(
+            not_dir.contains(&format!("`{}`", file.display()))
+                && not_dir.contains("does not exist or is not a directory"),
+            "{not_dir}"
+        );
+
+        assert_eq!(validate_session_cwd(&dir), Ok(()));
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
