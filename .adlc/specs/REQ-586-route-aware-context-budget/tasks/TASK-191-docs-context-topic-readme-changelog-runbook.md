@@ -1,7 +1,7 @@
 ---
 id: TASK-191
 title: "Docs: teton_docs `context` topic, providers/doctor topic lines, README, CHANGELOG, manual-verification runbook, architecture.md pattern + ADR-006 note"
-status: draft
+status: complete
 parent: REQ-586
 created: 2026-08-19
 updated: 2026-08-19
@@ -32,9 +32,9 @@ section, and the Key Pattern / ADR-006 note in `.adlc/context/architecture.md`.
 
 ## Acceptance Criteria
 
-- [ ] `cargo test -p tetond harness::tools::docs` green incl. ceiling/floor for `context`; both prompt-margin tests green without moving the ceiling.
-- [ ] `web_setup_contracts.rs` README/guide/topic gates green; `every_bundled_topic_is_under_the_ceiling` green.
-- [ ] The runbook section names every manual check of AC-14 with a checkbox, and records the resident-prompt headroom after this REQ (the `+9 B` description growth against the ≈887 B BUG-181 left — measure, as REQ-577/579/581/583 did; REQ-587 will read it).
+- [x] `cargo test -p tetond harness::tools::docs` green incl. ceiling/floor for `context`; both prompt-margin tests green without moving the ceiling.
+- [x] `web_setup_contracts.rs` README/guide/topic gates green; `every_bundled_topic_is_under_the_ceiling` green.
+- [x] The runbook section names every manual check of AC-14 with a checkbox, and records the resident-prompt headroom after this REQ (the `+9 B` description growth against the ≈887 B BUG-181 left — measure, as REQ-577/579/581/583 did; REQ-587 will read it).
 
 ## Technical Notes
 

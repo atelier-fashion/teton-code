@@ -2190,6 +2190,24 @@ mod tests {
     /// byte cost, not the probe's strings; and this sweep now checks that the widest
     /// prompt it measured carries `Session root: ` at all, so the row cannot be
     /// dropped and leave the sweep passing on the smaller shape.
+    ///
+    /// **Recorded headroom at REQ-586:** the worst prompt is 6,096 bytes,
+    /// `spent` is 9,372, and the margin is **868** — against BUG-181's
+    /// 10,240-byte overhead, with the floor still 48 and the overhead still
+    /// 10 KiB (AC-13: neither moved for this REQ). Every figure above this
+    /// paragraph predates BUG-181 and was measured against the 9,216 it
+    /// replaced; this branch's tip before the docs task was 6,078 / 9,354 /
+    /// **886**.
+    ///
+    /// This REQ spent **18** of that, and it is the ADR-11 trade working: the
+    /// budget vocabulary is 3.4 KB of prose and it entered the prompt as one
+    /// word. `teton_docs`'s topic list gained `context` — nine bytes in its
+    /// description and nine more in the tool schema's `One of: …`, which is
+    /// rendered too — and nothing else resident moved. The `context` topic
+    /// itself, the `window:` column, the doctor advisories and the pressure
+    /// lines are tool results and CLI surfaces, which cost the prompt nothing.
+    /// The opted-in twin is 6,049 / 9,325 / **915** and stays the looser of
+    /// the two.
     #[test]
     fn the_total_cap_clears_the_harness_context_budget_with_margin() {
         use teton_core::capability::{SearchGap, WebCapabilityState};

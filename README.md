@@ -301,11 +301,15 @@ differentiators:
 # Register the provider. Every remote kind needs --kind, --endpoint and
 # --model; the API key is read from TETON_PROVIDER_KEY or prompted for, and
 # stored in the OS keychain — never written to a file. --endpoint is the full
-# request URL, posted exactly as given, not a vendor's base_url:
+# request URL, posted exactly as given, not a vendor's base_url. --max-context
+# declares the model's context window, so turns routed there are assembled to
+# fit it rather than the local default:
 teton provider add opus --kind anthropic \
-  --endpoint https://api.anthropic.com/v1/messages --model claude-opus-5
+  --endpoint https://api.anthropic.com/v1/messages --model claude-opus-5 \
+  --max-context 1000000
 teton provider add kimi --kind openai-compatible \
-  --endpoint https://api.moonshot.ai/v1/chat/completions --model kimi-k3
+  --endpoint https://api.moonshot.ai/v1/chat/completions --model kimi-k3 \
+  --max-context 1000000
 
 # Route work to it — a whole tier (reflex | scan | build | think), with an
 # optional fallback, or a single category ahead of its tier:
@@ -320,6 +324,16 @@ teton doctor
 
 Config lives in `config.toml` in Teton's state directory (override with
 `TETON_CONFIG`); API keys are never stored in it.
+
+**Context budget.** Every turn is assembled to fit the route it takes. A
+provider that declares a window gets a budget derived from it — in words *and*
+bytes, and on a remote route it is the byte guard that binds for prose and for
+code; one that declares none runs under the local default of 4,096 words, and
+`teton doctor` says so rather than leaving it a surprise. `/provider setup`
+records the window for the recipes it ships, `--max-context` sets one by hand,
+and `--context-budget-cap` holds a large window to a smaller budget — the
+budget bounds a model *call*, and a prompt may make up to 25 of them. The
+whole of it is one topic: ask a session for `teton_docs context`.
 
 Recipes for Anthropic, OpenAI, Moonshot (Kimi), DeepSeek, Ollama and
 Grok (xAI) ship inside the binary. Ask in a session and the agent hands back

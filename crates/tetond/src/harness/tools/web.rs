@@ -2260,6 +2260,15 @@ mod tests {
     /// byte bound moved into `environment_block` (`bounded_field_bytes`, the
     /// prompt's alone) and the row is byte-identical; this sweep now also
     /// checks that its widest prompt carries the block at all.
+    ///
+    /// **Recorded headroom at REQ-586:** 6,049 bytes, `spent` 9,325, margin
+    /// **915** — against BUG-181's 10,240-byte overhead, which every figure
+    /// above predates. The tip before the docs task was 6,031 / 9,307 /
+    /// **933**; REQ-586 spent the **18** both shapes pay, the `context` entry
+    /// in `teton_docs`'s topic list (nine bytes in the description, nine in
+    /// the schema's `One of: …`). This shape stays the looser of the two, and
+    /// the account of what those eighteen bytes bought — a 3.4 KB topic served
+    /// as a tool result — is `egress::redact`'s note.
     #[tokio::test]
     async fn the_web_tool_docs_clear_the_outbound_body_overhead() {
         use teton_core::capability::{SearchGap, WebCapabilityState};

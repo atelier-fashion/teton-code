@@ -41,6 +41,10 @@ are never in config — they live in the OS keychain under the service `teton` �
 so a provider registered without its key looks perfectly healthy here and fails
 at its first call. See topic `providers` for what a 401 usually means.
 
+Each row carries `window:` — the declared context window, or `unknown`. Doctor
+advises on one that declares none, and on an inert `context_budget_cap` (at or
+above its window). Topic `context`.
+
 ## Where config lives
 
 `config.toml` in Teton's state directory: `$XDG_RUNTIME_DIR/teton` when that is

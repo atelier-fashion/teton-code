@@ -2027,3 +2027,126 @@ Support/teton/models` were listed intact afterwards.
 **Still outstanding for a person:** step 2 at a real terminal, watching the
 screen for the *Media & Apple Music* / *Photos* / *"data from other apps"*
 dialogs across the turn (and noting a Desktop/Documents one if it appears).
+
+# Manual verification runbook — REQ-586 (a declared window, and what a turn is assembled to fit)
+
+**Status: OUTSTANDING.** CI pins the mechanism everywhere it can reach it: the
+derivation is a pure table-tested function (`harness::budget`), the router is
+its one caller, the corpus fixture pins both guards against a real tokenizer,
+the wire fields and the event are contract-tested, the `window:` column and the
+two doctor advisories run through the shipped binaries (`cli_e2e`), and the
+reroute refit, the carry drop, the redact bound and the pressure emissions are
+driven end to end in the daemon's integration suite.
+
+What no CI run settles is the claim a user actually cares about: that a real
+frontier provider, given a real window, really does take a prompt that used to
+be silently cut — and that the cost row agrees. The mock providers accept
+whatever they are sent, so "the whole prompt arrived" is only observable
+against a vendor that would have refused it (LESSON-481: pay for the harness or
+record the gap). The model's *reply* is an observation, never an assertion
+(LESSON-532); what is asserted is the surfaces.
+
+## Prerequisites
+
+A build with the local engine (`cargo build --release --features
+tetond/llama`) or the shipped binary, `TETON_TEST_SEAMS` unset, verified
+weights (`teton model status` → `verified`), and a real Moonshot key. Use the
+isolation recipe above (a short `XDG_RUNTIME_DIR` base, weights symlinked at
+`$BASE/teton/models`) to keep a launchd daemon out of it. A 6,000-word prompt
+is ~34 KB of prose — well past the old 4,096-word budget and past the 32,768-B
+one, so before this REQ it was guaranteed to be cut.
+
+## Procedure
+
+1. [ ] **Declare the window through the new surface, not by hand.** Either
+   `/provider setup kimi build` in a session (it records the recipe's window —
+   1,000,000 — when you take `kimi-k3`, the recipe's example model), or
+   `teton provider add kimi --kind openai-compatible --endpoint
+   https://api.moonshot.ai/v1/chat/completions --model kimi-k3 --max-context
+   128000`. AC-14 names 128,000; the recipe now ships 1,000,000, and either is
+   a valid record of this step — write down which you used. Confirm
+   `config.toml` gained `max_context` under `[providers.kimi.capabilities]`
+   without you opening the file.
+2. [ ] **`teton doctor` shows the window.** The `kimi` row ends `window: 128k`
+   (or `1m`), and there is **no** advisory line for it. A provider you have
+   *not* given a window still reads `window: unknown — context budget
+   defaulted (set capabilities.max_context)` and draws the advisory — check
+   one, so the column is not vacuously green. `teton provider list` shows the
+   same column.
+3. [ ] **A 6,000-word prompt reaches Kimi whole.** Route `build` to `kimi`
+   (`teton policy set-tier build kimi`), start a session with `/verbose`, and
+   paste ~6,000 words (any long document; prose is the class the byte guard
+   binds on). Expect on the route line
+   `· budget 84,650 words / 254 KB (bound: window)` for a 128k window, or
+   `· budget 665,984 words / 2 MB (bound: window)` for 1m — and **no**
+   `context:` pressure line at all. Record both the route line and `/cost`'s
+   input-token count for the turn; the input tokens should be in the same
+   ballpark as the prompt's own token count (≈7,500 for 6,000 words of prose),
+   not clipped near 4,096 words.
+4. [ ] **The same prompt under `redact = true` names the redact bound.** Set
+   `[privacy] redact = true`, restart the daemon, and paste the same prompt.
+   Expect `(bound: redact scan)` on the route line — the byte figure drops to
+   `89 KB` while the word figure stays window-derived — and expect the turn to
+   **complete**, never a block for an unscannable body.
+5. [ ] **Chunk-count note.** Record how long step 4's turn took before the
+   model's first token. A body near the bound is scanned in up to five chunks
+   (`REDACT_MAX_CHUNKS` — four chunk-widths plus the overlap), each one a local
+   model call, so this is where a redacted big-window turn spends its latency.
+   There is no per-chunk surface by design; the number to write down is the
+   wall time and whether anything was flagged.
+6. [ ] **Record the worst case per prompt at this budget.** The budget bounds
+   one model **call**. A prompt runs up to 25 tool iterations
+   (`NATIVE_MAX_ITERATIONS`) and each re-sends the context, so a 1,000,000-token
+   window — 665,984 words / 2 MB per call — is up to **≈25 million input
+   tokens for a single prompt**; a 128,000-token window is 84,650 words / 254 KB
+   per call and ≈3.2 million per prompt. Price both against your provider's
+   rate and write the two numbers down. `context_budget_cap` is the knob that
+   lowers the ceiling; there is no spend cap, and this runbook is where that is
+   said out loud (BR-9).
+7. [ ] **Once REQ-585 lands: `/proceed REQ-xxx` expands rather than being
+   refused for size.** The seven ADLC skills that fit on no tier before this
+   REQ — `/spec`, `/manifest`, `/analyze`, `/template-drift`, `/wrapup`,
+   `/sprint`, `/proceed` — should expand on a Kimi-routed `build` tier with no
+   pressure line. Until REQ-585 ships there is nothing to type here; leave the
+   box open rather than closing it on the smaller claim.
+
+## Recorded resident-prompt headroom after REQ-586
+
+The number REQ-587 should read before it writes a resident sentence. Measured
+on this branch's tip with the two margin tests
+(`egress::redact::tests::the_total_cap_clears_the_harness_context_budget_with_margin`
+and `harness::tools::web::tests::the_web_tool_docs_clear_the_outbound_body_overhead`),
+against BUG-181's 10,240-byte body overhead and the unmoved 48-byte floor:
+
+| shape | worst prompt | spent | margin |
+|---|---|---|---|
+| opted-out (no web tool) — the tighter | 6,096 | 9,372 | **868** |
+| opted-in (web tool docs + schema) | 6,049 | 9,325 | **915** |
+
+Before this task the same two were 6,078 / 9,354 / **886** and 6,031 / 9,307 /
+**933**. REQ-586 spent **18 bytes** of resident prompt, and that is the whole
+of its cost: nine for `context` in the `teton_docs` topic index, nine more for
+the same word in the tool's schema. The 3.4 KB `context` topic, the `window:`
+column, the doctor advisories, the budget clause and the pressure lines are
+tool results and CLI surfaces, which the prompt does not pay for (ADR-11).
+Neither the overhead nor the floor moved (AC-13). The description is now
+**exactly** at its 120-character ceiling, so a sixth topic buys its name by
+shortening the sentence in front of the index.
+
+## Sign-off
+
+```
+Date / build     :
+Provider + model :
+Window declared  :            (how: /provider setup | provider add --max-context)
+Step 1 — config gained max_context without a hand edit : yes / no
+Step 2 — doctor row window, and an unknown row advised : yes / no
+Step 3 — route line budget + bound                     :
+Step 3 — /cost input tokens for the turn               :
+Step 3 — any `context:` pressure line                  : yes / no
+Step 4 — bound: redact scan, turn completed            : yes / no
+Step 5 — wall time to first token under redact         :
+Step 6 — worst case per prompt, priced                 :
+Step 7 — REQ-585 skills expand                         : yes / no / not yet shipped
+Notes / findings :
+```
