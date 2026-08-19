@@ -538,9 +538,12 @@ client's own echo line is the record.
   `/spec` (2,717), `/manifest`, `/analyze`, `/template-drift`, `/wrapup`,
   `/sprint`, `/proceed` (7,222); on a remote route with a declared window of
   16k tokens or more, all seventeen expand (`/proceed` is 8,671 words with
-  ethos and system prompt, ≈ 13k tokens at REQ-586's working ratio). The
-  64 KiB body cap admits every shipped skill; it exists to refuse a mistaken
-  file, not to ration real skills.
+  ethos and system prompt, ≈ 13k tokens at REQ-586's working ratio). On a
+  machine with `[privacy] redact = true`, REQ-586 BR-4's scannable bound
+  (≈ 89 KB with today's constants) still admits every skill — `/proceed`'s
+  expansion is ≈ 61 KB with ethos and system prompt — so the success bar
+  holds there too. The 64 KiB body cap admits every shipped skill; it exists
+  to refuse a mistaken file, not to ration real skills.
 - Fidelity: the agent-fleet and skill-invoking skills (`/proceed`,
   `/sprint`, `/analyze`) will degrade under a single model with five tools
   even once the budget admits them, and `/proceed`/`/sprint` will stall at
