@@ -1075,6 +1075,22 @@ impl Client {
             .to_owned()
     }
 
+    /// Create a session rooted at `cwd` (REQ-583) and return the **full**
+    /// response object — `result.session_id` and `result.root` on success, or
+    /// the daemon's `error` when the cwd is refused (BR-6 names the path).
+    ///
+    /// Beside [`Self::create_session`] rather than folded into it: the suite's
+    /// existing sessions stand on the daemon's `TETON_REPO_ROOT` fallback and
+    /// read nothing back, and a session-root test wants both the path it chose
+    /// and the derived view the daemon answered with.
+    pub fn create_session_at(&mut self, mode: &str, phase: Option<&str>, cwd: &Path) -> Value {
+        let mut params = json!({ "mode": mode, "cwd": cwd });
+        if let Some(phase) = phase {
+            params["phase"] = json!(phase);
+        }
+        self.call("session/create", params)
+    }
+
     /// Submit a text prompt turn and return the full response object.
     pub fn prompt(&mut self, session_id: &str, text: &str) -> Value {
         self.call(

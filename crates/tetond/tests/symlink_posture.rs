@@ -444,7 +444,7 @@ fn read_refuses_a_link_that_resolves_outside_the_root() {
         out.content
     );
     assert!(
-        out.content.contains("escapes the repo root"),
+        out.content.contains("is outside the session root"),
         "the refusal must be the jail's, not an I/O accident: {}",
         out.content
     );
@@ -477,7 +477,7 @@ fn edit_refuses_a_link_that_resolves_outside_the_root() {
         out.content
     );
     assert!(
-        out.content.contains("escapes the repo root"),
+        out.content.contains("is outside the session root"),
         "the refusal must be the jail's: {}",
         out.content
     );
@@ -824,7 +824,7 @@ fn read_refuses_a_new_leaf_through_an_escaping_link_and_keeps_accepting_one_in_t
     let existing = ReadTool.run(&ctx, &json!({ "path": "escape-dir/outside-secret.txt" }));
     assert!(existing.is_error, "{}", existing.content);
     assert!(
-        existing.content.contains("escapes the repo root"),
+        existing.content.contains("is outside the session root"),
         "an existing file through a directory link must be the jail's refusal: {}",
         existing.content
     );
@@ -837,7 +837,7 @@ fn read_refuses_a_new_leaf_through_an_escaping_link_and_keeps_accepting_one_in_t
         out.content
     );
     assert!(
-        out.content.contains("escapes the repo root"),
+        out.content.contains("is outside the session root"),
         "the refusal must be the jail's, decided on the resolved path: {}",
         out.content
     );
@@ -852,7 +852,7 @@ fn read_refuses_a_new_leaf_through_an_escaping_link_and_keeps_accepting_one_in_t
     let missing = ReadTool.run(&ctx, &json!({ "path": "src/not-created-yet.rs" }));
     assert!(missing.is_error, "{}", missing.content);
     assert!(
-        !missing.content.contains("escapes the repo root"),
+        !missing.content.contains("is outside the session root"),
         "a new file in the repo was refused by the jail — the fix over-refuses: {}",
         missing.content
     );
@@ -903,7 +903,7 @@ fn edit_refuses_to_reach_a_new_leaf_through_an_escaping_link() {
         out.content
     );
     assert!(
-        out.content.contains("escapes the repo root"),
+        out.content.contains("is outside the session root"),
         "the refusal must be the jail's: {}",
         out.content
     );

@@ -1,6 +1,6 @@
 //! The `read` tool: return a file's contents (optionally a line window).
 //!
-//! Reads are jailed to the repo root ([`ToolContext`]). Output is line-numbered
+//! Reads are jailed to the session root ([`ToolContext`]). Output is line-numbered
 //! so the model can cite lines back to the `edit` tool, and an optional
 //! `offset`/`limit` window keeps a large file from blowing the small-model
 //! context budget in one call.
@@ -55,7 +55,7 @@ fn divergence_note(raw: &str, resolved: &ProvenanceId) -> Option<String> {
     (requested != resolved.as_str()).then(|| format!("`{raw}` -> `{}`", resolved.as_str()))
 }
 
-/// Reads a file within the repo-root jail.
+/// Reads a file within the session-root jail.
 #[derive(Debug, Default, Clone, Copy)]
 pub struct ReadTool;
 
@@ -65,14 +65,14 @@ impl Tool for ReadTool {
     }
 
     fn description(&self) -> &str {
-        "Read a text file within the repository. Returns line-numbered contents."
+        "Read a text file under the session root. Returns line-numbered contents."
     }
 
     fn input_schema(&self) -> Value {
         json!({
             "type": "object",
             "properties": {
-                "path": { "type": "string", "description": "Repo-relative file path" },
+                "path": { "type": "string", "description": "Root-relative file path" },
                 "offset": { "type": "integer", "description": "1-based first line to return" },
                 "limit": { "type": "integer", "description": "Maximum number of lines" }
             },
@@ -97,6 +97,14 @@ impl Tool for ReadTool {
             Ok(r) => r,
             Err(e) => return e.into(),
         };
+        // Regular files only, decided off `metadata` before anything is opened
+        // (REQ-583 verify): a FIFO's open blocks for a writer that never comes,
+        // and a device or a socket is not a text file — none of them may hold
+        // the turn. A path that cannot be stat'ed at all falls through to the
+        // open, whose error names the reason (missing, unreadable).
+        if let Err(e) = super::refuse_non_regular_file(&raw, &path) {
+            return e.into();
+        }
 
         let contents = match std::fs::read_to_string(&path) {
             Ok(c) => c,
@@ -203,6 +211,37 @@ mod tests {
         let ctx = ToolContext::new(&root);
         let out = ReadTool.run(&ctx, &json!({ "path": "nope.txt" }));
         assert!(out.is_error);
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// **A FIFO (or any non-regular file) is refused before it is opened, so
+    /// it cannot block the turn** (REQ-583 verify). Opening a FIFO for reading
+    /// waits for a writer; a read that opened first would sit there for the
+    /// rest of the turn. The type is read off `metadata` and the refusal is
+    /// jail-shaped and names the request — asserted on a worker thread with a
+    /// deadline, so a regression is a failed test and not a hung suite.
+    #[test]
+    fn a_fifo_is_refused_as_not_a_regular_file_without_blocking() {
+        let root = temp_root("fifo");
+        crate::mkfifo(&root.join("pipe"));
+        let worker_root = root.clone();
+        let out = crate::with_deadline("read of a FIFO", move || {
+            ReadTool.run(&ToolContext::new(&worker_root), &json!({ "path": "pipe" }))
+        });
+        assert!(out.is_error, "{}", out.content);
+        assert!(
+            out.content.contains("path `pipe` is not a regular file"),
+            "{}",
+            out.content
+        );
+        // A directory is the same refusal: not something `read` opens.
+        std::fs::create_dir_all(root.join("dir")).unwrap();
+        let out = ReadTool.run(&ToolContext::new(&root), &json!({ "path": "dir" }));
+        assert!(
+            out.is_error && out.content.contains("path `dir` is not a regular file"),
+            "{}",
+            out.content
+        );
         std::fs::remove_dir_all(&root).ok();
     }
 

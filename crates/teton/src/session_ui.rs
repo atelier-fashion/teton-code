@@ -38,9 +38,11 @@ use teton_protocol::events::{
 };
 use teton_protocol::methods::{
     AttachConsentOutcome, AttachConsentParams, PermissionOutcome, PermissionRespondParams,
+    SessionRoot,
 };
 use teton_protocol::{Phase, RequestId, SessionId};
 
+use crate::banner;
 use crate::cost_ui::CostMeter;
 use crate::firstrun;
 use crate::prompt::Prompter;
@@ -165,6 +167,17 @@ pub struct SessionState {
     /// [`hand_off_after_turn`] — an interrupted one, or one the daemon
     /// refused — cannot leak its text into the turn after it.
     turn_reply: String,
+    /// This session's root — the directory its tools are scoped to — as the
+    /// daemon last described it (REQ-583 ADR-4).
+    ///
+    /// A cache of a daemon fact, not client state: filled from
+    /// `SessionCreateResult.root` when the session starts and replaced by every
+    /// `session_root_changed` for this session, so `/cd`'s bare form can print
+    /// the root without an RPC. `None` before the session exists, on a passive
+    /// context, or against a daemon older than the field — and a root nobody
+    /// knows renders as a notice saying so, never as a guess: the client does
+    /// not derive kind (ADR-1).
+    pub root: Option<SessionRoot>,
     /// The user's typed prompt for the turn in flight (REQ-581 ADR-4).
     ///
     /// REQ-579's nudge could read the reply alone because the failure it
@@ -219,6 +232,18 @@ pub struct SessionState {
     /// sets it: a flag any other flow could raise would be a way to silence a
     /// notice about a test this client never ran.
     pub(crate) provider_test_in_flight: bool,
+    /// Whether this session's stdout is a terminal (REQ-583 BR-5 / ADR-5).
+    ///
+    /// The not-a-project notice is content the surface draws only at a
+    /// terminal: launch prints it under the banner inside the same `if
+    /// interactive` gate as the banner, and BR-8's re-fire after `/cd` — drawn
+    /// from the `session_root_changed` arm, which has only this state to ask —
+    /// takes the same gate from here, so a pipe sees the root line and nothing
+    /// more (byte parity, ADR-007's TTY clause). Set once by `run_session` from
+    /// the same `is_terminal` read the banner uses; `false` by default, which is
+    /// the piped posture and the safe one — a passive context that was never
+    /// told draws no notice rather than one nobody asked for.
+    pub interactive: bool,
 }
 
 /// What the session's web capability currently is, for the status row.
@@ -799,7 +824,64 @@ pub fn render_event(
             surface.line(LineKind::Notice, &format_turn_queued(queued));
             EventOutcome::Rendered
         }
+        Event::SessionRootChanged(changed) => {
+            // REQ-583 BR-7/BR-8. The `context_cleared` event that precedes this
+            // one has already drawn its line — the disposition of a move is a
+            // clear, in the existing shape — so this arm draws only the news
+            // that is new: where the session is now, and (when that is not a
+            // project) the same one-line notice launch would have printed. Never
+            // verbose-gated, for `context_cleared`'s reason: the jail every
+            // later tool call runs under just moved.
+            //
+            // And it says *whose* root when it was not this client's session
+            // (the bus is daemon-wide) — without redrawing that root here, since
+            // this client's cache is about this client's session.
+            match other_session(state.session_id.as_ref(), env.session_id.as_ref()) {
+                Some(session) => {
+                    surface.line(LineKind::Notice, &format_root_moved_elsewhere(session));
+                }
+                None => {
+                    // The cache is *this* session's root, so it follows the
+                    // event only when this client knows which session it is
+                    // in. With no session of its own (a passive context, or the
+                    // window before `session/create` answers) unknown is not
+                    // evidence of elsewhere — the line still draws — but it is
+                    // not evidence of *here* either, and caching another
+                    // session's root would make a later bare `/cd` describe a
+                    // root this client never had.
+                    if state.session_id.is_some() {
+                        state.root = Some(changed.root.clone());
+                    }
+                    surface.line(
+                        LineKind::Notice,
+                        &format_session_root_changed(&changed.root),
+                    );
+                    // BR-8, under BR-5's gate: the notice's bytes are for a
+                    // terminal, at launch and here alike — a pipe gets the
+                    // root line above and nothing more.
+                    if state.interactive {
+                        if let Some(notice) = banner::root_notice(&changed.root) {
+                            surface.line(LineKind::Notice, &notice);
+                        }
+                    }
+                }
+            }
+            EventOutcome::Rendered
+        }
     }
+}
+
+/// The line a `session_root_changed` event draws for the session it is about
+/// (REQ-583 BR-7): the new root and its kind, in the one spelling
+/// [`banner::root_line`] gives every surface.
+fn format_session_root_changed(root: &SessionRoot) -> String {
+    format!("session root is now {}", banner::root_line(root))
+}
+
+/// The line drawn when *another* session's root moved: named, and nothing
+/// else — a root this client is not in is not a root it should describe.
+fn format_root_moved_elsewhere(session: &SessionId) -> String {
+    format!("session root moved in another session ({session})")
 }
 
 /// The line a connection test renders for a client that did **not** run it
@@ -2317,9 +2399,10 @@ mod tests {
     use crate::render::RecordingSurface;
     use teton_protocol::events::{
         ByteSpan, ContextCleared, CostRecord, CostRecorded, FindingKind, ModelSelectionDecided,
-        PlanEntry, PlanEntryStatus, SelectionSource, SessionUpdate, WebTaintOverridden,
+        PlanEntry, PlanEntryStatus, SelectionSource, SessionRootChanged, SessionUpdate,
+        WebTaintOverridden,
     };
-    use teton_protocol::methods::{ProviderHealth, ProviderTestOutcome, TierBinding};
+    use teton_protocol::methods::{ProviderHealth, ProviderTestOutcome, RootKind, TierBinding};
     use teton_protocol::{ProviderId, ProviderKind, RequestId, SessionId, Tier};
 
     /// A consent request as the daemon would publish it.
@@ -3980,6 +4063,192 @@ mod tests {
             "rendered as {:?}",
             surface.lines_of(LineKind::Notice)
         );
+    }
+
+    // -- REQ-583 BR-7 / BR-8: the session-root line and its notice ----------
+
+    fn session_root(kind: RootKind, display: &str) -> SessionRoot {
+        SessionRoot {
+            display: display.to_owned(),
+            kind,
+            project_name: (kind == RootKind::Project).then(|| "teton-code".to_owned()),
+            vcs_branch: (kind == RootKind::Project).then(|| "main".to_owned()),
+        }
+    }
+
+    /// A `session_root_changed` envelope for `session`, moving it to `root`.
+    fn root_changed(session: &str, root: SessionRoot) -> EventEnvelope {
+        EventEnvelope::new(
+            1,
+            Some(SessionId::from(session)),
+            Event::SessionRootChanged(SessionRootChanged {
+                previous_display: "~/before".to_owned(),
+                root,
+            }),
+        )
+    }
+
+    /// The client that is *in* the moved session reads where it is now — root
+    /// and kind, in the one spelling every surface uses — and its cache of the
+    /// root moves with it, so `/cd`'s bare form answers from what the daemon
+    /// last said. A project draws that one line and **no** notice (BR-8 fires
+    /// only when the new kind is not a project).
+    #[test]
+    fn a_root_move_in_this_session_states_the_new_root_and_kind() {
+        let mut surface = RecordingSurface::new();
+        let mut state = SessionState::new();
+        state.session_id = Some(SessionId::from("s1"));
+        state.root = Some(session_root(RootKind::Home, "~"));
+
+        let root = session_root(RootKind::Project, "~/Documents/GitHub/teton-code");
+        render_event(&root_changed("s1", root.clone()), &mut surface, &mut state);
+
+        assert!(
+            surface.any_line_contains(
+                LineKind::Notice,
+                "session root is now ~/Documents/GitHub/teton-code (project teton-code, branch main)"
+            ),
+            "rendered as {:?}",
+            surface.lines_of(LineKind::Notice)
+        );
+        assert!(
+            !surface.any_line_contains(LineKind::Notice, "Not inside a project"),
+            "a project root needs no notice: {:?}",
+            surface.lines_of(LineKind::Notice)
+        );
+        assert!(
+            !surface.any_line_contains(LineKind::Notice, "another session"),
+            "this client's own move must not be attributed elsewhere"
+        );
+        // The disposition line is the `context_cleared` event's to draw, not
+        // this arm's — one clear, one line, drawn once (BR-7's "existing shape").
+        assert!(!surface.any_line_contains(LineKind::Notice, "context cleared"));
+        assert_eq!(state.root, Some(root), "the cache follows the daemon");
+    }
+
+    /// **BR-8 / AC-11.** A `/cd ~` from a project fires the BR-5 notice again:
+    /// the user gets the same one line they would have gotten at launch, drawn
+    /// by the same function, right after the root line.
+    #[test]
+    fn a_root_move_to_home_refires_the_launch_notice() {
+        let mut surface = RecordingSurface::new();
+        let mut state = SessionState::new();
+        state.interactive = true;
+        state.session_id = Some(SessionId::from("s1"));
+        state.root = Some(session_root(
+            RootKind::Project,
+            "~/Documents/GitHub/teton-code",
+        ));
+
+        let home = session_root(RootKind::Home, "~");
+        render_event(&root_changed("s1", home.clone()), &mut surface, &mut state);
+
+        let notices = surface.lines_of(LineKind::Notice);
+        assert_eq!(
+            notices.len(),
+            2,
+            "the root line, then the notice: {notices:?}"
+        );
+        assert_eq!(notices[0], "session root is now ~ (your home folder)");
+        assert_eq!(
+            notices[1],
+            banner::root_notice(&home).expect("home is announced"),
+            "the re-fired notice is launch's own, not a second wording"
+        );
+        assert!(notices[1].contains("`/cd <path>`"), "{}", notices[1]);
+        assert_eq!(state.root, Some(home));
+    }
+
+    /// **BR-5's gate applies to the re-fire (TASK-180).** The same move on a
+    /// pipe — stdout not a terminal, `interactive` false as `run_session` sets
+    /// it — draws the root line and **no** notice: the notice's content is
+    /// pure and its bytes are the terminal's, at launch and after `/cd` alike,
+    /// so piped output moves only by the one line the move itself adds.
+    #[test]
+    fn a_root_move_to_home_on_a_pipe_draws_the_root_line_and_no_notice() {
+        let mut surface = RecordingSurface::new();
+        let mut state = SessionState::new();
+        assert!(!state.interactive, "the default is the piped posture");
+        state.session_id = Some(SessionId::from("s1"));
+        state.root = Some(session_root(
+            RootKind::Project,
+            "~/Documents/GitHub/teton-code",
+        ));
+
+        let home = session_root(RootKind::Home, "~");
+        render_event(&root_changed("s1", home.clone()), &mut surface, &mut state);
+
+        assert_eq!(
+            surface.lines_of(LineKind::Notice),
+            vec!["session root is now ~ (your home folder)".to_owned()],
+            "on a pipe the move is the root line alone"
+        );
+        assert_eq!(state.root, Some(home), "the cache still follows the daemon");
+    }
+
+    /// **The bus is daemon-wide.** A move in a *different* session names that
+    /// session and describes nothing — this client's root did not move, its
+    /// cache stays, and no notice about someone else's root fires here.
+    #[test]
+    fn a_root_move_in_another_session_says_so_and_names_it() {
+        let mut surface = RecordingSurface::new();
+        let mut state = SessionState::new();
+        state.session_id = Some(SessionId::from("s1"));
+        let ours = session_root(RootKind::Project, "~/Documents/GitHub/teton-code");
+        state.root = Some(ours.clone());
+
+        render_event(
+            &root_changed("s2", session_root(RootKind::Home, "~")),
+            &mut surface,
+            &mut state,
+        );
+
+        let notices = surface.lines_of(LineKind::Notice);
+        assert_eq!(
+            notices,
+            vec!["session root moved in another session (s2)"],
+            "rendered as {notices:?}"
+        );
+        assert_eq!(state.root, Some(ours), "another session's move is not ours");
+    }
+
+    /// A client with no session of its own (a passive context, or the window
+    /// before `session/create` answers) renders the plain line — unknown is not
+    /// evidence of elsewhere, exactly as for `context_cleared` — but it does
+    /// **not** cache the root: unknown is not evidence of *here* either, and a
+    /// later bare `/cd` must not describe a root this client never had.
+    #[test]
+    fn a_root_move_is_not_attributed_elsewhere_when_this_client_has_no_session() {
+        let mut surface = RecordingSurface::new();
+        let mut state = SessionState::new();
+        state.interactive = true;
+        assert_eq!(state.session_id, None);
+
+        render_event(
+            &root_changed("s2", session_root(RootKind::Plain, "/opt/scratch")),
+            &mut surface,
+            &mut state,
+        );
+
+        assert!(
+            surface.any_line_contains(
+                LineKind::Notice,
+                "session root is now /opt/scratch (not a project)"
+            ),
+            "rendered as {:?}",
+            surface.lines_of(LineKind::Notice)
+        );
+        assert!(surface.any_line_contains(LineKind::Notice, "Not inside a project"));
+        assert_eq!(
+            state.root, None,
+            "with no session of its own this client must not cache another session's root"
+        );
+    }
+
+    /// The root cache starts empty: nothing is known until the daemon says.
+    #[test]
+    fn the_root_cache_starts_unknown() {
+        assert_eq!(SessionState::new().root, None);
     }
 
     // ------------------------------------------------------------------

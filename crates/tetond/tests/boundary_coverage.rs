@@ -62,6 +62,7 @@ const TOOL_SOURCES: &[(&str, &str)] = &[
     ("mcp.rs", include_str!("../src/harness/tools/mcp.rs")),
     ("read.rs", include_str!("../src/harness/tools/read.rs")),
     ("shell.rs", include_str!("../src/harness/tools/shell.rs")),
+    ("walk.rs", include_str!("../src/harness/tools/walk.rs")),
     ("web.rs", include_str!("../src/harness/tools/web.rs")),
 ];
 
@@ -446,7 +447,7 @@ fn every_content_surfacing_tool_has_a_boundary_test() {
     // an empty claim (BUG-159).
     assert_eq!(
         TOOL_SOURCES.len(),
-        9,
+        10,
         "the embedded source list shrank; the scan below is narrower than the module"
     );
     for (file, text) in TOOL_SOURCES {
@@ -749,5 +750,124 @@ fn each_out_of_repo_matcher_assertion_is_paired_with_a_tool_layer_test() {
                 pair.matcher_assertion
             );
         }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// REQ-583 — one walk policy (AC-18) and no "repository" in the rendered docs (AC-6)
+// ---------------------------------------------------------------------------
+
+/// **REQ-583 AC-18 (BR-11), the source half.** No walker declares a private
+/// skip list: outside `walk.rs`, no tool source names a `SKIP_DIRS`-shaped
+/// constant, and both walkers drive their recursion through `walk::visit`.
+///
+/// The behavioural half — that the walkers honour every name in the shared
+/// definition — lives beside each tool
+/// (`glob::tests::glob_is_built_from_the_shared_walk_definition`,
+/// `grep::tests::grep_is_built_from_the_shared_walk_definition`). This
+/// half is what stops the next walker from quietly bringing its own list back:
+/// BR-11 says one skip set, one media set, one budget, and a second copy is a
+/// build failure rather than a review comment.
+#[test]
+fn no_walker_declares_a_private_skip_list_and_both_walk_through_the_shared_driver() {
+    // Floor: the shared definition really is in `walk.rs` and really is what
+    // the scan below would catch elsewhere.
+    let walk = production_half(source(TOOL_SOURCES, "walk.rs"));
+    for anchor in [
+        "pub const WALK_SKIP_DIRS",
+        "pub const HOME_TOP_LEVEL_SKIPS",
+        "pub const MEDIA_BUNDLE_SUFFIXES",
+        "pub struct WalkBudget",
+        "pub fn visit(",
+    ] {
+        assert!(
+            walk.contains(anchor),
+            "`walk.rs` no longer declares `{anchor}`; the shared definition moved and \
+             this scan no longer knows what a private copy would look like"
+        );
+    }
+
+    // A `const`/`static` whose name says SKIP, outside `walk.rs`, is a private
+    // skip list — the exact shape `glob.rs` and `grep.rs` each carried before
+    // ADR-3. Comment lines are ignored; the test modules are cut off (a test
+    // may import the shared constants by name).
+    let is_private_skip_decl = |line: &str| {
+        let line = line.trim_start();
+        if line.starts_with("//") {
+            return false;
+        }
+        let is_decl = [
+            "const ",
+            "pub const ",
+            "pub(crate) const ",
+            "static ",
+            "pub static ",
+        ]
+        .iter()
+        .any(|prefix| line.starts_with(prefix));
+        is_decl && line.contains("SKIP")
+    };
+    for (file, text) in TOOL_SOURCES {
+        if *file == "walk.rs" {
+            continue;
+        }
+        let production = production_half(text);
+        let offenders: Vec<&str> = production
+            .lines()
+            .filter(|line| is_private_skip_decl(line))
+            .collect();
+        assert!(
+            offenders.is_empty(),
+            "{file} declares a skip list of its own: {offenders:?}. BR-11: the skip \
+             set, the media set and the budget are defined once in `walk.rs` and read \
+             through `ToolContext::walk_policy()`."
+        );
+        assert!(
+            !production.contains("SKIP_DIRS"),
+            "{file} names a `SKIP_DIRS` in its production half; the walkers read the \
+             policy off the context rather than naming the constant (BR-11)"
+        );
+    }
+
+    for walker in ["glob.rs", "grep.rs"] {
+        let text = production_half(source(TOOL_SOURCES, walker));
+        assert!(
+            text.contains("walk::visit("),
+            "{walker} no longer walks through `walk::visit`; a walker with its own \
+             recursion is a walker with its own budget, skip set and trailer (BR-10/11)"
+        );
+        assert!(
+            text.contains("ctx.walk_policy()"),
+            "{walker} does not read the context's walk policy; the AC-14 budget seam \
+             and the shared definition both ride on it"
+        );
+        assert!(
+            !text.contains("fn walk(") && !text.contains("fn search("),
+            "{walker} still carries a private recursive walker"
+        );
+    }
+}
+
+/// **REQ-583 AC-6, the rendered half.** No tool description or argument
+/// schema the model is shown says "repository": the tools are jailed to a
+/// *session root*, which may be a home folder or `/`, and a description that
+/// promises a repository misdescribes every non-project session.
+///
+/// Asserted over the registry's rendered docs — the bytes the prompt carries —
+/// rather than over the source strings, so a description assembled at runtime
+/// (`teton_docs`'s is) is covered too.
+#[test]
+fn no_rendered_tool_doc_says_repository() {
+    let docs = ToolRegistry::with_builtins().docs(None);
+    assert!(
+        docs.len() > 500 && docs.contains("- glob:") && docs.contains("- shell:"),
+        "the rendered docs are not what this test expects to scan: {docs:?}"
+    );
+    for word in ["repository", "Repository", "Repo-relative", "repo-relative"] {
+        assert!(
+            !docs.contains(word),
+            "the rendered tool docs say {word:?}; the tools are jailed to a session \
+             root, not a repository (BR-2/AC-6):\n{docs}"
+        );
     }
 }

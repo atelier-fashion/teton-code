@@ -407,6 +407,75 @@ async fn glob_enumerating_a_boundary_file_blocks_the_next_remote_turn() {
     std::fs::remove_dir_all(&repo).ok();
 }
 
+/// **REQ-583 OQ-7, the adopted decision, pinned.** A `glob` that lists the
+/// *directory* `secrets/` surfaces a name, not content: the outcome is tagged
+/// with the bare identity `secrets`, and the boundary `secrets/**` — which
+/// covers the files under `secrets/`, not the name itself — does not block the
+/// next remote turn. The sibling case above (`secrets/**`, enumerating the
+/// files) still blocks. A matcher change that made a bare directory identity
+/// taint would fail this test by name, which is the point: the decision is
+/// privacy-adjacent and was made deliberately (architecture ADR-3), so it is
+/// pinned rather than left to whatever the matcher happens to do.
+#[tokio::test]
+async fn glob_listing_the_boundary_directory_by_name_tags_it_but_does_not_block() {
+    let repo = temp_repo();
+    let (result, captured, blocks, ctx) =
+        run_touching_tool(&repo, ("c1", "glob", r#"{"pattern":"**/secrets"}"#)).await;
+
+    // The positive half: the directory really was listed and tagged under
+    // its bare identity — the listed name and the tagged identity are one
+    // value (BR-9), and it is `secrets`, not a file under it.
+    let framed = ctx
+        .blocks()
+        .iter()
+        .rev()
+        .find(|b| {
+            matches!(
+                b.provenance,
+                tetond::harness::context::Provenance::Tool { .. }
+            )
+        })
+        .map(|b| b.text.clone())
+        .expect("the glob result was folded into context");
+    assert!(
+        framed.contains("secrets/"),
+        "the directory must have been listed, marked as one: {framed}"
+    );
+    let provenance = context_provenance(&ctx);
+    assert!(
+        provenance.contains("secrets"),
+        "the bare directory identity must be tagged: {:?}",
+        provenance.sources().collect::<Vec<_>>()
+    );
+    assert!(
+        !provenance.contains("secrets/prod.env"),
+        "listing the directory by name enumerates no file under it: {:?}",
+        provenance.sources().collect::<Vec<_>>()
+    );
+
+    // The decision: a name is not content, so the boundary over the content
+    // does not fire, and the second turn goes out.
+    assert!(
+        result.is_ok(),
+        "OQ-7 (adopted): a listed directory name does not taint — the next remote \
+         turn must not be blocked: {result:?}"
+    );
+    assert!(
+        blocks.is_empty(),
+        "no privacy block was warranted: {blocks:?}"
+    );
+    assert_eq!(
+        captured.len(),
+        2,
+        "the fixture must really have put a second request on the wire"
+    );
+    // And no boundary *content* left the machine either way.
+    for body in &captured {
+        assert!(!contains_bytes(body, SECRET), "boundary content leaked");
+    }
+    std::fs::remove_dir_all(&repo).ok();
+}
+
 // ---------------------------------------------------------------------------
 // teton_docs — no repo file, and therefore no taint (REQ-577 BR-6)
 // ---------------------------------------------------------------------------

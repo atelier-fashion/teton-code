@@ -1,10 +1,10 @@
 ---
 id: REQ-583
 title: "Session-root awareness and bounded discovery — the agent knows where it is, the user is told when it is nowhere, and a search cannot become a disk crawl"
-status: draft
+status: complete
 deployable: true
 created: 2026-08-18
-updated: 2026-08-18
+updated: 2026-08-19
 component: "daemon/harness"
 domain: "harness"
 stack: ["rust", "daemon", "cli", "json-rpc"]
@@ -265,8 +265,12 @@ _Leg A_
   errors share one shape.
 - [ ] AC-6: No tool description or jail refusal contains the word
   "repository" (a rendered-output assertion over the registry's docs and the
-  enumerated refusal shapes); the notice and the environment block contain
-  "project" only for a `project`-kind root.
+  enumerated refusal shapes); the notice and the environment block never
+  render `project <name>`/`repository` for a non-project root. (Reworded at
+  verify: the mandated notice opens "Not inside a project" and the plain
+  kind's phrase is "not a project", so "contains the word only for a project
+  root" could not hold as written — the invariant is that a non-project root
+  is never *called* a project.)
 
 _Leg B_
 
@@ -402,14 +406,34 @@ _Leg C_
 - [ ] OQ-6: Windows path display and marker table are out of scope (Windows is
   out of MVP scope) — but should the kind derivation refuse to compile rather
   than misclassify there? Architecture.
-- [ ] OQ-7: **What does a bare directory identity taint?** A `glob` that lists
+- [x] OQ-7: **What does a bare directory identity taint?** A `glob` that lists
   `secrets/` surfaces a *name*, not content, and today's matcher says
   `secrets/**` covers the files under it, not the bare `secrets` (the
   boundary module's documented semantics). Recommendation: keep the matcher's
   verdict as-is (a listed directory name does not taint) and say so in the
   architecture — but confirm, because it is a privacy-adjacent product call
   and REQ-571's fail-closed posture could argue for treating a directory whose
-  subtree is covered as covered.
+  subtree is covered as covered. *Status:* the architecture adopted the
+  recommendation (ADR-3, "OQ-7 resolved"), and a `provenance_egress` case
+  now pins it — a listed directory name under a covered subtree does not
+  taint. **Resolved 2026-08-19 (product): confirmed** — a listed directory
+  name never taints; files under the boundary still do; the
+  `provenance_egress` pin is the record.
+- [x] OQ-8: **Do session-scoped AllowAlways permission grants survive a
+  `/cd`?** Today they do: a move clears only the conversation (BR-7, OQ-2),
+  and the session's grants, taint pin and pasted URLs stay as they do across
+  `/clear`. LESSON-495 (a remembered grant answers every question its key
+  matches, so the key must encode the whole question) is the frame, and it
+  cuts both ways: the grant's key never encoded the root — a grant is "this
+  tool, this session", not "this tool under this directory" — so under
+  today's key a move has nothing to invalidate; but if the user was really
+  deciding "allow `shell` in *this project*", the key is missing a noun and
+  the grant should die with the root it was given under. Decision pending;
+  until it is made, the `/cd` line says the conversation was cleared and
+  nothing about grants, which is what is true.
+  **Resolved 2026-08-19 (product): keep.** Session-scoped grants survive a
+  `/cd`, as they survive `/clear` — a grant is "this tool, this session"; the
+  `/cd` line and the re-fired notice are what tell the user the ground moved.
 
 ## Out of Scope
 

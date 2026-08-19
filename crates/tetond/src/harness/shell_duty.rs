@@ -24,7 +24,7 @@
 //!   recover what the fragment was part of.
 //!
 //! **A call that never reached a shell is not in either set.** A missing
-//! `command` argument or an unreachable repo root produces a fixed harness
+//! `command` argument or an unreachable session root produces a fixed harness
 //! sentence and no command line at all; those arms measure nothing
 //! ([`ToolOutcome::measured`](super::tools::ToolOutcome)) and
 //! [`tools::shell`](super::tools::shell)'s `refine` returns before this
@@ -83,7 +83,7 @@
 //! The "**any** boundary" in that sentence is universal because
 //! [`tools::shell`](super::tools::shell)'s `refine` fires only on results a
 //! command actually produced. Its two pre-spawn failures — a missing `command`
-//! argument, a repo root that does not exist — carry *empty* provenance rather
+//! argument, a session root that does not exist — carry *empty* provenance rather
 //! than `Unknown`, which is the honest tag (nothing ran, so nothing came off the
 //! machine) but also the one the egress choke point fast-paths without
 //! consulting a boundary. Letting those reach the duty would have made this

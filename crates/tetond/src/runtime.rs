@@ -117,7 +117,7 @@ use teton_inference::{ChatFormat, Completion, Engine, EngineError, GenParams, Mo
 
 use teton_protocol::events::{
     BlockCause, CapabilityDeadEnd, ContextCleared, Event, ModelLifecycle, ModelLifecycleStage,
-    PrivacyAction, ProviderTested, SessionTitled, TierWarming, TurnQueued,
+    PrivacyAction, ProviderTested, SessionRootChanged, SessionTitled, TierWarming, TurnQueued,
     WebCapabilityState as WireWebCapabilityState, WebLookup, WebSetupCompleted, WebTaintOverridden,
     WebTier as WireWebTier,
 };
@@ -129,11 +129,11 @@ use teton_protocol::methods::{
     ProviderConfig, ProviderHealth as WireProviderHealth, ProviderSetupCandidate,
     ProviderSetupCommitResult, ProviderSetupPlanResult, ProviderSetupPreviewResult,
     ProviderTestOutcome, ProviderTestResult, SessionClearParams, SessionClearResult,
-    SessionPermissionsParams, SessionPermissionsResult, TierBinding as WireTierBinding,
-    TierBindingConfig, TierRouteView, TierSummary, WebOverrideParams, WebOverrideResult,
-    WebRefreshOutcome, WebRefreshParams, WebRefreshResult, WebSetupCommitParams,
-    WebSetupCommitResult, WebSetupPlanResult, WebSetupPreviewParams, WebSetupPreviewResult,
-    WebTableSummary, WebTotalsView,
+    SessionPermissionsParams, SessionPermissionsResult, SessionSetCwdParams, SessionSetCwdResult,
+    TierBinding as WireTierBinding, TierBindingConfig, TierRouteView, TierSummary,
+    WebOverrideParams, WebOverrideResult, WebRefreshOutcome, WebRefreshParams, WebRefreshResult,
+    WebSetupCommitParams, WebSetupCommitResult, WebSetupPlanResult, WebSetupPreviewParams,
+    WebSetupPreviewResult, WebTableSummary, WebTotalsView,
 };
 use teton_protocol::permissions::PermissionLevel;
 use teton_protocol::{
@@ -183,7 +183,8 @@ use crate::router::{
     to_protocol_category, to_protocol_phase, to_protocol_tier, Router, TierOrigin, TierReport,
 };
 use crate::selection_store::SelectionStore;
-use crate::sessions::{SessionRegistry, TurnClaimError};
+use crate::session_root::{home, ProbedRoot};
+use crate::sessions::{validate_session_cwd, SessionRegistry, TurnClaimError};
 use crate::web::{UserUrls, WebCache};
 // The module rather than the function: `suggestion_catalog()` on its own would
 // read, in a file this size, as something the runtime computes.
@@ -2670,7 +2671,9 @@ impl DaemonRuntime {
     /// unrecoverable provider failure occurs.
     // The parameters are the session's own facts, passed individually because
     // that is how the caller reads them off `session/prompt` — the same shape
-    // `run_one_attempt` already carries below.
+    // `run_one_attempt` already carries below. `session_cwd` is the caller's
+    // pre-claim snapshot of the root; the turn re-reads the registry once it
+    // holds the claim and uses the snapshot only if the session is gone.
     #[allow(clippy::too_many_arguments)]
     pub async fn run_prompt_turn(
         self: &Arc<Self>,
@@ -2707,6 +2710,21 @@ impl DaemonRuntime {
         let _claim = sessions
             .try_begin_turn(&session_id, &turn_id)
             .map_err(|err| refused_claim_error(&err))?;
+
+        // REQ-583 verify: the `session_cwd` parameter was read off the registry
+        // BEFORE the claim above was taken (`spawn_prompt_turn` snapshots the
+        // summary, then spawns). A `session/set_cwd` that landed in that window
+        // moved the root and cleared the conversation — and a turn built on the
+        // stale snapshot would run jailed to the old root, state that root in
+        // its environment block, and commit its blocks into the just-cleared
+        // conversation. Now that the claim is held no move can land, so the
+        // registry's path is authoritative for the whole turn and is re-read
+        // here; the snapshot stands in only for a session the registry no
+        // longer has, which the claim a moment ago says is not this one.
+        let session_cwd = sessions
+            .get(&session_id)
+            .map(|summary| summary.cwd)
+            .unwrap_or(session_cwd);
 
         let config = self.config.lock().expect("config mutex poisoned").clone();
         let router = self.turn_router(&config, &session_id);
@@ -2839,7 +2857,17 @@ impl DaemonRuntime {
         // The daemon-global `repo_root` is only a fallback for clients that did
         // not send one — under launchd it is `/`, which is what had every tool
         // call running against the filesystem root.
-        let tool_ctx = ToolContext::new(session_cwd.as_deref().unwrap_or(&self.repo_root));
+        //
+        // REQ-583 ADR-1: the root is probed here, per turn, from the registry's
+        // path — never cached, never client-derived — and the ONE probe feeds
+        // both consumers: the jail (`ToolContext::for_root`, whose refusals name
+        // the display) and the prompt (`route.harness.session_root`, the
+        // environment block). Both are built from one `ProbedRoot`, so the jail
+        // path and the probed view cannot come from two readings. Probing per
+        // turn is what keeps the branch honest after a checkout between turns
+        // and moves every consumer the turn after a `/cd` rewrote the path.
+        let probed = self.session_root_for(session_cwd.as_deref());
+        let tool_ctx = ToolContext::for_root(&probed);
         let stream_events = SessionEvents::new(events.clone(), session_id.clone());
 
         // REQ-572 BR-3: the prompt's capability clause reads the same classifier
@@ -2850,6 +2878,9 @@ impl DaemonRuntime {
             &config.web,
             self.local_model_present(),
         ));
+        // REQ-583 BR-1: the same probed root the jail above was built from — so
+        // the environment block and the jail's refusals print one spelling.
+        route.harness.session_root = Some(probed.view);
         let system = build_system_prompt(&tools, &route.harness);
         // REQ-567 BR-1: this turn begins from what the session has already said.
         // The head was rebuilt from *this* turn's tools and route, and the
@@ -3129,6 +3160,143 @@ impl DaemonRuntime {
             Event::ContextCleared(ContextCleared { blocks_dropped }),
         );
         Ok(SessionClearResult { blocks_dropped })
+    }
+
+    /// The path a session's tools are jailed to: its own `cwd`, or — for a
+    /// client that sent none — the daemon's `repo_root` fallback (BUG-147).
+    ///
+    /// One function, so `session/create`'s answer, `session/set_cwd`'s
+    /// `previous_display` and every turn's jail agree on what "no cwd" means:
+    /// the root a create reports is the root the turn will jail to, by
+    /// construction rather than by two call sites remembering the same
+    /// fallback.
+    fn jail_root<'a>(&'a self, session_cwd: Option<&'a Path>) -> &'a Path {
+        session_cwd.unwrap_or(&self.repo_root)
+    }
+
+    /// The session root a session on `session_cwd` stands on, as every surface
+    /// renders it (REQ-583 ADR-1): [`crate::session_root::probe`] over
+    /// [`Self::jail_root`], with the daemon's own `HOME` — returned **with the
+    /// path it was probed at** ([`ProbedRoot`]), so a turn builds its jail and
+    /// its prompt from one value and the two cannot disagree.
+    ///
+    /// Called per use — at `session/create`, on `session/set_cwd` (twice: the
+    /// old root for `previous_display`, the new one for the answer) and at the
+    /// top of every turn — and never cached: the registry stores the path and
+    /// nothing else, so kind, display, project name and branch are always
+    /// derived from the path as it stands now.
+    #[must_use]
+    pub fn session_root_for(&self, session_cwd: Option<&Path>) -> ProbedRoot {
+        ProbedRoot::probe(self.jail_root(session_cwd).to_path_buf(), home().as_deref())
+    }
+
+    /// Move a live session's root and clear its conversation, announcing both
+    /// (`session/set_cwd`, REQ-583 BR-7 / ADR-4).
+    ///
+    /// Modelled on [`Self::clear_session`], and it takes the **same turn claim**
+    /// for the same reason: a turn owns the conversation until it commits, and
+    /// it also holds a `ToolContext` built from the root as it stood when the
+    /// turn began — so a root that moved underneath would leave that turn's
+    /// tools jailed to a directory the session no longer stands on, with the
+    /// user already told the move succeeded. Refused as `SESSION_BUSY` through
+    /// [`refused_claim_error`], the one classifier a concurrent prompt and a
+    /// clear share (LESSON-456); an unknown session is `UNKNOWN_SESSION` from
+    /// the same call.
+    ///
+    /// ## Order: claim → validate → mutate → clear → announce → answer
+    ///
+    /// Validation ([`validate_session_cwd`], the validator `session/create`'s
+    /// `cwd` goes through — BR-6/BR-7's "one grammar") runs **after** the claim
+    /// and **before** any mutation, so a refusal leaves both the path and the
+    /// conversation exactly as they were, and a busy session says it is busy
+    /// before it says anything about the path. `previous_display` is probed
+    /// off the old path before it is overwritten — carried on the event for
+    /// clients (a transcript that wants to say where the session stood, a
+    /// monitor diffing roots); the daemon itself does not render it.
+    ///
+    /// ## Why the conversation is cleared (OQ-2, resolved)
+    ///
+    /// Every carried block's provenance identity is relative to the root it was
+    /// minted under, and a carried identity judged under a new root names a
+    /// different file — so the conversation cannot be carried safely, and the
+    /// disposition is a clear, reported in the existing `context_cleared` shape
+    /// every attached client already renders. Idempotent in the same sense as a
+    /// clear: an empty session moves with `blocks_dropped: 0` and still
+    /// announces, because the event is the user's action.
+    ///
+    /// ## Two events, both session-scoped, in this order
+    ///
+    /// `context_cleared` first, then `session_root_changed` — a client learns
+    /// the conversation went before it learns where the session now stands, and
+    /// both precede the response (the server's fence rule). Both ride
+    /// `Some(session_id)`: the display is content-class on the wire
+    /// (`server.rs`'s `reduce_for` omits `cwd` from a reduced row), so
+    /// `forward_events` filters them for a connection not entitled to the
+    /// session's content.
+    ///
+    /// Nothing under `harness/` names this method or its params: a model must
+    /// never be able to move its own jail — the same posture that keeps
+    /// clearing off the tool surface.
+    ///
+    /// # Errors
+    ///
+    /// [`error_code::SESSION_BUSY`] while a turn holds the session,
+    /// [`error_code::UNKNOWN_SESSION`] for a session the registry does not
+    /// have, and [`error_code::INVALID_PARAMS`] — naming the path — for a cwd
+    /// that is relative, missing, or not a directory.
+    pub fn set_session_cwd(
+        &self,
+        params: &SessionSetCwdParams,
+        sessions: &SessionRegistry,
+        events: &Arc<EventBus>,
+    ) -> Result<SessionSetCwdResult, RpcError> {
+        // `cd-N` off the turn counter, for `clear_session`'s reason: a refused
+        // peer is told "already running turn cd-4", which names what actually
+        // holds the session.
+        let _claim = sessions
+            .try_begin_turn(
+                &params.session_id,
+                &teton_protocol::TurnId::from(format!(
+                    "cd-{}",
+                    self.turn_counter.fetch_add(1, Ordering::SeqCst)
+                )),
+            )
+            .map_err(|err| refused_claim_error(&err))?;
+
+        // Validate before touching anything: a refusal leaves the root and the
+        // conversation exactly as they were.
+        validate_session_cwd(&params.cwd)
+            .map_err(|refusal| RpcError::new(error_code::INVALID_PARAMS, refusal.to_string()))?;
+
+        // The claim above proved the session exists, so `get` cannot miss —
+        // but the fallback reads as what it is rather than as an unwrap.
+        let previous_cwd = sessions.get(&params.session_id).and_then(|s| s.cwd);
+        let previous_display = self.session_root_for(previous_cwd.as_deref()).view.display;
+
+        if !sessions.set_cwd(&params.session_id, params.cwd.clone()) {
+            return Err(RpcError::new(
+                error_code::UNKNOWN_SESSION,
+                format!("no session `{}`", params.session_id),
+            ));
+        }
+        let root = self.session_root_for(Some(&params.cwd)).view;
+        let blocks_dropped =
+            u64::try_from(sessions.clear_conversation(&params.session_id)).unwrap_or(u64::MAX);
+        events.publish(
+            Some(params.session_id.clone()),
+            Event::ContextCleared(ContextCleared { blocks_dropped }),
+        );
+        events.publish(
+            Some(params.session_id.clone()),
+            Event::SessionRootChanged(SessionRootChanged {
+                previous_display,
+                root: root.clone(),
+            }),
+        );
+        Ok(SessionSetCwdResult {
+            root,
+            blocks_dropped,
+        })
     }
 
     /// The route this turn takes, chosen before the harness runs (REQ-558 BR-1).
@@ -23843,14 +24011,33 @@ provider_id = \"deepseek\"
             (Arc::new(runtime), (seen, duties))
         }
 
-        /// A registry holding one freeform session.
-        fn one_session() -> (SessionRegistry, SessionId) {
+        /// A registry holding one freeform session whose root is `cwd` — or
+        /// the daemon's fallback root when `None`. The one constructor both
+        /// shorthands below delegate to.
+        fn one_session_with(cwd: Option<PathBuf>) -> (SessionRegistry, SessionId) {
             let sessions = SessionRegistry::new();
             let session = sessions
-                .create(SessionMode::Freeform, None, None)
+                .create(SessionMode::Freeform, None, cwd)
                 .expect("a freeform session needs no phase");
             let id = session.session_id.clone();
             (sessions, id)
+        }
+
+        /// A registry holding one freeform session on the daemon's fallback root.
+        fn one_session() -> (SessionRegistry, SessionId) {
+            one_session_with(None)
+        }
+
+        /// A registry holding one freeform session whose root is `cwd`.
+        ///
+        /// The registry's path is what a turn jails to (REQ-583 verify: the
+        /// turn re-reads it once it holds the claim), so a fixture whose
+        /// scripted tool calls name files under `cwd` creates the session
+        /// there rather than relying on the `session_cwd` parameter — which is
+        /// only the pre-claim snapshot, and only a fallback for a session the
+        /// registry no longer has.
+        fn one_session_at(cwd: &Path) -> (SessionRegistry, SessionId) {
+            one_session_with(Some(cwd.to_path_buf()))
         }
 
         /// Drive one prompt to completion.
@@ -24242,7 +24429,7 @@ provider_id = \"deepseek\"
                 Scripted::Say("Fine."),
             ]);
             let events = Arc::new(EventBus::new());
-            let (sessions, session_id) = one_session();
+            let (sessions, session_id) = one_session_at(&repo);
 
             prompt(
                 &runtime,
@@ -24296,7 +24483,7 @@ provider_id = \"deepseek\"
             let (control_runtime, control_seen) =
                 carry_runtime(&[Scripted::Say("Noted."), Scripted::Say("Fine.")]);
             let control_events = Arc::new(EventBus::new());
-            let (control_sessions, control_id) = one_session();
+            let (control_sessions, control_id) = one_session_at(&repo);
             for text in ["remember the retry budget", "and what did we say?"] {
                 prompt(
                     &control_runtime,
@@ -24357,7 +24544,7 @@ provider_id = \"deepseek\"
             ]);
             let events = Arc::new(EventBus::new());
             let mut sub = events.subscribe(64);
-            let (sessions, session_id) = one_session();
+            let (sessions, session_id) = one_session_at(&repo);
 
             prompt(
                 &runtime,
@@ -24569,7 +24756,7 @@ provider_id = \"deepseek\"
                 Scripted::Say("Read them all."),
             ]);
             let events = Arc::new(EventBus::new());
-            let (sessions, session_id) = one_session();
+            let (sessions, session_id) = one_session_at(&repo);
 
             prompt(
                 &runtime,
@@ -24630,7 +24817,7 @@ provider_id = \"deepseek\"
                 Scripted::Say(r#"{"tool": "read", "arguments": {"path": "c.rs"}}"#),
                 Scripted::Say("Read them."),
             ]);
-            let (control_sessions, control_id) = one_session();
+            let (control_sessions, control_id) = one_session_at(&repo);
             prompt(
                 &control_runtime,
                 &events,
@@ -24669,7 +24856,7 @@ provider_id = \"deepseek\"
             ]);
             let events = Arc::new(EventBus::new());
             let mut sub = events.subscribe(64);
-            let (sessions, session_id) = one_session();
+            let (sessions, session_id) = one_session_at(&repo);
 
             let turn = {
                 let runtime = Arc::clone(&runtime);
@@ -25369,6 +25556,653 @@ provider_id = \"deepseek\"
                 !asked_again,
                 "the clear dropped the session grant and the user was asked again"
             );
+        }
+
+        // -- REQ-583: the session root through the runtime -------------------
+
+        /// A unique scratch directory; the caller removes it. Holds a project
+        /// marker when `project` is set, so the probe classifies it as one.
+        fn scratch_root(tag: &str, project: bool) -> PathBuf {
+            use std::sync::atomic::AtomicU64;
+            static NEXT: AtomicU64 = AtomicU64::new(0);
+            let dir = std::env::temp_dir().join(format!(
+                "teton-runtime-root-{tag}-{}-{}",
+                std::process::id(),
+                NEXT.fetch_add(1, Ordering::Relaxed)
+            ));
+            std::fs::create_dir_all(&dir).unwrap();
+            if project {
+                std::fs::write(dir.join("Cargo.toml"), "[package]\n").unwrap();
+            }
+            dir
+        }
+
+        /// Shorthand for the RPC under test.
+        fn set_cwd(
+            runtime: &Arc<DaemonRuntime>,
+            events: &Arc<EventBus>,
+            sessions: &SessionRegistry,
+            session_id: &SessionId,
+            cwd: &Path,
+        ) -> Result<SessionSetCwdResult, RpcError> {
+            runtime.set_session_cwd(
+                &SessionSetCwdParams {
+                    session_id: session_id.clone(),
+                    cwd: cwd.to_path_buf(),
+                },
+                sessions,
+                events,
+            )
+        }
+
+        /// Every event currently queued on `sub` that a move publishes, in
+        /// order, as `(envelope session, event)`.
+        fn drained_moves(
+            sub: &mut crate::broadcast::Subscription,
+        ) -> Vec<(Option<SessionId>, Event)> {
+            let mut found = Vec::new();
+            while let Some(envelope) = sub.try_recv() {
+                if matches!(
+                    envelope.event,
+                    Event::ContextCleared(_) | Event::SessionRootChanged(_)
+                ) {
+                    found.push((envelope.session_id, envelope.event));
+                }
+            }
+            found
+        }
+
+        /// **REQ-583 ADR-1: one derivation.** `session_root_for` probes the
+        /// session's own cwd when it has one and the daemon's `repo_root`
+        /// fallback when it does not — the same fallback the turn jails to
+        /// (BUG-147) — with the daemon's `HOME`, and hands back the path it
+        /// probed beside the answer. What `session/create` answers, what `/cd`
+        /// carries as `previous_display`, and what every turn puts on
+        /// `HarnessConfig.session_root` and into its jail are readings of this
+        /// one function.
+        #[test]
+        fn the_session_root_is_probed_from_the_cwd_or_the_daemon_fallback() {
+            let runtime = DaemonRuntime::minimal();
+            let home = crate::session_root::home();
+            let project = scratch_root("derive", true);
+
+            let derived = runtime.session_root_for(Some(&project));
+            assert_eq!(
+                derived.view,
+                crate::session_root::probe(&project, home.as_deref()),
+                "a session with a cwd stands on that cwd"
+            );
+            assert_eq!(
+                derived.path, project,
+                "the jail path rides beside the view it was probed for"
+            );
+            assert_eq!(
+                derived.view.kind,
+                teton_protocol::methods::RootKind::Project,
+                "the marker makes it a project root: {derived:?}"
+            );
+
+            let fallback = runtime.session_root_for(None);
+            assert_eq!(
+                fallback.view,
+                crate::session_root::probe(&runtime.repo_root, home.as_deref()),
+                "a session without a cwd stands on the daemon's repo_root — \
+                 the value the turn jails to"
+            );
+            assert_eq!(
+                fallback.path, runtime.repo_root,
+                "and the jail's fallback IS that repo_root"
+            );
+            assert_eq!(
+                runtime.jail_root(None),
+                runtime.repo_root.as_path(),
+                "and the jail's fallback IS that repo_root"
+            );
+            assert_eq!(runtime.jail_root(Some(&project)), project.as_path());
+
+            let _ = std::fs::remove_dir_all(&project);
+        }
+
+        /// **REQ-583 ADR-1 through the turn.** A turn on a session with a cwd
+        /// jails its tools to that cwd through the probed root: a `read` of an
+        /// absolute path outside it is refused in the BR-2 shape — the caller's
+        /// path, "is outside the session root", and the root's **display** as
+        /// the probe spelled it — and the refusal is what the model is handed on
+        /// its next call. The display is the same bytes `session_root_for`
+        /// derives, which is what makes the jail's refusals and the environment
+        /// block (`route.harness.session_root`, set from the same value on the
+        /// adjacent line) print one spelling.
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn a_turns_jail_refusal_names_the_probed_root_display() {
+            let root = scratch_root("jail", true);
+            let outside = scratch_root("outside", false);
+            std::fs::write(outside.join("elsewhere.txt"), "not yours\n").unwrap();
+            let escape = outside.join("elsewhere.txt");
+            // The script is `'static`; leak the one path this test needs in it.
+            let call: &'static str = Box::leak(
+                format!(
+                    r#"{{"tool": "read", "arguments": {{"path": "{}"}}}}"#,
+                    escape.display()
+                )
+                .into_boxed_str(),
+            );
+            let (runtime, seen) =
+                carry_runtime(&[Scripted::Say(call), Scripted::Say("I cannot see that.")]);
+            let events = Arc::new(EventBus::new());
+            let sessions = SessionRegistry::new();
+            let session = sessions
+                .create(SessionMode::Freeform, None, Some(root.clone()))
+                .expect("a freeform session needs no phase");
+
+            prompt(
+                &runtime,
+                &events,
+                &sessions,
+                &session.session_id,
+                Some(root.clone()),
+                "read the file over there",
+            )
+            .await
+            .expect("a refused tool call is a turn that completes");
+
+            let seen = seen.lock().expect("recorded-context mutex").clone();
+            assert!(
+                seen.len() >= 2,
+                "the refusal must have been handed back to the model on a second \
+                 call: {} contexts recorded",
+                seen.len()
+            );
+            let after = seen.last().unwrap();
+            let expected = runtime.session_root_for(Some(&root)).view;
+            assert!(
+                after.contains("is outside the session root"),
+                "the read outside the root must be refused in the BR-2 shape: {after}"
+            );
+            assert!(
+                after.contains(&format!("is outside the session root {}", expected.display)),
+                "the refusal must name the root's display as the probe spelled it \
+                 (`{}`): {after}",
+                expected.display
+            );
+            assert!(
+                !after.contains("not yours"),
+                "the file outside the root must not have been read: {after}"
+            );
+            // BR-1 on a real turn: the environment block for THIS root rode in
+            // the prompt the model was handed — the same bytes the jail's
+            // refusal above spelled, from the same probe.
+            let block = crate::harness::turn_loop::environment_block(&expected);
+            for (n, prompt) in seen.iter().enumerate() {
+                assert!(
+                    prompt.contains(block.trim_end()),
+                    "turn prompt {n} must carry the environment block `{}`: {prompt}",
+                    block.trim_end()
+                );
+            }
+
+            let _ = std::fs::remove_dir_all(&root);
+            let _ = std::fs::remove_dir_all(&outside);
+        }
+
+        /// **REQ-583 BR-7 / ADR-4.** A move on a populated, idle session:
+        /// rewrites the registry's path, clears the conversation and reports
+        /// the count, answers with the probe of the new path, and publishes
+        /// `context_cleared` **then** `session_root_changed` — both
+        /// session-scoped, the latter carrying the old root's display as
+        /// `previous_display` — and the next turn starts from the head alone
+        /// **and** is jailed to the new root.
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn a_move_rewrites_the_root_clears_the_conversation_and_announces_both() {
+            let start = scratch_root("move-start", true);
+            let target = scratch_root("move-target", false);
+            std::fs::write(start.join("here.txt"), "under the old root\n").unwrap();
+            let old_file: &'static str = Box::leak(
+                format!(
+                    r#"{{"tool": "read", "arguments": {{"path": "{}"}}}}"#,
+                    start.join("here.txt").display()
+                )
+                .into_boxed_str(),
+            );
+            let (runtime, seen) = carry_runtime(&[
+                Scripted::Say("The router allows three attempts."),
+                Scripted::Say(old_file),
+                Scripted::Say("That is outside now."),
+            ]);
+            let events = Arc::new(EventBus::new());
+            let sessions = SessionRegistry::new();
+            let session = sessions
+                .create(SessionMode::Freeform, None, Some(start.clone()))
+                .expect("a freeform session needs no phase");
+            let session_id = session.session_id.clone();
+            let home = crate::session_root::home();
+
+            prompt(
+                &runtime,
+                &events,
+                &sessions,
+                &session_id,
+                Some(start.clone()),
+                "how many attempts does the router allow?",
+            )
+            .await
+            .expect("the scripted turn completes");
+            let retained = sessions.conversation_snapshot(&session_id).len();
+            assert!(
+                retained >= 2,
+                "the turn must have retained something to drop"
+            );
+            // BR-1 before the move: the first turn's prompt carried the block
+            // for the root the session was created on.
+            let before_block = crate::harness::turn_loop::environment_block(
+                &crate::session_root::probe(&start, home.as_deref()),
+            );
+            {
+                let seen = seen.lock().expect("recorded-context mutex").clone();
+                assert_eq!(seen.len(), 1, "one turn so far");
+                assert!(
+                    seen[0].contains(before_block.trim_end()),
+                    "the pre-move turn must state the pre-move root `{}`: {}",
+                    before_block.trim_end(),
+                    seen[0]
+                );
+            }
+
+            let mut sub = events.subscribe(64);
+            let moved = set_cwd(&runtime, &events, &sessions, &session_id, &target)
+                .expect("an idle session moves");
+
+            let expected = crate::session_root::probe(&target, home.as_deref());
+            assert_eq!(
+                moved.root, expected,
+                "the answer is the probe of the new path"
+            );
+            assert_eq!(
+                moved.root.kind,
+                teton_protocol::methods::RootKind::Plain,
+                "the target holds no marker"
+            );
+            assert_eq!(
+                moved.blocks_dropped,
+                as_wire_count(retained),
+                "the answer counts the blocks that actually went"
+            );
+            assert!(
+                sessions.conversation_snapshot(&session_id).is_empty(),
+                "the move left blocks behind"
+            );
+            assert_eq!(
+                sessions.get(&session_id).unwrap().cwd.as_deref(),
+                Some(target.as_path()),
+                "the registry's one stored fact moved"
+            );
+
+            let announced = drained_moves(&mut sub);
+            assert_eq!(announced.len(), 2, "two events per move: {announced:?}");
+            assert_eq!(announced[0].0.as_ref(), Some(&session_id));
+            assert_eq!(announced[1].0.as_ref(), Some(&session_id));
+            match &announced[0].1 {
+                Event::ContextCleared(cleared) => {
+                    assert_eq!(cleared.blocks_dropped, moved.blocks_dropped);
+                }
+                other => panic!("context_cleared must come first, got {other:?}"),
+            }
+            match &announced[1].1 {
+                Event::SessionRootChanged(changed) => {
+                    assert_eq!(changed.root, expected);
+                    assert_eq!(
+                        changed.previous_display,
+                        crate::session_root::probe(&start, home.as_deref()).display,
+                        "`previous_display` is the old root's spelling"
+                    );
+                }
+                other => panic!("session_root_changed must come second, got {other:?}"),
+            }
+
+            // The next turn: the head alone, and jailed to the NEW root — the
+            // file under the old root is now outside.
+            let session_cwd = sessions.get(&session_id).unwrap().cwd;
+            prompt(
+                &runtime,
+                &events,
+                &sessions,
+                &session_id,
+                session_cwd,
+                "read the file we had",
+            )
+            .await
+            .expect("a moved session still serves turns");
+            let seen = seen.lock().expect("recorded-context mutex").clone();
+            let after = seen.last().unwrap();
+            assert!(
+                !after.contains("how many attempts does the router allow?"),
+                "the cleared user message came back in the next context: {after}"
+            );
+            assert!(
+                after.contains(&format!("is outside the session root {}", expected.display)),
+                "the next turn must be jailed to the new root, naming it: {after}"
+            );
+            assert!(
+                !after.contains("under the old root"),
+                "the file under the old root must not have been read: {after}"
+            );
+            // BR-1 after the move: the environment block now states the NEW
+            // root — the same probe the jail's refusal above was spelled from —
+            // and the old root's block is gone from the prompt.
+            let after_block = crate::harness::turn_loop::environment_block(&expected);
+            assert!(
+                after.contains(after_block.trim_end()),
+                "the post-move turn must state the post-move root `{}`: {after}",
+                after_block.trim_end()
+            );
+            assert!(
+                !after.contains(before_block.trim_end()),
+                "the post-move turn must not still state the pre-move root: {after}"
+            );
+            assert_ne!(
+                before_block, after_block,
+                "the fixture's two roots must differ"
+            );
+
+            let _ = std::fs::remove_dir_all(&start);
+            let _ = std::fs::remove_dir_all(&target);
+        }
+
+        /// **REQ-583 verify — the claim-time root.** `spawn_prompt_turn` reads
+        /// the session's `cwd` off the registry, then spawns the turn, which
+        /// takes the claim: a `session/set_cwd` can land in that window. Staged
+        /// here as the two calls in that order — the move first, then a turn
+        /// handed the **stale** pre-move snapshot as its `session_cwd` — the
+        /// turn must run on the root the registry holds once the claim is
+        /// taken: its jail refuses the old root's file naming the NEW display,
+        /// its environment block states the NEW root, and its blocks commit
+        /// into the moved session's (cleared) conversation rather than
+        /// resurrecting the old one under a stale root.
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn a_turn_handed_a_stale_cwd_snapshot_runs_on_the_root_the_registry_holds_at_claim_time(
+        ) {
+            let start = scratch_root("toctou-start", true);
+            let target = scratch_root("toctou-target", false);
+            std::fs::write(start.join("here.txt"), "under the old root\n").unwrap();
+            let old_file: &'static str = Box::leak(
+                format!(
+                    r#"{{"tool": "read", "arguments": {{"path": "{}"}}}}"#,
+                    start.join("here.txt").display()
+                )
+                .into_boxed_str(),
+            );
+            let (runtime, seen) = carry_runtime(&[
+                Scripted::Say("Noted."),
+                Scripted::Say(old_file),
+                Scripted::Say("That is outside now."),
+            ]);
+            let events = Arc::new(EventBus::new());
+            let sessions = SessionRegistry::new();
+            let session = sessions
+                .create(SessionMode::Freeform, None, Some(start.clone()))
+                .expect("a freeform session needs no phase");
+            let session_id = session.session_id.clone();
+            let home = crate::session_root::home();
+
+            // A first turn, so the move has a conversation to clear.
+            prompt(
+                &runtime,
+                &events,
+                &sessions,
+                &session_id,
+                Some(start.clone()),
+                "remember the retry budget",
+            )
+            .await
+            .expect("the scripted turn completes");
+            assert!(!sessions.conversation_snapshot(&session_id).is_empty());
+
+            // The snapshot a `session/prompt` handler would have taken — then
+            // the move lands before that prompt's turn takes its claim.
+            let stale_snapshot = sessions.get(&session_id).unwrap().cwd;
+            assert_eq!(stale_snapshot.as_deref(), Some(start.as_path()));
+            let moved = set_cwd(&runtime, &events, &sessions, &session_id, &target)
+                .expect("an idle session moves");
+            assert!(moved.blocks_dropped > 0);
+            assert!(sessions.conversation_snapshot(&session_id).is_empty());
+
+            // The turn runs with the STALE snapshot as its parameter.
+            prompt(
+                &runtime,
+                &events,
+                &sessions,
+                &session_id,
+                stale_snapshot,
+                "read the file we had",
+            )
+            .await
+            .expect("a moved session still serves turns");
+
+            let new_root = crate::session_root::probe(&target, home.as_deref());
+            let old_root = crate::session_root::probe(&start, home.as_deref());
+            let seen = seen.lock().expect("recorded-context mutex").clone();
+            let after = seen.last().unwrap();
+            assert!(
+                after.contains(&format!("is outside the session root {}", new_root.display)),
+                "the turn must be jailed to the root the registry holds, naming it: {after}"
+            );
+            assert!(
+                !after.contains("under the old root"),
+                "the file under the stale root must not have been read: {after}"
+            );
+            let new_block = crate::harness::turn_loop::environment_block(&new_root);
+            let old_block = crate::harness::turn_loop::environment_block(&old_root);
+            assert!(
+                after.contains(new_block.trim_end()),
+                "the environment block must state the registry's root `{}`: {after}",
+                new_block.trim_end()
+            );
+            assert!(
+                !after.contains(old_block.trim_end()),
+                "the environment block must not state the stale snapshot's root: {after}"
+            );
+            assert!(
+                !after.contains("remember the retry budget"),
+                "the cleared conversation must not come back under the turn: {after}"
+            );
+            // And what the turn committed is the moved session's conversation:
+            // the head alone plus this turn, not the pre-move blocks.
+            let committed = sessions.conversation_snapshot(&session_id);
+            assert!(
+                !committed
+                    .blocks()
+                    .iter()
+                    .any(|b| b.text.contains("remember the retry budget")),
+                "the pre-move conversation was resurrected by the stale turn's commit"
+            );
+            assert!(
+                committed
+                    .blocks()
+                    .iter()
+                    .any(|b| b.text.contains("read the file we had")),
+                "the turn's own blocks must have committed: {committed:?}"
+            );
+
+            let _ = std::fs::remove_dir_all(&start);
+            let _ = std::fs::remove_dir_all(&target);
+        }
+
+        /// **REQ-583 BR-7: refusal leaves everything untouched.** A move to a
+        /// path that does not exist is refused `INVALID_PARAMS` **naming the
+        /// path**, and the root, the conversation and the event stream are
+        /// exactly as they were; a session the registry never had is
+        /// `UNKNOWN_SESSION` (the claim's classifier), not a cheerful move.
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn a_refused_move_leaves_the_root_and_the_conversation_alone() {
+            let start = scratch_root("refuse-start", true);
+            let (runtime, _seen) = carry_runtime(&[Scripted::Say("Noted.")]);
+            let events = Arc::new(EventBus::new());
+            let sessions = SessionRegistry::new();
+            let session = sessions
+                .create(SessionMode::Freeform, None, Some(start.clone()))
+                .expect("a freeform session needs no phase");
+            let session_id = session.session_id.clone();
+
+            prompt(
+                &runtime,
+                &events,
+                &sessions,
+                &session_id,
+                Some(start.clone()),
+                "remember the retry budget",
+            )
+            .await
+            .expect("the scripted turn completes");
+            let before = sessions.conversation_snapshot(&session_id);
+            assert!(
+                !before.is_empty(),
+                "the fixture needs a conversation to keep"
+            );
+
+            let mut sub = events.subscribe(64);
+            let refused = set_cwd(
+                &runtime,
+                &events,
+                &sessions,
+                &session_id,
+                Path::new("/nope/teton-runtime-cd"),
+            )
+            .expect_err("a nonexistent cwd is refused");
+            assert_eq!(refused.code, error_code::INVALID_PARAMS);
+            assert_eq!(
+                refused.message,
+                "path `/nope/teton-runtime-cd` does not exist or is not a directory",
+                "the refusal is the validator's one root-neutral sentence, naming the path"
+            );
+            let relative = set_cwd(
+                &runtime,
+                &events,
+                &sessions,
+                &session_id,
+                Path::new("relative/dir"),
+            )
+            .expect_err("a relative cwd is refused");
+            assert_eq!(relative.code, error_code::INVALID_PARAMS);
+            assert_eq!(
+                relative.message,
+                "path `relative/dir` must be an absolute path"
+            );
+
+            assert_eq!(
+                sessions.get(&session_id).unwrap().cwd.as_deref(),
+                Some(start.as_path()),
+                "a refused move must not touch the root"
+            );
+            assert_eq!(
+                sessions.conversation_snapshot(&session_id).len(),
+                before.len(),
+                "a refused move must not clear the conversation"
+            );
+            assert!(
+                drained_moves(&mut sub).is_empty(),
+                "a refused move must announce nothing"
+            );
+
+            let ghost = set_cwd(
+                &runtime,
+                &events,
+                &sessions,
+                &SessionId::from("sess-ghost"),
+                &start,
+            )
+            .expect_err("there is no such session to move");
+            assert_eq!(ghost.code, error_code::UNKNOWN_SESSION);
+            assert_ne!(ghost.code, error_code::SESSION_BUSY);
+
+            let _ = std::fs::remove_dir_all(&start);
+        }
+
+        /// **REQ-583 ADR-4 under D-3.** A move issued while a turn is in flight
+        /// is refused with the same typed busy error a concurrent prompt or
+        /// clear gets — the turn's tools hold a jail built from the root as it
+        /// stood, and the conversation is the turn's until it commits — and it
+        /// succeeds the moment the turn is over.
+        #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+        async fn a_move_during_an_in_flight_turn_is_refused_and_succeeds_after_it() {
+            let start = scratch_root("busy-start", true);
+            let target = scratch_root("busy-target", false);
+            let (runtime, _seen) = carry_runtime(&[
+                Scripted::Say(r#"{"tool": "shell", "arguments": {"command": "echo hi"}}"#),
+                Scripted::Say("The tests pass."),
+            ]);
+            let events = Arc::new(EventBus::new());
+            let mut sub = events.subscribe(256);
+            let sessions = SessionRegistry::new();
+            let session = sessions
+                .create(SessionMode::Freeform, None, Some(start.clone()))
+                .expect("a freeform session needs no phase");
+            let session_id = session.session_id.clone();
+
+            let turn = {
+                let runtime = Arc::clone(&runtime);
+                let events = Arc::clone(&events);
+                let sessions = sessions.clone();
+                let session_id = session_id.clone();
+                let start = start.clone();
+                tokio::spawn(async move {
+                    prompt(
+                        &runtime,
+                        &events,
+                        &sessions,
+                        &session_id,
+                        Some(start),
+                        "run the tests please",
+                    )
+                    .await
+                })
+            };
+            let request = await_permission_request(&mut sub, "shell").await;
+
+            let refused = set_cwd(&runtime, &events, &sessions, &session_id, &target)
+                .expect_err("a move cannot land under a running turn");
+            assert_eq!(
+                refused.code,
+                error_code::SESSION_BUSY,
+                "a busy session is its own state: {}",
+                refused.message
+            );
+            assert!(
+                refused.message.contains("turn-0"),
+                "the refusal must name the turn holding the session: {}",
+                refused.message
+            );
+            assert_eq!(
+                sessions.get(&session_id).unwrap().cwd.as_deref(),
+                Some(start.as_path()),
+                "the jail must not move under a running turn"
+            );
+            assert!(
+                drained_moves(&mut sub).is_empty(),
+                "a refused move must announce nothing"
+            );
+
+            runtime.pending.resolve(
+                &request.request_id,
+                teton_protocol::methods::PermissionOutcome::Selected {
+                    option_id: "allow_once".to_owned(),
+                },
+            );
+            turn.await
+                .expect("the turn task joins")
+                .expect("the answered turn completes");
+
+            let moved = set_cwd(&runtime, &events, &sessions, &session_id, &target)
+                .expect("the session is free the moment its turn commits");
+            assert!(
+                moved.blocks_dropped > 0,
+                "the refusal was honoured, so this move had the turn's blocks to drop"
+            );
+            assert_eq!(
+                sessions.get(&session_id).unwrap().cwd.as_deref(),
+                Some(target.as_path())
+            );
+
+            let _ = std::fs::remove_dir_all(&start);
+            let _ = std::fs::remove_dir_all(&target);
         }
     }
 

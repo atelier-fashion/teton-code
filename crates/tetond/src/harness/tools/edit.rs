@@ -37,7 +37,7 @@ impl Tool for EditTool {
         json!({
             "type": "object",
             "properties": {
-                "path": { "type": "string", "description": "Repo-relative file path" },
+                "path": { "type": "string", "description": "Root-relative file path" },
                 "old_string": { "type": "string", "description": "Exact text to replace (must be unique)" },
                 "new_string": { "type": "string", "description": "Replacement text" }
             },
@@ -77,6 +77,11 @@ impl Tool for EditTool {
             Ok(r) => r,
             Err(e) => return e.into(),
         };
+        // Regular files only, off `metadata` and before the open — `read`'s
+        // rule, for `read`'s reason (a FIFO's open blocks the turn).
+        if let Err(e) = super::refuse_non_regular_file(&raw, &path) {
+            return e.into();
+        }
 
         let contents = match std::fs::read_to_string(&path) {
             Ok(c) => c,
@@ -157,6 +162,30 @@ mod tests {
         assert_eq!(
             std::fs::read_to_string(&file).unwrap(),
             "const V: u32 = 2;\n"
+        );
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// **A FIFO is refused before it is opened, so it cannot block the turn**
+    /// (REQ-583 verify): `read`'s rule, asserted on `edit` with the same
+    /// deadline, so a regression in either tool is a failed test and not a
+    /// hung suite.
+    #[test]
+    fn a_fifo_is_refused_as_not_a_regular_file_without_blocking() {
+        let root = temp_root("fifo");
+        crate::mkfifo(&root.join("pipe"));
+        let worker_root = root.clone();
+        let out = crate::with_deadline("edit of a FIFO", move || {
+            EditTool.run(
+                &ToolContext::new(&worker_root),
+                &json!({ "path": "pipe", "old_string": "a", "new_string": "b" }),
+            )
+        });
+        assert!(out.is_error, "{}", out.content);
+        assert!(
+            out.content.contains("path `pipe` is not a regular file"),
+            "{}",
+            out.content
         );
         std::fs::remove_dir_all(&root).ok();
     }

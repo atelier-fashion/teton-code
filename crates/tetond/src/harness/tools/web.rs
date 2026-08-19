@@ -2244,12 +2244,30 @@ mod tests {
     /// before this REQ, against an 8 KiB overhead. This shape stays the
     /// *smaller* of the two prompts measured against that constant, because a
     /// registered web tool replaces the opt-out clause rather than adding to it.
+    ///
+    /// **Recorded headroom at REQ-583:** 5,844 bytes, `spent` 9,120, margin
+    /// **96**, with the environment block's largest row in the sweep (the same
+    /// `worst_case_session_root` the opted-out shape measures). The account of
+    /// what the block cost and what paid for it — 234 bytes of guide reference
+    /// data moved behind `teton_docs` topics — is `egress::redact`'s note; both
+    /// shapes moved by the same guide bytes and gained the same block.
+    /// Re-measured at the merged tip (TASK-180): **5,844 / 9,120 / 96,
+    /// unchanged**, and the row is now the byte-worst rendering in every
+    /// script — the environment block bounds bytes as well as characters, at
+    /// the ASCII cost this row already paid (`teton_core::session_root::byte_ceiling`;
+    /// the reasoning is in `egress::redact`'s note). Re-measured again after
+    /// the verify pass (finding S): **5,844 / 9,120 / 96, unchanged** — the
+    /// byte bound moved into `environment_block` (`bounded_field_bytes`, the
+    /// prompt's alone) and the row is byte-identical; this sweep now also
+    /// checks that its widest prompt carries the block at all.
     #[tokio::test]
     async fn the_web_tool_docs_clear_the_outbound_body_overhead() {
         use teton_core::capability::{SearchGap, WebCapabilityState};
 
         use crate::egress::redact::{MIN_PROMPT_HEADROOM_BYTES, REDACT_BODY_OVERHEAD_BYTES};
-        use crate::harness::turn_loop::{build_system_prompt, HarnessConfig};
+        use crate::harness::turn_loop::{
+            build_system_prompt, worst_case_session_root, HarnessConfig,
+        };
 
         let dir = temp_dir("budget");
         // The largest shape: `search` (the longer description) and
@@ -2285,7 +2303,13 @@ mod tests {
         // search-blocked (docs *and* clause — the largest prompt there is).
         // `OffAvailable` is absent because it cannot occur here: it is exactly
         // the state in which this tool does not register.
-        let worst = [
+        //
+        // Crossed, since REQ-583, with the largest session root the environment
+        // block can render and with no root at all — the same row the
+        // opted-out sweep in `egress::redact` measures, from the same fixture,
+        // so the two shapes cannot come to hold different worst cases.
+        let roots = [None, Some(worst_case_session_root())];
+        let widest = [
             None,
             Some(WebCapabilityState::Ready(WebTier::Search)),
             Some(WebCapabilityState::SearchUnavailable {
@@ -2293,18 +2317,33 @@ mod tests {
             }),
         ]
         .into_iter()
-        .map(|web_capability| {
+        .flat_map(|web_capability| {
+            roots
+                .clone()
+                .into_iter()
+                .map(move |session_root| (web_capability, session_root))
+        })
+        .map(|(web_capability, session_root)| {
             build_system_prompt(
                 &tools,
                 &HarnessConfig {
                     web_capability,
+                    session_root,
                     ..base.clone()
                 },
             )
-            .len()
         })
-        .max()
+        .max_by_key(String::len)
         .expect("the state sweep is not empty");
+        // Self-check (the twin of `egress::redact`'s): the widest prompt is one
+        // that carries the block, so dropping the root row cannot leave this
+        // sweep passing on the smaller, root-less shape.
+        assert!(
+            widest.contains("Session root: "),
+            "the widest prompt measured carries no environment block, so the sweep is \
+             not measuring the row it claims to:\n{widest}"
+        );
+        let worst = widest.len();
 
         let escaping = base.context_budget_bytes / 10;
         let spent = worst + escaping;

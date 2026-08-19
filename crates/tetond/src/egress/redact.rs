@@ -2012,13 +2012,85 @@ mod tests {
     /// moved that guarantee onto the CLI surface, where it costs zero prompt
     /// bytes — the reason the next person here should not expect to buy
     /// behaviour with this margin.
+    ///
+    /// **Recorded headroom at REQ-583:** the worst prompt is 5,891 bytes,
+    /// `spent` is 9,167, and the margin is **49** — one byte above the floor,
+    /// with the floor and the 9,216 exactly where they were. This is the
+    /// paragraph above being followed rather than worked around. The prompt
+    /// gained the environment block (BR-1, ADR-2): one line after the opener —
+    /// `Session root: <display> (project <name>, branch <branch>). Platform:
+    /// macOS.` — which is precisely "the fact a model must have without a tool
+    /// call", because the tools are jailed to the answer. Its worst case is
+    /// **203 bytes**: a 200-character root elided to the 80-character display
+    /// ceiling, a name and a branch elided to 32, kind `project` (the longest
+    /// phrase), which is the row this sweep and its twin now cross with every
+    /// capability state (`turn_loop::worst_case_session_root`). It was bought
+    /// with **234 bytes of guide**, 2,406 → 2,172 on the file, none of it an
+    /// instruction (ASSUME-008's split): the web paragraph's *reference data*
+    /// — the `[web]` key list, the keychain-reference example, the "search also
+    /// needs the local model" sentence — went behind "the rest: `teton_docs
+    /// web`" (179 bytes; the `web` topic already carried every fact, so
+    /// nothing was added to it), and step 2's `--fallback`/`set-category`
+    /// clause was compressed to `[--fallback <id>]` inside the `set-tier`
+    /// command's own syntax and "`set-category` binds a category" (55 bytes;
+    /// the `policy` topic carries both in full). Every pinned string stayed:
+    /// the three auth templates and the keyless SearxNG line, the recipes and
+    /// their URLs, the inspect step's spellings, step 1's hand-off, the
+    /// prohibition and the tier purposes. The same trim also paid for the 32
+    /// bytes TASK-176's reworded tool descriptions ("repository" → "session
+    /// root") had already spent — 5,890 → 5,922 left this test **red at 18**
+    /// before this task, by design (ADR-2: measure the docs actually in the
+    /// tree, then pay), and it was paid the same way rather than by moving
+    /// either number. The opted-in web shape is 5,844 / 9,120 / **96**, and
+    /// stays the looser of the two.
+    ///
+    /// **Re-measured at the merged tip (TASK-180): 5,891 / 9,167 / margin
+    /// 49, unchanged** — the integration task added no resident byte, and the
+    /// opted-in twin is likewise still 5,844 / 9,120 / **96**. What did change
+    /// is the row's standing. TASK-177 recorded that `bounded_field` bounded
+    /// *characters* while this ceiling counts bytes, so an all-multibyte root
+    /// (up to four bytes a character) rendered longer than the 200-character
+    /// ASCII row AC-4 names — 240 bytes of display against the row's 82. That
+    /// is closed in `teton-core`, where the bound belongs: every value in the
+    /// block is also held to `byte_ceiling(max_chars)` bytes — the cost of an
+    /// ASCII value cut to the character ceiling, `max_chars + 2` — eliding
+    /// further at character boundaries around one mark, so the row's three
+    /// values sit exactly at their byte ceilings and no script can render past
+    /// them (`turn_loop::the_worst_case_root_is_the_byte_worst_for_multibyte_roots_too`
+    /// drives a 200-character CJK path and 33-character CJK name and branch,
+    /// and their astral-plane twins, through the block and asserts none renders
+    /// longer than the row). The bound was chosen at the ASCII cost rather than
+    /// wider — twice the character ceiling, say — because a wider one would
+    /// have made the row 138 bytes longer, and one byte of margin does not pay
+    /// for that; the ASCII rendering is what it always was. And one byte is
+    /// still not room for a clause: the next resident sentence buys itself the
+    /// way this one did, out of a topic.
+    ///
+    /// **Re-measured after the verify pass (finding S): 5,891 / 9,167 / margin
+    /// 49, unchanged**, and the opted-in twin still 5,844 / 9,120 / **96** —
+    /// the row is byte-identical. What moved is *where* the byte bound lives:
+    /// it is now `bounded_field_bytes`, applied inside `environment_block`
+    /// alone (display, name and branch, before the shared kind phrase is
+    /// built), because the resident prompt is the one surface a root value is
+    /// paid for in bytes. `bounded_field` — the probe's, the CLI banner's, the
+    /// notice's, `/cd`'s and every jail refusal's — went back to bounding
+    /// characters (plus control-character *and* bidi/zero-width
+    /// neutralisation), so a person reading a CJK path sees its full eighty
+    /// characters rather than a third of them. The multibyte test
+    /// (`turn_loop::tests::the_worst_case_root_is_the_byte_worst_for_multibyte_roots_too`)
+    /// now asserts on `environment_block(..).len()` and pins the row's exact
+    /// byte cost, not the probe's strings; and this sweep now checks that the widest
+    /// prompt it measured carries `Session root: ` at all, so the row cannot be
+    /// dropped and leave the sweep passing on the smaller shape.
     #[test]
     fn the_total_cap_clears_the_harness_context_budget_with_margin() {
         use teton_core::capability::{SearchGap, WebCapabilityState};
         use teton_core::config::WebTier;
 
         use crate::harness::tools::ToolRegistry;
-        use crate::harness::turn_loop::{build_system_prompt, HarnessConfig};
+        use crate::harness::turn_loop::{
+            build_system_prompt, worst_case_session_root, HarnessConfig,
+        };
 
         // The strong-model shape (`max_tools: None`), so every builtin's
         // description is in the prompt: the larger of the two harness configs
@@ -2045,17 +2117,43 @@ mod tests {
             }),
             Some(WebCapabilityState::Ready(WebTier::Search)),
         ];
-        let worst = states
+        // Since REQ-583 the prompt also carries the environment block when the
+        // caller supplies a session root, and the block's length is the root's
+        // — so the sweep crosses every capability state with the **largest**
+        // root the block can render (a 200-character path elided to the display
+        // ceiling, name and branch elided to theirs, kind `project`, which is
+        // the longest kind phrase) as well as with no root at all. A root that
+        // pushed the block past what this row measures would be a bounding
+        // failure in `environment_block`, not a prompt that quietly grew.
+        let roots = [None, Some(worst_case_session_root())];
+        let widest = states
             .into_iter()
-            .map(|web_capability| {
+            .flat_map(|web_capability| {
+                roots
+                    .clone()
+                    .into_iter()
+                    .map(move |session_root| (web_capability, session_root))
+            })
+            .map(|(web_capability, session_root)| {
                 let config = HarnessConfig {
                     web_capability,
+                    session_root,
                     ..base.clone()
                 };
-                build_system_prompt(&ToolRegistry::with_builtins(), &config).len()
+                build_system_prompt(&ToolRegistry::with_builtins(), &config)
             })
-            .max()
+            .max_by_key(String::len)
             .expect("the state sweep is not empty");
+        // Self-check: the widest prompt is one that carries the block. Were the
+        // root row dropped from the sweep (or the block from the prompt), the
+        // measurement below would quietly become the smaller, root-less shape
+        // and pass on the wrong number.
+        assert!(
+            widest.contains("Session root: "),
+            "the widest prompt measured carries no environment block, so the sweep \
+             is not measuring the row it claims to:\n{widest}"
+        );
+        let worst = widest.len();
 
         let spent = worst + escaping;
         // Strictly under, and asserted **before** the subtraction below: a
@@ -2065,10 +2163,11 @@ mod tests {
         assert!(
             spent < REDACT_BODY_OVERHEAD_BYTES,
             "the assumed body overhead no longer covers what a body carries: a \
-             {worst}-byte system prompt (the largest capability clause) plus \
-             {escaping} bytes of escaping against an assumed \
-             {REDACT_BODY_OVERHEAD_BYTES}. Shorten the bundled guide or a clause; \
-             do not raise the overhead without re-checking the two claims below."
+             {worst}-byte system prompt (the largest capability clause and the \
+             largest session root) plus {escaping} bytes of escaping against an \
+             assumed {REDACT_BODY_OVERHEAD_BYTES}. Shorten the bundled guide or a \
+             clause; do not raise the overhead without re-checking the two claims \
+             below."
         );
         // The margin is asserted against a **floor**, not merely against zero: a
         // prompt that cleared the overhead by three bytes would pass a `> 0`
