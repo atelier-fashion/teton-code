@@ -39,6 +39,12 @@ teton-code/
   inspection is not acceptance.
 - Router policy decisions are pure functions in `teton-core` — table-driven
   unit tests.
+- A fixture must not depend on directory listing order (APFS hashes, ext4 and
+  tmpfs do not) nor on a spawned CLI reading its stdin before it exits — when
+  "the first entry" matters, plant one; when a child may legitimately exit
+  early, treat `BrokenPipe` on the stdin write as that outcome and keep every
+  other write error fatal (LESSON-540). CI's ubuntu leg is where the macOS-only
+  assumption fails.
 
 ## Error Handling
 
