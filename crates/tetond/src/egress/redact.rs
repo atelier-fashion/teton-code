@@ -2051,9 +2051,9 @@ mod tests {
     /// *characters* while this ceiling counts bytes, so an all-multibyte root
     /// (up to four bytes a character) rendered longer than the 200-character
     /// ASCII row AC-4 names — 240 bytes of display against the row's 82. That
-    /// is closed in `teton-core`, where the bound belongs: `bounded_field` now
-    /// also holds every value to `byte_ceiling(max_chars)` bytes — the cost of
-    /// an ASCII value cut to the character ceiling, `max_chars + 2` — eliding
+    /// is closed in `teton-core`, where the bound belongs: every value in the
+    /// block is also held to `byte_ceiling(max_chars)` bytes — the cost of an
+    /// ASCII value cut to the character ceiling, `max_chars + 2` — eliding
     /// further at character boundaries around one mark, so the row's three
     /// values sit exactly at their byte ceilings and no script can render past
     /// them (`turn_loop::the_worst_case_root_is_the_byte_worst_for_multibyte_roots_too`
@@ -2065,6 +2065,22 @@ mod tests {
     /// for that; the ASCII rendering is what it always was. And one byte is
     /// still not room for a clause: the next resident sentence buys itself the
     /// way this one did, out of a topic.
+    ///
+    /// **Re-measured after the verify pass (finding S): 5,891 / 9,167 / margin
+    /// 49, unchanged**, and the opted-in twin still 5,844 / 9,120 / **96** —
+    /// the row is byte-identical. What moved is *where* the byte bound lives:
+    /// it is now `bounded_field_bytes`, applied inside `environment_block`
+    /// alone (display, name and branch, before the shared kind phrase is
+    /// built), because the resident prompt is the one surface a root value is
+    /// paid for in bytes. `bounded_field` — the probe's, the CLI banner's, the
+    /// notice's, `/cd`'s and every jail refusal's — went back to bounding
+    /// characters (plus control-character *and* bidi/zero-width
+    /// neutralisation), so a person reading a CJK path sees its full eighty
+    /// characters rather than a third of them. The multibyte test above now
+    /// asserts on `environment_block(..).len()` and pins the row's exact byte
+    /// cost, not the probe's strings; and this sweep now checks that the widest
+    /// prompt it measured carries `Session root: ` at all, so the row cannot be
+    /// dropped and leave the sweep passing on the smaller shape.
     #[test]
     fn the_total_cap_clears_the_harness_context_budget_with_margin() {
         use teton_core::capability::{SearchGap, WebCapabilityState};
@@ -2109,7 +2125,7 @@ mod tests {
         // pushed the block past what this row measures would be a bounding
         // failure in `environment_block`, not a prompt that quietly grew.
         let roots = [None, Some(worst_case_session_root())];
-        let worst = states
+        let widest = states
             .into_iter()
             .flat_map(|web_capability| {
                 roots
@@ -2123,10 +2139,20 @@ mod tests {
                     session_root,
                     ..base.clone()
                 };
-                build_system_prompt(&ToolRegistry::with_builtins(), &config).len()
+                build_system_prompt(&ToolRegistry::with_builtins(), &config)
             })
-            .max()
+            .max_by_key(String::len)
             .expect("the state sweep is not empty");
+        // Self-check: the widest prompt is one that carries the block. Were the
+        // root row dropped from the sweep (or the block from the prompt), the
+        // measurement below would quietly become the smaller, root-less shape
+        // and pass on the wrong number.
+        assert!(
+            widest.contains("Session root: "),
+            "the widest prompt measured carries no environment block, so the sweep \
+             is not measuring the row it claims to:\n{widest}"
+        );
+        let worst = widest.len();
 
         let spent = worst + escaping;
         // Strictly under, and asserted **before** the subtraction below: a

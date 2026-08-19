@@ -50,6 +50,18 @@ then `ToolContext::for_root(root.clone())` and
 calls plus one small file read; a per-turn cost invisible next to a model call,
 and it keeps the branch honest after a checkout between turns.
 
+**Claim-time re-read (verify pass, fix A).** The path the probe reads is taken
+from the registry *after* the turn holds its claim (`try_begin_turn`), not from
+the `session_cwd` snapshot the server took when it parsed the request. A
+`session/set_cwd` that lands between that snapshot and the claim would
+otherwise leave the turn jailed — and its environment block written — under a
+root the registry no longer holds, and commit its blocks into the conversation
+the move had just cleared; re-reading under the claim closes that window, since
+a `/cd` cannot take the claim while the turn has it (ADR-4). The snapshot stands
+in only for a session the registry no longer has, which the claim a moment
+earlier says is not this one. One `ProbedRoot` then feeds both the jail path
+and the wire view, so the two cannot come from two readings.
+
 The CLI does **not** derive kind itself. It sends the path (as today, or from
 `--cwd`) and reads the derived view back on `SessionCreateResult.root` and on
 the `session_root_changed` event — one derivation, on the side that enforces
@@ -209,9 +221,16 @@ two refusals now name the path, BR-6), `SessionRegistry::set_cwd` (a
 `set_title`-shaped mutator — none exists today), `clear_conversation`, publish
 `Event::ContextCleared { blocks_dropped }` **and** `Event::SessionRootChanged {
 previous_display, root }` (both `Some(session_id)`-scoped — the display is
-content-class on the wire, `server.rs:1364-1373`, so `forward_events` filters
-them for monitors), then answer. Events precede the response (module rule,
-`server.rs:4032-4037`). Nothing under `harness/` names `clear_session`,
+content-class on the wire, `server.rs:1364-1373`, and the scoping is what keeps
+it off the daemon-wide fan-out: `should_forward` delivers a session-scoped
+envelope to the connections attached to that session *and to monitors*, so a
+monitor does receive it; what the scope refuses is a connection attached to
+some other session, or to none), then answer. Events precede the response
+(module rule, `server.rs:4032-4037`). The mutation and the two events happen
+under the same turn claim a prompt turn takes, and a prompt turn re-reads the
+session's cwd from the registry once it holds that claim (ADR-1, claim-time
+re-read) — so a move and a turn cannot interleave into a turn running under a
+root the registry has already left. Nothing under `harness/` names `clear_session`,
 `SessionClearParams` or the new method — `no_tool_can_clear_a_session_and_no_mcp_wiring_path_could`
 (`tools/mod.rs:1224-1281`) scans that tree, and a model must never be able to
 move its own jail (the same posture that keeps clearing off the tool surface).

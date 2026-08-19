@@ -391,20 +391,24 @@ pub(crate) fn home_dir() -> Option<PathBuf> {
         .filter(|home| !home.as_os_str().is_empty())
 }
 
-/// The session root this process asks the daemon for (REQ-583 BR-6): the
-/// resolved `--cwd`, or `shell_cwd` — today's behaviour, `None` when the shell's
-/// directory is unreadable — when the flag is absent.
+/// The session root *path* this process asks the daemon for (REQ-583 BR-6):
+/// the resolved `--cwd`, or `shell_cwd` — today's behaviour, `None` when the
+/// shell's directory is unreadable — when the flag is absent. A path and
+/// nothing more: the daemon's `session_root_for` derives the kind, name and
+/// branch from it, and this client never does (ADR-1).
 ///
 /// Pure, so the `--cwd` parse test can drive it with teton-core's grammar table
 /// (AC-12): the flag's value goes through [`resolve_cwd_argument`], the same
 /// function `/cd` uses, and nothing else — no canonicalization and no
-/// existence check, because the daemon validates the path it is sent (ADR-4).
+/// existence check, because the daemon validates the path it is sent (ADR-4;
+/// the fail-fast in `main` is a courtesy copy of one clause of that
+/// validation, not a second validator).
 ///
 /// # Errors
 /// [`CwdArgError`] when `--cwd` was given and could not become an absolute
 /// path (empty, `~` without a home, or a relative path with no shell directory
 /// to join it onto).
-pub(crate) fn session_root_for(
+pub(crate) fn resolve_session_root_path(
     cwd_flag: Option<&str>,
     shell_cwd: Option<&Path>,
     home: Option<&Path>,
@@ -421,6 +425,31 @@ pub(crate) fn session_root_for(
     }
 }
 
+/// The refusal a `--cwd` that names no directory earns **before this process
+/// connects to anything** (REQ-583 BR-6, verify finding V): the daemon's own
+/// sentence for the same path — `path `<p>` does not exist or is not a
+/// directory`, root-neutral, naming the argument as resolved — behind the
+/// `could not start a session:` prefix `run_session` gives a refused create,
+/// so a script reads one line either way. `None` when the path is a directory
+/// (or when `--cwd` was not given: the shell's directory is not judged here).
+///
+/// The daemon's validator (`session/create`, `session/set_cwd`) stays the
+/// authority for the RPC — a directory that vanishes between this check and
+/// the create, or a path this process cannot stat but the daemon can, is still
+/// refused there with the same sentence. This is a fail-fast so `teton --cwd
+/// /typo` does not first autostart a daemon, offer to register launchd, or
+/// raise a first-run model prompt on the way to being told the path was wrong.
+#[must_use]
+fn cwd_flag_refusal(cwd_flag: Option<&str>, resolved: Option<&Path>) -> Option<String> {
+    let path = resolved.filter(|_| cwd_flag.is_some())?;
+    (!path.is_dir()).then(|| {
+        format!(
+            "could not start a session: path `{}` does not exist or is not a directory",
+            path.display()
+        )
+    })
+}
+
 fn main() -> ExitCode {
     let cli = Cli::parse();
     let paths = socket_path::daemon_paths();
@@ -429,8 +458,10 @@ fn main() -> ExitCode {
     // `--cwd` through the grammar `/cd` shares, or the shell's directory as
     // before — and threaded to the two places a session is created. A malformed
     // `--cwd` is refused before anything connects, in the `bail!` shape every
-    // other refused argument takes: one line on stderr, non-zero exit.
-    let session_root = match session_root_for(
+    // other refused argument takes: one line on stderr, non-zero exit — and so
+    // is a well-formed one that names no directory (`cwd_flag_refusal`), with
+    // the daemon's own sentence, before a daemon is autostarted or asked.
+    let session_root = match resolve_session_root_path(
         cli.cwd.as_deref(),
         std::env::current_dir().ok().as_deref(),
         home_dir().as_deref(),
@@ -441,6 +472,10 @@ fn main() -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
+    if let Some(refusal) = cwd_flag_refusal(cli.cwd.as_deref(), session_root.as_deref()) {
+        eprintln!("teton: {refusal}");
+        return ExitCode::FAILURE;
+    }
 
     let result = match cli.command {
         None => run_session(&paths, cli.yes, cli.verbose, session_root.as_deref()),
@@ -3678,10 +3713,10 @@ mod tests {
         // Absent: the shell's directory, exactly as before the flag existed.
         assert!(parse(&["teton"]).cwd.is_none());
         assert_eq!(
-            session_root_for(None, Some(shell_cwd), Some(home)),
+            resolve_session_root_path(None, Some(shell_cwd), Some(home)),
             Ok(Some(shell_cwd.to_path_buf()))
         );
-        assert_eq!(session_root_for(None, None, Some(home)), Ok(None));
+        assert_eq!(resolve_session_root_path(None, None, Some(home)), Ok(None));
 
         for row in CWD_ARGUMENT_GRAMMAR {
             let cli = parse(&["teton", "--cwd", row.raw]);
@@ -3690,7 +3725,7 @@ mod tests {
                 Some(row.raw),
                 "clap must carry the value verbatim"
             );
-            let got = session_root_for(cli.cwd.as_deref(), Some(shell_cwd), Some(home));
+            let got = resolve_session_root_path(cli.cwd.as_deref(), Some(shell_cwd), Some(home));
             match row.expect {
                 Ok(path) => assert_eq!(
                     got,
@@ -3711,31 +3746,79 @@ mod tests {
         // AC-12's named spellings, read back through the parser as a script
         // would type them: relative, `~/x`, absolute, and empty → refused.
         assert_eq!(
-            session_root_for(Some("rel"), Some(shell_cwd), Some(home)),
+            resolve_session_root_path(Some("rel"), Some(shell_cwd), Some(home)),
             Ok(Some(PathBuf::from("/work/here/rel")))
         );
         assert_eq!(
-            session_root_for(Some("~/x"), Some(shell_cwd), Some(home)),
+            resolve_session_root_path(Some("~/x"), Some(shell_cwd), Some(home)),
             Ok(Some(PathBuf::from("/home/u/x")))
         );
         assert_eq!(
-            session_root_for(Some("/abs"), Some(shell_cwd), Some(home)),
+            resolve_session_root_path(Some("/abs"), Some(shell_cwd), Some(home)),
             Ok(Some(PathBuf::from("/abs")))
         );
         assert_eq!(
-            session_root_for(Some(""), Some(shell_cwd), Some(home)),
+            resolve_session_root_path(Some(""), Some(shell_cwd), Some(home)),
             Err(CwdArgError::Empty)
         );
         // No shell directory: an absolute argument still resolves, a relative
         // one is refused rather than guessed at.
         assert_eq!(
-            session_root_for(Some("/abs"), None, Some(home)),
+            resolve_session_root_path(Some("/abs"), None, Some(home)),
             Ok(Some(PathBuf::from("/abs")))
         );
         assert!(matches!(
-            session_root_for(Some("rel"), None, Some(home)),
+            resolve_session_root_path(Some("rel"), None, Some(home)),
             Err(CwdArgError::NotAbsolute(_))
         ));
+    }
+
+    /// REQ-583 BR-6 (verify finding V): a `--cwd` that names no directory is
+    /// refused by this process, before it connects, with the daemon's own
+    /// sentence — `path `<p>` does not exist or is not a directory` — behind
+    /// the `could not start a session:` prefix a refused create gets. A
+    /// directory passes; a file is "not a directory"; and the shell's own
+    /// directory is never judged here (no `--cwd`, no refusal), because the
+    /// daemon is the validator and this is only the fail-fast for the flag.
+    #[test]
+    fn a_cwd_flag_naming_no_directory_is_refused_before_connecting_in_the_daemons_words() {
+        let dir = std::env::temp_dir().join(format!("teton-root-flag-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("a-file");
+        std::fs::write(&file, b"x").unwrap();
+        let missing = dir.join("nope");
+
+        assert_eq!(cwd_flag_refusal(Some("."), Some(&dir)), None);
+        assert_eq!(
+            cwd_flag_refusal(Some("nope"), Some(&missing)).as_deref(),
+            Some(
+                format!(
+                    "could not start a session: path `{}` does not exist or is not a directory",
+                    missing.display()
+                )
+                .as_str()
+            )
+        );
+        let refused = cwd_flag_refusal(Some("a-file"), Some(&file)).expect("a file is refused");
+        assert!(
+            refused.contains("does not exist or is not a directory"),
+            "{refused}"
+        );
+        assert!(
+            refused.contains(&format!("`{}`", file.display())),
+            "{refused}"
+        );
+        assert!(
+            !refused
+                .replace(&file.display().to_string(), "")
+                .contains("cwd"),
+            "root-neutral, no `cwd` in the sentence itself: {refused}"
+        );
+        // No flag: the shell's directory (even a stale one) is the daemon's to
+        // judge, and nothing is refused here.
+        assert_eq!(cwd_flag_refusal(None, Some(&missing)), None);
+        assert_eq!(cwd_flag_refusal(None, None), None);
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     /// `--cwd` is a flag of the session (and of the one subcommand that opens a

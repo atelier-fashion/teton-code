@@ -2,11 +2,12 @@
 //!
 //! A session's tools are jailed to one directory — the **session root**. This
 //! module is the one derivation of what that directory *is*: which kind of place
-//! it is ([`classify`]), how it is spelled to a person ([`display_for`]), how a
+//! it is ([`classify`]), how it is spelled to a person ([`display_for`]), how
+//! its kind is said in the user's words ([`kind_phrase`]), how a
 //! user-controlled value from it is bounded before it lands in a prompt or a
-//! refusal ([`bounded_field`]), which names make a directory a project
-//! ([`PROJECT_MARKERS`]), and how a `--cwd`/`/cd` argument becomes a path
-//! ([`resolve_cwd_argument`]).
+//! refusal ([`bounded_field`], [`bounded_field_bytes`]), which names make a
+//! directory a project ([`PROJECT_MARKERS`]), and how a `--cwd`/`/cd` argument
+//! becomes a path ([`resolve_cwd_argument`]).
 //!
 //! Everything here is pure: no filesystem, no environment. The daemon's
 //! `tetond::session_root::probe` supplies the I/O (does a marker exist, what
@@ -17,7 +18,7 @@
 
 use std::path::{Component, Path, PathBuf};
 
-use teton_protocol::methods::RootKind;
+use teton_protocol::methods::{RootKind, SessionRoot};
 
 /// The names that make a directory a project (REQ-583 BR-4): a VCS directory or
 /// a top-level build manifest.
@@ -62,14 +63,58 @@ const ELISION: char = '…';
 /// 200-character root cut to the character ceiling. Without a byte bound an
 /// all-multibyte value — up to four bytes a character — rendered longer than
 /// that row, so the row was not the worst case it was said to be. This bound
-/// makes it exactly the worst: an all-ASCII value at the ceiling costs
-/// `max_chars` bytes and one cut to it costs `max_chars + 2`, and nothing in
-/// any script may cost more. (A wider byte cap — say twice the character
-/// ceiling — would need the block's worst row, and the ceiling that pays for
-/// it, to grow by over a hundred bytes; the margin there is one.)
+/// ([`bounded_field_bytes`] holds it) makes it exactly the worst: an all-ASCII
+/// value at the ceiling costs `max_chars` bytes and one cut to it costs
+/// `max_chars + 2`, and nothing in any script may cost more. (A wider byte cap
+/// — say twice the character ceiling — would need the block's worst row, and
+/// the ceiling that pays for it, to grow by over a hundred bytes; the margin
+/// there is one.)
 #[must_use]
 pub const fn byte_ceiling(max_chars: usize) -> usize {
     max_chars + ELISION.len_utf8() - 1
+}
+
+/// Whether `c` is a character that renders as nothing or re-orders what is
+/// around it — the format and line characters a control-character check does
+/// not catch, and the ones a path or a branch name could use to hide a frame
+/// label or make a refusal read backwards.
+///
+/// There is no Unicode-tables crate in this workspace, so the set is a
+/// hand-kept range match: the zero-width and joiner marks (U+200B–U+200F,
+/// U+2060–U+2064), the bidi embedding, override and isolate controls
+/// (U+202A–U+202E, U+2066–U+2069), the byte-order mark (U+FEFF), the line and
+/// paragraph separators (U+2028, U+2029), the Arabic letter mark (U+061C) and
+/// the Mongolian vowel separator (U+180E). Not an exhaustive `Cf` table — the
+/// remaining format characters do not hide text or reverse it — and kept
+/// private so the one list is [`bounded_field`]'s.
+const fn is_hidden_or_bidi(c: char) -> bool {
+    matches!(
+        c,
+        '\u{200B}'..='\u{200F}'
+            | '\u{202A}'..='\u{202E}'
+            | '\u{2060}'..='\u{2064}'
+            | '\u{2066}'..='\u{2069}'
+            | '\u{FEFF}'
+            | '\u{2028}'
+            | '\u{2029}'
+            | '\u{061C}'
+            | '\u{180E}'
+    )
+}
+
+/// `s` with every character that could break, hide or re-order the line it
+/// sits on replaced by `?`: the control characters (newlines and carriage
+/// returns included) and the hidden/bidi set [`is_hidden_or_bidi`] names.
+fn neutralized(s: &str) -> String {
+    s.chars()
+        .map(|c| {
+            if c.is_control() || is_hidden_or_bidi(c) {
+                '?'
+            } else {
+                c
+            }
+        })
+        .collect()
 }
 
 /// What kind of place `path` is (BR-4).
@@ -119,25 +164,44 @@ pub fn display_for(path: &Path, home: Option<&Path>) -> String {
     path.display().to_string()
 }
 
-/// `s`, made safe to print mid-line in a prompt or a refusal (ADR-2 bounding).
+/// `s`, made safe to print mid-line in a refusal, a banner line or a notice
+/// (ADR-2 bounding) — bounded in **characters**, the unit a person reads.
 ///
-/// Every control character — newlines and carriage returns included — becomes
-/// `?`, so a path can neither break the line it sits on nor smuggle a
-/// frame label to column 0; then the result is [`middle_elide`]d to at most
-/// `max_chars` characters **and** at most [`byte_ceiling`]`(max_chars)` bytes,
-/// so no path can blow the resident-prompt ceiling in either unit. The byte
-/// bound is met by eliding further, at character boundaries, still around one
-/// [`ELISION`] mark; an all-ASCII value never meets it (it is the ASCII cost),
-/// so the rendering of an ASCII path is what it always was. The three
-/// user-controlled root values (display, project name, branch) all pass
-/// through here, with [`DISPLAY_MAX_CHARS`] or [`NAME_MAX_CHARS`]. Idempotent:
-/// a value already within both bounds comes back unchanged.
+/// Every control character — newlines and carriage returns included — and
+/// every hidden or bidi format character ([`is_hidden_or_bidi`]: zero-width
+/// marks, direction overrides and isolates, the line separators, the BOM)
+/// becomes `?`, so a path can neither break the line it sits on, smuggle a
+/// frame label to column 0, nor make the line read backwards; then the result
+/// is [`middle_elide`]d to at most `max_chars` characters. Counted in
+/// characters and not bytes on purpose: the CLI banner, the launch notice, the
+/// `/cd` line and every jail refusal are for a person, and a CJK path should
+/// show them its full [`DISPLAY_MAX_CHARS`] characters, not a third of them.
+/// The three user-controlled root values (display, project name, branch) pass
+/// through here, with [`DISPLAY_MAX_CHARS`] or [`NAME_MAX_CHARS`]; the one
+/// surface counted in bytes — the resident environment block — uses
+/// [`bounded_field_bytes`] instead. Idempotent: a value already within the
+/// bound comes back unchanged, and a value bounded by [`bounded_field_bytes`]
+/// is within it.
 #[must_use]
 pub fn bounded_field(s: &str, max_chars: usize) -> String {
-    let neutral: String = s
-        .chars()
-        .map(|c| if c.is_control() { '?' } else { c })
-        .collect();
+    middle_elide(&neutralized(s), max_chars)
+}
+
+/// [`bounded_field`] and, on top of it, a **byte** bound: at most `max_chars`
+/// characters *and* at most [`byte_ceiling`]`(max_chars)` bytes.
+///
+/// For the one place a root value is paid for in bytes — the environment
+/// block resident in every turn's prompt, whose ceiling sweeps measure an
+/// ASCII row cut to the character ceiling. The byte bound is met by eliding
+/// further, at character boundaries, still around one [`ELISION`] mark; an
+/// all-ASCII value never meets it (it *is* the ASCII cost), so the rendering
+/// of an ASCII path is what it always was, and no script can render past the
+/// row the sweeps measure. Idempotent, and a value it bounded passes through
+/// [`bounded_field`] unchanged — so a phrase built by [`kind_phrase`] from a
+/// byte-bounded root keeps the byte bound.
+#[must_use]
+pub fn bounded_field_bytes(s: &str, max_chars: usize) -> String {
+    let neutral = neutralized(s);
     let max_bytes = byte_ceiling(max_chars);
     // Largest character budget whose elision fits the byte ceiling. Below the
     // value's own length an elision's byte count only grows with the budget
@@ -149,6 +213,46 @@ pub fn bounded_field(s: &str, max_chars: usize) -> String {
         .map(|keep| middle_elide(&neutral, keep))
         .find(|out| out.len() <= max_bytes)
         .unwrap_or_default()
+}
+
+/// What kind of place `root` is, in the user's words (BR-1's phrases; BR-3:
+/// "project" names a kind only when the kind *is* project).
+///
+/// - `project {name}, branch {branch}` / `project {name}` for a project, with
+///   the name and branch re-bounded here through [`bounded_field`] at
+///   [`NAME_MAX_CHARS`] (idempotent on the probe's bounded values, and it
+///   protects the phrase against a root that arrived unbounded);
+/// - `a project, branch {branch}` / `a project` for a project the probe could
+///   not name — the wire says a project always carries its name, so this arm
+///   is defensive: still a project, still never an invented name;
+/// - `your home folder`, `the filesystem root`, `not a project` otherwise.
+///
+/// **The one phrase.** The daemon's environment block and the CLI's banner
+/// notice, `session_root_changed` line and `/cd` all print this — the model
+/// and the person read the same words for the same root, and neither side
+/// can grow a second vocabulary. An empty name or branch (after bounding)
+/// counts as absent, so no phrase ever reads `project ` with nothing after it.
+#[must_use]
+pub fn kind_phrase(root: &SessionRoot) -> String {
+    match root.kind {
+        RootKind::Project => {
+            let bounded_name = |value: &str| {
+                let bounded = bounded_field(value, NAME_MAX_CHARS);
+                (!bounded.is_empty()).then_some(bounded)
+            };
+            let name = root.project_name.as_deref().and_then(bounded_name);
+            let branch = root.vcs_branch.as_deref().and_then(bounded_name);
+            match (name, branch) {
+                (Some(name), Some(branch)) => format!("project {name}, branch {branch}"),
+                (Some(name), None) => format!("project {name}"),
+                (None, Some(branch)) => format!("a project, branch {branch}"),
+                (None, None) => "a project".to_owned(),
+            }
+        }
+        RootKind::Home => "your home folder".to_owned(),
+        RootKind::FilesystemRoot => "the filesystem root".to_owned(),
+        RootKind::Plain => "not a project".to_owned(),
+    }
 }
 
 /// `s` if it fits in `max_chars`, otherwise its head and tail around one `…`,
@@ -495,6 +599,50 @@ mod tests {
     #[test]
     fn bounded_field_replaces_control_characters_and_line_breaks() {
         assert_eq!(bounded_field("a\nb\rc\td\u{1b}[31me", 80), "a?b?c?d?[31me");
+        assert_eq!(
+            bounded_field_bytes("a\nb\rc\td\u{1b}[31me", 80),
+            "a?b?c?d?[31me"
+        );
+    }
+
+    /// **The hidden and bidi characters are neutralised too.** A right-to-left
+    /// override in a branch name would make the rest of the line — the
+    /// platform, a frame label, the closing bracket — read backwards on a
+    /// terminal and in a prompt; a zero-width joiner or a BOM would hide in a
+    /// name and make two spellings of one path look identical. None of them
+    /// is a control character, so `is_control` alone let them through; each
+    /// becomes `?` like a control character does, in both bounding functions.
+    #[test]
+    fn bounded_field_neutralizes_bidi_overrides_and_zero_width_characters() {
+        // An RLO in a branch name, then a plausible tail.
+        let branch = "feat/\u{202E}niam-ot-egrem";
+        let out = bounded_field(branch, NAME_MAX_CHARS);
+        assert_eq!(out, "feat/?niam-ot-egrem", "{out:?}");
+        assert_eq!(bounded_field_bytes(branch, NAME_MAX_CHARS), out);
+        // Every character in the named set, one at a time, between two
+        // letters: each is `?`, nothing else moves.
+        let hidden = [
+            '\u{200B}', '\u{200C}', '\u{200D}', '\u{200E}', '\u{200F}', '\u{202A}', '\u{202B}',
+            '\u{202C}', '\u{202D}', '\u{202E}', '\u{2060}', '\u{2061}', '\u{2062}', '\u{2063}',
+            '\u{2064}', '\u{2066}', '\u{2067}', '\u{2068}', '\u{2069}', '\u{FEFF}', '\u{2028}',
+            '\u{2029}', '\u{061C}', '\u{180E}',
+        ];
+        for c in hidden {
+            assert!(
+                !c.is_control(),
+                "{c:?} is a control character; the test is vacuous for it"
+            );
+            let s = format!("a{c}b");
+            assert_eq!(bounded_field(&s, 80), "a?b", "U+{:04X}", c as u32);
+            assert_eq!(bounded_field_bytes(&s, 80), "a?b", "U+{:04X}", c as u32);
+        }
+        // Ordinary non-ASCII letters and marks are not touched: the set is the
+        // hidden and re-ordering characters, not "anything unusual".
+        assert_eq!(bounded_field("é漢字-ß", 80), "é漢字-ß");
+        assert_eq!(
+            bounded_field("~/文档/项目", DISPLAY_MAX_CHARS),
+            "~/文档/项目"
+        );
     }
 
     #[test]
@@ -537,33 +685,66 @@ mod tests {
     /// value that fits costs at most `max_chars` bytes, one that was cut costs
     /// `max_chars + 2` (the three-byte mark for one character), and that is
     /// the ceiling — so the ASCII row the resident-prompt sweeps measure is the
-    /// byte-worst rendering there is.
+    /// byte-worst rendering there is. On ASCII the two bounding functions
+    /// agree byte for byte: the byte bound is never the one that bites.
     #[test]
     fn the_byte_ceiling_is_what_an_elided_ascii_value_costs() {
         assert_eq!(byte_ceiling(DISPLAY_MAX_CHARS), 82);
         assert_eq!(byte_ceiling(NAME_MAX_CHARS), 34);
         assert_eq!(byte_ceiling(1), ELISION.len_utf8());
-        let cut = bounded_field(&"/segment".repeat(25), DISPLAY_MAX_CHARS);
+        let long = "/segment".repeat(25);
+        let cut = bounded_field_bytes(&long, DISPLAY_MAX_CHARS);
         assert_eq!(cut.len(), byte_ceiling(DISPLAY_MAX_CHARS));
         assert_eq!(cut.chars().count(), DISPLAY_MAX_CHARS);
+        assert_eq!(bounded_field(&long, DISPLAY_MAX_CHARS), cut);
         let fits = "a".repeat(DISPLAY_MAX_CHARS);
         assert_eq!(bounded_field(&fits, DISPLAY_MAX_CHARS), fits);
+        assert_eq!(bounded_field_bytes(&fits, DISPLAY_MAX_CHARS), fits);
     }
 
-    /// **The multibyte hardening (TASK-180).** A value made of three- and
-    /// four-byte characters is bounded in bytes as well as characters: it
-    /// renders no longer than the byte ceiling, still around one elision mark,
-    /// still cut at character boundaries (valid UTF-8 by construction), and a
-    /// bounded value passed through again is unchanged. Before this bound a
-    /// 200-character CJK path came out at 80 characters and 240 bytes — three
-    /// times the ASCII row the ceiling sweeps call the worst case.
+    /// **The person's bound is characters (verify finding S).** The banner,
+    /// the launch notice, the `/cd` line and a jail refusal are read by a
+    /// person, so an 80-character CJK path shows all 80 of its characters —
+    /// `bounded_field` never trades characters for bytes — while the same
+    /// value through [`bounded_field_bytes`] is cut to the byte ceiling, and
+    /// that is the environment block's concern alone.
+    #[test]
+    fn bounded_field_counts_characters_so_a_cjk_path_shows_its_full_width() {
+        let cjk = format!("/{}", "漢".repeat(DISPLAY_MAX_CHARS - 1));
+        assert_eq!(cjk.chars().count(), DISPLAY_MAX_CHARS);
+        assert_eq!(
+            bounded_field(&cjk, DISPLAY_MAX_CHARS),
+            cjk,
+            "a value at the character ceiling is shown whole"
+        );
+        let longer = format!("/{}", "漢".repeat(199));
+        let shown = bounded_field(&longer, DISPLAY_MAX_CHARS);
+        assert_eq!(shown.chars().count(), DISPLAY_MAX_CHARS, "{shown}");
+        assert!(shown.len() > byte_ceiling(DISPLAY_MAX_CHARS), "{shown}");
+        // The prompt's function cuts the same value to the byte ceiling.
+        let paid = bounded_field_bytes(&longer, DISPLAY_MAX_CHARS);
+        assert!(paid.len() <= byte_ceiling(DISPLAY_MAX_CHARS), "{paid}");
+        assert!(paid.chars().count() < shown.chars().count(), "{paid}");
+        // And what the byte function bounded, the character function leaves
+        // alone: a phrase built from a byte-bounded root keeps its bound.
+        assert_eq!(bounded_field(&paid, DISPLAY_MAX_CHARS), paid);
+    }
+
+    /// **The multibyte hardening (TASK-180), on the prompt's function.** A
+    /// value made of three- and four-byte characters is bounded in bytes as
+    /// well as characters: it renders no longer than the byte ceiling, still
+    /// around one elision mark, still cut at character boundaries (valid UTF-8
+    /// by construction), and a bounded value passed through again is
+    /// unchanged. Before this bound a 200-character CJK path came out at 80
+    /// characters and 240 bytes — three times the ASCII row the ceiling sweeps
+    /// call the worst case.
     #[test]
     fn a_multibyte_value_is_bounded_in_bytes_too_and_still_elided_in_the_middle() {
         for (script, ch) in [("cjk", '漢'), ("astral", '𝔘')] {
             assert!(ch.len_utf8() >= 3, "{script}: not a multibyte fixture");
             let long = ch.to_string().repeat(200);
             for (max_chars, what) in [(DISPLAY_MAX_CHARS, "display"), (NAME_MAX_CHARS, "name")] {
-                let out = bounded_field(&long, max_chars);
+                let out = bounded_field_bytes(&long, max_chars);
                 let ceiling = byte_ceiling(max_chars);
                 assert!(
                     out.len() <= ceiling,
@@ -588,23 +769,96 @@ mod tests {
                     out.len()
                 );
                 assert_eq!(
-                    bounded_field(&out, max_chars),
+                    bounded_field_bytes(&out, max_chars),
                     out,
                     "{script} {what}: idempotent"
+                );
+                assert_eq!(
+                    bounded_field(&out, max_chars),
+                    out,
+                    "{script} {what}: the character bound leaves a byte-bounded value alone"
                 );
             }
         }
         // A short multibyte value under both bounds is left alone.
         assert_eq!(
-            bounded_field("~/文档/项目", DISPLAY_MAX_CHARS),
+            bounded_field_bytes("~/文档/项目", DISPLAY_MAX_CHARS),
             "~/文档/项目"
         );
         // Two-byte characters at the character ceiling exceed the byte ceiling
         // and are elided too — the bound is bytes, not "wide characters".
         let latin = "é".repeat(DISPLAY_MAX_CHARS);
-        let out = bounded_field(&latin, DISPLAY_MAX_CHARS);
+        let out = bounded_field_bytes(&latin, DISPLAY_MAX_CHARS);
         assert!(out.len() <= byte_ceiling(DISPLAY_MAX_CHARS), "{out}");
         assert!(out.contains(ELISION), "{out}");
+    }
+
+    // ---- kind_phrase (BR-1's phrases, BR-3's one term) ----
+
+    fn root(kind: RootKind, display: &str) -> SessionRoot {
+        SessionRoot {
+            display: display.to_owned(),
+            kind,
+            project_name: None,
+            vcs_branch: None,
+        }
+    }
+
+    /// One phrase per kind; "project" names a kind only when the kind is
+    /// project (BR-3), with the branch when it was read and without it
+    /// otherwise; a nameless project is `a project`, never an invented name.
+    #[test]
+    fn kind_phrase_spells_each_kind_once() {
+        assert_eq!(kind_phrase(&root(RootKind::Home, "~")), "your home folder");
+        assert_eq!(
+            kind_phrase(&root(RootKind::FilesystemRoot, "/")),
+            "the filesystem root"
+        );
+        assert_eq!(
+            kind_phrase(&root(RootKind::Plain, "/opt/x")),
+            "not a project"
+        );
+        let mut project = root(RootKind::Project, "~/Documents/GitHub/teton-code");
+        assert_eq!(kind_phrase(&project), "a project");
+        project.vcs_branch = Some("main".to_owned());
+        assert_eq!(kind_phrase(&project), "a project, branch main");
+        project.project_name = Some("teton-code".to_owned());
+        assert_eq!(kind_phrase(&project), "project teton-code, branch main");
+        project.vcs_branch = None;
+        assert_eq!(kind_phrase(&project), "project teton-code");
+        // An empty name or branch is absent, so no phrase dangles.
+        project.project_name = Some(String::new());
+        project.vcs_branch = Some("dev".to_owned());
+        assert_eq!(kind_phrase(&project), "a project, branch dev");
+        project.vcs_branch = Some(String::new());
+        assert_eq!(kind_phrase(&project), "a project");
+        for kind in [RootKind::Home, RootKind::FilesystemRoot] {
+            assert!(!kind_phrase(&root(kind, "~")).contains("project"));
+        }
+    }
+
+    /// The phrase bounds what it prints (ADR-2): a control character or a bidi
+    /// override in a name cannot break the line, and a long name is cut to the
+    /// name ceiling — in characters, since the phrase is read by a person, and
+    /// idempotently on a value the prompt already byte-bounded.
+    #[test]
+    fn kind_phrase_bounds_the_name_and_the_branch() {
+        let mut project = root(RootKind::Project, "~/x");
+        project.project_name = Some("a\nb".to_owned());
+        project.vcs_branch = Some("x".repeat(100));
+        let phrase = kind_phrase(&project);
+        assert!(!phrase.contains('\n'), "{phrase}");
+        assert!(phrase.starts_with("project a?b, branch x"), "{phrase}");
+        let branch = phrase.rsplit("branch ").next().unwrap();
+        assert_eq!(branch.chars().count(), NAME_MAX_CHARS, "{phrase}");
+        project.vcs_branch = Some("feat/\u{202E}x".to_owned());
+        assert_eq!(kind_phrase(&project), "project a?b, branch feat/?x");
+        // A byte-bounded name (the prompt's) comes through unchanged.
+        let cjk = "漢".repeat(NAME_MAX_CHARS + 1);
+        let paid = bounded_field_bytes(&cjk, NAME_MAX_CHARS);
+        project.project_name = Some(paid.clone());
+        project.vcs_branch = None;
+        assert_eq!(kind_phrase(&project), format!("project {paid}"));
     }
 
     #[test]

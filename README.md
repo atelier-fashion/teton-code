@@ -74,8 +74,9 @@ prompts:
 A session's tools are scoped to one directory — its **session root**: the
 directory you ran `teton` from, or the one you name with `teton --cwd <path>`
 (a relative path resolves against your shell, `~` expands, and a path that does
-not exist or is not a directory is refused before the session starts). The
-banner's `cwd:` line shows it. Outside a project — your home folder, `/`, or a
+not exist or is not a directory fails fast — refused on one line, before `teton`
+even connects to the daemon, so nothing starts). The banner's `cwd:` line shows
+it. Outside a project — your home folder, `/`, or a
 plain directory — the session says so under the banner, because every search
 then walks all of it and no project's privacy boundaries apply; `/cd <path>`
 moves the root of a live session and starts the conversation fresh.

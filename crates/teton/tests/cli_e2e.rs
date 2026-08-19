@@ -4871,7 +4871,7 @@ fn cwd_scopes_the_session_and_slash_cd_moves_it_and_reports_each_step() {
     let read_done = format!("read {} [done]", notes.display());
     let read_failed = format!("read {} [failed]", notes.display());
     let refusal =
-        "the session root could not be moved: cwd `/nope` does not exist or is not a directory";
+        "the session root could not be moved: path `/nope` does not exist or is not a directory";
 
     let at = |needle: &str| {
         body.find(needle).unwrap_or_else(|| {
@@ -4962,6 +4962,14 @@ fn cwd_scopes_the_session_and_slash_cd_moves_it_and_reports_each_step() {
 /// **AC-9 / BR-6: `teton --cwd /nope` is one refusal naming the path, an error
 /// exit, and no session output — never a session that starts and then fails on
 /// every tool.**
+///
+/// Since the verify pass (finding V) the CLI refuses this itself, before it
+/// connects — the same sentence the daemon's validator would answer with, so a
+/// script reads one line either way — which is why the assertion below is on
+/// the sentence and not on which process wrote it. The daemon stays the
+/// authority for the RPC (`tetond`'s e2e pins its refusal for a `cwd` sent on
+/// the wire); a daemon is still spawned here so a CLI that *did* connect
+/// would be caught doing so by the no-session-output assertions.
 #[test]
 fn a_cwd_that_does_not_exist_is_refused_before_any_session_output_and_exits_non_zero() {
     let daemon_bin = daemon_bin();
@@ -4982,12 +4990,12 @@ fn a_cwd_that_does_not_exist_is_refused_before_any_session_output_and_exits_non_
         "stdout:\n{stdout}\nstderr:\n{stderr}"
     );
     let refusal =
-        "teton: could not start a session: cwd `/nope` does not exist or is not a directory";
+        "teton: could not start a session: path `/nope` does not exist or is not a directory";
     assert_eq!(
         stderr.trim_end().lines().last(),
         Some(refusal),
-        "the refusal is the daemon's sentence, naming the path, once, on stderr; \
-         stderr:\n{stderr}"
+        "the refusal is the daemon's sentence (spoken by the CLI's fail-fast), naming the \
+         path, once, on stderr; stderr:\n{stderr}"
     );
     assert_eq!(
         stderr.matches("/nope").count(),

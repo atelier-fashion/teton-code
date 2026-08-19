@@ -33,6 +33,7 @@
 use std::sync::{Arc, Mutex};
 use teton_core::capability::WebCapabilityState;
 use teton_core::effort::{EffortOmission, ResolvedEffort};
+use teton_core::session_root::kind_phrase;
 
 use serde_json::Value;
 
@@ -40,7 +41,7 @@ use teton_inference::{ChatFormat, Engine, EngineError, GenParams};
 use teton_protocol::events::{
     CapabilityDeadEnd, Event, PrefixCache, SessionUpdate, SessionUpdatePayload, ToolCallStatus,
 };
-use teton_protocol::methods::{RootKind, SessionRoot, StopReason};
+use teton_protocol::methods::{SessionRoot, StopReason};
 use teton_protocol::{ProviderId, SessionId};
 use teton_providers::{BlockDetail, HarnessProfile, ProviderError, ToolCall};
 
@@ -1260,24 +1261,32 @@ const fn platform_word() -> &'static str {
 /// Facts only, in the order BR-1 lists them — display, kind, project name and
 /// branch when the kind is a project, platform — and no directive about what to
 /// do with them: the tools enforce the jail, and a small model transfers data
-/// far more reliably than instructions (LESSON-532). "project" appears only
-/// when the kind *is* one (BR-3), and the branch only when the probe read one —
-/// never a guessed value.
+/// far more reliably than instructions (LESSON-532). The kind, name and branch
+/// are one phrase, [`kind_phrase`](teton_core::session_root::kind_phrase) —
+/// the same words the CLI's banner notice, `session_root_changed` line and
+/// `/cd` print, so the model and the person read one vocabulary for one root.
+/// "project" appears only when the kind *is* one (BR-3), and the branch only
+/// when the probe read one — never a guessed value.
 ///
 /// **Bounding.** The three user-controlled values (display, project name,
 /// branch) are the trust class of an MCP tool description landing in the
 /// system prompt (BUG-148, LESSON-477 §2). The probe already passed them
-/// through [`bounded_field`](teton_core::session_root::bounded_field) once;
-/// they pass again here —
+/// through [`bounded_field`](teton_core::session_root::bounded_field) once,
+/// in characters; they pass again here through
+/// [`bounded_field_bytes`](teton_core::session_root::bounded_field_bytes) —
 /// [`DISPLAY_MAX_CHARS`](teton_core::session_root::DISPLAY_MAX_CHARS) for the
 /// display, [`NAME_MAX_CHARS`](teton_core::session_root::NAME_MAX_CHARS) for
 /// name and branch — so this function holds its own ceiling whatever it is
-/// handed: no control character reaches the line, and no path can grow it past
-/// the display ceiling, in characters or in bytes
+/// handed: no control or bidi character reaches the line, and no path can
+/// grow it past the display ceiling, in characters **or in bytes**
 /// ([`byte_ceiling`](teton_core::session_root::byte_ceiling): the ASCII cost
-/// of the character ceiling, held for every script) — about 200 bytes for
-/// the 200-character root that is the row the resident-prompt ceiling sweeps
-/// measure
+/// of the character ceiling, held for every script). The byte bound is this
+/// block's alone — the resident prompt is the one surface a root value is
+/// paid for in bytes; the person-facing lines keep the character bound — and
+/// it is applied to the root *before* the phrase is built, so the phrase
+/// (which re-bounds in characters, idempotently) keeps it: about 200 bytes
+/// for the 200-character root that is the row the resident-prompt ceiling
+/// sweeps measure
 /// (`egress::redact::tests::the_total_cap_clears_the_harness_context_budget_with_margin`
 /// and its twin beside the web tool). Every value sits mid-line after a harness
 /// label, never at column 0, so `neutralize_frame_labels` and
@@ -1289,73 +1298,73 @@ const fn platform_word() -> &'static str {
 /// line, and cannot come to measure a different spelling.
 #[must_use]
 pub(crate) fn environment_block(root: &SessionRoot) -> String {
-    use teton_core::session_root::{bounded_field, DISPLAY_MAX_CHARS, NAME_MAX_CHARS};
-
-    let display = bounded_field(&root.display, DISPLAY_MAX_CHARS);
-    let kind = match root.kind {
-        RootKind::Project => {
-            let name = root
-                .project_name
-                .as_deref()
-                .map(|name| bounded_field(name, NAME_MAX_CHARS))
-                .filter(|name| !name.is_empty());
-            let branch = root
-                .vcs_branch
-                .as_deref()
-                .map(|branch| bounded_field(branch, NAME_MAX_CHARS))
-                .filter(|branch| !branch.is_empty());
-            match (name, branch) {
-                (Some(name), Some(branch)) => format!("project {name}, branch {branch}"),
-                (Some(name), None) => format!("project {name}"),
-                // A project the probe could not name: still a project, and
-                // still never a guessed name.
-                (None, Some(branch)) => format!("a project, branch {branch}"),
-                (None, None) => "a project".to_owned(),
-            }
-        }
-        RootKind::Home => "your home folder".to_owned(),
-        RootKind::FilesystemRoot => "the filesystem root".to_owned(),
-        RootKind::Plain => "not a project".to_owned(),
-    };
+    let paid = byte_bounded_root(root);
     format!(
-        "Session root: {display} ({kind}). Platform: {}.\n",
+        "Session root: {} ({}). Platform: {}.\n",
+        paid.display,
+        kind_phrase(&paid),
         platform_word()
     )
+}
+
+/// `root` with its three user-controlled values held to the prompt's byte
+/// bound ([`bounded_field_bytes`](teton_core::session_root::bounded_field_bytes)
+/// at the display and name ceilings) — what [`environment_block`] renders and
+/// what [`worst_case_session_root`] is built from, so the two cannot come to
+/// bound differently.
+fn byte_bounded_root(root: &SessionRoot) -> SessionRoot {
+    use teton_core::session_root::{bounded_field_bytes, DISPLAY_MAX_CHARS, NAME_MAX_CHARS};
+
+    SessionRoot {
+        display: bounded_field_bytes(&root.display, DISPLAY_MAX_CHARS),
+        kind: root.kind,
+        project_name: root
+            .project_name
+            .as_deref()
+            .map(|name| bounded_field_bytes(name, NAME_MAX_CHARS)),
+        vcs_branch: root
+            .vcs_branch
+            .as_deref()
+            .map(|branch| bounded_field_bytes(branch, NAME_MAX_CHARS)),
+    }
 }
 
 /// The largest [`SessionRoot`] the environment block can render, for the two
 /// resident-prompt ceiling sweeps (REQ-583 AC-4).
 ///
 /// A 200-character path — the figure AC-4 names — elided to
-/// [`DISPLAY_MAX_CHARS`](teton_core::session_root::DISPLAY_MAX_CHARS) by the
-/// same [`bounded_field`](teton_core::session_root::bounded_field) the probe
-/// uses, a name and a branch **over**
+/// [`DISPLAY_MAX_CHARS`](teton_core::session_root::DISPLAY_MAX_CHARS), a name
+/// and a branch **over**
 /// [`NAME_MAX_CHARS`](teton_core::session_root::NAME_MAX_CHARS) and elided to
-/// it, and kind `project` — the one kind whose phrase carries both. Elided
-/// rather than merely at the cap because the ceiling is counted in bytes and
-/// the bound in characters: the elision mark is three bytes for one character,
-/// so a value that was cut is two bytes longer than one that just fit — and
-/// that cost, [`byte_ceiling`](teton_core::session_root::byte_ceiling) of the
-/// character ceiling, is also the byte bound `bounded_field` holds every
-/// script to (TASK-180), which is what makes this ASCII row the **byte-worst**
-/// rendering there is: each of its three values sits exactly at its byte
-/// ceiling, and no all-multibyte value can render past one. Built here rather
-/// than in each sweep so the two cannot come to measure different worst
-/// cases, and `#[cfg(test)]` because it is a measurement fixture, not a value
-/// the daemon ever holds.
+/// it, and kind `project` — the one kind whose phrase carries both — all
+/// through the block's own [`byte_bounded_root`]. Elided rather than merely at
+/// the cap because the ceiling is counted in bytes and the bound in
+/// characters: the elision mark is three bytes for one character, so a value
+/// that was cut is two bytes longer than one that just fit — and that cost,
+/// [`byte_ceiling`](teton_core::session_root::byte_ceiling) of the character
+/// ceiling, is also the byte bound the block holds every script to
+/// (TASK-180; `bounded_field_bytes`), which is what makes this ASCII row the
+/// **byte-worst** rendering there is: each of its three values sits exactly at
+/// its byte ceiling, and no all-multibyte value can render past one — a
+/// guarantee of the *block*, asserted on the rendered block's bytes, not of
+/// the probe's strings, which are bounded in characters for the person who
+/// reads them. Built here rather than in each sweep so the two cannot come to
+/// measure different worst cases, and `#[cfg(test)]` because it is a
+/// measurement fixture, not a value the daemon ever holds.
 #[cfg(test)]
 pub(crate) fn worst_case_session_root() -> SessionRoot {
-    use teton_core::session_root::{bounded_field, DISPLAY_MAX_CHARS, NAME_MAX_CHARS};
+    use teton_core::session_root::NAME_MAX_CHARS;
+    use teton_protocol::methods::RootKind;
 
     // Exactly 200 characters: twenty-five eight-character segments.
     let long_path = "/segment".repeat(25);
     let over_cap = |c: char| c.to_string().repeat(NAME_MAX_CHARS + 1);
-    SessionRoot {
-        display: bounded_field(&long_path, DISPLAY_MAX_CHARS),
+    byte_bounded_root(&SessionRoot {
+        display: long_path,
         kind: RootKind::Project,
-        project_name: Some(bounded_field(&over_cap('n'), NAME_MAX_CHARS)),
-        vcs_branch: Some(bounded_field(&over_cap('b'), NAME_MAX_CHARS)),
-    }
+        project_name: Some(over_cap('n')),
+        vcs_branch: Some(over_cap('b')),
+    })
 }
 
 /// Build the system prompt: the agent's instructions, Teton's bundled
@@ -1527,6 +1536,7 @@ mod tests {
     use teton_core::capability::SearchGap;
     use teton_core::config::WebTier;
     use teton_inference::{ChatFormat, MockEngine};
+    use teton_protocol::methods::RootKind;
     use teton_providers::TokenUsage;
 
     use crate::egress::Provenance as EgressProvenance;
@@ -3468,31 +3478,40 @@ mod tests {
     }
 
     /// **REQ-583 / TASK-180: the sweeps' row is the byte-worst, in every
-    /// script.** The resident-prompt ceiling is counted in bytes and the
-    /// display/name ceilings in characters; `bounded_field` bounds both, at
-    /// the ASCII cost of the character ceiling, so a root made of three- or
+    /// script — a guarantee of the rendered block.** The resident-prompt
+    /// ceiling is counted in bytes and the display/name ceilings in
+    /// characters; the block holds both, through `bounded_field_bytes` at the
+    /// ASCII cost of the character ceiling, so a root made of three- or
     /// four-byte characters — a 200-character CJK path, a 33-character CJK
     /// name and branch, and the astral-plane twins of each — must render no
-    /// longer than `worst_case_session_root`, whose three values each sit
-    /// exactly at their byte ceiling. Asserted on the rendered block, which is
-    /// what the sweeps measure, and on the fixture's own bytes, so a fixture
-    /// that quietly slipped under its ceiling would fail here before it made
-    /// the sweeps measure less than the block can be.
+    /// longer than the block for `worst_case_session_root`. Asserted on
+    /// `environment_block(..).len()`, which is what the sweeps measure, and
+    /// **not** on the probe's strings: since verify finding S the probe (and
+    /// every person-facing line) bounds in characters, so a CJK root's
+    /// `display` may well be longer than the row's in bytes — the byte bound
+    /// is the prompt's alone. The row's own block is also pinned to the exact
+    /// byte cost the three ceilings add up to, so a fixture that quietly
+    /// slipped under its ceiling fails here before it makes the sweeps
+    /// measure less than the block can be.
     #[test]
     fn the_worst_case_root_is_the_byte_worst_for_multibyte_roots_too() {
-        use teton_core::session_root::{byte_ceiling, DISPLAY_MAX_CHARS, NAME_MAX_CHARS};
+        use teton_core::session_root::{
+            bounded_field, byte_ceiling, DISPLAY_MAX_CHARS, NAME_MAX_CHARS,
+        };
 
         let worst = worst_case_session_root();
-        assert_eq!(worst.display.len(), byte_ceiling(DISPLAY_MAX_CHARS));
-        assert_eq!(
-            worst.project_name.as_deref().map(str::len),
-            Some(byte_ceiling(NAME_MAX_CHARS))
-        );
-        assert_eq!(
-            worst.vcs_branch.as_deref().map(str::len),
-            Some(byte_ceiling(NAME_MAX_CHARS))
-        );
         let worst_block = environment_block(&worst);
+        // The row costs exactly what the three byte ceilings and the fixed
+        // words add up to — a fixture under any ceiling would come up short.
+        let fixed = format!(
+            "Session root:  (project , branch ). Platform: {}.\n",
+            platform_word()
+        );
+        assert_eq!(
+            worst_block.len(),
+            fixed.len() + byte_ceiling(DISPLAY_MAX_CHARS) + 2 * byte_ceiling(NAME_MAX_CHARS),
+            "the row is not at its byte ceilings:\n{worst_block}"
+        );
 
         for (script, ch) in [("cjk", '漢'), ("astral", '𝔘')] {
             assert!(ch.len_utf8() >= 3);
@@ -3503,27 +3522,92 @@ mod tests {
                 "{script}: AC-4's 200-character path"
             );
             let name = ch.to_string().repeat(NAME_MAX_CHARS + 1);
-            // Unbounded on purpose: the block must hold its own ceiling even
-            // for a root that arrived without the probe's bounding.
-            let root = SessionRoot {
+            // As the probe would hand it over — bounded in characters, which
+            // for this script is far more bytes than the row's display — and
+            // once more unbounded, since the block must hold its own ceiling
+            // whatever it is handed.
+            let as_probed = SessionRoot {
+                display: bounded_field(&path, DISPLAY_MAX_CHARS),
+                kind: RootKind::Project,
+                project_name: Some(bounded_field(&name, NAME_MAX_CHARS)),
+                vcs_branch: Some(bounded_field(&name, NAME_MAX_CHARS)),
+            };
+            assert!(
+                as_probed.display.len() > worst.display.len(),
+                "{script}: the probe's display is character-bounded, so in this script it \
+                 is longer in bytes than the row's — the byte bound is the block's, not \
+                 the probe's"
+            );
+            let unbounded = SessionRoot {
                 display: path,
                 kind: RootKind::Project,
                 project_name: Some(name.clone()),
                 vcs_branch: Some(name),
             };
+            for (how, root) in [("probed", as_probed), ("unbounded", unbounded)] {
+                let block = environment_block(&root);
+                assert!(
+                    block.len() <= worst_block.len(),
+                    "{script} ({how}): a multibyte root renders {} bytes, past the {}-byte \
+                     row the ceiling sweeps measure:\n{block}",
+                    block.len(),
+                    worst_block.len()
+                );
+                assert!(
+                    block.contains('…'),
+                    "{script} ({how}): the values were elided:\n{block}"
+                );
+                assert_eq!(block.matches('\n').count(), 1, "{script} ({how}): one line");
+            }
+        }
+    }
+
+    /// **REQ-583 verify finding E: one kind phrase.** The block's kind, name
+    /// and branch are `teton_core::session_root::kind_phrase` — the same
+    /// function the CLI's `banner::root_line` prints — so for every kind, and
+    /// for a project with and without a branch, the parenthesis in the block is
+    /// exactly that phrase; the CLI's own test pins the same for its line, and
+    /// the two surfaces cannot grow separate vocabularies.
+    #[test]
+    fn the_environment_block_kind_is_the_shared_kind_phrase() {
+        let mut roots = vec![
+            project_root(Some("main")),
+            project_root(None),
+            SessionRoot {
+                display: "~".to_owned(),
+                kind: RootKind::Home,
+                project_name: None,
+                vcs_branch: None,
+            },
+            SessionRoot {
+                display: "/".to_owned(),
+                kind: RootKind::FilesystemRoot,
+                project_name: None,
+                vcs_branch: None,
+            },
+            SessionRoot {
+                display: "~/scratch".to_owned(),
+                kind: RootKind::Plain,
+                project_name: None,
+                vcs_branch: None,
+            },
+        ];
+        // The defensive arm: a project the probe could not name.
+        let mut nameless = project_root(Some("main"));
+        nameless.project_name = None;
+        roots.push(nameless);
+        for root in roots {
             let block = environment_block(&root);
+            let expected = format!(" ({}). Platform: ", kind_phrase(&root));
             assert!(
-                block.len() <= worst_block.len(),
-                "{script}: a multibyte root renders {} bytes, past the {}-byte row the \
-                 ceiling sweeps measure:\n{block}",
-                block.len(),
-                worst_block.len()
-            );
-            assert!(
-                block.contains('…'),
-                "{script}: the values were elided:\n{block}"
+                block.contains(&expected),
+                "the block's kind is not the shared phrase for {root:?}:\n{block}"
             );
         }
+        // And on a bounded root the phrase is byte-for-byte the shared one —
+        // the block re-bounds before phrasing, and the phrase is idempotent.
+        let worst = worst_case_session_root();
+        assert!(environment_block(&worst).contains(&format!("({})", kind_phrase(&worst))));
     }
 
     /// **AC-1's structural half.** Absent is absent: the registry does not

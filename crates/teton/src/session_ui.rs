@@ -841,7 +841,17 @@ pub fn render_event(
                     surface.line(LineKind::Notice, &format_root_moved_elsewhere(session));
                 }
                 None => {
-                    state.root = Some(changed.root.clone());
+                    // The cache is *this* session's root, so it follows the
+                    // event only when this client knows which session it is
+                    // in. With no session of its own (a passive context, or the
+                    // window before `session/create` answers) unknown is not
+                    // evidence of elsewhere — the line still draws — but it is
+                    // not evidence of *here* either, and caching another
+                    // session's root would make a later bare `/cd` describe a
+                    // root this client never had.
+                    if state.session_id.is_some() {
+                        state.root = Some(changed.root.clone());
+                    }
                     surface.line(
                         LineKind::Notice,
                         &format_session_root_changed(&changed.root),
@@ -4204,12 +4214,15 @@ mod tests {
 
     /// A client with no session of its own (a passive context, or the window
     /// before `session/create` answers) renders the plain line — unknown is not
-    /// evidence of elsewhere, exactly as for `context_cleared`.
+    /// evidence of elsewhere, exactly as for `context_cleared` — but it does
+    /// **not** cache the root: unknown is not evidence of *here* either, and a
+    /// later bare `/cd` must not describe a root this client never had.
     #[test]
     fn a_root_move_is_not_attributed_elsewhere_when_this_client_has_no_session() {
         let mut surface = RecordingSurface::new();
         let mut state = SessionState::new();
         state.interactive = true;
+        assert_eq!(state.session_id, None);
 
         render_event(
             &root_changed("s2", session_root(RootKind::Plain, "/opt/scratch")),
@@ -4226,6 +4239,10 @@ mod tests {
             surface.lines_of(LineKind::Notice)
         );
         assert!(surface.any_line_contains(LineKind::Notice, "Not inside a project"));
+        assert_eq!(
+            state.root, None,
+            "with no session of its own this client must not cache another session's root"
+        );
     }
 
     /// The root cache starts empty: nothing is known until the daemon says.

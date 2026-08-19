@@ -18,7 +18,7 @@
 use std::io::IsTerminal;
 use std::path::Path;
 
-use teton_core::session_root::{bounded_field, DISPLAY_MAX_CHARS, NAME_MAX_CHARS};
+use teton_core::session_root::{bounded_field, kind_phrase, DISPLAY_MAX_CHARS};
 use teton_protocol::methods::{RootKind, SessionRoot};
 
 use crate::render::{LineKind, Surface};
@@ -79,19 +79,26 @@ pub fn color_enabled() -> bool {
         && std::env::var("TERM").map_or(true, |t| t != "dumb")
 }
 
-/// The session root as shown in the banner's `cwd:` line, `~`-abbreviated.
+/// The session root as shown in the banner's `cwd:` line, `~`-abbreviated and
+/// bounded like every other spelling of a root.
 ///
 /// A thin wrapper over [`teton_core::session_root::display_for`] — the one
 /// spelling the daemon's environment block, the launch notice, the jail refusals
-/// and `/cd` all print (REQ-583 ADR-1). The banner draws before the session
-/// exists, so this is the one root fact the client computes locally, and it
-/// computes it with the daemon's own function rather than a rule of its own. The
-/// caller supplies the root (the resolved `--cwd`, or the shell's directory);
-/// the home folder is read from `HOME` here, as it always was.
+/// and `/cd` all print (REQ-583 ADR-1) — passed through [`bounded_field`] at
+/// [`DISPLAY_MAX_CHARS`] as every other root spelling is (ADR-2), so a
+/// 200-character or control-laden path cannot run away with the banner line
+/// either. The banner draws before the session exists, so this is the one root
+/// fact the client computes locally, and it computes it with the daemon's own
+/// functions rather than a rule of its own. The caller supplies the root (the
+/// resolved `--cwd`, or the shell's directory); the home folder is read from
+/// `HOME` here, as it always was.
 #[must_use]
 pub fn cwd_display(session_root: &Path) -> String {
     let home = crate::home_dir();
-    teton_core::session_root::display_for(session_root, home.as_deref())
+    bounded_field(
+        &teton_core::session_root::display_for(session_root, home.as_deref()),
+        DISPLAY_MAX_CHARS,
+    )
 }
 
 /// The root spelled for a person: `{display} ({kind phrase})` — `~ (your home
@@ -101,9 +108,12 @@ pub fn cwd_display(session_root: &Path) -> String {
 /// One function for the three lines that say where a session is — the launch
 /// notice, the `session_root_changed` line and `/cd`'s bare form — so a root is
 /// never described two ways (BR-3's one-term rule, applied to the kind
-/// vocabulary). The daemon builds the display and names bounded (ADR-2), and
-/// [`bounded_field`] is idempotent on a bounded value, so passing them through
-/// again costs nothing and protects the line against a daemon that did not.
+/// vocabulary). The kind phrase is [`kind_phrase`], the very function the
+/// daemon's environment block prints, so the person and the model read one
+/// vocabulary for one root. The daemon builds the display and names bounded
+/// (ADR-2), and [`bounded_field`] is idempotent on a bounded value, so passing
+/// them through again costs nothing and protects the line against a daemon
+/// that did not.
 #[must_use]
 pub fn root_line(root: &SessionRoot) -> String {
     format!(
@@ -113,39 +123,13 @@ pub fn root_line(root: &SessionRoot) -> String {
     )
 }
 
-/// What kind of place the root is, in the user's words (BR-1's phrases, BR-3:
-/// "project" appears only when the kind *is* project).
-fn kind_phrase(root: &SessionRoot) -> String {
-    match root.kind {
-        RootKind::Project => {
-            let name = root
-                .project_name
-                .as_deref()
-                .map(|name| bounded_field(name, NAME_MAX_CHARS));
-            let branch = root
-                .vcs_branch
-                .as_deref()
-                .map(|branch| bounded_field(branch, NAME_MAX_CHARS));
-            match (name, branch) {
-                (Some(name), Some(branch)) => format!("project {name}, branch {branch}"),
-                (Some(name), None) => format!("project {name}"),
-                // A project root always carries its name on the wire; if one
-                // did not, say the kind rather than invent a name.
-                (None, _) => "project".to_owned(),
-            }
-        }
-        RootKind::Home => "your home folder".to_owned(),
-        RootKind::FilesystemRoot => "the filesystem root".to_owned(),
-        RootKind::Plain => "not a project".to_owned(),
-    }
-}
-
 /// The one-line notice a non-project root earns under the banner (REQ-583 BR-5,
 /// ADR-5) — `None` for a project, which needs no announcing.
 ///
-/// Pure content: it names the root, states the consequence in the user's terms,
-/// and names both remedies (`teton --cwd <path>` and `/cd <path>`). The bytes
-/// are TTY-gated by the caller — this function is not a banner line (the ≤ 60
+/// Pure content: it names the root — by the term every surface uses for it,
+/// the *session root* (BR-3) — states the consequence in the user's terms, and
+/// names both remedies (`teton --cwd <path>` and `/cd <path>`). The bytes are
+/// TTY-gated by the caller — this function is not a banner line (the ≤ 60
 /// column rule is [`lines`]'s alone), which is why it stands apart from
 /// [`print`]. `/cd` re-fires it through the same function when the new root is
 /// not a project (BR-8), so launch and move announce with one voice.
@@ -157,9 +141,9 @@ pub fn root_notice(root: &SessionRoot) -> Option<String> {
         RootKind::Home | RootKind::Plain => "all of it",
     };
     Some(format!(
-        "Not inside a project — tools are scoped to {}: every search walks {walks}, and privacy \
-         boundaries declared for a project do not apply here. Run teton from the project, \
-         `teton --cwd <path>`, or `/cd <path>` here.",
+        "Not inside a project — the session root is {}; tools are scoped to it: every search \
+         walks {walks}, and privacy boundaries declared for a project do not apply here. Run \
+         teton from the project, `teton --cwd <path>`, or `/cd <path>` here.",
         root_line(root)
     ))
 }
@@ -250,9 +234,12 @@ mod tests {
                 root_notice(&root(kind, display)).expect("a non-project root is announced");
             assert_eq!(notice.lines().count(), 1, "one line: {notice:?}");
             assert!(notice.starts_with("Not inside a project"), "{notice}");
-            // (a) the root, by display and kind.
+            // (a) the root, by display and kind, called what every surface
+            // calls it — the session root (BR-3) — and what the scoping is.
             assert!(
-                notice.contains(&format!("{display} ({phrase})")),
+                notice.contains(&format!(
+                    "the session root is {display} ({phrase}); tools are scoped to it"
+                )),
                 "{notice}"
             );
             // (b) the consequence, in the user's terms.
@@ -331,10 +318,54 @@ mod tests {
         assert!(root_line(&root(RootKind::Plain, "~/x")).ends_with("(not a project)"));
     }
 
+    /// **One kind phrase (verify finding E).** The parenthesis in `root_line`
+    /// is `teton_core::session_root::kind_phrase` — the function the daemon's
+    /// environment block prints its kind with — for every kind, with and
+    /// without a branch, and for the defensive nameless-project arm. The
+    /// daemon's own test pins the same for its block, so the two surfaces
+    /// agree on the phrase for the same root by construction.
+    #[test]
+    fn root_line_kind_is_the_shared_kind_phrase() {
+        let mut project = root(RootKind::Project, "~/Documents/GitHub/teton-code");
+        let mut roots = vec![
+            root(RootKind::Home, "~"),
+            root(RootKind::FilesystemRoot, "/"),
+            root(RootKind::Plain, "/opt/x"),
+            project.clone(),
+        ];
+        project.project_name = Some("teton-code".to_owned());
+        roots.push(project.clone());
+        project.vcs_branch = Some("main".to_owned());
+        roots.push(project.clone());
+        project.project_name = None;
+        roots.push(project);
+        for root in roots {
+            assert_eq!(
+                root_line(&root),
+                format!("{} ({})", root.display, kind_phrase(&root)),
+                "{root:?}"
+            );
+        }
+        // The nameless arm reads as the daemon's does — `a project`, never an
+        // invented name and never a dangling `project `.
+        let mut nameless = root(RootKind::Project, "~/x");
+        assert_eq!(root_line(&nameless), "~/x (a project)");
+        nameless.vcs_branch = Some("dev".to_owned());
+        assert_eq!(root_line(&nameless), "~/x (a project, branch dev)");
+    }
+
+    /// The fixed words a `root_line` adds around its bounded values: the
+    /// space-paren-paren and the longest kind phrase's own words
+    /// (`project , branch `) — what the length assertion below allows on top of
+    /// the display and two name ceilings.
+    const ROOT_LINE_FIXED_CHARS: usize = " ()".len() + "project , branch ".len();
+
     /// The line bounds what it prints (ADR-2): a control character cannot break
     /// it and an unbounded display cannot run away with it.
     #[test]
     fn root_line_bounds_the_display_and_the_names() {
+        use teton_core::session_root::NAME_MAX_CHARS;
+
         let mut long = root(RootKind::Plain, &"/very-long-segment".repeat(20));
         assert!(long.display.chars().count() > DISPLAY_MAX_CHARS);
         let line = root_line(&long);
@@ -347,22 +378,36 @@ mod tests {
         assert!(!line.contains('\n'), "{line}");
         assert!(line.contains("project a?b, branch x"), "{line}");
         assert!(
-            line.chars().count() < DISPLAY_MAX_CHARS + 2 * NAME_MAX_CHARS + 32,
+            line.chars().count() <= DISPLAY_MAX_CHARS + 2 * NAME_MAX_CHARS + ROOT_LINE_FIXED_CHARS,
             "{line}"
+        );
+        // A bidi override in a branch cannot make the line read backwards.
+        long.vcs_branch = Some("feat/\u{202E}x".to_owned());
+        assert!(
+            root_line(&long).ends_with("branch feat/?x)"),
+            "{}",
+            root_line(&long)
         );
     }
 
     /// The banner's `cwd:` spelling is teton-core's `display_for` — `~` for the
     /// home folder and `~/rest` under it — so the client cannot drift from the
-    /// daemon's own spelling of the same path (ADR-1).
+    /// daemon's own spelling of the same path (ADR-1); and it is bounded like
+    /// every other root spelling (ADR-2), so a very long path is middle-elided
+    /// on the banner too.
     #[test]
-    fn cwd_display_is_the_shared_display_rule() {
+    fn cwd_display_is_the_shared_display_rule_and_is_bounded() {
         let Some(home) = crate::home_dir() else {
             return; // no HOME in this environment: nothing to abbreviate against
         };
         assert_eq!(cwd_display(&home), "~");
         assert_eq!(cwd_display(&home.join("x/y")), "~/x/y");
         assert_eq!(cwd_display(Path::new("/")), "/");
+        let long = home.join("segment/".repeat(25));
+        let shown = cwd_display(&long);
+        assert_eq!(shown.chars().count(), DISPLAY_MAX_CHARS, "{shown}");
+        assert!(shown.starts_with("~/segment/"), "{shown}");
+        assert!(shown.contains('…'), "{shown}");
     }
 
     #[test]

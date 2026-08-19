@@ -1283,10 +1283,10 @@ fn a_move_to_a_non_project_root_re_fires_the_notice_at_a_terminal() {
     );
     assert!(
         launch.contains(&format!(
-            "tools are scoped to {} (not a project)",
+            "the session root is {} (not a project); tools are scoped to it",
             plain.display()
         )),
-        "the notice names the root and its kind; transcript:\n{launch}"
+        "the notice names the session root and its kind; transcript:\n{launch}"
     );
     assert_eq!(
         launch.matches(NOT_A_PROJECT).count(),
@@ -1340,7 +1340,7 @@ fn a_move_to_a_non_project_root_re_fires_the_notice_at_a_terminal() {
         "clear line, root line, notice — in that order; transcript:\n{after}"
     );
     assert!(
-        after.contains("tools are scoped to ~ (your home folder)"),
+        after.contains("the session root is ~ (your home folder); tools are scoped to it"),
         "the re-fired notice names the home root; transcript:\n{after}"
     );
 }

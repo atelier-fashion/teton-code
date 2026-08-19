@@ -98,7 +98,7 @@
 // REQ-582 verify M2: `run_cli_line` validates a pre-REQ row's typed argv with
 // the binary's own parser before the row runs.
 use clap::Parser;
-use teton_core::session_root::resolve_cwd_argument;
+use teton_core::session_root::{resolve_cwd_argument, CwdArgError};
 use teton_protocol::effort::EffortLevel;
 use teton_protocol::jsonrpc::{error_code, RpcError};
 use teton_protocol::methods::{
@@ -2218,7 +2218,7 @@ fn current_root_line(root: Option<&SessionRoot>) -> (LineKind, String) {
 
 /// The rejection a `/cd` argument that cannot become a path gets back — the
 /// grammar's own sentence (it names the argument), plus what to type instead.
-fn cd_argument_refusal(err: &teton_core::session_root::CwdArgError) -> String {
+fn cd_argument_refusal(err: &CwdArgError) -> String {
     format!(
         "/cd: {err} — `/cd <path>` takes an absolute path, a path relative to your shell, or `~`."
     )
@@ -3845,14 +3845,18 @@ mod tests {
 
         let mut surface = RecordingSurface::new();
         report_cd_refusal(
-            &RpcError::new(error_code::INVALID_PARAMS, "cwd `/nope` is not a directory"),
+            &RpcError::new(
+                error_code::INVALID_PARAMS,
+                "path `/nope` does not exist or is not a directory",
+            ),
             &mut surface,
         );
         let failed = surface.lines_of(LineKind::Error).join("\n");
-        assert!(failed.contains("could not be moved"), "{failed}");
-        assert!(
-            failed.contains("`/nope`"),
-            "the daemon's reason names the path: {failed}"
+        assert_eq!(
+            failed,
+            "the session root could not be moved: path `/nope` does not exist or is not a \
+             directory",
+            "the daemon's reason, naming the path, after this line's own words"
         );
         assert!(
             surface.lines_of(LineKind::Notice).is_empty(),

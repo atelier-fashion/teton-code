@@ -1826,10 +1826,11 @@ needs a **terminal**, so at least that step is typed, not piped.
 
 1. `cd ~ && teton`. Wait for `local model … ready`. Expect, **under the banner
    and before the ready line**, one notice:
-   `Not inside a project — tools are scoped to ~ (your home folder): every
-   search walks all of it, and privacy boundaries declared for a project do not
-   apply here. Run teton from the project, `teton --cwd <path>`, or `/cd <path>`
-   here.` The banner's `cwd:` line reads `~`. (BR-5, AC-8.)
+   `Not inside a project — the session root is ~ (your home folder); tools are
+   scoped to it: every search walks all of it, and privacy boundaries declared
+   for a project do not apply here. Run teton from the project, `teton --cwd
+   <path>`, or `/cd <path>` here.` The banner's `cwd:` line reads `~`. (BR-5,
+   AC-8.)
 2. Type, verbatim:
 
    ```
@@ -1866,8 +1867,13 @@ needs a **terminal**, so at least that step is typed, not piped.
    — the same spelling as step 4's line. Then `/cd ~` and expect the clear
    line, `session root is now ~ (your home folder)`, and the step-1 notice
    again (BR-8, AC-11). `/cd /nope` must print
-   `the session root could not be moved: cwd `/nope` does not exist or is not a
-   directory` and a following `/cd` still names `~`.
+   `the session root could not be moved: path `/nope` does not exist or is not
+   a directory` and a following `/cd` still names `~`. From a shell, `teton
+   --cwd /nope` must print `teton: could not start a session: path `/nope` does
+   not exist or is not a directory` and exit 1 **without** autostarting a
+   daemon or printing a banner (the CLI fails fast; the daemon's validator
+   answers the same sentence for a path that passes the CLI but not the
+   daemon).
 
 Record the model's replies in steps 2 and 4 as **observations** — what it
 searched, what it found, what it said — not as pass/fail (LESSON-532).
@@ -1974,9 +1980,13 @@ turn ended (EndTurn).
 › >> context cleared; 4 retained blocks dropped.
 >> session root is now ~ (your home folder)
 › session root: ~ (your home folder)
-› error: the session root could not be moved: cwd `/nope` does not exist or is not a directory
+› error: the session root could not be moved: path `/nope` does not exist or is not a directory
 › session root: ~ (your home folder)
 ```
+
+(Transcripts re-spelled to the wording shipped after the verify pass — `path`
+for `cwd` in the refusal, and the notice's `the session root is … ; tools are
+scoped to it` form; the runs' behaviour is unchanged.)
 
 Observations: `/cd` alone spelled the root with its kind and branch (step 5);
 the model's `read Cargo.toml` was root-relative and succeeded — the
@@ -1993,7 +2003,7 @@ then `/cd`, `/cd ~/Documents/GitHub/teton-code`, `/cd ~`, `/quit`:
   cwd: ~
 >> probe: 48.0 GiB RAM — clears the local-tier floor
 >> local model qwen3-coder-30b-a3b ready
->> Not inside a project — tools are scoped to ~ (your home folder): every search walks all of it, and privacy boundaries declared for a project do not apply here. Run teton from the project, `teton --cwd <path>`, or `/cd <path>` here.
+>> Not inside a project — the session root is ~ (your home folder); tools are scoped to it: every search walks all of it, and privacy boundaries declared for a project do not apply here. Run teton from the project, `teton --cwd <path>`, or `/cd <path>` here.
 session sess-… ready (freeform). Type a prompt or /help for commands; Ctrl-D to end.
 …
 session root: ~ (your home folder)
@@ -2003,7 +2013,7 @@ session root: ~ (your home folder)
 … /cd ~
 >> context cleared; there was nothing retained to drop.
 >> session root is now ~ (your home folder)
->> Not inside a project — tools are scoped to ~ (your home folder): every search walks all of it, and privacy boundaries declared for a project do not apply here. Run teton from the project, `teton --cwd <path>`, or `/cd <path>` here.
+>> Not inside a project — the session root is ~ (your home folder); tools are scoped to it: every search walks all of it, and privacy boundaries declared for a project do not apply here. Run teton from the project, `teton --cwd <path>`, or `/cd <path>` here.
 ```
 
 Observations: at a terminal the notice sits under the banner (`cwd: ~`) and

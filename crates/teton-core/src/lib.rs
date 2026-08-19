@@ -122,15 +122,11 @@ pub use policy::{ProviderHealth, RouteOutcome};
 // spans the daemon's tools, its egress inspector, and this crate's boundary
 // matcher — `teton_core::ProvenanceId` is the one path all three name it by.
 pub use provenance_id::{ProvenanceError, ProvenanceId};
-// REQ-583 ADR-1: re-exported at the crate root because the root's spelling is
-// printed by the daemon (environment block, jail refusals) and by the CLI
-// (banner, launch notice, `/cd`), and `teton_core::display_for` is the one path
-// both name it by — one derivation, so the two surfaces cannot drift.
-pub use session_root::{
-    bounded_field, byte_ceiling, classify, display_for, middle_elide, resolve_cwd_argument,
-    CwdArgError, CwdGrammarRow, CWD_ARGUMENT_GRAMMAR, CWD_GRAMMAR_HOME, CWD_GRAMMAR_SHELL_CWD,
-    DISPLAY_MAX_CHARS, NAME_MAX_CHARS, PROJECT_MARKERS,
-};
+// REQ-583 ADR-1: `session_root` is deliberately *not* re-exported at the crate
+// root. Every consumer — the daemon's probe, environment block and jail
+// refusals, the CLI's banner, launch notice and `/cd` — names its functions by
+// the module path (`teton_core::session_root::display_for`), and one path is
+// how the two surfaces stay one derivation.
 
 /// Returns the crate version (equal to the workspace version).
 #[must_use]

@@ -2253,9 +2253,13 @@ mod tests {
     /// shapes moved by the same guide bytes and gained the same block.
     /// Re-measured at the merged tip (TASK-180): **5,844 / 9,120 / 96,
     /// unchanged**, and the row is now the byte-worst rendering in every
-    /// script — `bounded_field` bounds bytes as well as characters, at the
-    /// ASCII cost this row already paid (`teton_core::session_root::byte_ceiling`;
-    /// the reasoning is in `egress::redact`'s note).
+    /// script — the environment block bounds bytes as well as characters, at
+    /// the ASCII cost this row already paid (`teton_core::session_root::byte_ceiling`;
+    /// the reasoning is in `egress::redact`'s note). Re-measured again after
+    /// the verify pass (finding S): **5,844 / 9,120 / 96, unchanged** — the
+    /// byte bound moved into `environment_block` (`bounded_field_bytes`, the
+    /// prompt's alone) and the row is byte-identical; this sweep now also
+    /// checks that its widest prompt carries the block at all.
     #[tokio::test]
     async fn the_web_tool_docs_clear_the_outbound_body_overhead() {
         use teton_core::capability::{SearchGap, WebCapabilityState};
@@ -2305,7 +2309,7 @@ mod tests {
         // opted-out sweep in `egress::redact` measures, from the same fixture,
         // so the two shapes cannot come to hold different worst cases.
         let roots = [None, Some(worst_case_session_root())];
-        let worst = [
+        let widest = [
             None,
             Some(WebCapabilityState::Ready(WebTier::Search)),
             Some(WebCapabilityState::SearchUnavailable {
@@ -2328,10 +2332,18 @@ mod tests {
                     ..base.clone()
                 },
             )
-            .len()
         })
-        .max()
+        .max_by_key(String::len)
         .expect("the state sweep is not empty");
+        // Self-check (the twin of `egress::redact`'s): the widest prompt is one
+        // that carries the block, so dropping the root row cannot leave this
+        // sweep passing on the smaller, root-less shape.
+        assert!(
+            widest.contains("Session root: "),
+            "the widest prompt measured carries no environment block, so the sweep is \
+             not measuring the row it claims to:\n{widest}"
+        );
+        let worst = widest.len();
 
         let escaping = base.context_budget_bytes / 10;
         let spent = worst + escaping;
