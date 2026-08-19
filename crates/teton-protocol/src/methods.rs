@@ -38,6 +38,48 @@ pub fn request<P: RpcMethod>(id: Id, params: P) -> Request<P> {
 // session lifecycle
 // ---------------------------------------------------------------------------
 
+/// What kind of place a session's root is (REQ-583 System Model, BR-4).
+///
+/// Derived by the daemon from the stored path at every use, never stored:
+/// `home` when the path is `$HOME`, `filesystem_root` when it is `/`,
+/// `project` when the directory holds a name from the project-marker table,
+/// `plain` otherwise. Wire spellings are snake_case (`filesystem_root`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RootKind {
+    /// The directory holds a project marker (a VCS directory or a top-level
+    /// build manifest).
+    Project,
+    /// The path is the user's home directory.
+    Home,
+    /// The path is `/`.
+    FilesystemRoot,
+    /// None of the above: a directory that is not a project.
+    Plain,
+}
+
+/// The wire view of a session's root — the directory its tools are jailed to
+/// (REQ-583 System Model).
+///
+/// The daemon derives this from the stored path; the client renders what it
+/// was told and never re-derives. `display` is the one spelling every surface
+/// uses (banner, launch notice, environment block, jail refusals, `/cd`).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SessionRoot {
+    /// Home-relative (`~`, `~/Documents/GitHub/teton-code`) or absolute when
+    /// not under `$HOME`.
+    pub display: String,
+    /// What kind of place the root is.
+    pub kind: RootKind,
+    /// The root directory's basename; present iff `kind == project`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub project_name: Option<String>,
+    /// The git branch, when the project is a git checkout and the branch can
+    /// be read without invoking git; absent otherwise (never a guessed value).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub vcs_branch: Option<String>,
+}
+
 /// Create a new session. ACP equivalent: `session/new`.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct SessionCreateParams {
@@ -60,6 +102,14 @@ pub struct SessionCreateParams {
 pub struct SessionCreateResult {
     /// The id assigned to the new session.
     pub session_id: SessionId,
+    /// The session root the daemon settled on (REQ-583 BR-6): what the CLI's
+    /// banner `cwd:` line and launch notice render.
+    ///
+    /// Optional for wire compatibility in both directions — an older daemon
+    /// omits it and an older client ignores it (additive; no
+    /// `PROTOCOL_VERSION` bump).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub root: Option<SessionRoot>,
 }
 
 impl RpcMethod for SessionCreateParams {
@@ -227,6 +277,44 @@ pub struct SessionClearResult {
 impl RpcMethod for SessionClearParams {
     const METHOD: &'static str = "session/clear";
     type Result = SessionClearResult;
+}
+
+/// Move a live session's root (REQ-583 BR-7, architecture ADR-4) — the `/cd`
+/// verb, modelled on [`SessionClearParams`].
+///
+/// No ACP equivalent. The daemon validates `cwd` exactly as it validates
+/// `session/create`'s `cwd` (BR-6): absolute, exists, is a directory; a refusal
+/// names the path and the reason, and the root is unchanged. On success the
+/// conversation is **cleared** (every carried block's provenance identity is
+/// relative to the root it was minted under) and reported in the existing
+/// `context_cleared` shape, alongside a `session_root_changed` event.
+///
+/// **User-only, by construction**, for [`SessionClearParams`]'s reason: no
+/// tool wraps it, so a model can never move its own jail. Available at every
+/// permission level — it moves the jail, it does not mutate files.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SessionSetCwdParams {
+    /// The session whose root moves.
+    pub session_id: SessionId,
+    /// The new root. Absolute after client-side resolution (`~` expansion,
+    /// relative-to-shell-cwd joining); the daemon validates, the client does
+    /// not canonicalize.
+    pub cwd: std::path::PathBuf,
+}
+
+/// Result of [`SessionSetCwdParams`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SessionSetCwdResult {
+    /// The root the daemon settled on, as it will render everywhere.
+    pub root: SessionRoot,
+    /// How many retained blocks the accompanying clear dropped; `0` when the
+    /// session had nothing to say yet ([`SessionClearResult::blocks_dropped`]).
+    pub blocks_dropped: u64,
+}
+
+impl RpcMethod for SessionSetCwdParams {
+    const METHOD: &'static str = "session/set_cwd";
+    type Result = SessionSetCwdResult;
 }
 
 // ---------------------------------------------------------------------------
@@ -2466,6 +2554,16 @@ mod tests {
         });
         round_trip(&SessionCreateResult {
             session_id: SessionId::from("s1"),
+            root: None,
+        });
+        round_trip(&SessionCreateResult {
+            session_id: SessionId::from("s1"),
+            root: Some(SessionRoot {
+                display: "~/Documents/GitHub/teton-code".to_owned(),
+                kind: RootKind::Project,
+                project_name: Some("teton-code".to_owned()),
+                vcs_branch: Some("main".to_owned()),
+            }),
         });
     }
 
@@ -2475,6 +2573,45 @@ mod tests {
         // must still create a session — the field defaults to None.
         let params: SessionCreateParams = serde_json::from_str(r#"{"mode":"freeform"}"#).unwrap();
         assert_eq!(params.cwd, None);
+    }
+
+    /// REQ-583's additive `root` on the create result, both directions of the
+    /// wire: an older daemon's answer without it still deserializes, an
+    /// answer with it round-trips, and every [`RootKind`] spelling is the
+    /// spec's snake_case one — `filesystem_root` in particular, which a
+    /// derived camelCase or a hand-typed `FilesystemRoot` would both get wrong.
+    #[test]
+    fn session_create_result_without_root_still_deserializes() {
+        let result: SessionCreateResult = serde_json::from_str(r#"{"session_id":"s1"}"#).unwrap();
+        assert_eq!(result.session_id, SessionId::from("s1"));
+        assert_eq!(result.root, None);
+
+        // A `None` root emits no key at all, so an older client sees exactly
+        // the shape it was written against.
+        let wire = serde_json::to_value(&result).unwrap();
+        assert!(wire.get("root").is_none(), "{wire}");
+
+        let with_root: SessionCreateResult = serde_json::from_str(
+            r#"{"session_id":"s1","root":{"display":"/","kind":"filesystem_root"}}"#,
+        )
+        .unwrap();
+        let root = with_root.root.clone().expect("root is present");
+        assert_eq!(root.kind, RootKind::FilesystemRoot);
+        assert_eq!(root.display, "/");
+        assert_eq!(root.project_name, None);
+        assert_eq!(root.vcs_branch, None);
+        round_trip(&with_root);
+
+        for (kind, spelling) in [
+            (RootKind::Project, "project"),
+            (RootKind::Home, "home"),
+            (RootKind::FilesystemRoot, "filesystem_root"),
+            (RootKind::Plain, "plain"),
+        ] {
+            assert_eq!(serde_json::to_value(kind).unwrap(), spelling);
+            let back: RootKind = serde_json::from_value(serde_json::json!(spelling)).unwrap();
+            assert_eq!(back, kind);
+        }
     }
 
     #[test]
@@ -2519,6 +2656,45 @@ mod tests {
         // differently: "there was nothing retained to drop" and a real number.
         round_trip(&SessionClearResult { blocks_dropped: 0 });
         round_trip(&SessionClearResult { blocks_dropped: 12 });
+    }
+
+    /// REQ-583 ADR-4's one new method, pinned beside `session/clear` it is
+    /// modelled on. The result carries the root both ways the two optionals
+    /// can go — a project with a name and a branch, and a home root with
+    /// neither — because a `skip_serializing_if` field that round-trips only
+    /// when populated is the bug this test exists to catch.
+    #[test]
+    fn session_set_cwd_round_trips() {
+        round_trip(&SessionSetCwdParams {
+            session_id: SessionId::from("s1"),
+            cwd: std::path::PathBuf::from("/Users/dev/repo"),
+        });
+        round_trip(&SessionSetCwdResult {
+            root: SessionRoot {
+                display: "~/repo".to_owned(),
+                kind: RootKind::Project,
+                project_name: Some("repo".to_owned()),
+                vcs_branch: Some("main".to_owned()),
+            },
+            blocks_dropped: 12,
+        });
+        let home = SessionSetCwdResult {
+            root: SessionRoot {
+                display: "~".to_owned(),
+                kind: RootKind::Home,
+                project_name: None,
+                vcs_branch: None,
+            },
+            blocks_dropped: 0,
+        };
+        round_trip(&home);
+        // The absent optionals emit no key: "no project name" is the absence
+        // of the field, never a null a client must learn to read.
+        let wire = serde_json::to_value(&home).unwrap();
+        assert!(wire["root"].get("project_name").is_none(), "{wire}");
+        assert!(wire["root"].get("vcs_branch").is_none(), "{wire}");
+        assert_eq!(wire["root"]["kind"], "home");
+        assert_eq!(wire["blocks_dropped"], 0);
     }
 
     #[test]
@@ -3397,6 +3573,11 @@ mod tests {
         // dispatch match and both CLI call sites (`/provider test <id>` and
         // `teton provider test <id>`) are written against this literal.
         assert_eq!(ProviderTestParams::METHOD, "provider/test");
+        // REQ-583's one method, pinned beside the verb it is modelled on: the
+        // daemon's dispatch match and the CLI's `/cd` call are written against
+        // this literal.
+        assert_eq!(SessionClearParams::METHOD, "session/clear");
+        assert_eq!(SessionSetCwdParams::METHOD, "session/set_cwd");
         assert_eq!(
             request(Id::Number(2), ModelStatusParams::default()).method,
             "model/status"

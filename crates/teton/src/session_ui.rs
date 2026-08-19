@@ -799,6 +799,7 @@ pub fn render_event(
             surface.line(LineKind::Notice, &format_turn_queued(queued));
             EventOutcome::Rendered
         }
+        Event::SessionRootChanged(_) => EventOutcome::Rendered, // TASK-179 renders this
     }
 }
 

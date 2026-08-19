@@ -3261,6 +3261,7 @@ fn handle_session_create(daemon: &Daemon, conn: &ConnState, id: Id, params: Valu
                 id,
                 &SessionCreateResult {
                     session_id: summary.session_id,
+                    root: None, // TASK-178 fills this from the probe
                 },
             )
         }

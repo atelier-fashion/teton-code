@@ -26,7 +26,10 @@
 //! `turn_queued` (BR-2), which says a prompt turn is being held for a local tier
 //! that is still coming up rather than refused. REQ-581 adds `provider_tested`
 //! (BR-3), the typed result of the one consented call a user's connection test
-//! makes against a registered provider.
+//! makes against a registered provider. REQ-583 adds `session_root_changed`
+//! (BR-7), which announces that a live session's root moved on the user's
+//! `/cd` — always beside a `context_cleared`, since the move clears the
+//! conversation.
 //!
 //! This list is an index, not decoration: a new variant of [`Event`] that is not
 //! named here makes the paragraph above wrong.
@@ -34,7 +37,7 @@
 use serde::{Deserialize, Serialize};
 
 use crate::effort::ResolvedEffort;
-use crate::methods::{ProviderHealth, ProviderTestOutcome, TierBinding};
+use crate::methods::{ProviderHealth, ProviderTestOutcome, SessionRoot, TierBinding};
 use crate::{
     Category, ClientKind, Phase, ProtocolVersion, ProviderId, ProviderKind, RequestId, SessionId,
     Tier, TurnId,
@@ -176,6 +179,8 @@ pub enum Event {
     /// A user's connection test finished, with what came back and where it left
     /// the provider's health (REQ-581 BR-3/BR-4).
     ProviderTested(ProviderTested),
+    /// The user moved a live session's root with `/cd` (REQ-583 BR-7).
+    SessionRootChanged(SessionRootChanged),
 }
 
 impl Event {
@@ -212,6 +217,7 @@ impl Event {
             Event::CapabilityDeadEnd(_) => "capability_dead_end",
             Event::TurnQueued(_) => "turn_queued",
             Event::ProviderTested(_) => "provider_tested",
+            Event::SessionRootChanged(_) => "session_root_changed",
         }
     }
 }
@@ -2053,6 +2059,33 @@ pub struct ContextCleared {
 }
 
 // ---------------------------------------------------------------------------
+// session_root_changed (REQ-583)
+// ---------------------------------------------------------------------------
+
+/// A live session's root moved (REQ-583 BR-7, architecture ADR-4).
+///
+/// Published on every accepted `session/set_cwd`, right beside the
+/// [`ContextCleared`] the move implies — the two are one user action, and a
+/// client that renders only the clear would report a reset without its cause.
+/// The client that typed `/cd` has the RPC's own answer; this event exists so
+/// every *other* attached client learns the root moved (BR-8's re-announce
+/// keys off it) and so the issuing client's cached root is refreshed from a
+/// daemon fact rather than from what it asked for.
+///
+/// The session is named by [`EventEnvelope::session_id`], not by a field here:
+/// [`Event`] is internally tagged and flattened, so a `session_id` on this
+/// struct would emit the key twice and fail to deserialize — the same shape
+/// [`ContextCleared`], [`SessionTitled`] and [`PrefixCache`] document.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SessionRootChanged {
+    /// The display of the root the session had before the move — the same
+    /// spelling its banner and refusals used.
+    pub previous_display: String,
+    /// The root the session has now, as the daemon derived it.
+    pub root: SessionRoot,
+}
+
+// ---------------------------------------------------------------------------
 // attach_consent_requested / attach_refused (REQ-569)
 // ---------------------------------------------------------------------------
 
@@ -2270,6 +2303,7 @@ pub struct SessionGrantMinted {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::methods::RootKind;
     use serde::de::DeserializeOwned;
 
     fn round_trip<T>(value: &T)
@@ -2533,6 +2567,18 @@ mod tests {
                 }),
                 "provider_tested",
             ),
+            (
+                Event::SessionRootChanged(SessionRootChanged {
+                    previous_display: "~/repo".to_owned(),
+                    root: SessionRoot {
+                        display: "~".to_owned(),
+                        kind: RootKind::Home,
+                        project_name: None,
+                        vcs_branch: None,
+                    },
+                }),
+                "session_root_changed",
+            ),
         ];
 
         for (event, expected) in cases {
@@ -2603,6 +2649,68 @@ mod tests {
             wire["blocks_dropped"], 0,
             "a clear that dropped nothing must still say so on the wire"
         );
+    }
+
+    /// **REQ-583 BR-7's wire half.** A moved root reaches a client as a flat
+    /// `session_root_changed` object naming its session, where the root was,
+    /// and where it is now, and survives the round trip unchanged.
+    ///
+    /// `session_id` is asserted on the wire object rather than on the payload
+    /// for [`ContextCleared`]'s reason: the envelope is what carries it, and
+    /// `envelope_wire` round-trips before returning, so re-adding `session_id`
+    /// to [`SessionRootChanged`] fails here on the duplicate key rather than
+    /// reaching a client. The payload's own keys are asserted absent of a
+    /// `session_id` for the same reason, from the other side.
+    ///
+    /// Both ends of the optionals ride along: a project root with a name and a
+    /// branch, and a home root with neither — the second emits no key for
+    /// either, which is what BR-8's re-announce reads.
+    #[test]
+    fn session_root_changed_round_trips_under_its_wire_name() {
+        let changed = SessionRootChanged {
+            previous_display: "~".to_owned(),
+            root: SessionRoot {
+                display: "~/Documents/GitHub/teton-code".to_owned(),
+                kind: RootKind::Project,
+                project_name: Some("teton-code".to_owned()),
+                vcs_branch: Some("main".to_owned()),
+            },
+        };
+        round_trip(&changed);
+
+        let wire = envelope_wire(Event::SessionRootChanged(changed.clone()));
+        assert_eq!(wire["event"], "session_root_changed");
+        assert_eq!(wire["session_id"], "s1");
+        assert_eq!(wire["previous_display"], "~");
+        assert_eq!(wire["root"]["display"], "~/Documents/GitHub/teton-code");
+        assert_eq!(wire["root"]["kind"], "project");
+        assert_eq!(wire["root"]["project_name"], "teton-code");
+        assert_eq!(wire["root"]["vcs_branch"], "main");
+        let payload = serde_json::to_value(&changed).unwrap();
+        assert!(
+            payload.get("session_id").is_none(),
+            "the envelope names the session, the payload must not: {payload}"
+        );
+
+        assert_eq!(
+            Event::SessionRootChanged(changed).name(),
+            "session_root_changed"
+        );
+
+        let to_home = SessionRootChanged {
+            previous_display: "~/Documents/GitHub/teton-code".to_owned(),
+            root: SessionRoot {
+                display: "~".to_owned(),
+                kind: RootKind::Home,
+                project_name: None,
+                vcs_branch: None,
+            },
+        };
+        round_trip(&to_home);
+        let wire = envelope_wire(Event::SessionRootChanged(to_home));
+        assert_eq!(wire["root"]["kind"], "home");
+        assert!(wire["root"].get("project_name").is_none(), "{wire}");
+        assert!(wire["root"].get("vcs_branch").is_none(), "{wire}");
     }
 
     #[test]

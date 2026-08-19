@@ -1,7 +1,7 @@
 ---
 id: TASK-174
 title: "Protocol: SessionRoot/RootKind wire types, SessionCreateResult.root, session/set_cwd, session_root_changed"
-status: draft
+status: complete
 parent: REQ-583
 created: 2026-08-18
 updated: 2026-08-18
