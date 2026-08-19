@@ -1,0 +1,51 @@
+Every model you can route a turn to has a context window, and the window is
+not the same size everywhere. A local engine running on a laptop might accept
+sixteen thousand tokens. A hosted frontier model might accept two hundred
+thousand. When the daemon assembles a prompt, it has to decide how much of the
+conversation, how many tool results, and how much of the system preamble it
+can afford to include, and that decision has to be made before the request
+leaves the machine, because the provider will not negotiate: either the prompt
+fits or the call is rejected.
+
+The difficulty is that the daemon does not have a tokenizer. It has a cheap
+estimate built from splitting text on whitespace and counting the pieces. For
+ordinary English prose that estimate is already conservative in the useful
+direction, because a typical word is one token and a long or unusual word is
+two. For source code the estimate drifts, since a single whitespace-delimited
+piece such as a long identifier with several underscores, a fully qualified
+path, or a string of punctuation can cost many tokens. For a base64 blob or a
+minified JSON document the estimate collapses entirely: a line with no spaces
+in it counts as one word and may be hundreds of tokens.
+
+So the budget is measured in two currencies at once. The first is words, scaled
+by a safety ratio that assumes three tokens for every two words. The second is
+bytes, divided by a floor that assumes no real tokenizer produces fewer than
+two bytes per token on valid text. Whichever currency runs out first is the one
+that binds. On prose, the word guard is generous and the byte guard is what
+actually limits the prompt, because prose runs at roughly five to six bytes
+per word and the byte floor was chosen for dense content. On a directory
+listing full of long absolute paths, the word guard would happily wave through
+a prompt that is three times too large, and only the byte guard keeps the
+request honest.
+
+Neither number is a guess that stays a guess. Both are pinned by a test that
+runs once, offline, against a small corpus: a few kilobytes of prose like this
+paragraph, a real slice of the daemon's own source, a minified tool result, a
+list of file paths, and a block of base64. Each sample was tokenized with a
+reference tokenizer and the token count was written into a fixture alongside
+the word and byte counts. The test recomputes the words and bytes from the
+files, refuses to run if they no longer match what was recorded, and then
+checks that the larger of the two estimates covers the true count for every
+sample. If someone lowers the ratio or raises the floor, a sample fails and
+the failure names it.
+
+What the user sees is simpler than any of this. When a turn is routed, the
+decision names the budget in both currencies and says what bounded it: the
+provider's window, a cap the user set, the redaction scanner's reach, or the
+local engine's fixed size. When the budget is exceeded by the conversation,
+the daemon drops the oldest blocks first and says how many it dropped. When it
+cannot make a prompt fit at all, the response is a typed outcome that names
+the window and the size of what was assembled, and the provider is not marked
+unhealthy for refusing something that could never have fit. The point of all
+the measurement is that the explanation in the session log is the same thing
+the code computed, and not a paraphrase written from memory.

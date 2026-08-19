@@ -1,0 +1,42 @@
+[
+  {
+    "file": "base64.txt",
+    "words": 54,
+    "bytes": 4150,
+    "tokens": 2868,
+    "tokenizer": "o200k_base",
+    "tokenizer_version": "tiktoken 0.14.0"
+  },
+  {
+    "file": "minified.json",
+    "words": 33,
+    "bytes": 5337,
+    "tokens": 1489,
+    "tokenizer": "o200k_base",
+    "tokenizer_version": "tiktoken 0.14.0"
+  },
+  {
+    "file": "paths.txt",
+    "words": 196,
+    "bytes": 14952,
+    "tokens": 4171,
+    "tokenizer": "o200k_base",
+    "tokenizer_version": "tiktoken 0.14.0"
+  },
+  {
+    "file": "prose.txt",
+    "words": 614,
+    "bytes": 3414,
+    "tokens": 743,
+    "tokenizer": "o200k_base",
+    "tokenizer_version": "tiktoken 0.14.0"
+  },
+  {
+    "file": "rust.rs",
+    "words": 495,
+    "bytes": 3364,
+    "tokens": 839,
+    "tokenizer": "o200k_base",
+    "tokenizer_version": "tiktoken 0.14.0"
+  }
+]

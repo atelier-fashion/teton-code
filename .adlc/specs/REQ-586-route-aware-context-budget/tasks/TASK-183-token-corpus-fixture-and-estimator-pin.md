@@ -1,7 +1,7 @@
 ---
 id: TASK-183
 title: "AC-3 token corpus: committed fixture + generator + the combined-estimate pin for the safety ratio and byte floor"
-status: draft
+status: complete
 parent: REQ-586
 created: 2026-08-19
 updated: 2026-08-19
@@ -34,3 +34,33 @@ word/byte counts still match the sample files (a stale fixture is red).
 
 - LESSON-460 fixture fidelity: the generator is checked in; the counts are reproducible. CI does not run the python script — the Rust test only reads the json.
 - Commit as `test(harness): token corpus pins the budget estimator allowances [TASK-183]`.
+
+## Outcome (2026-08-19)
+
+Corpus tokenized with tiktoken 0.14.0 `o200k_base` (`python3 tools/token_corpus/count.py`):
+
+| sample        | words | bytes | tokens | B/token | tok/word | words×3/2 | bytes/2 | covered |
+|---------------|------:|------:|-------:|--------:|---------:|----------:|--------:|:-------:|
+| prose.txt     |   614 |  3414 |    743 |    4.59 |     1.21 |       921 |    1707 | yes |
+| rust.rs       |   495 |  3364 |    839 |    4.01 |     1.69 |       742 |    1682 | yes (bytes) |
+| minified.json |    33 |  5337 |   1489 |    3.58 |    45.12 |        49 |    2668 | yes (bytes) |
+| paths.txt     |   196 | 14952 |   4171 |    3.58 |    21.28 |       294 |    7476 | yes (bytes) |
+| base64.txt    |    54 |  4150 |   2868 |    1.45 |    53.11 |        81 |    2075 | **NO** |
+
+- The word guard alone covers only prose; every denser class (Rust included,
+  at 1.69 tok/word) needs the byte guard — the architecture's "the byte guard
+  binds for code" holds.
+- **Finding**: the 2 B/token floor does not cover base64 — `o200k_base`
+  encodes random base64 at ≈1.45 B/token (cl100k_base ≈1.37; hex ≈1.75), so
+  `max(words×3/2, bytes/2)` is ≈28% short on `base64.txt`. Covering it needs a
+  floor ≤ 1.44 (e.g. 4/3), at the cost of every prose/code prompt the byte guard
+  already binds — or base64 stays with the typed `context_length_exceeded`
+  backstop (BR-2). Recorded in the test as `KNOWN_UNCOVERED_AT_PINNED_FLOOR`,
+  asserted both ways so the entry cannot go stale; the decision is TASK-182's
+  (constant home) and the swap TASK-192's. AC-1's "every sample" is therefore
+  met for four of five classes; the fifth is pinned as a named gap, not hidden.
+- Mutation check: 3/2 → 1/1 fails `words_guard_alone_covers_prose_but_not_dense_content`
+  naming prose.txt; bytes/2 → bytes/4 fails the combined test naming
+  minified.json and paths.txt.
+- Paths in `paths.txt`/`minified.json` use the CI checkout root
+  (`/home/runner/work/teton-code/teton-code`) so no local path is committed.
