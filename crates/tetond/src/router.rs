@@ -78,6 +78,7 @@ use crate::broadcast::EventBus;
 use crate::classify::Classification;
 use crate::cost::CostAttribution;
 use crate::egress::EgressContext;
+use crate::harness::budget::{self, BudgetInputs, RouteBudget};
 use crate::harness::turn_loop::{HarnessConfig, TurnRoute};
 
 /// Map a `teton_core::Phase` (the routing axis) to the `teton_protocol::Phase`
@@ -217,6 +218,23 @@ pub struct Route {
     /// *selected* provider. Meaningful only when a provider was selected; for the
     /// no-provider case it is the strict [`HarnessConfig::default`].
     pub harness: HarnessConfig,
+    /// The context budget this route attempt runs under (REQ-586 BR-1/BR-8):
+    /// the `(words, bytes)` pair, what bound it, and the window's name for the
+    /// elision marker.
+    ///
+    /// Resolved **once**, by [`Router::budget_for`] (ADR-1), and a *copy* of
+    /// [`Route::harness`]'s own [`HarnessConfig::budget`] rather than a second
+    /// derivation — the two are asserted equal, because a route whose event
+    /// announced one budget while its harness ran under another is exactly the
+    /// two-computations-of-one-fact drift LESSON-456 is about. It lives here as
+    /// well as on the config because the *route* is what `route_decided`,
+    /// `/verbose` and the reroute arms hold; digging a budget out of a
+    /// `HarnessConfig` to report it would make the config the wire's source.
+    ///
+    /// Never `None`: a route that resolved no provider carries the default
+    /// (local) derivation its [`HarnessConfig::default`] harness carries, and
+    /// reports nothing at all — [`Route::route_decided`] is `None` for it.
+    pub budget: RouteBudget,
     /// The [`CategoryResolution`] this route was built from, when the decision
     /// came through the category chain (`teton_core::category::resolve`).
     ///
@@ -276,12 +294,16 @@ impl Route {
             // **clamped** level — reporting the requested one would make the
             // event lie about the call (BR-5, AC-4).
             effort: self.effort,
-            // TASK-186 projects these off `Route::budget` (REQ-586 ADR-1) —
-            // until the route carries a budget there is nothing honest to
-            // report, and `None` is the pre-REQ-586 wire exactly.
-            budget_tokens: None,
-            budget_bytes: None,
-            bound: None,
+            // Projected off `Route::budget`, never recomputed (REQ-586 ADR-1,
+            // BR-8) — the same ADR-D discipline the category/tier/effort
+            // projections follow. The event must report the budget the attempt
+            // actually runs under, which it cannot do if the two are derived
+            // separately. Always `Some(..)` on a route the router built: the
+            // budget is a property of the attempt, and `None` on this wire now
+            // means "a daemon that predates REQ-586".
+            budget_tokens: Some(self.budget.budget_tokens as u64),
+            budget_bytes: Some(self.budget.budget_bytes as u64),
+            bound: Some(self.budget.bound),
         })
     }
 
@@ -368,6 +390,16 @@ pub struct Router {
     /// the user configured — so two providers pointing at one endpoint are
     /// remembered separately.
     effort_refused: BTreeSet<String>,
+    /// Whether `[privacy] redact = true` on this daemon (REQ-586 BR-4, ADR-1).
+    ///
+    /// A routing input only in the budget sense: the redaction scan reads a
+    /// whole assembled body, and its input cap is what a remote route's *byte*
+    /// budget must fit inside, so a route derived without this fact would send
+    /// turns the gate `redaction_gate` installs could not scan. The router
+    /// never saw the flag before REQ-586 (gotcha #2) — `build_router` feeds it
+    /// from the same `config.privacy.redact` the gate consults, so the bound
+    /// and the gate cannot disagree.
+    redact_scan: bool,
 }
 
 impl Router {
@@ -387,6 +419,10 @@ impl Router {
             local_available: true,
             effort: EffortLevel::default(),
             effort_refused: BTreeSet::new(),
+            // Off unless the daemon says otherwise: `[privacy] redact` is
+            // opt-in, and a router that assumed the scan were on would hold
+            // every remote route to the scannable bound nothing asked for.
+            redact_scan: false,
         }
     }
 
@@ -462,6 +498,55 @@ impl Router {
         ))
     }
 
+    /// **The** per-route context budget (REQ-586 ADR-1, BR-1/BR-8).
+    ///
+    /// The `effort_for` shape, and for the same reason: every `Route` this
+    /// router builds gets its budget here, so the `route_decided` event, the
+    /// `HarnessConfig` the loop runs under, the elision marker and every
+    /// refusal read one value instead of four derivations that can drift
+    /// (LESSON-456). The derivation itself is
+    /// [`crate::harness::budget::derive`] — pure, table-tested there, and
+    /// called from **exactly one place in this crate's routing layer**: here.
+    ///
+    /// What the router contributes is the *classification*, not the
+    /// arithmetic:
+    ///
+    /// - **local or nothing** — the local tier is classified from
+    ///   [`CategoryTable::local_provider_id`], never from "its capabilities
+    ///   look like the default" (BR-8, gotcha #9): the tier comes from the
+    ///   engine rather than from a `[[providers]]` entry, so it is legitimately
+    ///   absent from `providers` and a capability-shape test would call every
+    ///   undeclared remote provider local. `None` — an unresolvable route —
+    ///   takes the same inputs: there is no window to derive from, and the
+    ///   default pair is what its [`HarnessConfig::default`] harness carries.
+    /// - **remote** — the window and the user's cap come off
+    ///   `capability_of(id)`, and the reservation is the `max_tokens` the
+    ///   adapters actually send ([`HarnessConfig::default`]'s `gen_params`), so
+    ///   the budget leaves room for the generation the same config asks for.
+    /// - the id travels into the inputs because the window's *name* is part of
+    ///   the fact: the in-prompt elision marker says whose window ran out (BR-7).
+    #[must_use]
+    pub fn budget_for(&self, provider_id: Option<&str>) -> RouteBudget {
+        let inputs = match provider_id {
+            Some(id) if !self.is_local_tier(id) => {
+                let capabilities = self.capability_of(id);
+                BudgetInputs {
+                    window: capabilities.max_context,
+                    cap: capabilities.context_budget_cap,
+                    reservation: HarnessConfig::default().gen_params.max_tokens,
+                    is_local: false,
+                    redact_scan: self.redact_scan,
+                    provider_id: Some(id),
+                }
+            }
+            // The local tier and the unresolvable route: no declared window, no
+            // cap, and the engine's own `n_ctx` — not a provider declaration —
+            // is what the default pair is sized against (OQ-3).
+            _ => BudgetInputs::local(),
+        };
+        budget::derive(inputs)
+    }
+
     /// Set the category a freeform judgment turn falls back to (BR-9). Read from
     /// `Config::judgment_default`, which is why it is configuration-visible
     /// rather than a constant compiled in here (AC-12).
@@ -511,6 +596,20 @@ impl Router {
     #[must_use]
     pub fn with_local_available(mut self, available: bool) -> Self {
         self.local_available = available;
+        self
+    }
+
+    /// Set whether the egress redaction scan is enabled (REQ-586 BR-4).
+    ///
+    /// Read from `[privacy] redact` by `build_router` — the same field
+    /// `redaction_gate` consults before installing the gate — so a remote
+    /// route's byte budget is bounded by what the scan can actually read
+    /// whole. Without it a large-window route would assemble a body the gate
+    /// then refused as unscannable, which is a size failure wearing a privacy
+    /// error's clothes.
+    #[must_use]
+    pub fn with_redact_scan(mut self, redact_scan: bool) -> Self {
+        self.redact_scan = redact_scan;
         self
     }
 
@@ -651,9 +750,16 @@ impl Router {
     #[must_use]
     pub fn resolve_local_pin(&self, reason: impl Into<String>) -> Route {
         let Some(provider) = self.table.local_provider_id.clone() else {
+            // No local tier to derive anything from, and no turn will run: the
+            // strict default config, whose budget is the default (local) pair
+            // under `bound: local_engine` — the same fact
+            // `HarnessConfig::default()` has always carried, now named. Nothing
+            // reports it: `route_decided()` is `None` without a provider.
+            let harness = HarnessConfig::default();
             return Route {
                 model: None,
-                harness: HarnessConfig::default(),
+                budget: harness.budget.clone(),
+                harness,
                 provider_id: None,
                 phase: None,
                 reason: "This session is pinned to the local tier for privacy, but no local \
@@ -669,9 +775,14 @@ impl Router {
         // field on a locally-served turn. The cap comes from the clamp table,
         // not from per-category configuration (which BR-2 forbids).
         let effort = self.effort_for(Some(&provider));
+        // Through `harness_config_for` like every other route, so the pin gets
+        // the local tier's derived budget (`bound: local_engine`) from the one
+        // classifier rather than by construction (REQ-586 BR-8).
+        let harness = self.harness_config_for(&provider);
         Route {
             model: self.model_of(&provider),
-            harness: self.harness_config_for(&provider),
+            budget: harness.budget.clone(),
+            harness,
             provider_id: Some(ProviderId::from(provider)),
             phase: None,
             reason: reason.into(),
@@ -753,7 +864,9 @@ impl Router {
                     failed_provider,
                     RouteOutcome::PrimaryDegraded,
                     reason,
-                    degraded_harness_config(),
+                    // The failed provider's own budget under a reduced profile
+                    // (ADR-2): the tool-call tier changed, the window did not.
+                    self.degraded_harness_config(failed_provider),
                 );
                 FailureOutcome {
                     degraded: Some(ProviderDegraded {
@@ -836,9 +949,17 @@ impl Router {
     /// The BR-6 [`HarnessConfig`] a `provider_id` should run under, derived from
     /// its capability profile. An unregistered provider defaults to the strict
     /// (Native) profile.
+    ///
+    /// Two facts about the provider, stamped in one place (REQ-586 ADR-1): the
+    /// *tool-call* profile (how long a loop, how many tools, verification) and
+    /// the *context budget* the turn runs under. The budget goes on through
+    /// [`HarnessConfig::with_route_budget`] rather than being set field by
+    /// field, so a config's budget-bearing fields cannot disagree with the
+    /// [`RouteBudget`] the route reports.
     #[must_use]
     pub fn harness_config_for(&self, provider_id: &str) -> HarnessConfig {
         HarnessConfig::from_harness_profile(self.capability_of(provider_id).harness_profile())
+            .with_route_budget(self.budget_for(Some(provider_id)))
     }
 
     // ---- internal helpers ----
@@ -995,11 +1116,16 @@ impl Router {
     /// tier without recomputing either (ADR-D, AC-11).
     fn route_from(&self, resolution: CategoryResolution) -> Route {
         let provider_id = resolution.provider_id.clone();
+        // The no-provider arm keeps the strict default, whose budget is the
+        // default (local) pair under `bound: local_engine` (REQ-586): the
+        // category resolved to nobody, so there is no window to derive from,
+        // and no attempt will be made — `route_decided()` reports nothing here.
         let harness = provider_id
             .as_deref()
             .map_or_else(HarnessConfig::default, |id| self.harness_config_for(id));
         Route {
             model: provider_id.as_deref().and_then(|id| self.model_of(id)),
+            budget: harness.budget.clone(),
             provider_id: provider_id.map(ProviderId::from),
             // Attribution only, and stamped on by the caller after the fact
             // (BR-11, AC-9). The resolver never saw a phase.
@@ -1147,6 +1273,11 @@ impl Router {
             phase: failed.phase,
             reason,
             outcome,
+            // The continuing route's budget is the continuing config's — the
+            // caller already derived it (`harness_config_for` on a fallback or
+            // a retry, `degraded_harness_config` on a degrade), so this arm
+            // copies rather than re-deriving (REQ-586 AC-12).
+            budget: harness.budget.clone(),
             harness,
             effort: self.effort_for(Some(provider)),
             resolution: failed.resolution.clone(),
@@ -1160,25 +1291,39 @@ impl Router {
     /// Called from exactly one place — the [`FailureAction::Fallback`] arm — and
     /// that is the whole point. "The fallback has been used" is a fact about
     /// having switched providers, so only the switch may assert it.
+    /// The forced reduced BR-6 harness profile for `failed`, used when a
+    /// failure reveals weak tool-calling regardless of the declared tier.
+    ///
+    /// It derives from the **failed provider's own** capability profile with
+    /// only [`ToolCallTier::Degraded`] forced on, rather than from
+    /// `CapabilityProfile::default()`: what the failure revealed is that this
+    /// provider calls tools badly, not that it forgot how big its window is. A
+    /// derivation from the default profile would silently re-budget a 128k
+    /// route down to the unknown-window default mid-turn, and report
+    /// `bound: default_unknown` for a provider that declares a window — the
+    /// regression REQ-586 ADR-2 exists to prevent. The window survives the
+    /// degrade, the bound stays `window`, and no refit is needed because the
+    /// budget did not move (BR-1, AC-15).
+    ///
+    /// Only the tier is overridden: every other capability — the ladder, the
+    /// reasoning shape, the cap — is still the provider's own. The tier is the
+    /// one fact the failure is evidence about.
+    fn degraded_harness_config(&self, failed: &str) -> HarnessConfig {
+        use teton_core::ToolCallTier;
+        let degraded = CapabilityProfile {
+            tool_call_tier: ToolCallTier::Degraded,
+            ..self.capability_of(failed)
+        };
+        HarnessConfig::from_harness_profile(degraded.harness_profile())
+            .with_route_budget(self.budget_for(Some(failed)))
+    }
+
     fn consume_fallback(mut route: Route) -> Route {
         if let Some(resolution) = route.resolution.as_mut() {
             resolution.fallback_id = None;
         }
         route
     }
-}
-
-/// The forced reduced BR-6 harness profile, used when a failure reveals weak
-/// tool-calling regardless of the provider's declared capability tier.
-fn degraded_harness_config() -> HarnessConfig {
-    use teton_core::ToolCallTier;
-    HarnessConfig::from_harness_profile(
-        CapabilityProfile {
-            tool_call_tier: ToolCallTier::Degraded,
-            ..CapabilityProfile::default()
-        }
-        .harness_profile(),
-    )
 }
 
 /// Map a `teton_providers::FailureClass` to the `teton_protocol` event vocabulary
@@ -1202,9 +1347,11 @@ fn to_protocol_failure_class(class: FailureClass) -> ProtoFailureClass {
 mod tests {
     use super::*;
     use crate::classify::ClassificationSignal;
+    use crate::egress::redact::REDACT_SCANNABLE_CONTEXT_BYTES;
     use teton_core::category::category_for_phase;
     use teton_core::effort::EffortLadder;
     use teton_core::ToolCallTier;
+    use teton_protocol::events::BudgetBound;
 
     /// A `Route` carrying `resolution`, with everything else fixed. The point of
     /// each test below is the resolution, not the wiring around it.
@@ -1216,6 +1363,9 @@ mod tests {
             reason: resolution.reason.clone(),
             outcome: resolution.outcome,
             harness: HarnessConfig::default(),
+            // The wiring the point of these tests is not: the default harness
+            // and its own budget, so the pair still agrees (AC-12).
+            budget: HarnessConfig::default().budget,
             effort: None,
             resolution: Some(resolution),
         }
@@ -1243,7 +1393,8 @@ mod tests {
 
         for category in CoreCategory::ALL {
             let resolution = resolve(category, &table, |_| ProviderHealth::Healthy, |_| true);
-            let decided = route_from(resolution.clone())
+            let route = route_from(resolution.clone());
+            let decided = route
                 .route_decided()
                 .unwrap_or_else(|| panic!("{category} selected no provider"));
 
@@ -1251,6 +1402,21 @@ mod tests {
             assert_eq!(decided.tier, Some(to_protocol_tier(resolution.tier)));
             assert_eq!(decided.provider_id.0, resolution.provider_id.unwrap());
             assert!(!decided.reason.is_empty(), "{category}");
+            // REQ-586 BR-8: and the budget the attempt runs under, projected
+            // off the route rather than recomputed — never absent, on any
+            // category. `None` on this wire means "a daemon that predates
+            // REQ-586", which is a different claim from "no budget applied".
+            assert_eq!(
+                decided.budget_tokens,
+                Some(route.budget.budget_tokens as u64),
+                "{category}"
+            );
+            assert_eq!(
+                decided.budget_bytes,
+                Some(route.budget.budget_bytes as u64),
+                "{category}"
+            );
+            assert_eq!(decided.bound, Some(route.budget.bound), "{category}");
         }
     }
 
@@ -1479,6 +1645,14 @@ mod tests {
             "and the event carries the fact that it WAS clamped, so a reader \
              does not have to infer it by comparing against the setting",
         );
+        // REQ-586 AC-1/AC-4, through the real router rather than a fixture
+        // literal: `three_rungs` declares the 200,000-token window `native()`
+        // carries, so the event announces the pair derived from it — 199k
+        // usable words after the 1,024-token generation reservation — under
+        // `bound: window`.
+        assert_eq!(decided.budget_tokens, Some(132_650));
+        assert_eq!(decided.budget_bytes, Some(397_952));
+        assert_eq!(decided.bound, Some(BudgetBound::Window));
     }
 
     /// ADR-G: one resolution, two readers. The value the event announces and the
@@ -2147,6 +2321,237 @@ mod tests {
         assert!(cfg.require_verification);
         assert_eq!(cfg.max_tools, Some(5));
         assert!(cfg.max_turns <= 5);
+        // REQ-586: a weak tool-caller is not a small-windowed one. `degraded()`
+        // declares 32,000 tokens, and the config the turn runs under is
+        // budgeted from that window — the reduced profile and the budget are
+        // two facts about the provider, stamped by one call.
+        assert_eq!(cfg.budget.bound, BudgetBound::Window);
+        assert_eq!(cfg.budget, router.budget_for(Some("kimi")));
+        assert_eq!(cfg.context_budget_tokens, cfg.budget.budget_tokens);
+        assert_eq!(cfg.context_budget_bytes, cfg.budget.budget_bytes);
+    }
+
+    // ---- REQ-586: the budget is a property of the route attempt ----------
+
+    /// **AC-1 / BR-1, BR-2, BR-5, BR-8**, as a table: what each shape of route
+    /// is budgeted at, and which constraint gets the credit.
+    ///
+    /// The arithmetic belongs to `harness::budget` and is table-tested there;
+    /// what this pins is the router's half — the *classification* that reaches
+    /// it. Every wrong classification still produces a plausible pair, so the
+    /// bound is what gives it away: reading the window off the wrong provider,
+    /// calling a defaulted provider "local", or missing `[privacy] redact`
+    /// each change the bound while leaving a number that looks fine.
+    #[test]
+    fn the_route_budget_is_derived_from_the_routes_own_window() {
+        let router = Router::new(CategoryTable::new().with_local_provider("local"), None)
+            .with_provider(
+                "wide",
+                ProviderKind::OpenaiCompatible,
+                "wide-model",
+                CapabilityProfile {
+                    max_context: 128_000,
+                    ..native()
+                },
+                ProviderHealth::Healthy,
+            )
+            .with_provider(
+                "silent",
+                ProviderKind::OpenaiCompatible,
+                "silent-model",
+                CapabilityProfile {
+                    max_context: 0,
+                    ..native()
+                },
+                ProviderHealth::Healthy,
+            )
+            .with_provider(
+                "capped",
+                ProviderKind::OpenaiCompatible,
+                "capped-model",
+                CapabilityProfile {
+                    max_context: 200_000,
+                    context_budget_cap: 40_000,
+                    ..native()
+                },
+                ProviderHealth::Healthy,
+            );
+
+        // A declared window, less the 1,024-token generation reservation the
+        // adapters actually send: (128,000 − 1,024) words ÷ the 3/2 safety
+        // ratio, and the same figure × the 2 B/token floor.
+        let wide = router.budget_for(Some("wide"));
+        assert_eq!((wide.budget_tokens, wide.budget_bytes), (84_650, 253_952));
+        assert_eq!(wide.bound, BudgetBound::Window);
+
+        // No declared window: today's pair, and the event says *why* — a
+        // provider stuck at 4,096 for want of one line of config must be
+        // legible as that rather than as a mysterious clamp (BR-3).
+        let silent = router.budget_for(Some("silent"));
+        assert_eq!((silent.budget_tokens, silent.budget_bytes), (4_096, 32_768));
+        assert_eq!(silent.bound, BudgetBound::DefaultUnknown);
+
+        // The local tier: the same pair for a different reason, and classified
+        // from the routing table's local provider id (gotcha #9) — it has no
+        // `[[providers]]` entry at all, so a "capabilities look defaulted" test
+        // would have called `silent` local too. The bound is what separates
+        // them, which is why the pairs being equal is not enough.
+        let local = router.budget_for(Some("local"));
+        assert_eq!((local.budget_tokens, local.budget_bytes), (4_096, 32_768));
+        assert_eq!(local.bound, BudgetBound::LocalEngine);
+        assert_ne!(
+            silent.bound, local.bound,
+            "one pair, two reasons — the bound is the fact that tells them apart"
+        );
+
+        // The user's cap is a window ceiling, not a post-hoc clamp: both
+        // currencies are recomputed from it, and it takes the credit (BR-5).
+        let capped = router.budget_for(Some("capped"));
+        assert_eq!(
+            (capped.budget_tokens, capped.budget_bytes),
+            (25_984, 77_952)
+        );
+        assert_eq!(capped.bound, BudgetBound::UserCap);
+        assert!(
+            capped.budget_tokens < router.budget_for(Some("wide")).budget_tokens,
+            "a 40k cap on a 200k window must bind below an uncapped 128k route"
+        );
+
+        // `[privacy] redact = true`: the scan reads a whole assembled body, so
+        // the bytes are held to what it can take — applied last, so it names
+        // the bound whenever it is the thing that actually bit, and the word
+        // half stays window-derived (BR-4).
+        let scanning = router.clone().with_redact_scan(true);
+        let redacted = scanning.budget_for(Some("wide"));
+        assert_eq!(redacted.budget_bytes, REDACT_SCANNABLE_CONTEXT_BYTES);
+        assert_eq!(redacted.budget_tokens, wide.budget_tokens);
+        assert_eq!(redacted.bound, BudgetBound::RedactScan);
+        assert_eq!(
+            scanning.budget_for(Some("local")).bound,
+            BudgetBound::LocalEngine,
+            "the scan bounds what leaves the machine; a local turn does not leave"
+        );
+
+        // And the unresolvable route — no provider to derive from — carries the
+        // default pair its `HarnessConfig::default()` harness carries.
+        let nowhere = router.budget_for(None);
+        assert_eq!(nowhere, HarnessConfig::default().budget);
+    }
+
+    /// **ADR-2 / AC-15**: a degrade changes the profile, not the window.
+    ///
+    /// `Degrade` is the one mid-turn re-config that must *not* move the budget:
+    /// the failure said this provider calls tools badly, not that it forgot how
+    /// big its window is. Deriving the reduced config from
+    /// `CapabilityProfile::default()` — which is what it did before REQ-586
+    /// (gotcha #1) — re-budgets a 128k route to 4,096 words mid-turn and
+    /// reports `default_unknown` for a provider that declares a window. Both
+    /// halves are asserted, because the pair alone would also match a
+    /// coincidentally-defaulted route.
+    #[test]
+    fn a_degrade_keeps_the_failed_providers_budget() {
+        let router = Router::new(
+            CategoryTable::new()
+                .with_local_provider("local")
+                .with_tier(tier(CoreTier::Think, "wide", None)),
+            None,
+        )
+        .with_provider(
+            "wide",
+            ProviderKind::OpenaiCompatible,
+            "wide-model",
+            CapabilityProfile {
+                max_context: 128_000,
+                ..native()
+            },
+            ProviderHealth::Healthy,
+        );
+
+        let route = router.resolve(CoreCategory::Design);
+        assert_eq!(route.budget.bound, BudgetBound::Window);
+        assert_eq!(route.budget.budget_tokens, 84_650);
+
+        let outcome = router.on_provider_failure(&route, "wide", FailureClass::MalformedToolCall);
+        let next = outcome.route.expect("continues on the same provider");
+        assert_eq!(
+            next.harness.max_tools,
+            Some(5),
+            "the profile did degrade — this test is about what did not"
+        );
+        assert_eq!(
+            next.budget, route.budget,
+            "the window survives the degrade, so no refit is needed (AC-15)"
+        );
+        assert_eq!(next.budget.bound, BudgetBound::Window);
+        assert_eq!(next.harness.budget, next.budget);
+        let before = route
+            .route_decided()
+            .expect("the failed route reported one");
+        let after = next
+            .route_decided()
+            .expect("the degrade keeps the provider");
+        assert_eq!(
+            (after.budget_tokens, after.budget_bytes, after.bound),
+            (before.budget_tokens, before.budget_bytes, before.bound),
+            "the event after the degrade announces the budget it announced before"
+        );
+        assert_eq!(after.budget_tokens, Some(84_650));
+    }
+
+    /// **AC-12 / BR-8**: one budget, one source.
+    ///
+    /// The value the event announces, the value stamped on the config the loop
+    /// runs under, and the value `budget_for` computes are the *same* value —
+    /// not three computations of one fact. A mutation to the derivation moves
+    /// all of them together or fails here, which is what makes "no surface
+    /// re-derives it" assertable rather than a comment.
+    #[test]
+    fn the_budget_the_event_reports_is_the_budget_the_turn_runs_under() {
+        let router = router();
+        for category in CoreCategory::ALL {
+            let route = router.resolve(category);
+            let Some(decided) = route.route_decided() else {
+                continue;
+            };
+            let id = route.provider_id.as_ref().expect("a provider was selected");
+            assert_eq!(
+                route.budget, route.harness.budget,
+                "{category}: the route and the config it hands the loop"
+            );
+            assert_eq!(
+                route.budget,
+                router.budget_for(Some(&id.0)),
+                "{category}: and the classifier they both came from"
+            );
+            assert_eq!(
+                decided.budget_tokens,
+                Some(route.budget.budget_tokens as u64)
+            );
+            assert_eq!(decided.budget_bytes, Some(route.budget.budget_bytes as u64));
+            assert_eq!(decided.bound, Some(route.budget.bound));
+
+            // What the harness is actually held to, in both currencies: the
+            // event would still be honest about a `RouteBudget` nothing read.
+            let turn = route.turn_route().expect("a provider was selected");
+            assert_eq!(
+                turn.config.context_budget_tokens,
+                route.budget.budget_tokens
+            );
+            assert_eq!(turn.config.context_budget_bytes, route.budget.budget_bytes);
+            assert_eq!(turn.config.budget, route.budget);
+        }
+
+        // The two routes that report nothing still agree with themselves: the
+        // taint pin (local, by privacy) and an unresolvable category.
+        let pin = router.resolve_local_pin("session touched local-only content");
+        assert_eq!(pin.budget, pin.harness.budget);
+        assert_eq!(pin.budget.bound, BudgetBound::LocalEngine);
+        let nowhere = Router::new(CategoryTable::new(), None).resolve(CoreCategory::Design);
+        assert_eq!(nowhere.budget, nowhere.harness.budget);
+        assert!(
+            nowhere.route_decided().is_none(),
+            "no provider, nothing to report"
+        );
     }
 
     /// **BR-7**: session taint overrides every category binding.

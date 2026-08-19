@@ -9345,6 +9345,12 @@ fn build_router(
 
     let mut router = Router::new(table, default_provider)
         .with_judgment_default(config.judgment_default)
+        // REQ-586 BR-4 / ADR-1: the router derives each route's byte budget,
+        // and on this daemon that budget must fit what the redaction scan can
+        // read whole. It is the same `config.privacy.redact` `redaction_gate`
+        // consults before installing the gate — one field, so the bound and
+        // the gate cannot disagree about whether anything is scanning.
+        .with_redact_scan(config.privacy.redact)
         // REQ-559 BR-2/BR-8: one global level, read from the persisted config so
         // it is configuration-visible rather than a constant compiled in here.
         // The session override (ADR-I) is layered on by the caller that has a
@@ -12508,6 +12514,9 @@ permission_allow = [\"fetch_user_url\"]
             reason: resolution.reason.clone(),
             outcome: resolution.outcome,
             harness: Default::default(),
+            // REQ-586: the route carries its harness's budget — the default
+            // (local) pair here, since this fixture's harness is the default.
+            budget: crate::harness::turn_loop::HarnessConfig::default().budget,
             effort: None,
             resolution: Some(resolution),
         };
@@ -12531,6 +12540,7 @@ permission_allow = [\"fetch_user_url\"]
             reason: "No provider is bound to the 'build' tier.".to_owned(),
             outcome: RouteOutcome::NoPolicy,
             harness: Default::default(),
+            budget: crate::harness::turn_loop::HarnessConfig::default().budget,
             // No provider was selected, so there was nothing to resolve against.
             effort: None,
             resolution: None,
@@ -26821,6 +26831,7 @@ provider_id = \"deepseek\"
                     reason: String::new(),
                     outcome: RouteOutcome::Primary,
                     harness: Default::default(),
+                    budget: crate::harness::turn_loop::HarnessConfig::default().budget,
                     effort: None,
                     resolution: None,
                 }

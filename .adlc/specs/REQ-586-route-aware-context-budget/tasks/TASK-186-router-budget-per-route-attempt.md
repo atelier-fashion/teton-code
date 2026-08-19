@@ -1,7 +1,7 @@
 ---
 id: TASK-186
 title: "Router: with_redact_scan, harness_config_for derives RouteBudget, degraded_harness_config(id) keeps the window, Route carries budget, route_decided projects budget/bound"
-status: draft
+status: complete
 parent: REQ-586
 created: 2026-08-19
 updated: 2026-08-19
@@ -25,9 +25,9 @@ keeps the failed provider's window; `build_router` feeds `privacy.redact`.
 
 ## Acceptance Criteria
 
-- [ ] `cargo test -p tetond router` and `--test routing` green; AC-1 and the Degrade-keeps-budget case pinned; `route_decided` carries `budget_tokens`/`budget_bytes`/`bound` on every route the router builds — production duty routes go through `route.route_decided()` too (runtime.rs:6094, 6311) and carry `Some(..)`; only the test literals in digest.rs/grep.rs/harness/redact.rs stay `None`.
-- [ ] `grep -n "budget::derive(" crates/tetond/src/router.rs` shows exactly one call site (`budget_for`).
-- [ ] Every existing router/routing test green or updated with a one-line reason.
+- [x] `cargo test -p tetond router` and `--test routing` green; AC-1 and the Degrade-keeps-budget case pinned; `route_decided` carries `budget_tokens`/`budget_bytes`/`bound` on every route the router builds — production duty routes go through `route.route_decided()` too (runtime.rs:6094, 6311) and carry `Some(..)`; only the test literals in digest.rs/grep.rs/harness/redact.rs stay `None`.
+- [x] `grep -n "budget::derive(" crates/tetond/src/router.rs` shows exactly one call site (`budget_for`).
+- [x] Every existing router/routing test green or updated with a one-line reason.
 
 ## Technical Notes
 
