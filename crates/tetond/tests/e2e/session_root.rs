@@ -21,8 +21,10 @@
 //!
 //! The CLI halves — `--cwd`, the banner line, the `/cd` command and the
 //! transcript lines the two events render into — are TASK-179's, asserted in
-//! `crates/teton/tests/cli_e2e.rs`; the environment block the next turn
-//! carries is TASK-177's, asserted once it renders (TASK-180).
+//! `crates/teton/tests/cli_e2e.rs`. The environment block is asserted **here,
+//! on the wire**: the provider body of every turn carries `Session root:
+//! <display>` for the root the session stood on when that turn ran — the old
+//! display before the move, the new one after it (BR-1/AC-10).
 
 use std::path::Path;
 use std::time::Duration;
@@ -172,9 +174,9 @@ fn session_create_returns_the_root_and_refuses_a_bad_cwd_naming_it() {
         "a cwd that does not exist is refused: {missing}"
     );
     let message = missing["error"]["message"].as_str().unwrap_or_default();
-    assert!(
-        message.contains("/nope") && message.contains("does not exist or is not a directory"),
-        "the refusal names the path and the reason (BR-6): {message}"
+    assert_eq!(
+        message, "path `/nope` does not exist or is not a directory",
+        "the refusal is the validator's one root-neutral sentence, naming the path (BR-6)"
     );
     let relative = client.call(
         "session/create",
@@ -185,9 +187,9 @@ fn session_create_returns_the_root_and_refuses_a_bad_cwd_naming_it() {
         relative["error"]["code"].as_i64(),
         Some(error_code::INVALID_PARAMS)
     );
-    assert!(
-        message.contains("relative/dir") && message.contains("must be an absolute path"),
-        "the refusal names the path and the reason (BR-6): {message}"
+    assert_eq!(
+        message, "path `relative/dir` must be an absolute path",
+        "the refusal is the validator's one root-neutral sentence, naming the path (BR-6)"
     );
     assert_eq!(
         client.session_ids().len(),
@@ -252,6 +254,10 @@ fn set_cwd_moves_the_jail_clears_and_announces_at_every_permission_level() {
         "path `{}` is outside the session root {new_display}",
         readme.display()
     );
+    // BR-1's block, as the provider body carries it (JSON-escaped, so asserted
+    // on the label-plus-display prefix rather than the whole line).
+    let old_block = format!("Session root: {old_display} (");
+    let new_block = format!("Session root: {new_display} (");
     let mut turns_seen = 0usize;
 
     for level in PermissionLevel::ALL {
@@ -296,6 +302,13 @@ fn set_cwd_moves_the_jail_clears_and_announces_at_every_permission_level() {
             "{level_name}: under the old root the model must be handed the file: {}",
             turns[turns_seen + 1]
         );
+        for body in &turns[turns_seen..] {
+            assert!(
+                body.contains(&old_block) && !body.contains(&new_block),
+                "{level_name}: before the move every turn's prompt states the old \
+                 root `{old_block}`: {body}"
+            );
+        }
         turns_seen = turns.len();
 
         // 2. The move: answer, and both events on the wire ahead of it.
@@ -385,6 +398,13 @@ fn set_cwd_moves_the_jail_clears_and_announces_at_every_permission_level() {
             !follow_up.contains("A tiny fixture repo"),
             "{level_name}: the file under the old root must not be read: {follow_up}"
         );
+        for body in &turns[turns_seen..] {
+            assert!(
+                body.contains(&new_block) && !body.contains(&old_block),
+                "{level_name}: after the move every turn's prompt states the new \
+                 root `{new_block}` and not the old: {body}"
+            );
+        }
         turns_seen = turns.len();
 
         // 4. A refused move: names the path, publishes nothing, moves nothing,
@@ -400,9 +420,9 @@ fn set_cwd_moves_the_jail_clears_and_announces_at_every_permission_level() {
             "{level_name}: {refused}"
         );
         let message = refused["error"]["message"].as_str().unwrap_or_default();
-        assert!(
-            message.contains("/nope") && message.contains("does not exist or is not a directory"),
-            "{level_name}: the refusal names the path and the reason: {message}"
+        assert_eq!(
+            message, "path `/nope` does not exist or is not a directory",
+            "{level_name}: the refusal is the validator's one sentence, naming the path"
         );
         client.drain_events(Duration::from_millis(100));
         assert!(

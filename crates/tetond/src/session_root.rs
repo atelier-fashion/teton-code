@@ -14,6 +14,7 @@
 //! over. Nothing here shells out: the branch is read from `HEAD` directly, and
 //! a value that cannot be read is `None`, never a guess (BR-1).
 
+use std::io::Read;
 use std::path::{Path, PathBuf};
 
 use teton_core::session_root::{
@@ -21,18 +22,65 @@ use teton_core::session_root::{
 };
 use teton_protocol::methods::{RootKind, SessionRoot};
 
+/// The most bytes read from `.git` (the worktree pointer file) or `HEAD`. Both
+/// are one short line in every checkout git writes; anything longer is not the
+/// file this reader is for, and the bound is what keeps a `HEAD` that is a
+/// FIFO or a multi-gigabyte file from holding a probe — which runs on every
+/// turn — hostage.
+const GIT_FILE_MAX_BYTES: u64 = 4096;
+
+/// The daemon's `HOME`, read at the call site of every session-root probe
+/// (REQ-583 ADR-1): the daemon runs as the user, so this is the home the display
+/// spelling is relative to and the home the `home` kind is judged against.
+/// `None` when unset or empty — never a guess (the CLI's `home_dir` applies the
+/// same rule) — and then the probe displays absolute paths and never classifies
+/// a root as `home`, which also leaves BR-12's home-tree pruning inert: a
+/// daemon started with no `HOME` (a bare service environment) walks a real
+/// home folder as a `plain` root, so `HOME` is part of what makes the daemon's
+/// launch environment correct.
+#[must_use]
+pub(crate) fn home() -> Option<PathBuf> {
+    std::env::var_os("HOME")
+        .map(PathBuf::from)
+        .filter(|home| !home.as_os_str().is_empty())
+}
+
+/// The probe's answer together with the path it was asked about — one value,
+/// so a jail built from `path` and a prompt built from `view` are two readings
+/// of one probe and cannot disagree about which directory they describe.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProbedRoot {
+    /// The path the session's tools are jailed to, as the registry stores it.
+    pub path: PathBuf,
+    /// [`probe`]'s answer for `path`: the wire view every surface renders.
+    pub view: SessionRoot,
+}
+
+impl ProbedRoot {
+    /// [`probe`] `path` under `home`, keeping the path beside the answer.
+    #[must_use]
+    pub fn probe(path: PathBuf, home: Option<&Path>) -> Self {
+        let view = probe(&path, home);
+        Self { path, view }
+    }
+}
+
 /// Derive the session root for `path`, given the caller's `HOME` (or `None`).
 ///
 /// - `kind`: [`classify`] over whether any [`PROJECT_MARKERS`] entry exists at
 ///   `path` as a file **or** a directory (a linked git worktree's `.git` is a
-///   file naming its `gitdir:`).
+///   file naming its `gitdir:`). Classified on the best-effort canonical
+///   spellings of `path` and `home`, so an alias of the home folder — a symlink
+///   to it, macOS's `/private` prefix, a `..` in the middle — is `home` and not
+///   a `plain` directory that happens to hold every media tree BR-12 prunes.
 /// - `project_name`: the bounded basename, present iff `kind == Project`.
 /// - `vcs_branch`: from `.git/HEAD` (following a `gitdir:` file), present iff
 ///   `kind == Project` and `HEAD` names a branch — a detached SHA, an unreadable
 ///   `HEAD`, or a non-git project all yield `None`. A home-kind root with a
 ///   `~/.git` says no branch: home wins over the marker (BR-4), so the branch is
 ///   not read there at all.
-/// - `display`: [`display_for`], bounded to [`DISPLAY_MAX_CHARS`].
+/// - `display`: [`display_for`] over the path **as given** (the spelling the
+///   user chose, not the canonical one), bounded to [`DISPLAY_MAX_CHARS`].
 ///
 /// The three user-controlled strings are bounded here, once, so the environment
 /// block, the jail refusal, the launch notice and the `/cd` line all print the
@@ -42,7 +90,11 @@ pub fn probe(path: &Path, home: Option<&Path>) -> SessionRoot {
     let has_marker = PROJECT_MARKERS
         .iter()
         .any(|marker| path.join(marker).exists());
-    let kind = classify(path, home, has_marker);
+    // Kind is judged on canonical spellings; the display keeps the user's.
+    let canonical_path = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
+    let canonical_home =
+        home.map(|home| home.canonicalize().unwrap_or_else(|_| home.to_path_buf()));
+    let kind = classify(&canonical_path, canonical_home.as_deref(), has_marker);
     let is_project = kind == RootKind::Project;
     let project_name = if is_project {
         path.file_name()
@@ -68,16 +120,18 @@ pub fn probe(path: &Path, home: Option<&Path>) -> SessionRoot {
 /// `<root>/.git` is either the git directory itself or — in a linked worktree —
 /// a file whose first line is `gitdir: <path>` (relative paths are relative to
 /// `root`); the pointer is followed one hop. `HEAD` reading `ref: refs/heads/<b>`
-/// yields `Some(b)`; a detached SHA, a ref outside `refs/heads/`, an unreadable
-/// or missing file, or no `.git` at all yields `None`.
+/// yields `Some(b)`; a detached SHA, a ref outside `refs/heads/`, an empty
+/// branch name, an unreadable, missing, oversize or non-UTF-8 file, or no `.git`
+/// at all yields `None`. Both files are opened only when they are regular files
+/// and read to at most [`GIT_FILE_MAX_BYTES`] — see [`read_small_file`].
 fn read_git_branch(root: &Path) -> Option<String> {
     let dot_git = root.join(".git");
     let git_dir = if dot_git.is_dir() {
         dot_git
     } else {
-        gitdir_pointer(root, &std::fs::read_to_string(&dot_git).ok()?)?
+        gitdir_pointer(root, &read_small_file(&dot_git)?)?
     };
-    let head = std::fs::read_to_string(git_dir.join("HEAD")).ok()?;
+    let head = read_small_file(&git_dir.join("HEAD"))?;
     let branch = head
         .trim()
         .strip_prefix("ref:")?
@@ -88,6 +142,28 @@ fn read_git_branch(root: &Path) -> Option<String> {
     } else {
         Some(branch.to_owned())
     }
+}
+
+/// The contents of the **regular** file at `path`, read to at most
+/// [`GIT_FILE_MAX_BYTES`]; `None` for anything else — a directory, a FIFO (whose
+/// open would block for a writer that never comes), a device, a file past the
+/// bound, an unreadable one, or one that is not UTF-8.
+///
+/// The type is checked before the open, off `metadata` (following a symlink,
+/// which a `.git` file or `HEAD` may legitimately be), and the read is `take`n
+/// as well as size-checked so a file that grows under the read stays bounded.
+fn read_small_file(path: &Path) -> Option<String> {
+    let metadata = std::fs::metadata(path).ok()?;
+    if !metadata.is_file() || metadata.len() > GIT_FILE_MAX_BYTES {
+        return None;
+    }
+    let mut contents = String::new();
+    std::fs::File::open(path)
+        .ok()?
+        .take(GIT_FILE_MAX_BYTES)
+        .read_to_string(&mut contents)
+        .ok()?;
+    Some(contents)
 }
 
 /// The git directory a `.git` *file* points at, or `None` when the file is not
@@ -340,5 +416,140 @@ mod tests {
         let root = probe(&repo, Some(&home));
         assert_eq!(root.display, "~/Documents/GitHub/teton-code");
         std::fs::remove_dir_all(&home).ok();
+    }
+
+    /// **An alias of the home folder is `home`.** A symlink to it, a `..` in
+    /// the middle, or (on macOS) the `/private` spelling of a `/var` path all
+    /// name the same directory, and BR-12's pruning keys on the kind — so the
+    /// kind is judged on the canonical spellings. The display keeps the
+    /// spelling the caller gave: that is what the user typed and what they
+    /// will recognise.
+    #[test]
+    fn an_alias_of_the_home_folder_is_home_and_keeps_its_own_spelling() {
+        let base = temp_root("alias");
+        let home = base.join("home");
+        std::fs::create_dir_all(home.join("Music")).unwrap();
+        std::fs::write(home.join("Cargo.toml"), "[package]\n").unwrap();
+        let link = base.join("home-link");
+        std::os::unix::fs::symlink(&home, &link).unwrap();
+
+        // Through the link, with `HOME` spelled plainly.
+        let root = probe(&link, Some(&home));
+        assert_eq!(root.kind, RootKind::Home, "{root:?}");
+        assert_eq!(root.project_name, None, "home wins over the marker");
+        assert_eq!(root.vcs_branch, None);
+        assert_eq!(
+            root.display,
+            bounded_field(&link.display().to_string(), DISPLAY_MAX_CHARS),
+            "the display is the caller's spelling, not the canonical one"
+        );
+
+        // Plainly, with `HOME` spelled through the link.
+        assert_eq!(probe(&home, Some(&link)).kind, RootKind::Home);
+
+        // With a `..` in the middle of either side.
+        let dotted = home.join("Music/..");
+        assert_eq!(probe(&dotted, Some(&home)).kind, RootKind::Home);
+        assert_eq!(probe(&home, Some(&dotted)).kind, RootKind::Home);
+
+        // A different directory that merely looks like a home is not one.
+        let other = base.join("other");
+        std::fs::create_dir_all(&other).unwrap();
+        assert_eq!(probe(&other, Some(&home)).kind, RootKind::Plain);
+        std::fs::remove_dir_all(&base).ok();
+    }
+
+    /// The branch reader refuses every degenerate `HEAD` and pointer without a
+    /// guess: an empty branch name, a `gitdir:` naming a directory that is not
+    /// there, a `HEAD` that is not UTF-8, and one past the size bound.
+    #[test]
+    fn a_degenerate_head_or_pointer_yields_no_branch() {
+        let base = temp_root("degenerate-empty");
+        write_head(&base.join(".git"), "ref: refs/heads/\n");
+        assert_eq!(probe(&base, None).vcs_branch, None, "an empty branch name");
+        std::fs::remove_dir_all(&base).ok();
+
+        let base = temp_root("degenerate-pointer");
+        std::fs::write(base.join(".git"), "gitdir: ../nowhere/.git/worktrees/x\n").unwrap();
+        let root = probe(&base, None);
+        assert_eq!(root.kind, RootKind::Project, "the pointer file is a marker");
+        assert_eq!(root.vcs_branch, None, "a pointer to a missing directory");
+        std::fs::remove_dir_all(&base).ok();
+
+        let base = temp_root("degenerate-utf8");
+        std::fs::create_dir_all(base.join(".git")).unwrap();
+        std::fs::write(base.join(".git/HEAD"), b"ref: refs/heads/\xff\xfe\n").unwrap();
+        assert_eq!(probe(&base, None).vcs_branch, None, "invalid UTF-8");
+        std::fs::remove_dir_all(&base).ok();
+
+        let base = temp_root("degenerate-huge");
+        let huge = format!(
+            "ref: refs/heads/{}\n",
+            "b".repeat(GIT_FILE_MAX_BYTES as usize + 16)
+        );
+        write_head(&base.join(".git"), &huge);
+        assert_eq!(probe(&base, None).vcs_branch, None, "past the size bound");
+        // Just under the bound still reads (and is then bounded for display).
+        let base2 = temp_root("degenerate-under");
+        write_head(&base2.join(".git"), "ref: refs/heads/main\n");
+        assert_eq!(probe(&base2, None).vcs_branch.as_deref(), Some("main"));
+        std::fs::remove_dir_all(&base).ok();
+        std::fs::remove_dir_all(&base2).ok();
+    }
+
+    /// A `HEAD` that is a FIFO does not hold the probe: the type is read off
+    /// `metadata` before any open, so the open that would block for a writer
+    /// never happens. On a worker thread with a deadline, so a regression fails
+    /// rather than hangs.
+    #[test]
+    fn a_fifo_named_head_does_not_block_the_probe() {
+        use std::os::unix::ffi::OsStrExt;
+        let base = temp_root("fifo-head");
+        std::fs::create_dir_all(base.join(".git")).unwrap();
+        let head = base.join(".git/HEAD");
+        let c_path = std::ffi::CString::new(head.as_os_str().as_bytes()).unwrap();
+        // SAFETY: `mkfifo` reads a NUL-terminated path and a mode; nothing else.
+        let made = unsafe { libc::mkfifo(c_path.as_ptr(), 0o644) };
+        assert_eq!(
+            made,
+            0,
+            "mkfifo failed: {}",
+            std::io::Error::last_os_error()
+        );
+
+        let (tx, rx) = std::sync::mpsc::channel();
+        let probed = base.clone();
+        std::thread::spawn(move || {
+            let _ = tx.send(probe(&probed, None));
+        });
+        let root = rx
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .expect("the probe must return: a FIFO HEAD blocked it");
+        assert_eq!(root.kind, RootKind::Project);
+        assert_eq!(root.vcs_branch, None);
+        std::fs::remove_dir_all(&base).ok();
+    }
+
+    /// The one `HOME` reader: the variable's value, or `None` when it is unset
+    /// or empty. Read-only against the process environment — the same rule the
+    /// CLI's `home_dir` applies.
+    #[test]
+    fn home_is_the_variable_or_none_when_empty() {
+        let raw = std::env::var_os("HOME").map(PathBuf::from);
+        let expected = raw.filter(|h| !h.as_os_str().is_empty());
+        assert_eq!(home(), expected);
+    }
+
+    /// `ProbedRoot` keeps the path beside the probe's answer for it — one value
+    /// for the jail and the prompt to be built from.
+    #[test]
+    fn a_probed_root_carries_the_path_and_the_probe_of_that_path() {
+        let base = temp_root("probed");
+        write_head(&base.join(".git"), "ref: refs/heads/main\n");
+        let probed = ProbedRoot::probe(base.clone(), None);
+        assert_eq!(probed.path, base);
+        assert_eq!(probed.view, probe(&base, None));
+        assert_eq!(probed.view.vcs_branch.as_deref(), Some("main"));
+        std::fs::remove_dir_all(&base).ok();
     }
 }

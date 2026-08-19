@@ -20,12 +20,16 @@
 //! - **unreadable folders** — counted and named rather than swallowed (BR-13).
 //!
 //! The tools decide what an entry *means* (a match, a file to read); the driver
-//! [`visit`] decides which entries are seen. Every harness line a walker appends
-//! is written here and starts with `... (` — the shape grep's cap notice already
-//! had — so [`is_harness_line`] is one recogniser for all of them and the triage
-//! duty never ranks a harness sentence as a match.
+//! [`visit`] decides which entries are seen, and a tool that has all it can use
+//! ends the walk by returning [`ControlFlow::Break`] from its callback (grep's
+//! match cap — a stop the tool asked for, not a budget stop). Every harness line
+//! a walker appends is written here and starts with [`HARNESS_LINE_PREFIX`] —
+//! the shape grep's cap notice already had — and [`is_harness_line`] recognises
+//! exactly the known line shapes, so the triage duty never ranks a harness
+//! sentence as a match and never peels a match that merely looks like one.
 
 use std::fs;
+use std::ops::ControlFlow;
 use std::path::Path;
 use std::time::{Duration, Instant};
 
@@ -34,8 +38,11 @@ use teton_protocol::methods::RootKind;
 
 use super::skip_symlink_entry;
 
-/// Directory names never descended into, at any depth and from any root kind:
-/// VCS internals and build output hold no source a model should read.
+/// Directory names **never** descended into, at any depth, from any root kind,
+/// and whatever the pattern names: VCS internals and build output hold no
+/// source a model should read. Unlike the BR-12 sets below, naming one of these
+/// in a pattern does not enter it — `target/**/*.d` from a project root finds
+/// nothing, as it always has.
 ///
 /// `.hg`, `.svn` and `__pycache__` are inert in a repository that has none of
 /// them and cost nothing to name; they join the three the walkers always had.
@@ -69,18 +76,33 @@ pub const MEDIA_BUNDLE_SUFFIXES: &[&str] = &[".photoslibrary", ".musiclibrary"];
 /// How many unreadable folders the trailer names before saying "and N more".
 pub const UNREADABLE_NAMED_MAX: usize = 5;
 
+/// The prefix every harness line a walker writes starts with — the trailer
+/// lines here and both tools' cap notices. One constant, so every writer and
+/// the one recogniser ([`is_harness_line`]) spell the same bytes.
+pub(crate) const HARNESS_LINE_PREFIX: &str = "... (";
+
 /// The macOS-only clause of the unreadable line (BR-13).
 ///
 /// `cfg!`-selected text rather than a `#[cfg]` item so both spellings compile
 /// on every platform (the `service.rs` idiom): the line reads the same
 /// everywhere up to this clause, and a Linux build still type-checks the macOS
-/// sentence.
-const MACOS_CONSENT_CLAUSE: &str =
+/// sentence. `pub(crate)` so the tools' tests assert the clause they were
+/// written against rather than a retyped copy of it.
+pub(crate) const MACOS_CONSENT_CLAUSE: &str =
     " — macOS may have blocked access to that folder, or be waiting on a consent dialog for it";
 
 /// What to do about a stopped walk — the same words whether zero or many
 /// matches were found before the stop (BR-10: never a silent partial).
-const STOPPED_ADVICE: &str = "narrow the pattern, or move the session root with /cd";
+/// `pub(crate)` for the same reason as [`MACOS_CONSENT_CLAUSE`].
+pub(crate) const STOPPED_ADVICE: &str = "narrow the pattern, or move the session root with /cd";
+
+/// How many entries the per-directory loop hands over between two reads of the
+/// wall clock. The clock is read before every descent as well; this is what
+/// bounds a single flat directory of very many entries — a `Downloads/` with
+/// fifty thousand files — which the per-descent read alone never sees the end
+/// of. Small enough that a stop lands within a few hundred entries of the
+/// deadline, large enough that the clock is not the cost of the walk.
+pub const WALL_CHECK_EVERY: usize = 256;
 
 /// A walk's bound: entries seen and wall-clock elapsed, whichever runs out
 /// first (BR-10).
@@ -201,6 +223,11 @@ pub struct WalkReport {
 
 /// Walk `root` under `policy`, handing every entry seen to `on_entry` as
 /// `(path, file type, root-relative identity)`, and report how the walk went.
+/// `on_entry` answers [`ControlFlow::Continue`] to go on and
+/// [`ControlFlow::Break`] to end the walk where it stands — the tool has all
+/// it can use (grep at its match cap). A tool's stop is **not** a budget stop:
+/// the report's `truncated_by` stays `None`, and the tool says what stopped it
+/// (its cap notice) in its own words (BR-10: the caps stay as they are).
 ///
 /// `root` is the jail root, already canonicalized by the caller (both walkers
 /// canonicalize before anything else). `kind` gates the home-tree pruning
@@ -220,8 +247,11 @@ pub struct WalkReport {
 ///   descend, so a pruned directory is still *seen* (glob can list `Library/`
 ///   from `~`) even though nothing under it is.
 /// - Within one directory, files are handed over first and child directories
-///   are entered afterwards; the wall clock is read once per directory
-///   boundary, before each descent. The root itself is always entered.
+///   are entered afterwards, **in name order** — so which of two sibling trees
+///   a walk reaches first is a fact a test can build on rather than whatever
+///   the filesystem's hash order happened to be. The wall clock is read before
+///   each descent and once every [`WALL_CHECK_EVERY`] entries within a
+///   directory. The root itself is always entered.
 ///
 /// A budget hit stops the whole walk, not one branch, and is recorded on the
 /// report so the tool can say so ([`trailer_lines`]) whether it had found
@@ -231,7 +261,7 @@ pub fn visit(
     kind: RootKind,
     named_prefix: &[&str],
     policy: &WalkPolicy,
-    on_entry: &mut dyn FnMut(&Path, &fs::FileType, &ProvenanceId),
+    on_entry: &mut dyn FnMut(&Path, &fs::FileType, &ProvenanceId) -> ControlFlow<()>,
 ) -> WalkReport {
     let mut walk = Walk {
         root,
@@ -247,6 +277,23 @@ pub fn visit(
     walk.report
 }
 
+/// The root-relative segments under which macOS mounts the data volume — a
+/// firmlink, so `/System/Volumes/Data/Users/<name>` *is* `/Users/<name>` and a
+/// walk from `/` meets each home twice. Read as absent by
+/// `Walk::parent_is_a_home`, so the BR-12 position rule holds on both spellings.
+const MACOS_DATA_VOLUME_FIRMLINK: [&str; 3] = ["System", "Volumes", "Data"];
+
+/// Why a directory is not descended into.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Prune {
+    /// The skip set ([`WALK_SKIP_DIRS`]): never entered, from any root, whatever
+    /// the pattern names.
+    Always,
+    /// The BR-12 sets ([`HOME_TOP_LEVEL_SKIPS`], [`MEDIA_BUNDLE_SUFFIXES`]) from
+    /// a home-kind root: entered only when the pattern names the tree.
+    UnlessNamed,
+}
+
 /// The state of one walk: the inputs, the clock, the count, and the report
 /// being built.
 struct Walk<'a> {
@@ -254,7 +301,7 @@ struct Walk<'a> {
     kind: RootKind,
     named_prefix: &'a [&'a str],
     policy: &'a WalkPolicy,
-    on_entry: &'a mut dyn FnMut(&Path, &fs::FileType, &ProvenanceId),
+    on_entry: &'a mut dyn FnMut(&Path, &fs::FileType, &ProvenanceId) -> ControlFlow<()>,
     started: Instant,
     /// Entries seen so far, files and directories alike.
     seen: usize,
@@ -262,8 +309,8 @@ struct Walk<'a> {
 }
 
 impl Walk<'_> {
-    /// Handle one directory. `false` means the budget ran out and the whole
-    /// walk must stop.
+    /// Handle one directory. `false` means the walk must stop here — the
+    /// budget ran out, or the tool said it has all it can use.
     fn dir(&mut self, dir: &Path) -> bool {
         let entries = match fs::read_dir(dir) {
             Ok(entries) => entries,
@@ -280,6 +327,12 @@ impl Walk<'_> {
                     Some(TruncatedBy::Entries(self.policy.budget.max_entries));
                 return false;
             }
+            // The clock, inside the loop as well as before each descent: a flat
+            // directory of very many entries never reaches a descent, and the
+            // per-descent read alone would let it run to its end.
+            if self.seen.is_multiple_of(WALL_CHECK_EVERY) && self.wall_ran_out() {
+                return false;
+            }
             let path = entry.path();
             let Ok(file_type) = entry.file_type() else {
                 continue;
@@ -294,21 +347,26 @@ impl Walk<'_> {
             let Ok(id) = ProvenanceId::from_resolved(self.root, &path) else {
                 continue;
             };
-            (self.on_entry)(&path, &file_type, &id);
+            if (self.on_entry)(&path, &file_type, &id).is_break() {
+                // The tool's stop, not the budget's: `truncated_by` stays as it
+                // is, and the tool reports the stop in its own words.
+                return false;
+            }
             if file_type.is_dir() {
                 let name = entry.file_name();
                 let name = name.to_string_lossy();
                 let segments: Vec<&str> = id.as_str().split('/').collect();
-                if self.is_pruned(&name, &segments) && !self.is_named(&segments) {
-                    continue;
+                match self.prune(&name, &segments) {
+                    Some(Prune::Always) => continue,
+                    Some(Prune::UnlessNamed) if !self.is_named(&segments) => continue,
+                    _ => children.push(path),
                 }
-                children.push(path);
             }
         }
+        // Name order, so the walk's reach is deterministic (see `visit`).
+        children.sort();
         for child in children {
-            if self.started.elapsed() >= self.policy.budget.max_wall {
-                self.report.truncated_by =
-                    Some(TruncatedBy::WallClock(self.policy.budget.max_wall));
+            if self.wall_ran_out() {
                 return false;
             }
             if !self.dir(&child) {
@@ -318,16 +376,31 @@ impl Walk<'_> {
         true
     }
 
-    /// Whether the policy says not to descend into the directory `name`, whose
-    /// root-relative path is `segments`.
-    fn is_pruned(&self, name: &str, segments: &[&str]) -> bool {
-        if self.policy.skip.contains(&name) {
+    /// Whether the wall-clock budget is spent — recording the stop on the
+    /// report when it is, so every caller reports the same reading.
+    fn wall_ran_out(&mut self) -> bool {
+        if self.started.elapsed() >= self.policy.budget.max_wall {
+            self.report.truncated_by = Some(TruncatedBy::WallClock(self.policy.budget.max_wall));
             return true;
+        }
+        false
+    }
+
+    /// Why — if at all — the policy says not to descend into the directory
+    /// `name`, whose root-relative path is `segments`.
+    ///
+    /// The skip set is [`Prune::Always`]: never entered, and no pattern names
+    /// its way in. The BR-12 sets are [`Prune::UnlessNamed`]: pruned only from a
+    /// home-kind root, and entered when the pattern's leading literal segments
+    /// name the tree ([`Walk::is_named`]).
+    fn prune(&self, name: &str, segments: &[&str]) -> Option<Prune> {
+        if self.policy.skip.contains(&name) {
+            return Some(Prune::Always);
         }
         // BR-12 is inert from a `project`/`plain` root: a `Library/` there is
         // project content, and so is a bundle someone checked in.
         if !matches!(self.kind, RootKind::Home | RootKind::FilesystemRoot) {
-            return false;
+            return None;
         }
         if self
             .policy
@@ -335,9 +408,10 @@ impl Walk<'_> {
             .iter()
             .any(|suffix| name.ends_with(suffix))
         {
-            return true;
+            return Some(Prune::UnlessNamed);
         }
-        self.policy.home_top.contains(&name) && self.parent_is_a_home(segments)
+        (self.policy.home_top.contains(&name) && self.parent_is_a_home(segments))
+            .then_some(Prune::UnlessNamed)
     }
 
     /// Whether the directory at `segments` sits directly under a user's home
@@ -345,13 +419,18 @@ impl Walk<'_> {
     ///
     /// From a `home` root the home *is* the root, so the directory is a
     /// top-level child. From `/` a home is `/Users/<name>` or `/home/<name>`,
-    /// so the directory is three deep with `Users`/`home` as its first segment.
-    /// Nowhere else: `~/Documents/GitHub/app/Library` is four deep from `~` and
-    /// walked.
+    /// so the directory is three deep with `Users`/`home` as its first segment
+    /// — and on macOS the data volume is firmlinked at `/System/Volumes/Data`,
+    /// so `/System/Volumes/Data/Users/<name>` is the same home reached the long
+    /// way round; that leading run is read as if absent. Nowhere else:
+    /// `~/Documents/GitHub/app/Library` is four deep from `~` and walked.
     fn parent_is_a_home(&self, segments: &[&str]) -> bool {
         match self.kind {
             RootKind::Home => segments.len() == 1,
             RootKind::FilesystemRoot => {
+                let segments = segments
+                    .strip_prefix(&MACOS_DATA_VOLUME_FIRMLINK)
+                    .unwrap_or(segments);
                 segments.len() == 3 && matches!(segments[0], "Users" | "home")
             }
             RootKind::Project | RootKind::Plain => false,
@@ -359,8 +438,9 @@ impl Walk<'_> {
     }
 
     /// Whether the pattern's leading literal segments name this directory or
-    /// something under it — BR-12's "unless named": a pruned directory the
-    /// caller asked for by name is entered.
+    /// something under it — BR-12's "unless named": a [`Prune::UnlessNamed`]
+    /// directory the caller asked for by name is entered. Never consulted for
+    /// the skip set ([`Prune::Always`]).
     fn is_named(&self, segments: &[&str]) -> bool {
         self.named_prefix.starts_with(segments)
     }
@@ -396,11 +476,13 @@ pub fn trailer_lines(report: &WalkReport) -> Vec<String> {
     let mut lines = Vec::new();
     match report.truncated_by {
         Some(TruncatedBy::Entries(n)) => {
-            lines.push(format!("... (stopped after {n} entries; {STOPPED_ADVICE})"));
+            lines.push(format!(
+                "{HARNESS_LINE_PREFIX}stopped after {n} entries; {STOPPED_ADVICE})"
+            ));
         }
         Some(TruncatedBy::WallClock(elapsed)) => {
             lines.push(format!(
-                "... (stopped after {} s; {STOPPED_ADVICE})",
+                "{HARNESS_LINE_PREFIX}stopped after {} s; {STOPPED_ADVICE})",
                 format_secs(elapsed)
             ));
         }
@@ -418,7 +500,7 @@ pub fn trailer_lines(report: &WalkReport) -> Vec<String> {
 fn unreadable_line(report: &WalkReport) -> String {
     let n = report.unreadable_total;
     let noun = if n == 1 { "folder" } else { "folders" };
-    let mut line = format!("... ({n} {noun} could not be read");
+    let mut line = format!("{HARNESS_LINE_PREFIX}{n} {noun} could not be read");
     if !report.unreadable.is_empty() {
         line.push_str(" (permission denied): ");
         line.push_str(&report.unreadable.join(", "));
@@ -443,13 +525,43 @@ fn format_secs(duration: Duration) -> String {
     }
 }
 
+/// Append `lines` to `out`, one per line, after whatever `out` already holds
+/// — the one way a tool puts the walk's trailer (and its own cap notice) under
+/// its result, so the five places that used to hand-roll the loop cannot drift
+/// in where the newline goes.
+pub fn append_trailer<I, S>(out: &mut String, lines: I)
+where
+    I: IntoIterator<Item = S>,
+    S: AsRef<str>,
+{
+    for line in lines {
+        out.push('\n');
+        out.push_str(line.as_ref());
+    }
+}
+
 /// Whether `line` is one the harness wrote rather than a tool's own result
-/// line: every trailer line here, and the walkers' cap notices, start with
-/// `... (`. The one recogniser grep's triage split uses (ADR-3), so a new
+/// line — the one recogniser grep's triage split uses (ADR-3), so a new
 /// harness line is never ranked as a match by accident.
+///
+/// Recognised by **exact known shape**, not by the prefix alone: after
+/// [`HARNESS_LINE_PREFIX`] the line continues `stopped after ` (the budget
+/// lines), `<digits> folder(s) could not be read` (the unreadable line), or
+/// `capped at ` (both tools' cap notices). A grep match from a file whose path
+/// begins `... (` — which a `MATCH` line spelling `... (x.rs:1: y` would
+/// produce — is a match, and is not peeled.
 #[must_use]
 pub fn is_harness_line(line: &str) -> bool {
-    line.starts_with("... (")
+    let Some(body) = line.strip_prefix(HARNESS_LINE_PREFIX) else {
+        return false;
+    };
+    if body.starts_with("stopped after ") || body.starts_with("capped at ") {
+        return true;
+    }
+    let after_digits = body.trim_start_matches(|c: char| c.is_ascii_digit());
+    after_digits.len() < body.len()
+        && (after_digits.starts_with(" folder could not be read")
+            || after_digits.starts_with(" folders could not be read"))
 }
 
 /// The segments of `pattern` before the first one containing a wildcard
@@ -463,6 +575,14 @@ pub fn leading_literal_segments(pattern: &str) -> Vec<&str> {
         .filter(|segment| !segment.is_empty())
         .take_while(|segment| !segment.contains(['*', '?']))
         .collect()
+}
+
+/// Whether the test process runs as root — who can read a mode-`000` directory,
+/// so every unreadable-folder fixture skips itself. Through the daemon's own
+/// uid reader rather than a third `unsafe { libc::geteuid() }`.
+#[cfg(test)]
+pub(crate) fn running_as_root() -> bool {
+    crate::auth::current_uid() == 0
 }
 
 #[cfg(test)]
@@ -508,6 +628,7 @@ mod tests {
             if !ft.is_dir() {
                 seen.push(id.as_str().to_owned());
             }
+            ControlFlow::Continue(())
         });
         seen.sort();
         (seen, report)
@@ -636,9 +757,10 @@ mod tests {
 
     /// **BR-12's "unless named".** A pruned directory is entered when the
     /// pattern's leading literal segments name it or something under it — and
-    /// only that one; naming `Library` does not unprune `Music`.
+    /// only that one; naming `Library` does not unprune `Music`. The skip set
+    /// is not nameable: `target/` stays out whatever the pattern says.
     #[test]
-    fn a_named_prefix_enters_a_pruned_directory() {
+    fn a_named_prefix_enters_a_pruned_directory_but_never_the_skip_set() {
         let root = temp_root("named");
         plant(&root, "Library/Preferences/a.plist");
         plant(&root, "Library/Caches/b.plist");
@@ -661,19 +783,17 @@ mod tests {
             vec!["Library/Caches/b.plist", "Library/Preferences/a.plist"]
         );
 
-        // The rule is one rule: naming a skip-set directory enters it too
-        // (from a project root, where BR-12 is inert and only the skip set
-        // prunes).
-        let (seen, _) = files_seen(&root, RootKind::Project, &[], &policy);
-        assert!(
-            !seen.contains(&"target/debug/build.log".to_owned()),
-            "{seen:?}"
-        );
-        let (seen, _) = files_seen(&root, RootKind::Project, &["target", "debug"], &policy);
-        assert!(
-            seen.contains(&"target/debug/build.log".to_owned()),
-            "{seen:?}"
-        );
+        // The skip set is a different rule: never descended, from any root
+        // kind, and naming it does not open it — "never" means never.
+        for kind in [RootKind::Project, RootKind::Home] {
+            for named in [&[][..], &["target"][..], &["target", "debug"][..]] {
+                let (seen, _) = files_seen(&root, kind, named, &policy);
+                assert!(
+                    !seen.contains(&"target/debug/build.log".to_owned()),
+                    "{kind:?} named {named:?}: the skip set was entered: {seen:?}"
+                );
+            }
+        }
 
         let (seen, _) = files_seen(&root, RootKind::Home, &["Documents"], &policy);
         assert!(seen.is_empty(), "{seen:?}");
@@ -764,8 +884,7 @@ mod tests {
     #[test]
     fn an_unreadable_folder_is_reported_and_the_walk_continues() {
         use std::os::unix::fs::PermissionsExt;
-        // SAFETY: `geteuid` reads the process's effective uid; no arguments.
-        if unsafe { libc::geteuid() } == 0 {
+        if running_as_root() {
             eprintln!("skipped: running as root, mode 000 does not refuse");
             return;
         }
@@ -853,6 +972,269 @@ mod tests {
         assert!(!is_harness_line(
             "[triage: 2 of 3 matches, most useful first]"
         ));
+    }
+
+    /// The recogniser knows the harness's line shapes and nothing else: the
+    /// prefix alone is not enough. A match line from a file whose *path*
+    /// begins `... (` is a match, not a trailer.
+    #[test]
+    fn a_harness_line_is_recognised_by_its_exact_shape_not_by_the_prefix_alone() {
+        for line in [
+            format!("{HARNESS_LINE_PREFIX}stopped after 3 entries; {STOPPED_ADVICE})"),
+            format!("{HARNESS_LINE_PREFIX}stopped after 0.5 s; {STOPPED_ADVICE})"),
+            format!("{HARNESS_LINE_PREFIX}1 folder could not be read (permission denied): a/)"),
+            format!("{HARNESS_LINE_PREFIX}12 folders could not be read)"),
+            format!("{HARNESS_LINE_PREFIX}capped at 200 matches)"),
+            format!("{HARNESS_LINE_PREFIX}capped at 200 results)"),
+        ] {
+            assert!(is_harness_line(&line), "{line}");
+        }
+        for line in [
+            "... (x.rs:1: let needle = 1;",
+            "... (stopped.rs:1: fn stopped_after()",
+            "... (folder/a.rs:3: x",
+            "... (3 folder-shaped names.rs:1: y",
+            "... (",
+            "...",
+            "",
+            "capped at 200 matches",
+        ] {
+            assert!(
+                !is_harness_line(line),
+                "{line:?} must not be peeled as a harness line"
+            );
+        }
+    }
+
+    /// The tool ends the walk with `Break`, and that is **not** a budget
+    /// stop: nothing after the break is seen, and the report says the budget
+    /// was not touched.
+    #[test]
+    fn a_tools_break_ends_the_walk_without_a_budget_stop() {
+        let root = temp_root("break");
+        plant(&root, "a/one.rs");
+        plant(&root, "a/two.rs");
+        plant(&root, "b/three.rs");
+        let canonical = root.canonicalize().unwrap();
+        let mut seen = Vec::new();
+        let report = visit(
+            &canonical,
+            RootKind::Plain,
+            &[],
+            &WalkPolicy::default(),
+            &mut |_, ft, id| {
+                if ft.is_dir() {
+                    return ControlFlow::Continue(());
+                }
+                seen.push(id.as_str().to_owned());
+                if id.as_str().starts_with("a/") {
+                    ControlFlow::Break(())
+                } else {
+                    ControlFlow::Continue(())
+                }
+            },
+        );
+        // Children are entered in name order, so `a/` is entered before `b/`;
+        // the first file under `a/` breaks, and `b/` is never reached.
+        assert_eq!(seen.len(), 1, "{seen:?}");
+        assert!(seen[0].starts_with("a/"), "{seen:?}");
+        assert_eq!(
+            report,
+            WalkReport::default(),
+            "a tool's stop is not a budget stop"
+        );
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// **BR-10, wall clock inside one directory.** The clock is also read every
+    /// [`WALL_CHECK_EVERY`] entries, so a flat directory of many files — which
+    /// never reaches a descent — still stops on a spent budget.
+    #[test]
+    fn the_wall_clock_is_read_within_a_flat_directory_every_n_entries() {
+        let root = temp_root("wall-flat");
+        for n in 0..(WALL_CHECK_EVERY + 20) {
+            plant(&root, &format!("f{n:04}.rs"));
+        }
+        let policy = WalkPolicy::default().with_budget(WalkBudget {
+            max_entries: 100_000,
+            max_wall: Duration::ZERO,
+        });
+        let (seen, report) = files_seen(&root, RootKind::Plain, &[], &policy);
+        assert_eq!(
+            report.truncated_by,
+            Some(TruncatedBy::WallClock(Duration::ZERO)),
+            "a flat directory must still meet the wall clock"
+        );
+        assert!(
+            seen.len() < WALL_CHECK_EVERY,
+            "the stop must land at the first check, not at the end: {} seen",
+            seen.len()
+        );
+        assert!(
+            !seen.is_empty(),
+            "the entries before the first check are handed over"
+        );
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// **The macOS firmlink (BR-12 from `/`).** `/System/Volumes/Data/Users/<n>`
+    /// is `/Users/<n>` reached the long way round, so its top-level media trees
+    /// are pruned exactly as the short spelling's are — and only at that
+    /// position: `/System/Volumes/Data/Library` is a system tree, walked.
+    #[test]
+    fn the_data_volume_firmlink_is_read_as_absent_when_judging_a_home() {
+        let root = temp_root("firmlink");
+        plant(&root, "System/Volumes/Data/Users/ada/Library/top.rs");
+        plant(&root, "System/Volumes/Data/Users/ada/Music/song.rs");
+        plant(
+            &root,
+            "System/Volumes/Data/Users/ada/Documents/app/Library/nested.rs",
+        );
+        plant(&root, "System/Volumes/Data/Library/system.rs");
+        plant(&root, "System/Volumes/Library/other.rs");
+        plant(&root, "Users/ada/Library/top.rs");
+
+        let (seen, _) = files_seen(&root, RootKind::FilesystemRoot, &[], &WalkPolicy::default());
+        for pruned in [
+            "System/Volumes/Data/Users/ada/Library/top.rs",
+            "System/Volumes/Data/Users/ada/Music/song.rs",
+            "Users/ada/Library/top.rs",
+        ] {
+            assert!(
+                !seen.contains(&pruned.to_owned()),
+                "{pruned} was entered: {seen:?}"
+            );
+        }
+        for walked in [
+            "System/Volumes/Data/Users/ada/Documents/app/Library/nested.rs",
+            "System/Volumes/Data/Library/system.rs",
+            "System/Volumes/Library/other.rs",
+        ] {
+            assert!(
+                seen.contains(&walked.to_owned()),
+                "{walked} was pruned: {seen:?}"
+            );
+        }
+        // Naming the tree still enters it through the long spelling.
+        let (seen, _) = files_seen(
+            &root,
+            RootKind::FilesystemRoot,
+            &["System", "Volumes", "Data", "Users", "ada", "Library"],
+            &WalkPolicy::default(),
+        );
+        assert!(
+            seen.contains(&"System/Volumes/Data/Users/ada/Library/top.rs".to_owned()),
+            "{seen:?}"
+        );
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// The root itself unreadable: the walk hands over nothing, and the report
+    /// names the root as `./` — the one path with no identity to spell.
+    #[test]
+    fn an_unreadable_root_is_reported_as_here() {
+        use std::os::unix::fs::PermissionsExt;
+        if running_as_root() {
+            eprintln!("skipped: running as root, mode 000 does not refuse");
+            return;
+        }
+        let root = temp_root("unreadable-root");
+        plant(&root, "a.rs");
+        std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o000)).unwrap();
+        // Driven on the raw path: `read_dir` fails before any entry exists to
+        // resolve, so nothing here needs the canonical spelling.
+        let mut seen = 0usize;
+        let report = visit(
+            &root,
+            RootKind::Plain,
+            &[],
+            &WalkPolicy::default(),
+            &mut |_, _, _| {
+                seen += 1;
+                ControlFlow::Continue(())
+            },
+        );
+        std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o755)).unwrap();
+        assert_eq!(seen, 0);
+        assert_eq!(report.unreadable, vec!["./"]);
+        assert_eq!(report.unreadable_total, 1);
+        let lines = trailer_lines(&report);
+        assert!(
+            lines[0].starts_with(&format!(
+                "{HARNESS_LINE_PREFIX}1 folder could not be read (permission denied): ./"
+            )),
+            "{}",
+            lines[0]
+        );
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// The other unreadable arm (BR-13's "other `read_dir` errors keep
+    /// skip-and-continue but are counted"): a directory that vanishes between
+    /// being seen and being entered — removed by the callback itself, which is
+    /// the deterministic way to stage "removed mid-walk" — is counted, not
+    /// named, and the walk goes on.
+    #[test]
+    fn a_directory_that_vanishes_mid_walk_is_counted_but_not_named() {
+        let root = temp_root("vanish");
+        plant(&root, "gone/inside.rs");
+        plant(&root, "kept/inside.rs");
+        let canonical = root.canonicalize().unwrap();
+        let mut seen = Vec::new();
+        let report = visit(
+            &canonical,
+            RootKind::Plain,
+            &[],
+            &WalkPolicy::default(),
+            &mut |path, ft, id| {
+                if ft.is_dir() && id.as_str() == "gone" {
+                    std::fs::remove_dir_all(path).unwrap();
+                } else if !ft.is_dir() {
+                    seen.push(id.as_str().to_owned());
+                }
+                ControlFlow::Continue(())
+            },
+        );
+        assert_eq!(seen, vec!["kept/inside.rs"], "{seen:?}");
+        assert_eq!(report.unreadable_total, 1, "{report:?}");
+        assert!(
+            report.unreadable.is_empty(),
+            "a vanished folder is not a permission error"
+        );
+        assert_eq!(
+            trailer_lines(&report),
+            vec![format!("{HARNESS_LINE_PREFIX}1 folder could not be read)")]
+        );
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// The filesystem root under a one-entry budget: no panic, a stopped line,
+    /// nothing else. The smallest walk `/` can be asked for.
+    #[test]
+    fn the_filesystem_root_under_a_one_entry_budget_stops_without_panicking() {
+        let policy = WalkPolicy::default().with_budget(WalkBudget {
+            max_entries: 1,
+            max_wall: Duration::from_secs(60),
+        });
+        let mut seen = 0usize;
+        let report = visit(
+            Path::new("/"),
+            RootKind::FilesystemRoot,
+            &[],
+            &policy,
+            &mut |_, _, _| {
+                seen += 1;
+                ControlFlow::Continue(())
+            },
+        );
+        assert!(seen <= 1, "{seen}");
+        assert_eq!(report.truncated_by, Some(TruncatedBy::Entries(1)));
+        assert_eq!(
+            trailer_lines(&report),
+            vec![format!(
+                "{HARNESS_LINE_PREFIX}stopped after 1 entries; {STOPPED_ADVICE})"
+            )]
+        );
     }
 
     /// Symlinks are skipped before anything else (REQ-571 BR-5): a link to a

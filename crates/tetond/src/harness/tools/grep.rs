@@ -8,10 +8,12 @@
 //!
 //! The walk itself — what is skipped, what is pruned from a home-kind root, how
 //! far it may go, and what it says when it stops — is [`walk`]'s (REQ-583
-//! ADR-3); this tool decides only what to do with a file it is handed. Every
-//! line the harness appends after the matches (the walk's trailer, the cap
-//! notice) starts with `... (`, and [`split_harness_trailer`] peels them all
-//! before the triage duty sees a match list.
+//! ADR-3); this tool decides only what to do with a file it is handed: open it
+//! if it is a regular file of at most [`MAX_FILE_BYTES`], and end the walk once
+//! the match cap is full. Every line the harness appends after the matches (the
+//! walk's trailer, the cap notice) starts with [`HARNESS_LINE_PREFIX`], and
+//! [`split_harness_trailer`] peels exactly those shapes before the triage duty
+//! sees a match list.
 //!
 //! ## The `triage` duty attaches here (REQ-561 TASK-060)
 //!
@@ -35,15 +37,24 @@
 use async_trait::async_trait;
 use serde_json::{json, Value};
 use std::collections::BTreeSet;
+use std::io::Read;
+use std::ops::ControlFlow;
 
 use super::glob::glob_match;
-use super::walk;
+use super::walk::{self, HARNESS_LINE_PREFIX};
 use super::{opt_str_arg, str_arg, RefinedOutcome, Tool, ToolContext, ToolDuties, ToolOutcome};
 use crate::harness::digest::tool_result_provenance;
 use crate::harness::triage;
 
 /// Cap on returned matching lines.
 const MAX_MATCHES: usize = 200;
+
+/// The most bytes read from any one file. A file past this is skipped whole —
+/// no error, no partial scan: a search for a literal is not the tool for a
+/// multi-gigabyte log, and one such file must not be what a `grep` spends its
+/// wall clock and the daemon's memory on. Read through [`Read::take`] as well
+/// as checked up front, so a file that grows under the read is bounded too.
+pub(crate) const MAX_FILE_BYTES: u64 = 8 * 1024 * 1024;
 
 /// Searches files under the session root for a literal substring, jailed to
 /// that root.
@@ -89,7 +100,7 @@ impl Tool for GrepTool {
 
         let root = match ctx.repo_root().canonicalize() {
             Ok(r) => r,
-            Err(_) => return ToolOutcome::error("session root does not exist"),
+            Err(_) => return ctx.root_missing_error().into(),
         };
 
         let needle = if ignore_case {
@@ -116,22 +127,21 @@ impl Tool for GrepTool {
             &named,
             ctx.walk_policy(),
             &mut |path, file_type, id| {
-                // Past the cap the walk still runs to its end (so its trailer is
-                // honest about what was and was not seen), but no more files are
-                // opened: the result cannot grow, so the reads would buy nothing.
-                if file_type.is_dir() || hits.len() > MAX_MATCHES {
-                    return;
+                // Regular files only, decided on the entry's own type before
+                // anything is opened: a FIFO or a device would block the open
+                // (a FIFO's `open` waits for a writer that never comes), and a
+                // socket has nothing to search.
+                if !file_type.is_file() {
+                    return ControlFlow::Continue(());
                 }
                 let rel = id.as_str();
                 if let Some(g) = file_glob.as_deref() {
                     if !glob_match(g, rel) {
-                        return;
+                        return ControlFlow::Continue(());
                     }
                 }
-                // Skip binary-ish files: read_to_string fails on invalid UTF-8,
-                // which is the cheap heuristic we want.
-                let Ok(contents) = std::fs::read_to_string(path) else {
-                    return;
+                let Some(contents) = read_bounded(path) else {
+                    return ControlFlow::Continue(());
                 };
                 for (i, line) in contents.lines().enumerate() {
                     let haystack = if ignore_case {
@@ -142,11 +152,16 @@ impl Tool for GrepTool {
                     if haystack.contains(needle.as_str()) {
                         matched_files.insert(id.clone());
                         hits.push(format!("{rel}:{}: {}", i + 1, line.trim_end()));
+                        // The cap is full: the result cannot grow, so the walk
+                        // ends here — the tool's stop, reported by the cap
+                        // notice below and not by the walk's stopped line
+                        // (BR-10: the caps stay as they are).
                         if hits.len() > MAX_MATCHES {
-                            return;
+                            return ControlFlow::Break(());
                         }
                     }
                 }
+                ControlFlow::Continue(())
             },
         );
         let trailer = walk::trailer_lines(&report);
@@ -164,10 +179,7 @@ impl Tool for GrepTool {
             // BR-10: a budget hit is never a silent partial — the walk's trailer
             // rides under the empty answer exactly as it rides under a full one.
             let mut out = format!("no matches for `{pattern}`");
-            for line in &trailer {
-                out.push('\n');
-                out.push_str(line);
-            }
+            walk::append_trailer(&mut out, &trailer);
             return ToolOutcome::ok(out).measuring(0);
         }
         let found = hits.len();
@@ -176,13 +188,9 @@ impl Tool for GrepTool {
         let mut out = hits.join("\n");
         // Matches, then the walk's own lines, then the cap notice last — the
         // position it always had (ADR-3).
-        for line in &trailer {
-            out.push('\n');
-            out.push_str(line);
-        }
+        walk::append_trailer(&mut out, &trailer);
         if truncated {
-            out.push('\n');
-            out.push_str(&cap_notice());
+            walk::append_trailer(&mut out, [cap_notice()]);
         }
         ToolOutcome::ok(out)
             .with_paths(matched_files)
@@ -260,21 +268,43 @@ impl Tool for GrepTool {
     }
 }
 
+/// The contents of the regular file at `path`, or `None` when it is not worth
+/// searching: larger than [`MAX_FILE_BYTES`], unreadable, or not UTF-8 (the
+/// cheap binary heuristic this tool always had — `read_to_string` refuses
+/// invalid UTF-8).
+///
+/// Bounded twice: the size is checked off the open handle (one `fstat`, no
+/// second path lookup) and the read itself is `take`n, so a file that grows
+/// between the two cannot be read past the cap.
+fn read_bounded(path: &std::path::Path) -> Option<String> {
+    let file = std::fs::File::open(path).ok()?;
+    if file.metadata().ok()?.len() > MAX_FILE_BYTES {
+        return None;
+    }
+    let mut contents = String::new();
+    file.take(MAX_FILE_BYTES)
+        .read_to_string(&mut contents)
+        .ok()?;
+    Some(contents)
+}
+
 /// The line [`Tool::run`] appends when the search hit [`MAX_MATCHES`].
 ///
-/// It wears the `... (` prefix every harness line wears
-/// ([`walk::is_harness_line`]), which is what tells [`Tool::refine`] that a
-/// trailing line is the harness talking rather than a match — one recogniser
-/// for this notice and for every line the walk appends (ADR-3), so a new
-/// harness line is never ranked as a match by accident.
+/// It wears [`HARNESS_LINE_PREFIX`] like every harness line, and
+/// [`walk::is_harness_line`] knows its `capped at` shape — which is what tells
+/// [`Tool::refine`] that a trailing line is the harness talking rather than a
+/// match: one recogniser for this notice and for every line the walk appends
+/// (ADR-3), so a new harness line is never ranked as a match by accident.
 fn cap_notice() -> String {
-    format!("... (capped at {MAX_MATCHES} matches)")
+    format!("{HARNESS_LINE_PREFIX}capped at {MAX_MATCHES} matches)")
 }
 
 /// A `grep` result split into its match lines and the harness's own trailing
 /// lines — the walk's stopped/unreadable lines and the cap notice, in the order
 /// they were written — so [`render_ranked`] can put the same lines back
-/// verbatim under the ranked matches.
+/// verbatim under the ranked matches. Only [`walk::is_harness_line`]'s exact
+/// shapes are peeled: a match whose path happens to begin `... (` stays a
+/// match.
 fn split_harness_trailer(content: &str) -> (Vec<&str>, Vec<&str>) {
     let mut lines: Vec<&str> = content.lines().collect();
     let mut trailer = Vec::new();
@@ -369,10 +399,7 @@ fn render_ranked(matches: &[&str], order: &[usize], trailer: &[&str]) -> String 
             rest.join("\n")
         ));
     }
-    for line in trailer {
-        out.push('\n');
-        out.push_str(line);
-    }
+    walk::append_trailer(&mut out, trailer);
     out
 }
 
@@ -384,7 +411,10 @@ mod tests {
     use std::time::Duration;
     use teton_protocol::methods::RootKind;
 
-    use crate::harness::tools::walk::{WalkBudget, HOME_TOP_LEVEL_SKIPS, WALK_SKIP_DIRS};
+    use crate::harness::tools::walk::{
+        running_as_root, WalkBudget, HOME_TOP_LEVEL_SKIPS, MACOS_CONSENT_CLAUSE, STOPPED_ADVICE,
+        WALK_SKIP_DIRS,
+    };
 
     /// The counter, not the timestamp, guarantees uniqueness: `SystemTime::now()`
     /// can return the same value for two calls within one clock tick.
@@ -1006,18 +1036,20 @@ mod tests {
     /// harness talking from a match and put the same lines back.
     #[test]
     fn the_harness_trailer_is_split_off_rather_than_ranked() {
-        let stopped =
-            "... (stopped after 3 entries; narrow the pattern, or move the session root with /cd)";
-        let unreadable = "... (1 folder could not be read (permission denied): secrets/)";
+        let stopped = format!("{HARNESS_LINE_PREFIX}stopped after 3 entries; {STOPPED_ADVICE})");
+        let unreadable = format!(
+            "{HARNESS_LINE_PREFIX}1 folder could not be read (permission denied): secrets/)"
+        );
         let capped = format!(
             "a.rs:1: x\nb.rs:2: y\n{stopped}\n{unreadable}\n{}",
             cap_notice()
         );
+        let notice = cap_notice();
         assert_eq!(
             split_harness_trailer(&capped),
             (
                 vec!["a.rs:1: x", "b.rs:2: y"],
-                vec![stopped, unreadable, "... (capped at 200 matches)"]
+                vec![stopped.as_str(), unreadable.as_str(), notice.as_str()]
             )
         );
         assert_eq!(
@@ -1026,9 +1058,25 @@ mod tests {
         );
         // A harness-looking line *inside* the matches is a match: only the
         // trailing run is peeled.
+        let stopped_mid = format!("a.rs:1: x\n{stopped}\nb.rs:2: y");
         assert_eq!(
-            split_harness_trailer("a.rs:1: x\n... (mid)\nb.rs:2: y"),
-            (vec!["a.rs:1: x", "... (mid)", "b.rs:2: y"], vec![])
+            split_harness_trailer(&stopped_mid),
+            (vec!["a.rs:1: x", stopped.as_str(), "b.rs:2: y"], vec![])
+        );
+        // A trailing MATCH from a file whose path begins `... (` is a match:
+        // the recogniser knows the harness's shapes, not just its prefix, so
+        // the line is not peeled — and after ranking it stays in the ranked
+        // list rather than falling under the trailer.
+        let odd_path = "... (notes)/x.rs:1: let needle = 1;";
+        let with_odd_last = format!("a.rs:1: x\n{odd_path}");
+        assert_eq!(
+            split_harness_trailer(&with_odd_last),
+            (vec!["a.rs:1: x", odd_path], vec![])
+        );
+        let with_odd_then_cap = format!("a.rs:1: x\n{odd_path}\n{}", cap_notice());
+        assert_eq!(
+            split_harness_trailer(&with_odd_then_cap),
+            (vec!["a.rs:1: x", odd_path], vec![notice.as_str()])
         );
     }
 
@@ -1038,9 +1086,10 @@ mod tests {
     /// of them is offered to the duty as a match.
     #[tokio::test]
     async fn the_walk_trailer_survives_refine_verbatim_and_unranked() {
-        let stopped =
-            "... (stopped after 3 entries; narrow the pattern, or move the session root with /cd)";
-        let unreadable = "... (1 folder could not be read (permission denied): secrets/)";
+        let stopped = format!("{HARNESS_LINE_PREFIX}stopped after 3 entries; {STOPPED_ADVICE})");
+        let unreadable = format!(
+            "{HARNESS_LINE_PREFIX}1 folder could not be read (permission denied): secrets/)"
+        );
         let matches = ["a.rs:1: needle", "b.rs:2: needle", "c.rs:3: needle"];
         let content = format!(
             "{}\n{stopped}\n{unreadable}\n{}",
@@ -1103,7 +1152,7 @@ mod tests {
     /// found and with none — and a fixture under the budget produces no such
     /// line.
     #[test]
-    fn ac14_ac15_grep_reports_the_entry_budget_with_and_without_matches() {
+    fn grep_reports_the_entry_budget_with_and_without_matches() {
         let root = temp_root("ac14-entries");
         for n in 0..8 {
             plant(&root, &format!("f{n}.rs"));
@@ -1112,8 +1161,8 @@ mod tests {
             max_entries: 3,
             max_wall: Duration::from_secs(60),
         };
-        let stopped =
-            "... (stopped after 3 entries; narrow the pattern, or move the session root with /cd)";
+        let stopped = format!("{HARNESS_LINE_PREFIX}stopped after 3 entries; {STOPPED_ADVICE})");
+        let stopped = stopped.as_str();
 
         let ctx = ToolContext::new(&root).with_walk_budget(small);
         let out = GrepTool.run(&ctx, &json!({ "pattern": "needle" }));
@@ -1138,7 +1187,7 @@ mod tests {
     /// **AC-14 (BR-10), wall clock.** A zero wall budget lets the root's own
     /// listing through and stops at the first descent.
     #[test]
-    fn ac14_grep_reports_the_wall_clock_budget() {
+    fn grep_reports_the_wall_clock_budget() {
         let root = temp_root("ac14-wall");
         plant(&root, "top.rs");
         plant(&root, "sub/deep.rs");
@@ -1146,8 +1195,8 @@ mod tests {
             max_entries: 1_000,
             max_wall: Duration::ZERO,
         });
-        let stopped =
-            "... (stopped after 0 s; narrow the pattern, or move the session root with /cd)";
+        let stopped = format!("{HARNESS_LINE_PREFIX}stopped after 0 s; {STOPPED_ADVICE})");
+        let stopped = stopped.as_str();
 
         let out = GrepTool.run(&ctx, &json!({ "pattern": "needle" }));
         assert_eq!(matched_in(&out), vec!["top.rs"], "{}", out.content);
@@ -1167,7 +1216,7 @@ mod tests {
     /// naming the tree through the glob enters it; from a `project` root
     /// everything is searched.
     #[test]
-    fn ac16_grep_prunes_home_media_trees_unless_named() {
+    fn grep_prunes_home_media_trees_unless_named() {
         let root = temp_root("ac16");
         plant(&root, "Library/Preferences/lib.rs");
         plant(&root, "Music/tune.rs");
@@ -1222,10 +1271,9 @@ mod tests {
     /// consent sentence is present on macOS and absent elsewhere. Skipped as
     /// root, who can read anything.
     #[test]
-    fn ac17_grep_reports_an_unreadable_folder_and_still_returns_the_rest() {
+    fn grep_reports_an_unreadable_folder_and_still_returns_the_rest() {
         use std::os::unix::fs::PermissionsExt;
-        // SAFETY: `geteuid` reads the process's effective uid; no arguments.
-        if unsafe { libc::geteuid() } == 0 {
+        if running_as_root() {
             eprintln!("skipped: running as root, mode 000 does not refuse");
             return;
         }
@@ -1242,16 +1290,209 @@ mod tests {
         assert_eq!(matched_in(&out), vec!["src/main.rs"], "{}", out.content);
         let last = out.content.lines().last().unwrap();
         assert!(
-            last.starts_with("... (1 folder could not be read (permission denied): secrets/"),
+            last.starts_with(&format!(
+                "{HARNESS_LINE_PREFIX}1 folder could not be read (permission denied): secrets/"
+            )),
             "{last}"
         );
-        let sentence = "macOS may have blocked access to that folder, or be waiting on a consent dialog for it";
         assert_eq!(
-            last.contains(sentence),
+            last.contains(MACOS_CONSENT_CLAUSE),
             cfg!(target_os = "macos"),
             "the consent sentence is macOS-only: {last}"
         );
         assert_eq!(out.measured, Some(1), "the trailer is not a match");
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// The root missing: the one sentence every tool prints for it, naming the
+    /// display (BR-2's term, BR-3's one term).
+    #[test]
+    fn a_missing_root_is_the_shared_sentence() {
+        let root = temp_root("missing");
+        let ctx = ToolContext::new(&root);
+        std::fs::remove_dir_all(&root).ok();
+        let out = GrepTool.run(&ctx, &json!({ "pattern": "needle" }));
+        assert!(out.is_error);
+        assert_eq!(out.content, ctx.root_missing_error().to_string());
+    }
+
+    /// **The trailer rides between the matches and the cap notice** — the twin
+    /// of glob's ordering test. Grep stops its walk at the cap, so the only
+    /// trailer line that can precede a cap notice is one recorded *before* the
+    /// cap filled: an unreadable folder the walk met first. Children are
+    /// entered in name order, so `a-locked/` is met before `b-src/a.rs` fills
+    /// the cap. Skipped as root, who can read anything.
+    #[test]
+    fn the_cap_notice_stays_last_under_a_trailer() {
+        use std::os::unix::fs::PermissionsExt;
+        if running_as_root() {
+            eprintln!("skipped: running as root, mode 000 does not refuse");
+            return;
+        }
+        let root = temp_root("cap-order");
+        plant(&root, "a-locked/hidden.rs");
+        let body: String = (0..(MAX_MATCHES + 5))
+            .map(|n| format!("let needle_{n} = 1;\n"))
+            .collect();
+        std::fs::create_dir_all(root.join("b-src")).unwrap();
+        std::fs::write(root.join("b-src/a.rs"), body).unwrap();
+        let locked = root.join("a-locked");
+        std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o000)).unwrap();
+
+        let out = GrepTool.run(&ToolContext::new(&root), &json!({ "pattern": "needle" }));
+        std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        let lines: Vec<&str> = out.content.lines().collect();
+        assert_eq!(lines.len(), MAX_MATCHES + 2, "{}", out.content);
+        assert!(
+            lines[MAX_MATCHES].starts_with(&format!(
+                "{HARNESS_LINE_PREFIX}1 folder could not be read (permission denied): a-locked/"
+            )),
+            "{}",
+            lines[MAX_MATCHES]
+        );
+        assert_eq!(lines[MAX_MATCHES + 1], cap_notice());
+        assert!(
+            !out.content.contains("stopped after"),
+            "a cap stop is not a budget stop: {}",
+            out.content
+        );
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// **The cap ends the walk** (BR-10: the 200-match cap stays as it was —
+    /// grep stops walking at it). Root holds one file with more than
+    /// [`MAX_MATCHES`] hits and a directory `zz/` of several files under an
+    /// entry budget that `zz/` alone would exhaust: the file fills the cap in
+    /// the root's own loop, the walk ends before any descent, and the result
+    /// carries the cap notice and **no** stopped line. The control — a file
+    /// under the cap — walks on into `zz/` and does hit the budget.
+    #[test]
+    fn grep_stops_walking_at_the_match_cap_and_reports_it_as_the_cap_not_the_budget() {
+        let root = temp_root("cap-stop");
+        for n in 0..5 {
+            plant(&root, &format!("zz/f{n}.rs"));
+        }
+        let budget = WalkBudget {
+            // The root's two entries plus two more: `zz/`'s five would exceed it.
+            max_entries: 4,
+            max_wall: Duration::from_secs(60),
+        };
+        let over: String = (0..(MAX_MATCHES + 1))
+            .map(|n| format!("let needle_{n} = 1;\n"))
+            .collect();
+        std::fs::write(root.join("a.rs"), over).unwrap();
+        let ctx = ToolContext::new(&root).with_walk_budget(budget);
+        let out = GrepTool.run(&ctx, &json!({ "pattern": "needle" }));
+        assert!(!out.is_error, "{}", out.content);
+        assert_eq!(
+            out.content.lines().last(),
+            Some(cap_notice().as_str()),
+            "{}",
+            out.content
+        );
+        assert!(
+            !out.content.contains("stopped after"),
+            "the cap ended the walk; the budget was never reached: {}",
+            out.content
+        );
+        assert_eq!(out.measured, Some(MAX_MATCHES + 1));
+        assert!(
+            !out.content.contains("zz/"),
+            "nothing under `zz/` was visited after the cap: {}",
+            out.content
+        );
+
+        // The control: well under the cap (even with `zz/`'s hits added), the
+        // walk goes on into `zz/` and the budget stops it there.
+        let under: String = (0..10).map(|n| format!("let needle_{n} = 1;\n")).collect();
+        std::fs::write(root.join("a.rs"), under).unwrap();
+        let out = GrepTool.run(&ctx, &json!({ "pattern": "needle" }));
+        assert!(
+            out.content.contains("stopped after 4 entries"),
+            "the control must reach the budget: {}",
+            out.content
+        );
+        assert!(!out.content.contains("capped at"), "{}", out.content);
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// **A FIFO in the tree does not hang the search.** Opening a FIFO for
+    /// reading blocks until a writer appears; a walker that opened every entry
+    /// would sit there forever. The entry's own type is consulted first, so the
+    /// FIFO is never opened — asserted on a worker thread with a deadline, so a
+    /// regression is a failed test and not a hung suite.
+    #[test]
+    fn a_fifo_in_the_tree_is_skipped_and_the_search_returns() {
+        use std::os::unix::ffi::OsStrExt;
+        use std::os::unix::fs::FileTypeExt;
+        let root = temp_root("fifo");
+        plant(&root, "a.rs");
+        let fifo = root.join("pipe");
+        let c_path = std::ffi::CString::new(fifo.as_os_str().as_bytes()).unwrap();
+        // SAFETY: `mkfifo` reads a NUL-terminated path and a mode; nothing else.
+        let made = unsafe { libc::mkfifo(c_path.as_ptr(), 0o644) };
+        assert_eq!(
+            made,
+            0,
+            "mkfifo failed: {}",
+            std::io::Error::last_os_error()
+        );
+        assert!(
+            std::fs::symlink_metadata(&fifo)
+                .unwrap()
+                .file_type()
+                .is_fifo(),
+            "the fixture must be a FIFO"
+        );
+
+        let (tx, rx) = std::sync::mpsc::channel();
+        let worker_root = root.clone();
+        std::thread::spawn(move || {
+            let out = GrepTool.run(
+                &ToolContext::new(&worker_root),
+                &json!({ "pattern": "needle" }),
+            );
+            let _ = tx.send(out);
+        });
+        let out = rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("the search must return: a FIFO in the tree hung it");
+        assert!(!out.is_error, "{}", out.content);
+        assert_eq!(matched_in(&out), vec!["a.rs"], "{}", out.content);
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// **A file past [`MAX_FILE_BYTES`] is skipped whole** — no error, no
+    /// partial scan — while its neighbours are searched. The needle sits at the
+    /// very end of the oversize file, so a partial read of the first cap's
+    /// worth would also miss it: what is asserted is that the file is not
+    /// what a search costs its wall clock on.
+    #[test]
+    fn an_oversize_file_is_skipped_without_an_error() {
+        let root = temp_root("oversize");
+        plant(&root, "small.rs");
+        let big = root.join("big.log");
+        {
+            use std::io::Write;
+            let mut file = std::io::BufWriter::new(std::fs::File::create(&big).unwrap());
+            let line = "x".repeat(1023) + "\n";
+            let mut written = 0u64;
+            while written <= MAX_FILE_BYTES {
+                file.write_all(line.as_bytes()).unwrap();
+                written += line.len() as u64;
+            }
+            file.write_all(b"let needle = 1;\n").unwrap();
+            file.flush().unwrap();
+        }
+        assert!(
+            std::fs::metadata(&big).unwrap().len() > MAX_FILE_BYTES,
+            "the fixture must exceed the cap"
+        );
+        let out = GrepTool.run(&ToolContext::new(&root), &json!({ "pattern": "needle" }));
+        assert!(!out.is_error, "{}", out.content);
+        assert_eq!(matched_in(&out), vec!["small.rs"], "{}", out.content);
+        assert!(!out.content.contains("big.log"), "{}", out.content);
         std::fs::remove_dir_all(&root).ok();
     }
 
@@ -1262,7 +1503,7 @@ mod tests {
     /// the source scan in `tests/boundary_coverage.rs` proves neither tool
     /// declares a list of its own.)
     #[test]
-    fn ac18_grep_is_built_from_the_shared_walk_definition() {
+    fn grep_is_built_from_the_shared_walk_definition() {
         let root = temp_root("ac18");
         for name in WALK_SKIP_DIRS.iter().chain(HOME_TOP_LEVEL_SKIPS) {
             plant(&root, &format!("{name}/inside.rs"));

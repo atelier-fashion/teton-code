@@ -303,6 +303,33 @@ pub fn within_minted_length(session_id: &SessionId) -> bool {
     session_id.0.len() <= SESSION_ID_PREFIX.len() + SESSION_ID_BODY_LEN
 }
 
+/// Why a path may not be a session's root — the refusal behind
+/// [`validate_session_cwd`], typed so the two RPC edges and the CLI print one
+/// sentence each without retyping it.
+///
+/// The wording is root-neutral on purpose: it says *path*, never "cwd" (wire
+/// jargon a user of `--cwd` or `/cd` never typed) and never "session root"
+/// (the thing this path failed to become).
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum CwdRefusal {
+    /// Not absolute after the client's own resolution.
+    #[error("path `{0}` must be an absolute path")]
+    NotAbsolute(PathBuf),
+    /// Missing, or present but not a directory.
+    #[error("path `{0}` does not exist or is not a directory")]
+    NotADirectory(PathBuf),
+}
+
+impl CwdRefusal {
+    /// The path the refusal names.
+    #[must_use]
+    pub fn path(&self) -> &Path {
+        match self {
+            Self::NotAbsolute(path) | Self::NotADirectory(path) => path,
+        }
+    }
+}
+
 /// Whether `cwd` may be a session's root — the **one** validator behind
 /// `session/create`'s `cwd` and `session/set_cwd` (REQ-583 BR-6/BR-7, ADR-4).
 ///
@@ -314,10 +341,10 @@ pub fn within_minted_length(session_id: &SessionId) -> bool {
 /// per call).
 ///
 /// A refusal **names the path** (BR-6): the sentence is what the CLI prints
-/// before any session output, and "cwd must be an absolute path" without the
-/// path sends the user back to guess which of their spellings the daemon saw.
-/// The path is the caller's own argument echoed back to that caller alone,
-/// never published.
+/// before any session output, and "must be an absolute path" without the path
+/// sends the user back to guess which of their spellings the daemon saw. The
+/// path is the caller's own argument echoed back to that caller alone, never
+/// published.
 ///
 /// It lives here — with the registry that stores the path — rather than in the
 /// server or the runtime because both of them call it: the server validates a
@@ -327,16 +354,13 @@ pub fn within_minted_length(session_id: &SessionId) -> bool {
 ///
 /// # Errors
 ///
-/// The reason, as the wire message.
-pub fn validate_session_cwd(cwd: &Path) -> Result<(), String> {
+/// The typed reason ([`CwdRefusal`]); its `Display` is the wire message.
+pub fn validate_session_cwd(cwd: &Path) -> Result<(), CwdRefusal> {
     if !cwd.is_absolute() {
-        return Err(format!("cwd `{}` must be an absolute path", cwd.display()));
+        return Err(CwdRefusal::NotAbsolute(cwd.to_path_buf()));
     }
     if !cwd.is_dir() {
-        return Err(format!(
-            "cwd `{}` does not exist or is not a directory",
-            cwd.display()
-        ));
+        return Err(CwdRefusal::NotADirectory(cwd.to_path_buf()));
     }
     Ok(())
 }
@@ -955,28 +979,39 @@ mod tests {
     }
 
     /// REQ-583 BR-6: the one cwd validator refuses a relative path and a
-    /// missing or non-directory path, **naming the path** in each refusal, and
-    /// accepts a real directory.
+    /// missing or non-directory path — typed, and **naming the path** in each
+    /// refusal's one root-neutral sentence — and accepts a real directory.
     #[test]
     fn the_cwd_validator_names_the_path_in_every_refusal() {
         let relative = validate_session_cwd(std::path::Path::new("relative/dir"))
             .expect_err("a relative cwd is refused");
-        assert!(
-            relative.contains("`relative/dir`") && relative.contains("must be an absolute path"),
-            "the refusal names the path and the reason: {relative}"
+        assert_eq!(
+            relative,
+            CwdRefusal::NotAbsolute(PathBuf::from("relative/dir"))
+        );
+        assert_eq!(
+            relative.to_string(),
+            "path `relative/dir` must be an absolute path"
         );
 
         let missing = validate_session_cwd(std::path::Path::new("/nope-teton-sessions-test"))
             .expect_err("a nonexistent cwd is refused");
-        assert!(
-            missing.contains("`/nope-teton-sessions-test`")
-                && missing.contains("does not exist or is not a directory"),
-            "the refusal names the path and the reason: {missing}"
+        assert_eq!(
+            missing,
+            CwdRefusal::NotADirectory(PathBuf::from("/nope-teton-sessions-test"))
+        );
+        assert_eq!(
+            missing.to_string(),
+            "path `/nope-teton-sessions-test` does not exist or is not a directory"
+        );
+        assert_eq!(
+            missing.path(),
+            std::path::Path::new("/nope-teton-sessions-test")
         );
 
         // A file, not a directory: same refusal, same shape.
         let dir = std::env::temp_dir().join(format!(
-            "teton-sessions-cwd-{}-{}",
+            "teton-sessions-root-{}-{}",
             std::process::id(),
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
@@ -987,11 +1022,21 @@ mod tests {
         let file = dir.join("a-file");
         std::fs::write(&file, b"x").unwrap();
         let not_dir = validate_session_cwd(&file).expect_err("a file is not a directory");
-        assert!(
-            not_dir.contains(&format!("`{}`", file.display()))
-                && not_dir.contains("does not exist or is not a directory"),
-            "{not_dir}"
+        assert_eq!(
+            not_dir.to_string(),
+            format!(
+                "path `{}` does not exist or is not a directory",
+                file.display()
+            )
         );
+        for refusal in [&relative, &missing, &not_dir] {
+            let text = refusal.to_string();
+            assert!(
+                !text.contains("cwd"),
+                "wire jargon in a user-facing refusal: {text}"
+            );
+            assert!(!text.contains("session root"), "{text}");
+        }
 
         assert_eq!(validate_session_cwd(&dir), Ok(()));
         let _ = std::fs::remove_dir_all(&dir);

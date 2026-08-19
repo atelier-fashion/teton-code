@@ -14,7 +14,7 @@
 //!
 //! ## Module map
 //! - [`tools`] — the built-in read/edit/glob/grep/shell tools, each jailed to the
-//!   repo root; `edit` is exact-match and refuses ambiguous replacements.
+//!   session root; `edit` is exact-match and refuses ambiguous replacements.
 //! - [`permissions`] — per-tool allow/ask/deny policy, the `permission_request`
 //!   client round-trip over TASK-004's bus, and session-scoped grants.
 //! - [`context`] — small-model context management: truncation, tool-result

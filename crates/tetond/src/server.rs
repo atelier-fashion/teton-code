@@ -1922,7 +1922,11 @@ fn spawn_prompt_turn(
     // The turn carries the registry, not just the summary read out of it: the
     // `title` duty (REQ-561 TASK-062) has to *write back* the name it derives
     // and take the once-per-session claim that keeps it from re-deriving one.
-    // The summary above is a snapshot, so it cannot serve either purpose.
+    // The summary above is a snapshot, so it cannot serve either purpose — and
+    // its `cwd` is a pre-claim snapshot too: the runtime re-reads the root off
+    // the registry once it holds the turn claim (REQ-583 verify), so a
+    // `session/set_cwd` landing between this read and that claim moves the
+    // turn rather than being run over.
     let daemon = Arc::clone(daemon);
     let out = out_tx.clone();
 
@@ -3217,8 +3221,8 @@ fn handle_session_create(daemon: &Daemon, conn: &ConnState, id: Id, params: Valu
     // validator is the one `session/set_cwd` uses too (REQ-583 BR-6/BR-7: one
     // grammar, two spellings), and its refusal names the path.
     if let Some(cwd) = &params.cwd {
-        if let Err(reason) = validate_session_cwd(cwd) {
-            return error_string(id, error_code::INVALID_PARAMS, &reason);
+        if let Err(refusal) = validate_session_cwd(cwd) {
+            return error_string(id, error_code::INVALID_PARAMS, &refusal.to_string());
         }
     }
 
@@ -3258,7 +3262,7 @@ fn handle_session_create(daemon: &Daemon, conn: &ConnState, id: Id, params: Valu
             // same path — or the same fallback — every turn will jail to, so
             // what the CLI's banner and launch notice render is what the tools
             // will enforce (ADR-1: one derivation, on the side that enforces).
-            let root = daemon.runtime.session_root_for(summary.cwd.as_deref());
+            let root = daemon.runtime.session_root_for(summary.cwd.as_deref()).view;
             ok_string(
                 id,
                 &SessionCreateResult {
@@ -7256,12 +7260,7 @@ mod tests {
             Some("plain"),
             "the answer carries the probe's kind for the new path: {moved}"
         );
-        let expected = crate::session_root::probe(
-            &target,
-            std::env::var_os("HOME")
-                .map(std::path::PathBuf::from)
-                .as_deref(),
-        );
+        let expected = crate::session_root::probe(&target, crate::session_root::home().as_deref());
         assert_eq!(
             parsed["result"]["root"]["display"].as_str(),
             Some(expected.display.as_str()),
@@ -7286,12 +7285,8 @@ mod tests {
         match second.event {
             Event::SessionRootChanged(changed) => {
                 assert_eq!(changed.root, expected);
-                let was = crate::session_root::probe(
-                    &start,
-                    std::env::var_os("HOME")
-                        .map(std::path::PathBuf::from)
-                        .as_deref(),
-                );
+                let was =
+                    crate::session_root::probe(&start, crate::session_root::home().as_deref());
                 assert_eq!(
                     changed.previous_display, was.display,
                     "`previous_display` is the old root's spelling — what \
@@ -7361,9 +7356,8 @@ mod tests {
         .unwrap();
         assert!(
             bad.contains(&error_code::INVALID_PARAMS.to_string())
-                && bad.contains("/nope/teton-cd")
-                && bad.contains("does not exist or is not a directory"),
-            "the refusal names the path and the reason: {bad}"
+                && bad.contains("path `/nope/teton-cd` does not exist or is not a directory"),
+            "the refusal is the validator's one sentence, naming the path: {bad}"
         );
         assert_eq!(
             daemon.sessions.get(&session).unwrap().cwd.as_deref(),
@@ -7385,7 +7379,7 @@ mod tests {
     fn session_create_returns_the_probed_root_for_a_cwd_and_for_the_fallback() {
         let daemon = Daemon::new();
         let conn = unattached(&daemon);
-        let home = std::env::var_os("HOME").map(std::path::PathBuf::from);
+        let home = crate::session_root::home();
 
         let project = scratch_root("create-root", true);
         let created = handle_session_create(
@@ -7458,9 +7452,9 @@ mod tests {
         );
         assert!(
             missing.contains(&error_code::INVALID_PARAMS.to_string())
-                && missing.contains("/nope/teton-create")
-                && missing.contains("does not exist or is not a directory"),
-            "the refusal names the path and the reason: {missing}"
+                && missing
+                    .contains("path `/nope/teton-create` does not exist or is not a directory"),
+            "the refusal is the validator's one sentence, naming the path: {missing}"
         );
 
         let relative = handle_session_create(
@@ -7471,9 +7465,8 @@ mod tests {
         );
         assert!(
             relative.contains(&error_code::INVALID_PARAMS.to_string())
-                && relative.contains("relative/dir")
-                && relative.contains("must be an absolute path"),
-            "the refusal names the path and the reason: {relative}"
+                && relative.contains("path `relative/dir` must be an absolute path"),
+            "the refusal is the validator's one sentence, naming the path: {relative}"
         );
 
         assert_eq!(

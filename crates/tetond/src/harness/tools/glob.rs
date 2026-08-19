@@ -10,10 +10,12 @@
 //! far it may go, and what it says when it stops — is [`walk`]'s (REQ-583
 //! ADR-3); this tool decides only what an entry it is handed *means*.
 
+use std::ops::ControlFlow;
+
 use serde_json::{json, Value};
 use teton_core::ProvenanceId;
 
-use super::walk;
+use super::walk::{self, HARNESS_LINE_PREFIX};
 use super::{str_arg, Tool, ToolContext, ToolOutcome};
 
 /// Cap on returned paths.
@@ -51,7 +53,7 @@ impl Tool for GlobTool {
         };
         let root = match ctx.repo_root().canonicalize() {
             Ok(r) => r,
-            Err(_) => return ToolOutcome::error("session root does not exist"),
+            Err(_) => return ctx.root_missing_error().into(),
         };
 
         // BR-9 / ADR-3: a directory is a match when the pattern's *final*
@@ -67,14 +69,15 @@ impl Tool for GlobTool {
             ctx.root_kind(),
             &named,
             ctx.walk_policy(),
+            // Every entry is looked at: a glob lists what matches and its cap
+            // is applied to the sorted result below, so it never asks the walk
+            // to stop early (the walk's own budget is what bounds it).
             &mut |_, file_type, id| {
                 let is_dir = file_type.is_dir();
-                if is_dir && files_only {
-                    return;
-                }
-                if glob_match(&pattern, id.as_str()) {
+                if !(is_dir && files_only) && glob_match(&pattern, id.as_str()) {
                     matches.push((id.clone(), is_dir));
                 }
+                ControlFlow::Continue(())
             },
         );
         matches.sort();
@@ -84,10 +87,7 @@ impl Tool for GlobTool {
             // BR-10: a budget hit is never a silent partial — the stopped line
             // rides under the empty answer exactly as it rides under a full one.
             let mut out = format!("no matches for `{pattern}`");
-            for line in &trailer {
-                out.push('\n');
-                out.push_str(line);
-            }
+            walk::append_trailer(&mut out, &trailer);
             return ToolOutcome::ok(out);
         }
         let truncated = matches.len() > MAX_RESULTS;
@@ -107,12 +107,9 @@ impl Tool for GlobTool {
             })
             .collect::<Vec<_>>()
             .join("\n");
-        for line in &trailer {
-            out.push('\n');
-            out.push_str(line);
-        }
+        walk::append_trailer(&mut out, &trailer);
         if truncated {
-            out.push_str(&format!("\n... (capped at {MAX_RESULTS} results)"));
+            walk::append_trailer(&mut out, [cap_notice()]);
         }
         // REQ-544 C-1: the enumerated entries ARE the result's content, so tag
         // the outcome with them — a glob that surfaces a `local-only` file blocks
@@ -123,6 +120,13 @@ impl Tool for GlobTool {
         // `secrets/`, not the name `secrets`.
         ToolOutcome::ok(out).with_paths(matches.into_iter().map(|(id, _)| id))
     }
+}
+
+/// The line [`Tool::run`] appends when more than [`MAX_RESULTS`] entries
+/// matched. It wears [`HARNESS_LINE_PREFIX`] like every harness line, and
+/// [`walk::is_harness_line`] knows its `capped at` shape.
+fn cap_notice() -> String {
+    format!("{HARNESS_LINE_PREFIX}capped at {MAX_RESULTS} results)")
 }
 
 /// Whether the pattern's final segment is `**` — the shape that means "every
@@ -169,7 +173,10 @@ mod tests {
     use super::*;
     use crate::fixture_id;
     use crate::harness::context::ToolProvenance;
-    use crate::harness::tools::walk::{WalkBudget, HOME_TOP_LEVEL_SKIPS, WALK_SKIP_DIRS};
+    use crate::harness::tools::walk::{
+        running_as_root, WalkBudget, HOME_TOP_LEVEL_SKIPS, MACOS_CONSENT_CLAUSE, STOPPED_ADVICE,
+        WALK_SKIP_DIRS,
+    };
     use std::path::{Path, PathBuf};
     use std::time::Duration;
     use teton_protocol::methods::RootKind;
@@ -282,7 +289,7 @@ mod tests {
     /// with a trailing `/` — and tagged under the same identity; a pattern
     /// ending in a file wildcard still returns files only.
     #[test]
-    fn ac13_glob_lists_a_matching_directory_marked_and_tagged() {
+    fn glob_lists_a_matching_directory_marked_and_tagged() {
         let root = temp_root("ac13");
         plant(&root, "a/teton-code/x.rs");
         plant(&root, "a/teton-code/src/lib.rs");
@@ -328,7 +335,7 @@ mod tests {
     /// found and with none — and a fixture under the budget produces no such
     /// line.
     #[test]
-    fn ac14_ac15_glob_reports_the_entry_budget_with_and_without_matches() {
+    fn glob_reports_the_entry_budget_with_and_without_matches() {
         let root = temp_root("ac14-entries");
         for n in 0..8 {
             plant(&root, &format!("f{n}.rs"));
@@ -337,8 +344,8 @@ mod tests {
             max_entries: 3,
             max_wall: Duration::from_secs(60),
         };
-        let stopped =
-            "... (stopped after 3 entries; narrow the pattern, or move the session root with /cd)";
+        let stopped = format!("{HARNESS_LINE_PREFIX}stopped after 3 entries; {STOPPED_ADVICE})");
+        let stopped = stopped.as_str();
 
         // With matches: three entries were seen, all `.rs`, then the walk stopped.
         let ctx = ToolContext::new(&root).with_walk_budget(small);
@@ -367,7 +374,7 @@ mod tests {
     /// listing through and stops at the first descent, so the result ends with
     /// the stopped-by-time line — with matches, and with none.
     #[test]
-    fn ac14_glob_reports_the_wall_clock_budget() {
+    fn glob_reports_the_wall_clock_budget() {
         let root = temp_root("ac14-wall");
         plant(&root, "top.rs");
         plant(&root, "sub/deep.rs");
@@ -375,8 +382,8 @@ mod tests {
             max_entries: 1_000,
             max_wall: Duration::ZERO,
         });
-        let stopped =
-            "... (stopped after 0 s; narrow the pattern, or move the session root with /cd)";
+        let stopped = format!("{HARNESS_LINE_PREFIX}stopped after 0 s; {STOPPED_ADVICE})");
+        let stopped = stopped.as_str();
 
         let out = GlobTool.run(&ctx, &json!({ "pattern": "**/*.rs" }));
         assert_eq!(listed(&out), vec!["top.rs"], "{}", out.content);
@@ -411,14 +418,12 @@ mod tests {
         let lines: Vec<&str> = out.content.lines().collect();
         assert_eq!(lines.len(), MAX_RESULTS + 2, "{}", out.content);
         assert!(
-            lines[MAX_RESULTS].starts_with("... (stopped after"),
+            lines[MAX_RESULTS].starts_with(&format!("{HARNESS_LINE_PREFIX}stopped after")),
             "{}",
             lines[MAX_RESULTS]
         );
-        assert_eq!(
-            lines[MAX_RESULTS + 1],
-            format!("... (capped at {MAX_RESULTS} results)")
-        );
+        assert_eq!(lines[MAX_RESULTS + 1], cap_notice());
+        assert!(walk::is_harness_line(&cap_notice()));
         std::fs::remove_dir_all(&root).ok();
     }
 
@@ -440,7 +445,7 @@ mod tests {
     /// a bundle at any depth are not entered; a project's own `Library/` is;
     /// naming the tree enters it; from a `project` root everything is found.
     #[test]
-    fn ac16_glob_prunes_home_media_trees_unless_named() {
+    fn glob_prunes_home_media_trees_unless_named() {
         let root = home_fixture("ac16");
         let home = ToolContext::new(&root).with_root_kind(RootKind::Home);
 
@@ -486,10 +491,9 @@ mod tests {
     /// consent sentence is present on macOS and absent elsewhere. Skipped as
     /// root, who can read anything.
     #[test]
-    fn ac17_glob_reports_an_unreadable_folder_and_still_lists_the_rest() {
+    fn glob_reports_an_unreadable_folder_and_still_lists_the_rest() {
         use std::os::unix::fs::PermissionsExt;
-        // SAFETY: `geteuid` reads the process's effective uid; no arguments.
-        if unsafe { libc::geteuid() } == 0 {
+        if running_as_root() {
             eprintln!("skipped: running as root, mode 000 does not refuse");
             return;
         }
@@ -506,16 +510,37 @@ mod tests {
         assert_eq!(listed(&out), vec!["src/main.rs"], "{}", out.content);
         let last = out.content.lines().last().unwrap();
         assert!(
-            last.starts_with("... (1 folder could not be read (permission denied): secrets/"),
+            last.starts_with(&format!(
+                "{HARNESS_LINE_PREFIX}1 folder could not be read (permission denied): secrets/"
+            )),
             "{last}"
         );
-        let sentence = "macOS may have blocked access to that folder, or be waiting on a consent dialog for it";
         assert_eq!(
-            last.contains(sentence),
+            last.contains(MACOS_CONSENT_CLAUSE),
             cfg!(target_os = "macos"),
             "the consent sentence is macOS-only: {last}"
         );
         std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// The root missing: the one sentence every tool prints for it, naming the
+    /// display (BR-2's term, BR-3's one term).
+    #[test]
+    fn a_missing_root_is_the_shared_sentence() {
+        let root = temp_root("missing");
+        let ctx = ToolContext::new(&root);
+        std::fs::remove_dir_all(&root).ok();
+        let out = GlobTool.run(&ctx, &json!({ "pattern": "*" }));
+        assert!(out.is_error);
+        assert_eq!(out.content, ctx.root_missing_error().to_string());
+        assert!(
+            out.content.contains(&format!(
+                "the session root {} does not exist",
+                ctx.root_display()
+            )),
+            "{}",
+            out.content
+        );
     }
 
     /// **AC-18 (BR-11), the behavioural half.** The walker is built from the
@@ -525,7 +550,7 @@ mod tests {
     /// the source scan in `tests/boundary_coverage.rs` proves neither tool
     /// declares a list of its own.)
     #[test]
-    fn ac18_glob_is_built_from_the_shared_walk_definition() {
+    fn glob_is_built_from_the_shared_walk_definition() {
         let root = temp_root("ac18");
         for name in WALK_SKIP_DIRS.iter().chain(HOME_TOP_LEVEL_SKIPS) {
             plant(&root, &format!("{name}/inside.rs"));

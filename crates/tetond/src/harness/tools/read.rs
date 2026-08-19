@@ -1,6 +1,6 @@
 //! The `read` tool: return a file's contents (optionally a line window).
 //!
-//! Reads are jailed to the repo root ([`ToolContext`]). Output is line-numbered
+//! Reads are jailed to the session root ([`ToolContext`]). Output is line-numbered
 //! so the model can cite lines back to the `edit` tool, and an optional
 //! `offset`/`limit` window keeps a large file from blowing the small-model
 //! context budget in one call.
@@ -55,7 +55,7 @@ fn divergence_note(raw: &str, resolved: &ProvenanceId) -> Option<String> {
     (requested != resolved.as_str()).then(|| format!("`{raw}` -> `{}`", resolved.as_str()))
 }
 
-/// Reads a file within the repo-root jail.
+/// Reads a file within the session-root jail.
 #[derive(Debug, Default, Clone, Copy)]
 pub struct ReadTool;
 

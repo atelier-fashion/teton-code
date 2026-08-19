@@ -763,8 +763,8 @@ fn each_out_of_repo_matcher_assertion_is_paired_with_a_tool_layer_test() {
 ///
 /// The behavioural half — that the walkers honour every name in the shared
 /// definition — lives beside each tool
-/// (`glob::tests::ac18_glob_is_built_from_the_shared_walk_definition`,
-/// `grep::tests::ac18_grep_is_built_from_the_shared_walk_definition`). This
+/// (`glob::tests::glob_is_built_from_the_shared_walk_definition`,
+/// `grep::tests::grep_is_built_from_the_shared_walk_definition`). This
 /// half is what stops the next walker from quietly bringing its own list back:
 /// BR-11 says one skip set, one media set, one budget, and a second copy is a
 /// build failure rather than a review comment.

@@ -4,7 +4,7 @@
 //! Three hard constraints, each a security property (AC) — plus one usability
 //! guarantee about `PATH` that the security constraints do not imply:
 //!
-//! - **cwd jail** — the command runs with the repo root as its working
+//! - **cwd jail** — the command runs with the session root as its working
 //!   directory. (Absolute paths a command constructs itself are outside the
 //!   tool's reach; the jail is the default surface an agent operates on.)
 //! - **env scrub** — every variable whose *name* matches a credential substring
@@ -161,7 +161,7 @@ impl Tool for ShellTool {
         };
         let root = match ctx.repo_root().canonicalize() {
             Ok(r) => r,
-            Err(_) => return ToolOutcome::error("session root does not exist"),
+            Err(_) => return ctx.root_missing_error().into(),
         };
 
         let timeout_ms = opt_u64_arg(args, "timeout_ms")
@@ -312,7 +312,7 @@ impl Tool for ShellTool {
         // **The duty is for command output, so it fires only when there is
         // command output** (REQ-561 verify). `measured` is `Some` on exactly the
         // arms of `run` that spawned something; a missing `command` argument or a
-        // repo root that does not exist never reached a shell, and handing the
+        // session root that does not exist never reached a shell, and handing the
         // duty a fixed harness sentence and an empty command line buys an
         // interpretation of nothing.
         //
@@ -647,7 +647,7 @@ mod tests {
     /// consent-dialog sentence on macOS (and nowhere else); the same command
     /// under a `project`-kind context receives today's message byte-for-byte.
     #[test]
-    fn ac19_a_timeout_from_a_home_kind_root_hints_at_the_consent_dialog() {
+    fn a_timeout_from_a_home_kind_root_hints_at_the_consent_dialog() {
         let root = temp_root("ac19");
         let args = json!({ "command": "sleep 10" });
         let plain = "command timed out after 200ms and was killed";
@@ -1070,7 +1070,7 @@ mod tests {
     /// **The duty is for command output, so a call that never ran a command does
     /// not buy one** (REQ-561 verify).
     ///
-    /// Both pre-spawn failures: a missing `command` argument, and a repo root
+    /// Both pre-spawn failures: a missing `command` argument, and a session root
     /// that does not exist. `worth_interpreting` sees `is_error == true` for both
     /// and would fire, handing the model a fixed harness sentence to interpret
     /// with an empty command line beside it.
