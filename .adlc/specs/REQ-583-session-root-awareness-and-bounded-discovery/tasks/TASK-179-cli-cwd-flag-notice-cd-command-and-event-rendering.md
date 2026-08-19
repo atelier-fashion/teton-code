@@ -5,7 +5,7 @@ status: draft
 parent: REQ-583
 created: 2026-08-18
 updated: 2026-08-18
-dependencies: ["TASK-174"]
+dependencies: ["TASK-174", "TASK-175"]
 ---
 
 ## Description

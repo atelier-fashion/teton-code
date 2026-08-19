@@ -5,12 +5,12 @@ status: draft
 parent: REQ-583
 created: 2026-08-18
 updated: 2026-08-18
-dependencies: ["TASK-176", "TASK-177", "TASK-178", "TASK-179"]
+dependencies: ["TASK-177", "TASK-178", "TASK-179"]
 ---
 
 ## Description
 
-Close the loop across the four parallel tasks: the socket-level CLI legs of
+Close the loop across the parallel tasks (TASK-176 lands transitively through TASK-177): the socket-level CLI legs of
 AC-9/AC-10/AC-11/AC-12, the final resident-headroom figure, the AC-20/AC-21
 by-hand runbook, and — where the machine allows — the AC-20 live A/B itself,
 recorded as an observation.

@@ -120,10 +120,11 @@ hand-off (`turn_loop.rs:2641`). If the paragraph does not free enough, the
 next source is step 2's `--fallback`/`set-category` clause (the `policy` topic
 carries both). Both ceiling sweeps (`redact.rs:2016`, `web.rs:2248`) gain a
 row with a 200-character root and the same two assertions; the redact.rs
-headroom note gains a REQ-583 paragraph. **The task must leave ≥ 80 bytes of
-margin, not 48** — a sibling task in the same tier rewords five tool
-descriptions ("repository" → "session root", a few bytes each), and the
-integration task records the final figure.
+headroom note gains a REQ-583 paragraph. The task that adds the block runs **after** the task that
+rewords the five tool descriptions ("repository" → "session root", a few
+bytes each), so the sweep measures the docs actually in the tree — the floor
+stays 48 (AC-4) and no allowance is guessed (LESSON-491); the integration task
+re-records the final figure at the merged tip.
 
 **Rejected**: moving `REDACT_BODY_OVERHEAD_BYTES` to 10 KiB (the arithmetic
 still yields 4 chunks, but the constant's note forbids it and AC-4 pins "the
@@ -330,14 +331,16 @@ spellings), BUG-147/LESSON-473 (the predecessor).
 T0  TASK-174 protocol types + session/set_cwd + session_root_changed
 T1  TASK-175 session-root value: teton-core pure module, tetond probe, ToolContext carries it,
              jail refusals name it, HarnessConfig field (unrendered)          ← 174
-T2  TASK-176 walk.rs + glob/grep/shell + five tool docs + AC-6/13..19        ← 175   (owns tools/*.rs except mod.rs, boundary_coverage.rs)
-    TASK-177 environment block + ceiling + guide trim + AC-1..4               ← 175   (owns turn_loop.rs, self_config.md, redact.rs, web.rs test)
-    TASK-178 daemon wiring: create/set_cwd/registry/runtime + e2e AC-10       ← 174,175 (owns server.rs, runtime.rs, sessions.rs, tetond/tests/e2e)
-    TASK-179 CLI: --cwd, banner, notice, /cd, events + AC-8/9/11/12 units     ← 174   (owns crates/teton/src/*)
-T3  TASK-180 integration: cli e2e, headroom record, docs runbook, live A/B    ← 176,177,178,179
+T2  TASK-176 walk.rs + glob/grep/shell + five tool docs + AC-6/13..19        ← 175      (owns tools/*.rs except mod.rs's non-slot lines, boundary_coverage.rs)
+    TASK-178 daemon wiring: create/set_cwd/registry/runtime + e2e AC-10       ← 174,175  (owns server.rs, runtime.rs, sessions.rs, tetond/tests/e2e)
+    TASK-179 CLI: --cwd, banner, notice, /cd, events + AC-8/9/11/12 units     ← 174,175  (owns crates/teton/src/*, README)
+T3  TASK-177 environment block + ceiling + guide trim + AC-1..4               ← 176      (owns turn_loop.rs, self_config.md, redact.rs, web.rs test)
+T4  TASK-180 integration: cli e2e, headroom record, docs runbook, live A/B    ← 177,178,179
 ```
 
 Tier-2 tasks run in parallel in **one** worktree, so file ownership is
 disjoint by construction (listed per task); an implementer that sees a
 compile error in a file it does not own waits and retries rather than
-"fixing" it.
+"fixing" it. TASK-177 follows TASK-176 deliberately (ADR-2: the ceiling is
+measured against the reworded docs, not an allowance); it may run alongside
+a still-running TASK-178/179 since their files are disjoint.

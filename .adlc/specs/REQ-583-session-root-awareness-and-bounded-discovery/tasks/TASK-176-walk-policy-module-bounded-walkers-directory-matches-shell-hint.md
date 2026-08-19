@@ -41,7 +41,7 @@ seam, default policy in `new`/`for_root`), `turn_loop.rs`, `redact.rs`,
 - [ ] AC-13, AC-14, AC-15, AC-16, AC-17, AC-18, AC-19 each have a named test; AC-6 rendered-docs assertion passes.
 - [ ] Both walkers consume `walk::visit` and `ToolContext::walk_policy()`; no private skip list remains (the scan proves it).
 - [ ] The trailer lines survive `refine`: a test drives `GrepTool::refine` (or `render_ranked`) on an output carrying stopped + unreadable + cap lines and asserts all three come back verbatim after the matches.
-- [ ] Docs bytes: the five descriptions together grow by ≤ 40 bytes versus today (TASK-177 budgets for it).
+- [ ] Docs bytes: the five descriptions together grow by ≤ 40 bytes versus today (TASK-177 measures the ceiling after this task lands — keep the rewording tight).
 
 ## Technical Notes
 
