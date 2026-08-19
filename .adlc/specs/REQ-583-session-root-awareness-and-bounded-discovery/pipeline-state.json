@@ -3,13 +3,14 @@
   "branch": "feat/REQ-583-session-root-awareness",
   "startedAt": "2026-08-18T23:55:55Z",
   "completed": false,
-  "currentPhase": 5,
+  "currentPhase": 6,
   "completedPhases": [
     0,
     1,
     2,
     3,
-    4
+    4,
+    5
   ],
   "phaseHistory": [
     {
@@ -36,6 +37,11 @@
       "phase": 4,
       "name": "Implement",
       "completedAt": "2026-08-19T01:48:59Z"
+    },
+    {
+      "phase": 5,
+      "name": "Verify",
+      "completedAt": "2026-08-19T13:25:35Z"
     }
   ],
   "integrationBranch": "main",
@@ -84,10 +90,10 @@
     "reverify": "all closed",
     "workspace": "3074 passed / 0 failed",
     "haltedAt": "2026-08-19T13:20:42Z",
-    "halt": "legitimate halt #2 \u2014 reflector user-facing questions",
-    "pendingQuestions": [
-      "Q1 (OQ-8): do session-scoped AllowAlways permission grants survive a /cd? Today they do (only the conversation is cleared). Recommendation: drop session grants on /cd and say so on the /cd line (LESSON-495 \u2014 the grant's key never encoded the root).",
-      "Q2 (OQ-7): a listed DIRECTORY identity (e.g. `secrets/` from `glob **/secrets`) does not taint egress; files under a boundary still do. Adopted and pinned by provenance_egress test; confirm or ask for fail-closed."
-    ]
+    "halt": "resolved",
+    "resolved": {
+      "Q1 OQ-8": "keep (2026-08-19)",
+      "Q2 OQ-7": "confirm (2026-08-19)"
+    }
   }
 }

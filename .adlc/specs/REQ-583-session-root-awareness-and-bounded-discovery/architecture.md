@@ -190,7 +190,7 @@ lists exactly two files) and `glob.rs` `provenance_is_the_set_of_enumerated_file
 directory is listed as `id/` and tagged as `id`: `ProvenanceId::mint` already
 elides a trailing `/` (`provenance_id.rs:269`), so the two spellings resolve to
 one identity, and the trailing `/` is the conventional marker of a directory
-name, not a second name. **OQ-7 resolved (recommendation adopted):** a bare
+name, not a second name. **OQ-7 resolved (recommendation adopted; product-confirmed 2026-08-19):** a bare
 directory identity carries whatever verdict the matcher gives it —
 `secrets/**` covers the files under `secrets/`, not the name `secrets` — so a
 listed directory name never taints; the name is metadata, the boundary is
@@ -279,7 +279,7 @@ nothing *else* gates it, iterating `PermissionLevel::ALL` (LESSON-524's
 "exposure is not callability", the `a_bundled_docs_read_is_allowed_at_every_level`
 template).
 
-The disposition is **clear** (OQ-2 resolved as recommended): every carried
+The disposition is **clear** (OQ-2 resolved as recommended) and **session grants survive the move** (OQ-8, product decision 2026-08-19: keep — a grant is "this tool, this session", exactly as across `/clear`): every carried
 block's provenance identity is root-relative, and a carried identity judged
 under a new root names a different file. The CLI reports it with the
 `context_cleared` line it already renders (`format_context_cleared`), and the

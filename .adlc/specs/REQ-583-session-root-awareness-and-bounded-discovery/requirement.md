@@ -4,7 +4,7 @@ title: "Session-root awareness and bounded discovery — the agent knows where i
 status: approved
 deployable: true
 created: 2026-08-18
-updated: 2026-08-18
+updated: 2026-08-19
 component: "daemon/harness"
 domain: "harness"
 stack: ["rust", "daemon", "cli", "json-rpc"]
@@ -406,7 +406,7 @@ _Leg C_
 - [ ] OQ-6: Windows path display and marker table are out of scope (Windows is
   out of MVP scope) — but should the kind derivation refuse to compile rather
   than misclassify there? Architecture.
-- [ ] OQ-7: **What does a bare directory identity taint?** A `glob` that lists
+- [x] OQ-7: **What does a bare directory identity taint?** A `glob` that lists
   `secrets/` surfaces a *name*, not content, and today's matcher says
   `secrets/**` covers the files under it, not the bare `secrets` (the
   boundary module's documented semantics). Recommendation: keep the matcher's
@@ -416,8 +416,10 @@ _Leg C_
   subtree is covered as covered. *Status:* the architecture adopted the
   recommendation (ADR-3, "OQ-7 resolved"), and a `provenance_egress` case
   now pins it — a listed directory name under a covered subtree does not
-  taint — pending the product confirmation this question still asks for.
-- [ ] OQ-8: **Do session-scoped AllowAlways permission grants survive a
+  taint. **Resolved 2026-08-19 (product): confirmed** — a listed directory
+  name never taints; files under the boundary still do; the
+  `provenance_egress` pin is the record.
+- [x] OQ-8: **Do session-scoped AllowAlways permission grants survive a
   `/cd`?** Today they do: a move clears only the conversation (BR-7, OQ-2),
   and the session's grants, taint pin and pasted URLs stay as they do across
   `/clear`. LESSON-495 (a remembered grant answers every question its key
@@ -429,6 +431,9 @@ _Leg C_
   the grant should die with the root it was given under. Decision pending;
   until it is made, the `/cd` line says the conversation was cleared and
   nothing about grants, which is what is true.
+  **Resolved 2026-08-19 (product): keep.** Session-scoped grants survive a
+  `/cd`, as they survive `/clear` — a grant is "this tool, this session"; the
+  `/cd` line and the re-fired notice are what tell the user the ground moved.
 
 ## Out of Scope
 
