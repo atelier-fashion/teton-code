@@ -33,5 +33,7 @@ newest-user-block elision is also a turn notice.
 
 ## Technical Notes
 
+- **From TASK-185's report**: the shipped spellings are OpenAI `"context_length_exceeded"` (quoted token, matches pretty-printed bodies) / `maximum context length` and Anthropic `prompt is too long`; Moonshot/Kimi's own overflow spelling is NOT pinned yet and Kimi is the dogfood provider — verify Kimi's 400 body for a context overflow against the Moonshot API docs (web lookup) and add it as a fourth `const` in `teton-providers/src/lib.rs` + a conformance case in this task (the providers crate is yours to touch here; TASK-185 is done). Also `provider_id` on the variant is a `String` (the crate has no `ProviderId`); convert at the `HarnessError` mapping.
+
 - Order inside the reroute arm: choose route → rebudget → emit → `continue` (the event precedes the next `route_decided`). The Degrade arm must be **quiet** — pin it.
 - Commit as `feat(daemon): the budget follows the route attempt — refit on reroute, pressure as news, typed context-length outcome [TASK-189]`.

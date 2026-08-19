@@ -277,6 +277,15 @@ stale fixture is a red test).
 **Rationale**: no network or heavy dev-dependency in the test graph; the
 spec allows either; LESSON-460 governs fixture fidelity — the generator is
 checked in and the counts are reproducible.
+**Measured (TASK-183, tiktoken 0.14.0 `o200k_base`)**: prose 4.59 B/token,
+Rust 4.01, minified JSON 3.58, paths 3.58, random base64 **1.45**. Decision:
+the 2 B/token floor stays — base64 is the documented uncovered class
+(`KNOWN_UNCOVERED_AT_PINNED_FLOOR`, asserted both ways), bounded by the
+digest threshold and backstopped by the typed `context_length_exceeded`
+outcome; lowering the floor to 1.45 would shrink every prose/code prompt's
+remote byte budget by ≈25% to protect content the harness rarely carries raw.
+The word ratio 3/2 is pinned only by "prose is covered by words alone"
+(mutation 3/2 → 1/1 is caught there).
 
 ## Tracer gotchas the tasks cite
 

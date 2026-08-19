@@ -312,7 +312,13 @@ adds the numbers and the per-turn budget line from `route_decided`.
   a fixture corpus (prose, Rust source, minified JSON tool results,
   path-heavy shell output, base64) with a reference tokenizer (dev-dependency
   or a committed token-count fixture) and asserts `max(words × safety_ratio,
-  bytes / bytes_per_token_floor) ≥ tokens` for every sample; a provider
+  bytes / bytes_per_token_floor) ≥ tokens` for every sample **except the
+  documented gap**: random base64 tokenizes at ≈1.45 B/token under
+  `o200k_base` (measured, TASK-183), below the 2 B/token floor; the floor is
+  kept at 2 (lowering it to cover base64 would cost every prose/code prompt
+  ≈25% of its remote budget), base64 is recorded as `KNOWN_UNCOVERED` in the
+  test — asserted in both directions — and the typed context-length outcome
+  is its backstop; a provider
   `context_length_exceeded`-class response surfaces as a typed outcome
   naming the window and the assembled size, with no retry, no failover and
   no change to the provider's health. (unit + remote-loop fixture; BR-2)

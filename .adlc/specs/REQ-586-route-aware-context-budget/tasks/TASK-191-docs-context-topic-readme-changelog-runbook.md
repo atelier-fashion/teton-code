@@ -38,5 +38,7 @@ section, and the Key Pattern / ADR-006 note in `.adlc/context/architecture.md`.
 
 ## Technical Notes
 
+- **From TASK-188 (verified 2026-08-19)**: the shipped recipe windows are Anthropic claude-opus-5 **1,000,000**, OpenAI gpt-5.6 **1,050,000**, Kimi-k3 **1,000,000**, DeepSeek **1,000,000**, Grok-4.6 **500,000**, Ollama llama3.2 **4,096** (served default). The runbook's worst case must be computed at the 1M class (≈665k words × up to 25 iterations per prompt — say it plainly and point at `context_budget_cap`), AC-14's Kimi step now gets 1M via `/provider setup` (or any figure by hand), and a declared 4k window yields a budget *smaller* than the local default (correct; worth one sentence in context.md).
+
 - Do **not** touch `crates/tetond/src/harness/self_config.md` (BUG-181's headroom; REQ-585 BR-9 owns its next amendment).
 - Commit as `docs(REQ-586): context topic, window docs, runbook, architecture pattern [TASK-191]`.
