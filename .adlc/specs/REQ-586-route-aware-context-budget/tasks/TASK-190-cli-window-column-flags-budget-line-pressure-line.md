@@ -1,7 +1,7 @@
 ---
 id: TASK-190
 title: "CLI: --max-context/--context-budget-cap, window column + doctor advisory, verbose budget line on route_decided, context_pressure line, setup candidate window; cli_e2e"
-status: draft
+status: complete
 parent: REQ-586
 created: 2026-08-19
 updated: 2026-08-19

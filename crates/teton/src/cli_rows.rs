@@ -918,6 +918,31 @@ mod tests {
                     "kimi-k3",
                 ],
             ),
+            // REQ-586 BR-3: the window flags are part of the same grammar, so
+            // the session spelling has to reach the same parse as the shell's.
+            // A flag added to the clap tree but not to the mirrored row would
+            // be a command a user can run in one place and not the other.
+            (
+                "teton provider add",
+                "kimi --kind openai-compatible --endpoint https://x/v1/chat/completions \
+                 --model kimi-k3 --max-context 128000 --context-budget-cap 40000",
+                vec![
+                    "teton",
+                    "provider",
+                    "add",
+                    "kimi",
+                    "--kind",
+                    "openai-compatible",
+                    "--endpoint",
+                    "https://x/v1/chat/completions",
+                    "--model",
+                    "kimi-k3",
+                    "--max-context",
+                    "128000",
+                    "--context-budget-cap",
+                    "40000",
+                ],
+            ),
         ] {
             let from_session = Cli::try_parse_from(mirrored_argv(twin, args))
                 .unwrap_or_else(|err| panic!("`/{twin}` did not parse: {err}"));

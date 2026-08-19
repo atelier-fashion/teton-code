@@ -1155,6 +1155,15 @@ fn slash_verbose_toggles_the_route_notice_around_real_turns() {
         !quiet.contains("route [") && !quiet.contains("turn ended"),
         "a default session must start quiet; segment:\n{quiet}"
     );
+    // REQ-586 BR-7/AC-10, the negative half: a short turn clamps nothing, so
+    // there is no pressure line to draw. The positive half — a turn that really
+    // does drop blocks draws exactly one — is the daemon's emission to prove
+    // and rides its own fixture; what this pins is that the never-gated line is
+    // not chatter on every turn.
+    assert!(
+        !quiet.contains("context: "),
+        "a turn that clamped nothing must say nothing about context; segment:\n{quiet}"
+    );
 
     // Turn two, after the toggle: the routing notice and the turn-end line. The
     // notice's key is the **category and tier** the turn resolved through
@@ -1168,12 +1177,32 @@ fn slash_verbose_toggles_the_route_notice_around_real_turns() {
         loud.contains("turn ended"),
         "`/verbose` did not surface the turn-end line; segment:\n{loud}"
     );
+    // REQ-586 BR-9/AC-4: the route notice carries the budget that turn ran
+    // under and what bound it. The local tier is the route here, so the bound
+    // is the local engine's — the one case where a declared window would not
+    // change the answer.
+    let route = loud
+        .lines()
+        .find(|line| line.contains("route ["))
+        .unwrap_or_else(|| panic!("the verbose segment has no route line:\n{loud}"));
+    assert!(
+        route.contains(" · budget ") && route.contains(" words / "),
+        "the budget rides the route line, in both currencies; line: {route:?}"
+    );
+    assert!(
+        route.ends_with("(bound: local engine)"),
+        "a turn on the local tier names the local engine as its bound; line: {route:?}"
+    );
 
     // Turn three, after the second toggle: quiet again — the toggle flips back,
     // it does not latch.
     assert!(
         !quiet_again.contains("route [") && !quiet_again.contains("turn ended"),
         "a second `/verbose` must hide the notices again; segment:\n{quiet_again}"
+    );
+    assert!(
+        !quiet_again.contains("context: "),
+        "still nothing to clamp, so still nothing to say; segment:\n{quiet_again}"
     );
 
     // And the counts, which is what makes the three segments an exclusive
@@ -1929,6 +1958,254 @@ fn provider_list_renders_the_declared_model() {
         listed.contains("deepseek-v4-pro"),
         "the listing must show the model the provider calls, not only its id; \
          output:\n{listed}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// REQ-586: the context window on the provider surfaces, and the budget on a turn
+// ---------------------------------------------------------------------------
+
+/// A remote provider that declares a 128k window, and one that declares a
+/// window with a cap sitting at it — the two shapes the listing and doctor say
+/// different things about. Written the way a user writes them, as a
+/// `[providers.capabilities]` sub-table.
+fn windowed_provider_config() -> String {
+    "[[providers]]\nid = \"windowed\"\nkind = \"openai-compatible\"\n\
+     endpoint = \"https://api.example.invalid/v1/chat/completions\"\n\
+     model = \"windowed-model\"\n[providers.capabilities]\nmax_context = 128000\n\n\
+     [[providers]]\nid = \"capped\"\nkind = \"anthropic\"\n\
+     endpoint = \"https://api.example.invalid/v1/messages\"\n\
+     model = \"capped-model\"\n[providers.capabilities]\n\
+     max_context = 200000\ncontext_budget_cap = 200000\n\n"
+        .to_owned()
+}
+
+/// **AC-4 through the shipped binary, on both surfaces.**
+///
+/// Every provider row names its context window, and the three answers are three
+/// different sentences: a declared window, an undeclared one that says the
+/// budget is defaulted and which key fixes it (BR-3 — stated, never silent),
+/// and the local tier, whose budget is the local engine's whatever any window
+/// says and which therefore has nothing to set.
+///
+/// Asserted on `/provider list` **and** `teton provider list` because the claim
+/// is about the shipped renderer both reach (REQ-582's one-renderer rule); the
+/// byte-for-byte half of that is
+/// `every_read_row_prints_exactly_what_its_shell_twin_prints`, which stays green
+/// for the same reason.
+///
+/// The fourth state — `window: not reported`, an absent field from a daemon
+/// older than it — has no fixture here: the shipped daemon always populates the
+/// field, so it is pinned as a `render_config` unit test instead.
+#[test]
+fn every_provider_row_names_its_window_on_both_surfaces() {
+    let daemon_path = daemon_bin();
+    // Scripted, because the session half is a **pipe**: a daemon with no engine
+    // leaves the first-run proposal outstanding, and the first piped line would
+    // be eaten answering it rather than reaching the entry loop.
+    let daemon = TestDaemon::spawn_scripted_with_config(
+        &daemon_path,
+        TURN_REPLIES,
+        &windowed_provider_config(),
+    );
+    let teton = teton_bin();
+
+    let shell = daemon.run_cli(&teton, &["provider", "list"]);
+    let session = daemon.run_cli_with_stdin(&teton, &[], "/provider list\n");
+
+    for (what, listing) in [
+        ("teton provider list", &shell),
+        ("/provider list", &session),
+    ] {
+        let row = |id: &str| -> &str {
+            listing
+                .lines()
+                .find(|line| line.contains(&format!("  {id} [")))
+                .unwrap_or_else(|| panic!("{what} printed no row for `{id}`:\n{listing}"))
+        };
+        assert!(
+            row("windowed").ends_with("window: 128k"),
+            "{what}: a declared window must be shown:\n{listing}"
+        );
+        assert!(
+            row("deepseek").ends_with(
+                "window: unknown — context budget defaulted (set capabilities.max_context)"
+            ),
+            "{what}: BR-3 — an unknown window is stated, with the key that fixes it:\n{listing}"
+        );
+        assert!(
+            row("local").ends_with("(local engine)") && !row("local").contains("unknown"),
+            "{what}: the local tier's budget is its own, so it has no unknown window to \
+             report:\n{listing}"
+        );
+    }
+}
+
+/// **AC-4's advisory half, end to end, and BR-5's inert cap beside it.**
+///
+/// Doctor is where a user goes with "why is this provider only being sent 4k?",
+/// so the two things the listing column can only imply are said outright: an
+/// undeclared window means the budget is defaulted and here is the key, and a
+/// cap that sits at or above its window never binds. Neither is a fault, and
+/// neither may change doctor's exit status — the REQ-578 advisory's posture,
+/// one class over.
+#[test]
+fn doctor_advises_on_an_undeclared_window_and_an_inert_cap_and_stays_green() {
+    let daemon_path = daemon_bin();
+    let daemon = TestDaemon::spawn_with_config(&daemon_path, &windowed_provider_config());
+    let teton = teton_bin();
+
+    let (output, status) = daemon.run_cli_capture(&teton, &["doctor"], "");
+
+    assert!(
+        status.success(),
+        "an advisory must not change doctor's exit status; output:\n{output}\n\
+         daemon log:\n{}",
+        daemon.log()
+    );
+    let advisories: Vec<&str> = output
+        .lines()
+        .filter(|line| line.contains("context budget") || line.contains("context_budget_cap"))
+        .collect();
+
+    assert!(
+        advisories
+            .iter()
+            .any(|line| line.contains("`deepseek`") && line.contains("capabilities.max_context")),
+        "a provider with no declared window must be named, with the remedy; \
+         advisories:\n{advisories:#?}\nfull output:\n{output}"
+    );
+    assert!(
+        advisories
+            .iter()
+            .any(|line| line.contains("`capped`") && line.contains("never binds")),
+        "a cap at the window is inert and doctor says so; advisories:\n{advisories:#?}\n\
+         full output:\n{output}"
+    );
+    assert!(
+        !advisories.iter().any(|line| line.contains("`windowed`")),
+        "a provider that declared its window has nothing to act on; \
+         advisories:\n{advisories:#?}"
+    );
+    assert!(
+        !advisories.iter().any(|line| line.contains("`local`")),
+        "the local tier has no `max_context` worth setting — advising it would send a user to \
+         edit a key that changes nothing; advisories:\n{advisories:#?}"
+    );
+}
+
+/// **AC-5, the CLI half: `--max-context` is a flag, not a hand edit.**
+///
+/// Registering a **local** provider because that is the one kind this suite can
+/// register end to end: every remote kind reads a credential, and the CLI's
+/// keychain is the machine's own (the harness clears `TETON_PROVIDER_KEY` for
+/// exactly that reason), so a test that completed a remote registration would
+/// write a fake key into the developer's login keychain.
+///
+/// The evidence is the **daemon's config file**, not the CLI's echo: what BR-3
+/// claims is that a window typed on the command line is recorded, and a client
+/// sentence about it would be this process agreeing with itself. The listing
+/// then shows the local row as `(local engine)`, which is the same claim from
+/// the other side — a declared window does not make the local tier's budget
+/// anything other than the local engine's.
+#[test]
+fn provider_add_records_a_declared_window_in_the_daemons_config() {
+    let daemon_path = daemon_bin();
+    let daemon = TestDaemon::spawn(&daemon_path);
+    let teton = teton_bin();
+
+    let (output, status) = daemon.run_cli_capture(
+        &teton,
+        &[
+            "provider",
+            "add",
+            "on-device",
+            "--kind",
+            "local",
+            "--max-context",
+            "128000",
+        ],
+        "",
+    );
+    assert!(
+        status.success(),
+        "a local provider needs no credential, so the flag alone must register; output:\n{output}"
+    );
+
+    let written = std::fs::read_to_string(daemon.root.join("config.toml"))
+        .expect("the fixture's config is where the daemon writes");
+    assert!(
+        written.contains("max_context = 128000"),
+        "the window typed on the command line must reach the stored record; config:\n{written}"
+    );
+
+    let listed = daemon.run_cli(&teton, &["provider", "list"]);
+    let row = listed
+        .lines()
+        .find(|line| line.contains("  on-device ["))
+        .unwrap_or_else(|| panic!("the new provider is not listed:\n{listed}"));
+    assert!(
+        row.ends_with("(local engine)"),
+        "a local row's budget is the local engine's whatever it declares; row: {row:?}"
+    );
+}
+
+/// **AC-8 at the CLI: a cap below the window is what `/verbose` names as the
+/// bound.**
+///
+/// The turn is routed to a provider nothing is listening for, and that is fine:
+/// the route — and the budget stamped on it — is decided before the call, so
+/// the line under test is printed whether or not the provider answers. What
+/// matters is that the bound the user reads is `user cap` and not `window`,
+/// because those two are the difference between "this is as much as the model
+/// takes" and "this is as much as you asked me to send it".
+///
+/// `[privacy] redact` is off in this fixture, so the redact clamp cannot be
+/// what bound the budget — which is the other half of the precedence claim.
+#[test]
+fn a_cap_below_the_window_is_the_bound_a_verbose_turn_names() {
+    let daemon_path = daemon_bin();
+    let daemon = TestDaemon::spawn_scripted_with_config(
+        &daemon_path,
+        TURN_REPLIES,
+        &format!(
+            "[[providers]]\nid = \"capped\"\nkind = \"openai-compatible\"\n\
+             endpoint = \"http://127.0.0.1:{}/v1/chat/completions\"\n\
+             model = \"capped-model\"\n[providers.capabilities]\n\
+             max_context = 200000\ncontext_budget_cap = 40000\n\n",
+            closed_port()
+        ),
+    );
+    let teton = teton_bin();
+
+    let bound = daemon.run_cli(&teton, &["policy", "set-tier", "build", "capped"]);
+    assert!(
+        bound.contains("capped"),
+        "the fixture's tier binding did not move, so the turn below would route \
+         elsewhere; output:\n{bound}"
+    );
+
+    let session = daemon.run_cli_with_stdin(&teton, &[], "/verbose\nexplain the first thing\n");
+
+    let route = session
+        .lines()
+        .find(|line| line.contains("route [") && line.contains("capped"))
+        .unwrap_or_else(|| {
+            panic!(
+                "the turn never routed to the capped provider; session:\n{session}\n\
+                 daemon log:\n{}",
+                daemon.log()
+            )
+        });
+    assert!(
+        route.contains("(bound: user cap)"),
+        "AC-8: a cap below the window is what bound the budget, and the line must say so \
+         rather than naming the window; line: {route:?}"
+    );
+    assert!(
+        route.contains(" · budget ") && route.contains(" words / "),
+        "BR-9: the budget is printed in both currencies — the byte guard is what binds on a \
+         remote route, so the word figure alone would overstate what fits; line: {route:?}"
     );
 }
 
