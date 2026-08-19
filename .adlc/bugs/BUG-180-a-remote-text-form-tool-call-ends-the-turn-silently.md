@@ -166,6 +166,14 @@ and only when — the provider sent **no** native tool call:
 Nothing changes for the display: the `StreamGate` already hid the JSON,
 and now the tool status line presents the call it was hiding it *for*.
 
+**A witness for the shape that remains.** The loop's `EndTurn` arm now
+writes one content-free line to the daemon's stderr when a non-empty final
+answer reached the user as *nothing* — the gate withheld it in full (a
+byte count, never the text). That is the shape BUG-180 took, and it is the
+shape the two residual cases below would still take; a turn that "did
+nothing" should at least leave a line saying why (LESSON-538 #4:
+diagnosability is part of the fix).
+
 Deliberately **not** changed here, noted for follow-up:
 
 - The system prompt still teaches the text grammar to native-tier
@@ -203,5 +211,9 @@ Deliberately **not** changed here, noted for follow-up:
   go red with the old `EndTurn` arm restored; the loop test and the
   text-form test also go red with `call_in_text` forced `false`
   (mutation-checked locally).
+- `crates/tetond/src/harness/turn_loop.rs` — the `EndTurn` arm logs a
+  content-free stderr line when the reply was withheld in full and the
+  turn ended with nothing shown (`shown_any` tracked across the gate's
+  live pushes and its held tail).
 - `crates/tetond/src/harness/reply.rs` — `parse_reply` doc names both
   readers.
