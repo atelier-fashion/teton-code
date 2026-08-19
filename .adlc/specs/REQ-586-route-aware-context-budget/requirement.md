@@ -507,6 +507,19 @@ adds the numbers and the per-turn budget line from `route_decided`.
   AC-3 corpus (never more than N words raw on any route), on top of BR-6's
   proportional rule; decide N in `/architect` with the corpus.
 
+## Deferred (found in implementation)
+
+- **A clamped newest-user block can be dropped by the same turn's exit gate.**
+  Observed in TASK-193's AC-10 fixture: the in-place clamp fills the byte
+  budget exactly, so appending the model's reply makes the exit gate drop the
+  now-oldest block — which is the user's own message. The answer is retained
+  without the question. This is existing REQ-561/REQ-567 behaviour, and this
+  REQ makes it **honest** (two `context_pressure` events, the second naming
+  the drop) rather than silent, which is BR-7's whole claim; making it not
+  *happen* — reserving room for the reply before clamping, or refusing the
+  turn as an oversized skill turn is refused — is a follow-up REQ, not this
+  one.
+
 ## Out of Scope
 
 - Changing the local tier's budget or the prefix-cache behaviour (OQ-3).

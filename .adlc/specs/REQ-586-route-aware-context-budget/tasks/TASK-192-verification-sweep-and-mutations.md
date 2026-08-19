@@ -29,5 +29,7 @@ whole workspace, prove the pins bite, and prove no number grew a second home.
 
 ## Technical Notes
 
+- **From TASK-187**: `context.rs`'s `DEFAULT_WINDOW_LABEL` and `budget.rs`'s private `LOCAL_WINDOW_LABEL` are two homes for the same string (a test asserts they agree, so drift is red). Collapse them in the one-home pass: make `budget.rs`'s label `pub(crate)` and have `context.rs` read it, then delete the equality test's reason for existing (keep the test if it still means something).
+
 - LESSON-441 (a fix pass is new code — re-verify adversarially).
 - Commit as `chore(REQ-586): verification sweep — mutations, one-home grep, headroom [TASK-192]`.
