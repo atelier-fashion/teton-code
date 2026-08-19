@@ -507,7 +507,10 @@ mod tests {
         );
         // Bytes: 253,952 × 12,000 / 32,768 = 93,000 — the fraction, uncapped.
         assert_eq!(on_128k.digest_threshold_bytes, 93_000);
-        assert!(93_000 < DIGEST_ABSOLUTE_CEILING_BYTES);
+        assert!(
+            on_128k.digest_threshold_bytes < DIGEST_ABSOLUTE_CEILING_BYTES,
+            "the bytes fraction on 128k stays under the ceiling"
+        );
 
         let on_200k = derive(remote(200_000, 0, false));
         let words_fraction_200k =
@@ -521,7 +524,10 @@ mod tests {
             on_200k.digest_threshold_bytes, 145_734,
             "the bytes fraction on 200k stays under the ceiling"
         );
-        assert!(145_734 < DIGEST_ABSOLUTE_CEILING_BYTES);
+        assert!(
+            on_200k.digest_threshold_bytes < DIGEST_ABSOLUTE_CEILING_BYTES,
+            "the bytes ceiling does not bind on 200k"
+        );
     }
 
     /// BR-7: the marker's window name follows the route — local, the
