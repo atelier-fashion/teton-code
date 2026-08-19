@@ -653,9 +653,13 @@ pub async fn run_session_turn_with_source(
         // suppressed and flat-only markers never fire against a templated reply.
         // Read before `produce_turn`'s `&mut source` borrow opens below.
         let mut stream_gate = StreamGate::for_format(source.chat_format());
+        // Whether any byte of this reply reached the user (BUG-180's witness,
+        // below).
+        let mut shown_any = false;
         let produced = {
             let mut on_token = |token: &str| {
                 if let Some(out) = stream_gate.push(token) {
+                    shown_any = true;
                     events.agent_message(&out);
                 }
             };
@@ -682,11 +686,29 @@ pub async fn run_session_turn_with_source(
         // A held tail is the final answer only on an end-of-turn; on a tool
         // call (or malformed call) it is the JSON itself and stays hidden.
         if let Some(tail) = stream_gate.finish(matches!(decision, TurnDecision::EndTurn { .. })) {
+            shown_any = true;
             events.agent_message(&tail);
         }
 
         match decision {
             TurnDecision::EndTurn { final_text } => {
+                // BUG-180: an answer the user saw none of is a defect signal,
+                // not a quiet success. The gate hides tool-shaped JSON and
+                // fabricated frames on the premise that something else
+                // presents them (the tool status line) or that they must not
+                // be seen at all; on an end-of-turn there is no presenter, so
+                // a reply hidden in full ends the turn with nothing on screen
+                // and nothing in any log — which is how BUG-180 went
+                // undiagnosed until the cost ledger was read by hand. One
+                // content-free line (a byte count, never the text) on the
+                // daemon's stderr is the witness. Local tier: a reply cut at a
+                // frame marker at byte 0 is already empty and says nothing.
+                if !shown_any && !final_text.trim().is_empty() {
+                    eprintln!(
+                        "tetond: the model's reply ({} bytes) was withheld in full by the                          display gate — it was tool-shaped or began a fabricated frame — and                          the turn ended with nothing shown",
+                        final_text.len()
+                    );
+                }
                 // Mandatory verification (BR-6): a weak model may not declare an
                 // edit done without checking it. Nudge once, then respect the
                 // model's decision so the loop still terminates.
