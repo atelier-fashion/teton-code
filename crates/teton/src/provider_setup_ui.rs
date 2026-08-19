@@ -286,6 +286,9 @@ impl Answers {
             model: self.model.clone(),
             key_ref,
             bindings: self.bindings.clone(),
+            // TASK-190 carries `entry.max_context` into the candidate here
+            // (REQ-586 ADR-9, silently); until then the window stays unknown.
+            max_context: None,
         }
     }
 
@@ -1683,6 +1686,7 @@ mod tests {
                 endpoint: None,
                 example_model: "claude-opus-5".to_owned(),
                 notes: None,
+                max_context: 131_072,
             },
             ProviderRecipeEntry {
                 id_suggestion: "kimi".to_owned(),
@@ -1692,6 +1696,7 @@ mod tests {
                 endpoint: Some("https://api.moonshot.ai/v1/chat/completions".to_owned()),
                 example_model: "kimi-k3".to_owned(),
                 notes: None,
+                max_context: 131_072,
             },
             ProviderRecipeEntry {
                 id_suggestion: "deepseek".to_owned(),
@@ -1701,6 +1706,7 @@ mod tests {
                 endpoint: Some("https://api.deepseek.com/chat/completions".to_owned()),
                 example_model: "deepseek-v4-pro".to_owned(),
                 notes: Some("a sentence about pricing".to_owned()),
+                max_context: 131_072,
             },
         ]
     }
@@ -1717,6 +1723,7 @@ mod tests {
                 endpoint: Some("https://one.sentinel.example/v1/chat/completions".to_owned()),
                 example_model: "sentinel-model-1".to_owned(),
                 notes: None,
+                max_context: 131_072,
             },
             ProviderRecipeEntry {
                 id_suggestion: "sentinel-two".to_owned(),
@@ -1726,6 +1733,7 @@ mod tests {
                 endpoint: Some("https://two.sentinel.example/v1/chat/completions".to_owned()),
                 example_model: "sentinel-model-2".to_owned(),
                 notes: None,
+                max_context: 131_072,
             },
         ]
     }

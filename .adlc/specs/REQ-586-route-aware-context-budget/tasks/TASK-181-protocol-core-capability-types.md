@@ -1,7 +1,7 @@
 ---
 id: TASK-181
 title: "Protocol + core + capability types: wire ProviderConfig window fields, RouteDecided budget/bound, ContextPressure event, BudgetBound, recipe/candidate max_context, config context_budget_cap"
-status: draft
+status: complete
 parent: REQ-586
 created: 2026-08-19
 updated: 2026-08-19
@@ -31,11 +31,11 @@ Add the additive type surface every other task builds on — no behaviour. Wire
 
 ## Acceptance Criteria
 
-- [ ] `cargo test -p teton-protocol -p teton-core -p teton-providers` green; `PROTOCOL_VERSION` unchanged; `event_names_match_the_spec_events_table` and the every-variant list carry `context_pressure`.
-- [ ] A `ProviderConfig` JSON without the two fields deserializes; one with them round-trips; a pre-field struct reads a frame/snapshot that carries them (skew tests both directions).
-- [ ] `RouteDecided` JSON without `budget_tokens`/`bound` deserializes; with them round-trips; `ContextPressure` round-trips under `"event":"context_pressure"` with the envelope's `session_id` and no payload `session_id`.
-- [ ] `config_preservation.rs` canonical-rendering witness (L831-843) still passes byte-for-byte (the core field is skipped when 0).
-- [ ] `cargo build --workspace --all-targets` compiles (placeholder arms and literals).
+- [x] `cargo test -p teton-protocol -p teton-core -p teton-providers` green; `PROTOCOL_VERSION` unchanged; `event_names_match_the_spec_events_table` and the every-variant list carry `context_pressure`.
+- [x] A `ProviderConfig` JSON without the two fields deserializes; one with them round-trips; a pre-field struct reads a frame/snapshot that carries them (skew tests both directions).
+- [x] `RouteDecided` JSON without `budget_tokens`/`bound` deserializes; with them round-trips; `ContextPressure` round-trips under `"event":"context_pressure"` with the envelope's `session_id` and no payload `session_id`.
+- [x] `config_preservation.rs` canonical-rendering witness (L831-843) still passes byte-for-byte (the core field is skipped when 0).
+- [x] `cargo build --workspace --all-targets` compiles (placeholder arms and literals).
 
 ## Technical Notes
 

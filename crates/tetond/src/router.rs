@@ -276,6 +276,12 @@ impl Route {
             // **clamped** level — reporting the requested one would make the
             // event lie about the call (BR-5, AC-4).
             effort: self.effort,
+            // TASK-186 projects these off `Route::budget` (REQ-586 ADR-1) —
+            // until the route carries a budget there is nothing honest to
+            // report, and `None` is the pre-REQ-586 wire exactly.
+            budget_tokens: None,
+            budget_bytes: None,
+            bound: None,
         })
     }
 

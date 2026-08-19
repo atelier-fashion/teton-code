@@ -29,6 +29,13 @@ pub struct CapabilityProfile {
     pub parallel_calls: bool,
     /// Maximum context window in tokens (`0` means unknown / unset).
     pub max_context: u32,
+    /// A user ceiling on the context budget, in tokens, below the window
+    /// (REQ-586 BR-5). `0` means no cap.
+    ///
+    /// The adapter does not read it — the router derives the budget before the
+    /// request is built — it is carried here only so the projection back to
+    /// [`ProviderCapabilities`] stays lossless, for `reasoning_shape`'s reason.
+    pub context_budget_cap: u32,
     /// Which reasoning field(s) this provider accepts (REQ-559 BR-4). `None`
     /// means not declared; the per-kind default applies at resolution time.
     ///
@@ -51,6 +58,7 @@ impl CapabilityProfile {
             tool_call_tier: caps.tool_call_tier,
             parallel_calls: caps.parallel_calls,
             max_context: caps.max_context,
+            context_budget_cap: caps.context_budget_cap,
             reasoning_shape: caps.reasoning_shape,
             effort_ladder: caps.effort_ladder,
         }
@@ -63,6 +71,7 @@ impl CapabilityProfile {
             tool_call_tier: self.tool_call_tier,
             parallel_calls: self.parallel_calls,
             max_context: self.max_context,
+            context_budget_cap: self.context_budget_cap,
             reasoning_shape: self.reasoning_shape,
             effort_ladder: self.effort_ladder,
         }
@@ -119,10 +128,17 @@ mod tests {
         // between the config and the adapter, and the clamp would then quietly
         // fall back to the per-kind default — a downgrade with nothing observing
         // it (LESSON-456).
+        //
+        // REQ-586: the user's budget cap must survive it too, for the same
+        // reason — a cap dropped here would let a route run over a ceiling the
+        // user declared, with nothing observing it. Non-zero on purpose, so a
+        // projection that reset it to the default would fail rather than
+        // coincide.
         let caps = ProviderCapabilities {
             tool_call_tier: ToolCallTier::Degraded,
             parallel_calls: true,
             max_context: 128_000,
+            context_budget_cap: 64_000,
             reasoning_shape: Some(ReasoningShape::ThinkingFlagOnly),
             effort_ladder: Some(EffortLadder::from_levels(&[
                 teton_core::EffortLevel::Low,
@@ -130,6 +146,10 @@ mod tests {
             ])),
         };
         assert_eq!(CapabilityProfile::from_core(caps).to_core(), caps);
+        assert_eq!(
+            CapabilityProfile::from_core(caps).context_budget_cap,
+            64_000
+        );
 
         // And the undeclared case round-trips as undeclared — `None` must not
         // become a materialized default anywhere in the projection.
@@ -137,6 +157,7 @@ mod tests {
         let back = CapabilityProfile::from_core(bare).to_core();
         assert_eq!(back, bare);
         assert!(back.reasoning_shape.is_none() && back.effort_ladder.is_none());
+        assert_eq!(back.context_budget_cap, 0, "no cap round-trips as no cap");
     }
 
     #[test]

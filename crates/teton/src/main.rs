@@ -3420,6 +3420,10 @@ fn build_provider_registration(
         endpoint,
         model,
         auth_ref,
+        // TASK-190 threads `--max-context` / `--context-budget-cap` through
+        // here (REQ-586 ADR-9); `None` preserves whatever the daemon stores.
+        max_context: None,
+        context_budget_cap: None,
     })
 }
 
@@ -4013,6 +4017,8 @@ mod tests {
             endpoint: Some("https://example.invalid".to_owned()),
             model: model.map(str::to_owned),
             auth_ref: None,
+            max_context: None,
+            context_budget_cap: None,
         };
 
         let mut surface = RecordingSurface::new();
@@ -6182,6 +6188,8 @@ mod tests {
             endpoint: Some("https://alice:hunter2@gw.example.com/v1".to_owned()),
             model: Some("a-model".to_owned()),
             auth_ref: None,
+            max_context: None,
+            context_budget_cap: None,
         })
         .expect("a bare `/v1` base URL is advised on");
         assert!(
@@ -6213,6 +6221,8 @@ mod tests {
             endpoint: endpoint.map(str::to_owned),
             model: Some("a-model".to_owned()),
             auth_ref: None,
+            max_context: None,
+            context_budget_cap: None,
         };
 
         // Counts are assertable here because this table is the test's own. The

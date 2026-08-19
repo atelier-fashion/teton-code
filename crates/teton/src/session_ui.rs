@@ -868,6 +868,10 @@ pub fn render_event(
             }
             EventOutcome::Rendered
         }
+        // TASK-190 renders this (REQ-586 BR-7): one line, never verbose-gated,
+        // naming what the gate did, the budget and its bound. Until then the
+        // event is consumed so the exhaustive match compiles; nothing is drawn.
+        Event::ContextPressure(_) => EventOutcome::Rendered,
     }
 }
 
@@ -2560,6 +2564,9 @@ mod tests {
                          binding."
                     .to_owned(),
                 effort: None,
+                budget_tokens: None,
+                budget_bytes: None,
+                bound: None,
             })),
             &mut surface,
             &mut state,
@@ -2605,6 +2612,9 @@ mod tests {
                              pinned to the local tier (BR-1 backstop)"
                         .to_owned(),
                     effort: None,
+                    budget_tokens: None,
+                    budget_bytes: None,
+                    bound: None,
                 })),
                 &mut surface,
                 &mut state,
@@ -2637,6 +2647,9 @@ mod tests {
                 model: Some("claude-opus-4".to_owned()),
                 reason: "architecture routes to the frontier tier".to_owned(),
                 effort: None,
+                budget_tokens: None,
+                budget_bytes: None,
+                bound: None,
             }),
             Event::PrivacyBlock(PrivacyBlock {
                 path: "secrets/prod.env".to_owned(),
@@ -2838,6 +2851,9 @@ mod tests {
                 model: None,
                 reason: "coding turn goes to the default provider".to_owned(),
                 effort: None,
+                budget_tokens: None,
+                budget_bytes: None,
+                bound: None,
             }),
             Event::PrivacyBlock(PrivacyBlock {
                 path: "secrets/prod.env".to_owned(),

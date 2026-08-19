@@ -355,6 +355,11 @@ fn register(id: &str) -> ConfigUpdate {
         endpoint: Some("https://api.deepseek.com".to_owned()),
         model: Some("deepseek-chat".to_owned()),
         auth_ref: Some("keychain:cheap".to_owned()),
+        // REQ-586: a registration that declares no window leaves the stored
+        // capabilities alone, so the canonical rendering below is byte-for-byte
+        // what it was (`max_context = 0`, no cap line).
+        max_context: None,
+        context_budget_cap: None,
     })
 }
 

@@ -5362,6 +5362,11 @@ impl DaemonRuntime {
                 endpoint: endpoint.clone(),
                 model: Some(model.to_owned()),
                 auth_ref: Some(key_ref.to_owned()),
+                // TASK-188 writes the candidate's window here (REQ-586 ADR-7);
+                // `None` preserves whatever is stored, which is the pre-REQ-586
+                // behaviour exactly.
+                max_context: None,
+                context_budget_cap: None,
             }),
         );
         for binding in &candidate.bindings {
@@ -8997,6 +9002,14 @@ fn probe_outcome(
                  this test does not send"
             ),
         },
+        // REQ-586 TASK-185: the probe's fixed payload cannot exceed a window; folded like EffortRefused
+        ProviderError::ContextLengthExceeded { .. } => ProviderTestOutcome::Refused {
+            status: 400,
+            reason: format!(
+                "HTTP 400 from `{host}` — the vendor refused the request as exceeding its \
+                 context window, which this test's fixed payload cannot do"
+            ),
+        },
         // Cannot occur: empty provenance and a constant payload, with no
         // redaction gate installed. Nothing left the machine if it does.
         ProviderError::PrivacyBlocked(_) => ProviderTestOutcome::Unreachable {
@@ -9788,6 +9801,12 @@ fn snapshot_from_config(
                 endpoint: p.endpoint.clone(),
                 model: p.model.clone(),
                 auth_ref: p.auth_ref.clone(),
+                // TASK-188 projects `Some(p.capabilities.max_context)` and the
+                // cap here (REQ-586 ADR-7: the daemon always populates the
+                // window, `Some(0)` = unknown). Until it lands the snapshot
+                // reads as a pre-REQ-586 daemon's.
+                max_context: None,
+                context_budget_cap: None,
             })
             .collect(),
         tiers: Tier::ALL
@@ -11663,6 +11682,8 @@ permission_allow = [\"fetch_user_url\"]
                 endpoint: Some("https://api.deepseek.com/v1/chat/completions".to_owned()),
                 model: Some("deepseek-chat".to_owned()),
                 auth_ref: Some("keychain:deepseek".to_owned()),
+                max_context: None,
+                context_budget_cap: None,
             }),
         );
         apply_update(
@@ -11750,6 +11771,8 @@ permission_allow = [\"fetch_user_url\"]
                 endpoint: Some("https://api.deepseek.com/v1/chat/completions".to_owned()),
                 model: Some("deepseek-chat".to_owned()),
                 auth_ref: None,
+                max_context: None,
+                context_budget_cap: None,
             }),
         );
         config
@@ -11888,6 +11911,8 @@ permission_allow = [\"fetch_user_url\"]
                 endpoint: Some("https://api.anthropic.com".to_owned()),
                 model: None,
                 auth_ref: None,
+                max_context: None,
+                context_budget_cap: None,
             }),
         );
         let before = config.clone();
@@ -11922,6 +11947,8 @@ permission_allow = [\"fetch_user_url\"]
                 endpoint: Some("https://api.anthropic.com".to_owned()),
                 model: Some("claude-opus-5".to_owned()),
                 auth_ref: None,
+                max_context: None,
+                context_budget_cap: None,
             }),
         );
         *runtime.config.lock().expect("config") = usable;
@@ -12186,6 +12213,8 @@ permission_allow = [\"fetch_user_url\"]
                 endpoint: Some(endpoint.to_owned()),
                 model: Some("test-model".to_owned()),
                 auth_ref: None,
+                max_context: None,
+                context_budget_cap: None,
             })
         };
         apply_update(
@@ -20912,6 +20941,7 @@ provider_id = \"deepseek\"
                     tier: WireTier::Think,
                     provider_id: ProviderId::from("kimi"),
                 }],
+                max_context: None,
             }
         }
 

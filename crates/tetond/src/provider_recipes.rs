@@ -332,6 +332,11 @@ pub fn recipe_entries() -> Vec<ProviderRecipeEntry> {
             endpoint: recipe.endpoint,
             example_model: recipe.example_model,
             notes: recipe.notes,
+            // TASK-188 gives `ProviderRecipe` its `max_context` and carries it
+            // here (REQ-586 BR-3). `0` is a deliberate placeholder, not a
+            // value: the wire "unknown" spelling, so TASK-188's contract test
+            // ("never 0 in the shipped catalog") is red until it lands.
+            max_context: 0,
         })
         .collect()
 }

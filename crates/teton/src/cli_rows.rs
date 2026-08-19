@@ -1563,6 +1563,8 @@ mod tests {
                     endpoint: Some("https://api.moonshot.ai/v1/chat/completions".to_owned()),
                     model: Some("kimi-k3".to_owned()),
                     auth_ref: Some("keychain://teton/kimi".to_owned()),
+                    max_context: None,
+                    context_budget_cap: None,
                 }],
                 ..Default::default()
             },

@@ -2876,6 +2876,9 @@ mod tests {
         let announce = || {
             Some(RouteDecided {
                 effort: None,
+                budget_tokens: None,
+                budget_bytes: None,
+                bound: None,
                 category: Some(Category::Redact),
                 tier: Some(Tier::Scan),
                 phase: None,

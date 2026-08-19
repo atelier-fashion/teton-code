@@ -692,6 +692,27 @@ pub struct ProviderConfig {
     /// wire and config only carry the reference, the daemon resolves it.
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub auth_ref: Option<String>,
+    /// The provider's declared context window in tokens —
+    /// `capabilities.max_context` (REQ-586 BR-3).
+    ///
+    /// On a snapshot, the daemon **always populates** this field: `Some(0)`
+    /// means "unknown / unset — the budget is defaulted", which `/doctor` and
+    /// `/provider list` state rather than hide. `None` means the snapshot came
+    /// from a daemon that predates the field — the `RouteDecided::effort` rule,
+    /// so `Option` is for **wire additivity only** and moves neither
+    /// [`crate::PROTOCOL_VERSION`] nor [`crate::PROTOCOL_VERSION_MIN`].
+    ///
+    /// On a `RegisterProvider` update, `Some(v)` writes the window and `None`
+    /// preserves whatever is stored (an older client's re-registration cannot
+    /// zero a declared window — architecture ADR-7, field-wise merge).
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub max_context: Option<u32>,
+    /// A user ceiling on the context budget, in tokens, below the window —
+    /// `capabilities.context_budget_cap` (REQ-586 BR-5). `Some(0)` is "no cap".
+    /// Same additivity and merge rule as [`Self::max_context`]; a cap above the
+    /// window is inert, not invalid (ADR-7).
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub context_budget_cap: Option<u32>,
 }
 
 // `RoutingRule` and `ConfigUpdate::SetRoutingRule` are **gone** (REQ-558 AC-9).
@@ -1880,6 +1901,15 @@ pub struct ProviderRecipeEntry {
     /// when it says everything. Absent from the wire when `None`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub notes: Option<String>,
+    /// The context window, in tokens, of [`Self::example_model`] — what
+    /// `/provider setup` records as `capabilities.max_context` so the budget
+    /// follows the route from the first turn (REQ-586 BR-3). Never `0` in the
+    /// shipped catalog (the daemon's contract test pins that); `0` is what an
+    /// entry from a daemon predating the field reads as, which is the
+    /// "unknown" spelling the config already uses — so the field is not
+    /// optional on the wire, and a client never has to tell absent from unset.
+    #[serde(default)]
+    pub max_context: u32,
 }
 
 /// A provider the config already holds, for the flow to show before it offers
@@ -2057,6 +2087,13 @@ pub struct ProviderSetupCandidate {
     /// "route nothing" has one spelling.
     #[serde(default)]
     pub bindings: Vec<TierBinding>,
+    /// The context window to record as `capabilities.max_context`, in tokens —
+    /// the recipe's default, carried silently by the setup UI (REQ-586 BR-3,
+    /// architecture ADR-9). `None` leaves the window unknown, which is the
+    /// honest outcome for a candidate built from no recipe, and what a client
+    /// predating the field sends; absent from the wire when `None`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_context: Option<u32>,
 }
 
 /// Show exactly what registering the candidate would write, without writing it
@@ -3025,6 +3062,10 @@ mod tests {
                     endpoint: Some("https://api.anthropic.com".to_owned()),
                     model: Some("claude-opus-5".to_owned()),
                     auth_ref: Some("keychain://teton/anthropic".to_owned()),
+                    // REQ-586: what a daemon that has the field always sends —
+                    // the declared window, and no cap.
+                    max_context: Some(200_000),
+                    context_budget_cap: None,
                 }],
                 tiers: vec![TierRouteView {
                     tier: Tier::Think,
@@ -3207,6 +3248,108 @@ mod tests {
         assert_eq!(old.judgment_default, Some(Category::Edit));
     }
 
+    /// REQ-586's additive rule on the wire `ProviderConfig`, in the direction a
+    /// **newer client** reads an **older daemon**: a provider record without
+    /// `max_context`/`context_budget_cap` deserializes, and both read `None` —
+    /// "the daemon predates the field", which is a different claim from
+    /// `Some(0)`, "the daemon says the window is unknown". Keeping the two
+    /// distinct is what lets `/doctor` say which one it is (BR-3).
+    ///
+    /// And the non-vacuity: a record that carries them round-trips with the
+    /// values it carried, and one built with `None` emits no key rather than
+    /// `null` — the same wire an older daemon writes.
+    #[test]
+    fn a_provider_record_without_the_window_fields_still_deserializes() {
+        let pre_586: ProviderConfig = serde_json::from_str(
+            r#"{"id":"kimi","kind":"openai-compatible",
+                "endpoint":"https://api.moonshot.ai/v1/chat/completions",
+                "model":"kimi-k3","auth_ref":"keychain://teton/kimi"}"#,
+        )
+        .unwrap();
+        assert_eq!(pre_586.id, ProviderId::from("kimi"));
+        assert_eq!(pre_586.max_context, None);
+        assert_eq!(pre_586.context_budget_cap, None);
+        let wire = serde_json::to_value(&pre_586).unwrap();
+        assert!(wire.get("max_context").is_none(), "{wire}");
+        assert!(wire.get("context_budget_cap").is_none(), "{wire}");
+
+        // The daemon's "unknown" spelling is a present zero, not an absence.
+        let unknown = ProviderConfig {
+            max_context: Some(0),
+            ..pre_586.clone()
+        };
+        round_trip(&unknown);
+        let wire = serde_json::to_value(&unknown).unwrap();
+        assert_eq!(wire["max_context"], 0, "{wire}");
+
+        let declared = ProviderConfig {
+            max_context: Some(131_072),
+            context_budget_cap: Some(65_536),
+            ..pre_586
+        };
+        round_trip(&declared);
+        let wire = serde_json::to_value(&declared).unwrap();
+        assert_eq!(wire["max_context"], 131_072, "{wire}");
+        assert_eq!(wire["context_budget_cap"], 65_536, "{wire}");
+    }
+
+    /// The other direction of the same claim: a client that predates the
+    /// window fields still reads a provider that carries them, and the
+    /// snapshot around it.
+    ///
+    /// Serde ignores unknown fields by default and no type here opts out, but
+    /// this posture is what keeps [`crate::PROTOCOL_VERSION`] still across the
+    /// addition, so it is asserted rather than assumed — modelled by the
+    /// pre-REQ-586 shape of the reader, exactly as
+    /// `a_client_predating_redact_enabled_still_reads_a_snapshot_that_carries_it`
+    /// does one REQ up.
+    #[test]
+    fn a_client_predating_the_window_fields_still_reads_a_provider_that_carries_them() {
+        #[derive(Deserialize)]
+        struct PreWindowProvider {
+            id: ProviderId,
+            kind: ProviderKind,
+            model: Option<String>,
+            auth_ref: Option<String>,
+        }
+        #[derive(Deserialize)]
+        struct PreWindowSnapshot {
+            providers: Vec<PreWindowProvider>,
+            redact_enabled: bool,
+        }
+
+        let wire = serde_json::to_string(&ConfigSnapshot {
+            providers: vec![ProviderConfig {
+                id: ProviderId::from("kimi"),
+                kind: ProviderKind::OpenaiCompatible,
+                endpoint: Some("https://api.moonshot.ai/v1/chat/completions".to_owned()),
+                model: Some("kimi-k3".to_owned()),
+                auth_ref: Some("keychain://teton/kimi".to_owned()),
+                max_context: Some(131_072),
+                context_budget_cap: Some(65_536),
+            }],
+            redact_enabled: true,
+            ..ConfigSnapshot::default()
+        })
+        .unwrap();
+        assert!(
+            wire.contains(r#""max_context":131072"#)
+                && wire.contains(r#""context_budget_cap":65536"#),
+            "the fixture must actually carry the new keys: {wire}"
+        );
+
+        let old: PreWindowSnapshot = serde_json::from_str(&wire).unwrap();
+        assert_eq!(old.providers.len(), 1, "the old reader still gets its rows");
+        assert_eq!(old.providers[0].id, ProviderId::from("kimi"));
+        assert_eq!(old.providers[0].kind, ProviderKind::OpenaiCompatible);
+        assert_eq!(old.providers[0].model.as_deref(), Some("kimi-k3"));
+        assert_eq!(
+            old.providers[0].auth_ref.as_deref(),
+            Some("keychain://teton/kimi")
+        );
+        assert!(old.redact_enabled);
+    }
+
     /// The eleven categories, spelled out rather than iterated, so a twelfth
     /// has to be added here by hand — the same reason the `Category` tests in
     /// `lib.rs` spell them.
@@ -3371,6 +3514,12 @@ mod tests {
                 endpoint: Some("https://api.deepseek.com".to_owned()),
                 model: Some("deepseek-chat".to_owned()),
                 auth_ref: Some("keychain://teton/deepseek".to_owned()),
+                // REQ-586 BR-3/BR-5: a registration that declares both the
+                // window and a cap below it — both fields set, so a round trip
+                // that silently dropped either would fail rather than coincide
+                // with the absent default.
+                max_context: Some(128_000),
+                context_budget_cap: Some(64_000),
             }),
             ConfigUpdate::SetTierBinding(TierBindingConfig {
                 tier: Tier::Build,
@@ -3922,6 +4071,9 @@ mod tests {
                 tier: Tier::Think,
                 provider_id: ProviderId::from("kimi"),
             }],
+            // REQ-586: the recipe's window, carried silently into the
+            // candidate so the registration records one (BR-3).
+            max_context: Some(131_072),
         }
     }
 
@@ -3951,6 +4103,7 @@ mod tests {
                     endpoint: Some("https://api.sentinel.example/v1/chat/completions".to_owned()),
                     example_model: "sentinel-1".to_owned(),
                     notes: Some("a sentinel note".to_owned()),
+                    max_context: 131_072,
                 },
                 // The kind that carries its own address (ADR-7) and has nothing
                 // to add: two of its keys are the ones that *aren't* there.
@@ -3962,6 +4115,7 @@ mod tests {
                     endpoint: None,
                     example_model: "sentinel-native-1".to_owned(),
                     notes: None,
+                    max_context: 200_000,
                 },
             ],
             existing: vec![],
@@ -3993,10 +4147,16 @@ mod tests {
                 "guide_spelling",
                 "id_suggestion",
                 "kind",
-                "label"
+                "label",
+                "max_context"
             ],
             "a recipe with no endpoint and no notes drops both keys: {wire}"
         );
+        // REQ-586: the window is never optional on a recipe — it is a fact
+        // about the example model, carried as a number even when it is the
+        // "unknown" zero, so a client does not have to tell absent from unset.
+        assert_eq!(wire["catalog"][0]["max_context"], 131_072);
+        assert_eq!(wire["catalog"][1]["max_context"], 200_000);
         assert!(
             wire["tiers"][0].get("provider_id").is_none(),
             "an unbound tier is an absent id, not an empty string: {wire}"
@@ -4062,6 +4222,9 @@ mod tests {
                 model: "claude-x".to_owned(),
                 key_ref: "keychain://teton/native".to_owned(),
                 bindings: vec![],
+                // A candidate built from no recipe: the window stays unknown,
+                // and the key stays off the wire (REQ-586).
+                max_context: None,
             },
         });
 
@@ -4171,6 +4334,7 @@ mod tests {
             endpoint: Some("https://api.sentinel.example/v1/chat/completions".to_owned()),
             example_model: "sentinel-1".to_owned(),
             notes: Some("a sentinel note".to_owned()),
+            max_context: 131_072,
         })
         .unwrap();
         assert_eq!(
@@ -4182,10 +4346,76 @@ mod tests {
                 "id_suggestion",
                 "kind",
                 "label",
+                "max_context",
                 "notes"
             ],
             "{wire}"
         );
+    }
+
+    /// REQ-586's additivity on the two setup types: a recipe entry from a daemon
+    /// predating the window reads as the "unknown" zero rather than failing,
+    /// and a candidate from a client predating it reads as `None`; a reader
+    /// built before either field still reads an entry and a candidate that
+    /// carry them.
+    #[test]
+    fn recipe_entry_and_setup_candidate_window_fields_are_additive_in_both_directions() {
+        // Older daemon → newer client: no key, the unknown spelling.
+        let entry: ProviderRecipeEntry = serde_json::from_str(
+            r#"{"id_suggestion":"kimi","label":"Moonshot (Kimi)",
+                "guide_spelling":"Moonshot/Kimi","kind":"openai-compatible",
+                "endpoint":"https://api.moonshot.ai/v1/chat/completions",
+                "example_model":"kimi-k3"}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            entry.max_context, 0,
+            "absent reads as unknown, not as an error"
+        );
+
+        // Older client → newer daemon: no key, no window to record.
+        let candidate: ProviderSetupCandidate = serde_json::from_str(
+            r#"{"id":"kimi","kind":"openai-compatible",
+                "endpoint":"https://api.moonshot.ai/v1/chat/completions",
+                "model":"kimi-k3","key_ref":"keychain://teton/kimi"}"#,
+        )
+        .unwrap();
+        assert_eq!(candidate.max_context, None);
+        assert_eq!(candidate.bindings, vec![]);
+        let wire = serde_json::to_value(&candidate).unwrap();
+        assert!(
+            wire.get("max_context").is_none(),
+            "a candidate with no window emits no key, not null: {wire}"
+        );
+
+        // The other direction: readers built before the fields.
+        #[derive(Deserialize)]
+        struct PreWindowEntry {
+            id_suggestion: String,
+            example_model: String,
+        }
+        #[derive(Deserialize)]
+        struct PreWindowCandidate {
+            id: ProviderId,
+            model: String,
+            key_ref: String,
+        }
+        let wire = serde_json::to_string(&ProviderRecipeEntry {
+            max_context: 131_072,
+            ..entry
+        })
+        .unwrap();
+        assert!(wire.contains(r#""max_context":131072"#), "{wire}");
+        let old: PreWindowEntry = serde_json::from_str(&wire).unwrap();
+        assert_eq!(old.id_suggestion, "kimi");
+        assert_eq!(old.example_model, "kimi-k3");
+
+        let wire = serde_json::to_string(&sentinel_candidate()).unwrap();
+        assert!(wire.contains(r#""max_context":131072"#), "{wire}");
+        let old: PreWindowCandidate = serde_json::from_str(&wire).unwrap();
+        assert_eq!(old.id, ProviderId::from("kimi"));
+        assert_eq!(old.model, "kimi-k2-turbo-preview");
+        assert_eq!(old.key_ref, "keychain://teton/kimi");
     }
 
     /// BR-2's wire half, re-applied at this second flow rather than assumed
@@ -4229,7 +4459,15 @@ mod tests {
             .collect();
         assert_eq!(
             candidate_keys,
-            ["bindings", "endpoint", "id", "key_ref", "kind", "model"]
+            [
+                "bindings",
+                "endpoint",
+                "id",
+                "key_ref",
+                "kind",
+                "max_context",
+                "model"
+            ]
         );
 
         // And the params wrapping it carry only the session, the candidate, and
