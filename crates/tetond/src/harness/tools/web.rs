@@ -2251,6 +2251,11 @@ mod tests {
     /// what the block cost and what paid for it — 234 bytes of guide reference
     /// data moved behind `teton_docs` topics — is `egress::redact`'s note; both
     /// shapes moved by the same guide bytes and gained the same block.
+    /// Re-measured at the merged tip (TASK-180): **5,844 / 9,120 / 96,
+    /// unchanged**, and the row is now the byte-worst rendering in every
+    /// script — `bounded_field` bounds bytes as well as characters, at the
+    /// ASCII cost this row already paid (`teton_core::session_root::byte_ceiling`;
+    /// the reasoning is in `egress::redact`'s note).
     #[tokio::test]
     async fn the_web_tool_docs_clear_the_outbound_body_overhead() {
         use teton_core::capability::{SearchGap, WebCapabilityState};

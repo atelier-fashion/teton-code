@@ -2044,14 +2044,27 @@ mod tests {
     /// either number. The opted-in web shape is 5,844 / 9,120 / **96**, and
     /// stays the looser of the two.
     ///
-    /// Two things the record should carry. The block's bound is in
-    /// *characters* (`bounded_field`), and this ceiling is in bytes: an
-    /// all-multibyte root (up to four bytes a character) renders longer than
-    /// the 200-character ASCII row AC-4 names — the row measures what AC-4
-    /// asks, and a byte bound is a `teton-core` decision, not one for this
-    /// sweep. And one byte is not room for a clause: the next resident sentence
-    /// buys itself the way this one did, out of a topic, and the integration
-    /// task re-records this figure at the merged tip.
+    /// **Re-measured at the merged tip (TASK-180): 5,891 / 9,167 / margin
+    /// 49, unchanged** — the integration task added no resident byte, and the
+    /// opted-in twin is likewise still 5,844 / 9,120 / **96**. What did change
+    /// is the row's standing. TASK-177 recorded that `bounded_field` bounded
+    /// *characters* while this ceiling counts bytes, so an all-multibyte root
+    /// (up to four bytes a character) rendered longer than the 200-character
+    /// ASCII row AC-4 names — 240 bytes of display against the row's 82. That
+    /// is closed in `teton-core`, where the bound belongs: `bounded_field` now
+    /// also holds every value to `byte_ceiling(max_chars)` bytes — the cost of
+    /// an ASCII value cut to the character ceiling, `max_chars + 2` — eliding
+    /// further at character boundaries around one mark, so the row's three
+    /// values sit exactly at their byte ceilings and no script can render past
+    /// them (`turn_loop::the_worst_case_root_is_the_byte_worst_for_multibyte_roots_too`
+    /// drives a 200-character CJK path and 33-character CJK name and branch,
+    /// and their astral-plane twins, through the block and asserts none renders
+    /// longer than the row). The bound was chosen at the ASCII cost rather than
+    /// wider — twice the character ceiling, say — because a wider one would
+    /// have made the row 138 bytes longer, and one byte of margin does not pay
+    /// for that; the ASCII rendering is what it always was. And one byte is
+    /// still not room for a clause: the next resident sentence buys itself the
+    /// way this one did, out of a topic.
     #[test]
     fn the_total_cap_clears_the_harness_context_budget_with_margin() {
         use teton_core::capability::{SearchGap, WebCapabilityState};

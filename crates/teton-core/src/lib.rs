@@ -127,8 +127,8 @@ pub use provenance_id::{ProvenanceError, ProvenanceId};
 // (banner, launch notice, `/cd`), and `teton_core::display_for` is the one path
 // both name it by — one derivation, so the two surfaces cannot drift.
 pub use session_root::{
-    bounded_field, classify, display_for, middle_elide, resolve_cwd_argument, CwdArgError,
-    CwdGrammarRow, CWD_ARGUMENT_GRAMMAR, CWD_GRAMMAR_HOME, CWD_GRAMMAR_SHELL_CWD,
+    bounded_field, byte_ceiling, classify, display_for, middle_elide, resolve_cwd_argument,
+    CwdArgError, CwdGrammarRow, CWD_ARGUMENT_GRAMMAR, CWD_GRAMMAR_HOME, CWD_GRAMMAR_SHELL_CWD,
     DISPLAY_MAX_CHARS, NAME_MAX_CHARS, PROJECT_MARKERS,
 };
 

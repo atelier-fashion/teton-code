@@ -126,6 +126,21 @@ impl TestDaemon {
     /// is off by default, BR-1), and a lookup only happens if the scripted tier
     /// emits the tool call that asks for one.
     fn spawn_with(daemon: &Path, extra: &str, replies: &[&str]) -> Self {
+        Self::spawn_with_env(daemon, extra, replies, &[])
+    }
+
+    /// As [`Self::spawn_with`], with `extra_env` on the daemon's environment.
+    ///
+    /// REQ-583's terminal test hands it a `HOME` under the fixture root — the
+    /// daemon decides a root is "the home folder" by reading `HOME`, and the
+    /// pty session it drives is given the same value — so the home a `/cd ~`
+    /// moves to is a directory the test made, never the developer's own.
+    fn spawn_with_env(
+        daemon: &Path,
+        extra: &str,
+        replies: &[&str],
+        extra_env: &[(&str, &Path)],
+    ) -> Self {
         static SEQ: AtomicUsize = AtomicUsize::new(0);
         // Per-daemon, so two tests in this file never share a root, a socket, or
         // the single-instance flock — and so neither `drop` deletes the other's
@@ -157,7 +172,8 @@ impl TestDaemon {
         std::fs::write(&script, replies.join("\n---\n")).unwrap();
 
         let log = std::fs::File::create(root.join("tetond.log")).unwrap();
-        let child = std::process::Command::new(daemon)
+        let mut command = std::process::Command::new(daemon);
+        command
             // REQ-565: a fixture daemon whose lifetime this test owns (killed in
             // `Drop`). Without `never` it would exit when the PTY session
             // disconnects, and a later command in the same test would autostart
@@ -177,9 +193,11 @@ impl TestDaemon {
             .env("TETON_PROBE_DISK_BYTES", (500u64 << 30).to_string())
             .env("TETON_PROBE_GPU", "apple-silicon")
             .stdout(std::process::Stdio::from(log.try_clone().unwrap()))
-            .stderr(std::process::Stdio::from(log))
-            .spawn()
-            .expect("spawn daemon");
+            .stderr(std::process::Stdio::from(log));
+        for (key, value) in extra_env {
+            command.env(key, value);
+        }
+        let child = command.spawn().expect("spawn daemon");
         let daemon = Self {
             root,
             runtime_dir,
@@ -1180,4 +1198,149 @@ fn a_session_provider_add_asks_for_its_key_echo_off_and_stores_nothing_untyped()
     // m13); the rule it stood for is the section comment above, and the walk's
     // own steps are what enforce it: nothing here writes anything at the key
     // prompt but a bare return.)
+}
+
+// ---------------------------------------------------------------------------
+// REQ-583 — the not-a-project notice, at a real terminal
+// ---------------------------------------------------------------------------
+
+/// The head of the notice (`banner::root_notice`); its bytes are TTY-only.
+const NOT_A_PROJECT: &str = "Not inside a project";
+
+/// **REQ-583 AC-8 / AC-11 / BR-5 / BR-8, the terminal half.** The piped suite
+/// pins the notice's *absence* on a pipe (`cli_e2e`); this is where it is
+/// allowed to appear, and must.
+///
+/// Two sessions against one daemon, each at a pty with a `HOME` the test made:
+///
+/// 1. `teton --cwd <plain>` draws the banner with the session root on its
+///    `cwd:` line, then the notice, then the ready line — in that order (BR-5:
+///    under the banner, once, before the session proceeds).
+/// 2. `teton --cwd <project>` draws no notice at launch; typing `/cd ~` draws
+///    the clear line, `session root is now ~ (your home folder)`, and the
+///    notice again — the same one line launch would have printed (BR-8).
+#[test]
+fn a_move_to_a_non_project_root_re_fires_the_notice_at_a_terminal() {
+    let daemon_path = daemon_bin();
+    // The daemon's root is minted inside `spawn`, so the home lives beside it,
+    // named the same way; the project and plain fixtures go under the root
+    // once it exists.
+    let home = PathBuf::from("/tmp").join(format!("tcptyhome{:x}", std::process::id() & 0xffff));
+    let _ = std::fs::remove_dir_all(&home);
+    std::fs::create_dir_all(&home).unwrap();
+    let daemon =
+        TestDaemon::spawn_with_env(&daemon_path, "", &["scripted reply"], &[("HOME", &home)]);
+    let project = daemon.root.join("proj");
+    let plain = daemon.root.join("plain");
+    std::fs::create_dir_all(&project).unwrap();
+    std::fs::create_dir_all(&plain).unwrap();
+    std::fs::write(project.join("Cargo.toml"), "[package]\nname = \"proj\"\n").unwrap();
+
+    let open = |cwd: &Path| {
+        let pty = native_pty_system()
+            .openpty(PtySize {
+                rows: 40,
+                cols: 100,
+                pixel_width: 0,
+                pixel_height: 0,
+            })
+            .expect("openpty");
+        let mut cmd = CommandBuilder::new(teton_bin());
+        cmd.args(["--cwd", cwd.to_str().unwrap()]);
+        cmd.env("XDG_RUNTIME_DIR", &daemon.runtime_dir);
+        cmd.env("TETON_CONFIG", daemon.root.join("config.toml"));
+        cmd.env("TETON_REPO_ROOT", &daemon.root);
+        cmd.env("HOME", &home);
+        let session = pty.slave.spawn_command(cmd).expect("spawn teton under pty");
+        drop(pty.slave);
+        let transcript = spawn_reader(pty.master.try_clone_reader().expect("pty reader"));
+        let writer = pty.master.take_writer().expect("pty writer");
+        (session, transcript, writer)
+    };
+
+    // 1. A plain root: banner, notice, ready — in that order.
+    let (mut session, transcript, _writer) = open(&plain);
+    let ready = wait_for(&transcript, "ready (freeform)");
+    let launch = snapshot(&transcript);
+    let _ = session.kill();
+    let _ = session.wait();
+    assert!(
+        ready,
+        "the plain-root session never reached the entry prompt; transcript:\n{launch}"
+    );
+    let cwd_line = format!("cwd: {}", plain.display());
+    let at = |needle: &str| {
+        launch.find(needle).unwrap_or_else(|| {
+            panic!("`{needle}` never reached the terminal; transcript:\n{launch}")
+        })
+    };
+    let banner_at = at(&cwd_line);
+    let notice_at = at(NOT_A_PROJECT);
+    let ready_at = at("ready (freeform)");
+    assert!(
+        banner_at < notice_at && notice_at < ready_at,
+        "the notice belongs under the banner and before the ready line; transcript:\n{launch}"
+    );
+    assert!(
+        launch.contains(&format!(
+            "tools are scoped to {} (not a project)",
+            plain.display()
+        )),
+        "the notice names the root and its kind; transcript:\n{launch}"
+    );
+    assert_eq!(
+        launch.matches(NOT_A_PROJECT).count(),
+        1,
+        "once, at launch; transcript:\n{launch}"
+    );
+
+    // 2. A project root: no notice at launch; `/cd ~` re-fires it.
+    let (mut session, transcript, mut writer) = open(&project);
+    assert!(
+        wait_for(&transcript, "ready (freeform)"),
+        "the project session never reached the entry prompt; transcript:\n{}",
+        snapshot(&transcript)
+    );
+    let before = snapshot(&transcript);
+    assert!(
+        !before.contains(NOT_A_PROJECT),
+        "a project root earns no notice at launch; transcript:\n{before}"
+    );
+    assert!(
+        before.contains(&format!("cwd: {}", project.display())),
+        "the banner's cwd line is the --cwd root; transcript:\n{before}"
+    );
+
+    writer.write_all(b"/cd ~\r").expect("type /cd ~");
+    writer.flush().ok();
+    let moved = wait_for(&transcript, "session root is now ~ (your home folder)");
+    let refired = wait_for(&transcript, NOT_A_PROJECT);
+    let after = snapshot(&transcript);
+    let _ = session.kill();
+    let _ = session.wait();
+    let _ = std::fs::remove_dir_all(&home);
+
+    assert!(
+        moved,
+        "`/cd ~` never reported the new root; transcript:\n{after}"
+    );
+    assert!(
+        refired,
+        "the notice did not re-fire after `/cd ~` at a terminal (BR-8); transcript:\n{after}"
+    );
+    let cleared_at = after
+        .find("context cleared;")
+        .unwrap_or_else(|| panic!("a move clears, and says so; transcript:\n{after}"));
+    let moved_at = after
+        .find("session root is now ~ (your home folder)")
+        .unwrap();
+    let notice_at = after.find(NOT_A_PROJECT).unwrap();
+    assert!(
+        cleared_at < moved_at && moved_at < notice_at,
+        "clear line, root line, notice — in that order; transcript:\n{after}"
+    );
+    assert!(
+        after.contains("tools are scoped to ~ (your home folder)"),
+        "the re-fired notice names the home root; transcript:\n{after}"
+    );
 }

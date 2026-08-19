@@ -1,7 +1,7 @@
 ---
 id: TASK-180
 title: "Integration: CLI e2e for --cwd and /cd, final headroom record, manual-verification runbook, live A/B on the local tier"
-status: draft
+status: complete
 parent: REQ-583
 created: 2026-08-18
 updated: 2026-08-18
@@ -34,3 +34,71 @@ recorded as an observation.
 - Byte-parity legs compare piped output before/after with `mask_session_id` as the suite already does.
 - The consent-dialog non-appearance cannot be automated; it is a runbook step by design (LESSON-481's "pay for the harness or record the gap").
 - Commit as `test(REQ-583): e2e for --cwd and /cd, final headroom, runbook [TASK-180]`.
+
+## Implementation record (2026-08-18)
+
+- **cli_e2e legs** (`crates/teton/tests/cli_e2e.rs`, new section "REQ-583 —
+  the session root"): (a)+(c)+(d) `cwd_scopes_the_session_and_slash_cd_moves_it_and_reports_each_step`
+  — one session: bare `/cd` names the `--cwd` root (`project proj`), a
+  scripted absolute `read` is `[done]`, `/cd <plain>` draws `context cleared;
+  N …` **then** `session root is now … (not a project)`, the bare form names
+  the new root, the same `read` is `[failed]`, `/cd /nope` prints the daemon's
+  refusal naming the path, clears nothing, and the root stays; the notice never
+  reaches the pipe. (b) `a_cwd_that_does_not_exist_is_refused_before_any_session_output_and_exits_non_zero`
+  — exit code 1, one stderr line naming `/nope`, no ready/cost/root/clear
+  marker, no turn. (f) + `~/x`:
+  `a_relative_cwd_joins_the_shell_directory_and_a_tilde_cwd_expands_home` (the
+  CLI run *from* the fixture root with `--cwd proj`; `HOME` set for both
+  processes so `~/x` is spelled `~/x` by the daemon). (e) piped half:
+  `slash_cd_to_home_on_a_pipe_is_byte_identical_to_a_move_to_a_project` — with
+  the one root line and the session id masked, `/cd ~` and `/cd <project>`
+  transcripts are byte-identical. Harness: `run_cli_from` (cwd + env) and
+  `spawn_scripted_with_env`. (e) terminal half: `pty_e2e::a_move_to_a_non_project_root_re_fires_the_notice_at_a_terminal`
+  (`spawn_with_env` added to the pty harness) — banner `cwd:` line, notice,
+  ready line in that order for a plain `--cwd`; no notice for a project; `/cd
+  ~` draws clear, root line, notice. `slash_clear_runs_no_turn…`'s scan
+  needed no change: that session types only `/clear`.
+- **Found by the e2e and fixed here:** TASK-179's `session_root_changed` arm
+  re-fired the notice on a pipe (BR-5's gate covered launch only). The gate is
+  now `SessionState.interactive` (set once in `run_session` from the same
+  `is_terminal` read the banner uses; `false` by default), and the arm draws
+  the notice only under it — unit tests `a_root_move_to_home_on_a_pipe_draws_the_root_line_and_no_notice`
+  (new) and `a_root_move_to_home_refires_the_launch_notice` (now sets the
+  flag).
+- **Multibyte hardening** (TASK-177's open note): `teton_core::session_root::bounded_field`
+  now also holds every value to `byte_ceiling(max_chars) = max_chars + 2`
+  bytes — the cost of an ASCII value cut to the character ceiling — eliding
+  further at char boundaries around one `…`; the ASCII rendering is unchanged
+  and the function is idempotent. Tests: `the_byte_ceiling_is_what_an_elided_ascii_value_costs`,
+  `a_multibyte_value_is_bounded_in_bytes_too_and_still_elided_in_the_middle`
+  (3- and 4-byte chars, both ceilings). `turn_loop::worst_case_session_root`
+  is now provably the byte-worst:
+  `the_worst_case_root_is_the_byte_worst_for_multibyte_roots_too` drives a
+  200-char CJK path and 33-char CJK name/branch (and astral-plane twins)
+  through `environment_block` and asserts none renders longer than the fixture,
+  whose three values sit exactly at their byte ceilings. **Deviation from the
+  brief:** the brief named a byte ceiling of `2 * max_chars`; at that width the
+  block's worst row grows 203 → 341 bytes and both sweeps go red (redact margin
+  49 → −89) with the constants pinned, so the ceiling is the ASCII cost
+  instead — the only width that makes the AC-4 row the byte-worst without
+  paying, recorded in `byte_ceiling`'s doc and the redact note.
+- **Final headroom, re-measured at the merged tip:** opted-out (`egress::redact`)
+  worst 5,891 / spent 9,167 / margin **49**; opted-in (`tools::web`) 5,844 /
+  9,120 / **96** — unchanged from TASK-177 (this task added no resident byte).
+  Constants unchanged (9,216 / 48). Both notes carry the re-measurement and the
+  byte-bound account.
+- **Runbook:** `docs/manual-verification.md` gained `# Manual verification
+  runbook — REQ-583 (session root awareness)` (OUTSTANDING; five steps;
+  sign-off block) plus a run record.
+- **AC-20 live A/B: RAN from a script**, release build with `tetond/llama`
+  (51 s), isolated daemon under `/tmp/t583` with the real
+  `qwen3-coder-30b-a3b` weights symlinked; three runs recorded verbatim in the
+  runbook — piped from `~` (three `glob` walks `[done]`, a shell call refused
+  for want of a piped answer, the model found nothing; the home has > 100k
+  entries under the skip rules, so the walk ended by budget — inferred, not
+  read), piped `--cwd <repo>` (`/cd` bare, a root-relative `read Cargo.toml`,
+  `/cd ~` clear+root lines, `/cd /nope` refused, root unchanged), and a
+  `script(1)` pty run (notice under the banner before ready; none after a move
+  to the project; re-fired after `/cd ~`). **The consent-dialog step is
+  OUTSTANDING**: it cannot be observed from a script. Cleanup done: daemon
+  stopped, symlink unlinked before `rm -rf`, real weights listed intact.

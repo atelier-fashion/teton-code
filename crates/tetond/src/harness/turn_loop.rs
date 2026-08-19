@@ -1273,8 +1273,11 @@ const fn platform_word() -> &'static str {
 /// display, [`NAME_MAX_CHARS`](teton_core::session_root::NAME_MAX_CHARS) for
 /// name and branch — so this function holds its own ceiling whatever it is
 /// handed: no control character reaches the line, and no path can grow it past
-/// the display ceiling — about 200 bytes for the 200-character root that is
-/// the row the resident-prompt ceiling sweeps measure
+/// the display ceiling, in characters or in bytes
+/// ([`byte_ceiling`](teton_core::session_root::byte_ceiling): the ASCII cost
+/// of the character ceiling, held for every script) — about 200 bytes for
+/// the 200-character root that is the row the resident-prompt ceiling sweeps
+/// measure
 /// (`egress::redact::tests::the_total_cap_clears_the_harness_context_budget_with_margin`
 /// and its twin beside the web tool). Every value sits mid-line after a harness
 /// label, never at column 0, so `neutralize_frame_labels` and
@@ -1331,12 +1334,15 @@ pub(crate) fn environment_block(root: &SessionRoot) -> String {
 /// it, and kind `project` — the one kind whose phrase carries both. Elided
 /// rather than merely at the cap because the ceiling is counted in bytes and
 /// the bound in characters: the elision mark is three bytes for one character,
-/// so a value that was cut is two bytes longer than one that just fit. (An
-/// all-multibyte path is longer still — the bound is per character, up to four
-/// bytes each — and is not what this row measures; AC-4 names a 200-character
-/// path.) Built here rather than in each sweep so the two cannot come to
-/// measure different worst cases, and `#[cfg(test)]` because it is a
-/// measurement fixture, not a value the daemon ever holds.
+/// so a value that was cut is two bytes longer than one that just fit — and
+/// that cost, [`byte_ceiling`](teton_core::session_root::byte_ceiling) of the
+/// character ceiling, is also the byte bound `bounded_field` holds every
+/// script to (TASK-180), which is what makes this ASCII row the **byte-worst**
+/// rendering there is: each of its three values sits exactly at its byte
+/// ceiling, and no all-multibyte value can render past one. Built here rather
+/// than in each sweep so the two cannot come to measure different worst
+/// cases, and `#[cfg(test)]` because it is a measurement fixture, not a value
+/// the daemon ever holds.
 #[cfg(test)]
 pub(crate) fn worst_case_session_root() -> SessionRoot {
     use teton_core::session_root::{bounded_field, DISPLAY_MAX_CHARS, NAME_MAX_CHARS};
@@ -3457,6 +3463,65 @@ mod tests {
             assert!(
                 !block.contains("repo"),
                 "the block's own text must not say repository/repo:\n{block}"
+            );
+        }
+    }
+
+    /// **REQ-583 / TASK-180: the sweeps' row is the byte-worst, in every
+    /// script.** The resident-prompt ceiling is counted in bytes and the
+    /// display/name ceilings in characters; `bounded_field` bounds both, at
+    /// the ASCII cost of the character ceiling, so a root made of three- or
+    /// four-byte characters — a 200-character CJK path, a 33-character CJK
+    /// name and branch, and the astral-plane twins of each — must render no
+    /// longer than `worst_case_session_root`, whose three values each sit
+    /// exactly at their byte ceiling. Asserted on the rendered block, which is
+    /// what the sweeps measure, and on the fixture's own bytes, so a fixture
+    /// that quietly slipped under its ceiling would fail here before it made
+    /// the sweeps measure less than the block can be.
+    #[test]
+    fn the_worst_case_root_is_the_byte_worst_for_multibyte_roots_too() {
+        use teton_core::session_root::{byte_ceiling, DISPLAY_MAX_CHARS, NAME_MAX_CHARS};
+
+        let worst = worst_case_session_root();
+        assert_eq!(worst.display.len(), byte_ceiling(DISPLAY_MAX_CHARS));
+        assert_eq!(
+            worst.project_name.as_deref().map(str::len),
+            Some(byte_ceiling(NAME_MAX_CHARS))
+        );
+        assert_eq!(
+            worst.vcs_branch.as_deref().map(str::len),
+            Some(byte_ceiling(NAME_MAX_CHARS))
+        );
+        let worst_block = environment_block(&worst);
+
+        for (script, ch) in [("cjk", '漢'), ("astral", '𝔘')] {
+            assert!(ch.len_utf8() >= 3);
+            let path = format!("/{}", ch.to_string().repeat(199));
+            assert_eq!(
+                path.chars().count(),
+                200,
+                "{script}: AC-4's 200-character path"
+            );
+            let name = ch.to_string().repeat(NAME_MAX_CHARS + 1);
+            // Unbounded on purpose: the block must hold its own ceiling even
+            // for a root that arrived without the probe's bounding.
+            let root = SessionRoot {
+                display: path,
+                kind: RootKind::Project,
+                project_name: Some(name.clone()),
+                vcs_branch: Some(name),
+            };
+            let block = environment_block(&root);
+            assert!(
+                block.len() <= worst_block.len(),
+                "{script}: a multibyte root renders {} bytes, past the {}-byte row the \
+                 ceiling sweeps measure:\n{block}",
+                block.len(),
+                worst_block.len()
+            );
+            assert!(
+                block.contains('…'),
+                "{script}: the values were elided:\n{block}"
             );
         }
     }

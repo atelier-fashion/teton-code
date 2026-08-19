@@ -123,6 +123,18 @@ impl TestDaemon {
         )
     }
 
+    /// A scripted daemon whose environment carries `extra_env` — REQ-583's
+    /// tests hand it a `HOME` under the fixture root, so "the home folder" is a
+    /// directory the test made rather than the developer's own, and the CLI it
+    /// drives is given the same value (`run_cli_from`).
+    fn spawn_scripted_with_env(
+        daemon: &Path,
+        replies: &[&str],
+        extra_env: &[(&str, &str)],
+    ) -> Self {
+        Self::spawn_with_script_env(daemon, Some(replies), "", extra_env)
+    }
+
     fn spawn_with_script(daemon: &Path, replies: Option<&[&str]>, extra_config: &str) -> Self {
         Self::spawn_with_script_env(daemon, replies, extra_config, &[])
     }
@@ -352,6 +364,37 @@ impl TestDaemon {
         stdin: &str,
         seams: CliSeams,
     ) -> (String, String, std::process::ExitStatus) {
+        self.run_cli_process(teton, args, stdin, seams, None, &[])
+    }
+
+    /// As [`Self::run_cli_streams`], with the CLI's working directory and extra
+    /// environment under the test's control.
+    ///
+    /// REQ-583 is the first thing here that cares where the CLI *runs from*: a
+    /// relative `--cwd` joins onto the process's directory, and `~` — in `--cwd`
+    /// and in `/cd` — is `HOME`, which the daemon reads too when it decides a
+    /// root is the home folder. Every other runner inherits the test runner's
+    /// directory and environment, as it always did.
+    fn run_cli_from(
+        &self,
+        teton: &Path,
+        args: &[&str],
+        stdin: &str,
+        cwd: Option<&Path>,
+        env: &[(&str, &Path)],
+    ) -> (String, String, std::process::ExitStatus) {
+        self.run_cli_process(teton, args, stdin, CliSeams::Off, cwd, env)
+    }
+
+    fn run_cli_process(
+        &self,
+        teton: &Path,
+        args: &[&str],
+        stdin: &str,
+        seams: CliSeams,
+        cwd: Option<&Path>,
+        env: &[(&str, &Path)],
+    ) -> (String, String, std::process::ExitStatus) {
         let mut command = Command::new(teton);
         command
             .args(args)
@@ -359,6 +402,12 @@ impl TestDaemon {
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
+        if let Some(cwd) = cwd {
+            command.current_dir(cwd);
+        }
+        for (key, value) in env {
+            command.env(key, value);
+        }
         // Removed rather than simply not set, for the same reason as
         // `TETON_TEST_SEAMS` below: a developer who exports a provider key in
         // their shell must still run the test CI runs. `read_secret` takes this
@@ -4705,5 +4754,438 @@ fn an_attested_session_set_tier_writes() {
         build_row.contains("→ deepseek"),
         "the attested binding never reached the running config; \
          row: {build_row:?}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// REQ-583 — the session root: `--cwd`, `/cd`, and the lines they draw
+// ---------------------------------------------------------------------------
+//
+// The daemon's halves of AC-9 and AC-10 — the derived root on `session/create`,
+// the jail moving under `session/set_cwd`, the two events on the wire ahead of
+// the answer, a `read` refused in the BR-2 shape, at every permission level —
+// are `tetond`'s `tests/e2e/session_root.rs`, on captured request bodies. What
+// only the shipped binary can settle is the **user's** side of the same story:
+// that `teton --cwd` scopes the session to the directory named, that a refused
+// `--cwd` is one line and an error exit with no session behind it, that `/cd`
+// draws the clear line and the new root in that order and refuses naming the
+// path, that a relative `--cwd` is relative to the shell and `~` is `HOME`, and
+// that none of it puts the launch notice on a pipe. Every root here is a
+// directory the test made under the daemon's own root, and every "home" is a
+// `HOME` the test set — the developer's real home is never the fixture.
+
+/// One tool call: a `read` of `path` (absolute, so the same call is admitted
+/// under the root that contains it and refused under one that does not).
+fn read_call(path: &Path) -> String {
+    format!(
+        "{{\"tool\": \"read\", \"arguments\": {{\"path\": \"{}\"}}}}",
+        path.display()
+    )
+}
+
+/// The lines a `session_root_changed` event and a bare `/cd` draw
+/// (`session_ui::format_session_root_changed`, `slash::current_root_line`).
+const ROOT_MOVED: &str = "session root is now ";
+const ROOT_LINE: &str = "session root: ";
+
+/// The head of the launch notice (`banner::root_notice`) — TTY-only bytes.
+const NOT_A_PROJECT: &str = "Not inside a project";
+
+/// A project fixture (holds a `Cargo.toml`) and a plain one beside it, under
+/// `root`; the project holds `notes.txt` for the read legs.
+fn root_fixtures(root: &Path) -> (PathBuf, PathBuf) {
+    let project = root.join("proj");
+    let plain = root.join("plain");
+    std::fs::create_dir_all(&project).unwrap();
+    std::fs::create_dir_all(&plain).unwrap();
+    std::fs::write(project.join("Cargo.toml"), "[package]\nname = \"proj\"\n").unwrap();
+    std::fs::write(project.join("notes.txt"), "alpha\n").unwrap();
+    (project, plain)
+}
+
+/// **AC-9 / AC-10 through the binary: `--cwd` scopes the session, `/cd` moves
+/// it — clear line, then the new root — and a refused `/cd` moves nothing.**
+///
+/// One session, in order: a bare `/cd` names the `--cwd` root and its kind; a
+/// scripted `read` of a file under it runs (`[done]`); `/cd <plain>` draws
+/// `context cleared; N …` **then** `session root is now <plain> (not a
+/// project)`; a bare `/cd` now names the new root; the *same* absolute `read`
+/// is refused (`[failed]`) — the file is still there, the jail moved (the BR-2
+/// refusal's bytes are asserted at the daemon, `tests/e2e/session_root.rs`;
+/// the CLI shows the status the model saw); `/cd /nope` prints the daemon's
+/// refusal naming the path and clears nothing; a last bare `/cd` still names
+/// the plain root. And no launch notice anywhere: stdout is a pipe.
+#[test]
+fn cwd_scopes_the_session_and_slash_cd_moves_it_and_reports_each_step() {
+    let daemon_bin = daemon_bin();
+    // The scripted read names an absolute path, so the fixture has to exist
+    // before the daemon's script is written — and the daemon's own root is
+    // minted inside `spawn`. The fixture therefore lives beside it under
+    // `/tmp`, named from the same pid, and is removed at the end.
+    let fixture = PathBuf::from("/tmp").join(format!("tcroot{:x}", std::process::id() & 0xffff));
+    let _ = std::fs::remove_dir_all(&fixture);
+    let (project, plain) = root_fixtures(&fixture);
+    let notes = project.join("notes.txt");
+    let read_notes = read_call(&notes);
+    let daemon = TestDaemon::spawn_scripted(
+        &daemon_bin,
+        &[
+            &read_notes,
+            "scripted-turn-one complete.",
+            &read_notes,
+            "scripted-turn-two complete.",
+        ],
+    );
+    let teton = teton_bin();
+
+    let session = daemon.run_cli_with_stdin(
+        &teton,
+        &["--cwd", project.to_str().unwrap()],
+        &format!(
+            "/cd\n\
+             read the notes\n\
+             /cd {plain}\n\
+             /cd\n\
+             read the notes again\n\
+             /cd /nope\n\
+             /cd\n",
+            plain = plain.display()
+        ),
+    );
+    let _ = std::fs::remove_dir_all(&fixture);
+    let log = daemon.log();
+
+    // Both turns ran — otherwise the `[done]`/`[failed]` pair below is about
+    // nothing.
+    for reply in ["scripted-turn-one complete.", "scripted-turn-two complete."] {
+        assert!(
+            session.contains(reply),
+            "the turn ending `{reply}` never completed; output:\n{session}\nlog:\n{log}"
+        );
+    }
+
+    let body = session_body(&session, "the --cwd session");
+    let project_line = format!("{ROOT_LINE}{} (project proj)", project.display());
+    let plain_line = format!("{ROOT_LINE}{} (not a project)", plain.display());
+    let moved_line = format!("{ROOT_MOVED}{} (not a project)", plain.display());
+    let read_done = format!("read {} [done]", notes.display());
+    let read_failed = format!("read {} [failed]", notes.display());
+    let refusal =
+        "the session root could not be moved: cwd `/nope` does not exist or is not a directory";
+
+    let at = |needle: &str| {
+        body.find(needle).unwrap_or_else(|| {
+            panic!("`{needle}` never printed; session body:\n{body}\nlog:\n{log}")
+        })
+    };
+    // (a) the bare form names the `--cwd` root, kind and all.
+    let first_bare = at(&project_line);
+    // The control read ran under the old root.
+    let done = at(&read_done);
+    // (c) the move: the clear line, then the new root, in that order.
+    let cleared = at(CLEAR_MARKER);
+    let moved = at(&moved_line);
+    let second_bare = body[moved..]
+        .find(&plain_line)
+        .map(|i| moved + i)
+        .unwrap_or_else(|| panic!("no bare `/cd` line after the move; session body:\n{body}"));
+    // The same read is now refused: the file did not move, the jail did.
+    let failed = at(&read_failed);
+    // (d) the refused move names the path …
+    let refused = at(refusal);
+    // … and the root stayed where it was.
+    let third_bare = body[refused..]
+        .find(&plain_line)
+        .map(|i| refused + i)
+        .unwrap_or_else(|| {
+            panic!("no bare `/cd` line after the refused move; session body:\n{body}")
+        });
+    assert!(
+        first_bare < done
+            && done < cleared
+            && cleared < moved
+            && moved < second_bare
+            && second_bare < failed
+            && failed < refused
+            && refused < third_bare,
+        "the lines are out of order; session body:\n{body}"
+    );
+
+    // Exactly one clear, and it dropped the turn that ran before it: `/cd
+    // <plain>` cleared, `/cd /nope` did not (validate before mutate).
+    let counts = clear_counts(&session);
+    assert_eq!(
+        counts.len(),
+        1,
+        "one accepted move, one clear line — a refused move must not clear; \
+         output:\n{session}"
+    );
+    assert!(
+        counts[0] > 0,
+        "the move cleared nothing, so the turn before it retained nothing and the \
+         `context cleared` line is not about a conversation; output:\n{session}"
+    );
+    assert_eq!(
+        body.matches(ROOT_MOVED).count(),
+        1,
+        "one accepted move draws one `session root is now` line; body:\n{body}"
+    );
+    assert!(
+        !body.contains(&format!("{ROOT_LINE}/nope"))
+            && !body.contains(&format!("{ROOT_MOVED}/nope")),
+        "a refused `/cd` must never be reported as the root; body:\n{body}"
+    );
+    // The `--cwd` root was named exactly once (before the move) — a bare `/cd`
+    // after it names the plain root, twice.
+    assert_eq!(body.matches(&project_line).count(), 1, "body:\n{body}");
+    assert_eq!(body.matches(&plain_line).count(), 2, "body:\n{body}");
+    // The read's title carries the same path both times: the file did not
+    // change, and the second status is the jail's verdict.
+    assert_eq!(body.matches(&read_done).count(), 1, "body:\n{body}");
+    assert_eq!(body.matches(&read_failed).count(), 1, "body:\n{body}");
+
+    // BR-5's bytes are TTY-only: a pipe never carries the launch notice, even
+    // for a plain root (ADR-5) — the move to one drew its two lines and nothing
+    // more.
+    assert!(
+        !session.contains(NOT_A_PROJECT),
+        "the not-a-project notice reached a pipe; output:\n{session}"
+    );
+    // The commands themselves cost no turn: only the two scripted reads did.
+    assert_eq!(
+        session.matches("scripted-turn-").count(),
+        2,
+        "a `/cd` reached the model; output:\n{session}"
+    );
+}
+
+/// **AC-9 / BR-6: `teton --cwd /nope` is one refusal naming the path, an error
+/// exit, and no session output — never a session that starts and then fails on
+/// every tool.**
+#[test]
+fn a_cwd_that_does_not_exist_is_refused_before_any_session_output_and_exits_non_zero() {
+    let daemon_bin = daemon_bin();
+    let daemon = TestDaemon::spawn_scripted(&daemon_bin, TURN_REPLIES);
+    let teton = teton_bin();
+
+    let (stdout, stderr, status) =
+        daemon.run_cli_streams(&teton, &["--cwd", "/nope"], "hello\n", CliSeams::Off);
+
+    assert!(
+        !status.success(),
+        "a refused --cwd must exit non-zero (a script would read 0 as a session that \
+         ran); stdout:\n{stdout}\nstderr:\n{stderr}"
+    );
+    assert_eq!(
+        status.code(),
+        Some(1),
+        "stdout:\n{stdout}\nstderr:\n{stderr}"
+    );
+    let refusal =
+        "teton: could not start a session: cwd `/nope` does not exist or is not a directory";
+    assert_eq!(
+        stderr.trim_end().lines().last(),
+        Some(refusal),
+        "the refusal is the daemon's sentence, naming the path, once, on stderr; \
+         stderr:\n{stderr}"
+    );
+    assert_eq!(
+        stderr.matches("/nope").count(),
+        1,
+        "the path is named once — one line, not a line and a repeat; stderr:\n{stderr}"
+    );
+    // No session opened, so nothing a session prints follows: no ready line,
+    // no reply to the prompt that was piped in, no cost summary.
+    for marker in [
+        READY_MARKER,
+        COST_MARKER,
+        ROOT_LINE,
+        ROOT_MOVED,
+        CLEAR_MARKER,
+    ] {
+        assert!(
+            !stdout.contains(marker) && !stderr.contains(marker),
+            "`{marker}` printed after a refused create; stdout:\n{stdout}\nstderr:\n{stderr}"
+        );
+    }
+    assert_no_turn_ran(
+        &format!("{stdout}{stderr}"),
+        "the piped prompt after a refused --cwd",
+    );
+}
+
+/// **AC-9 / AC-12: a relative `--cwd` is relative to the shell's directory, and
+/// `~/x` is `HOME`'s `x` — the grammar `/cd` shares.**
+///
+/// The CLI is run *from* the fixture root with `--cwd proj`, and again with
+/// `--cwd ~/x` under a `HOME` the test set; a bare `/cd` in each session names
+/// the root the daemon derived — the resolved directory and its kind — which is
+/// the only place a piped session says where it stands. The daemon is given the
+/// same `HOME`, so its display for the second root is `~/x`: one spelling, from
+/// the daemon's own rule (ADR-1).
+#[test]
+fn a_relative_cwd_joins_the_shell_directory_and_a_tilde_cwd_expands_home() {
+    let daemon_bin = daemon_bin();
+    // `HOME` for both processes: a directory under `/tmp` the test made, holding
+    // `x/` — named from the pid, like the daemon's own root, and removed after.
+    let home = PathBuf::from("/tmp").join(format!("tchome{:x}", std::process::id() & 0xffff));
+    let _ = std::fs::remove_dir_all(&home);
+    std::fs::create_dir_all(home.join("x")).unwrap();
+    let daemon = TestDaemon::spawn_scripted_with_env(
+        &daemon_bin,
+        TURN_REPLIES,
+        &[("HOME", home.to_str().unwrap())],
+    );
+    let teton = teton_bin();
+    let (project, _plain) = root_fixtures(&daemon.root);
+
+    // Relative: `proj` from the daemon's root. The CLI resolves it against its
+    // own working directory as the OS reports it — on macOS `/tmp` is a link,
+    // so the daemon's spelling of the result may begin `/private/tmp` — which
+    // is why the assertion is on the tail of the path, not on the fixture's
+    // own spelling of it.
+    let (stdout, stderr, status) = daemon.run_cli_from(
+        &teton,
+        &["--cwd", "proj"],
+        "/cd\n",
+        Some(&daemon.root),
+        &[("HOME", &home)],
+    );
+    assert!(status.success(), "stdout:\n{stdout}\nstderr:\n{stderr}");
+    let root_line = stdout
+        .lines()
+        .find(|line| line.contains(ROOT_LINE))
+        .unwrap_or_else(|| panic!("no bare `/cd` line; stdout:\n{stdout}\nstderr:\n{stderr}"));
+    let expected_tail = format!(
+        "/{}/proj (project proj)",
+        daemon.root.file_name().unwrap().to_str().unwrap()
+    );
+    assert!(
+        root_line.ends_with(&expected_tail),
+        "a relative --cwd must resolve against the shell's directory to the project \
+         fixture; line: {root_line:?}, expected tail {expected_tail:?}"
+    );
+    // The fixture is the directory the line names — spelled by the OS, so the
+    // tail comparison above is the honest one; the project marker is what
+    // made it `project proj`.
+    assert!(project.join("Cargo.toml").is_file());
+
+    // `~/x`: `HOME`'s `x`, a marker-less directory — a plain root, spelled `~/x`
+    // by the daemon because it reads the same `HOME`.
+    let (stdout, stderr, status) = daemon.run_cli_from(
+        &teton,
+        &["--cwd", "~/x"],
+        "/cd\n",
+        Some(&daemon.root),
+        &[("HOME", &home)],
+    );
+    let _ = std::fs::remove_dir_all(&home);
+    assert!(status.success(), "stdout:\n{stdout}\nstderr:\n{stderr}");
+    assert!(
+        stdout.contains(&format!("{ROOT_LINE}~/x (not a project)")),
+        "`--cwd ~/x` must resolve to HOME's x and be spelled `~/x`; stdout:\n{stdout}\nstderr:\n{stderr}"
+    );
+    assert!(
+        !stdout.contains(NOT_A_PROJECT),
+        "the not-a-project notice reached a pipe; stdout:\n{stdout}"
+    );
+}
+
+/// **AC-11 / BR-8, the piped half: `/cd ~` from a project fires nothing extra
+/// on a pipe — byte parity with a move to another project.**
+///
+/// Two fresh daemons, two sessions from a project fixture; one types `/cd ~`
+/// (`HOME` a directory the test made — a `home`-kind root, which at a terminal
+/// re-fires the launch notice), the other `/cd <another project>`. Both draw
+/// the clear line and a `session root is now …` line; with that one line
+/// masked and the session ids masked, the two transcripts are **byte-identical**
+/// — the notice's bytes are TTY-only (ADR-5), so a pipe sees the same stream
+/// whichever kind of root the session moved to. The terminal half — the notice
+/// really firing after `/cd ~` — is `pty_e2e::a_move_to_a_non_project_root_re_fires_the_notice_at_a_terminal`.
+#[test]
+fn slash_cd_to_home_on_a_pipe_is_byte_identical_to_a_move_to_a_project() {
+    let daemon_bin = daemon_bin();
+    let teton = teton_bin();
+    let home = PathBuf::from("/tmp").join(format!("tchome2{:x}", std::process::id() & 0xffff));
+    let _ = std::fs::remove_dir_all(&home);
+    std::fs::create_dir_all(&home).unwrap();
+
+    /// The transcript with its one root-dependent line replaced by a sentinel.
+    fn mask_root_line(transcript: &str) -> String {
+        let mut hits = 0;
+        let masked: Vec<String> = transcript
+            .lines()
+            .map(|line| {
+                if let Some(at) = line.find(ROOT_MOVED) {
+                    hits += 1;
+                    format!("{}{ROOT_MOVED}<root>", &line[..at])
+                } else {
+                    line.to_owned()
+                }
+            })
+            .collect();
+        assert_eq!(
+            hits, 1,
+            "one move, one root line; transcript:\n{transcript}"
+        );
+        let mut out = masked.join("\n");
+        if transcript.ends_with('\n') {
+            out.push('\n');
+        }
+        out
+    }
+
+    let run = |target: &dyn Fn(&Path) -> String| -> (String, String) {
+        let daemon = TestDaemon::spawn_scripted_with_env(
+            &daemon_bin,
+            TURN_REPLIES,
+            &[("HOME", home.to_str().unwrap())],
+        );
+        let (project, _plain) = root_fixtures(&daemon.root);
+        let other = daemon.root.join("proj2");
+        std::fs::create_dir_all(&other).unwrap();
+        std::fs::write(other.join("package.json"), "{}\n").unwrap();
+        let (stdout, stderr, status) = daemon.run_cli_from(
+            &teton,
+            &["--cwd", project.to_str().unwrap()],
+            &format!("/cd {}\n", target(&other)),
+            None,
+            &[("HOME", &home)],
+        );
+        assert!(status.success(), "stdout:\n{stdout}\nstderr:\n{stderr}");
+        (stdout, stderr)
+    };
+    let (to_home, home_stderr) = run(&|_| "~".to_owned());
+    let (to_project, project_stderr) = run(&|other| other.display().to_string());
+    let _ = std::fs::remove_dir_all(&home);
+
+    // Non-vacuity: each run moved where it was told, and said so.
+    assert!(
+        to_home.contains(&format!("{ROOT_MOVED}~ (your home folder)")),
+        "`/cd ~` must move to the home folder; stdout:\n{to_home}\nstderr:\n{home_stderr}"
+    );
+    assert!(
+        to_project.contains(ROOT_MOVED) && to_project.contains("(project proj2)"),
+        "`/cd <project>` must move to the project; stdout:\n{to_project}\nstderr:\n{project_stderr}"
+    );
+    assert!(
+        to_home.contains(CLEAR_MARKER) && to_project.contains(CLEAR_MARKER),
+        "a move clears; home:\n{to_home}\nproject:\n{to_project}"
+    );
+    // The claim: on a pipe, the move to a non-project root added no bytes.
+    assert!(
+        !to_home.contains(NOT_A_PROJECT),
+        "the not-a-project notice reached a pipe after `/cd ~`; stdout:\n{to_home}"
+    );
+    assert_eq!(
+        mask_root_line(&mask_session_id(&to_home, "the /cd ~ run")),
+        mask_root_line(&mask_session_id(&to_project, "the /cd <project> run")),
+        "piped output after `/cd ~` differs from a move to a project by more than the \
+         root line — the notice's bytes (or something else) reached the pipe.\n\
+         /cd ~:\n{to_home}\n/cd <project>:\n{to_project}"
+    );
+    assert_eq!(
+        home_stderr, project_stderr,
+        "stderr differs between the two moves"
     );
 }

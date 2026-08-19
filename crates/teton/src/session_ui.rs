@@ -232,6 +232,18 @@ pub struct SessionState {
     /// sets it: a flag any other flow could raise would be a way to silence a
     /// notice about a test this client never ran.
     pub(crate) provider_test_in_flight: bool,
+    /// Whether this session's stdout is a terminal (REQ-583 BR-5 / ADR-5).
+    ///
+    /// The not-a-project notice is content the surface draws only at a
+    /// terminal: launch prints it under the banner inside the same `if
+    /// interactive` gate as the banner, and BR-8's re-fire after `/cd` — drawn
+    /// from the `session_root_changed` arm, which has only this state to ask —
+    /// takes the same gate from here, so a pipe sees the root line and nothing
+    /// more (byte parity, ADR-007's TTY clause). Set once by `run_session` from
+    /// the same `is_terminal` read the banner uses; `false` by default, which is
+    /// the piped posture and the safe one — a passive context that was never
+    /// told draws no notice rather than one nobody asked for.
+    pub interactive: bool,
 }
 
 /// What the session's web capability currently is, for the status row.
@@ -834,8 +846,13 @@ pub fn render_event(
                         LineKind::Notice,
                         &format_session_root_changed(&changed.root),
                     );
-                    if let Some(notice) = banner::root_notice(&changed.root) {
-                        surface.line(LineKind::Notice, &notice);
+                    // BR-8, under BR-5's gate: the notice's bytes are for a
+                    // terminal, at launch and here alike — a pipe gets the
+                    // root line above and nothing more.
+                    if state.interactive {
+                        if let Some(notice) = banner::root_notice(&changed.root) {
+                            surface.line(LineKind::Notice, &notice);
+                        }
                     }
                 }
             }
@@ -4106,6 +4123,7 @@ mod tests {
     fn a_root_move_to_home_refires_the_launch_notice() {
         let mut surface = RecordingSurface::new();
         let mut state = SessionState::new();
+        state.interactive = true;
         state.session_id = Some(SessionId::from("s1"));
         state.root = Some(session_root(
             RootKind::Project,
@@ -4129,6 +4147,33 @@ mod tests {
         );
         assert!(notices[1].contains("`/cd <path>`"), "{}", notices[1]);
         assert_eq!(state.root, Some(home));
+    }
+
+    /// **BR-5's gate applies to the re-fire (TASK-180).** The same move on a
+    /// pipe — stdout not a terminal, `interactive` false as `run_session` sets
+    /// it — draws the root line and **no** notice: the notice's content is
+    /// pure and its bytes are the terminal's, at launch and after `/cd` alike,
+    /// so piped output moves only by the one line the move itself adds.
+    #[test]
+    fn a_root_move_to_home_on_a_pipe_draws_the_root_line_and_no_notice() {
+        let mut surface = RecordingSurface::new();
+        let mut state = SessionState::new();
+        assert!(!state.interactive, "the default is the piped posture");
+        state.session_id = Some(SessionId::from("s1"));
+        state.root = Some(session_root(
+            RootKind::Project,
+            "~/Documents/GitHub/teton-code",
+        ));
+
+        let home = session_root(RootKind::Home, "~");
+        render_event(&root_changed("s1", home.clone()), &mut surface, &mut state);
+
+        assert_eq!(
+            surface.lines_of(LineKind::Notice),
+            vec!["session root is now ~ (your home folder)".to_owned()],
+            "on a pipe the move is the root line alone"
+        );
+        assert_eq!(state.root, Some(home), "the cache still follows the daemon");
     }
 
     /// **The bus is daemon-wide.** A move in a *different* session names that
@@ -4164,6 +4209,7 @@ mod tests {
     fn a_root_move_is_not_attributed_elsewhere_when_this_client_has_no_session() {
         let mut surface = RecordingSurface::new();
         let mut state = SessionState::new();
+        state.interactive = true;
 
         render_event(
             &root_changed("s2", session_root(RootKind::Plain, "/opt/scratch")),

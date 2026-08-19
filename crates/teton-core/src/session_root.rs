@@ -52,6 +52,26 @@ pub const NAME_MAX_CHARS: usize = 32;
 /// field is never longer than its ceiling.
 const ELISION: char = '…';
 
+/// The byte ceiling that goes with a character ceiling of `max_chars`: what an
+/// ASCII value elided to `max_chars` costs — `max_chars - 1` one-byte
+/// characters and the three-byte [`ELISION`] mark.
+///
+/// The character ceilings ([`DISPLAY_MAX_CHARS`], [`NAME_MAX_CHARS`]) are for
+/// the person reading; the resident-prompt ceiling the environment block is
+/// paid under is counted in **bytes**, and its two sweeps measure an ASCII
+/// 200-character root cut to the character ceiling. Without a byte bound an
+/// all-multibyte value — up to four bytes a character — rendered longer than
+/// that row, so the row was not the worst case it was said to be. This bound
+/// makes it exactly the worst: an all-ASCII value at the ceiling costs
+/// `max_chars` bytes and one cut to it costs `max_chars + 2`, and nothing in
+/// any script may cost more. (A wider byte cap — say twice the character
+/// ceiling — would need the block's worst row, and the ceiling that pays for
+/// it, to grow by over a hundred bytes; the margin there is one.)
+#[must_use]
+pub const fn byte_ceiling(max_chars: usize) -> usize {
+    max_chars + ELISION.len_utf8() - 1
+}
+
 /// What kind of place `path` is (BR-4).
 ///
 /// `Home` when `path == home`, `FilesystemRoot` when `path == /`, `Project`
@@ -104,16 +124,31 @@ pub fn display_for(path: &Path, home: Option<&Path>) -> String {
 /// Every control character — newlines and carriage returns included — becomes
 /// `?`, so a path can neither break the line it sits on nor smuggle a
 /// frame label to column 0; then the result is [`middle_elide`]d to at most
-/// `max_chars` characters, so no path can blow the resident-prompt ceiling. The
-/// three user-controlled root values (display, project name, branch) all pass
-/// through here, with [`DISPLAY_MAX_CHARS`] or [`NAME_MAX_CHARS`].
+/// `max_chars` characters **and** at most [`byte_ceiling`]`(max_chars)` bytes,
+/// so no path can blow the resident-prompt ceiling in either unit. The byte
+/// bound is met by eliding further, at character boundaries, still around one
+/// [`ELISION`] mark; an all-ASCII value never meets it (it is the ASCII cost),
+/// so the rendering of an ASCII path is what it always was. The three
+/// user-controlled root values (display, project name, branch) all pass
+/// through here, with [`DISPLAY_MAX_CHARS`] or [`NAME_MAX_CHARS`]. Idempotent:
+/// a value already within both bounds comes back unchanged.
 #[must_use]
 pub fn bounded_field(s: &str, max_chars: usize) -> String {
     let neutral: String = s
         .chars()
         .map(|c| if c.is_control() { '?' } else { c })
         .collect();
-    middle_elide(&neutral, max_chars)
+    let max_bytes = byte_ceiling(max_chars);
+    // Largest character budget whose elision fits the byte ceiling. Below the
+    // value's own length an elision's byte count only grows with the budget
+    // (each step keeps one more character), so the first fit from the top is
+    // the longest one; a budget of zero renders the empty string, which always
+    // fits, so the search cannot fall through.
+    (0..=max_chars)
+        .rev()
+        .map(|keep| middle_elide(&neutral, keep))
+        .find(|out| out.len() <= max_bytes)
+        .unwrap_or_default()
 }
 
 /// `s` if it fits in `max_chars`, otherwise its head and tail around one `…`,
@@ -496,6 +531,80 @@ mod tests {
         let out = middle_elide(&s, 5);
         assert_eq!(out.chars().count(), 5);
         assert_eq!(out, "éé…éé");
+    }
+
+    /// The byte ceiling is the ASCII cost of the character ceiling: an ASCII
+    /// value that fits costs at most `max_chars` bytes, one that was cut costs
+    /// `max_chars + 2` (the three-byte mark for one character), and that is
+    /// the ceiling — so the ASCII row the resident-prompt sweeps measure is the
+    /// byte-worst rendering there is.
+    #[test]
+    fn the_byte_ceiling_is_what_an_elided_ascii_value_costs() {
+        assert_eq!(byte_ceiling(DISPLAY_MAX_CHARS), 82);
+        assert_eq!(byte_ceiling(NAME_MAX_CHARS), 34);
+        assert_eq!(byte_ceiling(1), ELISION.len_utf8());
+        let cut = bounded_field(&"/segment".repeat(25), DISPLAY_MAX_CHARS);
+        assert_eq!(cut.len(), byte_ceiling(DISPLAY_MAX_CHARS));
+        assert_eq!(cut.chars().count(), DISPLAY_MAX_CHARS);
+        let fits = "a".repeat(DISPLAY_MAX_CHARS);
+        assert_eq!(bounded_field(&fits, DISPLAY_MAX_CHARS), fits);
+    }
+
+    /// **The multibyte hardening (TASK-180).** A value made of three- and
+    /// four-byte characters is bounded in bytes as well as characters: it
+    /// renders no longer than the byte ceiling, still around one elision mark,
+    /// still cut at character boundaries (valid UTF-8 by construction), and a
+    /// bounded value passed through again is unchanged. Before this bound a
+    /// 200-character CJK path came out at 80 characters and 240 bytes — three
+    /// times the ASCII row the ceiling sweeps call the worst case.
+    #[test]
+    fn a_multibyte_value_is_bounded_in_bytes_too_and_still_elided_in_the_middle() {
+        for (script, ch) in [("cjk", '漢'), ("astral", '𝔘')] {
+            assert!(ch.len_utf8() >= 3, "{script}: not a multibyte fixture");
+            let long = ch.to_string().repeat(200);
+            for (max_chars, what) in [(DISPLAY_MAX_CHARS, "display"), (NAME_MAX_CHARS, "name")] {
+                let out = bounded_field(&long, max_chars);
+                let ceiling = byte_ceiling(max_chars);
+                assert!(
+                    out.len() <= ceiling,
+                    "{script} {what}: {} bytes over a {ceiling}-byte ceiling: {out}",
+                    out.len()
+                );
+                assert!(out.chars().count() <= max_chars, "{script} {what}: {out}");
+                assert_eq!(
+                    out.matches(ELISION).count(),
+                    1,
+                    "{script} {what}: one elision mark, kept: {out}"
+                );
+                assert!(
+                    out.starts_with(ch) && out.ends_with(ch),
+                    "{script} {what}: cut in the middle, not at an end: {out}"
+                );
+                // As long as the byte ceiling allows: one more character on
+                // either side would cross it.
+                assert!(
+                    out.len() + ch.len_utf8() > ceiling,
+                    "{script} {what}: elided further than the byte ceiling requires: {} bytes",
+                    out.len()
+                );
+                assert_eq!(
+                    bounded_field(&out, max_chars),
+                    out,
+                    "{script} {what}: idempotent"
+                );
+            }
+        }
+        // A short multibyte value under both bounds is left alone.
+        assert_eq!(
+            bounded_field("~/文档/项目", DISPLAY_MAX_CHARS),
+            "~/文档/项目"
+        );
+        // Two-byte characters at the character ceiling exceed the byte ceiling
+        // and are elided too — the bound is bytes, not "wide characters".
+        let latin = "é".repeat(DISPLAY_MAX_CHARS);
+        let out = bounded_field(&latin, DISPLAY_MAX_CHARS);
+        assert!(out.len() <= byte_ceiling(DISPLAY_MAX_CHARS), "{out}");
+        assert!(out.contains(ELISION), "{out}");
     }
 
     #[test]

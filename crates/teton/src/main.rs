@@ -954,6 +954,10 @@ fn run_session(
     let mut surface = stdout_surface_with_color(color);
     let mut state = SessionState::new();
     state.verbose = verbose;
+    // The same terminal fact, carried on the state for the one arm that draws
+    // TTY-only bytes without reaching this scope (REQ-583 BR-8's re-fire of
+    // the not-a-project notice; `session_ui::SessionState::interactive`).
+    state.interactive = interactive;
     let mut prompter = StdinPrompter::new();
 
     // The *other* half of "interactive", read once here at the edge and carried

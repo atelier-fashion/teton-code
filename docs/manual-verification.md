@@ -1791,3 +1791,229 @@ Step 8 — a typed write applied and the shell twin agreed : yes / no
 Step 9 — a piped write refused and changed nothing : yes / no
 Notes / findings :
 ```
+
+# Manual verification runbook — REQ-583 (session root awareness)
+
+**Status: OUTSTANDING.** CI pins the mechanism at every seam it can reach: the
+root's kind, display and branch are derived by one pure module and probed once
+per turn; the environment block is in every prompt under the resident ceiling
+(both sweeps cross a 200-character root); the walkers share one skip set, one
+media set and one budget, and end a stopped or partly unreadable walk with the
+line that says so; `--cwd`, `/cd`, the refusals and the two events are asserted
+through the shipped binaries on a pipe (`cli_e2e`) and at a pty (`pty_e2e`),
+and `session/set_cwd` at every permission level over the socket
+(`tetond/tests/e2e/session_root.rs`).
+
+What no CI run can settle is the thing that opened this REQ: a **real model**,
+started from the home folder, asked for a repository it has to go looking for —
+and the **macOS consent dialogs** that a walk into `~/Library`, `~/Music` or
+`~/Pictures` raises. Whether a dialog appeared is a fact about the screen, not
+about any process's output; it cannot be observed from a script, so it is a
+by-hand step by design (LESSON-481's "pay for the harness or record the gap";
+AC-20/AC-21). And whether the model's *reply* is a good one is an observation,
+never an assertion (LESSON-532): the guarantees are at the surface — the notice,
+the trailer lines, the jail — and the prose is recorded beside them.
+
+## Procedure
+
+Run on a build with the local engine (`cargo build --release --features
+tetond/llama`) or the shipped binary, with `TETON_TEST_SEAMS` unset. Use a
+machine with verified weights (`teton model status` → `verified`). To run it
+without disturbing a launchd daemon, use the isolation recipe above (a short
+`XDG_RUNTIME_DIR` base, the weights symlinked at `$BASE/teton/models`,
+`model-selection.toml` copied beside them) — but the consent-dialog step (2)
+needs a **terminal**, so at least that step is typed, not piped.
+
+1. `cd ~ && teton`. Wait for `local model … ready`. Expect, **under the banner
+   and before the ready line**, one notice:
+   `Not inside a project — tools are scoped to ~ (your home folder): every
+   search walks all of it, and privacy boundaries declared for a project do not
+   apply here. Run teton from the project, `teton --cwd <path>`, or `/cd <path>`
+   here.` The banner's `cwd:` line reads `~`. (BR-5, AC-8.)
+2. Type, verbatim:
+
+   ```
+   look in my development folder for the Teton repo
+   ```
+
+   Watch the **screen**, not the transcript, for the whole turn. Expect **no**
+   macOS consent dialog for *Media & Apple Music*, *Photos*, or *"data from
+   other apps"* — those are what a walk into `~/Music`, `~/Pictures` or
+   `~/Library` raises, and from a home-kind root the walkers do not enter them
+   unless the pattern names them (BR-12). A dialog for **Desktop** or
+   **Documents** may still appear if this terminal was never granted them —
+   that is the OS asking about a folder the user *did* name, and is not a
+   failure; record it if it happens. Record every tool line the session drew
+   (`- glob …`, `- grep …`, `- shell …`, each with its `[done]`/`[failed]`),
+   and the reply. (AC-20 b.)
+3. Every `glob`/`grep` the model ran either completed or ended with a
+   `... (stopped after N entries; narrow the pattern, or move the session root
+   with /cd)` (or `stopped after N s`) line, or a `... (N folder(s) could not be
+   read (permission denied): …)` line — and the turn **finished**. Nothing hung.
+   If a `shell` command timed out, its message ended with the consent-dialog
+   sentence (BR-14). Record which trailer lines appeared, verbatim. (BR-10,
+   BR-13, AC-20 c.)
+4. Type `/cd ~/Documents/GitHub/teton-code`. Expect two lines, in this order:
+   `context cleared; N retained blocks dropped.` (or `there was nothing retained
+   to drop.` if step 2 retained nothing) and
+   `session root is now ~/Documents/GitHub/teton-code (project teton-code,
+   branch <the checked-out branch>)` — and **no** notice, because the new root
+   is a project. Then ask a trivial question about the repo (`what is in
+   Cargo.toml?`) and confirm the reply is about *this* repo — the next turn's
+   environment block names the new root. (BR-7, AC-10.)
+5. Type `/cd` alone. Expect
+   `session root: ~/Documents/GitHub/teton-code (project teton-code, branch …)`
+   — the same spelling as step 4's line. Then `/cd ~` and expect the clear
+   line, `session root is now ~ (your home folder)`, and the step-1 notice
+   again (BR-8, AC-11). `/cd /nope` must print
+   `the session root could not be moved: cwd `/nope` does not exist or is not a
+   directory` and a following `/cd` still names `~`.
+
+Record the model's replies in steps 2 and 4 as **observations** — what it
+searched, what it found, what it said — not as pass/fail (LESSON-532).
+
+## Sign-off
+
+```
+REQ-583 sign-off
+----------------
+Verified by      :
+Date             :
+Platform / OS    :
+Build            :               (`teton --version`, or the release build's commit)
+Local model      :
+TETON_TEST_SEAMS confirmed unset : yes / no
+Step 1 — notice under the banner, before the ready line, cwd `~` : yes / no
+Step 2 — NO Media & Apple Music / Photos / other-apps dialog     : yes / no
+Step 2 — a Desktop/Documents dialog appeared (not a failure)     : yes / no / n/a
+Step 2 — tool lines drawn (verbatim)                             :
+Step 3 — every walk completed or ended with a `... (stopped …)` /
+         `... (… could not be read …)` line; nothing hung          : yes / no
+Step 3 — trailer lines seen (verbatim)                           :
+Step 4 — `context cleared;` then `session root is now … (project teton-code, branch …)` : yes / no
+Step 4 — no notice after the move to a project                   : yes / no
+Step 5 — `/cd` alone printed the same root line                  : yes / no
+Step 5 — `/cd ~` re-fired the notice; `/cd /nope` refused naming the path : yes / no
+Model prose (steps 2 and 4), as observations :
+Notes / findings :
+```
+
+### Run record — 2026-08-18, from a script (TASK-180)
+
+The procedure was driven once against the merged tip (commit of TASK-180's
+parent, `6bf9cf9` + this task's tree), **from a script, not by a person**:
+`cargo build --workspace --release --features tetond/llama` (51 s, engine
+cached), an isolated daemon (`XDG_RUNTIME_DIR=/tmp/t583`, weights symlinked at
+`/tmp/t583/teton/models`, `model-selection.toml` copied beside them,
+`--shutdown-policy never`), the real `qwen3-coder-30b-a3b` weights on Apple
+Silicon (48 GiB), `TETON_TEST_SEAMS` unset. Steps 1–3 were run **piped** (so
+step 1's notice could not appear there — a pipe never carries it, by design)
+and step 1/4/5 again under `script -q /dev/null` for a pty. Everything below is
+an **observation** (LESSON-532); the sign-off block stays blank because the one
+thing this runbook exists for — whether a **consent dialog** appeared on the
+screen — cannot be observed from a script and was not observed. Left
+OUTSTANDING for a person at the keyboard.
+
+Run 1 — `cd ~ && printf 'look in my development folder for the Teton repo\n/quit\n' | teton -v`
+(48 s wall clock including the model load; the model's own words are its own):
+
+```
+>> local tier disabled: qwen3-coder-30b-a3b's weights are installed and verified; the daemon is loading and benchmarking them now — the local tier opens when that completes.
+session sess-… ready (freeform). Type a prompt or /help for commands; Ctrl-D to end.
+› >> message queued until qwen3-coder-30b-a3b finishes loading — it will run as soon as the local tier opens.
+>> benchmark qwen3-coder-30b-a3b: first token 640 ms, 61.9 tok/s
+>> local model qwen3-coder-30b-a3b ready
+>> route [edit/build] → local (model tbd) — …
+I'll look for the Teton repo in your development folder.
+ - glob dev/**/teton* [running]
+ - glob dev/**/teton* [done]
+Let me try a broader search for any Teton-related repositories.
+ - glob **/teton* [running]
+ - glob **/teton* [done]
+Let me check what's in your home directory to see if we can find the Teton repo there.
+ - glob ~/*teton* [running]
+ - glob ~/*teton* [done]
+Let me check what directories exist in your home folder to get a better sense of your file structure.
+ - shell: ls -la ~ | grep -E '^[d].*teton' [running]
+? permission requested: shell — shell: ls -la ~ | grep -E '^[d].*teton'
+  allow shell? [y]es / [n]o / [a]llow-always / [d]eny-always: …
+ - shell: ls -la ~ | grep -E '^[d].*teton' [failed]
+I apologize, but I'm unable to locate the Teton repository in your development folder. The search attempts didn't return any matches for "teton" in your home directory or development folders. …
+turn ended (EndTurn).
+```
+
+Observations: three `glob` walks from a `home`-kind root, each `[done]` within
+seconds — the whole turn, three walks and a refused shell, ended in well under a
+minute, so nothing hung (AC-20 c). The shell call was refused only because the
+piped stdin had no answer left for the permission question. This home holds
+more than 100,000 entries under the walk's skip rules (`find` with the same
+prunes reaches the cap in 0.2 s), so `glob **/teton*` from `~` can only have
+ended by a budget — the entry budget, or the 10 s wall clock — and therefore
+with a `... (stopped after …; narrow the pattern, or move the session root with
+/cd)` line in the model's tool result (BR-10). That is an **inference** from
+the counts and from CI's BR-10 tests, not a reading of this transcript: the
+transcript shows tool status only, not the tool's text, and the model's prose
+did not relay the line. Whether the walk **entered** `~/Library`,
+`~/Music` or `~/Pictures` cannot be read from this transcript either; the
+walkers' pruning of them from a home root is CI's (`tools::walk` /
+`glob`/`grep` AC-16 tests), and the dialog non-appearance is the by-hand step.
+The model did not find the repository (it lives at `~/Documents/GitHub/teton-code`;
+its first pattern named a `dev/` folder this home does not have, its third used
+a literal `~` segment) — recorded, not judged.
+
+Run 2 — `teton -v --cwd ~/Documents/GitHub/teton-code` piped `/cd`, a
+question, `/cd ~`, `/cd`, `/cd /nope`, `/cd`, `/quit` (1 s; the model was
+already loaded):
+
+```
+› session root: ~/Documents/GitHub/teton-code (project teton-code, branch main)
+ - read Cargo.toml [running]
+ - read Cargo.toml [done]
+The package name is not explicitly stated in the provided Cargo.toml file. It appears to be a workspace with multiple crates, but the root package name is not defined. …
+turn ended (EndTurn).
+› >> context cleared; 4 retained blocks dropped.
+>> session root is now ~ (your home folder)
+› session root: ~ (your home folder)
+› error: the session root could not be moved: cwd `/nope` does not exist or is not a directory
+› session root: ~ (your home folder)
+```
+
+Observations: `/cd` alone spelled the root with its kind and branch (step 5);
+the model's `read Cargo.toml` was root-relative and succeeded — the
+environment block named the root it read from (step 4's "the reply is about
+this repo"; the workspace `Cargo.toml` really has no `[package]`); `/cd ~` drew
+the clear line then the root line, in that order, and no notice on a pipe;
+`/cd /nope` was refused naming the path and a following `/cd` still said `~`.
+
+Run 3 — the same binary under `script -q /dev/null` (a pty), `teton --cwd ~`
+then `/cd`, `/cd ~/Documents/GitHub/teton-code`, `/cd ~`, `/quit`:
+
+```
+  Teton Code v0.1.22 — local-first AI coding agent
+  cwd: ~
+>> probe: 48.0 GiB RAM — clears the local-tier floor
+>> local model qwen3-coder-30b-a3b ready
+>> Not inside a project — tools are scoped to ~ (your home folder): every search walks all of it, and privacy boundaries declared for a project do not apply here. Run teton from the project, `teton --cwd <path>`, or `/cd <path>` here.
+session sess-… ready (freeform). Type a prompt or /help for commands; Ctrl-D to end.
+…
+session root: ~ (your home folder)
+… /cd /Users/brettluelling/Documents/GitHub/teton-code
+>> context cleared; there was nothing retained to drop.
+>> session root is now ~/Documents/GitHub/teton-code (project teton-code, branch main)
+… /cd ~
+>> context cleared; there was nothing retained to drop.
+>> session root is now ~ (your home folder)
+>> Not inside a project — tools are scoped to ~ (your home folder): every search walks all of it, and privacy boundaries declared for a project do not apply here. Run teton from the project, `teton --cwd <path>`, or `/cd <path>` here.
+```
+
+Observations: at a terminal the notice sits under the banner (`cwd: ~`) and
+before the ready line (step 1); a move to the project drew no notice; `/cd ~`
+re-fired it after the root line (step 5, BR-8).
+
+Cleanup: my daemon was stopped, `/tmp/t583/teton/models` was unlinked before
+`/tmp/t583` was removed, and the real weights at `~/Library/Application
+Support/teton/models` were listed intact afterwards.
+
+**Still outstanding for a person:** step 2 at a real terminal, watching the
+screen for the *Media & Apple Music* / *Photos* / *"data from other apps"*
+dialogs across the turn (and noting a Desktop/Documents one if it appears).
