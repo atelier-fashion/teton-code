@@ -2875,6 +2875,94 @@ mod tests {
         );
     }
 
+    /// BUG-181: the model affirmed capabilities Teton does not have. Asked "are
+    /// you able to leverage the skills and framework available?" beside a
+    /// `~/.claude/skills` tree it had just read, it said yes; the user typed
+    /// `/analyze` and the closed command table (REQ-555 BR-7) correctly said
+    /// `unknown command`. The prompt had no fact to answer a *capability*
+    /// question from — the guide's first line gives the model facts about
+    /// Teton's *setup* so it stops hunting the repository for them (BUG-160),
+    /// and this is the same pattern for what the session can run.
+    ///
+    /// What is pinned: the fact is **resident** (in `build_system_prompt`'s
+    /// output for both harness shapes, not only in the file), it is **one
+    /// line** (the guide is sized per sentence and a second line about
+    /// commands is a decision, not drift), it names **`/help`** as the roster
+    /// (the one pointer a model can give a user without seeing the table),
+    /// it says **nothing is loaded** from both `.claude/` and `~/.claude` (the
+    /// two places another agent's skills, commands, `CLAUDE.md`, agents and
+    /// hooks live — naming one would leave the other to be affirmed), and it
+    /// says **only the user runs** the commands. It sits **before** step 1 so a
+    /// model reading top-down has it before the first recipe.
+    ///
+    /// Why equality on the pointer and the two paths rather than on the whole
+    /// line: REQ-585 (skills as `/` commands) amends this sentence on purpose —
+    /// skills *will* be loaded and listed by `/help` — and the amendment must
+    /// update this test, not delete it. The three anchors are the parts that
+    /// stay true across that amendment; the "loads nothing" phrase is the part
+    /// REQ-585 will re-word, and it is asserted separately so the failure names
+    /// it.
+    #[test]
+    fn the_system_prompt_states_what_the_session_can_run_and_from_where() {
+        let capability: Vec<&str> = SELF_CONFIG_GUIDE
+            .lines()
+            .filter(|line| line.contains("/help"))
+            .collect();
+        assert_eq!(
+            capability.len(),
+            1,
+            "the guide has {} lines naming `/help`, and exactly one may: the capability \
+             fact (BUG-181). A second line about what the session can run is a decision — \
+             fold it into the one line or amend this test deliberately.\nlines: {capability:?}",
+            capability.len()
+        );
+        let line = capability[0];
+        for anchor in [".claude/", "~/.claude", "only the user runs"] {
+            assert!(
+                line.contains(anchor),
+                "the capability sentence no longer says `{anchor}`. It has to name both \
+                 places other agents load capabilities from and say the user is the one who \
+                 runs commands, or a model beside a skills tree affirms it can use them \
+                 (BUG-181).\nline: {line}"
+            );
+        }
+        // The half REQ-585 re-words. Asserted on its own so that amendment's
+        // failure names this phrase and nothing else.
+        assert!(
+            line.contains("loads nothing from"),
+            "the capability sentence no longer says Teton loads nothing from those \
+             places. If skills are now loaded (REQ-585 BR-9), re-word this phrase and this \
+             assertion together — the pointer at `/help` and the two paths above must \
+             survive the amendment.\nline: {line}"
+        );
+        // Before the first numbered step: a model reading top-down meets the
+        // capability fact before the first setup recipe (the REQ-579 A1–A3
+        // finding — the model follows the numbered steps, so what precedes them
+        // is what frames them).
+        let step_one = SELF_CONFIG_GUIDE
+            .find("\n1. ")
+            .expect("the guide has a numbered step 1");
+        let fact_at = SELF_CONFIG_GUIDE
+            .find(line)
+            .expect("the capability line is in the guide");
+        assert!(
+            fact_at < step_one,
+            "the capability fact moved below step 1; it has to frame the steps, not trail \
+             them.\nfact at {fact_at}, step 1 at {step_one}"
+        );
+        // Resident, in both harness shapes: a fact in the file that the builder
+        // dropped would pass every assertion above and still leave the model
+        // with nothing to answer from.
+        for config in [HarnessConfig::default(), HarnessConfig::for_strong_model()] {
+            let system = build_system_prompt(&ToolRegistry::with_builtins(), &config);
+            assert!(
+                system.contains(line),
+                "the capability fact is in self_config.md but not in the built system \
+                 prompt for {config:?}"
+            );
+        }
+    }
+
     /// A stand-in for the real [`WebTool`](super::tools::WebTool), registered
     /// under the name the prompt builder and the untrusted-framing list key on.
     ///
