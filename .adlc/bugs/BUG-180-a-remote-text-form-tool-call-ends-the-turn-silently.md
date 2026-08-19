@@ -178,6 +178,15 @@ Deliberately **not** changed here, noted for follow-up:
   at line start, a ChatML control token) is still wholly suppressed by the
   gate and committed whole. Different cause (the frame-forgery axis, BUG-148
   family), not seen in the field, out of scope here.
+- The display gate's tool-shape test is wider than the parser's grammar, on
+  **both** tiers and since BUG-147: `ReplyScanner` stops at the first closed
+  top-level object whose bytes *contain* `"tool"` or `"name"`, while
+  `parse_reply` requires the object to parse and to carry that key at the
+  top level. A tool-shaped object that is not valid JSON (a trailing comma),
+  or a quoted object with a nested `"name"`, is hidden from the screen but
+  is no call — the turn ends with the rest of the reply unseen. Same family
+  of symptom, different cause (a heuristic and a grammar that should be one
+  rule), pre-existing and shared by the local tier; worth its own report.
 
 ## Files Changed
 
