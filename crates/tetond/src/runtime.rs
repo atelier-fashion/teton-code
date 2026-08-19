@@ -11506,6 +11506,7 @@ permission_allow = [\"fetch_user_url\"]
             "read",
             &"word ".repeat(500),
             50,
+            50 * crate::harness::context::APPROX_BYTES_PER_TOKEN,
             &crate::harness::ToolProvenance::none(),
         )
         .await;
@@ -15774,13 +15775,14 @@ permission_allow = [\"fetch_user_url\"]
                     ("title", crate::harness::title::title_prompt(REQUEST)),
                     (
                         "compact",
-                        crate::harness::compact::compact_prompt(&[
-                            crate::harness::context::ContextBlock {
+                        crate::harness::compact::compact_prompt(
+                            &[crate::harness::context::ContextBlock {
                                 role: crate::harness::context::BlockRole::User,
                                 text: "do the thing".to_owned(),
                                 provenance: crate::harness::context::Provenance::User,
-                            },
-                        ]),
+                            }],
+                            crate::harness::compact::COMPACT_PROMPT_BUDGET_BYTES,
+                        ),
                     ),
                 ] {
                     let out = engine
@@ -16072,7 +16074,10 @@ permission_allow = [\"fetch_user_url\"]
 
                 let duty = engine
                     .complete(
-                        &crate::harness::compact::compact_prompt(&blocks),
+                        &crate::harness::compact::compact_prompt(
+                            &blocks,
+                            crate::harness::compact::COMPACT_PROMPT_BUDGET_BYTES,
+                        ),
                         &params,
                         &mut |_| true,
                     )
@@ -16095,10 +16100,11 @@ permission_allow = [\"fetch_user_url\"]
             /// away from the duty it is meant to answer.
             #[test]
             fn the_stand_in_recognizes_the_contract_the_prompt_carries() {
-                assert!(
-                    crate::harness::compact::compact_prompt(pressured().blocks())
-                        .contains(COMPACT_OUTPUT_CONTRACT)
-                );
+                assert!(crate::harness::compact::compact_prompt(
+                    pressured().blocks(),
+                    crate::harness::compact::COMPACT_PROMPT_BUDGET_BYTES,
+                )
+                .contains(COMPACT_OUTPUT_CONTRACT));
             }
         }
 

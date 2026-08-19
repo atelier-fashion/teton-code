@@ -532,16 +532,18 @@ mod tests {
     /// coupling is written down here rather than left to hold by luck.
     #[test]
     fn the_topic_ceiling_stays_under_the_summarize_threshold() {
-        use crate::harness::context::APPROX_BYTES_PER_TOKEN;
         use crate::harness::turn_loop::HarnessConfig;
 
-        let threshold_bytes =
-            HarnessConfig::default().summarize_threshold_tokens * APPROX_BYTES_PER_TOKEN;
+        // The byte twin is read off the config rather than recomputed from the
+        // word threshold (REQ-586 BR-6, gotcha #3): the two thresholds scale
+        // from two different currencies on a remote route, so a topic must clear
+        // the byte one the harness will actually apply.
+        let threshold_bytes = HarnessConfig::default().summarize_threshold_bytes;
         assert!(
             MAX_TOPIC_BYTES < threshold_bytes,
             "the per-topic ceiling is {MAX_TOPIC_BYTES} bytes and the default harness \
              summarizes a tool result past {threshold_bytes} bytes \
-             ({} tokens × {APPROX_BYTES_PER_TOKEN}). A topic at the ceiling would be \
+             ({} tokens). A topic at the ceiling would be \
              summarized instead of served — a model call, and on a remote tier a model call \
              carrying the body, which is not what `teton_docs` promises. Lower \
              `MAX_TOPIC_BYTES`, or raise the threshold deliberately and say why here.",

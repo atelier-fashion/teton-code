@@ -629,7 +629,8 @@ pub async fn run_session_turn_with_source(
             // one. Fixing a postcondition at one of its two exits would leave it
             // false at the other, and the next reader would reasonably believe
             // it held.
-            ctx.truncate_to_budget();
+            // TASK-189 emits this.
+            let _pressure = ctx.truncate_to_budget();
             return Ok(TurnOutcome {
                 stop_reason: StopReason::MaxTurnRequests,
                 turns,
@@ -670,7 +671,8 @@ pub async fn run_session_turn_with_source(
                  context was truncated deterministically instead"
             );
         }
-        ctx.truncate_to_budget();
+        // TASK-189 emits this.
+        let _pressure = ctx.truncate_to_budget();
 
         // ---- model call ----
         // The egress provenance of the assembled context travels with the turn so
@@ -782,7 +784,8 @@ pub async fn run_session_turn_with_source(
                 // copy. `final_text` is returned whole below and has already been
                 // streamed, so what the user receives is untouched — only what
                 // the next turn carries is bounded, which is the point.
-                ctx.truncate_to_budget();
+                // TASK-189 emits this.
+                let _pressure = ctx.truncate_to_budget();
                 return Ok(TurnOutcome {
                     stop_reason: StopReason::EndTurn,
                     turns,
@@ -985,6 +988,7 @@ pub async fn run_session_turn_with_source(
                                 &name,
                                 &folded,
                                 config.summarize_threshold_tokens,
+                                config.summarize_threshold_bytes,
                                 &provenance,
                             )
                             .await;
@@ -4109,7 +4113,7 @@ mod tests {
                 "step {i}: reading yet another file to fill the budget"
             ));
         }
-        ctx.truncate_to_budget();
+        let _ = ctx.truncate_to_budget();
 
         assert!(
             !ctx.blocks()

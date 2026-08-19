@@ -245,7 +245,12 @@ impl CarriedTurn {
         // of the last writer. Unconditional and ahead of the trim, for the same
         // reason the loop's own gate is unconditional: what enforces a budget is
         // never allowed to be skipped by a path.
-        ctx.truncate_to_budget();
+        // TASK-189 returns this to the runtime, which publishes the
+        // between-turns drop as `context_pressure` (BR-10): the commit runs
+        // from `Drop` and holds no `SessionEvents`, so the seam re-asserts the
+        // invariant and the news is published where the handle lives
+        // (LESSON-501).
+        let _pressure = ctx.truncate_to_budget();
         let pending_call = ctx.pending_tool_call();
         let mut retained = ctx.into_retained();
         if cancelled && pending_call {
