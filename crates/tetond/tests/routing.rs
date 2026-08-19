@@ -537,6 +537,8 @@ async fn a_malformed_tool_call_degrades_in_place_rather_than_failing() {
     // The other side of "falls back per failure class": a weak-tool-calling
     // failure keeps the provider but forces the reduced BR-6 profile, still
     // completing rather than aborting.
+    let bus = Arc::new(EventBus::new());
+    let mut sub = bus.subscribe(64);
     let router = structured_router();
     let before = structured_route(&router, CorePhase::Implement);
     let outcome = router.on_provider_failure(&before, "deepseek", FailureClass::MalformedToolCall);
@@ -577,6 +579,48 @@ async fn a_malformed_tool_call_degrades_in_place_rather_than_failing() {
             .expect("the failed route reported one")
             .budget_tokens,
         "the event after the degrade announces the budget it announced before"
+    );
+
+    // AC-15c, the negative half: **no `refit_on_reroute`**. The daemon's two
+    // reroute arms re-budget and announce because they move the turn to a
+    // different window; an in-place degrade moves it to a different *profile*,
+    // and re-fitting a context that already fits — then telling the user their
+    // context was re-fitted — would be a clamp that never happened.
+    //
+    // Pinned two ways, because either alone is weak. The pairs are byte-equal,
+    // which is the condition `runtime::refit_for_reroute` returns on, so the
+    // refit is unreachable rather than merely unobserved…
+    assert_eq!(
+        (
+            route.budget.budget_tokens,
+            route.budget.budget_bytes,
+            route.harness.context_budget_tokens,
+            route.harness.context_budget_bytes,
+        ),
+        (
+            before.budget.budget_tokens,
+            before.budget.budget_bytes,
+            before.harness.context_budget_tokens,
+            before.harness.context_budget_bytes,
+        ),
+        "the pair moved, so the runtime would re-fit and announce a \
+         degrade that changed no window"
+    );
+    // …and the whole degrade path, announcement included, publishes nothing of
+    // the kind.
+    router.emit_provider_degraded(&bus, None, degraded);
+    let events = collect_events(&mut sub).await;
+    assert!(
+        events
+            .iter()
+            .any(|e| matches!(e.event, Event::ProviderDegraded(_))),
+        "non-vacuity: the degrade really was announced"
+    );
+    assert!(
+        !events
+            .iter()
+            .any(|e| matches!(e.event, Event::ContextPressure(_))),
+        "an in-place degrade announced context pressure: {events:#?}"
     );
 }
 

@@ -116,10 +116,10 @@ use teton_inference::probe::{decide, GpuClass, HardwareProfile, TierDecision, GI
 use teton_inference::{ChatFormat, Completion, Engine, EngineError, GenParams, MockEngine};
 
 use teton_protocol::events::{
-    BlockCause, CapabilityDeadEnd, ContextCleared, Event, ModelLifecycle, ModelLifecycleStage,
-    PrivacyAction, ProviderTested, SessionRootChanged, SessionTitled, TierWarming, TurnQueued,
-    WebCapabilityState as WireWebCapabilityState, WebLookup, WebSetupCompleted, WebTaintOverridden,
-    WebTier as WireWebTier,
+    BlockCause, CapabilityDeadEnd, ContextCleared, ContextPressureKind, Event, ModelLifecycle,
+    ModelLifecycleStage, PrivacyAction, ProviderTested, SessionRootChanged, SessionTitled,
+    TierWarming, TurnQueued, WebCapabilityState as WireWebCapabilityState, WebLookup,
+    WebSetupCompleted, WebTaintOverridden, WebTier as WireWebTier,
 };
 use teton_protocol::jsonrpc::{error_code, RpcError};
 use teton_protocol::methods::{
@@ -162,10 +162,11 @@ use crate::egress::{
     EgressError, HttpTransport, LookupContext, LookupOutcome, LookupRecord, LookupRecorder,
     LookupRequest, Provenance, RedactionGate, RedactionVerdict, TaintView,
 };
+use crate::harness::budget::RouteBudget;
 use crate::harness::completion::{context_provenance, RemoteProviderSource};
 use crate::harness::context::NoopProvenanceHook;
 use crate::harness::tools::web::{register_web_tool, tier_name, SeamError, WebLookupSeam};
-use crate::harness::turn_loop::{run_session_turn_with_source, HarnessError};
+use crate::harness::turn_loop::{pressure_kind, run_session_turn_with_source, HarnessError};
 use crate::harness::{
     build_system_prompt, ContextManager, DutyKind, DutyRoute, LocalEngineSource,
     PendingPermissions, PermissionGate, SessionEvents, ToolContext, ToolDuties, ToolRegistry,
@@ -2958,7 +2959,14 @@ impl DaemonRuntime {
                             failed_reroute_block_sentence(detail),
                         ));
                     }
+                    // REQ-586 BR-1: the budget follows the route. The local
+                    // pin's window is a fraction of the remote one this turn
+                    // was assembled against, so the context is re-fitted here —
+                    // after the route is chosen, before the retry — rather than
+                    // arriving over-window at a tier that has no fallback left.
+                    let previous = route.budget.clone();
                     route = router.resolve_local_pin(reroute_after_block_reason(detail));
+                    refit_for_reroute(&mut conversation, &stream_events, &previous, &route.budget);
                     rerouted_local = true;
                     continue;
                 }
@@ -2984,6 +2992,42 @@ impl DaemonRuntime {
                         turn_id,
                         stop_reason: outcome.stop_reason,
                     });
+                }
+                // REQ-586 BR-2 / ADR-8: the provider answered that the
+                // request does not fit its window. A **typed outcome**, and
+                // therefore ahead of every `Remote` arm below: this is not a
+                // provider failure and must not be run through the machinery
+                // that treats one.
+                //
+                // No `record_health` — a provider that correctly reported its
+                // own limit is not unhealthy, and downgrading it would move
+                // *later* turns off a provider that is working. No
+                // `on_provider_failure` — a fallback would send the same bytes
+                // to a window that may be smaller, and would emit a
+                // `provider_degraded` blaming the provider for the daemon's
+                // sizing. And no retry, because nothing about resending
+                // unchanged bytes can succeed.
+                //
+                // The sentence carries the three numbers a user can act on and
+                // no response body (BR-11): the provider, what was assembled,
+                // and the budget the route was running under. A wide gap
+                // between the last two says the declared window is wrong; a
+                // narrow one says this content tokenizes denser than the
+                // estimator assumed.
+                Err(HarnessError::ContextLengthExceeded {
+                    provider_id,
+                    assembled_tokens,
+                    budget_tokens,
+                }) => {
+                    break 'turn Err(RpcError::new(
+                        error_code::CONTEXT_LENGTH_EXCEEDED,
+                        format!(
+                            "`{provider_id}` refused this turn as larger than {}: about \
+                             {assembled_tokens} words were assembled against a \
+                             {budget_tokens}-word budget",
+                            route.budget.window_label,
+                        ),
+                    ));
                 }
                 Err(HarnessError::Remote(perr)) if attempts < 2 => {
                     attempts += 1;
@@ -3012,7 +3056,20 @@ impl DaemonRuntime {
                     }
                     match fo.route {
                         Some(next) => {
+                            // REQ-586 BR-1/ADR-2: a fallback provider may
+                            // declare a smaller window than the one that just
+                            // failed, so the same refit runs here. An in-place
+                            // degrade arrives through this arm too and is
+                            // silent by construction — it keeps the failed
+                            // provider's pair (see `refit_for_reroute`).
+                            let previous = route.budget.clone();
                             route = next;
+                            refit_for_reroute(
+                                &mut conversation,
+                                &stream_events,
+                                &previous,
+                                &route.budget,
+                            );
                             continue;
                         }
                         None => {
@@ -3075,7 +3132,19 @@ impl DaemonRuntime {
         // construction: the pre-turn vector was never touched.
         match outcome {
             Ok(result) => {
-                conversation.commit();
+                // REQ-586 BR-10: the commit re-asserts the budget one last
+                // time, and what it took is news like any other clamp. It is
+                // published here rather than inside the commit because that
+                // seam also runs from `Drop`, where there is no event handle
+                // and no one left to tell (LESSON-501).
+                let pressure = conversation.commit_reporting();
+                if !pressure.is_quiet() {
+                    stream_events.context_pressure(
+                        &pressure,
+                        pressure_kind(&pressure),
+                        &route.budget,
+                    );
+                }
                 Ok(result)
             }
             Err(err) => {
@@ -9213,6 +9282,52 @@ fn reroute_after_block_reason(detail: BlockDetail) -> String {
         "remote egress refused — {}; rerouted to the local tier (BR-1)",
         refusal_clause(detail)
     )
+}
+
+/// Re-fit a turn's context to the route it is about to take, and publish the
+/// change (REQ-586 BR-1, ADR-2/ADR-3).
+///
+/// The mid-turn seam both reroute arms share — a privacy block pinning the turn
+/// local, and a provider failure falling over to a fallback. `previous` is the
+/// budget the last attempt ran under, `next` the one the next attempt will:
+/// called after the new route is chosen and **before** the retry, so the
+/// context that reaches the next model call already fits the window it is being
+/// sent to. Without it, a 60,000-word conversation assembled on a 128k route
+/// arrives at a 4k local pin over-window and the reroute that was supposed to
+/// rescue the turn kills it.
+///
+/// ## The refit itself is the news
+///
+/// The event fires whenever the **pair changed**, even when the report is
+/// quiet. "Your turn moved to a window a quarter the size and nothing had to be
+/// cut" is exactly as much a budget change as one that dropped ten blocks, and
+/// a client that only heard about the lossy case could not explain why the next
+/// `route_decided` carries different numbers. The order is deliberate — choose
+/// route, refit, announce, retry — so this event precedes the new route's
+/// `route_decided` rather than trailing it.
+///
+/// ## The in-place degrade is silent, by construction
+///
+/// A `MalformedToolCall` degrade continues on the *same* provider under the
+/// reduced harness profile, and ADR-2 has `degraded_harness_config` keep that
+/// provider's window — so `next` and `previous` carry the same pair, this
+/// returns before touching the manager, and no `context_pressure` is published.
+/// That is the right answer rather than a lucky one: nothing was re-budgeted, so
+/// there is nothing to say. The window *label* still follows the route, which
+/// costs nothing and keeps the in-prompt marker honest if a same-pair reroute
+/// ever crosses providers.
+fn refit_for_reroute(
+    conversation: &mut CarriedTurn,
+    events: &SessionEvents,
+    previous: &RouteBudget,
+    next: &RouteBudget,
+) {
+    conversation.set_window_label(&next.window_label);
+    if next.budget_tokens == previous.budget_tokens && next.budget_bytes == previous.budget_bytes {
+        return;
+    }
+    let report = conversation.rebudget(next);
+    events.context_pressure(&report, ContextPressureKind::RefitOnReroute, next);
 }
 
 /// The local tier's canonical provider id when the config declares no explicit
@@ -26444,6 +26559,364 @@ provider_id = \"deepseek\"
 
             let _ = std::fs::remove_dir_all(&start);
             let _ = std::fs::remove_dir_all(&target);
+        }
+    }
+
+    /// REQ-586: the budget follows the route attempt.
+    ///
+    /// Three claims that live in `run_prompt_turn` and nowhere else: a reroute
+    /// re-fits the turn's context to the window it is about to be sent to and
+    /// says so; a route change that moves no window says nothing; and a
+    /// provider's own "too big" answer ends the turn typed, without touching
+    /// the machinery that exists for providers that *failed*.
+    mod route_budget {
+        use super::*;
+        use crate::carry::CarriedTurn;
+        use crate::harness::budget::{derive, BudgetInputs, RouteBudget};
+        use crate::sessions::SessionRegistry;
+        use std::io::{Read, Write};
+        use std::net::TcpListener;
+        use teton_protocol::events::{ContextPressure, ContextPressureKind};
+
+        /// ADR-1's reservation — the `max_tokens` the adapters send.
+        const RESERVATION: u32 = 1_024;
+
+        fn remote_budget(window: u32) -> RouteBudget {
+            derive(BudgetInputs {
+                window,
+                cap: 0,
+                reservation: RESERVATION,
+                is_local: false,
+                redact_scan: false,
+                provider_id: Some("kimi"),
+            })
+        }
+
+        /// A turn holding `blocks` model turns of `words` words each, seeded
+        /// against `budget`.
+        fn turn_of(
+            sessions: &SessionRegistry,
+            session_id: &SessionId,
+            budget: &RouteBudget,
+            blocks: usize,
+            words: usize,
+        ) -> CarriedTurn {
+            let config = crate::harness::turn_loop::HarnessConfig::for_strong_model()
+                .with_route_budget(budget.clone());
+            let mut turn = CarriedTurn::begin(
+                sessions,
+                session_id,
+                "SYSTEM HEAD",
+                &config,
+                Arc::new(SessionTaint::new()),
+                Vec::new(),
+                "the opening prompt",
+            );
+            let filler = vec!["lorem"; words].join(" ");
+            for _ in 0..blocks {
+                turn.ctx_mut().push_model(filler.clone());
+            }
+            turn
+        }
+
+        fn one_freeform_session() -> (SessionRegistry, SessionId) {
+            let sessions = SessionRegistry::new();
+            let session = sessions
+                .create(SessionMode::Freeform, None, None)
+                .expect("a freeform session needs no phase");
+            let id = session.session_id.clone();
+            (sessions, id)
+        }
+
+        /// Every `context_pressure` published on `bus` since `sub` was taken.
+        async fn pressure(sub: &mut crate::broadcast::Subscription) -> Vec<ContextPressure> {
+            let mut out = Vec::new();
+            while let Ok(Some(env)) =
+                tokio::time::timeout(Duration::from_millis(50), sub.recv()).await
+            {
+                if let Event::ContextPressure(cp) = env.event {
+                    out.push(cp);
+                }
+            }
+            out
+        }
+
+        /// **BR-1 / AC-15.** A reroute to a smaller window re-fits the turn's
+        /// context *before* the next attempt and publishes the refit.
+        ///
+        /// The failure this prevents is the one AC-15 describes: a turn
+        /// assembled against a 128k provider is privacy-blocked, pinned to the
+        /// local tier, and — without this — hands a 60,000-word context to a
+        /// 4,096-word window. The reroute meant to rescue the turn is what kills
+        /// it, and the user sees a second failure with no account of the first.
+        #[tokio::test]
+        async fn a_reroute_to_a_smaller_window_refits_the_context_and_publishes_it() {
+            let (sessions, session_id) = one_freeform_session();
+            let bus = Arc::new(EventBus::new());
+            let mut sub = bus.subscribe(64);
+            let events = SessionEvents::new(Arc::clone(&bus), session_id.clone());
+
+            let wide = remote_budget(128_000);
+            let local = derive(BudgetInputs::local());
+            // Enough conversation to overflow the local pair several times over
+            // while sitting comfortably inside the wide one.
+            let mut turn = turn_of(&sessions, &session_id, &wide, 12, 2_000);
+            let before = turn.ctx().estimated_tokens();
+            assert!(
+                before > local.budget_tokens && before < wide.budget_tokens,
+                "the fixture must fit the wide window and not the narrow one \
+                 ({before} words)"
+            );
+
+            refit_for_reroute(&mut turn, &events, &wide, &local);
+
+            assert!(
+                turn.ctx().estimated_tokens() <= local.budget_tokens
+                    && turn.ctx().estimated_bytes() <= local.budget_bytes,
+                "the context still does not fit the route it is about to be sent to"
+            );
+            let published = pressure(&mut sub).await;
+            assert_eq!(published.len(), 1, "{published:#?}");
+            let event = published[0];
+            assert_eq!(event.kind, ContextPressureKind::RefitOnReroute);
+            assert!(event.dropped_blocks > 0, "{event:?}");
+            // Both currencies, from the route the turn is moving TO — a client
+            // told the old numbers could not explain what just happened.
+            assert_eq!(event.budget_tokens, local.budget_tokens as u64);
+            assert_eq!(event.budget_bytes, local.budget_bytes as u64);
+            assert_eq!(event.bound, local.bound);
+
+            turn.abandon();
+        }
+
+        /// **BR-1, the quiet half.** A reroute whose new window happens to hold
+        /// everything already there is still announced: the *budget* changed,
+        /// and the next `route_decided` will carry different numbers with no
+        /// account of why.
+        #[tokio::test]
+        async fn a_refit_with_nothing_to_cut_is_still_the_news() {
+            let (sessions, session_id) = one_freeform_session();
+            let bus = Arc::new(EventBus::new());
+            let mut sub = bus.subscribe(64);
+            let events = SessionEvents::new(Arc::clone(&bus), session_id.clone());
+
+            let wide = remote_budget(128_000);
+            let narrower = remote_budget(32_000);
+            let mut turn = turn_of(&sessions, &session_id, &wide, 2, 50);
+
+            refit_for_reroute(&mut turn, &events, &wide, &narrower);
+
+            let published = pressure(&mut sub).await;
+            assert_eq!(published.len(), 1, "{published:#?}");
+            assert_eq!(published[0].kind, ContextPressureKind::RefitOnReroute);
+            assert_eq!(
+                (published[0].dropped_blocks, published[0].elided_bytes),
+                (0, 0),
+                "nothing was cut, which is exactly what the line should say"
+            );
+            assert_eq!(published[0].budget_tokens, narrower.budget_tokens as u64);
+
+            turn.abandon();
+        }
+
+        /// **AC-15c / ADR-2.** The in-place degrade keeps the failed provider's
+        /// window, so it re-fits nothing and announces nothing.
+        ///
+        /// The counterpart to the two tests above, and the reason
+        /// `refit_for_reroute` compares pairs rather than trusting its callers:
+        /// the degrade arrives through the *same* `route = next` arm as a
+        /// fallback, so "the degrade is quiet" has to be a property of the
+        /// budget it carries, not of which line of the runtime called.
+        #[tokio::test]
+        async fn a_degrade_that_keeps_the_window_refits_nothing_and_says_nothing() {
+            let (sessions, session_id) = one_freeform_session();
+            let bus = Arc::new(EventBus::new());
+            let mut sub = bus.subscribe(64);
+            let events = SessionEvents::new(Arc::clone(&bus), session_id.clone());
+
+            let wide = remote_budget(128_000);
+            let mut turn = turn_of(&sessions, &session_id, &wide, 12, 2_000);
+            let before = turn.ctx().estimated_tokens();
+
+            refit_for_reroute(&mut turn, &events, &wide, &wide.clone());
+
+            assert!(
+                pressure(&mut sub).await.is_empty(),
+                "an in-place degrade announced a re-fit that never happened"
+            );
+            assert_eq!(
+                turn.ctx().estimated_tokens(),
+                before,
+                "and it must not have touched the conversation either"
+            );
+
+            turn.abandon();
+        }
+
+        /// **BR-10.** The commit's own budget gate reports what it took, so the
+        /// between-turns drop can be published where the events handle lives.
+        ///
+        /// The seam's whole reason for existing: `commit_now` runs from `Drop`
+        /// as well as from the success arm, so it cannot hold a `SessionEvents`
+        /// and cannot emit. If it swallowed its report instead of returning it,
+        /// a session whose retained conversation no longer fits the next turn's
+        /// window would lose its oldest turns with nothing said — the exact
+        /// silence BR-7 forbids, at the one gate the loop's three do not cover.
+        #[test]
+        fn the_commit_reports_the_blocks_it_dropped_to_fit() {
+            let (sessions, session_id) = one_freeform_session();
+            // A conversation assembled on a wide route meeting the local pair,
+            // which is BR-10's scenario in miniature.
+            let turn = turn_of(
+                &sessions,
+                &session_id,
+                &derive(BudgetInputs::local()),
+                40,
+                500,
+            );
+            let report = turn.commit_reporting();
+            assert!(
+                report.dropped_blocks > 0,
+                "the commit re-asserted the budget but reported nothing: {report:?}"
+            );
+            assert!(!report.is_quiet());
+            // And the write still happened — the report is a by-product of the
+            // commit, not a replacement for it.
+            assert!(!sessions
+                .conversation_snapshot(&session_id)
+                .blocks()
+                .is_empty());
+        }
+
+        /// A provider bound to every tier at `endpoint`, declaring a 128k
+        /// window it will then refuse a request against.
+        fn refusing_provider_config(endpoint: &str) -> Config {
+            Config {
+                providers: vec![ModelProvider {
+                    id: "kimi".to_owned(),
+                    kind: ProviderKind::OpenaiCompatible,
+                    endpoint: Some(endpoint.to_owned()),
+                    model: Some("kimi-k2".to_owned()),
+                    auth_ref: None,
+                    capabilities: ProviderCapabilities {
+                        max_context: 128_000,
+                        ..ProviderCapabilities::default()
+                    },
+                }],
+                tiers: Tier::ALL
+                    .iter()
+                    .map(|tier| TierBinding {
+                        tier: *tier,
+                        provider_id: "kimi".to_owned(),
+                        // No fallback at all: if the arm below ever asked for
+                        // one, the absence would surface as a *different* error
+                        // code and this test would fail loudly rather than
+                        // silently passing on a fallback that could not be
+                        // built.
+                        fallback_id: None,
+                    })
+                    .collect(),
+                ..Config::default()
+            }
+        }
+
+        /// **AC-3, at the runtime.** A provider answering the vendor's
+        /// context-length 400 ends the turn with the typed
+        /// `CONTEXT_LENGTH_EXCEEDED`, and the provider's standing with the
+        /// router is exactly what it was before.
+        ///
+        /// Driven against a real socket rather than a mocked source, because the
+        /// claim is about `run_prompt_turn`'s arms — health, `provider_degraded`,
+        /// and the code the client receives — and those only run when the error
+        /// has travelled the whole adapter → egress → source → loop path. The
+        /// body is Moonshot's own spelling: Kimi is the dogfood provider and the
+        /// spelling it sends is the one that was not pinned before this REQ.
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn a_context_length_refusal_changes_no_health_and_degrades_nothing() {
+            const BODY: &str = r#"{"error":{"type":"invalid_request_error","message":"Input token length too long"}}"#;
+            let listener = TcpListener::bind("127.0.0.1:0").expect("bind a mock vendor");
+            let addr = listener.local_addr().expect("mock vendor address");
+            let hits = Arc::new(AtomicUsize::new(0));
+            let served = Arc::clone(&hits);
+            std::thread::spawn(move || {
+                for stream in listener.incoming() {
+                    let Ok(mut stream) = stream else { break };
+                    served.fetch_add(1, Ordering::SeqCst);
+                    // Enough of the request to know it arrived; the response is
+                    // fixed either way.
+                    let mut buf = [0u8; 4096];
+                    let _ = stream.read(&mut buf);
+                    let _ = stream.write_all(
+                        format!(
+                            "HTTP/1.1 400 Bad Request\r\nContent-Type: application/json\r\n\
+                             Content-Length: {}\r\nConnection: close\r\n\r\n{BODY}",
+                            BODY.len()
+                        )
+                        .as_bytes(),
+                    );
+                    let _ = stream.flush();
+                }
+            });
+
+            let runtime = Arc::new(DaemonRuntime::minimal());
+            *runtime.config.lock().expect("config mutex") =
+                refusing_provider_config(&format!("http://{addr}/v1/chat/completions"));
+            let events = Arc::new(EventBus::new());
+            let mut sub = events.subscribe(256);
+            let sessions = SessionRegistry::new();
+            let session_id = sessions
+                .create(SessionMode::Structured, Some(ProtoPhase::Implement), None)
+                .expect("a structured session takes a phase")
+                .session_id;
+
+            let before = runtime.health_snapshot();
+            let err = runtime
+                .run_prompt_turn(
+                    &events,
+                    &sessions,
+                    session_id.clone(),
+                    SessionMode::Structured,
+                    Some(ProtoPhase::Implement),
+                    None,
+                    "a prompt the provider will say is too large".to_owned(),
+                    ClientPresence::unwatched(),
+                )
+                .await
+                .expect_err("a refused turn must not report success");
+
+            // Typed, and naming what the user can act on.
+            assert_eq!(err.code, error_code::CONTEXT_LENGTH_EXCEEDED, "{err:?}");
+            assert!(err.message.contains("kimi"), "{}", err.message);
+            assert!(err.message.contains("word budget"), "{}", err.message);
+            assert!(
+                !err.message.contains("Input token length"),
+                "the provider's own body leaked into the turn error: {}",
+                err.message
+            );
+
+            // No health change: a provider that correctly reported its own limit
+            // is not unhealthy, and downgrading it here would move *later* turns
+            // off a provider that works.
+            assert_eq!(
+                runtime.health_snapshot(),
+                before,
+                "the refusal changed the provider's standing with the router"
+            );
+            // And no `provider_degraded`: nothing failed over, so nothing may
+            // tell the user their provider was demoted.
+            let mut degraded = Vec::new();
+            while let Ok(Some(env)) =
+                tokio::time::timeout(Duration::from_millis(100), sub.recv()).await
+            {
+                if let Event::ProviderDegraded(pd) = env.event {
+                    degraded.push(pd);
+                }
+            }
+            assert!(degraded.is_empty(), "{degraded:#?}");
+            assert!(
+                hits.load(Ordering::SeqCst) >= 1,
+                "non-vacuity: the daemon really did reach the mock vendor"
+            );
         }
     }
 

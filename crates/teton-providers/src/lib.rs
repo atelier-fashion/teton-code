@@ -259,6 +259,34 @@ const OPENAI_CONTEXT_LENGTH_MESSAGE: &str = "maximum context length";
 /// the API returns a 400 `invalid_request_error` ("prompt is too long")").
 const ANTHROPIC_CONTEXT_LENGTH_MESSAGE: &str = "prompt is too long";
 
+/// The Moonshot/Kimi platform spelling: a 400 `invalid_request_error` whose
+/// message is `Input token length too long`, glossed by the vendor as "The
+/// input tokens exceed the model's maximum context limit". Verified against
+/// vendor docs 2026-08-19 (<https://platform.kimi.ai/docs/api/errors>, "Common
+/// Error Codes"; the CN mirror is `platform.kimi.com/docs/api/errors`).
+///
+/// Pinned because **Kimi is the dogfood provider** and Moonshot does not send
+/// either OpenAI spelling: `context_length_exceeded` appears nowhere in their
+/// published docs corpus or their OpenAPI document, so without this const a
+/// Kimi overflow would fall through to `ClientError { 400 }` — a health
+/// downgrade and a failover for a request that is simply too big, which is the
+/// exact outcome BR-2 exists to prevent.
+///
+/// The leading `Input` is deliberately **not** part of the match: the vendor's
+/// table heads the column "Typical message" rather than promising the byte
+/// string, so the fragment is the part that carries the meaning and survives a
+/// re-worded prefix — the same posture as
+/// [`OPENAI_CONTEXT_LENGTH_MESSAGE`], which is likewise a fragment of a longer
+/// sentence.
+///
+/// Moonshot's *Kimi Code* subscription endpoint (`kimi-for-coding`) words the
+/// same refusal differently — `Invalid request: Your request exceeded model
+/// token limit: N (requested: M)` — and is left unpinned on purpose: it is a
+/// different product surface from the OpenAI-compatible
+/// `/v1/chat/completions` this crate's adapters call, and ADR-8's narrowness
+/// rule says a spelling is pinned when an adapter can actually receive it.
+const MOONSHOT_CONTEXT_LENGTH_MESSAGE: &str = "token length too long";
+
 /// Whether a 400 body names the reasoning field this request sent (REQ-559
 /// BR-12).
 ///
@@ -285,7 +313,7 @@ pub fn body_names_the_effort_field(body: &[u8]) -> bool {
 /// The [`body_names_the_effort_field`] posture: **exact vendor spellings only**,
 /// no general parse. A false positive here turns an ordinary client error into
 /// a typed outcome the daemon neither retries nor fails over nor counts against
-/// the provider's health — so the sniff matches the three spellings the two
+/// the provider's health — so the sniff matches the four spellings the three
 /// vendors actually send and nothing that merely resembles a size complaint.
 /// Like the effort sniff it reads only the bounded `read_error_head` prefix; the
 /// matched text never leaves this function (conventions: no provider prose in
@@ -301,6 +329,7 @@ pub fn body_names_context_length(body: &[u8]) -> bool {
     text.contains(OPENAI_CONTEXT_LENGTH_CODE)
         || text.contains(OPENAI_CONTEXT_LENGTH_MESSAGE)
         || text.contains(ANTHROPIC_CONTEXT_LENGTH_MESSAGE)
+        || text.contains(MOONSHOT_CONTEXT_LENGTH_MESSAGE)
 }
 
 /// Read a bounded prefix of an error body so a 400 can be classified (REQ-559

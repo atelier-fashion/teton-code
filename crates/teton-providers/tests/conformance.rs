@@ -933,6 +933,18 @@ const OPENAI_TOO_LONG_BODY: &str = "{\n  \"error\": {\n    \"message\": \"This m
 /// endpoint that reuses OpenAI's code but not its wording would send.
 const COMPAT_CODE_ONLY_BODY: &str = r#"{"error":{"message":"Input too long for this endpoint","type":"invalid_request_error","param":null,"code":"context_length_exceeded"}}"#;
 
+/// Moonshot/Kimi's 400 for a prompt that exceeds the window, in the envelope
+/// their error reference documents — `type` + `message`, no `code` at all
+/// (verified 2026-08-19, <https://platform.kimi.ai/docs/api/errors>).
+///
+/// The case that matters most: Kimi is the dogfood provider, it is reached
+/// through the OpenAI-compatible adapter, and its body carries **neither**
+/// OpenAI spelling — so before this const it classified as a plain
+/// `ClientError { 400 }` and cost the provider a health downgrade for a
+/// request that was merely too big.
+const MOONSHOT_TOO_LONG_BODY: &str =
+    r#"{"error":{"type":"invalid_request_error","message":"Input token length too long"}}"#;
+
 /// An unrelated 400 — neither vendor's spelling — which must keep today's path.
 const UNRELATED_400_BODY: &str =
     r#"{"error":{"message":"invalid model: no such model `test-model`"}}"#;
@@ -953,10 +965,12 @@ fn drive_400(adapter: &dyn Provider, body: &'static str, effort: ResolvedEffort)
 /// and ADR-8 says the head is read for every 400 regardless.
 #[test]
 fn each_adapter_maps_its_vendor_spelling_to_context_length_exceeded() {
-    let cases: [(&str, &dyn Provider, &'static str); 3] = [
+    let cases: [(&str, &dyn Provider, &'static str); 4] = [
         ("anthropic", &anthropic(), ANTHROPIC_TOO_LONG_BODY),
         ("deepseek", &openai(), OPENAI_TOO_LONG_BODY),
         ("deepseek", &openai(), COMPAT_CODE_ONLY_BODY),
+        // REQ-586 TASK-189: the dogfood provider's own spelling.
+        ("deepseek", &openai(), MOONSHOT_TOO_LONG_BODY),
     ];
     for (expected_id, adapter, body) in cases {
         for effort in [
@@ -1034,6 +1048,27 @@ fn the_context_length_classifier_is_shared_across_adapters() {
         ResolvedEffort::omit(EffortOmission::ShapeNone),
     );
     assert!(err.is_context_length_exceeded(), "{err:?}");
+}
+
+/// Moonshot's *other* size refusal is a different failure and must keep the
+/// generic path: `total message size N exceeds limit 2097152` is the 2 MB
+/// request-body cap, not the token window, and compaction by word count does
+/// not reliably fix it. Typing it as a context-length outcome would end the
+/// turn with a budget report for a fault the budget cannot explain — the
+/// narrowness ADR-8 asks for, on the one provider that sends both.
+#[test]
+fn moonshots_request_body_size_cap_is_not_a_context_length_refusal() {
+    const BODY_SIZE_CAP: &str = r#"{"error":{"type":"invalid_request_error","message":"total message size 5943865 exceeds limit 2097152"}}"#;
+    let err = drive_400(
+        &openai(),
+        BODY_SIZE_CAP,
+        ResolvedEffort::omit(EffortOmission::ShapeNone),
+    );
+    assert!(!err.is_context_length_exceeded(), "{err:?}");
+    assert!(
+        matches!(err, ProviderError::ClientError { status: 400 }),
+        "{err:?}"
+    );
 }
 
 // ---------------------------------------------------------------------------

@@ -512,6 +512,26 @@ pub mod error_code {
         /// "this config would not load" are different answers, and folding them
         /// would tell an unattached connection its endpoint was the problem.
         PROVIDER_SETUP_INVALID = -32021;
+        /// The provider refused this turn as larger than its context window
+        /// (REQ-586 BR-2, ADR-8).
+        ///
+        /// A **typed outcome**, which is the whole reason it is not
+        /// [`INTERNAL_ERROR`]: the daemon knows exactly what happened — the
+        /// assembled context did not fit the window the route was budgeted
+        /// against — and the accompanying message says so with the provider,
+        /// the window and the assembled size. Reporting it as an internal
+        /// error would tell a user their turn broke when the remedy is a
+        /// smaller prompt, a declared `capabilities.max_context`, or a
+        /// `context_budget_cap` that is not lying about the window.
+        ///
+        /// It is deliberately **not** retryable and deliberately not a health
+        /// signal: retrying sends the same bytes, failing over sends them to a
+        /// provider that may have a *smaller* window, and a provider that
+        /// correctly reported its own limit is not unhealthy. Distinct from
+        /// [`SESSION_BUSY`] and [`TIER_WARMING`] — the other two "the daemon
+        /// knows why" codes — because those resolve by waiting and this one
+        /// resolves only by sending less.
+        CONTEXT_LENGTH_EXCEEDED = -32022;
     }
 }
 

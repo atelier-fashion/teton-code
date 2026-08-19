@@ -39,7 +39,8 @@ use serde_json::Value;
 
 use teton_inference::{ChatFormat, Engine, EngineError, GenParams};
 use teton_protocol::events::{
-    CapabilityDeadEnd, Event, PrefixCache, SessionUpdate, SessionUpdatePayload, ToolCallStatus,
+    CapabilityDeadEnd, ContextPressure, ContextPressureKind, Event, PrefixCache, SessionUpdate,
+    SessionUpdatePayload, ToolCallStatus,
 };
 use teton_protocol::methods::{SessionRoot, StopReason};
 use teton_protocol::{ProviderId, SessionId};
@@ -55,7 +56,7 @@ use super::compact::COMPACT_DUTY;
 use super::completion::{
     context_provenance, CompletionSource, LocalEngineSource, SourceTurn, TurnDecision,
 };
-use super::context::{summarize_if_large, ContextManager, ProvenanceHook};
+use super::context::{summarize_if_large, ContextManager, PressureReport, ProvenanceHook};
 use super::digest::DIGEST_DUTY;
 use super::duty::DutyRoute;
 use super::permissions::{PermissionDecision, PermissionGate};
@@ -135,6 +136,38 @@ pub enum HarnessError {
     /// classifies it from that state rather than the loop guessing here.
     #[error("no tier could serve this turn")]
     NoTierAvailable,
+    /// The provider refused the request as larger than its context window
+    /// (REQ-586 BR-2, ADR-8).
+    ///
+    /// Deliberately **not** [`Remote`](Self::Remote), even though it arrives as
+    /// a [`ProviderError`]: that arm means "this provider failed", and it is the
+    /// arm that records health and asks the router for a fallback. Neither is
+    /// right here. The provider did not fail — it answered correctly about its
+    /// own limit — and a fallback would send the same bytes to a window that may
+    /// be smaller. So it leaves the loop as its own variant and the daemon ends
+    /// the turn with a report.
+    ///
+    /// It carries the two numbers the report needs and the adapter could not
+    /// know: how big the context this daemon assembled actually was, and what
+    /// budget the route was running under. The gap between them is the whole
+    /// diagnosis — a wide gap says the declared `max_context` is wrong, a narrow
+    /// one says the estimator undercounted this content (the base64 class AC-3
+    /// documents). No response body and no prompt text, per conventions.md.
+    #[error(
+        "provider `{provider_id}` refused the turn: about {assembled_tokens} words \
+         were assembled against a {budget_tokens}-word budget"
+    )]
+    ContextLengthExceeded {
+        /// The provider that refused, as [`ProviderError::ContextLengthExceeded`]
+        /// named it (a `String` there — the providers crate has no `ProviderId`).
+        provider_id: String,
+        /// The assembled context's size in the harness's own word estimator —
+        /// what this daemon believed it was sending.
+        assembled_tokens: usize,
+        /// The route's word budget, from the [`HarnessConfig`] the attempt ran
+        /// under — never re-derived here (BR-8).
+        budget_tokens: usize,
+    },
 }
 
 impl HarnessError {
@@ -450,6 +483,47 @@ impl SessionEvents {
         );
     }
 
+    /// Announce what the context gate did to fit this turn's budget (REQ-586
+    /// BR-7, ADR-3).
+    ///
+    /// A narrow typed emitter for [`Self::prefix_cache`]'s reason, and the one
+    /// place a [`PressureReport`] becomes news: the [`ContextManager`] holds no
+    /// event handle (its commit runs from `Drop`), so it reports and the call
+    /// site publishes.
+    ///
+    /// `budget` is the route's own [`RouteBudget`] — the value
+    /// [`super::budget::derive`] produced where the route was decided — so the
+    /// numbers on this event, on `route_decided`, and in the in-prompt elision
+    /// marker are one value rather than three readings of it (BR-8, AC-12).
+    /// **Both currencies always**: on a remote route the byte guard is what
+    /// binds for prose and code, so a client told only the word figure would
+    /// overstate what fits.
+    ///
+    /// `kind` is passed rather than derived from `report` because only the
+    /// caller knows *why* the gate ran: an identical report is
+    /// [`ContextPressureKind::BlocksDropped`] at a loop gate and
+    /// [`ContextPressureKind::RefitOnReroute`] at a reroute arm, and the
+    /// difference is the whole of what the line tells the user.
+    pub fn context_pressure(
+        &self,
+        report: &PressureReport,
+        kind: ContextPressureKind,
+        budget: &RouteBudget,
+    ) {
+        self.bus.publish(
+            Some(self.session_id.clone()),
+            Event::ContextPressure(ContextPressure {
+                kind,
+                dropped_blocks: report.dropped_blocks as u64,
+                elided_bytes: report.elided_bytes as u64,
+                newest_user_elided: report.newest_user_elided,
+                budget_tokens: budget.budget_tokens as u64,
+                budget_bytes: budget.budget_bytes as u64,
+                bound: budget.bound,
+            }),
+        );
+    }
+
     fn agent_message(&self, text: &str) {
         self.emit(SessionUpdatePayload::AgentMessageChunk {
             text: text.to_owned(),
@@ -473,6 +547,59 @@ impl SessionEvents {
                 ToolCallStatus::Failed
             },
         });
+    }
+}
+
+/// Which kind of pressure a budget gate's report describes (REQ-586 BR-7).
+///
+/// One classifier, so the loop's three gates and the carry commit cannot come
+/// to disagree about what to call the same report. A report that is *both* — the
+/// gate drops oldest-first and then clamps whatever is left — is announced as a
+/// drop, because losing whole turns is the larger fact; `elided_bytes` rides
+/// along in the payload either way, so nothing is hidden by the choice.
+///
+/// [`ContextPressureKind::RefitOnReroute`] is deliberately not reachable from
+/// here: a refit is named by *why* the gate ran, which only the reroute arm
+/// knows, and a report that happens to look identical is a different piece of
+/// news.
+#[must_use]
+pub fn pressure_kind(report: &PressureReport) -> ContextPressureKind {
+    if report.dropped_blocks > 0 {
+        ContextPressureKind::BlocksDropped
+    } else {
+        ContextPressureKind::BlockElided
+    }
+}
+
+/// Publish what one of the loop's budget gates just did — and, when the clamp
+/// landed on the user's own newest message, say so in the turn's output as well
+/// (REQ-586 BR-7).
+///
+/// Quiet reports are dropped here rather than at each gate: `truncate_to_budget`
+/// runs unconditionally on every iteration and on every exit, so the
+/// overwhelming majority of calls have nothing to announce, and a client that
+/// received a `context_pressure` per iteration could not tell the one that
+/// mattered from the noise.
+///
+/// The extra sentence exists for exactly one case. Dropping older turns costs
+/// the model memory it can ask about again; clamping the **newest user block**
+/// means the model is answering a prompt the user did not send, and an event a
+/// client may render in a status line is not where that belongs. It travels the
+/// same [`SessionEvents::agent_message`] path the turn's prose does, so it lands
+/// in the transcript the user is actually reading. It names the window and a
+/// byte count and nothing else — never a fragment of what was cut (BR-11).
+fn announce_pressure(events: &SessionEvents, report: &PressureReport, budget: &RouteBudget) {
+    if report.is_quiet() {
+        return;
+    }
+    events.context_pressure(report, pressure_kind(report), budget);
+    if report.newest_user_elided {
+        events.agent_message(&format!(
+            "\n\n[note: your message did not fit {} — its middle was elided \
+             ({} bytes) before this turn was assembled, so I am answering a \
+             shortened version of it.]\n",
+            budget.window_label, report.elided_bytes,
+        ));
     }
 }
 
@@ -629,8 +756,11 @@ pub async fn run_session_turn_with_source(
             // one. Fixing a postcondition at one of its two exits would leave it
             // false at the other, and the next reader would reasonably believe
             // it held.
-            // TASK-189 emits this.
-            let _pressure = ctx.truncate_to_budget();
+            // BR-7: and what it took is announced, not swallowed. This exit
+            // is the one a user is least likely to expect a clamp on, because
+            // nothing about "the turn hit its ceiling" says the conversation
+            // was also cut.
+            announce_pressure(events, &ctx.truncate_to_budget(), &config.budget);
             return Ok(TurnOutcome {
                 stop_reason: StopReason::MaxTurnRequests,
                 turns,
@@ -671,8 +801,11 @@ pub async fn run_session_turn_with_source(
                  context was truncated deterministically instead"
             );
         }
-        // TASK-189 emits this.
-        let _pressure = ctx.truncate_to_budget();
+        // BR-7: never silent. This is the gate that fires on a carried
+        // conversation meeting a smaller route (BR-10) and on a tool result
+        // that outgrew the budget, so it is where most of this event comes
+        // from.
+        announce_pressure(events, &ctx.truncate_to_budget(), &config.budget);
 
         // ---- model call ----
         // The egress provenance of the assembled context travels with the turn so
@@ -784,8 +917,10 @@ pub async fn run_session_turn_with_source(
                 // copy. `final_text` is returned whole below and has already been
                 // streamed, so what the user receives is untouched — only what
                 // the next turn carries is bounded, which is the point.
-                // TASK-189 emits this.
-                let _pressure = ctx.truncate_to_budget();
+                // BR-7: announced like the other two. What the user
+                // received is untouched (`final_text` was streamed whole and is
+                // returned below); this says what the *next* turn will carry.
+                announce_pressure(events, &ctx.truncate_to_budget(), &config.budget);
                 return Ok(TurnOutcome {
                     stop_reason: StopReason::EndTurn,
                     turns,

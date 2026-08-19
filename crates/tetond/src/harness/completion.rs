@@ -44,7 +44,8 @@ use crate::cost::{CostAttribution, LocalUsageMeter};
 use crate::egress::{Egress, EgressContext, Provenance};
 
 use super::context::{
-    ContextManager, MessageRole, PreparedPrompt, Provenance as CtxProvenance, ToolProvenance,
+    approx_tokens, ContextManager, MessageRole, PreparedPrompt, Provenance as CtxProvenance,
+    ToolProvenance,
 };
 use super::digest::tool_result_provenance;
 use super::render;
@@ -489,6 +490,30 @@ impl<'a, T: Transport> RemoteProviderSource<'a, T> {
         self
     }
 
+    /// The size of what this attempt actually sent, in the harness's own word
+    /// estimator (REQ-586 BR-2).
+    ///
+    /// Measured off the **prepared prompt** rather than off the
+    /// [`ContextManager`], for two reasons. It is what a remote request is
+    /// built from — system field plus the role-typed messages, which is exactly
+    /// the payload the provider counted — and it is what this frame can reach:
+    /// `produce_turn` is handed a prompt, never the manager that assembled it,
+    /// and threading one in to read a number would hand every completion source
+    /// a mutable handle on the conversation to serve an error path.
+    ///
+    /// The same [`approx_tokens`] the budget gate measures with, so the figure
+    /// this reports and the budget it is reported against are in one currency —
+    /// a report mixing a word estimate with a BPE count would make every
+    /// refusal look like a wildly wrong window.
+    fn assembled_words(prompt: &PreparedPrompt) -> usize {
+        approx_tokens(&prompt.system)
+            + prompt
+                .messages
+                .iter()
+                .map(|m| approx_tokens(&m.text))
+                .sum::<usize>()
+    }
+
     /// Say on the daemon's stderr that this provider failed the turn, and how.
     ///
     /// BUG-178 was diagnosed by replaying the request by hand, because the one
@@ -623,6 +648,28 @@ impl<T: Transport> CompletionSource for RemoteProviderSource<'_, T> {
                 // effort changes nothing about egress).
                 let transport = self.egress.scoped(provenance.clone(), egress_ctx());
                 self.provider.stream_turn(fallback, &transport).await?
+            }
+            // REQ-586 BR-2 / ADR-8: the request was too big for the window.
+            // Typed here, at the seam that holds both halves of the report —
+            // the adapter knows only that the provider refused, and the loop
+            // above knows only that a turn ended, but *this* frame has the
+            // assembled prompt and the route's budget side by side.
+            //
+            // No `note_failure`, and not because the call would print nothing
+            // (a class-less error is already filtered there): the line's whole
+            // subject is "provider `x` failed the turn", and this provider did
+            // not fail. The daemon reports the size mismatch instead.
+            //
+            // Open time only, mirroring the effort refusal beside it: a
+            // context-length refusal is a 400 on the request, which is answered
+            // before a single event flows. A mid-stream error is a different
+            // fault and keeps the `Remote` path it has today.
+            Err(err) if err.is_context_length_exceeded() => {
+                return Err(HarnessError::ContextLengthExceeded {
+                    provider_id: self.provider_id.to_string(),
+                    assembled_tokens: Self::assembled_words(prompt),
+                    budget_tokens: config.context_budget_tokens,
+                });
             }
             Err(err) => {
                 self.note_failure("before it answered", &err);

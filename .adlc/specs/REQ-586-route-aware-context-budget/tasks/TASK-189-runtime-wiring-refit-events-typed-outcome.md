@@ -1,7 +1,7 @@
 ---
 id: TASK-189
 title: "Runtime wiring: per-attempt budget, reroute/fallback re-fit + context_pressure, SessionEvents emitter, newest-block notice, carry report, ContextLengthExceeded arm; remote-loop + routing + carry unit tests"
-status: draft
+status: complete
 parent: REQ-586
 created: 2026-08-19
 updated: 2026-08-19
