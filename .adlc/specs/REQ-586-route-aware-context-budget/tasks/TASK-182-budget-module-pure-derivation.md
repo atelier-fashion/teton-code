@@ -1,7 +1,7 @@
 ---
 id: TASK-182
 title: "harness/budget.rs: RouteBudget, BudgetInputs, derive(), constants, digest thresholds, window label — pure, table-tested"
-status: draft
+status: complete
 parent: REQ-586
 created: 2026-08-19
 updated: 2026-08-19

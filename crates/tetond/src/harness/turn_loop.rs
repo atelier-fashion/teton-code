@@ -47,11 +47,15 @@ use teton_providers::{BlockDetail, HarnessProfile, ProviderError, ToolCall};
 
 use crate::broadcast::EventBus;
 
+use super::budget::{
+    self, BudgetInputs, RouteBudget, LOCAL_BUDGET_BYTES, LOCAL_BUDGET_TOKENS,
+    LOCAL_DIGEST_THRESHOLD_BYTES, LOCAL_DIGEST_THRESHOLD_TOKENS,
+};
 use super::compact::COMPACT_DUTY;
 use super::completion::{
     context_provenance, CompletionSource, LocalEngineSource, SourceTurn, TurnDecision,
 };
-use super::context::{summarize_if_large, ContextManager, ProvenanceHook, APPROX_BYTES_PER_TOKEN};
+use super::context::{summarize_if_large, ContextManager, ProvenanceHook};
 use super::digest::DIGEST_DUTY;
 use super::duty::DutyRoute;
 use super::permissions::{PermissionDecision, PermissionGate};
@@ -187,6 +191,13 @@ pub struct HarnessConfig {
     /// condensed through the `digest` category (REQ-558) before they enter
     /// context — locally, or wherever `digest` is bound.
     pub summarize_threshold_tokens: usize,
+    /// The byte twin of [`summarize_threshold_tokens`](Self::summarize_threshold_tokens)
+    /// (REQ-586 BR-6): on the default route it is the same 12,000 bytes the
+    /// twin used to be recomputed as at the call site; on a remote route it
+    /// scales with `budget_bytes` — never `words × 8`, which would let a
+    /// dense (minified JSON, base64) result slide in raw at the edge of the
+    /// byte budget.
+    pub summarize_threshold_bytes: usize,
     /// Cap on tools exposed to the model (`None` = all).
     pub max_tools: Option<u32>,
     /// Require a verification step after an edit before the turn may end.
@@ -224,17 +235,27 @@ pub struct HarnessConfig {
     /// (`HarnessConfig::default()` and the `..Default::default()` literals in
     /// the tests) keeps the prompt it had.
     pub session_root: Option<teton_protocol::methods::SessionRoot>,
+    /// The route-budget fact this config runs under (REQ-586 BR-8): the pair
+    /// above, what bound it, and the window's name for the elision marker —
+    /// derived once by [`super::budget::derive`] where the route is decided
+    /// and stamped here via [`with_route_budget`](Self::with_route_budget).
+    /// The default is the local derivation, which is also the
+    /// unresolvable-route case (`bound: local_engine`).
+    pub budget: RouteBudget,
 }
 
 impl Default for HarnessConfig {
     fn default() -> Self {
-        // The weak-model native shape.
-        let context_budget_tokens = 4_096;
+        // The weak-model native shape. The pair and thresholds read the
+        // `LOCAL_*` constants from `harness::budget` — their one home
+        // (REQ-586, LESSON-456) — and `budget` carries the local derivation
+        // built from the same constants (the AC pins the two equal).
         Self {
             max_turns: 12,
-            context_budget_tokens,
-            context_budget_bytes: context_budget_tokens * APPROX_BYTES_PER_TOKEN,
-            summarize_threshold_tokens: 1_500,
+            context_budget_tokens: LOCAL_BUDGET_TOKENS,
+            context_budget_bytes: LOCAL_BUDGET_BYTES,
+            summarize_threshold_tokens: LOCAL_DIGEST_THRESHOLD_TOKENS,
+            summarize_threshold_bytes: LOCAL_DIGEST_THRESHOLD_BYTES,
             max_tools: Some(5),
             require_verification: true,
             // Agent turns need room for prose plus a complete tool call. The
@@ -252,6 +273,7 @@ impl Default for HarnessConfig {
             // Unsupplied: no environment block until the daemon's turn path
             // probes the root and sets it (REQ-583).
             session_root: None,
+            budget: budget::derive(BudgetInputs::local()),
         }
     }
 }
@@ -279,6 +301,21 @@ impl HarnessConfig {
             require_verification: profile.require_verification,
             ..Self::default()
         }
+    }
+
+    /// Stamp a route's derived budget onto this config (REQ-586 BR-1/BR-8):
+    /// the pair, both `digest` thresholds, and the budget fact itself — the
+    /// router's one entry point (`Router::harness_config_for`, ADR-1), so a
+    /// config's five budget-bearing fields cannot disagree with the
+    /// [`RouteBudget`] every surface reads.
+    #[must_use]
+    pub fn with_route_budget(mut self, budget: RouteBudget) -> Self {
+        self.context_budget_tokens = budget.budget_tokens;
+        self.context_budget_bytes = budget.budget_bytes;
+        self.summarize_threshold_tokens = budget.digest_threshold_tokens;
+        self.summarize_threshold_bytes = budget.digest_threshold_bytes;
+        self.budget = budget;
+        self
     }
 }
 

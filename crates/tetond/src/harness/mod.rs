@@ -13,6 +13,11 @@
 //! model runs the same loop with a longer leash.
 //!
 //! ## Module map
+//! - [`budget`] — route-budget policy (REQ-586): the one pure derivation that
+//!   turns a route's window facts into the `(tokens, bytes)` context budget,
+//!   its bound, its window label and the scaled digest thresholds — plus the
+//!   constants those numbers have their one home in. The router is the
+//!   caller; every surface reads the derived [`budget::RouteBudget`].
 //! - [`tools`] — the built-in read/edit/glob/grep/shell tools, each jailed to the
 //!   session root; `edit` is exact-match and refuses ambiguous replacements.
 //! - [`permissions`] — per-tool allow/ask/deny policy, the `permission_request`
@@ -75,6 +80,7 @@
 //!   keyword): context assembly, model call, tool dispatch, result folding, and
 //!   bounded termination.
 
+pub mod budget;
 pub mod compact;
 pub mod completion;
 pub mod context;
@@ -90,6 +96,7 @@ pub mod tools;
 pub mod triage;
 pub mod turn_loop;
 
+pub use budget::{BudgetInputs, RouteBudget};
 pub use compact::COMPACT_DUTY;
 pub use completion::{
     context_provenance, CompletionSource, LocalEngineSource, RemoteProviderSource, SourceTurn,
