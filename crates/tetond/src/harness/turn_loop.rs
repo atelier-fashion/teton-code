@@ -342,6 +342,27 @@ impl HarnessConfig {
     /// config's five budget-bearing fields cannot disagree with the
     /// [`RouteBudget`] every surface reads.
     #[must_use]
+    /// Both digest thresholds set past anything a result can reach, so tool
+    /// results enter context **whole**.
+    ///
+    /// The two thresholds are one decision in two currencies (LESSON-446), and
+    /// since REQ-586 BR-6 they are two independent fields: a caller that sets
+    /// only `summarize_threshold_tokens` and takes the other from
+    /// [`Default`] gets the *default* byte twin, which digests exactly the
+    /// results it meant to keep — silently, because the suite stays green
+    /// while the fixture stops testing what it names. That is how
+    /// `conversation_carry`'s compaction fixture stopped pressing its budget
+    /// (found in TASK-189's verification, REQ-586). Production never has the
+    /// problem — every route goes through
+    /// [`with_route_budget`](Self::with_route_budget), which sets both — so
+    /// the guard that matters is making the *intent* sayable in one call.
+    #[must_use]
+    pub fn without_digest(mut self) -> Self {
+        self.summarize_threshold_tokens = usize::MAX;
+        self.summarize_threshold_bytes = usize::MAX;
+        self
+    }
+
     pub fn with_route_budget(mut self, budget: RouteBudget) -> Self {
         self.context_budget_tokens = budget.budget_tokens;
         self.context_budget_bytes = budget.budget_bytes;

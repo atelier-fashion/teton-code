@@ -475,12 +475,15 @@ impl Carry {
                 max_tokens: 128,
                 temperature: 0.0,
             },
-            // A tool result enters context whole: these fixtures fill the budget
-            // deliberately, and a digest duty condensing them first would be the
-            // thing under test rather than compaction.
-            summarize_threshold_tokens: usize::MAX,
             ..HarnessConfig::default()
-        };
+        }
+        // A tool result enters context whole: these fixtures fill the budget
+        // deliberately, and a digest duty condensing them first would be the
+        // thing under test rather than compaction. Both currencies, in one
+        // call — setting only the token threshold leaves the byte twin at its
+        // default and digests the very results this fixture needs kept
+        // (REQ-586 TASK-189 verification).
+        .without_digest();
         if let Some(tokens) = budget_tokens {
             let system = build_system_prompt(&tools, &config);
             config.context_budget_tokens = approx_tokens(&system) + tokens;

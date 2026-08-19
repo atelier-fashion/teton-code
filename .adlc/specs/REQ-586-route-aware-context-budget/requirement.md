@@ -322,13 +322,17 @@ adds the numbers and the per-turn budget line from `route_decided`.
   `context_length_exceeded`-class response surfaces as a typed outcome
   naming the window and the assembled size, with no retry, no failover and
   no change to the provider's health. (unit + remote-loop fixture; BR-2)
-- [ ] AC-4: `route_decided` carries `budget_tokens` and `bound`; `/verbose`
-  prints `context budget: N words (bound: default_unknown)` on a turn routed
-  to a provider with `max_context = 0`; `/doctor` and `/provider list` say
-  `window: unknown — context budget defaulted (set capabilities.max_context)`
-  for it and `window: 128k` otherwise — over the additive wire field, with an
-  older daemon degrading to "window: not reported". (`cli_e2e` + protocol
-  contract test; BR-3, BR-8, BR-9)
+- [ ] AC-4: `route_decided` carries `budget_tokens`, `budget_bytes` and
+  `bound`; under `/verbose` the route line ends `· budget {n} words / {k} KB
+  (bound: {b})` with the bound in words (`window`, `unknown window`, `redact
+  scan`, `user cap`, `local engine`), and is byte-identical to the pre-REQ
+  line when any field is absent; `/doctor` and `/provider list` say `window:
+  unknown — context budget defaulted (set capabilities.max_context)` for a
+  provider with `max_context = 0`, `window: 128k` (or `1m`) otherwise,
+  `(local engine)` for a local row, and `window: not reported` against an
+  older daemon — over the additive wire field. (`cli_e2e` + protocol contract
+  test; the older-daemon case is a `render_config` unit test, since a shipped
+  daemon always populates the field; BR-3, BR-8, BR-9)
 - [ ] AC-5: The wire `ProviderConfig` (or a `ConfigUpdate` variant) carries
   `max_context` and `context_budget_cap` additively — an older client's
   request without the field is accepted and preserves the stored value; every
@@ -336,7 +340,11 @@ adds the numbers and the per-turn budget line from `route_decided`.
   contract test asserts none is zero; `/provider setup` writes it;
   `/provider add` accepts it (flag per OQ-1); `config/set` accepts it through
   the same write gate as every provider-record write. (unit + `cli_e2e`;
-  BR-3)
+  BR-3. Harness note: no e2e completes a *remote* registration — every remote
+  kind reads a credential through the developer's real login keychain — so
+  the flag→payload seam is pinned by unit test and the end-to-end write is
+  pinned with a local provider plus a config-declared window on both listing
+  surfaces.)
 - [ ] AC-6: With `[privacy] redact = true` and a 128k provider, the budget
   in effect is the scannable bound, `/verbose` says `bound: redact_scan`, and
   a 40,000-word prompt is compacted/clamped to fit **and then scanned
