@@ -2012,13 +2012,55 @@ mod tests {
     /// moved that guarantee onto the CLI surface, where it costs zero prompt
     /// bytes — the reason the next person here should not expect to buy
     /// behaviour with this margin.
+    ///
+    /// **Recorded headroom at REQ-583:** the worst prompt is 5,891 bytes,
+    /// `spent` is 9,167, and the margin is **49** — one byte above the floor,
+    /// with the floor and the 9,216 exactly where they were. This is the
+    /// paragraph above being followed rather than worked around. The prompt
+    /// gained the environment block (BR-1, ADR-2): one line after the opener —
+    /// `Session root: <display> (project <name>, branch <branch>). Platform:
+    /// macOS.` — which is precisely "the fact a model must have without a tool
+    /// call", because the tools are jailed to the answer. Its worst case is
+    /// **203 bytes**: a 200-character root elided to the 80-character display
+    /// ceiling, a name and a branch elided to 32, kind `project` (the longest
+    /// phrase), which is the row this sweep and its twin now cross with every
+    /// capability state (`turn_loop::worst_case_session_root`). It was bought
+    /// with **234 bytes of guide**, 2,406 → 2,172 on the file, none of it an
+    /// instruction (ASSUME-008's split): the web paragraph's *reference data*
+    /// — the `[web]` key list, the keychain-reference example, the "search also
+    /// needs the local model" sentence — went behind "the rest: `teton_docs
+    /// web`" (179 bytes; the `web` topic already carried every fact, so
+    /// nothing was added to it), and step 2's `--fallback`/`set-category`
+    /// clause was compressed to `[--fallback <id>]` inside the `set-tier`
+    /// command's own syntax and "`set-category` binds a category" (55 bytes;
+    /// the `policy` topic carries both in full). Every pinned string stayed:
+    /// the three auth templates and the keyless SearxNG line, the recipes and
+    /// their URLs, the inspect step's spellings, step 1's hand-off, the
+    /// prohibition and the tier purposes. The same trim also paid for the 32
+    /// bytes TASK-176's reworded tool descriptions ("repository" → "session
+    /// root") had already spent — 5,890 → 5,922 left this test **red at 18**
+    /// before this task, by design (ADR-2: measure the docs actually in the
+    /// tree, then pay), and it was paid the same way rather than by moving
+    /// either number. The opted-in web shape is 5,844 / 9,120 / **96**, and
+    /// stays the looser of the two.
+    ///
+    /// Two things the record should carry. The block's bound is in
+    /// *characters* (`bounded_field`), and this ceiling is in bytes: an
+    /// all-multibyte root (up to four bytes a character) renders longer than
+    /// the 200-character ASCII row AC-4 names — the row measures what AC-4
+    /// asks, and a byte bound is a `teton-core` decision, not one for this
+    /// sweep. And one byte is not room for a clause: the next resident sentence
+    /// buys itself the way this one did, out of a topic, and the integration
+    /// task re-records this figure at the merged tip.
     #[test]
     fn the_total_cap_clears_the_harness_context_budget_with_margin() {
         use teton_core::capability::{SearchGap, WebCapabilityState};
         use teton_core::config::WebTier;
 
         use crate::harness::tools::ToolRegistry;
-        use crate::harness::turn_loop::{build_system_prompt, HarnessConfig};
+        use crate::harness::turn_loop::{
+            build_system_prompt, worst_case_session_root, HarnessConfig,
+        };
 
         // The strong-model shape (`max_tools: None`), so every builtin's
         // description is in the prompt: the larger of the two harness configs
@@ -2045,11 +2087,27 @@ mod tests {
             }),
             Some(WebCapabilityState::Ready(WebTier::Search)),
         ];
+        // Since REQ-583 the prompt also carries the environment block when the
+        // caller supplies a session root, and the block's length is the root's
+        // — so the sweep crosses every capability state with the **largest**
+        // root the block can render (a 200-character path elided to the display
+        // ceiling, name and branch elided to theirs, kind `project`, which is
+        // the longest kind phrase) as well as with no root at all. A root that
+        // pushed the block past what this row measures would be a bounding
+        // failure in `environment_block`, not a prompt that quietly grew.
+        let roots = [None, Some(worst_case_session_root())];
         let worst = states
             .into_iter()
-            .map(|web_capability| {
+            .flat_map(|web_capability| {
+                roots
+                    .clone()
+                    .into_iter()
+                    .map(move |session_root| (web_capability, session_root))
+            })
+            .map(|(web_capability, session_root)| {
                 let config = HarnessConfig {
                     web_capability,
+                    session_root,
                     ..base.clone()
                 };
                 build_system_prompt(&ToolRegistry::with_builtins(), &config).len()
@@ -2065,10 +2123,11 @@ mod tests {
         assert!(
             spent < REDACT_BODY_OVERHEAD_BYTES,
             "the assumed body overhead no longer covers what a body carries: a \
-             {worst}-byte system prompt (the largest capability clause) plus \
-             {escaping} bytes of escaping against an assumed \
-             {REDACT_BODY_OVERHEAD_BYTES}. Shorten the bundled guide or a clause; \
-             do not raise the overhead without re-checking the two claims below."
+             {worst}-byte system prompt (the largest capability clause and the \
+             largest session root) plus {escaping} bytes of escaping against an \
+             assumed {REDACT_BODY_OVERHEAD_BYTES}. Shorten the bundled guide or a \
+             clause; do not raise the overhead without re-checking the two claims \
+             below."
         );
         // The margin is asserted against a **floor**, not merely against zero: a
         // prompt that cleared the overhead by three bytes would pass a `> 0`
