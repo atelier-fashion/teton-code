@@ -18,8 +18,10 @@ daemon (architecture.md "Policy is pure, mechanism is gated"). The router
 stamps the result into `HarnessConfig` (the pair every consumer already
 reads — `CarriedTurn::begin`, the loop-top gate, the carry commit), into
 `Route` (so `Route::route_decided()` projects `budget_tokens`/`bound` off the
-route, never recomputed — ADR-D/ADR-G of REQ-559), and the config snapshot
-reads the same function for `/doctor`'s per-provider window line.
+route, never recomputed — ADR-D/ADR-G of REQ-559). `/doctor` and `/provider
+list` render the **window field** the snapshot carries (AC-4); "defaulted"
+and "inert cap" are rendered from that field client-side — two display
+predicates over a daemon-owned fact, not a second derivation of the budget.
 
 Three things that are today implicit become explicit seams:
 
@@ -65,8 +67,8 @@ REQ-573/REQ-559 rule).
 | `teton-protocol` wire `ProviderConfig` | `max_context: Option<u32>`, `context_budget_cap: Option<u32>` (`#[serde(default, skip_serializing_if = "Option::is_none")]`). Daemon **always populates** `max_context` on the snapshot (`Some(0)` = unknown) — `None` means "older daemon" — the `RouteDecided.effort` rule | additive |
 | `teton-protocol` `ProviderRecipeEntry` / daemon `ProviderRecipe` | `max_context: u32` (never 0 in the shipped catalog; contract test) | additive |
 | `teton-protocol` `ProviderSetupCandidate` | `max_context: Option<u32>` (recipe default; the setup UI carries it silently) | additive |
-| `teton-protocol` `RouteDecided` | `budget_tokens: Option<u64>`, `bound: Option<BudgetBound>` — daemon always populates | additive |
-| `teton-protocol` new | `BudgetBound { Window, DefaultUnknown, RedactScan, UserCap, LocalEngine }` (snake_case); `ContextPressureKind { BlocksDropped, BlockElided, RefitOnReroute }`; `Event::ContextPressure(ContextPressure { kind, dropped_blocks: u64, elided_bytes: u64, newest_user_elided: bool, budget_tokens: u64, bound: BudgetBound })` — no `session_id` in the payload (envelope rule, events.rs:2048-2059); `Event::name()` `"context_pressure"` | additive |
+| `teton-protocol` `RouteDecided` | `budget_tokens: Option<u64>`, `budget_bytes: Option<u64>`, `bound: Option<BudgetBound>` — daemon always populates | additive |
+| `teton-protocol` new | `BudgetBound { Window, DefaultUnknown, RedactScan, UserCap, LocalEngine }` (snake_case); `ContextPressureKind { BlocksDropped, BlockElided, RefitOnReroute }`; `Event::ContextPressure(ContextPressure { kind, dropped_blocks: u64, elided_bytes: u64, newest_user_elided: bool, budget_tokens: u64, budget_bytes: u64, bound: BudgetBound })` — no `session_id` in the payload (envelope rule, events.rs:2048-2059); `Event::name()` `"context_pressure"` | additive |
 | `teton-providers` `ProviderError` | `ContextLengthExceeded { provider_id }` — `failure_class() → None` (the `EffortRefused` shape, lib.rs:372-445) | internal |
 | `tetond` `HarnessConfig` | unchanged field names for the pair; **new** `summarize_threshold_bytes`, `budget: RouteBudget` (bound + window label) | internal |
 | `tetond` new `harness/budget.rs` | `RouteBudget { budget_tokens, budget_bytes, bound, window_label }`, `BudgetInputs { window, cap, reservation, is_local, redact_scan }`, `derive(BudgetInputs) -> RouteBudget`, the constants below | internal |
@@ -77,8 +79,9 @@ REQ-573/REQ-559 rule).
 |---|---|---|---|
 | `REMOTE_TOKENS_PER_WORD` (safety ratio) | 3/2 (integer num/den) | `harness/budget.rs` | AC-3 corpus test (`max(words×3/2, bytes/2) ≥ tokens`) |
 | `REMOTE_BYTES_PER_TOKEN_FLOOR` | reuse `DUTY_REQUEST_BYTES_PER_TOKEN` = 2 (harness/duty.rs:438) — not a third bytes-per-token number (gotcha #12) | `harness/duty.rs` | AC-3 corpus test |
-| `DIGEST_THRESHOLD_FRACTION` | 1,500/4,096 for words; 12,000/32,768 for bytes (both 36.6%) — default route byte-identical to today | `harness/budget.rs` | context.rs digest tests |
-| `DIGEST_ABSOLUTE_CEILING` (OQ-7) | 20,000 words / 160 KiB — any single tool result above is digested on every route | `harness/budget.rs` | context.rs test |
+| `LOCAL_BUDGET_TOKENS` / `LOCAL_BUDGET_BYTES` | 4,096 / 4,096 × `APPROX_BYTES_PER_TOKEN` — **the one home** of the default pair; `HarnessConfig::default()` reads them (no recursion into `derive`) | `harness/budget.rs` | existing + margin tests |
+| `LOCAL_DIGEST_THRESHOLD_TOKENS` / `_BYTES` | 1,500 / 12,000 — the one home; the digest fraction is written as `LOCAL_DIGEST_THRESHOLD_* / LOCAL_BUDGET_*` (36.6%), default route byte-identical to today | `harness/budget.rs` | context.rs digest tests |
+| `DIGEST_ABSOLUTE_CEILING` (OQ-7) | 20,000 words / 160 KiB — any single tool result above is digested on every route. Rationale: ≈ the largest single file a code task legitimately reads whole (a 160 KiB source file ≈ 4k lines); above it a raw fold displaces more conversation than it informs. A placeholder until TASK-183's corpus numbers say otherwise; the words ceiling binds on 200k, the bytes ceiling does not (145,734 < 163,840) | `harness/budget.rs` | context.rs test |
 | `REDACT_SCANNABLE_CONTEXT_BYTES` | `(REDACT_INPUT_MAX_BYTES − REDACT_BODY_OVERHEAD_BYTES) × 10 / 11` ≈ 89,127 | `egress/redact.rs` | new assertion beside the margin test |
 | `REDACT_BODY_OVERHEAD_BYTES` | 10 KiB, **promoted** from `#[cfg(test)]` to `pub(crate) const` | `egress/redact.rs` | existing margin tests unchanged |
 | `COMPACT_PROMPT_BUDGET_BYTES` | the duty prompt budget for the local binding (same derivation shape as `REDACT_PROMPT_BUDGET_BYTES`: `(LOCAL_ENGINE_N_CTX − max_tokens) × DUTY_BYTES_PER_TOKEN − envelope`) | `harness/compact.rs` | compact.rs test |
@@ -96,16 +99,23 @@ derive(inputs):
     tokens   = usable × 2 / 3                      (REMOTE_TOKENS_PER_WORD)
     bytes    = usable × 2                           (REMOTE_BYTES_PER_TOKEN_FLOOR)
     bound    = Window
-    if cap > 0 and cap < window:  tokens/bytes recomputed from cap; bound = UserCap
+    if cap > 0 and cap < window:  window_eff = cap — the cap is a window ceiling:
+                                    usable/tokens/bytes recomputed from window_eff; bound = UserCap
     if redact_scan and bytes > REDACT_SCANNABLE_CONTEXT_BYTES:
                                     bytes = REDACT_SCANNABLE_CONTEXT_BYTES; bound = RedactScan
-                                    (words stay; the byte guard binds — BR-4)
+                                    (applies LAST; words stay; the byte guard binds — BR-4)
   digest thresholds = fraction × (tokens, bytes), capped by DIGEST_ABSOLUTE_CEILING
   window_label = "the local context window" | "<id>'s context window (Nk)" | "the redact-scannable window"
 ```
 
-Precedence is stated and tested: `LocalEngine` > `DefaultUnknown` > `UserCap` >
-`RedactScan` > `Window`. `is_local` is classified by the router from
+Precedence is stated and tested pairwise: `LocalEngine` > `DefaultUnknown`
+> (`RedactScan` when it bites) > `UserCap` > `Window` — i.e. the redact clamp
+is applied last and names the bound when it binds, otherwise the cap, otherwise
+the window. **Both currencies are surfaced**: on remote routes the byte guard
+(2 B/token) is what binds for prose and code (≈3 B/word budget vs ≈5.7 B/word
+prose), so `route_decided`, `context_pressure`, `/verbose` and the `context`
+topic carry and print `budget_tokens` **and** `budget_bytes`; the word figure
+alone would overstate what fits. `is_local` is classified by the router from
 `CategoryTable::local_provider_id` (gotcha #9), never from "capabilities ==
 default".
 
@@ -162,8 +172,9 @@ honor BR-1 without re-seeding (which would lose the turn's blocks).
 `classify.rs`, `triage.rs`, `title.rs`, `shell_duty.rs`, `compact.rs` and the
 mechanical digest fallback; a sibling `truncate_middle_with(text, room,
 marker)` is used by `truncate_to_budget` with the manager's
-`window_label`. `TRUNCATION_NOTE_BYTES` (context.rs:1471) is re-measured
-against the longest label and its test updated. The `assemble` note
+`window_label`; the marker lives inside the clamped block and is bounded by
+`room` by construction — what a longer label touches is `truncate_middle`'s
+`keep < 64` degenerate branch, which the clamp test covers. The `assemble` note
 ("truncated to fit the context window") is already window-neutral and stays.
 **Rationale**: BR-7 / F-9; six duty callers must not change bytes.
 
@@ -248,8 +259,9 @@ M-word budget (bound: …)` / `…newest message middle-elided by K bytes…`).
 line, `capabilities.max_context` / `context_budget_cap`, and the worst-case
 per-prompt input; `TOPICS`, `TOPIC_INDEX` and `DESCRIPTION` gain the one word
 (docs.rs:68-83, 127-130 — the BR-10 "a fifth topic costs one word" design).
-`providers.md` (≈3.5 KB of its 4 KiB ceiling) gains only the one sentence
-"declare the window with `--max-context`; unknown = defaulted". The resident
+`providers.md` is at **4,050 of its 4,096 B** ceiling, so it gains at most a
+≤ 40 B pointer (`Windows: teton_docs context.`) — or nothing — and the window
+sentence lives in the `context` topic. The resident
 guide (`self_config.md`) is **not** touched — its headroom is BUG-181's.
 **Rationale**: REQ-577 ADR-3 (depth lives in the tool, not the prompt);
 `every_bundled_topic_is_under_the_ceiling`.
@@ -265,6 +277,21 @@ stale fixture is a red test).
 **Rationale**: no network or heavy dev-dependency in the test graph; the
 spec allows either; LESSON-460 governs fixture fidelity — the generator is
 checked in and the counts are reproducible.
+
+## Tracer gotchas the tasks cite
+
+1. `degraded_harness_config()` builds from `CapabilityProfile::default()` (router.rs:1167-1176) — a naive derivation gives Degrade `DefaultUnknown`.
+2. `harness_config_for` takes only a provider id; the router never sees `[privacy] redact` (read solely in `redaction_gate`, runtime.rs:3994-4010) nor `max_tokens`.
+3. `summarize_if_large`'s byte twin is `threshold_tokens × APPROX_BYTES_PER_TOKEN` (context.rs:1620).
+4. Three hard-coded "local context window" strings: `truncate_middle`'s marker (context.rs:1505), shared by the clamp, the mechanical digest fallback (1633) and `compact_prompt` (compact.rs:300).
+5. `REDACT_BODY_OVERHEAD_BYTES` is `#[cfg(test)]` (egress/redact.rs:284); `REDACT_TOTAL_CAP_CHUNKS` is private.
+6. `apply_update`'s `RegisterProvider` arm replaces the whole `ModelProvider` and preserves capabilities by lookup (runtime.rs:9946-9958) — merge field-wise.
+7. `format_route` does not render `effort` (session_ui.rs:2264-2284); `render_config` (main.rs:3624) is the single row renderer for `/doctor` and `/provider list`.
+8. `CompactionOutcome`/`truncate_to_budget` return no counts; `truncate_to_budget()` is called at four sites (turn_loop.rs:595, 636, 748; carry.rs:248) and the carry commit has no `SessionEvents`.
+9. The local tier is absent from `Router.providers` — classify `local_engine` from `table.local_provider_id` as `effort_for` does.
+10. `route.harness.web_capability`/`session_root` are stamped only on the first route (runtime.rs:2877-2883).
+11. `ProviderRecipe`/`ProviderRecipeEntry` are pinned field-for-field and by a hand-written golden.
+12. `APPROX_BYTES_PER_TOKEN = 8` (word bridge) vs `DUTY_REQUEST_BYTES_PER_TOKEN = 2` (BPE estimate) are two different numbers — the byte floor reuses the duty constant.
 
 ## Proposed additions to `.adlc/context/architecture.md`
 
@@ -282,18 +309,22 @@ checked in and the counts are reproducible.
 ```
 Tier 0 (parallel, no deps)
   TASK-181 protocol+core+capability types (wire fields, event, enum, recipe entry, config cap)
-  TASK-182 harness/budget.rs pure derivation + constants + table tests
   TASK-183 token corpus fixture + generator + AC-3 pin
   TASK-184 egress/redact scannable bound + promoted constant + assertions
   TASK-185 providers ContextLengthExceeded (error, sniff, class-less) + conformance
 Tier 1
-  TASK-186 router: budget_for/harness_config_for/degraded(id)/with_redact_scan/Route/route_decided  [181,182,184]
-  TASK-187 context manager: PressureReport, rebudget, marker label, digest thresholds, compact prompt bound  [182]
-  TASK-188 recipes window + apply_update merge + setup commit + snapshot projection + validate cap  [181]
+  TASK-182 harness/budget.rs pure derivation + constants + table tests  [181,184]
+  TASK-188 recipes window + apply_update merge + setup commit + snapshot projection  [181]
 Tier 2
-  TASK-189 runtime wiring: reroute refit + events, ContextLengthExceeded arm, SessionEvents emitter, notice, carry report; remote-loop/carry/egress-capture tests  [185,186,187]
+  TASK-186 router: budget_for/harness_config_for/degraded(id)/with_redact_scan/Route/route_decided  [182]   (188 lands first — both touch runtime.rs in disjoint regions)
+  TASK-187 context manager: PressureReport, rebudget, marker label, digest thresholds, compact prompt bound  [182]
   TASK-190 CLI: --max-context, window column + doctor advisory, verbose budget line, context_pressure line, setup candidate; cli_e2e  [181,188]
 Tier 3
-  TASK-191 docs: providers/policy/doctor topics, README, CHANGELOG, manual-verification, architecture.md pattern  [189,190]
-  TASK-192 verification sweep: workspace --no-fail-fast, margin tests, mutation checks, guide headroom untouched  [191]
+  TASK-189 runtime wiring: reroute refit + events, ContextLengthExceeded arm, SessionEvents emitter, notice, carry report; remote-loop + routing + carry unit tests  [185,186,187]
+Tier 4
+  TASK-193 e2e/integration fixtures: privacy_fixes refit (AC-15a), ac_matrix fallback (AC-15b), conversation_carry AC-11, redact_egress AC-6, AC-10 daemon emissions  [189]
+Tier 5
+  TASK-191 docs: context topic, doctor/providers pointer, README, CHANGELOG, manual-verification, architecture.md pattern, recorded headroom  [193,190]
+Tier 6
+  TASK-192 verification sweep: workspace --no-fail-fast, margin tests, mutation checks (a–i), one-home grep, guide headroom untouched  [191]
 ```

@@ -22,8 +22,8 @@ whole workspace, prove the pins bite, and prove no number grew a second home.
 ## Acceptance Criteria
 
 - [ ] `cargo fmt --all --check`, `cargo clippy --workspace --all-targets -- -D warnings`, `cargo test --workspace --no-fail-fast` green (grep the log for `FAILED` — LESSON-533).
-- [ ] Mutations each make ≥ 1 test fail (apply, run, revert; record the failing test): (a) `derive()` returns `Window` for `is_local`; (b) Degrade arm builds from `CapabilityProfile::default()` again; (c) reroute arm skips `rebudget`; (d) `truncate_to_budget` returns a zeroed report; (e) `REMOTE_TOKENS_PER_WORD` 3/2 → 1/1; (f) `RegisterProvider` replaces instead of merges; (g) `ContextLengthExceeded` given a `FailureClass`; (h) `REDACT_SCANNABLE_CONTEXT_BYTES` replaced by the literal `89_127` — the assertion passes (expected) but the one-home grep below catches it.
-- [ ] `grep -rn "89_127\|89127" crates/ --include=*.rs | grep -v "//"` is empty; `4_096`/`32_768`/`1_500`/`12_000` each have exactly one non-test home.
+- [ ] Mutations each make ≥ 1 test fail (apply, run, revert; record the failing test): (a) `derive()` returns `Window` for `is_local`; (b) Degrade arm builds from `CapabilityProfile::default()` again; (c) reroute arm skips `rebudget`; (d) `truncate_to_budget` returns a zeroed report; (e) `REMOTE_TOKENS_PER_WORD` 3/2 → 1/1; (f) `RegisterProvider` replaces instead of merges; (g) `ContextLengthExceeded` given a `FailureClass`; (h) `REDACT_SCANNABLE_CONTEXT_BYTES` replaced by the literal `89_127` — the assertion passes (expected) but the one-home grep below catches it; (i) `with_redact_scan` ignored by `budget_for` → TASK-193's redact_egress AC-6 test fails.
+- [ ] `grep -rn "89_127\|89127" crates/ --include=*.rs | grep -v "//"` is empty; `4_096`/`1_500` each have exactly one non-test home (`budget.rs` `LOCAL_*`), and `32_768`/`12_000` appear in no non-test source (derived).
 - [ ] `git diff main -- crates/tetond/src/harness/self_config.md` is empty; both prompt-margin tests green with the ceiling unchanged.
 - [ ] Every task file in this REQ has status `complete`; the spec's automated AC checkboxes are ticked with the test name.
 

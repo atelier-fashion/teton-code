@@ -5,7 +5,7 @@ status: draft
 parent: REQ-586
 created: 2026-08-19
 updated: 2026-08-19
-dependencies: ["TASK-189", "TASK-190"]
+dependencies: ["TASK-193", "TASK-190"]
 repo: teton-code
 ---
 
@@ -13,8 +13,11 @@ repo: teton-code
 
 Ship the vocabulary (ADR-11, BR-9): a fifth bundled `teton_docs` topic
 `context` (budget, window, bound, `context_pressure`, `capabilities.max_context`,
-`context_budget_cap`, worst-case per-prompt input), one sentence in
-`providers.md`/`doctor.md`, README rows, CHANGELOG, the REQ-586 runbook
+`context_budget_cap`, worst-case per-prompt input — in **both** currencies,
+words and bytes, saying the byte guard binds for prose/code on remote routes,
+with the measured bytes/token per corpus class from TASK-183), a ≤ 40 B
+pointer in `providers.md` (it sits at 4,050 of 4,096 B — if it does not fit,
+nothing) and a line in `doctor.md`, README rows, CHANGELOG, the REQ-586 runbook
 section, and the Key Pattern / ADR-006 note in `.adlc/context/architecture.md`.
 
 ## Files to Create/Modify
@@ -31,7 +34,7 @@ section, and the Key Pattern / ADR-006 note in `.adlc/context/architecture.md`.
 
 - [ ] `cargo test -p tetond harness::tools::docs` green incl. ceiling/floor for `context`; both prompt-margin tests green without moving the ceiling.
 - [ ] `web_setup_contracts.rs` README/guide/topic gates green; `every_bundled_topic_is_under_the_ceiling` green.
-- [ ] The runbook section names every manual check of AC-14 with a checkbox.
+- [ ] The runbook section names every manual check of AC-14 with a checkbox, and records the resident-prompt headroom after this REQ (the `+9 B` description growth against the ≈887 B BUG-181 left — measure, as REQ-577/579/581/583 did; REQ-587 will read it).
 
 ## Technical Notes
 
