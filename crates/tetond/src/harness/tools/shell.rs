@@ -60,6 +60,7 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use serde_json::{json, Value};
+use teton_protocol::methods::RootKind;
 
 use super::{
     opt_str_arg, opt_u64_arg, str_arg, RefinedOutcome, Tool, ToolContext, ToolDuties, ToolOutcome,
@@ -67,6 +68,18 @@ use super::{
 use crate::env_path::apply_path_floor;
 use crate::harness::digest::tool_result_provenance;
 use crate::harness::shell_duty;
+
+/// The sentence appended to a timeout from a `home`/`filesystem_root` context
+/// on macOS (REQ-583 BR-14): the one place a killed command is plausibly a
+/// consent dialog nobody can see, because the session root's own trees are the
+/// ones the OS gates. From a `project` root the message is unchanged — no
+/// noise where the cause is implausible.
+///
+/// `cfg!`-selected at the call site rather than a `#[cfg]` item, so both
+/// spellings compile on every platform (the `service.rs` idiom).
+const TIMEOUT_CONSENT_HINT: &str = " On macOS a consent dialog for a protected folder holds a \
+                                    command until it is answered — narrow the command to a \
+                                    project path or move the session root with /cd.";
 
 /// Cap on captured output characters, so a chatty command cannot blow the
 /// small-model context budget.
@@ -114,7 +127,7 @@ impl Tool for ShellTool {
     }
 
     fn description(&self) -> &str {
-        "Run a shell command in the repository root under a timeout. Use it to \
+        "Run a shell command in the session root under a timeout. Use it to \
          verify changes (build, test, grep). Secrets in the environment are \
          removed."
     }
@@ -148,7 +161,7 @@ impl Tool for ShellTool {
         };
         let root = match ctx.repo_root().canonicalize() {
             Ok(r) => r,
-            Err(_) => return ToolOutcome::error("repo root does not exist"),
+            Err(_) => return ToolOutcome::error("session root does not exist"),
         };
 
         let timeout_ms = opt_u64_arg(args, "timeout_ms")
@@ -260,11 +273,18 @@ impl Tool for ShellTool {
                     libc::kill(-(pid as libc::pid_t), libc::SIGKILL);
                 }
                 let _ = handle.join();
-                ToolOutcome::error(format!(
-                    "command timed out after {timeout_ms}ms and was killed"
-                ))
-                .with_unknown_provenance()
-                .measuring(NO_OUTPUT_CAPTURED)
+                let mut message = format!("command timed out after {timeout_ms}ms and was killed");
+                // BR-14: from a home-kind root on macOS, the likeliest reason a
+                // command hangs is a consent dialog for a protected folder that
+                // nobody at the terminal can see. Say so, once, only there.
+                if cfg!(target_os = "macos")
+                    && matches!(ctx.root_kind(), RootKind::Home | RootKind::FilesystemRoot)
+                {
+                    message.push_str(TIMEOUT_CONSENT_HINT);
+                }
+                ToolOutcome::error(message)
+                    .with_unknown_provenance()
+                    .measuring(NO_OUTPUT_CAPTURED)
             }
             Err(RecvTimeoutError::Disconnected) => {
                 let _ = handle.join();
@@ -620,6 +640,46 @@ mod tests {
         assert!(out.content.contains("timed out"));
         // Killed promptly, nowhere near the 10s sleep.
         assert!(started.elapsed() < Duration::from_secs(3));
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// **AC-19 (BR-14).** A timeout under a `home`-kind context carries the
+    /// consent-dialog sentence on macOS (and nowhere else); the same command
+    /// under a `project`-kind context receives today's message byte-for-byte.
+    #[test]
+    fn ac19_a_timeout_from_a_home_kind_root_hints_at_the_consent_dialog() {
+        let root = temp_root("ac19");
+        let args = json!({ "command": "sleep 10" });
+        let plain = "command timed out after 200ms and was killed";
+
+        for kind in [RootKind::Home, RootKind::FilesystemRoot] {
+            let ctx = ToolContext::new(&root).with_root_kind(kind);
+            let out = ShellTool::with_timeouts(200, 500).run(&ctx, &args);
+            assert!(out.is_error);
+            if cfg!(target_os = "macos") {
+                assert_eq!(
+                    out.content,
+                    format!("{plain}{TIMEOUT_CONSENT_HINT}"),
+                    "{kind:?}"
+                );
+                assert!(out.content.contains("consent dialog"), "{kind:?}");
+            } else {
+                assert_eq!(out.content, plain, "{kind:?}: the hint is macOS-only");
+            }
+            // The arm's other facts are unchanged: no output, unknown provenance.
+            assert_eq!(out.measured, Some(0), "{kind:?}");
+        }
+
+        for kind in [RootKind::Project, RootKind::Plain] {
+            let ctx = ToolContext::new(&root).with_root_kind(kind);
+            let out = ShellTool::with_timeouts(200, 500).run(&ctx, &args);
+            assert!(out.is_error);
+            assert_eq!(
+                out.content, plain,
+                "{kind:?}: no noise where the cause is implausible"
+            );
+            assert_eq!(out.measured, Some(0), "{kind:?}");
+        }
         std::fs::remove_dir_all(&root).ok();
     }
 
@@ -1030,7 +1090,7 @@ mod tests {
                 json!({ "timeout_ms": 1_000 }),
             ),
             (
-                "repo root does not exist",
+                "session root does not exist",
                 PathBuf::from("/nonexistent-teton-root-for-this-test"),
                 json!({ "command": "echo hi" }),
             ),

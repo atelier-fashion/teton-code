@@ -51,6 +51,7 @@ pub mod grep;
 pub mod mcp;
 pub mod read;
 pub mod shell;
+pub mod walk;
 pub mod web;
 
 pub use docs::{DocsTool, DOCS_TOOL_NAME};
@@ -85,6 +86,8 @@ pub struct ToolContext {
     display: String,
     /// What kind of place the root is.
     kind: RootKind,
+    /// The walk policy every walker under this context runs under (ADR-3).
+    walk: walk::WalkPolicy,
 }
 
 impl ToolContext {
@@ -102,6 +105,7 @@ impl ToolContext {
             repo_root,
             display,
             kind: RootKind::Plain,
+            walk: walk::WalkPolicy::default(),
         }
     }
 
@@ -116,6 +120,7 @@ impl ToolContext {
             repo_root: repo_root.into(),
             display: root.display.clone(),
             kind: root.kind,
+            walk: walk::WalkPolicy::default(),
         }
     }
 
@@ -126,6 +131,21 @@ impl ToolContext {
     pub fn with_root_kind(mut self, kind: RootKind) -> Self {
         self.kind = kind;
         self
+    }
+
+    /// The same context with its walk budget replaced — the test seam a
+    /// walker's stopped line (AC-14/AC-15) is exercised through, without a
+    /// giant fixture or a sleep.
+    #[must_use]
+    pub fn with_walk_budget(mut self, budget: walk::WalkBudget) -> Self {
+        self.walk = self.walk.with_budget(budget);
+        self
+    }
+
+    /// The walk policy every walker under this context reads (ADR-3, BR-11).
+    #[must_use]
+    pub fn walk_policy(&self) -> &walk::WalkPolicy {
+        &self.walk
     }
 
     /// The jail root.

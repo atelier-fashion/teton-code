@@ -37,7 +37,7 @@ impl Tool for EditTool {
         json!({
             "type": "object",
             "properties": {
-                "path": { "type": "string", "description": "Repo-relative file path" },
+                "path": { "type": "string", "description": "Root-relative file path" },
                 "old_string": { "type": "string", "description": "Exact text to replace (must be unique)" },
                 "new_string": { "type": "string", "description": "Replacement text" }
             },

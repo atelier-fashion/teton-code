@@ -65,14 +65,14 @@ impl Tool for ReadTool {
     }
 
     fn description(&self) -> &str {
-        "Read a text file within the repository. Returns line-numbered contents."
+        "Read a text file under the session root. Returns line-numbered contents."
     }
 
     fn input_schema(&self) -> Value {
         json!({
             "type": "object",
             "properties": {
-                "path": { "type": "string", "description": "Repo-relative file path" },
+                "path": { "type": "string", "description": "Root-relative file path" },
                 "offset": { "type": "integer", "description": "1-based first line to return" },
                 "limit": { "type": "integer", "description": "Maximum number of lines" }
             },

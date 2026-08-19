@@ -6,6 +6,13 @@
 //! file set (reusing the [`glob`](super::glob) matcher). Output is
 //! `path:line: text`, capped for a small model's context.
 //!
+//! The walk itself — what is skipped, what is pruned from a home-kind root, how
+//! far it may go, and what it says when it stops — is [`walk`]'s (REQ-583
+//! ADR-3); this tool decides only what to do with a file it is handed. Every
+//! line the harness appends after the matches (the walk's trailer, the cap
+//! notice) starts with `... (`, and [`split_harness_trailer`] peels them all
+//! before the triage duty sees a match list.
+//!
 //! ## The `triage` duty attaches here (REQ-561 TASK-060)
 //!
 //! [`Tool::run`] answers with the first [`MAX_MATCHES`] hits **in file order**,
@@ -28,24 +35,18 @@
 use async_trait::async_trait;
 use serde_json::{json, Value};
 use std::collections::BTreeSet;
-use std::path::Path;
-use teton_core::ProvenanceId;
 
 use super::glob::glob_match;
-use super::{
-    opt_str_arg, skip_symlink_entry, str_arg, RefinedOutcome, Tool, ToolContext, ToolDuties,
-    ToolOutcome,
-};
+use super::walk;
+use super::{opt_str_arg, str_arg, RefinedOutcome, Tool, ToolContext, ToolDuties, ToolOutcome};
 use crate::harness::digest::tool_result_provenance;
 use crate::harness::triage;
-
-/// Directory names never searched.
-const SKIP_DIRS: &[&str] = &[".git", "target", "node_modules"];
 
 /// Cap on returned matching lines.
 const MAX_MATCHES: usize = 200;
 
-/// Searches repository files for a literal substring, jailed to the repo root.
+/// Searches files under the session root for a literal substring, jailed to
+/// that root.
 #[derive(Debug, Default, Clone, Copy)]
 pub struct GrepTool;
 
@@ -56,8 +57,8 @@ impl Tool for GrepTool {
     }
 
     fn description(&self) -> &str {
-        "Search repository files for a literal substring. Optional glob narrows \
-         the files; set ignore_case for case-insensitive matching."
+        "Search files under the session root for a literal substring. Optional glob \
+         narrows the files; set ignore_case for case-insensitive matching."
     }
 
     fn input_schema(&self) -> Value {
@@ -88,7 +89,7 @@ impl Tool for GrepTool {
 
         let root = match ctx.repo_root().canonicalize() {
             Ok(r) => r,
-            Err(_) => return ToolOutcome::error("repo root does not exist"),
+            Err(_) => return ToolOutcome::error("session root does not exist"),
         };
 
         let needle = if ignore_case {
@@ -97,36 +98,88 @@ impl Tool for GrepTool {
             pattern.clone()
         };
 
-        let mut hits = Vec::new();
+        let mut hits: Vec<String> = Vec::new();
         // REQ-544 C-1: the files whose *content* appears in the output. Only
         // matched files surface content into context, so those are the paths the
         // result's egress provenance must carry (a file that was scanned but had
         // no match contributes nothing and is not tagged).
         let mut matched_files = BTreeSet::new();
-        search(
+        // The pattern's leading literal segments name the tree the walk may enter
+        // even where the policy would prune it (BR-12's "unless named").
+        let named = file_glob
+            .as_deref()
+            .map(walk::leading_literal_segments)
+            .unwrap_or_default();
+        let report = walk::visit(
             &root,
-            &root,
-            &needle,
-            ignore_case,
-            file_glob.as_deref(),
-            &mut hits,
-            &mut matched_files,
+            ctx.root_kind(),
+            &named,
+            ctx.walk_policy(),
+            &mut |path, file_type, id| {
+                // Past the cap the walk still runs to its end (so its trailer is
+                // honest about what was and was not seen), but no more files are
+                // opened: the result cannot grow, so the reads would buy nothing.
+                if file_type.is_dir() || hits.len() > MAX_MATCHES {
+                    return;
+                }
+                let rel = id.as_str();
+                if let Some(g) = file_glob.as_deref() {
+                    if !glob_match(g, rel) {
+                        return;
+                    }
+                }
+                // Skip binary-ish files: read_to_string fails on invalid UTF-8,
+                // which is the cheap heuristic we want.
+                let Ok(contents) = std::fs::read_to_string(path) else {
+                    return;
+                };
+                for (i, line) in contents.lines().enumerate() {
+                    let haystack = if ignore_case {
+                        line.to_lowercase()
+                    } else {
+                        line.to_owned()
+                    };
+                    if haystack.contains(needle.as_str()) {
+                        matched_files.insert(id.clone());
+                        hits.push(format!("{rel}:{}: {}", i + 1, line.trim_end()));
+                        if hits.len() > MAX_MATCHES {
+                            return;
+                        }
+                    }
+                }
+            },
         );
+        let trailer = walk::trailer_lines(&report);
 
         if hits.is_empty() {
             // REQ-561 verify M3: `measuring(0)` is what tells `refine` this is
             // prose rather than a match list. `pattern` is model-supplied and may
             // contain a newline — and a newline-bearing pattern can NEVER match,
-            // since `search` compares against `contents.lines()`, so this branch
-            // is exactly where such a pattern always lands. Counting the lines of
-            // the sentence below read that as two "matches" and bought a `triage`
-            // call which then rebuilt the message out of its own chosen subset.
-            return ToolOutcome::ok(format!("no matches for `{pattern}`")).measuring(0);
+            // since the search compares against `contents.lines()`, so this
+            // branch is exactly where such a pattern always lands. Counting the
+            // lines of the sentence below read that as two "matches" and bought a
+            // `triage` call which then rebuilt the message out of its own chosen
+            // subset.
+            //
+            // BR-10: a budget hit is never a silent partial — the walk's trailer
+            // rides under the empty answer exactly as it rides under a full one.
+            let mut out = format!("no matches for `{pattern}`");
+            for line in &trailer {
+                out.push('\n');
+                out.push_str(line);
+            }
+            return ToolOutcome::ok(out).measuring(0);
         }
         let found = hits.len();
         let truncated = found > MAX_MATCHES;
         hits.truncate(MAX_MATCHES);
         let mut out = hits.join("\n");
+        // Matches, then the walk's own lines, then the cap notice last — the
+        // position it always had (ADR-3).
+        for line in &trailer {
+            out.push('\n');
+            out.push_str(line);
+        }
         if truncated {
             out.push('\n');
             out.push_str(&cap_notice());
@@ -173,7 +226,7 @@ impl Tool for GrepTool {
             // that failed.
             return RefinedOutcome::unrefined(outcome);
         }
-        let (matches, capped) = split_cap_notice(&outcome.content);
+        let (matches, trailer) = split_harness_trailer(&outcome.content);
         // BR-7 / LESSON-432: the egress provenance of the **matched files**, as
         // this tool itself reported them on the outcome — narrower than the
         // turn's context, and never read off an argument's name. A match inside a
@@ -190,7 +243,7 @@ impl Tool for GrepTool {
         .await;
         match ranked {
             Ok(order) => {
-                let content = render_ranked(&matches, &order, capped);
+                let content = render_ranked(&matches, &order, &trailer);
                 // Rebuilt by *update*, not from scratch — the same shape
                 // `ShellTool::refine` uses, and for a reason that outlives
                 // today's caller. `ToolOutcome::ok(content)` would reset
@@ -209,23 +262,31 @@ impl Tool for GrepTool {
 
 /// The line [`Tool::run`] appends when the search hit [`MAX_MATCHES`].
 ///
-/// Written once here and recognized once in [`split_cap_notice`], for the reason
-/// every other duty constant in this REQ is shared between its writer and its
-/// reader: two spellings of one sentence drift, and this one is what tells
-/// [`Tool::refine`] which trailing line is the harness talking rather than a
-/// match.
+/// It wears the `... (` prefix every harness line wears
+/// ([`walk::is_harness_line`]), which is what tells [`Tool::refine`] that a
+/// trailing line is the harness talking rather than a match — one recogniser
+/// for this notice and for every line the walk appends (ADR-3), so a new
+/// harness line is never ranked as a match by accident.
 fn cap_notice() -> String {
     format!("... (capped at {MAX_MATCHES} matches)")
 }
 
-/// A `grep` result split into its match lines and whether [`Tool::run`] capped
-/// it.
-fn split_cap_notice(content: &str) -> (Vec<&str>, bool) {
-    let suffix = format!("\n{}", cap_notice());
-    match content.strip_suffix(&suffix) {
-        Some(head) => (head.lines().collect(), true),
-        None => (content.lines().collect(), false),
+/// A `grep` result split into its match lines and the harness's own trailing
+/// lines — the walk's stopped/unreadable lines and the cap notice, in the order
+/// they were written — so [`render_ranked`] can put the same lines back
+/// verbatim under the ranked matches.
+fn split_harness_trailer(content: &str) -> (Vec<&str>, Vec<&str>) {
+    let mut lines: Vec<&str> = content.lines().collect();
+    let mut trailer = Vec::new();
+    while let Some(last) = lines.last() {
+        if !walk::is_harness_line(last) {
+            break;
+        }
+        trailer.push(*last);
+        lines.pop();
     }
+    trailer.reverse();
+    (lines, trailer)
 }
 
 /// The search, in one line, for the duty prompt: what "relevant" is being judged
@@ -273,7 +334,11 @@ fn describe_search(args: &Value) -> String {
 /// may reorder, but a ranking is resolved against the list it was given, so it
 /// can never hand back more lines than `run` found — and the cap here says so at
 /// the one place a future change could break it.
-fn render_ranked(matches: &[&str], order: &[usize], capped: bool) -> String {
+///
+/// `trailer` is what [`split_harness_trailer`] peeled off — the walk's lines
+/// and the cap notice — re-appended verbatim and in order, so a stopped or
+/// partly unreadable walk says so after ranking exactly as it did before.
+fn render_ranked(matches: &[&str], order: &[usize], trailer: &[&str]) -> String {
     let ranked: Vec<&str> = order
         .iter()
         .take(MAX_MATCHES)
@@ -304,100 +369,22 @@ fn render_ranked(matches: &[&str], order: &[usize], capped: bool) -> String {
             rest.join("\n")
         ));
     }
-    if capped {
+    for line in trailer {
         out.push('\n');
-        out.push_str(&cap_notice());
+        out.push_str(line);
     }
     out
-}
-
-/// Recursively search text files under `dir`. `matched` accumulates the
-/// repo-relative identity of every file that produced at least one hit — the
-/// egress provenance of the result (REQ-544 C-1).
-///
-/// REQ-571: the id is minted by [`ProvenanceId::from_resolved`] rather than by an
-/// inline `strip_prefix` + separator fixup. Same arithmetic, one implementation:
-/// the convention "every walker repeats this idiom correctly" is exactly what
-/// `read`/`edit` failed to hold, so the idiom is no longer copied. A file whose
-/// id cannot be minted surfaces nothing — untagged content is content egress
-/// could not judge.
-#[allow(clippy::too_many_arguments)]
-fn search(
-    root: &Path,
-    dir: &Path,
-    needle: &str,
-    ignore_case: bool,
-    file_glob: Option<&str>,
-    out: &mut Vec<String>,
-    matched: &mut BTreeSet<ProvenanceId>,
-) {
-    let entries = match std::fs::read_dir(dir) {
-        Ok(e) => e,
-        Err(_) => return,
-    };
-    for entry in entries.flatten() {
-        if out.len() > MAX_MATCHES {
-            return;
-        }
-        let path = entry.path();
-        let file_type = match entry.file_type() {
-            Ok(t) => t,
-            Err(_) => continue,
-        };
-        // REQ-571 ADR-C: a link is skipped before either branch below — this is
-        // the deliberate posture for walking tools, and it is tested on the entry
-        // rather than inferred from `!is_dir()`. See `skip_symlink_entry` for both
-        // halves of why.
-        if skip_symlink_entry(file_type) {
-            continue;
-        }
-        let name = entry.file_name();
-        let name = name.to_string_lossy();
-        if file_type.is_dir() {
-            if SKIP_DIRS.contains(&name.as_ref()) {
-                continue;
-            }
-            search(root, &path, needle, ignore_case, file_glob, out, matched);
-            continue;
-        }
-        let id = match ProvenanceId::from_resolved(root, &path) {
-            Ok(id) => id,
-            Err(_) => continue,
-        };
-        let rel = id.as_str();
-        if let Some(g) = file_glob {
-            if !glob_match(g, rel) {
-                continue;
-            }
-        }
-        // Skip binary-ish files: read_to_string fails on invalid UTF-8, which is
-        // the cheap heuristic we want.
-        let contents = match std::fs::read_to_string(&path) {
-            Ok(c) => c,
-            Err(_) => continue,
-        };
-        for (i, line) in contents.lines().enumerate() {
-            let haystack = if ignore_case {
-                line.to_lowercase()
-            } else {
-                line.to_owned()
-            };
-            if haystack.contains(needle) {
-                matched.insert(id.clone());
-                out.push(format!("{rel}:{}: {}", i + 1, line.trim_end()));
-                if out.len() > MAX_MATCHES {
-                    return;
-                }
-            }
-        }
-    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::fixture_id;
-    use std::path::PathBuf;
+    use std::path::{Path, PathBuf};
+    use std::time::Duration;
+    use teton_protocol::methods::RootKind;
+
+    use crate::harness::tools::walk::{WalkBudget, HOME_TOP_LEVEL_SKIPS, WALK_SKIP_DIRS};
 
     /// The counter, not the timestamp, guarantees uniqueness: `SystemTime::now()`
     /// can return the same value for two calls within one clock tick.
@@ -572,12 +559,12 @@ mod tests {
         (raw, refined)
     }
 
-    /// The match lines of a grep result, with the harness's own header and cap
-    /// notice removed.
+    /// The match lines of a grep result, with the harness's own header and
+    /// trailer lines (the walk's, and the cap notice) removed.
     fn match_lines(content: &str) -> Vec<&str> {
         content
             .lines()
-            .filter(|l| !l.starts_with("[triage:") && !l.starts_with("... (capped at"))
+            .filter(|l| !l.starts_with("[triage:") && !walk::is_harness_line(l))
             .collect()
     }
 
@@ -1014,18 +1001,277 @@ mod tests {
         std::fs::remove_dir_all(&root).ok();
     }
 
-    /// The cap notice is written once and recognized once, so `refine` can tell
-    /// the harness's own trailing line from a match — and never ranks it as one.
+    /// Every harness line — the walk's trailer and the cap notice — is split off
+    /// rather than ranked, in the order it was written, so `refine` can tell the
+    /// harness talking from a match and put the same lines back.
     #[test]
-    fn the_cap_notice_is_split_off_rather_than_ranked() {
-        let capped = format!("a.rs:1: x\nb.rs:2: y\n{}", cap_notice());
-        assert_eq!(
-            split_cap_notice(&capped),
-            (vec!["a.rs:1: x", "b.rs:2: y"], true)
+    fn the_harness_trailer_is_split_off_rather_than_ranked() {
+        let stopped =
+            "... (stopped after 3 entries; narrow the pattern, or move the session root with /cd)";
+        let unreadable = "... (1 folder could not be read (permission denied): secrets/)";
+        let capped = format!(
+            "a.rs:1: x\nb.rs:2: y\n{stopped}\n{unreadable}\n{}",
+            cap_notice()
         );
         assert_eq!(
-            split_cap_notice("a.rs:1: x\nb.rs:2: y"),
-            (vec!["a.rs:1: x", "b.rs:2: y"], false)
+            split_harness_trailer(&capped),
+            (
+                vec!["a.rs:1: x", "b.rs:2: y"],
+                vec![stopped, unreadable, "... (capped at 200 matches)"]
+            )
         );
+        assert_eq!(
+            split_harness_trailer("a.rs:1: x\nb.rs:2: y"),
+            (vec!["a.rs:1: x", "b.rs:2: y"], vec![])
+        );
+        // A harness-looking line *inside* the matches is a match: only the
+        // trailing run is peeled.
+        assert_eq!(
+            split_harness_trailer("a.rs:1: x\n... (mid)\nb.rs:2: y"),
+            (vec!["a.rs:1: x", "... (mid)", "b.rs:2: y"], vec![])
+        );
+    }
+
+    /// **The trailer survives ranking.** Driven through `refine` on an outcome
+    /// carrying the stopped line, the unreadable line and the cap notice: all
+    /// three come back verbatim, in order, after the ranked matches — and none
+    /// of them is offered to the duty as a match.
+    #[tokio::test]
+    async fn the_walk_trailer_survives_refine_verbatim_and_unranked() {
+        let stopped =
+            "... (stopped after 3 entries; narrow the pattern, or move the session root with /cd)";
+        let unreadable = "... (1 folder could not be read (permission denied): secrets/)";
+        let matches = ["a.rs:1: needle", "b.rs:2: needle", "c.rs:3: needle"];
+        let content = format!(
+            "{}\n{stopped}\n{unreadable}\n{}",
+            matches.join("\n"),
+            cap_notice()
+        );
+        let outcome = ToolOutcome::ok(&content)
+            .with_paths([fixture_id("a.rs"), fixture_id("b.rs"), fixture_id("c.rs")])
+            .measuring(matches.len());
+        let route = local_route("2 3");
+        let refined = GrepTool
+            .refine(
+                &json!({ "pattern": "needle" }),
+                "find the needle",
+                &ToolDuties {
+                    triage: &route,
+                    shell: &DutyRoute::unresolved("no shell route in this test"),
+                },
+                outcome,
+            )
+            .await;
+        assert_eq!(refined.duty_error, None, "the fixture must reach the duty");
+        let out = &refined.outcome.content;
+        assert!(out.starts_with("[triage: 2 of 3 matches"), "{out}");
+        assert_eq!(
+            match_lines(out),
+            vec![matches[1], matches[2], matches[0]],
+            "{out}"
+        );
+        assert!(
+            out.ends_with(&format!("\n{stopped}\n{unreadable}\n{}", cap_notice())),
+            "the trailer must come back verbatim, in order, after the matches: {out}"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // The walk under `grep` (REQ-583 ADR-3) — twins of the `glob` tests.
+    // -----------------------------------------------------------------------
+
+    /// Create `rel` (a file holding `needle`) under `root`, with its parents.
+    fn plant(root: &Path, rel: &str) {
+        let path = root.join(rel);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(path, "let needle = 1;\n").unwrap();
+    }
+
+    /// The files a `grep` for `needle` matched, sorted.
+    fn matched_in(out: &ToolOutcome) -> Vec<String> {
+        let mut files: Vec<String> = match_lines(&out.content)
+            .iter()
+            .filter(|l| !l.starts_with("no matches for"))
+            .map(|l| l.split(':').next().unwrap().to_owned())
+            .collect();
+        files.sort();
+        files
+    }
+
+    /// **AC-14 / AC-15 (BR-10), entries.** An injected budget smaller than the
+    /// fixture ends the result with the stopped-by-entries line — with matches
+    /// found and with none — and a fixture under the budget produces no such
+    /// line.
+    #[test]
+    fn ac14_ac15_grep_reports_the_entry_budget_with_and_without_matches() {
+        let root = temp_root("ac14-entries");
+        for n in 0..8 {
+            plant(&root, &format!("f{n}.rs"));
+        }
+        let small = WalkBudget {
+            max_entries: 3,
+            max_wall: Duration::from_secs(60),
+        };
+        let stopped =
+            "... (stopped after 3 entries; narrow the pattern, or move the session root with /cd)";
+
+        let ctx = ToolContext::new(&root).with_walk_budget(small);
+        let out = GrepTool.run(&ctx, &json!({ "pattern": "needle" }));
+        assert!(!out.is_error, "{}", out.content);
+        assert_eq!(matched_in(&out).len(), 3, "{}", out.content);
+        assert_eq!(out.content.lines().last(), Some(stopped), "{}", out.content);
+        assert_eq!(out.measured, Some(3), "the trailer is not a match");
+
+        let out = GrepTool.run(&ctx, &json!({ "pattern": "absent-from-this-repo" }));
+        assert_eq!(
+            out.content,
+            format!("no matches for `absent-from-this-repo`\n{stopped}")
+        );
+        assert_eq!(out.measured, Some(0));
+
+        let out = GrepTool.run(&ToolContext::new(&root), &json!({ "pattern": "needle" }));
+        assert_eq!(matched_in(&out).len(), 8);
+        assert!(!out.content.contains("stopped after"), "{}", out.content);
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// **AC-14 (BR-10), wall clock.** A zero wall budget lets the root's own
+    /// listing through and stops at the first descent.
+    #[test]
+    fn ac14_grep_reports_the_wall_clock_budget() {
+        let root = temp_root("ac14-wall");
+        plant(&root, "top.rs");
+        plant(&root, "sub/deep.rs");
+        let ctx = ToolContext::new(&root).with_walk_budget(WalkBudget {
+            max_entries: 1_000,
+            max_wall: Duration::ZERO,
+        });
+        let stopped =
+            "... (stopped after 0 s; narrow the pattern, or move the session root with /cd)";
+
+        let out = GrepTool.run(&ctx, &json!({ "pattern": "needle" }));
+        assert_eq!(matched_in(&out), vec!["top.rs"], "{}", out.content);
+        assert_eq!(out.content.lines().last(), Some(stopped), "{}", out.content);
+
+        let out = GrepTool.run(&ctx, &json!({ "pattern": "needle", "glob": "sub/*.rs" }));
+        assert_eq!(out.content, format!("no matches for `needle`\n{stopped}"));
+
+        let out = GrepTool.run(&ToolContext::new(&root), &json!({ "pattern": "needle" }));
+        assert_eq!(matched_in(&out), vec!["sub/deep.rs", "top.rs"]);
+        assert!(!out.content.contains("stopped after"), "{}", out.content);
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// **AC-16 (BR-12).** From a `home`-kind root the top-level media trees and
+    /// a bundle at any depth are not searched; a project's own `Library/` is;
+    /// naming the tree through the glob enters it; from a `project` root
+    /// everything is searched.
+    #[test]
+    fn ac16_grep_prunes_home_media_trees_unless_named() {
+        let root = temp_root("ac16");
+        plant(&root, "Library/Preferences/lib.rs");
+        plant(&root, "Music/tune.rs");
+        plant(&root, "Pictures/pic.rs");
+        plant(&root, "Documents/x.photoslibrary/inside.rs");
+        plant(&root, "Documents/app/Library/proj_lib.rs");
+        plant(&root, "Documents/app/src/main.rs");
+        let home = ToolContext::new(&root).with_root_kind(RootKind::Home);
+
+        let out = GrepTool.run(&home, &json!({ "pattern": "needle" }));
+        assert_eq!(
+            matched_in(&out),
+            vec![
+                "Documents/app/Library/proj_lib.rs",
+                "Documents/app/src/main.rs"
+            ],
+            "{}",
+            out.content
+        );
+
+        let out = GrepTool.run(
+            &home,
+            &json!({ "pattern": "needle", "glob": "Library/**/*.rs" }),
+        );
+        assert_eq!(
+            matched_in(&out),
+            vec!["Library/Preferences/lib.rs"],
+            "{}",
+            out.content
+        );
+
+        let project = ToolContext::new(&root).with_root_kind(RootKind::Project);
+        let out = GrepTool.run(&project, &json!({ "pattern": "needle" }));
+        assert_eq!(
+            matched_in(&out),
+            vec![
+                "Documents/app/Library/proj_lib.rs",
+                "Documents/app/src/main.rs",
+                "Documents/x.photoslibrary/inside.rs",
+                "Library/Preferences/lib.rs",
+                "Music/tune.rs",
+                "Pictures/pic.rs",
+            ],
+            "{}",
+            out.content
+        );
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// **AC-17 (BR-13).** An unreadable folder ends the result with the
+    /// permission-denied line; matches elsewhere are still returned; the macOS
+    /// consent sentence is present on macOS and absent elsewhere. Skipped as
+    /// root, who can read anything.
+    #[test]
+    fn ac17_grep_reports_an_unreadable_folder_and_still_returns_the_rest() {
+        use std::os::unix::fs::PermissionsExt;
+        // SAFETY: `geteuid` reads the process's effective uid; no arguments.
+        if unsafe { libc::geteuid() } == 0 {
+            eprintln!("skipped: running as root, mode 000 does not refuse");
+            return;
+        }
+        let root = temp_root("ac17");
+        plant(&root, "secrets/hidden.rs");
+        plant(&root, "src/main.rs");
+        let locked = root.join("secrets");
+        std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o000)).unwrap();
+
+        let out = GrepTool.run(&ToolContext::new(&root), &json!({ "pattern": "needle" }));
+        std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        assert!(!out.is_error, "{}", out.content);
+        assert_eq!(matched_in(&out), vec!["src/main.rs"], "{}", out.content);
+        let last = out.content.lines().last().unwrap();
+        assert!(
+            last.starts_with("... (1 folder could not be read (permission denied): secrets/"),
+            "{last}"
+        );
+        let sentence = "macOS may have blocked access to that folder, or be waiting on a consent dialog for it";
+        assert_eq!(
+            last.contains(sentence),
+            cfg!(target_os = "macos"),
+            "the consent sentence is macOS-only: {last}"
+        );
+        assert_eq!(out.measured, Some(1), "the trailer is not a match");
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// **AC-18 (BR-11), the behavioural half.** The walker is built from the
+    /// shared definition: every name in [`WALK_SKIP_DIRS`] is skipped and every
+    /// name in [`HOME_TOP_LEVEL_SKIPS`] is pruned from a home root — read off
+    /// the definition, not off a second list. (`glob`'s twin lives beside it;
+    /// the source scan in `tests/boundary_coverage.rs` proves neither tool
+    /// declares a list of its own.)
+    #[test]
+    fn ac18_grep_is_built_from_the_shared_walk_definition() {
+        let root = temp_root("ac18");
+        for name in WALK_SKIP_DIRS.iter().chain(HOME_TOP_LEVEL_SKIPS) {
+            plant(&root, &format!("{name}/inside.rs"));
+        }
+        plant(&root, "src/main.rs");
+        let home = ToolContext::new(&root).with_root_kind(RootKind::Home);
+        let out = GrepTool.run(&home, &json!({ "pattern": "needle" }));
+        assert_eq!(matched_in(&out), vec!["src/main.rs"], "{}", out.content);
+        assert_eq!(home.walk_policy(), &walk::WalkPolicy::default());
+        std::fs::remove_dir_all(&root).ok();
     }
 }

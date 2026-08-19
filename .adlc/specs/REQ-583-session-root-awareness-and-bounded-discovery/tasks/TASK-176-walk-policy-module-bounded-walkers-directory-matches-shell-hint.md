@@ -1,7 +1,7 @@
 ---
 id: TASK-176
 title: "One walk policy: bounded glob/grep with directory matches, home-media pruning, unreadable reporting, harness trailers; shell timeout hint; tool docs say session root"
-status: draft
+status: complete
 parent: REQ-583
 created: 2026-08-18
 updated: 2026-08-18
