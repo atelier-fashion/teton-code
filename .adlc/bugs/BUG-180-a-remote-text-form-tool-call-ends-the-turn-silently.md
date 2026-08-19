@@ -1,7 +1,7 @@
 ---
 id: BUG-180
 title: "A remote provider's text-form tool call ends the turn silently: nothing runs, nothing renders"
-status: open
+status: resolved
 severity: high
 created: 2026-08-19
 updated: 2026-08-19
@@ -195,6 +195,15 @@ Deliberately **not** changed here, noted for follow-up:
   is no call — the turn ends with the rest of the reply unseen. Same family
   of symptom, different cause (a heuristic and a grammar that should be one
   rule), pre-existing and shared by the local tier; worth its own report.
+
+## Deployment
+
+- Merged to `main` 2026-08-19 as `b54a590` (PR #186, squash; CI all seven
+  checks green on `ac28ced`). No staging/production service — this is the
+  OSS CLI/daemon, so the fix ships with the next tagged release (the release
+  runbook); the user's install at report time was 0.1.23, which does not yet
+  carry it.
+- Knowledge: LESSON-542 (a grammar you teach must be read on every path).
 
 ## Files Changed
 
