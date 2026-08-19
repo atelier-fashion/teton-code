@@ -1,7 +1,7 @@
 ---
 id: TASK-179
 title: "CLI: --cwd, banner root, the not-a-project notice, /cd, and session_root_changed rendering"
-status: draft
+status: complete
 parent: REQ-583
 created: 2026-08-18
 updated: 2026-08-18
@@ -27,13 +27,20 @@ the socket-level e2e legs are TASK-180 (they need TASK-178's daemon).
 
 ## Acceptance Criteria
 
-- [ ] `cargo test -p teton` green: AC-8 notice content, `--cwd` parse/resolve legs (`rel`, `~/x`, `/abs`, empty → error), `/cd` bare-form line, `/cd` refusal rendering, `session_root_changed` this-session/elsewhere/notice-refire tests, promised-list test.
-- [ ] `LEADING_GLOBAL_FLAGS` pin (`slash.rs:4468`) unchanged — `--cwd` is not global.
-- [ ] Piped/non-TTY output byte-identical to today when no `--cwd` is given (the notice and banner are TTY-gated; existing cli_e2e byte-parity tests green: `cargo test -p teton --test cli_e2e slash_quit`).
-- [ ] The banner's `cwd:` line shows the session root when `--cwd` differs from the shell cwd.
+- [x] `cargo test -p teton` green: AC-8 notice content, `--cwd` parse/resolve legs (`rel`, `~/x`, `/abs`, empty → error), `/cd` bare-form line, `/cd` refusal rendering, `session_root_changed` this-session/elsewhere/notice-refire tests, promised-list test. (`cargo test -p teton --bin teton`: 539 passed.)
+- [x] `LEADING_GLOBAL_FLAGS` pin (`slash.rs:4468`) unchanged — `--cwd` is not global (`cwd_flag_is_not_global` + the two-way pin both green).
+- [x] Piped/non-TTY output byte-identical to today when no `--cwd` is given (the notice and banner are TTY-gated; existing cli_e2e byte-parity tests green: `cargo test -p teton --test cli_e2e slash_quit` — and the full `cli_e2e` suite, 50 passed, against a daemon built from the tree at that moment).
+- [x] The banner's `cwd:` line shows the session root when `--cwd` differs from the shell cwd (`banner::print` is handed `cwd_display(session_root)`, the resolved `--cwd`).
 
 ## Technical Notes
 
 - Do not print the `context_cleared` line from the `/cd` handler or the new arm — the `ContextCleared` event already renders it (BR-7's "existing shape").
 - `SessionCreateResult.root` may be `None` from an older daemon — the notice and `/cd` bare form must degrade to a one-line notice, not panic.
 - Commit as `feat(cli): --cwd, the not-a-project notice, /cd, and session-root lines [TASK-179]`.
+
+## Implementation notes (2026-08-18)
+
+- A refused `session/create` in `run_session` is `anyhow::bail!("could not start a session: …")` — `main` prints it once on stderr (`teton: …`) and exits non-zero (REQ-582 ADR-3's refused-argument shape), rather than a `LineKind::Error` surface line followed by a second print. `run_provider_test`'s refusal path is unchanged (its doc and an e2e pin "reported on the surface, returns Ok").
+- `banner::cwd_display` now takes the session root path (`cwd_display(&Path) -> String`) and is a thin wrapper over `teton_core::session_root::display_for(path, HOME)`; `main` passes the resolved `--cwd` or the shell cwd. `banner::root_line(&SessionRoot)` is the one `{display} ({kind phrase})` spelling the notice, the `session_root_changed` line and `/cd`'s bare form share.
+- `main::session_root_for(cwd_flag, shell_cwd, home)` is the pure resolver the `--cwd` grammar test drives; `main::home_dir()` is the one `HOME` read (banner, `--cwd`, `/cd`).
+- The `/cd` grammar test maps the table's two empty-argument rows to the bare form (a read), because unlike `--cwd` an empty `/cd` has something useful to do; every non-empty row resolves to the table's path through the same `resolve_cwd_argument`.

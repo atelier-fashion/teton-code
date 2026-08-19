@@ -62,6 +62,7 @@ prompts:
 | `/model` | One line naming the model the local tier is on |
 | `/model set <name>` | Change the local model (typed input only; asks before an above-RAM-floor pick) |
 | `/clear` | Drop this session's retained conversation; the next prompt starts fresh |
+| `/cd [path]` | Move this session's root — the directory tools are scoped to — and clear the conversation; bare, print the current root |
 | `/verbose` | Toggle routing and turn-end notices for this session |
 | `/effort [level]` | Show, or change, the global reasoning effort |
 | `/permissions [level]` | Show, or change, what this session may run without asking |
@@ -69,6 +70,15 @@ prompts:
 | `/web allow` | Lift this session's web taint restriction (grants no new tier) |
 | `/web refresh <url>` | Drop a URL's cached copy so the next lookup re-fetches |
 | `/quit` (or `/exit`) | End the session (same as Ctrl-D) |
+
+A session's tools are scoped to one directory — its **session root**: the
+directory you ran `teton` from, or the one you name with `teton --cwd <path>`
+(a relative path resolves against your shell, `~` expands, and a path that does
+not exist or is not a directory is refused before the session starts). The
+banner's `cwd:` line shows it. Outside a project — your home folder, `/`, or a
+plain directory — the session says so under the banner, because every search
+then walks all of it and no project's privacy boundaries apply; `/cd <path>`
+moves the root of a live session and starts the conversation fresh.
 
 Everything you would otherwise open a second terminal for is here too. The ten
 commands below that have a `teton …` twin *are* that twin — the same arguments,

@@ -98,16 +98,19 @@
 // REQ-582 verify M2: `run_cli_line` validates a pre-REQ row's typed argv with
 // the binary's own parser before the row runs.
 use clap::Parser;
+use teton_core::session_root::resolve_cwd_argument;
 use teton_protocol::effort::EffortLevel;
 use teton_protocol::jsonrpc::{error_code, RpcError};
 use teton_protocol::methods::{
     ConfigGetParams, ConfigSetParams, ConfigUpdate, ModelStatusParams, PromptBlock,
     PromptTurnParams, SessionClearParams, SessionPermissionsParams, SessionPermissionsResult,
-    WebOverrideParams, WebOverrideResult, WebRefreshOutcome, WebRefreshParams, WebRefreshResult,
+    SessionRoot, SessionSetCwdParams, WebOverrideParams, WebOverrideResult, WebRefreshOutcome,
+    WebRefreshParams, WebRefreshResult,
 };
 use teton_protocol::permissions::PermissionLevel;
 use teton_protocol::SessionId;
 
+use crate::banner;
 use crate::cli_rows::{self, Mirror, WriteGate};
 use crate::client::{Connection, UiContext};
 use crate::model_ui;
@@ -352,7 +355,7 @@ struct CommandSpec {
     /// — what makes a typed `teton provider list` resolvable to this row by
     /// walking clap's tree rather than by matching words (ADR-1).
     ///
-    /// `None` on `/help`, `/clear`, `/verbose`, `/permissions`, `/web …`,
+    /// `None` on `/help`, `/clear`, `/cd`, `/verbose`, `/permissions`, `/web …`,
     /// `/provider setup`, `/provider test`, `/quit` — and on `/cost`, `/effort`
     /// and `/model set`, which do have `teton` twins but whose session rows
     /// predate this REQ and carry gates and flows of their own (`/model set`'s
@@ -461,6 +464,23 @@ const COMMANDS: &[CommandSpec] = &[
         args: Args::None,
         mirror: None,
         handler: handle_clear,
+    },
+    // REQ-583's move of a live session's root (BR-7). Beside `/clear` because it
+    // *is* a clear with a destination: every carried block's provenance identity
+    // is relative to the root it was minted under, so the conversation is
+    // dropped and the daemon reports it in `/clear`'s own shape. Session-only —
+    // its shell twin is `teton --cwd <path>` at launch, a flag rather than a
+    // subcommand, so there is no `Mirror` and a typed `teton cd` is a prompt.
+    // The bare form is a read (the current root), which is what `Args::Optional`
+    // is for (`/effort`, `/permissions`).
+    CommandSpec {
+        name: "cd",
+        aliases: &[],
+        summary: "Move this session's root — the directory tools are scoped to; clears the \
+                  conversation. Bare form prints the current root.",
+        args: Args::Optional,
+        mirror: None,
+        handler: handle_cd,
     },
     CommandSpec {
         name: "verbose",
@@ -2121,6 +2141,130 @@ fn report_clear_refusal(err: &RpcError, surface: &mut dyn Surface) {
     }
 }
 
+/// `/cd [path]` (REQ-583 BR-7): move this session's root, or print it.
+///
+/// **Bare** it is a read of the root the daemon last described —
+/// `SessionCreateResult.root`, refreshed by every `session_root_changed` — from
+/// the state cache, with no RPC (`/permissions`' shape). A root nobody knows
+/// (an older daemon that reported none) is said to be unknown, never guessed:
+/// the client does not derive kind (ADR-1).
+///
+/// **With an argument** the path goes through [`resolve_cwd_argument`] — the
+/// grammar `--cwd` uses, so the two accept and reject the same spellings
+/// (AC-12) — and a spelling that cannot become an absolute path is one error
+/// line and no RPC. Otherwise `session/set_cwd` is sent on the session's own
+/// connection and context (D-4), and on success **nothing** is printed here:
+/// the daemon publishes `context_cleared` and `session_root_changed` before it
+/// answers, and those events draw the lines — the clear in its existing shape,
+/// then the new root and (when it is not a project) the launch notice again
+/// (BR-8) — on every attached client, the issuer included. A second rendering
+/// from the answer would say the same thing twice to the one person who typed
+/// it (`/clear`'s rule).
+///
+/// No typed-input gate, for `/clear`'s reason: session-scoped, no consent, no
+/// money, and the daemon validates the path (BR-6's one validator). Available at
+/// every permission level — it moves the jail, it does not mutate files.
+fn handle_cd(
+    conn: &mut Connection,
+    ctx: &mut UiContext<'_>,
+    args: &str,
+) -> anyhow::Result<CommandOutcome> {
+    let args = args.trim();
+    if args.is_empty() {
+        let (kind, line) = current_root_line(ctx.state.root.as_ref());
+        ctx.surface.line(kind, &line);
+        return Ok(CommandOutcome::Continue);
+    }
+    let Some(session_id) = ctx.session_id.clone() else {
+        ctx.surface.line(LineKind::Error, CD_NEEDS_A_SESSION);
+        return Ok(CommandOutcome::Continue);
+    };
+    // The shell's directory and home, read here at the edge: a relative `/cd
+    // src` is relative to where the user's shell is, exactly as `--cwd src`
+    // would be, and `~` is the same `~` (BR-7: one grammar, two spellings).
+    let shell_cwd = std::env::current_dir().unwrap_or_default();
+    let home = crate::home_dir();
+    let cwd = match resolve_cwd_argument(args, &shell_cwd, home.as_deref()) {
+        Ok(cwd) => cwd,
+        Err(err) => {
+            // One line, no RPC — the same shape every other rejected command
+            // line takes (BR-2). The error names the argument it refused.
+            ctx.surface
+                .line(LineKind::Error, &cd_argument_refusal(&err));
+            return Ok(CommandOutcome::Continue);
+        }
+    };
+    if let Err(err) = conn.call(SessionSetCwdParams { session_id, cwd }, ctx)? {
+        report_cd_refusal(&err, ctx.surface);
+    }
+    Ok(CommandOutcome::Continue)
+}
+
+/// The line a bare `/cd` prints: the cached root and its kind, or — when no
+/// daemon has described one — a notice saying so.
+///
+/// Split out so both arms are asserted without a socket. The known arm is
+/// [`banner::root_line`]'s spelling, so `/cd`, the launch notice and the
+/// `session_root_changed` line describe one root one way.
+fn current_root_line(root: Option<&SessionRoot>) -> (LineKind, String) {
+    match root {
+        Some(root) => (
+            LineKind::Info,
+            format!("session root: {}", banner::root_line(root)),
+        ),
+        None => (LineKind::Notice, CD_ROOT_UNKNOWN.to_owned()),
+    }
+}
+
+/// The rejection a `/cd` argument that cannot become a path gets back — the
+/// grammar's own sentence (it names the argument), plus what to type instead.
+fn cd_argument_refusal(err: &teton_core::session_root::CwdArgError) -> String {
+    format!(
+        "/cd: {err} — `/cd <path>` takes an absolute path, a path relative to your shell, or `~`."
+    )
+}
+
+/// What `/cd <path>` says when there is no session whose root to move.
+const CD_NEEDS_A_SESSION: &str = "`/cd` needs a session to act on, and this command owns none.";
+
+/// What a bare `/cd` says when the daemon never described the root — a build
+/// older than `SessionCreateResult.root`, or a context that owns no session.
+///
+/// A version fact, not a failure (BUG-152's rule), so it is a notice: nothing is
+/// wrong with the session, the client simply was not told.
+const CD_ROOT_UNKNOWN: &str = "the session root is not known yet — this daemon did not report one \
+                               when the session started.";
+
+/// What `/cd <path>` says to a daemon built before REQ-583.
+///
+/// `CLEAR_UNAVAILABLE`'s shape: a version fact rather than a failure, and it says
+/// what is true of such a daemon — the root a session starts with is the root it
+/// keeps, so the remedy is to start one where the work is.
+const CD_UNAVAILABLE: &str = "this daemon build cannot move a session root — start a session from \
+                              the directory instead (`teton --cwd <path>`).";
+
+/// Render the reason a `/cd <path>` did not happen — and nothing at all when it
+/// did ([`report_clear_refusal`]'s shape, class matched on the code, never the
+/// wording).
+fn report_cd_refusal(err: &RpcError, surface: &mut dyn Surface) {
+    match err.code {
+        error_code::METHOD_NOT_FOUND => surface.line(LineKind::Notice, CD_UNAVAILABLE),
+        // The daemon's sentence names the turn holding the session and says to
+        // retry when it finishes; this adds only that the root did not move.
+        error_code::SESSION_BUSY => surface.line(
+            LineKind::Notice,
+            &format!("the session root was not moved: {}", err.message),
+        ),
+        // A refused path (not a directory, does not exist) and anything else:
+        // the daemon's own reason, which names the path (BR-6), on one error
+        // line. The root and the conversation are unchanged.
+        _ => surface.line(
+            LineKind::Error,
+            &format!("the session root could not be moved: {}", err.message),
+        ),
+    }
+}
+
 /// Whether this binary may honour the `TETON_TEST_SEAMS` master switch.
 ///
 /// The daemon's posture, mirrored (`tetond`'s `test_seams_enabled`): a **debug
@@ -2381,6 +2525,11 @@ mod tests {
             // REQ-567 BR-8: the user-only clear, declared here for the same
             // reason the web rows were — a new command is a spec decision.
             "clear",
+            // REQ-583 BR-7: the move of a live session's root, declared here
+            // for the reason every row above it was. Session-only by design:
+            // its shell twin is the `--cwd` flag at launch, not a subcommand,
+            // so it carries no mirror and a typed `teton cd` stays a prompt.
+            "cd",
             // REQ-559 BR-9: this REQ owns `/effort` — the row, its bare-argument
             // read path, and its `/help` entry. Declared here first, as the
             // rows above were. REQ-560 renders the effort *value* in its status
@@ -3483,6 +3632,235 @@ mod tests {
             "a real failure must not be softened into a notice: {:?}",
             surface.calls
         );
+    }
+
+    // ------------------------------------------------------------------
+    // REQ-583: `/cd` (BR-7, AC-10's rendering, AC-12)
+    // ------------------------------------------------------------------
+
+    fn a_root(kind: teton_protocol::methods::RootKind, display: &str) -> SessionRoot {
+        use teton_protocol::methods::RootKind;
+        SessionRoot {
+            display: display.to_owned(),
+            kind,
+            project_name: (kind == RootKind::Project).then(|| "teton-code".to_owned()),
+            vcs_branch: (kind == RootKind::Project).then(|| "main".to_owned()),
+        }
+    }
+
+    /// The row is in the table, beside `/clear`, optional-argument, session-only
+    /// (no mirror — its shell twin is a flag), and `/help` lists it with a
+    /// summary that says both what it does and that it clears.
+    #[test]
+    fn cd_is_a_session_only_optional_argument_row_beside_clear() {
+        let cd = COMMANDS
+            .iter()
+            .find(|spec| spec.name == "cd")
+            .expect("the /cd row");
+        assert!(matches!(cd.args, Args::Optional), "the bare form is a read");
+        assert!(cd.mirror.is_none(), "`teton cd` is not a subcommand");
+        assert!(cd.aliases.is_empty());
+        assert!(cd.summary.contains("session's root"), "{}", cd.summary);
+        assert!(
+            cd.summary.contains("clears the conversation"),
+            "{}",
+            cd.summary
+        );
+        let names: Vec<&str> = COMMANDS.iter().map(|spec| spec.name).collect();
+        let clear = names.iter().position(|n| *n == "clear").unwrap();
+        assert_eq!(names[clear + 1], "cd", "beside /clear: {names:?}");
+
+        let mut surface = RecordingSurface::new();
+        render_help(&mut surface);
+        assert!(
+            surface
+                .lines_of(LineKind::Info)
+                .iter()
+                .any(|line| line.starts_with("/cd ") && line.contains(cd.summary)),
+            "/cd must reach /help through the table"
+        );
+        // A typed `teton cd …` is not a recognized CLI line: there is no such
+        // subcommand, so it is a prompt (BR-4's rule), never a dispatch.
+        assert!(!matches!(classify("teton cd ~"), Input::CliLine { .. }));
+    }
+
+    /// AC-12, the `/cd` half: the argument goes through the very grammar table
+    /// `--cwd`'s test in `main.rs` and teton-core's own test iterate. Every
+    /// spelling the table resolves, `/cd` resolves to the same path; the
+    /// spellings the table refuses are the *empty* ones, and for `/cd` an empty
+    /// argument is the bare form — a read, not a refusal — because unlike a
+    /// flag it has something useful to do with no path.
+    #[test]
+    fn cd_arguments_obey_the_shared_grammar_table() {
+        use std::path::Path;
+        use teton_core::session_root::{
+            CWD_ARGUMENT_GRAMMAR, CWD_GRAMMAR_HOME, CWD_GRAMMAR_SHELL_CWD,
+        };
+        let shell_cwd = Path::new(CWD_GRAMMAR_SHELL_CWD);
+        let home = Some(Path::new(CWD_GRAMMAR_HOME));
+        for row in CWD_ARGUMENT_GRAMMAR {
+            let typed = format!("/cd {}", row.raw);
+            let Input::Command { name, args } = classify(&typed) else {
+                panic!("`{typed}` must be a command line");
+            };
+            let Resolution::Run(spec, args) = resolve(name, args) else {
+                panic!("`{typed}` must dispatch to the row, whatever the argument");
+            };
+            assert_eq!(spec.name, "cd");
+            match row.expect {
+                Ok(path) => {
+                    assert_eq!(
+                        args,
+                        row.raw.trim(),
+                        "the argument reaches the handler as typed"
+                    );
+                    assert_eq!(
+                        resolve_cwd_argument(args, shell_cwd, home).as_deref(),
+                        Ok(Path::new(path)),
+                        "/cd {:?} must resolve to {path}, as --cwd does",
+                        row.raw
+                    );
+                }
+                Err(fragment) => {
+                    // The table refuses only the empty spellings; the same
+                    // function says so for `/cd`, and the handler's bare-form
+                    // check is the same emptiness test.
+                    assert!(args.trim().is_empty(), "row {:?} → {args:?}", row.raw);
+                    let err = resolve_cwd_argument(args, shell_cwd, home).unwrap_err();
+                    assert!(err.to_string().contains(fragment), "{err}");
+                    assert!(
+                        cd_argument_refusal(&err).contains(fragment),
+                        "the refusal carries the grammar's own sentence"
+                    );
+                }
+            }
+        }
+    }
+
+    /// A refused argument is one error line naming the argument, and no RPC:
+    /// the refusal sentence is the grammar's own (it names what was typed) and
+    /// says what `/cd` takes.
+    #[test]
+    fn a_cd_argument_that_is_no_path_is_one_error_line_naming_it() {
+        use std::path::Path;
+        let err = resolve_cwd_argument("~/x", Path::new("/work"), None).unwrap_err();
+        let line = cd_argument_refusal(&err);
+        assert!(line.starts_with("/cd: "), "{line}");
+        assert!(line.contains("`~/x`"), "{line}");
+        assert!(line.contains("HOME is not set"), "{line}");
+        assert!(line.contains("`/cd <path>`"), "{line}");
+        assert_eq!(line.lines().count(), 1);
+    }
+
+    /// **BR-7: the bare form.** `/cd` alone prints the current root and kind from
+    /// the cache the daemon fills — one info line in the one spelling every
+    /// surface uses — and, when no daemon has described the root, one notice
+    /// saying so rather than a panic or a guess (an older daemon omits
+    /// `SessionCreateResult.root`).
+    #[test]
+    fn a_bare_cd_prints_the_current_root_or_says_it_is_unknown() {
+        use teton_protocol::methods::RootKind;
+        let (kind, line) = current_root_line(Some(&a_root(
+            RootKind::Project,
+            "~/Documents/GitHub/teton-code",
+        )));
+        assert_eq!(kind, LineKind::Info);
+        assert_eq!(
+            line,
+            "session root: ~/Documents/GitHub/teton-code (project teton-code, branch main)"
+        );
+        let (kind, line) = current_root_line(Some(&a_root(RootKind::Home, "~")));
+        assert_eq!(kind, LineKind::Info);
+        assert_eq!(line, "session root: ~ (your home folder)");
+        let (kind, line) = current_root_line(Some(&a_root(RootKind::FilesystemRoot, "/")));
+        assert_eq!(
+            (kind, line.as_str()),
+            (LineKind::Info, "session root: / (the filesystem root)")
+        );
+        let (kind, line) = current_root_line(Some(&a_root(RootKind::Plain, "/opt/x")));
+        assert_eq!(
+            (kind, line.as_str()),
+            (LineKind::Info, "session root: /opt/x (not a project)")
+        );
+
+        let (kind, line) = current_root_line(None);
+        assert_eq!(kind, LineKind::Notice);
+        assert_eq!(line, CD_ROOT_UNKNOWN);
+        assert!(line.contains("not known"), "{line}");
+        assert_eq!(line.lines().count(), 1);
+
+        // Through the handler: the bare form reads the cache and touches no
+        // socket — a `Connection` is never needed for it, which is why the
+        // dispatch can be exercised here through `resolve` alone.
+        let Input::Command { name, args } = classify("/cd") else {
+            panic!("`/cd` must be a command line");
+        };
+        assert!(matches!(resolve(name, args), Resolution::Run(spec, "") if spec.name == "cd"));
+        let mut state = SessionState::new();
+        state.root = Some(a_root(RootKind::Home, "~"));
+        assert_eq!(
+            current_root_line(state.root.as_ref()).1,
+            "session root: ~ (your home folder)"
+        );
+    }
+
+    /// **The render decision (BR-7's refusal half).** A `/cd` that worked prints
+    /// nothing here — `context_cleared` then `session_root_changed` draw the
+    /// lines on every attached client — so this pins the arms that *do* render,
+    /// and their classes, in `report_clear_refusal`'s shape: a build without the
+    /// method and a busy session are notices; a refused path is an error line
+    /// carrying the daemon's reason, which names the path (BR-6).
+    #[test]
+    fn a_cd_refusal_renders_by_class_and_a_worked_cd_renders_nothing_here() {
+        let mut surface = RecordingSurface::new();
+        report_cd_refusal(
+            &RpcError::new(error_code::METHOD_NOT_FOUND, "no such method"),
+            &mut surface,
+        );
+        let notice = surface.lines_of(LineKind::Notice).join("\n");
+        assert!(notice.contains("cannot move a session root"), "{notice}");
+        assert!(notice.contains("--cwd"), "the remedy is named: {notice}");
+        assert!(
+            surface.lines_of(LineKind::Error).is_empty(),
+            "{:?}",
+            surface.calls
+        );
+
+        let mut surface = RecordingSurface::new();
+        report_cd_refusal(
+            &RpcError::new(
+                error_code::SESSION_BUSY,
+                "session s1 is already running turn turn-2; retry when it finishes",
+            ),
+            &mut surface,
+        );
+        let busy = surface.lines_of(LineKind::Notice).join("\n");
+        assert!(busy.contains("was not moved"), "{busy}");
+        assert!(busy.contains("turn-2"), "{busy}");
+        assert!(
+            surface.lines_of(LineKind::Error).is_empty(),
+            "{:?}",
+            surface.calls
+        );
+
+        let mut surface = RecordingSurface::new();
+        report_cd_refusal(
+            &RpcError::new(error_code::INVALID_PARAMS, "cwd `/nope` is not a directory"),
+            &mut surface,
+        );
+        let failed = surface.lines_of(LineKind::Error).join("\n");
+        assert!(failed.contains("could not be moved"), "{failed}");
+        assert!(
+            failed.contains("`/nope`"),
+            "the daemon's reason names the path: {failed}"
+        );
+        assert!(
+            surface.lines_of(LineKind::Notice).is_empty(),
+            "{:?}",
+            surface.calls
+        );
+
+        assert!(CD_NEEDS_A_SESSION.contains("needs a session"));
     }
 
     // ------------------------------------------------------------------

@@ -11,6 +11,7 @@
 //! HTTP client of its own — every remote call is the daemon's, through its single
 //! egress choke point (BR-1).
 
+use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
 use clap::{Parser, Subcommand, ValueEnum};
@@ -19,6 +20,7 @@ use clap::{Parser, Subcommand, ValueEnum};
 // way in because this binary's `ProviderKind` is the *wire* one it parses and
 // sends; the composition rule is written against the core enum, and [`core_kind`]
 // is the only place the two meet.
+use teton_core::session_root::{resolve_cwd_argument, CwdArgError};
 use teton_core::{
     canonical_request_path, compose_endpoint, is_absolute_http_url, is_cleartext_to_a_remote_host,
     url_host, ProviderKind as CoreProviderKind,
@@ -105,6 +107,19 @@ pub(crate) struct Cli {
     /// activity; privacy and degradation warnings always show.
     #[arg(long, short = 'v', global = true)]
     pub(crate) verbose: bool,
+
+    /// Session root for this session — the directory tools are scoped to —
+    /// instead of the shell's directory. A relative path resolves against the
+    /// shell's directory and `~` expands (REQ-583 BR-6); the daemon validates it
+    /// exactly as it validates the shell's directory today.
+    ///
+    /// Deliberately **not** `global`: a global flag is stepped over by the
+    /// session's `teton …` line classifier and silently dropped by every
+    /// mirrored row (`LEADING_GLOBAL_FLAGS`, `cli_rows::run_mirrored_seamed`), and
+    /// a session root is a fact about how a session *starts*, not something a
+    /// row inside one should ever parse.
+    #[arg(long, value_name = "PATH")]
+    pub(crate) cwd: Option<String>,
 
     /// The subcommand to run; omit to open an interactive session.
     #[command(subcommand)]
@@ -367,12 +382,68 @@ pub(crate) fn parse_cli_category(name: &str) -> Result<CliCategory, String> {
         .map_err(|e| e.to_string())
 }
 
+/// The user's home folder, from `HOME` — `None` when unset or empty, never a
+/// guess. The one read of the variable in this binary: the banner's `cwd:`
+/// spelling, `--cwd`'s `~` and `/cd`'s `~` all take their home from here.
+pub(crate) fn home_dir() -> Option<PathBuf> {
+    std::env::var_os("HOME")
+        .map(PathBuf::from)
+        .filter(|home| !home.as_os_str().is_empty())
+}
+
+/// The session root this process asks the daemon for (REQ-583 BR-6): the
+/// resolved `--cwd`, or `shell_cwd` — today's behaviour, `None` when the shell's
+/// directory is unreadable — when the flag is absent.
+///
+/// Pure, so the `--cwd` parse test can drive it with teton-core's grammar table
+/// (AC-12): the flag's value goes through [`resolve_cwd_argument`], the same
+/// function `/cd` uses, and nothing else — no canonicalization and no
+/// existence check, because the daemon validates the path it is sent (ADR-4).
+///
+/// # Errors
+/// [`CwdArgError`] when `--cwd` was given and could not become an absolute
+/// path (empty, `~` without a home, or a relative path with no shell directory
+/// to join it onto).
+pub(crate) fn session_root_for(
+    cwd_flag: Option<&str>,
+    shell_cwd: Option<&Path>,
+    home: Option<&Path>,
+) -> Result<Option<PathBuf>, CwdArgError> {
+    match cwd_flag {
+        None => Ok(shell_cwd.map(Path::to_path_buf)),
+        Some(raw) => {
+            // With no shell directory a relative argument cannot join onto
+            // anything, and `resolve_cwd_argument` says so (`NotAbsolute`); an
+            // absolute or `~` argument still resolves.
+            let shell_cwd = shell_cwd.unwrap_or_else(|| Path::new(""));
+            resolve_cwd_argument(raw, shell_cwd, home).map(Some)
+        }
+    }
+}
+
 fn main() -> ExitCode {
     let cli = Cli::parse();
     let paths = socket_path::daemon_paths();
 
+    // REQ-583 BR-6: the session root is resolved once, here at the edge —
+    // `--cwd` through the grammar `/cd` shares, or the shell's directory as
+    // before — and threaded to the two places a session is created. A malformed
+    // `--cwd` is refused before anything connects, in the `bail!` shape every
+    // other refused argument takes: one line on stderr, non-zero exit.
+    let session_root = match session_root_for(
+        cli.cwd.as_deref(),
+        std::env::current_dir().ok().as_deref(),
+        home_dir().as_deref(),
+    ) {
+        Ok(root) => root,
+        Err(err) => {
+            eprintln!("teton: --cwd: {err}");
+            return ExitCode::FAILURE;
+        }
+    };
+
     let result = match cli.command {
-        None => run_session(&paths, cli.yes, cli.verbose),
+        None => run_session(&paths, cli.yes, cli.verbose, session_root.as_deref()),
         Some(Command::Doctor) => run_doctor(&paths),
         Some(Command::Cost) => run_cost(&paths),
         Some(Command::Effort { level }) => run_effort(&paths, level.as_deref()),
@@ -389,7 +460,9 @@ fn main() -> ExitCode {
                 model,
             } => run_provider_add(&paths, &id, kind.into(), endpoint, model),
             ProviderAction::List => run_provider_list(&paths),
-            ProviderAction::Test { id } => run_provider_test(&paths, &id, cli.yes),
+            ProviderAction::Test { id } => {
+                run_provider_test(&paths, &id, cli.yes, session_root.as_deref())
+            }
         },
         Some(Command::Boundary { action }) => match action {
             BoundaryAction::Add { glob, mode } => run_boundary_add(&paths, glob, mode.into()),
@@ -853,7 +926,24 @@ fn cli_line_note(name: &str) -> String {
 /// This is the client that owns the first-run model prompt: it answers permission
 /// requests and model proposals, and `auto_accept` (`--yes`) makes the latter
 /// unattended (BR-5).
-fn run_session(paths: &DaemonPaths, auto_accept: bool, verbose: bool) -> anyhow::Result<()> {
+///
+/// `session_root` is the directory the session's tools are scoped to (REQ-583
+/// BR-6): the resolved `--cwd`, or the shell's directory. It is what the banner's
+/// `cwd:` line shows and what `session/create` is sent; `None` only when the
+/// shell's directory was unreadable and no `--cwd` was given, in which case the
+/// daemon falls back to its own root as it always has.
+///
+/// # Errors
+///
+/// A transport error, or a `session/create` the daemon refused — the refusal
+/// names the path and the reason, and it is an error exit (BR-6: never a session
+/// that starts and then fails on every tool; a script must see the failure).
+fn run_session(
+    paths: &DaemonPaths,
+    auto_accept: bool,
+    verbose: bool,
+    session_root: Option<&Path>,
+) -> anyhow::Result<()> {
     // The banner is for humans at a terminal. Piped stdout (the e2e suites,
     // shell composition) sees the same byte stream it always did.
     let interactive = std::io::IsTerminal::is_terminal(&std::io::stdout());
@@ -873,10 +963,13 @@ fn run_session(paths: &DaemonPaths, auto_accept: bool, verbose: bool) -> anyhow:
     // derivable from the other, and a handler must never read either itself.
     let typed_input = std::io::IsTerminal::is_terminal(&std::io::stdin());
     if interactive {
+        // The `cwd:` line shows the *session root* — the resolved `--cwd` when
+        // one was given — never the shell's directory when the two differ
+        // (BR-6), spelled by the daemon's own display rule (ADR-1).
         banner::print(
             &mut surface,
             env!("CARGO_PKG_VERSION"),
-            banner::cwd_display().as_deref(),
+            session_root.map(banner::cwd_display).as_deref(),
         );
     }
 
@@ -910,20 +1003,21 @@ fn run_session(paths: &DaemonPaths, auto_accept: bool, verbose: bool) -> anyhow:
                 mode: SessionMode::Freeform,
                 phase: None,
                 // BUG-147: the daemon runs under launchd (cwd `/`); the tool
-                // jail must be THIS terminal's directory, so send it.
-                cwd: std::env::current_dir().ok(),
+                // jail must be THIS terminal's directory — or the `--cwd` the
+                // user named instead of it (REQ-583 BR-6) — so send it.
+                cwd: session_root.map(Path::to_path_buf),
             },
             &mut ctx,
         )?;
-        let session_id = match created {
-            Ok(res) => res.session_id,
-            Err(err) => {
-                ctx.surface.line(
-                    LineKind::Error,
-                    &format!("could not start a session: {}", err.message),
-                );
-                return Ok(());
-            }
+        let (session_id, root) = match created {
+            Ok(res) => (res.session_id, res.root),
+            // BR-6: a refused create is one line naming the path and the reason,
+            // and an error exit — `Ok(())` here read as success to a script, and
+            // "never a session that starts and then fails" needs the failure to
+            // be one. `bail!` at the binary edge, as every refused argument is
+            // (REQ-582 ADR-3): `main` prints it once, on stderr, and nothing
+            // about a session follows.
+            Err(err) => anyhow::bail!("could not start a session: {}", err.message),
         };
         // The slash handlers act on this session and reach it only through the
         // context (REQ-563: `/web allow` names the session whose restriction it
@@ -931,6 +1025,20 @@ fn run_session(paths: &DaemonPaths, auto_accept: bool, verbose: bool) -> anyhow:
         // another session's on the daemon-wide bus (REQ-567 BR-8).
         ctx.session_id = Some(session_id.clone());
         ctx.state.session_id = Some(session_id.clone());
+        // The root the daemon settled on (REQ-583): a cache of a daemon fact
+        // for `/cd`'s bare form, refreshed by every `session_root_changed`.
+        // `None` from a daemon older than the field, and nothing here assumes
+        // otherwise.
+        ctx.state.root = root;
+        if interactive {
+            // BR-5: a root that is not a project is announced once, under the
+            // banner and before the ready line — the same TTY gate as the
+            // banner, so piped output is byte-identical (ADR-5). Content is
+            // `banner::root_notice`'s; only the bytes are gated here.
+            if let Some(notice) = ctx.state.root.as_ref().and_then(banner::root_notice) {
+                ctx.surface.line(LineKind::Notice, &notice);
+            }
+        }
         ctx.surface.line(
             LineKind::Info,
             &format!(
@@ -2140,7 +2248,12 @@ pub(crate) fn provider_add_on(
 ///
 /// Propagates a transport error. A daemon that *answers* — including a refusal
 /// to create the session — is reported on the surface and returns `Ok`.
-fn run_provider_test(paths: &DaemonPaths, id: &str, assume_yes: bool) -> anyhow::Result<()> {
+fn run_provider_test(
+    paths: &DaemonPaths,
+    id: &str,
+    assume_yes: bool,
+    session_root: Option<&Path>,
+) -> anyhow::Result<()> {
     let mut surface = stdout_surface();
     let mut conn = client::ensure_connected(paths, &mut surface)?;
     let mut state = SessionState::new();
@@ -2156,8 +2269,9 @@ fn run_provider_test(paths: &DaemonPaths, id: &str, assume_yes: bool) -> anyhow:
             mode: SessionMode::Freeform,
             phase: None,
             // BUG-147: the daemon runs under launchd (cwd `/`); a session it
-            // mints must still be anchored to THIS terminal's directory.
-            cwd: std::env::current_dir().ok(),
+            // mints must still be anchored to THIS terminal's directory — or
+            // to the `--cwd` named instead of it (REQ-583 BR-6).
+            cwd: session_root.map(Path::to_path_buf),
         },
         &mut ctx,
     )?;
@@ -3543,6 +3657,111 @@ mod tests {
         // <name> --yes` is where BR-3's second confirmation is supplied).
         assert!(parse(&["teton", "model", "set", "qwen2.5-coder-7b", "--yes"]).yes);
         assert!(!parse(&["teton", "model", "list"]).yes);
+    }
+
+    /// REQ-583 BR-6 / AC-12: `--cwd` parses as a top-level flag, and its value
+    /// obeys teton-core's grammar table — the **same rows** the `/cd` test in
+    /// `slash.rs` and teton-core's own test iterate, so `--cwd` and `/cd`
+    /// accept and reject the same spellings by construction.
+    #[test]
+    fn cwd_flag_parses_and_resolves_by_the_shared_grammar_table() {
+        use teton_core::session_root::{
+            CWD_ARGUMENT_GRAMMAR, CWD_GRAMMAR_HOME, CWD_GRAMMAR_SHELL_CWD,
+        };
+        let shell_cwd = Path::new(CWD_GRAMMAR_SHELL_CWD);
+        let home = Path::new(CWD_GRAMMAR_HOME);
+
+        // Absent: the shell's directory, exactly as before the flag existed.
+        assert!(parse(&["teton"]).cwd.is_none());
+        assert_eq!(
+            session_root_for(None, Some(shell_cwd), Some(home)),
+            Ok(Some(shell_cwd.to_path_buf()))
+        );
+        assert_eq!(session_root_for(None, None, Some(home)), Ok(None));
+
+        for row in CWD_ARGUMENT_GRAMMAR {
+            let cli = parse(&["teton", "--cwd", row.raw]);
+            assert_eq!(
+                cli.cwd.as_deref(),
+                Some(row.raw),
+                "clap must carry the value verbatim"
+            );
+            let got = session_root_for(cli.cwd.as_deref(), Some(shell_cwd), Some(home));
+            match row.expect {
+                Ok(path) => assert_eq!(
+                    got,
+                    Ok(Some(PathBuf::from(path))),
+                    "--cwd {:?} must resolve to {path}",
+                    row.raw
+                ),
+                Err(fragment) => {
+                    let err = got.expect_err("the row must be refused");
+                    assert!(
+                        err.to_string().contains(fragment),
+                        "--cwd {:?}: {err} must mention {fragment:?}",
+                        row.raw
+                    );
+                }
+            }
+        }
+        // AC-12's named spellings, read back through the parser as a script
+        // would type them: relative, `~/x`, absolute, and empty → refused.
+        assert_eq!(
+            session_root_for(Some("rel"), Some(shell_cwd), Some(home)),
+            Ok(Some(PathBuf::from("/work/here/rel")))
+        );
+        assert_eq!(
+            session_root_for(Some("~/x"), Some(shell_cwd), Some(home)),
+            Ok(Some(PathBuf::from("/home/u/x")))
+        );
+        assert_eq!(
+            session_root_for(Some("/abs"), Some(shell_cwd), Some(home)),
+            Ok(Some(PathBuf::from("/abs")))
+        );
+        assert_eq!(
+            session_root_for(Some(""), Some(shell_cwd), Some(home)),
+            Err(CwdArgError::Empty)
+        );
+        // No shell directory: an absolute argument still resolves, a relative
+        // one is refused rather than guessed at.
+        assert_eq!(
+            session_root_for(Some("/abs"), None, Some(home)),
+            Ok(Some(PathBuf::from("/abs")))
+        );
+        assert!(matches!(
+            session_root_for(Some("rel"), None, Some(home)),
+            Err(CwdArgError::NotAbsolute(_))
+        ));
+    }
+
+    /// `--cwd` is a flag of the session (and of the one subcommand that opens a
+    /// session, `provider test`), so it sits **before** a subcommand and is not
+    /// `global`: after one it is an error, the way any unknown flag is. The
+    /// two-way pin in `slash.rs` (`LEADING_GLOBAL_FLAGS`) is what this keeps
+    /// honest — a global `--cwd` would be stepped over and dropped there.
+    #[test]
+    fn cwd_flag_is_not_global() {
+        let cli = parse(&["teton", "--cwd", "/x", "provider", "test", "kimi"]);
+        assert_eq!(cli.cwd.as_deref(), Some("/x"));
+        assert!(matches!(
+            cli.command,
+            Some(Command::Provider {
+                action: ProviderAction::Test { .. }
+            })
+        ));
+        assert!(
+            Cli::try_parse_from(["teton", "doctor", "--cwd", "/x"]).is_err(),
+            "--cwd after a subcommand must be a parse error, not a global flag"
+        );
+        assert!(Cli::try_parse_from(["teton", "provider", "test", "kimi", "--cwd", "/x"]).is_err());
+        use clap::CommandFactory;
+        let root = Cli::command();
+        let cwd = root
+            .get_arguments()
+            .find(|arg| arg.get_id() == "cwd")
+            .expect("the --cwd argument");
+        assert!(!cwd.is_global_set(), "--cwd must not be global");
+        assert_eq!(cwd.get_value_names().map(|names| names.len()), Some(1));
     }
 
     #[test]
