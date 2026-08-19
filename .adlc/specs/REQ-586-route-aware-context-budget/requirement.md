@@ -1,7 +1,7 @@
 ---
 id: REQ-586
 title: "A turn's context budget follows its route — remote tiers get the provider's window, bounded by what the redact scan can cover, and nothing is clamped in silence"
-status: draft
+status: approved
 deployable: true
 created: 2026-08-19
 updated: 2026-08-19
@@ -152,7 +152,11 @@ adds the numbers and the per-turn budget line from `route_decided`.
   pin, a provider failure to the fallback route), the budget is re-derived
   from the new route and the context is re-fitted by `truncate_to_budget`
   **before the next model call**, with a `context_pressure { kind:
-  refit_on_reroute }` event. Today every route's budget is equal so the stale
+  refit_on_reroute }` event. The third mid-turn re-config path — a
+  **degrade** of the *same* provider to the reduced harness profile
+  (`PrimaryDegraded`, after a malformed tool call) — keeps the provider's
+  derived budget: the profile changes, the window does not, and no refit or
+  `default_unknown` bound appears for a provider whose window is declared. Today every route's budget is equal so the stale
   seed is invisible; after this REQ an 80k-word context assembled for a 128k
   route and rerouted local must compact-and-fit, never reach the local engine
   as an over-window error or a smaller fallback provider as a 400 (informed
@@ -196,15 +200,21 @@ adds the numbers and the per-turn budget line from `route_decided`.
   unscannable (`REDACT_INPUT_MAX_BYTES`, fail-closed → Block). The effective
   budget on such a route is therefore `min(window-derived, scannable)`, where
   `scannable_bytes = (REDACT_INPUT_MAX_BYTES − system-prompt overhead) /
-  escaping factor` — **cap minus overhead, not cap with the 2× margin
-  inverted**: the margin in the cap's derivation exists so a budget bumped
+  escaping factor` — a **floor** (the overhead term already folds the
+  default budget's escaping, so the bound is conservative by a few KB), and
+  **cap minus overhead, not cap with the 2× margin inverted**: the margin in the cap's derivation exists so a budget bumped
   elsewhere cannot drift past the cap, and a bound *derived from* the cap
   cannot drift by construction. With today's constants that is ≈ 89 KB of
-  context (≈ 2.7× today's budget; a body at the cap is four chunks, inside
-  the envelope REQ-562 measured); it admits every ADLC skill. The overhead
+  context (≈ 2.7× today's budget; a body at the cap is four chunk-widths —
+  up to five chunks with the overlap, `REDACT_MAX_CHUNKS` — inside the
+  envelope REQ-562 measured); it admits every ADLC skill. The overhead
   term is today a `#[cfg(test)]` assumption (`REDACT_BODY_OVERHEAD_BYTES`) and
-  must be promoted to, or replaced by, a production constant the bound reads.
-  `/verbose` says `bound: redact_scan`; raising the chunk cap is not this REQ
+  must be promoted to, or replaced by, a production constant defined as
+  "what the body carries beyond the assembled context" that the bound reads.
+  The scan is byte-denominated, so `redact_scan` bounds `budget_bytes` (the
+  word component stays window-derived and the byte guard binds), which is
+  what makes the bound classification unambiguous. `/verbose` says `bound:
+  redact_scan`; raising the chunk cap is not this REQ
   (OQ-2) (informed by REQ-563 BR-2, REQ-567, LESSON-456).
 - [ ] BR-5: **An optional per-provider cap holds a big window to a smaller
   budget.** `[providers.<id>.capabilities] context_budget_cap` (name
@@ -219,10 +229,21 @@ adds the numbers and the per-turn budget line from `route_decided`.
   at 100% (REQ-561 BR-4a is unchanged in kind and in number). The `digest`
   duty's per-result threshold (`summarize_threshold_tokens`, 1,500 words
   today) becomes the same fraction of the route budget it is today
-  (1,500/4,096 ≈ 37%), so a 128k route does not condense a 1,500-word `read`
-  result through a local model call it has ample room to carry raw — a
-  fidelity loss the user did not ask for — while the local tier's rule is
-  byte-identical to today. A `compact` or `digest` duty that is itself routed
+  (1,500/4,096 ≈ 37%) — **and its byte twin becomes the same fraction of
+  `budget_bytes`** (12,000/32,768, the same 36.6%), never words × 8, so a
+  dense (minified JSON, base64) tool result on a big route is still digested
+  rather than folded raw at the edge of the byte budget — so a 128k route
+  does not condense a 1,500-word `read` result through a local model call it
+  has ample room to carry raw (a fidelity loss the user did not ask for),
+  while the local tier's rule is byte-identical to today. And because the
+  `compact` duty's own prompt renders every block (up to 1,024 bytes each)
+  with no total bound, a big-route conversation at 70% pressure can exceed
+  the *local* engine's window when `compact` is on its default local binding
+  and degrade to the REQ-561 deterministic drop every time: the duty's prompt
+  therefore **stays bounded to its route's engine window as the conversation
+  grows** (e.g. a bounded window of the oldest blocks — the answer is block
+  numbers, so a partial offer still compacts), so "compaction keeps its
+  proportion" is true in practice and not only in the threshold. A `compact` or `digest` duty that is itself routed
   remote is subject to the same egress rules as today (informed by REQ-561
   BR-4/BR-4a, REQ-567 BR-4).
 - [ ] BR-7: **Nothing is clamped in silence, on any tier — and what the
@@ -331,7 +352,10 @@ adds the numbers and the per-turn budget line from `route_decided`.
   still fires at 100%; the REQ-561 fallback (failed compaction →
   deterministic truncation) is unchanged and pinned; the `digest` threshold
   on the local tier is byte-identical to today's 1,500 and on a 128k route a
-  3,000-word tool result enters context raw. (unit; BR-6)
+  3,000-word tool result enters context raw while a 240 KB minified tool
+  result is digested; a 200-block conversation on a 128k route compacts
+  through the local `compact` binding (the duty's prompt fits the local
+  window) rather than degrading to the deterministic drop. (unit; BR-6)
 - [ ] AC-10: A prompt that forces `truncate_to_budget` to drop three blocks
   emits one `context_pressure { kind: blocks_dropped, dropped_blocks: 3,
   budget_tokens, bound }`; a single oversized user block that is middle-elided
@@ -360,14 +384,16 @@ adds the numbers and the per-turn budget line from `route_decided`.
   `/doctor` shows the window; with `redact = true` the same prompt shows
   `bound: redact_scan` and completes; the runbook records the worst-case
   per-prompt input at that budget; and once REQ-585 lands, `/proceed REQ-xxx`
-  expands rather than being refused for size. (manual)
+  expands rather than being refused for size. (manual; BR-3, BR-4, BR-9)
 - [ ] AC-15: **Mid-turn reroute re-fits.** On a 128k route, a turn with a
   60,000-word context hits a privacy block and is rerouted to the local pin:
   the context is re-fitted to the local budget with `context_pressure { kind:
   refit_on_reroute }` **before** the next model call and the turn completes —
   no over-window error; the same for a provider failure failing over to a
-  fallback provider with a smaller declared window — no 400. (remote-loop
-  fixture; BR-1)
+  fallback provider with a smaller declared window — no 400; and a
+  `MalformedToolCall` on a 128k route continues under the reduced profile
+  with the same `budget_tokens` and `bound: window`, with no
+  `refit_on_reroute`. (remote-loop fixture; BR-1)
 
 ## External Dependencies
 
@@ -408,8 +434,8 @@ adds the numbers and the per-turn budget line from `route_decided`.
   when it is `true` and covers the whole outbound request body; the search
   tier's scan is a separate slot over lookup egress. The scannable bound with
   today's constants is ≈ 89 KB (cap minus overhead, escaping modelled) — ≈
-  2.7× today's budget, four chunks at the cap — which admits every ADLC
-  skill; `REDACT_BODY_OVERHEAD_BYTES` is `#[cfg(test)]` today.
+  2.7× today's budget, up to five chunks at the cap — which admits every
+  ADLC skill; `REDACT_BODY_OVERHEAD_BYTES` is `#[cfg(test)]` today.
 - Truncation is user-invisible today: `was_truncated()` is read only by
   tests (several, across `carry.rs`, `sessions.rs`, `turn_loop.rs`,
   `context.rs`), and `ContextCleared` (for `/clear` and `/cd`) is the only
@@ -463,8 +489,9 @@ adds the numbers and the per-turn budget line from `route_decided`.
   cap (Deferred) if dogfood bills say so.
 - [ ] OQ-7: **Should the `digest` threshold have an absolute ceiling on big
   routes** (e.g. never carry a >20k-word single tool result raw, even on
-  200k)? *Lean:* yes, a ceiling at the same fraction of the *cap-or-window*
-  — decide in `/architect` with the corpus.
+  200k)? *Lean:* yes — an **absolute** word/byte ceiling chosen against the
+  AC-3 corpus (never more than N words raw on any route), on top of BR-6's
+  proportional rule; decide N in `/architect` with the corpus.
 
 ## Out of Scope
 
@@ -506,6 +533,13 @@ in the in-prompt marker (F-9); BR-8/AC-1 classify `local_engine` from the
 routing table (F-10); Assumptions corrected on `was_truncated` readers
 (F-11); External Dependencies name the dev-dependency (F-12); OQ-5 resolved
 toward BR-9 (F-13); REQ-585 consistency confirmed (F-14).
+
+`/proceed` Phase 1 re-validation (2026-08-19): APPROVED; 3 Warnings + 5 Info
+applied before `/architect` — the `Degrade` re-config arm keeps the provider's
+budget (BR-1/AC-15); the `digest` byte twin scales and the `compact` duty's
+own prompt stays bounded to its route's window (BR-6/AC-9); five chunks at
+the cap, the ≈89 KB bound is a floor and byte-denominated (BR-4); AC-14 BR
+tags; OQ-7 lean is an absolute ceiling.
 
 ## Retrieved Context
 
