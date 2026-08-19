@@ -12,8 +12,9 @@
 //!
 //! The bundled guide ([`SELF_CONFIG_GUIDE`](crate::harness::turn_loop)) is the
 //! right vehicle for the always-needed surface, and it is nearly full: the
-//! system prompt sits under a pinned byte ceiling with tens of bytes of
-//! headroom, and BUG-168 already had to shorten one phrase to pay for another.
+//! system prompt sits under a pinned byte ceiling with little headroom — BUG-168
+//! had to shorten one phrase to pay for another, and BUG-181 had to move the
+//! ceiling (with its arithmetic re-checked) to land one capability sentence.
 //! Depth cannot live there. It lives here instead, and the only resident cost is
 //! [`DESCRIPTION`] — one line naming the topic index — so adding a fifth topic
 //! later costs the prompt one word rather than a page (BR-10).

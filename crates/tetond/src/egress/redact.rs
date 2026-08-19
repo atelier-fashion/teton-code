@@ -263,6 +263,16 @@ pub const REDACT_CHUNK_MAX_BYTES: usize =
 /// have closed it. The floor itself is untouched — it is the line the margin is
 /// never traded away across (REQ-577 BR-4).
 ///
+/// Raised 9→10 KiB by BUG-181, for the same shape of reason: the capability
+/// sentence the bug adds to the bundled guide (the session's commands are the
+/// ones `/help` lists; nothing is loaded from `.claude/`) is 186 bytes, and the
+/// 9 KiB assumption had **1 byte** of slack above [`MIN_PROMPT_HEADROOM_BYTES`]
+/// — every other line of the guide is pinned by whole-line or per-segment
+/// assertions tuned by live A/B (REQ-579), so paying for it by trimming would
+/// have meant re-tuning a sentence that works. Chunk caps and
+/// [`REDACT_INPUT_MAX_BYTES`] are again unchanged (verify:
+/// 2×(32768+10240)=86016 ≤ 108280, chunks stay 4). The floor is again untouched.
+///
 /// `pub(crate)` because the *other* prompt shape has to clear it too and cannot
 /// be built from here: with `[web] tier` above `off` the system prompt carries
 /// the web tool's docs instead of REQ-563's BR-6 opt-in clause, and building
@@ -272,7 +282,7 @@ pub const REDACT_CHUNK_MAX_BYTES: usize =
 /// this is the number both of them measure against, so the two shapes cannot
 /// come to disagree about the budget.
 #[cfg(test)]
-pub(crate) const REDACT_BODY_OVERHEAD_BYTES: usize = 9 * 1024;
+pub(crate) const REDACT_BODY_OVERHEAD_BYTES: usize = 10 * 1024;
 
 /// The smallest headroom [`REDACT_BODY_OVERHEAD_BYTES`] may be left with after
 /// the largest system prompt this build produces (REQ-572 verify).
@@ -300,25 +310,26 @@ pub(crate) const MIN_PROMPT_HEADROOM_BYTES: usize = 48;
 ///
 /// ```text
 ///   HarnessConfig::context_budget_bytes   32,768 bytes  (turn_loop.rs)
-///   + `REDACT_BODY_OVERHEAD_BYTES`         9,216 bytes  (system prompt, tool
+///   + `REDACT_BODY_OVERHEAD_BYTES`        10,240 bytes  (system prompt, tool
 ///                                                        descriptions, JSON
 ///                                                        envelope + escaping —
 ///                                                        the assumption, and
 ///                                                        the test below checks
 ///                                                        it against the real
 ///                                                        system prompt)
-///   = the largest ordinary outbound body  41,984 bytes
+///   = the largest ordinary outbound body  43,008 bytes
 ///   × 2 (the margin — a cap that only just clears the body it has to hold is
 ///        one context-budget bump away from being the old collision again)
-///   = 83,968 bytes to clear
-///   ÷ REDACT_CHUNK_MAX_BYTES              83,968 / 27,070 = 3.10
+///   = 86,016 bytes to clear
+///   ÷ REDACT_CHUNK_MAX_BYTES              86,016 / 27,070 = 3.18
 ///   → the next whole chunk up                        4
 /// ```
 ///
-/// The overhead term moved 8→9 KiB in REQ-577 and the quotient moved 3.03→3.10,
-/// which is the point of writing the arithmetic out rather than the answer: the
-/// chunk count is unchanged, so [`REDACT_INPUT_MAX_BYTES`] is unchanged, and a
-/// reader can see that rather than take it on trust.
+/// The overhead term moved 8→9 KiB in REQ-577 (quotient 3.03→3.10) and 9→10 KiB
+/// in BUG-181 (3.10→3.18), which is the point of writing the arithmetic out
+/// rather than the answer: the chunk count is unchanged both times, so
+/// [`REDACT_INPUT_MAX_BYTES`] is unchanged, and a reader can see that rather
+/// than take it on trust.
 ///
 /// The other half of the choice is the chunk **count**, because every chunk is
 /// a model call and ADR-8's budget is per call. With the
@@ -350,8 +361,9 @@ const REDACT_TOTAL_CAP_CHUNKS: usize = 4;
 ///
 /// **This is the number that used to sit under the harness's context budget**
 /// (32,768) and block every context-budget-full remote turn. It is now
-/// **108,280** — 3.3× that budget, 2.58× a full body with the system prompt and
-/// JSON overhead on top of it (2.6× before REQ-577 widened the overhead term).
+/// **108,280** — 3.3× that budget, 2.52× a full body with the system prompt and
+/// JSON overhead on top of it (2.6× before REQ-577 widened the overhead term,
+/// 2.58× before BUG-181 widened it again).
 /// The collision is closed rather than measured; what
 /// `docs/manual-verification.md` now records is the *chunk-count distribution*,
 /// which is where the cost went.
