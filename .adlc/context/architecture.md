@@ -284,6 +284,31 @@
   the wire-shape rules — user-first, alternating, **no empty message** — at
   the seam that builds the sequence, because more than one writer can produce
   an empty block (BUG-178, LESSON-538).
+- **A session's ground is a derived value with one probe and three consumers**
+  — the jail root's kind, display and project facts are derived from the
+  stored path at every use (turn, `session/create`, `/cd`), never cached; the
+  prompt states them as data (one bounded line, byte-bounded only where it is
+  resident), the tools enforce them (jail refusals name the root, walkers read
+  the kind), and the client renders what the daemon derived. A turn re-reads
+  the path **after** taking its claim — state snapshotted before the claim is a
+  hint, not a fact (REQ-583 ADR-1/ADR-2/ADR-4, LESSON-539, LESSON-473).
+- **A walker's harness lines wear one prefix and are peeled by one recogniser
+  that knows every writer's shape** — every non-match line a search tool
+  appends starts `... (` and is authored in `walk.rs` (trailers, cap notices);
+  the duty that ranks matches strips exactly those shapes, so authoring a new
+  harness line is a two-sided change (writer + recogniser, pinned by a test
+  that enumerates every writer) and a new line is never ranked as a match by
+  accident. The walk itself is one policy — budget, skip set (never nameable),
+  home-top-level prune (nameable), bundle suffixes — consumed by every walker,
+  and a zero-budget fixture holds one entry because listing order is the
+  filesystem's, not the test's (REQ-583 ADR-3, LESSON-540).
+- **A resident fact is bought with reference data, never with the ceiling** —
+  the third instance of the redact.rs rule: the environment block (a fact a
+  model cannot learn by calling a tool) was paid for by moving the guide's
+  `[web]` key reference into the `teton_docs web` topic, with the floor and
+  the 9 KiB overhead untouched; the task that measures a composed artifact
+  runs after every task that writes to it (REQ-583 ADR-2, ASSUME-008,
+  LESSON-541, LESSON-491).
 
 ## ADRs
 

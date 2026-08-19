@@ -453,6 +453,17 @@ _Leg C_
   beyond the refusal wording.
 - Windows.
 
+## Deferred
+
+- AC-20 (b) — the by-hand check that no Media / Photos / "data from other
+  apps" consent dialog appears during a `~`-rooted search — is OUTSTANDING
+  in `docs/manual-verification.md` (REQ-583 runbook); tracked as ASSUME-014.
+  Everything automatable in AC-20 ran against the real local model
+  (TASK-180).
+- Recommendations 4 (project locator) and 5 (consent-aware walks in Teton's
+  voice) and the OQ-1 boundary-anchoring narrowing remain unfiled follow-ups
+  (see Out of Scope).
+
 ## Retrieved Context
 
 - LESSON-524 (lesson, score 13): Exposure is not callability — a capability asserted present must be asserted usable at every permission level

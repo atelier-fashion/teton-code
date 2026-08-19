@@ -2,7 +2,7 @@
   "req": "REQ-583",
   "branch": "feat/REQ-583-session-root-awareness",
   "startedAt": "2026-08-18T23:55:55Z",
-  "completed": false,
+  "completed": true,
   "currentPhase": 8,
   "completedPhases": [
     0,
@@ -12,7 +12,8 @@
     4,
     5,
     6,
-    7
+    7,
+    8
   ],
   "phaseHistory": [
     {
@@ -54,6 +55,11 @@
       "phase": 7,
       "name": "PR Cleanup & CI",
       "completedAt": "2026-08-19T13:38:12Z"
+    },
+    {
+      "phase": 8,
+      "name": "Wrapup",
+      "completedAt": "2026-08-19T13:46:10Z"
     }
   ],
   "integrationBranch": "main",
@@ -67,9 +73,10 @@
       "prUrl": "https://github.com/atelier-fashion/teton-code/pull/182",
       "prNumber": 182,
       "prCreatedAt": "2026-08-18T23:55:58Z",
-      "merged": false,
+      "merged": true,
       "snapshotBranch": null,
-      "snapshotPR": null
+      "snapshotPR": null,
+      "mergeCommit": "312f7f9e696d8b432f561132354261128b160d08"
     }
   },
   "mergeOrder": [
@@ -107,5 +114,18 @@
       "Q1 OQ-8": "keep (2026-08-19)",
       "Q2 OQ-7": "confirm (2026-08-19)"
     }
+  },
+  "wrapup": {
+    "lessons": [
+      "LESSON-539",
+      "LESSON-540",
+      "LESSON-541"
+    ],
+    "assumptions": [
+      "ASSUME-014",
+      "ASSUME-015"
+    ],
+    "mergeCommit": "312f7f9",
+    "pr": "https://github.com/atelier-fashion/teton-code/pull/182"
   }
 }
