@@ -1,7 +1,7 @@
 ---
 id: TASK-184
 title: "egress/redact.rs: REDACT_SCANNABLE_CONTEXT_BYTES derived from the cap constants; REDACT_BODY_OVERHEAD_BYTES promoted; assertions beside the margin test"
-status: draft
+status: complete
 parent: REQ-586
 created: 2026-08-19
 updated: 2026-08-19

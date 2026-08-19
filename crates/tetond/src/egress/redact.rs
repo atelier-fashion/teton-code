@@ -238,21 +238,46 @@ pub const REDACT_CHUNK_MAX_BYTES: usize =
         * REDACT_DEFUSE_GROWTH_DIVISOR
         / (REDACT_DEFUSE_GROWTH_DIVISOR + 1);
 
+/// The escaping factor an outbound body is modelled with: the JSON escaping of
+/// the assembled context costs **one part in this many** of the context's own
+/// bytes — `context / REDACT_ESCAPING_DIVISOR` on top of the context.
+///
+/// One home for the term (REQ-586 BR-11), because it sits in two places that
+/// have to agree: the margin tests
+/// (`the_total_cap_clears_the_harness_context_budget_with_margin` here and
+/// `harness::tools::web::tests::the_web_tool_docs_clear_the_outbound_body_overhead`)
+/// charge `budget / REDACT_ESCAPING_DIVISOR` against
+/// [`REDACT_BODY_OVERHEAD_BYTES`], and [`REDACT_SCANNABLE_CONTEXT_BYTES`] is
+/// solved for the context that, escaped by the same factor, still fits under the
+/// cap. A body's escaping is overwhelmingly the quotes, backslashes and newlines
+/// of code and tool output, and a tenth is the allowance REQ-562's margin test
+/// has charged since the cap was first derived against it; were it to move,
+/// the bound and the measurement would move together or not at all.
+pub(crate) const REDACT_ESCAPING_DIVISOR: usize = 10;
+
 /// Bytes a remote request body carries **beyond** the harness's assembled
 /// context: the system prompt (tool descriptions included), the JSON envelope,
 /// and the escaping of the context itself.
 ///
 /// It exists so that [`REDACT_INPUT_MAX_BYTES`]'s "with room to spare" is a
-/// number a test can check rather than a claim in prose — which is why it is
-/// test-only: nothing in the send path needs it, and a production constant
-/// nothing reads is a number that drifts unnoticed. It is an **assumption**
-/// about the outbound body, and
+/// number a test can check rather than a claim in prose. It is an
+/// **assumption** about the outbound body, and
 /// `the_total_cap_clears_the_harness_context_budget_with_margin` checks the half
 /// of it that is measurable: the real
 /// [`build_system_prompt`](crate::harness::turn_loop::build_system_prompt) with
-/// every builtin tool registered, plus a tenth of the context budget for JSON
-/// escaping, must fit inside it. If a later REQ adds enough tools to overflow
-/// that, the assumption turns red instead of silently eating the margin.
+/// every builtin tool registered, plus a tenth of the context budget
+/// ([`REDACT_ESCAPING_DIVISOR`]) for JSON escaping, must fit inside it. If a
+/// later REQ adds enough tools to overflow that, the assumption turns red
+/// instead of silently eating the margin.
+///
+/// It was `#[cfg(test)]` until REQ-586 (ADR-6): nothing in the send path read
+/// it, and a production constant nothing reads is a number that drifts
+/// unnoticed. It now has a production reader —
+/// [`REDACT_SCANNABLE_CONTEXT_BYTES`] subtracts it from the cap to find how much
+/// *context* a scanned route may assemble — so it is the one definition of
+/// "what the body carries beyond the assembled context" that both the margin
+/// tests and the bound read. The value is unchanged by the promotion; the two
+/// claims the margin test makes about it are unchanged too.
 ///
 /// Raised 8→9 KiB by REQ-577 when `teton_docs` (a sixth, cap-exempt builtin)
 /// made the 8 KiB assumption red; chunk caps and [`REDACT_INPUT_MAX_BYTES`] are
@@ -281,7 +306,6 @@ pub const REDACT_CHUNK_MAX_BYTES: usize =
 /// (`harness::tools::web::tests::the_web_tool_docs_clear_the_outbound_body_overhead`);
 /// this is the number both of them measure against, so the two shapes cannot
 /// come to disagree about the budget.
-#[cfg(test)]
 pub(crate) const REDACT_BODY_OVERHEAD_BYTES: usize = 10 * 1024;
 
 /// The smallest headroom [`REDACT_BODY_OVERHEAD_BYTES`] may be left with after
@@ -331,6 +355,17 @@ pub(crate) const MIN_PROMPT_HEADROOM_BYTES: usize = 48;
 /// [`REDACT_INPUT_MAX_BYTES`] is unchanged, and a reader can see that rather
 /// than take it on trust.
 ///
+/// **REQ-586: the remote budget is bounded by this when the scan applies.**
+/// The arithmetic above runs from the *default* context budget up to the cap;
+/// [`REDACT_SCANNABLE_CONTEXT_BYTES`] runs it the other way, from the cap down
+/// to the largest context a `[privacy] redact = true` route may assemble, with
+/// the same two terms (the overhead and the escaping) and without the 2×
+/// margin — the margin exists so a budget bumped *elsewhere* cannot drift past
+/// the cap, and a bound derived *from* the cap cannot drift by construction. So
+/// the one thing a reader should take from this block is that there is still
+/// only one cap: a route's budget on a scanned route is a function of the same
+/// constants this chunk count is, and moving either of them re-derives both.
+///
 /// The other half of the choice is the chunk **count**, because every chunk is
 /// a model call and ADR-8's budget is per call. With the
 /// [`REDACT_CHUNK_OVERLAP_BYTES`](crate::harness::redact::REDACT_CHUNK_OVERLAP_BYTES)
@@ -368,6 +403,67 @@ const REDACT_TOTAL_CAP_CHUNKS: usize = 4;
 /// `docs/manual-verification.md` now records is the *chunk-count distribution*,
 /// which is where the cost went.
 pub const REDACT_INPUT_MAX_BYTES: usize = REDACT_TOTAL_CAP_CHUNKS * REDACT_CHUNK_MAX_BYTES;
+
+/// The largest assembled **context** a `[privacy] redact = true` route may
+/// carry, in bytes — the bound the redact scan places on a remote route's byte
+/// budget (REQ-586 BR-4, ADR-6).
+///
+/// The model redact scan runs on the whole outbound body, and a body above
+/// [`REDACT_INPUT_MAX_BYTES`] is refused unscanned (→ Block). A scanned route
+/// therefore cannot be allowed to assemble a body the redactor will not scan:
+/// its budget is `min(window-derived, this)`, with the byte guard binding
+/// (`harness::budget::derive` applies it last and names the bound
+/// `redact_scan` when it bites). The word component stays window-derived — the
+/// scan is byte-denominated, so this is a byte bound.
+///
+/// **Derived, never a literal** — the same constants as
+/// [`REDACT_TOTAL_CAP_CHUNKS`], run from the cap downward (BR-11, LESSON-491):
+///
+/// ```text
+///   REDACT_INPUT_MAX_BYTES              108,280 bytes  (the cap: 4 × 27,070)
+///   − REDACT_BODY_OVERHEAD_BYTES         10,240 bytes  (system prompt, JSON
+///                                                       envelope — what the
+///                                                       body carries beyond
+///                                                       the context)
+///   = room for the escaped context       98,040 bytes
+///   ÷ (1 + 1/REDACT_ESCAPING_DIVISOR)    × 10 / 11     (the context plus its
+///                                                       own escaping has to fit
+///                                                       in that room)
+///   = the scannable context               89,127 bytes
+/// ```
+///
+/// So a body at the bound is `89,127 + 8,912 (escaping) + 10,240 (overhead) =
+/// 108,279 ≤ 108,280`: four chunk-widths, up to five chunks with the overlap
+/// ([`REDACT_MAX_CHUNKS`](crate::harness::redact::REDACT_MAX_CHUNKS)) — inside
+/// the envelope REQ-562 measured, and ≈ 2.7× the default context budget
+/// (32,768), which admits every ADLC skill.
+///
+/// Two things about the shape of the expression, both decisions rather than
+/// arithmetic:
+///
+/// - **A floor.** The overhead term already folds the *default* budget's
+///   escaping (the margin test charges `budget / REDACT_ESCAPING_DIVISOR`
+///   against it), so a body at this bound escapes its context twice over — by
+///   the divisor here and by the allowance inside the overhead. The bound is
+///   conservative by a few KB; it is never optimistic.
+/// - **Cap minus overhead, not the cap with the 2× margin inverted.** The
+///   margin in [`REDACT_TOTAL_CAP_CHUNKS`]'s derivation exists so a context
+///   budget bumped *elsewhere* cannot drift past the cap. This bound is
+///   derived *from* the cap: move [`REDACT_BODY_OVERHEAD_BYTES`] or the chunk
+///   count and it re-derives, and
+///   `the_scannable_bound_plus_overhead_and_escaping_fits_under_the_cap` is
+///   what says so. Halving it for a margin it cannot need would bound a
+///   200k-window route to ≈ 44 KB of context for no collision it prevents.
+///
+/// `pub`, like the cap and the per-chunk window beside it: `harness::budget`
+/// reads it, and the egress-capture integration tests (the redact bound's own,
+/// AC-6) read the caps the same way from outside the crate. It is the *only*
+/// place the redact chain's arithmetic leaves this module — a second copy of
+/// the number anywhere (TASK-192's one-home grep: `89_127`/`89127` must hit
+/// comments only) would be the drift LESSON-446 is about.
+pub const REDACT_SCANNABLE_CONTEXT_BYTES: usize =
+    (REDACT_INPUT_MAX_BYTES - REDACT_BODY_OVERHEAD_BYTES) * REDACT_ESCAPING_DIVISOR
+        / (REDACT_ESCAPING_DIVISOR + 1);
 
 /// How much the pipeline trusts a finding — **derived, never self-reported**
 /// (BR-4, ADR-4).
@@ -2115,7 +2211,11 @@ mod tests {
         // in this module.
         let base = HarnessConfig::for_strong_model();
         let budget = base.context_budget_bytes;
-        let escaping = budget / 10;
+        // The escaping allowance is the one the scannable bound is solved with
+        // (`REDACT_ESCAPING_DIVISOR`), read rather than restated: this test
+        // measures the *default* budget against the overhead, and the bound is
+        // the cap minus that overhead for a context escaped by the same factor.
+        let escaping = budget / REDACT_ESCAPING_DIVISOR;
 
         // Every state a clause can be built from, plus the unsupplied case that
         // falls back to the registry. A state added to the classifier without a
@@ -2219,6 +2319,96 @@ mod tests {
             REDACT_TOTAL_CAP_CHUNKS * REDACT_CHUNK_MAX_BYTES,
             "the total cap is a stated multiple of the per-chunk cap, not a \
              number chosen beside it"
+        );
+    }
+
+    /// **A body at the scannable bound fits under the cap** — REQ-586 BR-4 /
+    /// BR-11 / AC-7, the second assertion ADR-6 puts beside the margin test.
+    ///
+    /// The test above runs the arithmetic *up* from the default budget to the
+    /// cap; this one runs it *down* from the cap to the largest context a
+    /// `[privacy] redact = true` route may assemble, and checks the two agree
+    /// on the terms: a context at [`REDACT_SCANNABLE_CONTEXT_BYTES`], escaped
+    /// by the same factor the margin test charges
+    /// (`/ REDACT_ESCAPING_DIVISOR`), plus the same overhead the margin test
+    /// measures ([`REDACT_BODY_OVERHEAD_BYTES`]), is a body the redactor will
+    /// scan rather than refuse.
+    ///
+    /// What it catches, named so the next reader knows which failure is
+    /// which:
+    ///
+    /// - **A literal copy of the bound** (TASK-192's one-home grep, mutation
+    ///   (h)): `89_127` written where the expression belongs *passes* every
+    ///   assertion here today — which is why the grep exists — but the moment
+    ///   the cap or the overhead moves, the literal stays put and this test is
+    ///   the one that says the bound no longer fits (or, moving the other way,
+    ///   that it stopped spending the cap).
+    /// - **An inverted 2× margin**: a bound halved "for safety" — `(cap −
+    ///   overhead) / 2 …`, ≈ 44 KB — still fits under the cap, so the first
+    ///   assertion lets it through; the *third* is the one it trips, because
+    ///   the bound is then at most half the room under the cap, which is the
+    ///   margin the cap already carries being charged a second time. The
+    ///   second assertion is the floor the same mistake breaches once the cap
+    ///   has no slack left: at the margin test's minimum (cap = 2 × a default
+    ///   body) an inverted bound sits *under* the default budget, and a
+    ///   scanned remote route would be budgeted below the local engine — the
+    ///   collision REQ-562 closed, back by another door.
+    /// - **A dropped escaping term**: `cap − overhead` with no divisor is
+    ///   98,040, and a body at it escapes to 98,040 + 9,804 + 10,240 = 118,084
+    ///   — over the cap by nearly ten KB, refused unscanned, every
+    ///   context-full turn blocked. That is the first assertion.
+    ///
+    /// And what it is **meant to pass**: moving [`REDACT_BODY_OVERHEAD_BYTES`]
+    /// or [`REDACT_TOTAL_CAP_CHUNKS`] alone. The bound is an expression over
+    /// those constants, so it re-derives with them and every inequality here
+    /// holds by construction; a change to either shows up in the margin test
+    /// (which measures the overhead against the real prompt, and the cap
+    /// against the default body) rather than here. This test pins the *shape*
+    /// of the derivation, not its inputs.
+    #[test]
+    fn the_scannable_bound_plus_overhead_and_escaping_fits_under_the_cap() {
+        use crate::harness::turn_loop::HarnessConfig;
+
+        let escaping = REDACT_SCANNABLE_CONTEXT_BYTES / REDACT_ESCAPING_DIVISOR;
+        let body = REDACT_SCANNABLE_CONTEXT_BYTES + escaping + REDACT_BODY_OVERHEAD_BYTES;
+        assert!(
+            body <= REDACT_INPUT_MAX_BYTES,
+            "a body at the scannable bound does not fit under the cap: \
+             {REDACT_SCANNABLE_CONTEXT_BYTES} of context + {escaping} of escaping + \
+             {REDACT_BODY_OVERHEAD_BYTES} of overhead = {body} > \
+             {REDACT_INPUT_MAX_BYTES}. The bound must be derived from the cap \
+             (`(cap − overhead) × divisor / (divisor + 1)`), never copied or \
+             written without its escaping term"
+        );
+
+        // The bound is a floor on what a scanned route may carry, and it has
+        // to sit above the default pair: the local shape is what REQ-562
+        // measured the cap against (2× a default body), so a bound that fell
+        // below the default budget would have inverted that margin rather than
+        // subtracted the overhead.
+        let default_budget = HarnessConfig::default().context_budget_bytes;
+        assert!(
+            REDACT_SCANNABLE_CONTEXT_BYTES > default_budget,
+            "the scannable bound ({REDACT_SCANNABLE_CONTEXT_BYTES}) does not clear \
+             the default context budget ({default_budget}): a scanned remote route \
+             would be budgeted below the local engine. The bound is cap minus \
+             overhead, not the cap with the 2× margin inverted"
+        );
+
+        // And the bound *spends* the room under the cap rather than half of
+        // it. The 2× in the cap's derivation is the cap's margin against a
+        // budget bumped elsewhere; a bound derived from the cap cannot drift,
+        // and charging the margin again here would halve every scanned route
+        // for no collision it prevents. This is the line a `/ 2` trips: a
+        // halved bound is at most half the room (the divisions floor), and the
+        // derived one is ten elevenths of it.
+        let room = REDACT_INPUT_MAX_BYTES - REDACT_BODY_OVERHEAD_BYTES;
+        assert!(
+            REDACT_SCANNABLE_CONTEXT_BYTES > room / 2,
+            "the scannable bound ({REDACT_SCANNABLE_CONTEXT_BYTES}) is no more than \
+             half the room under the cap ({room}): the bound is carrying the 2× \
+             margin a second time. It is cap minus overhead, not the cap with the \
+             margin inverted"
         );
     }
 

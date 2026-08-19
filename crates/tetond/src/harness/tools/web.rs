@@ -2264,7 +2264,9 @@ mod tests {
     async fn the_web_tool_docs_clear_the_outbound_body_overhead() {
         use teton_core::capability::{SearchGap, WebCapabilityState};
 
-        use crate::egress::redact::{MIN_PROMPT_HEADROOM_BYTES, REDACT_BODY_OVERHEAD_BYTES};
+        use crate::egress::redact::{
+            MIN_PROMPT_HEADROOM_BYTES, REDACT_BODY_OVERHEAD_BYTES, REDACT_ESCAPING_DIVISOR,
+        };
         use crate::harness::turn_loop::{
             build_system_prompt, worst_case_session_root, HarnessConfig,
         };
@@ -2345,7 +2347,10 @@ mod tests {
         );
         let worst = widest.len();
 
-        let escaping = base.context_budget_bytes / 10;
+        // The same escaping allowance the opted-out shape charges and the
+        // scannable bound is solved with (`egress::redact`'s
+        // `REDACT_ESCAPING_DIVISOR`), read rather than restated.
+        let escaping = base.context_budget_bytes / REDACT_ESCAPING_DIVISOR;
         let spent = worst + escaping;
         // Strictly under, and checked before the subtraction: otherwise an
         // overflowing prompt panics on the arithmetic instead of on the sentence
