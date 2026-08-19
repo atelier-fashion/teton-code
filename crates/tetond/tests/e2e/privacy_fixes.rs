@@ -12,8 +12,8 @@
 use std::time::Duration;
 
 use crate::harness::{
-    assert_no_boundary_bytes, openai_turn, Client, Daemon, DaemonOptions, MockProvider,
-    MockResponse, Workspace,
+    assert_no_boundary_bytes, openai_turn, remote_provider_block_with_window, Client, Daemon,
+    DaemonOptions, MockProvider, MockResponse, Workspace,
 };
 
 const GIB: u64 = 1024 * 1024 * 1024;
@@ -193,4 +193,166 @@ fn glob_enumerating_boundary_files_taints_and_reroutes() {
     // glob that enumerates the boundary file: the enumerated file is the result's
     // provenance.
     taint_and_reroute("px-glob", ("c1", "glob", r#"{"pattern":"secrets/**"}"#));
+}
+
+// ===========================================================================
+// REQ-586 AC-15a — the privacy reroute re-fits the context before the local
+// pin serves the turn
+// ===========================================================================
+
+/// Whitespace words in the AC-15a paste, at **4 bytes per word** (`"abc "`).
+///
+/// 30,000 words / 120,000 bytes fits the 128k-derived pair (84,650 words /
+/// 253,952 bytes) with room to spare — under *both* of its 70% soft thresholds,
+/// so the `compact` duty never fires on the remote leg and the paste reaches the
+/// provider whole. It is 7× the local pair's words and 3.7× its bytes, so the
+/// local pin cannot take it unchanged.
+///
+/// The density is the point (REQ-586 Phase-3 F-19). At more than 4 B/word the
+/// **byte** guard would bind while the turn was still being assembled for the
+/// remote route, the paste would already be clamped before any reroute happened,
+/// and this test would be quietly measuring the assembly gate instead of the
+/// refit.
+const AC15A_PASTE_WORDS: usize = 30_000;
+
+/// A marker in the middle of that paste. `truncate_middle_with` keeps a head and
+/// a tail; only the middle proves the whole thing travelled.
+const AC15A_MIDDLE: &str = "MIDDLE-OF-THE-PASTE-MARKER";
+
+fn ac15a_paste() -> String {
+    let half = "abc ".repeat(AC15A_PASTE_WORDS / 2);
+    format!("HEAD-OF-THE-PASTE-MARKER {half}{AC15A_MIDDLE} {half}TAIL-OF-THE-PASTE-MARKER")
+}
+
+/// **REQ-586 AC-15a / BR-1.** A turn assembled against a **128k** provider's
+/// window is privacy-blocked mid-turn and pinned to the local tier: the context
+/// is re-fitted to the local pair with `context_pressure { kind:
+/// refit_on_reroute }` **before** the local `route_decided`, and the turn
+/// completes.
+///
+/// ## What was wrong before, and what this catches
+///
+/// `CarriedTurn::begin` seeds the turn's manager once, from the *first*
+/// attempt's pair. While every route's budget was equal that stale seed was
+/// invisible. With a route-derived budget it is a wedge: a 30,000-word context
+/// assembled for a 128k window, re-sent unchanged to a local engine with a
+/// 16,384-token one, is the typed over-window refusal — and a refused turn never
+/// commits (REQ-567 BR-6), so the session replays it into the same refusal
+/// forever. "The turn completes" is therefore the load-bearing assertion here,
+/// and the ordering is what makes it explicable: choose route, refit, announce,
+/// retry.
+///
+/// ## Why the mock's received bytes are read
+///
+/// That the paste reached the provider *whole* is what makes this a test of the
+/// refit rather than of the assembly gate (see the byte-density note on
+/// [`AC15A_PASTE_WORDS`]), and it is only true because the budget followed the
+/// route in the first place — on the pre-REQ default pair this same prompt would
+/// have arrived at the provider already clamped.
+#[test]
+fn a_128k_turn_blocked_by_privacy_is_refitted_before_the_local_pin_serves_it() {
+    let provider = MockProvider::start(
+        vec![MockResponse::ok(openai_turn(
+            "Reading the production config.",
+            Some(("c1", "read", r#"{"path":"secrets/prod.env"}"#)),
+            120,
+            20,
+        ))],
+        MockResponse::ok(openai_turn("Should never be reached.", None, 10, 5)),
+    );
+
+    let mut config = String::new();
+    config.push_str(&remote_provider_block_with_window(
+        "deepseek",
+        &provider.openai_endpoint(),
+        "deepseek-chat",
+        128_000,
+    ));
+    config.push_str(&tier_block("build", "deepseek"));
+    config.push_str(&boundary_block("secrets/**", "local-only"));
+
+    let ws = Workspace::new("px-refit");
+    ws.write_config(&config);
+    let script = ws.write_script("Rerouted locally; done.");
+    let daemon = Daemon::spawn(&ws, probe_16gb_with_local(script));
+    let mut client = daemon.connect();
+
+    let session = client.create_session("structured", Some("implement"));
+    let paste = ac15a_paste();
+    let resp = client.prompt(
+        &session,
+        &format!("Read the production configuration and summarize it.\n\n{paste}"),
+    );
+
+    // The load-bearing claim: it finished. A context re-sent unchanged to the
+    // local pin is an over-window refusal, and the reroute has no fallback left.
+    assert_eq!(
+        resp["result"]["stop_reason"].as_str(),
+        Some("end_turn"),
+        "the rerouted-to-local turn must complete, not die over-window: {resp}"
+    );
+    client.drain_events(Duration::from_millis(400));
+
+    // Exactly one block, and the blocked provider was never retried (REQ-544).
+    assert_eq!(client.events_named("privacy_block").len(), 1);
+    assert_eq!(count_route_decided_to(&client, "deepseek"), 1);
+
+    // The paste reached the 128k provider whole — so the budget really did
+    // follow the route, and what the refit below cut is a context that was
+    // assembled at full size rather than one already clamped on the way out.
+    let sent = String::from_utf8_lossy(&provider.requests()[0]).into_owned();
+    assert!(
+        sent.contains(AC15A_MIDDLE),
+        "a 128k route must carry a 120 KB paste whole; a clamped one here would \
+         mean the fixture never tested the refit"
+    );
+
+    // --- The refit, and where it sits in the stream. ---
+    let blocked = client
+        .event_index_from(0, |e| e["event"] == "privacy_block")
+        .expect("the turn was blocked");
+    let refit = client
+        .event_index_from(blocked, |e| {
+            e["event"] == "context_pressure" && e["kind"] == "refit_on_reroute"
+        })
+        .unwrap_or_else(|| {
+            panic!(
+                "no refit_on_reroute after the block: {:?}",
+                client.event_names()
+            )
+        });
+    let local_route = client
+        .event_index_from(blocked, |e| {
+            e["event"] == "route_decided" && e["provider_id"] == "local"
+        })
+        .expect("the blocked turn must reroute to the local tier (M-1)");
+    assert!(
+        refit < local_route,
+        "the refit must precede the route it re-budgeted for: refit at {refit}, \
+         local route_decided at {local_route}"
+    );
+
+    // It names the local pair and its bound, and it really cut something.
+    let event = &client.events()[refit];
+    assert_eq!(
+        event["bound"].as_str(),
+        Some("local_engine"),
+        "the pin is the local tier, whatever the blocked provider declared: {event}"
+    );
+    assert_eq!(event["budget_tokens"].as_u64(), Some(4_096), "{event}");
+    assert_eq!(event["budget_bytes"].as_u64(), Some(32_768), "{event}");
+    assert!(
+        event["dropped_blocks"].as_u64().unwrap_or(0) > 0
+            || event["elided_bytes"].as_u64().unwrap_or(0) > 0,
+        "a refit that cut nothing would leave this vacuous — 120 KB does not fit \
+         32,768 bytes: {event}"
+    );
+    assert_eq!(
+        client.events_named("context_pressure").len(),
+        1,
+        "one reroute, one refit, one announcement"
+    );
+
+    // The boundary file's content never reached the mock provider.
+    assert_no_boundary_bytes();
 }

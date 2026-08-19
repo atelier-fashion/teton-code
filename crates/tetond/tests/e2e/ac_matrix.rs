@@ -12,8 +12,8 @@ use serde_json::{json, Value};
 
 use crate::harness::{
     anthropic_turn, assert_no_boundary_bytes, edit_answer_script, mcp_call_script, mcp_stdio_toml,
-    openai_turn, write_mcp_stdio_server, Client, Daemon, DaemonOptions, MockProvider, MockResponse,
-    Workspace,
+    openai_turn, remote_provider_block_with_window, write_mcp_stdio_server, Client, Daemon,
+    DaemonOptions, MockProvider, MockResponse, Workspace,
 };
 
 const GIB: u64 = 1024 * 1024 * 1024;
@@ -672,7 +672,34 @@ fn bug177_a_replayed_lifecycle_reaches_only_the_client_that_attached() {
 // ===========================================================================
 // AC-7 — a degraded provider triggers provider_degraded and the session
 // completes via the fallback.
+//
+// Extended for REQ-586 AC-15b: the fallback declares a **smaller window** than
+// the primary, so the same turn must be re-budgeted and re-fitted before it is
+// re-sent — announced, and before the fallback's own `route_decided`.
 // ===========================================================================
+
+/// Whitespace words in the AC-15b paste, at 4 bytes per word (`"abc "`).
+///
+/// 30,000 words / 120,000 bytes sits **inside** the primary's 128k-derived pair
+/// (84,650 words / 253,952 bytes) and **outside** the fallback's 32k-derived one
+/// (20,650 / 61,952) in *both* currencies — which is the whole of AC-15b's
+/// premise. A denser filler (>4 B/word) would bust the primary's byte guard
+/// before the turn ever left, and the fixture would be testing the assembly gate
+/// rather than the refit (REQ-586 Phase-3 F-19).
+const AC15B_PASTE_WORDS: usize = 30_000;
+
+/// A marker planted in the middle of that paste.
+///
+/// `truncate_middle_with` keeps a head and a tail, so a marker at either end
+/// survives a clamp and proves nothing. The middle is the part that goes.
+const AC15B_MIDDLE: &str = "MIDDLE-OF-THE-PASTE-MARKER";
+
+/// The paste: a head marker, 30,000 filler words with [`AC15B_MIDDLE`] halfway
+/// through, and a tail marker.
+fn ac15b_paste() -> String {
+    let half = "abc ".repeat(AC15B_PASTE_WORDS / 2);
+    format!("HEAD-OF-THE-PASTE-MARKER {half}{AC15B_MIDDLE} {half}TAIL-OF-THE-PASTE-MARKER")
+}
 
 #[test]
 fn ac7_degraded_provider_falls_back_and_completes() {
@@ -683,17 +710,22 @@ fn ac7_degraded_provider_falls_back_and_completes() {
     // Two providers declaring the SAME model behind different endpoints — the
     // BR-3 shape this REQ exists to make expressible. Neither id appears in the
     // price table, so both are unpriced; AC-7 is about health fallback, not cost.
-    config.push_str(&provider_block(
+    //
+    // REQ-586 AC-15b: and they declare **different windows**. Before this REQ
+    // every route's budget was equal, so the stale seed was invisible; a turn
+    // assembled for a 128k primary and re-sent unchanged to a 32k fallback is
+    // the 400 BR-1 exists to prevent.
+    config.push_str(&remote_provider_block_with_window(
         "flaky",
-        "openai-compatible",
         &flaky.openai_endpoint(),
         "deepseek-chat",
+        128_000,
     ));
-    config.push_str(&provider_block(
+    config.push_str(&remote_provider_block_with_window(
         "healthy",
-        "openai-compatible",
         &healthy.openai_endpoint(),
         "deepseek-chat",
+        32_000,
     ));
     config.push_str(&tier_block("build", "flaky", Some("healthy")));
 
@@ -703,7 +735,8 @@ fn ac7_degraded_provider_falls_back_and_completes() {
     let mut client = daemon.connect();
 
     let session = client.create_session("structured", Some("implement"));
-    let resp = client.prompt(&session, "implement the feature");
+    let paste = ac15b_paste();
+    let resp = client.prompt(&session, &format!("implement the feature\n\n{paste}"));
 
     // The session completed rather than failing.
     assert_eq!(
@@ -711,7 +744,7 @@ fn ac7_degraded_provider_falls_back_and_completes() {
         Some("end_turn"),
         "session did not recover via fallback: {resp}"
     );
-    client.drain_events(Duration::from_millis(200));
+    client.drain_events(Duration::from_millis(400));
 
     // provider_degraded named the failing provider and its fallback.
     let degraded = client.events_named("provider_degraded");
@@ -721,6 +754,78 @@ fn ac7_degraded_provider_falls_back_and_completes() {
             .any(|e| e["provider_id"].as_str() == Some("flaky")
                 && e["fallback_id"].as_str() == Some("healthy")),
         "expected provider_degraded flaky -> healthy; saw {degraded:?}"
+    );
+
+    // --- REQ-586 AC-15b -------------------------------------------------
+    //
+    // The refit is announced, and it is announced *before* the fallback's own
+    // route_decided: choose route, refit, say so, retry. A client that heard the
+    // new route's numbers first could not tell which attempt the clamp belonged
+    // to.
+    let failed = client
+        .event_index_from(0, |e| e["event"] == "provider_degraded")
+        .expect("the primary was degraded");
+    let refit = client
+        .event_index_from(failed, |e| {
+            e["event"] == "context_pressure" && e["kind"] == "refit_on_reroute"
+        })
+        .unwrap_or_else(|| {
+            panic!(
+                "no refit_on_reroute before the fallback attempt: {:?}",
+                client.event_names()
+            )
+        });
+    let fallback_route = client
+        .event_index_from(failed, |e| {
+            e["event"] == "route_decided" && e["provider_id"] == "healthy"
+        })
+        .expect("the fallback must have announced its own route");
+    assert!(
+        refit < fallback_route,
+        "the refit must precede the route it re-budgeted for: refit at {refit},          fallback route_decided at {fallback_route}"
+    );
+
+    // It carries the fallback's pair, and it really cut something: the paste
+    // fitted the primary's window and does not fit this one.
+    let event = &client.events()[refit];
+    assert_eq!(
+        event["bound"].as_str(),
+        Some("window"),
+        "the fallback declares a window, so the bound is that window — not          default_unknown: {event}"
+    );
+    assert_eq!(
+        event["budget_bytes"].as_u64(),
+        Some((32_000u64 - 1_024) * 2),
+        "the event must carry the pair derived from the *fallback's* window:          {event}"
+    );
+    assert!(
+        event["elided_bytes"].as_u64().unwrap_or(0) > 0
+            || event["dropped_blocks"].as_u64().unwrap_or(0) > 0,
+        "a refit that cut nothing would leave AC-15b vacuous — the paste is          sized to fit one window and not the other: {event}"
+    );
+
+    // …and the bytes agree with the event. The primary was sent the whole
+    // paste; the fallback was sent one with its middle taken out. That is the
+    // "no 400" claim read off the wire rather than off an event.
+    let sent_to_flaky = String::from_utf8_lossy(&flaky.requests()[0]).into_owned();
+    let sent_to_healthy = String::from_utf8_lossy(&healthy.requests()[0]).into_owned();
+    assert!(
+        sent_to_flaky.contains(AC15B_MIDDLE),
+        "the primary's 128k window had room for the whole paste"
+    );
+    assert!(
+        !sent_to_healthy.contains(AC15B_MIDDLE),
+        "the fallback was re-sent a context assembled for a window four times          its own — the over-window 400 BR-1 exists to prevent"
+    );
+    assert!(
+        sent_to_healthy.contains("HEAD-OF-THE-PASTE-MARKER"),
+        "…but it was re-fitted, not emptied: the clamp keeps a head and a tail"
+    );
+    assert!(
+        sent_to_healthy.len() < sent_to_flaky.len(),
+        "the fallback's request must be the smaller one: {} against {}",
+        sent_to_healthy.len(),
+        sent_to_flaky.len()
     );
 
     assert_no_boundary_bytes();
