@@ -43,6 +43,11 @@
 //! - [`lifetime`] — the daemon's arm/disarm/defer/commit decision as a pure
 //!   state machine, so the exit-on-last-client behaviour is testable without a
 //!   socket, launchd, or a TTY (REQ-565 BR-9).
+//! - [`session_root`] — the session root as a pure value (REQ-583 ADR-1): what
+//!   kind of place a directory is, how it is spelled to a person, how a value
+//!   from it is bounded before it lands in a prompt, the one project-marker
+//!   table, and the `--cwd`/`/cd` argument grammar. The daemon's probe supplies
+//!   the I/O; the CLI's banner links this so the two spellings cannot drift.
 
 pub mod boundary;
 pub mod capability;
@@ -57,6 +62,7 @@ pub mod mcp;
 pub mod phase;
 pub mod policy;
 pub mod provenance_id;
+pub mod session_root;
 
 pub use boundary::{match_boundary, BoundaryError, BoundaryMatcher};
 // REQ-572 BR-3: re-exported at the crate root because the classifier's whole
@@ -116,6 +122,15 @@ pub use policy::{ProviderHealth, RouteOutcome};
 // spans the daemon's tools, its egress inspector, and this crate's boundary
 // matcher — `teton_core::ProvenanceId` is the one path all three name it by.
 pub use provenance_id::{ProvenanceError, ProvenanceId};
+// REQ-583 ADR-1: re-exported at the crate root because the root's spelling is
+// printed by the daemon (environment block, jail refusals) and by the CLI
+// (banner, launch notice, `/cd`), and `teton_core::display_for` is the one path
+// both name it by — one derivation, so the two surfaces cannot drift.
+pub use session_root::{
+    bounded_field, classify, display_for, middle_elide, resolve_cwd_argument, CwdArgError,
+    CwdGrammarRow, CWD_ARGUMENT_GRAMMAR, CWD_GRAMMAR_HOME, CWD_GRAMMAR_SHELL_CWD,
+    DISPLAY_MAX_CHARS, NAME_MAX_CHARS, PROJECT_MARKERS,
+};
 
 /// Returns the crate version (equal to the workspace version).
 #[must_use]

@@ -210,6 +210,19 @@ pub struct HarnessConfig {
     /// and any test constructing `HarnessConfig::default()`) keeps the behaviour
     /// it had, and a caller that *does* set it gets the finer clause.
     pub web_capability: Option<WebCapabilityState>,
+    /// The session root this turn's tools are jailed to, as the daemon probed
+    /// it (REQ-583 ADR-1) — or `None` when the caller has not said.
+    ///
+    /// The same contract as [`web_capability`](Self::web_capability): the root
+    /// is the *caller's* fact, derived per turn by `tetond::session_root::probe`
+    /// from the registry's path and put here beside the [`ToolContext`] built
+    /// from the same value, so the prompt's environment block (BR-1) and the
+    /// jail's refusals (BR-2) print one spelling. `None` is not a fifth kind:
+    /// it means "not supplied", and [`build_system_prompt`] renders no
+    /// environment block — so every existing caller that never sets this field
+    /// (`HarnessConfig::default()` and the `..Default::default()` literals in
+    /// the tests) keeps the prompt it had.
+    pub session_root: Option<teton_protocol::methods::SessionRoot>,
 }
 
 impl Default for HarnessConfig {
@@ -235,6 +248,9 @@ impl Default for HarnessConfig {
             // to the tool registry, which is what every caller keyed on before
             // this field existed.
             web_capability: None,
+            // Unsupplied: no environment block until the daemon's turn path
+            // probes the root and sets it (REQ-583).
+            session_root: None,
         }
     }
 }

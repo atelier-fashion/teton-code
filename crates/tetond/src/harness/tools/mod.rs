@@ -11,12 +11,12 @@
 //! [`docs`] answers questions about Teton, out of bodies compiled into this
 //! binary, and is the only built-in that touches no path at all (REQ-577).
 //!
-//! Every tool runs inside a **repo-root jail** ([`ToolContext`]): a path that
+//! Every tool runs inside a **session-root jail** ([`ToolContext`]): a path that
 //! escapes the root — via `..`, an absolute path, or a symlink that resolves
-//! outside — is refused before any I/O. Tools never panic and never propagate an
-//! error to the loop; an internal failure is folded into a [`ToolOutcome`] with
-//! `is_error = true` so the *model* sees it and can retry (never a silent
-//! success — AC).
+//! outside — is refused before any I/O, and the refusal names the root (REQ-583
+//! BR-2). Tools never panic and never propagate an error to the loop; an
+//! internal failure is folded into a [`ToolOutcome`] with `is_error = true` so
+//! the *model* sees it and can retry (never a silent success — AC).
 //!
 //! # Symlink posture splits by tool class (REQ-571 ADR-C, BR-5)
 //!
@@ -37,7 +37,9 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use serde_json::Value;
+use teton_core::session_root::{bounded_field, display_for, DISPLAY_MAX_CHARS};
 use teton_core::ProvenanceId;
+use teton_protocol::methods::{RootKind, SessionRoot};
 
 use super::context::ToolProvenance;
 use super::duty::DutyRoute;
@@ -60,22 +62,70 @@ pub use read::ReadTool;
 pub use shell::ShellTool;
 pub use web::{register_web_tool, WebTool, WEB_TOOL_NAME};
 
-/// Shared execution context for every tool: the repo-root jail.
+/// Shared execution context for every tool: the session-root jail.
 ///
 /// All file access resolves relative to [`ToolContext::repo_root`] and is
 /// verified to stay within it. The shell tool additionally runs with this as its
 /// working directory and a scrubbed environment (see [`shell`]).
+///
+/// # The root is carried, not re-derived (REQ-583 ADR-1)
+///
+/// Beside the path the context carries the root's *display* spelling — what a
+/// jail refusal names (BR-2) — and its *kind* — what the walkers key their
+/// home-tree pruning on (ADR-3) and the shell's timeout hint reads (BR-14).
+/// Both are the daemon's derivation, probed once per turn by
+/// `tetond::session_root::probe` and handed in through [`ToolContext::for_root`],
+/// so a refusal prints the same bytes as the environment block. [`ToolContext::new`]
+/// is the plain constructor every existing call site uses: kind `Plain`, display
+/// spelled from the path and `HOME` — the same rule, no probe.
 #[derive(Debug, Clone)]
 pub struct ToolContext {
     repo_root: PathBuf,
+    /// The root's display spelling, already bounded (ADR-2).
+    display: String,
+    /// What kind of place the root is.
+    kind: RootKind,
 }
 
 impl ToolContext {
-    /// A context jailed to `repo_root`.
+    /// A context jailed to `repo_root`, of kind [`RootKind::Plain`], displayed
+    /// home-relative when `HOME` is set.
+    ///
+    /// The one place in the tools tree that reads the environment: the display
+    /// rule itself is pure ([`display_for`]), and `HOME` is the caller's fact —
+    /// this constructor stands in for a caller that has not probed the root.
     pub fn new(repo_root: impl Into<PathBuf>) -> Self {
+        let repo_root = repo_root.into();
+        let home = std::env::var_os("HOME").map(PathBuf::from);
+        let display = bounded_field(&display_for(&repo_root, home.as_deref()), DISPLAY_MAX_CHARS);
+        Self {
+            repo_root,
+            display,
+            kind: RootKind::Plain,
+        }
+    }
+
+    /// A context jailed to `repo_root`, carrying the display and kind the daemon
+    /// probed for it — the runtime's constructor (ADR-1).
+    ///
+    /// `root` is the probe's answer for `repo_root`; the path is passed alongside
+    /// rather than read out of it because the wire view deliberately carries the
+    /// display spelling only, never the absolute path.
+    pub fn for_root(repo_root: impl Into<PathBuf>, root: &SessionRoot) -> Self {
         Self {
             repo_root: repo_root.into(),
+            display: root.display.clone(),
+            kind: root.kind,
         }
+    }
+
+    /// The same context with its root kind replaced — the test seam a walker's
+    /// home-tree pruning (AC-16) and the shell's timeout hint (AC-19) are
+    /// exercised through, without a real home folder as the jail.
+    #[must_use]
+    pub fn with_root_kind(mut self, kind: RootKind) -> Self {
+        self.kind = kind;
+        self
     }
 
     /// The jail root.
@@ -84,8 +134,21 @@ impl ToolContext {
         &self.repo_root
     }
 
+    /// What kind of place the jail root is.
+    #[must_use]
+    pub fn root_kind(&self) -> RootKind {
+        self.kind
+    }
+
+    /// The jail root's display spelling — the one every refusal names (BR-2),
+    /// already bounded.
+    #[must_use]
+    pub fn root_display(&self) -> &str {
+        &self.display
+    }
+
     /// Resolve a caller-supplied path against the jail, refusing any path that
-    /// escapes the repo root.
+    /// escapes the session root.
     ///
     /// Relative paths join onto the root; absolute paths are taken as-is and then
     /// checked. `.`/`..` are collapsed lexically, and the result is resolved
@@ -116,18 +179,26 @@ impl ToolContext {
     /// Returns [`ToolError::Jail`] when the resolved path is not inside the root
     /// (or the root itself cannot be resolved), when the path cannot be resolved
     /// at all because it passes through a broken link, and — the same refusal, one
-    /// step later — when the resolved path has no repo-relative identity to mint.
+    /// step later — when the resolved path has no root-relative identity to mint.
     ///
     /// **There is no fallback to `raw`, ever** (ADR-B). A mint failure means the
     /// resolved path is not a file under the root, which is precisely the case
     /// where substituting the caller's own string would be worst: it is the
     /// attacker-controlled value, and the boundary would then be matched against
     /// something the daemon never opened. The operation is refused instead.
+    ///
+    /// # The escape refusal names the root (REQ-583 BR-2)
+    ///
+    /// An outside-the-jail refusal is one shape for every tool: the caller's own
+    /// path, the words "is outside the session root", and the root's display —
+    /// and nothing else (no listing, no suggested paths). The display is a value
+    /// the model already holds from the environment block, so naming it leaks
+    /// nothing new, and it is what lets a small model say "I can only see under
+    /// `~/x`" instead of retrying blind.
     pub fn resolve(&self, raw: &str) -> Result<Resolved, ToolError> {
-        let root = self
-            .repo_root
-            .canonicalize()
-            .map_err(|_| ToolError::jail("repo root does not exist"))?;
+        let root = self.repo_root.canonicalize().map_err(|_| {
+            ToolError::jail(format!("the session root {} does not exist", self.display))
+        })?;
 
         let joined = if Path::new(raw).is_absolute() {
             PathBuf::from(raw)
@@ -146,15 +217,17 @@ impl ToolContext {
 
         if !checked.starts_with(&root) {
             return Err(ToolError::jail(format!(
-                "path `{raw}` escapes the repo root"
+                "path `{raw}` is outside the session root {}",
+                self.display
             )));
         }
         // The `starts_with` above is exactly `strip_prefix`'s precondition, so the
         // only reachable mint failure is a resolved path that names no file under
         // the root — `.`, or the root itself. The message stays content-free and
         // repeats only what the caller already supplied.
-        let provenance = ProvenanceId::from_resolved(&root, &checked)
-            .map_err(|_| ToolError::jail(format!("path `{raw}` names no file in the repo root")))?;
+        let provenance = ProvenanceId::from_resolved(&root, &checked).map_err(|_| {
+            ToolError::jail(format!("path `{raw}` names no file in the session root"))
+        })?;
         Ok(Resolved {
             path: checked,
             provenance,
@@ -426,7 +499,9 @@ impl From<ToolError> for ToolOutcome {
 /// reaches the loop — the model, not the daemon, handles tool failures.
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]
 pub enum ToolError {
-    /// The path escaped the repo-root jail.
+    /// The path escaped the session-root jail. The prefix is the error's
+    /// *category*; the payload is the BR-2 shape (path, "is outside the session
+    /// root", display) for an escape, and names no other path for the rest.
     #[error("path jail violation: {0}")]
     Jail(String),
     /// The tool arguments were missing or the wrong shape.
@@ -956,6 +1031,119 @@ mod tests {
         std::fs::remove_dir_all(&root).ok();
     }
 
+    /// **REQ-583 AC-5, the one shape.** The escape refusal every tool gives
+    /// names the caller's own path, says "is outside the session root", and
+    /// names the root's display — and nothing else. One helper judges both
+    /// tools' errors, so the two cannot drift into two shapes.
+    fn assert_outside_root_shape(content: &str, raw: &str, display: &str) {
+        assert!(
+            content.contains(&format!("`{raw}`")),
+            "the refusal must name the caller's path {raw:?}: {content}"
+        );
+        assert!(
+            content.contains("is outside the session root"),
+            "the refusal must say the path is outside the session root: {content}"
+        );
+        assert!(
+            content.contains(display),
+            "the refusal must name the root display {display:?}: {content}"
+        );
+        // Nothing else: no listing, no suggested alternative.
+        assert!(
+            !content.contains("try ") && !content.contains("did you mean"),
+            "the refusal must not suggest other paths: {content}"
+        );
+        assert_eq!(
+            content.lines().count(),
+            1,
+            "the refusal is one line, not a listing: {content}"
+        );
+    }
+
+    #[test]
+    fn read_and_edit_outside_the_jail_share_one_refusal_shape_naming_the_root() {
+        use serde_json::json;
+        let root = temp_root("ac5");
+        std::fs::write(root.join("in.txt"), "inside\n").unwrap();
+        let ctx = ToolContext::new(&root);
+        let display = ctx.root_display().to_owned();
+        assert!(!display.is_empty());
+
+        let read = ReadTool.run(&ctx, &json!({ "path": "../outside.txt" }));
+        assert!(read.is_error, "{}", read.content);
+        assert_outside_root_shape(&read.content, "../outside.txt", &display);
+
+        let edit = EditTool.run(
+            &ctx,
+            &json!({ "path": "/etc/hosts", "old_string": "a", "new_string": "b" }),
+        );
+        assert!(edit.is_error, "{}", edit.content);
+        assert_outside_root_shape(&edit.content, "/etc/hosts", &display);
+
+        // And the two are literally one template: strip the path and the two
+        // messages are the same bytes.
+        let shape = |content: &str, raw: &str| content.replace(&format!("`{raw}`"), "`<path>`");
+        assert_eq!(
+            shape(&read.content, "../outside.txt"),
+            shape(&edit.content, "/etc/hosts")
+        );
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// The refusal prints the *probed* display when the context was built from a
+    /// [`SessionRoot`] — the same bytes the environment block carries — and the
+    /// plain constructor spells the path home-relative by the same rule.
+    #[test]
+    fn for_root_carries_the_probed_display_and_kind_and_new_is_plain() {
+        let root = temp_root("forroot");
+        let probed = SessionRoot {
+            display: "~/probed/display".to_owned(),
+            kind: RootKind::Home,
+            project_name: None,
+            vcs_branch: None,
+        };
+        let ctx = ToolContext::for_root(root.clone(), &probed);
+        assert_eq!(ctx.root_kind(), RootKind::Home);
+        assert_eq!(ctx.root_display(), "~/probed/display");
+        assert_eq!(ctx.repo_root(), root.as_path());
+        let err = ctx.resolve("/etc/hosts").unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("path `/etc/hosts` is outside the session root ~/probed/display"),
+            "{err}"
+        );
+
+        let plain = ToolContext::new(&root);
+        assert_eq!(plain.root_kind(), RootKind::Plain);
+        let home = std::env::var_os("HOME").map(PathBuf::from);
+        assert_eq!(
+            plain.root_display(),
+            bounded_field(&display_for(&root, home.as_deref()), DISPLAY_MAX_CHARS)
+        );
+
+        let kinded = ToolContext::new(&root).with_root_kind(RootKind::FilesystemRoot);
+        assert_eq!(kinded.root_kind(), RootKind::FilesystemRoot);
+        assert_eq!(kinded.root_display(), plain.root_display());
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// The other three jail arms say "session root", never "repo root" (BR-3:
+    /// one term for the jail).
+    #[test]
+    fn no_jail_refusal_says_repo_root() {
+        let root = temp_root("noterm");
+        let ctx = ToolContext::new(&root);
+        let names_no_file = ctx.resolve(".").unwrap_err().to_string();
+        assert!(names_no_file.contains("session root"), "{names_no_file}");
+        assert!(!names_no_file.contains("repo root"), "{names_no_file}");
+
+        std::fs::remove_dir_all(&root).ok();
+        let gone = ctx.resolve("a.txt").unwrap_err().to_string();
+        assert!(gone.contains("session root"), "{gone}");
+        assert!(gone.contains(ctx.root_display()), "{gone}");
+        assert!(!gone.contains("repo root"), "{gone}");
+    }
+
     /// **REQ-571 BR-6, the case the ancestor walk exists for.** The leaf does not
     /// exist, so canonicalizing the whole path fails — but `link` does exist and
     /// resolves outside the repo, so the re-joined path is outside and refused.
@@ -974,7 +1162,10 @@ mod tests {
 
         let err = ctx.resolve("link/new.txt").unwrap_err();
         assert!(matches!(err, ToolError::Jail(_)), "{err:?}");
-        assert!(err.to_string().contains("escapes the repo root"), "{err}");
+        assert!(
+            err.to_string().contains("is outside the session root"),
+            "{err}"
+        );
         std::fs::remove_dir_all(&root).ok();
         std::fs::remove_dir_all(&outside).ok();
     }

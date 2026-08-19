@@ -67,6 +67,10 @@
 //!   so a backend's endpoint and header shape are written down once and clients
 //!   render what they were handed, rather than each keeping a copy that drifts
 //!   from the others — which is what BUG-165 was.
+//! - [`session_root`] — the session-root probe (REQ-583 ADR-1): the I/O half
+//!   of "what ground does this session stand on" — is a project marker present,
+//!   what does `.git/HEAD` say — over the pure classification in
+//!   `teton_core::session_root`. Called per use, never cached.
 //! - [`single_instance`] — the `flock`-based single-instance guard.
 //!
 //! Socket and lock path resolution lives in the shared
@@ -97,6 +101,7 @@ pub mod router;
 pub mod runtime;
 pub mod selection_store;
 pub mod server;
+pub mod session_root;
 pub mod sessions;
 pub mod single_instance;
 pub mod structured;

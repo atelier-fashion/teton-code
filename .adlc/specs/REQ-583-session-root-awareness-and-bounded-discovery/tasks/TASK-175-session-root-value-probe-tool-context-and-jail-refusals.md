@@ -1,7 +1,7 @@
 ---
 id: TASK-175
 title: "The session-root value: teton-core pure module, tetond probe, ToolContext carries it, jail refusals name it, HarnessConfig field"
-status: draft
+status: complete
 parent: REQ-583
 created: 2026-08-18
 updated: 2026-08-18
