@@ -1,7 +1,7 @@
 ---
 id: TASK-185
 title: "teton-providers: ProviderError::ContextLengthExceeded — class-less, narrowly sniffed from the 400 body, conformance-tested"
-status: draft
+status: complete
 parent: REQ-586
 created: 2026-08-19
 updated: 2026-08-19
@@ -24,8 +24,8 @@ Mirror `EffortRefused` exactly (lib.rs:372-445).
 
 ## Acceptance Criteria
 
-- [ ] `cargo test -p teton-providers` green; a 400 body with each vendor spelling yields `ContextLengthExceeded` with `failure_class() == None`; an unrelated 400 still classifies `Fallback`.
-- [ ] The sniff reads only `read_error_head` bytes (no full-body parse); the message carries no body text (conventions: no provider prose in errors).
+- [x] `cargo test -p teton-providers` green; a 400 body with each vendor spelling yields `ContextLengthExceeded` with `failure_class() == None`; an unrelated 400 still classifies `Fallback`.
+- [x] The sniff reads only `read_error_head` bytes (no full-body parse); the message carries no body text (conventions: no provider prose in errors).
 
 ## Technical Notes
 

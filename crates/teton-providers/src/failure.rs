@@ -67,6 +67,17 @@ pub struct FailureDecision {
 ///   **fallback**;
 /// - a malformed tool call means weak tool-calling → **degrade** the harness
 ///   profile (BR-6) rather than abandon the provider.
+///
+/// Some provider errors never reach this function, because they have no
+/// [`FailureClass`] at all (`ProviderError::failure_class()` is `None`): a
+/// privacy block (REQ-544 M-1), an effort refusal (REQ-559 BR-12), and a
+/// context-length refusal — `ProviderError::ContextLengthExceeded` (REQ-586
+/// BR-2 / ADR-8). The last is a 400 that says the request is bigger than the
+/// provider's window; no arm here could answer it correctly, since retrying
+/// sends the same bytes and a fallback with the same or a smaller window
+/// refuses them too, and a provider that reported its limit is not unhealthy.
+/// The daemon reports it as a typed outcome naming the window and the
+/// assembled size instead.
 #[must_use]
 pub fn classify(class: FailureClass) -> FailureDecision {
     let (action, retryable) = match class {
