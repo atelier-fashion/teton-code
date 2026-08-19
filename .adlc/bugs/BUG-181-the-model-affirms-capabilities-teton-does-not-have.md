@@ -1,7 +1,7 @@
 ---
 id: BUG-181
 title: "The model affirms capabilities Teton does not have: asked whether it can use the skills it just read on disk, it says yes"
-status: open
+status: resolved
 severity: medium
 created: 2026-08-19
 updated: 2026-08-19
@@ -164,10 +164,22 @@ One sentence, one raised ceiling, one pinning test.
 
 Verification: `cargo fmt --all --check` clean; `cargo clippy --workspace
 --all-targets -- -D warnings` clean; `cargo test --workspace --no-fail-fast`
-3080 passed, 0 failed (2026-08-19). No protocol change, no client change, no
-behaviour change for any prompt that is not a capability question. The live
-A/B (the 2026-08-19 question re-asked against a build carrying the sentence)
-is recorded under Deployment once the fix ships.
+3080 passed, 0 failed (2026-08-19); CI all green on the PR (both OS legs,
+acceptance suite, catalog integrity, audit, release tooling, feature-gated
+targets). No protocol change, no client change, no behaviour change for any
+prompt that is not a capability question.
+
+## Deployment
+
+- Merged: PR #188 → `main` at `7796dca` (2026-08-19, squash).
+- Release: not yet in a tagged release at merge time (latest tag v0.1.23); the
+  sentence ships with the next `chore(release)`. This repo has no Cloud Run /
+  staging pipeline — plain OSS flow, so "deployed" means "in a tagged release".
+- Live A/B (by hand, after the user's `brew upgrade`): re-ask *"are you able
+  to leverage the skills and framework available?"* beside the ADLC toolkit
+  and confirm the answer names `/help` and says the skills are not loaded —
+  OUTSTANDING, recorded in `docs/manual-verification.md` when run.
+- Lesson: LESSON-543.
 
 ## Files Changed
 
