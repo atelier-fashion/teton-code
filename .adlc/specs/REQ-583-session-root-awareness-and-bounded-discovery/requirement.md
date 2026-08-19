@@ -1,7 +1,7 @@
 ---
 id: REQ-583
 title: "Session-root awareness and bounded discovery — the agent knows where it is, the user is told when it is nowhere, and a search cannot become a disk crawl"
-status: approved
+status: complete
 deployable: true
 created: 2026-08-18
 updated: 2026-08-19
