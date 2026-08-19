@@ -106,18 +106,22 @@ pub struct SourceTurn {
     /// Whether a [`TurnDecision::ToolCall`] on this turn is **already embedded
     /// in [`text`](Self::text)** rather than arriving beside it (REQ-567 OQ-1).
     ///
-    /// The two sources answer differently and the difference is structural, not
-    /// stylistic:
+    /// The answer follows **where the call came from**, and the difference is
+    /// structural, not stylistic:
     ///
     /// - [`LocalEngineSource`] parses the call **out of the reply text**, so the
     ///   text literally ends with the call's JSON.
-    /// - [`RemoteProviderSource`] receives the call as a structured
-    ///   [`TurnEvent::ToolCall`]; the text is prose only — often none at all —
-    ///   and any JSON in it is something the model was *talking about*.
+    /// - [`RemoteProviderSource`] usually receives the call as a structured
+    ///   [`TurnEvent::ToolCall`]; then the text is prose only — often none at
+    ///   all — and any JSON in it is something the model was *talking about*.
+    ///   But a remote model may also *write* its call, in the text grammar the
+    ///   system prompt teaches (BUG-180); with no native call on the turn the
+    ///   source parses the text exactly as the local tier does, and then the
+    ///   text ends with the call just as a local reply's does.
     ///
     /// Either way the block the loop pushes **ends with the call**: the loop
-    /// renders a remote call onto the prose in the reply grammar before it
-    /// pushes (BUG-178 — an assistant turn pushed as the bare prose was empty
+    /// renders a native remote call onto the prose in the reply grammar before
+    /// it pushes (BUG-178 — an assistant turn pushed as the bare prose was empty
     /// whenever the model said nothing first, and every remote provider refuses
     /// an empty assistant turn on the next request). This flag says who put the
     /// call there, so the loop knows whether it still has to; the trailing
@@ -169,11 +173,12 @@ pub trait CompletionSource: Send {
     ///
     /// Defaults to [`ChatFormat::Flat`], which is right for every source that is
     /// not a local text engine. [`RemoteProviderSource`] stays `Flat` on purpose:
-    /// fabrication markers are a *local text parsing* concern — a remote turn's
-    /// tool calls arrive as structured [`TurnEvent::ToolCall`] events and its
-    /// prose as `TextDelta`s, so there is no transcript rendering in the text for
-    /// a marker to describe, and the provider owns its own wire format. The
-    /// default also keeps every test source compiling unchanged.
+    /// fabrication markers are a *transcript rendering* concern — a remote
+    /// provider is shown role-typed messages and owns its own wire format, so
+    /// there is no template frame in its text for a ChatML marker to describe.
+    /// (Its text may still carry a tool call in the reply grammar, BUG-180, and
+    /// the flat gate already holds that back — the grammar is format-agnostic.)
+    /// The default also keeps every test source compiling unchanged.
     fn chat_format(&self) -> ChatFormat {
         ChatFormat::Flat
     }
@@ -517,7 +522,7 @@ impl<T: Transport> CompletionSource for RemoteProviderSource<'_, T> {
         provenance: &Provenance,
         config: &HarnessConfig,
         tools: &ToolRegistry,
-        _exposed: &[&str],
+        exposed: &[&str],
         on_token: &mut (dyn for<'s> FnMut(&'s str) + Send),
     ) -> Result<SourceTurn, HarnessError> {
         // REQ-544 M-8: map the structured context to a real system prompt plus
@@ -659,9 +664,42 @@ impl<T: Transport> CompletionSource for RemoteProviderSource<'_, T> {
             }
         }
 
-        let decision = tool_call.unwrap_or_else(|| TurnDecision::EndTurn {
-            final_text: text.trim().to_owned(),
-        });
+        // BUG-180: a provider that sent no native call may still have *called*
+        // — in the text grammar the system prompt teaches every model and the
+        // carried history shows it on every prior call (`append_tool_call`,
+        // BUG-178). That text is read by the same `parse_reply` the local tier
+        // uses, so a call the loop dispatches is recognized by one grammar
+        // whichever source produced it (LESSON-494). Left unparsed, the call
+        // was the turn's *answer*: the gate hid it as tool-shaped, nothing ran,
+        // nothing rendered, and the bare JSON was committed as the assistant's
+        // reply — a silent empty turn.
+        //
+        // A native call still wins outright and leaves the text alone: on that
+        // path the prose is prose, however call-shaped some JSON in it may
+        // look (REQ-567 OQ-1), and the loop renders the call onto it. Only the
+        // *absence* of a native call makes the text the place to look.
+        let (decision, call_in_text, dropped_calls) = match tool_call {
+            Some(call) => (call, false, dropped_calls),
+            None => {
+                let parsed = parse_reply(&text, exposed);
+                let decision = match parsed.turn {
+                    ParsedTurn::ToolCall { name, arguments } => {
+                        TurnDecision::ToolCall { name, arguments }
+                    }
+                    ParsedTurn::EndTurn(final_text) => TurnDecision::EndTurn { final_text },
+                    // An unknown tool or non-object arguments: folded back as
+                    // the correction the local tier gets, never accepted as an
+                    // answer.
+                    ParsedTurn::Malformed(reason) => TurnDecision::Malformed { reason },
+                };
+                // The call *is* the text: keep through its end, drop whatever
+                // the model went on to write past it, and say so with
+                // `call_in_text` so the loop does not render the call twice.
+                text.truncate(parsed.clean_len);
+                let call_in_text = matches!(decision, TurnDecision::ToolCall { .. });
+                (decision, call_in_text, parsed.dropped_calls)
+            }
+        };
         Ok(SourceTurn {
             text,
             decision,
@@ -671,16 +709,15 @@ impl<T: Transport> CompletionSource for RemoteProviderSource<'_, T> {
             // source has no prefix cache", which is a different fact from a
             // miss and must not be reported as one.
             cache: None,
-            // REQ-567 OQ-1: never. A remote call arrives as a structured
-            // `TurnEvent::ToolCall` and is assembled above from *that*, not from
-            // the stream's `TextDelta`s — so `text` is prose the user watched
-            // stream, however tool-call-shaped some JSON in it may look. The
-            // loop renders the call onto it before the block is pushed
-            // (BUG-178), which is why this stays an honest `false` rather than
-            // this source doing the rendering: the guarantee that a tool-call
+            // REQ-567 OQ-1 / BUG-180: `true` only for a text-form call this
+            // source parsed out of the prose — the call is already at the
+            // text's end, where `clean_len` left it. A native call arrives as a
+            // structured `TurnEvent::ToolCall` beside prose that does not
+            // contain it, so the loop renders it on before the block is pushed
+            // (BUG-178) and this stays `false`: the guarantee that a tool-call
             // block carries its call belongs at the one seam every source
-            // passes through, not in each source's own report.
-            call_in_text: false,
+            // passes through, and this flag only says who put it there.
+            call_in_text,
         })
     }
 }
@@ -962,6 +999,361 @@ mod tests {
                 reasoning_tokens: None,
             }
         );
+    }
+
+    // ---- BUG-180: a remote provider's text-form tool call -----------------
+
+    /// A provider that streams **only text** — `chunks`, in order, then a
+    /// terminal `Completed` — and never a structured `TurnEvent::ToolCall`.
+    /// This is the shape of a model that obeyed the system prompt's "reply with
+    /// ONLY a JSON object" over the API's native tool field (BUG-180: Kimi K3,
+    /// `edit`-routed, 2026-08-19). Each call to `stream_turn` serves the next
+    /// scripted reply, so one provider can drive a whole loop turn.
+    struct TextOnlyProvider {
+        replies: Mutex<std::collections::VecDeque<Vec<&'static str>>>,
+    }
+
+    impl TextOnlyProvider {
+        fn scripted(replies: Vec<Vec<&'static str>>) -> Self {
+            Self {
+                replies: Mutex::new(replies.into_iter().collect()),
+            }
+        }
+    }
+
+    #[async_trait]
+    impl Provider for TextOnlyProvider {
+        fn id(&self) -> &str {
+            "text-only"
+        }
+        fn capabilities(&self) -> CapabilityProfile {
+            CapabilityProfile::default()
+        }
+        async fn stream_turn(
+            &self,
+            _request: TurnRequest,
+            _transport: &dyn Transport,
+        ) -> Result<TurnStream, ProviderError> {
+            let chunks = self
+                .replies
+                .lock()
+                .expect("script mutex poisoned")
+                .pop_front()
+                .expect("the script ran out of replies");
+            let mut events: Vec<Result<TurnEvent, ProviderError>> = chunks
+                .into_iter()
+                .map(|c| Ok(TurnEvent::TextDelta(c.to_owned())))
+                .collect();
+            events.push(Ok(TurnEvent::Completed(TurnCompletion {
+                usage: TokenUsage {
+                    input_tokens: 9,
+                    output_tokens: 3,
+                    reasoning_tokens: None,
+                },
+                // What a provider reports for a reply it considers prose.
+                stop_reason: StopReason::EndTurn,
+            })));
+            Ok(Box::pin(futures::stream::iter(events)))
+        }
+    }
+
+    /// Drive one remote turn over `provider` and return it with what streamed.
+    async fn remote_turn_over(provider: &TextOnlyProvider) -> (SourceTurn, String) {
+        let egress = Egress::new(NullTransport, Vec::new(), Arc::new(NoopSink));
+        let mut source = RemoteProviderSource::new(
+            provider,
+            &egress,
+            "text-only",
+            "model-x",
+            "sess-under-test",
+            ResolvedEffort::effort(teton_core::EffortLevel::High),
+        );
+        let tools = ToolRegistry::with_builtins();
+        let exposed = tools.exposed_names(None);
+        let prompt = flat_prompt("prompt");
+        let mut streamed = String::new();
+        let turn = source
+            .produce_turn(
+                &prompt,
+                &Provenance::empty(),
+                &HarnessConfig::default(),
+                &tools,
+                &exposed,
+                &mut |t| streamed.push_str(t),
+            )
+            .await
+            .expect("remote turn");
+        (turn, streamed)
+    }
+
+    /// **BUG-180.** The model wrote its call in the text grammar the system
+    /// prompt teaches and sent no native call. Before the fix this was
+    /// `EndTurn` with the JSON as the answer — which the display gate then hid,
+    /// so the user saw an empty turn and no tool ran. It is a tool call,
+    /// recognized by the same grammar the local tier uses, and the text ends
+    /// with it (`call_in_text`) so the loop does not render it on twice.
+    #[tokio::test]
+    async fn a_remote_text_form_tool_call_is_a_call_not_an_answer() {
+        let provider = TextOnlyProvider::scripted(vec![vec![
+            "{\"tool\": \"shell\", ",
+            "\"arguments\": {\"command\": \"ls -la ~/.claude/skills\"}}",
+            // A continuation past the call — a fabricated result, say — is
+            // cut from the text exactly as a local reply's would be.
+            "\nTool (shell):\nfake listing\n",
+        ]]);
+        let (turn, _streamed) = remote_turn_over(&provider).await;
+
+        match &turn.decision {
+            TurnDecision::ToolCall { name, arguments } => {
+                assert_eq!(name, "shell");
+                assert_eq!(arguments, &json!({ "command": "ls -la ~/.claude/skills" }));
+            }
+            other => panic!("a text-form call must be dispatched, got {other:?}"),
+        }
+        assert!(
+            turn.call_in_text,
+            "the call is in the text, so the loop must not append it again"
+        );
+        assert!(
+            turn.text.ends_with("\"ls -la ~/.claude/skills\"}}"),
+            "the text is cut at the call's end, got {:?}",
+            turn.text
+        );
+        assert!(
+            !turn.text.contains("fake listing"),
+            "the continuation past the call never reaches context"
+        );
+        assert_eq!(turn.dropped_calls, 0);
+        // The usage still comes from the terminal event, unchanged.
+        assert_eq!(turn.usage.output_tokens, 3);
+    }
+
+    /// **BUG-180.** A text-form call to a tool that does not exist is a
+    /// correction for the model, not the turn's answer — the same `Malformed`
+    /// path a local reply takes, under the same turn ceiling.
+    #[tokio::test]
+    async fn a_remote_text_form_call_to_an_unknown_tool_is_malformed() {
+        let provider =
+            TextOnlyProvider::scripted(vec![vec!["{\"tool\":\"teleport\",\"arguments\":{}}"]]);
+        let (turn, _) = remote_turn_over(&provider).await;
+        match &turn.decision {
+            TurnDecision::Malformed { reason } => {
+                assert!(reason.contains("teleport"), "{reason}");
+            }
+            other => panic!("an unknown tool must be folded back, got {other:?}"),
+        }
+        assert!(
+            !turn.call_in_text,
+            "no call was accepted, so none is embedded"
+        );
+    }
+
+    /// **BUG-180, the other direction.** Prose is still prose: an object the
+    /// model merely *quotes*, with no `tool`/`name` key, does not become a
+    /// call, and the turn ends with the whole text as its answer.
+    #[tokio::test]
+    async fn remote_prose_quoting_a_non_call_object_still_ends_the_turn() {
+        let provider = TextOnlyProvider::scripted(vec![vec![
+            "The config is:\n",
+            "{\"port\": 8080}",
+            "\nas requested.",
+        ]]);
+        let (turn, streamed) = remote_turn_over(&provider).await;
+        assert_eq!(
+            turn.decision,
+            TurnDecision::EndTurn {
+                final_text: "The config is:\n{\"port\": 8080}\nas requested.".to_owned()
+            }
+        );
+        assert_eq!(turn.text, "The config is:\n{\"port\": 8080}\nas requested.");
+        assert_eq!(streamed, turn.text, "prose streams through untouched");
+        assert!(!turn.call_in_text);
+    }
+
+    /// **BUG-180, precedence.** A native call still wins outright, and the
+    /// prose beside it is left alone however call-shaped some JSON in it may
+    /// look (REQ-567 OQ-1): the loop renders the native call onto the prose,
+    /// so the source must not also read a call out of it.
+    #[tokio::test]
+    async fn a_native_call_wins_and_leaves_call_shaped_prose_alone() {
+        struct NativeWithQuotedJson;
+
+        #[async_trait]
+        impl Provider for NativeWithQuotedJson {
+            fn id(&self) -> &str {
+                "native"
+            }
+            fn capabilities(&self) -> CapabilityProfile {
+                CapabilityProfile::default()
+            }
+            async fn stream_turn(
+                &self,
+                _request: TurnRequest,
+                _transport: &dyn Transport,
+            ) -> Result<TurnStream, ProviderError> {
+                let events: Vec<Result<TurnEvent, ProviderError>> = vec![
+                    Ok(TurnEvent::TextDelta(
+                        "Cargo says {\"name\": \"serde\", \"version\": \"1\"} here. ".to_owned(),
+                    )),
+                    Ok(TurnEvent::ToolCall(ToolCall {
+                        id: "call-a".to_owned(),
+                        name: "read".to_owned(),
+                        arguments: json!({ "path": "Cargo.toml" }),
+                    })),
+                    Ok(TurnEvent::Completed(TurnCompletion {
+                        usage: TokenUsage::default(),
+                        stop_reason: StopReason::ToolUse,
+                    })),
+                ];
+                Ok(Box::pin(futures::stream::iter(events)))
+            }
+        }
+
+        let provider = NativeWithQuotedJson;
+        let egress = Egress::new(NullTransport, Vec::new(), Arc::new(NoopSink));
+        let mut source = RemoteProviderSource::new(
+            &provider,
+            &egress,
+            "native",
+            "model-x",
+            "sess-under-test",
+            ResolvedEffort::effort(teton_core::EffortLevel::High),
+        );
+        let tools = ToolRegistry::with_builtins();
+        let exposed = tools.exposed_names(None);
+        let turn = source
+            .produce_turn(
+                &flat_prompt("prompt"),
+                &Provenance::empty(),
+                &HarnessConfig::default(),
+                &tools,
+                &exposed,
+                &mut |_| {},
+            )
+            .await
+            .expect("remote turn");
+        assert_eq!(
+            turn.decision,
+            TurnDecision::ToolCall {
+                name: "read".to_owned(),
+                arguments: json!({ "path": "Cargo.toml" }),
+            }
+        );
+        assert!(!turn.call_in_text, "a native call is not in the text");
+        assert_eq!(
+            turn.text, "Cargo says {\"name\": \"serde\", \"version\": \"1\"} here. ",
+            "the prose beside a native call is untouched"
+        );
+    }
+
+    /// **BUG-180, through the loop.** What the user saw on 2026-08-19: a turn
+    /// that ended with nothing on screen and no tool run. Driven here by a real
+    /// [`RemoteProviderSource`] over a provider that writes its call as text:
+    /// the tool status line is presented, the tool runs, the model is called
+    /// again with the result, and the raw JSON never reaches the user.
+    #[tokio::test]
+    async fn a_remote_text_form_call_runs_the_tool_instead_of_ending_the_turn_silently() {
+        use crate::broadcast::EventBus;
+        use crate::harness::context::{BlockRole, NoopProvenanceHook};
+        use crate::harness::duty::DutyRoute;
+        use crate::harness::permissions::{PendingPermissions, PermissionConfig, PermissionGate};
+        use crate::harness::tools::{ToolContext, ToolDuties};
+        use crate::harness::turn_loop::{run_session_turn_with_source, SessionEvents};
+        use teton_protocol::events::{Event, SessionUpdate, SessionUpdatePayload};
+        use teton_protocol::methods::StopReason as TurnStop;
+
+        let provider = TextOnlyProvider::scripted(vec![
+            vec!["{\"tool\":\"read\",\"arguments\":{\"path\":\"nope.txt\"}}"],
+            vec!["Done."],
+        ]);
+        let egress = Egress::new(NullTransport, Vec::new(), Arc::new(NoopSink));
+        let mut source = RemoteProviderSource::new(
+            &provider,
+            &egress,
+            "text-only",
+            "model-x",
+            "bug180",
+            ResolvedEffort::effort(teton_core::EffortLevel::High),
+        );
+
+        let session_id = SessionId::from("bug180");
+        let bus = Arc::new(EventBus::new());
+        let mut sub = bus.subscribe(256);
+        let gate = PermissionGate::new(
+            session_id.clone(),
+            PermissionConfig::permissive(),
+            Arc::clone(&bus),
+            Arc::new(PendingPermissions::new()),
+        );
+        let events = SessionEvents::new(Arc::clone(&bus), session_id);
+        let config = HarnessConfig::default();
+        let tools = ToolRegistry::with_builtins();
+        let tool_ctx = ToolContext::new(std::env::temp_dir());
+        let mut hook = NoopProvenanceHook;
+        let mut ctx = ContextManager::new("sys", config.context_budget_tokens);
+        ctx.push_user("show me the skills");
+
+        let outcome = run_session_turn_with_source(
+            &mut source,
+            &tools,
+            &tool_ctx,
+            &gate,
+            &events,
+            &mut ctx,
+            &config,
+            &mut hook,
+            &DutyRoute::unresolved("no digest route in this test"),
+            &DutyRoute::unresolved("no compact route in this test"),
+            &ToolDuties {
+                triage: &DutyRoute::unresolved("no triage route in this test"),
+                shell: &DutyRoute::unresolved("no shell route in this test"),
+            },
+        )
+        .await
+        .expect("the turn completes");
+
+        assert_eq!(outcome.stop_reason, TurnStop::EndTurn);
+        assert_eq!(
+            outcome.turns, 2,
+            "the tool ran and the model was called again"
+        );
+        assert_eq!(outcome.final_text, "Done.");
+
+        // The tool status line presented the call, and the JSON never streamed.
+        let mut titles = Vec::new();
+        let mut shown = String::new();
+        while let Some(env) = sub.try_recv() {
+            match &env.event {
+                Event::SessionUpdate(SessionUpdate {
+                    update: SessionUpdatePayload::ToolCall { title, .. },
+                }) => titles.push(title.clone()),
+                Event::SessionUpdate(SessionUpdate {
+                    update: SessionUpdatePayload::AgentMessageChunk { text },
+                }) => shown.push_str(text),
+                _ => {}
+            }
+        }
+        assert_eq!(titles, vec!["read nope.txt".to_owned()]);
+        assert!(
+            !shown.contains("{\"tool\""),
+            "raw tool-call JSON must not reach the user, got {shown:?}"
+        );
+        assert!(shown.contains("Done."));
+
+        // The assistant block for the call turn ends with the call, once —
+        // `call_in_text` kept the loop from rendering it on a second time.
+        let assistant: Vec<&str> = ctx
+            .blocks()
+            .iter()
+            .filter(|b| b.role == BlockRole::Assistant)
+            .map(|b| b.text.as_str())
+            .collect();
+        assert_eq!(assistant.len(), 2, "{assistant:?}");
+        assert_eq!(
+            assistant[0],
+            "{\"tool\":\"read\",\"arguments\":{\"path\":\"nope.txt\"}}"
+        );
+        assert_eq!(assistant[0].matches("\"tool\"").count(), 1);
     }
 
     /// The native tool-spec projection sees the same exposure the prompt does —

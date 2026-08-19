@@ -191,6 +191,11 @@ fn tool_call_name(value: &Value) -> Option<&str> {
 /// Parse a model reply into a tool call, an end-of-turn answer, or a malformed
 /// call. A reply is a tool call only if it contains a JSON object with a `tool`
 /// (or `name`) key; anything else is treated as the final answer.
+///
+/// The one reader of the reply grammar for **both** sources: the local tier's
+/// text is always read here, and a remote provider's prose is read here when
+/// the provider sent no native call (BUG-180) — the system prompt teaches
+/// every model this grammar, so a call written in it is a call whoever wrote it.
 pub(crate) fn parse_reply(text: &str, known_tools: &[&str]) -> ParsedReply {
     let spans = json_object_spans(text);
     let mut first_call: Option<(usize, usize, ParsedTurn)> = None;
