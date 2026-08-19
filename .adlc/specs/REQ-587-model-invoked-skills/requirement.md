@@ -72,11 +72,12 @@ position this spec takes with its trade-off stated:
    prompt too, in the tool docs — and answers it with a **bounded** roster of
    names (BR-2): the name is what `/proceed` tells the model to invoke, the
    descriptions are one call away, and the roster's cap is a pinned constant
-   the prompt-margin tests measure at its widest. On the weak-model profile
-   (`max_tools: Some(5)`, the local tier and every degraded provider) the tool
+   the prompt-margin tests measure at its widest. On the degraded profile
+   (`max_tools: Some(5)` — a record that declares `tool_call_tier =
+   "degraded"`, or any provider a failure drops there) the tool
    must not be displaced by the cap — "registered last, cut first" would be
-   "never available", the exact trap LESSON-496 documents — so it is exposed
-   on every profile that exposes tools, at the cost of one more tool schema in
+   "never available", the exact trap LESSON-496 documents — so it follows the
+   exempt set's exposure, at the cost of one more tool schema in
    front of the weakest models (OQ-1 on the mechanism).
 2. **A model-triggered inlining of a file the user did not type is a
    different trust posture.** REQ-585's body is user-role content because the
@@ -92,7 +93,8 @@ position this spec takes with its trade-off stated:
    passing the guards a typed prompt passes — and a **project-level** skill,
    which is repository content a third party may have authored, becomes
    model-invocable only after the user says so **once per session**, under
-   its own gate key, at the levels that ask (BR-4). Effects were never the
+   its own gate key, at the levels that ask — and, for a project skill that
+   shadows a user skill, even at `full` (BR-4). Effects were never the
    question — a skill body can run nothing by itself; `shell` and `edit` are
    gated as today — what changes is that repository text can reach the model
    labelled as instructions without a human typing its name, and that is what
@@ -155,15 +157,15 @@ _Shapes below are illustrative — the field names and variant names are what
 | Skill | user_invocable | bool | `true` unless frontmatter `user-invocable: false`; a model-only skill is listed by `/help` as not dispatchable (`(model-only)`, the shadowed-entry shape) and `/name` refuses it with a hint |
 | Skill | ignored_keys | string[] | REQ-585's list **minus** `disable-model-invocation` and `user-invocable`, which are now honored; a flag whose value is not a boolean literal takes the safe value (hidden from the model / user-invocable) and is named in the diagnostics |
 | Skill | source | `user` / `project` | REQ-585's; decides whether a model invocation needs the session's project-skill acknowledgment (BR-4) |
-| SkillTool (new, per turn) | name | string | `skill`; registered into the turn's tool registry only when the registry holds ≥ 1 model-invocable skill, exposed on every profile that exposes tools (`max_tools ≠ Some(0)`), never displaced by the cap |
+| SkillTool (new, per turn) | name | string | `skill`; registered into the turn's tool registry only when the registry holds ≥ 1 model-invocable skill; once registered it follows the exempt set's exposure (`exposed_tools` yields cap-exempt tools regardless of `max_tools` — `teton_docs` is exposed even under `Some(0)`), never displaced by the cap |
 | SkillTool | description | string | a fixed sentence + the roster of model-invocable names (shadowed entries excluded), in `/help` order, bounded by a pinned byte cap; overflow renders `… and N more (call skill with no name to list)` |
 | SkillTool | schema | JSON | `name` (string; omit to list) and `arguments` (string; the `<rest>` of `/name <rest>`, same substitution rules); both model-supplied and therefore bounded wherever echoed (the `teton_docs` echo bound) |
 | SkillInvocation (REQ-585, extended) | invoked_by | `user` / `model` | who asked; the expander is shared and the output bytes are identical for the same (skill, arguments, dynamic outcomes) |
-| SkillInvocation | frame | string | the model-facing wrapper of a model invocation: names the skill, its source and home-relative path, and the arguments, and says the body is to be followed as the user's (or the acknowledged repository's) instructions; envelope tags, control tokens and frame labels in the body neutralized where the frame is written (ADR-009, BUG-148); dynamic-context output inside it keeps REQ-585's untrusted tool-result envelope |
+| SkillInvocation | frame | string | the model-facing wrapper of a model invocation: names the skill, its source and home-relative path — the source naming shadowing explicitly when a project skill shadows a user skill (`validate (project — shadows your user skill)`) — and the arguments, and says the body is to be followed as the user's (or the acknowledged repository's) instructions; envelope tags, control tokens and frame labels in the body neutralized where the frame is written (ADR-009, BUG-148); dynamic-context output inside it keeps REQ-585's untrusted tool-result envelope |
 | SkillInvocation | refusal | typed enum | `unknown_skill` (with the roster), `not_model_invocable`, `project_not_acknowledged`, `repeated`, `per_turn_cap`, `over_budget { size, budget, bound }`, `shadowed` — never prose the model has to parse; each names what the model (or the user) can do next |
 | TurnSkillState (new, per prompt turn) | invocations | (name, arguments)[] | the chain so far, in order; resets every prompt turn; drives `repeated` and `per_turn_cap` |
-| TurnSkillState | cap | pinned constant | illustratively 8 — at least the seven gate invocations `/proceed` names (`manifest`, `validate`, `architect`, `validate`, `reflect`, `review`, `wrapup`) plus one re-invocation for recovery after compaction |
-| SessionSkillTrust (new, per session) | acknowledged_roots | set of session roots | project skills under an acknowledged root are model-invocable; the acknowledgment is a permission grant under its own key and follows the gate's existing once / session / always scopes |
+| TurnSkillState | cap | pinned constant | illustratively 12 — above the worst-case nine-to-ten skill invocations one `/proceed` prompt can name (five gates — `manifest`, `validate`, `architect`, `validate`, `wrapup`; `reflect` and `review` dispatch agents, not skills — plus up to three re-validation loops at Phases 1 and 3 and a `/manifest` re-run), with room for re-invocation after compaction; `max_turns` is the effective bound |
+| SessionSkillTrust (new, per session) | acknowledged_roots | set of session roots | project skills under an acknowledged root are model-invocable; the acknowledgment is a permission grant under its own key with the gate's once / for-this-session scopes only (`AllowAlways` is session-scoped; the gate's one durable option is web's `OPTION_ID_ENABLE_PERMANENT` and this key does not offer it) |
 
 ### Events
 
@@ -180,7 +182,7 @@ the CLI renders each as one line (BR-9).
 | Action | Roles Allowed |
 |--------|---------------|
 | model invoking a **user-level** skill (`~/.claude`) that is model-invocable | the model, at every permission level — the expansion is a read of text the user installed (the read-only posture `read`/`teton_docs` have; LESSON-524); no per-invocation "allow skill?" prompt |
-| model invoking a **project-level** skill (session root's `.claude/`) | the model, after the session's **project-skill acknowledgment** under its own gate key (default posture: `guarded` ask once per session per root, `edits` ask, `plan` deny, `full` allow); on piped stdin at a level that asks: refused by the client without reading a line (REQ-585 BR-11's rule), and the model is told the user must acknowledge or run at `full` |
+| model invoking a **project-level** skill (session root's `.claude/`) | the model, after the session's **project-skill acknowledgment** under its own gate key (default posture: `guarded` ask once per session per root, `edits` ask, `plan` deny, `full` allow — except a project skill that **shadows a user skill**, which asks even at `full`; BR-4); on piped stdin at a level that asks: refused by the client without reading a line (REQ-585 BR-11's rule), and the model is told the user must acknowledge or run at `full` |
 | model invoking a `disable-model-invocation: true` skill | never — absent from the roster, refused typed if named |
 | user typing `/name` for a `user-invocable: false` skill | never — refused with a hint naming the flag; the model may invoke it |
 | dynamic-context commands of a model-triggered invocation | the session's permission level through the gate under the **skill's own key** (REQ-585 BR-6: `guarded` ask, `edits` ask, `plan` deny, `full` allow); the consent lists every command verbatim **as substituted with the model's arguments** and says the model asked; same pipe rule as REQ-585 BR-11; `full` is the unattended posture |
@@ -202,10 +204,13 @@ the CLI renders each as one line (BR-9).
   is who asked (`invoked_by`), how the result enters the turn (a tool result
   inside the loop, not a prompt turn), the frame around it (BR-4), and the
   refusals only a model can earn (BR-3, BR-6). A call naming a skill the
-  registry does not hold — or no name at all — returns the roster with
-  one-line descriptions and argument hints in the same reply (the
+  registry does not hold returns a typed `unknown_skill` carrying the roster
+  with one-line descriptions and argument hints in the same reply (the
   `teton_docs` unknown-topic posture: tell the model what exists and let it
-  spend its next reply on the right one); a shadowed name resolves to what
+  spend its next reply on the right one); a call with **no name** is a
+  **listing** — a typed `listed` outcome carrying the same roster, not a
+  refusal; both are data, framed as BR-4 frames every non-expansion result;
+  a shadowed name resolves to what
   `/name` would run (the project skill, or the built-in — in which case the
   refusal says the name is a built-in command only the user runs) (informed
   by REQ-585, REQ-577, LESSON-456).
@@ -235,8 +240,10 @@ the CLI renders each as one line (BR-9).
   REQ-577/BUG-181 path, a reviewed decision, never a silent squeeze
   (LESSON-543). The roster rides the prefix cache like any other prompt
   change: it changes only when the registry does (launch, `/cd`). On the
-  weak-model profile (`max_tools: Some(5)` — the local tier and every
-  degraded provider) the tool is **exposed alongside the five built-ins and
+  degraded profile (`max_tools: Some(5)` — a record declaring `tool_call_tier
+  = "degraded"`, or any provider `degraded_harness_config()` drops there
+  after a failure; the local tier's record defaults to `Native` like any
+  other) the tool is **exposed alongside the five built-ins and
   `teton_docs`**: a capability that exists because the user installed skills
   must not be silently withheld by a cap whose limit equals the built-in
   count (LESSON-496), and a tool with two string arguments is the cheapest
@@ -278,7 +285,9 @@ the CLI renders each as one line (BR-9).
   the opposite of what a skill is for, and a model that honors it — or a
   small model that reads "DATA" and transfers data (LESSON-532) — defeats
   the feature. Instead the result is its own frame: one line naming the
-  skill, its source (`user`/`project`), its home-relative path and the
+  skill, its source (`user`/`project` — naming shadowing explicitly when a
+  project skill shadows a user skill: `validate (project — shadows your user
+  skill)`), its home-relative path and the
   arguments, the body, and a closing harness-authored sentence saying the
   block is the body of that skill — a command the user installed (or the
   repository defines and the user acknowledged) — and is to be followed as
@@ -287,7 +296,12 @@ the CLI renders each as one line (BR-9).
   the frame is written — ADR-009) **plus** envelope-tag neutralization so a
   body cannot close its own frame early (BUG-148's shape); dynamic-context
   *output* inside the body keeps REQ-585 BR-6's untrusted tool-result
-  envelope, because command output is data wherever it lands. A **user-level
+  envelope, because command output is data wherever it lands. **Only the
+  expansion earns the instructions frame**: every non-expansion `skill`
+  result — the `listed` roster, `unknown_skill`, every typed refusal — is a
+  catalogue or a verdict, not a command, and is framed as **data** in the
+  `teton_docs` envelope posture; the frame follows the result, not the tool
+  name. A **user-level
   skill** (`~/.claude`) expands this way at every permission level with no
   per-invocation prompt — the user put the file there, and the model reading
   it is the read-only posture `read` and `teton_docs` have. A **project-level
@@ -299,11 +313,28 @@ the CLI renders each as one line (BR-9).
   dynamic-context key — LESSON-495: the key encodes the question, and the
   question is "may the model run this repository's skills as instructions?"):
   at `guarded`/`edits` it asks once, naming the root and listing the
-  project's model-invocable skills, with the gate's once / session / always
-  scopes; at `plan` it is denied (the model is told project skills are not
-  model-invocable at `plan`); at `full` it is allowed — the automation posture,
+  project's model-invocable skills — the list bounded (at most 20 names,
+  then `+N more`; an unbounded prompt is LESSON-517's shape) and each
+  shadowing entry marked (`validate (project — shadows your user skill)`) —
+  with the gate's once / for-this-session scopes (`AllowAlways` is
+  session-scoped; nothing the gate offers here survives the session — its
+  one durable option is web's `OPTION_ID_ENABLE_PERMANENT`, not offered
+  under this key, and durable trust is wholly Deferred); at `plan` it is
+  denied (the model is told project skills are not
+  model-invocable at `plan` — they stay **in the roster**,
+  present-but-refused, because the roster is level-blind and changes only
+  with the registry (BR-2), and a level-varying roster would churn the
+  prompt prefix on every `/permissions`); at `full` it is allowed — the
+  automation posture,
   consistent with `full` already running every model-chosen `shell` command
-  in that repository unprompted; on piped stdin at a level that asks, the
+  in that repository unprompted — **except a project skill that shadows a
+  user skill, which asks even at `full`**: a shadowed name is the one case a
+  `full` session can be surprised by — the model invokes `validate` meaning
+  the skill the user installed and gets a body the repository substituted —
+  so the swap is acknowledged once per session per root even in the
+  unattended posture, and an unattended pipe that needs a shadowing project
+  skill sees the client refuse without reading stdin, exactly as any ask on
+  a pipe does; on piped stdin at a level that asks, the
   client refuses **without reading stdin** (REQ-585 BR-11) and the model is
   told the user must acknowledge or the session must run at `full`. The
   position, stated against its alternative: nothing here grants an effect —
@@ -341,11 +372,18 @@ the CLI renders each as one line (BR-9).
   skill's key answers later *model* invocations of that skill too (that is
   what a session grant means), which is sound when the commands do not depend
   on the arguments — and when a command interpolates `$ARGUMENTS`/`$N`, a
-  model could change what the remembered grant runs. So a remembered grant
-  covers a model invocation only when the invocation's substituted command
-  set is the one consented; a different set asks again (LESSON-495: the key
-  must encode the whole question, and here the question includes the command
-  text). None of the seventeen ADLC skills interpolates arguments into a
+  model could change what the remembered grant runs. The rule, one rule for
+  **both callers**: whenever any command in the body interpolates
+  `$ARGUMENTS`/`$N`, the remembered grant's key includes a **digest of the
+  substituted command set** — for user-typed `/name` and model-called
+  `skill` alike, because the risk is the arguments changing what the grant
+  runs, not who supplied them (LESSON-495: the key must encode the whole
+  question, and here the question includes the command text). A skill with
+  no interpolating command keys as REQ-585 BR-6 does — per skill, no digest —
+  and a different substituted command set is a different key and asks again.
+  The digest-bearing key is **new remembering machinery** and amends a
+  REQ-585 assumption (see Assumptions). None of the seventeen ADLC skills
+  interpolates arguments into a
   dynamic command, so the common path is one consent per skill per session;
   the rule exists for the skill that does (informed by REQ-585 BR-6/BR-11,
   LESSON-495, LESSON-537, REQ-560 BR-2 — no prompt storm).
@@ -354,18 +392,33 @@ the CLI renders each as one line (BR-9).
   says "invoke `/x`" is text the model acts on by calling the tool again —
   nothing expands inside an expansion, so there is no stack to unwind and no
   depth counter to pretend to. The bounds are: (a) a **per-turn invocation
-  cap**, a pinned constant (illustratively 8) that is at least the seven gate
-  invocations `/proceed` names plus one — the ninth call in a prompt turn is
-  refused `per_turn_cap` naming the cap, and the count resets with the next
-  prompt; (b) **no back-to-back repeat** — the same `(name, arguments)` called
+  cap**, a pinned constant (illustratively 12), derived from what one
+  `/proceed` prompt can actually name: five *skill* invocations —
+  `/manifest`, `/validate`, `/architect`, a second `/validate`, `/wrapup`
+  (`/reflect` and `/review` dispatch agents, not skills, and `/review` is
+  explicitly never re-run) — plus up to three re-validation loops at each of
+  Phases 1 and 3 and a possible `/manifest` re-run, a worst case of nine to
+  ten in one prompt; 12 holds that worst case with recovery room, the count
+  resets with each new prompt, and the call past the cap is refused
+  `per_turn_cap` naming the cap; (b) **no back-to-back repeat** — the same
+  `(name, arguments)` **expanded**
   again with no other tool call completed in between is refused `repeated`,
   telling the model it already holds that expansion (a confused model
   re-issuing a call, and a skill that invokes itself, both stop here;
   `/proceed`'s two `/validate` passes, separated by `read`s and an
   `/architect`, are not a repeat); (c) the loop's own iteration ceiling
-  (`max_turns`: 25 on a `Native` profile, 40 strong, 5 degraded), which every
+  (`max_turns`: 25 on a `Native` profile, 5 degraded, 1 on `None`;
+  `for_strong_model`'s 40 is test-only and no production route constructs
+  it), which every
   skill call spends one of — stated as the real bound on how far one prompt
-  gets. Every refusal is a typed outcome the model can relay, and none of
+  gets: the cap bounds skill chatter inside a prompt, `max_turns` bounds the
+  prompt. The chain's bookkeeping is explicit: **every** `skill` call —
+  expansion, `listed` roster, or typed refusal — counts one against the
+  per-turn cap (a refusal spends a call, or a loop of refusals would be
+  unbounded), and **only expansions** seed the repeat rule — a refused call
+  left the model with nothing, so retrying the same name after a refusal
+  (after the user acknowledges the project root, say) is not `repeated`.
+  Every refusal is a typed outcome the model can relay, and none of
   them is silent (informed by REQ-585 BR-13, BUG-147 — never drop a call
   silently, LESSON-482).
 - [ ] BR-7: **An expansion is admitted whole against the route's budget or
@@ -404,10 +457,14 @@ the CLI renders each as one line (BR-9).
 - [ ] BR-8: **The guide says who runs what, in one sentence, inside its
   constraints.** The bundled self-configuration guide's capability sentence
   (BUG-181; REQ-585 BR-9 re-words "loads nothing from") is amended again so
-  it stays true: the session's `/` commands are those `/help` lists and only
-  the user runs the built-in ones; skills are listed there too — the user
-  runs one as `/name`, and the model runs one only through the `skill` tool
-  when that tool is listed below. The sentence is true on every turn: when no
+  it stays true — illustratively: *"Teton loads skills and commands from
+  `.claude/` and `~/.claude` (never CLAUDE.md, agents or hooks); the
+  session's commands are exactly those `/help` lists — only the user runs
+  the built-in ones and `/name`, and the model runs a skill only through the
+  `skill` tool when it is listed below."* The sentence keeps every anchor
+  the pinning test holds: `.claude/`, `~/.claude`, the CLAUDE.md/agents/hooks
+  negative space, and the verbatim "only the user runs" — now scoped as
+  "only the user runs the built-in ones". The sentence is true on every turn: when no
   skill is model-invocable the tool is absent and "the skills the `skill`
   tool lists" is the empty set. The pinning test
   (`the_system_prompt_states_what_the_session_can_run_and_from_where`) is
@@ -418,19 +475,28 @@ the CLI renders each as one line (BR-9).
   still present in both harness shapes. The guide's own constraints hold: one
   sentence, no second line containing "ask", no `teton …` shell form, and the
   resident prompt's byte headroom — which BR-2's roster also draws on, so the
-  two are measured together (informed by BUG-181, LESSON-543, REQ-585 BR-9,
+  two are re-counted **together**, the amended sentence and the tool doc in
+  one prompt-margin run against today's ≈ 0.84 KB of headroom (informed by
+  BUG-181, LESSON-543, REQ-585 BR-9,
   REQ-579 — the model hands off what it cannot run).
 - [ ] BR-9: **A model invocation is a tool call in every ledger, and it is
   observable without being noisy.** It raises the `tool_call` /
   `tool_call_update` events every tool call raises, titled `skill <name>`
   with the name bounded as `teton_docs` bounds its topic echo; it costs no
   model call and no egress itself, and the expansion's tokens are priced on
-  the next model call under the route as any context is (REQ-586 BR-9 —
-  attribution unchanged, `/cost` rows unchanged in shape). The session
+  **every subsequent model call of the turn** — the expansion enters the
+  context and the carry, so the honest worst case is `/proceed`'s ≈ 11k
+  tokens paid on each of up to 25 loop iterations, not once (REQ-586 BR-9 —
+  attribution unchanged, `/cost` rows unchanged in shape; the price of a
+  skill is a context price, and this REQ says so rather than implying a
+  one-shot fee). The session
   surface echoes one line per invocation in REQ-585 BR-12's form with who
   asked (`skill validate (user, 4.6 KB, 2 dynamic commands) — invoked by the
-  model`), and one line per typed refusal; the body is never printed.
-  `/verbose` adds the home-relative path, the flags, each dynamic command's
+  model`), naming shadowing when it applies (`skill validate (project —
+  shadows your user skill, …)`), and one line per typed refusal; the body is
+  never printed.
+  `/verbose` adds the home-relative path, the flags, the shadowing fact,
+  each dynamic command's
   typed outcome, and the turn's invocation count against the cap. A refusal
   is never silent and never a crash (informed by REQ-585 BR-12, REQ-577,
   LESSON-456).
@@ -482,8 +548,9 @@ the CLI renders each as one line (BR-9).
 - [ ] AC-1: With fixtures `alpha` (user), `beta` (user, `disable-model-invocation:
   true`), `delta` (user, `user-invocable: false`) and `gamma` (project): the
   tool's description roster names `alpha`, `delta`, `gamma` and not `beta`;
-  `skill {}` (no name) and `skill { name: "zzz" }` return the roster with
-  REQ-585's one-line descriptions and hints and a typed `unknown_skill`;
+  `skill {}` (no name) returns a typed `listed` outcome carrying the roster
+  with REQ-585's one-line descriptions and hints, and `skill { name: "zzz" }`
+  returns the same roster under a typed `unknown_skill`;
   `skill { name: "beta" }` is refused `not_model_invocable` naming the flag,
   with no expansion, no dynamic command run and no consent prompt raised; a
   skill carrying both flags is a named diagnostic. (daemon unit; BR-1, BR-2,
@@ -493,7 +560,11 @@ the CLI renders each as one line (BR-9).
   teton  code "repo"` from the same expander (asserted by calling both paths
   on one fixture), wrapped in the BR-4 frame naming `alpha`, `user`, the
   home-relative path and the arguments, and **not** in `frame_untrusted_builtin`'s
-  envelope (`UNTRUSTED_OUTPUT_TOOLS` does not contain `skill`); a body that
+  envelope (`UNTRUSTED_OUTPUT_TOOLS` does not contain `skill` — the fold
+  must never wrap an expansion), while a `skill {}` listing and an
+  `unknown_skill` reply from the same registry **are** framed as untrusted
+  data (the `teton_docs` envelope posture, written where the reply is
+  rendered) — the frame follows the result, not the tool name; a body that
   plants the frame's own closing tag, `<tool-result>`, `User:`, `Assistant:`
   and `<|im_start|>` reaches the model neutralized; a `<tool-result>` planted
   in a dynamic command's *output* reaches the model inside REQ-585's untrusted
@@ -510,7 +581,10 @@ the CLI renders each as one line (BR-9).
   BR-8)
 - [ ] AC-4: Under `max_tools: Some(5)` the exposed set is the five built-ins,
   `teton_docs` and `skill`; under the strong profile `skill` is exposed; under
-  `Some(0)` it is not; a registry with an opted-in `web` tool exposes all of
+  `Some(0)` it follows the exempt set's exposure — present exactly as
+  `teton_docs` is today (`exposed_tools` yields cap-exempt tools regardless
+  of the cap, and a `None`-tier turn runs zero iterations anyway); a registry
+  with an opted-in `web` tool exposes all of
   them on the degraded profile — pinned beside
   `a_cap_exempt_tool_is_never_displaced_by_the_max_tools_cut` so the headroom
   is asserted, not assumed. (unit; BR-2)
@@ -521,37 +595,55 @@ the CLI renders each as one line (BR-9).
   accepting "for this session" answers the next *model* invocation of the
   same skill without asking, leaves a different skill asking and a
   model-issued `shell` call asking; a prior allow-always on `shell` does not
-  un-ask it; a fixture skill whose command interpolates `$ARGUMENTS` asks
+  un-ask it; a fixture skill whose command interpolates `$ARGUMENTS` keys
+  its grant on the digest of the substituted command set — it asks
   again when the model's arguments change the command and not when they do
-  not. At `plan` the placeholders name the level; at `full` the commands run
+  not, and the **same digest rule binds the user-typed path**: `/name` with
+  different arguments on that fixture asks again too (one rule, both
+  callers). At `plan` the placeholders name the level; at `full` the commands run
   with no prompt. On piped stdin at `guarded` the client refuses without
   reading stdin — a `y` fed as the next line arrives as the next prompt — and
   the placeholders say no human could be asked. (daemon unit for the gate and
   key; `cli_e2e` for the pipe; BR-5)
 - [ ] AC-6: At `guarded`, the first model invocation of a project skill
   raises the acknowledgment naming the session root and listing the
-  project's model-invocable skills; declining refuses the call
+  project's model-invocable skills (twenty-five fixtures list twenty and
+  `+5 more`); declining refuses the call
   `project_not_acknowledged` with the user's next step named and runs no
   dynamic command; accepting for the session expands it and a second project
   skill in the same session does not ask again; a user skill never raises it;
   `/cd` to another root asks again for that root; at `plan` the call is
-  refused naming the level; at `full` it expands with no prompt; on piped
+  refused naming the level and the skill is still in the roster; at `full` a
+  non-shadowing project skill expands with no prompt, while a project
+  `validate` that shadows a user `validate` still raises the acknowledgment
+  — the prompt and the BR-4 frame's source line both reading `validate
+  (project — shadows your user skill)`; on piped
   stdin at `guarded` the client refuses without reading stdin and the model
   is told to have the user acknowledge or run at `full`. (daemon unit + pty
   for the prompt bytes + `cli_e2e` for the pipe; BR-4)
-- [ ] AC-7: In one prompt turn the ninth invocation is refused `per_turn_cap`
+- [ ] AC-7: In one prompt turn the call past the pinned cap (the thirteenth
+  at 12) is refused `per_turn_cap`
   naming the cap and the next prompt starts at zero; `skill { validate,
   "REQ-1" }` twice back-to-back is refused `repeated` the second time, and the
-  same pair with a `read` between them is allowed; a fixture skill whose body
+  same pair with a `read` between them is allowed; a refused call never seeds
+  the repeat rule — a call refused `not_model_invocable` and re-issued is
+  refused the same way again, not `repeated`, and a refusal followed by the
+  first successful expansion of that name is not `repeated` either; refusals
+  and `skill {}` listings each count against the cap (a fixture asserts a
+  run of listings exhausts it); a fixture skill whose body
   names itself stops at the `repeated` refusal rather than at the cap; every
   skill call counts one loop iteration and `max_turns` still ends the turn.
   (daemon unit; BR-6)
-- [ ] AC-8: On a route with `max_context = 128000`, `proceed` (the real
-  49.8 KiB file as a fixture) expands whole — no `digest` `route_decided`
+- [ ] AC-8: On a route with `max_context = 128000`, a synthetic
+  7,222-word fixture of `/proceed`'s measured shape (the real file is
+  third-party content and stays out of the repo) expands whole — no `digest`
+  `route_decided`
   event, no elision, the body present verbatim in the next prompt; on the
   local route it is refused `over_budget` with `bound: local_engine` naming
   the skill, size and budget; on a remote route with `max_context = 0` the
   refusal says `bound: default_unknown` and names `capabilities.max_context`;
+  the digest-bypass assertion runs on the **default budget route** — the
+  threshold at its 1,500-word default, where the fold would bite — where
   a 2,800-word fixture (the `architect` + ethos shape) above
   `summarize_threshold_tokens` enters context raw, and a test that restores
   the `digest` fold for `skill` results fails; a fixture that fits alone but
@@ -606,15 +698,20 @@ the CLI renders each as one line (BR-9).
   name: "validate", arguments: "REQ-587" }` — the echo line shows `skill
   validate … invoked by the model` — the `/validate` body lands and the model
   validates this spec's own file; the run continues through `/architect`
-  (Phase 2) as far as the loop's iteration ceiling allows, and the point at
+  (Phase 2) across several "continue" prompts — one prompt's 25 iterations
+  do not span the pipeline (OQ-8), and the runbook records how many were
+  needed — and the point at
   which it next stalls (the first "dispatch an agent" step, Phase 4) is
   recorded as the subagent spec's evidence; (b) a scratch copy of a skill with
   `disable-model-invocation: true` is absent from the roster and the model's
   call for it is refused typed; (c) asked *"can you run `/validate`?"* the
   model says it can through the `skill` tool, and asked *"can you run
   `/help`?"* it says the user runs it (BR-8); (d) unattended: `printf
-  '/proceed REQ-587\n' | teton --permissions full` runs the ethos include and
-  reaches the first gate without a prompt, and the same at `guarded`
+  '/permissions full\n/proceed REQ-587\n' | teton` runs the ethos include and
+  reaches the first gate without a prompt — there is no `--permissions`
+  flag; the level is set with REQ-560's `/permissions` session command, and
+  REQ-585 AC-20(e) carries the same nonexistent flag and needs the same
+  correction when it is run — and the same piped run at the default `guarded`
   produces placeholders and still completes (the teton-code repo has no
   project skills, so the acknowledgment path is exercised with a scratch
   `.claude/skills/scratch/SKILL.md` in a throwaway root: at `guarded` on the
@@ -642,6 +739,18 @@ the CLI renders each as one line (BR-9).
   roster** (or this REQ re-sizes it with the arithmetic re-stated) — stated
   here so the two do not land with a resident prompt larger than the bound
   assumes.
+- **REQ-584** (read-only `projects` tool; spec PR #185, drafted, not
+  merged) is a sibling claim on the same two surfaces this REQ draws on: its
+  tool is cap-exempt and its doc is resident prompt. Whichever of REQ-584
+  and this REQ lands first moves `REDACT_BODY_OVERHEAD_BYTES` (at most once,
+  arithmetic re-stated); the second **re-measures** rather than moving it
+  again, and the test that enumerates the exempt set names every member
+  with its stated reason — on a "5-tool" degraded profile the exposed set is
+  then the five built-ins plus `teton_docs`, `web` (when opted in), `skill`
+  and `projects`. Stated plainly: when the exempt set rivals the capped set
+  in size, `max_tools` has stopped meaning anything — the next cap-exempt
+  candidate should trigger a re-derivation of the cap, not one more
+  exemption.
 - BUG-181 is merged (`main` at 7796dca) and its sentence is the one BR-8
   amends after REQ-585 BR-9 has. The ADLC toolkit on the dogfood machine and
   its Kimi record at `max_context = 128000` are AC-15's preconditions.
@@ -693,22 +802,32 @@ the CLI renders each as one line (BR-9).
   (separately), position before step 1, presence in both shapes. Headroom:
   BUG-181 measured 9,167 of 9,216 bytes before its sentence and moved
   `REDACT_BODY_OVERHEAD_BYTES` to 10 KiB; with the sentence the widest prompt
-  is estimated at ≈ 9.45 KB escaped, leaving ≈ 0.7 KB above the 48-byte
-  floor. A `skill` tool doc (one sentence, a two-field schema, a roster at a
+  is estimated at ≈ 9.45 KB escaped, leaving ≈ 0.84 KB above the 48-byte
+  floor — a headroom BR-8's amended sentence and BR-2's tool doc draw on
+  together, so the margin is re-counted with both in place, never one at a
+  time. A `skill` tool doc (one sentence, a two-field schema, a roster at a
   256–512-byte cap) is ≈ 0.6–0.9 KB before escaping, so BR-2 expects one
   reviewed ceiling move (10 → 11 KiB: 2 × (32,768 + 11,264) = 88,064 ≤
   108,280, chunks stay 4) unless `/architect` fits it; `REDACT_BODY_OVERHEAD_BYTES`
   and `MIN_PROMPT_HEADROOM_BYTES` are `#[cfg(test)]` today and REQ-586 BR-4
   promotes the former.
-- **Profiles and loops:** `HarnessConfig::default()` is the weak-model shape
-  (`max_turns` 12, `max_tools: Some(5)`), `for_strong_model` 40 / `None`,
-  `from_harness_profile` carries `max_tool_iterations` 25 (`Native`) / 5
+- **Profiles and loops:** `HarnessConfig::default()` is the conservative
+  constructor shape (`max_turns` 12, `max_tools: Some(5)`);
+  `for_strong_model` (40 / `None`) is **test-only** — no production route
+  constructs it; a routed turn runs
+  `from_harness_profile(capability_of(id).harness_profile())`, which carries
+  `max_tool_iterations` 25 (`Native`) / 5
   (`Degraded`) / 0 (`None`, clamped to 1); a config provider record defaults
   to `Native` (`ProviderCapabilities` derive default) and the
   OpenAI-compatible adapter's own `Degraded` default is overridden by the
-  record's value — so on the dogfood machine the Kimi route runs `Native`
-  (25 iterations, no cap) unless its record declares otherwise, and
-  the local tier runs the capped profile. `/proceed`'s gates are reachable
+  record's value — so on the dogfood machine the Kimi route **and the local
+  tier both** run `Native` (25 iterations, no tool cap) unless a record
+  declares `tool_call_tier = "degraded"`; only `degraded_harness_config()`,
+  forced after a failure reveals weak tool-calling, imposes the reduced
+  shape ad hoc. OQ-6 and AC-15(e) therefore stand on the local tier's
+  **budget** (`bound: local_engine`), never on a tool cap. Production
+  `max_turns` is 25 / 5 / 1 (or the constructor default 12) — never 40.
+  `/proceed`'s gates are reachable
   in 25 iterations; the whole pipeline is not, and the user (or a pipe)
   prompting "continue" with the carry (REQ-567) is how a long skill spans
   prompts — stated as a caveat, not solved here (OQ-8).
@@ -738,6 +857,18 @@ the CLI renders each as one line (BR-9).
   invocation and REQ-585's gate remains the boundary for effects. The
   `local-only`/`Unknown` pinning consequences of REQ-585 BR-7 carry over
   unchanged.
+- **This REQ amends three REQ-585 statements, named so each amendment is a
+  decision and not a drift:** (1) REQ-585 AC-15's "the skill roster is
+  **not** in the system prompt" is re-scoped to "not in the **guide**" —
+  the tool docs are part of the system prompt, and BR-2 puts the roster
+  exactly there; (2) REQ-585 BR-10's classifier gains the model-only hint
+  case (`/name` on a `user-invocable: false` skill refuses with a hint —
+  BR-3), a branch REQ-585 did not have; (3) REQ-585's Assumption that
+  "per-command-string remembering would be new and is not needed" is
+  half-kept — it **is** new machinery, and BR-5's digest-keyed grant is
+  this REQ needing it after all: the grant key gains a
+  substituted-command-set digest whenever a command interpolates arguments,
+  on both callers.
 - REQ id allocated with remote verification (`ADLC_ALLOC_DEGRADED` unset,
   2026-08-19).
 
@@ -756,11 +887,14 @@ the CLI renders each as one line (BR-9).
   `skill` and `args`. *Lean:* `name` + `args` (illustrative names throughout
   this spec are not the contract); `/architect` decides with the local
   model's call format in front of it.
-- [ ] OQ-3: **How long does a project-skill acknowledgment last?** Session
-  scope by default, with the gate's existing "always" option remembering it
-  across sessions under the same root, no new config. *Lean:* as stated;
-  revisit if a persisted per-repo trust file (Claude Code's shape) is asked
-  for.
+- [x] OQ-3: **How long does a project-skill acknowledgment last?**
+  *Resolved: the session, at most.* The gate's options are allow once /
+  allow for this session / reject — `RememberedGrant::AllowAlways` is
+  **session-scoped**, and the only durable option the gate has ever offered
+  is web's `OPTION_ID_ENABLE_PERMANENT`, which writes `[web]` config and is
+  not offered under this key. Nothing about project-skill trust survives a
+  restart in v1; durable trust of any form (a persisted per-repo trust file,
+  Claude Code's shape, or a config-writing gate option) is wholly Deferred.
 - [ ] OQ-4: **Should a skill expansion be compaction-pinned** (never
   condensed by `compact` while the turn runs)? It would protect `/proceed`'s
   body across seven gates but would also let one skill hold the window
@@ -773,22 +907,35 @@ the CLI renders each as one line (BR-9).
   on the listing call; revisit with dogfood if the model fails to find a
   skill a user asks for by topic.
 - [ ] OQ-6: **Expose the tool on the local tier at all**, given its budget
-  refuses seven of the seventeen ADLC skills? *Lean:* yes — ten fit, the
+  refuses seven of the seventeen ADLC skills? The constraint is the
+  **budget** (`bound: local_engine`), not a tool cap — the local record
+  defaults to `Native` and runs uncapped (see Assumptions). *Lean:* yes —
+  ten fit, the
   refusals are typed and name the bound, and hiding it would be the
   silent-withholding LESSON-496 forbids.
-- [ ] OQ-7: **The per-turn cap's value.** Eight covers `/proceed`'s seven
-  gate invocations plus one recovery; `/sprint` over N REQs would exceed it
-  in one turn — but `/sprint` needs subagents anyway. *Lean:* 8, pinned with a
-  test that counts `/proceed`'s named gates; `/architect` decides.
+- [ ] OQ-7: **The per-turn cap's value.** Re-derived in BR-6: `/proceed`
+  names five skill invocations (`/manifest`, `/validate`, `/architect`,
+  `/validate`, `/wrapup` — `/reflect` and `/review` are agent dispatches,
+  and `/review` is never re-run), and its fix loops allow up to three
+  re-validations at each of Phases 1 and 3 plus a `/manifest` re-run: nine
+  to ten worst case in one prompt, so eight would make automation beg for
+  "continue" prompts at exactly the wrong moment. `/sprint` over N REQs
+  would exceed any cap — but `/sprint` needs subagents anyway. *Lean:* 12,
+  pinned with a test that counts the gate invocations of an **in-repo
+  `/proceed` fixture** (never a test-time read of `~/.claude`); `/architect`
+  decides.
 - [ ] OQ-8: **Should a turn that invoked a skill get a longer loop** (more
   than `max_turns` 25 on `Native`)? `/proceed` will not finish in one prompt
   either way. *Lean:* no — out of scope; the carry and a "continue" prompt
   are the mechanism; record how far one prompt gets in the AC-15 runbook and
   spec a loop budget separately if automation needs it.
-- [ ] OQ-9: **Remembered dynamic-context grants and model-chosen
-  arguments** (BR-5): per-invocation ask when any command interpolates
-  arguments, or a key that includes the substituted command text? *Lean:* the
-  former — simpler, and no shipped skill needs the latter.
+- [x] OQ-9: **Remembered dynamic-context grants and model-chosen
+  arguments** (BR-5). *Resolved into BR-5:* the grant key includes a digest
+  of the substituted command set whenever any command interpolates
+  `$ARGUMENTS`/`$N`, on **both** callers — user `/name` and model `skill` —
+  so one rule governs remembering with no per-caller special case; a skill
+  with no interpolating command keys per skill, as REQ-585 BR-6 does. New
+  remembering machinery, recorded in Assumptions as a REQ-585 amendment.
 
 ## Out of Scope
 
@@ -818,9 +965,66 @@ the CLI renders each as one line (BR-9).
   skill's own directory, one level, bounded) or an equivalent — `/proceed`
   names three; this REQ records the refusal rather than widening the jail.
 - Compaction-pinned expansions (OQ-4); a longer loop for skill-driven turns
-  (OQ-8); a persisted per-repo trust file (OQ-3).
+  (OQ-8); **durable project-skill trust in any form** — a persisted per-repo
+  trust file (Claude Code's shape) or a config-writing gate option like
+  web's `OPTION_ID_ENABLE_PERMANENT` (OQ-3, resolved to session-only in v1).
 - `docs/manual-verification.md` REQ-587 runbook — AC-15 needs a release and
   the ADLC toolkit on the user's machine.
+
+## Validation
+
+`/validate` ran 2026-08-19 on the first draft: 0 Blockers, 10 Warnings, 6
+Info (NEEDS REVISION); all sixteen findings are applied in this revision.
+Shadowing is named end-to-end — the acknowledgment prompt, the BR-4 frame's
+source line, the BR-9 echo, `/verbose` and AC-6's new case all read
+`validate (project — shadows your user skill)` — and the decision is stated
+as a BR-4 clause: a project skill that shadows a user skill asks even at
+`full` (W-1); non-expansion `skill` results (the `listed` roster,
+`unknown_skill`, every typed refusal) are framed as untrusted data in the
+`teton_docs` posture, only the expansion carrying the instructions frame —
+BR-1/BR-4/AC-2 (W-2); AC-4's `Some(0)` claim corrected — cap-exempt tools
+are exposed regardless of `max_tools`, `skill` follows the exempt set's
+exposure, and the Entities row's `max_tools ≠ Some(0)` condition is gone
+(W-3); one remembering rule — the grant key gains a substituted-command-set
+digest whenever a command interpolates `$ARGUMENTS`/`$N`, on both callers —
+BR-5/AC-5 aligned, OQ-9 resolved to it, the new machinery recorded in
+Assumptions as a REQ-585 amendment (W-4); the cap re-derived from
+`/proceed`'s five named skill invocations plus re-validation loops (worst
+case nine to ten), set to 12, `max_turns` named the effective bound, the
+count resetting per prompt, and the OQ-7 pin now counts an in-repo fixture
+— BR-6/Entities/AC-7/OQ-7 (W-5); the local tier's profile corrected — a
+routed turn is `Native` (25 iterations, no cap) unless its record declares
+`tool_call_tier = "degraded"`, only `degraded_harness_config()` after a
+failure forces the reduced shape, and OQ-6/AC-15(e) stand on the budget —
+Description/BR-2/Assumptions (W-6); no cross-session "always" — the gate
+offers once / for-this-session / reject and its one durable option is
+web's `OPTION_ID_ENABLE_PERMANENT`, so BR-4, OQ-3 (resolved) and the
+SessionSkillTrust row say session-only and durable trust moved wholly to
+Deferred (W-7); AC-8 names the default-budget route for the digest-bypass
+assertion — the 1,500-word threshold where the fold would bite — keeping
+the 128k route for the expands-whole case (W-8); REQ-584 (spec PR #185)
+named in External Dependencies — who moves `REDACT_BODY_OVERHEAD_BYTES`,
+whose test enumerates the exempt set, and when the cap stops meaning
+anything (W-9); chain bookkeeping stated — refusals and listings count
+toward `per_turn_cap`, only expansions seed the repeat rule — BR-6/AC-7
+(W-10); BR-8's illustrative sentence keeps the pinning anchors (`.claude/`,
+`~/.claude`, the CLAUDE.md/agents/hooks negative space, "only the user
+runs" as "only the user runs the built-in ones") and the headroom is
+re-counted with the sentence and the tool doc together, ≈ 0.84 KB today
+(I-11); AC-15(d) drops the nonexistent `--permissions` flag for REQ-560's
+`/permissions` session command, with REQ-585 AC-20(e) noted as needing the
+same fix (I-12); `for_strong_model`'s 40 marked test-only, production
+`max_turns` 25 / 5 / 1 or the default 12 — BR-6(c)/Assumptions (I-13); the
+REQ-585 pins this REQ amends are named in Assumptions — AC-15's roster
+claim re-scoped to the guide, BR-10's classifier gaining the model-only
+hint case (I-14); BR-9 prices the expansion on every subsequent model call
+of the turn (the carry), worst case ≈ 11k tokens × up to 25 iterations
+(I-15); and `skill {}` is a typed `listed` outcome rather than
+`unknown_skill`, the acknowledgment's list is bounded at 20 names then
+`+N more` (LESSON-517), project skills stay present-but-refused in the
+roster at `plan`, AC-8 uses a synthetic 7,222-word fixture in place of the
+third-party file, and AC-15(a) states the several "continue" prompts a
+25-iteration loop needs (I-16).
 
 ## Retrieved Context
 
