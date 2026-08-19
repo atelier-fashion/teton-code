@@ -167,13 +167,16 @@ _Leg B — the surfaces_
   clause (it is already somewhere). This is data, not a directive (LESSON-532,
   ASSUME-008): the model learns *that these projects exist* with no tool
   call; the tool is for paths and queries.
-- [ ] BR-8: **`/cd` accepts a project name.** An argument that is not a path
-  spelling (contains no `/`, does not start with `~`, `.` or `-`) is first
-  resolved against the registry: a unique name match moves there (`/cd
-  teton-code`); an ambiguous one prints the candidates with their display
-  paths and moves nowhere; no match falls through to REQ-583's path grammar
-  (so a plain subdirectory named like a project still works) and, when that
-  also finds nothing, the refusal names both readings. `--cwd` keeps path
+- [ ] BR-8: **`/cd` accepts a project name — after the shell's own reading.**
+  An argument that is not a path spelling (contains no `/`, does not start
+  with `~`, `.` or `-`) is tried first exactly as REQ-583 reads it — a
+  directory of that name under the current root wins, so `/cd src` still
+  means `./src` and REQ-583's behaviour is unchanged wherever it applied.
+  Only when no such directory exists is the argument resolved against the
+  registry: a unique name match moves there (`/cd teton-code`); an ambiguous
+  one prints the candidates with their display paths and moves nowhere; no
+  match at all → the refusal names both readings ("no directory `x` under
+  the session root, and no known project named `x`"). `--cwd` keeps path
   semantics only (OQ-3).
 - [ ] BR-9: **`/projects` lists them.** Bare `/projects` renders the LocatorView
   (registry first, then the scan on demand, with the budget-stop line when
@@ -204,7 +207,8 @@ _Leg A_
 - [ ] AC-2: An entry whose directory is removed, or whose marker is removed, is
   absent from the next `projects` result and from the next registry write; a
   registry over the cap drops the oldest `last_seen` entry.
-- [ ] AC-3: The scan, with a test-injected DevFolder table pointing at a
+- [ ] AC-3: The conventional DevFolder table is enumerated by name in a test
+  (BR-4). The scan, with a test-injected DevFolder table pointing at a
   fixture, finds projects at depth 1 and 2 and not at depth 3; does not enter
   `Library/`, `node_modules/`, a `.photoslibrary`, or a symlinked directory
   planted in the fixture; records finds as `scanned`; stops at an injected
@@ -236,13 +240,15 @@ _Leg B_
   sweeps pass with constants unchanged and their worst prompt is still the
   project row; a `project` root carries no clause; an empty registry carries
   no clause; a name with a newline/bidi char renders neutralised.
-- [ ] AC-9: `/cd teton-code` with one registry match moves the session (the
-  REQ-583 `context cleared; …` + `session root is now …` lines follow);
-  `/cd api` with two matches prints both candidates with display paths and
-  moves nowhere; `/cd nothing-known` falls through to the path grammar and,
-  absent such a directory, the refusal names both readings; `/cd ~/x`,
-  `/cd ./x`, `/cd /abs` keep REQ-583's behaviour byte-for-byte (the grammar
-  table is re-run).
+- [ ] AC-9: `/cd teton-code` with no such subdirectory and one registry
+  match moves the session (the REQ-583 `context cleared; …` + `session root
+  is now …` lines follow); `/cd src` when `./src` exists under the root moves
+  to `./src` even if a known project is also named `src` (REQ-583's reading
+  wins); `/cd api` with no such subdirectory and two registry matches prints
+  both candidates with display paths and moves nowhere; `/cd nothing-known`
+  with neither yields the two-reading refusal; `/cd ~/x`, `/cd ./x`,
+  `/cd /abs` keep REQ-583's behaviour byte-for-byte (its grammar table is
+  re-run).
 - [ ] AC-10: `/projects` renders the same facts the tool returns (a test diffs
   the content through one renderer); `/projects teton` filters; the scan's
   budget-stop line appears when the injected budget is hit; nothing is
