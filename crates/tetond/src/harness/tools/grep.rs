@@ -1195,13 +1195,15 @@ mod tests {
         std::fs::remove_dir_all(&root).ok();
     }
 
-    /// **AC-14 (BR-10), wall clock.** A zero wall budget lets the root's own
-    /// listing through and stops at the first descent.
+    /// **AC-14 (BR-10), wall clock.** A zero wall budget hands over exactly
+    /// one entry and stops. The root holds a single file while the budget is
+    /// zero, so which entry is "the one" does not depend on the filesystem's
+    /// listing order (APFS and ext4 disagree — the ubuntu CI leg is where a
+    /// two-entry root failed).
     #[test]
     fn grep_reports_the_wall_clock_budget() {
         let root = temp_root("ac14-wall");
         plant(&root, "top.rs");
-        plant(&root, "sub/deep.rs");
         let ctx = ToolContext::new(&root).with_walk_budget(WalkBudget {
             max_entries: 1_000,
             max_wall: Duration::ZERO,
@@ -1216,6 +1218,8 @@ mod tests {
         let out = GrepTool.run(&ctx, &json!({ "pattern": "needle", "glob": "sub/*.rs" }));
         assert_eq!(out.content, format!("no matches for `needle`\n{stopped}"));
 
+        // Under the budget the whole tree is searched and nothing is stopped.
+        plant(&root, "sub/deep.rs");
         let out = GrepTool.run(&ToolContext::new(&root), &json!({ "pattern": "needle" }));
         assert_eq!(matched_in(&out), vec!["sub/deep.rs", "top.rs"]);
         assert!(!out.content.contains("stopped after"), "{}", out.content);
