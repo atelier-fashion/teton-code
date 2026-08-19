@@ -15,7 +15,7 @@ use std::ops::ControlFlow;
 use serde_json::{json, Value};
 use teton_core::ProvenanceId;
 
-use super::walk::{self, HARNESS_LINE_PREFIX};
+use super::walk;
 use super::{str_arg, Tool, ToolContext, ToolOutcome};
 
 /// Cap on returned paths.
@@ -109,7 +109,8 @@ impl Tool for GlobTool {
             .join("\n");
         walk::append_trailer(&mut out, &trailer);
         if truncated {
-            walk::append_trailer(&mut out, [cap_notice()]);
+            // The cap notice is `walk`'s, like every harness line (ADR-3).
+            walk::append_trailer(&mut out, [walk::cap_notice(MAX_RESULTS, "results")]);
         }
         // REQ-544 C-1: the enumerated entries ARE the result's content, so tag
         // the outcome with them — a glob that surfaces a `local-only` file blocks
@@ -120,13 +121,6 @@ impl Tool for GlobTool {
         // `secrets/`, not the name `secrets`.
         ToolOutcome::ok(out).with_paths(matches.into_iter().map(|(id, _)| id))
     }
-}
-
-/// The line [`Tool::run`] appends when more than [`MAX_RESULTS`] entries
-/// matched. It wears [`HARNESS_LINE_PREFIX`] like every harness line, and
-/// [`walk::is_harness_line`] knows its `capped at` shape.
-fn cap_notice() -> String {
-    format!("{HARNESS_LINE_PREFIX}capped at {MAX_RESULTS} results)")
 }
 
 /// Whether the pattern's final segment is `**` — the shape that means "every
@@ -174,10 +168,15 @@ mod tests {
     use crate::fixture_id;
     use crate::harness::context::ToolProvenance;
     use crate::harness::tools::walk::{
-        running_as_root, WalkBudget, HOME_TOP_LEVEL_SKIPS, MACOS_CONSENT_CLAUSE, STOPPED_ADVICE,
-        WALK_SKIP_DIRS,
+        running_as_root, WalkBudget, HARNESS_LINE_PREFIX, HOME_TOP_LEVEL_SKIPS,
+        MACOS_CONSENT_CLAUSE, STOPPED_ADVICE, WALK_SKIP_DIRS,
     };
     use std::path::{Path, PathBuf};
+
+    /// The notice this tool appends at its cap, as `walk` writes it.
+    fn glob_cap_notice() -> String {
+        walk::cap_notice(MAX_RESULTS, "results")
+    }
     use std::time::Duration;
     use teton_protocol::methods::RootKind;
 
@@ -422,8 +421,9 @@ mod tests {
             "{}",
             lines[MAX_RESULTS]
         );
-        assert_eq!(lines[MAX_RESULTS + 1], cap_notice());
-        assert!(walk::is_harness_line(&cap_notice()));
+        assert_eq!(lines[MAX_RESULTS + 1], glob_cap_notice());
+        assert_eq!(glob_cap_notice(), "... (capped at 200 results)");
+        assert!(walk::is_harness_line(&glob_cap_notice()));
         std::fs::remove_dir_all(&root).ok();
     }
 

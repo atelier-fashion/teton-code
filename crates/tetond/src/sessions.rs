@@ -28,6 +28,7 @@ use std::fmt;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
+use teton_core::session_root::CwdRefusal;
 use teton_protocol::methods::SessionSummary;
 use teton_protocol::{Phase, SessionId, SessionMode, TurnId};
 
@@ -303,33 +304,6 @@ pub fn within_minted_length(session_id: &SessionId) -> bool {
     session_id.0.len() <= SESSION_ID_PREFIX.len() + SESSION_ID_BODY_LEN
 }
 
-/// Why a path may not be a session's root — the refusal behind
-/// [`validate_session_cwd`], typed so the two RPC edges and the CLI print one
-/// sentence each without retyping it.
-///
-/// The wording is root-neutral on purpose: it says *path*, never "cwd" (wire
-/// jargon a user of `--cwd` or `/cd` never typed) and never "session root"
-/// (the thing this path failed to become).
-#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
-pub enum CwdRefusal {
-    /// Not absolute after the client's own resolution.
-    #[error("path `{0}` must be an absolute path")]
-    NotAbsolute(PathBuf),
-    /// Missing, or present but not a directory.
-    #[error("path `{0}` does not exist or is not a directory")]
-    NotADirectory(PathBuf),
-}
-
-impl CwdRefusal {
-    /// The path the refusal names.
-    #[must_use]
-    pub fn path(&self) -> &Path {
-        match self {
-            Self::NotAbsolute(path) | Self::NotADirectory(path) => path,
-        }
-    }
-}
-
 /// Whether `cwd` may be a session's root — the **one** validator behind
 /// `session/create`'s `cwd` and `session/set_cwd` (REQ-583 BR-6/BR-7, ADR-4).
 ///
@@ -344,7 +318,10 @@ impl CwdRefusal {
 /// before any session output, and "must be an absolute path" without the path
 /// sends the user back to guess which of their spellings the daemon saw. The
 /// path is the caller's own argument echoed back to that caller alone, never
-/// published.
+/// published. The sentence itself is [`CwdRefusal`]'s, a pure type in
+/// `teton-core` so the CLI's fail-fast for a `--cwd` that names no directory
+/// constructs the same value instead of retyping it; the I/O that reaches the
+/// verdict lives here alone.
 ///
 /// It lives here — with the registry that stores the path — rather than in the
 /// server or the runtime because both of them call it: the server validates a
@@ -1004,10 +981,6 @@ mod tests {
             missing.to_string(),
             "path `/nope-teton-sessions-test` does not exist or is not a directory"
         );
-        assert_eq!(
-            missing.path(),
-            std::path::Path::new("/nope-teton-sessions-test")
-        );
 
         // A file, not a directory: same refusal, same shape.
         let dir = std::env::temp_dir().join(format!(
@@ -1029,8 +1002,19 @@ mod tests {
                 file.display()
             )
         );
-        for refusal in [&relative, &missing, &not_dir] {
-            let text = refusal.to_string();
+        for (refusal, named) in [
+            (&relative, "relative/dir".to_owned()),
+            (&missing, "/nope-teton-sessions-test".to_owned()),
+            (&not_dir, file.display().to_string()),
+        ] {
+            // The path is the caller's own and may spell anything (a temp dir
+            // under a `cwd`-named parent, say), so it is stripped before the
+            // sentence itself is judged root-neutral.
+            let text = refusal.to_string().replace(&named, "<path>");
+            assert!(
+                text.contains("`<path>`"),
+                "the refusal must name the path: {text}"
+            );
             assert!(
                 !text.contains("cwd"),
                 "wire jargon in a user-facing refusal: {text}"

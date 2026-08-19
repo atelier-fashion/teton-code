@@ -6,8 +6,9 @@
 //! its kind is said in the user's words ([`kind_phrase`]), how a
 //! user-controlled value from it is bounded before it lands in a prompt or a
 //! refusal ([`bounded_field`], [`bounded_field_bytes`]), which names make a
-//! directory a project ([`PROJECT_MARKERS`]), and how a `--cwd`/`/cd` argument
-//! becomes a path ([`resolve_cwd_argument`]).
+//! directory a project ([`PROJECT_MARKERS`]), how a `--cwd`/`/cd` argument
+//! becomes a path ([`resolve_cwd_argument`]), and what the daemon says when
+//! that path may not be a root ([`CwdRefusal`] — the sentence, not the check).
 //!
 //! Everything here is pure: no filesystem, no environment. The daemon's
 //! `tetond::session_root::probe` supplies the I/O (does a marker exist, what
@@ -77,28 +78,51 @@ pub const fn byte_ceiling(max_chars: usize) -> usize {
 /// Whether `c` is a character that renders as nothing or re-orders what is
 /// around it — the format and line characters a control-character check does
 /// not catch, and the ones a path or a branch name could use to hide a frame
-/// label or make a refusal read backwards.
+/// label or make a refusal read backwards. [`neutralized`] replaces each one
+/// with `?`.
 ///
-/// There is no Unicode-tables crate in this workspace, so the set is a
-/// hand-kept range match: the zero-width and joiner marks (U+200B–U+200F,
-/// U+2060–U+2064), the bidi embedding, override and isolate controls
-/// (U+202A–U+202E, U+2066–U+2069), the byte-order mark (U+FEFF), the line and
-/// paragraph separators (U+2028, U+2029), the Arabic letter mark (U+061C) and
-/// the Mongolian vowel separator (U+180E). Not an exhaustive `Cf` table — the
-/// remaining format characters do not hide text or reverse it — and kept
-/// private so the one list is [`bounded_field`]'s.
+/// **Best-effort, not exhaustive.** There is no Unicode-tables crate in this
+/// workspace, so the set is a hand-kept range match over the characters that
+/// hide or re-order text: the zero-width and joiner marks (U+200B–U+200F), the
+/// word joiner and invisible operators (U+2060–U+2064), the deprecated format
+/// controls (U+206A–U+206F), the bidi embedding, override and isolate
+/// controls (U+202A–U+202E, U+2066–U+2069), the byte-order mark (U+FEFF), the
+/// interlinear annotation marks (U+FFF9–U+FFFB), the line and paragraph
+/// separators (U+2028, U+2029), the soft hyphen (U+00AD), the combining
+/// grapheme joiner (U+034F), the Arabic letter mark (U+061C), the Mongolian
+/// vowel separator (U+180E), the Tags block (U+E0000–U+E007F, invisible
+/// modifier characters) and the blank Hangul fillers (U+115F, U+1160, U+3164,
+/// U+FFA0 — render as a blank the width of a letter). Not a `Cf` table: the
+/// remaining format characters do not hide text or reverse it.
+///
+/// **Two trade-offs, made on purpose.** The zero-width non-joiner and joiner
+/// (U+200C, U+200D) are legitimate in Persian and Indic text and inside emoji
+/// sequences, and they are neutralised anyway: in a path or a branch name read
+/// back to a person they are far likelier to be hiding two spellings of one
+/// name than joining a ligature, and a `?` in a refusal costs nothing. The
+/// variation selectors (U+FE00–U+FE0F, U+E0100–U+E01EF) are **left alone**:
+/// they break legitimate emoji (`❤️` is U+2764 U+FE0F) and neither hide text
+/// nor re-order it. Kept private so the one list is [`bounded_field`]'s.
 const fn is_hidden_or_bidi(c: char) -> bool {
     matches!(
         c,
-        '\u{200B}'..='\u{200F}'
-            | '\u{202A}'..='\u{202E}'
-            | '\u{2060}'..='\u{2064}'
-            | '\u{2066}'..='\u{2069}'
-            | '\u{FEFF}'
+        '\u{00AD}'
+            | '\u{034F}'
+            | '\u{061C}'
+            | '\u{115F}'
+            | '\u{1160}'
+            | '\u{180E}'
+            | '\u{200B}'..='\u{200F}'
             | '\u{2028}'
             | '\u{2029}'
-            | '\u{061C}'
-            | '\u{180E}'
+            | '\u{202A}'..='\u{202E}'
+            | '\u{2060}'..='\u{2064}'
+            | '\u{2066}'..='\u{206F}'
+            | '\u{3164}'
+            | '\u{FEFF}'
+            | '\u{FFA0}'
+            | '\u{FFF9}'..='\u{FFFB}'
+            | '\u{E0000}'..='\u{E007F}'
     )
 }
 
@@ -280,11 +304,33 @@ pub fn middle_elide(s: &str, max_chars: usize) -> String {
     out
 }
 
+/// Why a resolved path may not be a session's root (BR-6/BR-7, ADR-4) — the
+/// refusal the daemon's one validator (`tetond::sessions::validate_session_cwd`,
+/// behind `session/create` and `session/set_cwd`) answers with, typed here so
+/// the CLI's own fail-fast for a `--cwd` that names no directory renders the
+/// **same** sentence by constructing the same value rather than retyping it.
+///
+/// Pure: the type carries the verdict and its wording; the I/O that reaches a
+/// verdict (`is_absolute`, `is_dir`) stays in the daemon. Its `Display` is the
+/// wire message and the user-facing line, root-neutral on purpose: it says
+/// *path*, never "cwd" (wire jargon a user of `--cwd` or `/cd` never typed) and
+/// never "session root" (the thing this path failed to become).
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum CwdRefusal {
+    /// Not absolute after the client's own resolution.
+    #[error("path `{0}` must be an absolute path")]
+    NotAbsolute(PathBuf),
+    /// Missing, or present but not a directory.
+    #[error("path `{0}` does not exist or is not a directory")]
+    NotADirectory(PathBuf),
+}
+
 /// Why a `--cwd`/`/cd` argument could not become a path (BR-6/BR-7).
 ///
 /// Each message names the argument, so the refusal a user reads says which
 /// spelling was refused and why. Existence and directory-ness are **not** judged
-/// here — the daemon validates the resolved path (one validator, ADR-4).
+/// here — the daemon validates the resolved path (one validator, ADR-4) and
+/// answers with a [`CwdRefusal`].
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum CwdArgError {
     /// The argument was empty (or only whitespace).
@@ -622,10 +668,53 @@ mod tests {
         // Every character in the named set, one at a time, between two
         // letters: each is `?`, nothing else moves.
         let hidden = [
-            '\u{200B}', '\u{200C}', '\u{200D}', '\u{200E}', '\u{200F}', '\u{202A}', '\u{202B}',
-            '\u{202C}', '\u{202D}', '\u{202E}', '\u{2060}', '\u{2061}', '\u{2062}', '\u{2063}',
-            '\u{2064}', '\u{2066}', '\u{2067}', '\u{2068}', '\u{2069}', '\u{FEFF}', '\u{2028}',
-            '\u{2029}', '\u{061C}', '\u{180E}',
+            '\u{200B}',
+            '\u{200C}',
+            '\u{200D}',
+            '\u{200E}',
+            '\u{200F}',
+            '\u{202A}',
+            '\u{202B}',
+            '\u{202C}',
+            '\u{202D}',
+            '\u{202E}',
+            '\u{2060}',
+            '\u{2061}',
+            '\u{2062}',
+            '\u{2063}',
+            '\u{2064}',
+            '\u{2066}',
+            '\u{2067}',
+            '\u{2068}',
+            '\u{2069}',
+            '\u{FEFF}',
+            '\u{2028}',
+            '\u{2029}',
+            '\u{061C}',
+            '\u{180E}',
+            // The verify-pass additions: soft hyphen, combining grapheme
+            // joiner, the deprecated format controls, the interlinear
+            // annotation marks, the Tags block's ends and a middle, and the
+            // blank Hangul fillers.
+            '\u{00AD}',
+            '\u{034F}',
+            '\u{206A}',
+            '\u{206B}',
+            '\u{206C}',
+            '\u{206D}',
+            '\u{206E}',
+            '\u{206F}',
+            '\u{FFF9}',
+            '\u{FFFA}',
+            '\u{FFFB}',
+            '\u{E0000}',
+            '\u{E0001}',
+            '\u{E0020}',
+            '\u{E007F}',
+            '\u{115F}',
+            '\u{1160}',
+            '\u{3164}',
+            '\u{FFA0}',
         ];
         for c in hidden {
             assert!(
@@ -643,6 +732,38 @@ mod tests {
             bounded_field("~/文档/项目", DISPLAY_MAX_CHARS),
             "~/文档/项目"
         );
+        // The variation selectors are deliberately left alone: they are what
+        // makes an emoji presentation (`❤️` is U+2764 U+FE0F), and they neither
+        // hide text nor re-order it — see `is_hidden_or_bidi`.
+        for emoji in ["\u{2764}\u{FE0F}", "a\u{FE0E}b", "\u{1F600}\u{E0100}"] {
+            assert_eq!(bounded_field(emoji, 80), emoji, "{emoji:?}");
+            assert_eq!(bounded_field_bytes(emoji, 80), emoji, "{emoji:?}");
+        }
+    }
+
+    /// The daemon's refusal sentences, typed here so the CLI's fail-fast and
+    /// the daemon's validator render one value: each names the path and says
+    /// *path* — never "cwd", never "session root".
+    #[test]
+    fn a_cwd_refusal_names_the_path_in_one_root_neutral_sentence_per_arm() {
+        let not_absolute = CwdRefusal::NotAbsolute(PathBuf::from("relative/dir"));
+        assert_eq!(
+            not_absolute.to_string(),
+            "path `relative/dir` must be an absolute path"
+        );
+        let not_a_dir = CwdRefusal::NotADirectory(PathBuf::from("/nope"));
+        assert_eq!(
+            not_a_dir.to_string(),
+            "path `/nope` does not exist or is not a directory"
+        );
+        for refusal in [&not_absolute, &not_a_dir] {
+            let text = refusal.to_string();
+            assert!(
+                !text.contains("cwd"),
+                "wire jargon in a user-facing refusal: {text}"
+            );
+            assert!(!text.contains("session root"), "{text}");
+        }
     }
 
     #[test]

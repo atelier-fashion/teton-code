@@ -1099,6 +1099,20 @@ mod tests {
             let (raw, refined) = run_and_refine(&root, &args, &route).await;
 
             assert!(raw.is_error, "{label}: the fixture must be a failure");
+            if label == "session root does not exist" {
+                // The missing-root arm is the context's one refusal, verbatim
+                // — the sentence `resolve`, `glob` and `grep` print too.
+                assert_eq!(
+                    raw.content,
+                    ToolContext::new(&root).root_missing_error().to_string(),
+                    "{label}"
+                );
+                assert!(
+                    raw.content.contains("does not exist"),
+                    "{label}: {}",
+                    raw.content
+                );
+            }
             assert_eq!(
                 raw.measured, None,
                 "{label}: nothing spawned, so nothing was measured"
@@ -1163,6 +1177,20 @@ mod tests {
             let (raw, refined) = run_and_refine(&root, &args, &route).await;
 
             assert!(raw.is_error, "{label}: the fixture must be a failure");
+            if label == "session root does not exist" {
+                // The missing-root arm is the context's one refusal, verbatim
+                // — the sentence `resolve`, `glob` and `grep` print too.
+                assert_eq!(
+                    raw.content,
+                    ToolContext::new(&root).root_missing_error().to_string(),
+                    "{label}"
+                );
+                assert!(
+                    raw.content.contains("does not exist"),
+                    "{label}: {}",
+                    raw.content
+                );
+            }
             assert!(
                 raw.measured.is_some(),
                 "{label}: a command that reached a shell always measures"

@@ -44,9 +44,9 @@ marker table) lives in `teton-core::session_root`; the I/O half (marker probe,
 `run_prompt_turn` already builds a fresh `ToolContext` per turn from
 `session_cwd` (`runtime.rs:2838-2842`, BUG-147) and injects the per-turn
 `web_capability` fact into `route.harness` right beside it (`:2849-2852`). The
-root joins that seam: `let root = session_root::probe(cwd_or_fallback, home)`,
-then `ToolContext::for_root(root.clone())` and
-`route.harness.session_root = Some(root)`. The probe is a handful of `exists()`
+root joins that seam: `let probed = ProbedRoot::probe(cwd_or_fallback, home)`,
+then `ToolContext::for_root(&probed)` and
+`route.harness.session_root = Some(probed.view)`. The probe is a handful of `exists()`
 calls plus one small file read; a per-turn cost invisible next to a model call,
 and it keeps the branch honest after a checkout between turns.
 
@@ -138,6 +138,21 @@ bytes each), so the sweep measures the docs actually in the tree — the floor
 stays 48 (AC-4) and no allowance is guessed (LESSON-491); the integration task
 re-records the final figure at the merged tip.
 
+**Verify-pass corrections.** The block's three values are bounded by
+`teton_core::session_root::bounded_field_bytes` — the character bound *and* a
+byte bound at `byte_ceiling(max_chars)`, the ASCII cost of the character
+ceiling — because the resident prompt is paid for in bytes and an
+all-multibyte path would otherwise render past the row the sweeps measure.
+`bounded_field` (characters only, plus control-character and hidden/bidi
+neutralisation) is what the probe and every person-facing line use. The
+**model** therefore reads one byte-bounded spelling in two places — the
+environment block and every jail refusal (`ToolContext::for_root` applies the
+same byte bound to the display it carries) — while the **person** reads the
+character-bounded one (the CLI banner, the launch notice, `/cd`, the
+`session_root_changed` line): an 80-character CJK path shows a person all 80
+characters and shows the model the bytes the ceiling was measured for. The
+kind's words are one function, `kind_phrase`, for both readers.
+
 **Rejected**: moving `REDACT_BODY_OVERHEAD_BYTES` to 10 KiB (the arithmetic
 still yields 4 chunks, but the constant's note forbids it and AC-4 pins "the
 same ceiling and headroom"); dropping the platform (BR-1 requires it, and it is
@@ -202,6 +217,28 @@ kind `home`/`filesystem_root` **and** `cfg!(target_os = "macos")` it appends
 one sentence to the existing message; `measuring(0)` and provenance are
 unchanged, so `shell_duty` and the timeout tests survive.
 
+**Verify-pass corrections.** The skip set is `Prune::Always` — never entered
+from any root kind, and **never nameable**: `target/**/*.d` does not open
+`target/`; only the BR-12 sets are `Prune::UnlessNamed`. `is_harness_line`
+recognises harness lines by **exact known shape** after the `... (` prefix
+(`stopped after `, `<n> folder(s) could not be read`, `capped at `) and not by
+the prefix alone, so a match from a file whose path begins `... (` is a match;
+every writer lives in `walk.rs` (`trailer_lines`, `cap_notice` — both tools
+call it) and authoring a new harness line is a **two-sided change**: the
+writer and the recogniser, in the same commit, with a test that enumerates
+every writer against the recogniser. `visit`'s callback returns `ControlFlow`
+and can end the walk (grep at its match cap — the tool's stop, not a budget
+stop, so no stopped line); within a directory every entry is handed over in
+listing order and descents happen afterwards in name order (`children.sort()`,
+pinned). The wall clock is read after **every** entry (tens of nanoseconds; the
+callback it follows may have read megabytes) and again before each descent.
+`grep` skips non-regular files off the entry's own type (a FIFO is never
+opened), reads each file through the crate's one bounded reader
+(`fs_util::read_regular_file_bounded`, 8 MiB per file), and cuts each reported
+match line to 4 KiB at a character boundary — a single-line 8 MiB file is one
+small hit, not an 8 MiB one. `read` and `edit` refuse anything that is not a
+regular file (``path `{raw}` is not a regular file``) before opening it.
+
 **Rejected**: putting the budget on `GlobTool`/`GrepTool` (fifteen unit-struct
 call sites); pruning media names at any depth (hides `~/Documents/GitHub/app/Library`
 — the spec's own counter-example, AC-16); a `.gitignore`-aware walk (a
@@ -265,6 +302,24 @@ create prints the daemon's path-naming refusal and exits **non-zero** — today'
 and `/cd` share `teton_core::session_root::resolve_cwd_argument(raw, shell_cwd,
 home)`, so one grammar table drives both tests (AC-12).
 
+**Verify-pass corrections.** The structural scan is
+`no_tool_can_move_a_sessions_root_and_no_harness_source_names_it`
+(`tools/mod.rs`): no production source under `harness/` names
+`set_session_cwd`, `SessionSetCwdParams`, `session/set_cwd`, `SessionRegistry`
+or `.set_cwd(`, and no registered tool is named for it. The validator is the
+typed `CwdRefusal { NotAbsolute, NotADirectory }` — the **type** (a pure
+`thiserror` Display) lives in `teton_core::session_root` beside `CwdArgError`;
+the I/O (`validate_session_cwd`: `is_absolute`, `is_dir`) stays in
+`tetond::sessions`. The CLI **fails fast** on a `--cwd` that names no
+directory: the two paths that open a session (`run_session`, `provider test`)
+render `CwdRefusal::NotADirectory(path)` behind the one
+`could not start a session: ` prefix and exit 1 before the banner and before
+anything connects, so `teton --cwd /typo` never autostarts a daemon; `teton
+--cwd /nope doctor` opens no session and is not refused. The daemon remains the
+authority — its validator answers the same sentence for a path that passes the
+CLI but not the daemon — and the CLI half is pinned on its own by a cli_e2e
+run with no reachable daemon.
+
 **Rejected**: a `session_root_changed` event *instead of* `context_cleared`
 (BR-7 says the existing shape; and every attached client already renders it);
 carrying the conversation with re-minted ids (unsafe in general — OQ-2).
@@ -289,11 +344,12 @@ re-announce after `/cd` reuses the same function from the event arm.
 |---|---|
 | `teton-protocol::methods` | `SessionRoot { display, kind: RootKind, project_name: Option<String>, vcs_branch: Option<String> }`, `RootKind { Project, Home, FilesystemRoot, Plain }` (serde `snake_case`); `SessionCreateResult.root: Option<SessionRoot>` (`default`, `skip_serializing_if`); `SessionSetCwdParams { session_id, cwd: PathBuf }` / `SessionSetCwdResult { root: SessionRoot, blocks_dropped: u64 }`, `METHOD = "session/set_cwd"`. |
 | `teton-protocol::events` | `Event::SessionRootChanged(SessionRootChanged { previous_display: String, root: SessionRoot })`, wire name `session_root_changed`, no `session_id` field (flatten rule). |
-| `teton-core::session_root` (new) | `PROJECT_MARKERS: &[&str]` (`.git`, `.hg`, `.svn`, `Cargo.toml`, `package.json`, `pyproject.toml`, `go.mod`, `pom.xml`, `build.gradle`, `Gemfile`, `mix.exs`, `.adlc`), `classify(path, home, has_marker) -> RootKind`, `display_for(path, home) -> String`, `bounded_field(s, max) -> String`, `middle_elide`, `resolve_cwd_argument(raw, shell_cwd, home) -> Result<PathBuf, CwdArgError>`. Pure, no I/O. |
-| `tetond::session_root` (new) | `probe(path, home) -> SessionRoot`: marker probe (`.git` as **file or dir** — this repo's worktrees have a `gitdir:` file), branch from `.git/HEAD` following a `gitdir:` pointer, `None` on detached/unreadable. |
+| `teton-core::session_root` (new) | `PROJECT_MARKERS: &[&str]` (`.git`, `.hg`, `.svn`, `Cargo.toml`, `package.json`, `pyproject.toml`, `go.mod`, `pom.xml`, `build.gradle`, `Gemfile`, `mix.exs`, `.adlc`), `classify(path, home, has_marker) -> RootKind`, `display_for(path, home) -> String`, `bounded_field(s, max_chars) -> String` (characters; control and hidden/bidi characters → `?`), `bounded_field_bytes(s, max_chars)` (the same plus a byte bound at `byte_ceiling(max_chars) = max_chars + 2` — the environment block's and the jail display's), `kind_phrase(&SessionRoot) -> String` (the one phrase per kind, for the model and the person alike), `middle_elide`, `resolve_cwd_argument(raw, shell_cwd, home) -> Result<PathBuf, CwdArgError>`, `CwdRefusal { NotAbsolute(PathBuf), NotADirectory(PathBuf) }` (the daemon's refusal sentences as a type; the check stays in tetond). Pure, no I/O. |
+| `tetond::session_root` (new) | `probe(path, home) -> SessionRoot`: marker probe (`.git` as **file or dir** — this repo's worktrees have a `gitdir:` file), branch from `.git/HEAD` following a `gitdir:` pointer, `None` on detached/unreadable; home judged by identity (`(dev, ino)`, canonical-spelling fallback). `ProbedRoot { path, view }` — one probe's path and answer, the value the runtime hands to `ToolContext::for_root(&ProbedRoot)` and `HarnessConfig.session_root`. `home() -> Option<PathBuf>` — the daemon's one `HOME` reader (`None` when unset or empty). |
+| `tetond::fs_util` (new) | `read_regular_file_bounded(path, max_bytes) -> Option<String>` — the one bounded reader: type and size off `metadata` before the open, the read `take`n; the probe's `.git`/`HEAD` reads and `grep`'s per-file reads both go through it. |
 | `tetond::harness::turn_loop::HarnessConfig` | `session_root: Option<SessionRoot>` (default `None`); `environment_block()`; the block after the opener. |
-| `tetond::harness::tools::ToolContext` | carries `root: SessionRoot`-ish (path + display + kind) and `WalkPolicy`; `new`, `for_root`, `with_root_kind`, `with_walk_budget`; `root_display()`, `root_kind()`; jail refusal ``path `{raw}` is outside the session root {display}``. |
-| `tetond::harness::tools::walk` (new) | as ADR-3. Added to `boundary_coverage.rs` `TOOL_SOURCES` (no `impl Tool`). |
+| `tetond::harness::tools::ToolContext` | carries the jail path, the display (byte-bounded in `for_root`) and the kind, plus `WalkPolicy`; `new(path)`, `for_root(&ProbedRoot)`, `with_root_kind`, `with_walk_budget`; `root_display()`, `root_kind()`, `root_missing_error()`; jail refusal ``path `{raw}` is outside the session root {display}``; `read`/`edit` add ``path `{raw}` is not a regular file`` before any open. |
+| `tetond::harness::tools::walk` (new) | as ADR-3; `HARNESS_LINE_PREFIX` (`... (`) and `is_harness_line(line) -> bool` (exact known shapes), `trailer_lines(&WalkReport)`, `cap_notice(cap, noun)` — every harness-line writer and the one recogniser. Added to `boundary_coverage.rs` `TOOL_SOURCES` (no `impl Tool`). |
 | `tetond::sessions::SessionRegistry` | `set_cwd(&SessionId, PathBuf) -> bool`. |
 | CLI | `Cli.cwd: Option<PathBuf>`; `SessionState.root`; `/cd` row (`Args::Optional`) beside `/clear`; `session_ui` arm; `banner::root_notice`. |
 
@@ -337,10 +393,13 @@ spellings), BUG-147/LESSON-473 (the predecessor).
   the jail root's kind, display and project facts are derived from the stored
   path at every use (turn, create, `/cd`), never cached; the prompt states them
   as data, the tools enforce them, the client renders what the daemon derived.
-- **A walker's harness lines wear one prefix and are peeled by one splitter** —
-  every non-match line a search tool appends starts `... (`; the duty that
-  ranks matches strips them all, so a new harness line is never ranked as a
-  match by accident.
+- **A walker's harness lines wear one prefix and are peeled by one recogniser
+  that knows every writer's shape** — every non-match line a search tool
+  appends is written in `walk.rs` and starts `... (`; the duty that ranks
+  matches strips exactly the known shapes, so a harness line is never ranked
+  as a match and a match that merely looks like one is never peeled; a new
+  harness line is a two-sided change (writer and recogniser), enumerated by
+  one test.
 - **A resident fact is bought with reference data, never with the ceiling** —
   ADR-2 here is the third instance of the redact.rs rule.
 

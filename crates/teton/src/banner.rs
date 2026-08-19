@@ -18,7 +18,7 @@
 use std::io::IsTerminal;
 use std::path::Path;
 
-use teton_core::session_root::{bounded_field, kind_phrase, DISPLAY_MAX_CHARS};
+use teton_core::session_root::{bounded_field, display_for, kind_phrase, DISPLAY_MAX_CHARS};
 use teton_protocol::methods::{RootKind, SessionRoot};
 
 use crate::render::{LineKind, Surface};
@@ -96,7 +96,7 @@ pub fn color_enabled() -> bool {
 pub fn cwd_display(session_root: &Path) -> String {
     let home = crate::home_dir();
     bounded_field(
-        &teton_core::session_root::display_for(session_root, home.as_deref()),
+        &display_for(session_root, home.as_deref()),
         DISPLAY_MAX_CHARS,
     )
 }

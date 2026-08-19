@@ -2076,9 +2076,10 @@ mod tests {
     /// notice's, `/cd`'s and every jail refusal's — went back to bounding
     /// characters (plus control-character *and* bidi/zero-width
     /// neutralisation), so a person reading a CJK path sees its full eighty
-    /// characters rather than a third of them. The multibyte test above now
-    /// asserts on `environment_block(..).len()` and pins the row's exact byte
-    /// cost, not the probe's strings; and this sweep now checks that the widest
+    /// characters rather than a third of them. The multibyte test
+    /// (`turn_loop::tests::the_worst_case_root_is_the_byte_worst_for_multibyte_roots_too`)
+    /// now asserts on `environment_block(..).len()` and pins the row's exact
+    /// byte cost, not the probe's strings; and this sweep now checks that the widest
     /// prompt it measured carries `Session root: ` at all, so the row cannot be
     /// dropped and leave the sweep passing on the smaller shape.
     #[test]

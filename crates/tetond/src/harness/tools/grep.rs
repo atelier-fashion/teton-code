@@ -9,9 +9,11 @@
 //! The walk itself — what is skipped, what is pruned from a home-kind root, how
 //! far it may go, and what it says when it stops — is [`walk`]'s (REQ-583
 //! ADR-3); this tool decides only what to do with a file it is handed: open it
-//! if it is a regular file of at most [`MAX_FILE_BYTES`], and end the walk once
-//! the match cap is full. Every line the harness appends after the matches (the
-//! walk's trailer, the cap notice) starts with [`HARNESS_LINE_PREFIX`], and
+//! if it is a regular file of at most [`MAX_SEARCHED_FILE_BYTES`] (through the
+//! crate's one bounded reader), report each matching line cut to
+//! [`MAX_MATCH_LINE_BYTES`], and end the walk once the match cap is full. Every
+//! line the harness appends after the matches (the walk's trailer, the cap
+//! notice) is written by `walk` and starts with its `HARNESS_LINE_PREFIX`, and
 //! [`split_harness_trailer`] peels exactly those shapes before the triage duty
 //! sees a match list.
 //!
@@ -37,12 +39,12 @@
 use async_trait::async_trait;
 use serde_json::{json, Value};
 use std::collections::BTreeSet;
-use std::io::Read;
 use std::ops::ControlFlow;
 
 use super::glob::glob_match;
-use super::walk::{self, HARNESS_LINE_PREFIX};
+use super::walk;
 use super::{opt_str_arg, str_arg, RefinedOutcome, Tool, ToolContext, ToolDuties, ToolOutcome};
+use crate::fs_util::read_regular_file_bounded;
 use crate::harness::digest::tool_result_provenance;
 use crate::harness::triage;
 
@@ -52,9 +54,18 @@ const MAX_MATCHES: usize = 200;
 /// The most bytes read from any one file. A file past this is skipped whole —
 /// no error, no partial scan: a search for a literal is not the tool for a
 /// multi-gigabyte log, and one such file must not be what a `grep` spends its
-/// wall clock and the daemon's memory on. Read through [`Read::take`] as well
-/// as checked up front, so a file that grows under the read is bounded too.
-pub(crate) const MAX_FILE_BYTES: u64 = 8 * 1024 * 1024;
+/// wall clock and the daemon's memory on. Read through
+/// [`read_regular_file_bounded`], which `take`s the read as well as checking
+/// the size up front, so a file that grows under the read is bounded too.
+const MAX_SEARCHED_FILE_BYTES: u64 = 8 * 1024 * 1024;
+
+/// The most bytes of any one matching line that are reported. A file that is
+/// one eight-megabyte line (a minified bundle, a log with no newlines) matches
+/// as one line, and without this cap that one hit *was* eight megabytes in the
+/// model's context. Cut at a character boundary and marked with `…`; the match
+/// itself was judged on the whole line, so a hit whose needle sits past the cut
+/// is still a hit, shown truncated.
+const MAX_MATCH_LINE_BYTES: usize = 4096;
 
 /// Searches files under the session root for a literal substring, jailed to
 /// that root.
@@ -140,7 +151,8 @@ impl Tool for GrepTool {
                         return ControlFlow::Continue(());
                     }
                 }
-                let Some(contents) = read_bounded(path) else {
+                let Some(contents) = read_regular_file_bounded(path, MAX_SEARCHED_FILE_BYTES)
+                else {
                     return ControlFlow::Continue(());
                 };
                 for (i, line) in contents.lines().enumerate() {
@@ -151,7 +163,11 @@ impl Tool for GrepTool {
                     };
                     if haystack.contains(needle.as_str()) {
                         matched_files.insert(id.clone());
-                        hits.push(format!("{rel}:{}: {}", i + 1, line.trim_end()));
+                        hits.push(format!(
+                            "{rel}:{}: {}",
+                            i + 1,
+                            bounded_match_line(line.trim_end())
+                        ));
                         // The cap is full: the result cannot grow, so the walk
                         // ends here — the tool's stop, reported by the cap
                         // notice below and not by the walk's stopped line
@@ -190,7 +206,8 @@ impl Tool for GrepTool {
         // position it always had (ADR-3).
         walk::append_trailer(&mut out, &trailer);
         if truncated {
-            walk::append_trailer(&mut out, [cap_notice()]);
+            // The cap notice is `walk`'s, like every harness line (ADR-3).
+            walk::append_trailer(&mut out, [walk::cap_notice(MAX_MATCHES, "matches")]);
         }
         ToolOutcome::ok(out)
             .with_paths(matched_files)
@@ -268,35 +285,24 @@ impl Tool for GrepTool {
     }
 }
 
-/// The contents of the regular file at `path`, or `None` when it is not worth
-/// searching: larger than [`MAX_FILE_BYTES`], unreadable, or not UTF-8 (the
-/// cheap binary heuristic this tool always had — `read_to_string` refuses
-/// invalid UTF-8).
-///
-/// Bounded twice: the size is checked off the open handle (one `fstat`, no
-/// second path lookup) and the read itself is `take`n, so a file that grows
-/// between the two cannot be read past the cap.
-fn read_bounded(path: &std::path::Path) -> Option<String> {
-    let file = std::fs::File::open(path).ok()?;
-    if file.metadata().ok()?.len() > MAX_FILE_BYTES {
-        return None;
+/// `line` as a match reports it: whole when it fits [`MAX_MATCH_LINE_BYTES`],
+/// otherwise its head cut at the last character boundary that leaves room for
+/// the one `…` that marks the cut, so the rendered text is never longer than
+/// the cap and always valid UTF-8.
+fn bounded_match_line(line: &str) -> std::borrow::Cow<'_, str> {
+    const MARK: char = '…';
+    if line.len() <= MAX_MATCH_LINE_BYTES {
+        return std::borrow::Cow::Borrowed(line);
     }
-    let mut contents = String::new();
-    file.take(MAX_FILE_BYTES)
-        .read_to_string(&mut contents)
-        .ok()?;
-    Some(contents)
-}
-
-/// The line [`Tool::run`] appends when the search hit [`MAX_MATCHES`].
-///
-/// It wears [`HARNESS_LINE_PREFIX`] like every harness line, and
-/// [`walk::is_harness_line`] knows its `capped at` shape — which is what tells
-/// [`Tool::refine`] that a trailing line is the harness talking rather than a
-/// match: one recogniser for this notice and for every line the walk appends
-/// (ADR-3), so a new harness line is never ranked as a match by accident.
-fn cap_notice() -> String {
-    format!("{HARNESS_LINE_PREFIX}capped at {MAX_MATCHES} matches)")
+    let budget = MAX_MATCH_LINE_BYTES - MARK.len_utf8();
+    let mut cut = budget;
+    while !line.is_char_boundary(cut) {
+        cut -= 1;
+    }
+    let mut out = String::with_capacity(MAX_MATCH_LINE_BYTES);
+    out.push_str(&line[..cut]);
+    out.push(MARK);
+    std::borrow::Cow::Owned(out)
 }
 
 /// A `grep` result split into its match lines and the harness's own trailing
@@ -412,9 +418,14 @@ mod tests {
     use teton_protocol::methods::RootKind;
 
     use crate::harness::tools::walk::{
-        running_as_root, WalkBudget, HOME_TOP_LEVEL_SKIPS, MACOS_CONSENT_CLAUSE, STOPPED_ADVICE,
-        WALK_SKIP_DIRS,
+        running_as_root, WalkBudget, HARNESS_LINE_PREFIX, HOME_TOP_LEVEL_SKIPS,
+        MACOS_CONSENT_CLAUSE, STOPPED_ADVICE, WALK_SKIP_DIRS,
     };
+
+    /// The notice this tool appends at its cap, as `walk` writes it.
+    fn grep_cap_notice() -> String {
+        walk::cap_notice(MAX_MATCHES, "matches")
+    }
 
     /// The counter, not the timestamp, guarantees uniqueness: `SystemTime::now()`
     /// can return the same value for two calls within one clock tick.
@@ -1042,9 +1053,9 @@ mod tests {
         );
         let capped = format!(
             "a.rs:1: x\nb.rs:2: y\n{stopped}\n{unreadable}\n{}",
-            cap_notice()
+            grep_cap_notice()
         );
-        let notice = cap_notice();
+        let notice = grep_cap_notice();
         assert_eq!(
             split_harness_trailer(&capped),
             (
@@ -1073,7 +1084,7 @@ mod tests {
             split_harness_trailer(&with_odd_last),
             (vec!["a.rs:1: x", odd_path], vec![])
         );
-        let with_odd_then_cap = format!("a.rs:1: x\n{odd_path}\n{}", cap_notice());
+        let with_odd_then_cap = format!("a.rs:1: x\n{odd_path}\n{}", grep_cap_notice());
         assert_eq!(
             split_harness_trailer(&with_odd_then_cap),
             (vec!["a.rs:1: x", odd_path], vec![notice.as_str()])
@@ -1094,7 +1105,7 @@ mod tests {
         let content = format!(
             "{}\n{stopped}\n{unreadable}\n{}",
             matches.join("\n"),
-            cap_notice()
+            grep_cap_notice()
         );
         let outcome = ToolOutcome::ok(&content)
             .with_paths([fixture_id("a.rs"), fixture_id("b.rs"), fixture_id("c.rs")])
@@ -1120,7 +1131,7 @@ mod tests {
             "{out}"
         );
         assert!(
-            out.ends_with(&format!("\n{stopped}\n{unreadable}\n{}", cap_notice())),
+            out.ends_with(&format!("\n{stopped}\n{unreadable}\n{}", grep_cap_notice())),
             "the trailer must come back verbatim, in order, after the matches: {out}"
         );
     }
@@ -1351,7 +1362,7 @@ mod tests {
             "{}",
             lines[MAX_MATCHES]
         );
-        assert_eq!(lines[MAX_MATCHES + 1], cap_notice());
+        assert_eq!(lines[MAX_MATCHES + 1], grep_cap_notice());
         assert!(
             !out.content.contains("stopped after"),
             "a cap stop is not a budget stop: {}",
@@ -1387,7 +1398,7 @@ mod tests {
         assert!(!out.is_error, "{}", out.content);
         assert_eq!(
             out.content.lines().last(),
-            Some(cap_notice().as_str()),
+            Some(grep_cap_notice().as_str()),
             "{}",
             out.content
         );
@@ -1424,20 +1435,11 @@ mod tests {
     /// regression is a failed test and not a hung suite.
     #[test]
     fn a_fifo_in_the_tree_is_skipped_and_the_search_returns() {
-        use std::os::unix::ffi::OsStrExt;
         use std::os::unix::fs::FileTypeExt;
         let root = temp_root("fifo");
         plant(&root, "a.rs");
         let fifo = root.join("pipe");
-        let c_path = std::ffi::CString::new(fifo.as_os_str().as_bytes()).unwrap();
-        // SAFETY: `mkfifo` reads a NUL-terminated path and a mode; nothing else.
-        let made = unsafe { libc::mkfifo(c_path.as_ptr(), 0o644) };
-        assert_eq!(
-            made,
-            0,
-            "mkfifo failed: {}",
-            std::io::Error::last_os_error()
-        );
+        crate::mkfifo(&fifo);
         assert!(
             std::fs::symlink_metadata(&fifo)
                 .unwrap()
@@ -1446,28 +1448,23 @@ mod tests {
             "the fixture must be a FIFO"
         );
 
-        let (tx, rx) = std::sync::mpsc::channel();
         let worker_root = root.clone();
-        std::thread::spawn(move || {
-            let out = GrepTool.run(
+        let out = crate::with_deadline("the search with a FIFO in the tree", move || {
+            GrepTool.run(
                 &ToolContext::new(&worker_root),
                 &json!({ "pattern": "needle" }),
-            );
-            let _ = tx.send(out);
+            )
         });
-        let out = rx
-            .recv_timeout(Duration::from_secs(5))
-            .expect("the search must return: a FIFO in the tree hung it");
         assert!(!out.is_error, "{}", out.content);
         assert_eq!(matched_in(&out), vec!["a.rs"], "{}", out.content);
         std::fs::remove_dir_all(&root).ok();
     }
 
-    /// **A file past [`MAX_FILE_BYTES`] is skipped whole** — no error, no
-    /// partial scan — while its neighbours are searched. The needle sits at the
-    /// very end of the oversize file, so a partial read of the first cap's
-    /// worth would also miss it: what is asserted is that the file is not
-    /// what a search costs its wall clock on.
+    /// **A file past [`MAX_SEARCHED_FILE_BYTES`] is skipped whole** — no
+    /// error, no partial scan — while its neighbours are searched. The needle
+    /// sits at the very end of the oversize file, so a partial read of the
+    /// first cap's worth would also miss it: what is asserted is that the file
+    /// is not what a search costs its wall clock on.
     #[test]
     fn an_oversize_file_is_skipped_without_an_error() {
         let root = temp_root("oversize");
@@ -1478,7 +1475,7 @@ mod tests {
             let mut file = std::io::BufWriter::new(std::fs::File::create(&big).unwrap());
             let line = "x".repeat(1023) + "\n";
             let mut written = 0u64;
-            while written <= MAX_FILE_BYTES {
+            while written <= MAX_SEARCHED_FILE_BYTES {
                 file.write_all(line.as_bytes()).unwrap();
                 written += line.len() as u64;
             }
@@ -1486,13 +1483,102 @@ mod tests {
             file.flush().unwrap();
         }
         assert!(
-            std::fs::metadata(&big).unwrap().len() > MAX_FILE_BYTES,
+            std::fs::metadata(&big).unwrap().len() > MAX_SEARCHED_FILE_BYTES,
             "the fixture must exceed the cap"
         );
         let out = GrepTool.run(&ToolContext::new(&root), &json!({ "pattern": "needle" }));
         assert!(!out.is_error, "{}", out.content);
         assert_eq!(matched_in(&out), vec!["small.rs"], "{}", out.content);
         assert!(!out.content.contains("big.log"), "{}", out.content);
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// **A matching line is reported cut to [`MAX_MATCH_LINE_BYTES`]** — a
+    /// single-line file just under the per-file cap is one hit of a few
+    /// kilobytes, not one hit of several megabytes — cut at a character
+    /// boundary (the fixture is multibyte, so a byte-index cut would panic
+    /// or split a character) and marked with `…`. The needle past the cut
+    /// still counts: the match was judged on the whole line. A line at the
+    /// cap exactly is shown whole.
+    #[test]
+    fn a_matching_line_is_reported_cut_to_the_line_cap_at_a_char_boundary() {
+        let root = temp_root("longline");
+        let big = root.join("one-line.js");
+        {
+            use std::io::Write;
+            let mut file = std::io::BufWriter::new(std::fs::File::create(&big).unwrap());
+            // Three-byte characters, so no cut point is a byte boundary by
+            // accident; a few megabytes of them, under the per-file cap; the
+            // needle at the very end.
+            let chunk = "漢".repeat(1024);
+            let mut written = 0usize;
+            while written < 3 * 1024 * 1024 {
+                file.write_all(chunk.as_bytes()).unwrap();
+                written += chunk.len();
+            }
+            file.write_all(b"needle").unwrap();
+            file.flush().unwrap();
+        }
+        let size = std::fs::metadata(&big).unwrap().len();
+        assert!(
+            size < MAX_SEARCHED_FILE_BYTES,
+            "the fixture must be searchable"
+        );
+        assert!(
+            size as usize > MAX_MATCH_LINE_BYTES * 100,
+            "and far past the line cap"
+        );
+        let at_cap = "y".repeat(MAX_MATCH_LINE_BYTES - "needle".len()) + "needle";
+        std::fs::write(root.join("at-cap.txt"), format!("{at_cap}\n")).unwrap();
+
+        let out = GrepTool.run(&ToolContext::new(&root), &json!({ "pattern": "needle" }));
+        assert!(!out.is_error, "{}", out.content);
+        let lines: Vec<&str> = out.content.lines().collect();
+        assert_eq!(lines.len(), 2, "{}", out.content);
+        let long = lines
+            .iter()
+            .find(|l| l.starts_with("one-line.js:1: "))
+            .unwrap_or_else(|| panic!("the long line must match: {}", out.content));
+        let text = &long["one-line.js:1: ".len()..];
+        assert!(
+            text.len() <= MAX_MATCH_LINE_BYTES,
+            "{} bytes reported",
+            text.len()
+        );
+        assert!(
+            text.ends_with('…'),
+            "the cut is marked: …{}",
+            &text[text.len() - 12..]
+        );
+        assert!(text.starts_with("漢漢"), "the head is kept");
+        assert!(!text.contains("needle"), "the needle sat past the cut");
+        let whole = lines
+            .iter()
+            .find(|l| l.starts_with("at-cap.txt:1: "))
+            .unwrap_or_else(|| panic!("the at-cap line must match: {}", out.content));
+        assert_eq!(
+            &whole["at-cap.txt:1: ".len()..],
+            at_cap,
+            "a line at the cap is whole"
+        );
+        // The provenance still names the long file: it matched.
+        assert_eq!(matched_in(&out), vec!["at-cap.txt", "one-line.js"]);
+
+        // The cutter on its own: ASCII cuts at the budget, multibyte at the
+        // boundary just under it, short lines are untouched.
+        assert_eq!(bounded_match_line("short"), "short");
+        let ascii = "a".repeat(MAX_MATCH_LINE_BYTES + 1);
+        let cut = bounded_match_line(&ascii);
+        assert_eq!(cut.len(), MAX_MATCH_LINE_BYTES);
+        assert!(cut.ends_with('…'));
+        let wide = "漢".repeat(MAX_MATCH_LINE_BYTES);
+        let cut = bounded_match_line(&wide);
+        assert!(cut.len() <= MAX_MATCH_LINE_BYTES);
+        assert!(cut.ends_with('…') && cut.starts_with('漢'));
+        assert!(
+            cut.len() + '漢'.len_utf8() > MAX_MATCH_LINE_BYTES,
+            "cut no further than needed"
+        );
         std::fs::remove_dir_all(&root).ok();
     }
 

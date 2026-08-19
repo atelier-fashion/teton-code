@@ -37,12 +37,15 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use serde_json::Value;
-use teton_core::session_root::{bounded_field, display_for, DISPLAY_MAX_CHARS};
+use teton_core::session_root::{
+    bounded_field, bounded_field_bytes, display_for, DISPLAY_MAX_CHARS,
+};
 use teton_core::ProvenanceId;
-use teton_protocol::methods::{RootKind, SessionRoot};
+use teton_protocol::methods::RootKind;
 
 use super::context::ToolProvenance;
 use super::duty::DutyRoute;
+use crate::session_root::ProbedRoot;
 
 pub mod docs;
 pub mod edit;
@@ -75,10 +78,20 @@ pub use web::{register_web_tool, WebTool, WEB_TOOL_NAME};
 /// jail refusal names (BR-2) — and its *kind* — what the walkers key their
 /// home-tree pruning on (ADR-3) and the shell's timeout hint reads (BR-14).
 /// Both are the daemon's derivation, probed once per turn by
-/// `tetond::session_root::probe` and handed in through [`ToolContext::for_root`],
-/// so a refusal prints the same bytes as the environment block. [`ToolContext::new`]
-/// is the plain constructor every existing call site uses: kind `Plain`, display
-/// spelled from the path and `HOME` — the same rule, no probe.
+/// `tetond::session_root::probe` and handed in as one [`ProbedRoot`] through
+/// [`ToolContext::for_root`], so the jail's path and its display cannot come
+/// from two readings. [`ToolContext::new`] is the plain constructor every
+/// existing call site uses: kind `Plain`, display spelled from the path and
+/// `HOME` — the same rule, no probe.
+///
+/// **The model reads one spelling.** `for_root` holds the display to the
+/// prompt's **byte** bound ([`bounded_field_bytes`] at [`DISPLAY_MAX_CHARS`]),
+/// the bound the environment block applies to the same value — so a jail
+/// refusal and the block, the two places a model reads the root, print the
+/// same bytes for a CJK path too. The person-facing surfaces (the CLI banner,
+/// the launch notice, `/cd`, the `session_root_changed` line) keep the
+/// character-bounded spelling the probe produced; they are read by a person,
+/// and the `display` on the wire is theirs.
 #[derive(Debug, Clone)]
 pub struct ToolContext {
     repo_root: PathBuf,
@@ -110,19 +123,19 @@ impl ToolContext {
         }
     }
 
-    /// A context jailed to `path`, carrying the display and kind the daemon
-    /// probed for it — the runtime's constructor (ADR-1).
+    /// A context jailed to `probed.path`, carrying the display and kind the
+    /// daemon probed for it — the runtime's constructor (ADR-1).
     ///
-    /// `probed` is the probe's answer for `path`; the runtime hands both halves
-    /// of one `session_root::ProbedRoot` here, so the jail's path and the probed
-    /// view cannot come from two readings. The path rides alongside rather than
-    /// inside the wire view because that view deliberately carries the display
-    /// spelling only, never the absolute path.
-    pub fn for_root(path: impl Into<PathBuf>, probed: &SessionRoot) -> Self {
+    /// One argument, one probe: the jail's path and the probed view are the two
+    /// halves of the [`ProbedRoot`] the runtime built for the turn, so they
+    /// cannot come from two readings. The display is held to the prompt's byte
+    /// bound here (see the type docs): the model reads one spelling in the
+    /// environment block and in every jail refusal.
+    pub fn for_root(probed: &ProbedRoot) -> Self {
         Self {
-            repo_root: path.into(),
-            display: probed.display.clone(),
-            kind: probed.kind,
+            repo_root: probed.path.clone(),
+            display: bounded_field_bytes(&probed.view.display, DISPLAY_MAX_CHARS),
+            kind: probed.view.kind,
             walk: walk::WalkPolicy::default(),
         }
     }
@@ -267,6 +280,29 @@ impl ToolContext {
             path: checked,
             provenance,
         })
+    }
+}
+
+/// Refuse `path` — a request the jail already resolved — unless `metadata` says
+/// it is a regular file (REQ-583 verify pass); `read` and `edit` call this
+/// before they open anything.
+///
+/// A FIFO's open for reading blocks until a writer appears, and a device or a
+/// socket is not a text file: none of them may hold the turn. The type is read
+/// off `metadata` (following a symlink, which the jail has already judged by
+/// its target) and the refusal is jail-shaped — `path `{raw}` is not a regular
+/// file`, naming the request text as every jail refusal does and nothing else.
+/// A path that cannot be stat'ed at all is **not** refused here: the open that
+/// follows names the reason (missing, unreadable), as it always did.
+///
+/// # Errors
+/// [`ToolError::Jail`] when `path` exists and is not a regular file.
+pub(super) fn refuse_non_regular_file(raw: &str, path: &Path) -> Result<(), ToolError> {
+    match std::fs::metadata(path) {
+        Ok(metadata) if !metadata.is_file() => Err(ToolError::jail(format!(
+            "path `{raw}` is not a regular file"
+        ))),
+        _ => Ok(()),
     }
 }
 
@@ -1126,18 +1162,22 @@ mod tests {
     }
 
     /// The refusal prints the *probed* display when the context was built from a
-    /// [`SessionRoot`] — the same bytes the environment block carries — and the
+    /// [`ProbedRoot`] — the same bytes the environment block carries — and the
     /// plain constructor spells the path home-relative by the same rule.
     #[test]
     fn for_root_carries_the_probed_display_and_kind_and_new_is_plain() {
+        use teton_protocol::methods::SessionRoot;
         let root = temp_root("forroot");
-        let probed = SessionRoot {
-            display: "~/probed/display".to_owned(),
-            kind: RootKind::Home,
-            project_name: None,
-            vcs_branch: None,
+        let probed = ProbedRoot {
+            path: root.clone(),
+            view: SessionRoot {
+                display: "~/probed/display".to_owned(),
+                kind: RootKind::Home,
+                project_name: None,
+                vcs_branch: None,
+            },
         };
-        let ctx = ToolContext::for_root(root.clone(), &probed);
+        let ctx = ToolContext::for_root(&probed);
         assert_eq!(ctx.root_kind(), RootKind::Home);
         assert_eq!(ctx.root_display(), "~/probed/display");
         assert_eq!(ctx.repo_root(), root.as_path());
@@ -1147,6 +1187,30 @@ mod tests {
                 .contains("path `/etc/hosts` is outside the session root ~/probed/display"),
             "{err}"
         );
+
+        // The model's one spelling: a CJK display at the character ceiling is
+        // held to the prompt's byte bound here, exactly as the environment
+        // block holds it, so the refusal and the block print the same bytes.
+        let cjk = ProbedRoot {
+            path: root.clone(),
+            view: SessionRoot {
+                display: format!("/{}", "漢".repeat(DISPLAY_MAX_CHARS - 1)),
+                kind: RootKind::Plain,
+                project_name: None,
+                vcs_branch: None,
+            },
+        };
+        let ctx = ToolContext::for_root(&cjk);
+        assert_eq!(
+            ctx.root_display(),
+            bounded_field_bytes(&cjk.view.display, DISPLAY_MAX_CHARS)
+        );
+        assert!(
+            ctx.root_display().len() <= teton_core::session_root::byte_ceiling(DISPLAY_MAX_CHARS)
+        );
+        assert_ne!(ctx.root_display(), cjk.view.display, "the byte bound bit");
+        let err = ctx.resolve("/etc/hosts").unwrap_err().to_string();
+        assert!(err.contains(ctx.root_display()), "{err}");
 
         let plain = ToolContext::new(&root);
         assert_eq!(plain.root_kind(), RootKind::Plain);
@@ -1550,10 +1614,14 @@ mod tests {
     #[test]
     fn no_tool_can_move_a_sessions_root_and_no_harness_source_names_it() {
         let reg = ToolRegistry::with_builtins();
-        assert!(
-            reg.get("read").is_some() && reg.names().len() == 6,
-            "the built-in set is missing, so the sweep below proves nothing: {:?}",
-            reg.names()
+        // Non-vacuity: the registry under test is the populated one — the
+        // built-in set by name, not by count, so a tool swapped for another
+        // under the same count cannot make the sweep below about a different
+        // registry.
+        assert_eq!(
+            reg.names(),
+            vec!["read", "edit", "grep", "glob", "shell", "teton_docs"],
+            "the built-in set is not the one the sweep below is about"
         );
 
         let ctx = ToolContext::new(std::env::temp_dir());
@@ -1602,7 +1670,16 @@ mod tests {
         );
         for (path, source) in &harness {
             let code = crate::call_sites::scan::code_only(source);
-            for named in ["set_session_cwd", "SessionSetCwdParams", "session/set_cwd"] {
+            // The runtime's mover, its params type, its wire method — and the
+            // registry that holds the path plus the mutator on it, so a tool
+            // cannot reach the stored root around the RPC either.
+            for named in [
+                "set_session_cwd",
+                "SessionSetCwdParams",
+                "session/set_cwd",
+                "SessionRegistry",
+                ".set_cwd(",
+            ] {
                 assert!(
                     !code.contains(named),
                     "{path} names `{named}`, so tool dispatch has a path to moving a \

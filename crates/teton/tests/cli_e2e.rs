@@ -4813,17 +4813,28 @@ fn root_fixtures(root: &Path) -> (PathBuf, PathBuf) {
 /// is refused (`[failed]`) — the file is still there, the jail moved (the BR-2
 /// refusal's bytes are asserted at the daemon, `tests/e2e/session_root.rs`;
 /// the CLI shows the status the model saw); `/cd /nope` prints the daemon's
-/// refusal naming the path and clears nothing; a last bare `/cd` still names
-/// the plain root. And no launch notice anywhere: stdout is a pipe.
+/// refusal naming the path and clears nothing; a bare `/cd` still names the
+/// plain root; then the **relative** leg (AC-12's `rel` spelling, end to end):
+/// `/cd proj` — a name under the CLI process's own working directory, which is
+/// the fixture — resolves against that directory, not the session's root,
+/// moves back to the project (clear line, `session root is now <project>
+/// (project proj)`), and a last bare `/cd` names it. And no launch notice
+/// anywhere: stdout is a pipe.
 #[test]
 fn cwd_scopes_the_session_and_slash_cd_moves_it_and_reports_each_step() {
     let daemon_bin = daemon_bin();
     // The scripted read names an absolute path, so the fixture has to exist
     // before the daemon's script is written — and the daemon's own root is
     // minted inside `spawn`. The fixture therefore lives beside it under
-    // `/tmp`, named from the same pid, and is removed at the end.
+    // `/tmp`, named from the same pid, and is removed at the end. Spelled
+    // canonically (on macOS `/tmp` is a link to `/private/tmp`), because the
+    // relative leg below resolves against the CLI's working directory as the
+    // OS reports it, and the lines it draws are compared to the fixture's own
+    // spelling.
     let fixture = PathBuf::from("/tmp").join(format!("tcroot{:x}", std::process::id() & 0xffff));
     let _ = std::fs::remove_dir_all(&fixture);
+    std::fs::create_dir_all(&fixture).unwrap();
+    let fixture = fixture.canonicalize().unwrap();
     let (project, plain) = root_fixtures(&fixture);
     let notes = project.join("notes.txt");
     let read_notes = read_call(&notes);
@@ -4838,7 +4849,10 @@ fn cwd_scopes_the_session_and_slash_cd_moves_it_and_reports_each_step() {
     );
     let teton = teton_bin();
 
-    let session = daemon.run_cli_with_stdin(
+    // Run *from* the fixture, so `/cd proj` has a working directory to be
+    // relative to that is not the session root (the project) and not the
+    // test runner's.
+    let (stdout, stderr, _status) = daemon.run_cli_from(
         &teton,
         &["--cwd", project.to_str().unwrap()],
         &format!(
@@ -4848,10 +4862,15 @@ fn cwd_scopes_the_session_and_slash_cd_moves_it_and_reports_each_step() {
              /cd\n\
              read the notes again\n\
              /cd /nope\n\
+             /cd\n\
+             /cd proj\n\
              /cd\n",
             plain = plain.display()
         ),
+        Some(&fixture),
+        &[],
     );
+    let session = format!("{stdout}{stderr}");
     let _ = std::fs::remove_dir_all(&fixture);
     let log = daemon.log();
 
@@ -4868,6 +4887,7 @@ fn cwd_scopes_the_session_and_slash_cd_moves_it_and_reports_each_step() {
     let project_line = format!("{ROOT_LINE}{} (project proj)", project.display());
     let plain_line = format!("{ROOT_LINE}{} (not a project)", plain.display());
     let moved_line = format!("{ROOT_MOVED}{} (not a project)", plain.display());
+    let moved_back_line = format!("{ROOT_MOVED}{} (project proj)", project.display());
     let read_done = format!("read {} [done]", notes.display());
     let read_failed = format!("read {} [failed]", notes.display());
     let refusal =
@@ -4900,6 +4920,22 @@ fn cwd_scopes_the_session_and_slash_cd_moves_it_and_reports_each_step() {
         .unwrap_or_else(|| {
             panic!("no bare `/cd` line after the refused move; session body:\n{body}")
         });
+    // (e) the relative leg: `/cd proj` resolved against the CLI's working
+    // directory (the fixture) — not against the session's root, which was the
+    // plain directory and holds no `proj` — and moved back to the project …
+    let moved_back = body[third_bare..]
+        .find(&moved_back_line)
+        .map(|i| third_bare + i)
+        .unwrap_or_else(|| {
+            panic!("`/cd proj` did not move back to the project; session body:\n{body}")
+        });
+    // … which the last bare `/cd` names.
+    let fourth_bare = body[moved_back..]
+        .find(&project_line)
+        .map(|i| moved_back + i)
+        .unwrap_or_else(|| {
+            panic!("no bare `/cd` line after the relative move; session body:\n{body}")
+        });
     assert!(
         first_bare < done
             && done < cleared
@@ -4907,17 +4943,20 @@ fn cwd_scopes_the_session_and_slash_cd_moves_it_and_reports_each_step() {
             && moved < second_bare
             && second_bare < failed
             && failed < refused
-            && refused < third_bare,
+            && refused < third_bare
+            && third_bare < moved_back
+            && moved_back < fourth_bare,
         "the lines are out of order; session body:\n{body}"
     );
 
-    // Exactly one clear, and it dropped the turn that ran before it: `/cd
-    // <plain>` cleared, `/cd /nope` did not (validate before mutate).
+    // Exactly two clears — one per accepted move — and the first dropped the
+    // turn that ran before it: `/cd <plain>` cleared, `/cd /nope` did not
+    // (validate before mutate), `/cd proj` cleared again.
     let counts = clear_counts(&session);
     assert_eq!(
         counts.len(),
-        1,
-        "one accepted move, one clear line — a refused move must not clear; \
+        2,
+        "two accepted moves, two clear lines — a refused move must not clear; \
          output:\n{session}"
     );
     assert!(
@@ -4927,17 +4966,18 @@ fn cwd_scopes_the_session_and_slash_cd_moves_it_and_reports_each_step() {
     );
     assert_eq!(
         body.matches(ROOT_MOVED).count(),
-        1,
-        "one accepted move draws one `session root is now` line; body:\n{body}"
+        2,
+        "two accepted moves draw two `session root is now` lines; body:\n{body}"
     );
     assert!(
         !body.contains(&format!("{ROOT_LINE}/nope"))
             && !body.contains(&format!("{ROOT_MOVED}/nope")),
         "a refused `/cd` must never be reported as the root; body:\n{body}"
     );
-    // The `--cwd` root was named exactly once (before the move) — a bare `/cd`
-    // after it names the plain root, twice.
-    assert_eq!(body.matches(&project_line).count(), 1, "body:\n{body}");
+    // The project root was named twice (before the first move, and after the
+    // relative move back) — a bare `/cd` in between names the plain root,
+    // twice.
+    assert_eq!(body.matches(&project_line).count(), 2, "body:\n{body}");
     assert_eq!(body.matches(&plain_line).count(), 2, "body:\n{body}");
     // The read's title carries the same path both times: the file did not
     // change, and the second status is the jail's verdict.
@@ -5020,6 +5060,107 @@ fn a_cwd_that_does_not_exist_is_refused_before_any_session_output_and_exits_non_
         &format!("{stdout}{stderr}"),
         "the piped prompt after a refused --cwd",
     );
+}
+
+/// **BR-6 (verify finding V), the CLI half isolated: `teton --cwd /nope` is
+/// refused by the CLI itself, with no daemon to reach.**
+///
+/// The test above would pass on the daemon's validator alone — it speaks the
+/// same sentence — so it cannot tell whether the CLI's fail-fast is wired.
+/// This one can: there is **no reachable daemon** (an empty `XDG_RUNTIME_DIR`,
+/// and a `TETON_CONFIG` an autostart would refuse — the
+/// `a_refused_config_is_reported_by_the_cli_that_autostarted_the_daemon`
+/// fixture), so a CLI that reached `ensure_connected` would print `could not
+/// reach the daemon` and quote the config refusal. It must instead exit 1 on
+/// the one refusal line and print none of that, no banner, no ready line.
+///
+/// And the fail-fast belongs to the commands that open a session: `teton
+/// --cwd /nope doctor` under the same conditions opens none, is not refused,
+/// and reports the daemon as not running.
+#[test]
+fn a_missing_cwd_is_refused_by_the_cli_itself_with_no_daemon_to_reach() {
+    let daemon = daemon_bin();
+    if !daemon.exists() {
+        let _ = std::io::stderr()
+            .write_all(b"skipping CLI e2e: teton-code binary not built (run under --workspace)\n");
+        return;
+    }
+    let root = PathBuf::from("/tmp").join(format!("tcnod{:x}", std::process::id()));
+    let runtime_dir = root.join("x");
+    std::fs::create_dir_all(&runtime_dir).unwrap();
+    let config_path = root.join("config.toml");
+    std::fs::write(&config_path, "pinned_local_model = \"qwen2.5-coder-3b\"\n").unwrap();
+
+    let run = |args: &[&str]| {
+        let mut child = Command::new(teton_bin())
+            .args(args)
+            .env("XDG_RUNTIME_DIR", &runtime_dir)
+            .env("TETON_CONFIG", &config_path)
+            .env("TETON_REPO_ROOT", &root)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("spawn teton");
+        child
+            .stdin
+            .take()
+            .expect("piped stdin")
+            .write_all(b"hello\n")
+            .expect("write teton stdin");
+        let output = child.wait_with_output().expect("run teton");
+        (
+            String::from_utf8_lossy(&output.stdout).into_owned(),
+            String::from_utf8_lossy(&output.stderr).into_owned(),
+            output.status,
+        )
+    };
+
+    let (stdout, stderr, status) = run(&["--cwd", "/nope"]);
+    assert_eq!(
+        status.code(),
+        Some(1),
+        "stdout:\n{stdout}\nstderr:\n{stderr}"
+    );
+    assert_eq!(
+        stderr.trim_end(),
+        "teton: could not start a session: path `/nope` does not exist or is not a directory",
+        "one refusal line, the CLI's own, and nothing else on stderr; stdout:\n{stdout}"
+    );
+    assert!(stdout.is_empty(), "nothing on stdout; stdout:\n{stdout}");
+    let combined = format!("{stdout}{stderr}");
+    for reach in [
+        "could not reach the daemon",
+        "The daemon reported:",
+        "configuration is present but invalid",
+        "Teton Code v",
+        "ready (",
+    ] {
+        assert!(
+            !combined.contains(reach),
+            "`{reach}` printed: the CLI reached for a daemon instead of failing fast; \
+             output:\n{combined}"
+        );
+    }
+
+    // `doctor` opens no session: the flag is carried but nothing is refused,
+    // and the command does its job against the absent daemon.
+    let (stdout, stderr, status) = run(&["--cwd", "/nope", "doctor"]);
+    let combined = format!("{stdout}{stderr}");
+    assert!(
+        status.success(),
+        "`teton --cwd /nope doctor` must not be refused; output:\n{combined}"
+    );
+    assert!(
+        combined.contains("daemon: not running"),
+        "doctor must report the daemon as not running; output:\n{combined}"
+    );
+    assert!(
+        !combined.contains("could not start a session"),
+        "a command that opens no session was refused for its --cwd; output:\n{combined}"
+    );
+
+    let _ = std::fs::remove_dir_all(&root);
 }
 
 /// **AC-9 / AC-12: a relative `--cwd` is relative to the shell's directory, and

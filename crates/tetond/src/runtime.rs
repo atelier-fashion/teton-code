@@ -2867,7 +2867,7 @@ impl DaemonRuntime {
         // turn is what keeps the branch honest after a checkout between turns
         // and moves every consumer the turn after a `/cd` rewrote the path.
         let probed = self.session_root_for(session_cwd.as_deref());
-        let tool_ctx = ToolContext::for_root(&probed.path, &probed.view);
+        let tool_ctx = ToolContext::for_root(&probed);
         let stream_events = SessionEvents::new(events.clone(), session_id.clone());
 
         // REQ-572 BR-3: the prompt's capability clause reads the same classifier
@@ -24011,14 +24011,21 @@ provider_id = \"deepseek\"
             (Arc::new(runtime), (seen, duties))
         }
 
-        /// A registry holding one freeform session on the daemon's fallback root.
-        fn one_session() -> (SessionRegistry, SessionId) {
+        /// A registry holding one freeform session whose root is `cwd` — or
+        /// the daemon's fallback root when `None`. The one constructor both
+        /// shorthands below delegate to.
+        fn one_session_with(cwd: Option<PathBuf>) -> (SessionRegistry, SessionId) {
             let sessions = SessionRegistry::new();
             let session = sessions
-                .create(SessionMode::Freeform, None, None)
+                .create(SessionMode::Freeform, None, cwd)
                 .expect("a freeform session needs no phase");
             let id = session.session_id.clone();
             (sessions, id)
+        }
+
+        /// A registry holding one freeform session on the daemon's fallback root.
+        fn one_session() -> (SessionRegistry, SessionId) {
+            one_session_with(None)
         }
 
         /// A registry holding one freeform session whose root is `cwd`.
@@ -24030,12 +24037,7 @@ provider_id = \"deepseek\"
         /// only the pre-claim snapshot, and only a fallback for a session the
         /// registry no longer has.
         fn one_session_at(cwd: &Path) -> (SessionRegistry, SessionId) {
-            let sessions = SessionRegistry::new();
-            let session = sessions
-                .create(SessionMode::Freeform, None, Some(cwd.to_path_buf()))
-                .expect("a freeform session needs no phase");
-            let id = session.session_id.clone();
-            (sessions, id)
+            one_session_with(Some(cwd.to_path_buf()))
         }
 
         /// Drive one prompt to completion.

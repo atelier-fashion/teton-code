@@ -23,10 +23,11 @@
 //! [`visit`] decides which entries are seen, and a tool that has all it can use
 //! ends the walk by returning [`ControlFlow::Break`] from its callback (grep's
 //! match cap — a stop the tool asked for, not a budget stop). Every harness line
-//! a walker appends is written here and starts with [`HARNESS_LINE_PREFIX`] —
-//! the shape grep's cap notice already had — and [`is_harness_line`] recognises
-//! exactly the known line shapes, so the triage duty never ranks a harness
-//! sentence as a match and never peels a match that merely looks like one.
+//! a walker appends is written here — the trailer ([`trailer_lines`]) and both
+//! tools' cap notices ([`cap_notice`]) — and starts with
+//! [`HARNESS_LINE_PREFIX`], and [`is_harness_line`] recognises exactly the known
+//! line shapes, so the triage duty never ranks a harness sentence as a match
+//! and never peels a match that merely looks like one.
 
 use std::fs;
 use std::ops::ControlFlow;
@@ -74,7 +75,9 @@ pub const HOME_TOP_LEVEL_SKIPS: &[&str] = &[
 pub const MEDIA_BUNDLE_SUFFIXES: &[&str] = &[".photoslibrary", ".musiclibrary"];
 
 /// How many unreadable folders the trailer names before saying "and N more".
-pub const UNREADABLE_NAMED_MAX: usize = 5;
+/// `pub(crate)`, like the other rendering details below: a fact about the
+/// line's shape, not part of the walk policy.
+pub(crate) const UNREADABLE_NAMED_MAX: usize = 5;
 
 /// The prefix every harness line a walker writes starts with — the trailer
 /// lines here and both tools' cap notices. One constant, so every writer and
@@ -95,14 +98,6 @@ pub(crate) const MACOS_CONSENT_CLAUSE: &str =
 /// matches were found before the stop (BR-10: never a silent partial).
 /// `pub(crate)` for the same reason as [`MACOS_CONSENT_CLAUSE`].
 pub(crate) const STOPPED_ADVICE: &str = "narrow the pattern, or move the session root with /cd";
-
-/// How many entries the per-directory loop hands over between two reads of the
-/// wall clock. The clock is read before every descent as well; this is what
-/// bounds a single flat directory of very many entries — a `Downloads/` with
-/// fifty thousand files — which the per-descent read alone never sees the end
-/// of. Small enough that a stop lands within a few hundred entries of the
-/// deadline, large enough that the clock is not the cost of the walk.
-pub const WALL_CHECK_EVERY: usize = 256;
 
 /// A walk's bound: entries seen and wall-clock elapsed, whichever runs out
 /// first (BR-10).
@@ -201,8 +196,9 @@ impl WalkPolicy {
 pub enum TruncatedBy {
     /// The entry budget: this many entries were seen, then the walk stopped.
     Entries(usize),
-    /// The wall-clock budget: this much time had elapsed at a directory
-    /// boundary, and the walk stopped there.
+    /// The wall-clock budget: this much time had elapsed when the clock was
+    /// read — after an entry was handed over, or before a descent — and the
+    /// walk stopped there.
     WallClock(Duration),
 }
 
@@ -246,12 +242,13 @@ pub struct WalkReport {
 ///   budget and handed to `on_entry` **before** the driver decides whether to
 ///   descend, so a pruned directory is still *seen* (glob can list `Library/`
 ///   from `~`) even though nothing under it is.
-/// - Within one directory, files are handed over first and child directories
-///   are entered afterwards, **in name order** — so which of two sibling trees
-///   a walk reaches first is a fact a test can build on rather than whatever
-///   the filesystem's hash order happened to be. The wall clock is read before
-///   each descent and once every [`WALL_CHECK_EVERY`] entries within a
-///   directory. The root itself is always entered.
+/// - Within one directory, every entry is handed over in the order the
+///   directory lists them; descents into children happen afterwards, **in name
+///   order** — so which of two sibling trees a walk reaches first is a fact a
+///   test can build on rather than whatever the filesystem's hash order
+///   happened to be. The wall clock is read after **every** entry (a read is
+///   tens of nanoseconds; the callback it follows may have read megabytes) and
+///   again before each descent. The root itself is always entered.
 ///
 /// A budget hit stops the whole walk, not one branch, and is recorded on the
 /// report so the tool can say so ([`trailer_lines`]) whether it had found
@@ -327,12 +324,6 @@ impl Walk<'_> {
                     Some(TruncatedBy::Entries(self.policy.budget.max_entries));
                 return false;
             }
-            // The clock, inside the loop as well as before each descent: a flat
-            // directory of very many entries never reaches a descent, and the
-            // per-descent read alone would let it run to its end.
-            if self.seen.is_multiple_of(WALL_CHECK_EVERY) && self.wall_ran_out() {
-                return false;
-            }
             let path = entry.path();
             let Ok(file_type) = entry.file_type() else {
                 continue;
@@ -350,6 +341,14 @@ impl Walk<'_> {
             if (self.on_entry)(&path, &file_type, &id).is_break() {
                 // The tool's stop, not the budget's: `truncated_by` stays as it
                 // is, and the tool reports the stop in its own words.
+                return false;
+            }
+            // The clock, after every entry: the callback just returned from may
+            // have read megabytes (grep's per-file cap), and a flat directory
+            // of very many entries never reaches a descent — so neither a
+            // batched read nor the per-descent read alone would bound it. A
+            // read is tens of nanoseconds; it is never the cost of the walk.
+            if self.wall_ran_out() {
                 return false;
             }
             if file_type.is_dir() {
@@ -468,9 +467,9 @@ impl Walk<'_> {
 /// the stopped line (if the budget ran out), then the unreadable line (if any
 /// folder could not be read). Empty for a walk with nothing to add.
 ///
-/// Every line starts with `... (` — see [`is_harness_line`] — and the tool
-/// appends its own cap notice **after** these, so that notice keeps the last
-/// position it always had.
+/// Every line starts with [`HARNESS_LINE_PREFIX`] (`... (`) and is a shape
+/// [`is_harness_line`] knows; the tool appends its own [`cap_notice`] **after**
+/// these, so that notice keeps the last position it always had.
 #[must_use]
 pub fn trailer_lines(report: &WalkReport) -> Vec<String> {
     let mut lines = Vec::new();
@@ -492,6 +491,17 @@ pub fn trailer_lines(report: &WalkReport) -> Vec<String> {
         lines.push(unreadable_line(report));
     }
     lines
+}
+
+/// The cap notice a tool appends when its own result cap was hit — `... (capped
+/// at 200 matches)` for grep, `... (capped at 200 results)` for glob — written
+/// here beside the other harness lines so every writer spells the prefix and
+/// the shape [`is_harness_line`] knows from one place. `noun` is the tool's
+/// unit (`matches`, `results`); a tool appends this **after** the walk's
+/// trailer, keeping the last position it always had.
+#[must_use]
+pub fn cap_notice(cap: usize, noun: &str) -> String {
+    format!("{HARNESS_LINE_PREFIX}capped at {cap} {noun})")
 }
 
 /// The BR-13 line: how many folders could not be read, which (up to
@@ -541,15 +551,22 @@ where
 }
 
 /// Whether `line` is one the harness wrote rather than a tool's own result
-/// line — the one recogniser grep's triage split uses (ADR-3), so a new
-/// harness line is never ranked as a match by accident.
+/// line — the one recogniser grep's triage split uses (ADR-3), so a harness
+/// line is never ranked as a match.
 ///
 /// Recognised by **exact known shape**, not by the prefix alone: after
 /// [`HARNESS_LINE_PREFIX`] the line continues `stopped after ` (the budget
 /// lines), `<digits> folder(s) could not be read` (the unreadable line), or
-/// `capped at ` (both tools' cap notices). A grep match from a file whose path
-/// begins `... (` — which a `MATCH` line spelling `... (x.rs:1: y` would
-/// produce — is a match, and is not peeled.
+/// `capped at ` (both tools' cap notices, [`cap_notice`]). A grep match from a
+/// file whose path begins `... (` — which a `MATCH` line spelling
+/// `... (x.rs:1: y` would produce — is a match, and is not peeled.
+///
+/// **The rule is two-sided.** Every writer of a harness line lives in this
+/// module ([`trailer_lines`], [`cap_notice`]) and every shape is named here:
+/// authoring a new harness line means adding its shape to this function in the
+/// same change, and the test that enumerates every writer against this
+/// recogniser (`every_harness_line_writer_is_recognised`) is what fails when
+/// one side moves without the other.
 #[must_use]
 pub fn is_harness_line(line: &str) -> bool {
     let Some(body) = line.strip_prefix(HARNESS_LINE_PREFIX) else {
@@ -846,11 +863,13 @@ mod tests {
         std::fs::remove_dir_all(&root).ok();
     }
 
-    /// **BR-10, wall clock.** The clock is read at each directory boundary,
-    /// so a zero budget lets the root's own files through and stops at the
-    /// first descent — deterministic, no sleep, no giant fixture.
+    /// **BR-10, wall clock.** The clock is read after every entry, so a zero
+    /// budget hands over exactly the root's first entry — whichever the
+    /// directory lists first — and stops before anything under a child is
+    /// seen: deterministic, no sleep, no giant fixture. The root itself is
+    /// always entered.
     #[test]
-    fn the_wall_clock_budget_stops_the_walk_at_a_directory_boundary() {
+    fn the_wall_clock_budget_stops_the_walk_after_the_first_entry() {
         let root = temp_root("wall");
         plant(&root, "top.rs");
         plant(&root, "sub/deep.rs");
@@ -858,8 +877,23 @@ mod tests {
             max_entries: 1_000,
             max_wall: Duration::ZERO,
         });
-        let (seen, report) = files_seen(&root, RootKind::Plain, &[], &policy);
-        assert_eq!(seen, vec!["top.rs"], "the root is always entered");
+        let canonical = root.canonicalize().unwrap();
+        let mut handed = Vec::new();
+        let report = visit(
+            &canonical,
+            RootKind::Plain,
+            &[],
+            &policy,
+            &mut |_, _, id| {
+                handed.push(id.as_str().to_owned());
+                ControlFlow::Continue(())
+            },
+        );
+        assert_eq!(handed.len(), 1, "one entry, then the clock: {handed:?}");
+        assert!(
+            handed[0] == "top.rs" || handed[0] == "sub",
+            "the root's own entry, never a child's: {handed:?}"
+        );
         assert_eq!(
             report.truncated_by,
             Some(TruncatedBy::WallClock(Duration::ZERO))
@@ -1046,13 +1080,13 @@ mod tests {
         std::fs::remove_dir_all(&root).ok();
     }
 
-    /// **BR-10, wall clock inside one directory.** The clock is also read every
-    /// [`WALL_CHECK_EVERY`] entries, so a flat directory of many files — which
-    /// never reaches a descent — still stops on a spent budget.
+    /// **BR-10, wall clock inside one directory.** The clock is read after
+    /// every entry, so a flat directory of many files — which never reaches a
+    /// descent — stops on a spent budget after its first entry, not at its end.
     #[test]
-    fn the_wall_clock_is_read_within_a_flat_directory_every_n_entries() {
+    fn the_wall_clock_is_read_after_every_entry_within_a_flat_directory() {
         let root = temp_root("wall-flat");
-        for n in 0..(WALL_CHECK_EVERY + 20) {
+        for n in 0..300 {
             plant(&root, &format!("f{n:04}.rs"));
         }
         let policy = WalkPolicy::default().with_budget(WalkBudget {
@@ -1065,16 +1099,109 @@ mod tests {
             Some(TruncatedBy::WallClock(Duration::ZERO)),
             "a flat directory must still meet the wall clock"
         );
-        assert!(
-            seen.len() < WALL_CHECK_EVERY,
-            "the stop must land at the first check, not at the end: {} seen",
+        assert_eq!(
+            seen.len(),
+            1,
+            "the stop lands after the first entry, not at the end: {} seen",
             seen.len()
         );
-        assert!(
-            !seen.is_empty(),
-            "the entries before the first check are handed over"
-        );
         std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// **Descents are name-ordered, pinned directly** (`children.sort()`):
+    /// three sibling directories created as `c/`, `a/`, `b/` — an order a
+    /// filesystem's hash order may well return — are entered `a`, `b`, `c`,
+    /// which the *raw* order the files under them are handed over in shows.
+    /// Captured here rather than through `files_seen`, which sorts.
+    #[test]
+    fn child_directories_are_entered_in_name_order_whatever_the_listing_order() {
+        let root = temp_root("order");
+        for dir in ["c", "a", "b"] {
+            plant(&root, &format!("{dir}/inside.rs"));
+        }
+        let canonical = root.canonicalize().unwrap();
+        let mut descents = Vec::new();
+        let report = visit(
+            &canonical,
+            RootKind::Plain,
+            &[],
+            &WalkPolicy::default(),
+            &mut |_, ft, id| {
+                if !ft.is_dir() {
+                    descents.push(id.as_str().to_owned());
+                }
+                ControlFlow::Continue(())
+            },
+        );
+        assert_eq!(
+            descents,
+            vec!["a/inside.rs", "b/inside.rs", "c/inside.rs"],
+            "descents must be lexicographic"
+        );
+        assert_eq!(report, WalkReport::default());
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// **Every writer of a harness line is recognised** — the two-sided rule
+    /// `is_harness_line` documents, enumerated: each `trailer_lines` variant
+    /// (the entry stop, the wall-clock stop whole and fractional, the unreadable
+    /// line with names, with names and "and N more", and counted-only) and
+    /// both tools' cap notices. A new writer belongs in this list, and a new
+    /// shape belongs in the recogniser, in the same change.
+    #[test]
+    fn every_harness_line_writer_is_recognised() {
+        let reports = [
+            WalkReport {
+                truncated_by: Some(TruncatedBy::Entries(100_000)),
+                ..WalkReport::default()
+            },
+            WalkReport {
+                truncated_by: Some(TruncatedBy::WallClock(Duration::from_secs(10))),
+                ..WalkReport::default()
+            },
+            WalkReport {
+                truncated_by: Some(TruncatedBy::WallClock(Duration::from_millis(1_500))),
+                ..WalkReport::default()
+            },
+            WalkReport {
+                truncated_by: None,
+                unreadable: vec!["a/".into()],
+                unreadable_total: 1,
+            },
+            WalkReport {
+                truncated_by: None,
+                unreadable: vec!["a/".into(), "b/".into()],
+                unreadable_total: 9,
+            },
+            WalkReport {
+                truncated_by: None,
+                unreadable: vec![],
+                unreadable_total: 3,
+            },
+            // Both halves at once, in order.
+            WalkReport {
+                truncated_by: Some(TruncatedBy::Entries(7)),
+                unreadable: vec!["x/".into()],
+                unreadable_total: 1,
+            },
+        ];
+        let mut lines: Vec<String> = reports.iter().flat_map(trailer_lines).collect();
+        assert_eq!(lines.len(), 8, "{lines:?}");
+        lines.push(cap_notice(200, "matches"));
+        lines.push(cap_notice(200, "results"));
+        lines.push(cap_notice(1, "results"));
+        for line in &lines {
+            assert!(
+                line.starts_with(HARNESS_LINE_PREFIX),
+                "a writer dropped the prefix: {line}"
+            );
+            assert!(
+                is_harness_line(line),
+                "a writer's shape is unknown to the recogniser: {line}"
+            );
+        }
+        // And the empty report writes nothing, so nothing is peeled.
+        assert!(trailer_lines(&WalkReport::default()).is_empty());
     }
 
     /// **The macOS firmlink (BR-12 from `/`).** `/System/Volumes/Data/Users/<n>`

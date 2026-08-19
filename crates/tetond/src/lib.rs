@@ -71,6 +71,10 @@
 //!   of "what ground does this session stand on" — is a project marker present,
 //!   what does `.git/HEAD` say — over the pure classification in
 //!   `teton_core::session_root`. Called per use, never cached.
+//! - [`fs_util`] — the one bounded file reader (REQ-583 verify): type and size
+//!   checked off `metadata` before the open, the read `take`n — shared by the
+//!   probe's `.git`/`HEAD` reads and `grep`'s per-file reads, so a FIFO or a
+//!   giant file holds neither hostage and the two cannot drift in order.
 //! - [`single_instance`] — the `flock`-based single-instance guard.
 //!
 //! Socket and lock path resolution lives in the shared
@@ -88,6 +92,7 @@ pub mod cost;
 pub mod download;
 pub mod egress;
 pub mod env_path;
+pub mod fs_util;
 pub mod grants;
 pub mod harness;
 pub mod install;
@@ -134,6 +139,53 @@ pub fn version() -> &'static str {
 pub(crate) fn fixture_id(path: &str) -> teton_core::ProvenanceId {
     teton_core::ProvenanceId::claimed(path)
         .unwrap_or_else(|e| panic!("fixture path {path:?} is not an identity: {e}"))
+}
+
+/// Create a FIFO at `path` — the test fixture for "an entry that is not a
+/// regular file and whose open would block for a writer" (REQ-583 verify).
+/// `mkfifo(2)` through libc, panicking on failure so a fixture that could not be
+/// made is a failed test and never a vacuous one. Test-only, one helper for
+/// every FIFO test in the crate (the probe's `HEAD`, `grep`'s tree, `read` and
+/// `edit`'s path, the bounded reader) rather than one `unsafe` block per
+/// module.
+#[cfg(test)]
+pub(crate) fn mkfifo(path: &std::path::Path) {
+    use std::os::unix::ffi::OsStrExt;
+    let c_path = std::ffi::CString::new(path.as_os_str().as_bytes()).unwrap();
+    // SAFETY: `mkfifo` reads a NUL-terminated path and a mode; nothing else.
+    let made = unsafe { libc::mkfifo(c_path.as_ptr(), 0o644) };
+    assert_eq!(
+        made,
+        0,
+        "mkfifo {}: {}",
+        path.display(),
+        std::io::Error::last_os_error()
+    );
+}
+
+/// Run `work` on a worker thread and return its result, failing the test if it
+/// has not returned within five seconds — so a test whose regression is a hang
+/// (a FIFO opened for reading) fails instead of stalling the suite. `what`
+/// names the call in the failure message.
+#[cfg(test)]
+pub(crate) fn with_deadline<T: Send + 'static>(
+    what: &str,
+    work: impl FnOnce() -> T + Send + 'static,
+) -> T {
+    use std::sync::mpsc::RecvTimeoutError;
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let _ = tx.send(work());
+    });
+    match rx.recv_timeout(std::time::Duration::from_secs(5)) {
+        Ok(value) => value,
+        Err(RecvTimeoutError::Timeout) => {
+            panic!("{what} must return: it was still running after 5 s (a blocking open?)")
+        }
+        Err(RecvTimeoutError::Disconnected) => {
+            panic!("{what} panicked on its worker thread; see the panic above")
+        }
+    }
 }
 
 #[cfg(test)]

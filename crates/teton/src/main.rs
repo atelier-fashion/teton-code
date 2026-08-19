@@ -20,7 +20,7 @@ use clap::{Parser, Subcommand, ValueEnum};
 // way in because this binary's `ProviderKind` is the *wire* one it parses and
 // sends; the composition rule is written against the core enum, and [`core_kind`]
 // is the only place the two meet.
-use teton_core::session_root::{resolve_cwd_argument, CwdArgError};
+use teton_core::session_root::{resolve_cwd_argument, CwdArgError, CwdRefusal};
 use teton_core::{
     canonical_request_path, compose_endpoint, is_absolute_http_url, is_cleartext_to_a_remote_host,
     url_host, ProviderKind as CoreProviderKind,
@@ -401,8 +401,8 @@ pub(crate) fn home_dir() -> Option<PathBuf> {
 /// (AC-12): the flag's value goes through [`resolve_cwd_argument`], the same
 /// function `/cd` uses, and nothing else — no canonicalization and no
 /// existence check, because the daemon validates the path it is sent (ADR-4;
-/// the fail-fast in `main` is a courtesy copy of one clause of that
-/// validation, not a second validator).
+/// the fail-fast in the session-opening paths, [`cwd_flag_refusal`], renders
+/// one clause of that validation's own type, not a second validator).
 ///
 /// # Errors
 /// [`CwdArgError`] when `--cwd` was given and could not become an absolute
@@ -425,13 +425,19 @@ pub(crate) fn resolve_session_root_path(
     }
 }
 
+/// The prefix every refused session start wears — the CLI's own fail-fast for
+/// a `--cwd` that names no directory ([`cwd_flag_refusal`]) and a
+/// `session/create` the daemon refused ([`run_session`]) — so a script reads
+/// one line shape either way, and the two cannot drift.
+const SESSION_START_REFUSAL_PREFIX: &str = "could not start a session: ";
+
 /// The refusal a `--cwd` that names no directory earns **before this process
 /// connects to anything** (REQ-583 BR-6, verify finding V): the daemon's own
-/// sentence for the same path — `path `<p>` does not exist or is not a
-/// directory`, root-neutral, naming the argument as resolved — behind the
-/// `could not start a session:` prefix `run_session` gives a refused create,
-/// so a script reads one line either way. `None` when the path is a directory
-/// (or when `--cwd` was not given: the shell's directory is not judged here).
+/// sentence for the same path — [`CwdRefusal::NotADirectory`], the very type
+/// the daemon's validator answers with, so the wording is constructed and
+/// never retyped — behind [`SESSION_START_REFUSAL_PREFIX`]. `None` when the
+/// path is a directory (or when `--cwd` was not given: the shell's directory
+/// is not judged here).
 ///
 /// The daemon's validator (`session/create`, `session/set_cwd`) stays the
 /// authority for the RPC — a directory that vanishes between this check and
@@ -439,13 +445,16 @@ pub(crate) fn resolve_session_root_path(
 /// refused there with the same sentence. This is a fail-fast so `teton --cwd
 /// /typo` does not first autostart a daemon, offer to register launchd, or
 /// raise a first-run model prompt on the way to being told the path was wrong.
+/// It is applied by the two paths that **open a session** — [`run_session`]
+/// and [`run_provider_test`] — before either connects, and nowhere else:
+/// `teton --cwd /nope doctor` opens no session and has nothing to refuse.
 #[must_use]
 fn cwd_flag_refusal(cwd_flag: Option<&str>, resolved: Option<&Path>) -> Option<String> {
     let path = resolved.filter(|_| cwd_flag.is_some())?;
     (!path.is_dir()).then(|| {
         format!(
-            "could not start a session: path `{}` does not exist or is not a directory",
-            path.display()
+            "{SESSION_START_REFUSAL_PREFIX}{}",
+            CwdRefusal::NotADirectory(path.to_path_buf())
         )
     })
 }
@@ -458,9 +467,10 @@ fn main() -> ExitCode {
     // `--cwd` through the grammar `/cd` shares, or the shell's directory as
     // before — and threaded to the two places a session is created. A malformed
     // `--cwd` is refused before anything connects, in the `bail!` shape every
-    // other refused argument takes: one line on stderr, non-zero exit — and so
-    // is a well-formed one that names no directory (`cwd_flag_refusal`), with
-    // the daemon's own sentence, before a daemon is autostarted or asked.
+    // other refused argument takes: one line on stderr, non-zero exit. A
+    // well-formed one that names no directory is refused by the two
+    // session-opening paths themselves (`cwd_flag_refusal`), with the daemon's
+    // own sentence, before a daemon is autostarted or asked.
     let session_root = match resolve_session_root_path(
         cli.cwd.as_deref(),
         std::env::current_dir().ok().as_deref(),
@@ -472,13 +482,15 @@ fn main() -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
-    if let Some(refusal) = cwd_flag_refusal(cli.cwd.as_deref(), session_root.as_deref()) {
-        eprintln!("teton: {refusal}");
-        return ExitCode::FAILURE;
-    }
 
     let result = match cli.command {
-        None => run_session(&paths, cli.yes, cli.verbose, session_root.as_deref()),
+        None => run_session(
+            &paths,
+            cli.yes,
+            cli.verbose,
+            session_root.as_deref(),
+            cli.cwd.as_deref(),
+        ),
         Some(Command::Doctor) => run_doctor(&paths),
         Some(Command::Cost) => run_cost(&paths),
         Some(Command::Effort { level }) => run_effort(&paths, level.as_deref()),
@@ -495,9 +507,13 @@ fn main() -> ExitCode {
                 model,
             } => run_provider_add(&paths, &id, kind.into(), endpoint, model),
             ProviderAction::List => run_provider_list(&paths),
-            ProviderAction::Test { id } => {
-                run_provider_test(&paths, &id, cli.yes, session_root.as_deref())
-            }
+            ProviderAction::Test { id } => run_provider_test(
+                &paths,
+                &id,
+                cli.yes,
+                session_root.as_deref(),
+                cli.cwd.as_deref(),
+            ),
         },
         Some(Command::Boundary { action }) => match action {
             BoundaryAction::Add { glob, mode } => run_boundary_add(&paths, glob, mode.into()),
@@ -966,19 +982,29 @@ fn cli_line_note(name: &str) -> String {
 /// BR-6): the resolved `--cwd`, or the shell's directory. It is what the banner's
 /// `cwd:` line shows and what `session/create` is sent; `None` only when the
 /// shell's directory was unreadable and no `--cwd` was given, in which case the
-/// daemon falls back to its own root as it always has.
+/// daemon falls back to its own root as it always has. `cwd_flag` is the
+/// `--cwd` argument as typed (`None` when absent): a flag that names no
+/// directory is refused here first, before the banner and before anything
+/// connects ([`cwd_flag_refusal`]).
 ///
 /// # Errors
 ///
-/// A transport error, or a `session/create` the daemon refused — the refusal
-/// names the path and the reason, and it is an error exit (BR-6: never a session
-/// that starts and then fails on every tool; a script must see the failure).
+/// A `--cwd` that names no directory (the CLI's fail-fast), a transport error,
+/// or a `session/create` the daemon refused — each refusal names the path and
+/// the reason, and it is an error exit (BR-6: never a session that starts and
+/// then fails on every tool; a script must see the failure).
 fn run_session(
     paths: &DaemonPaths,
     auto_accept: bool,
     verbose: bool,
     session_root: Option<&Path>,
+    cwd_flag: Option<&str>,
 ) -> anyhow::Result<()> {
+    // BR-6's fail-fast, first: nothing is printed and nothing is connected on
+    // the way to telling the user the path was wrong.
+    if let Some(refusal) = cwd_flag_refusal(cwd_flag, session_root) {
+        anyhow::bail!(refusal);
+    }
     // The banner is for humans at a terminal. Piped stdout (the e2e suites,
     // shell composition) sees the same byte stream it always did.
     let interactive = std::io::IsTerminal::is_terminal(&std::io::stdout());
@@ -1056,7 +1082,7 @@ fn run_session(
             // be one. `bail!` at the binary edge, as every refused argument is
             // (REQ-582 ADR-3): `main` prints it once, on stderr, and nothing
             // about a session follows.
-            Err(err) => anyhow::bail!("could not start a session: {}", err.message),
+            Err(err) => anyhow::bail!("{SESSION_START_REFUSAL_PREFIX}{}", err.message),
         };
         // The slash handlers act on this session and reach it only through the
         // context (REQ-563: `/web allow` names the session whose restriction it
@@ -2285,14 +2311,21 @@ pub(crate) fn provider_add_on(
 ///
 /// # Errors
 ///
-/// Propagates a transport error. A daemon that *answers* — including a refusal
-/// to create the session — is reported on the surface and returns `Ok`.
+/// A `--cwd` that names no directory (`cwd_flag` is the flag as typed; the
+/// CLI's fail-fast, [`cwd_flag_refusal`], before anything connects — this
+/// subcommand opens a session, so it is refused exactly as `teton` itself is),
+/// or a transport error. A daemon that *answers* — including a refusal to
+/// create the session — is reported on the surface and returns `Ok`.
 fn run_provider_test(
     paths: &DaemonPaths,
     id: &str,
     assume_yes: bool,
     session_root: Option<&Path>,
+    cwd_flag: Option<&str>,
 ) -> anyhow::Result<()> {
+    if let Some(refusal) = cwd_flag_refusal(cwd_flag, session_root) {
+        anyhow::bail!(refusal);
+    }
     let mut surface = stdout_surface();
     let mut conn = client::ensure_connected(paths, &mut surface)?;
     let mut state = SessionState::new();
@@ -3795,6 +3828,17 @@ mod tests {
                 format!(
                     "could not start a session: path `{}` does not exist or is not a directory",
                     missing.display()
+                )
+                .as_str()
+            )
+        );
+        // The sentence is the daemon's type rendered, not a retyped copy.
+        assert_eq!(
+            cwd_flag_refusal(Some("nope"), Some(&missing)).as_deref(),
+            Some(
+                format!(
+                    "{SESSION_START_REFUSAL_PREFIX}{}",
+                    CwdRefusal::NotADirectory(missing.clone())
                 )
                 .as_str()
             )
