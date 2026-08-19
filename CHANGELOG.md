@@ -18,6 +18,56 @@ unchanged. What belongs here is what an *upgrade* does to a machine that was
 already running — above all, anything that changes where data goes without the
 user having asked for it.
 
+## [0.1.23] - 2026-08-19
+
+### Added
+
+- **The session knows where it stands, says so when it is nowhere, and a
+  search can no longer crawl your disk (REQ-583).** Launched from a home
+  folder and asked to "look in my development folder for the Teton repo",
+  Teton walked the whole of `~` — macOS asked for Music, then Photos, then
+  "data from other apps", then Desktop — and still found nothing. Three
+  changes, one upgrade:
+
+  - **Every prompt carries the session root.** One line —
+    `Session root: ~/Documents/GitHub/teton-code (project teton-code, branch
+    main). Platform: macOS.` — so the model reasons from where it actually is.
+    A refusal to read outside it names the root (``path `x` is outside the
+    session root ~/…``), and the tools say "session root", never "repository".
+    It is paid for inside the same resident-prompt ceiling as before: the
+    guide's `[web]` key reference moved into the `teton_docs web` topic; no
+    fact was lost.
+  - **Starting outside a project is announced, and movable.** `teton` run from
+    your home folder, `/`, or any directory without a `.git` or build manifest
+    prints one notice naming the root and its consequence ("every search walks
+    all of it, and privacy boundaries declared for a project do not apply
+    here") with the two remedies: `teton --cwd <path>`, or `/cd <path>` inside
+    the session, which moves the session's root, clears the conversation
+    (provenance identities are root-relative), and says so; `/cd` alone prints
+    the current root. `--cwd` refuses a missing directory before anything
+    connects. Session "allow always" answers survive a `/cd`, exactly as they
+    survive `/clear`.
+  - **Searches are bounded and honest.** `glob` and `grep` run under one walk
+    policy — 100,000 entries or 10 seconds — and say when they stopped
+    (`... (stopped after …; narrow the pattern, or move the session root with
+    /cd)`); `glob` returns directories when the pattern names one
+    (`**/teton-code` finds the folder); from a home-rooted session the
+    top-level `Library`, `Music`, `Pictures`, `Movies`, `.Trash` and dev caches
+    are not entered unless you name them — those are the trees macOS gates
+    behind a consent dialog — and folders that could not be read are reported
+    instead of silently skipped (on macOS the line says a consent dialog may be
+    why; a timed-out shell command from such a root says the same). `grep`
+    skips devices, FIFOs and multi-GB files and caps a match line; `read` and
+    `edit` refuse anything that is not a regular file.
+
+  No wire-format break: `SessionCreateResult.root`, `session/set_cwd` and the
+  `session_root_changed` event are additive, so an older CLI keeps working
+  against this daemon and this CLI against an older daemon (it says "this
+  daemon build cannot move a session root" if you `/cd` there). The one check
+  that cannot be automated — that no Media / Photos / "other apps" dialog
+  appears during a `~`-rooted search — is a runbook step in
+  `docs/manual-verification.md`.
+
 ## [0.1.22] - 2026-08-18
 
 ### Fixed
