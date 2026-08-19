@@ -69,5 +69,25 @@
       "TASK-180"
     ],
     "failedTasks": []
+  },
+  "phase5": {
+    "verifyCommits": [
+      "bbb23a6",
+      "64b06dc",
+      "e50bd3b"
+    ],
+    "findings": {
+      "critical": 0,
+      "major": 5,
+      "minorNitFixed": "~25"
+    },
+    "reverify": "all closed",
+    "workspace": "3074 passed / 0 failed",
+    "haltedAt": "2026-08-19T13:20:42Z",
+    "halt": "legitimate halt #2 \u2014 reflector user-facing questions",
+    "pendingQuestions": [
+      "Q1 (OQ-8): do session-scoped AllowAlways permission grants survive a /cd? Today they do (only the conversation is cleared). Recommendation: drop session grants on /cd and say so on the /cd line (LESSON-495 \u2014 the grant's key never encoded the root).",
+      "Q2 (OQ-7): a listed DIRECTORY identity (e.g. `secrets/` from `glob **/secrets`) does not taint egress; files under a boundary still do. Adopted and pinned by provenance_egress test; confirm or ask for fail-closed."
+    ]
   }
 }
