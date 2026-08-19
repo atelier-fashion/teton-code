@@ -342,6 +342,15 @@ impl HarnessConfig {
     /// config's five budget-bearing fields cannot disagree with the
     /// [`RouteBudget`] every surface reads.
     #[must_use]
+    pub fn with_route_budget(mut self, budget: RouteBudget) -> Self {
+        self.context_budget_tokens = budget.budget_tokens;
+        self.context_budget_bytes = budget.budget_bytes;
+        self.summarize_threshold_tokens = budget.digest_threshold_tokens;
+        self.summarize_threshold_bytes = budget.digest_threshold_bytes;
+        self.budget = budget;
+        self
+    }
+
     /// Both digest thresholds set past anything a result can reach, so tool
     /// results enter context **whole**.
     ///
@@ -360,15 +369,6 @@ impl HarnessConfig {
     pub fn without_digest(mut self) -> Self {
         self.summarize_threshold_tokens = usize::MAX;
         self.summarize_threshold_bytes = usize::MAX;
-        self
-    }
-
-    pub fn with_route_budget(mut self, budget: RouteBudget) -> Self {
-        self.context_budget_tokens = budget.budget_tokens;
-        self.context_budget_bytes = budget.budget_bytes;
-        self.summarize_threshold_tokens = budget.digest_threshold_tokens;
-        self.summarize_threshold_bytes = budget.digest_threshold_bytes;
-        self.budget = budget;
         self
     }
 }
