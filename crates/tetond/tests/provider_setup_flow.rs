@@ -805,6 +805,74 @@ fn a_replacement_is_previewed_as_one_and_leaves_every_other_byte_alone() {
     );
 }
 
+/// **A fresh setup records the recipe's window** (REQ-586 BR-3, AC-5) — the
+/// daemon half of "declaring a window is not a hand edit", proved on the file
+/// a real daemon wrote.
+///
+/// The candidate carries the build's own catalog figure for the recipe's
+/// example model (the CLI carries it silently; here it is read from
+/// `tetond::provider_recipes` so a re-verified vendor figure re-verifies this
+/// test), the preview shows the `max_context = N` line the user confirms, and
+/// the committed file holds the same line. The replace test above is this
+/// test's complement: a candidate WITHOUT the field left the hand-authored
+/// `max_context = 200000` alone, because `None` preserves (ADR-7).
+#[test]
+fn a_fresh_setup_writes_the_recipe_window_into_the_capabilities_table() {
+    let ws = Workspace::new("provider-setup-window");
+    ws.write_config(&fresh_config());
+    let script = ws.write_script(NO_TURNS);
+    let daemon = Daemon::spawn(&ws, probe().script(script));
+    let mut client = daemon.connect();
+    let session = client.create_session("freeform", None);
+
+    let window = tetond::provider_recipes::recipe_catalog()
+        .iter()
+        .find(|r| r.id_suggestion == "kimi")
+        .map(|r| r.max_context)
+        .expect("the build ships a kimi recipe");
+    assert!(
+        window > 0,
+        "the recipe contract test pins a non-zero window"
+    );
+    let window_line = format!("max_context = {window}");
+
+    let mut candidate = kimi("kimi-k3");
+    candidate["max_context"] = json!(window);
+    let previewed = client.call(
+        "provider/setup_preview",
+        json!({ "session_id": session, "candidate": candidate }),
+    );
+    let toml = previewed["result"]["toml"]
+        .as_str()
+        .unwrap_or_else(|| panic!("the preview must render the candidate rows: {previewed}"));
+    assert!(
+        toml.contains(&window_line),
+        "the preview must show the window a commit would record:\n{toml}"
+    );
+
+    let digest = digest_of(&previewed);
+    let committed = client.call(
+        "provider/setup_commit",
+        json!({ "session_id": session, "candidate": candidate, "expect_digest": digest }),
+    );
+    assert_eq!(
+        committed["result"]["applied"].as_bool(),
+        Some(true),
+        "the commit must apply: {committed}\ndaemon log:\n{}",
+        daemon.log()
+    );
+
+    let written = std::fs::read_to_string(&ws.config_path).expect("the config was written");
+    assert!(
+        written.contains("[providers.capabilities]"),
+        "the window lands as a `[providers.capabilities]` table:\n{written}"
+    );
+    assert!(
+        written.contains(&window_line),
+        "the window the preview showed is the window the file holds:\n{written}"
+    );
+}
+
 // ---------------------------------------------------------------------------
 // (5) AC-11 / BR-12 — the presence gate
 // ---------------------------------------------------------------------------

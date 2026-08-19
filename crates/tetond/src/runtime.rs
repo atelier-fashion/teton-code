@@ -5352,6 +5352,29 @@ impl DaemonRuntime {
             }
         }
 
+        // The window, carried only with the model it describes (REQ-586 BR-3:
+        // no window is ever *guessed* from a model name outside the recipes).
+        // A candidate's `max_context` is the recipe's figure for the recipe's
+        // **example model**, carried silently by the setup UI — so it is
+        // written only when the chosen model is that example, matched as the
+        // (example_model, window) pair so a stale client's old catalog cannot
+        // smuggle a superseded figure under a current model name. Any other
+        // model writes `0`: "unknown", stated in the preview's
+        // `max_context = 0` line rather than defaulted silently. `None` — no
+        // recipe behind the candidate, or a client predating the field —
+        // preserves whatever the config already holds, which is the
+        // pre-REQ-586 behaviour exactly (ADR-7 field-wise merge).
+        let max_context = candidate.max_context.map(|window| {
+            let is_the_recipes_own_example = crate::provider_recipes::recipe_catalog()
+                .iter()
+                .any(|recipe| recipe.example_model == model && recipe.max_context == window);
+            if is_the_recipes_own_example {
+                window
+            } else {
+                0
+            }
+        });
+
         // The candidate, built by identity — see the section above.
         let mut config = current.clone();
         apply_update(
@@ -5362,10 +5385,11 @@ impl DaemonRuntime {
                 endpoint: endpoint.clone(),
                 model: Some(model.to_owned()),
                 auth_ref: Some(key_ref.to_owned()),
-                // TASK-188 writes the candidate's window here (REQ-586 ADR-7);
-                // `None` preserves whatever is stored, which is the pre-REQ-586
-                // behaviour exactly.
-                max_context: None,
+                max_context,
+                // The flow asks no cap question, so it contributes no answer —
+                // the `SetTierBinding` fallback reasoning, one field over: a
+                // question this flow does not ask is not an answer of "none",
+                // and `None` leaves a hand-authored cap exactly where it was.
                 context_budget_cap: None,
             }),
         );
@@ -9801,12 +9825,12 @@ fn snapshot_from_config(
                 endpoint: p.endpoint.clone(),
                 model: p.model.clone(),
                 auth_ref: p.auth_ref.clone(),
-                // TASK-188 projects `Some(p.capabilities.max_context)` and the
-                // cap here (REQ-586 ADR-7: the daemon always populates the
-                // window, `Some(0)` = unknown). Until it lands the snapshot
-                // reads as a pre-REQ-586 daemon's.
-                max_context: None,
-                context_budget_cap: None,
+                // REQ-586 ADR-7: always populated — `Some(0)` is "unknown" /
+                // "no cap", stated rather than hidden (BR-3), and `None` is
+                // reserved for a snapshot from a daemon predating the fields,
+                // so a live daemon never emits it.
+                max_context: Some(p.capabilities.max_context),
+                context_budget_cap: Some(p.capabilities.context_budget_cap),
             })
             .collect(),
         tiers: Tier::ALL
@@ -9967,6 +9991,21 @@ fn apply_update(config: &mut Config, update: ConfigUpdate) {
                 .iter()
                 .find(|p| p.id == id)
                 .map_or_else(ProviderCapabilities::default, |p| p.capabilities);
+            // REQ-586 ADR-7: the two window fields are the one exception to
+            // "capabilities are not settable over this RPC", and they merge
+            // **field-wise** — `Some(v)` writes (`0` included: it is the
+            // config's own "unknown" / "no cap" spelling, and un-declaring a
+            // window is a write, not an absence), `None` preserves what is
+            // stored. An older client's re-registration therefore cannot zero
+            // a declared window, and the rest of the profile still rides the
+            // BUG-155 lookup above untouched.
+            let capabilities = ProviderCapabilities {
+                max_context: pc.max_context.unwrap_or(capabilities.max_context),
+                context_budget_cap: pc
+                    .context_budget_cap
+                    .unwrap_or(capabilities.context_budget_cap),
+                ..capabilities
+            };
             let provider = ModelProvider {
                 id,
                 kind: to_core_kind(pc.kind),
@@ -11713,6 +11752,30 @@ permission_allow = [\"fetch_user_url\"]
         assert_eq!(snap.providers.len(), 1);
         assert_eq!(snap.providers[0].kind, ProtoProviderKind::OpenaiCompatible);
         assert_eq!(snap.privacy[0].mode, PrivacyMode::LocalOnly);
+        // REQ-586 ADR-7: the snapshot ALWAYS populates the window fields — a
+        // provider with no capabilities table reads `Some(0)` ("unknown" /
+        // "no cap"), never `None`, which is reserved for a daemon predating
+        // the fields.
+        assert_eq!(snap.providers[0].max_context, Some(0));
+        assert_eq!(snap.providers[0].context_budget_cap, Some(0));
+
+        // And a declared window round-trips: registered over the wire,
+        // projected back out as the same figures.
+        apply_update(
+            &mut config,
+            ConfigUpdate::RegisterProvider(ProviderConfig {
+                id: ProviderId::from("deepseek"),
+                kind: ProtoProviderKind::OpenaiCompatible,
+                endpoint: Some("https://api.deepseek.com/v1/chat/completions".to_owned()),
+                model: Some("deepseek-chat".to_owned()),
+                auth_ref: Some("keychain:deepseek".to_owned()),
+                max_context: Some(131_072),
+                context_budget_cap: Some(65_536),
+            }),
+        );
+        let snap = snapshot_from_config(&config, &router_for_config(&config), false);
+        assert_eq!(snap.providers[0].max_context, Some(131_072));
+        assert_eq!(snap.providers[0].context_budget_cap, Some(65_536));
     }
 
     /// **The snapshot reports whether the redaction scan is enabled** (REQ-562;
@@ -12230,6 +12293,53 @@ permission_allow = [\"fetch_user_url\"]
             config.providers[0].endpoint.as_deref(),
             Some("https://b.example/v1/chat/completions")
         );
+    }
+
+    /// **REQ-586 AC-5 (daemon half): the window fields merge field-wise on
+    /// re-registration** (ADR-7, tracer gotcha #6).
+    ///
+    /// `None` preserves — an older client's re-registration cannot zero a
+    /// declared window — and `Some` writes, `0` included, because `0` is the
+    /// config's own "unknown" / "no cap" spelling and un-declaring is a write,
+    /// not an absence. The rest of the capability profile rides the BUG-155
+    /// lookup, which this merge builds on rather than replaces.
+    #[test]
+    fn re_registration_merges_the_window_fields_field_wise() {
+        let register = |max_context: Option<u32>, cap: Option<u32>| {
+            ConfigUpdate::RegisterProvider(ProviderConfig {
+                id: ProviderId::from("kimi"),
+                kind: ProtoProviderKind::OpenaiCompatible,
+                endpoint: Some("https://api.moonshot.ai/v1/chat/completions".to_owned()),
+                model: Some("kimi-k3".to_owned()),
+                auth_ref: None,
+                max_context,
+                context_budget_cap: cap,
+            })
+        };
+
+        let mut config = Config::default();
+        apply_update(&mut config, register(Some(200_000), Some(40_000)));
+        assert_eq!(config.providers[0].capabilities.max_context, 200_000);
+        assert_eq!(config.providers[0].capabilities.context_budget_cap, 40_000);
+
+        // AC-5's exact case: a request without the fields preserves the stored
+        // values instead of zeroing them.
+        apply_update(&mut config, register(None, None));
+        assert_eq!(config.providers.len(), 1);
+        assert_eq!(config.providers[0].capabilities.max_context, 200_000);
+        assert_eq!(config.providers[0].capabilities.context_budget_cap, 40_000);
+
+        // One field written, the other preserved: the merge is per FIELD, not
+        // per request.
+        apply_update(&mut config, register(Some(128_000), None));
+        assert_eq!(config.providers[0].capabilities.max_context, 128_000);
+        assert_eq!(config.providers[0].capabilities.context_budget_cap, 40_000);
+
+        // And `Some(0)` is a write — the "unknown" / "no cap" spelling —
+        // never a preserve.
+        apply_update(&mut config, register(Some(0), Some(0)));
+        assert_eq!(config.providers[0].capabilities.max_context, 0);
+        assert_eq!(config.providers[0].capabilities.context_budget_cap, 0);
     }
 
     /// E-5: the consent gate must not switch itself off the moment a real engine
@@ -21675,6 +21785,91 @@ fallback_id = \"local\"
                     rendered.full_text
                 );
             }
+        }
+
+        /// **The setup flow records the recipe's window — for the recipe's own
+        /// example model** (REQ-586 BR-3, AC-5, ADR-7).
+        ///
+        /// The candidate's `max_context` is read from the daemon's own catalog
+        /// rather than typed here, so a re-verified vendor figure re-verifies
+        /// this test instead of breaking it. The preview's `max_context = N`
+        /// line is the user's view of what a commit would record.
+        #[test]
+        fn a_candidate_on_the_recipes_example_model_records_the_recipes_window() {
+            let (runtime, _path) = runtime_seeded("provider-setup-window-recorded", SEEDED);
+            let window = crate::provider_recipes::recipe_catalog()
+                .iter()
+                .find(|r| r.id_suggestion == "kimi")
+                .map(|r| r.max_context)
+                .expect("the catalog ships a kimi recipe");
+            assert!(
+                window > 0,
+                "the recipe contract test pins a non-zero window"
+            );
+
+            let candidate = ProviderSetupCandidate {
+                max_context: Some(window),
+                ..kimi()
+            };
+            let rendered = derive(&runtime, &candidate).expect("previews");
+            assert_eq!(
+                rendered
+                    .candidate_config
+                    .providers
+                    .iter()
+                    .find(|p| p.id == "kimi")
+                    .map(|p| p.capabilities.max_context),
+                Some(window),
+                "the chosen model IS the recipe's example, so the recipe's window is \
+                 recorded"
+            );
+            assert!(
+                rendered
+                    .full_text
+                    .contains(&format!("max_context = {window}")),
+                "the preview must show the window a commit would record:\n{}",
+                rendered.full_text
+            );
+        }
+
+        /// **A substituted model does not inherit the recipe's window**
+        /// (REQ-586 BR-3: no window is ever guessed from a model name outside
+        /// the recipes).
+        ///
+        /// The carried figure describes the recipe's example model. A user who
+        /// named their own model gets `0` — "unknown", visible in the
+        /// preview's `max_context = 0` line — never a neighbouring model's
+        /// window recorded as fact.
+        #[test]
+        fn a_candidate_on_a_substituted_model_records_the_window_as_unknown() {
+            let (runtime, _path) = runtime_seeded("provider-setup-window-substituted", SEEDED);
+            let window = crate::provider_recipes::recipe_catalog()
+                .iter()
+                .find(|r| r.id_suggestion == "kimi")
+                .map(|r| r.max_context)
+                .expect("the catalog ships a kimi recipe");
+
+            let candidate = ProviderSetupCandidate {
+                model: "kimi-k2.5-turbo".to_owned(),
+                max_context: Some(window),
+                ..kimi()
+            };
+            let rendered = derive(&runtime, &candidate).expect("previews");
+            assert_eq!(
+                rendered
+                    .candidate_config
+                    .providers
+                    .iter()
+                    .find(|p| p.id == "kimi")
+                    .map(|p| p.capabilities.max_context),
+                Some(0),
+                "a substituted model must not inherit the example model's window"
+            );
+            assert!(
+                rendered.full_text.contains("max_context = 0"),
+                "the unknown window is stated in the preview, not hidden:\n{}",
+                rendered.full_text
+            );
         }
 
         // -- the preview: the warnings ----------------------------------------

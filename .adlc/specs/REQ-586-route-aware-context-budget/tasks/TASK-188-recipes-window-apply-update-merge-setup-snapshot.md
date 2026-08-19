@@ -1,7 +1,7 @@
 ---
 id: TASK-188
 title: "Recipes carry max_context; apply_update merges window fields field-wise; /provider setup writes the candidate's window; snapshot projects window"
-status: draft
+status: complete
 parent: REQ-586
 created: 2026-08-19
 updated: 2026-08-19
@@ -25,8 +25,8 @@ config snapshot always populates `max_context` (`Some(0)` = unknown).
 
 ## Acceptance Criteria
 
-- [ ] AC-5 (daemon half): a `RegisterProvider` without the fields preserves a stored `max_context = 200000`; with `Some(128000)` writes it; the snapshot for a provider with no capabilities table reads `max_context: Some(0)`; every recipe has a non-zero window and the contract test pins it.
-- [ ] `cargo test -p tetond provider_recipes runtime::tests --test provider_setup_flow --test provider_setup_contracts --test config_preservation` green; README/guide/topic ↔ catalog gates in `web_setup_contracts.rs` (L968, L1151, L1354) green (update README rows if they enumerate recipe fields).
+- [x] AC-5 (daemon half): a `RegisterProvider` without the fields preserves a stored `max_context = 200000`; with `Some(128000)` writes it; the snapshot for a provider with no capabilities table reads `max_context: Some(0)`; every recipe has a non-zero window and the contract test pins it.
+- [x] `cargo test -p tetond provider_recipes runtime::tests --test provider_setup_flow --test provider_setup_contracts --test config_preservation` green; README/guide/topic ↔ catalog gates in `web_setup_contracts.rs` (L968, L1151, L1354) green (update README rows if they enumerate recipe fields).
 
 ## Technical Notes
 

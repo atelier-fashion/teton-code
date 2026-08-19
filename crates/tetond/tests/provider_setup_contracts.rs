@@ -177,6 +177,7 @@ fn every_recipe_reaches_the_plan_field_for_field() {
             kind,
             endpoint,
             example_model,
+            max_context,
             notes,
         } = recipe;
 
@@ -211,6 +212,13 @@ fn every_recipe_reaches_the_plan_field_for_field() {
             entry.example_model, example_model,
             "`{id_suggestion}`'s example model — the default the model question offers \
              (BR-6)"
+        );
+        assert_eq!(
+            entry.max_context, max_context,
+            "`{id_suggestion}`'s window — what the flow records as \
+             `capabilities.max_context` when the example model is kept (REQ-586 BR-3); a \
+             plan that dropped it would register the vendor with its window unknown and \
+             the budget silently defaulted"
         );
         assert_eq!(
             entry.notes, notes,

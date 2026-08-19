@@ -870,6 +870,85 @@ fn registering_a_provider_leaves_the_web_table_and_its_comments_alone() {
     daemon.cleanup();
 }
 
+/// **A registration that says nothing about the window leaves the stored one
+/// alone — and one that declares it writes it** (REQ-586 AC-5, ADR-7), seen
+/// from the file a real daemon wrote.
+///
+/// The wire fields are `Option` for additivity: an older client's
+/// re-registration arrives with neither, and it must not zero the
+/// `max_context` a user hand-authored (or `/provider setup` recorded). The
+/// in-crate merge test proves the property of `apply_update`; this one proves
+/// the daemon's writer carries it to disk — LESSON-502's rule, and why both
+/// exist.
+#[test]
+fn a_field_less_registration_preserves_the_stored_window_and_a_declared_one_writes_it() {
+    let before = "\
+# Hand-written, and staying that way.
+
+[[providers]]
+id = \"anthropic\"
+kind = \"anthropic\"
+endpoint = \"https://api.anthropic.com/v1/messages\"
+model = \"claude-opus-4\"
+auth_ref = \"keychain:anthropic\"
+[providers.capabilities]
+max_context = 200000
+";
+    let daemon = Daemon::start("window-merge", Some(before));
+    let register = |max_context: Option<u32>, cap: Option<u32>| {
+        ConfigUpdate::RegisterProvider(ProviderConfig {
+            id: ProviderId::from("anthropic"),
+            kind: ProviderKind::Anthropic,
+            endpoint: Some("https://api.anthropic.com/v1/messages".to_owned()),
+            model: Some("claude-opus-5".to_owned()),
+            auth_ref: Some("keychain:anthropic".to_owned()),
+            max_context,
+            context_budget_cap: cap,
+        })
+    };
+
+    // (1) No fields → the stored window survives the re-registration.
+    daemon
+        .runtime
+        .apply_config_update(register(None, None))
+        .expect("the field-less re-registration lands");
+    let after = daemon.document();
+    assert!(
+        after.contains("max_context = 200000"),
+        "a registration without the window fields zeroed the hand-authored \
+         window (REQ-586 ADR-7, `None` preserves):\n{after}"
+    );
+    assert_eq!(
+        daemon.reload().providers[0].capabilities.max_context,
+        200_000,
+        "and the loaded config agrees with the document"
+    );
+
+    // (2) `Some` writes: the window is edited in place, and a declared cap
+    // gains its line (the canonical rendering skips a zero cap, so this is
+    // the line-insertion path, not just a value edit).
+    daemon
+        .runtime
+        .apply_config_update(register(Some(128_000), Some(64_000)))
+        .expect("the declaring re-registration lands");
+    let after = daemon.document();
+    assert!(
+        after.contains("max_context = 128000") && !after.contains("max_context = 200000"),
+        "a declared window must replace the stored one:\n{after}"
+    );
+    assert!(
+        after.contains("context_budget_cap = 64000"),
+        "a declared cap must reach the document:\n{after}"
+    );
+    let reloaded = daemon.reload();
+    assert_eq!(reloaded.providers[0].capabilities.max_context, 128_000);
+    assert_eq!(
+        reloaded.providers[0].capabilities.context_budget_cap,
+        64_000
+    );
+    daemon.cleanup();
+}
+
 /// **An unknown key inside a `[[providers]]` entry survives a registration, and
 /// survives the next one** (spec BR-1, AC-2, AC-8).
 ///
