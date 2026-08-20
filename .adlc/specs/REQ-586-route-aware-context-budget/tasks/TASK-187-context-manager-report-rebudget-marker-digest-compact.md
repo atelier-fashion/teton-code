@@ -29,7 +29,11 @@ thresholds; `compact_prompt` is bounded to the duty's own prompt budget.
 
 - [x] `cargo test -p tetond harness::context harness::compact harness::turn_loop carry sessions` green; default-route digest behaviour byte-identical (1,500 / 12,000); marker default text unchanged for the duty callers.
 - [x] `truncate_to_budget`'s report is bound at all four call sites (no silently dropped report).
-- [ ] (deferred to TASK-193 — `tests/conversation_carry.rs` is outside this task's parallel-tier file ownership; the unit equivalent `harness::compact::tests::a_two_hundred_block_conversation_still_fits_the_duty_prompt` is green) A 200-block pressured context compacts through a scripted local engine without an over-window refusal (`tests/conversation_carry.rs` `a_session_driven_past_its_budget_compacts_and_keeps_answering` L911 extended or a sibling).
+- [x] (deferred to TASK-193 — `tests/conversation_carry.rs` is outside this task's parallel-tier file ownership; the unit equivalent `harness::compact::tests::a_two_hundred_block_conversation_still_fits_the_duty_prompt` is green) A 200-block pressured context compacts through a scripted local engine without an over-window refusal (`tests/conversation_carry.rs` `a_session_driven_past_its_budget_compacts_and_keeps_answering` L911 extended or a sibling).
+      *(carried out by TASK-193 as the sibling the AC allowed:
+      `context_pressure.rs::a_two_hundred_block_conversation_on_a_big_route_compacts_through_the_local_binding`
+      drives 200 blocks on a 128k route through a scripted local engine that
+      refuses an over-window prompt, so an unbounded offer is red.)*
 
 ## Technical Notes
 

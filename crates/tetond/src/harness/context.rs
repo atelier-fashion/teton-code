@@ -1603,9 +1603,8 @@ pub const APPROX_BYTES_PER_TOKEN: usize = 8;
 /// generation.
 pub const SUMMARIZER_INPUT_MAX_BYTES: usize = 16_384;
 
-/// What the elision marker calls the window when no route label was stamped —
-/// **the one home** of the string the marker used to hard-code (REQ-586 ADR-4,
-/// gotcha #4).
+/// What the elision marker calls the window when no route label was stamped
+/// (REQ-586 ADR-4, gotcha #4).
 ///
 /// The six duty callers of [`truncate_middle`] all bound content against the
 /// *local* engine's window (their duty runs there whatever the turn's route is),
@@ -1614,10 +1613,13 @@ pub const SUMMARIZER_INPUT_MAX_BYTES: usize = 16_384;
 /// against the **turn's** window — substitutes the route's own label, through
 /// [`truncate_middle_with`].
 ///
-/// Pinned equal to `budget::derive(BudgetInputs::local()).window_label` by a
-/// test below, so the manager's default and the derivation's local arm cannot
-/// drift into two different sentences.
-pub const DEFAULT_WINDOW_LABEL: &str = "the local context window";
+/// The sentence itself lives in
+/// [`budget::LOCAL_WINDOW_LABEL`](crate::harness::budget::LOCAL_WINDOW_LABEL) —
+/// the derivation's local arm hands out the same string, and this reads it
+/// rather than restating it, so there is one literal and no drift to police
+/// (TASK-192's one-home pass). The test below still pins the *derivation's*
+/// local arm to this label, which the alias alone does not guarantee.
+pub const DEFAULT_WINDOW_LABEL: &str = crate::harness::budget::LOCAL_WINDOW_LABEL;
 
 /// Truncate `text` to at most `max_bytes`, keeping the head and tail with an
 /// elision marker between them (errors cluster at the end of build logs, paths
@@ -2628,9 +2630,14 @@ mod tests {
         );
     }
 
-    /// The default is the local route's label, in both homes — so an unstamped
-    /// manager and `budget::derive`'s local arm cannot drift into two different
-    /// sentences (gotcha #4).
+    /// The default is the local route's label — an unstamped manager and
+    /// `budget::derive`'s local arm say the same sentence (gotcha #4).
+    ///
+    /// Since TASK-192 the *string* has one home (`DEFAULT_WINDOW_LABEL` reads
+    /// `budget::LOCAL_WINDOW_LABEL`), so the second assertion is no longer
+    /// about two literals drifting — it pins the derivation's **local arm** to
+    /// that label, which the alias does not guarantee: `derive` picking any
+    /// other constant for `is_local` is still red here.
     #[test]
     fn the_default_window_label_is_the_local_routes_label() {
         assert_eq!(

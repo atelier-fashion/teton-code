@@ -1297,17 +1297,29 @@ impl Router {
     /// It derives from the **failed provider's own** capability profile with
     /// only [`ToolCallTier::Degraded`] forced on, rather than from
     /// `CapabilityProfile::default()`: what the failure revealed is that this
-    /// provider calls tools badly, not that it forgot how big its window is. A
-    /// derivation from the default profile would silently re-budget a 128k
-    /// route down to the unknown-window default mid-turn, and report
-    /// `bound: default_unknown` for a provider that declares a window — the
-    /// regression REQ-586 ADR-2 exists to prevent. The window survives the
-    /// degrade, the bound stays `window`, and no refit is needed because the
-    /// budget did not move (BR-1, AC-15).
+    /// provider calls tools badly, not that it forgot how big its window is.
+    /// Only the tier is overridden — every other capability, the ladder, the
+    /// reasoning shape, the cap, is still the provider's own — because the tier
+    /// is the one fact the failure is evidence about.
     ///
-    /// Only the tier is overridden: every other capability — the ladder, the
-    /// reasoning shape, the cap — is still the provider's own. The tier is the
-    /// one fact the failure is evidence about.
+    /// **What actually keeps the window is the line below it.** Pre-REQ-586 the
+    /// budget rode the profile, so a default-profile degrade re-budgeted a 128k
+    /// route to the unknown-window default mid-turn and reported
+    /// `bound: default_unknown` for a provider that declares a window (gotcha
+    /// #1). ADR-2's fix was to stop deriving the budget from the profile at all:
+    /// it is stamped from [`Router::budget_for`], the crate's one derivation,
+    /// against `capability_of(failed)`. So the window survives the degrade, the
+    /// bound stays `window`, and no refit is needed because the budget did not
+    /// move (BR-1, AC-15) — pinned by
+    /// `a_degrade_keeps_the_failed_providers_budget`, which is red if that
+    /// stamp is dropped or re-sourced.
+    ///
+    /// The spread above is therefore *not* what protects the budget today, and
+    /// TASK-192's mutation (b) — writing `..CapabilityProfile::default()` here —
+    /// is an **equivalent mutant**: [`CapabilityProfile::harness_profile`]'s
+    /// `Degraded` arm is a constant that reads no other field, so no test can
+    /// distinguish the two spellings. The spread stays because it states the
+    /// right rule for the day that arm starts reading one.
     fn degraded_harness_config(&self, failed: &str) -> HarnessConfig {
         use teton_core::ToolCallTier;
         let degraded = CapabilityProfile {
@@ -2496,6 +2508,29 @@ mod tests {
             "the event after the degrade announces the budget it announced before"
         );
         assert_eq!(after.budget_tokens, Some(84_650));
+
+        // The user's cap is part of "the failed provider's budget" too, and it
+        // is the half a re-derivation from an empty profile would lose *without*
+        // changing the pair to the obvious default (TASK-192: the pair alone is
+        // not enough to catch a wrong source). A capped provider that degrades
+        // still runs under its cap, and still says so.
+        let capped = router.clone().with_provider(
+            "wide",
+            ProviderKind::OpenaiCompatible,
+            "wide-model",
+            CapabilityProfile {
+                max_context: 128_000,
+                context_budget_cap: 40_000,
+                ..native()
+            },
+            ProviderHealth::Healthy,
+        );
+        let route = capped.resolve(CoreCategory::Design);
+        assert_eq!(route.budget.bound, BudgetBound::UserCap);
+        let outcome = capped.on_provider_failure(&route, "wide", FailureClass::MalformedToolCall);
+        let next = outcome.route.expect("continues on the same provider");
+        assert_eq!(next.budget, route.budget);
+        assert_eq!(next.budget.bound, BudgetBound::UserCap);
     }
 
     /// **AC-12 / BR-8**: one budget, one source.

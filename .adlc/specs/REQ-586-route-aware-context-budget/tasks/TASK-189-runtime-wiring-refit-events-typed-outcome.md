@@ -27,9 +27,22 @@ newest-user-block elision is also a turn notice.
 
 ## Acceptance Criteria
 
-- [ ] AC-2, AC-3 (typed outcome), AC-15c and the reroute-arm unit pins green in the harnesses named above (AC-6/10/11/15a/b are TASK-193's).
-- [ ] `cargo test -p tetond --no-fail-fast` green.
-- [ ] A `ContextLengthExceeded` leaves router health unchanged (assert before/after) and emits no `provider_degraded`.
+- [x] AC-2, AC-3 (typed outcome), AC-15c and the reroute-arm unit pins green in the harnesses named above (AC-6/10/11/15a/b are TASK-193's).
+      *(`remote_loop.rs::a_128k_route_assembles_a_20000_word_prompt_whole_and_the_default_pair_clamps_it`
+      (AC-2),
+      `remote_loop.rs::a_context_length_refusal_ends_the_turn_typed_after_one_request`
+      (AC-3), `router.rs::a_degrade_keeps_the_failed_providers_budget`
+      (AC-15c), and the reroute-arm unit pins
+      `runtime.rs::a_reroute_to_a_smaller_window_refits_the_context_and_publishes_it`
+      / `a_degrade_that_keeps_the_window_refits_nothing_and_says_nothing`.)*
+- [x] `cargo test -p tetond --no-fail-fast` green.
+      *(green inside TASK-192's `cargo test --workspace --no-fail-fast`:
+      3,159 passed / 0 failed / 1 ignored across 59 targets, no `FAILED` in
+      the log.)*
+- [x] A `ContextLengthExceeded` leaves router health unchanged (assert before/after) and emits no `provider_degraded`.
+      *(`runtime.rs::a_context_length_refusal_changes_no_health_and_degrades_nothing`
+      — a real socket answering the vendor's 400, health snapshotted before
+      and after, and no `provider_degraded` on the bus.)*
 
 ## Technical Notes
 

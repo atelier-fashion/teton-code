@@ -1097,6 +1097,40 @@ async fn a_redact_scanned_128k_route_assembles_a_body_the_scan_reads_whole_and_f
         unscanned.budget_bytes
     );
 
+    // **The wiring, not only the arithmetic** (added by TASK-192's sweep: the
+    // mutation `budget_for` ignoring `with_redact_scan` left every assertion
+    // above green, because both legs call `derive` themselves). What makes
+    // `[privacy] redact = true` a *budget* is the router passing that flag
+    // down, so the same two pairs are demanded of `Router::budget_for` — the
+    // call the daemon actually makes. A router that drops the flag hands this
+    // 128k route the 253,952-byte pair, which is the unscannable one leg 2
+    // refuses.
+    let router_for = |redact_scan: bool| {
+        Router::new(CategoryTable::new(), Some("frontier".to_owned()))
+            .with_provider(
+                "frontier",
+                ProviderKind::OpenaiCompatible,
+                "claude-opus-4",
+                CapabilityProfile {
+                    max_context: WINDOW,
+                    ..CapabilityProfile::default()
+                },
+                ProviderHealth::Healthy,
+            )
+            .with_redact_scan(redact_scan)
+    };
+    assert_eq!(
+        router_for(true).budget_for(Some("frontier")),
+        scanned,
+        "the redact-scan flag must reach the derivation through the router, \
+         not only through this test"
+    );
+    assert_eq!(
+        router_for(false).budget_for(Some("frontier")),
+        unscanned,
+        "and with the scan off the same route is window-bound"
+    );
+
     // --- Leg 1: a body filling the bounded budget is scanned and forwards. ---
     let capture = CaptureTransport::default();
     let sink = Arc::new(CapturingSink::default());

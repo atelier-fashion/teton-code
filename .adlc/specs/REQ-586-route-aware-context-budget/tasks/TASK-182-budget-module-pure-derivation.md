@@ -26,10 +26,22 @@ router only calls it.
 
 ## Acceptance Criteria
 
-- [ ] Table tests in `budget.rs`: local → default pair/`LocalEngine`; window 0 → default/`DefaultUnknown`; 128,000 − 1,024 → `(84_650, 253_952)`/`Window`; cap 40,000 on 200k → `UserCap` with the pair from `window_eff = 40,000`; `redact_scan` on 128k → bytes = scannable, words window-derived, `RedactScan`; cap 60k + redact on 200k → `RedactScan` (the clamp is last); cap whose bytes stay under the scannable bound + redact → `UserCap`; cap above window → inert (`Window`); reservation ≥ window → default/`DefaultUnknown`; precedence pinned pairwise.
-- [ ] Digest thresholds: default route (1,500 / 12,000) byte-identical to today; on a 128k route the fraction (≈30,990 words / ≈93 KB) is capped by the ceiling where the ceiling is smaller — assert `min(fraction, ceiling)` on both currencies and that the ceiling binds on 200k.
-- [ ] `HarnessConfig::default().budget` equals `derive(local)` and its pair equals `(LOCAL_BUDGET_TOKENS, LOCAL_BUDGET_BYTES)` — one source.
-- [ ] `cargo test -p tetond harness::budget` green; no clippy warnings; integer arithmetic only.
+- [x] Table tests in `budget.rs`: local → default pair/`LocalEngine`; window 0 → default/`DefaultUnknown`; 128,000 − 1,024 → `(84_650, 253_952)`/`Window`; cap 40,000 on 200k → `UserCap` with the pair from `window_eff = 40,000`; `redact_scan` on 128k → bytes = scannable, words window-derived, `RedactScan`; cap 60k + redact on 200k → `RedactScan` (the clamp is last); cap whose bytes stay under the scannable bound + redact → `UserCap`; cap above window → inert (`Window`); reservation ≥ window → default/`DefaultUnknown`; precedence pinned pairwise.
+      *(`budget.rs::derivation_table` (every row above, expectations by
+      hand) and `budget.rs::precedence_is_pinned_pairwise`.)*
+- [x] Digest thresholds: default route (1,500 / 12,000) byte-identical to today; on a 128k route the fraction (≈30,990 words / ≈93 KB) is capped by the ceiling where the ceiling is smaller — assert `min(fraction, ceiling)` on both currencies and that the ceiling binds on 200k.
+      *(`budget.rs::digest_thresholds_on_the_default_route_are_todays` and
+      `budget.rs::digest_thresholds_scale_with_the_pair_under_the_ceiling` —
+      `min(fraction, ceiling)` on both currencies, the words ceiling binding
+      on 200k and the bytes ceiling not.)*
+- [x] `HarnessConfig::default().budget` equals `derive(local)` and its pair equals `(LOCAL_BUDGET_TOKENS, LOCAL_BUDGET_BYTES)` — one source.
+      *(`budget.rs::harness_config_default_reads_this_module`, plus
+      `budget.rs::with_route_budget_stamps_pair_thresholds_and_fact` for the
+      router's entry point.)*
+- [x] `cargo test -p tetond harness::budget` green; no clippy warnings; integer arithmetic only.
+      *(green in TASK-192's workspace gate (3,159 passed / 0 failed); `cargo
+      clippy --workspace --all-targets -- -D warnings` clean; the derivation
+      is integer-only (no float appears in `budget.rs`).)*
 
 ## Technical Notes
 

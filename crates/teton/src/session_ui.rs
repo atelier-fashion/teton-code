@@ -3404,8 +3404,12 @@ mod tests {
 
         let bare = route(None);
         assert_eq!(bare, "route [edit/build] → kimi kimi-k3 — a reason.");
+        // A plausible redact-scan pair, rounded on purpose: the CLI renders the
+        // numbers the daemon states and holds no copy of the scannable bound —
+        // whose one home is the daemon's `REDACT_SCANNABLE_CONTEXT_BYTES`, a
+        // constant this crate cannot even see (TASK-192's one-home grep).
         assert_eq!(
-            route(Some((84_650, 89_127, BudgetBound::RedactScan))),
+            route(Some((84_650, 89_000, BudgetBound::RedactScan))),
             format!("{bare} · budget 84,650 words / 89 KB (bound: redact scan)")
         );
         // AC-8: a cap below the window is what the line says bound the budget.

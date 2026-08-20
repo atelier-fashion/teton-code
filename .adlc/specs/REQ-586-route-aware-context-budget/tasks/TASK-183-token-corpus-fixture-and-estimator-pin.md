@@ -26,9 +26,22 @@ word/byte counts still match the sample files (a stale fixture is red).
 
 ## Acceptance Criteria
 
-- [ ] `cargo test -p tetond --test token_corpus` green; weakening either constant (3/2 → 1/1, or bytes/2 → bytes/4) makes a sample fail and the message names it.
-- [ ] `python3 tools/token_corpus/count.py --check` passes on the committed fixture; the script's header says how to regenerate and which tokenizer/version.
-- [ ] No new Cargo dependency.
+- [x] `cargo test -p tetond --test token_corpus` green; weakening either constant (3/2 → 1/1, or bytes/2 → bytes/4) makes a sample fail and the message names it.
+      *(green; TASK-192 ran both weakenings — 3/2 -> 1/1 is red on
+      `words_guard_alone_covers_prose_but_not_dense_content`, and the byte
+      floor 2 -> 4 is red on
+      `combined_estimate_covers_every_sample_outside_the_documented_gap`
+      with the message naming `minified.json`. Since TASK-192 the suite
+      reads both constants from production rather than restating them, and
+      the mutations show that did not make it vacuous.)*
+- [x] `python3 tools/token_corpus/count.py --check` passes on the committed fixture; the script's header says how to regenerate and which tokenizer/version.
+      *(run under tiktoken 0.14.0 (the version every row records): `ok:
+      crates/tetond/tests/fixtures/token_corpus/token_counts.json is
+      current`, and the printed table reproduces the module docs' figures
+      exactly. The header names the tokenizer, its version, the word rule
+      and the regeneration command.)*
+- [x] No new Cargo dependency.
+      *(`git diff main -- '*Cargo.toml' Cargo.lock` is empty.)*
 
 ## Technical Notes
 

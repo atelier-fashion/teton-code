@@ -25,8 +25,22 @@ CLI, see it in `/doctor` and `/provider list`, see the budget per turn under
 
 ## Acceptance Criteria
 
-- [ ] `cargo test -p teton` and `--test cli_e2e` green; AC-4, AC-5 (CLI), AC-8, AC-10 (CLI) pinned; an older-daemon snapshot (`max_context: None`) renders `window: not reported` and a `route_decided` without the fields renders the pre-REQ line byte-for-byte.
-- [ ] `/provider list` and `teton provider list` print identical rows (L4180 golden).
+- [x] `cargo test -p teton` and `--test cli_e2e` green; AC-4, AC-5 (CLI), AC-8, AC-10 (CLI) pinned; an older-daemon snapshot (`max_context: None`) renders `window: not reported` and a `route_decided` without the fields renders the pre-REQ line byte-for-byte.
+      *(green in TASK-192's workspace gate. AC-4/AC-8:
+      `session_ui.rs::a_route_line_carries_the_budget_when_the_daemon_states_one`
+      (including the byte-identical pre-REQ line on a partial set) and
+      `cli_e2e.rs::a_cap_below_the_window_is_the_bound_a_verbose_turn_names`;
+      AC-5/AC-4 rows:
+      `cli_e2e.rs::every_provider_row_names_its_window_on_both_surfaces`,
+      with `window: not reported` in
+      `main.rs::every_row_says_what_is_known_about_its_context_window`;
+      AC-10:
+      `session_ui.rs::each_pressure_shape_names_the_budget_and_its_bound`.)*
+- [x] `/provider list` and `teton provider list` print identical rows (L4180 golden).
+      *(`cli_e2e.rs::every_provider_row_names_its_window_on_both_surfaces`
+      asserts the window row on both surfaces, over the byte-identical body
+      already pinned by
+      `cli_e2e.rs::a_typed_teton_line_runs_the_row_it_names_and_costs_no_turn`.)*
 
 ## Technical Notes
 

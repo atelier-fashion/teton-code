@@ -106,8 +106,10 @@ pub const LOCAL_DIGEST_THRESHOLD_BYTES: usize =
 /// tokens/word and Rust 1.69 — 3/2 covers prose on its own (the byte guard
 /// covers everything denser), and AC-3's corpus test pins it from below
 /// (mutation 3/2 → 1/1 fails on prose). Integer num/den because the budget
-/// arithmetic is integer-only. `tests/token_corpus.rs` restates the pair as
-/// literals until TASK-192 swaps it to read these constants.
+/// arithmetic is integer-only. `tests/token_corpus.rs` reads this pair rather
+/// than restating it (TASK-192): its assertions are measured token counts, so
+/// lowering the ratio moves the estimate without moving the corpus, and the
+/// suite goes red instead of agreeing with itself.
 pub const REMOTE_TOKENS_PER_WORD_NUM: usize = 3;
 
 /// Denominator of the words→tokens safety ratio. See
@@ -136,12 +138,18 @@ pub const DIGEST_ABSOLUTE_CEILING_TOKENS: usize = 20_000;
 /// words ceiling is the one that bites first on today's windows.
 pub const DIGEST_ABSOLUTE_CEILING_BYTES: usize = 160 * 1024;
 
-/// The elision marker's name for the local pair's window.
+/// The elision marker's name for the local pair's window — **the one home** of
+/// the string (LESSON-456).
 ///
 /// The pre-REQ-586 hard-coded string (gotcha #4), now the derivation's to
 /// hand out: BR-7 says the marker names the *route's* window, and this is the
 /// route-is-local (and defensive no-provider) spelling.
-const LOCAL_WINDOW_LABEL: &str = "the local context window";
+///
+/// [`crate::harness::context::DEFAULT_WINDOW_LABEL`] — what an unstamped
+/// `ContextManager` and the six duty callers of `truncate_middle` say — *reads*
+/// this constant rather than restating the sentence (TASK-192's one-home pass;
+/// the two used to be separate literals held equal by a test).
+pub(crate) const LOCAL_WINDOW_LABEL: &str = "the local context window";
 
 /// The elision marker's name for a redact-scan-bounded window (BR-4).
 const REDACT_WINDOW_LABEL: &str = "the redact-scannable window";

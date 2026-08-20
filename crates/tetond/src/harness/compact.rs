@@ -103,6 +103,7 @@
 
 use teton_protocol::Category;
 
+use super::budget::LOCAL_BUDGET_BYTES;
 use super::context::{truncate_middle, ContextBlock, Provenance};
 use super::duty::{DutyKind, DUTY_REQUEST_BYTES_PER_TOKEN};
 use super::render::CHATML_DUTY_ENVELOPE_BYTES;
@@ -113,7 +114,7 @@ use crate::runtime::LOCAL_ENGINE_N_CTX;
 /// The **loosest of the five**, deliberately: a `title` is a handful of words and
 /// a `triage` is a list of numbers, but a compaction stands in for a
 /// conversation. Sized to the default context **byte** budget
-/// (`HarnessConfig::default().context_budget_bytes` — 4,096 whitespace tokens ×
+/// ([`LOCAL_BUDGET_BYTES`] — 4,096 whitespace tokens ×
 /// [`APPROX_BYTES_PER_TOKEN`](super::context::APPROX_BYTES_PER_TOKEN)), because a
 /// replacement paragraph larger than the window it is making room in cannot
 /// possibly be applied: the budget check in
@@ -121,9 +122,15 @@ use crate::runtime::LOCAL_ENGINE_N_CTX;
 /// would reject it anyway, so accumulating more than this is bytes spent to be
 /// thrown away.
 ///
+/// It **reads** that budget rather than restating its 32,768 (REQ-586 BR-8,
+/// TASK-192's one-home grep): the sentence above already said the ceiling *is*
+/// the default byte budget, so a literal here was a copy waiting to drift — and
+/// the duty that repairs an over-budget context must not be allowed to return
+/// more than the budget it is repairing to.
+///
 /// Enforced in the duty implementation rather than requested of the provider
 /// (LESSON-484): `max_tokens` is a request, and a request is not a bound.
-pub const COMPACT_OUTPUT_MAX_BYTES: usize = 32_768;
+pub const COMPACT_OUTPUT_MAX_BYTES: usize = LOCAL_BUDGET_BYTES;
 
 /// The `compact` duty on the shared seam: its category and its output ceiling.
 ///

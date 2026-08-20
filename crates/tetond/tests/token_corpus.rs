@@ -45,12 +45,21 @@ use std::path::{Path, PathBuf};
 use serde::Deserialize;
 use tetond::harness::context::approx_tokens;
 
-// pinned to budget.rs (TASK-182); TASK-192 swaps these to the constants
-/// `REMOTE_TOKENS_PER_WORD` as an integer ratio: 3 tokens per 2 words.
-const REMOTE_TOKENS_PER_WORD_NUM: u64 = 3;
-const REMOTE_TOKENS_PER_WORD_DEN: u64 = 2;
-/// `REMOTE_BYTES_PER_TOKEN_FLOOR` — reuses `DUTY_REQUEST_BYTES_PER_TOKEN`.
-const REMOTE_BYTES_PER_TOKEN_FLOOR: u64 = 2;
+// The three allowances are **read from the production constants**, not restated
+// here (TASK-192's one-home pass; TASK-183 pinned them as literals with this
+// swap deferred). That keeps the suite an empirical claim about the corpus
+// rather than a restatement of budget.rs: the assertions below are measured
+// token counts from a reference tokenizer, so lowering the ratio or the floor
+// makes them fail *here* — mutation (e), 3/2 → 1/1, is red on prose — instead
+// of moving the test's own expectations with it.
+/// `REMOTE_TOKENS_PER_WORD` as an integer ratio: 3 tokens per 2 words, as
+/// [`tetond::harness::budget`] derives a remote word budget.
+const REMOTE_TOKENS_PER_WORD_NUM: u64 = tetond::harness::budget::REMOTE_TOKENS_PER_WORD_NUM as u64;
+const REMOTE_TOKENS_PER_WORD_DEN: u64 = tetond::harness::budget::REMOTE_TOKENS_PER_WORD_DEN as u64;
+/// The bytes-per-token floor the remote byte budget is derived at — the duty
+/// constant `budget::derive` itself multiplies by, not a second 2.
+const REMOTE_BYTES_PER_TOKEN_FLOOR: u64 =
+    tetond::harness::duty::DUTY_REQUEST_BYTES_PER_TOKEN as u64;
 
 /// The reference tokenizer every row must have been produced with.
 const REFERENCE_TOKENIZER: &str = "o200k_base";

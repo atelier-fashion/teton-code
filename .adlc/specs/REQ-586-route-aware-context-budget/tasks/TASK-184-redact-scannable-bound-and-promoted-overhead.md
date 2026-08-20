@@ -25,9 +25,22 @@ shape and a new assertion pins the bound.
 
 ## Acceptance Criteria
 
-- [ ] `cargo test -p tetond egress::redact` and `harness::tools::web` green; `the_total_cap_clears_the_harness_context_budget_with_margin` still measures `for_strong_model()`'s default pair and stays green with no ceiling move.
-- [ ] `REDACT_SCANNABLE_CONTEXT_BYTES` is computed, never a literal; `grep -n "89_127\|89127" crates/` finds only comments.
-- [ ] The constant is `pub(crate)` and reachable from `harness/budget.rs` (TASK-182).
+- [x] `cargo test -p tetond egress::redact` and `harness::tools::web` green; `the_total_cap_clears_the_harness_context_budget_with_margin` still measures `for_strong_model()`'s default pair and stays green with no ceiling move.
+      *(green in TASK-192's workspace gate;
+      `the_total_cap_clears_the_harness_context_budget_with_margin` and
+      `the_web_tool_docs_clear_the_outbound_body_overhead` both pass with
+      `REDACT_BODY_OVERHEAD_BYTES` unmoved at 10 KiB.)*
+- [x] `REDACT_SCANNABLE_CONTEXT_BYTES` is computed, never a literal; `grep -n "89_127\|89127" crates/` finds only comments.
+      *(computed from `REDACT_INPUT_MAX_BYTES`, `REDACT_BODY_OVERHEAD_BYTES`
+      and `REDACT_ESCAPING_DIVISOR`; the grep now finds comments only.
+      TASK-192 removed the last non-comment occurrence — a `session_ui.rs`
+      render sample that had copied the value into a crate that cannot even
+      see the constant.)*
+- [x] The constant is `pub(crate)` and reachable from `harness/budget.rs` (TASK-182).
+      *(reachable from `harness/budget.rs`, which reads it for the redact
+      clamp. It is `pub`, not `pub(crate)`: `tests/redact_egress.rs` (AC-6,
+      TASK-193) asserts the bound from outside the crate, and that test is
+      the reason the number has one home.)*
 
 ## Technical Notes
 
