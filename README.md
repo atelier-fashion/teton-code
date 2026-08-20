@@ -118,13 +118,52 @@ session running it.
 
 Two limits. Arguments are split on whitespace and quotes are **not**
 interpreted, so a value containing a space has to be given to `teton` in a
-shell. And the four commands that write (`/provider add`, `/boundary add`,
-`/policy set-tier`, `/policy set-category`) are typed-input only: piped into a
-session they change nothing and name the shell command instead. Every
-daemon-side gate is the same one the shell twin meets.
+shell. That is how the built-in rows above read an argument; a skill row is
+handed its line as typed. And the four commands that write (`/provider add`,
+`/boundary add`, `/policy set-tier`, `/policy set-category`) are typed-input
+only: piped into a session they change nothing and name the shell command
+instead. Every daemon-side gate is the same one the shell twin meets.
 
 To send a prompt that genuinely starts with a slash — a pasted path, say —
 double it: `//usr/local/bin/x — why?` asks the model about `/usr/local/bin/x`.
+
+### Your own commands
+
+The Claude Code-style skills you already have are session commands here. At
+launch — and again whenever `/cd` moves the root — Teton reads
+`~/.claude/skills/*/SKILL.md`, `~/.claude/commands/*.md` and the same two under
+the session root's `.claude/`. Four globs, one level deep, nothing else: no
+recursion, and `CLAUDE.md`, agents and hooks are not loaded. Each file registers
+one `/name`, listed in `/help` with where it came from, and anything found but
+not registered is named there with its reason. A built-in row always wins the
+name; the skill is listed as shadowed.
+
+`/name <rest>` becomes exactly one prompt turn — the file's body with
+`$ARGUMENTS` replaced by the rest of your line **as typed** — and from there it
+takes the path any prompt takes: same routing, same permission level, same
+egress gate, same cost row.
+
+A `` !`cmd` `` in a body inlines that command's output at expansion time. It
+runs under that skill's own permission key, never the `shell` tool's, so no
+grant crosses between the two: at `guarded` and `edits` the session lists every
+command of the invocation and asks once, `plan` does not run them, `full` runs
+them, and piped into a session at a level that would ask they are refused
+without a line of stdin being read. Whatever did not run leaves a placeholder
+saying so, in the prompt, where the model can see it. One consequence worth
+knowing before you configure a boundary: dynamic-context output is unattributed,
+like all shell output, so an invocation that ran one pins that turn to this
+machine.
+
+What this is **not** is a Claude Code runtime. Frontmatter other than `name`,
+`description` and `argument-hint` is inert — nothing in a file changes your
+permission level, your routing or your boundaries — and the body is passed as
+written, with no translation of tool names and no rewriting of references to
+`Agent`, `Task`, `Skill` or subagents, because there is nothing behind them
+here. Prompt-template skills work. A skill that dispatches subagents or invokes
+other skills gets one model with five tools, and stalls where it would have
+invoked one. And a skill whose expansion does not fit the route's context budget
+is refused with the numbers and the bound — never quietly shortened into
+something you did not type.
 
 ### Permission levels
 

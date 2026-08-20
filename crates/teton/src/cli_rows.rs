@@ -789,6 +789,7 @@ mod tests {
             auto_accept_model: false,
             typed_input,
             session_id: None,
+            skills: crate::slash::SkillSnapshot::empty(),
         }
     }
 

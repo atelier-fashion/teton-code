@@ -28,19 +28,19 @@ use std::collections::{HashMap, HashSet};
 use teton_protocol::events;
 use teton_protocol::events::{
     AttachConsentRequested, BlockCause, BudgetBound, CapabilityDeadEnd, ConsentScope,
-    ContextPressure, ContextPressureKind, DaemonClientAttach, DaemonLifetimeStage, Event,
-    EventEnvelope, EvictionReason, FailureClass, ModelLifecycle, ModelSelectionProposed,
-    PermissionOption, PermissionOptionKind, PermissionRequest, PhaseTransition, PrefixCache,
-    PrefixCacheMiss, PrefixCacheOutcome, PrivacyAction, PrivacyBlock, ProvenanceRejected,
-    ProvenanceRejection, ProviderDegraded, ProviderSetupCompleted, ProviderSetupRejected,
-    ProviderTested, RouteDecided, SessionGrantMinted, SessionUpdatePayload, TierWarming,
-    ToolCallStatus, TurnQueued, WebCapabilityState, WebConsentDecided, WebConsentScope, WebLookup,
-    WebLookupKind, WebLookupOutcome, WebSetupCompleted, WebSetupRejected, WebTier,
-    OPTION_ID_ENABLE_PERMANENT,
+    ContextPressure, ContextPressureKind, DaemonClientAttach, DaemonLifetimeStage, DynamicOutcome,
+    DynamicOutcomeView, Event, EventEnvelope, EvictionReason, FailureClass, ModelLifecycle,
+    ModelSelectionProposed, NotRunReason, PermissionOption, PermissionOptionKind,
+    PermissionRequest, PermissionSubject, PhaseTransition, PrefixCache, PrefixCacheMiss,
+    PrefixCacheOutcome, PrivacyAction, PrivacyBlock, ProvenanceRejected, ProvenanceRejection,
+    ProviderDegraded, ProviderSetupCompleted, ProviderSetupRejected, ProviderTested, RouteDecided,
+    SessionGrantMinted, SessionUpdatePayload, SkillInvoked, TierWarming, ToolCallStatus,
+    TurnQueued, WebCapabilityState, WebConsentDecided, WebConsentScope, WebLookup, WebLookupKind,
+    WebLookupOutcome, WebSetupCompleted, WebSetupRejected, WebTier, OPTION_ID_ENABLE_PERMANENT,
 };
 use teton_protocol::methods::{
     AttachConsentOutcome, AttachConsentParams, PermissionOutcome, PermissionRespondParams,
-    SessionRoot,
+    RefusalReason, SessionRoot,
 };
 use teton_protocol::{Phase, RequestId, SessionId};
 
@@ -74,6 +74,30 @@ impl SessionGrants {
     /// Remember an allow-for-session grant.
     pub fn allow_always(&mut self, tool: &str) {
         self.allow_always.insert(tool.to_owned());
+    }
+
+    /// Forget every **project** skill grant, because the session root moved.
+    ///
+    /// The other half of ADR-6, and the half a daemon-side test cannot see.
+    /// `PermissionGate::drop_project_skill_grants` forgets the daemon's copy on
+    /// `/cd`; this store holds the same key, is consulted *before* any prompt is
+    /// drawn, and answers `allow_always` on its own. Without this, the daemon
+    /// re-asks after a root move and the client auto-answers from a grant the
+    /// user gave in a different repo — one `auto-allow` line, no commands
+    /// shown, and the daemon then re-remembers it under the new root. That is
+    /// exactly the harm ADR-6 exists to prevent, one hop across the seam.
+    ///
+    /// User skills are kept: `~/.claude/skills/<name>` is the same file
+    /// whatever the root is. The predicate is
+    /// [`teton_protocol::methods::is_project_skill_key`] rather than a literal
+    /// prefix, so the two stores cannot drift about which keys expire.
+    pub fn forget_project_skills(&mut self) -> usize {
+        let before = self.allow_always.len() + self.reject_always.len();
+        self.allow_always
+            .retain(|key| !teton_protocol::methods::is_project_skill_key(key));
+        self.reject_always
+            .retain(|key| !teton_protocol::methods::is_project_skill_key(key));
+        before - (self.allow_always.len() + self.reject_always.len())
     }
 
     /// Remember a deny-for-session grant.
@@ -246,6 +270,25 @@ pub struct SessionState {
     /// the piped posture and the safe one — a passive context that was never
     /// told draws no notice rather than one nobody asked for.
     pub interactive: bool,
+    /// This session's root moved, so its skill snapshot is out of date
+    /// (REQ-585 ADR-2).
+    ///
+    /// A one-bit fold of `session_root_changed`, raised here rather than acted
+    /// on there because refreshing the snapshot means **an RPC**, and
+    /// [`render_event`] runs inside the event pump — where a blocking `call`
+    /// would re-enter the pump from inside an event dispatch, the same
+    /// re-entrancy the permission and proposal replies are fire-and-forget to
+    /// avoid. So the arm that *sees* the move records it, and the entry loop —
+    /// which owns the connection — is what asks.
+    ///
+    /// Raised only for **this client's own** session, under the same condition
+    /// the root cache itself is written under: another session's `/cd`
+    /// re-derives nothing here.
+    ///
+    /// [`SessionState::take_skills_stale`] is the only reader, and it clears as
+    /// it reads — a flag two places could clear would be a refresh that stopped
+    /// happening the first time one of them ran.
+    skills_stale: bool,
 }
 
 /// What the session's web capability currently is, for the status row.
@@ -421,6 +464,17 @@ impl SessionState {
     pub fn claim_model_proposal(&mut self, request_id: &RequestId) -> bool {
         self.model_seen.insert(request_id.clone())
     }
+
+    /// Whether this session's skill snapshot needs re-fetching, clearing the
+    /// flag (REQ-585 ADR-2).
+    ///
+    /// Read by the entry loop before it classifies a line, which is the last
+    /// moment at which a stale snapshot could still dispatch a skill the
+    /// session no longer has. Clearing as it reads is what keeps one `/cd` to
+    /// one `skills/list` rather than one per typed line.
+    pub fn take_skills_stale(&mut self) -> bool {
+        std::mem::take(&mut self.skills_stale)
+    }
 }
 
 /// What a rendered event needs from the caller afterwards.
@@ -462,6 +516,15 @@ pub fn render_event(
             // this" starts to matter — the same reason `context_cleared` reads
             // it below.
             render_session_update(&su.update, env.session_id.as_ref(), surface, state);
+            EventOutcome::Rendered
+        }
+        // REQ-585 BR-12 / ADR-15. Never verbose-gated: *every* invocation
+        // echoes one line, because the line is the only record that a `/name`
+        // the user typed became a turn at all — the body is deliberately not
+        // printed, so without this the transcript would show a prompt turn
+        // nobody can see the question for. `/verbose` adds the detail under it.
+        Event::SkillInvoked(invoked) => {
+            render_skill_invoked(invoked, surface, state.verbose);
             EventOutcome::Rendered
         }
         Event::RouteDecided(rd) => {
@@ -853,6 +916,22 @@ pub fn render_event(
                     // root this client never had.
                     if state.session_id.is_some() {
                         state.root = Some(changed.root.clone());
+                        // REQ-585 ADR-2: the project half of the registry is
+                        // derived from the root, so a move re-derives it. Under
+                        // the *same* condition as the root cache, and for the
+                        // same reason: a client that does not know which
+                        // session it is in has no registry of its own to
+                        // refresh, and re-fetching on another session's move
+                        // would ask for a root this client never had.
+                        state.skills_stale = true;
+                        // …and the answers the user gave about *this* root's
+                        // skills. The daemon drops its copy inside
+                        // `set_session_cwd`; this is the same moment on this
+                        // side of the wire, under the same own-session
+                        // condition, because a grant consulted before the
+                        // prompt is drawn would otherwise auto-answer for a
+                        // repo the user never approved.
+                        state.grants.forget_project_skills();
                     }
                     surface.line(
                         LineKind::Notice,
@@ -889,6 +968,157 @@ pub fn render_event(
 /// [`banner::root_line`] gives every surface.
 fn format_session_root_changed(root: &SessionRoot) -> String {
     format!("session root is now {}", banner::root_line(root))
+}
+
+// ---------------------------------------------------------------------------
+// REQ-585: the invocation echo line (BR-12, ADR-15)
+// ---------------------------------------------------------------------------
+
+/// BR-12's one line per invocation, plus the detail `/verbose` adds under it.
+///
+/// **The body is never printed** — it is in the file, and BR-12 says so. What
+/// reaches the surface is a summary of the file and, under `/verbose`, where it
+/// lives, what of its frontmatter was inert, and what became of each dynamic
+/// command.
+///
+/// Everything rendered here is either the daemon's own typed value or
+/// file-supplied text the daemon already bounded; `Surface::line` defuses it
+/// again at the frame it is drawn into (ADR-009's two-layer shape).
+///
+/// One [`Surface::line`] per command, never one string with newlines in it:
+/// `line` neutralizes newlines, so a joined list would arrive as one run-on
+/// line — the same mechanical reason the *consent* lists commands one per line
+/// (ADR-7).
+fn render_skill_invoked(invoked: &SkillInvoked, surface: &mut dyn Surface, verbose: bool) {
+    surface.line(LineKind::Notice, &skill_echo_line(invoked));
+    if !verbose {
+        return;
+    }
+    surface.line(LineKind::Info, &format!("  {}", invoked.path_display));
+    // Only when there were any: BR-5's ignored keys are news about *this* file,
+    // and "ignored frontmatter: " with nothing after it is a line about nothing.
+    if let Some(note) = &invoked.name_note {
+        surface.line(LineKind::Notice, &format!("  {note}"));
+    }
+    if !invoked.ignored_keys.is_empty() {
+        surface.line(
+            LineKind::Info,
+            &format!("  ignored frontmatter: {}", invoked.ignored_keys.join(", ")),
+        );
+    }
+    for view in &invoked.outcomes {
+        surface.line(LineKind::Info, &dynamic_outcome_line(view));
+    }
+}
+
+/// BR-12's echo line: `/status → skill status (user, 5.3 KiB, 4 dynamic commands)`.
+///
+/// The count is how many dynamic commands the invocation **had**, not how many
+/// succeeded: `outcomes` carries one entry per `` !`…` `` in the body whatever
+/// became of it, an empty list is the honest "0 dynamic commands" of a skill
+/// with no dynamic context, and what each one did is `/verbose`'s line rather
+/// than a number that would have to summarize four different endings.
+///
+/// The size is [`teton_protocol::format_bytes`] — the product's single byte
+/// formatter, the one the daemon's own skip reasons (`over 64 KiB (67,184 B)`)
+/// and the first-run sentences already speak. The spec writes the example as
+/// `5.3 KB`; two spellings of a file size in one feature would be worse than
+/// one that differs from an illustration by a unit suffix.
+fn skill_echo_line(invoked: &SkillInvoked) -> String {
+    let count = invoked.outcomes.len();
+    // How many of them actually started. A command that was declined, refused
+    // for want of a terminal, denied by the level, or never spawned leaves a
+    // placeholder in the prompt rather than output — and the count alone cannot
+    // say so. Reporting only `4 dynamic commands` after a decline would put the
+    // one line the user *sees* at odds with what the model actually got, while
+    // the record that resolves it sits behind `/verbose`. So the line says both
+    // numbers whenever they differ, and stays a single count when they do not
+    // (BR-12: observable, not noisy).
+    let ran = invoked
+        .outcomes
+        .iter()
+        .filter(|view| !matches!(view.outcome, DynamicOutcome::NotRun { .. }))
+        .count();
+    let dynamic = if count == 0 {
+        "0 dynamic commands".to_owned()
+    } else if ran == count {
+        format!(
+            "{count} dynamic command{}",
+            if count == 1 { "" } else { "s" }
+        )
+    } else if ran == 0 {
+        format!(
+            "{count} dynamic command{}, none run",
+            if count == 1 { "" } else { "s" }
+        )
+    } else {
+        format!("{count} dynamic commands, {ran} run")
+    };
+    format!(
+        "/{name} → skill {name} ({source}, {size}, {dynamic})",
+        name = invoked.name,
+        source = slash::source_word(invoked.source),
+        size = teton_protocol::format_bytes(invoked.body_bytes),
+    )
+}
+
+/// One `/verbose` line for one dynamic command and what became of it.
+fn dynamic_outcome_line(view: &DynamicOutcomeView) -> String {
+    format!(
+        "  {} — {}",
+        dynamic_command_text(&view.command),
+        dynamic_outcome_words(&view.outcome)
+    )
+}
+
+/// A dynamic command as both surfaces spell it — the consent and the
+/// `/verbose` line — in the body's own `` !`…` `` form.
+///
+/// One speller, because the whole point of showing the command at consent time
+/// is that the user recognizes the same thing afterwards in the record.
+fn dynamic_command_text(command: &str) -> String {
+    format!("!`{command}`")
+}
+
+/// The typed outcome, in words (BR-6's four endings).
+///
+/// A projection of [`DynamicOutcome`], never a re-parse of the daemon's own
+/// placeholder sentence: the daemon composes what the *model* reads and this
+/// composes what the *user* reads, and a client that recovered "declined" by
+/// scanning `[dynamic context not run: … — declined]` would be a second parser
+/// of that sentence (LESSON-529).
+fn dynamic_outcome_words(outcome: &DynamicOutcome) -> String {
+    match outcome {
+        DynamicOutcome::Ran {
+            output_bytes,
+            truncated,
+        } => {
+            let cut = if *truncated { ", truncated" } else { "" };
+            format!("ran ({}{cut})", teton_protocol::format_bytes(*output_bytes))
+        }
+        DynamicOutcome::NotRun { reason } => format!("not run: {}", not_run_words(*reason)),
+        DynamicOutcome::Failed {
+            exit_status: Some(code),
+        } => format!("failed (exit {code})"),
+        DynamicOutcome::Failed { exit_status: None } => "failed (killed by a signal)".to_owned(),
+        DynamicOutcome::TimedOut => "timed out".to_owned(),
+    }
+}
+
+/// Why a dynamic command never started, in words — four doors, four sentences.
+///
+/// Distinct on purpose and asserted as such: "the user declined" and "no human
+/// could be asked" are different facts about the same missing output, and BR-6
+/// exists because collapsing them would tell a user their answer decided
+/// something they were never asked.
+fn not_run_words(reason: NotRunReason) -> &'static str {
+    match reason {
+        NotRunReason::Declined => "the user declined",
+        NotRunReason::Level => "this session's permission level does not run them",
+        NotRunReason::NoTerminal => "no human could be asked",
+        NotRunReason::UnrecognizedSubject => "this client did not recognize the request",
+        NotRunReason::CouldNotStart => "it could not be started",
+    }
 }
 
 /// The line drawn when *another* session's root moved: named, and nothing
@@ -2221,18 +2451,132 @@ fn render_diff(path: &str, old_text: Option<&str>, new_text: &str, surface: &mut
     }
 }
 
-/// Resolve a permission request: apply any session grant, else prompt.
+/// What [`consent_gate`] decides (REQ-585 ADR-8).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ConsentGate {
+    /// Render the request and ask — every prompt this client has ever shown.
+    Answerable,
+    /// Refuse with [`RefusalReason::NoTerminal`], asking nobody.
+    RefuseNoTerminal,
+    /// Refuse with [`RefusalReason::UnrecognizedSubject`], asking nobody.
+    RefuseUnrecognized,
+}
+
+/// Whether a permission request may be put to a human at all, from the
+/// request's own subject and where this session's input comes from
+/// (REQ-585 BR-11, ADR-8).
+///
+/// **A pure two-input predicate, consulted before `prompter.ask`** —
+/// [`crate::cli_rows::write_gate`]'s shape, and for a sharper version of its
+/// reason. `StdinPrompter::ask` reads a line *unconditionally*: a refusal
+/// computed after the call has already eaten one, and on a pipe the user's next
+/// **prompt** line becomes the answer — a pasted `y` turning into consent for
+/// shell commands, which is exactly LESSON-537's shape. Deciding first is what
+/// makes "the commands were not run and your next line is still your next line"
+/// true by construction rather than by care.
+///
+/// Three rules, and the polarity of each is deliberate:
+///
+/// - **No subject at all is answerable, terminal or not.** Every prompt this
+///   client showed before REQ-585 arrives this way, and the piped shell consent
+///   answering from the next stdin line is behaviour a shipped script depends
+///   on. BR-11's narrowing is about the *skill* consent and nothing else; a gate
+///   that generalized it would be a silent change to every tool prompt.
+/// - **A skill's dynamic context needs a terminal.** This is the narrowing, and
+///   it is the whole of it. At `full` the daemon asks nothing, so a piped
+///   session still runs dynamic context exactly as a TTY does — that is the
+///   automation posture, and it is why this gate never sees those turns.
+/// - **An unrecognized subject is refused, terminal or not.** A client that does
+///   not know what it is being asked cannot render the question, so there is
+///   nothing to put to the user even at a terminal; falling through to `ask`
+///   would be reading a line to answer a question nobody was shown. Fail-closed
+///   in the direction that can only cost a skill invocation, never a swallowed
+///   prompt line.
+///
+/// Pure, so all six rows are unit-tested without a terminal, a pipe or a
+/// daemon: the rows that matter are the ones a test process cannot otherwise
+/// reach.
+#[must_use]
+pub(crate) fn consent_gate(subject: Option<&PermissionSubject>, typed_input: bool) -> ConsentGate {
+    match subject {
+        None => ConsentGate::Answerable,
+        Some(PermissionSubject::Unrecognized) => ConsentGate::RefuseUnrecognized,
+        Some(PermissionSubject::SkillDynamicContext { .. }) => {
+            if typed_input {
+                ConsentGate::Answerable
+            } else {
+                ConsentGate::RefuseNoTerminal
+            }
+        }
+    }
+}
+
+/// Resolve a permission request: refuse what cannot be asked, apply any session
+/// grant, else prompt.
 ///
 /// Returns the [`PermissionRespondParams`] to send back to the daemon and, as a
 /// side effect, records "always" decisions in `grants` so a later request for the
 /// same tool needs no prompt.
+///
+/// `typed_input` is the session's own terminal fact, threaded from the one edge
+/// that reads it (`main.rs`'s `IsTerminal` on **stdin**) rather than recomputed
+/// here — the same discipline `UiContext::typed_input` documents, and the reason
+/// is that a second reading is a second answer waiting to disagree.
+///
+/// [`consent_gate`] is consulted **first, before anything else in this
+/// function**, and that ordering is the guarantee rather than a tidiness: it is
+/// the only arrangement under which no path can reach `prompter.ask` with a
+/// request that was never answerable (REQ-585 BR-11, ADR-8). The grant lookups
+/// below consume no prompt and would be harmless above it — but "the gate is
+/// first" is a property a reader can check in one glance, and "the gate is
+/// somewhere before the loop" is not.
+///
+/// A refusal is [`PermissionOutcome::Refused`] and never
+/// [`PermissionOutcome::Cancelled`]: `Cancelled` already means *the user
+/// dismissed the prompt*, it is what EOF on a pipe returns two dozen lines
+/// below, and AC-9 needs the daemon's placeholders to be able to say that no
+/// human could be asked — which a dismissal cannot tell it.
 pub fn resolve_permission(
     req: &PermissionRequest,
     surface: &mut dyn Surface,
     prompter: &mut dyn Prompter,
     grants: &mut SessionGrants,
+    typed_input: bool,
 ) -> PermissionRespondParams {
     let tool = req.tool_name.as_str();
+
+    // REQ-585 BR-11: before the grants, before the render, and above all before
+    // any call that could read a line.
+    match consent_gate(req.subject.as_ref(), typed_input) {
+        ConsentGate::Answerable => {}
+        ConsentGate::RefuseNoTerminal => {
+            render_consent_subject(req.subject.as_ref(), surface);
+            surface.line(
+                LineKind::Notice,
+                &refusal_line(req, RefusalReason::NoTerminal),
+            );
+            return respond(
+                req,
+                PermissionOutcome::Refused {
+                    reason: RefusalReason::NoTerminal,
+                },
+            );
+        }
+        ConsentGate::RefuseUnrecognized => {
+            // No subject block: this is precisely the request whose contents
+            // this build cannot read, so there is nothing of it to show.
+            surface.line(
+                LineKind::Notice,
+                &refusal_line(req, RefusalReason::UnrecognizedSubject),
+            );
+            return respond(
+                req,
+                PermissionOutcome::Refused {
+                    reason: RefusalReason::UnrecognizedSubject,
+                },
+            );
+        }
+    }
 
     // Session-scoped auto-decisions first — these consume no prompt.
     if grants.is_reject_always(tool) {
@@ -2259,6 +2603,11 @@ pub fn resolve_permission(
         LineKind::Prompt,
         &format!("permission requested: {tool}{description}"),
     );
+    // REQ-585 ADR-7: what is being consented to, from the typed subject rather
+    // than from the key or the description. Nothing renders for a request that
+    // carries no subject, so every prompt that existed before this REQ is
+    // byte-identical.
+    render_consent_subject(req.subject.as_ref(), surface);
 
     // REQ-563 BR-4: the persistent option exists only on prompts that offer it
     // (the web tiers), and the question must not advertise a key that answers
@@ -2311,6 +2660,84 @@ pub fn resolve_permission(
             "" => return respond(req, PermissionOutcome::Cancelled),
             _ => surface.line(LineKind::Prompt, retry),
         }
+    }
+}
+
+/// Render what a request is about, from its typed subject (REQ-585 ADR-7).
+///
+/// **One [`Surface::line`] per command.** `Surface::line` defuses its text, and
+/// defusing destroys newlines — so BR-6's "every command of the invocation,
+/// listed verbatim" cannot ride one joined string, and could not have ridden
+/// `PermissionRequest::description` either. That mechanical fact is half of why
+/// the subject is a structure at all.
+///
+/// A request with no subject renders nothing: every prompt that existed before
+/// REQ-585 arrives that way, and its bytes do not move.
+///
+/// [`PermissionSubject::Unrecognized`] renders nothing either, and never
+/// reaches here on the asking path — [`consent_gate`] refuses it first. It is
+/// matched rather than wildcarded so that adding a subject variant is a
+/// compile error here, where the question is drawn, and not a silently blank
+/// prompt.
+fn render_consent_subject(subject: Option<&PermissionSubject>, surface: &mut dyn Surface) {
+    match subject {
+        None | Some(PermissionSubject::Unrecognized) => {}
+        Some(PermissionSubject::SkillDynamicContext {
+            skill,
+            source,
+            commands,
+        }) => {
+            surface.line(
+                LineKind::Prompt,
+                &format!(
+                    "  skill `{skill}` ({}) wants to run {} dynamic-context command{}:",
+                    slash::source_word(*source),
+                    commands.len(),
+                    if commands.len() == 1 { "" } else { "s" },
+                ),
+            );
+            for command in commands {
+                surface.line(
+                    LineKind::Prompt,
+                    &format!("    {}", dynamic_command_text(command)),
+                );
+            }
+        }
+    }
+}
+
+/// The one line a refused request gets, naming what was refused and why
+/// (REQ-585 BR-11).
+///
+/// It reports exactly what was checked — "this session's input is not a
+/// terminal" — never a claim to have identified anyone, and it names the remedy,
+/// because a refusal without one is a dead end
+/// ([`crate::cli_rows::typed_only_line`]'s rule). The remedy is BR-11's stated
+/// automation posture: an unattended runner that wants a skill's dynamic
+/// context chooses `full` for the session, the same choice it already makes for
+/// every `shell` call.
+///
+/// The subject supplies the name when it has one. The fallbacks name the
+/// request's key instead — *rendered*, never parsed: what a client may not do
+/// is **select** on that string (ADR-7), and printing the thing the daemon
+/// called this request is how a user finds it in a log.
+fn refusal_line(req: &PermissionRequest, reason: RefusalReason) -> String {
+    let subject = match &req.subject {
+        Some(PermissionSubject::SkillDynamicContext { skill, .. }) => {
+            format!("skill `{skill}`'s dynamic context")
+        }
+        _ => format!("`{}`", req.tool_name),
+    };
+    match reason {
+        RefusalReason::NoTerminal => format!(
+            "{subject} was refused without asking: this session's input is not a terminal, so \
+             nobody could be asked — send `/permissions full` ahead of it, or set \
+             `[permissions] default_level`, to allow it unattended."
+        ),
+        RefusalReason::UnrecognizedSubject => format!(
+            "{subject} was refused without asking: this build does not recognize what it is \
+             asking to do, and a question it cannot show is not one it may answer."
+        ),
     }
 }
 
@@ -3169,6 +3596,7 @@ mod tests {
             request_id: RequestId::from("r1"),
             tool_name: tool.to_owned(),
             description: Some("run `cargo test`".to_owned()),
+            subject: None,
             options: vec![
                 PermissionOption {
                     option_id: "allow_once".to_owned(),
@@ -3680,7 +4108,7 @@ mod tests {
         let mut surface = RecordingSurface::new();
         let mut prompter = ScriptedPrompter::new(&["y"]);
         let mut grants = SessionGrants::default();
-        let resp = resolve_permission(&req, &mut surface, &mut prompter, &mut grants);
+        let resp = resolve_permission(&req, &mut surface, &mut prompter, &mut grants, true);
         assert_eq!(resp.request_id, RequestId::from("r1"));
         assert_eq!(
             resp.outcome,
@@ -3697,7 +4125,7 @@ mod tests {
         let mut surface = RecordingSurface::new();
         let mut prompter = ScriptedPrompter::new(&["n"]);
         let mut grants = SessionGrants::default();
-        let resp = resolve_permission(&req, &mut surface, &mut prompter, &mut grants);
+        let resp = resolve_permission(&req, &mut surface, &mut prompter, &mut grants, true);
         assert_eq!(
             resp.outcome,
             PermissionOutcome::Selected {
@@ -3712,7 +4140,7 @@ mod tests {
         let mut surface = RecordingSurface::new();
         let mut prompter = ScriptedPrompter::new(&[]);
         let mut grants = SessionGrants::default();
-        let resp = resolve_permission(&req, &mut surface, &mut prompter, &mut grants);
+        let resp = resolve_permission(&req, &mut surface, &mut prompter, &mut grants, true);
         assert_eq!(resp.outcome, PermissionOutcome::Cancelled);
     }
 
@@ -3725,7 +4153,7 @@ mod tests {
         let mut prompter = ScriptedPrompter::new(&["a"]);
         let mut grants = SessionGrants::default();
 
-        let first = resolve_permission(&req, &mut surface, &mut prompter, &mut grants);
+        let first = resolve_permission(&req, &mut surface, &mut prompter, &mut grants, true);
         assert_eq!(
             first.outcome,
             PermissionOutcome::Selected {
@@ -3734,7 +4162,7 @@ mod tests {
         );
         assert!(grants.is_allow_always("shell"));
 
-        let second = resolve_permission(&req, &mut surface, &mut prompter, &mut grants);
+        let second = resolve_permission(&req, &mut surface, &mut prompter, &mut grants, true);
         assert_eq!(
             second.outcome,
             PermissionOutcome::Selected {
@@ -3753,7 +4181,7 @@ mod tests {
         let mut prompter = ScriptedPrompter::new(&["d"]);
         let mut grants = SessionGrants::default();
 
-        let first = resolve_permission(&req, &mut surface, &mut prompter, &mut grants);
+        let first = resolve_permission(&req, &mut surface, &mut prompter, &mut grants, true);
         assert_eq!(
             first.outcome,
             PermissionOutcome::Selected {
@@ -3762,7 +4190,7 @@ mod tests {
         );
         assert!(grants.is_reject_always("shell"));
 
-        let second = resolve_permission(&req, &mut surface, &mut prompter, &mut grants);
+        let second = resolve_permission(&req, &mut surface, &mut prompter, &mut grants, true);
         assert!(matches!(second.outcome, PermissionOutcome::Selected { .. }));
         assert_eq!(prompter.asked, 1);
     }
@@ -3773,7 +4201,7 @@ mod tests {
         let mut surface = RecordingSurface::new();
         let mut prompter = ScriptedPrompter::new(&["huh?", "y"]);
         let mut grants = SessionGrants::default();
-        let resp = resolve_permission(&req, &mut surface, &mut prompter, &mut grants);
+        let resp = resolve_permission(&req, &mut surface, &mut prompter, &mut grants, true);
         assert_eq!(
             resp.outcome,
             PermissionOutcome::Selected {
@@ -4413,7 +4841,7 @@ mod tests {
         let mut prompter = ScriptedPrompter::new(&["p"]);
         let mut grants = SessionGrants::default();
 
-        let resp = resolve_permission(&req, &mut surface, &mut prompter, &mut grants);
+        let resp = resolve_permission(&req, &mut surface, &mut prompter, &mut grants, true);
         assert_eq!(
             resp.outcome,
             PermissionOutcome::Selected {
@@ -4434,7 +4862,7 @@ mod tests {
         let mut prompter = ScriptedPrompter::new(&["p", "y"]);
         let mut grants = SessionGrants::default();
 
-        let resp = resolve_permission(&req, &mut surface, &mut prompter, &mut grants);
+        let resp = resolve_permission(&req, &mut surface, &mut prompter, &mut grants, true);
         assert_eq!(
             resp.outcome,
             PermissionOutcome::Selected {
@@ -4458,7 +4886,7 @@ mod tests {
         let mut prompter = ScriptedPrompter::new(&["a"]);
         let mut grants = SessionGrants::default();
 
-        let resp = resolve_permission(&req, &mut surface, &mut prompter, &mut grants);
+        let resp = resolve_permission(&req, &mut surface, &mut prompter, &mut grants, true);
         assert_eq!(
             resp.outcome,
             PermissionOutcome::Selected {
@@ -4478,6 +4906,7 @@ mod tests {
             &mut surface,
             &mut prompter,
             &mut SessionGrants::default(),
+            true,
         );
         assert!(
             prompter.any_question_contains("[p]ermanently"),
@@ -4492,6 +4921,7 @@ mod tests {
             &mut surface,
             &mut prompter,
             &mut SessionGrants::default(),
+            true,
         );
         assert!(
             !prompter.any_question_contains("[p]ermanently"),
@@ -6717,5 +7147,863 @@ mod tests {
                 "{spelling:?} is not a row of the table: {line}"
             );
         }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// REQ-585: the pipe rule, the consent subject, and the echo line
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod skill_tests {
+    use super::*;
+    use crate::prompt::ScriptedPrompter;
+    use crate::render::RecordingSurface;
+    use teton_protocol::events::{SessionRootChanged, SkillInvoked};
+    use teton_protocol::methods::{RootKind, SkillSource};
+    use teton_protocol::{RequestId, SessionId};
+
+    /// An envelope for this client's own session, as the module above spells
+    /// one.
+    fn envelope(event: Event) -> EventEnvelope {
+        EventEnvelope::new(1, Some(SessionId::from("s1")), event)
+    }
+
+    /// The subject a skill consent carries: three commands, already substituted,
+    /// in document order (ADR-7).
+    fn skill_subject(skill: &str) -> PermissionSubject {
+        PermissionSubject::SkillDynamicContext {
+            skill: skill.to_owned(),
+            source: SkillSource::User,
+            commands: vec![
+                "ls -1 .adlc/specs".to_owned(),
+                "git status --short".to_owned(),
+                "grep -c '' README.md".to_owned(),
+            ],
+        }
+    }
+
+    /// A skill consent as the daemon raises it: the grant key is ADR-6's
+    /// `skill:<source>:<name>`, and nothing in this crate reads its shape.
+    fn skill_permission_request(subject: Option<PermissionSubject>) -> PermissionRequest {
+        PermissionRequest {
+            request_id: RequestId::from("r-skill"),
+            tool_name: "skill:user:status".to_owned(),
+            description: None,
+            subject,
+            options: vec![
+                PermissionOption {
+                    option_id: "allow_once".to_owned(),
+                    label: "Allow once".to_owned(),
+                    kind: PermissionOptionKind::AllowOnce,
+                },
+                PermissionOption {
+                    option_id: "allow_always".to_owned(),
+                    label: "Allow for session".to_owned(),
+                    kind: PermissionOptionKind::AllowAlways,
+                },
+                PermissionOption {
+                    option_id: "reject_once".to_owned(),
+                    label: "Reject once".to_owned(),
+                    kind: PermissionOptionKind::RejectOnce,
+                },
+            ],
+        }
+    }
+
+    /// A subject whose `kind` this build has never heard of, arriving through
+    /// serde exactly as a future daemon's would — never constructed by hand,
+    /// because the variant only exists as `#[serde(other)]`'s output and a
+    /// hand-built one would prove nothing about the wire (LESSON-544).
+    fn unrecognized_subject() -> PermissionSubject {
+        let wire = serde_json::json!({ "kind": "something_invented_later", "detail": 7 });
+        let subject: PermissionSubject =
+            serde_json::from_value(wire).expect("an unknown kind degrades, never errors");
+        assert_eq!(subject, PermissionSubject::Unrecognized);
+        subject
+    }
+
+    // ----------------------------------------------------------------- gate
+
+    /// **ADR-8's truth table.** All six rows of a two-input predicate, pinned
+    /// the way `cli_rows::write_gate`'s are — because the two rows that matter
+    /// (a pipe, and a subject from the future) are the ones a test process
+    /// cannot reach through a real terminal.
+    #[test]
+    fn the_consent_gate_is_a_truth_table_over_the_subject_and_the_terminal() {
+        let skill = skill_subject("status");
+        let unknown = unrecognized_subject();
+        for (case, subject, typed_input, expected) in [
+            (
+                "no subject, at a terminal: every prompt before REQ-585",
+                None,
+                true,
+                ConsentGate::Answerable,
+            ),
+            (
+                "no subject, on a pipe: the shell consent still answers from \
+                 the next line, and BR-11 narrows nothing else",
+                None,
+                false,
+                ConsentGate::Answerable,
+            ),
+            (
+                "a skill's dynamic context, at a terminal: ask",
+                Some(&skill),
+                true,
+                ConsentGate::Answerable,
+            ),
+            (
+                "a skill's dynamic context, on a pipe: refuse (BR-11)",
+                Some(&skill),
+                false,
+                ConsentGate::RefuseNoTerminal,
+            ),
+            (
+                "an unknown subject, at a terminal: still refused — a question \
+                 this build cannot show is not one it may answer",
+                Some(&unknown),
+                true,
+                ConsentGate::RefuseUnrecognized,
+            ),
+            (
+                "an unknown subject, on a pipe: refused",
+                Some(&unknown),
+                false,
+                ConsentGate::RefuseUnrecognized,
+            ),
+        ] {
+            assert_eq!(consent_gate(subject, typed_input), expected, "{case}");
+        }
+    }
+
+    // ------------------------------------------------- the negative pin
+
+    /// **BR-11 / AC-9, written as the negative pin it is.** A piped session at
+    /// a level that would ask refuses the skill consent **without reading a
+    /// line** — the prompter is scripted with the `y` a paste would have left
+    /// sitting there, and the assertion is that it is still sitting there.
+    ///
+    /// This is LESSON-537's shape: `StdinPrompter::ask` reads unconditionally,
+    /// so a refusal computed *after* the call has already eaten the user's next
+    /// prompt line and turned a pasted `y` into consent for shell commands.
+    /// Moving `prompter.ask` above the gate fails here.
+    #[test]
+    fn a_piped_skill_consent_is_refused_without_reading_a_line() {
+        let req = skill_permission_request(Some(skill_subject("status")));
+        let mut surface = RecordingSurface::new();
+        // The line a paste would have queued behind the invocation. It must
+        // survive as the *next prompt line*, not become an answer.
+        let mut prompter = ScriptedPrompter::new(&["y"]);
+        let mut grants = SessionGrants::default();
+
+        let resp = resolve_permission(&req, &mut surface, &mut prompter, &mut grants, false);
+
+        assert_eq!(
+            prompter.asked, 0,
+            "the gate ran before `ask`: {:?}",
+            prompter.questions
+        );
+        assert_eq!(
+            resp.outcome,
+            PermissionOutcome::Refused {
+                reason: RefusalReason::NoTerminal
+            }
+        );
+        assert!(
+            !grants.is_allow_always("skill:user:status")
+                && !grants.is_reject_always("skill:user:status"),
+            "a refusal nobody answered records no session grant"
+        );
+    }
+
+    /// **BR-11's fail-closed half.** A subject this build does not recognize is
+    /// refused rather than falling through to `prompter.ask`, and it is refused
+    /// **at a terminal too**: there is nothing to show, so there is nothing to
+    /// ask. Treating `Unrecognized` as answerable fails here.
+    #[test]
+    fn an_unrecognized_subject_is_refused_without_reading_a_line_even_at_a_terminal() {
+        for typed_input in [true, false] {
+            let req = skill_permission_request(Some(unrecognized_subject()));
+            let mut surface = RecordingSurface::new();
+            let mut prompter = ScriptedPrompter::new(&["y"]);
+            let mut grants = SessionGrants::default();
+
+            let resp =
+                resolve_permission(&req, &mut surface, &mut prompter, &mut grants, typed_input);
+
+            assert_eq!(prompter.asked, 0, "typed_input={typed_input}");
+            assert_eq!(
+                resp.outcome,
+                PermissionOutcome::Refused {
+                    reason: RefusalReason::UnrecognizedSubject
+                },
+                "typed_input={typed_input}"
+            );
+        }
+    }
+
+    /// **ADR-7's naming rule.** A refusal is `Refused`, never `Cancelled` —
+    /// `Cancelled` already means *the user dismissed the prompt*, and it is what
+    /// EOF on a pipe returns for an ordinary request. The two outcomes are
+    /// asserted side by side so that collapsing them is a failure rather than a
+    /// silent re-spelling: AC-9's placeholder can only say "no human could be
+    /// asked" if the daemon is told which of the two happened.
+    #[test]
+    fn a_refusal_is_never_the_cancellation_a_dismissed_prompt_produces() {
+        let refused = {
+            let req = skill_permission_request(Some(skill_subject("status")));
+            let mut surface = RecordingSurface::new();
+            let mut prompter = ScriptedPrompter::new(&[]);
+            let mut grants = SessionGrants::default();
+            resolve_permission(&req, &mut surface, &mut prompter, &mut grants, false).outcome
+        };
+        let dismissed = {
+            // The same session, the same empty stdin — but an ordinary request,
+            // which is read to EOF and cancels.
+            let req = skill_permission_request(None);
+            let mut surface = RecordingSurface::new();
+            let mut prompter = ScriptedPrompter::new(&[]);
+            let mut grants = SessionGrants::default();
+            resolve_permission(&req, &mut surface, &mut prompter, &mut grants, false).outcome
+        };
+
+        assert_eq!(
+            refused,
+            PermissionOutcome::Refused {
+                reason: RefusalReason::NoTerminal
+            }
+        );
+        assert_eq!(dismissed, PermissionOutcome::Cancelled);
+        assert_ne!(
+            refused, dismissed,
+            "a refusal nobody was asked for is not a dismissal"
+        );
+    }
+
+    /// **The narrowing is exactly one case wide.** An ordinary tool prompt on a
+    /// pipe still answers from the next stdin line, as every shipped script
+    /// depends on: a gate that generalized BR-11 to every request would be a
+    /// silent change to the shell consent's piped behaviour.
+    #[test]
+    fn an_ordinary_prompt_on_a_pipe_still_answers_from_the_next_line() {
+        let req = skill_permission_request(None);
+        let mut surface = RecordingSurface::new();
+        let mut prompter = ScriptedPrompter::new(&["y"]);
+        let mut grants = SessionGrants::default();
+
+        let resp = resolve_permission(&req, &mut surface, &mut prompter, &mut grants, false);
+
+        assert_eq!(prompter.asked, 1);
+        assert_eq!(
+            resp.outcome,
+            PermissionOutcome::Selected {
+                option_id: "allow_once".to_owned()
+            }
+        );
+    }
+
+    // ------------------------------------------------- consent rendering
+
+    /// **ADR-7's mechanical half.** Three commands reach the surface as three
+    /// lines, each carrying its command verbatim. `Surface::line` defuses, and
+    /// defusing destroys newlines, so a joined string could not have carried
+    /// them — which is why the subject is a structure and not a description.
+    #[test]
+    fn a_skill_consent_lists_every_command_on_its_own_line() {
+        let subject = skill_subject("status");
+        let PermissionSubject::SkillDynamicContext { commands, .. } = &subject else {
+            panic!("the fixture is a skill subject");
+        };
+        let commands = commands.clone();
+
+        let req = skill_permission_request(Some(subject));
+        let mut surface = RecordingSurface::new();
+        let mut prompter = ScriptedPrompter::new(&["y"]);
+        let mut grants = SessionGrants::default();
+        resolve_permission(&req, &mut surface, &mut prompter, &mut grants, true);
+
+        let lines = surface.lines_of(LineKind::Prompt);
+        for command in &commands {
+            let hits = lines.iter().filter(|line| line.contains(command)).count();
+            assert_eq!(hits, 1, "{command:?} rides exactly one line: {lines:?}");
+        }
+        assert!(
+            lines.iter().any(|line| line.contains("skill `status`")
+                && line.contains("(user)")
+                && line.contains("3 dynamic-context commands")),
+            "the block names the skill, its source and the count: {lines:?}"
+        );
+    }
+
+    /// The refusal says what was checked and names the remedy, because a
+    /// refusal without one is a dead end — and the remedy is BR-11's stated
+    /// automation posture, not an invitation to type at a terminal.
+    #[test]
+    fn the_no_terminal_refusal_names_the_skill_and_the_unattended_remedy() {
+        let req = skill_permission_request(Some(skill_subject("status")));
+        let mut surface = RecordingSurface::new();
+        let mut prompter = ScriptedPrompter::new(&[]);
+        let mut grants = SessionGrants::default();
+        resolve_permission(&req, &mut surface, &mut prompter, &mut grants, false);
+
+        let notices = surface.lines_of(LineKind::Notice);
+        assert_eq!(notices.len(), 1, "one line, not a paragraph: {notices:?}");
+        assert!(notices[0].contains("skill `status`"), "{}", notices[0]);
+        assert!(
+            notices[0].contains("not a terminal"),
+            "it reports what was checked: {}",
+            notices[0]
+        );
+        // The remedy has to be something that exists. `--permissions` is not a
+        // flag — `teton`'s globals are `--yes` and `--verbose` — so a line
+        // naming one would send an unattended user to a parse error at the one
+        // moment they cannot be asked anything. Both spellings below are real:
+        // a `/permissions full` line piped ahead of the invocation, and the
+        // config key a runner sets once.
+        assert!(
+            notices[0].contains("/permissions full"),
+            "it names the unattended remedy: {}",
+            notices[0]
+        );
+        assert!(
+            notices[0].contains("[permissions] default_level"),
+            "it names the durable remedy too: {}",
+            notices[0]
+        );
+        assert!(
+            !notices[0].contains("--permissions"),
+            "the remedy named a flag that does not exist: {}",
+            notices[0]
+        );
+    }
+
+    // --------------------------------------------------------- echo line
+
+    /// One invocation, as the daemon publishes it.
+    fn invoked(outcomes: Vec<DynamicOutcomeView>) -> SkillInvoked {
+        SkillInvoked {
+            name: "status".to_owned(),
+            source: SkillSource::User,
+            path_display: "~/.claude/skills/status/SKILL.md".to_owned(),
+            body_bytes: 5_432,
+            ignored_keys: vec!["allowed-tools".to_owned(), "model".to_owned()],
+            name_note: None,
+            outcomes,
+        }
+    }
+
+    fn ran(command: &str, bytes: u64) -> DynamicOutcomeView {
+        DynamicOutcomeView {
+            command: command.to_owned(),
+            outcome: DynamicOutcome::Ran {
+                output_bytes: bytes,
+                truncated: false,
+            },
+        }
+    }
+
+    /// **BR-12 / AC-19.** Every invocation echoes exactly one line naming the
+    /// skill, its source, its size and how many dynamic commands it had — and
+    /// the **body is never printed**, which is the half a byte assertion can
+    /// only make by counting what was drawn.
+    #[test]
+    fn an_invocation_echoes_one_line_and_never_the_body() {
+        let mut surface = RecordingSurface::new();
+        let mut state = SessionState::new();
+        let outcome = render_event(
+            &envelope(Event::SkillInvoked(invoked(vec![
+                ran("ls -1", 120),
+                ran("git status --short", 40),
+                ran("date", 30),
+                ran("grep -c '' README.md", 4),
+            ]))),
+            &mut surface,
+            &mut state,
+        );
+
+        assert!(matches!(outcome, EventOutcome::Rendered));
+        assert_eq!(
+            surface.calls.len(),
+            1,
+            "one line, and nothing else: {:?}",
+            surface.calls
+        );
+        assert_eq!(
+            surface.lines_of(LineKind::Notice),
+            vec!["/status → skill status (user, 5.3 KiB, 4 dynamic commands)"]
+        );
+    }
+
+    /// A skill with no dynamic context says so honestly, and singular reads as
+    /// singular: "1 dynamic command", never "1 dynamic commands".
+    #[test]
+    fn the_echo_line_counts_zero_and_one_in_words_that_read() {
+        let declined = |command: &str| DynamicOutcomeView {
+            command: command.to_owned(),
+            outcome: DynamicOutcome::NotRun {
+                reason: NotRunReason::Declined,
+            },
+        };
+        for (outcomes, expected) in [
+            (Vec::new(), "0 dynamic commands"),
+            (vec![ran("ls -1", 12)], "1 dynamic command"),
+            (vec![ran("ls -1", 12), ran("date", 8)], "2 dynamic commands"),
+            // The count alone cannot say a command never started, and after a
+            // decline every one of them is a placeholder in the prompt rather
+            // than output. The line the user *sees* has to agree with what the
+            // model actually got.
+            (vec![declined("ls -1")], "1 dynamic command, none run"),
+            (
+                vec![declined("ls -1"), declined("date")],
+                "2 dynamic commands, none run",
+            ),
+            (
+                vec![ran("ls -1", 12), declined("date"), declined("git status")],
+                "3 dynamic commands, 1 run",
+            ),
+            // A command that started and failed still ran: the model has its
+            // placeholder *and* the fact that it was attempted.
+            (
+                vec![
+                    ran("ls -1", 12),
+                    DynamicOutcomeView {
+                        command: "false".to_owned(),
+                        outcome: DynamicOutcome::Failed {
+                            exit_status: Some(1),
+                        },
+                    },
+                ],
+                "2 dynamic commands",
+            ),
+        ] {
+            let line = skill_echo_line(&invoked(outcomes));
+            assert!(line.ends_with(&format!("{expected})")), "{line}");
+        }
+    }
+
+    /// **BR-12's `/verbose` clause.** The path, the ignored frontmatter keys and
+    /// one line per command's typed outcome — added under the echo line, and
+    /// only under `/verbose`.
+    #[test]
+    fn verbose_adds_the_path_the_ignored_keys_and_one_line_per_outcome() {
+        let event = Event::SkillInvoked(invoked(vec![
+            ran("ls -1 .adlc/specs", 2_048),
+            DynamicOutcomeView {
+                command: "git status --short".to_owned(),
+                outcome: DynamicOutcome::NotRun {
+                    reason: NotRunReason::NoTerminal,
+                },
+            },
+            DynamicOutcomeView {
+                command: "false".to_owned(),
+                outcome: DynamicOutcome::Failed {
+                    exit_status: Some(1),
+                },
+            },
+            DynamicOutcomeView {
+                command: "sleep 600".to_owned(),
+                outcome: DynamicOutcome::TimedOut,
+            },
+        ]));
+
+        let mut quiet = RecordingSurface::new();
+        let mut state = SessionState::new();
+        render_event(&envelope(event.clone()), &mut quiet, &mut state);
+        assert_eq!(quiet.calls.len(), 1, "no detail without /verbose");
+
+        let mut surface = RecordingSurface::new();
+        let mut state = SessionState::new();
+        state.verbose = true;
+        render_event(&envelope(event), &mut surface, &mut state);
+
+        let detail = surface.lines_of(LineKind::Info);
+        assert_eq!(
+            surface.lines_of(LineKind::Notice).len(),
+            1,
+            "still exactly one echo line"
+        );
+        assert!(
+            detail[0].contains("~/.claude/skills/status/SKILL.md"),
+            "the path is home-relative, as the daemon spelled it: {detail:?}"
+        );
+        assert!(
+            !detail[0].contains("/Users/"),
+            "BR-1's entity table: never an absolute path: {detail:?}"
+        );
+        assert!(
+            detail[1] == "  ignored frontmatter: allowed-tools, model",
+            "BR-5's inert keys are named: {detail:?}"
+        );
+        assert_eq!(
+            &detail[2..],
+            [
+                "  !`ls -1 .adlc/specs` — ran (2.0 KiB)",
+                "  !`git status --short` — not run: no human could be asked",
+                "  !`false` — failed (exit 1)",
+                "  !`sleep 600` — timed out",
+            ],
+            "one line per command, in document order"
+        );
+    }
+
+    /// A file that declared no inert keys gets no line about them: a header with
+    /// nothing after it is a line about nothing.
+    #[test]
+    fn verbose_says_nothing_about_ignored_keys_when_there_were_none() {
+        let mut event = invoked(vec![ran("date", 8)]);
+        event.ignored_keys.clear();
+        let mut surface = RecordingSurface::new();
+        let mut state = SessionState::new();
+        state.verbose = true;
+        render_event(
+            &envelope(Event::SkillInvoked(event)),
+            &mut surface,
+            &mut state,
+        );
+
+        assert!(
+            !surface.any_line_contains(LineKind::Info, "ignored frontmatter"),
+            "{:?}",
+            surface.lines_of(LineKind::Info)
+        );
+    }
+
+    /// **BR-6's four doors, four sentences.** "The user declined" and "no human
+    /// could be asked" are different facts about the same missing output;
+    /// collapsing any two of them would tell a user their answer decided
+    /// something they were never asked.
+    #[test]
+    fn the_not_run_reasons_read_as_different_sentences() {
+        // Every arm, listed exhaustively rather than sampled: a reason added
+        // later that this crate forgets to word would otherwise reach a user
+        // wearing another reason's sentence.
+        let mut seen: Vec<&str> = [
+            NotRunReason::Declined,
+            NotRunReason::Level,
+            NotRunReason::NoTerminal,
+            NotRunReason::UnrecognizedSubject,
+            NotRunReason::CouldNotStart,
+        ]
+        .into_iter()
+        .map(not_run_words)
+        .collect();
+        let total = seen.len();
+        seen.sort_unstable();
+        seen.dedup();
+        assert_eq!(seen.len(), total, "two reasons share a sentence: {seen:?}");
+    }
+
+    /// A truncated run says so: the model is reading a prefix, and the record
+    /// the user reads says which.
+    #[test]
+    fn a_truncated_run_is_marked_as_one() {
+        assert_eq!(
+            dynamic_outcome_words(&DynamicOutcome::Ran {
+                output_bytes: 4_096,
+                truncated: true,
+            }),
+            "ran (4.0 KiB, truncated)"
+        );
+        assert_eq!(
+            dynamic_outcome_words(&DynamicOutcome::Failed { exit_status: None }),
+            "failed (killed by a signal)"
+        );
+    }
+
+    // ------------------------------------------------- snapshot lifetime
+
+    fn root_moved(session: &str) -> EventEnvelope {
+        EventEnvelope::new(
+            1,
+            Some(SessionId::from(session)),
+            Event::SessionRootChanged(SessionRootChanged {
+                previous_display: "~/before".to_owned(),
+                root: SessionRoot {
+                    display: "~/Documents/GitHub/teton-code".to_owned(),
+                    kind: RootKind::Project,
+                    project_name: Some("teton-code".to_owned()),
+                    vcs_branch: Some("main".to_owned()),
+                },
+            }),
+        )
+    }
+
+    /// **ADR-2 / AC-14.** A `/cd` in *this* session marks the snapshot stale, so
+    /// the entry loop re-fetches before it classifies the next line — and the
+    /// flag clears as it is read, so one move costs one `skills/list` rather
+    /// than one per typed line.
+    #[test]
+    fn a_root_move_in_this_session_marks_the_snapshot_stale_exactly_once() {
+        let mut surface = RecordingSurface::new();
+        let mut state = SessionState::new();
+        state.session_id = Some(SessionId::from("s1"));
+        assert!(
+            !state.take_skills_stale(),
+            "a fresh session has already fetched"
+        );
+
+        render_event(&root_moved("s1"), &mut surface, &mut state);
+
+        assert!(state.take_skills_stale(), "the move is news");
+        assert!(
+            !state.take_skills_stale(),
+            "reading clears it: one move, one fetch"
+        );
+    }
+
+    /// **ADR-6's client half.** A root move forgets the answers the user gave
+    /// about *this* root's skills, and keeps the ones that are still about the
+    /// same file.
+    ///
+    /// This store is consulted *before* any prompt is drawn, so a grant that
+    /// outlived its root does not merely linger — it silently answers. The
+    /// daemon drops its copy inside `set_session_cwd` and then re-asks; without
+    /// this, the re-ask is auto-answered from a different repo's approval, one
+    /// `auto-allow` line goes by, the commands are never shown, and the daemon
+    /// re-remembers the grant under the new root. The daemon-side test cannot
+    /// see any of that, because by then the request never reaches a human.
+    #[test]
+    fn a_root_move_forgets_the_project_skill_grants_and_keeps_the_others() {
+        use teton_protocol::methods::{skill_permission_key, SkillSource};
+
+        let mut surface = RecordingSurface::new();
+        let mut state = SessionState::new();
+        state.session_id = Some(SessionId::from("s1"));
+
+        let project = skill_permission_key(SkillSource::Project, "deploy");
+        let user = skill_permission_key(SkillSource::User, "status");
+        state.grants.allow_always(&project);
+        state.grants.allow_always(&user);
+        state.grants.allow_always("shell");
+        state
+            .grants
+            .reject_always(&skill_permission_key(SkillSource::Project, "canary"));
+
+        render_event(&root_moved("s1"), &mut surface, &mut state);
+
+        assert!(
+            !state.grants.is_allow_always(&project),
+            "a project skill's grant outlived the root that gave its name meaning",
+        );
+        assert!(
+            !state
+                .grants
+                .is_reject_always(&skill_permission_key(SkillSource::Project, "canary")),
+            "a project skill's refusal outlived it too — the same key names another file now",
+        );
+        // Kept: `~/.claude/skills/status` is the same file whatever the root
+        // is, and `shell` is not root-scoped at all. Forgetting these would
+        // re-ask questions whose answers are still true.
+        assert!(
+            state.grants.is_allow_always(&user),
+            "a user skill's grant is still about its file"
+        );
+        assert!(
+            state.grants.is_allow_always("shell"),
+            "`shell` is not root-scoped"
+        );
+    }
+
+    /// Another session's `/cd` re-derives nothing here — the bus is daemon-wide,
+    /// and this client's registry is about this client's root. Under the same
+    /// condition the root cache itself is written under, so the two cannot come
+    /// to describe different sessions.
+    #[test]
+    fn another_sessions_root_move_leaves_this_snapshot_alone() {
+        let mut surface = RecordingSurface::new();
+        let mut state = SessionState::new();
+        state.session_id = Some(SessionId::from("s1"));
+
+        render_event(&root_moved("s2"), &mut surface, &mut state);
+
+        assert!(!state.take_skills_stale());
+        assert_eq!(state.root, None, "and the root cache is untouched too");
+    }
+}
+
+// ---------------------------------------------------------------------------
+// REQ-585 ADR-7: the client selects on the subject, never on the key string
+// ---------------------------------------------------------------------------
+
+/// A source-level scan of the whole `teton` crate, in the style of
+/// `tetond/tests/boundary_coverage.rs`'s.
+///
+/// The claim ADR-7 makes is a **negative** one — `req.tool_name`'s
+/// `skill:<source>:<name>` shape is not parsed anywhere in this crate — and a
+/// negative claim about code that does not exist cannot be asserted by running
+/// anything. So it is asserted about the source itself, embedded with
+/// `include_str!` at compile time rather than read from disk, which is BUG-159's
+/// trap: a scan that opens files at runtime passes vacuously from a directory
+/// that is not the crate.
+///
+/// The rule this guards is not "the key is unimportant" — it is the grant key,
+/// and [`SessionGrants`] uses it as an **opaque** one, whole, hashed, never
+/// split. What a client may not do is *select behaviour* by its shape: BR-11
+/// says the key is an implementation detail, and a client sniffing an unstable
+/// string mis-fires in the one direction that costs a swallowed stdin line.
+/// `OPTION_ID_ENABLE_PERMANENT` is the shipped precedent for the single value a
+/// client may match by string; everything else is matched by typed kind, and
+/// [`PermissionSubject`] is that kind for the subject of a request.
+#[cfg(test)]
+mod key_scan {
+    use std::collections::BTreeSet;
+
+    /// Every production source file of this crate. A fixed list, because
+    /// `include_str!` takes a literal path — and
+    /// [`every_module_of_this_crate_is_scanned`] fails the day one is added and
+    /// not listed here, so the list cannot silently stop covering the crate.
+    const CRATE_SOURCES: &[(&str, &str)] = &[
+        ("main.rs", include_str!("main.rs")),
+        ("banner.rs", include_str!("banner.rs")),
+        ("cli_rows.rs", include_str!("cli_rows.rs")),
+        ("client.rs", include_str!("client.rs")),
+        ("cost_ui.rs", include_str!("cost_ui.rs")),
+        ("effort_ui.rs", include_str!("effort_ui.rs")),
+        ("firstrun.rs", include_str!("firstrun.rs")),
+        ("keychain.rs", include_str!("keychain.rs")),
+        ("loading.rs", include_str!("loading.rs")),
+        ("model_ui.rs", include_str!("model_ui.rs")),
+        ("prompt.rs", include_str!("prompt.rs")),
+        ("provider_setup_ui.rs", include_str!("provider_setup_ui.rs")),
+        ("provider_test_ui.rs", include_str!("provider_test_ui.rs")),
+        ("render.rs", include_str!("render.rs")),
+        ("service.rs", include_str!("service.rs")),
+        ("session_ui.rs", include_str!("session_ui.rs")),
+        ("slash.rs", include_str!("slash.rs")),
+        ("status.rs", include_str!("status.rs")),
+        ("uninstall.rs", include_str!("uninstall.rs")),
+        ("web_setup_ui.rs", include_str!("web_setup_ui.rs")),
+    ];
+
+    /// A string literal that opens with the grant key's prefix — `"skill:` —
+    /// which is what `starts_with`, `strip_prefix`, `split` and `format!` all
+    /// need in order to take the key apart or to build one.
+    const KEY_LITERAL: &str = "\"skill:";
+
+    /// Ways to decompose the key once it is in hand. `as_str`, `clone` and a
+    /// bare `{}` are absent on purpose: passing the key along whole, hashing it
+    /// as a grant, and *printing* it are all fine — printing what the daemon
+    /// called a request is how a user finds it in a log.
+    const DECOMPOSITIONS: &[&str] = &[
+        "tool_name.split",
+        "tool_name.splitn",
+        "tool_name.rsplit",
+        "tool_name.strip_prefix",
+        "tool_name.strip_suffix",
+        "tool_name.starts_with",
+        "tool_name.ends_with",
+        "tool_name.contains",
+        "tool_name.find",
+    ];
+
+    /// Everything in `text` before its first `#[cfg(test)] mod …`.
+    ///
+    /// A test fixture may of course spell a key — this module's own does — and a
+    /// scan that counted them would be asserting about itself. The anchor is the
+    /// attribute *and* the `mod` line together; a file that loses the pair is
+    /// scanned whole, which can only make the scan **stricter**, never blinder.
+    fn production_half(text: &str) -> &str {
+        match text.find("\n#[cfg(test)]\nmod ") {
+            Some(at) => &text[..at],
+            None => text,
+        }
+    }
+
+    /// Source lines that are not comments — the scan is about code, and every
+    /// ADR reference in this crate's prose spells the key on purpose.
+    fn code_lines(text: &str) -> impl Iterator<Item = (usize, &str)> {
+        text.lines().enumerate().filter(|(_, line)| {
+            let t = line.trim_start();
+            !(t.starts_with("//") || t.starts_with("/*") || t.starts_with('*'))
+        })
+    }
+
+    /// **ADR-7 / BR-11.** No production line of this crate builds or takes apart
+    /// the `skill:<source>:<name>` permission key. A client that sniffed it
+    /// would mis-fire the one way that costs a stdin line, and the typed
+    /// `PermissionSubject` exists precisely so that it never has to.
+    #[test]
+    fn no_production_source_parses_the_skill_permission_key() {
+        let mut offences: Vec<String> = Vec::new();
+        for (file, text) in CRATE_SOURCES {
+            for (index, line) in code_lines(production_half(text)) {
+                if line.contains(KEY_LITERAL) {
+                    offences.push(format!("{file}:{}: {}", index + 1, line.trim()));
+                }
+                for needle in DECOMPOSITIONS {
+                    if line.contains(needle) {
+                        offences.push(format!("{file}:{}: {}", index + 1, line.trim()));
+                    }
+                }
+            }
+        }
+        assert!(
+            offences.is_empty(),
+            "the client must select on `PermissionSubject`, never on the key string \
+             (REQ-585 BR-11, ADR-7):\n{}",
+            offences.join("\n")
+        );
+    }
+
+    /// The scan covers the crate, not a list somebody forgot to grow.
+    ///
+    /// `include_str!` takes a literal path, so [`CRATE_SOURCES`] cannot be
+    /// derived — but the module list in `main.rs` can be, and a module declared
+    /// there and absent here fails this rather than silently going unscanned
+    /// (LESSON-546: a one-home rule needs a test, not a grep).
+    #[test]
+    fn every_module_of_this_crate_is_scanned() {
+        let main = CRATE_SOURCES
+            .iter()
+            .find(|(name, _)| *name == "main.rs")
+            .expect("the crate root is scanned")
+            .1;
+        let declared: BTreeSet<String> = main
+            .lines()
+            .map(str::trim)
+            .filter(|line| !line.starts_with("//"))
+            .filter_map(|line| {
+                let decl = line.strip_prefix("pub ").unwrap_or(line);
+                let name = decl.strip_prefix("mod ")?.strip_suffix(';')?;
+                name.chars()
+                    .all(|c| c.is_ascii_alphanumeric() || c == '_')
+                    .then(|| format!("{name}.rs"))
+            })
+            .collect();
+        let scanned: BTreeSet<String> = CRATE_SOURCES
+            .iter()
+            .map(|(name, _)| (*name).to_owned())
+            .collect();
+
+        assert!(!declared.is_empty(), "main.rs declares modules");
+        let missing: Vec<&String> = declared.difference(&scanned).collect();
+        assert!(
+            missing.is_empty(),
+            "these modules are not scanned; add each `include_str!` to \
+             `CRATE_SOURCES`: {missing:?}"
+        );
+    }
+
+    /// The scan is not vacuous: it really would fire.
+    ///
+    /// Both needles are exercised against text shaped like the mutation they
+    /// exist to catch — a client that recognized a skill consent by reading its
+    /// key — so a later edit that broke `production_half`, `code_lines` or the
+    /// needle list is a failure here rather than a green scan of nothing.
+    #[test]
+    fn the_scan_would_catch_a_client_that_sniffed_the_key() {
+        let sniffing = "    if req.tool_name.starts_with(\"skill:\") {\n        ask();\n    }\n";
+        let hits: Vec<&str> = code_lines(production_half(sniffing))
+            .filter(|(_, line)| {
+                line.contains(KEY_LITERAL) || DECOMPOSITIONS.iter().any(|n| line.contains(n))
+            })
+            .map(|(_, line)| line)
+            .collect();
+        assert_eq!(hits.len(), 1, "the mutation is caught: {hits:?}");
+
+        // And a comment saying the same words is not an offence.
+        let prose = "    /// The key's `skill:<source>:<name>` shape (`\"skill:`) is not parsed.\n";
+        assert_eq!(code_lines(production_half(prose)).count(), 0);
     }
 }

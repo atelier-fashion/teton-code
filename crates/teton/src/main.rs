@@ -32,7 +32,8 @@ use teton_protocol::methods::{
     CategoryBindingConfig, ConfigGetParams, ConfigSetParams, ConfigSetResult, ConfigSnapshot,
     ConfigUpdate, ContentClass, CostQueryParams, CostQueryResult, CostReportView, ModelListParams,
     ModelListResult, ModelSetParams, ModelStatusParams, ModelStatusResult, PrivacyBoundaryConfig,
-    ProviderConfig, SessionCreateParams, SessionPermissionsParams, TierBindingConfig,
+    PromptTurnParams, ProviderConfig, SessionCreateParams, SessionPermissionsParams,
+    SkillInvocation, TierBindingConfig,
 };
 use teton_protocol::SessionId;
 use teton_protocol::{
@@ -1087,6 +1088,10 @@ fn run_session(
             // there is no session for a command to act on, and `None` is that
             // fact rather than a placeholder.
             session_id: None,
+            // Likewise: `skills/list` is a session-scoped query, so it cannot
+            // be asked until there is a session. Empty until then, and empty is
+            // the state in which nothing classifies as a skill (REQ-585 ADR-2).
+            skills: slash::SkillSnapshot::empty(),
         };
 
         // A proposal raised before this client attached is never replayed as an
@@ -1163,6 +1168,24 @@ fn run_session(
             read_permission_level(&mut conn, &mut ctx, &session_id);
             read_config_view(&mut conn, &mut ctx);
         }
+        // REQ-585 ADR-2: the registry this session's `/name` lines dispatch
+        // from, asked for once the session exists and again after every
+        // `session_root_changed`.
+        //
+        // **Not** gated on `interactive`, unlike the two reads above: those
+        // seed a status row a pipe never draws, while a piped session
+        // dispatches skills exactly as a terminal one does (BR-11) and needs
+        // the same snapshot. The TTY gates this REQ adds are on the consent
+        // prompt and on nothing else.
+        //
+        // Placed here, after the launch lines, for the reason every other
+        // startup RPC is: `call` pumps the event stream, so a query issued
+        // above the ready line could paint an event between the banner and the
+        // root notice. A daemon that does not serve the method leaves the
+        // snapshot empty and raises nothing — the handshake (ADR-2): no skill
+        // classifies, so no `skill` field is ever sent to it and no skill
+        // consent can ever arrive from it.
+        conn.refresh_skills(&mut ctx)?;
         // The indicator's animation clock, persisted across turns so the dots do
         // not restart every time a turn ends (REQ-556).
         let mut frame_tick: u64 = 0;
@@ -1194,69 +1217,128 @@ fn run_session(
             if text.is_empty() {
                 continue;
             }
+            // REQ-585 ADR-2: a `/cd` that moved this session re-derives the
+            // project half of the registry, so the snapshot is refreshed here —
+            // after the line was read and before it is classified, which is the
+            // last moment at which a stale one could still dispatch a skill the
+            // session no longer has. One `skills/list` per move, not per line:
+            // the flag clears as it is read.
+            if ctx.state.take_skills_stale() {
+                conn.refresh_skills(&mut ctx)?;
+            }
             // Slash commands are intercepted before any RPC is built (BR-1), so
             // a command never reaches the model, the transcript, or the meter.
-            let prompt_text = match slash::classify(text) {
-                slash::Input::Command { name, args } => {
-                    match slash::dispatch(name, args, &mut conn, &mut ctx)? {
-                        slash::CommandOutcome::Continue => continue,
-                        // `/quit` leaves through the same post-loop path Ctrl-D
-                        // takes — session-end cost summary, no `process::exit`
-                        // and no parallel shutdown to drift from it (BR-6).
-                        slash::CommandOutcome::Quit => break,
+            //
+            // The classifier reads this session's snapshot (REQ-585 BR-3). It is
+            // cloned rather than borrowed because `dispatch` needs the registry
+            // *and* the whole context — `/help` renders its section from
+            // `ctx.skills`, so the two readings are of one value and cannot
+            // disagree — and a clone is what lets both borrows exist. It is a
+            // handful of names and hints, once per typed line.
+            let skills = ctx.skills.clone();
+            let (params, turn_record): (PromptTurnParams, &str) =
+                match slash::classify(text, &skills) {
+                    // REQ-585 BR-4 / ADR-3: the invocation crosses the wire as a
+                    // **name**, never as an expansion, and the typed line never
+                    // goes in `prompt` at all — so a daemon that dropped the
+                    // field yields a visible empty turn rather than a leaked
+                    // `/status --with args` reaching a model. Exactly one of the
+                    // two is populated; the daemon refuses a request carrying
+                    // both.
+                    //
+                    // `raw_arguments` is the classifier's own bytes, moved here
+                    // and not re-joined from tokens: `/alpha teton  code "repo"`
+                    // reaches `$ARGUMENTS` with both interior spaces and both
+                    // quotes intact (BR-4).
+                    slash::Input::Skill {
+                        name,
+                        raw_arguments,
+                    } => (
+                        PromptTurnParams {
+                            session_id: session_id.clone(),
+                            prompt: Vec::new(),
+                            skill: Some(SkillInvocation {
+                                name,
+                                raw_arguments,
+                            }),
+                        },
+                        // What the *user* asked, for REQ-581 ADR-4's record:
+                        // the typed line, which is the only form of this turn's
+                        // question that exists on this side of the seam — the
+                        // client never sees the body it expands into.
+                        text,
+                    ),
+                    slash::Input::Command { name, args } => {
+                        match slash::dispatch(name, args, &skills, &mut conn, &mut ctx)? {
+                            slash::CommandOutcome::Continue => continue,
+                            // `/quit` leaves through the same post-loop path
+                            // Ctrl-D takes — session-end cost summary, no
+                            // `process::exit` and no parallel shutdown to drift
+                            // from it (BR-6).
+                            slash::CommandOutcome::Quit => break,
+                        }
                     }
-                }
-                // REQ-582 BR-4/BR-5: a typed `teton …` line whose subcommand
-                // path names a row runs **that row**, through the same
-                // `dispatch` a `/` line reaches — no `std::process::Command`,
-                // no second `Connection`, no prompt turn. The invariant is
-                // structural rather than checked: recognition ends in a table
-                // lookup, so it can only run what the table lists, on the
-                // connection this session already holds (D-4). Spawning the
-                // binary instead would announce an attach into the very session
-                // that typed the line (BUG-177's shape).
-                slash::Input::CliLine {
-                    name,
-                    args,
-                    shell_flags,
-                } => {
-                    // First, and always: the line the user typed is not the
-                    // spelling this session uses, and one notice is how they
-                    // learn the one that is (AC-5). Then the row, through
-                    // `run_cli_line` rather than `dispatch` directly: a row
-                    // that predates this REQ (`/model set`, `/effort`, …) has
-                    // its whole typed argv validated by the binary's own parser
-                    // first, so `teton model set qwen --yes` cannot hand the
-                    // row "qwen --yes" as a model name (verify M2).
-                    ctx.surface.line(LineKind::Notice, &cli_line_note(name));
-                    match slash::run_cli_line(name, args, shell_flags, &mut conn, &mut ctx)? {
-                        slash::CommandOutcome::Continue => continue,
-                        slash::CommandOutcome::Quit => break,
+                    // REQ-582 BR-4/BR-5: a typed `teton …` line whose subcommand
+                    // path names a row runs **that row**, through the same
+                    // `dispatch` a `/` line reaches — no `std::process::Command`,
+                    // no second `Connection`, no prompt turn. The invariant is
+                    // structural rather than checked: recognition ends in a table
+                    // lookup, so it can only run what the table lists, on the
+                    // connection this session already holds (D-4). Spawning the
+                    // binary instead would announce an attach into the very
+                    // session that typed the line (BUG-177's shape).
+                    slash::Input::CliLine {
+                        name,
+                        args,
+                        shell_flags,
+                    } => {
+                        // First, and always: the line the user typed is not the
+                        // spelling this session uses, and one notice is how they
+                        // learn the one that is (AC-5). Then the row, through
+                        // `run_cli_line` rather than `dispatch` directly: a row
+                        // that predates this REQ (`/model set`, `/effort`, …) has
+                        // its whole typed argv validated by the binary's own
+                        // parser first, so `teton model set qwen --yes` cannot
+                        // hand the row "qwen --yes" as a model name (verify M2).
+                        ctx.surface.line(LineKind::Notice, &cli_line_note(name));
+                        match slash::run_cli_line(
+                            name,
+                            args,
+                            shell_flags,
+                            &skills,
+                            &mut conn,
+                            &mut ctx,
+                        )? {
+                            slash::CommandOutcome::Continue => continue,
+                            slash::CommandOutcome::Quit => break,
+                        }
                     }
-                }
-                // A real command with no session form: one line saying why and
-                // where to go instead, composed by the classifier from the same
-                // clap tree that recognized the path (BR-4). No RPC, no turn.
-                slash::Input::CliRefused(refusal) => {
-                    ctx.surface.line(LineKind::Error, &refusal);
-                    continue;
-                }
-                // `teton provider --help`: the parser's own help page for that
-                // family, rendered as information — a user who asked for help
-                // got what they asked for, and no line of it is an error
-                // (verify T6). No RPC, no turn.
-                slash::Input::CliHelp(text) => {
-                    cli_rows::render_clap_text(&text, false, &mut *ctx.surface);
-                    continue;
-                }
-                // The escape hatch has already collapsed its leading pair
-                // (BR-1b); a plain prompt is the trimmed line's own bytes.
-                slash::Input::EscapedPrompt(text) | slash::Input::Prompt(text) => text,
-            };
-            // Built by the classifier's own module, so the bytes on the wire are
-            // the bytes it classified (AC-7 / AC-7b) rather than a second
-            // reading of the line taken here.
-            let params = slash::prompt_turn_params(&session_id, prompt_text);
+                    // A real command with no session form: one line saying why
+                    // and where to go instead, composed by the classifier from
+                    // the same clap tree that recognized the path (BR-4). No
+                    // RPC, no turn.
+                    slash::Input::CliRefused(refusal) => {
+                        ctx.surface.line(LineKind::Error, &refusal);
+                        continue;
+                    }
+                    // `teton provider --help`: the parser's own help page for
+                    // that family, rendered as information — a user who asked
+                    // for help got what they asked for, and no line of it is an
+                    // error (verify T6). No RPC, no turn.
+                    slash::Input::CliHelp(help) => {
+                        cli_rows::render_clap_text(&help, false, &mut *ctx.surface);
+                        continue;
+                    }
+                    // The escape hatch has already collapsed its leading pair
+                    // (BR-1b); a plain prompt is the trimmed line's own bytes.
+                    //
+                    // Built by the classifier's own module, so the bytes on the
+                    // wire are the bytes it classified (AC-7 / AC-7b) rather
+                    // than a second reading of the line taken here.
+                    slash::Input::EscapedPrompt(prompt) | slash::Input::Prompt(prompt) => {
+                        (slash::prompt_turn_params(&session_id, prompt), prompt)
+                    }
+                };
             // REQ-579 ADR-9: the hand-off check reads *this* turn's reply, so
             // the accumulator opens here — at the send — rather than closing at
             // the previous turn's end. A turn that was interrupted or refused
@@ -1266,8 +1348,11 @@ fn run_session(
             // REQ-581 ADR-4 opens it with the **question** as well: the same
             // bytes `prompt_turn_params` just put on the wire, so what the
             // connection predicate reads is what was asked rather than a second
-            // reading of the input line taken here.
-            ctx.state.begin_turn(prompt_text);
+            // reading of the input line taken here. For a skill invocation
+            // (REQ-585) that is the typed `/name …` line, which is the only form
+            // of the question this side of the seam has — the client never sees
+            // the body the daemon expands it into.
+            ctx.state.begin_turn(turn_record);
             match conn.call(params, &mut ctx)? {
                 Ok(res) => {
                     // REQ-579 ADR-9. Before the turn's closing line, because
@@ -1406,6 +1491,10 @@ fn passive_ctx<'a>(
         auto_accept_model: false,
         typed_input: std::io::IsTerminal::is_terminal(&std::io::stdin()),
         session_id: None,
+        // No session, so no registry: `skills/list` is session-scoped, and a
+        // passive context owns no session to ask about. Empty is that fact
+        // (REQ-585 ADR-2) — and no slash command runs here to read it.
+        skills: slash::SkillSnapshot::empty(),
     }
 }
 
@@ -5793,6 +5882,7 @@ mod tests {
                 auto_accept_model: assume_yes,
                 typed_input: true,
                 session_id: None,
+                skills: slash::SkillSnapshot::empty(),
             };
             provider_add_on(
                 &mut conn,
@@ -7429,6 +7519,7 @@ mod tests {
                 auto_accept_model: false,
                 typed_input: true,
                 session_id: None,
+                skills: slash::SkillSnapshot::empty(),
             };
 
             // Nothing observed yet: nothing drawn, no rows to take back.
@@ -7493,6 +7584,7 @@ mod tests {
             auto_accept_model: false,
             typed_input: true,
             session_id: None,
+            skills: slash::SkillSnapshot::empty(),
         };
 
         // BR-1: a machine that never opted in draws exactly what it drew before
@@ -7572,6 +7664,7 @@ mod tests {
             auto_accept_model: false,
             typed_input: true,
             session_id: None,
+            skills: slash::SkillSnapshot::empty(),
         };
 
         for (capability, expected) in [

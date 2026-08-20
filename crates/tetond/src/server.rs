@@ -112,8 +112,9 @@ use tokio::task::JoinHandle;
 
 use teton_protocol::events::{
     AttachConsentRequested, AttachRefused, AttachRefusedReason, ConsentScope, DaemonClientAttach,
-    Event, EventEnvelope, PhaseTransition, ProviderSetupCompleted, ProviderSetupRejected,
-    SessionGrantMinted, WebSetupRejected, EVENT_METHOD, SUBSCRIPTION_LAGGED_METHOD,
+    Event, EventEnvelope, PermissionRequest, PhaseTransition, ProviderSetupCompleted,
+    ProviderSetupRejected, SessionGrantMinted, WebSetupRejected, EVENT_METHOD,
+    SUBSCRIPTION_LAGGED_METHOD,
 };
 use teton_protocol::handshake::{self, HandshakeParams, HandshakeResult};
 use teton_protocol::jsonrpc::{error_code, Id, Notification, Response, RpcError};
@@ -125,12 +126,14 @@ use teton_protocol::methods::{
     ProviderSetupPlanParams, ProviderSetupPreviewParams, ProviderTestParams, RpcMethod,
     SessionAttachParams, SessionAttachResult, SessionClearParams, SessionCreateParams,
     SessionCreateResult, SessionListParams, SessionListResult, SessionPermissionsParams,
-    SessionSetCwdParams, SessionSummary, WebOverrideParams, WebRefreshParams, WebSetupCommitParams,
+    SessionSetCwdParams, SessionSummary, SkillSkipped, SkillView, SkillsListParams,
+    SkillsListResult, WebOverrideParams, WebRefreshParams, WebSetupCommitParams,
     WebSetupPlanParams, WebSetupPreviewParams,
 };
 use teton_protocol::{RequestId, SessionId};
 
 use teton_core::lifetime::{BlockingActivity, PolicySource, ShutdownPolicy};
+use teton_core::session_root::{bounded_field, display_for};
 
 use crate::attest::{
     AttestationRefusal, AttestationRegistry, MechanismAvailability, PresenceVerifier,
@@ -141,10 +144,12 @@ use crate::consent::{
     ConsentOutcome, ConsentRoute, ConsentSurfaces, PendingConsents, CONSENT_TIMEOUT,
 };
 use crate::grants::{monitor_witness, ConnectionId, Grant, GrantRegistry};
+use crate::harness::permissions::AddressedPermissionDelivery;
 use crate::lifetime::LifetimeSupervisor;
 use crate::peer::{is_descendant_of, Ancestry, KernelParentOf, MAX_ANCESTRY_DEPTH};
 use crate::runtime::{ClientPresence, DaemonRuntime};
 use crate::sessions::{self, validate_session_cwd, SessionCreateError, SessionRegistry};
+use crate::skills::{DirLister, RealFs, SkillRegistry};
 
 /// Depth of a client's outbound message queue (responses + events).
 const OUTBOUND_CAPACITY: usize = 1024;
@@ -293,7 +298,13 @@ pub struct Daemon {
     pub consents: PendingConsents,
     /// Every live connection a consent prompt can be rendered at (BR-6's
     /// routing question, which no single connection can answer for itself).
-    pub surfaces: ConsentSurfaces,
+    ///
+    /// Behind an `Arc` since REQ-585: the daemon's
+    /// [`AddressedPermissionDelivery`] route holds the **same** registry this
+    /// field names, so a skill consent is put in front of the connection this
+    /// daemon actually has live rather than a copy of one (LESSON-484 — one
+    /// definition, in one place).
+    pub surfaces: Arc<ConsentSurfaces>,
     /// Verified human presence, bound to one connection and one request
     /// (REQ-570 BR-6).
     ///
@@ -324,6 +335,20 @@ pub struct Daemon {
     /// [`Daemon::new`] both take the constant — and a fixture has to say
     /// [`Daemon::with_consent_timeout`] out loud to change it.
     pub consent_timeout: std::time::Duration,
+    /// The filesystem a session's skill discovery reads through (REQ-585
+    /// BR-1, ADR-4).
+    ///
+    /// A field for [`Self::verifier`]'s reason: the claim REQ-585 makes about
+    /// discovery is a claim about *what was not opened* and *how often* — four
+    /// listings at `session/create`, four more at `/cd`, and none per turn —
+    /// and neither half is observable from outside the process. Behind the
+    /// [`DirLister`] seam a fixture records every path handed to it, so "a
+    /// two-turn session listed the four roots once" is a decidable fact rather
+    /// than a comment.
+    ///
+    /// Production never sets it: [`RealFs`] is what both constructors take, and
+    /// a fixture has to say [`Daemon::with_skill_lister`] out loud.
+    pub skills_fs: Arc<dyn DirLister + Send + Sync>,
     /// The window a connection's grant-announcement allowance is counted over
     /// (R3, [`GRANT_ANNOUNCEMENTS_PER_WINDOW`]).
     ///
@@ -349,16 +374,19 @@ impl Daemon {
             PolicySource::Default,
             Arc::clone(&events),
         ));
+        let runtime = Arc::new(DaemonRuntime::minimal());
+        let surfaces = wire_addressed_delivery(&runtime, &events);
         Self {
             sessions: SessionRegistry::new(),
             events,
-            runtime: Arc::new(DaemonRuntime::minimal()),
+            runtime,
             lifetime,
             grants: GrantRegistry::new(),
             consents: PendingConsents::new(),
-            surfaces: ConsentSurfaces::new(),
+            surfaces,
             attestations: AttestationRegistry::new(),
             verifier: crate::attest::default_verifier(),
+            skills_fs: Arc::new(RealFs),
             consent_timeout: CONSENT_TIMEOUT,
             grant_announcement_window: GRANT_ANNOUNCEMENT_WINDOW,
             // `Embedded`, for the same reason `ShutdownPolicy::Never` is above:
@@ -414,6 +442,23 @@ impl Daemon {
         self
     }
 
+    /// Replaces the filesystem a session's skill discovery reads through
+    /// (REQ-585 ADR-4).
+    ///
+    /// **The observation seam the cost criterion is written against.** Whether
+    /// discovery was paid once or once per turn cannot be read off a registry —
+    /// both produce the same rows — so the assertion has to be made against
+    /// what was *opened*, and only a recording [`DirLister`] can say that.
+    ///
+    /// A fixture has to name this out loud, exactly as it does
+    /// [`Self::with_presence_verifier`]: production takes [`RealFs`] in both
+    /// constructors, so no shipped path can be reading a stand-in filesystem.
+    #[must_use]
+    pub fn with_skill_lister(mut self, fs: Arc<dyn DirLister + Send + Sync>) -> Self {
+        self.skills_fs = fs;
+        self
+    }
+
     /// Replaces the window a connection's grant announcements are rate-limited
     /// over (R3).
     ///
@@ -450,6 +495,7 @@ impl Daemon {
         runtime: Arc<DaemonRuntime>,
         lifetime: Arc<LifetimeSupervisor>,
     ) -> Self {
+        let surfaces = wire_addressed_delivery(&runtime, &events);
         Self {
             sessions: SessionRegistry::new(),
             events,
@@ -457,9 +503,10 @@ impl Daemon {
             lifetime,
             grants: GrantRegistry::new(),
             consents: PendingConsents::new(),
-            surfaces: ConsentSurfaces::new(),
+            surfaces,
             attestations: AttestationRegistry::new(),
             verifier: crate::attest::default_verifier(),
+            skills_fs: Arc::new(RealFs),
             // The production answer, and taken here rather than passed in so
             // `main` cannot ship a daemon that forgot to state it: this daemon
             // is its own process, and the children it spawns are what BR-4
@@ -1892,6 +1939,31 @@ fn spawn_prompt_turn(
         return None;
     }
 
+    // REQ-585 ADR-3: exactly one of `prompt`/`skill`. A request carrying both is
+    // a combination that was never valid, so refusing it narrows nothing — and
+    // it is the one shape the daemon cannot resolve, since the two would
+    // disagree about what this turn's text is.
+    //
+    // A both-**empty** request is deliberately NOT refused: `flatten_prompt(&[])`
+    // returns `""` and such a turn runs today, so rejecting it would narrow an
+    // existing method for third-party clients while `PROTOCOL_VERSION` is
+    // asserted unchanged. The failure worth designing against — a raw
+    // `/name args` line reaching a model — is already impossible: the CLI never
+    // puts the typed line in `prompt` at all, so a dropped `skill` field yields
+    // a visible empty turn rather than a leaked command line.
+    //
+    // A shape check, reading no session state, so it is no more of an existence
+    // oracle than the `serde` failure above.
+    if !params.prompt.is_empty() && params.skill.is_some() {
+        let _ = out_tx.try_send(error_string(
+            id,
+            error_code::INVALID_PARAMS,
+            "`prompt` and `skill` are exclusive: a turn is typed text or a `/name` \
+             invocation, never both",
+        ));
+        return None;
+    }
+
     // REQ-568 BR-4, and its position is the requirement: ahead of the registry
     // lookup below, ahead of the lifetime claim, ahead of the spawn. A refused
     // prompt starts no task and touches no runtime state — so a connection that
@@ -1917,6 +1989,12 @@ fn spawn_prompt_turn(
     };
 
     let prompt = flatten_prompt(&params.prompt);
+    // REQ-585: the invocation travels **beside** the flattened prompt, not
+    // through it — a skill turn has no `PromptBlock`s to flatten, and
+    // `raw_arguments` is the rest of the typed line verbatim (ADR-3), so it must
+    // not be re-joined from tokens or folded into a text block anywhere on this
+    // path. The daemon expands it; the client never composes a body.
+    let skill = params.skill;
     let runtime = Arc::clone(&daemon.runtime);
     let events = Arc::clone(&daemon.events);
     // The turn carries the registry, not just the summary read out of it: the
@@ -1929,6 +2007,9 @@ fn spawn_prompt_turn(
     // turn rather than being run over.
     let daemon = Arc::clone(daemon);
     let out = out_tx.clone();
+    // Read off the connection here, where it exists: the turn runs on its own
+    // task and `ConnState` does not travel with it (REQ-585 ADR-7).
+    let invoker = conn.id;
 
     // REQ-565 BR-2: the turn pins the daemon for its whole execution. Taken here
     // rather than inside the task so the claim exists before `spawn` returns —
@@ -1952,6 +2033,11 @@ fn spawn_prompt_turn(
                 summary.phase,
                 summary.cwd.clone(),
                 prompt,
+                skill,
+                // REQ-585 ADR-7: the connection that typed the `/name`, so its
+                // dynamic-context consent is put in front of that client and
+                // answerable by nobody else.
+                Some(invoker),
                 presence,
             )
             .await;
@@ -2391,6 +2477,10 @@ fn dispatch(
         ProviderSetupPreviewParams::METHOD => {
             Some(handle_provider_setup_preview(daemon, conn, id, params))
         }
+        // REQ-585 ADR-2: `skills/list` is a read of a stored snapshot — no
+        // human, no network, no filesystem — so it stays on the synchronous
+        // path beside the other session-scoped reads.
+        SkillsListParams::METHOD => Some(handle_skills_list(daemon, conn, id, params)),
         SessionPermissionsParams::METHOD => {
             Some(handle_session_permissions(daemon, conn, id, params))
         }
@@ -3024,7 +3114,16 @@ fn handle_permission_respond(daemon: &Daemon, conn: &ConnState, id: Id, params: 
             return error_string(id, error_code::NOT_ATTACHED, NOT_ATTACHED_MESSAGE);
         }
     }
-    pending.resolve(&params.request_id, params.outcome);
+    // `resolve_from`, never `resolve` (REQ-585 ADR-7): an **addressed** waiter
+    // — a skill's dynamic-context consent — may only be answered by the
+    // connection the question was put to, and `resolve` names no connection at
+    // all, so it now refuses such a waiter outright. Naming the answering
+    // connection here is what lets the entitled answer through and leaves an
+    // older client's fall-through `prompter.ask` inert, with the prompt still
+    // standing for the client that was actually asked. Every pre-REQ-585 prompt
+    // is unaddressed and is unaffected: its delivery policy is attachment, and
+    // the `may_drive` check above is where that is enforced.
+    pending.resolve_from(&params.request_id, params.outcome, conn.id);
     ok_string(id, &PermissionRespondResult {})
 }
 
@@ -3266,6 +3365,13 @@ fn handle_session_create(daemon: &Daemon, conn: &ConnState, id: Id, params: Valu
             // also writes to).
             conn.record_created(summary.session_id.clone());
 
+            // REQ-585 BR-1: the session's skills, discovered once, here. Before
+            // the response, so the `skills/list` the client sends on reading it
+            // cannot arrive ahead of the registry it is asking for; and after
+            // the create, because the registry is stored against the id that
+            // create just minted.
+            rebuild_session_skills(daemon, &summary.session_id, summary.cwd.as_deref());
+
             // Broadcast a session-scoped event so attached peers learn of the
             // new session. Entering a structured session's first phase is a
             // phase transition from nothing to that phase.
@@ -3329,11 +3435,83 @@ fn handle_session_create(daemon: &Daemon, conn: &ConnState, id: Id, params: Valu
 /// is not news to anyone who receives it, because the requester is the
 /// connection that named it and the other recipients are attached to it.
 fn routed_event_frame(daemon: &Daemon, session_id: Option<SessionId>, event: Event) -> String {
-    let envelope = EventEnvelope::new(daemon.events.next_seq(), session_id, event);
+    routed_frame(&daemon.events, session_id, event)
+}
+
+/// [`routed_event_frame`] over the bus alone.
+///
+/// The daemon's fourth routed event — REQ-585's addressed permission request —
+/// is built by [`AddressedRoute`], which holds the bus and the surface registry
+/// and deliberately **not** the [`Daemon`] that owns them: the daemon holds the
+/// runtime, the runtime holds the route, and a route holding the daemon back
+/// would close that ring into a leak. Splitting the body rather than duplicating
+/// it is what keeps the sequence number coming from one place — `next_seq`, the
+/// bus's own counter — so a routed frame still cannot collide with a broadcast
+/// one on the same connection (BUG-177).
+fn routed_frame(events: &EventBus, session_id: Option<SessionId>, event: Event) -> String {
+    let envelope = EventEnvelope::new(events.next_seq(), session_id, event);
     // Infallible for these payloads (plain strings and closed enums); a
     // hypothetical failure costs the prompt a delivery, which the bounded
     // window already turns into a refusal.
     serde_json::to_string(&Notification::new(EVENT_METHOD, envelope)).unwrap_or_default()
+}
+
+/// The daemon's implementation of REQ-585 ADR-7's addressed delivery: put one
+/// [`PermissionRequest`] in front of one connection, and nobody else.
+///
+/// **Without this the feature asks nobody.** [`PermissionGate::authorize_skill`]
+/// answers `SkillConsent::Unanswerable` on a gate with no route, deliberately —
+/// the only honest fallback would be the event bus, and the bus is what
+/// addressing exists to keep a skill consent off (a pre-REQ-585 client attached
+/// to the same session would receive a subject it cannot recognize and answer it
+/// by reading stdin).
+///
+/// It holds the two things the model layer must not know about — the live
+/// surface registry and the bus's sequence counter — and nothing else.
+struct AddressedRoute {
+    surfaces: Arc<ConsentSurfaces>,
+    events: Arc<EventBus>,
+}
+
+impl AddressedPermissionDelivery for AddressedRoute {
+    fn deliver(
+        &self,
+        connection: ConnectionId,
+        session_id: &SessionId,
+        request: PermissionRequest,
+    ) -> bool {
+        // Session-scoped on the envelope, exactly as the published form is: the
+        // frame carries the same shape a client already parses, and only its
+        // *delivery* is narrowed (ADR-7). The `seq` comes from the bus, so this
+        // frame cannot wear a number a broadcast one on this connection will
+        // also wear (BUG-177's shape).
+        let frame = routed_frame(
+            &self.events,
+            Some(session_id.clone()),
+            Event::PermissionRequest(request),
+        );
+        self.surfaces.deliver_to(connection, &frame)
+    }
+}
+
+/// Build the surface registry this daemon will use and install the addressed
+/// route over it on `runtime`, answering with the registry.
+///
+/// One function, called by both constructors, because a daemon that forgot to
+/// wire it is a daemon whose skill consents are silently unanswerable — a
+/// fail-closed hole with no error message anywhere. `set` is best-effort: two
+/// daemons over one runtime is not a production shape, and the first one's route
+/// is as good as the second's.
+fn wire_addressed_delivery(
+    runtime: &Arc<DaemonRuntime>,
+    events: &Arc<EventBus>,
+) -> Arc<ConsentSurfaces> {
+    let surfaces = Arc::new(ConsentSurfaces::new());
+    runtime.install_addressed_delivery(Arc::new(AddressedRoute {
+        surfaces: Arc::clone(&surfaces),
+        events: Arc::clone(events),
+    }));
+    surfaces
 }
 
 /// Tell the surfaces a request was offered to how it ended (BR-5).
@@ -4121,12 +4299,186 @@ fn handle_session_set_cwd(daemon: &Daemon, conn: &ConnState, id: Id, params: Val
     if !conn.may_drive(&params.session_id) {
         return error_string(id, error_code::NOT_ATTACHED, NOT_ATTACHED_MESSAGE);
     }
-    match daemon
-        .runtime
-        .set_session_cwd(&params, &daemon.sessions, &daemon.events)
-    {
+    // REQ-585 BR-1/AC-14: the project half of the registry is derived from the
+    // root, so the root moving re-derives it — **inside** the move, ahead of the
+    // `session_root_changed` publish, so a second attached client reacting to
+    // that event cannot read the pre-move registry. The seam
+    // (`Daemon::skills_fs`) still belongs to the daemon and is handed in; only
+    // the timing moved. Dropping the stale `skill:project:*` grants happens
+    // there too, where the session's gate is reachable (ADR-6).
+    match daemon.runtime.set_session_cwd(
+        &params,
+        &daemon.sessions,
+        &daemon.events,
+        daemon.skills_fs.as_ref(),
+    ) {
         Ok(result) => ok_string(id, &result),
         Err(err) => error_from(id, err),
+    }
+}
+
+/// Derive this session's skill registry from the root it stands on and store it
+/// (REQ-585 BR-1, ADR-1).
+///
+/// **Two derivation sites, ever**: this function, from
+/// [`handle_session_create`], and the identical derivation inside
+/// [`DaemonRuntime::set_session_cwd`], which owns the `/cd` half because the
+/// rebuild has to land *before* `session_root_changed` reaches a second
+/// attached client. There is no third, and that is the cost criterion rather
+/// than an accident — discovery is four directory listings and
+/// one file read per candidate, so a turn that re-derived it would pay that
+/// while a user waits, for an answer that cannot have changed unless the root
+/// did. The consequence is a snapshot, stated where the type is
+/// ([`SkillRegistry`]): a skill file written mid-session is picked up at the
+/// next `/cd`, and there is no watcher.
+///
+/// This function is the **probe** and the daemon's seam; the derivation itself
+/// is `DaemonRuntime::store_session_skills`, which both call sites share so the
+/// four globs are spelled once. What is added here is the reading of the root
+/// ([`DaemonRuntime::session_root_for`]) and the `Daemon`-shaped arguments a
+/// handler has in hand.
+///
+/// **The `/cd` half is not complete without dropping the project grants**, and
+/// that is the other reason the move owns it. A remembered
+/// `skill:project:<name>` grant authorizes a file under the old root, and a
+/// rebuilt registry beside a stale grant is exactly LESSON-501's shape —
+/// carried state that sheds its invariants silently. That drop reaches
+/// `PermissionGate::drop_project_skill_grants` (REQ-585 TASK-201) through
+/// `DaemonRuntime::drop_project_skill_grants`, which needs the private
+/// `session_gates` map. A *fresh* session has no grants and no gate, which is
+/// why this function has nothing to drop.
+fn rebuild_session_skills(daemon: &Daemon, session_id: &SessionId, cwd: Option<&Path>) {
+    DaemonRuntime::store_session_skills(
+        &daemon.sessions,
+        session_id,
+        &daemon.runtime.session_root_for(cwd),
+        daemon.skills_fs.as_ref(),
+    );
+}
+
+/// The `/name` commands this session dispatches (`skills/list`, REQ-585 BR-3,
+/// ADR-1/ADR-2).
+///
+/// **This method is the capability handshake** (ADR-2): a client calls it after
+/// `session/create` and again after every `session_root_changed`, and a daemon
+/// that does not have it answers `METHOD_NOT_FOUND`, which the client reads as
+/// an empty snapshot rather than as an error. Nothing here has to know that —
+/// the point of proving a capability by a successful call is that the answer is
+/// the same shape either way.
+///
+/// Gated on [`ConnState::may_drive`], exactly as [`handle_session_permissions`]
+/// is and for its reason: this is a read of a session's content — file-authored
+/// descriptions from a repo the connection may have no business seeing — and a
+/// looser gate here would make the refusal an oracle for which sessions exist
+/// (ADR-B). The length check comes first, so an attacker-chosen id is not
+/// hashed through the attachment set before it is refused (BUG-166 residual).
+///
+/// It answers from the stored snapshot and opens nothing: the discovery this
+/// reports was paid at [`rebuild_session_skills`]'s two call sites.
+fn handle_skills_list(daemon: &Daemon, conn: &ConnState, id: Id, params: Value) -> String {
+    let params: SkillsListParams = match serde_json::from_value(params) {
+        Ok(params) => params,
+        Err(_) => return error_string(id, error_code::INVALID_PARAMS, "invalid params"),
+    };
+    if let Some(refusal) = refuse_unmintable_session_id(&id, &params.session_id) {
+        return refusal;
+    }
+    if !conn.may_drive(&params.session_id) {
+        return error_string(id, error_code::NOT_ATTACHED, NOT_ATTACHED_MESSAGE);
+    }
+    let registry = daemon.sessions.skills(&params.session_id);
+    ok_string(
+        id,
+        &skills_list_result(&registry, crate::session_root::home().as_deref()),
+    )
+}
+
+/// The ceiling, in characters, on a skill's `description` — 200.
+///
+/// The requirement's figure (BR-1's entity table), chosen against the corpus it
+/// has to render: 5 of the 17 shipped ADLC skill descriptions are longer than
+/// this, and every one of them is a paragraph that would take a `/help` row off
+/// the screen. Counted in characters rather than bytes for
+/// [`bounded_field`](teton_core::session_root::bounded_field)'s reason — the row
+/// is for a person, and a CJK description should get its full 200.
+const SKILL_DESCRIPTION_MAX_CHARS: usize = 200;
+
+/// The ceiling, in characters, on a skill's `argument-hint`.
+///
+/// The one-line display ceiling REQ-583 already sized for a person, reused
+/// rather than a fresh number: the hint shares a `/help` row with the
+/// description and is by nature a few words (`[path]`, `<REQ-id> [--force]`).
+const SKILL_HINT_MAX_CHARS: usize = teton_core::session_root::DISPLAY_MAX_CHARS;
+
+/// The ceiling, in characters, on the name a *skipped* entry carries.
+///
+/// [`crate::skills::MAX_NAME_LEN`], because a name that passed
+/// `is_valid_skill_name` fits it exactly — but an entry skipped *for* its name
+/// never passed anything, so the bound is what stops a 4,000-character
+/// directory name from riding a diagnostic onto a screen.
+const SKILL_SKIPPED_NAME_MAX_CHARS: usize = crate::skills::MAX_NAME_LEN;
+
+/// The wire view of a registry: every row, bounded and neutralized **here**,
+/// before it leaves the process (REQ-585 BR-3, LESSON-517).
+///
+/// Descriptions, hints, skipped paths and skipped names are all *file bytes* —
+/// written by whoever owns the repo the session stands in, which is not always
+/// the person reading the screen. They are bounded at the wire rather than at
+/// the renderer because there is more than one renderer: the CLI defuses again
+/// through `Surface::line` (ADR-009's two-ends shape), and the phase-2 VS Code
+/// client will not have that function at all. A 4,000-character description
+/// with a bidi override in it must therefore be harmless *as protocol*, not
+/// merely as terminal output.
+///
+/// The one field that is **not** bounded here is [`SkillView::name`], and the
+/// asymmetry is the point: a registered name matched
+/// `^[a-z0-9][a-z0-9_-]{0,63}$` before discovery would register it (BR-2), so it
+/// is ASCII, one line and at most 64 characters by construction. Bounding it
+/// again would say the invariant is not trusted, in the one place it is
+/// actually enforced.
+fn skills_list_result(registry: &SkillRegistry, home: Option<&Path>) -> SkillsListResult {
+    SkillsListResult {
+        skills: registry
+            .skills()
+            .iter()
+            .map(|skill| SkillView {
+                name: skill.name.clone(),
+                source: skill.source,
+                description: skill
+                    .description
+                    .as_deref()
+                    .map(|text| bounded_field(text, SKILL_DESCRIPTION_MAX_CHARS)),
+                argument_hint: skill
+                    .argument_hint
+                    .as_deref()
+                    .map(|hint| bounded_field(hint, SKILL_HINT_MAX_CHARS)),
+                // The daemon knows the two contests it can see; the third — a
+                // reserved built-in name — is the client's, so this says what
+                // *this* side found and never `None` where it found something.
+                shadowed: skill.shadowed.map(|by| by.to_string()),
+            })
+            .collect(),
+        skipped: registry
+            .skipped()
+            .iter()
+            .map(|entry| SkillSkipped {
+                name: bounded_field(
+                    &entry.name.clone().unwrap_or_default(),
+                    SKILL_SKIPPED_NAME_MAX_CHARS,
+                ),
+                // BR-1's entity table: never an absolute path. A refusal that
+                // said `/Users/jane/.claude/skills/broken/SKILL.md` would carry
+                // a username into a transcript and, through `/help`, into a
+                // screenshot.
+                path: bounded_field(
+                    &display_for(&entry.path, home),
+                    teton_core::session_root::DISPLAY_MAX_CHARS,
+                ),
+                // The daemon's own words, from the daemon's own enum: no file
+                // bytes reach this string (BR-1's named reasons).
+                reason: entry.reason.to_string(),
+            })
+            .collect(),
     }
 }
 
@@ -9946,10 +10298,17 @@ mod tests {
         let mut sub = daemon.events.subscribe(16);
         let oversized = SessionId::from(format!("sess-{}", "a".repeat(4096)).as_str());
 
+        // REQ-585 ADR-2: `skills/list` joins the sweep, and joins **both**
+        // loops. Its params are `{session_id}` alone, so it is well-formed
+        // under either helper's shape — which is the property worth asserting
+        // twice: serde ignores the extra keys, so what refuses the call is the
+        // length check rather than a parse failure wearing its code
+        // (LESSON-502).
         for method in [
             WebSetupPlanParams::METHOD,
             WebSetupPreviewParams::METHOD,
             WebSetupCommitParams::METHOD,
+            SkillsListParams::METHOD,
         ] {
             let refused = route_setup(
                 &daemon,
@@ -9975,6 +10334,7 @@ mod tests {
             ProviderSetupPlanParams::METHOD,
             ProviderSetupPreviewParams::METHOD,
             ProviderSetupCommitParams::METHOD,
+            SkillsListParams::METHOD,
         ] {
             let refused = route_setup(
                 &daemon,
@@ -10063,11 +10423,16 @@ mod tests {
                 serde_json::json!({"session_id": session_id})
             }
         };
+        // REQ-585: `skills/list` joins for `session/permissions`' reason — it is
+        // a *read* behind the same gate, and reading a session's commands is
+        // reading that session. This loop is where its gate leg is asserted:
+        // the setup sweep above only pins the length check.
         for method in [
             WebOverrideParams::METHOD,
             SessionPermissionsParams::METHOD,
             SessionClearParams::METHOD,
             SessionSetCwdParams::METHOD,
+            SkillsListParams::METHOD,
         ] {
             let refused = dispatch(
                 &daemon,

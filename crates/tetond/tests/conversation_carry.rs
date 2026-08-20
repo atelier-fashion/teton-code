@@ -629,6 +629,8 @@ impl Carry {
             // ones that can watch egress.
             Vec::new(),
             text,
+            std::collections::BTreeSet::new(),
+            false,
         );
 
         // Metered exactly as dispatch meters it, so the ledger rows below are

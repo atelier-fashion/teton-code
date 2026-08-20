@@ -32,6 +32,9 @@
 //! conversation. REQ-586 adds `context_pressure` (BR-7), which announces that
 //! the context gate dropped blocks, elided one in place, or re-fitted the
 //! conversation to a new route's budget — nothing is clamped in silence.
+//! REQ-585 adds `skill_invoked` (BR-12), which announces that a user-typed
+//! `/name` expanded into a prompt turn, and carries what the echo line and
+//! `/verbose` render — never the body, which stays in the file.
 //!
 //! This list is an index, not decoration: a new variant of [`Event`] that is not
 //! named here makes the paragraph above wrong.
@@ -39,7 +42,7 @@
 use serde::{Deserialize, Serialize};
 
 use crate::effort::ResolvedEffort;
-use crate::methods::{ProviderHealth, ProviderTestOutcome, SessionRoot, TierBinding};
+use crate::methods::{ProviderHealth, ProviderTestOutcome, SessionRoot, SkillSource, TierBinding};
 use crate::{
     Category, ClientKind, Phase, ProtocolVersion, ProviderId, ProviderKind, RequestId, SessionId,
     Tier, TurnId,
@@ -186,6 +189,8 @@ pub enum Event {
     /// The context gate dropped, elided, or re-fitted conversation to a
     /// turn's budget (REQ-586 BR-7).
     ContextPressure(ContextPressure),
+    /// A user-typed `/name` expanded into a prompt turn (REQ-585 BR-12).
+    SkillInvoked(SkillInvoked),
 }
 
 impl Event {
@@ -224,6 +229,7 @@ impl Event {
             Event::ProviderTested(_) => "provider_tested",
             Event::SessionRootChanged(_) => "session_root_changed",
             Event::ContextPressure(_) => "context_pressure",
+            Event::SkillInvoked(_) => "skill_invoked",
         }
     }
 }
@@ -1151,6 +1157,65 @@ pub struct PermissionRequest {
     pub description: Option<String>,
     /// The choices offered to the user.
     pub options: Vec<PermissionOption>,
+    /// What is being consented to, as a **structure** rather than a sentence
+    /// (REQ-585 BR-11, architecture ADR-7).
+    ///
+    /// Absent on every request a pre-REQ-585 daemon raises and on every
+    /// ordinary tool prompt, so this is additive and moves no version. Present
+    /// when the client must be able to recognize the request **without parsing
+    /// the permission key**: BR-11 says so outright, because the key's
+    /// `skill:<source>:<name>` shape is an implementation detail and a client
+    /// sniffing an unstable string would mis-fire in the one direction that
+    /// costs a swallowed stdin line.
+    ///
+    /// It is a structure and not a [`Self::description`] string for a
+    /// mechanical reason as well: `Surface::line` destroys newlines, so "every
+    /// command of the invocation, listed verbatim" cannot ride a one-line
+    /// description — the client has to render one line per command, from a
+    /// list.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub subject: Option<PermissionSubject>,
+}
+
+/// What a [`PermissionRequest`] is about, in a form a client selects on by
+/// **kind** rather than by string (REQ-585 ADR-7).
+///
+/// [`OPTION_ID_ENABLE_PERMANENT`] is the shipped precedent for the one value a
+/// client may match by string; everything else is matched by a typed
+/// discriminant, and this is that discriminant for the *subject* of a request.
+///
+/// **Fail-closed by construction.** [`Self::Unrecognized`] exists so that a
+/// subject a client has never heard of maps to a variant it *can* see: the
+/// client refuses (with
+/// [`crate::methods::RefusalReason::UnrecognizedSubject`]) instead of falling
+/// through to `prompter.ask`, which on a pipe would read the user's next line
+/// and turn a pasted `y` into consent for shell commands. A `kind` this build
+/// does not know must therefore **deserialize**, not error — that is the whole
+/// property, and it is pinned by a test rather than left to serde's defaults.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum PermissionSubject {
+    /// A skill's dynamic-context commands, asked about **once per invocation**
+    /// with every command shown (REQ-585 BR-6).
+    SkillDynamicContext {
+        /// The skill's dispatchable name.
+        skill: String,
+        /// Which root it came from — half of the grant key, and the half that
+        /// decides whether the grant survives a `/cd` (ADR-6).
+        source: SkillSource,
+        /// Every command of this invocation, in document order, **already
+        /// substituted**: BR-4 puts `$ARGUMENTS`/`$N` substitution before
+        /// execution precisely so the consent shows what will actually run.
+        ///
+        /// Each entry is file-supplied text, bounded and rendered on one line
+        /// by the daemon and defused again by the client's `Surface`.
+        commands: Vec<String>,
+    },
+    /// A subject this build does not know. Never constructed by a daemon —
+    /// serde produces it when the `kind` is one this build has never heard of,
+    /// which is exactly the case the client must refuse rather than guess at.
+    #[serde(other)]
+    Unrecognized,
 }
 
 /// One offered permission choice. ACP: `PermissionOption`.
@@ -2570,6 +2635,152 @@ pub struct SessionGrantMinted {
     pub attestation: String,
 }
 
+// ---------------------------------------------------------------------------
+// skill_invoked (REQ-585)
+// ---------------------------------------------------------------------------
+
+/// A user-typed `/name` expanded into a prompt turn (REQ-585 BR-12,
+/// architecture ADR-15).
+///
+/// **Typed, not pre-rendered.** The CLI already knows the name and source from
+/// its `skills/list` snapshot but not the size, the ignored keys or the
+/// outcomes, so *some* event is required; making it a structure rather than a
+/// finished sentence is LESSON-544's rule — a test that builds the wire value
+/// by hand leaves the producer unguarded, and the assertion has to run against
+/// what the daemon actually emitted.
+///
+/// **Published before the second budget check, never after** (ADR-11's Stage
+/// B). A turn where the user approved four commands, watched them run, and was
+/// then refused is precisely the turn whose record matters most; emitting
+/// after a refusal would leave it with no echo line and no `/verbose`
+/// outcomes, while BR-12 says *every* invocation echoes one.
+///
+/// The **body is never here**. BR-12 says it is not printed — it is in the
+/// file — and this event is what the printing is driven from.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SkillInvoked {
+    /// The skill's dispatchable name.
+    pub name: String,
+    /// Which root it came from.
+    pub source: SkillSource,
+    /// The file it was read from, **home-relative**
+    /// (`session_root::display_for`) and bounded with `bounded_field` — never
+    /// an absolute path carrying a username into a transcript (BR-1's entity
+    /// table).
+    pub path_display: String,
+    /// The body's size in bytes, which is what BR-12's echo line renders
+    /// (`/status → skill status (user, 5.3 KB, 4 dynamic commands)`).
+    pub body_bytes: u64,
+    /// The frontmatter keys Teton does not honor, listed so `/verbose` can say
+    /// what was inert rather than leaving a user to infer it from behaviour
+    /// (BR-5: `allowed-tools`, `model`, `effort`, … are read and ignored).
+    pub ignored_keys: Vec<String>,
+    /// A frontmatter `name` that disagrees with the file's own name, said out
+    /// loud rather than silently ignored (BR-2).
+    ///
+    /// The spelling that dispatches is the directory or the file stem, always —
+    /// one spelling reaches one handler, REQ-555's rule. A file that declares a
+    /// different one is not wrong, it is *misleading*, and the author is the
+    /// person best placed to fix it. Additive: absent for every skill whose
+    /// declaration agrees, which is nearly all of them.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub name_note: Option<String>,
+    /// One entry per `` !`command` `` in the body, in document order.
+    ///
+    /// Empty for a skill with no dynamic context — which is a real state, not
+    /// a missing one, and is why BR-12's echo line can honestly say "0 dynamic
+    /// commands".
+    pub outcomes: Vec<DynamicOutcomeView>,
+}
+
+/// What became of one `` !`command` `` (REQ-585 BR-6, BR-12).
+///
+/// A **typed** outcome, never prose a renderer parses (the spec's System Model
+/// says so in as many words): the daemon composes the placeholder that goes
+/// into the turn, and this is the parallel record the surface renders. The two
+/// are deliberately not the same string — a client that had to re-parse
+/// `[dynamic context not run: … — declined]` to count what ran would be a
+/// second parser of the daemon's own sentence (LESSON-529).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DynamicOutcomeView {
+    /// The command as it was considered, **after** `$ARGUMENTS`/`$N`
+    /// substitution (BR-4 precedes BR-6, so this is what the consent showed).
+    ///
+    /// File-supplied bytes: bounded and rendered on one line by the daemon,
+    /// defused again by the client's `Surface`. It is echoed into the not-run
+    /// placeholder too, which is why the expander neutralizes envelope tags in
+    /// it — at `plan`, where no command runs, the raw command text is the part
+    /// that reaches the model (ADR-10).
+    pub command: String,
+    /// How it ended.
+    pub outcome: DynamicOutcome,
+}
+
+/// The four ways a dynamic-context command can end (REQ-585 BR-6).
+///
+/// Only the first one puts anything in the turn; the other three leave an
+/// explicit placeholder, because BR-6's rule is that the model is **told** what
+/// it does not have rather than left to read a gap. None of them fails the
+/// invocation.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum DynamicOutcome {
+    /// Ran to completion and its stdout was inlined.
+    Ran {
+        /// How many bytes of stdout were inlined, after the cap.
+        output_bytes: u64,
+        /// Whether the `shell` tool's `MAX_OUTPUT_CHARS` cut it short — the
+        /// model is reading a prefix, and the surface says so.
+        truncated: bool,
+    },
+    /// Never started, and why.
+    NotRun {
+        /// Which door was closed.
+        reason: NotRunReason,
+    },
+    /// Ran and exited non-zero.
+    Failed {
+        /// The exit status, or `None` when the process was killed by a signal
+        /// and there is none to report.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        exit_status: Option<i32>,
+    },
+    /// Killed at the `shell` tool's timeout.
+    TimedOut,
+}
+
+/// Why a dynamic-context command was never started (REQ-585 BR-6, BR-11).
+///
+/// Four closed doors rather than one, because the placeholder the model reads
+/// says which: "the user declined" and "no human could be asked" are different
+/// facts about the same missing output, and AC-9 requires the pipe case to say
+/// so explicitly.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum NotRunReason {
+    /// The user was asked and said no.
+    Declined,
+    /// The session's permission level does not run them at all (`plan`).
+    Level,
+    /// There was no terminal to ask at — piped stdin at a level that would ask
+    /// (BR-11). The client refused **without reading stdin**, so the user's
+    /// next line stayed their next prompt.
+    NoTerminal,
+    /// The client did not recognize the request's [`PermissionSubject`] and
+    /// refused rather than guessing (ADR-7).
+    UnrecognizedSubject,
+    /// Consent was given and the command still never started — the shell was
+    /// missing, the jail root could not be resolved, the spawn failed.
+    ///
+    /// The one arm that is **not** a closed door. It exists because the other
+    /// four are all answers to "who said no", and reporting a command that
+    /// never ran as [`DynamicOutcome::Failed`] instead would tell a reader it
+    /// was attempted and exited — a false statement on `/verbose`, and one that
+    /// points at the wrong fix. What went wrong here is on this machine, not in
+    /// anybody's answer.
+    CouldNotStart,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2759,6 +2970,7 @@ mod tests {
                     tool_name: "shell".to_owned(),
                     description: None,
                     options: vec![],
+                    subject: None,
                 }),
                 "permission_request",
             ),
@@ -2874,6 +3086,24 @@ mod tests {
                     bound_floored: false,
                 }),
                 "context_pressure",
+            ),
+            (
+                Event::SkillInvoked(SkillInvoked {
+                    name: "status".to_owned(),
+                    source: SkillSource::User,
+                    path_display: "~/.claude/skills/status/SKILL.md".to_owned(),
+                    body_bytes: 5_432,
+                    ignored_keys: vec!["allowed-tools".to_owned()],
+                    name_note: None,
+                    outcomes: vec![DynamicOutcomeView {
+                        command: "git branch --show-current".to_owned(),
+                        outcome: DynamicOutcome::Ran {
+                            output_bytes: 19,
+                            truncated: false,
+                        },
+                    }],
+                }),
+                "skill_invoked",
             ),
         ];
 
@@ -3433,6 +3663,248 @@ mod tests {
             old.effort,
             Some(ResolvedEffort::effort(crate::effort::EffortLevel::High))
         );
+    }
+
+    /// REQ-585's additivity, both directions, for `PermissionRequest.subject`
+    /// — the `route_decided` budget rule re-applied rather than assumed
+    /// inherited.
+    ///
+    /// A request from a daemon predating the field carries no key and reads
+    /// `None`; a client built before the field still reads a request that
+    /// carries it. Serde ignores unknown fields by default and no type here
+    /// opts out, but the posture is what keeps [`crate::PROTOCOL_VERSION`]
+    /// still, so it is asserted.
+    #[test]
+    fn permission_request_subject_is_additive_in_both_directions() {
+        // A pre-REQ-585 request: no subject — absent, not an error. This is
+        // also every ordinary tool prompt from *this* build, which is why the
+        // client cannot treat "has a subject" as the only recognizable state.
+        let request: PermissionRequest =
+            serde_json::from_str(r#"{"request_id":"r1","tool_name":"shell","options":[]}"#)
+                .expect("a request from a daemon predating the field must still parse");
+        assert_eq!(request.subject, None);
+        assert_eq!(request.tool_name, "shell");
+
+        // And a request that never populated it emits no key at all, rather
+        // than `null` — the same wire an older daemon writes.
+        let wire = serde_json::to_value(&request).unwrap();
+        assert!(wire.get("subject").is_none(), "{wire}");
+
+        // The other direction: a reader built before the field.
+        #[derive(Deserialize)]
+        struct PreSubjectPermissionRequest {
+            request_id: RequestId,
+            tool_name: String,
+            options: Vec<PermissionOption>,
+        }
+        let wire = serde_json::to_string(&PermissionRequest {
+            request_id: RequestId::from("r1"),
+            tool_name: "skill:user:status".to_owned(),
+            description: None,
+            options: vec![PermissionOption {
+                option_id: "allow_once".to_owned(),
+                label: "Allow once".to_owned(),
+                kind: PermissionOptionKind::AllowOnce,
+            }],
+            subject: Some(PermissionSubject::SkillDynamicContext {
+                skill: "status".to_owned(),
+                source: SkillSource::User,
+                commands: vec![
+                    "cat ~/.claude/adlc/ETHOS.md".to_owned(),
+                    "git branch --show-current".to_owned(),
+                ],
+            }),
+        })
+        .unwrap();
+        assert!(
+            wire.contains(r#""subject":{"kind":"skill_dynamic_context""#)
+                && wire.contains(r#""source":"user""#)
+                && wire.contains(r#""git branch --show-current""#),
+            "the fixture must actually carry the new key: {wire}"
+        );
+        let old: PreSubjectPermissionRequest =
+            serde_json::from_str(&wire).expect("a client predating the field still reads it");
+        assert_eq!(old.request_id, RequestId::from("r1"));
+        assert_eq!(old.tool_name, "skill:user:status");
+        assert_eq!(old.options.len(), 1, "the old reader still gets its fields");
+
+        // BR-6: the commands ride as a **list**, one entry per command, not as
+        // a joined sentence — `Surface::line` destroys newlines, so a client
+        // that had to split a string could not render one line per command.
+        let back: PermissionRequest = serde_json::from_str(&wire).unwrap();
+        match back.subject.expect("the subject survives the round trip") {
+            PermissionSubject::SkillDynamicContext {
+                skill,
+                source,
+                commands,
+            } => {
+                assert_eq!(skill, "status");
+                assert_eq!(source, SkillSource::User);
+                assert_eq!(commands.len(), 2);
+                assert_eq!(commands[1], "git branch --show-current");
+            }
+            PermissionSubject::Unrecognized => panic!("a known kind must not read as unrecognized"),
+        }
+
+        assert_eq!(
+            crate::PROTOCOL_VERSION,
+            crate::ProtocolVersion(2),
+            "REQ-585 adds only optional fields and one method, so the negotiated version \
+             does not move — the capability is proven by a successful `skills/list`"
+        );
+    }
+
+    /// ADR-7's fail-closed rule, pinned at the layer that has to hold it: a
+    /// subject `kind` this build has never heard of **deserializes**, to a
+    /// variant the client can see, and does not error.
+    ///
+    /// This is not a serde nicety. The client's rule is "refuse anything you do
+    /// not recognize, without calling `prompter.ask`" — and a subject that
+    /// failed to parse would take the whole `PermissionRequest` with it, so the
+    /// client would see no request at all and fall back to whatever it does for
+    /// a malformed event. On a pipe that difference costs the user's next stdin
+    /// line, which becomes a `y` (LESSON-537). `Unrecognized` is what makes the
+    /// unknown case *visible* rather than absent.
+    #[test]
+    fn an_unknown_permission_subject_kind_reads_as_unrecognized_and_does_not_error() {
+        let wire = r#"{
+            "request_id":"r1",
+            "tool_name":"skill:project:deploy",
+            "options":[],
+            "subject":{"kind":"some_future_thing","fields":"a client cannot know"}
+        }"#;
+        let request: PermissionRequest =
+            serde_json::from_str(wire).expect("an unknown kind must not fail the whole request");
+        assert_eq!(
+            request.subject,
+            Some(PermissionSubject::Unrecognized),
+            "the unknown case has to be a value the client can branch on"
+        );
+
+        // Non-vacuity: the *known* kind still reaches its own variant, so the
+        // assertion above is reached by the tag being unknown rather than by a
+        // catch-all that swallows everything.
+        let known = serde_json::to_string(&PermissionSubject::SkillDynamicContext {
+            skill: "status".to_owned(),
+            source: SkillSource::Project,
+            commands: vec!["pwd".to_owned()],
+        })
+        .unwrap();
+        assert!(
+            known.contains(r#""kind":"skill_dynamic_context""#),
+            "{known}"
+        );
+        let back: PermissionSubject = serde_json::from_str(&known).unwrap();
+        assert!(
+            matches!(back, PermissionSubject::SkillDynamicContext { .. }),
+            "a known kind must not be swallowed by the catch-all"
+        );
+    }
+
+    /// REQ-585 BR-12 / ADR-15: the echo line and `/verbose`'s detail are
+    /// rendered from one typed event, and the body is not in it.
+    ///
+    /// The four outcome shapes are round-tripped together because BR-6's rule
+    /// is that a command which did not run **says so** — "declined", "no human
+    /// could be asked", "timed out" and "exit 1" are four different sentences
+    /// the daemon composes, and folding them into one string here is what would
+    /// make the surface re-parse the daemon's own prose (LESSON-529).
+    #[test]
+    fn skill_invoked_carries_the_echo_line_without_carrying_the_body() {
+        let invoked = SkillInvoked {
+            name: "status".to_owned(),
+            source: SkillSource::User,
+            path_display: "~/.claude/skills/status/SKILL.md".to_owned(),
+            body_bytes: 5_432,
+            ignored_keys: vec!["allowed-tools".to_owned(), "model".to_owned()],
+            name_note: None,
+            outcomes: vec![
+                DynamicOutcomeView {
+                    command: "cat ~/.claude/adlc/ETHOS.md".to_owned(),
+                    outcome: DynamicOutcome::Ran {
+                        output_bytes: 3_812,
+                        truncated: false,
+                    },
+                },
+                DynamicOutcomeView {
+                    command: "grep -rn TODO .".to_owned(),
+                    outcome: DynamicOutcome::Ran {
+                        output_bytes: 8_000,
+                        truncated: true,
+                    },
+                },
+                DynamicOutcomeView {
+                    command: "gcloud run services list".to_owned(),
+                    outcome: DynamicOutcome::NotRun {
+                        reason: NotRunReason::NoTerminal,
+                    },
+                },
+                DynamicOutcomeView {
+                    command: "test -f .adlc/context/architecture.md".to_owned(),
+                    outcome: DynamicOutcome::Failed {
+                        exit_status: Some(1),
+                    },
+                },
+                DynamicOutcomeView {
+                    command: "sleep 600".to_owned(),
+                    outcome: DynamicOutcome::TimedOut,
+                },
+            ],
+        };
+        round_trip(&invoked);
+
+        let wire = envelope_wire(Event::SkillInvoked(invoked));
+        assert_eq!(wire["event"], "skill_invoked");
+        assert_eq!(wire["name"], "status");
+        assert_eq!(wire["source"], "user");
+        assert_eq!(wire["body_bytes"], 5_432);
+        // BR-1's entity table: home-relative, never an absolute path carrying a
+        // username into a transcript.
+        assert_eq!(wire["path_display"], "~/.claude/skills/status/SKILL.md");
+        assert!(
+            !wire["path_display"]
+                .as_str()
+                .expect("a string")
+                .starts_with('/'),
+            "{wire}"
+        );
+        // BR-12: the body is never printed, so it is never sent either. The
+        // size is the only thing about it that crosses.
+        assert!(wire.get("body").is_none(), "{wire}");
+        assert_eq!(
+            wire["outcomes"][0]["command"],
+            "cat ~/.claude/adlc/ETHOS.md"
+        );
+        assert_eq!(wire["outcomes"][0]["outcome"]["kind"], "ran");
+        assert_eq!(wire["outcomes"][0]["outcome"]["output_bytes"], 3_812);
+        assert_eq!(wire["outcomes"][1]["outcome"]["truncated"], true);
+        assert_eq!(wire["outcomes"][2]["outcome"]["kind"], "not_run");
+        assert_eq!(wire["outcomes"][2]["outcome"]["reason"], "no_terminal");
+        assert_eq!(wire["outcomes"][3]["outcome"]["kind"], "failed");
+        assert_eq!(wire["outcomes"][3]["outcome"]["exit_status"], 1);
+        assert_eq!(wire["outcomes"][4]["outcome"]["kind"], "timed_out");
+
+        // A skill with no dynamic context is a real state, not a missing one:
+        // BR-12's echo line says "0 dynamic commands" from an empty list.
+        let plain = SkillInvoked {
+            name: "beta".to_owned(),
+            source: SkillSource::Project,
+            path_display: ".claude/commands/beta.md".to_owned(),
+            body_bytes: 118,
+            ignored_keys: vec![],
+            name_note: None,
+            outcomes: vec![],
+        };
+        round_trip(&plain);
+        let wire = serde_json::to_value(&plain).unwrap();
+        assert_eq!(wire["outcomes"], serde_json::json!([]), "{wire}");
+        assert_eq!(wire["ignored_keys"], serde_json::json!([]), "{wire}");
+
+        // A signal-killed command has no status to report, and the absent case
+        // emits no key rather than `null`.
+        let signalled = serde_json::to_value(DynamicOutcome::Failed { exit_status: None }).unwrap();
+        assert_eq!(signalled["kind"], "failed");
+        assert!(signalled.get("exit_status").is_none(), "{signalled}");
     }
 
     /// REQ-558 AC-8: the four things a decision must name travel together, and
@@ -4081,6 +4553,7 @@ mod tests {
                     kind: PermissionOptionKind::RejectAlways,
                 },
             ],
+            subject: None,
         });
     }
 

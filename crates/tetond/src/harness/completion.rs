@@ -803,15 +803,26 @@ impl<T: Transport> CompletionSource for RemoteProviderSource<'_, T> {
 }
 
 /// The egress [`Provenance`] of the context currently assembled in `ctx`: the
-/// union of every tool result's [`ToolProvenance`].
+/// union of every block that carries file provenance.
 ///
 /// This is the loop → egress bridge for BR-1 (REQ-544 C-1). A tool result tagged
 /// with the files it touched contributes those paths; a result with UNKNOWN
 /// provenance (a `shell` command) makes the whole context's provenance unknown,
-/// which egress fail-closes; system/user/model blocks carry no file provenance.
-/// The remote source hands the result to [`Egress::scoped`], so a turn whose
-/// context touched a `local-only` file — or ran an unparseable shell command — is
-/// blocked before a byte leaves.
+/// which egress fail-closes. The remote source hands the result to
+/// [`Egress::scoped`], so a turn whose context touched a `local-only` file — or
+/// ran an unparseable shell command — is blocked before a byte leaves.
+///
+/// ## A user block can carry file provenance too (REQ-585 BR-7)
+///
+/// System and model blocks carry none, and user blocks used to be in that list.
+/// They are not any more: a `/skill` invocation expands a `SKILL.md` into the
+/// user turn, so that turn is prompt text by role and *file content* by origin
+/// and has to pin the turn exactly as a `read` of the same file would. Its
+/// sources fold in through the identical mapping the tool results use, and a
+/// skill whose file has no mintable identity — a user-scoped skill outside the
+/// session root — folds in as `Unknown` and fail-closes, the strictest reading
+/// and the one that keeps a file outside the root from silently counting as
+/// unpinnable (ADR-9).
 ///
 /// ## Forgotten blocks are counted too (REQ-567 BR-3)
 ///
@@ -827,12 +838,29 @@ impl<T: Transport> CompletionSource for RemoteProviderSource<'_, T> {
 pub fn context_provenance(ctx: &ContextManager) -> Provenance {
     let mut prov = Provenance::empty();
     for block in ctx.blocks() {
-        if let CtxProvenance::Tool { provenance, .. } = &block.provenance {
-            // One per-result mapping, shared with the `digest` duty (which scopes
-            // a *single* result rather than the whole context). Two spellings of
-            // "what does this tool result mean to egress" is how one of them ends
-            // up laxer than the other.
-            prov.merge(&tool_result_provenance(provenance));
+        match &block.provenance {
+            CtxProvenance::Tool { provenance, .. } => {
+                // One per-result mapping, shared with the `digest` duty (which
+                // scopes a *single* result rather than the whole context). Two
+                // spellings of "what does this tool result mean to egress" is
+                // how one of them ends up laxer than the other.
+                prov.merge(&tool_result_provenance(provenance));
+            }
+            // Through that same mapping, for that same reason: a skill
+            // expansion's files mean to egress exactly what a `read` of them
+            // means. The empty-set/`!unknown` case — ordinary typed prompt text
+            // — contributes nothing and takes neither branch.
+            CtxProvenance::User { sources, unknown } => {
+                if !sources.is_empty() {
+                    prov.merge(&tool_result_provenance(&ToolProvenance::Sources(
+                        sources.clone(),
+                    )));
+                }
+                if *unknown {
+                    prov.merge(&tool_result_provenance(&ToolProvenance::Unknown));
+                }
+            }
+            CtxProvenance::System | CtxProvenance::Model => {}
         }
     }
     // Through the same mapping, for the same reason: the forgotten blocks are
@@ -873,6 +901,7 @@ mod tests {
     use crate::harness::context::{StructuredMessage, ToolProvenance};
     use async_trait::async_trait;
     use serde_json::json;
+    use std::collections::BTreeSet;
     use teton_inference::{Completion, GenParams, MockEngine};
     use teton_providers::{
         CapabilityProfile, ProviderError, StopReason, ToolCall, TransportError, TransportRequest,
@@ -1573,8 +1602,18 @@ mod tests {
         assert!(specs[0].input_schema.is_object());
     }
 
+    /// **Seam 2 of three (REQ-585 BR-7, ADR-9).** The union is over every block
+    /// that carries file provenance — which now includes a **user** block, because
+    /// a `/skill` expansion is prompt text by role and file content by origin and
+    /// has to pin the turn exactly as a `read` of that file would.
+    ///
+    /// This test was named `context_provenance_unions_tool_result_paths_only`,
+    /// and that name *was* the claim BR-7 breaks: it is renamed and re-asserted
+    /// rather than deleted, so the seam keeps a witness across the change.
+    /// Typed prompt text still contributes nothing, and the empty set is what
+    /// says so — which is precisely why `unknown` could not be encoded inside it.
     #[test]
-    fn context_provenance_unions_tool_result_paths_only() {
+    fn context_provenance_unions_tool_result_and_skill_expansion_sources() {
         let mut ctx = ContextManager::new("system", 10_000);
         ctx.push_user("do the thing");
         ctx.push_model("{\"tool\":\"read\"}");
@@ -1583,12 +1622,50 @@ mod tests {
         // A tool result with no touched files (e.g. a benign status) contributes
         // nothing and is not unknown.
         ctx.push_tool_result("shell", None, "ok");
+        // A skill expansion: a user block whose text came out of a repo file.
+        ctx.push_user_from(
+            "run the release checklist",
+            [fixture_id(".claude/skills/release/SKILL.md")]
+                .into_iter()
+                .collect(),
+            false,
+        );
 
         let prov = context_provenance(&ctx);
-        assert_eq!(prov.len(), 2);
+        assert_eq!(prov.len(), 3, "{prov:?}");
         assert!(prov.contains("src/lib.rs"));
         assert!(prov.contains("secrets/prod.env"));
+        assert!(
+            prov.contains(".claude/skills/release/SKILL.md"),
+            "a skill expansion must pin the turn as a read of its file would"
+        );
         assert!(!prov.is_unknown());
+    }
+
+    /// **ADR-9's id-minting gap.** A skill file with no mintable identity — a
+    /// user-scoped `~/.claude/skills/x/SKILL.md` in a repo-rooted session, which
+    /// `ProvenanceId::from_resolved` refuses by design (REQ-571 ADR-B) — sets
+    /// `unknown` on its user block, and the whole context fail-closes, exactly
+    /// as a `shell` result does. The alternative would be a file outside the
+    /// root silently counting as unpinnable.
+    ///
+    /// The empty set beside the bit is the point: this block names no file *and*
+    /// is not ordinary typed prose, and only two fields can say both.
+    #[test]
+    fn a_user_block_whose_sources_cannot_be_minted_makes_the_context_unknown() {
+        let mut ctx = ContextManager::new("system", 10_000);
+        ctx.push_tool_result("read", Some(fixture_id("src/lib.rs")), "code");
+        ctx.push_user_from("run my personal skill", BTreeSet::new(), true);
+
+        let prov = context_provenance(&ctx);
+        assert!(
+            prov.is_unknown(),
+            "an unpinnable skill expansion must fail the turn closed"
+        );
+        assert!(!prov.is_empty(), "unknown provenance is never empty");
+        // Known sources are still carried alongside the unknown bit — the pair,
+        // not one collapsed into the other.
+        assert!(prov.contains("src/lib.rs"));
     }
 
     #[test]
@@ -1613,12 +1690,19 @@ mod tests {
         assert!(prov.contains("src/lib.rs"));
     }
 
+    /// The half of ADR-9 that a one-field `Provenance::User` would have broken:
+    /// an ordinary typed prompt is the empty set with `unknown` clear, and it
+    /// pins nothing. Encoding "unpinnable" as the empty set would make this
+    /// context unknown and pin every typed prompt on every machine with a
+    /// boundary configured.
     #[test]
     fn a_context_of_only_prompt_text_has_empty_provenance() {
         let mut ctx = ContextManager::new("system", 10_000);
         ctx.push_user("just a question");
         ctx.push_model("just an answer");
-        assert!(context_provenance(&ctx).is_empty());
+        let prov = context_provenance(&ctx);
+        assert!(prov.is_empty());
+        assert!(!prov.is_unknown());
     }
 
     #[tokio::test]

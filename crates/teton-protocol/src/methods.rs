@@ -318,6 +318,234 @@ impl RpcMethod for SessionSetCwdParams {
 }
 
 // ---------------------------------------------------------------------------
+// skills (REQ-585)
+// ---------------------------------------------------------------------------
+
+/// Which of REQ-585's two discovery roots a skill was found under (BR-1).
+///
+/// `user` is `~/.claude/{skills,commands}`; `project` is the same pair under
+/// the session root. The distinction is not cosmetic: it decides the name
+/// contest (BR-2 — a project skill shadows a user skill of the same name), it
+/// is half of the permission key (`skill:<source>:<name>`, ADR-6), and it is
+/// why a `/cd` drops the project grants and keeps the user ones.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SkillSource {
+    /// Found under the user's `~/.claude`.
+    User,
+    /// Found under the session root's `.claude`.
+    Project,
+}
+
+/// Every name the built-in command table claims, so a skill can never take one.
+///
+/// **Why this lives above both crates.** BR-2 says a reserved name always wins,
+/// and the table that defines "reserved" is `teton`'s `COMMANDS` — which
+/// `tetond` cannot read, because the daemon does not depend on the CLI. So the
+/// client enforced it and the daemon did not, and `SkillRegistry::dispatchable`
+/// happily answered for a skill named `cost`. That is invisible while the only
+/// client is `teton`, and it is a hole the moment a second one exists: a
+/// `session/prompt { skill: { name: "cost" } }` from a client carrying no table
+/// runs a repo-supplied `.claude/skills/cost/SKILL.md`, and the spec's own
+/// Assumptions say project skills may be authored by someone other than the
+/// user. ADR-1's rule is that every rule with teeth lives in the daemon; this
+/// one had none there (REQ-585 verify).
+///
+/// **It is a list here and a derivation there.** `teton::slash::table_claim`
+/// still derives the same set from `COMMANDS` — rows, aliases, the first word
+/// of every multi-word row, and `teton` — and a test asserts the two agree in
+/// both directions, so adding a row without adding it here fails in the crate
+/// that owns the row. A hand-written list nothing checks is LESSON-546's shape;
+/// a hand-written list a derivation is checked against is a wire contract.
+pub const RESERVED_SKILL_NAMES: &[&str] = &[
+    "boundary",
+    "cd",
+    "clear",
+    "cost",
+    "doctor",
+    "effort",
+    "exit",
+    "help",
+    "model",
+    "permissions",
+    "policy",
+    "provider",
+    "quit",
+    "teton",
+    "verbose",
+    "web",
+];
+
+/// True when the built-in command table claims `name`, so no skill may dispatch
+/// under it (BR-2).
+#[must_use]
+pub fn is_reserved_skill_name(name: &str) -> bool {
+    RESERVED_SKILL_NAMES.contains(&name)
+}
+
+/// The permission key a skill's dynamic context asks under: `skill:<source>:<name>`.
+///
+/// **One home, because two crates enforce one rule.** The daemon mints the key
+/// and drops the project-scoped ones when the session root moves (ADR-6); the
+/// client memoizes "allow for this session" answers under the *same* string and
+/// has to forget them at the same moment. Those are the two halves of one
+/// decision, and a decision with two stores needs one invalidation rule — so
+/// the spelling and the predicate live here, above both, rather than being
+/// written out twice and drifting.
+#[must_use]
+pub fn skill_permission_key(source: SkillSource, name: &str) -> String {
+    format!("{}{name}", skill_permission_key_prefix(source))
+}
+
+/// The `skill:<source>:` prefix every key of one source shares.
+#[must_use]
+pub fn skill_permission_key_prefix(source: SkillSource) -> String {
+    let word = match source {
+        SkillSource::User => "user",
+        SkillSource::Project => "project",
+    };
+    format!("skill:{word}:")
+}
+
+/// True when `key` is a **project** skill's dynamic-context key — the grants a
+/// root move invalidates, on either side of the wire.
+///
+/// A user skill's file is the same file whatever the session root is, so its
+/// grant survives; a project skill's name means a different file in a different
+/// repo, which is the whole of ADR-6's argument.
+#[must_use]
+pub fn is_project_skill_key(key: &str) -> bool {
+    key.starts_with(&skill_permission_key_prefix(SkillSource::Project))
+}
+
+/// One registered skill, as a client sees it (REQ-585 BR-3, ADR-1).
+///
+/// This is the whole of what the CLI holds: enough to classify a `/name` line
+/// and to print a `/help` row, and nothing more. The body never crosses the
+/// wire — the daemon expands it (ADR-3), so a client cannot compose a turn out
+/// of file bytes it was handed.
+///
+/// `description` and `argument_hint` **are file bytes** and are treated as
+/// such at both ends: the daemon bounds them with `session_root::bounded_field`
+/// before they go on the wire, and the client defuses again at render through
+/// `Surface::line`. Two layers, each where the frame is authored — ADR-009's
+/// shape, and LESSON-517's.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SkillView {
+    /// The dispatchable spelling: the directory name (`skills/<name>/SKILL.md`)
+    /// or the file stem (`commands/<name>.md`). A frontmatter `name` that
+    /// differs creates no second spelling (BR-2).
+    pub name: String,
+    /// Which root it came from.
+    pub source: SkillSource,
+    /// The frontmatter `description`, bounded and one-line; absent when the
+    /// file declares none.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+    /// The frontmatter `argument-hint`, bounded and one-line; absent when the
+    /// file declares none.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub argument_hint: Option<String>,
+    /// What owns this name instead, when something does — a built-in row, a
+    /// project skill, or a `skills/` entry beating a `commands/` one (BR-2,
+    /// ADR-6). `Some` means **listed but never dispatchable**: `/help` marks
+    /// the row and `classify` must not return it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub shadowed: Option<String>,
+}
+
+/// One entry discovery found and did not register, with why (REQ-585 BR-1).
+///
+/// Named, never silent: BR-1's rule is that an unreadable, malformed,
+/// mis-named or oversized file is *counted and named*, because a skill that
+/// vanishes without a diagnostic is the LESSON-481 shape — a feature the user
+/// cannot see is one the suite cannot see either. A missing directory is the
+/// normal case and produces no entry, and a directory with no `SKILL.md` is
+/// not a skill.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SkillSkipped {
+    /// The name this entry **would have dispatched under**, empty when it names
+    /// no skill at all (a root-level refusal or truncation, or an entry whose
+    /// spelling was never a candidate).
+    ///
+    /// Named by the daemon rather than re-derived from [`Self::path`] by every
+    /// client that needs it. BR-2's rule — a `skills/` entry is named by its
+    /// directory, a `commands/` entry by its file stem — belongs to the side
+    /// that owns discovery; a client re-deriving it from a display path is a
+    /// second home for that rule in a crate that cannot see the four roots, and
+    /// two spellings of one decision are identical only until one of them is
+    /// edited (LESSON-528).
+    ///
+    /// **Untrusted, and bounded as such**: unlike [`SkillView::name`] — which is
+    /// dispatchable and therefore matched `^[a-z0-9][a-z0-9_-]{0,63}$` before it
+    /// was registered — this is whatever the filesystem spelled, *including* the
+    /// invalid spellings that are why the entry was skipped. The daemon
+    /// neutralizes and bounds it exactly as it does the description.
+    ///
+    /// Additive (REQ-585 ADR-2): a result from a daemon predating the field
+    /// carries no key and reads empty, and an entry that names nothing emits no
+    /// key rather than `""`.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub name: String,
+    /// The file, **home-relative** (`session_root::display_for`) and bounded,
+    /// exactly as [`SkillView`]'s description is.
+    ///
+    /// Not an absolute path: BR-1's entity table says a skill path is never
+    /// shown as one, because `/Users/jane/.claude/skills/broken/SKILL.md`
+    /// carries a username into a transcript, and AC-6 puts these entries on a
+    /// user-visible surface.
+    pub path: String,
+    /// Why it was skipped, in the daemon's own words — `unreadable (permission
+    /// denied)`, `over 64 KiB (67,184 B)`, `not UTF-8`, `malformed
+    /// frontmatter`, `invalid name`, `symlink not followed`, `shadowed by
+    /// <what>` (ADR-4).
+    pub reason: String,
+}
+
+/// List the skills this session would dispatch (REQ-585 BR-3, ADR-1/ADR-2).
+///
+/// **This method is the version handshake.** A client calls it after
+/// `session/create` and again after every `session_root_changed`; a daemon
+/// that answers [`crate::jsonrpc::error_code::METHOD_NOT_FOUND`] yields an
+/// **empty** snapshot rather than an error, which makes `classify` incapable
+/// of returning a skill and leaves a new CLI against an old daemon behaving
+/// byte-for-byte as it does today. The capability is proven by a successful
+/// call, never asserted from a version number — which is why
+/// [`crate::PROTOCOL_VERSION`] does not move for any of REQ-585's additions.
+///
+/// It carries a `session_id` because half the answer is derived from the
+/// session root (BR-1's two project globs), and the root moves under `/cd`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SkillsListParams {
+    /// The session whose registry to report.
+    pub session_id: SessionId,
+}
+
+/// Result of [`SkillsListParams`].
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SkillsListResult {
+    /// Every registered skill, including the shadowed ones — `/help` lists
+    /// them and `classify` refuses them, and both need to see the same rows
+    /// (BR-3: a skill cannot be dispatchable without appearing in `/help`).
+    ///
+    /// Ordered by the daemon, by name: APFS lists in hash order and ext4 does
+    /// not, so an order the client re-derived would be a platform-flaky
+    /// `/help` (LESSON-540).
+    #[serde(default)]
+    pub skills: Vec<SkillView>,
+    /// Everything found and not registered. Rides the same result as `skills`
+    /// so `/help`'s diagnostic line and BR-10's unknown-command hint read one
+    /// list rather than two that can disagree.
+    #[serde(default)]
+    pub skipped: Vec<SkillSkipped>,
+}
+
+impl RpcMethod for SkillsListParams {
+    const METHOD: &'static str = "skills/list";
+    type Result = SkillsListResult;
+}
+
+// ---------------------------------------------------------------------------
 // prompt turn
 // ---------------------------------------------------------------------------
 
@@ -340,6 +568,36 @@ pub enum PromptBlock {
     },
 }
 
+/// A user-typed skill invocation, carried as a name and the rest of the line
+/// (REQ-585 BR-4, architecture ADR-3).
+///
+/// **The invocation crosses the wire as a name, never as an expansion.** The
+/// client never composes the body, which keeps the untrusted file bytes on the
+/// side of the seam that sanitizes them (LESSON-517), and it never puts the
+/// typed `/name …` line in `prompt` either — so a daemon that dropped this
+/// field yields a visible empty turn, not a leaked command line reaching a
+/// model.
+///
+/// Deliberately **not** a [`PromptBlock`] variant: that enum is
+/// `#[serde(tag = "type")]`, where an unknown tag is a deserialization failure
+/// rather than a degrade — and an invocation is not prompt content in the
+/// first place.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SkillInvocation {
+    /// The skill's dispatchable name, as [`SkillView::name`] spells it.
+    pub name: String,
+    /// The rest of the typed line, **verbatim** — interior whitespace
+    /// preserved, quotes uninterpreted, the line's edges trimmed as the
+    /// classifier trims today.
+    ///
+    /// This is the one place the session does not use REQ-582 ADR-2's
+    /// tokenization (BR-4), so it must never be re-joined from a token list
+    /// anywhere on the path: `/alpha teton  code "repo"` reaches `$ARGUMENTS`
+    /// with both interior spaces and both quotes intact, and a re-join would
+    /// silently normalize them.
+    pub raw_arguments: String,
+}
+
 /// Submit a prompt turn to a session. ACP equivalent: `session/prompt`.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct PromptTurnParams {
@@ -347,6 +605,19 @@ pub struct PromptTurnParams {
     pub session_id: SessionId,
     /// The prompt, as an ordered list of content blocks.
     pub prompt: Vec<PromptBlock>,
+    /// A skill invocation to expand into this turn instead of `prompt`
+    /// (REQ-585 BR-4, ADR-3).
+    ///
+    /// Additive, and absent on every turn a pre-REQ-585 client sends. Exactly
+    /// one of `prompt`/`skill` is populated: the daemon refuses
+    /// [`crate::jsonrpc::error_code::INVALID_PARAMS`] when **both** are, a
+    /// combination that was never valid so nothing is narrowed. A request with
+    /// *neither* is still accepted — `flatten_prompt(&[])` is `""` and such a
+    /// turn runs today, so rejecting it would narrow an existing method for
+    /// third-party clients while [`crate::PROTOCOL_VERSION`] is asserted
+    /// unchanged.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub skill: Option<SkillInvocation>,
 }
 
 /// Why a prompt turn ended. ACP: `stopReason`.
@@ -407,6 +678,47 @@ pub enum PermissionOutcome {
     },
     /// The user dismissed the prompt without choosing.
     Cancelled,
+    /// The client refused the request **without asking anyone** (REQ-585
+    /// BR-11, architecture ADR-7/ADR-8).
+    ///
+    /// **Why this is not [`PermissionOutcome::Cancelled`].** `Cancelled`
+    /// already means *the user dismissed the prompt* — it is what EOF on a
+    /// pipe returns — so folding these into it would say a human declined when
+    /// no human was ever reachable. AC-9 requires the not-run placeholders to
+    /// say *no human could be asked*, which the daemon cannot know from a
+    /// dismissal, and BR-11's whole point is that the refusal happens
+    /// **before** `prompter.ask` reads a line: a refusal computed after that
+    /// call has already eaten the user's next prompt line and turned a pasted
+    /// `y` into consent (LESSON-537).
+    ///
+    /// Additive on a tagged enum, so it travels in one direction only and is
+    /// only ever sent to a daemon that answered `skills/list` (ADR-2's
+    /// handshake). A pre-REQ-585 daemon has no `refused` arm and would refuse
+    /// the params outright — which is why the handshake, not serde tolerance,
+    /// is what gates it.
+    Refused {
+        /// Which of BR-11's two closed doors this was.
+        reason: RefusalReason,
+    },
+}
+
+/// Why a client refused a permission request without asking (REQ-585 BR-11).
+///
+/// Closed on purpose: it is read by the daemon, which composes AC-9's
+/// placeholder sentence from it, and a reason it cannot render is a refusal it
+/// cannot explain. A future client inventing a third door fails the params
+/// rather than having its answer silently rendered as one of these two.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RefusalReason {
+    /// There is no terminal to ask at — piped stdin, at a level that would ask
+    /// (BR-11). The commands are not run and the next stdin line stays the
+    /// next prompt line.
+    NoTerminal,
+    /// The request carried a subject this client does not recognize, so it
+    /// refused rather than falling through to `prompter.ask` (ADR-7's
+    /// fail-closed rule; see [`crate::events::PermissionSubject::Unrecognized`]).
+    UnrecognizedSubject,
 }
 
 /// Result of [`PermissionRespondParams`].
@@ -2805,6 +3117,7 @@ mod tests {
                     name: None,
                 },
             ],
+            skill: None,
         });
         round_trip(&PromptTurnResult {
             turn_id: TurnId::from("t1"),
@@ -3791,10 +4104,313 @@ mod tests {
         // this literal.
         assert_eq!(SessionClearParams::METHOD, "session/clear");
         assert_eq!(SessionSetCwdParams::METHOD, "session/set_cwd");
+        // REQ-585's one method, and the literal matters more here than for the
+        // rest: this string *is* the capability handshake (ADR-2). The daemon's
+        // dispatch match and the CLI's post-`session/create` call are written
+        // against it, and a rename that edited only one side would not be a
+        // visible failure — it would be `METHOD_NOT_FOUND`, which the client
+        // deliberately reads as "this daemon has no skills", so every `/name`
+        // would quietly become `unknown command` on a daemon that has them.
+        assert_eq!(SkillsListParams::METHOD, "skills/list");
         assert_eq!(
             request(Id::Number(2), ModelStatusParams::default()).method,
             "model/status"
         );
+    }
+
+    /// REQ-585's snapshot round-trips, including every state whose *absence* is
+    /// a distinct fact: no description, no argument hint, nothing shadowing it,
+    /// and an entirely empty registry.
+    ///
+    /// The empty result is the one worth naming. It is what a daemon with no
+    /// `~/.claude` answers **and** what the client synthesizes from
+    /// `METHOD_NOT_FOUND` on an old daemon (ADR-2), so it has to be a value the
+    /// wire can carry rather than a shape that only exists in the client's
+    /// head — and it must be reachable from `Default`, because that is how the
+    /// old-daemon path constructs it.
+    #[test]
+    fn skills_list_round_trips_including_the_empty_registry() {
+        round_trip(&SkillsListParams {
+            session_id: SessionId::from("s1"),
+        });
+        round_trip(&SkillsListResult::default());
+        assert!(SkillsListResult::default().skills.is_empty());
+        assert!(SkillsListResult::default().skipped.is_empty());
+
+        round_trip(&SkillsListResult {
+            skills: vec![
+                SkillView {
+                    name: "alpha".to_owned(),
+                    source: SkillSource::User,
+                    description: Some("audit the repo".to_owned()),
+                    argument_hint: Some("[path]".to_owned()),
+                    shadowed: None,
+                },
+                // A project skill with nothing declared but its name — the
+                // `.claude/commands/*.md` shape, which routinely has no
+                // frontmatter at all.
+                SkillView {
+                    name: "gamma".to_owned(),
+                    source: SkillSource::Project,
+                    description: None,
+                    argument_hint: None,
+                    shadowed: None,
+                },
+                // Listed, never dispatchable (BR-2).
+                SkillView {
+                    name: "cost".to_owned(),
+                    source: SkillSource::User,
+                    description: None,
+                    argument_hint: None,
+                    shadowed: Some("a built-in command".to_owned()),
+                },
+            ],
+            skipped: vec![SkillSkipped {
+                name: "broken".to_owned(),
+                path: "~/.claude/skills/broken/SKILL.md".to_owned(),
+                reason: "malformed frontmatter".to_owned(),
+            }],
+        });
+
+        // The two sources keep their spec spellings on the wire: the grant key
+        // (`skill:<source>:<name>`) is built from them, so a rename here would
+        // silently invalidate every remembered grant.
+        assert_eq!(
+            serde_json::to_string(&SkillSource::User).unwrap(),
+            "\"user\""
+        );
+        assert_eq!(
+            serde_json::to_string(&SkillSource::Project).unwrap(),
+            "\"project\""
+        );
+
+        // An undeclared description emits **no key**, not `null` — a client
+        // that renders `Some("null")` into a `/help` row would be printing the
+        // absence rather than omitting it.
+        let bare = serde_json::to_value(SkillView {
+            name: "gamma".to_owned(),
+            source: SkillSource::Project,
+            description: None,
+            argument_hint: None,
+            shadowed: None,
+        })
+        .expect("serializes");
+        assert!(bare.get("description").is_none(), "{bare}");
+        assert!(bare.get("argument_hint").is_none(), "{bare}");
+        assert!(bare.get("shadowed").is_none(), "{bare}");
+    }
+
+    /// REQ-585 TASK-203: `SkillSkipped.name` is additive in both directions —
+    /// the `route_decided` budget rule re-applied to the one field this task
+    /// adds, rather than assumed inherited.
+    ///
+    /// The field exists so BR-2's naming rule ("a `skills/` entry is named by
+    /// its directory, a `commands/` entry by its stem") has one home, on the
+    /// side that owns discovery. That makes the skew question real: a client
+    /// that already re-derives the name from the path will keep working against
+    /// a daemon that has never sent one, and a daemon that sends one must not
+    /// break a reader built before it.
+    ///
+    /// Four legs, as the rule asks: an absent key parses, an empty name emits
+    /// **no** key rather than `""`, the new wire parses through a
+    /// locally-declared pre-REQ struct, and the fixture that proves the third
+    /// leg is checked for actually carrying the key (LESSON-502 — the vacuity
+    /// is the failure mode).
+    #[test]
+    fn a_skipped_entrys_name_is_additive_in_both_directions() {
+        // A result from a daemon predating the field: no `name` key at all.
+        let older: SkillsListResult = serde_json::from_str(
+            r#"{"skills":[],"skipped":[
+                {"path":"~/.claude/skills/broken/SKILL.md","reason":"malformed frontmatter"}]}"#,
+        )
+        .expect("a result from a daemon predating the field must still parse");
+        assert_eq!(older.skipped[0].name, "");
+        assert_eq!(older.skipped[0].reason, "malformed frontmatter");
+
+        // And an entry that names nothing — a root-level refusal — writes no
+        // key, rather than an empty string a client would render as a name.
+        let unnamed = serde_json::to_value(&older).unwrap();
+        assert!(
+            unnamed["skipped"][0].get("name").is_none(),
+            "an entry that names no skill emits no key: {unnamed}"
+        );
+
+        // The other direction: a reader built before the field.
+        #[derive(Deserialize)]
+        struct PreNameSkillSkipped {
+            path: String,
+            reason: String,
+        }
+        #[derive(Deserialize)]
+        struct PreNameSkillsListResult {
+            skipped: Vec<PreNameSkillSkipped>,
+        }
+        let wire = serde_json::to_string(&SkillsListResult {
+            skills: Vec::new(),
+            skipped: vec![SkillSkipped {
+                name: "broken".to_owned(),
+                path: "~/.claude/skills/broken/SKILL.md".to_owned(),
+                reason: "malformed frontmatter".to_owned(),
+            }],
+        })
+        .unwrap();
+        assert!(
+            wire.contains(r#""name":"broken""#),
+            "the fixture must actually carry the new key: {wire}"
+        );
+        let old: PreNameSkillsListResult =
+            serde_json::from_str(&wire).expect("a client predating the field still reads the list");
+        assert_eq!(old.skipped[0].path, "~/.claude/skills/broken/SKILL.md");
+        assert_eq!(old.skipped[0].reason, "malformed frontmatter");
+
+        assert_eq!(
+            crate::PROTOCOL_VERSION,
+            crate::ProtocolVersion(2),
+            "a named skipped entry is one more optional field, so the negotiated \
+             version does not move"
+        );
+    }
+
+    /// REQ-585's additivity for `PromptTurnParams.skill`, both directions —
+    /// the `route_decided` budget rule re-applied rather than assumed
+    /// inherited.
+    ///
+    /// A turn from a client predating the field carries no key and reads
+    /// `None`; a daemon that has never heard of the field still reads a turn
+    /// that carries it. Serde ignores unknown fields by default and no type
+    /// here opts out, but that posture is what keeps
+    /// [`crate::PROTOCOL_VERSION`] still, so it is asserted rather than
+    /// assumed.
+    #[test]
+    fn prompt_turn_skill_is_additive_in_both_directions() {
+        // A pre-REQ-585 turn: no `skill` key — absent, not an error.
+        let turn: PromptTurnParams =
+            serde_json::from_str(r#"{"session_id":"s1","prompt":[{"type":"text","text":"hi"}]}"#)
+                .expect("a turn from a client predating the field must still parse");
+        assert_eq!(turn.skill, None);
+        assert_eq!(turn.prompt.len(), 1);
+
+        // And a turn that never populated it emits no key at all, rather than
+        // `null` — the same wire an older client writes.
+        let wire = serde_json::to_value(&turn).unwrap();
+        assert!(wire.get("skill").is_none(), "{wire}");
+
+        // The other direction: a reader built before the field.
+        #[derive(Deserialize)]
+        struct PreSkillPromptTurn {
+            session_id: SessionId,
+            prompt: Vec<PromptBlock>,
+        }
+        let wire = serde_json::to_string(&PromptTurnParams {
+            session_id: SessionId::from("s1"),
+            // ADR-3: the client sends an **empty** prompt, so a dropped
+            // `skill` field yields a visible empty turn rather than a leaked
+            // `/name …` command line reaching a model.
+            prompt: vec![],
+            skill: Some(SkillInvocation {
+                name: "alpha".to_owned(),
+                raw_arguments: "teton  code \"repo\"".to_owned(),
+            }),
+        })
+        .unwrap();
+        assert!(
+            wire.contains(r#""skill":{"name":"alpha""#)
+                && wire.contains(r#""raw_arguments":"teton  code \"repo\"""#),
+            "the fixture must actually carry the new key: {wire}"
+        );
+        let old: PreSkillPromptTurn =
+            serde_json::from_str(&wire).expect("a daemon predating the field still reads the turn");
+        assert_eq!(old.session_id, SessionId::from("s1"));
+        assert!(
+            old.prompt.is_empty(),
+            "the old reader still gets its fields"
+        );
+
+        // BR-4: the rest of the line rides **verbatim**. Two interior spaces
+        // and both quotes survive the wire, because a re-join from a token
+        // list is the one transformation this field must never suffer.
+        let back: PromptTurnParams = serde_json::from_str(&wire).unwrap();
+        assert_eq!(
+            back.skill.expect("the skill survives").raw_arguments,
+            "teton  code \"repo\""
+        );
+
+        assert_eq!(
+            crate::PROTOCOL_VERSION,
+            crate::ProtocolVersion(2),
+            "REQ-585 adds only optional fields and one method, so the negotiated version \
+             does not move — the capability is proven by a successful `skills/list`"
+        );
+    }
+
+    /// `PermissionOutcome::Refused` is additive in the one direction it can be
+    /// — and the direction it cannot be is asserted too, because that is the
+    /// constraint the daemon's ordering rests on.
+    ///
+    /// This is a new **variant** on an internally tagged enum, not a new field,
+    /// so the four-leg field rule does not transfer: there is no "absent key
+    /// parses to the default" leg, and a reader that predates the variant
+    /// cannot ignore an unknown tag the way it ignores an unknown key. What
+    /// replaces it is the pin below — a pre-REQ-585 reader **fails**, which is
+    /// exactly why ADR-2's handshake (not serde's tolerance) is what gates
+    /// sending this: a client only ever sends `refused` to a daemon that
+    /// answered `skills/list`.
+    #[test]
+    fn permission_outcome_refused_travels_only_to_a_daemon_that_knows_it() {
+        for reason in [
+            RefusalReason::NoTerminal,
+            RefusalReason::UnrecognizedSubject,
+        ] {
+            round_trip(&PermissionRespondParams {
+                request_id: RequestId::from("r1"),
+                outcome: PermissionOutcome::Refused { reason },
+            });
+        }
+        let wire = serde_json::to_value(PermissionOutcome::Refused {
+            reason: RefusalReason::NoTerminal,
+        })
+        .unwrap();
+        assert_eq!(wire["outcome"], "refused", "{wire}");
+        assert_eq!(wire["reason"], "no_terminal", "{wire}");
+
+        // The two outcomes that were already there keep their tags. `refused`
+        // is emphatically **not** `cancelled`: that one means a human
+        // dismissed the prompt (it is what EOF on a pipe returns), and AC-9
+        // needs the daemon to tell "the user said no" from "no human could be
+        // asked".
+        assert_eq!(
+            serde_json::to_value(PermissionOutcome::Cancelled).unwrap()["outcome"],
+            "cancelled"
+        );
+        assert_eq!(
+            serde_json::to_value(PermissionOutcome::Selected {
+                option_id: "allow_once".to_owned(),
+            })
+            .unwrap()["outcome"],
+            "selected"
+        );
+
+        // The direction that does not work, pinned rather than assumed: a
+        // daemon built before the variant refuses the params outright.
+        #[derive(Deserialize)]
+        #[serde(tag = "outcome", rename_all = "snake_case")]
+        #[allow(dead_code)]
+        enum PreRefusalOutcome {
+            Selected { option_id: String },
+            Cancelled,
+        }
+        let refused = serde_json::to_string(&PermissionOutcome::Refused {
+            reason: RefusalReason::NoTerminal,
+        })
+        .unwrap();
+        assert!(
+            serde_json::from_str::<PreRefusalOutcome>(&refused).is_err(),
+            "an older daemon cannot read `refused`, which is why the handshake gates it: {refused}"
+        );
+        // And the old reader still reads what it always did, so nothing about
+        // the existing two arms moved.
+        let cancelled = serde_json::to_string(&PermissionOutcome::Cancelled).unwrap();
+        assert!(serde_json::from_str::<PreRefusalOutcome>(&cancelled).is_ok());
     }
 
     /// The two user-only web actions round-trip, and the override answers the

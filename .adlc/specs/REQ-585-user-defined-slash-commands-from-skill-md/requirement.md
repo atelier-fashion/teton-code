@@ -1,11 +1,11 @@
 ---
 id: REQ-585
 title: "User-defined slash commands from SKILL.md — the session discovers Claude Code-style skills and runs `/name` as a prompt expansion"
-status: draft
+status: complete
 deployable: true
 created: 2026-08-19
-updated: 2026-08-19
-component: "cli"
+updated: 2026-08-20
+component: "daemon/harness"
 domain: "clients"
 stack: ["rust", "cli", "daemon", "json-rpc"]
 concerns: ["developer-experience", "security", "extensibility", "privacy"]
@@ -56,27 +56,43 @@ tool the model can call, does not honor `allowed-tools`, `model`, `context:
 fork` or hooks, and does not rewrite a skill's references to tools it lacks.
 
 **The scope decision, resolved (OQ-0, 2026-08-19): the big skills are the
-point — they are what automation runs.** The harness applies one context
-budget on every tier — 4,096 whitespace tokens / 32 KiB, system prompt
-included (`HarnessConfig` default; `from_harness_profile` inherits it for
-remote tiers; the provider's `max_context` never reaches the harness) — and
-today an oversized prompt is **middle-elided in place, silently**
-(`ContextManager::truncate_to_budget`). Measured against that budget with the
-~850-word system prompt and the 599-word ethos include every ADLC skill
-inlines, ten of the seventeen skills fit and **seven do not on any tier**
-(`/spec` 2,717 words, `/manifest`, `/analyze`, `/template-drift`, `/wrapup`,
-`/sprint`, `/proceed` 7,222). The product owner's answer was that those seven
-are the ones that matter. So **REQ-586 — a route-aware context budget — lands
-first**: a remote route gets its provider's window, an unknown window is
-stated rather than silently defaulted, and nothing is clamped in silence on
-any tier. On top of it, this REQ's success bar is **every one of the
-seventeen expands on a remote route whose window is declared** (`/proceed` at
-8,671 words with ethos and system prompt needs roughly a 16k-token window
-after REQ-586's safety ratio; the dogfood Kimi route has 128k) and **ten of
-them expand on the local tier**; a skill turn that still does not fit its
-route — the local tier, an unknown window, a redact-scan-bound route — is an
-explicit refusal naming the skill, its size, the budget and the bound (BR-8),
-never an elision.
+point — they are what automation runs.** *Before* REQ-586, the harness applied
+one context budget on every tier — 4,096 whitespace tokens / 32 KiB, system
+prompt included — and an oversized prompt was middle-elided in place,
+silently. Measured against that budget with the ~850-word system prompt and
+the 599-word ethos include every ADLC skill inlines, ten of the seventeen
+fit and **seven did not on any tier** (`/spec` 2,717 words, `/manifest`,
+`/analyze`, `/template-drift`, `/wrapup`, `/sprint`, `/proceed` 7,222). The
+product owner's answer was that those seven are the ones that matter, so
+**REQ-586 landed first** (merged `c9e9265`, wrapup `adc6740`): the budget is
+now derived per route attempt, an unknown window is stated rather than
+silently defaulted, and nothing is clamped in silence.
+
+**This REQ's success bar, restated against what REQ-586 actually shipped.**
+Every one of the seventeen expands on a **sized** route — a declared window
+of **≈32k tokens or more** — and ten expand on the local tier. The threshold
+is a byte figure, not a word one, and that is the correction: REQ-586's
+`derive` produces a two-currency pair and the guard is an AND, so for a
+prose-heavy skill body the **byte half binds first**. `/proceed`'s expansion
+is ≈60.6 KB (51,037 B of body + 3,812 B of ethos + ~6,096 B of system
+prompt); at `DUTY_REQUEST_BYTES_PER_TOKEN = 2` a declared window of 16k
+yields only 29,952 budget bytes and **refuses** it, while its word half
+(9,984 against 8,671) would have passed. Solving the byte half gives
+`usable ≥ 30,278`, i.e. a declared window of ≈31.3k. The dogfood Kimi route
+(1M) clears it by thirty times.
+
+**And a declared window can be *smaller* than the local pair.** REQ-586's
+verify pass added a floor — `MIN_BUDGET_TOKENS` 2,048 / `MIN_BUDGET_BYTES`
+16,384 — so that a derivation never fails open. The shipped Ollama recipe
+declares its **served** default of 4,096 tokens, which derives to
+`(2,048, 6,144)` and is then floored to `(2,048, 16,384)`: half the local
+budget, on a route that *did* declare a window. After the system prompt and
+the ethos include that leaves ≈599 words for a body — roughly one skill
+(`/optimize`, 416 words). "Declared" is therefore not the property that
+unlocks the corpus; **sized** is. A skill turn that still does not fit its
+route — the local tier, an unknown window, a floored small window, a
+redact-scan-bound route — is an explicit refusal naming the skill, its size,
+the budget and the bound (BR-8), never an elision.
 
 **Automation, stated honestly.** "Automation" means unattended sessions —
 piped stdin, a script driving `teton`. Two things follow. First, the
@@ -194,19 +210,34 @@ client's own echo line is the record.
   before the table is consulted). A skill with a reserved name is never
   dispatchable: the built-in runs, byte-for-byte as today, and the skill is
   listed as shadowed. Between a project skill and a user skill of the same
-  name, the project skill wins and the user skill is listed as shadowed
-  (informed by REQ-582, LESSON-537).
+  name, the project skill wins and the user skill is listed as shadowed.
+  **Within one source, `skills/` beats `commands/`**: the four globs make
+  `~/.claude/skills/status/SKILL.md` and `~/.claude/commands/status.md` a legal
+  pair — same name, same source, and therefore the same permission key — so a
+  remembered grant would authorize whichever file won and would silently move
+  to the other if the winner ever changed. The `skills/` entry dispatches and
+  the `commands/` entry is listed as shadowed, so one spelling still reaches
+  one handler (informed by REQ-582, LESSON-537, LESSON-495).
 - [ ] BR-3: **`/help` lists skills from the registry that dispatches them.**
   REQ-555 BR-7 extends: a skill cannot be dispatchable without appearing in
   `/help`, and `/help` cannot list a dispatchable skill the table does not
-  resolve. Skills appear in their own section after the built-in rows, one
-  line each — `/name [argument-hint] — description (user|project)` — with
-  shadowed entries marked and a closing diagnostic line (`N skills (user A,
-  project B); M skipped: …`). The description and hint are file contents and
-  therefore untrusted for the terminal: they render only through the
-  `Surface` sanitizer, bounded to one line (informed by LESSON-517). The
-  built-in section's bytes are unchanged from today (informed by REQ-555,
-  REQ-582).
+  resolve. Skills appear in their own section after the built-in rows and
+  **before** `ARGUMENT_FOOTER`/`ESCAPE_FOOTER`, one line each —
+  `/name [argument-hint] — description (user|project)` — with shadowed entries
+  marked and a diagnostic line closing the *section* (`N skills (user A,
+  project B); M skipped: …`). `ESCAPE_FOOTER` stays the last line of `/help`,
+  as it has been since REQ-555 and as `render_help`'s own test pins.
+  `ARGUMENT_FOOTER` says arguments are split on whitespace and quotes are not
+  interpreted — which BR-4 makes **false for skill rows** — so it is qualified
+  to name the built-in rows it describes, or the skills section carries its
+  own one-line counter-statement. Whichever, the two must not sit adjacent and
+  contradict each other. The description and hint are file contents and
+  therefore untrusted for the terminal: they render only through the `Surface`
+  sanitizer, bounded to one line (informed by LESSON-517). The built-in
+  section's bytes are unchanged **from this REQ's merge base** — stated that
+  way because REQ-584 (spec PR #185) adds a `/projects` row, so an absolute
+  golden would make the two REQs unmergeable in either order (informed by
+  REQ-555, REQ-582).
 - [ ] BR-4: **An invocation is one prompt turn on the same path as typed
   text.** `/name <rest>` becomes exactly one user-role prompt turn whose text
   is: one preamble line naming the command and its home-relative source (`The
@@ -225,6 +256,11 @@ client's own echo line is the record.
   same cost row a typed prompt takes — "same path", not "indistinguishable":
   BR-7, BR-8 and BR-12 require the daemon to know it is a skill turn
   (informed by REQ-555, REQ-582).
+  The expansion is a **prompt**, not a tool result, so the `digest` duty never
+  touches it: REQ-586 scaled `summarize_threshold_tokens`/`_bytes` with the
+  route budget, but `summarize_if_large`'s only production call site is the
+  tool-result fold. A skill body is carried whole or refused (BR-8) — it is
+  never condensed into a summary of itself.
 - [ ] BR-5: **Skill content is user-role content and can change nothing
   about the session.** The expansion never enters the system prompt, and it
   passes the same input guards as any prompt text — control tokens and frame
@@ -273,23 +309,53 @@ client's own echo line is the record.
   any boundary is configured. The consequence is stated rather than hidden:
   **on a boundary-configured machine, every skill invocation that ran a
   dynamic command pins its turn local** — all seventeen ADLC skills run the
-  ethos include, so on such a machine they all run on the local tier. The
-  egress choke point sees the expansion as it sees any prompt text (redact
-  scan where configured). This is a BR-1-of-the-charter claim and carries an
-  egress-capture test (informed by REQ-563).
+  ethos include, so on such a machine they are all **pinned** to the local
+  tier. Pinned is not run: seven of the seventeen exceed the local budget and
+  are refused there (BR-8, and this spec's own Assumptions), so on that machine
+  those seven are refused rather than served, and the pin is what forces the
+  refusal. The egress choke point sees the expansion as it sees any prompt
+  text (redact scan where configured). This is a BR-1-of-the-charter claim and
+  carries an egress-capture test (informed by REQ-563).
 - [ ] BR-8: **Bounded, and never silently truncated — on REQ-586's budget.**
   A body over 64 KiB is skipped at discovery with its reason (the largest
   ADLC skill, `proceed`, is 49.8 KiB — a cap that admits the real corpus and
   refuses a pasted transcript). A skill turn whose expansion plus the system
   prompt exceeds **the route's budget** (REQ-586 BR-1: the provider's window
   on a declared remote route, the default on the local tier or an unknown
-  window, the scannable bound when the redact scan applies) is **refused
-  before any model call** with a message naming the skill, its size, the
-  budget and REQ-586's bound — `bound: default_unknown — set
-  capabilities.max_context for <id>` is the one a new user will meet — and is
-  never middle-elided into something the user did not invoke. Typed prompts
-  keep REQ-586 BR-7's loud elision; the refusal is for skill turns only.
-  Depends on REQ-586.
+  window, the scannable bound when the redact scan applies, or a **floored**
+  small window) is **refused before the expansion is appended to the
+  conversation** with a message naming the skill, its size, the budget and
+  REQ-586's bound — and is never middle-elided into something the user did
+  not invoke. Typed prompts keep REQ-586 BR-7's loud elision; the refusal is
+  for skill turns only.
+
+  Four things the refusal must get right, each because REQ-586 shipped the
+  machinery for it:
+  (a) **The bound is spoken, not spelled.** The message reads
+  `BudgetBound::words()` — `unknown window`, `local engine`, `redact scan`,
+  `user cap`, `window` — never the snake_case `wire_name()`. REQ-586 put
+  `words()` in `teton-protocol` expressly so this refusal could reach it from
+  the daemon without minting a second adjective table (the LESSON-528 shape).
+  The one a new user meets is `bound: unknown window — set
+  capabilities.max_context for <id>`.
+  (b) **A floored bound says it was floored.** REQ-586 carries `floored`
+  beside the bound precisely so a ceiling is not reported as in force when it
+  is not; the refusal carries the same clause, or an Ollama-shaped route reads
+  `bound: window` beside a budget larger than the window it declared.
+  (c) **Refusing is silent.** The check runs *before* the expansion joins the
+  conversation, so a refused skill turn emits no `context_pressure` of any
+  kind and no newest-user elision note. (An expansion that *fits* while the
+  assembled conversation does not is ordinary pressure: `blocks_dropped` on
+  older turns is expected and permitted.)
+  (d) **Refuse on the body before spending the user's consent.** The body's
+  own size is known at discovery; the dynamic-context output is not known
+  until the commands have run. A skill whose body alone cannot fit is refused
+  **before** BR-6 asks for consent, so a user is never walked through
+  approving four commands, watching them run, and then being told the turn was
+  refused. A skill that fits on its body and overflows only after its dynamic
+  output is refused after — and the message says which happened.
+
+  Depends on REQ-586 (merged `c9e9265`).
 - [ ] BR-9: **The model is told the truth about commands, in one place, inside
   the guide's constraints.** The bundled self-configuration guide carries
   BUG-181's sentence — *"Teton loads nothing from `.claude/` or `~/.claude`
@@ -328,15 +394,34 @@ client's own echo line is the record.
   with a refusal **without reading stdin** — today the shell consent on a
   pipe is answered from the next stdin line, and a pasted second line must
   not become a `y` (LESSON-537's shape) — so the commands are not run and
-  their placeholders say no human could be asked. At `full` there is nothing
+  their placeholders say no human could be asked. The client must be able to
+  recognize such a request **without parsing the permission key**: the key's
+  `skill:<name>` shape is illustrative and a client sniffing an unstable
+  string would mis-fire in the one direction that costs a stdin line. The
+  request therefore carries an explicit signal, and a client that does not
+  recognize it **refuses** rather than falling back to reading stdin —
+  fail-closed, in the direction that can only cost a skill invocation, never a
+  swallowed prompt line. At `full` there is nothing
   to ask: dynamic context runs on a pipe exactly as on a TTY, which is the
   automation posture — an unattended runner that wants the ethos include
   chooses `full` for the session, the same choice it makes for every `shell`
   call, and `plan` refuses on a pipe as it does on a TTY.
 - [ ] BR-12: **Observable, not noisy.** Every invocation echoes one line
-  naming the skill, its source and size, and how many dynamic commands ran
-  (`/status → skill status (user, 5.3 KB, 4 dynamic commands)`); the body is
-  never printed (it is in the file). `/verbose` adds the home-relative path,
+  naming the skill, its source and size, and its dynamic commands
+  (`/status → skill status (user, 5.3 KiB, 4 dynamic commands)`); the body is
+  never printed (it is in the file). Two spellings, decided in implementation
+  and recorded here: the size is rendered by `teton_protocol::format_bytes`,
+  the product's one byte formatter — which the daemon's own skip reasons
+  already speak (`over 64 KiB (67,184 B)`) — so the unit is `KiB`, and a
+  second spelling of a size inside one feature would be worse than a suffix
+  that differs from this illustration. And the line reports **both** numbers
+  whenever they differ (`4 dynamic commands, none run`; `3 dynamic commands,
+  1 run`): after a decline, a `plan` denial or a pipe refusal every command is
+  a placeholder in the prompt rather than output, and a bare count would put
+  the one line the user sees at odds with what the model actually got, with
+  the record that resolves it behind `/verbose`. A command that started and
+  failed **ran** — the model has its placeholder and the fact that it was
+  attempted. `/verbose` adds the home-relative path,
   the ignored frontmatter keys and each dynamic command's typed outcome. The
   turn appears in `/cost` as the prompt turn it is.
 - [ ] BR-13: **The body is passed as written; fidelity is stated, not
@@ -418,18 +503,33 @@ client's own echo line is the record.
   a command that exits non-zero yields a failed placeholder. (daemon unit;
   BR-6)
 - [ ] AC-11: Egress-capture: with a remote provider bound to the tier the
-  turn routes to, (a) a skill file under a `local-only` boundary pins the
-  turn local and nothing leaves the machine — exactly as a `read` of that
-  file would pin it; (b) with a boundary configured anywhere and a skill that
-  ran any dynamic command, the turn is pinned local because that output's
-  provenance is `Unknown`, exactly as a `shell` result's is; (c) with no
+  turn routes to, (a) a **project** skill file under a `local-only` boundary
+  pins the turn local and nothing leaves the machine — exactly as a `read` of
+  that file would pin it, because it sits under the session root and mints a
+  root-relative provenance id; a **user** skill at `~/.claude/skills/…` in a
+  repo-rooted session has no root-relative identity, so no id can be minted and
+  its block is marked unpinnable, which pins the turn local whenever *any*
+  boundary is configured — stricter than the `read`, and the AC asserts the two
+  separately rather than folding them (architecture ADR-9); (b) with a boundary
+  configured anywhere and a skill that ran any dynamic command, the turn is
+  pinned local because that output's provenance is `Unknown`, exactly as a
+  `shell` result's is; (c) with no
   boundary configured, a skill that ran dynamic commands reaches the remote
   provider and the payload is the expansion. (egress-capture; BR-7)
 - [ ] AC-12: A skill body that plants `User:`, `Assistant:` and `<|im_start|>`
   reaches the frame neutralized by the guards a typed prompt gets; a
   `<tool-result>` planted in a dynamic command's *output* reaches the frame
-  neutralized by the envelope; a test removing any one guard fails. (daemon
-  unit; BR-5)
+  neutralized by the envelope; a `<tool-result>` planted in the **body**
+  reaches it neutralized too — the expansion is one user block holding
+  file-supplied prose *concatenated with* a harness-authored envelope, so a
+  flush-left `</tool-result>` in the body would close the envelope of the
+  dynamic block spliced after it, and the expander is a frame author with a
+  frame author's duty (architecture ADR-10); and a flush-left `</tool-result>`
+  on the second line of a multi-line `` !`…` `` reaches it neutralized where
+  the fold echoes that command verbatim into a not-run placeholder — the
+  inversion is the point: `plan`, the level at which no command runs, is the
+  level at which the raw command bytes reach the model. A test removing any
+  one guard fails. (daemon unit; BR-5)
 - [ ] AC-13: A skill whose frontmatter says `allowed-tools: Bash(*)`,
   `model: opus`, `effort: max` registers; the session's permission level,
   effort and the turn's route are exactly what they would be for typed text;
@@ -442,19 +542,36 @@ client's own echo line is the record.
   is updated, not deleted: still one `/help` line, both paths, "only the user
   runs"; the "loads nothing from" assertion re-worded with the sentence; the
   `asking`-line count still 1; no `teton …` form; the two prompt-margin tests
-  green without moving the ceiling again. The skill roster is **not** in the
-  system prompt. (unit; BR-9)
+  green without moving the ceiling again — the recorded post-REQ-586 headroom
+  is **868 B** on the tighter shape (`docs/manual-verification.md`), not
+  BUG-181's 1 byte, so the sentence has room. The skill roster is **not** in
+  the bundled guide — worded that way rather than "not in the system prompt"
+  because REQ-587 puts a roster in the `skill` tool's description, which *is*
+  part of the assembled prompt; this AC must not fail the moment that lands.
+  (unit; BR-9)
 - [ ] AC-16: A skill whose expansion plus system prompt exceeds the
   **route's** budget is refused before any model call with a message naming
   the skill, its size, the budget and REQ-586's bound; the refusal is a typed
   outcome, not a clamped turn; a typed oversized prompt still elides (loudly,
   REQ-586 BR-7) — pinned so the refusal is seen to apply to skill turns only;
-  removing the check makes the test fail. Measured against the real corpus:
+  removing the check makes the test fail. Measured against the real corpus,
+  with every bound rendered through `BudgetBound::words()`:
   on the local route `/status` expands and `/proceed` is refused with `bound:
-  local_engine`; on a route with `max_context = 128000` `/proceed` expands; on
+  local engine`; on a route with `max_context = 128000` `/proceed` expands; on
   a remote route with `max_context = 0` `/proceed` is refused with `bound:
-  default_unknown` and the message names `capabilities.max_context`. (daemon
-  unit; BR-8)
+  unknown window` and the message names `capabilities.max_context`; on a route
+  with `max_context = 4096` (the shipped Ollama recipe, floored to
+  `(2,048, 16,384)`) **both** `/proceed` and `/status` are refused and the
+  message says the declared window was floored — but **at different stages**,
+  and the test asserts which: `/proceed`'s body alone exceeds the budget, so it
+  is refused at Stage A before consent is spent; `/status`'s body *fits* (about
+  12.5 KB with the system prompt, against 16 KB) and it is refused at Stage B
+  once its dynamic-context output is folded in. Stated that way because the
+  `/status` half depends on what its commands print, so an AC that only said
+  "both are refused" would pass vacuously on a machine where they print little
+  and would hide a Stage-A regression on one where they print a lot; and a
+  refused turn emits **no** `context_pressure` event of any kind (BR-8c).
+  (daemon unit; BR-8)
 - [ ] AC-17: `/analyze` with an `analyze` entry that was skipped prints the
   skipped reason; with no entry at all prints the pre-REQ
   `unknown command: `/analyze`` bytes — pinned in `cli_e2e` beside the
@@ -469,7 +586,10 @@ client's own echo line is the record.
 - [ ] AC-20: **Dogfood, by hand, recorded in `docs/manual-verification.md`:**
   in the teton-code repo with the ADLC toolkit installed (its
   `~/.claude/skills` a symlink) and the Kimi provider given `max_context =
-  128000` (REQ-586 AC-14), (a) `/status` expands, the ethos include and its
+  1000000` — the shipped recipe's figure, which is what `/provider setup`
+  records by default and is well above the ≈32k the corpus needs; a
+  hand-lowered 128,000 is equally valid, and the runbook records which was
+  used — (a) `/status` expands, the ethos include and its
   `ls`/`grep` commands run under one `guarded` consent, and the model
   produces a status report using `read`/`glob`/`shell`; (b) `/validate
   REQ-585` expands and the model validates this spec's own file; (c)
@@ -478,10 +598,16 @@ client's own echo line is the record.
   caveat); `/proceed REQ-585` expands and the point at which it stalls (the
   first "invoke the skill" step) is recorded as the Deferred follow-ups'
   evidence; (d) on the local tier `/analyze` is refused with the BR-8 message
-  naming `bound: local_engine`; (e) unattended: `printf '/status\n' | teton
-  --permissions full` runs the dynamic context without a prompt and produces
-  the report, and the same at `guarded` produces placeholders and still
-  completes; (f) if the machine has a `local-only` boundary configured, (a)
+  naming `bound: local engine` — the spoken form `BudgetBound::words()`
+  produces, never the snake_case wire spelling (BR-8a, AC-16); (e) unattended:
+  `printf '/permissions full\n/status\n' | teton` runs the dynamic context
+  without a prompt and produces the report, and the same without that first
+  line (at `guarded`) produces placeholders and still completes. Spelled that
+  way because **`--permissions` is not a flag** — `teton`'s globals are `--yes`
+  and `--verbose` — so the obvious-looking invocation would send an unattended
+  runner to a parse error at the one moment nobody can be asked anything. The
+  durable form is `[permissions] default_level = "full"` in the config, and the
+  refusal line names both; (f) if the machine has a `local-only` boundary configured, (a)
   and (b) run on the local tier and the runbook says why (BR-7). (manual;
   BR-8, BR-11, BR-13)
 
@@ -490,14 +616,27 @@ client's own echo line is the record.
 - None new. The frontmatter is a flat `key: value` block of three string
   keys; no YAML library is required or wanted for it (a full parser is an
   attack surface the feature does not need — see Assumptions).
-- **REQ-586 (route-aware context budget) lands first** — BR-8 and the
-  success bar stand on its derived budget, its `bound` fact and its
-  `context_pressure` surface. Spec drafted 2026-08-19 alongside this
-  revision.
-- Sequencing: BUG-181 is merged (`main` at 7796dca, 2026-08-19) and its
-  sentence is the one BR-9 amends. The ADLC toolkit on the dogfood machine,
-  and its Kimi record carrying `max_context = 128000`, are AC-20's
-  preconditions.
+- **REQ-586 (route-aware context budget) — MERGED** `c9e9265`, wrapup
+  `adc6740` (2026-08-20). BR-8 and the success bar stand on its delivered
+  budget, its `BudgetBound::words()` table, its `floored` fact and its
+  `context_pressure` surface. Three things changed shape during its build and
+  this spec was corrected against them at Phase-1 re-validation: the floor,
+  the two-currency AND (bytes bind first), and the spoken-vs-wire bound
+  spelling.
+- **REQ-587 (model-invoked skills) — spec PR #193, validated.** It amends two
+  things this REQ states as settled: the dynamic-context grant key gains a
+  digest of the *substituted* command set for **both** callers (so this REQ's
+  Assumption on remembering granularity is provisional — see Assumptions), and
+  it re-scopes AC-15's roster clause. Sequence 585 → 587.
+- **REQ-584 (project locator) — spec PR #185, open.** Independent but
+  colliding: it adds a `/projects` row to `COMMANDS`, which is why BR-3's
+  built-in-bytes claim is stated against this REQ's merge base rather than as
+  an absolute, and why `projects` joins BR-2's reserved set whichever order
+  they land in. It also spends resident-prompt headroom this REQ and REQ-587
+  both count against.
+- Sequencing: BUG-181 is merged (`main` at 7796dca) and its sentence is the
+  one BR-9 amends. The ADLC toolkit on the dogfood machine is AC-20's
+  precondition.
 
 ## Assumptions
 
@@ -519,8 +658,12 @@ client's own echo line is the record.
 - The permission gate keys grants by tool name and gives an unknown key the
   level table's default posture (ask / ask / deny / allow across guarded /
   edits / plan / full); BR-6's per-skill key rides that and invents no new
-  remembering granularity. Per-command-string remembering would be new and
-  is not needed.
+  remembering granularity. **Provisional**: REQ-587 BR-5 makes the key carry a
+  digest of the substituted command set whenever a command interpolates
+  `$ARGUMENTS`/`$N`, for both the user-typed and the model-invoked caller —
+  which *is* new machinery and supersedes this assumption when it lands. AC-8's
+  "for this session answers the next invocation of the same skill" holds under
+  either rule for a skill whose commands do not interpolate.
 - Prompt text carries no file provenance today and shell output carries
   `Unknown` provenance; BR-7's skill-file provenance is new machinery, and
   the `Unknown`-pins-local consequence for dynamic context is accepted for v1
@@ -534,11 +677,15 @@ client's own echo line is the record.
   `/validate`, `/status`, `/review`, `/canary`, `/adversary`, `/init`,
   `/architect`, `/bugfix` (2,427) — the last three only when their other
   dynamic commands stay small (`/architect`'s `cat .adlc/context/architecture.md`
-  alone is ~6,400 words in this repo and will push it over) — and refuses
+  alone is bounded by the `shell` tool's `MAX_OUTPUT_CHARS` = 8,000 — ≈1,150
+  words, not the file's ~6,400; the real per-invocation bound is
+  *commands × 8,000 chars*, so a six-command skill like `/template-drift` can
+  add ≈48 KB) — and refuses
   `/spec` (2,717), `/manifest`, `/analyze`, `/template-drift`, `/wrapup`,
   `/sprint`, `/proceed` (7,222); on a remote route with a declared window of
   16k tokens or more, all seventeen expand (`/proceed` is 8,671 words with
-  ethos and system prompt, ≈ 13k tokens at REQ-586's working ratio). On a
+  ethos and system prompt — but the BYTE half binds first, so the real
+  threshold is a declared window of ≈32k tokens, not 16k. On a
   machine with `[privacy] redact = true`, REQ-586 BR-4's scannable bound
   (≈ 89 KB with today's constants) still admits every skill — `/proceed`'s
   expansion is ≈ 61 KB with ethos and system prompt — so the success bar
@@ -644,6 +791,22 @@ client's own echo line is the record.
 - The VS Code extension (phase 2 client; it inherits whatever OQ-1 puts in
   the daemon).
 
+## Follow-ups filed at wrapup
+
+Found by the Phase 5 verify panel, not fixed in this REQ, and each filed rather
+than left as a comment:
+
+- **BUG-183** — AC-19's cost-attribution tests never touch the skill path, and
+  their central assertion is implied by their own setup. The only AC in this
+  REQ whose test would pass with the feature deleted.
+- **BUG-184** — skill discovery runs on the connection's synchronous reader
+  loop, where a macOS TCC dialog can park it.
+- **BUG-185** — one consent buys an unbounded number of dynamic commands, and
+  the invocation has no deadline of its own.
+- **BUG-186** — `NotRunReason` and the wire `DynamicOutcome` are closed enums
+  travelling daemon→client, so a future variant silently drops the whole
+  `skill_invoked` event on an older client.
+
 ## Deferred
 
 - ~~Route-aware context budget~~ — promoted to **REQ-586**, which lands
@@ -689,6 +852,33 @@ decided by the product owner ("big skills are the point, we need them for
 automation"): REQ-586 was drafted the same day, and this spec was re-scoped
 onto it — Description, BR-8, BR-11 (unattended posture), BR-13, AC-16, AC-20,
 External Dependencies, Assumptions, Deferred.
+
+## Validation
+
+`/validate` ran twice. **2026-08-19 (spec draft)**: 1 Blocker, 10 Warnings,
+5 Info — all applied; the Blocker was the single 4,096-token budget on every
+tier, which produced OQ-0 and REQ-586.
+
+**2026-08-20 (`/proceed` Phase 1, re-validated against REQ-586 as *merged*
+rather than as planned)**: 3 Blockers, 8 Warnings, 4 Info — all applied. The
+three Blockers were all places this REQ had rented a layer from REQ-586 that
+changed shape during its build: (F-1) AC-16/BR-8 pinned the **wire** spelling
+of the bound, but REQ-586 shipped `BudgetBound::words()` in `teton-protocol`
+expressly so this refusal could speak it — implementing as written would have
+minted the second adjective table LESSON-528 warns about; (F-2) the success
+bar "every skill expands on a route whose window is **declared**" is false for
+the shipped Ollama recipe, whose declared 4,096 derives to *half* the local
+pair once REQ-586's floor applies — the property is **sized**, not declared;
+(F-3) the ≈16k threshold reasoned in words, but the guard is an AND over two
+currencies and the **byte** half binds first for prose-heavy bodies, making
+the real figure ≈32k. Warnings covered the refusal's silence and ordering
+(F-4), the `floored` clause (F-5), `/help` placement against the pinned
+`ESCAPE_FOOTER` and the now-false argument footer (F-6), the pipe rule needing
+a recognizable signal rather than a key shape (F-7), stale REQ-586 status text
+(F-8), the `/architect` dynamic-context figure against the shell tool's real
+8,000-char cap (F-9), and the REQ-587/REQ-584 overlaps (F-10, F-11). Info:
+the recorded 868 B headroom (F-12), AC-20's Kimi figure (F-13), refusing
+before spending consent (F-14), and the component tag (F-15).
 
 ## Retrieved Context
 

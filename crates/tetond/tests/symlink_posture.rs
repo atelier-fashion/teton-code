@@ -974,3 +974,133 @@ fn a_dangling_link_is_refused_rather_than_minted_under_its_own_name() {
     );
     fx.cleanup();
 }
+
+// ---------------------------------------------------------------------------
+// REQ-585 BR-1 — the third posture: skill discovery
+// ---------------------------------------------------------------------------
+//
+// This file's subject is that a symlink is a second name for a file and each
+// tool class has to answer that differently. REQ-585 adds a third class, and it
+// splits the question in a way neither of the other two does:
+//
+// | class | a symlinked **root** | a symlinked **entry** |
+// |---|---|---|
+// | `read` / `edit` | followed, judged by the target | followed, judged by the target |
+// | `grep` / `glob` | (walked from the root given) | skipped, wherever it resolves |
+// | skill discovery | **followed** | **never followed** |
+//
+// The root half is not a concession: the dogfood machine's `~/.claude/skills`
+// *is* a symlink into a checkout, and a loader that refused it would find
+// nothing on the machine this REQ was written for. The entry half is the
+// narrowing, and its reason is the one ADR-A gives for `grep`/`glob`: a followed
+// entry link registers one file under two names — two `/`-commands, two
+// permission keys (`skill:user:<name>`) and two identities for one skill.
+//
+// The contrast is asserted rather than described: the very bytes discovery
+// declines to register a second time are bytes `read` hands over on request.
+
+/// **BR-1's narrowing, beside the postures it narrows from.** A symlinked root
+/// is followed; a symlinked entry under it is skipped with its reason, even when
+/// its target is a perfectly good skill directory inside the same tree — which
+/// `read` will open by that same name, and does, in the second half of this test.
+#[test]
+fn skill_discovery_follows_a_symlinked_root_and_never_a_symlinked_entry() {
+    let base = std::env::temp_dir().join(format!(
+        "teton-skilllink-{}-{:x}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .subsec_nanos()
+    ));
+    let _ = std::fs::remove_dir_all(&base);
+    let shelf = base.join("shelf");
+    let home = base.join("home");
+    let repo = base.join("repo");
+    std::fs::create_dir_all(shelf.join("one")).unwrap();
+    std::fs::create_dir_all(home.join(".claude")).unwrap();
+    std::fs::create_dir_all(&repo).unwrap();
+    std::fs::write(
+        shelf.join("one/SKILL.md"),
+        "---\ndescription: the real one\n---\nSKILL-BODY-MARKER\n",
+    )
+    .unwrap();
+    // The dogfood shape: the whole `skills` root is a link into a checkout.
+    symlink(&shelf, home.join(".claude/skills")).unwrap();
+    // …and inside it, an entry that is a link to a directory holding a
+    // genuinely valid skill. Nothing about the target is wrong; being reached
+    // by a second name is.
+    let entry_link = shelf.join("two");
+    symlink(shelf.join("one"), &entry_link).unwrap();
+
+    // Positive controls: both links really resolve, so neither half below is
+    // about a broken link.
+    assert!(
+        home.join(".claude/skills/one/SKILL.md")
+            .canonicalize()
+            .is_ok(),
+        "fixture: the root link must resolve"
+    );
+    assert!(
+        entry_link.join("SKILL.md").canonicalize().is_ok(),
+        "fixture: the entry link must resolve to a real skill file"
+    );
+
+    let registry = tetond::skills::discover(
+        Some(&home),
+        &repo,
+        teton_protocol::methods::RootKind::Project,
+        &tetond::skills::RealFs,
+    );
+
+    // The root was followed …
+    let names: Vec<&str> = registry
+        .skills()
+        .iter()
+        .map(|skill| skill.name.as_str())
+        .collect();
+    assert_eq!(
+        names,
+        vec!["one"],
+        "the skill behind the symlinked root must register, and the one behind \
+         the symlinked entry must not — a second name for a file is a second \
+         `/`-command and a second permission key for it"
+    );
+    // … and the entry was not, with its reason named rather than dropped.
+    let skipped: Vec<(std::path::PathBuf, String)> = registry
+        .skipped()
+        .iter()
+        .map(|entry| (entry.path.clone(), entry.reason.to_string()))
+        .collect();
+    assert_eq!(
+        skipped,
+        vec![(
+            // Named as discovery *opened* it — through the root it was globbed
+            // under, not through the checkout the root resolves into. That is
+            // the path a user would go and look at.
+            home.join(".claude/skills/two"),
+            "symlink not followed".to_owned(),
+        )],
+        "the skipped entry is named with why, and it is the only diagnostic"
+    );
+
+    // The contrast that makes this a *narrowing*: `read`, jailed to the same
+    // tree, opens the file through the very name discovery refused — and hands
+    // back the target's bytes under the target's identity, as AC-3 requires.
+    let ctx = ToolContext::new(&shelf);
+    let out = ReadTool.run(&ctx, &json!({ "path": "two/SKILL.md" }));
+    assert!(!out.is_error, "{}", out.content);
+    assert!(
+        out.content.contains("SKILL-BODY-MARKER"),
+        "the read through the link must surface the target's bytes: {}",
+        out.content
+    );
+    assert_eq!(
+        sole_identity(&out),
+        "one/SKILL.md",
+        "`read` resolves the link and is judged by its target — the posture \
+         discovery deliberately does not share"
+    );
+
+    std::fs::remove_dir_all(&base).ok();
+}

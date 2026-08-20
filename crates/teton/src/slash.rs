@@ -104,8 +104,8 @@ use teton_protocol::jsonrpc::{error_code, RpcError};
 use teton_protocol::methods::{
     ConfigGetParams, ConfigSetParams, ConfigUpdate, ModelStatusParams, PromptBlock,
     PromptTurnParams, SessionClearParams, SessionPermissionsParams, SessionPermissionsResult,
-    SessionRoot, SessionSetCwdParams, WebOverrideParams, WebOverrideResult, WebRefreshOutcome,
-    WebRefreshParams, WebRefreshResult,
+    SessionRoot, SessionSetCwdParams, SkillSkipped, SkillSource, SkillView, SkillsListResult,
+    WebOverrideParams, WebOverrideResult, WebRefreshOutcome, WebRefreshParams, WebRefreshResult,
 };
 use teton_protocol::permissions::PermissionLevel;
 use teton_protocol::SessionId;
@@ -131,9 +131,17 @@ const ESCAPE_FOOTER: &str =
 /// nothing in practice; it is documented rather than hidden because the shape it
 /// forbids (a glob with a space) is legal in principle and the shell twin does
 /// accept it.
+///
+/// REQ-585 ADR-12 **qualifies** it: a skill row takes its line as typed (BR-4),
+/// so the sentence is true of the built-in rows and false of the section below
+/// them. The qualification is *appended* rather than folded into the subject —
+/// `cli_e2e` pins the original clause as a substring, and rewriting the opening
+/// into "Built-in command arguments…" would move a byte a test elsewhere reads.
+/// One sentence of scope, added where the reader already is.
 const ARGUMENT_FOOTER: &str =
     "Command arguments are split on whitespace and quotes are not interpreted — a value with a \
-     space in it has to be given to `teton` in a shell.";
+     space in it has to be given to `teton` in a shell. That is how the built-in rows above read \
+     an argument; a skill row is handed its line as typed.";
 
 /// The tail every rejected command line carries, so an unknown command and a
 /// misused one point at the same place (BR-2).
@@ -256,11 +264,138 @@ pub enum Input<'a> {
     /// of a help page is an error. It is the one CLI outcome that renders more
     /// than a line, which is also why it cannot ride [`Self::CliRefused`].
     CliHelp(String),
+    /// A `/` line whose first token names a registered, **unshadowed** skill
+    /// (REQ-585 BR-10, ADR-13): the registry's spelling of the name, and the
+    /// rest of the line as typed.
+    ///
+    /// Owned, and deliberately so. The registry is a snapshot the session
+    /// re-fetches when its root moves (`/cd`), so a borrow taken from it would
+    /// have to outlive the fetch that replaces it — and the only ways to give a
+    /// borrowed name the `'static` the table's rows have are to leak the
+    /// registry or to intern the name, both of which would keep dispatching a
+    /// skill the session no longer has. Two `String`s per invocation, once per
+    /// typed line, is the price of a snapshot that can be dropped.
+    ///
+    /// `raw_arguments` is the line's own bytes after the name, trimmed at the
+    /// edges and untouched inside: interior whitespace runs and quotes survive,
+    /// because BR-4 hands them to the skill body rather than tokenizing them
+    /// (which is what [`ARGUMENT_FOOTER`]'s qualification tells the user).
+    Skill {
+        /// The dispatchable name, as the registry spells it.
+        name: String,
+        /// Everything after the name, as typed.
+        raw_arguments: String,
+    },
     /// A prompt that opened with the `//` escape, with exactly the leading pair
     /// collapsed to one `/` (BR-1b).
     EscapedPrompt(&'a str),
     /// A plain prompt — the input line's own bytes, untouched.
     Prompt(&'a str),
+}
+
+/// What this session's skill registry looks like from the client (REQ-585
+/// ADR-1/ADR-2).
+///
+/// The daemon owns the registry — it reads the files, decides the name
+/// contests, and bounds every field that came out of one — and this is the whole
+/// of what crosses to the client: enough to classify a `/name` line and to print
+/// a `/help` row. No body, no absolute path, no second reader of `~/.claude`.
+///
+/// It is a **snapshot**, refreshed after `session/create` and again after every
+/// `session_root_changed` (TASK-207), which is why nothing derived from it is
+/// ever `'static`: a `/cd` replaces it, and a name that outlived its snapshot
+/// would dispatch a skill the session no longer has.
+///
+/// The default is empty, and empty is a load-bearing state rather than a
+/// degenerate one: a user with no `~/.claude` has one, and so does a client
+/// talking to a daemon that answers `skills/list` with `METHOD_NOT_FOUND`
+/// (ADR-2). An empty snapshot makes [`classify`] incapable of returning
+/// [`Input::Skill`] and renders no `/help` section at all, which is what makes
+/// "byte-for-byte what it is today" true for both of them.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct SkillSnapshot {
+    /// Every registered skill, shadowed ones included — `/help` lists them and
+    /// [`classify`] refuses them, and BR-3 needs both to be reading one list.
+    /// Ordered by the daemon (LESSON-540: a client-side sort would be a
+    /// platform-flaky `/help`).
+    skills: Vec<SkillView>,
+    /// Everything discovery found and did not register, with why. Feeds
+    /// `/help`'s diagnostic line and BR-10's unknown-command hint.
+    skipped: Vec<SkillSkipped>,
+}
+
+impl SkillSnapshot {
+    /// The snapshot every session starts with, and the one an old daemon
+    /// leaves it with (ADR-2).
+    #[must_use]
+    pub const fn empty() -> Self {
+        Self {
+            skills: Vec::new(),
+            skipped: Vec::new(),
+        }
+    }
+
+    /// Nothing was found: no skills, and nothing skipped either.
+    ///
+    /// The predicate `/help` reads (ADR-12) — a section announcing `0 skills`
+    /// to the majority of users who have no `~/.claude` would be the line that
+    /// makes "`/help` is unchanged" false for them.
+    fn is_empty(&self) -> bool {
+        self.skills.is_empty() && self.skipped.is_empty()
+    }
+
+    /// The skill a `/name` line reaches, or `None` — the **only** way a skill
+    /// is looked up (BR-2).
+    ///
+    /// A shadowed entry is listed and never returned: `shadowed` names what
+    /// owns the spelling instead, and honouring it here is what keeps `/help`'s
+    /// mark and the dispatcher from disagreeing.
+    fn dispatchable(&self, name: &str) -> Option<&SkillView> {
+        self.skills
+            .iter()
+            .find(|view| view.name == name && view.shadowed.is_none())
+    }
+
+    /// The skipped entry a typed name would have been, or `None` (AC-17).
+    ///
+    /// Matches the **carried** `name`, not one re-derived from the path.
+    /// BR-2's naming rule (directory for `skills/`, stem for `commands/`)
+    /// belongs to discovery, which is the only place that knows which of the
+    /// four roots an entry came from; a copy here would be a second home for
+    /// it in the crate that cannot see them (LESSON-546). It is also strictly
+    /// weaker — a symlinked `commands/<name>.md` is refused before it is ever
+    /// a file that was opened, and its path alone cannot give the name back.
+    fn skipped_named(&self, name: &str) -> Option<&SkillSkipped> {
+        self.skipped
+            .iter()
+            // Never on an empty name: a root-level diagnostic (an unreadable
+            // directory, a truncated listing) names no skill and carries the
+            // empty string, which would otherwise match a bare `/` and answer
+            // for a line nobody meant to type.
+            .find(|entry| !entry.name.is_empty() && entry.name == name)
+    }
+
+    /// How many registered skills came from each root, as `/help`'s diagnostic
+    /// line counts them: `(user, project)`.
+    fn source_counts(&self) -> (usize, usize) {
+        let user = self
+            .skills
+            .iter()
+            .filter(|view| view.source == SkillSource::User)
+            .count();
+        (user, self.skills.len() - user)
+    }
+}
+
+/// A snapshot is built from the wire result and from nothing else — there is no
+/// second constructor a test could reach that production does not (LESSON-544).
+impl From<SkillsListResult> for SkillSnapshot {
+    fn from(result: SkillsListResult) -> Self {
+        Self {
+            skills: result.skills,
+            skipped: result.skipped,
+        }
+    }
 }
 
 /// What the entry loop does once a command has run.
@@ -702,8 +837,24 @@ const COMMANDS: &[CommandSpec] = &[
 /// the parser's own — clap's tree decides which words are a subcommand path —
 /// and everything it does not recognize reaches the model with its bytes
 /// unchanged.
+///
+/// # The registry is consulted last, and that is the whole of BR-2
+///
+/// REQ-585 adds one bucket and one parameter. The order inside is `//` escape →
+/// [`cli_line`] → [`split_name`] against [`COMMANDS`] → **then** `registry`
+/// (ADR-13), and the order is the requirement: a built-in match *returns*
+/// before the snapshot is reachable, so "reserved names always win" is a
+/// property of this function's shape rather than a list somewhere that has to
+/// stay in step with the table. A skill can only be reached by a name no row
+/// claims — which is also why the client does not have to trust the daemon to
+/// have marked `/cost` shadowed before it refuses to dispatch it.
+///
+/// The registry is borrowed and nothing borrowed from it is returned: the
+/// output lifetime is the *input line's* (`'a`), and [`Input::Skill`] owns its
+/// two strings. A snapshot is replaced on `/cd`, so a name that outlived one
+/// would name a skill the session no longer has.
 #[must_use]
-pub fn classify(input: &str) -> Input<'_> {
+pub fn classify<'a>(input: &'a str, registry: &SkillSnapshot) -> Input<'a> {
     let Some(rest) = input.strip_prefix('/') else {
         return cli_line(input).unwrap_or(Input::Prompt(input));
     };
@@ -735,7 +886,122 @@ pub fn classify(input: &str) -> Input<'_> {
         return recognized;
     }
     let (name, args) = split_name(rest, COMMANDS);
+    // The built-in table, first and structurally (ADR-13). `split_name` has
+    // already canonicalised any alias, so this is the same question `resolve`
+    // asks one step later — asked here so that the `return` below happens
+    // before the registry is in scope at all.
+    if let Some(spec) = builtin_row(name) {
+        return Input::Command {
+            name: spec.name,
+            args,
+        };
+    }
+    // Only now, and only for a name nothing in the table claims (BR-2) — which
+    // is a wider set than the rows: `provider` is spelled by no row, so
+    // `builtin_row` above says nothing about it, and `/provider foo` would
+    // reach a skill while `/provider list` stayed with the table. The daemon
+    // cannot close this (it has no `COMMANDS` to read — `tetond` does not
+    // depend on `teton`), so the reserved set is enforced here or nowhere.
+    if table_claim(name).is_none() {
+        if let Some(view) = registry.dispatchable(name) {
+            return Input::Skill {
+                name: view.name.clone(),
+                raw_arguments: args.to_owned(),
+            };
+        }
+    }
+    // Names no row and no skill: still a command line, still rejected by
+    // `resolve` with the bytes it has always used (BR-10).
     Input::Command { name, args }
+}
+
+/// The table row a classified name belongs to, or `None`.
+///
+/// One home for "is this spelling the table's" — [`classify`] asks it to decide
+/// whether the registry is reachable at all, [`resolve`] to decide whether to
+/// run or to reject, [`run_cli_line`] to find the row clap walked to, and
+/// [`render_help`] to decide whether a skill row is dispatchable. Several callers
+/// of one lookup, so `/help`'s shadow mark cannot claim something the
+/// dispatcher does not (BR-3).
+///
+/// Takes the **canonical** name: [`split_name`] resolves aliases before anyone
+/// looks a name up, so `exit` reaches here as `quit`.
+fn builtin_row(name: &str) -> Option<&'static CommandSpec> {
+    COMMANDS.iter().find(|spec| spec.name == name)
+}
+
+/// What the built-in table claims a name for, or `None` when a skill may have
+/// it — BR-2's reserved set, as a lookup rather than as a set, so a caller can
+/// say *why* a name is taken.
+///
+/// Three kinds, because BR-2 names three and they are taken for different
+/// reasons:
+///
+/// * a **row or alias** spelled exactly this — `/cost` runs the row;
+/// * a **family word**, the first word of a multi-word row. No row is spelled
+///   bare `provider`, so nothing above catches it, and a skill holding the name
+///   would take `/provider foo` while `/provider list` stayed with the table —
+///   one spelling reaching two handlers, which is the thing REQ-555 forbids;
+/// * **`teton`**, claimed by REQ-582's `cli_line` before the table is consulted
+///   at all, so a skill with that name is unreachable by construction and must
+///   be *seen* to be unreachable rather than silently listed.
+///
+/// Derived from [`COMMANDS`] and cached, never hand-listed: a hand-written copy
+/// is a second home for a fact whose first home is the table, and it ships
+/// green the day a row is added (LESSON-546, LESSON-456).
+fn table_claim(name: &str) -> Option<TableClaim> {
+    static CLAIMS: std::sync::OnceLock<std::collections::BTreeMap<&'static str, TableClaim>> =
+        std::sync::OnceLock::new();
+    CLAIMS
+        .get_or_init(|| {
+            let mut claims = std::collections::BTreeMap::new();
+            for spec in COMMANDS {
+                for spelling in spec.spellings() {
+                    let first = first_word(spelling);
+                    if first != spelling {
+                        claims.entry(first).or_insert(TableClaim::Family(first));
+                    }
+                }
+            }
+            // Rows last, and overwriting: a word that is both a family word and
+            // a row in its own right is the row (`/model` exists beside
+            // `/model set`), and the mark should say so.
+            for spec in COMMANDS {
+                for spelling in spec.spellings() {
+                    claims.insert(spelling, TableClaim::Row(spec));
+                }
+            }
+            claims.insert(TETON, TableClaim::TetonCli);
+            claims
+        })
+        .get(name)
+        .copied()
+}
+
+/// What [`table_claim`] found, and the words for it.
+///
+/// No `PartialEq`: [`CommandSpec`] carries a function pointer and does not have
+/// one, and nothing here needs to compare two claims — callers ask whether a
+/// name is claimed and, if so, how to say it.
+#[derive(Debug, Clone, Copy)]
+enum TableClaim {
+    /// A row or one of its aliases, spelled exactly.
+    Row(&'static CommandSpec),
+    /// The first word of one or more multi-word rows.
+    Family(&'static str),
+    /// REQ-582's `teton …` recognition, which runs before the table.
+    TetonCli,
+}
+
+impl TableClaim {
+    /// How `/help` names the claim in a shadow mark.
+    fn words(self) -> String {
+        match self {
+            Self::Row(spec) => format!("the built-in `/{}`", spec.name),
+            Self::Family(word) => format!("the `/{word}` commands"),
+            Self::TetonCli => "the `teton` command line".to_owned(),
+        }
+    }
 }
 
 /// Sort a line whose first word may be `teton` into its CLI bucket, or `None`
@@ -883,14 +1149,21 @@ fn after_words(line: &str, count: usize) -> &str {
     rest.trim()
 }
 
-/// Build the `prompt/turn` request a classified prompt line becomes.
+/// Build the `prompt/turn` request a classified **prompt** line becomes.
 ///
-/// The **one** place the entry loop turns a line into a request, so what reaches
+/// The one place the entry loop turns a *prompt* into a request, so what reaches
 /// the daemon is the classifier's output and nothing else: a plain line arrives
 /// byte-identically to what was typed (AC-7) and an escaped line arrives with
 /// exactly the leading pair collapsed (AC-7b). `text` is the payload of an
 /// [`Input::Prompt`] or [`Input::EscapedPrompt`]; a command never reaches here
 /// at all (BR-1).
+///
+/// An [`Input::Skill`] does not reach here either, and has no sibling
+/// constructor beside this one: its request carries **no prompt at all**
+/// (REQ-585 ADR-3 — `prompt: vec![]` and a `skill` naming the invocation), so
+/// there is no line for a builder to turn into content. The entry loop composes
+/// it at the same place it calls this, from the classifier's own `name` and
+/// `raw_arguments`.
 #[must_use]
 pub fn prompt_turn_params(session_id: &SessionId, text: &str) -> PromptTurnParams {
     PromptTurnParams {
@@ -898,6 +1171,9 @@ pub fn prompt_turn_params(session_id: &SessionId, text: &str) -> PromptTurnParam
         prompt: vec![PromptBlock::Text {
             text: text.to_owned(),
         }],
+        // A typed line is never a skill invocation. The two fields are mutually
+        // exclusive and the daemon refuses a request carrying both (ADR-3).
+        skill: None,
     }
 }
 
@@ -906,15 +1182,27 @@ pub fn prompt_turn_params(session_id: &SessionId, text: &str) -> PromptTurnParam
 /// The table is consulted through [`resolve`]; a line that resolves to no row
 /// renders one hint and issues no RPC (BR-2).
 ///
+/// `registry` is the session's snapshot, and it is read for exactly one thing
+/// (REQ-585 BR-10 / AC-17): a name discovery *found and did not register* says
+/// why, rather than "unknown command". A name with no entry at all takes the
+/// pre-REQ branch with the pre-REQ bytes, and a *shadowed* name never arrives
+/// here at all — the row or the project skill ran (BR-2), which is why there is
+/// no shadow branch to word.
+///
 /// # Errors
 ///
 /// Propagates any transport error a handler's RPC raises.
 pub fn dispatch(
     name: &str,
     args: &str,
+    registry: &SkillSnapshot,
     conn: &mut Connection,
     ctx: &mut UiContext<'_>,
 ) -> anyhow::Result<CommandOutcome> {
+    if let Some(hint) = skipped_skill_hint(name, registry) {
+        render_rejection(&hint, ctx.surface);
+        return Ok(CommandOutcome::Continue);
+    }
     match resolve(name, args) {
         Resolution::Run(spec, args) => (spec.handler)(conn, ctx, args),
         Resolution::Rejected(hint) => {
@@ -922,6 +1210,43 @@ pub fn dispatch(
             Ok(CommandOutcome::Continue)
         }
     }
+}
+
+/// The one line a name discovery skipped gets instead of "unknown command"
+/// (REQ-585 BR-10, AC-17), or `None` when the pre-REQ answer is the right one.
+///
+/// Three guards, in this order, and each is a claim:
+///
+/// * a name the **table** claims is not this — the row runs, and a file that
+///   happened to share its name is the daemon's to mark shadowed, not this
+///   function's to report;
+/// * a name with **no skipped entry** is `None`, so `resolve` composes the
+///   unknown-command bytes it always has (AC-17's "unchanged" leg);
+/// * only a name that matches a skipped entry is answered here, in the daemon's
+///   own words for why.
+///
+/// The reason is the daemon's own words, bounded to one line where it was
+/// composed (TASK-203) and defused again at the writer, because
+/// [`render_rejection`] renders through [`Surface::line`]. It keeps
+/// [`HELP_HINT`]'s tail because `/help`'s diagnostic line is where the skipped
+/// file is named in full — the pointer points somewhere useful.
+///
+/// One residual, recorded rather than fixed: [`typed_token`] bounds the echoed
+/// name at [`ECHO_MAX_CHARS`] (40) while BR-2 admits a name up to 64, so a
+/// skipped skill with a name longer than 40 characters is quoted with an
+/// ellipsis. AC-17's "pre-REQ bytes unchanged" holds for every name under that
+/// bound, and widening the constant would loosen the echo guard for every
+/// rejection in this module for the sake of a name nobody types.
+fn skipped_skill_hint(name: &str, registry: &SkillSnapshot) -> Option<String> {
+    if table_claim(name).is_some() {
+        return None;
+    }
+    let entry = registry.skipped_named(name)?;
+    Some(format!(
+        "`{}` is a skill that was skipped: {} — {HELP_HINT}",
+        typed_token(name),
+        entry.reason,
+    ))
 }
 
 /// Run a recognized `teton …` line — the entry loop's [`Input::CliLine`] arm
@@ -961,6 +1286,13 @@ pub fn dispatch(
 /// tokens, the judge is the binary's own clap tree, and what the row receives is
 /// what that tree parsed.
 ///
+/// `registry` is passed straight through to [`dispatch`] and is never read on
+/// this path: a recognized `teton …` line names a table row by construction, so
+/// the skipped-skill hint it feeds has nothing to say about one. It is threaded
+/// rather than faked with an empty snapshot, because a second entry point that
+/// quietly disagrees with `dispatch` about what the session knows is the drift
+/// this module exists to avoid.
+///
 /// # Errors
 ///
 /// Propagates any transport error the row's handler raises, as [`dispatch`]
@@ -969,10 +1301,11 @@ pub fn run_cli_line(
     name: &str,
     args: &str,
     shell_flags: &str,
+    registry: &SkillSnapshot,
     conn: &mut Connection,
     ctx: &mut UiContext<'_>,
 ) -> anyhow::Result<CommandOutcome> {
-    let Some(spec) = COMMANDS.iter().find(|spec| spec.name == name) else {
+    let Some(spec) = builtin_row(name) else {
         // Unreachable: `cli_line` only ever names a table row. Rendered rather
         // than `unreachable!`ed because a panic in a session is worse than a
         // sentence in it.
@@ -988,10 +1321,10 @@ pub fn run_cli_line(
         // the argument so its own clap parse meets them and says they were
         // ignored (m5).
         if shell_flags.is_empty() {
-            return dispatch(name, args, conn, ctx);
+            return dispatch(name, args, registry, conn, ctx);
         }
         let with_flags = format!("{shell_flags} {args}");
-        return dispatch(name, with_flags.trim(), conn, ctx);
+        return dispatch(name, with_flags.trim(), registry, conn, ctx);
     }
     if !cli_rows::is_leaf_path(&words) {
         // A pre-REQ row whose name is a **family** — `model`, whose bare form
@@ -1027,7 +1360,7 @@ pub fn run_cli_line(
                     .line(LineKind::Info, &cli_rows::shell_flags_line(name, cli.yes)),
             }
         }
-        return dispatch(name, args, conn, ctx);
+        return dispatch(name, args, registry, conn, ctx);
     }
     let argv: Vec<&str> = std::iter::once(TETON)
         .chain(shell_flags.split_whitespace())
@@ -1096,7 +1429,7 @@ pub fn run_cli_line(
         ctx.surface
             .line(LineKind::Info, &cli_rows::shell_flags_line(name, cli.yes));
     }
-    dispatch(name, &row_args, conn, ctx)
+    dispatch(name, &row_args, registry, conn, ctx)
 }
 
 /// Split a command line into its name and trailing argument. The table name
@@ -1179,8 +1512,14 @@ enum Resolution<'a> {
 }
 
 /// Look a classified command name up in the table. Pure.
+///
+/// Built-in only, and stays that way (REQ-585 ADR-13): it returns a
+/// `&'static CommandSpec`, which a `String`-backed skill name cannot be, and
+/// widening it to take one would mean either leaking the registry or handing
+/// every rejection path a lifetime it has no use for. A skill never reaches
+/// here — [`classify`] has already sorted it into [`Input::Skill`].
 fn resolve<'a>(name: &str, args: &'a str) -> Resolution<'a> {
-    let Some(spec) = COMMANDS.iter().find(|spec| spec.name == name) else {
+    let Some(spec) = builtin_row(name) else {
         return Resolution::Rejected(format!(
             "unknown command: `{}` — {HELP_HINT}",
             typed_token(name)
@@ -1319,6 +1658,56 @@ fn first_word(name: &'static str) -> &'static str {
     name.split_whitespace().next().unwrap_or(name)
 }
 
+/// BR-2's reserved set: every name a skill may not have, **derived** from
+/// [`COMMANDS`] rather than listed (REQ-585, ADR-13).
+///
+/// Three parts, and each is a claim about a way a name could be taken:
+///
+/// * every **spelling** of every row — the canonical name and every alias, so
+///   `exit` is reserved because `/exit` is `/quit`;
+/// * the **first word** of every row, so a skill named `provider` cannot take
+///   `/provider foo` and lose `/provider list` to longest-match — the one case
+///   where the table claims a name it does not spell as a row;
+/// * [`TETON`], which REQ-582's [`cli_line`] claims before the table is
+///   consulted at all.
+///
+/// It is derived because a hand-written copy is a second home for a fact whose
+/// first home is right here, and the copy ships green the day a row is added
+/// (LESSON-546, LESSON-456).
+///
+/// It is `#[cfg(test)]` because production reads the same derivation through
+/// [`table_claim`], which answers *which* claim rather than merely whether one
+/// exists. This function is the set-shaped view of the same map, kept so the
+/// test below can quantify over it.
+///
+/// **The daemon cannot read either of them**, and that is the reason the
+/// enforcement lives here: `tetond` does not depend on `teton`, so it has no
+/// `COMMANDS` to compare a name against, and `skills::mod` deliberately leaves
+/// the reserved case to this crate. There is no second copy over there — and
+/// no daemon-side mark to lean on, which is why the tests below use a registry
+/// that offers reserved names *unshadowed*: that is the shape the daemon really
+/// sends.
+#[cfg(test)]
+fn reserved_names() -> std::collections::BTreeSet<&'static str> {
+    let mut names = std::collections::BTreeSet::new();
+    for spec in COMMANDS {
+        for spelling in spec.spellings() {
+            names.insert(spelling);
+            names.insert(first_word(spelling));
+        }
+    }
+    names.insert(TETON);
+    // The two derivations must agree, or the test below quantifies over a set
+    // production does not enforce.
+    for name in &names {
+        assert!(
+            table_claim(name).is_some(),
+            "`{name}` is reserved here and unclaimed by `table_claim`",
+        );
+    }
+    names
+}
+
 /// `/help`: the command list, generated from [`COMMANDS`] (BR-7), grouped by
 /// family (REQ-582 BR-1), plus the footer lines documenting how arguments are
 /// read (ADR-2) and the `//` escape (BR-1b).
@@ -1331,7 +1720,20 @@ fn first_word(name: &'static str) -> &'static str {
 /// headings, no indentation. At ~25 rows the listing needs air rather than
 /// structure, and a heading would be a second name for a family whose rows
 /// already begin with it.
-fn render_help(surface: &mut dyn Surface) {
+///
+/// REQ-585 adds one section *below* the built-in rows and *above* both footers
+/// (ADR-12), and nothing else: the built-in half is generated by the same loop
+/// over the same table it always was, and [`help_family`] takes a
+/// `&'static str`, so a skill named `provider` cannot re-group the four
+/// `/provider` rows — the type says it will never be offered one.
+///
+/// An **empty** registry renders no section at all — no header, no `0 skills`
+/// line. That is the state of every user with no `~/.claude`, and the state
+/// ADR-2 leaves a client in against a daemon that does not serve `skills/list`,
+/// where the claim is that `/help` is byte-for-byte what it is today. A section
+/// announcing nothing would make that claim false for most of the people it is
+/// made to.
+fn render_help(surface: &mut dyn Surface, registry: &SkillSnapshot) {
     // Names pad to the widest row, so a later two-word row (`model set`)
     // re-aligns the whole list instead of breaking out of it.
     let width = COMMANDS
@@ -1365,6 +1767,7 @@ fn render_help(surface: &mut dyn Surface) {
             &format!("/{:<width$}  {}{also}", spec.name, spec.summary),
         );
     }
+    render_skills_section(surface, registry);
     // The footers are not rows, and the same blank line that separates two
     // families separates them from the last one.
     surface.line(LineKind::Info, "");
@@ -1372,6 +1775,128 @@ fn render_help(surface: &mut dyn Surface) {
     // Last, as it has been since REQ-555: the escape hatch is the line a user
     // scrolling to the bottom of `/help` is looking for.
     surface.line(LineKind::Info, ESCAPE_FOOTER);
+}
+
+/// The one line that opens `/help`'s skills section (REQ-585 ADR-12).
+///
+/// It carries the *positive* half of what [`ARGUMENT_FOOTER`]'s qualification
+/// says, at the top of the rows it is true of, so the two never sit adjacent and
+/// contradict each other (BR-3).
+const SKILLS_HEADER: &str = "skills — arguments are passed through as typed:";
+
+/// `/help`'s skills section: header, one row per skill, one diagnostic line —
+/// or nothing at all for an empty registry (REQ-585 BR-3, ADR-12).
+///
+/// Every field that came out of a file — the name, the hint, the description,
+/// the shadow reason, a skipped path — is rendered through [`Surface::line`],
+/// which defuses it. The daemon bounded them to one line when it read them
+/// (TASK-203); this is the second end of that, and it is the end that touches
+/// the terminal (LESSON-517, ADR-009's shape).
+fn render_skills_section(surface: &mut dyn Surface, registry: &SkillSnapshot) {
+    if registry.is_empty() {
+        return;
+    }
+    surface.line(LineKind::Info, "");
+    surface.line(LineKind::Info, SKILLS_HEADER);
+    for view in &registry.skills {
+        surface.line(LineKind::Info, &skill_row(view));
+    }
+    surface.line(LineKind::Info, &skills_diagnostic(registry));
+}
+
+/// One `/help` skill row: `/name [hint] — description (source)`, with a
+/// shadowed entry marked inside the same parenthetical (AC-1).
+///
+/// The shadow mark shares the source's parentheses rather than taking an
+/// em-dash of its own, because the description already owns that punctuation
+/// and a row with both would read as two sentences about different things.
+///
+/// **What counts as shadowed is not only what the daemon said.** A row the
+/// client's own table claims is marked too ([`claimed_by_a_row`]) — BR-3's rule
+/// is that `/help` cannot list a dispatchable skill the table does not resolve,
+/// and the client is the thing that resolves. The two normally agree; where they
+/// cannot is version skew (ADR-2's own scenario), a client carrying a row its
+/// daemon has never heard of, and there the client is right.
+fn skill_row(view: &SkillView) -> String {
+    let mut row = format!("/{}", view.name);
+    if let Some(hint) = &view.argument_hint {
+        row.push(' ');
+        row.push_str(hint);
+    }
+    if let Some(description) = &view.description {
+        row.push_str(" — ");
+        row.push_str(description);
+    }
+    row.push_str(" (");
+    row.push_str(source_word(view.source));
+    if let Some(reason) = shadow_reason(view) {
+        row.push_str(", shadowed by ");
+        row.push_str(&reason);
+    }
+    row.push(')');
+    row
+}
+
+/// What owns a skill's name instead of the skill, or `None` when the skill owns
+/// it and dispatches.
+///
+/// The one predicate `/help` and [`classify`] share (BR-3's both-directions
+/// pin): a row rendered without a mark is a row [`classify`] returns
+/// [`Input::Skill`] for, and a row with one is a row it does not.
+fn shadow_reason(view: &SkillView) -> Option<String> {
+    // This crate's own sentence first, where it has one. The daemon marks a
+    // reserved name too (it must — a client without a command table would
+    // otherwise dispatch one), but it knows only *that* the table claims the
+    // name, not whether it is a row, an alias or a family word. Preferring the
+    // wire's generic mark here would trade `the built-in `/quit`` for `a
+    // built-in command of the same name` on the one surface that can be
+    // specific.
+    if let Some(claim) = table_claim(&view.name) {
+        return Some(claim.words());
+    }
+    view.shadowed.clone()
+}
+
+/// How a source is spelled wherever this client names one.
+///
+/// `/help`'s rows and diagnostic line, the consent prompt's subject block, and
+/// BR-12's echo line all read it: one spelling of "user"/"project", so a user
+/// who approved `skill \`status\` (user)` reads the same word back in
+/// `/status → skill status (user, …)`. A second copy in `session_ui` would be
+/// two homes for one vocabulary (LESSON-546).
+pub(crate) fn source_word(source: SkillSource) -> &'static str {
+    match source {
+        SkillSource::User => "user",
+        SkillSource::Project => "project",
+    }
+}
+
+/// The line closing the skills *section* (BR-3): what was registered, from
+/// where, and what was found and not registered.
+///
+/// The skipped entries are named rather than counted alone, because a count is
+/// a diagnostic a user cannot act on — LESSON-481's shape, and the reason BR-1
+/// makes discovery name every file it drops.
+fn skills_diagnostic(registry: &SkillSnapshot) -> String {
+    let (user, project) = registry.source_counts();
+    let total = registry.skills.len();
+    let mut line = format!(
+        "{total} skill{} (user {user}, project {project}); {} skipped",
+        if total == 1 { "" } else { "s" },
+        registry.skipped.len(),
+    );
+    if !registry.skipped.is_empty() {
+        line.push_str(": ");
+        line.push_str(
+            &registry
+                .skipped
+                .iter()
+                .map(|entry| format!("{} — {}", entry.path, entry.reason))
+                .collect::<Vec<_>>()
+                .join("; "),
+        );
+    }
+    line
 }
 
 /// Every mirrored row, as `(session name, shell twin)`, in table order (REQ-582
@@ -1403,12 +1928,20 @@ fn toggle_verbose(ctx: &mut UiContext<'_>) {
 }
 
 /// The `/help` handler.
+///
+/// The section is rendered from the session's own snapshot (ADR-12), which is
+/// the same value [`classify`] dispatches from — BR-3's "a skill cannot be
+/// dispatchable without appearing in `/help`" holds because there is one list,
+/// not because two readers agree. An empty snapshot renders no section at all,
+/// which is the state of a user with no `~/.claude` and the state ADR-2 leaves
+/// a new CLI in against an old daemon: `/help` is then byte-for-byte what it
+/// was before this REQ.
 fn handle_help(
     _conn: &mut Connection,
     ctx: &mut UiContext<'_>,
     _args: &str,
 ) -> anyhow::Result<CommandOutcome> {
-    render_help(ctx.surface);
+    render_help(ctx.surface, &ctx.skills);
     Ok(CommandOutcome::Continue)
 }
 
@@ -2323,6 +2856,96 @@ mod tests {
     // `session_ui`, so the production code here never mentions the type.
     use teton_protocol::events::WebTier;
 
+    /// The registry of a session that found nothing — the state of every user
+    /// with no `~/.claude`, and the state ADR-2 leaves a client in against a
+    /// daemon that does not serve `skills/list`.
+    ///
+    /// Every pre-REQ-585 assertion in this module runs against it, which is the
+    /// point: with an empty snapshot [`classify`] cannot return
+    /// [`Input::Skill`] and `/help` renders no section, so "byte-for-byte what
+    /// it is today" is not a claim about a code path nobody takes — it is what
+    /// these ~66 call sites exercise.
+    fn no_skills() -> SkillSnapshot {
+        SkillSnapshot::empty()
+    }
+
+    /// A registry built the only way production builds one: out of the wire
+    /// result (LESSON-544 — a fixture that reaches past the constructor leaves
+    /// the constructor unguarded).
+    fn registry(skills: Vec<SkillView>, skipped: Vec<SkillSkipped>) -> SkillSnapshot {
+        SkillSnapshot::from(SkillsListResult { skills, skipped })
+    }
+
+    /// One registered skill, with everything optional left out.
+    fn skill(name: &str, source: SkillSource) -> SkillView {
+        SkillView {
+            name: name.to_owned(),
+            source,
+            description: None,
+            argument_hint: None,
+            shadowed: None,
+        }
+    }
+
+    /// [`skill`] with the two file-authored fields a `/help` row renders.
+    fn described(name: &str, source: SkillSource, hint: &str, description: &str) -> SkillView {
+        SkillView {
+            argument_hint: (!hint.is_empty()).then(|| hint.to_owned()),
+            description: Some(description.to_owned()),
+            ..skill(name, source)
+        }
+    }
+
+    /// A skill the **daemon** marked shadowed, as it does for every reserved
+    /// name (BR-2) — the realistic AC-2 fixture.
+    fn shadowed(name: &str, source: SkillSource, by: &str) -> SkillView {
+        SkillView {
+            shadowed: Some(by.to_owned()),
+            ..skill(name, source)
+        }
+    }
+
+    /// A daemon that offered a name it should have shadowed.
+    ///
+    /// Not a paranoid fixture: it is the only one that can tell BR-2's
+    /// structural claim from a claim about the daemon's diligence. If the
+    /// registry were consulted before the table, these entries would dispatch,
+    /// and every assertion written against a correctly-shadowed fixture would
+    /// still pass (ADR-13).
+    fn offered_unshadowed(names: &[&str]) -> SkillSnapshot {
+        registry(
+            names
+                .iter()
+                .map(|name| skill(name, SkillSource::User))
+                .collect(),
+            Vec::new(),
+        )
+    }
+
+    /// The `/help` lines a `RecordingSurface` recorded, blank lines kept.
+    fn help_lines(registry: &SkillSnapshot) -> Vec<String> {
+        let mut surface = RecordingSurface::new();
+        render_help(&mut surface, registry);
+        surface
+            .lines_of(LineKind::Info)
+            .iter()
+            .map(|line| (*line).to_owned())
+            .collect()
+    }
+
+    /// The rows of `/help`'s skills section: everything between
+    /// [`SKILLS_HEADER`] and the diagnostic line that closes it.
+    fn skill_rows(lines: &[String]) -> Vec<String> {
+        let Some(start) = lines.iter().position(|line| line == SKILLS_HEADER) else {
+            return Vec::new();
+        };
+        lines[start + 1..]
+            .iter()
+            .take_while(|line| line.starts_with('/'))
+            .cloned()
+            .collect()
+    }
+
     /// The session's own context (D-4). No answers are scripted: none of the
     /// client-local commands asks a question.
     ///
@@ -2345,6 +2968,9 @@ mod tests {
             auto_accept_model: false,
             typed_input: true,
             session_id: None,
+            // Empty by default; a test that needs a registry assigns
+            // `ctx.skills` itself (REQ-585 — `/help` renders from the field).
+            skills: SkillSnapshot::empty(),
         }
     }
 
@@ -2369,7 +2995,7 @@ mod tests {
         );
         for name in optional {
             for line in [format!("/{name}"), format!("/{name} high")] {
-                let Input::Command { name: n, args } = classify(&line) else {
+                let Input::Command { name: n, args } = classify(&line, &no_skills()) else {
                     panic!("`{line}` did not classify as a command");
                 };
                 assert!(
@@ -2386,7 +3012,7 @@ mod tests {
     #[test]
     fn effort_appears_in_help_because_help_is_generated_from_the_table() {
         let mut surface = RecordingSurface::new();
-        render_help(&mut surface);
+        render_help(&mut surface, &no_skills());
         assert!(
             surface
                 .lines_of(LineKind::Info)
@@ -2427,7 +3053,7 @@ mod tests {
             for spelling in spec.spellings() {
                 let typed = format!("/{spelling} {expected_args}");
                 let typed = typed.trim_end();
-                let Input::Command { name, args } = classify(typed) else {
+                let Input::Command { name, args } = classify(typed, &no_skills()) else {
                     panic!("`{typed}` did not classify as a command");
                 };
                 // An alias canonicalises on the way through, so what dispatches
@@ -2455,7 +3081,7 @@ mod tests {
     #[test]
     fn help_lists_every_alias_that_dispatches() {
         let mut surface = RecordingSurface::new();
-        render_help(&mut surface);
+        render_help(&mut surface, &no_skills());
         let listing = surface.lines_of(LineKind::Info).join("\n");
         for spec in COMMANDS {
             for alias in spec.aliases {
@@ -2484,7 +3110,7 @@ mod tests {
     // which `slash_quit_and_ctrl_d_leave_by_the_same_path` pins end to end.
     #[test]
     fn exit_resolves_to_the_very_same_row_as_quit() {
-        let Input::Command { name, args } = classify("/exit") else {
+        let Input::Command { name, args } = classify("/exit", &no_skills()) else {
             panic!("`/exit` must be a command line, never a prompt");
         };
         assert_eq!(name, "quit", "`/exit` must canonicalise to the quit row");
@@ -2597,7 +3223,7 @@ mod tests {
     #[test]
     fn whitespace_after_the_slash_is_never_a_command() {
         for typed in ["/ help", "/  model set qwen2.5-coder-3b", "/\tcost"] {
-            let Input::Command { name, args } = classify(typed) else {
+            let Input::Command { name, args } = classify(typed, &no_skills()) else {
                 panic!("`{typed}` must stay a command line — never a prompt");
             };
             let Resolution::Rejected(hint) = resolve(name, args) else {
@@ -2613,7 +3239,7 @@ mod tests {
     // the hint would name a feature the user never used.
     #[test]
     fn a_rejection_never_echoes_a_doubled_slash() {
-        let Input::Command { name, args } = classify("/ /foo") else {
+        let Input::Command { name, args } = classify("/ /foo", &no_skills()) else {
             panic!("`/ /foo` did not classify as a command");
         };
         let Resolution::Rejected(hint) = resolve(name, args) else {
@@ -2641,7 +3267,7 @@ mod tests {
             "/model\tset qwen2.5-coder-3b",
             "/model \t set qwen2.5-coder-3b",
         ] {
-            let Input::Command { name, args } = classify(typed) else {
+            let Input::Command { name, args } = classify(typed, &no_skills()) else {
                 panic!("`{typed}` did not classify as a command");
             };
             assert_eq!((name, args), ("model set", "qwen2.5-coder-3b"), "{typed}");
@@ -2672,7 +3298,7 @@ mod tests {
             "a/b/c",
             "-- /help",
         ] {
-            let Input::Prompt(text) = classify(line) else {
+            let Input::Prompt(text) = classify(line, &no_skills()) else {
                 panic!("`{line}` did not classify as a plain prompt");
             };
             let params = prompt_turn_params(&session, text);
@@ -2688,7 +3314,7 @@ mod tests {
             ("//help", "/help"),
             ("///etc", "//etc"),
         ] {
-            let Input::EscapedPrompt(text) = classify(typed) else {
+            let Input::EscapedPrompt(text) = classify(typed, &no_skills()) else {
                 panic!("`{typed}` did not classify as an escaped prompt");
             };
             assert_eq!(text_of(&prompt_turn_params(&session, text)), sent);
@@ -2730,7 +3356,7 @@ mod tests {
         let tail = "very-long-tail-".repeat(20);
         let typed = format!("/ \x1b[31mX {tail}");
 
-        let Input::Command { name, args } = classify(&typed) else {
+        let Input::Command { name, args } = classify(&typed, &no_skills()) else {
             panic!("a line opening with a slash is always a command line");
         };
         let Resolution::Rejected(hint) = resolve(name, args) else {
@@ -2780,7 +3406,7 @@ mod tests {
             "-- /help",
             "help",
         ] {
-            assert_eq!(classify(line), Input::Prompt(line));
+            assert_eq!(classify(line, &no_skills()), Input::Prompt(line));
         }
     }
 
@@ -2789,12 +3415,18 @@ mod tests {
     #[test]
     fn the_double_slash_escape_collapses_only_the_leading_pair() {
         assert_eq!(
-            classify("//usr/local/bin/x — why?"),
+            classify("//usr/local/bin/x — why?", &no_skills()),
             Input::EscapedPrompt("/usr/local/bin/x — why?")
         );
-        assert_eq!(classify("//"), Input::EscapedPrompt("/"));
-        assert_eq!(classify("///etc"), Input::EscapedPrompt("//etc"));
-        assert_eq!(classify("//help"), Input::EscapedPrompt("/help"));
+        assert_eq!(classify("//", &no_skills()), Input::EscapedPrompt("/"));
+        assert_eq!(
+            classify("///etc", &no_skills()),
+            Input::EscapedPrompt("//etc")
+        );
+        assert_eq!(
+            classify("//help", &no_skills()),
+            Input::EscapedPrompt("/help")
+        );
     }
 
     // The longest matching name wins on a word boundary, which is what lets the
@@ -2845,44 +3477,739 @@ mod tests {
     // the blank separators rather than zipped against every rendered line — the
     // property is still "one line per command, in table order, and nothing else
     // but the footers".
+    //
+    // REQ-585 ADR-12 **widens** it rather than relaxing it, which is a
+    // distinction worth writing down because the two edits look alike from a red
+    // test: the count and the row zip are re-scoped to the built-in *prefix*
+    // slice, and both footer assertions keep reading the **whole** rendered
+    // list. Dropping them to the prefix too would let a skills section slip
+    // below `ESCAPE_FOOTER` with every assertion still green — and the escape
+    // hatch being the last line of `/help` is the one thing a user scrolling to
+    // the bottom is looking for. It runs over both registries for the same
+    // reason: the built-in half is the same bytes either way.
     #[test]
     fn help_renders_every_table_row_and_the_escape_footer() {
-        let mut surface = RecordingSurface::new();
-        render_help(&mut surface);
-
-        let all = surface.lines_of(LineKind::Info);
-        let lines: Vec<&str> = all
-            .iter()
-            .copied()
-            .filter(|line| !line.is_empty())
-            .collect();
-        assert_eq!(
-            lines.len(),
-            COMMANDS.len() + 2,
-            "one line per command plus the argument and escape footers"
+        let three = registry(
+            vec![
+                described("alpha", SkillSource::User, "[topic]", "Draft a note."),
+                skill("beta", SkillSource::User),
+                skill("gamma", SkillSource::Project),
+            ],
+            Vec::new(),
         );
-        for (spec, line) in COMMANDS.iter().zip(&lines) {
-            assert!(line.starts_with(&format!("/{}", spec.name)), "{line}");
-            // The summary is the line's body; a row carrying aliases appends
-            // its "(also …)" clause after it, so the assertion is about where
-            // the summary sits rather than about the line ending there.
-            assert!(line.contains(spec.summary), "{line}");
-            let tail = line.split_once(spec.summary).expect("the summary").1;
-            match spec.aliases {
-                [] => assert!(tail.is_empty(), "a row with no alias trails: {line}"),
-                aliases => {
-                    for alias in aliases {
-                        assert!(tail.contains(&format!("/{alias}")), "{line}");
+        for (label, snapshot) in [("empty", no_skills()), ("three skills", three)] {
+            let all = help_lines(&snapshot);
+            let lines: Vec<&str> = all
+                .iter()
+                .map(String::as_str)
+                .filter(|line| !line.is_empty())
+                .collect();
+            // Re-scoped to the built-in prefix: the rows this table generates
+            // are the first `COMMANDS.len()` non-empty lines, in table order,
+            // and nothing else is asserted *about them* by a section below.
+            let builtin = &lines[..COMMANDS.len()];
+            for (spec, line) in COMMANDS.iter().zip(builtin) {
+                assert!(line.starts_with(&format!("/{}", spec.name)), "{line}");
+                // The summary is the line's body; a row carrying aliases appends
+                // its "(also …)" clause after it, so the assertion is about where
+                // the summary sits rather than about the line ending there.
+                assert!(line.contains(spec.summary), "{line}");
+                let tail = line.split_once(spec.summary).expect("the summary").1;
+                match spec.aliases {
+                    [] => assert!(tail.is_empty(), "a row with no alias trails: {line}"),
+                    aliases => {
+                        for alias in aliases {
+                            assert!(tail.contains(&format!("/{alias}")), "{line}");
+                        }
                     }
                 }
             }
+            // Over the whole list, not the prefix: last, and second-last.
+            assert_eq!(
+                lines.last(),
+                Some(&ESCAPE_FOOTER),
+                "the escape footer is not the last line of /help with a {label} registry"
+            );
+            assert!(ESCAPE_FOOTER.contains("//"));
+            // REQ-582 ADR-2 / OQ-5: the one way a session argument differs from
+            // the shell's, said once, above the escape footer.
+            assert_eq!(
+                lines[lines.len() - 2],
+                ARGUMENT_FOOTER,
+                "the argument footer is not second-last with a {label} registry"
+            );
+            assert!(ARGUMENT_FOOTER.contains("whitespace"));
         }
-        assert_eq!(lines.last(), Some(&ESCAPE_FOOTER));
-        assert!(ESCAPE_FOOTER.contains("//"));
-        // REQ-582 ADR-2 / OQ-5: the one way a session argument differs from the
-        // shell's, said once, above the escape footer.
-        assert_eq!(lines[lines.len() - 2], ARGUMENT_FOOTER);
-        assert!(ARGUMENT_FOOTER.contains("whitespace"));
+        // And the count, kept exact where it can be: with nothing registered
+        // there is no section, so the listing is still one line per command
+        // plus the two footers — the pre-REQ number, unchanged.
+        let empty = help_lines(&no_skills());
+        assert_eq!(
+            empty.iter().filter(|line| !line.is_empty()).count(),
+            COMMANDS.len() + 2,
+            "one line per command plus the argument and escape footers"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // REQ-585: classify over a registry, and /help's skills section
+    // -----------------------------------------------------------------------
+
+    /// ADR-12: an empty registry renders **no section at all** — no header, no
+    /// `0 skills` line.
+    ///
+    /// The default state of every user with no `~/.claude`, and the state ADR-2
+    /// leaves a client in against a daemon that answers `skills/list` with
+    /// `METHOD_NOT_FOUND`. Both are promised `/help` byte-for-byte as it is
+    /// today, so this is pinned as an equality against the whole listing rather
+    /// than as an absence of the header: a `0 skills` line, a stray blank, or a
+    /// section header with nothing under it would each break the promise while
+    /// passing a `!contains("skills —")`.
+    #[test]
+    fn an_empty_registry_renders_no_skills_section_at_all() {
+        let lines = help_lines(&no_skills());
+        assert!(
+            !lines.iter().any(|line| line == SKILLS_HEADER),
+            "an empty registry announced a section: {lines:#?}"
+        );
+        assert!(
+            !lines.iter().any(|line| line.contains("skipped")),
+            "an empty registry rendered a diagnostic line: {lines:#?}"
+        );
+        // Nothing at all: the listing ends at the footers it always ended at.
+        assert_eq!(lines.last().map(String::as_str), Some(ESCAPE_FOOTER));
+        assert_eq!(
+            lines[lines.len() - 2].as_str(),
+            ARGUMENT_FOOTER,
+            "{lines:#?}"
+        );
+        assert_eq!(
+            lines.iter().filter(|line| !line.is_empty()).count(),
+            COMMANDS.len() + 2,
+            "an empty registry changed the shape of /help: {lines:#?}"
+        );
+    }
+
+    /// BR-2 / ADR-13, structurally: a built-in match **returns** before the
+    /// registry is consulted.
+    ///
+    /// The fixture is a daemon that offered four reserved names *unshadowed*,
+    /// which is the only fixture that can tell the structural claim from a
+    /// claim about the daemon's diligence: against a correctly-shadowed
+    /// registry, consulting the snapshot first would pass every assertion
+    /// anyone would think to write. Move the `registry.dispatchable` lookup
+    /// above `split_name` in `classify` and this is the test that goes red.
+    #[test]
+    fn a_built_in_row_is_matched_before_the_registry_is_consulted() {
+        let hostile = offered_unshadowed(&["cost", "exit", "provider", "teton", "model", "help"]);
+
+        // A row name, an alias, and a row whose two words beat the one-word
+        // skill that shares its first word.
+        assert_eq!(
+            classify("/cost", &hostile),
+            Input::Command {
+                name: "cost",
+                args: ""
+            }
+        );
+        assert_eq!(
+            classify("/exit", &hostile),
+            Input::Command {
+                name: "quit",
+                args: ""
+            }
+        );
+        assert_eq!(
+            classify("/provider list", &hostile),
+            Input::Command {
+                name: "provider list",
+                args: ""
+            }
+        );
+        assert_eq!(
+            classify("/model set qwen", &hostile),
+            Input::Command {
+                name: "model set",
+                args: "qwen"
+            }
+        );
+        assert_eq!(
+            classify("/help", &hostile),
+            Input::Command {
+                name: "help",
+                args: ""
+            }
+        );
+        // `teton` is claimed one step earlier still — by `cli_line`, before the
+        // table is consulted at all (REQ-582).
+        let Input::CliLine { name, .. } = classify("teton provider list", &hostile) else {
+            panic!("a typed `teton provider list` stopped being recognized");
+        };
+        assert_eq!(name, "provider list");
+        assert!(matches!(classify("/teton", &hostile), Input::CliRefused(_)));
+    }
+
+    /// AC-2, with the fixture the daemon actually produces: four skills named
+    /// for reserved spellings, each marked shadowed.
+    ///
+    /// They are **listed** — BR-3 says `/help` shows what the registry holds —
+    /// and none of them dispatches. The four lines the AC names are asserted to
+    /// be what they are today, which is the whole of "byte-identical".
+    #[test]
+    fn a_skill_with_a_reserved_name_is_listed_shadowed_and_never_dispatches() {
+        // **Unshadowed**, which is the only honest fixture: the daemon cannot
+        // mark these. `tetond` does not depend on `teton`, so it has no
+        // `COMMANDS` to compare a name against and it deliberately leaves the
+        // reserved case to this crate (`skills::mod`'s header says so). A
+        // fixture that arrived pre-marked would be testing the daemon's
+        // diligence about a judgement the daemon never makes, and every
+        // assertion below would pass with the whole reserved set deleted.
+        let snapshot = offered_unshadowed(&["cost", "exit", "provider", "teton"]);
+
+        for line in ["/cost", "/exit", "/provider list", "/teton"] {
+            assert_eq!(
+                classify(line, &snapshot),
+                classify(line, &no_skills()),
+                "`{line}` classified differently once a same-named skill existed"
+            );
+        }
+        let Input::CliLine { name, .. } = classify("teton provider list", &snapshot) else {
+            panic!("a typed `teton provider list` stopped being recognized");
+        };
+        assert_eq!(name, "provider list");
+
+        // A **family word** is the case no row spelling covers: nothing is
+        // spelled bare `provider`, so `/provider foo` reaches neither
+        // `split_name`'s longest match nor `builtin_row`, and without the
+        // reserved set it would land on the skill while `/provider list` stayed
+        // with the table — one spelling reaching two handlers.
+        assert!(
+            !matches!(classify("/provider foo", &snapshot), Input::Skill { .. }),
+            "`/provider foo` reached a skill named after a family word",
+        );
+
+        // Listed, and every one of them marked — from the same predicate that
+        // refused to dispatch them, so `/help` cannot promise what `classify`
+        // declines (BR-3).
+        let rows = skill_rows(&help_lines(&snapshot));
+        assert_eq!(rows.len(), 4, "{rows:#?}");
+        for row in &rows {
+            assert!(row.contains("shadowed by"), "{row}");
+        }
+        assert!(
+            rows.iter()
+                .any(|row| row.contains("the `/provider` commands")),
+            "a family word's mark did not name the family: {rows:#?}",
+        );
+        assert!(
+            rows.iter()
+                .any(|row| row.contains("the `teton` command line")),
+            "`teton`'s mark did not name why it is unreachable: {rows:#?}",
+        );
+    }
+
+    /// The wire's reserved list and this crate's derivation are the same set.
+    ///
+    /// `tetond` cannot read `COMMANDS`, so BR-2's reserved half is enforced
+    /// daemon-side from `teton_protocol::methods::RESERVED_SKILL_NAMES` — a
+    /// list. This is what keeps the list honest: add a row to `COMMANDS`
+    /// without adding its spelling there and this fails, in the crate that owns
+    /// the row. Without it the daemon's copy is exactly the hand-written second
+    /// home LESSON-546 is about.
+    #[test]
+    fn the_wire_reserved_list_is_this_crates_derivation() {
+        use std::collections::BTreeSet;
+
+        // Only the spellings a skill *could* have. A skill name is
+        // `^[a-z0-9][a-z0-9_-]{0,63}$`, so `boundary add` can never collide
+        // with one — the daemon has nothing to defend against there, and
+        // listing it on the wire would reserve a name nobody can type.
+        let derived: BTreeSet<&str> = reserved_names()
+            .into_iter()
+            .filter(|name| {
+                let mut chars = name.chars();
+                chars
+                    .next()
+                    .is_some_and(|c| c.is_ascii_lowercase() || c.is_ascii_digit())
+                    && name.chars().all(|c| {
+                        c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-' || c == '_'
+                    })
+            })
+            .collect();
+        let on_the_wire: BTreeSet<&str> = teton_protocol::methods::RESERVED_SKILL_NAMES
+            .iter()
+            .copied()
+            .collect();
+
+        let missing: Vec<_> = derived.difference(&on_the_wire).collect();
+        assert!(
+            missing.is_empty(),
+            "the table claims names the daemon would let a skill take: {missing:?}"
+        );
+        let extra: Vec<_> = on_the_wire.difference(&derived).collect();
+        assert!(
+            extra.is_empty(),
+            "the wire reserves names no row claims, so a legal skill name is \
+             refused for no reason: {extra:?}"
+        );
+    }
+
+    /// LESSON-546: BR-2's reserved set is **derived**, and the derivation is
+    /// tested against what `classify` does — in both directions.
+    ///
+    /// Direction one is that nothing the table claims is missing from the set:
+    /// every spelling of every row, the first word of every row, and `teton`.
+    /// Replace the derivation with a hand-written list and the first row added
+    /// to `COMMANDS` afterwards fails here — which is the failure the grep in a
+    /// task file could not produce.
+    ///
+    /// Direction two is that nothing is in the set without the table putting it
+    /// there, and then that the set says what the classifier *does*: offered a
+    /// skill by a **row spelling** it should have shadowed, `classify` still
+    /// returns the row. The family words (`provider`, `web`, `boundary`,
+    /// `policy`) and `teton` are reserved for the other half of BR-2 — they are
+    /// names the table claims without spelling as a row — and what is asserted
+    /// for them is the thing reserving them protects: the family's rows still
+    /// win their lines. That scoping is deliberate and is the honest reading of
+    /// what this crate enforces; the client does not depend on it, because a
+    /// bare `/provider` is not a line any built-in answers.
+    #[test]
+    fn the_reserved_set_is_derived_from_the_table_and_says_what_classify_does() {
+        let reserved = reserved_names();
+
+        for spec in COMMANDS {
+            for spelling in spec.spellings() {
+                assert!(
+                    reserved.contains(spelling),
+                    "`{spelling}` dispatches but is not reserved",
+                );
+                assert!(
+                    reserved.contains(first_word(spelling)),
+                    "`{}` opens a row and is not reserved",
+                    first_word(spelling),
+                );
+            }
+        }
+        assert!(reserved.contains(TETON), "`teton` is claimed by `cli_line`");
+
+        for name in &reserved {
+            let justified = *name == TETON
+                || COMMANDS.iter().any(|spec| {
+                    spec.spellings()
+                        .any(|spelling| spelling == *name || first_word(spelling) == *name)
+                });
+            assert!(justified, "`{name}` is reserved and no table row says why");
+        }
+
+        for name in &reserved {
+            let hostile = offered_unshadowed(&[name]);
+            let spelled_by_a_row = COMMANDS
+                .iter()
+                .any(|spec| spec.spellings().any(|spelling| spelling == *name));
+            if spelled_by_a_row {
+                let line = format!("/{name}");
+                assert!(
+                    !matches!(classify(&line, &hostile), Input::Skill { .. }),
+                    "`{line}` reached a skill even though the table spells the name",
+                );
+            } else {
+                // A family word, or `teton`. Reserving it protects two things:
+                // the family's own rows, and the family word itself — a bare
+                // `/<word> …` must not reach a skill either, which is the half
+                // no row spelling can enforce.
+                let bare = format!("/{name} anything");
+                assert!(
+                    !matches!(classify(&bare, &hostile), Input::Skill { .. }),
+                    "`{bare}` reached a skill even though `{name}` is reserved",
+                );
+                for spec in COMMANDS {
+                    if first_word(spec.name) != *name || spec.name == *name {
+                        continue;
+                    }
+                    let line = format!("/{}", spec.name);
+                    assert_eq!(
+                        classify(&line, &hostile),
+                        Input::Command {
+                            name: spec.name,
+                            args: ""
+                        },
+                        "a skill named `{name}` took `{line}` from its family",
+                    );
+                }
+            }
+        }
+    }
+
+    /// AC-1: the section's shape, in full, for the fixture the AC describes —
+    /// a user `skills/alpha`, a user `commands/beta`, a project
+    /// `.claude/skills/gamma`.
+    ///
+    /// Pinned as literal lines rather than as `contains` checks: the row format
+    /// (`/name [hint] — description (source)`) and the diagnostic line are what
+    /// a user reads, and a `contains` would survive losing the hint, the source
+    /// or the em-dash.
+    #[test]
+    fn help_lists_every_skill_with_its_hint_source_and_description() {
+        let snapshot = registry(
+            vec![
+                described(
+                    "alpha",
+                    SkillSource::User,
+                    "[topic]",
+                    "Draft a release note.",
+                ),
+                described("beta", SkillSource::User, "", "Summarize the diff."),
+                described(
+                    "gamma",
+                    SkillSource::Project,
+                    "<path>",
+                    "Check the working tree.",
+                ),
+            ],
+            Vec::new(),
+        );
+        let lines = help_lines(&snapshot);
+        let start = lines
+            .iter()
+            .position(|line| line == SKILLS_HEADER)
+            .expect("the skills header");
+
+        assert_eq!(
+            &lines[start..start + 5],
+            &[
+                SKILLS_HEADER.to_owned(),
+                "/alpha [topic] — Draft a release note. (user)".to_owned(),
+                "/beta — Summarize the diff. (user)".to_owned(),
+                "/gamma <path> — Check the working tree. (project)".to_owned(),
+                "3 skills (user 2, project 1); 0 skipped".to_owned(),
+            ],
+        );
+        // AC-1's order: the built-in rows above, then a blank, then the
+        // section, then a blank, then the two footers — in that order and with
+        // nothing between the diagnostic line and the footers but the blank.
+        assert_eq!(lines[start - 1], "", "{lines:#?}");
+        assert_eq!(lines[start + 5], "", "{lines:#?}");
+        assert_eq!(lines[start + 6], ARGUMENT_FOOTER);
+        assert_eq!(lines[start + 7], ESCAPE_FOOTER);
+        assert_eq!(lines.len(), start + 8, "{lines:#?}");
+    }
+
+    /// BR-1's "counted and named": the diagnostic line names what discovery
+    /// dropped and why, and it renders even when nothing registered — a user
+    /// whose only skill file is broken has to be able to see that.
+    #[test]
+    fn the_diagnostic_line_names_every_skipped_entry() {
+        let snapshot = registry(
+            Vec::new(),
+            vec![
+                SkillSkipped {
+                    path: "~/.claude/skills/broken/SKILL.md".to_owned(),
+                    name: "broken".to_owned(),
+                    reason: "malformed frontmatter".to_owned(),
+                },
+                SkillSkipped {
+                    path: "~/.claude/commands/huge.md".to_owned(),
+                    name: "huge".to_owned(),
+                    reason: "over 64 KiB (67,184 B)".to_owned(),
+                },
+            ],
+        );
+        let lines = help_lines(&snapshot);
+        assert!(lines.iter().any(|line| line == SKILLS_HEADER), "{lines:#?}");
+        assert!(
+            lines.iter().any(|line| line
+                == "0 skills (user 0, project 0); 2 skipped: \
+                    ~/.claude/skills/broken/SKILL.md — malformed frontmatter; \
+                    ~/.claude/commands/huge.md — over 64 KiB (67,184 B)"),
+            "{lines:#?}"
+        );
+    }
+
+    /// BR-3, both directions, scoped to **unshadowed** rows (LESSON-524: the
+    /// likely repair for a red both-directions pin is to relax it rather than
+    /// to scope it, so the scope is written into the test's name and its
+    /// comment rather than discovered later).
+    ///
+    /// Forward: every name `classify` returns `Input::Skill` for appears as a
+    /// `/help` row. Backward: every `/help` skill row that is **not** marked
+    /// shadowed classifies as `Input::Skill`. The unqualified backward claim is
+    /// false for the shadowed rows AC-2 mandates — they are listed and do not
+    /// dispatch, which is the point of listing them — and BR-3's claim is about
+    /// dispatchable skills.
+    #[test]
+    fn every_dispatchable_skill_is_a_help_row_and_every_unshadowed_row_dispatches() {
+        let snapshot = registry(
+            vec![
+                described("alpha", SkillSource::User, "[topic]", "Draft a note."),
+                skill("beta", SkillSource::User),
+                shadowed("cost", SkillSource::User, "the built-in `/cost`"),
+                shadowed("analyze", SkillSource::User, "the project skill"),
+                skill("gamma", SkillSource::Project),
+            ],
+            Vec::new(),
+        );
+        let lines = help_lines(&snapshot);
+        let rows = skill_rows(&lines);
+        assert_eq!(rows.len(), 5, "every registered skill is listed: {rows:#?}");
+
+        // Forward, and it is the **unshadowed** row that has to be there: a
+        // name that dispatches while `/help` marks it shadowed is the same
+        // disagreement read from the other end, and a bare "a row exists"
+        // check would pass it (a shadowed skill made dispatchable keeps its
+        // row and only loses its mark).
+        for view in &snapshot.skills {
+            let line = format!("/{}", view.name);
+            if matches!(classify(&line, &snapshot), Input::Skill { .. }) {
+                let row = rows
+                    .iter()
+                    .find(|row| row.starts_with(&line))
+                    .unwrap_or_else(|| {
+                        panic!("`{line}` dispatches and is not in /help: {rows:#?}")
+                    });
+                assert!(
+                    !row.contains("shadowed by"),
+                    "`{line}` dispatches and /help calls it shadowed: {row}",
+                );
+            }
+        }
+
+        // Backward, over the rendered rows rather than over the fixture: the
+        // section is read back the way a user reads it.
+        let mut unshadowed = 0;
+        for row in &rows {
+            if row.contains("shadowed by") {
+                continue;
+            }
+            unshadowed += 1;
+            let name = row
+                .split_whitespace()
+                .next()
+                .expect("a row names a skill")
+                .to_owned();
+            assert!(
+                matches!(classify(&name, &snapshot), Input::Skill { .. }),
+                "/help lists `{name}` as dispatchable and it does not dispatch",
+            );
+        }
+        assert_eq!(unshadowed, 3, "the fixture must exercise both sides");
+    }
+
+    /// ADR-12: `help_family` never sees a skill.
+    ///
+    /// BR-2's reserved set stops a skill named `provider` from *dispatching*;
+    /// only a section of its own stops it from re-grouping the four built-in
+    /// `/provider` rows. Asserted as byte-equality of the built-in half — the
+    /// grouping is blank lines, so a re-grouping shows up as moved blanks and
+    /// nothing else, which a `contains` check cannot see.
+    #[test]
+    fn a_skill_never_regroups_the_built_in_rows() {
+        let baseline = help_lines(&no_skills());
+        let with_families = help_lines(&registry(
+            vec![
+                skill("provider", SkillSource::User),
+                skill("model", SkillSource::User),
+                skill("web", SkillSource::Project),
+                skill("doctor", SkillSource::User),
+            ],
+            Vec::new(),
+        ));
+        let built_in: Vec<&String> = with_families
+            .iter()
+            .take_while(|line| *line != SKILLS_HEADER)
+            .collect();
+        // The section's own leading blank is the last of those, and the
+        // baseline's is the blank before the footers.
+        assert_eq!(
+            built_in,
+            baseline.iter().take(built_in.len()).collect::<Vec<_>>(),
+            "a skill re-grouped the built-in listing",
+        );
+        // And `help_family` is typed so it cannot be handed one: its argument
+        // is `&'static str`, which a registry name is not.
+        assert_eq!(help_family("provider list"), "provider");
+        assert_eq!(help_family("doctor"), "");
+    }
+
+    /// ADR-12: `ARGUMENT_FOOTER` is qualified to name the rows it describes,
+    /// and qualified by **appending**.
+    ///
+    /// Two assertions, and the first is about a file this task does not own:
+    /// `cli_e2e` pins the original clause as a substring, so a qualification
+    /// that rewrote the subject (`Built-in command arguments…`) would go green
+    /// here and red there. Drop the appended clause and the second assertion
+    /// fails — the footer would then sit two lines from the skill rows it
+    /// contradicts (BR-4 hands a skill its line as typed).
+    #[test]
+    fn the_argument_footer_is_qualified_by_appending() {
+        assert!(
+            ARGUMENT_FOOTER.starts_with(
+                "Command arguments are split on whitespace and quotes are not \
+                     interpreted"
+            ),
+            "the qualification rewrote the subject; `cli_e2e` pins this clause: {ARGUMENT_FOOTER}",
+        );
+        assert!(
+            ARGUMENT_FOOTER.contains("built-in rows") && ARGUMENT_FOOTER.contains("skill row"),
+            "the footer does not say which rows it is true of: {ARGUMENT_FOOTER}",
+        );
+        // And the positive statement is the section header's, at the top of the
+        // rows it is true of, so the two never sit adjacent and disagree.
+        assert!(SKILLS_HEADER.contains("as typed"), "{SKILLS_HEADER}");
+    }
+
+    /// AC-17: a name discovery **skipped** says why; a name with no entry at
+    /// all gets the pre-REQ bytes.
+    ///
+    /// The second half is the one that has to be pinned as an equality: the
+    /// unknown-command line is what every user of every build has seen, and the
+    /// new case is allowed to add a case, not to reword the old one.
+    #[test]
+    fn a_skipped_name_says_why_and_an_unknown_one_says_what_it_always_did() {
+        let snapshot = registry(
+            Vec::new(),
+            vec![SkillSkipped {
+                path: "~/.claude/skills/analyze/SKILL.md".to_owned(),
+                name: "analyze".to_owned(),
+                reason: "malformed frontmatter".to_owned(),
+            }],
+        );
+        assert_eq!(
+            skipped_skill_hint("analyze", &snapshot).as_deref(),
+            Some(
+                "`/analyze` is a skill that was skipped: malformed frontmatter — \
+                 type /help for the commands this session knows."
+            ),
+        );
+        // No entry: nothing to say, so `resolve` composes what it always has.
+        assert_eq!(skipped_skill_hint("frobnicate", &snapshot), None);
+        let Resolution::Rejected(hint) = resolve("frobnicate", "") else {
+            panic!("an unknown name resolved to a row");
+        };
+        assert_eq!(
+            hint,
+            "unknown command: `/frobnicate` — type /help for the commands this session knows."
+        );
+        // A name a row owns never reaches the hint at all, even when a file by
+        // that name was skipped: the row runs (BR-2).
+        let owned = registry(
+            Vec::new(),
+            vec![SkillSkipped {
+                path: "~/.claude/commands/cost.md".to_owned(),
+                name: "cost".to_owned(),
+                reason: "not UTF-8".to_owned(),
+            }],
+        );
+        assert_eq!(skipped_skill_hint("cost", &owned), None);
+    }
+
+    /// A skipped entry is matched by the **name discovery carried**, not by one
+    /// this crate read back off the path.
+    ///
+    /// BR-2's naming rule belongs to discovery, which is the only place that
+    /// knows which of the four roots an entry came from. A copy here would be a
+    /// second home for it in the crate that cannot see them (LESSON-546), and a
+    /// strictly weaker one: the two entries below are the cases a path-reader
+    /// gets wrong. A symlinked `commands/status.md` is refused before it is
+    /// ever a file that was opened, and an entry skipped *because* its name is
+    /// invalid is named by the invalid spelling — which is what the user typed
+    /// and what they have to be told about.
+    #[test]
+    fn a_skipped_entry_is_matched_by_the_name_discovery_carried() {
+        let snapshot = registry(
+            Vec::new(),
+            vec![
+                SkillSkipped {
+                    path: "~/.claude/commands/status.md".to_owned(),
+                    name: "status".to_owned(),
+                    reason: "symlink not followed".to_owned(),
+                },
+                SkillSkipped {
+                    path: "~/.claude/skills".to_owned(),
+                    name: String::new(),
+                    reason: "unreadable (permission denied)".to_owned(),
+                },
+            ],
+        );
+
+        let hint = skipped_skill_hint("status", &snapshot).expect("a skipped name says why");
+        assert!(hint.contains("symlink not followed"), "{hint}");
+
+        // A root-level diagnostic names no skill, and the empty name must not
+        // become a wildcard that answers for every typed line.
+        assert_eq!(skipped_skill_hint("", &snapshot), None);
+        assert_eq!(skipped_skill_hint("anything", &snapshot), None);
+    }
+
+    /// BR-4: a skill is handed its line **as typed** — interior whitespace runs
+    /// and quotes survive, and only the edges are trimmed.
+    ///
+    /// This is the clause `ARGUMENT_FOOTER`'s qualification exists for: the
+    /// built-in rows split on whitespace and interpret no quotes, and a skill
+    /// row does neither.
+    #[test]
+    fn a_skill_is_handed_its_line_as_typed() {
+        let snapshot = registry(vec![skill("alpha", SkillSource::User)], Vec::new());
+        assert_eq!(
+            classify(r#"/alpha teton  code "repo"  "#, &snapshot),
+            Input::Skill {
+                name: "alpha".to_owned(),
+                raw_arguments: r#"teton  code "repo""#.to_owned(),
+            }
+        );
+        assert_eq!(
+            classify("/alpha", &snapshot),
+            Input::Skill {
+                name: "alpha".to_owned(),
+                raw_arguments: String::new(),
+            }
+        );
+    }
+
+    /// ADR-13: nothing is leaked to satisfy a lifetime.
+    ///
+    /// A leaked registry would survive `/cd` and dispatch a skill the session no
+    /// longer has, so `Input::Skill` owns its two strings and the classifier's
+    /// output lifetime is the *input line's*. The property is a compile-time
+    /// one, written as a test because that is where a future edit will look:
+    /// the registry is dropped and the classification is still readable.
+    #[test]
+    fn a_classification_outlives_the_registry_it_came_from() {
+        let line = String::from("/alpha take this");
+        let classified = {
+            let snapshot = registry(vec![skill("alpha", SkillSource::User)], Vec::new());
+            classify(&line, &snapshot)
+        };
+        assert_eq!(
+            classified,
+            Input::Skill {
+                name: "alpha".to_owned(),
+                raw_arguments: "take this".to_owned(),
+            }
+        );
+    }
+
+    /// A snapshot is built from the wire result, and an old daemon's answer is
+    /// an empty one rather than an error (ADR-2).
+    #[test]
+    fn a_snapshot_is_the_wire_result_and_the_default_is_empty() {
+        assert_eq!(
+            SkillSnapshot::from(SkillsListResult::default()),
+            SkillSnapshot::empty()
+        );
+        assert!(SkillSnapshot::empty().is_empty());
+        assert!(SkillSnapshot::default().is_empty());
+        let one = registry(vec![skill("alpha", SkillSource::User)], Vec::new());
+        assert!(!one.is_empty());
+        assert_eq!(one.source_counts(), (1, 0));
+        assert!(one.dispatchable("alpha").is_some());
+        assert!(one.dispatchable("beta").is_none());
+        // A shadowed entry is listed and never looked up.
+        let marked = registry(
+            vec![shadowed("alpha", SkillSource::User, "the project skill")],
+            Vec::new(),
+        );
+        assert!(marked.dispatchable("alpha").is_none());
+        assert_eq!(marked.skills.len(), 1);
     }
 
     // BR-5: the toggle owns one flag and echoes what it just set.
@@ -2913,7 +4240,7 @@ mod tests {
     // no path from here to an RPC — and renders exactly one actionable line.
     #[test]
     fn an_unknown_command_is_one_error_line_naming_help() {
-        let Input::Command { name, args } = classify("/frobnicate") else {
+        let Input::Command { name, args } = classify("/frobnicate", &no_skills()) else {
             panic!("`/frobnicate` did not classify as a command");
         };
         let Resolution::Rejected(hint) = resolve(name, args) else {
@@ -2929,7 +4256,7 @@ mod tests {
 
         // A bare `/` is the same shape: a command line with nothing to
         // dispatch, never a prompt.
-        let Input::Command { name, args } = classify("/") else {
+        let Input::Command { name, args } = classify("/", &no_skills()) else {
             panic!("a bare `/` did not classify as a command");
         };
         assert!(matches!(resolve(name, args), Resolution::Rejected(_)));
@@ -2938,7 +4265,7 @@ mod tests {
     // A command that takes no argument says so rather than ignoring it.
     #[test]
     fn a_trailing_argument_to_an_arg_less_command_is_rejected() {
-        let Input::Command { name, args } = classify("/help extra") else {
+        let Input::Command { name, args } = classify("/help extra", &no_skills()) else {
             panic!("`/help extra` did not classify as a command");
         };
         assert_eq!((name, args), ("help", "extra"));
@@ -2957,7 +4284,7 @@ mod tests {
     #[test]
     fn a_trailing_argument_to_cost_or_model_is_rejected() {
         for typed in ["/cost extra-arg", "/model extra"] {
-            let Input::Command { name, args } = classify(typed) else {
+            let Input::Command { name, args } = classify(typed, &no_skills()) else {
                 panic!("`{typed}` did not classify as a command");
             };
             assert!(!args.is_empty(), "`{typed}` parsed no argument");
@@ -2978,7 +4305,8 @@ mod tests {
     // a model name.
     #[test]
     fn model_set_routes_to_its_own_row_and_a_bare_one_asks_for_a_name() {
-        let Input::Command { name, args } = classify("/model set qwen2.5-coder-3b") else {
+        let Input::Command { name, args } = classify("/model set qwen2.5-coder-3b", &no_skills())
+        else {
             panic!("`/model set …` did not classify as a command");
         };
         assert_eq!((name, args), ("model set", "qwen2.5-coder-3b"));
@@ -2991,7 +4319,7 @@ mod tests {
         assert_eq!(run_args, "qwen2.5-coder-3b");
 
         // No name: the usage line, not a `model/list` with an empty name.
-        let Input::Command { name, args } = classify("/model set") else {
+        let Input::Command { name, args } = classify("/model set", &no_skills()) else {
             panic!("`/model set` did not classify as a command");
         };
         assert_eq!((name, args), ("model set", ""));
@@ -3004,7 +4332,7 @@ mod tests {
 
         // And the one-word row still refuses a stray word rather than treating
         // it as a model name.
-        let Input::Command { name, args } = classify("/model extra") else {
+        let Input::Command { name, args } = classify("/model extra", &no_skills()) else {
             panic!("`/model extra` did not classify as a command");
         };
         assert_eq!((name, args), ("model", "extra"));
@@ -3021,7 +4349,7 @@ mod tests {
     #[test]
     fn help_lists_both_web_commands_with_their_usage() {
         let mut surface = RecordingSurface::new();
-        render_help(&mut surface);
+        render_help(&mut surface, &no_skills());
         let listing = surface.lines_of(LineKind::Info).join("\n");
 
         assert!(listing.contains("/web allow"), "{listing}");
@@ -3040,7 +4368,7 @@ mod tests {
     #[test]
     fn help_lists_the_setup_command_and_promises_the_confirmation() {
         let mut surface = RecordingSurface::new();
-        render_help(&mut surface);
+        render_help(&mut surface, &no_skills());
         let listing = surface.lines_of(LineKind::Info).join("\n");
 
         assert!(listing.contains("/web setup"), "{listing}");
@@ -3061,7 +4389,7 @@ mod tests {
     #[test]
     fn help_lists_the_provider_setup_row_and_promises_the_confirmation() {
         let mut surface = RecordingSurface::new();
-        render_help(&mut surface);
+        render_help(&mut surface, &no_skills());
         let listing = surface.lines_of(LineKind::Info).join("\n");
 
         assert!(listing.contains("/provider setup"), "{listing}");
@@ -3087,7 +4415,7 @@ mod tests {
             ("/provider setup kimi think", "kimi think"),
             ("/provider  setup  kimi  think", "kimi  think"),
         ] {
-            let Input::Command { name, args } = classify(line) else {
+            let Input::Command { name, args } = classify(line, &no_skills()) else {
                 panic!("`{line}` did not classify as a command");
             };
             assert_eq!(name, "provider setup", "{line}");
@@ -3142,7 +4470,7 @@ mod tests {
     #[test]
     fn help_lists_the_provider_test_row_and_says_it_sends() {
         let mut surface = RecordingSurface::new();
-        render_help(&mut surface);
+        render_help(&mut surface, &no_skills());
         let listing = surface.lines_of(LineKind::Info).join("\n");
 
         assert!(listing.contains("/provider test"), "{listing}");
@@ -3163,7 +4491,7 @@ mod tests {
     /// guessing which of two ids was meant is the one thing it must not do.
     #[test]
     fn the_provider_test_command_takes_exactly_one_id() {
-        let Input::Command { name, args } = classify("/provider test kimi") else {
+        let Input::Command { name, args } = classify("/provider test kimi", &no_skills()) else {
             panic!("`/provider test kimi` did not classify as a command");
         };
         assert_eq!((name, args), ("provider test", "kimi"));
@@ -3171,7 +4499,7 @@ mod tests {
 
         // The bare form is rejected at `resolve`, so no RPC is issued and the
         // hint says what to type.
-        let Input::Command { name, args } = classify("/provider test") else {
+        let Input::Command { name, args } = classify("/provider test", &no_skills()) else {
             panic!("`/provider test` did not classify as a command");
         };
         let Resolution::Rejected(hint) = resolve(name, args) else {
@@ -3181,7 +4509,7 @@ mod tests {
 
         // The two rows are distinct: `/provider setup kimi` must never be read
         // as the test row, nor the reverse.
-        let Input::Command { name, .. } = classify("/provider setup kimi") else {
+        let Input::Command { name, .. } = classify("/provider setup kimi", &no_skills()) else {
             panic!("`/provider setup kimi` did not classify as a command");
         };
         assert_eq!(name, "provider setup");
@@ -3222,13 +4550,13 @@ mod tests {
     /// line nobody previewed.
     #[test]
     fn the_setup_command_parses_and_takes_no_arguments() {
-        let Input::Command { name, args } = classify("/web setup") else {
+        let Input::Command { name, args } = classify("/web setup", &no_skills()) else {
             panic!("`/web setup` did not classify as a command");
         };
         assert_eq!((name, args), ("web setup", ""));
         assert!(matches!(resolve(name, args), Resolution::Run(_, "")));
 
-        let Input::Command { name, args } = classify("/web setup search") else {
+        let Input::Command { name, args } = classify("/web setup search", &no_skills()) else {
             panic!("did not classify as a command");
         };
         let Resolution::Rejected(hint) = resolve(name, args) else {
@@ -3241,14 +4569,14 @@ mod tests {
     /// ones the table declares — rejected at resolve time, before any RPC.
     #[test]
     fn the_web_commands_parse_and_police_their_arguments() {
-        let Input::Command { name, args } = classify("/web allow") else {
+        let Input::Command { name, args } = classify("/web allow", &no_skills()) else {
             panic!("`/web allow` did not classify as a command");
         };
         assert_eq!((name, args), ("web allow", ""));
         assert!(matches!(resolve(name, args), Resolution::Run(_, "")));
 
         // `/web allow` takes nothing: a trailing word is a typo, not a tier.
-        let Input::Command { name, args } = classify("/web allow search") else {
+        let Input::Command { name, args } = classify("/web allow search", &no_skills()) else {
             panic!("did not classify as a command");
         };
         let Resolution::Rejected(hint) = resolve(name, args) else {
@@ -3258,7 +4586,9 @@ mod tests {
 
         // The URL reaches the handler verbatim — the daemon owns URL
         // normalization, so nothing here second-guesses it.
-        let Input::Command { name, args } = classify("/web refresh https://docs.rs/serde") else {
+        let Input::Command { name, args } =
+            classify("/web refresh https://docs.rs/serde", &no_skills())
+        else {
             panic!("did not classify as a command");
         };
         assert_eq!((name, args), ("web refresh", "https://docs.rs/serde"));
@@ -3269,7 +4599,7 @@ mod tests {
         assert_eq!(run_args, "https://docs.rs/serde");
 
         // A bare refresh gets the usage line, not an RPC with an empty URL.
-        let Input::Command { name, args } = classify("/web refresh") else {
+        let Input::Command { name, args } = classify("/web refresh", &no_skills()) else {
             panic!("did not classify as a command");
         };
         let Resolution::Rejected(hint) = resolve(name, args) else {
@@ -3285,7 +4615,7 @@ mod tests {
     /// one of them.
     #[test]
     fn a_bare_web_is_not_a_command() {
-        let Input::Command { name, args } = classify("/web") else {
+        let Input::Command { name, args } = classify("/web", &no_skills()) else {
             panic!("`/web` did not classify as a command line");
         };
         let Resolution::Rejected(hint) = resolve(name, args) else {
@@ -3418,7 +4748,7 @@ mod tests {
             // deciding not to send anything.
             ("/permissions bogus", "bogus"),
         ] {
-            let Input::Command { name, args } = classify(typed) else {
+            let Input::Command { name, args } = classify(typed, &no_skills()) else {
                 panic!("`{typed}` did not classify as a command");
             };
             assert_eq!(name, "permissions");
@@ -3672,7 +5002,7 @@ mod tests {
         assert_eq!(names[clear + 1], "cd", "beside /clear: {names:?}");
 
         let mut surface = RecordingSurface::new();
-        render_help(&mut surface);
+        render_help(&mut surface, &no_skills());
         assert!(
             surface
                 .lines_of(LineKind::Info)
@@ -3682,7 +5012,10 @@ mod tests {
         );
         // A typed `teton cd …` is not a recognized CLI line: there is no such
         // subcommand, so it is a prompt (BR-4's rule), never a dispatch.
-        assert!(!matches!(classify("teton cd ~"), Input::CliLine { .. }));
+        assert!(!matches!(
+            classify("teton cd ~", &no_skills()),
+            Input::CliLine { .. }
+        ));
     }
 
     /// AC-12, the `/cd` half: the argument goes through the very grammar table
@@ -3701,7 +5034,7 @@ mod tests {
         let home = Some(Path::new(CWD_GRAMMAR_HOME));
         for row in CWD_ARGUMENT_GRAMMAR {
             let typed = format!("/cd {}", row.raw);
-            let Input::Command { name, args } = classify(&typed) else {
+            let Input::Command { name, args } = classify(&typed, &no_skills()) else {
                 panic!("`{typed}` must be a command line");
             };
             let Resolution::Run(spec, args) = resolve(name, args) else {
@@ -3793,7 +5126,7 @@ mod tests {
         // Through the handler: the bare form reads the cache and touches no
         // socket — a `Connection` is never needed for it, which is why the
         // dispatch can be exercised here through `resolve` alone.
-        let Input::Command { name, args } = classify("/cd") else {
+        let Input::Command { name, args } = classify("/cd", &no_skills()) else {
             panic!("`/cd` must be a command line");
         };
         assert!(matches!(resolve(name, args), Resolution::Run(spec, "") if spec.name == "cd"));
@@ -3936,7 +5269,7 @@ mod tests {
     #[test]
     fn help_lists_every_mirrored_row_grouped_by_family() {
         let mut surface = RecordingSurface::new();
-        render_help(&mut surface);
+        render_help(&mut surface, &no_skills());
         let rendered = surface.lines_of(LineKind::Info);
 
         for spec in COMMANDS {
@@ -4127,14 +5460,14 @@ mod tests {
                 // whose first word *is* a family are refused with that family's
                 // session rows; the rest are prompts.
                 assert!(
-                    !matches!(classify(typed), Input::CliLine { .. }),
+                    !matches!(classify(typed, &no_skills()), Input::CliLine { .. }),
                     "`{typed}` names no subcommand path and must not be recognized"
                 );
                 continue;
             }
             reachable += 1;
             assert_eq!(
-                classify(typed),
+                classify(typed, &no_skills()),
                 Input::CliLine {
                     name: spec.name,
                     args: expected_args,
@@ -4144,7 +5477,7 @@ mod tests {
             );
             // And the row it reaches dispatches, which is what makes the notice
             // line's `/<name>` a spelling that works (AC-5).
-            let Input::CliLine { name, args, .. } = classify(typed) else {
+            let Input::CliLine { name, args, .. } = classify(typed, &no_skills()) else {
                 unreachable!("just asserted");
             };
             let Resolution::Run(resolved, run_args) = resolve(name, args) else {
@@ -4170,7 +5503,7 @@ mod tests {
     #[test]
     fn a_family_word_that_is_itself_a_row_runs_that_row() {
         assert_eq!(
-            classify("teton model"),
+            classify("teton model", &no_skills()),
             Input::CliLine {
                 name: "model",
                 args: "",
@@ -4178,7 +5511,10 @@ mod tests {
             }
         );
         // And the families that are *not* rows still refuse.
-        assert!(matches!(classify("teton provider"), Input::CliRefused(_)));
+        assert!(matches!(
+            classify("teton provider", &no_skills()),
+            Input::CliRefused(_)
+        ));
     }
 
     /// The argument is whatever the subcommand path did not consume, and the
@@ -4208,7 +5544,7 @@ mod tests {
             ("teton  policy   show", "policy show", ""),
         ] {
             assert_eq!(
-                classify(typed),
+                classify(typed, &no_skills()),
                 Input::CliLine {
                     name,
                     args,
@@ -4223,7 +5559,7 @@ mod tests {
     /// and its own flags. One line each, and never the model.
     #[test]
     fn a_teton_line_with_no_session_form_is_refused_with_the_reason() {
-        let refusal = |line: &str| match classify(line) {
+        let refusal = |line: &str| match classify(line, &no_skills()) {
             Input::CliRefused(text) => text,
             other => panic!("`{line}` classified as {other:?} rather than a refusal"),
         };
@@ -4324,7 +5660,11 @@ mod tests {
             // question rather than a refusal.
             "teton help me read this backtrace",
         ] {
-            assert_eq!(classify(line), Input::Prompt(line), "`{line}`");
+            assert_eq!(
+                classify(line, &no_skills()),
+                Input::Prompt(line),
+                "`{line}`"
+            );
         }
     }
 
@@ -4336,11 +5676,11 @@ mod tests {
     #[test]
     fn the_double_slash_escape_still_outranks_recognition() {
         assert_eq!(
-            classify("//teton provider list"),
+            classify("//teton provider list", &no_skills()),
             Input::EscapedPrompt("/teton provider list")
         );
         assert_eq!(
-            classify("//teton uninstall"),
+            classify("//teton uninstall", &no_skills()),
             Input::EscapedPrompt("/teton uninstall")
         );
     }
@@ -4354,7 +5694,7 @@ mod tests {
     #[test]
     fn a_slashed_cli_line_runs_the_same_row_and_an_unrecognized_one_still_rejects() {
         assert_eq!(
-            classify("/teton provider list"),
+            classify("/teton provider list", &no_skills()),
             Input::CliLine {
                 name: "provider list",
                 args: "",
@@ -4362,16 +5702,19 @@ mod tests {
             }
         );
         assert_eq!(
-            classify("/teton policy set-tier build kimi"),
+            classify("/teton policy set-tier build kimi", &no_skills()),
             Input::CliLine {
                 name: "policy set-tier",
                 args: "build kimi",
                 shell_flags: "",
             }
         );
-        assert!(matches!(classify("/teton"), Input::CliRefused(_)));
+        assert!(matches!(
+            classify("/teton", &no_skills()),
+            Input::CliRefused(_)
+        ));
 
-        let Input::Command { name, args } = classify("/teton frobnicate") else {
+        let Input::Command { name, args } = classify("/teton frobnicate", &no_skills()) else {
             panic!("a `/` line that names no subcommand is still a command line");
         };
         assert_eq!((name, args), ("teton", "frobnicate"));
@@ -4398,6 +5741,64 @@ mod tests {
         assert_eq!(after_words("anything", 0), "anything");
     }
 
+    /// **REQ-585 ADR-12 / AC-14.** `/help` renders its section from the
+    /// **session's own** snapshot — the same value [`classify`] dispatches from
+    /// — so a `/cd` that re-derived the registry is reflected without a
+    /// restart, and BR-3's "a skill cannot be dispatchable without appearing in
+    /// `/help`" holds because there is one list rather than two readers who
+    /// agree today. Rendering from a locally-built empty snapshot instead would
+    /// leave `/help` claiming the session has no skills while `/alpha` ran one.
+    ///
+    /// Driven through [`dispatch`] rather than [`render_help`] directly,
+    /// because the claim is about the *row*, not the renderer — and it asserts
+    /// the row issues no RPC, which is the `assert_no_turn_ran` posture `/help`
+    /// has always had.
+    #[test]
+    fn help_renders_the_sessions_own_snapshot() {
+        let snapshot = registry(
+            vec![described(
+                "alpha",
+                SkillSource::User,
+                "[topic]",
+                "Draft a note.",
+            )],
+            Vec::new(),
+        );
+        let (mut conn, peer) = Connection::scripted(&[]);
+        let mut surface = RecordingSurface::new();
+        let mut state = SessionState::new();
+        let mut prompter = ScriptedPrompter::new(&[]);
+        {
+            let mut ctx = session_ctx(&mut surface, &mut state, &mut prompter);
+            ctx.skills = snapshot.clone();
+            // The registry argument is `dispatch`'s own (it feeds BR-10's
+            // hint); `/help` must read the one on the context, so this one is
+            // deliberately empty. Reading the argument instead fails here.
+            let outcome =
+                dispatch("help", "", &no_skills(), &mut conn, &mut ctx).expect("/help renders");
+            assert_eq!(outcome, CommandOutcome::Continue);
+        }
+
+        let lines: Vec<String> = surface
+            .lines_of(LineKind::Info)
+            .iter()
+            .map(|line| (*line).to_owned())
+            .collect();
+        assert!(
+            lines.iter().any(|line| line == SKILLS_HEADER),
+            "the session's snapshot renders a section: {lines:?}"
+        );
+        assert_eq!(
+            skill_rows(&lines),
+            skill_rows(&help_lines(&snapshot)),
+            "the row is the one the renderer draws for this snapshot"
+        );
+        assert!(
+            crate::client::methods_written(&peer).is_empty(),
+            "/help issues no RPC and runs no turn"
+        );
+    }
+
     /// AC-6's third clause, at the seam that produces it: a recognized line with
     /// a stray word dispatches, and the row's clap parse prints the parser's own
     /// `unexpected argument` — the same text the shell prints for that argv.
@@ -4407,7 +5808,9 @@ mod tests {
     /// row it reaches judges the argument (BR-3).
     #[test]
     fn a_recognized_line_with_a_stray_word_prints_the_parsers_own_error() {
-        let Input::CliLine { name, args, .. } = classify("teton provider list please") else {
+        let Input::CliLine { name, args, .. } =
+            classify("teton provider list please", &no_skills())
+        else {
             panic!("a stray word does not un-recognize a command (ADR-1)");
         };
 
@@ -4417,7 +5820,7 @@ mod tests {
         let mut prompter = ScriptedPrompter::new(&[]);
         {
             let mut ctx = session_ctx(&mut surface, &mut state, &mut prompter);
-            let outcome = dispatch(name, args, &mut conn, &mut ctx)
+            let outcome = dispatch(name, args, &no_skills(), &mut conn, &mut ctx)
                 .expect("a parse error never fails the command");
             assert_eq!(outcome, CommandOutcome::Continue);
         }
@@ -4451,7 +5854,7 @@ mod tests {
     #[test]
     fn a_leading_global_flag_is_stepped_over_and_carried() {
         assert_eq!(
-            classify("teton -y policy set-tier build kimi"),
+            classify("teton -y policy set-tier build kimi", &no_skills()),
             Input::CliLine {
                 name: "policy set-tier",
                 args: "build kimi",
@@ -4459,7 +5862,7 @@ mod tests {
             }
         );
         assert_eq!(
-            classify("teton --verbose doctor"),
+            classify("teton --verbose doctor", &no_skills()),
             Input::CliLine {
                 name: "doctor",
                 args: "",
@@ -4468,7 +5871,7 @@ mod tests {
         );
         // Two flags, both carried as typed.
         assert_eq!(
-            classify("teton --yes -v model set qwen"),
+            classify("teton --yes -v model set qwen", &no_skills()),
             Input::CliLine {
                 name: "model set",
                 args: "qwen",
@@ -4478,17 +5881,17 @@ mod tests {
         // The bare binary with a flag is still the bare binary: the user is in
         // the session `teton -y` would have opened.
         assert_eq!(
-            classify("teton -y"),
+            classify("teton -y", &no_skills()),
             Input::CliRefused(ALREADY_IN_A_SESSION.to_owned())
         );
         assert_eq!(
-            classify("teton -y --help"),
+            classify("teton -y --help", &no_skills()),
             Input::CliRefused(CLI_FLAGS_ARE_SHELL_ONLY.to_owned())
         );
         // A leading token that merely starts with `-` is not a flag this
         // classifier knows, so the line is what the walk says: a prompt.
         assert_eq!(
-            classify("teton -whatever is going on"),
+            classify("teton -whatever is going on", &no_skills()),
             Input::Prompt("teton -whatever is going on")
         );
         // The split itself, on its edges.
@@ -4514,10 +5917,10 @@ mod tests {
             "teton provider -h",
             "teton policy -h",
         ] {
-            let Input::CliHelp(text) = classify(line) else {
+            let Input::CliHelp(text) = classify(line, &no_skills()) else {
                 panic!(
                     "`{line}` did not classify as a help page: {:?}",
-                    classify(line)
+                    classify(line, &no_skills())
                 );
             };
             let words: Vec<&str> = line.split_whitespace().skip(1).collect();
@@ -4531,7 +5934,7 @@ mod tests {
         }
         // The family's rows are named on the page — it is the page a shell
         // prints, and it lists the subcommands.
-        let Input::CliHelp(provider) = classify("teton provider --help") else {
+        let Input::CliHelp(provider) = classify("teton provider --help", &no_skills()) else {
             unreachable!("just asserted");
         };
         for sub in ["add", "list", "test"] {
@@ -4544,14 +5947,14 @@ mod tests {
         // `uninstall` is, and `provider setup --help` (a word that names no
         // subcommand) is still the family's session rows.
         assert!(
-            matches!(classify("teton uninstall --help"), Input::CliRefused(text) if text.contains("shell-only"))
+            matches!(classify("teton uninstall --help", &no_skills()), Input::CliRefused(text) if text.contains("shell-only"))
         );
         assert!(
-            matches!(classify("teton provider setup --help"), Input::CliRefused(text) if text.contains("/provider setup"))
+            matches!(classify("teton provider setup --help", &no_skills()), Input::CliRefused(text) if text.contains("/provider setup"))
         );
         // And a family typed bare is unchanged by this: the session's rows.
         assert!(
-            matches!(classify("teton provider"), Input::CliRefused(text) if text.contains("/provider list"))
+            matches!(classify("teton provider", &no_skills()), Input::CliRefused(text) if text.contains("/provider list"))
         );
         // The helper says `None` for anything that is not a family, so a caller
         // falls back to the refusal rather than to an empty page.
@@ -4571,7 +5974,7 @@ mod tests {
     /// own page.
     #[test]
     fn a_pre_req_row_has_its_whole_argv_validated_before_it_runs() {
-        /// Run `run_cli_line` over what `classify(line)` produced.
+        /// Run `run_cli_line` over what `classify(line, &no_skills())` produced.
         fn run(
             line: &str,
             scripted: &[serde_json::Value],
@@ -4581,9 +5984,12 @@ mod tests {
                 name,
                 args,
                 shell_flags,
-            } = classify(line)
+            } = classify(line, &no_skills())
             else {
-                panic!("`{line}` was not recognized: {:?}", classify(line));
+                panic!(
+                    "`{line}` was not recognized: {:?}",
+                    classify(line, &no_skills())
+                );
             };
             let (mut conn, peer) = Connection::scripted(scripted);
             let mut surface = RecordingSurface::new();
@@ -4592,8 +5998,9 @@ mod tests {
             {
                 let mut ctx = session_ctx(&mut surface, &mut state, &mut prompter);
                 ctx.typed_input = typed_input;
-                let outcome = run_cli_line(name, args, shell_flags, &mut conn, &mut ctx)
-                    .unwrap_or_else(|err| panic!("`{line}` failed: {err:#}"));
+                let outcome =
+                    run_cli_line(name, args, shell_flags, &no_skills(), &mut conn, &mut ctx)
+                        .unwrap_or_else(|err| panic!("`{line}` failed: {err:#}"));
                 assert_eq!(outcome, CommandOutcome::Continue);
             }
             conn.assert_all_consumed();

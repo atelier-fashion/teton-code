@@ -1615,6 +1615,7 @@ mod tests {
                 auto_accept_model: false,
                 typed_input: true,
                 session_id: Some(session()),
+                skills: crate::slash::SkillSnapshot::empty(),
             };
             assert!(
                 !ctx.state.provider_test_in_flight,

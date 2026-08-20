@@ -16,7 +16,7 @@
 //! had to shorten one phrase to pay for another, and BUG-181 had to move the
 //! ceiling (with its arithmetic re-checked) to land one capability sentence.
 //! Depth cannot live there. It lives here instead, and the only resident cost is
-//! [`DESCRIPTION`] — one line naming the topic index — so adding a fifth topic
+//! [`DESCRIPTION`] — one line naming the topic index — so adding a sixth topic
 //! later costs the prompt one word rather than a page (BR-10).
 //!
 //! # What a call touches
@@ -60,19 +60,22 @@ pub const MAX_TOPIC_BYTES: usize = 4096;
 
 /// Every bundled topic, as `(name, body)`, in the order a reader should meet
 /// them: how to connect a provider, where work is then routed, what each turn
-/// is assembled under, the separate web opt-in, and how to read the diagnostic
-/// when one of those is wrong.
+/// is assembled under, the separate web opt-in, the user's own `/` commands, and
+/// how to read the diagnostic when one of those is wrong.
 ///
 /// A `&[(&str, &str)]` rather than a constant apiece because every rule below —
 /// the ceiling sweep, the topic index, the unknown-topic error — is a statement
-/// about the *set*, and a set spelled out five times is one a sixth topic can be
-/// added to without. `context` (REQ-586 ADR-11) is the design paying off: the
-/// budget vocabulary is a page, and it cost the resident prompt nine bytes.
+/// about the *set*, and a set spelled out once is one a further topic can be
+/// added to without touching a rule. `context` (REQ-586 ADR-11) and `skills`
+/// (REQ-585 BR-13) are the design paying off: a page of budget vocabulary cost
+/// the resident prompt nine bytes, and a page on user-defined commands —
+/// including the half that says what Teton does *not* run — cost it eight.
 const TOPICS: &[(&str, &str)] = &[
     ("providers", include_str!("../docs/providers.md")),
     ("policy", include_str!("../docs/policy.md")),
     ("context", include_str!("../docs/context.md")),
     ("web", include_str!("../docs/web.md")),
+    ("skills", include_str!("../docs/skills.md")),
     ("doctor", include_str!("../docs/doctor.md")),
 ];
 
@@ -83,7 +86,7 @@ const TOPICS: &[(&str, &str)] = &[
 /// are `const` — and because a hand-written second spelling is what
 /// `the_description_indexes_every_bundled_topic` can compare against, the same
 /// golden posture the recipe catalog takes.
-const TOPIC_INDEX: &str = "providers, policy, context, web, doctor";
+const TOPIC_INDEX: &str = "providers, policy, context, web, skills, doctor";
 
 /// The longest echo of a caller-supplied topic any message here will carry.
 ///
@@ -125,21 +128,22 @@ pub(crate) fn bounded_topic_echo(topic: &str) -> String {
 ///
 /// It ends with the topic index because the index *is* the affordance: a model
 /// deciding whether this tool answers the question in front of it is matching
-/// the subject it was asked about against these five words. BUG-168's lesson
+/// the subject it was asked about against these six words. BUG-168's lesson
 /// applies — a capability the prompt does not name outright is one the local
 /// tier does not reach for. The fifth word, `context`, cost nine characters
-/// here for a 3.4 KB topic (REQ-586 ADR-11) — the trade this module exists to
-/// make.
+/// here for a 3.4 KB topic (REQ-586 ADR-11); the sixth, `skills`, cost eight for
+/// a 4.0 KB one (REQ-585) — the trade this module exists to make.
 ///
-/// The sentence in front of the index paid for it. `setup and troubleshooting`
+/// The sentence in front of the index paid for both. `setup and troubleshooting`
 /// named nothing `docs` does not already imply, and it was the only clause
 /// here that was not a topic name; dropping it took the description from the
 /// ceiling to 26 characters under it. **Spend that on names**: the index is
-/// the affordance, the sentence is the frame around it, and the next two
-/// topics should come out of this margin rather than out of `MAX_DESCRIPTION_CHARS`.
+/// the affordance, the sentence is the frame around it, and `skills` came out
+/// of that margin rather than out of `MAX_DESCRIPTION_CHARS`, which has not
+/// moved. **Spent: 102. Left: 18** — room for one more short name.
 const DESCRIPTION: &str = concat!(
     "Read Teton's own docs, bundled in this binary. ",
-    "topics: providers, policy, context, web, doctor"
+    "topics: providers, policy, context, web, skills, doctor"
 );
 
 /// The body of `topic`, or `None` when nothing by that name is bundled.
@@ -188,7 +192,7 @@ impl Tool for DocsTool {
         // than spelled a fourth time. This method returns an **owned** `Value`,
         // so nothing here has to be `const` — and a hand-written list that only
         // the schema carried would be the one copy no golden compares, which is
-        // exactly how a fifth topic ends up reachable from the description and
+        // exactly how a new topic ends up reachable from the description and
         // invisible in the schema the model actually fills.
         json!({
             "type": "object",
@@ -254,19 +258,21 @@ mod tests {
     /// pins that with a regression test, so the placement is convention, not a
     /// constraint.
     ///
-    /// **Spent and left, as of REQ-586.** The `context` topic's nine characters
+    /// **Spent and left, as of REQ-585.** The `context` topic's nine characters
     /// (`, context`) first took [`DESCRIPTION`] to exactly 120 — legal, and no
     /// headroom at all with a `projects` tool (REQ-584) and a `skill` tool
     /// (REQ-587) queued behind this one. So the room was bought where the
     /// review said to buy it: the sentence in front of the index lost `setup
     /// and troubleshooting`, 26 characters that named nothing the index does
-    /// not already carry. **Spent: 94. Left: 26** — room for roughly two more
-    /// topic names.
+    /// not already carry, leaving 94 spent and 26 free.
     ///
-    /// A sixth topic spends that margin, not this number: the two margin tests
-    /// measure the prompt this description sits in, and their headroom is what
-    /// the bundled guide is competing for. When the margin is gone, shorten the
-    /// frame again or make the case for a bigger ceiling out loud.
+    /// REQ-585's `skills` spent eight of those 26 out of the margin, exactly as
+    /// that note said the next topic should, and this number did not move.
+    /// **Spent: 102. Left: 18.** The margin, not the ceiling, is what a seventh
+    /// topic buys its name from: the two margin tests measure the prompt this
+    /// description sits in, and their headroom is what the bundled guide is
+    /// competing for. When the margin is gone, shorten the frame again or make
+    /// the case for a bigger ceiling out loud.
     pub(super) const MAX_DESCRIPTION_CHARS: usize = 120;
 
     fn ctx() -> ToolContext {
@@ -292,7 +298,7 @@ mod tests {
     fn every_topic_serves_its_whole_bundled_body() {
         assert_eq!(
             TOPICS.len(),
-            5,
+            6,
             "the topic roster changed: {:?}",
             TOPICS.iter().map(|(name, _)| *name).collect::<Vec<_>>()
         );
@@ -392,7 +398,7 @@ mod tests {
     /// are one request in every sense but `==`. Refusing them costs a whole
     /// turn — the didactic error, then a retry — to teach a casing rule that
     /// carries no meaning. Swept over every bundled topic rather than spot-
-    /// checked on one, so a fifth topic inherits the tolerance.
+    /// checked on one, so a new topic inherits the tolerance.
     #[test]
     fn a_topic_is_matched_past_case_and_surrounding_space() {
         for (name, body) in TOPICS {
@@ -492,7 +498,7 @@ mod tests {
 
     /// **BR-9 / AC-8: every bundled topic is under the ceiling.**
     ///
-    /// Swept over [`TOPICS`] rather than written per topic, so a fifth topic is
+    /// Swept over [`TOPICS`] rather than written per topic, so a new topic is
     /// covered the moment it is added rather than the moment someone remembers.
     /// The floor below is the other half of BUG-159's lesson: an empty or
     /// stub-length body would pass a ceiling check by having nothing in it.

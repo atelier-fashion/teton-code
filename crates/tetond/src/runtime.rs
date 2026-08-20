@@ -86,10 +86,10 @@
 //! *describing* the machine, changes no safety decision, and is how the offline
 //! session path is exercised at all.
 
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
 use teton_core::boundary::BoundaryMatcher;
@@ -107,7 +107,7 @@ use teton_core::phase::Phase as CorePhase;
 use teton_core::policy::ProviderHealth;
 use teton_core::{
     apply_config_delta, compose_endpoint, is_absolute_http_url, is_cleartext_to_a_remote_host,
-    table_section,
+    table_section, ProvenanceId,
 };
 
 use teton_inference::benchmark::{BenchmarkResult, DutySpec};
@@ -116,10 +116,12 @@ use teton_inference::probe::{decide, GpuClass, HardwareProfile, TierDecision, GI
 use teton_inference::{ChatFormat, Completion, Engine, EngineError, GenParams, MockEngine};
 
 use teton_protocol::events::{
-    BlockCause, CapabilityDeadEnd, ContextCleared, ContextPressureKind, Event, ModelLifecycle,
-    ModelLifecycleStage, PrivacyAction, ProviderTested, SessionRootChanged, SessionTitled,
-    TierWarming, TurnQueued, WebCapabilityState as WireWebCapabilityState, WebLookup,
-    WebSetupCompleted, WebTaintOverridden, WebTier as WireWebTier,
+    BlockCause, CapabilityDeadEnd, ContextCleared, ContextPressureKind,
+    DynamicOutcome as WireDynamicOutcome, DynamicOutcomeView, Event, ModelLifecycle,
+    ModelLifecycleStage, NotRunReason, PrivacyAction, ProviderTested, SessionRootChanged,
+    SessionTitled, SkillInvoked, TierWarming, TurnQueued,
+    WebCapabilityState as WireWebCapabilityState, WebLookup, WebSetupCompleted, WebTaintOverridden,
+    WebTier as WireWebTier,
 };
 use teton_protocol::jsonrpc::{error_code, RpcError};
 use teton_protocol::methods::{
@@ -128,9 +130,9 @@ use teton_protocol::methods::{
     ModelListResult, ModelSetResult, ModelStatusResult, PrivacyBoundaryConfig, PromptTurnResult,
     ProviderConfig, ProviderHealth as WireProviderHealth, ProviderSetupCandidate,
     ProviderSetupCommitResult, ProviderSetupPlanResult, ProviderSetupPreviewResult,
-    ProviderTestOutcome, ProviderTestResult, SessionClearParams, SessionClearResult,
+    ProviderTestOutcome, ProviderTestResult, RefusalReason, SessionClearParams, SessionClearResult,
     SessionPermissionsParams, SessionPermissionsResult, SessionSetCwdParams, SessionSetCwdResult,
-    TierBinding as WireTierBinding, TierBindingConfig, TierRouteView, TierSummary,
+    SkillInvocation, TierBinding as WireTierBinding, TierBindingConfig, TierRouteView, TierSummary,
     WebOverrideParams, WebOverrideResult, WebRefreshOutcome, WebRefreshParams, WebRefreshResult,
     WebSetupCommitParams, WebSetupCommitResult, WebSetupPlanResult, WebSetupPreviewParams,
     WebSetupPreviewResult, WebTableSummary, WebTotalsView,
@@ -162,9 +164,12 @@ use crate::egress::{
     EgressError, HttpTransport, LookupContext, LookupOutcome, LookupRecord, LookupRecorder,
     LookupRequest, Provenance, RedactionGate, RedactionVerdict, TaintView,
 };
-use crate::harness::budget::RouteBudget;
+use crate::grants::ConnectionId;
+use crate::harness::budget::{skill_fit, RouteBudget, SkillFit, SkillStage};
 use crate::harness::completion::{context_provenance, RemoteProviderSource};
 use crate::harness::context::{NoopProvenanceHook, PressureReport};
+use crate::harness::permissions::{AddressedPermissionDelivery, SkillConsent};
+use crate::harness::tools::shell;
 use crate::harness::tools::web::{register_web_tool, tier_name, SeamError, WebLookupSeam};
 use crate::harness::turn_loop::{pressure_kind, run_session_turn_with_source, HarnessError};
 use crate::harness::{
@@ -186,6 +191,8 @@ use crate::router::{
 use crate::selection_store::SelectionStore;
 use crate::session_root::{home, ProbedRoot};
 use crate::sessions::{validate_session_cwd, SessionRegistry, TurnClaimError};
+use crate::skills::expand::COMMAND_ECHO_MAX_CHARS;
+use crate::skills::{Command, DynamicOutcome, Expansion, Pending, SkillSource};
 use crate::web::{UserUrls, WebCache};
 // The module rather than the function: `suggestion_catalog()` on its own would
 // read, in a file this size, as something the runtime computes.
@@ -1422,6 +1429,156 @@ fn attempt_source<'a>(
     }
 }
 
+/// One accepted `/name` invocation, resolved against the session's registry and
+/// expanded **once** (REQ-585 BR-4, ADR-3, ADR-9, ADR-11).
+///
+/// Everything a skill turn needs that a typed turn does not, carried as one
+/// value from the moment the invocation is accepted to the moment the user block
+/// is seeded — which is what lets [`DaemonRuntime::run_prompt_turn`] read "this
+/// turn's prompt text" exactly once for the classifier, the naming attempt and
+/// both budget checks. Two derivations of that string would be BR-4's own
+/// failure mode one layer up: the turn the user consented to and the turn that
+/// ran would be two different strings.
+struct SkillTurn {
+    /// The dispatch name, as the registry validated it
+    /// (`^[a-z0-9][a-z0-9_-]{0,63}$`) — safe to put in a refusal sentence, and
+    /// the name [`skill_fit`] quotes.
+    name: String,
+    /// The expansion as it stands: [`crate::skills::PENDING_PLACEHOLDER`] in
+    /// each `` !`command` `` slot until the consent seam folds the outcomes in,
+    /// and the finished prompt text afterwards.
+    ///
+    /// Replaced at the seam in `run_prompt_turn`, after the commands have been
+    /// consented to and run, with [`Expansion::fold`]'s output — which is
+    /// precisely why Stage B measures this field rather than re-reading Stage
+    /// A's answer.
+    text: String,
+    /// The expansion value itself, taken at the seam and folded exactly once.
+    ///
+    /// `None` afterwards, and that is the type doing the work: [`Expansion::fold`]
+    /// consumes, so a second fold is not expressible, and BR-4's "built once
+    /// because two copies would disagree" holds one layer up as well — the
+    /// string the user consented to and the string the model receives come from
+    /// one value.
+    expansion: Option<Expansion<Pending>>,
+    /// The gate key this skill's dynamic context asks under
+    /// ([`crate::skills::Skill::permission_key`], ADR-6) — minted with the
+    /// registry row in hand rather than re-derived at the seam, so the key the
+    /// grant is remembered under cannot come from a second reading of the
+    /// registry.
+    permission_key: String,
+    /// Which of the two roots the file came from — half the permission key, and
+    /// what BR-12's echo line names.
+    source: SkillSource,
+    /// The file, home-relative and bounded (`session_root::display_for` +
+    /// `bounded_field`) — the one form allowed on a surface, because an absolute
+    /// path carries a username into a transcript (BR-1's entity table).
+    path_display: String,
+    /// The body's size in bytes, which is what BR-12's echo line renders.
+    body_bytes: u64,
+    /// The frontmatter keys this daemon read and ignored (BR-5), listed by
+    /// `/verbose` and inert everywhere else.
+    ignored_keys: Vec<String>,
+    /// A frontmatter `name` that disagrees with the file's own (BR-2), carried
+    /// so `/verbose` can say it. The dispatching spelling is never in doubt —
+    /// this is a note to the author, not a second name.
+    name_note: Option<String>,
+    /// The skill file's identity, for the seeded user block (BR-7, ADR-9). A
+    /// project skill is under the root and mints cleanly.
+    sources: BTreeSet<ProvenanceId>,
+    /// Set when the file has no root-relative identity to mint — a **user**
+    /// skill outside the session root, which `ProvenanceId::from_resolved`
+    /// refuses by design (REQ-571 ADR-B). The block then fails closed wherever a
+    /// boundary is configured, exactly as `shell` output does, which is stricter
+    /// than BR-7's letter and right in the charter's direction (ADR-9).
+    unknown: bool,
+}
+
+/// The gate's answer to one invocation, reduced to the fact both readers need:
+/// **which door was closed**, or `None` when the commands may run.
+///
+/// Two arms of [`SkillConsent`] collapse here and it is deliberate.
+/// `Refused(NoTerminal)` and `Unanswerable` differ in *why* there was nobody at
+/// the other end — a client that refused without reading stdin, versus a
+/// question that could not be put to anyone at all — and not in anything the
+/// model or the user can act on: no human was asked. Every other arm keeps its
+/// own door, because AC-9 turns on the difference between "you said no" and
+/// "nobody could be asked", and BR-6 on the difference between either and "the
+/// level does not run them".
+fn closed_door(consent: SkillConsent) -> Option<NotRunReason> {
+    match consent {
+        SkillConsent::Allowed => None,
+        SkillConsent::DeniedByLevel => Some(NotRunReason::Level),
+        SkillConsent::Declined => Some(NotRunReason::Declined),
+        SkillConsent::Refused(RefusalReason::NoTerminal) | SkillConsent::Unanswerable => {
+            Some(NotRunReason::NoTerminal)
+        }
+        SkillConsent::Refused(RefusalReason::UnrecognizedSubject) => {
+            Some(NotRunReason::UnrecognizedSubject)
+        }
+    }
+}
+
+/// The placeholder sentence a closed door earns, from
+/// [`crate::skills::dynamic`]'s own constructors.
+///
+/// The strings live there, beside the grammar and the runner, so the four
+/// sentences a model can read about a missing command are spelled in exactly one
+/// place (LESSON-528).
+fn door_outcome(door: NotRunReason) -> DynamicOutcome {
+    match door {
+        NotRunReason::Declined => DynamicOutcome::declined(),
+        NotRunReason::Level => DynamicOutcome::not_run_at_plan(),
+        NotRunReason::NoTerminal => DynamicOutcome::no_terminal(),
+        NotRunReason::UnrecognizedSubject => DynamicOutcome::unrecognized_subject(),
+        // Never reached from `closed_door`, which only ever answers with the
+        // consent's own doors. It is spelled out rather than left to an
+        // `unreachable!` because `NotRunReason` now also carries the runner's
+        // `CouldNotStart`, which arrives as an *outcome* and not as a door —
+        // and a future caller should meet a sentence here, not a panic.
+        NotRunReason::CouldNotStart => DynamicOutcome::could_not_start(),
+    }
+}
+
+/// One command's typed record for BR-12's event, projected from the outcome the
+/// daemon actually produced (LESSON-544: the wire value is derived from the real
+/// one, never composed beside it).
+///
+/// `door` is `Some` when the consent closed one, and it is what a not-run arm
+/// reports: the daemon-side outcome carries its reason as prose for the model,
+/// and re-reading a [`NotRunReason`] out of that sentence would be a second
+/// parser of the daemon's own words (LESSON-529).
+///
+/// A command the runner could not **start** (`sh` unavailable, an unresolvable
+/// jail root) has no door either, and reports [`NotRunReason::CouldNotStart`].
+/// It is not folded into `Failed`: that would say it was attempted and exited,
+/// which is untrue and points a reader at the wrong fix. It is not folded into
+/// one of the consent's doors either — nobody refused it.
+fn outcome_view(
+    command: &Command,
+    outcome: &DynamicOutcome,
+    door: Option<NotRunReason>,
+) -> DynamicOutcomeView {
+    DynamicOutcomeView {
+        // File-supplied bytes on a surface: bounded and rendered on one line
+        // here, at the same ceiling the fold's echoed placeholder uses (BR-3).
+        command: teton_core::session_root::bounded_field(command.as_str(), COMMAND_ECHO_MAX_CHARS),
+        outcome: match outcome {
+            DynamicOutcome::Ran { output, .. } => WireDynamicOutcome::Ran {
+                output_bytes: output.len() as u64,
+                truncated: outcome.output_truncated(),
+            },
+            DynamicOutcome::NotRun { .. } => WireDynamicOutcome::NotRun {
+                reason: door.unwrap_or(NotRunReason::CouldNotStart),
+            },
+            DynamicOutcome::Failed { exit_status, .. } => WireDynamicOutcome::Failed {
+                exit_status: *exit_status,
+            },
+            DynamicOutcome::TimedOut => WireDynamicOutcome::TimedOut,
+        },
+    }
+}
+
 /// The assembled daemon runtime shared by every client task.
 pub struct DaemonRuntime {
     /// The live configuration (providers, routing, boundaries). Mutated by
@@ -1572,6 +1729,29 @@ pub struct DaemonRuntime {
     /// as an endpoint-bound authorization header at the egress choke point and
     /// never reaches a log, `CostRecord`, or telemetry.
     secret_resolver: SecretResolver,
+    /// Where an **addressed** permission request is delivered (REQ-585 ADR-7).
+    ///
+    /// Installed once, by [`crate::server::Daemon`]'s constructors, over the
+    /// live surface registry that daemon holds. It lives here because the gate
+    /// is built here ([`Self::permission_gate_for`]) and cached for the
+    /// session's life, while the route is a daemon-wide fact fixed before any
+    /// connection exists.
+    ///
+    /// A [`OnceLock`] rather than a constructor parameter because the ownership
+    /// runs the other way: the daemon holds the runtime, so the runtime cannot
+    /// be handed the daemon's registry until the runtime already exists. Empty
+    /// on a runtime nobody wired one into, which is **no prompt** rather than a
+    /// degraded one — see [`AddressedPermissionDelivery`].
+    addressed_delivery: OnceLock<Arc<dyn AddressedPermissionDelivery>>,
+    /// The per-command deadline a skill's dynamic context runs under (REQ-585
+    /// BR-6: "the `shell` tool's jail, timeout and output cap").
+    ///
+    /// Production is [`shell::DEFAULT_TIMEOUT_MS`] — the same figure a `shell`
+    /// call that names no timeout gets — and it is a field only so a test can
+    /// reach the timed-out arm without waiting out a window sized for a human
+    /// (the argument `Daemon::with_consent_timeout` makes, and
+    /// `ShellTool::with_timeouts` makes for the tool itself).
+    skill_command_timeout_ms: u64,
 }
 
 impl DaemonRuntime {
@@ -1628,7 +1808,43 @@ impl DaemonRuntime {
             data_dir: std::env::temp_dir(),
             provider_health: Mutex::new(BTreeMap::new()),
             secret_resolver: SecretResolver::with_default_backend(),
+            addressed_delivery: OnceLock::new(),
+            skill_command_timeout_ms: shell::DEFAULT_TIMEOUT_MS,
         }
+    }
+
+    /// Install the route an addressed permission request is delivered on
+    /// (REQ-585 ADR-7) — the daemon's one call, made before any connection
+    /// exists.
+    ///
+    /// Idempotent-by-first-writer: a second call is ignored, because two
+    /// daemons over one runtime is not a production shape and the first
+    /// daemon's live surface registry is as good an answer as the second's.
+    ///
+    /// Without it every skill consent answers
+    /// [`SkillConsent::Unanswerable`](crate::harness::permissions::SkillConsent::Unanswerable)
+    /// and no dynamic command runs — fail-closed, which is the only safe
+    /// absence: the fallback would be the event bus, and keeping a skill
+    /// consent *off* the bus is the whole of ADR-7.
+    pub fn install_addressed_delivery(&self, route: Arc<dyn AddressedPermissionDelivery>) {
+        let _ = self.addressed_delivery.set(route);
+    }
+
+    /// Replace the per-command deadline a skill's dynamic context runs under
+    /// (REQ-585 AC-10).
+    ///
+    /// **The observation seam AC-10's turn-level claim is written against.**
+    /// Production takes [`shell::DEFAULT_TIMEOUT_MS`], 30 s — sized for a real
+    /// command — and a test that asserted "a command past the deadline leaves a
+    /// timed-out placeholder and the invocation still produces its turn" by
+    /// waiting that out would spend half a minute proving a branch it can prove
+    /// in milliseconds. A fixture has to say this out loud, exactly as it does
+    /// [`crate::server::Daemon::with_consent_timeout`], so no shipped path can
+    /// be running a shortened deadline.
+    #[must_use]
+    pub fn with_skill_command_timeout(mut self, timeout_ms: u64) -> Self {
+        self.skill_command_timeout_ms = timeout_ms;
+        self
     }
 
     /// [`Self::minimal`] with a **real config file** behind it, loaded (REQ-579
@@ -1806,6 +2022,8 @@ impl DaemonRuntime {
             data_dir: base_dir.to_path_buf(),
             provider_health: Mutex::new(BTreeMap::new()),
             secret_resolver: SecretResolver::with_default_backend(),
+            addressed_delivery: OnceLock::new(),
+            skill_command_timeout_ms: shell::DEFAULT_TIMEOUT_MS,
         })
     }
 
@@ -2686,6 +2904,249 @@ impl DaemonRuntime {
         }
     }
 
+    /// Resolve one `/name` invocation against **this daemon's** registry and
+    /// expand it (REQ-585 BR-4, ADR-3, ADR-9).
+    ///
+    /// # The client's snapshot is a convenience, not the authority
+    ///
+    /// `classify` runs client-side over a snapshot of this registry (ADR-13), so
+    /// in the ordinary case the name arriving here is one the client already
+    /// matched. That is not a reason to trust it: the snapshot is refreshed on
+    /// an event, a third-party client need not hold one at all, and the registry
+    /// moves under `/cd`. A check that lived only on the far side of the wire is
+    /// LESSON-520's shape — so the name is resolved again here, against the
+    /// registry that will actually be dispatched from, and an unknown or
+    /// **shadowed** name is refused. `SkillRegistry::dispatchable` is what
+    /// decides both: a shadowed row exists, is listed by `/help`, and never
+    /// dispatches (BR-2).
+    ///
+    /// # Nothing unvalidated reaches the sentence
+    ///
+    /// The name is checked against [`crate::skills::is_valid_skill_name`]
+    /// *before* it is echoed. A registered skill's name already satisfies it —
+    /// discovery would not have registered it otherwise — so this guard only
+    /// ever fires on a name that came off the wire and matched nothing, which is
+    /// exactly the string that must not be reflected verbatim into a message a
+    /// terminal renders (LESSON-517). `raw_arguments` is never echoed at all: it
+    /// reaches the model through [`crate::skills::expand`], which defuses it.
+    fn accept_invocation(
+        &self,
+        sessions: &SessionRegistry,
+        session_id: &SessionId,
+        probed: &ProbedRoot,
+        invocation: &SkillInvocation,
+    ) -> Result<SkillTurn, RpcError> {
+        if !crate::skills::is_valid_skill_name(&invocation.name) {
+            return Err(RpcError::new(
+                error_code::INVALID_PARAMS,
+                "`skill.name` is not a skill name: a skill dispatches under \
+                 `^[a-z0-9][a-z0-9_-]{0,63}$`, and nothing else is registered"
+                    .to_owned(),
+            ));
+        }
+        let registry = sessions.skills(session_id);
+        let Some(skill) = registry.dispatchable(&invocation.name) else {
+            return Err(RpcError::new(
+                error_code::INVALID_PARAMS,
+                format!(
+                    "no skill `/{}` in this session — `skills/list` is what this session \
+                     dispatches, and a name it does not list (or lists as shadowed) is not \
+                     one of them",
+                    invocation.name
+                ),
+            ));
+        };
+
+        // BR-4's preamble names the file, home-relative: an absolute path
+        // carries a username into a transcript and into every remote payload
+        // this turn produces. Reduced here, at the one surface that has both the
+        // path and `home`, so `expand` stays pure (BR-14).
+        let display = teton_core::session_root::display_for(&skill.path, home().as_deref());
+        let expansion = crate::skills::expand(skill, &invocation.raw_arguments, &display);
+        let text = expansion.pending_text();
+
+        // ADR-9's id-minting gap, decided rather than papered over: a project
+        // skill is under the root and mints; a user skill at
+        // `~/.claude/skills/x/SKILL.md` in a repo-rooted session has no
+        // repo-relative identity, and `from_resolved` refuses rather than
+        // inventing one. `unknown` is what carries that refusal forward.
+        let (sources, unknown) = match ProvenanceId::from_resolved(&probed.path, &skill.path) {
+            Ok(id) => (BTreeSet::from([id]), false),
+            Err(_) => (BTreeSet::new(), true),
+        };
+
+        Ok(SkillTurn {
+            name: skill.name.clone(),
+            text,
+            expansion: Some(expansion),
+            permission_key: skill.permission_key(),
+            source: skill.source,
+            // Bounded here, at the one surface that has the path and `home`,
+            // for the reason the preamble's copy is bounded here: BR-12's event
+            // goes to every attached client and into transcripts (ADR-15).
+            path_display: teton_core::session_root::bounded_field(
+                &display,
+                teton_core::session_root::DISPLAY_MAX_CHARS,
+            ),
+            body_bytes: skill.body.len() as u64,
+            ignored_keys: skill.ignored_keys.clone(),
+            name_note: skill.name_note.clone(),
+            sources,
+            unknown,
+        })
+    }
+
+    /// Ask once, run in document order, fold the outcomes back into the
+    /// expansion, and publish the invocation's record (REQ-585 BR-6, BR-12;
+    /// ADR-7, ADR-14, ADR-15).
+    ///
+    /// # One consent, every command
+    ///
+    /// [`PermissionGate::authorize_skill`] is called **once per invocation**,
+    /// with the whole command list in document order and already substituted, so
+    /// the prompt shows what will run. A prompt per command is REQ-560 BR-2's
+    /// named anti-pattern — the shipped ADLC corpus has skills with four `` !`…` ``
+    /// slots, and four prompts for one typed `/name` is a session nobody uses
+    /// twice.
+    ///
+    /// The key is the skill's own (`skill:<source>:<name>`, ADR-6), minted with
+    /// the registry row in hand at [`Self::accept_invocation`] and carried here
+    /// — never `shell`, or one "allow for this session" answered at a skill
+    /// prompt would free every later model-issued shell call (LESSON-495).
+    ///
+    /// # Nothing is re-read across the await
+    ///
+    /// The permission `await` releases this turn to the event loop, and nothing
+    /// below it re-reads a fact the gate settled above it: `decide` snapshots the
+    /// level at the top of its own body for exactly that reason (REQ-560 BR-7),
+    /// and the root, the commands and the expansion were all fixed before the
+    /// question was asked. A `/permissions` landing mid-prompt moves the *next*
+    /// turn.
+    ///
+    /// # The event is published here, and not one line later
+    ///
+    /// BR-12 says *every* invocation echoes one line, so the publish is the last
+    /// thing this function does and the Stage B check is the first thing after
+    /// it. A turn where the user approved four commands, watched them run, and
+    /// was then refused for size is the turn whose record matters most; a publish
+    /// on the far side of that refusal would leave it with no echo line and no
+    /// `/verbose` outcomes (ADR-15).
+    ///
+    /// # No model call happens here (BR-4)
+    ///
+    /// [`crate::skills::run_all`] is `run_bounded`'s second caller, not
+    /// `ShellTool::run`'s — so `Tool::refine`, which fires the `shell` duty and
+    /// *is* a model call, is not on this path (ADR-14).
+    async fn settle_dynamic_context(
+        self: &Arc<Self>,
+        events: &Arc<EventBus>,
+        session_id: &SessionId,
+        gate: &PermissionGate,
+        root: &Path,
+        invoker: Option<ConnectionId>,
+        skill: &mut SkillTurn,
+    ) {
+        // Taken, not borrowed: `fold` consumes, so this value can be spent once
+        // and the type says so (see [`SkillTurn::expansion`]). It is `Some` on
+        // every path into this function, which runs once per turn.
+        let Some(expansion) = skill.expansion.take() else {
+            return;
+        };
+        let commands = expansion.commands().to_vec();
+
+        // A skill with no dynamic context asks nothing. There is no question to
+        // put — a prompt listing zero commands is a prompt about nothing — and
+        // BR-12's line still gets published below with an empty outcome list,
+        // which is a real state ("0 dynamic commands") rather than a missing one.
+        let door = if commands.is_empty() {
+            None
+        } else {
+            let consent = match invoker {
+                Some(connection) => {
+                    gate.authorize_skill(
+                        &skill.permission_key,
+                        &skill.name,
+                        skill.source,
+                        commands.iter().map(|c| c.as_str().to_owned()).collect(),
+                        connection,
+                    )
+                    .await
+                }
+                // No addressable connection — an internal caller, or a fixture.
+                // The question cannot be *put* to anyone, which is precisely the
+                // gate's own fail-closed answer, so it is spelled with the gate's
+                // word rather than with a second one.
+                None => SkillConsent::Unanswerable,
+            };
+            closed_door(consent)
+        };
+
+        let outcomes = match door {
+            // Consent given. Sequential, in document order, with the session
+            // root as cwd and the `shell` tool's jail, scrub, PATH floor,
+            // process group and deadline (ADR-14).
+            None if !commands.is_empty() => {
+                let root = root.to_path_buf();
+                let to_run = commands.clone();
+                let timeout_ms = self.skill_command_timeout_ms;
+                // On the blocking pool: `run_bounded` waits on a child process
+                // for up to the deadline, per command, and a turn that parked an
+                // async worker for that long would stall every other session on
+                // it. A panic inside propagates exactly as an inline call's
+                // would — which is the only way this join can fail, since a
+                // `spawn_blocking` task is never cancelled.
+                tokio::task::spawn_blocking(move || {
+                    crate::skills::run_all(&root, &to_run, timeout_ms)
+                })
+                .await
+                .expect("the dynamic-context runner does not panic")
+            }
+            None => Vec::new(),
+            // A closed door is the same answer for every command of the
+            // invocation, because the question was asked once about all of them.
+            Some(reason) => vec![door_outcome(reason); commands.len()],
+        };
+
+        // The fold is where the output becomes prompt text: a ran slot enters
+        // inside `frame_untrusted_builtin("skill:<name>", …)` — the same
+        // envelope every built-in tool result gets, which neutralizes envelope
+        // tags in its payload — and every other slot becomes an explicit
+        // ``[dynamic context not run: `<cmd>` — <reason>]`` (BR-6).
+        skill.text = expansion.fold(&outcomes);
+
+        // BR-7: anything that came from a command carries what `shell` output
+        // carries — nothing that can be pinned. On a boundary-configured machine
+        // that fails closed, so an invocation that **spawned** any command pins
+        // its turn to the local tier, exactly as a `shell` result does. Recorded
+        // on the block the seed below builds, which is what egress inspects.
+        //
+        // `spawned`, not `did_run`: a command that ran and exited non-zero, or
+        // timed out, produces no output but still reports a *value the command
+        // chose*, and `fold` writes that value into the prompt (`exited 2`).
+        // Asking about output left a side channel that pinned nothing — one bit
+        // per command about a boundary-protected file, in a turn free to route
+        // remote. `ShellTool::run` tags every spawned arm the same way, and the
+        // claim above is parity with it.
+        skill.unknown |= outcomes.iter().any(DynamicOutcome::spawned);
+
+        events.publish(
+            Some(session_id.clone()),
+            Event::SkillInvoked(SkillInvoked {
+                name: skill.name.clone(),
+                source: skill.source,
+                path_display: skill.path_display.clone(),
+                body_bytes: skill.body_bytes,
+                ignored_keys: skill.ignored_keys.clone(),
+                name_note: skill.name_note.clone(),
+                outcomes: commands
+                    .iter()
+                    .zip(outcomes.iter())
+                    .map(|(command, outcome)| outcome_view(command, outcome, door))
+                    .collect(),
+            }),
+        );
+    }
+
     /// Run one prompt turn for `session`, streaming events over `events` and
     /// returning the turn result.
     ///
@@ -2707,14 +3168,41 @@ impl DaemonRuntime {
     /// client that disconnects while its turn waits gets no ghost turn run on
     /// its behalf once the tier opens (see [`ClientPresence`]).
     ///
+    /// ## A `/name` invocation is expanded here, and expanded FIRST (REQ-585)
+    ///
+    /// `skill` is the invocation as it crossed the wire — a name and the rest of
+    /// the typed line, never an expansion (ADR-3) — and `prompt` is empty
+    /// whenever it is `Some`. The expansion is built before
+    /// [`Self::dispatch_route`] and before [`Self::spawn_title_session`],
+    /// because both of those read the prompt *text*: a skill turn expanded after
+    /// them would be classified from `""` and would spend the session's one
+    /// naming attempt on `""`. From there the order is BR-8's, and BR-8(c) is a
+    /// statement about a single line — [`CarriedTurn::begin`] both pushes the
+    /// user block and arms the drop-commit, so a check placed after it has
+    /// already committed the expansion:
+    ///
+    /// ```text
+    /// probe root → expand → route + route.budget → Stage A
+    ///            → (TASK-205: consent + commands) → Stage B → CarriedTurn::begin
+    /// ```
+    ///
     /// # Errors
-    /// Returns a [`RpcError`] when no provider can serve the turn or an
-    /// unrecoverable provider failure occurs.
+    /// Returns a [`RpcError`] when no provider can serve the turn, an
+    /// unrecoverable provider failure occurs, the named skill is not one this
+    /// session dispatches ([`error_code::INVALID_PARAMS`]), or its expansion does
+    /// not fit the route's budget ([`error_code::SKILL_EXPANSION_TOO_LARGE`]).
     // The parameters are the session's own facts, passed individually because
     // that is how the caller reads them off `session/prompt` — the same shape
     // `run_one_attempt` already carries below. `session_cwd` is the caller's
     // pre-claim snapshot of the root; the turn re-reads the registry once it
     // holds the claim and uses the snapshot only if the session is gone.
+    //
+    // `invoker` is the connection that sent this prompt, and it is carried for
+    // exactly one purpose: a skill's dynamic-context consent is **addressed** to
+    // it and answerable by nobody else (REQ-585 ADR-7). `None` is a caller with
+    // no connection at all — an internal driver or a fixture — and it asks
+    // nobody, which is the gate's own fail-closed answer rather than a fallback
+    // to the bus.
     #[allow(clippy::too_many_arguments)]
     pub async fn run_prompt_turn(
         self: &Arc<Self>,
@@ -2725,6 +3213,8 @@ impl DaemonRuntime {
         phase: Option<ProtoPhase>,
         session_cwd: Option<PathBuf>,
         prompt: String,
+        skill: Option<SkillInvocation>,
+        invoker: Option<ConnectionId>,
         mut presence: ClientPresence,
     ) -> Result<PromptTurnResult, RpcError> {
         let turn_id = teton_protocol::TurnId::from(format!(
@@ -2767,12 +3257,49 @@ impl DaemonRuntime {
             .map(|summary| summary.cwd)
             .unwrap_or(session_cwd);
 
+        // REQ-583 ADR-1: the root is probed once per turn, from the registry's
+        // path, and the ONE probe feeds every consumer — the jail
+        // (`ToolContext::for_root`), the prompt's environment block
+        // (`route.harness.session_root`) and, since REQ-585, the skill file's
+        // home-relative display and the identity its user block is pinned to.
+        // It is read here rather than beside the jail below because the
+        // expansion needs it and the expansion runs before the route (see the
+        // comment at `accept_invocation`'s call site).
+        let probed = self.session_root_for(session_cwd.as_deref());
+
+        // REQ-585 BR-4/ADR-3: **expand before routing.** A skill turn's `prompt`
+        // is empty by ADR-3 — the invocation crosses the wire as a name — and
+        // both readers of the prompt text are below this line: `dispatch_route`
+        // runs the freeform classifier over it, and `spawn_title_session` spends
+        // the session's one naming attempt on it. Expanding after either would
+        // classify and name every invocation from `""`: on a machine with
+        // per-category bindings that is a route chosen from nothing, and it is a
+        // session left unnamed for its whole life.
+        //
+        // Refusing here is free in BR-8(c)'s sense: nothing has been seeded, no
+        // route has been decided, and no event has been published.
+        let mut skill_turn = match &skill {
+            Some(invocation) => {
+                Some(self.accept_invocation(sessions, &session_id, &probed, invocation)?)
+            }
+            None => None,
+        };
+        // The one reading of "this turn's prompt text". For a skill turn it is
+        // the **body-only** expansion — the dynamic-context output is not folded
+        // in yet, and that is deliberate rather than incidental: the classifier
+        // reads the skill's instructions, and the alternative would make the
+        // route depend on output that the route's own permission level decides
+        // whether to produce.
+        let routed_text: &str = skill_turn
+            .as_ref()
+            .map_or(prompt.as_str(), |skill| skill.text.as_str());
+
         let config = self.config.lock().expect("config mutex poisoned").clone();
         let router = self.turn_router(&config, &session_id);
 
         let core_phase = phase.map(to_core_phase);
         let mut route = self
-            .dispatch_route(&router, &session_id, mode, core_phase, &prompt)
+            .dispatch_route(&router, &session_id, mode, core_phase, routed_text)
             .await;
 
         // REQ-580 BR-1/BR-3: a turn with nowhere to run *only* because the
@@ -2828,7 +3355,7 @@ impl DaemonRuntime {
                 // where the classifier now says something settled.
                 let router = self.turn_router(&config, &session_id);
                 route = self
-                    .dispatch_route(&router, &session_id, mode, core_phase, &prompt)
+                    .dispatch_route(&router, &session_id, mode, core_phase, routed_text)
                     .await;
                 router
             }
@@ -2855,7 +3382,29 @@ impl DaemonRuntime {
         // below reads a title, and a session that is not named yet is a session
         // with no title — BR-3's degraded state. It cannot fail the turn — see
         // `spawn_title_session`.
-        let _ = self.spawn_title_session(events, sessions, &router, &config, &session_id, &prompt);
+        //
+        // REQ-585: `routed_text`, not `prompt` — the naming attempt is spent
+        // once per session, and a skill turn's `prompt` is empty.
+        //
+        // **A skill turn names later**, below Stage A. The naming duty is a
+        // model call: on a machine with `reflex` bound remotely it puts a
+        // bounded copy of its input on the wire. Spending it here would make
+        // BR-8's refusal sentence — *"Nothing was sent and no provider saw this
+        // turn"* — true of the turn and false of the machine, and would spend
+        // the session's one naming attempt on an expansion that never ran. A
+        // typed prompt still names exactly here, so REQ-561's "label the
+        // session the moment the user hits enter" is unchanged for every turn
+        // that is not a skill invocation.
+        if skill_turn.is_none() {
+            let _ = self.spawn_title_session(
+                events,
+                sessions,
+                &router,
+                &config,
+                &session_id,
+                routed_text,
+            );
+        }
 
         // Assemble the harness context, tools, and the permission gate once; a
         // fallback re-runs the loop against the same accumulated context.
@@ -2879,6 +3428,12 @@ impl DaemonRuntime {
         // about it in one breath classifies as `UserPasted` — the ordinary
         // shape of the request. This is the one ingestion point, and the text it
         // reads is the user's own (see `record_user_prompt_urls`).
+        //
+        // REQ-585: `prompt`, deliberately — **not** `routed_text`. A skill body
+        // is file-authored, and feeding it here would let a file on disk author
+        // its own authorization by writing a URL into the set the web tool then
+        // trusts. A skill turn's `prompt` is empty, so an invocation contributes
+        // nothing, which is the correct answer: nobody pasted anything.
         self.record_user_prompt_urls(&session_id, &prompt);
         // Fetched before the tools, because the web tool holds it: that tool
         // raises its own per-tier prompt inside its run rather than being
@@ -2907,7 +3462,10 @@ impl DaemonRuntime {
         // path and the probed view cannot come from two readings. Probing per
         // turn is what keeps the branch honest after a checkout between turns
         // and moves every consumer the turn after a `/cd` rewrote the path.
-        let probed = self.session_root_for(session_cwd.as_deref());
+        //
+        // REQ-585 moved the probe itself to the top of the turn — the expansion
+        // needs it, and the expansion runs before the route — so `probed` here
+        // is that same single reading, not a second one.
         let tool_ctx = ToolContext::for_root(&probed);
         let stream_events = SessionEvents::new(events.clone(), session_id.clone());
 
@@ -2923,6 +3481,130 @@ impl DaemonRuntime {
         // the environment block and the jail's refusals print one spelling.
         route.harness.session_root = Some(probed.view);
         let system = build_system_prompt(&tools, &route.harness);
+
+        // ── REQ-585 BR-8 / ADR-11: Stage A — does the BODY fit? ──────────────
+        //
+        // Before the user is asked to approve anything (BR-8d), and before
+        // `CarriedTurn::begin` below, which both pushes the user block and arms
+        // the drop-commit — so a check placed after it would have committed the
+        // very expansion it is refusing (BR-8c). Nothing is derived here: the
+        // budget is the one `Router::budget_for` stamped on this route, and the
+        // measurement is `ContextManager::would_seed_fit`, the estimators the
+        // pressure path itself runs on.
+        //
+        // A refused turn returns from here: no `context_pressure` of any kind,
+        // no health change, no degradation, no retry — none of the machinery
+        // below has run.
+        if let Some(skill) = &skill_turn {
+            if let SkillFit::TooLarge { message } = skill_fit(
+                SkillStage::Body,
+                &skill.name,
+                &system,
+                &skill.text,
+                &route.harness.budget,
+                route.provider_id.as_ref().map(|id| id.0.as_str()),
+            ) {
+                return Err(RpcError::new(
+                    error_code::SKILL_EXPANSION_TOO_LARGE,
+                    message,
+                ));
+            }
+        }
+
+        // Stage A said the body fits, so this turn is going to happen and the
+        // session may be named after it. Deferred to here rather than run with
+        // the typed prompts above, because the naming duty is a model call and
+        // a refused turn must not have reached one (BR-8).
+        if skill_turn.is_some() {
+            let _ = self.spawn_title_session(
+                events,
+                sessions,
+                &router,
+                &config,
+                &session_id,
+                routed_text,
+            );
+        }
+
+        // ── REQ-585 BR-6 / BR-12: dynamic-context consent and execution ──────
+        //
+        // The TASK-205 seam. One `authorize_skill` for the whole invocation,
+        // `run_all` in document order with the session root as cwd, the outcomes
+        // folded back into `skill_turn.text`, and BR-12's `skill_invoked`
+        // published — in that order, and all of it **between** the two budget
+        // stages.
+        //
+        // Stage A is above this and must stay there: a body that cannot fit is
+        // refused *before* a user is walked through approving four commands,
+        // watching them run, and then being told the turn was refused (BR-8d).
+        // Stage B is below it and must stay there: until this seam runs, the
+        // slots hold `skills::PENDING_PLACEHOLDER` — exactly what Stage A
+        // measured — and it is the fold that makes the second measurement a
+        // different one.
+        // ─────────────────────────────────────────────────────────────────────
+        if let Some(skill) = &mut skill_turn {
+            self.settle_dynamic_context(events, &session_id, &gate, &probed.path, invoker, skill)
+                .await;
+        }
+
+        // ── REQ-585 BR-8 / ADR-11: Stage B — does it still fit with the
+        // dynamic-context output folded in? ──────────────────────────────────
+        //
+        // Reached only once Stage A has answered `Fits`, which is what entitles
+        // this stage's sentence to say the body itself fit. Still before
+        // `CarriedTurn::begin`, for Stage A's reason.
+        if let Some(skill) = &skill_turn {
+            if let SkillFit::TooLarge { message } = skill_fit(
+                SkillStage::WithDynamicContext,
+                &skill.name,
+                &system,
+                &skill.text,
+                &route.harness.budget,
+                route.provider_id.as_ref().map(|id| id.0.as_str()),
+            ) {
+                return Err(RpcError::new(
+                    error_code::SKILL_EXPANSION_TOO_LARGE,
+                    message,
+                ));
+            }
+        }
+
+        // The seed, and its provenance (BR-7, ADR-9): the expansion for a skill
+        // turn, the typed text otherwise. One block either way — `push_user_from`
+        // with an empty set and `unknown: false` is byte-identical to the
+        // `push_user` every typed turn has always taken.
+        // What a **reroute** has to re-ask, carried past the move below.
+        //
+        // Both stages measured against the budget of the route this turn
+        // started on. A mid-turn reroute — the privacy pin, or a provider
+        // fallback — swaps in a smaller one, and `refit_for_reroute` then
+        // *clamps* the conversation: `truncate_to_budget` drops history until
+        // one block is left and middle-elides that block, which by then is the
+        // skill expansion. BR-8 says a skill turn is never middle-elided into
+        // something the user did not invoke, and BR-4 says carried whole or
+        // refused.
+        //
+        // It is not a corner: BR-7 makes the privacy pin the *expected* path
+        // for any invocation that ran a dynamic command on a boundary-configured
+        // machine, which is every ADLC skill. The name and the text are cloned
+        // because the seed below consumes them, and a clone of one expansion is
+        // the price of not shortening it behind the user's back.
+        // The system prompt rides along for the same reason: it is consumed by
+        // `CarriedTurn::begin` below, and the refusal has to measure the same
+        // pair Stage A and Stage B did — system plus expansion.
+        let skill_refit: Option<(String, String, String)> = skill_turn
+            .as_ref()
+            .map(|skill| (skill.name.clone(), skill.text.clone(), system.clone()));
+
+        // The seed, and its provenance (BR-7, ADR-9): the expansion for a skill
+        // turn, the typed text otherwise. One block either way — `push_user_from`
+        // with an empty set and `unknown: false` is byte-identical to the
+        // `push_user` every typed turn has always taken.
+        let (prompt, prompt_sources, prompt_unknown) = match skill_turn {
+            Some(skill) => (skill.text, skill.sources, skill.unknown),
+            None => (prompt, BTreeSet::new(), false),
+        };
+
         // REQ-567 BR-1: this turn begins from what the session has already said.
         // The head was rebuilt from *this* turn's tools and route, and the
         // carried blocks are replayed under it — so a mid-session head change
@@ -2940,6 +3622,11 @@ impl DaemonRuntime {
             Arc::clone(&self.session_taint),
             config.boundaries.clone(),
             prompt,
+            // REQ-585 BR-7: a typed prompt is drawn from no file; a skill turn
+            // carries the skill file's id, or the unpinnable marker for a user
+            // skill outside the root. It is the same block either way.
+            prompt_sources,
+            prompt_unknown,
         );
 
         let mut attempts = 0u32;
@@ -3006,6 +3693,14 @@ impl DaemonRuntime {
                     // arriving over-window at a tier that has no fallback left.
                     let previous = route.budget.clone();
                     route = router.resolve_local_pin(reroute_after_block_reason(detail));
+                    if let Some(message) =
+                        skill_would_not_survive_refit(skill_refit.as_ref(), &route)
+                    {
+                        break 'turn Err(RpcError::new(
+                            error_code::SKILL_EXPANSION_TOO_LARGE,
+                            message,
+                        ));
+                    }
                     refit_for_reroute(&mut conversation, &stream_events, &previous, &route.budget);
                     rerouted_local = true;
                     continue;
@@ -3104,6 +3799,14 @@ impl DaemonRuntime {
                             // provider's pair (see `refit_for_reroute`).
                             let previous = route.budget.clone();
                             route = next;
+                            if let Some(message) =
+                                skill_would_not_survive_refit(skill_refit.as_ref(), &route)
+                            {
+                                break 'turn Err(RpcError::new(
+                                    error_code::SKILL_EXPANSION_TOO_LARGE,
+                                    message,
+                                ));
+                            }
                             refit_for_reroute(
                                 &mut conversation,
                                 &stream_events,
@@ -3326,6 +4029,25 @@ impl DaemonRuntime {
     /// clear: an empty session moves with `blocks_dropped: 0` and still
     /// announces, because the event is the user's action.
     ///
+    /// ## The skill registry is re-derived *here*, ahead of the announcement
+    ///
+    /// The project half of the registry hangs off the root, so the root moving
+    /// re-derives it (REQ-585 BR-1, AC-14). It runs inside this method, before
+    /// `session_root_changed` is published, rather than in the handler after
+    /// this method returns: same-connection ordering was already safe (the
+    /// reader loop is serial), but a **second** attached client reacting to that
+    /// event within microseconds would call `skills/list` and be answered from
+    /// the pre-move registry. `skills_fs` is the daemon's discovery seam, passed
+    /// in because it lives on `Daemon` — the runtime performs the rebuild, the
+    /// daemon still owns what discovery reads.
+    ///
+    /// And the same move drops every remembered `skill:project:*` grant
+    /// (ADR-6). A grant remembered under `skill:project:<name>` in one repo
+    /// authorizes a file that no longer exists at that name, and a rebuilt
+    /// registry beside a stale grant is LESSON-501 exactly — carried state that
+    /// sheds its invariants silently. The user half is untouched: those names
+    /// still mean the same files.
+    ///
     /// ## Two events, both session-scoped, in this order
     ///
     /// `context_cleared` first, then `session_root_changed` — a client learns
@@ -3351,6 +4073,7 @@ impl DaemonRuntime {
         params: &SessionSetCwdParams,
         sessions: &SessionRegistry,
         events: &Arc<EventBus>,
+        skills_fs: &dyn crate::skills::DirLister,
     ) -> Result<SessionSetCwdResult, RpcError> {
         // `cd-N` off the turn counter, for `clear_session`'s reason: a refused
         // peer is told "already running turn cd-4", which names what actually
@@ -3381,7 +4104,16 @@ impl DaemonRuntime {
                 format!("no session `{}`", params.session_id),
             ));
         }
-        let root = self.session_root_for(Some(&params.cwd)).view;
+        let moved_to = self.session_root_for(Some(&params.cwd));
+
+        // REQ-585 BR-1/AC-14 and ADR-6, both before the announcement below, and
+        // both through the one derivation `session/create` also takes — a second
+        // spelling of the four globs would be LESSON-528's shape at the seam
+        // where the two answers have to agree.
+        Self::store_session_skills(sessions, &params.session_id, &moved_to, skills_fs);
+        self.drop_project_skill_grants(&params.session_id);
+
+        let root = moved_to.view;
         let blocks_dropped =
             u64::try_from(sessions.clear_conversation(&params.session_id)).unwrap_or(u64::MAX);
         events.publish(
@@ -3582,7 +4314,7 @@ impl DaemonRuntime {
             .lock()
             .expect("session gate mutex poisoned");
         Arc::clone(gates.entry(session_id.clone()).or_insert_with(|| {
-            Arc::new(
+            let mut gate =
                 // REQ-560: the gate is created at a *level*, not at a built
                 // table, because the level is what the user can change
                 // mid-session — a table snapshotted here would go stale the
@@ -3603,9 +4335,72 @@ impl DaemonRuntime {
                 // REQ-563 BR-4: the one consent answer that outlives the session
                 // writes through the daemon, never the client. The gate holds
                 // the seam and this is the only place it is filled in.
-                .with_web_persistence(Arc::clone(self) as Arc<dyn WebTierPersistence>),
-            )
+                .with_web_persistence(Arc::clone(self) as Arc<dyn WebTierPersistence>);
+            // REQ-585 ADR-7: and the route a skill's dynamic-context consent is
+            // *addressed* on. Filled in here for the same reason the web sink is
+            // — the gate is built in one place and is cached for the session's
+            // life — and left empty on a runtime nobody wired one into, which
+            // asks nobody rather than falling back to the bus.
+            if let Some(route) = self.addressed_delivery.get() {
+                gate = gate.with_addressed_delivery(Arc::clone(route));
+            }
+            Arc::new(gate)
         }))
+    }
+
+    /// Derive `session_id`'s skill registry from the root it stands on and store
+    /// it — **the one derivation** (REQ-585 BR-1, ADR-1).
+    ///
+    /// Two call sites, and they are the only two: `session/create`'s (through
+    /// `server::rebuild_session_skills`, which owns the cost argument for why
+    /// there is no third) and [`Self::set_session_cwd`]'s. They differ in *when*
+    /// they run, never in what they compute, so the four globs are spelled here
+    /// and nowhere else.
+    ///
+    /// `probed` arrives already probed rather than being re-derived from a path,
+    /// because discovery needs two things and the probe carries both: the path
+    /// the globs hang off, and the [`RootKind`](teton_protocol::methods::RootKind)
+    /// that decides whether there is a project pair at all. A session whose root
+    /// *is* `$HOME` must reach `~/.claude/skills` once, not twice — every skill
+    /// would otherwise register under both sources, shadowing itself, with two
+    /// permission keys for one file (AC-3). Taking the probe rather than probing
+    /// again also keeps the caller's reading and this one from being two
+    /// readings of a filesystem that can change between them.
+    pub(crate) fn store_session_skills(
+        sessions: &SessionRegistry,
+        session_id: &SessionId,
+        probed: &ProbedRoot,
+        fs: &dyn crate::skills::DirLister,
+    ) {
+        // `set_skills` answering `false` — a session that vanished between the
+        // caller's claim and this write — is nothing to act on: there is no
+        // record to hold a registry, and no id anyone can query it with.
+        sessions.set_skills(
+            session_id,
+            crate::skills::discover(home().as_deref(), &probed.path, probed.view.kind, fs),
+        );
+    }
+
+    /// Forget every remembered `skill:project:*` consent for this session, and
+    /// say how many went (REQ-585 ADR-6, TASK-201).
+    ///
+    /// The `/cd` half of the per-skill permission key. `skill:<source>:<name>`
+    /// encodes the whole question only for as long as `<name>` means the same
+    /// file: after the root moves it names a different one, so a grant that
+    /// survived would authorize another repo's commands under a name the user
+    /// approved somewhere else.
+    ///
+    /// **A missing gate is nothing to do, not a gate to mint.** Reaching for
+    /// [`Self::permission_gate_for`] here would create a session's gate at
+    /// `/cd` time — snapshotting `[web] permission_allow` earlier than the first
+    /// turn does — to then drop zero grants from it. A session that has never
+    /// run a turn has remembered no answers.
+    fn drop_project_skill_grants(&self, session_id: &SessionId) -> usize {
+        self.session_gates
+            .lock()
+            .expect("session gate mutex poisoned")
+            .get(session_id)
+            .map_or(0, |gate| gate.drop_project_skill_grants())
     }
 
     /// This session's set of user-pasted URLs, created on first use (BR-3).
@@ -9427,6 +10222,36 @@ fn reroute_after_block_reason(detail: BlockDetail) -> String {
 /// can. Saying it re-fitted anyway is the same untruth
 /// [`ContextPressureKind::DidNotFit`] exists to close, one call site along, so
 /// the over-budget answer wins here exactly as it does in
+/// Whether a **skill** turn would be middle-elided by the refit a reroute is
+/// about to perform — and if so, the refusal to raise instead.
+///
+/// `None` for a typed prompt, which keeps REQ-586 BR-7's loud elision, and
+/// `None` for a skill turn that still fits: the refit then runs as it always
+/// has, dropping *history* to make room, which is ordinary pressure.
+///
+/// This exists because both budget stages ran against the route the turn
+/// started on. A reroute swaps in a smaller budget, and `truncate_to_budget`
+/// clamps the newest block once history is gone — which for a skill turn is the
+/// expansion itself. BR-8: never middle-elided into something the user did not
+/// invoke. BR-4: carried whole or refused.
+fn skill_would_not_survive_refit(
+    skill: Option<&(String, String, String)>,
+    route: &crate::router::Route,
+) -> Option<String> {
+    let (name, text, system) = skill?;
+    match skill_fit(
+        SkillStage::WithDynamicContext,
+        name,
+        system,
+        text,
+        &route.harness.budget,
+        route.provider_id.as_ref().map(|id| id.0.as_str()),
+    ) {
+        SkillFit::Fits => None,
+        SkillFit::TooLarge { message } => Some(message),
+    }
+}
+
 /// [`pressure_kind`](crate::harness::turn_loop::pressure_kind).
 fn refit_for_reroute(
     conversation: &mut CarriedTurn,
@@ -16109,7 +16934,7 @@ permission_allow = [\"fetch_user_url\"]
                             &[crate::harness::context::ContextBlock {
                                 role: crate::harness::context::BlockRole::User,
                                 text: "do the thing".to_owned(),
-                                provenance: crate::harness::context::Provenance::User,
+                                provenance: crate::harness::context::Provenance::user(),
                             }],
                             crate::harness::compact::COMPACT_PROMPT_BUDGET_BYTES,
                         ),
@@ -17359,6 +18184,8 @@ permission_allow = [\"fetch_user_url\"]
                         None,
                         None,
                         format!("please summarize {SENTINEL} for me"),
+                        None,
+                        None,
                         ClientPresence::unwatched(),
                     )
                     .await
@@ -17418,6 +18245,8 @@ permission_allow = [\"fetch_user_url\"]
                         None,
                         None,
                         "please summarize src/main.rs for me".to_owned(),
+                        None,
+                        None,
                         ClientPresence::unwatched(),
                     )
                     .await
@@ -17480,6 +18309,8 @@ permission_allow = [\"fetch_user_url\"]
                         None,
                         None,
                         format!("please summarize {SENTINEL} for me"),
+                        None,
+                        None,
                         ClientPresence::unwatched(),
                     )
                     .await;
@@ -17554,6 +18385,8 @@ permission_allow = [\"fetch_user_url\"]
                         None,
                         None,
                         "please summarize src/main.rs for me".to_owned(),
+                        None,
+                        None,
                         ClientPresence::unwatched(),
                     )
                     .await
@@ -17616,6 +18449,8 @@ permission_allow = [\"fetch_user_url\"]
                         None,
                         None,
                         "please summarize sk-ABCDEFGHIJKLMNOPQRSTUVWX for me".to_owned(),
+                        None,
+                        None,
                         ClientPresence::unwatched(),
                     )
                     .await;
@@ -19146,6 +19981,8 @@ permission_allow = [\"fetch_user_url\"]
                             None,
                             None,
                             "what does the tokio page say about task pinning?".to_owned(),
+                            None,
+                            None,
                             ClientPresence::unwatched(),
                         )
                         .await
@@ -24629,6 +25466,8 @@ provider_id = \"deepseek\"
                     None,
                     cwd,
                     text.to_owned(),
+                    None,
+                    None,
                     ClientPresence::unwatched(),
                 )
                 .await
@@ -25511,6 +26350,8 @@ provider_id = \"deepseek\"
                     Arc::clone(&taint),
                     Vec::new(),
                     prompt.to_owned(),
+                    std::collections::BTreeSet::new(),
+                    false,
                 )
             };
 
@@ -26163,6 +27004,10 @@ provider_id = \"deepseek\"
                 },
                 sessions,
                 events,
+                // REQ-585: the real filesystem, so a move that finds no
+                // `.claude/` under the new root stores an empty registry —
+                // which is what a `/cd` in these fixtures actually does.
+                &crate::skills::RealFs,
             )
         }
 
@@ -26839,6 +27684,8 @@ provider_id = \"deepseek\"
                 Arc::new(SessionTaint::new()),
                 Vec::new(),
                 "the opening prompt",
+                std::collections::BTreeSet::new(),
+                false,
             );
             let filler = vec!["lorem"; words].join(" ");
             for _ in 0..blocks {
@@ -27406,6 +28253,8 @@ provider_id = \"deepseek\"
                     Some(ProtoPhase::Implement),
                     None,
                     "a prompt the provider will say is too large".to_owned(),
+                    None,
+                    None,
                     ClientPresence::unwatched(),
                 )
                 .await
@@ -27572,6 +28421,8 @@ provider_id = \"deepseek\"
                         None,
                         None,
                         "hi".to_owned(),
+                        None,
+                        None,
                         presence,
                     )
                     .await
@@ -28077,6 +28928,378 @@ provider_id = \"deepseek\"
             tier_opens(&live, &engine);
             assert!(live.local_tier_available());
             assert!(live.local_tier_hold().is_none());
+        }
+    }
+
+    /// REQ-585 TASK-204 — the two readers of "this turn's prompt text", observed
+    /// at the engine they reach.
+    ///
+    /// The integration suite (`tests/skill_turn.rs`) proves the *naming* half
+    /// behaviourally, through `claim_title`, and the ordering structurally. It
+    /// cannot reach the **classifier**: `route` has no configurable counterpart,
+    /// so it resolves to the local tier or to nothing, and an integration test
+    /// cannot install a local engine. So the classifier's own prompt is read
+    /// here, from inside the crate, off an engine that records every string it
+    /// was handed.
+    /// The one `NotRun` arm that is **not** a closed door.
+    ///
+    /// A command the runner could not start — no shell, an unresolvable jail
+    /// root, a failed spawn — arrives with consent already **given**, so there
+    /// is no door to name. Reporting it as `Failed` would tell a reader on
+    /// `/verbose` that it was attempted and exited, which is untrue and points
+    /// at the wrong fix; reporting one of the consent's four doors would blame
+    /// a refusal nobody made.
+    mod a_command_that_could_not_start {
+        use super::*;
+        use teton_protocol::events::{DynamicOutcome as WireDynamicOutcome, NotRunReason};
+
+        #[test]
+        fn is_not_a_closed_door_and_is_not_a_failure() {
+            let command = crate::skills::Command::new("definitely-not-a-program");
+            let never_started = crate::skills::DynamicOutcome::could_not_start();
+
+            // No door: consent was given and the machine could not carry it out.
+            let view = outcome_view(&command, &never_started, None);
+            assert!(
+                matches!(
+                    view.outcome,
+                    WireDynamicOutcome::NotRun {
+                        reason: NotRunReason::CouldNotStart
+                    }
+                ),
+                "{:?}",
+                view.outcome
+            );
+
+            // The control: with a door, the door is what is reported — so the
+            // arm above is reached by the *absence* of one, not by the outcome
+            // kind alone.
+            let declined = crate::skills::DynamicOutcome::declined();
+            let view = outcome_view(&command, &declined, Some(NotRunReason::Declined));
+            assert!(
+                matches!(
+                    view.outcome,
+                    WireDynamicOutcome::NotRun {
+                        reason: NotRunReason::Declined
+                    }
+                ),
+                "{:?}",
+                view.outcome
+            );
+        }
+    }
+
+    mod skill_turn_readers {
+        use super::*;
+        use crate::sessions::SessionRegistry;
+        use crate::skills::{discover, RealFs};
+        use teton_protocol::methods::SkillInvocation;
+
+        /// A body marker no other fixture in this crate uses, so a prompt
+        /// containing it can only have come from this expansion.
+        const MARKER: &str = "SKILLBODYMARKER-204";
+
+        /// An engine that answers `edit` — parseable as a judgment category, as
+        /// a session title, and as a finished turn — and remembers every prompt.
+        #[derive(Clone)]
+        struct RecordingEngine(Arc<Mutex<Vec<String>>>);
+
+        impl RecordingEngine {
+            fn new() -> Self {
+                Self(Arc::new(Mutex::new(Vec::new())))
+            }
+
+            fn prompts(&self) -> Vec<String> {
+                self.0.lock().expect("recorder mutex").clone()
+            }
+        }
+
+        impl Engine for RecordingEngine {
+            fn model_id(&self) -> &str {
+                "recording"
+            }
+
+            fn complete(
+                &self,
+                prompt: &str,
+                _params: &GenParams,
+                _on_token: &mut dyn FnMut(&str) -> bool,
+            ) -> Result<Completion, EngineError> {
+                self.0
+                    .lock()
+                    .expect("recorder mutex")
+                    .push(prompt.to_owned());
+                Ok(Completion::cold("edit".to_owned(), 0, 1))
+            }
+        }
+
+        /// A runtime whose local tier is this recorder — capability backed by a
+        /// fact, exactly as `with_consent` does it, because a `Ready` outcome
+        /// re-derives `local_available` from the slot's own state.
+        fn runtime_with(engine: &RecordingEngine) -> Arc<DaemonRuntime> {
+            let slot = EngineSlot::empty();
+            slot.install(
+                "recording".to_owned(),
+                Arc::new(Mutex::new(engine.clone())) as Arc<Mutex<dyn Engine>>,
+            );
+            Arc::new(DaemonRuntime {
+                engine: slot,
+                local_available: AtomicBool::new(true),
+                ..DaemonRuntime::minimal()
+            })
+        }
+
+        /// **Both assertions ADR-3 asks for**: the classifier receives the
+        /// expansion, and the naming attempt receives it.
+        ///
+        /// A skill turn's `prompt` is empty by ADR-3, so an expansion built
+        /// after either of them hands both `""` — a route chosen from nothing
+        /// and a session named from nothing, for the whole of its life. Both
+        /// prompts are identified by their own instruction text, so neither
+        /// assertion can be satisfied by the turn's request happening to carry
+        /// the body.
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn the_classifier_and_the_naming_attempt_both_read_the_expansion() {
+            let dir = scratch_dir("skill-readers");
+            std::fs::create_dir_all(dir.join(".claude/skills/marked")).unwrap();
+            std::fs::write(dir.join("Cargo.toml"), "[package]\n").unwrap();
+            std::fs::write(
+                dir.join(".claude/skills/marked/SKILL.md"),
+                format!("---\ndescription: marked\n---\n\nPlease handle {MARKER} now.\n"),
+            )
+            .unwrap();
+
+            let engine = RecordingEngine::new();
+            let runtime = runtime_with(&engine);
+            let events = Arc::new(EventBus::new());
+            let sessions = SessionRegistry::new();
+            let session_id = sessions
+                .create(SessionMode::Freeform, None, Some(dir.clone()))
+                .expect("a freeform session")
+                .session_id;
+            let probed = runtime.session_root_for(Some(&dir));
+            // `home: None` — the four globs then cover the fixture root only, so
+            // this assertion is about this file rather than about whatever
+            // `~/.claude/skills` the runner happens to have.
+            sessions.set_skills(
+                &session_id,
+                discover(None, &probed.path, probed.view.kind, &RealFs),
+            );
+
+            runtime
+                .run_prompt_turn(
+                    &events,
+                    &sessions,
+                    session_id,
+                    SessionMode::Freeform,
+                    None,
+                    Some(dir.clone()),
+                    String::new(),
+                    Some(SkillInvocation {
+                        name: "marked".to_owned(),
+                        raw_arguments: String::new(),
+                    }),
+                    None,
+                    ClientPresence::unwatched(),
+                )
+                .await
+                .expect("the skill turn runs on the local tier");
+
+            let prompts = engine.prompts();
+            let classifier = prompts
+                .iter()
+                .find(|p| p.contains("Classify one software-engineering request"))
+                .unwrap_or_else(|| {
+                    panic!(
+                        "the freeform classifier never ran: {} prompts",
+                        prompts.len()
+                    )
+                });
+            assert!(
+                classifier.contains(MARKER),
+                "the classifier was handed the empty typed prompt rather than the \
+                 expansion — every invocation would be routed from `\"\"`: {classifier}"
+            );
+
+            let title = prompts
+                .iter()
+                .find(|p| p.contains("Below is the first thing someone asked"))
+                .unwrap_or_else(|| {
+                    panic!("the naming attempt never ran: {} prompts", prompts.len())
+                });
+            assert!(
+                title.contains(MARKER),
+                "the naming attempt was handed the empty typed prompt — the session \
+                 would carry a name derived from nothing for its whole life: {title}"
+            );
+
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+    }
+
+    /// REQ-585 TASK-204 — the two seams TASK-201 and TASK-203 could not reach
+    /// from where they lived: the `/cd` grant drop, and the rebuild's position.
+    ///
+    /// `skill_consent_matrix.rs` proves `drop_project_skill_grants` **works**;
+    /// nothing proved anything *calls* it, which is the half that decides
+    /// whether a grant survives a move. The gate lives behind a private
+    /// `session_gates`, so the witness has to be in-crate.
+    mod cd_sheds_what_the_root_gave_meaning_to {
+        use super::*;
+        use crate::grants::{ConnectionId, GrantRegistry};
+        use crate::harness::permissions::{
+            AddressedPermissionDelivery, PermissionConfig, SkillConsent,
+        };
+        use crate::sessions::SessionRegistry;
+        use crate::skills::{permission_key_for, SkillSource};
+        use teton_protocol::events::PermissionRequest;
+        use teton_protocol::methods::PermissionOutcome;
+
+        /// A delivery route that answers "allow for this session" the instant a
+        /// prompt is put in front of it — the one thing these two assertions
+        /// need a client for, and nothing else.
+        struct AlwaysAllows(Arc<PendingPermissions>);
+
+        impl AddressedPermissionDelivery for AlwaysAllows {
+            fn deliver(
+                &self,
+                connection: ConnectionId,
+                _session_id: &SessionId,
+                request: PermissionRequest,
+            ) -> bool {
+                // `resolve_from`, not `resolve`: an addressed waiter treats an
+                // answer that cannot name a connection exactly as it treats the
+                // wrong one (ADR-7), so a fixture answering anonymously would
+                // be refused — which is the guard working, not a mock detail.
+                self.0.resolve_from(
+                    &request.request_id,
+                    PermissionOutcome::Selected {
+                        option_id: "allow_always".to_owned(),
+                    },
+                    connection,
+                )
+            }
+        }
+
+        /// **The inherited seam, both halves in one move.** A grant remembered
+        /// under `skill:project:<name>` names a file that the root moving
+        /// renames out from under it (LESSON-501), so `/cd` forgets it — while
+        /// `skill:user:<name>` names the same `~/.claude` file it always did and
+        /// is kept. The user half is the falsifier: a sweep that took everything
+        /// would satisfy the first assertion and re-ask a question the user has
+        /// already answered about the very same file.
+        ///
+        /// The rebuild's own position is asserted beside it: the registry a
+        /// reader sees straight after the move is the new root's, which is what
+        /// closes the cross-client window `session_root_changed` opens.
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn a_move_forgets_the_project_grants_and_re_derives_the_registry() {
+            let from = scratch_dir("cd-grants-from");
+            let to = scratch_dir("cd-grants-to");
+            std::fs::create_dir_all(to.join(".claude/skills/overthere")).unwrap();
+            std::fs::write(
+                to.join(".claude/skills/overthere/SKILL.md"),
+                "---\ndescription: only under the second root\n---\n\nBody.\n",
+            )
+            .unwrap();
+
+            let runtime = Arc::new(DaemonRuntime::minimal());
+            let events = Arc::new(EventBus::new());
+            let sessions = SessionRegistry::new();
+            let session_id = sessions
+                .create(SessionMode::Freeform, None, Some(from.clone()))
+                .expect("a freeform session")
+                .session_id;
+
+            // The session's own gate, wired with a route so a consent can be
+            // answered at all, and installed where `/cd` will look for it.
+            let pending = Arc::clone(runtime.pending());
+            let gate = Arc::new(
+                PermissionGate::new(
+                    session_id.clone(),
+                    PermissionConfig::default(),
+                    Arc::clone(&events),
+                    Arc::clone(&pending),
+                )
+                .with_addressed_delivery(Arc::new(AlwaysAllows(Arc::clone(&pending)))),
+            );
+            runtime
+                .session_gates
+                .lock()
+                .expect("session gate mutex poisoned")
+                .insert(session_id.clone(), Arc::clone(&gate));
+
+            let conn = GrantRegistry::new().next_connection_id();
+            let project = permission_key_for(SkillSource::Project, "audit");
+            let user = permission_key_for(SkillSource::User, "status");
+            assert_eq!(
+                gate.authorize_skill(
+                    &project,
+                    "audit",
+                    SkillSource::Project,
+                    vec!["./audit.sh".to_owned()],
+                    conn
+                )
+                .await,
+                SkillConsent::Allowed
+            );
+            assert_eq!(
+                gate.authorize_skill(
+                    &user,
+                    "status",
+                    SkillSource::User,
+                    vec!["git status".to_owned()],
+                    conn
+                )
+                .await,
+                SkillConsent::Allowed
+            );
+            assert!(
+                gate.remembered(&project).is_some(),
+                "the fixture remembered"
+            );
+            assert!(gate.remembered(&user).is_some(), "the fixture remembered");
+
+            runtime
+                .set_session_cwd(
+                    &SessionSetCwdParams {
+                        session_id: session_id.clone(),
+                        cwd: to.clone(),
+                    },
+                    &sessions,
+                    &events,
+                    &crate::skills::RealFs,
+                )
+                .expect("the move succeeds");
+
+            assert!(
+                gate.remembered(&project).is_none(),
+                "`skill:project:audit` named the first root's file; the move must \
+                 forget it rather than let it authorize the second root's"
+            );
+            assert!(
+                gate.remembered(&user).is_some(),
+                "`~/.claude` did not move when the session root did, so the user \
+                 grant answers the same file it always did"
+            );
+
+            // …and the registry a reader sees straight after the move is the one
+            // the new root defines. Derived inside `set_session_cwd`, ahead of
+            // the `session_root_changed` publish, so a second attached client
+            // reacting to that event cannot read the pre-move answer.
+            let registry = sessions.skills(&session_id);
+            assert!(
+                registry.dispatchable("overthere").is_some(),
+                "the move did not re-derive the project half of the registry: {:?}",
+                registry
+                    .skills()
+                    .iter()
+                    .map(|skill| skill.name.as_str())
+                    .collect::<Vec<_>>()
+            );
+
+            let _ = std::fs::remove_dir_all(&from);
+            let _ = std::fs::remove_dir_all(&to);
         }
     }
 }
