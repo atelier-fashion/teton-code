@@ -2,15 +2,18 @@
   "req": "REQ-586",
   "branch": "feat/REQ-586-route-aware-context-budget",
   "startedAt": "2026-08-19T20:06:06Z",
-  "completed": false,
-  "currentPhase": 6,
+  "completed": true,
+  "currentPhase": 8,
   "completedPhases": [
     0,
     1,
     2,
     3,
     4,
-    5
+    5,
+    6,
+    7,
+    8
   ],
   "phaseHistory": [
     {
@@ -42,6 +45,21 @@
       "phase": 5,
       "name": "Verify (reflect + review)",
       "completedAt": "2026-08-20T04:44:58Z"
+    },
+    {
+      "phase": 6,
+      "name": "Create PR",
+      "completedAt": "2026-08-20T05:07:48Z"
+    },
+    {
+      "phase": 7,
+      "name": "PR Cleanup & CI",
+      "completedAt": "2026-08-20T05:07:48Z"
+    },
+    {
+      "phase": 8,
+      "name": "Wrapup",
+      "completedAt": "2026-08-20T05:07:48Z"
     }
   ],
   "integrationBranch": "main",
@@ -55,9 +73,10 @@
       "prUrl": "https://github.com/atelier-fashion/teton-code/pull/192",
       "prNumber": 192,
       "prCreatedAt": "2026-08-19T20:06:22Z",
-      "merged": false,
+      "merged": true,
       "snapshotBranch": null,
-      "snapshotPR": null
+      "snapshotPR": null,
+      "mergeCommit": "c9e9265ac994096083fbf93d2aa4a7b1e2a9a32e"
     }
   },
   "mergeOrder": [
