@@ -713,6 +713,47 @@ pub struct ProviderConfig {
     /// window is inert, not invalid (ADR-7).
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub context_budget_cap: Option<u32>,
+    /// The pair turns to this provider actually run under, present **only**
+    /// when the derivation had to **raise** it off this provider's own
+    /// declaration (REQ-586 TASK-194 2b) — a snapshot field the daemon owns,
+    /// and one a client never sends.
+    ///
+    /// The one fact `/doctor`'s advisory cannot compute: whether the floor bit
+    /// depends on the generation reservation and the two budget ratios, which
+    /// live in the daemon's derivation and have exactly one home there
+    /// (LESSON-456). So the daemon answers it and the client renders the
+    /// answer, the way the `window:` column renders [`Self::max_context`].
+    ///
+    /// `None` on a `RegisterProvider` update (there is nothing to declare here
+    /// — the daemon ignores whatever a client puts in it), `None` on a
+    /// snapshot from a daemon predating the field, and `None` on a provider
+    /// whose budget was not floored. All three render nothing, which is why one
+    /// spelling covers them.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub floored_budget: Option<FlooredBudget>,
+}
+
+/// The budget a provider whose declaration fell **below the floor** actually
+/// runs under (REQ-586 TASK-194 2b).
+///
+/// The floor is the smallest budget that can still hold the harness's own
+/// system prompt; a window or a `context_budget_cap` deriving under it is
+/// raised to it, so the turn gets *more* than the declaration asked for. That
+/// is a deliberate degradation with a documented cost — a budget that cannot
+/// hold the system prompt would fail every turn instead — and this is what
+/// carries it to a surface.
+///
+/// Carried as a pair rather than as a boolean because the advisory that renders
+/// it has to say *what the turn gets instead* — "2,048 words / 16 KB" — and
+/// those two numbers are the daemon's derivation to state, not the client's to
+/// compute. Only one currency may have been raised, so this is the derived pair
+/// rather than the floor constants.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FlooredBudget {
+    /// The word budget in force.
+    pub budget_tokens: u64,
+    /// The byte budget in force.
+    pub budget_bytes: u64,
 }
 
 // `RoutingRule` and `ConfigUpdate::SetRoutingRule` are **gone** (REQ-558 AC-9).
@@ -1198,6 +1239,23 @@ pub struct ConfigSetParams {
 pub struct ConfigSetResult {
     /// True when the mutation was accepted and persisted.
     pub applied: bool,
+    /// The one sentence a registration that records a **big context window**
+    /// earns (REQ-586 TASK-194, OQ-6 as amended): what one call to this
+    /// provider may now carry, what one prompt may spend at worst, and the key
+    /// that would bound it.
+    ///
+    /// Composed by the daemon, not by the client, because every figure in it
+    /// comes from `harness::budget::derive` — the same derivation the router
+    /// runs, and one no thin client may repeat (BR-8, AC-12). `/provider
+    /// setup`'s preview carries the identical sentence in its own warning list;
+    /// this field is how `teton provider add --max-context` gets it, so the two
+    /// surfaces cannot drift into two wordings of one fact.
+    ///
+    /// `None` for every update that records no window above the threshold, and
+    /// from a daemon that predates the field — both render nothing, which is
+    /// exactly today's output.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub budget_notice: Option<String>,
 }
 
 impl RpcMethod for ConfigSetParams {
@@ -3066,6 +3124,7 @@ mod tests {
                     // the declared window, and no cap.
                     max_context: Some(200_000),
                     context_budget_cap: None,
+                    floored_budget: None,
                 }],
                 tiers: vec![TierRouteView {
                     tier: Tier::Think,
@@ -3327,6 +3386,7 @@ mod tests {
                 auth_ref: Some("keychain://teton/kimi".to_owned()),
                 max_context: Some(131_072),
                 context_budget_cap: Some(65_536),
+                floored_budget: None,
             }],
             redact_enabled: true,
             ..ConfigSnapshot::default()
@@ -3520,6 +3580,7 @@ mod tests {
                 // with the absent default.
                 max_context: Some(128_000),
                 context_budget_cap: Some(64_000),
+                floored_budget: None,
             }),
             ConfigUpdate::SetTierBinding(TierBindingConfig {
                 tier: Tier::Build,
@@ -3538,7 +3599,10 @@ mod tests {
         ] {
             round_trip(&ConfigSetParams { update });
         }
-        round_trip(&ConfigSetResult { applied: true });
+        round_trip(&ConfigSetResult {
+            applied: true,
+            budget_notice: None,
+        });
     }
 
     /// REQ-562 AC-4, RPC leg: `config/set` cannot carry a binding for a pinned

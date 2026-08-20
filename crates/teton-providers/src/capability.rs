@@ -10,7 +10,14 @@
 use teton_core::{EffortLadder, ProviderCapabilities, ReasoningShape, ToolCallTier};
 
 /// Full-loop iteration budget for a reliable (`Native`) tool-caller.
-const NATIVE_MAX_ITERATIONS: u32 = 25;
+///
+/// `pub` because it is half of a figure a user is shown: one *prompt* may run
+/// this many calls, so the input a single prompt can spend is the route's
+/// context budget times this number — the worst case REQ-586's big-window
+/// notice states at the moment a big window is recorded. That sentence reads
+/// the constant rather than restating 25, so raising the loop ceiling moves the
+/// warning with it (LESSON-456).
+pub const NATIVE_MAX_ITERATIONS: u32 = 25;
 /// Reduced-loop iteration budget for a `Degraded` tool-caller (BR-6).
 const DEGRADED_MAX_ITERATIONS: u32 = 5;
 /// Reduced tool-set cap for a `Degraded` tool-caller (BR-6).

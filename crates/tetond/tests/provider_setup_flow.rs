@@ -873,6 +873,121 @@ fn a_fresh_setup_writes_the_recipe_window_into_the_capabilities_table() {
     );
 }
 
+/// **TASK-194 (OQ-6 as amended).** Recording a big window says its size once,
+/// where the window is recorded — and both surfaces that record one say it in
+/// the *same words*, because there is one composer.
+///
+/// The product decision this drives: the declaration is still the consent (no
+/// cap is written, no route is bounded), but a user accepting a 1,000,000-token
+/// window should learn the size of the cheque at the moment they sign it. The
+/// shipped recipes moved that figure 8× and `/provider setup` recorded it in
+/// silence.
+///
+/// Byte-equality between the preview's warning and `config/set`'s answer is the
+/// assertion that matters. Two surfaces wording one fact is the drift
+/// LESSON-456 is about, and it is invisible to a test that checks each of them
+/// against its own expected string.
+#[test]
+fn a_recorded_big_window_is_stated_once_and_in_the_same_words_on_both_surfaces() {
+    let ws = Workspace::new("provider-setup-big-window");
+    ws.write_config(&fresh_config());
+    let script = ws.write_script(NO_TURNS);
+    let daemon = Daemon::spawn(&ws, probe().script(script));
+    let mut client = daemon.connect();
+    let session = client.create_session("freeform", None);
+
+    let (example_model, window) = kimi_recipe();
+    assert!(
+        window > 256_000,
+        "this test is about a window worth stating; the kimi recipe declares {window}"
+    );
+
+    // (1) The preview, carrying the recipe's own window.
+    let mut candidate = kimi(&example_model);
+    candidate["max_context"] = json!(window);
+    let previewed = client.call(
+        "provider/setup_preview",
+        json!({ "session_id": session, "candidate": candidate }),
+    );
+    let warnings: Vec<String> = previewed["result"]["warnings"]
+        .as_array()
+        .unwrap_or_else(|| panic!("a preview carries a warnings list: {previewed}"))
+        .iter()
+        .map(|w| w.as_str().unwrap_or_default().to_owned())
+        .collect();
+    let stated: Vec<&String> = warnings
+        .iter()
+        .filter(|w| w.contains("context window is recorded"))
+        .collect();
+    assert_eq!(
+        stated.len(),
+        1,
+        "exactly one notice, in the preview the user reads before committing: {warnings:#?}"
+    );
+    let notice = stated[0].clone();
+    for must in [
+        "words",
+        "one prompt may run up to",
+        "`capabilities.context_budget_cap`",
+    ] {
+        assert!(notice.contains(must), "{must} missing from: {notice}");
+    }
+
+    // (2) The other surface: `teton provider add --max-context` sends a
+    // `config/set` and prints whatever comes back on `budget_notice`.
+    let registered = client.call(
+        "config/set",
+        json!({ "update": {
+            "op": "register_provider",
+            "id": "kimi-again",
+            "kind": "openai-compatible",
+            "endpoint": "https://api.moonshot.ai/v1/chat/completions",
+            "model": example_model,
+            "auth_ref": "env:TETON_TASK194_CREDENTIAL_ABSENT",
+            "max_context": window,
+        }}),
+    );
+    assert_eq!(
+        registered["result"]["applied"].as_bool(),
+        Some(true),
+        "{registered}\ndaemon log:\n{}",
+        daemon.log()
+    );
+    assert_eq!(
+        registered["result"]["budget_notice"].as_str(),
+        Some(notice.as_str()),
+        "the two surfaces must say the same sentence byte for byte: {registered}"
+    );
+
+    // (3) And a window below the threshold says nothing at all, on the surface
+    // where a silent registration is today's behaviour.
+    let small = client.call(
+        "config/set",
+        json!({ "update": {
+            "op": "register_provider",
+            "id": "modest",
+            "kind": "openai-compatible",
+            "endpoint": "https://api.deepseek.com/chat/completions",
+            "model": "deepseek-v4-pro",
+            "auth_ref": "env:TETON_TASK194_CREDENTIAL_ABSENT",
+            "max_context": 128_000,
+        }}),
+    );
+    assert_eq!(small["result"]["applied"].as_bool(), Some(true), "{small}");
+    assert!(
+        small["result"].get("budget_notice").is_none(),
+        "a 128k window is not news, and an absent fact writes no key: {small}"
+    );
+
+    // (4) Nothing was capped by saying so — the declaration is still the
+    // consent (OQ-6 unchanged), which is the whole of the product decision.
+    let written = std::fs::read_to_string(&ws.config_path).expect("the config was written");
+    assert!(
+        !written.contains("context_budget_cap"),
+        "the notice must write no cap of its own:\n{written}"
+    );
+}
+
 /// The window this build's `kimi` recipe declares, and the model it declares it
 /// for — read from the catalog rather than retyped, so a re-verified vendor
 /// figure re-verifies the two tests below.

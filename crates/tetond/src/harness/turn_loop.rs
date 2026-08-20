@@ -556,6 +556,11 @@ impl SessionEvents {
                 budget_tokens: budget.budget_tokens as u64,
                 budget_bytes: budget.budget_bytes as u64,
                 bound: budget.bound,
+                // Read off the route's budget beside the bound it qualifies,
+                // never re-derived: a pressure line naming `user cap` for a
+                // budget the floor raised above that cap would be reporting a
+                // ceiling that is not in force (TASK-194 2b).
+                bound_floored: budget.floored,
             }),
         );
     }
@@ -599,14 +604,24 @@ impl SessionEvents {
 /// knows, and a report that happens to look identical is a different piece of
 /// news.
 ///
-/// A report that is *neither* — the gate could not fit the context at all
-/// ([`PressureReport::over_budget`], verify m1) — is announced as an elision
-/// with `elided_bytes: 0`, and that zero is the tell. There is no wire variant
-/// for "did not fit" and the alternative is silence, which is the one thing
-/// BR-7 rules out; the budget figures on the payload say what it did not fit.
+/// A gate that finished **still over budget** ([`PressureReport::over_budget`],
+/// verify m1) is [`ContextPressureKind::DidNotFit`] whatever else it did, and
+/// that check comes **first** (TASK-194 2a).
+///
+/// It used to ride as an elision with `elided_bytes: 0`, with a zero for a tell,
+/// which is worse than the silence BR-7 rules out: an event announced under the
+/// wrong name tells the reader something that did not happen. The ordering is
+/// the same defect one step along — the other three lines all end "to fit the
+/// N-word budget", and a gate that dropped three blocks and *still* did not fit
+/// did not drop them to fit. What it did drop rides in `dropped_blocks` and
+/// `elided_bytes` either way, so the choice hides nothing; it only decides
+/// which fact leads, and "the provider is about to be handed more than the
+/// route's budget" is the one that changes what a reader should expect next.
 #[must_use]
 pub fn pressure_kind(report: &PressureReport) -> ContextPressureKind {
-    if report.dropped_blocks > 0 {
+    if report.over_budget {
+        ContextPressureKind::DidNotFit
+    } else if report.dropped_blocks > 0 {
         ContextPressureKind::BlocksDropped
     } else {
         ContextPressureKind::BlockElided
@@ -2612,6 +2627,54 @@ mod tests {
             !displayed.contains("now do something else"),
             "the fabricated flat turn was displayed: {displayed:?}"
         );
+    }
+
+    /// **TASK-194 2a.** One classifier, four kinds, and the one that means "it
+    /// still does not fit" wins over the two that mean "here is how it was made
+    /// to fit".
+    ///
+    /// The defect: an over-budget gate rode as [`ContextPressureKind::BlockElided`]
+    /// with `elided_bytes: 0`, and the zero was the only tell. A reader was told
+    /// a block had been shortened when none had — and, for the mixed report, that
+    /// blocks had been dropped "to fit" a budget the turn then exceeded anyway.
+    /// BR-7's claim is that nothing is clamped in silence; an event under the
+    /// wrong name is worse than silence, because it is believed.
+    #[test]
+    fn a_gate_that_could_not_fit_the_context_is_its_own_kind() {
+        let report = |dropped_blocks, elided_bytes, over_budget| PressureReport {
+            dropped_blocks,
+            elided_bytes,
+            newest_user_elided: false,
+            over_budget,
+        };
+        // The three that fit.
+        assert_eq!(
+            pressure_kind(&report(3, 0, false)),
+            ContextPressureKind::BlocksDropped
+        );
+        assert_eq!(
+            pressure_kind(&report(0, 900, false)),
+            ContextPressureKind::BlockElided
+        );
+        assert_eq!(
+            pressure_kind(&report(2, 900, false)),
+            ContextPressureKind::BlocksDropped,
+            "a report that is both leads with the larger fact"
+        );
+        // And the one that does not, whatever else the gate managed.
+        for (dropped, elided) in [(0, 0), (3, 0), (0, 900), (3, 900)] {
+            assert_eq!(
+                pressure_kind(&report(dropped, elided, true)),
+                ContextPressureKind::DidNotFit,
+                "dropped {dropped}, elided {elided}"
+            );
+        }
+        // Non-vacuity: every one of those reports is news, so each really does
+        // reach a surface (the gates drop quiet ones before they get here).
+        for over_budget in [true, false] {
+            assert!(!report(1, 0, over_budget).is_quiet());
+        }
+        assert!(!report(0, 0, true).is_quiet());
     }
 
     #[test]

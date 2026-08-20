@@ -304,6 +304,11 @@ impl Route {
             budget_tokens: Some(self.budget.budget_tokens as u64),
             budget_bytes: Some(self.budget.budget_bytes as u64),
             bound: Some(self.budget.bound),
+            // Projected off the same value: whether the bound above is
+            // actually in force, or was overruled by the floor (TASK-194 2b).
+            // A surface printing the bound without it reports a ceiling the
+            // route is not running under.
+            bound_floored: Some(self.budget.floored),
         })
     }
 
@@ -533,7 +538,7 @@ impl Router {
                 BudgetInputs {
                     window: capabilities.max_context,
                     cap: capabilities.context_budget_cap,
-                    reservation: HarnessConfig::default().gen_params.max_tokens,
+                    reservation: budget::generation_reservation(),
                     is_local: false,
                     redact_scan: self.redact_scan,
                     provider_id: Some(id),

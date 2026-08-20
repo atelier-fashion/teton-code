@@ -382,6 +382,7 @@ mod tests {
                 reason: "Routing the 'digest' category to 'local' through its 'scan' tier \
                          binding."
                     .to_owned(),
+                bound_floored: None,
             }),
         );
 

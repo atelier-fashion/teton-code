@@ -2488,6 +2488,46 @@ impl DaemonRuntime {
             .collect()
     }
 
+    /// The big-window notice a provider's **recorded** window earns, or `None`
+    /// (REQ-586 OQ-6 as amended, TASK-194).
+    ///
+    /// Asked after `config/set` applied a `RegisterProvider`, so the figures
+    /// describe what was actually stored rather than what the client sent: the
+    /// merge is field-wise, and a registration that names no window inherits
+    /// the one the config already held (ADR-7). A provider that vanished
+    /// between the write and this read, or one below the threshold, answers
+    /// `None` — which renders nothing, exactly as today.
+    ///
+    /// **A local entry answers `None` however large its window.** Its turns run
+    /// on the engine on this machine, under the local pair, whatever
+    /// `max_context` says — which is why `provider list` renders such a row as
+    /// `(local engine)` and why `/doctor` does not advise it to set a window.
+    /// A notice naming a per-call figure and a worst-case spend for it would be
+    /// the exact class of untruth this task is closing, and it would name money
+    /// where none is spent.
+    ///
+    /// The sentence itself is `harness::budget`'s, shared byte for byte with
+    /// `/provider setup`'s preview warning: one composer, so the two surfaces
+    /// that record a window cannot come to word it differently (BR-8). (That
+    /// flow refuses a local candidate outright, so this is the only path where
+    /// the kind has to be asked about at all.)
+    #[must_use]
+    pub fn provider_budget_notice(&self, provider_id: &ProviderId) -> Option<String> {
+        let config = self.config.lock().expect("config mutex poisoned");
+        let provider = config
+            .providers
+            .iter()
+            .find(|provider| provider.id == provider_id.0)?;
+        if !provider.kind.is_remote() {
+            return None;
+        }
+        crate::harness::budget::big_window_notice(
+            provider.capabilities.max_context,
+            provider.capabilities.context_budget_cap,
+            config.privacy.redact,
+        )
+    }
+
     /// Apply a `config/set` mutation, validate, and persist it.
     ///
     /// ## Registration is stricter than loading, deliberately (BUG-155)
@@ -5476,6 +5516,9 @@ impl DaemonRuntime {
                 // question this flow does not ask is not an answer of "none",
                 // and `None` leaves a hand-authored cap exactly where it was.
                 context_budget_cap: None,
+                // A snapshot field, never an update one: the daemon derives it
+                // and a client never declares it (TASK-194 2b).
+                floored_budget: None,
             }),
         );
         for binding in &candidate.bindings {
@@ -5598,8 +5641,30 @@ impl DaemonRuntime {
             .iter()
             .find(|provider| provider.id == id)
             .map(existing_provider);
-        let warnings =
-            self.provider_setup_warnings(replaces.as_ref(), model, &endpoint, &dial_host);
+        // The window this registration will have **recorded**, read back off the
+        // candidate config rather than off `candidate.max_context`: the merge
+        // above is field-wise, so a `None` answer preserves a window the config
+        // already held, and that preserved figure is the one the user is about
+        // to live with (ADR-7). Same for the cap, which this flow never asks
+        // about and can therefore only inherit.
+        let recorded = config
+            .providers
+            .iter()
+            .find(|provider| provider.id == id)
+            .map_or((0, 0), |provider| {
+                (
+                    provider.capabilities.max_context,
+                    provider.capabilities.context_budget_cap,
+                )
+            });
+        let warnings = self.provider_setup_warnings(
+            replaces.as_ref(),
+            model,
+            &endpoint,
+            &dial_host,
+            recorded,
+            config.privacy.redact,
+        );
 
         Ok(RenderedProviderSetup {
             toml,
@@ -5625,12 +5690,21 @@ impl DaemonRuntime {
     /// renders them owns how they look, and a daemon that shipped escape codes
     /// down this wire would put them through a sanitizer built to strip exactly
     /// that.
+    ///
+    /// `recorded_window` is the `(max_context, context_budget_cap)` pair this
+    /// registration will have **recorded** — read off the candidate config
+    /// after the merge, not off the candidate — and `redact_scan` is
+    /// `[privacy] redact`. Both feed the REQ-586 big-window notice, and both
+    /// are passed in rather than read here so this stays a pure composer over
+    /// facts its caller already holds under the config lock.
     fn provider_setup_warnings(
         &self,
         replaces: Option<&ExistingProvider>,
         model: &str,
         endpoint: &str,
         dial_host: &str,
+        recorded_window: (u32, u32),
+        redact_scan: bool,
     ) -> Vec<String> {
         let mut warnings = Vec::new();
         // BR-14 / BUG-155's class: a replace is stated, never silent — but it is
@@ -5681,6 +5755,18 @@ impl DaemonRuntime {
                  machine.)"
             ));
         }
+        // REQ-586 OQ-6 as amended: the window is still the consent, and this is
+        // where its size is said. Composed by `harness::budget` — the same
+        // derivation a turn runs under, never a second arithmetic here
+        // (LESSON-456) — and byte-identical to what `teton provider add
+        // --max-context` prints off `config/set`, because it is the same
+        // function.
+        let (window, cap) = recorded_window;
+        warnings.extend(crate::harness::budget::big_window_notice(
+            window,
+            cap,
+            redact_scan,
+        ));
         warnings
     }
 
@@ -10007,6 +10093,22 @@ fn snapshot_from_config(
                 // so a live daemon never emits it.
                 max_context: Some(p.capabilities.max_context),
                 context_budget_cap: Some(p.capabilities.context_budget_cap),
+                // TASK-194 2b: whether this provider's declaration actually
+                // survives the derivation, answered by the **router's** budget
+                // for it — the same `budget_for` every route attempt runs
+                // through, so `/doctor` reports the floor a turn would really
+                // get rather than a client's guess at one (BR-8, AC-12).
+                // `Some` only when the floor bit, so a snapshot of ordinary
+                // providers is byte-identical to today's.
+                floored_budget: {
+                    let budget = router.budget_for(Some(p.id.as_str()));
+                    budget
+                        .floored
+                        .then_some(teton_protocol::methods::FlooredBudget {
+                            budget_tokens: budget.budget_tokens as u64,
+                            budget_bytes: budget.budget_bytes as u64,
+                        })
+                },
             })
             .collect(),
         tiers: Tier::ALL
@@ -11900,6 +12002,7 @@ permission_allow = [\"fetch_user_url\"]
                 auth_ref: Some("keychain:deepseek".to_owned()),
                 max_context: None,
                 context_budget_cap: None,
+                floored_budget: None,
             }),
         );
         apply_update(
@@ -11948,6 +12051,7 @@ permission_allow = [\"fetch_user_url\"]
                 auth_ref: Some("keychain:deepseek".to_owned()),
                 max_context: Some(131_072),
                 context_budget_cap: Some(65_536),
+                floored_budget: None,
             }),
         );
         let snap = snapshot_from_config(&config, &router_for_config(&config), false);
@@ -12013,6 +12117,7 @@ permission_allow = [\"fetch_user_url\"]
                 auth_ref: None,
                 max_context: None,
                 context_budget_cap: None,
+                floored_budget: None,
             }),
         );
         config
@@ -12153,6 +12258,7 @@ permission_allow = [\"fetch_user_url\"]
                 auth_ref: None,
                 max_context: None,
                 context_budget_cap: None,
+                floored_budget: None,
             }),
         );
         let before = config.clone();
@@ -12189,6 +12295,7 @@ permission_allow = [\"fetch_user_url\"]
                 auth_ref: None,
                 max_context: None,
                 context_budget_cap: None,
+                floored_budget: None,
             }),
         );
         *runtime.config.lock().expect("config") = usable;
@@ -12455,6 +12562,7 @@ permission_allow = [\"fetch_user_url\"]
                 auth_ref: None,
                 max_context: None,
                 context_budget_cap: None,
+                floored_budget: None,
             })
         };
         apply_update(
@@ -12491,6 +12599,7 @@ permission_allow = [\"fetch_user_url\"]
                 auth_ref: None,
                 max_context,
                 context_budget_cap: cap,
+                floored_budget: None,
             })
         };
 
@@ -26921,6 +27030,64 @@ provider_id = \"deepseek\"
             assert_eq!(published[0].kind, ContextPressureKind::BlockElided);
             assert_eq!(published[0].elided_bytes, 4_096);
             assert!(published[0].newest_user_elided);
+
+            // …and the third: the gate ran and could do nothing, which is its
+            // own kind rather than an elision of zero bytes (TASK-194 2a). The
+            // zero used to *be* the report, which meant a reader was told a
+            // block had been shortened when none had.
+            let did_not_fit = PressureReport {
+                over_budget: true,
+                ..PressureReport::default()
+            };
+            publish_commit_pressure(&events, &did_not_fit, &budget);
+            let published = pressure(&mut sub).await;
+            assert_eq!(published.len(), 1, "{published:#?}");
+            assert_eq!(published[0].kind, ContextPressureKind::DidNotFit);
+            assert_eq!(published[0].dropped_blocks, 0);
+            assert_eq!(published[0].elided_bytes, 0);
+        }
+
+        /// **TASK-194 2b.** The event carries whether the bound it names is
+        /// actually in force.
+        ///
+        /// A cap of 500 on a 200k provider derives below the floor, so the pair
+        /// is raised and the turn gets *more* than the cap asked for. Reporting
+        /// `bound: user cap` with nothing beside it is a line claiming a ceiling
+        /// the turn is not running under — and it is read off the route's own
+        /// budget here, never recomputed by comparing the pair to a floor.
+        #[tokio::test]
+        async fn a_floored_bound_says_so_on_the_event() {
+            let (_sessions, session_id) = one_freeform_session();
+            let bus = Arc::new(EventBus::new());
+            let mut sub = bus.subscribe(64);
+            let events = SessionEvents::new(Arc::clone(&bus), session_id.clone());
+            let dropped = PressureReport {
+                dropped_blocks: 1,
+                ..PressureReport::default()
+            };
+
+            let honoured = remote_budget(128_000);
+            assert!(!honoured.floored);
+            publish_commit_pressure(&events, &dropped, &honoured);
+            let published = pressure(&mut sub).await;
+            assert!(!published[0].bound_floored, "{published:#?}");
+
+            let floored = derive(BudgetInputs {
+                window: 200_000,
+                cap: 500,
+                reservation: RESERVATION,
+                is_local: false,
+                redact_scan: false,
+                provider_id: Some("kimi"),
+            });
+            assert_eq!(floored.bound, teton_protocol::events::BudgetBound::UserCap);
+            publish_commit_pressure(&events, &dropped, &floored);
+            let published = pressure(&mut sub).await;
+            assert!(
+                published[0].bound_floored,
+                "a cap the floor overruled must be reported as overruled: {published:#?}"
+            );
+            assert!(published[0].budget_tokens > 500);
         }
 
         /// **Verify M7-a.** `build_router` passes `[privacy] redact` into the

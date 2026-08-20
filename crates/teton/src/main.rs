@@ -3483,6 +3483,7 @@ fn build_provider_registration(
         // re-registration that says nothing about the window cannot zero one.
         max_context: window.max_context,
         context_budget_cap: window.context_budget_cap,
+        floored_budget: None,
     })
 }
 
@@ -3512,17 +3513,29 @@ fn report_registration_outcome(
         // The keychain sentence is claimed only when a key was stored — a local
         // provider stored nothing, and the old unconditional line told it a
         // key was in the keychain under ref `—`.
-        Ok(res) if res.applied => surface.line(
-            LineKind::Info,
-            &match prior {
-                Some(_) => format!(
-                    "provider `{id}` registered ({}). Key stored in the OS keychain (ref {auth}); \
-                     no key written to disk.",
-                    kind_label(kind)
-                ),
-                None => format!("provider `{id}` registered ({}).", kind_label(kind)),
-            },
-        ),
+        Ok(res) if res.applied => {
+            surface.line(
+                LineKind::Info,
+                &match prior {
+                    Some(_) => format!(
+                        "provider `{id}` registered ({}). Key stored in the OS keychain (ref \
+                         {auth}); no key written to disk.",
+                        kind_label(kind)
+                    ),
+                    None => format!("provider `{id}` registered ({}).", kind_label(kind)),
+                },
+            );
+            // REQ-586 OQ-6 as amended: a registration that recorded a big
+            // context window says its size once, here, and only here on this
+            // path. The **daemon** composed the sentence — every figure in it
+            // is `budget::derive`'s, which is not a thing a thin client may
+            // re-derive (BR-8) — so this renders the answer and words nothing
+            // of its own. `None` (no big window, or a daemon predating the
+            // field) prints nothing at all, which is today's output.
+            if let Some(notice) = res.budget_notice.as_deref() {
+                surface.line(LineKind::Notice, notice);
+            }
+        }
         Ok(_) => {
             surface.line(
                 LineKind::Notice,
@@ -3837,6 +3850,48 @@ fn advise_on_context_windows(providers: &[ProviderConfig], surface: &mut dyn Sur
                     ),
                 );
             }
+        }
+        // The third misreading in the family, and the only one where the config
+        // is doing *less* than it says: a declaration that derives below the
+        // smallest budget which can still hold the harness's own system prompt
+        // is raised to that floor, so the turn gets **more** room than the
+        // declaration asked for. `/verbose` says so per turn; this is the same
+        // fact where a user goes to fix it (TASK-194 2b).
+        //
+        // Both figures are the daemon's: whether the floor bit, and the pair
+        // that is in force instead. Neither is computable from this snapshot —
+        // the floor depends on the generation reservation and the two budget
+        // ratios, which have one home, in the daemon (BR-8, LESSON-456).
+        if let Some(floored) = provider.floored_budget {
+            let instead = format!(
+                "turns to it get {} words / {} instead",
+                teton_protocol::events::thousands(floored.budget_tokens),
+                teton_protocol::events::bytes_figure(floored.budget_bytes)
+            );
+            // Which declaration was floored is which one the user would edit.
+            // A cap only binds below the window; at or above it the inert-cap
+            // line above is the right sentence and this one names the window.
+            let declared = match (provider.context_budget_cap, provider.max_context) {
+                (Some(cap), Some(window)) if cap > 0 && window > 0 && cap < window => {
+                    format!("`context_budget_cap` is {}", window_figure(cap))
+                }
+                _ => match provider.max_context {
+                    Some(window) if window > 0 => {
+                        format!("the declared window is {}", window_figure(window))
+                    }
+                    _ => "the declared budget".to_owned(),
+                },
+            };
+            surface.line(
+                LineKind::Notice,
+                &format!(
+                    "provider `{id}`: {declared}, which is below the smallest budget that can \
+                     hold the harness's own system prompt — so it is floored rather than \
+                     honored, and {instead}. A budget under that floor could assemble no turn \
+                     at all; the provider's own refusal is what reports a prompt that is \
+                     genuinely too long."
+                ),
+            );
         }
     }
 }
@@ -4198,6 +4253,7 @@ mod tests {
             auth_ref: None,
             max_context: None,
             context_budget_cap: None,
+            floored_budget: None,
         };
 
         let mut surface = RecordingSurface::new();
@@ -4250,6 +4306,7 @@ mod tests {
             auth_ref: None,
             max_context,
             context_budget_cap: None,
+            floored_budget: None,
         };
 
         let mut surface = RecordingSurface::new();
@@ -4333,6 +4390,7 @@ mod tests {
             auth_ref: None,
             max_context,
             context_budget_cap,
+            floored_budget: None,
         };
 
         let mut surface = RecordingSurface::new();
@@ -4386,6 +4444,91 @@ mod tests {
                 "`{quiet}` has nothing to act on: {notices:#?}"
             );
         }
+    }
+
+    /// **TASK-194 2b, doctor's half.** A cap the daemon could not honor is
+    /// named as floored, with the pair that runs instead — and a cap that *is*
+    /// honored earns nothing new.
+    ///
+    /// The untruth this closes: a `context_budget_cap` of 500 on a 200k
+    /// provider derives below the smallest budget that can hold the harness's
+    /// own system prompt, so the pair is raised and every turn gets more room
+    /// than the cap asked for — while doctor said `window: 200k`, the inert-cap
+    /// line stayed silent (the cap *is* below the window), and `/verbose` said
+    /// `bound: user cap`. Three surfaces, none of them wrong on its own terms,
+    /// and no way to learn the cap was not in force.
+    ///
+    /// Both figures come off the snapshot, because neither is computable here:
+    /// whether the floor bit depends on the generation reservation and the two
+    /// budget ratios, which have one home and it is in the daemon (BR-8).
+    #[test]
+    fn doctor_says_when_a_declaration_was_floored_rather_than_honored() {
+        use teton_protocol::methods::{FlooredBudget, ProviderConfig};
+
+        let provider =
+            |id: &str,
+             max_context: Option<u32>,
+             context_budget_cap: Option<u32>,
+             floored_budget: Option<FlooredBudget>| ProviderConfig {
+                id: ProviderId::from(id),
+                kind: ProviderKind::Anthropic,
+                endpoint: Some("https://example.invalid".to_owned()),
+                model: Some("a-model".to_owned()),
+                auth_ref: None,
+                max_context,
+                context_budget_cap,
+                floored_budget,
+            };
+        let floor = Some(FlooredBudget {
+            budget_tokens: 2_048,
+            budget_bytes: 16_384,
+        });
+
+        let mut surface = RecordingSurface::new();
+        advise_on_context_windows(
+            &[
+                provider("sub-floor-cap", Some(200_000), Some(500), floor),
+                provider("sub-floor-window", Some(4_096), None, floor),
+                provider("honoured", Some(200_000), Some(40_000), None),
+            ],
+            &mut surface,
+        );
+        let notices = surface.lines_of(LineKind::Notice);
+        let about = |id: &str| -> Vec<&str> {
+            let needle = format!("`{id}`");
+            notices
+                .iter()
+                .copied()
+                .filter(|line| line.contains(&needle))
+                .collect()
+        };
+
+        let capped = about("sub-floor-cap");
+        assert_eq!(capped.len(), 1, "{notices:#?}");
+        assert!(
+            capped[0].contains("`context_budget_cap` is 500"),
+            "{capped:#?}"
+        );
+        assert!(
+            capped[0].contains("floored rather than honored"),
+            "{capped:#?}"
+        );
+        assert!(
+            capped[0].contains("2,048 words / 16 KB"),
+            "the pair in force is named, not only the fact: {capped:#?}"
+        );
+
+        // The same floor from the window's own side names the window, because
+        // that is the declaration a user would edit.
+        let windowed = about("sub-floor-window");
+        assert_eq!(windowed.len(), 1, "{notices:#?}");
+        assert!(
+            windowed[0].contains("the declared window is 4k"),
+            "{windowed:#?}"
+        );
+
+        // A cap doing exactly what it was written to do earns nothing.
+        assert!(about("honoured").is_empty(), "{notices:#?}");
     }
 
     /// **AC-5, the CLI half at the seam that matters**: what `--max-context` and
@@ -5612,7 +5755,11 @@ mod tests {
 
     /// `config/set`'s "applied" answer.
     fn applied() -> serde_json::Value {
-        serde_json::to_value(ConfigSetResult { applied: true }).expect("a set result serializes")
+        serde_json::to_value(ConfigSetResult {
+            applied: true,
+            budget_notice: None,
+        })
+        .expect("a set result serializes")
     }
 
     /// Run `provider_add_on` for [`ADD_ID`] under the session's consent mode,
@@ -6643,6 +6790,7 @@ mod tests {
             auth_ref: None,
             max_context: None,
             context_budget_cap: None,
+            floored_budget: None,
         })
         .expect("a bare `/v1` base URL is advised on");
         assert!(
@@ -6676,6 +6824,7 @@ mod tests {
             auth_ref: None,
             max_context: None,
             context_budget_cap: None,
+            floored_budget: None,
         };
 
         // Counts are assertable here because this table is the test's own. The
@@ -6865,6 +7014,73 @@ mod tests {
         ))
     }
 
+    /// **TASK-194 (OQ-6 as amended), the CLI half.** A registration that
+    /// recorded a big window prints the daemon's notice once, and one that did
+    /// not prints nothing new.
+    ///
+    /// The sentence is the *daemon's*: every figure in it is
+    /// `harness::budget::derive`'s, which a thin client may not repeat (BR-8,
+    /// AC-12). So this asserts the rendering — one line, on the applied path,
+    /// through the `Surface` seam — and the daemon's own tests assert the
+    /// words. `None` is both "no big window" and "a daemon predating the
+    /// field", and both must leave today's output untouched.
+    #[test]
+    fn a_recorded_big_window_prints_the_daemons_notice_once() {
+        let kc = MockKeychain::new();
+        let applied = |budget_notice: Option<String>| -> Result<ConfigSetResult, RpcError> {
+            Ok(ConfigSetResult {
+                applied: true,
+                budget_notice,
+            })
+        };
+        let render = |outcome| {
+            let mut surface = RecordingSurface::new();
+            report_registration_outcome(
+                outcome,
+                "kimi",
+                ProviderKind::OpenaiCompatible,
+                "keychain://teton/kimi",
+                None,
+                &kc,
+                &mut surface,
+            );
+            surface
+        };
+
+        let quiet = render(applied(None));
+        assert!(
+            quiet.lines_of(LineKind::Notice).is_empty(),
+            "a registration with no big window says nothing new: {:?}",
+            quiet.calls
+        );
+        assert!(quiet.any_line_contains(LineKind::Info, "provider `kimi` registered"));
+
+        let notice = "a 1,000,000-token context window is recorded, and so on.";
+        let loud = render(applied(Some(notice.to_owned())));
+        assert_eq!(
+            loud.lines_of(LineKind::Notice),
+            vec![notice],
+            "the daemon's sentence, once, verbatim: {:?}",
+            loud.calls
+        );
+        assert!(
+            loud.any_line_contains(LineKind::Info, "provider `kimi` registered"),
+            "and the registration line is still the registration line"
+        );
+
+        // A rejected registration recorded nothing, so it says nothing about a
+        // window either — the notice rides the applied arm alone.
+        let refused = render(Ok(ConfigSetResult {
+            applied: false,
+            budget_notice: Some(notice.to_owned()),
+        }));
+        assert!(
+            !refused.any_line_contains(LineKind::Notice, "context window is recorded"),
+            "{:?}",
+            refused.calls
+        );
+    }
+
     /// AC: the exact BUG-170 sequence — prompt, store, register, refuse — now
     /// takes the stored key back out and says so.
     #[test]
@@ -7025,7 +7241,10 @@ mod tests {
         let mut surface = RecordingSurface::new();
 
         report_registration_outcome(
-            Ok(ConfigSetResult { applied: true }),
+            Ok(ConfigSetResult {
+                applied: true,
+                budget_notice: None,
+            }),
             "opus",
             ProviderKind::Anthropic,
             &auth,
@@ -7044,7 +7263,10 @@ mod tests {
         // the old unconditional sentence reported a key under ref `—`.
         let mut local_surface = RecordingSurface::new();
         report_registration_outcome(
-            Ok(ConfigSetResult { applied: true }),
+            Ok(ConfigSetResult {
+                applied: true,
+                budget_notice: None,
+            }),
             "local2",
             ProviderKind::Local,
             "—",
@@ -7093,7 +7315,10 @@ mod tests {
 
         let mut surface = RecordingSurface::new();
         report_registration_outcome(
-            Ok(ConfigSetResult { applied: false }),
+            Ok(ConfigSetResult {
+                applied: false,
+                budget_notice: None,
+            }),
             "opus",
             ProviderKind::Anthropic,
             &auth,

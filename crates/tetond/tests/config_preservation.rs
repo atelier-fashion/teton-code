@@ -360,6 +360,7 @@ fn register(id: &str) -> ConfigUpdate {
         // what it was (`max_context = 0`, no cap line).
         max_context: None,
         context_budget_cap: None,
+        floored_budget: None,
     })
 }
 
@@ -904,6 +905,7 @@ max_context = 200000
             auth_ref: Some("keychain:anthropic".to_owned()),
             max_context,
             context_budget_cap: cap,
+            floored_budget: None,
         })
     };
 

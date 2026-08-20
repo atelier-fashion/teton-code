@@ -25,6 +25,7 @@
 
 use std::collections::{HashMap, HashSet};
 
+use teton_protocol::events;
 use teton_protocol::events::{
     AttachConsentRequested, BlockCause, BudgetBound, CapabilityDeadEnd, ConsentScope,
     ContextPressure, ContextPressureKind, DaemonClientAttach, DaemonLifetimeStage, Event,
@@ -1310,7 +1311,7 @@ fn format_context_cleared(blocks_dropped: u64, elsewhere: Option<&SessionId>) ->
 /// bound's, spelled for a person rather than as the wire's snake_case.
 fn format_context_pressure(pressure: &ContextPressure) -> String {
     let budget = format!("{}-word budget", thousands(pressure.budget_tokens));
-    let bound = format!("(bound: {})", bound_words(pressure.bound));
+    let bound = bound_clause(pressure.bound, pressure.bound_floored);
     match pressure.kind {
         ContextPressureKind::BlocksDropped => format!(
             "context: {} dropped to fit the {budget} {bound}",
@@ -1342,7 +1343,49 @@ fn format_context_pressure(pressure: &ContextPressure) -> String {
                 n => format!("{} dropped", older_blocks(n)),
             }
         ),
+        // The gate ran and could not finish the job: it will neither drop its
+        // last block nor clamp it to nothing, so the turn goes out over budget.
+        // The other three lines all end "to fit the …", and this one must not —
+        // it is the case where the fitting failed (TASK-194 2a). What the gate
+        // *did* manage trails the fact that it was not enough.
+        ContextPressureKind::DidNotFit => format!(
+            "context: could not be fitted to the {budget} {bound} — the turn was sent over \
+             budget{}",
+            match (pressure.dropped_blocks, pressure.elided_bytes) {
+                (0, 0) => String::new(),
+                (0, bytes) => format!(" after eliding {}", bytes_figure(bytes)),
+                (blocks, 0) => format!(" after dropping {}", older_blocks(blocks)),
+                (blocks, bytes) => format!(
+                    " after dropping {} and eliding {}",
+                    older_blocks(blocks),
+                    bytes_figure(bytes)
+                ),
+            }
+        ),
     }
+}
+
+/// `(bound: user cap)`, or the same with the floor named when the bound could
+/// not be honored (REQ-586 BR-8, TASK-194 2b).
+///
+/// One clause, read by the `/verbose` route line and by every pressure line,
+/// for the reason [`bound_words`] is one table: the bound is one fact with one
+/// source, and a budget that is *larger* than the bound the same line names is
+/// the one place a reader would conclude the surface is broken. The floor is
+/// the smallest budget that can still hold the harness's own system prompt; a
+/// window or cap deriving below it is raised to it, so the declaration is
+/// recorded but not in force.
+///
+/// The daemon decides `floored` where it derives the budget — this never
+/// compares the pair against a floor of its own (BR-8, AC-12).
+fn bound_clause(bound: BudgetBound, floored: bool) -> String {
+    if floored {
+        return format!(
+            "(bound: {} — floored: below the smallest budget that holds the system prompt)",
+            bound_words(bound)
+        );
+    }
+    format!("(bound: {})", bound_words(bound))
 }
 
 /// `1 older block` / `3 older blocks` — the phrase every pressure line counts
@@ -1376,16 +1419,7 @@ fn bound_words(bound: BudgetBound) -> &'static str {
 /// ("did that turn really only get 4k?"), and an ungrouped `132650` is the one
 /// shape that cannot be read at a glance.
 fn thousands(n: u64) -> String {
-    let digits = n.to_string();
-    let mut out = String::with_capacity(digits.len() + digits.len() / 3);
-    let first = digits.len() % 3;
-    for (at, ch) in digits.chars().enumerate() {
-        if at > 0 && at % 3 == first {
-            out.push(',');
-        }
-        out.push(ch);
-    }
-    out
+    events::thousands(n)
 }
 
 /// A byte figure for a budget line: `900 B`, `33 KB`, `4.2 MB`.
@@ -1403,17 +1437,7 @@ fn thousands(n: u64) -> String {
 /// number under a `KB` label is the exact confusion that formatter's doc warns
 /// about, which is why this one divides by 1000.
 fn bytes_figure(bytes: u64) -> String {
-    if bytes < 1_000 {
-        return format!("{bytes} B");
-    }
-    if bytes < 1_000_000 {
-        return format!("{} KB", (bytes + 500) / 1_000);
-    }
-    let tenths = (bytes + 50_000) / 100_000;
-    match tenths % 10 {
-        0 => format!("{} MB", tenths / 10),
-        frac => format!("{}.{frac} MB", tenths / 10),
-    }
+    events::bytes_figure(bytes)
 }
 
 /// The one-line verbose notice a `prefix_cache` event draws.
@@ -2437,10 +2461,12 @@ fn budget_clause(rd: &RouteDecided) -> Option<String> {
     let bytes = rd.budget_bytes?;
     let bound = rd.bound?;
     Some(format!(
-        " · budget {} words / {} (bound: {})",
+        " · budget {} words / {} {}",
         thousands(tokens),
         bytes_figure(bytes),
-        bound_words(bound)
+        // `false` from a daemon that predates the field: it floored nothing it
+        // could report, and the clause is today's byte for byte.
+        bound_clause(bound, rd.bound_floored.unwrap_or(false))
     ))
 }
 
@@ -2724,6 +2750,7 @@ mod tests {
                 budget_tokens: None,
                 budget_bytes: None,
                 bound: None,
+                bound_floored: None,
             })),
             &mut surface,
             &mut state,
@@ -2772,6 +2799,7 @@ mod tests {
                     budget_tokens: None,
                     budget_bytes: None,
                     bound: None,
+                    bound_floored: None,
                 })),
                 &mut surface,
                 &mut state,
@@ -2807,6 +2835,7 @@ mod tests {
                 budget_tokens: None,
                 budget_bytes: None,
                 bound: None,
+                bound_floored: None,
             }),
             Event::PrivacyBlock(PrivacyBlock {
                 path: "secrets/prod.env".to_owned(),
@@ -3011,6 +3040,7 @@ mod tests {
                 budget_tokens: None,
                 budget_bytes: None,
                 bound: None,
+                bound_floored: None,
             }),
             Event::PrivacyBlock(PrivacyBlock {
                 path: "secrets/prod.env".to_owned(),
@@ -3249,6 +3279,7 @@ mod tests {
                 budget_tokens: 4_096,
                 budget_bytes: 32_768,
                 bound: BudgetBound::LocalEngine,
+                bound_floored: false,
             }))
         };
 
@@ -3275,7 +3306,7 @@ mod tests {
         assert_eq!(surface.lines_of(LineKind::Notice), quiet);
     }
 
-    /// The three shapes, each naming the budget it was fitted to and the bound
+    /// The four shapes, each naming the budget it was fitted to and the bound
     /// that decided it — and the elision naming *which* block, because the
     /// newest user block is the case where the model answers a prompt the user
     /// did not send (BR-7).
@@ -3290,6 +3321,7 @@ mod tests {
                 budget_tokens: 4_096,
                 budget_bytes: 32_768,
                 bound,
+                bound_floored: false,
             })
         };
 
@@ -3351,6 +3383,100 @@ mod tests {
             BudgetBound::UserCap
         )
         .ends_with("(bound: user cap) — nothing dropped"));
+        // **TASK-194 2a.** The gate ran and could do nothing. It used to be
+        // announced as an elision of zero bytes — "an older message
+        // middle-elided by 0 B" — which described something that did not
+        // happen, on the one surface BR-7 exists to keep honest.
+        assert_eq!(
+            pressure(
+                ContextPressureKind::DidNotFit,
+                0,
+                0,
+                false,
+                BudgetBound::Window
+            ),
+            "context: could not be fitted to the 4,096-word budget (bound: window) — the turn \
+             was sent over budget"
+        );
+        // What the gate managed trails the fact that it was not enough — the
+        // one line that must never end "to fit the …", because the fitting is
+        // exactly what failed.
+        assert_eq!(
+            pressure(
+                ContextPressureKind::DidNotFit,
+                3,
+                512,
+                false,
+                BudgetBound::Window
+            ),
+            "context: could not be fitted to the 4,096-word budget (bound: window) — the turn \
+             was sent over budget after dropping 3 older blocks and eliding 512 B"
+        );
+    }
+
+    /// **TASK-194 2b.** A bound the floor overruled says so, on both surfaces
+    /// that name a bound — and a bound that is genuinely in force renders
+    /// exactly as it did before.
+    ///
+    /// The untruth this closes is small and complete: `bound: user cap` printed
+    /// beside a budget *larger* than that cap. The daemon decides `floored`
+    /// where it derives the budget; the clause below never compares a pair to a
+    /// floor of its own (BR-8).
+    #[test]
+    fn a_bound_the_floor_overruled_is_rendered_as_overruled() {
+        let line = |bound_floored| {
+            format_context_pressure(&ContextPressure {
+                kind: ContextPressureKind::BlocksDropped,
+                dropped_blocks: 1,
+                elided_bytes: 0,
+                newest_user_elided: false,
+                budget_tokens: 2_048,
+                budget_bytes: 16_384,
+                bound: BudgetBound::UserCap,
+                bound_floored,
+            })
+        };
+        assert_eq!(
+            line(false),
+            "context: 1 older block dropped to fit the 2,048-word budget (bound: user cap)"
+        );
+        assert_eq!(
+            line(true),
+            "context: 1 older block dropped to fit the 2,048-word budget (bound: user cap — \
+             floored: below the smallest budget that holds the system prompt)"
+        );
+
+        let route = |bound_floored| {
+            format_route(&RouteDecided {
+                category: None,
+                tier: None,
+                phase: None,
+                provider_id: ProviderId::from("kimi"),
+                model: Some("kimi-k3".to_owned()),
+                reason: "a reason.".to_owned(),
+                effort: None,
+                budget_tokens: Some(2_048),
+                budget_bytes: Some(16_384),
+                bound: Some(BudgetBound::UserCap),
+                bound_floored,
+            })
+        };
+        assert!(
+            route(Some(false)).ends_with(" · budget 2,048 words / 16 KB (bound: user cap)"),
+            "{}",
+            route(Some(false))
+        );
+        assert!(
+            route(Some(true)).ends_with(
+                " · budget 2,048 words / 16 KB (bound: user cap — floored: below the smallest \
+                 budget that holds the system prompt)"
+            ),
+            "{}",
+            route(Some(true))
+        );
+        // A daemon predating the field states nothing, and states it as
+        // "not floored" — today's line, byte for byte.
+        assert_eq!(route(None), route(Some(false)));
     }
 
     /// Every bound has its own words, and the wire's `default_unknown` is said
@@ -3402,6 +3528,7 @@ mod tests {
                 budget_tokens,
                 budget_bytes,
                 bound,
+                bound_floored: None,
             })
         };
 
@@ -3430,6 +3557,7 @@ mod tests {
                 budget_tokens: Some(4_096),
                 budget_bytes: None,
                 bound: Some(BudgetBound::LocalEngine),
+                bound_floored: None,
             }),
             "route [pinned] → kimi (model tbd) — a reason."
         );

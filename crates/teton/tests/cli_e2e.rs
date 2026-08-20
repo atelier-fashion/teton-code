@@ -2223,6 +2223,74 @@ fn a_cap_below_the_window_is_the_bound_a_verbose_turn_names() {
     );
 }
 
+/// **TASK-194 (OQ-6 as amended) at the CLI: a *local* row's declared window is
+/// never stated as a cost, however large.**
+///
+/// The notice this REQ adds names a per-call budget and a 25-call worst case,
+/// and both are facts about a **remote** route. A `kind = "local"` entry runs
+/// the engine on this machine under the local pair whatever `max_context` says
+/// — which is why `provider list` renders it `(local engine)` and why doctor
+/// does not advise it to declare a window. Printing "every call may carry
+/// 665,984 words … at worst" for it would be the exact class of untruth this
+/// task is closing, and it would name a spend where nothing is spent.
+///
+/// This suite can only complete a **local** registration end to end — every
+/// remote kind reads a credential, and the CLI's keychain is the machine's own
+/// (the harness clears `TETON_PROVIDER_KEY` for exactly that reason), so a test
+/// that registered a remote provider would write a fake key into the
+/// developer's login keychain. So the negative is what is drivable here, and it
+/// is the leg worth having: the positive path is asserted against a real daemon
+/// over the real socket in `tetond`'s `provider_setup_flow`
+/// (`a_recorded_big_window_is_stated_once_and_in_the_same_words_on_both_surfaces`,
+/// which also pins the two surfaces byte-identical) and the rendering in
+/// `main.rs`'s `a_recorded_big_window_prints_the_daemons_notice_once`.
+#[test]
+fn provider_add_states_no_per_call_cost_for_a_local_rows_declared_window() {
+    let daemon_path = daemon_bin();
+    let daemon = TestDaemon::spawn(&daemon_path);
+    let teton = teton_bin();
+
+    let (output, status) = daemon.run_cli_capture(
+        &teton,
+        &[
+            "provider",
+            "add",
+            "wide",
+            "--kind",
+            "local",
+            "--max-context",
+            "1000000",
+        ],
+        "",
+    );
+    assert!(
+        status.success(),
+        "a local provider needs no credential; output:\n{output}"
+    );
+    assert!(
+        output.contains("provider `wide` registered"),
+        "the registration itself must still be reported:\n{output}"
+    );
+    assert!(
+        !output.contains("context window is recorded"),
+        "a local row spends nothing per call, so nothing may be said about what it \
+         spends:\n{output}"
+    );
+
+    // The window is still *recorded* — the notice's absence is about what is
+    // said, not about what is stored (BR-3 is unchanged).
+    let written = std::fs::read_to_string(daemon.root.join("config.toml"))
+        .expect("the fixture's config is where the daemon writes");
+    assert!(
+        written.contains("max_context = 1000000"),
+        "the window typed on the command line still reaches the record:\n{written}"
+    );
+    assert!(
+        !written.contains("context_budget_cap"),
+        "and nothing was capped: the declaration is still the consent:\n{written}"
+    );
+}
+
 /// BUG-155 / REQ-557 AC-1: "registering a third with id `opus` fails."
 ///
 /// It did not. The daemon's `RegisterProvider` is replace-or-insert, so a second

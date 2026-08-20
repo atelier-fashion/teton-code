@@ -938,6 +938,7 @@ mod tests {
                 reason: "Routing the 'triage' category to 'local' through its 'scan' tier \
                          binding."
                     .to_owned(),
+                bound_floored: None,
             }),
         );
         let announced = |sub: &mut crate::broadcast::Subscription| -> Vec<RouteDecided> {

@@ -436,6 +436,22 @@ pub struct RouteDecided {
     /// and every refusal read. Same additivity as [`Self::budget_tokens`].
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub bound: Option<BudgetBound>,
+    /// Whether the derivation had to **raise** this attempt's pair to its floor
+    /// — so [`Self::bound`] names what the user declared, and the budget above
+    /// is larger than that declaration asked for (REQ-586 TASK-194 2b).
+    ///
+    /// The floor is the smallest budget that can still hold the harness's own
+    /// system prompt. A `context_budget_cap` of 500 on a 200k provider derives
+    /// *below* it, so the pair is raised and the turn gets more room than the
+    /// cap asked for — a bound reported as `user cap` with nothing beside it
+    /// would be a surface claiming a ceiling that is not in force. Rendered as
+    /// a clause on the `/verbose` route line and on every pressure line; the
+    /// remedy (`/doctor`'s advisory) reads the same fact off the snapshot.
+    ///
+    /// Same additivity as [`Self::budget_tokens`]: a daemon that has this field
+    /// always populates it, and `None` means a daemon that predates it.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub bound_floored: Option<bool>,
 }
 
 // ---------------------------------------------------------------------------
@@ -2194,6 +2210,66 @@ impl BudgetBound {
     }
 }
 
+/// A count with thousands separators: `4096` → `4,096` — **the one home** of
+/// how a budget's word figure is spelled (REQ-586 BR-8, LESSON-456).
+///
+/// Budgets are five- and six-digit numbers a reader compares at a glance ("did
+/// that turn really only get 4k?"), and an ungrouped `132650` is the one shape
+/// that cannot be read at a glance.
+///
+/// It lives beside [`BudgetBound::words`] and for the same reason: **both ends
+/// spell these figures**. The client words the `/verbose` route line and every
+/// `context_pressure` line; the daemon words the big-window notice its provider
+/// registration surfaces carry (`harness::budget::big_window_notice`), and it
+/// runs in `tetond`, which cannot reach a `teton` helper. Two private
+/// formatters for one figure is the mirrored-predicate shape LESSON-528 is
+/// about — identical today, and identical only until one of them is edited.
+#[must_use]
+pub fn thousands(n: u64) -> String {
+    let digits = n.to_string();
+    let mut out = String::with_capacity(digits.len() + digits.len() / 3);
+    let first = digits.len() % 3;
+    for (at, ch) in digits.chars().enumerate() {
+        if at > 0 && at % 3 == first {
+            out.push(',');
+        }
+        out.push(ch);
+    }
+    out
+}
+
+/// A byte figure for a budget line: `900 B`, `33 KB`, `4.2 MB` — **the one
+/// home** of how a budget's byte figure is spelled (REQ-586 BR-8).
+///
+/// Named for what it *is* rather than for its first caller: `budget_bytes` is
+/// the wire field's name (and one call site hands it `elided_bytes`, which is
+/// not a budget at all), so a formatter wearing that name read as an accessor.
+///
+/// **Decimal** units, and labelled as such. The CLI's `firstrun::format_bytes`
+/// is the other byte formatter in the workspace and stays where it is: it
+/// renders an *exact* download size in the binary units the daemon's own
+/// sentences use, where the tenth of a GiB is a fact about a file. A budget is
+/// an approximation with a safety ratio already baked into it, so it is rounded
+/// to whole KB and never claims a precision the number has not got — and
+/// rounding a 1024-based number under a `KB` label is the exact confusion that
+/// formatter's doc warns about, which is why this one divides by 1000.
+///
+/// Shared for [`thousands`]' reason: the daemon composes the same figures.
+#[must_use]
+pub fn bytes_figure(bytes: u64) -> String {
+    if bytes < 1_000 {
+        return format!("{bytes} B");
+    }
+    if bytes < 1_000_000 {
+        return format!("{} KB", (bytes + 500) / 1_000);
+    }
+    let tenths = (bytes + 50_000) / 100_000;
+    match tenths % 10 {
+        0 => format!("{} MB", tenths / 10),
+        frac => format!("{}.{frac} MB", tenths / 10),
+    }
+}
+
 /// What the context gate did to earn a [`ContextPressure`] event (REQ-586
 /// BR-7).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -2207,6 +2283,24 @@ pub enum ContextPressureKind {
     /// The conversation was re-fitted after a reroute or fallback moved the
     /// turn to a route with a different budget (BR-1).
     RefitOnReroute,
+    /// The gate ran and the context **still does not fit** either budget — the
+    /// turn is being sent over budget (REQ-586 verify m1, TASK-194 2a).
+    ///
+    /// Two arms of `truncate_to_budget` deliberately stop short: the in-place
+    /// clamp floors the last block's room at 1 KiB, and the drop loop stops at
+    /// one block whatever the word estimate says. Both are the right
+    /// degradation — a turn that cannot fit beats a turn with no content — and
+    /// neither may be silent.
+    ///
+    /// It has its own name because it used to ride as [`Self::BlockElided`]
+    /// with `elided_bytes: 0`, which is worse than silence: BR-7's whole claim
+    /// is that nothing is clamped without being said, and an event announced
+    /// under the wrong name says something that did not happen. A client
+    /// predating this variant drops the frame rather than mis-rendering it —
+    /// the same fail-closed choice the enum's snake_case tag makes everywhere
+    /// else — so no reader is ever told the wrong story about a context that
+    /// did not fit.
+    DidNotFit,
 }
 
 /// The context gate dropped, elided, or re-fitted conversation to a turn's
@@ -2247,6 +2341,18 @@ pub struct ContextPressure {
     /// Which constraint bound that budget — the route's, read off
     /// [`RouteDecided::bound`], never re-derived here.
     pub bound: BudgetBound,
+    /// Whether the derivation had to **raise** the pair to its floor, so the
+    /// bound above could not be honored as declared (REQ-586 TASK-194 2b).
+    ///
+    /// See [`RouteDecided::bound_floored`] for what the floor is and why a
+    /// bound that says `user cap` beside a budget larger than that cap is the
+    /// untruth this field exists to close.
+    ///
+    /// `#[serde(default)]` rather than `Option`: this event's other fields are
+    /// all required, and `false` is exactly what a frame from a daemon
+    /// predating the field means — that daemon floored nothing it could report.
+    #[serde(default)]
+    pub bound_floored: bool,
 }
 
 // ---------------------------------------------------------------------------
@@ -2543,6 +2649,7 @@ mod tests {
             budget_tokens: Some(132_650),
             budget_bytes: Some(397_952),
             bound: Some(BudgetBound::Window),
+            bound_floored: None,
         }));
         // Flattened: envelope metadata and the payload share one object.
         assert_eq!(wire["event"], "route_decided");
@@ -2578,6 +2685,7 @@ mod tests {
                     budget_tokens: None,
                     budget_bytes: None,
                     bound: None,
+                    bound_floored: None,
                 }),
                 "route_decided",
             ),
@@ -2763,6 +2871,7 @@ mod tests {
                     budget_tokens: 4_096,
                     budget_bytes: 32_768,
                     bound: BudgetBound::LocalEngine,
+                    bound_floored: false,
                 }),
                 "context_pressure",
             ),
@@ -2926,6 +3035,7 @@ mod tests {
             budget_tokens: 4_096,
             budget_bytes: 32_768,
             bound: BudgetBound::LocalEngine,
+            bound_floored: false,
         };
         round_trip(&pressure);
 
@@ -2961,6 +3071,7 @@ mod tests {
                 budget_tokens: 84_650,
                 budget_bytes: 253_952,
                 bound: BudgetBound::RedactScan,
+                bound_floored: false,
             };
             round_trip(&pressure);
             let wire = envelope_wire(Event::ContextPressure(pressure));
@@ -2973,6 +3084,100 @@ mod tests {
             assert_eq!(wire["newest_user_elided"], true);
             assert_eq!(wire["bound"], "redact_scan");
         }
+    }
+
+    /// **TASK-194 2a/2b, both directions of the additive rule.**
+    ///
+    /// `did_not_fit` is a fourth kind with its own wire spelling — the case
+    /// that used to ride as `block_elided` with a zero for a tell — and
+    /// `bound_floored` is a fifth field with a `false` default. The two
+    /// compatibility legs are asserted rather than assumed:
+    ///
+    /// * **older daemon → this client**: a frame with no `bound_floored` key
+    ///   reads `false`, so the line renders exactly as it did before.
+    /// * **newer daemon → older client**: an unrecognized `kind` is a *refusal*
+    ///   to deserialize, not a silent coercion into a neighbouring variant.
+    ///   That is the fail-closed half of BR-7 — a client that cannot name what
+    ///   happened must say nothing rather than say the wrong thing — and it is
+    ///   why `did_not_fit` needed a new spelling instead of reusing one.
+    #[test]
+    fn a_context_that_did_not_fit_has_its_own_kind_and_degrades_both_ways() {
+        let pressure = ContextPressure {
+            kind: ContextPressureKind::DidNotFit,
+            dropped_blocks: 0,
+            elided_bytes: 0,
+            newest_user_elided: false,
+            budget_tokens: 2_048,
+            budget_bytes: 16_384,
+            bound: BudgetBound::UserCap,
+            bound_floored: true,
+        };
+        round_trip(&pressure);
+        let wire = envelope_wire(Event::ContextPressure(pressure));
+        assert_eq!(wire["kind"], "did_not_fit");
+        assert_eq!(wire["bound_floored"], true);
+        // No two kinds share a spelling — the whole point of the new one.
+        let spellings: Vec<String> = [
+            ContextPressureKind::BlocksDropped,
+            ContextPressureKind::BlockElided,
+            ContextPressureKind::RefitOnReroute,
+            ContextPressureKind::DidNotFit,
+        ]
+        .into_iter()
+        .map(|kind| serde_json::to_value(kind).unwrap().to_string())
+        .collect();
+        let unique: std::collections::HashSet<&String> = spellings.iter().collect();
+        assert_eq!(unique.len(), spellings.len(), "{spellings:?}");
+
+        // Older daemon: no `bound_floored` key at all.
+        let older: ContextPressure = serde_json::from_str(
+            r#"{"kind":"block_elided","dropped_blocks":0,"elided_bytes":9,
+                "newest_user_elided":false,"budget_tokens":4096,"budget_bytes":32768,
+                "bound":"window"}"#,
+        )
+        .expect("a frame predating the field still parses");
+        assert!(!older.bound_floored);
+
+        // Older client: a kind it does not know is refused, never folded into
+        // one it does.
+        assert!(serde_json::from_str::<ContextPressureKind>("\"did_not_fit\"").is_ok());
+        assert!(serde_json::from_str::<ContextPressureKind>("\"a_kind_from_the_future\"").is_err());
+    }
+
+    /// **TASK-194 2b, the route line's half.** `bound_floored` rides
+    /// `route_decided` beside the bound it qualifies, and a frame from a daemon
+    /// predating it carries no key and reads `None` — the `effort` rule, one
+    /// field over.
+    #[test]
+    fn route_decided_carries_whether_its_bound_was_floored() {
+        let decided = RouteDecided {
+            category: None,
+            tier: None,
+            phase: None,
+            provider_id: crate::ProviderId::from("kimi"),
+            model: None,
+            reason: "r".to_owned(),
+            effort: None,
+            budget_tokens: Some(2_048),
+            budget_bytes: Some(16_384),
+            bound: Some(BudgetBound::UserCap),
+            bound_floored: Some(true),
+        };
+        round_trip(&decided);
+        let wire = serde_json::to_value(&decided).unwrap();
+        assert_eq!(wire["bound_floored"], true);
+
+        let quiet = RouteDecided {
+            bound_floored: None,
+            ..decided.clone()
+        };
+        let wire = serde_json::to_value(&quiet).unwrap();
+        assert!(
+            wire.get("bound_floored").is_none(),
+            "an unstated fact writes no key: {wire}"
+        );
+        let back: RouteDecided = serde_json::from_value(wire).unwrap();
+        assert_eq!(back.bound_floored, None);
     }
 
     #[test]
@@ -3093,6 +3298,7 @@ mod tests {
             budget_tokens: None,
             budget_bytes: None,
             bound: None,
+            bound_floored: None,
         });
 
         // REQ-586: the budget pair and its bound ride the same frame, and every
@@ -3116,6 +3322,7 @@ mod tests {
                 budget_tokens: Some(84_650),
                 budget_bytes: Some(253_952),
                 bound: Some(bound),
+                bound_floored: None,
             };
             round_trip(&decided);
             let wire: serde_json::Value =
@@ -3171,6 +3378,7 @@ mod tests {
             budget_tokens: Some(84_650),
             budget_bytes: Some(253_952),
             bound: Some(BudgetBound::UserCap),
+            bound_floored: None,
         })
         .unwrap();
         assert!(
@@ -3208,6 +3416,7 @@ mod tests {
             budget_tokens: None,
             budget_bytes: None,
             bound: None,
+            bound_floored: None,
         };
         round_trip(&decided);
         let wire: serde_json::Value =

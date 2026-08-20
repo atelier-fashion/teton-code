@@ -82,7 +82,8 @@
 //! path is not dead code. What this module does not have is a proof over a
 //! mixture, and it does not claim one.
 
-use teton_protocol::events::BudgetBound;
+use teton_protocol::events::{bytes_figure, thousands, BudgetBound};
+use teton_providers::capability::NATIVE_MAX_ITERATIONS;
 
 use super::context::APPROX_BYTES_PER_TOKEN;
 use super::duty::DUTY_REQUEST_BYTES_PER_TOKEN;
@@ -212,6 +213,30 @@ pub const DIGEST_ABSOLUTE_CEILING_TOKENS: usize = 20_000;
 /// does **not** bind there (pinned both ways by the table test here) — the
 /// words ceiling is the one that bites first on today's windows.
 pub const DIGEST_ABSOLUTE_CEILING_BYTES: usize = 160 * 1024;
+
+/// The declared context window above which recording one earns a **notice**
+/// (REQ-586 OQ-6 as amended, 2026-08-19).
+///
+/// **A notice threshold, not a policy threshold.** [`derive`] does not read it,
+/// no budget is bounded by it, and no cap is written because of it. OQ-6's
+/// answer is unchanged — the window the user declared is the consent, and a
+/// default cap would be a surprise in the other direction. What changed is the
+/// size of the declaration: four of the six shipped recipes declare 1,000,000
+/// tokens, and `/provider setup` recorded that in silence. A user who accepts a
+/// window this large should learn the size of the cheque at the moment they
+/// sign it, not from `/verbose` on a later turn.
+///
+/// Why 256,000 and not a rounder number: it is just above the largest window a
+/// *pre-recipe* configuration plausibly carried (200k), so an existing
+/// hand-written config gains no new line, and it is the point at which one
+/// prompt's worst case — the per-call budget times a `Native` route's
+/// [`NATIVE_MAX_ITERATIONS`] — stops being a number a reader can hold in their
+/// head. Above it, one prompt may spend more input than a whole day of turns on
+/// a 128k route.
+///
+/// One home, read only by [`big_window_notice`], which both surfaces that
+/// record a window render (BR-8, LESSON-456).
+pub const BIG_WINDOW_NOTICE_TOKENS: u32 = 256_000;
 
 /// The elision marker's name for the local pair's window — **the one home** of
 /// the string (LESSON-456).
@@ -350,6 +375,21 @@ pub struct RouteBudget {
     /// `digest` threshold in bytes: today's fraction of [`Self::budget_bytes`],
     /// capped at [`DIGEST_ABSOLUTE_CEILING_BYTES`] (BR-6).
     pub digest_threshold_bytes: usize,
+    /// Whether the floor **raised** this pair — the declared window or cap
+    /// derived below [`MIN_BUDGET_TOKENS`]/[`MIN_BUDGET_BYTES`], so the budget
+    /// above is larger than the declaration asked for (TASK-194 2b).
+    ///
+    /// [`Self::bound`] still names what the user set, because that is what they
+    /// would go and change; this says whether it is actually in force. The two
+    /// together are the whole truth, and a surface that printed only the first
+    /// reported a ceiling that is not being honored — `bound: user cap` beside
+    /// a budget bigger than the cap. The floor's cost was documented at
+    /// [`MIN_BUDGET_BYTES`] from the start; this is what carries it to a user.
+    ///
+    /// Never true for the [`BudgetBound::LocalEngine`] or
+    /// [`BudgetBound::DefaultUnknown`] arms: those return the default pair by
+    /// decision rather than by a clamp, and nothing was raised.
+    pub floored: bool,
 }
 
 /// Turn a route's window facts into its budget — the one classifier (BR-8,
@@ -385,9 +425,16 @@ pub fn derive(inputs: BudgetInputs<'_>) -> RouteBudget {
     // larger than the window said and would report a bound the route does not
     // have (verify M1). The floor only ever raises, never lowers, so no route
     // with room to spare is touched by it.
-    let budget_tokens =
-        (usable * REMOTE_TOKENS_PER_WORD_DEN / REMOTE_TOKENS_PER_WORD_NUM).max(MIN_BUDGET_TOKENS);
-    let mut budget_bytes = (usable * DUTY_REQUEST_BYTES_PER_TOKEN).max(MIN_BUDGET_BYTES);
+    let window_tokens = usable * REMOTE_TOKENS_PER_WORD_DEN / REMOTE_TOKENS_PER_WORD_NUM;
+    let window_bytes = usable * DUTY_REQUEST_BYTES_PER_TOKEN;
+    let budget_tokens = window_tokens.max(MIN_BUDGET_TOKENS);
+    let mut budget_bytes = window_bytes.max(MIN_BUDGET_BYTES);
+    // Whether the floor *bit*, kept as a fact rather than left implicit in the
+    // numbers: a surface comparing the pair against the floor would be
+    // re-deriving the thing this module exists to decide once (BR-8), and the
+    // bound alone cannot say it — `UserCap` is the same bound whether the cap
+    // is in force or has been overruled by the floor (TASK-194 2b).
+    let floored = window_tokens < MIN_BUDGET_TOKENS || window_bytes < MIN_BUDGET_BYTES;
 
     // The redact clamp applies LAST and names the bound only when it bites
     // (BR-4): the scan is byte-denominated, so only bytes clamp — the word
@@ -408,6 +455,7 @@ pub fn derive(inputs: BudgetInputs<'_>) -> RouteBudget {
         window_label,
         digest_threshold_tokens,
         digest_threshold_bytes,
+        floored,
     }
 }
 
@@ -423,6 +471,8 @@ fn default_pair(bound: BudgetBound, window_label: String) -> RouteBudget {
         window_label,
         digest_threshold_tokens,
         digest_threshold_bytes,
+        // The default pair is the answer, not a clamp of a smaller one.
+        floored: false,
     }
 }
 
@@ -439,6 +489,76 @@ fn digest_thresholds(budget_tokens: usize, budget_bytes: usize) -> (usize, usize
     let bytes = (budget_bytes * LOCAL_DIGEST_THRESHOLD_BYTES / LOCAL_BUDGET_BYTES)
         .min(DIGEST_ABSOLUTE_CEILING_BYTES);
     (tokens, bytes)
+}
+
+/// Provider tokens every route reserves for the generation — **the one home**
+/// of the reservation [`derive`] subtracts (ADR-1).
+///
+/// The `max_tokens` the adapters actually send, read off the config that sends
+/// it rather than restated as a literal: `Router::budget_for` and
+/// [`big_window_notice`] both derive under the same reservation, so the budget
+/// a user is *told about* at registration is the budget their turns get.
+#[must_use]
+pub fn generation_reservation() -> u32 {
+    super::turn_loop::HarnessConfig::default()
+        .gen_params
+        .max_tokens
+}
+
+/// The one sentence a registration that records a big context window earns, or
+/// `None` for a window at or below [`BIG_WINDOW_NOTICE_TOKENS`] (OQ-6 as
+/// amended).
+///
+/// **The composer, and the only one.** `/provider setup`'s preview puts this in
+/// its warning list and `teton provider add --max-context` prints it off the
+/// `config/set` answer; both render this string, byte for byte, because a
+/// second wording of "here is what you just agreed to spend" is the drift
+/// LESSON-456 and this REQ's own BR-8 exist to prevent. The CLI does not
+/// compose it — every figure in it is [`derive`]'s, and a thin client that
+/// re-derived a budget would be the second source BR-8 forbids.
+///
+/// **No behaviour changes here.** Nothing is capped, nothing is refused, and
+/// [`derive`] never reads [`BIG_WINDOW_NOTICE_TOKENS`]: the declaration is
+/// still the consent (OQ-6), and this only says out loud what was declared.
+///
+/// **Nothing provider-supplied reaches the sentence.** It names no id, no
+/// model, and no endpoint — only integers this module derived and two literal
+/// key names — so there is no string here for a sanitizer to have missed
+/// (ADR-009 rule 2 applies to [`RouteBudget::window_label`], which this does
+/// not use).
+///
+/// The figures are the route's own: the per-call pair comes from [`derive`]
+/// under the real [`generation_reservation`], the cap and the redact scan are
+/// applied exactly as a turn would apply them, and the worst case is that pair
+/// times [`NATIVE_MAX_ITERATIONS`] — a `Native` route's loop ceiling, which is
+/// how many calls one *prompt* may run.
+#[must_use]
+pub fn big_window_notice(window: u32, cap: u32, redact_scan: bool) -> Option<String> {
+    if window <= BIG_WINDOW_NOTICE_TOKENS {
+        return None;
+    }
+    let budget = derive(BudgetInputs {
+        window,
+        cap,
+        reservation: generation_reservation(),
+        is_local: false,
+        redact_scan,
+        // The label is the only thing an id would change, and this sentence
+        // carries none.
+        provider_id: None,
+    });
+    let calls = NATIVE_MAX_ITERATIONS as usize;
+    Some(format!(
+        "a {}-token context window is recorded, so every call to this provider may carry up to \
+         {} words / {} of context, and one prompt may run up to {calls} calls — {} words / {} of \
+         input at worst. Nothing is capped by default: the window you declare is the budget. Set \
+         `capabilities.context_budget_cap` below `capabilities.max_context` to spend less.",
+        thousands(u64::from(window)),
+        thousands(budget.budget_tokens as u64),
+        bytes_figure(budget.budget_bytes as u64),
+        thousands(budget.budget_tokens.saturating_mul(calls) as u64),
+        bytes_figure(budget.budget_bytes.saturating_mul(calls) as u64),
+    ))
 }
 
 #[cfg(test)]
@@ -939,5 +1059,170 @@ mod tests {
             budget.digest_threshold_bytes
         );
         assert_eq!(config.budget, budget);
+    }
+
+    /// **TASK-194 2b.** The floor is a fact the derivation reports, not one a
+    /// surface infers from the numbers.
+    ///
+    /// `bound` alone cannot say it: `UserCap` is the same bound whether the cap
+    /// is in force or has been overruled, and a surface printing only the bound
+    /// beside a budget *larger* than that cap is the untruth this closes. Both
+    /// currencies are checked, because either one can be the half that was
+    /// raised — a 9,000-token window floors its bytes while its words stand.
+    #[test]
+    fn the_floor_is_reported_where_it_bites_and_nowhere_else() {
+        // Roomy: nothing was raised.
+        for inputs in [remote(200_000, 0, false), remote(200_000, 40_000, false)] {
+            assert!(!derive(inputs).floored, "{inputs:?}");
+        }
+        // The default arms return the default pair by decision, not by a clamp.
+        assert!(!derive(BudgetInputs::local()).floored);
+        assert!(!derive(remote(0, 0, false)).floored);
+        // The cap case 2b is written about: 500 on a 200k provider derives to
+        // nothing, so the pair is raised and the user gets more than they asked.
+        let capped = derive(remote(200_000, 500, false));
+        assert!(capped.floored);
+        assert_eq!(capped.bound, BudgetBound::UserCap);
+        assert!(
+            capped.budget_tokens > 500,
+            "the very fact that needs saying: {} words against a 500-token cap",
+            capped.budget_tokens
+        );
+        // Only one half raised, and it still counts: 9,000 − 1,024 = 7,976 →
+        // 5,317 words (over the 2,048 floor) but 15,952 bytes (under 16,384).
+        let one_half = derive(remote(9_000, 0, false));
+        assert!(one_half.floored);
+        assert_eq!(
+            (one_half.budget_tokens, one_half.budget_bytes),
+            (5_317, MIN_BUDGET_BYTES)
+        );
+        // Ollama's shipped recipe is the live window case.
+        assert!(derive(remote(4_096, 0, false)).floored);
+        // And the redact clamp is never mistaken for the floor: it only ever
+        // *lowers*, and it bites far above the floor.
+        let scanned = derive(remote(128_000, 0, true));
+        assert_eq!(scanned.bound, BudgetBound::RedactScan);
+        assert!(!scanned.floored);
+    }
+
+    /// **The notice (OQ-6 as amended).** A big window says its own size, in the
+    /// two currencies a call spends and the worst case one prompt can run to,
+    /// and names the knob — and a window at or below the threshold says nothing.
+    #[test]
+    fn the_big_window_notice_names_the_call_the_prompt_and_the_knob() {
+        assert_eq!(
+            big_window_notice(1_000_000, 0, false).expect("a 1m window is above the threshold"),
+            "a 1,000,000-token context window is recorded, so every call to this provider may \
+             carry up to 665,984 words / 2 MB of context, and one prompt may run up to 25 calls \
+             — 16,649,600 words / 49.9 MB of input at worst. Nothing is capped by default: the \
+             window you declare is the budget. Set `capabilities.context_budget_cap` below \
+             `capabilities.max_context` to spend less."
+        );
+        // Threshold, both sides of it, exactly once.
+        assert_eq!(big_window_notice(BIG_WINDOW_NOTICE_TOKENS, 0, false), None);
+        assert_eq!(big_window_notice(128_000, 0, false), None);
+        assert_eq!(big_window_notice(0, 0, false), None);
+        assert!(big_window_notice(BIG_WINDOW_NOTICE_TOKENS + 1, 0, false).is_some());
+        // Every figure is `derive`'s, under the reservation a turn really runs
+        // with — not a second arithmetic (LESSON-456). Stated as a relation so
+        // that changing the ratios changes the sentence and this test with it.
+        let budget = derive(BudgetInputs {
+            window: 1_000_000,
+            cap: 0,
+            reservation: generation_reservation(),
+            is_local: false,
+            redact_scan: false,
+            provider_id: None,
+        });
+        let notice = big_window_notice(1_000_000, 0, false).expect("above the threshold");
+        for figure in [
+            thousands(budget.budget_tokens as u64),
+            bytes_figure(budget.budget_bytes as u64),
+            thousands((budget.budget_tokens * NATIVE_MAX_ITERATIONS as usize) as u64),
+            bytes_figure((budget.budget_bytes * NATIVE_MAX_ITERATIONS as usize) as u64),
+        ] {
+            assert!(notice.contains(&figure), "{figure} missing from: {notice}");
+        }
+        // A cap and a redact scan are honoured, because they are honoured by
+        // the turn: the sentence describes the budget that will really run.
+        let capped = big_window_notice(1_000_000, 300_000, false).expect("above the threshold");
+        assert!(
+            capped.contains(&thousands(
+                derive(remote(1_000_000, 300_000, false)).budget_tokens as u64
+            )),
+            "{capped}"
+        );
+        assert!(
+            big_window_notice(1_000_000, 0, true)
+                .expect("above the threshold")
+                .contains(&bytes_figure(REDACT_SCANNABLE_CONTEXT_BYTES as u64)),
+            "a scanned route's bytes are what the scan covers, and the notice says so"
+        );
+        // Nothing provider-supplied is in it, so there is no string a sanitizer
+        // could have missed (ADR-009).
+        assert!(!notice.contains("kimi"));
+    }
+
+    /// **The threshold is a notice threshold, not a policy threshold.**
+    ///
+    /// Nothing in the derivation reads it: the pair either side of it is the
+    /// same continuous window arithmetic, with no step, no clamp, and no bound
+    /// change. A reader who mistook the constant for a cap would look here.
+    #[test]
+    fn the_notice_threshold_bounds_no_budget() {
+        let below = derive(remote(BIG_WINDOW_NOTICE_TOKENS - 1, 0, false));
+        let at = derive(remote(BIG_WINDOW_NOTICE_TOKENS, 0, false));
+        let above = derive(remote(BIG_WINDOW_NOTICE_TOKENS + 1, 0, false));
+        for (name, got) in [("below", &below), ("at", &at), ("above", &above)] {
+            assert_eq!(got.bound, BudgetBound::Window, "{name}");
+        }
+        assert!(below.budget_tokens <= at.budget_tokens);
+        assert!(at.budget_tokens <= above.budget_tokens);
+        // And a window far past the threshold is still the window's own
+        // arithmetic — not held to the threshold's derivation.
+        let huge = derive(remote(1_000_000, 0, false));
+        let usable = (1_000_000 - RESERVATION) as usize;
+        assert_eq!(
+            (huge.budget_tokens, huge.budget_bytes),
+            (
+                usable * REMOTE_TOKENS_PER_WORD_DEN / REMOTE_TOKENS_PER_WORD_NUM,
+                usable * DUTY_REQUEST_BYTES_PER_TOKEN
+            )
+        );
+    }
+
+    /// The threshold pinned against the catalog the user actually meets: every
+    /// shipped recipe whose window is above it earns the notice, and the one
+    /// below it does not.
+    ///
+    /// Written against the catalog rather than as `assert_eq!(256_000)` because
+    /// the constant's *job* is to separate those two groups — moving it in
+    /// either direction moves a real recipe across the line, and this says
+    /// which.
+    #[test]
+    fn the_shipped_recipes_that_earn_the_notice_are_the_big_ones() {
+        let mut noticed = Vec::new();
+        let mut quiet = Vec::new();
+        for recipe in crate::provider_recipes::recipe_catalog() {
+            let notice = big_window_notice(recipe.max_context, 0, false);
+            if notice.is_some() {
+                noticed.push((recipe.id_suggestion.clone(), recipe.max_context));
+            } else {
+                quiet.push((recipe.id_suggestion.clone(), recipe.max_context));
+            }
+        }
+        assert!(
+            noticed.iter().all(|(_, window)| *window >= 500_000),
+            "every big-window recipe is noticed: {noticed:?}"
+        );
+        assert!(
+            noticed.len() >= 5,
+            "five of the six shipped recipes declare a window worth stating: {noticed:?}"
+        );
+        assert_eq!(
+            quiet,
+            vec![("ollama".to_owned(), 4_096)],
+            "only the small locally-served window is quiet"
+        );
     }
 }

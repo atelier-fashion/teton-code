@@ -1,7 +1,7 @@
 ---
 id: TASK-194
 title: "Say the true thing at the surface: a notice when a big window is recorded, a kind for a context that would not fit, and an honest bound when a cap cannot be honored"
-status: draft
+status: complete
 parent: REQ-586
 created: 2026-08-19
 updated: 2026-08-19
@@ -89,23 +89,23 @@ say it in the `context` docs topic.
 
 ## Acceptance Criteria
 
-- [ ] A `/provider setup` that records a window > `BIG_WINDOW_NOTICE_TOKENS`
+- [x] A `/provider setup` that records a window > `BIG_WINDOW_NOTICE_TOKENS`
       shows exactly one notice in the preview, naming: the derived budget in
       words **and** bytes, the worst case (budget × the route's iteration
       ceiling) for one prompt, and `capabilities.context_budget_cap` as the
       knob. A window at or below the threshold shows nothing.
-- [ ] `teton provider add --max-context <n>` above the threshold prints the same
+- [x] `teton provider add --max-context <n>` above the threshold prints the same
       sentence, byte-identical to the setup preview's, through the `Surface`
       seam; below it, output is unchanged from today.
-- [ ] The sentence is composed once and read by both surfaces; a test asserts
+- [x] The sentence is composed once and read by both surfaces; a test asserts
       byte-equality between them, and mutating the composer changes both.
-- [ ] The figures come from `budget::derive` and the profile's iteration
+- [x] The figures come from `budget::derive` and the profile's iteration
       ceiling — no second arithmetic anywhere; `grep` finds one composer.
-- [ ] No default behaviour change: no cap is written, no route is bounded, and
+- [x] No default behaviour change: no cap is written, no route is bounded, and
       a user who accepts the window gets exactly what they declared.
-- [ ] **2a**: a context the gate could not fit is announced as its own kind, not as a zero-byte elision; the CLI line says it plainly; an older client still renders something sane.
-- [ ] **2b**: a sub-floor cap is visibly floored on `/verbose` and in `/doctor`'s advisory, and the `context` topic says the floor exists and why; a cap at or above the floor renders exactly as today.
-- [ ] `cargo test --workspace --no-fail-fast` green; fmt and clippy clean.
+- [x] **2a**: a context the gate could not fit is announced as its own kind, not as a zero-byte elision; the CLI line says it plainly; an older client still renders something sane.
+- [x] **2b**: a sub-floor cap is visibly floored on `/verbose` and in `/doctor`'s advisory, and the `context` topic says the floor exists and why; a cap at or above the floor renders exactly as today.
+- [x] `cargo test --workspace --no-fail-fast` green; fmt and clippy clean.
 
 ## Technical Notes
 
@@ -115,3 +115,50 @@ say it in the `context` docs topic.
 - Keep the sentence short enough to sit in a preview warning list; the docs
   topic carries the long form.
 - Commit as `feat(daemon,cli): name the cost when a big window is recorded [TASK-194]`.
+
+## What shipped (2026-08-19)
+
+**The sentence, composed once** in `harness::budget::big_window_notice(window,
+cap, redact_scan)` beside `derive`, read by both surfaces:
+
+> a 1,000,000-token context window is recorded, so every call to this provider
+> may carry up to 665,984 words / 2 MB of context, and one prompt may run up to
+> 25 calls — 16,649,600 words / 49.9 MB of input at worst. Nothing is capped by
+> default: the window you declare is the budget. Set
+> `capabilities.context_budget_cap` below `capabilities.max_context` to spend
+> less.
+
+`teton provider add` could not compose it: every figure is `budget::derive`'s
+and the CLI is a thin client that may not re-derive a budget (BR-8, AC-12), and
+`teton` depends only on `teton-protocol`/`teton-core`. So the daemon composes
+and the client renders — the sentence rides back on an additive
+`ConfigSetResult::budget_notice`, and `/provider setup`'s preview carries the
+identical string in its existing warning list. A `kind = "local"` entry gets no
+notice however large its window: its turns run the local pair, so a per-call
+cost figure for it would be untrue.
+
+**2a**: `ContextPressureKind::DidNotFit`, checked **first** in `pressure_kind`
+— the other three lines all end "to fit the N-word budget", and a gate that
+dropped three blocks and still did not fit did not drop them to fit. What the
+gate managed trails the fact that it was not enough.
+
+**2b**: `RouteBudget::floored` (the derivation's own fact, not a surface's
+comparison), carried as `RouteDecided::bound_floored`,
+`ContextPressure::bound_floored`, and `ProviderConfig::floored_budget` (the
+pair in force, so `/doctor` can name it).
+
+### Known limitation, recorded
+
+An **older** client meeting `kind: "did_not_fit"` drops the frame rather than
+rendering it: `ContextPressureKind` is a plain snake_case enum with no
+catch-all, so serde refuses a tag it does not know. That is the fail-closed
+choice — it can never be mis-rendered as a neighbouring kind — but it is a
+lost line, not a degraded one, and only for binaries built before this change.
+Both directions are pinned by
+`a_context_that_did_not_fit_has_its_own_kind_and_degrades_both_ways`.
+
+The positive `provider add` notice is asserted end to end against a real daemon
+in `tetond`'s `provider_setup_flow`, not in `cli_e2e`: that suite can only
+complete a **local** registration (every remote kind reads a credential into
+the machine's own keychain), and a local row earns no notice by design. The
+`cli_e2e` leg asserts that negative.
