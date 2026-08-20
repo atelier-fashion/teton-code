@@ -1,7 +1,7 @@
 ---
 id: TASK-196
 title: "Protocol: skills/list, the invocation carrier, the consent subject, SkillInvoked, and a distinct refusal code"
-status: draft
+status: complete
 parent: REQ-585
 created: 2026-08-20
 updated: 2026-08-20

@@ -743,6 +743,8 @@ async fn the_marker_names_the_routes_window_when_the_turn_is_seeded_by_carried_t
         Arc::new(SessionTaint::new()),
         Vec::new(),
         format!("review this paste:\n{}", filler(6_000)),
+        std::collections::BTreeSet::new(),
+        false,
     );
     // Non-vacuity: the pasted block really is over the route's byte budget, so
     // the clamp has to fire and a marker has to be written.

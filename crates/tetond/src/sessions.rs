@@ -1226,7 +1226,7 @@ mod tests {
         ContextBlock {
             role: BlockRole::User,
             text: text.to_owned(),
-            provenance: Provenance::User,
+            provenance: Provenance::user(),
         }
     }
 

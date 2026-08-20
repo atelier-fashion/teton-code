@@ -2940,6 +2940,10 @@ impl DaemonRuntime {
             Arc::clone(&self.session_taint),
             config.boundaries.clone(),
             prompt,
+            // REQ-585 BR-7: a typed prompt is drawn from no file. The `/skill`
+            // path is what fills these in, and it is the same block either way.
+            std::collections::BTreeSet::new(),
+            false,
         );
 
         let mut attempts = 0u32;
@@ -16109,7 +16113,7 @@ permission_allow = [\"fetch_user_url\"]
                             &[crate::harness::context::ContextBlock {
                                 role: crate::harness::context::BlockRole::User,
                                 text: "do the thing".to_owned(),
-                                provenance: crate::harness::context::Provenance::User,
+                                provenance: crate::harness::context::Provenance::user(),
                             }],
                             crate::harness::compact::COMPACT_PROMPT_BUDGET_BYTES,
                         ),
@@ -25511,6 +25515,8 @@ provider_id = \"deepseek\"
                     Arc::clone(&taint),
                     Vec::new(),
                     prompt.to_owned(),
+                    std::collections::BTreeSet::new(),
+                    false,
                 )
             };
 
@@ -26839,6 +26845,8 @@ provider_id = \"deepseek\"
                 Arc::new(SessionTaint::new()),
                 Vec::new(),
                 "the opening prompt",
+                std::collections::BTreeSet::new(),
+                false,
             );
             let filler = vec!["lorem"; words].join(" ");
             for _ in 0..blocks {

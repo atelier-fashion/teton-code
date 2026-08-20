@@ -856,6 +856,20 @@ impl PermissionGate {
         outcome: PermissionOutcome,
         web: Option<WebTier>,
     ) -> PermissionDecision {
+        // A client that refused fail-closed did not make a consent decision —
+        // nobody decided it. Deny, remember nothing, and publish nothing, for
+        // the same reason the disconnect arm above publishes nothing: a
+        // `web_consent_decided { granted: false }` here would record a refusal
+        // the user never gave.
+        //
+        // REQ-585 TASK-201 carries the `reason` through to the caller, so a
+        // skill's not-run placeholder can say *no human could be asked* rather
+        // than *declined* (AC-9). Until then the reason is dropped here and
+        // nowhere else, which is the one place to look for it.
+        if let PermissionOutcome::Refused { .. } = outcome {
+            return PermissionDecision::Denied;
+        }
+
         let (decision, scope) = match outcome {
             PermissionOutcome::Selected { option_id } => match option_id.as_str() {
                 OPTION_ALLOW_ONCE => (PermissionDecision::Allowed, WebConsentScope::Once),
@@ -883,6 +897,10 @@ impl PermissionGate {
                 _ => (PermissionDecision::Denied, WebConsentScope::Once),
             },
             PermissionOutcome::Cancelled => (PermissionDecision::Denied, WebConsentScope::Once),
+            // Handled above, ahead of the web publish.
+            PermissionOutcome::Refused { .. } => {
+                (PermissionDecision::Denied, WebConsentScope::Once)
+            }
         };
 
         if let Some(tier) = web {

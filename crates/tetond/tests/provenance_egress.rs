@@ -653,6 +653,8 @@ async fn probe_spelling(repo: &std::path::Path, path_arg: &str) -> (SessionProbe
         Arc::clone(&taint),
         boundaries(),
         PROMPT,
+        std::collections::BTreeSet::new(),
+        false,
     );
 
     let args = serde_json::json!({ "path": path_arg }).to_string();

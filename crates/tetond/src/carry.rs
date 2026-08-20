@@ -12,10 +12,12 @@
 //! implementation and both callers consume it, which makes that mutation
 //! impossible to hide.
 
+use std::collections::BTreeSet;
 use std::io::Write;
 use std::sync::Arc;
 
 use teton_core::entities::PrivacyBoundary;
+use teton_core::ProvenanceId;
 use teton_protocol::SessionId;
 
 use crate::harness::budget::RouteBudget;
@@ -97,6 +99,24 @@ impl CarriedTurn {
     /// the acceptance fixture, which is what stops the fixture from drifting
     /// into an agreeing re-implementation of a dispatch that has changed
     /// (LESSON-451).
+    ///
+    /// # The prompt's provenance rides beside its text (REQ-585 BR-7)
+    ///
+    /// `prompt_sources`/`prompt_unknown` are the pair
+    /// [`ContextManager::push_user_from`] takes, passed straight through. A
+    /// typed prompt passes `(BTreeSet::new(), false)` and seeds exactly the
+    /// block it always seeded; a `/skill` expansion passes the skill file's
+    /// identity, so a `local-only` boundary pins the turn as a `read` would.
+    ///
+    /// The signature changed rather than gaining an overload on purpose. A
+    /// second seeding entry point is how a path nobody remembered to update
+    /// comes to push an unpinned block — and this is the one function every turn
+    /// in the daemon goes through.
+    // The prompt's two provenance facts are passed individually because that is
+    // the shape `ContextManager::push_user_from` takes them in, and one spelling
+    // of the pair across the whole seeding path is worth more here than a
+    // wrapper type that has to be unwrapped one line later.
+    #[allow(clippy::too_many_arguments)]
     #[must_use]
     pub fn begin(
         sessions: &SessionRegistry,
@@ -106,6 +126,8 @@ impl CarriedTurn {
         taint: Arc<SessionTaint>,
         boundaries: Vec<PrivacyBoundary>,
         prompt: impl Into<String>,
+        prompt_sources: BTreeSet<ProvenanceId>,
+        prompt_unknown: bool,
     ) -> Self {
         // REQ-586 BR-1/BR-7: the pair AND the window it is a budget *for*, from
         // the one `RouteBudget` the router derived — so the in-prompt elision
@@ -115,7 +137,7 @@ impl CarriedTurn {
             .with_budget_bytes(harness.context_budget_bytes)
             .with_window_label(harness.budget.window_label.clone());
         ctx.replay(sessions.conversation_snapshot(session_id).into_retained());
-        ctx.push_user(prompt);
+        ctx.push_user_from(prompt, prompt_sources, prompt_unknown);
         Self {
             ctx: Some(ctx),
             sessions: sessions.clone(),
@@ -398,7 +420,7 @@ mod tests {
         ContextBlock {
             role: BlockRole::User,
             text: text.to_owned(),
-            provenance: Provenance::User,
+            provenance: Provenance::user(),
         }
     }
 
@@ -481,6 +503,8 @@ mod tests {
             Arc::new(SessionTaint::new()),
             Vec::new(),
             "do the thing",
+            BTreeSet::new(),
+            false,
         )
     }
 
@@ -645,6 +669,8 @@ mod tests {
                 Arc::new(SessionTaint::new()),
                 Vec::new(),
                 "do the thing",
+                BTreeSet::new(),
+                false,
             );
             for i in 0..6 {
                 turn.ctx_mut()

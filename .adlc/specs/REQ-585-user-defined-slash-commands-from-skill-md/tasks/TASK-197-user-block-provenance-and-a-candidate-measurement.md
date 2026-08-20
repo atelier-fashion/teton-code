@@ -1,7 +1,7 @@
 ---
 id: TASK-197
 title: "Prompt text can carry file provenance, at all three seams — and a candidate turn can be measured before it is committed"
-status: draft
+status: complete
 parent: REQ-585
 created: 2026-08-20
 updated: 2026-08-20

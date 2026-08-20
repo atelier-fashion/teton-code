@@ -131,8 +131,33 @@ pub(crate) use crate::fixture_id;
 pub enum Provenance {
     /// The daemon's own instructions.
     System,
-    /// End-user prompt text.
-    User,
+    /// End-user prompt text — which since REQ-585 BR-7 may be *file-supplied*.
+    ///
+    /// A `/skill` invocation expands a `SKILL.md` into the user turn, so a user
+    /// block can carry the content of a repo file and must pin the turn exactly
+    /// as a `read` of that file would. Typed prompt text is the same variant
+    /// with an empty set and `unknown` clear — the state every
+    /// [`ContextManager::push_user`] caller is in.
+    ///
+    /// # Two fields, not one
+    ///
+    /// `unknown` cannot be folded into the set. The **empty set already means
+    /// ordinary typed prompt text**, so an "unpinnable" sentinel living inside
+    /// the set would either collide with that state or pin every typed prompt on
+    /// every machine that has a boundary configured. [`ToolProvenance`] and
+    /// [`DroppedProvenance`] carry the same pair for the same reason: "these
+    /// files" and "and something we cannot name" are both true at once.
+    User {
+        /// Repo-relative identities the prompt text was drawn from. Empty for
+        /// text the user typed.
+        sources: BTreeSet<ProvenanceId>,
+        /// Whether some file this text came from has **no** mintable identity —
+        /// a user-scoped skill outside the session root, which
+        /// [`ProvenanceId::from_resolved`] refuses by design (REQ-571 ADR-B).
+        /// Fail-closed at egress whenever any boundary is configured, the same
+        /// posture [`ToolProvenance::Unknown`] gets.
+        unknown: bool,
+    },
     /// Model-generated text (assistant turn).
     Model,
     /// A tool result, tagged with the [`ToolProvenance`] of the files the tool
@@ -144,6 +169,21 @@ pub enum Provenance {
         /// The files the tool touched (or `Unknown`).
         provenance: ToolProvenance,
     },
+}
+
+impl Provenance {
+    /// Ordinary typed prompt text: no file provenance, nothing unnameable.
+    ///
+    /// The one spelling of the state `Provenance::User` used to *be*, so a site
+    /// that only wants "the user typed this" does not have to name two fields
+    /// and cannot accidentally name them the other way round.
+    #[must_use]
+    pub fn user() -> Self {
+        Provenance::User {
+            sources: BTreeSet::new(),
+            unknown: false,
+        }
+    }
 }
 
 /// The speaker role of a context block, for prompt rendering.
@@ -255,15 +295,32 @@ pub struct DroppedProvenance {
 }
 
 impl DroppedProvenance {
-    /// Absorb one forgotten block's provenance. A non-tool block contributes
-    /// nothing — user and model text carries no file provenance of its own.
+    /// Absorb one forgotten block's provenance.
+    ///
+    /// Two variants contribute. A tool result contributes the files the tool
+    /// touched, or its "cannot tell" bit. A **user** block contributes whatever
+    /// its text was drawn from: since REQ-585 BR-7 a `/skill` expansion puts
+    /// file content into the user turn, so user text no longer "carries no file
+    /// provenance of its own" — the claim this method's doc comment used to make
+    /// and the reason it early-returned on everything but `Tool`. A dropped
+    /// skill block that shed its sources here would let a `local-only` skill
+    /// body egress on the next turn, the same hole [`DroppedProvenance`] exists
+    /// to close for tool results.
+    ///
+    /// Model text still contributes nothing directly — its stickiness is what
+    /// the accumulator's other entries are for — and a system head is the
+    /// harness's own.
     pub fn absorb(&mut self, provenance: &Provenance) {
-        let Provenance::Tool { provenance, .. } = provenance else {
-            return;
-        };
         match provenance {
-            ToolProvenance::Sources(paths) => self.sources.extend(paths.iter().cloned()),
-            ToolProvenance::Unknown => self.unknown = true,
+            Provenance::Tool { provenance, .. } => match provenance {
+                ToolProvenance::Sources(paths) => self.sources.extend(paths.iter().cloned()),
+                ToolProvenance::Unknown => self.unknown = true,
+            },
+            Provenance::User { sources, unknown } => {
+                self.sources.extend(sources.iter().cloned());
+                self.unknown |= *unknown;
+            }
+            Provenance::System | Provenance::Model => {}
         }
     }
 
@@ -529,6 +586,25 @@ impl PressureReport {
     }
 }
 
+/// What a candidate user turn would cost, and whether a route's budget can hold
+/// it (REQ-585 BR-8, ADR-11).
+///
+/// The answer [`ContextManager::would_seed_fit`] returns. Both currencies come
+/// back beside the verdict rather than only the verdict, because the refusal
+/// message names the figures — a caller that had to re-measure to write the
+/// message would be the second estimator ADR-11 exists to prevent.
+#[must_use]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Fit {
+    /// The candidate's estimated tokens, system prompt included.
+    pub tokens: usize,
+    /// The candidate's estimated bytes, system prompt and the truncation
+    /// surcharge included.
+    pub bytes: usize,
+    /// Whether both currencies land inside their budgets.
+    pub fits: bool,
+}
+
 /// What this manager has already spent on `compact`, and what that buys the rest
 /// of the turn (REQ-561 ADR-11).
 ///
@@ -712,18 +788,45 @@ impl ContextManager {
         self
     }
 
-    /// Append a user turn.
+    /// Append a user turn the user typed.
     ///
     /// Also records it as [`ContextManager::request`], which survives compaction
     /// and truncation — the block itself does not.
+    ///
+    /// Byte-identical to what it always did: [`Provenance::user`] is the empty
+    /// set with `unknown` clear, which is exactly the state this variant used to
+    /// be. File-supplied prompt text takes [`Self::push_user_from`].
     pub fn push_user(&mut self, text: impl Into<String>) {
+        self.push_user_from(text, BTreeSet::new(), false);
+    }
+
+    /// Append a user turn whose text was drawn from files (REQ-585 BR-7).
+    ///
+    /// The `/skill` path: a `SKILL.md` expansion is prompt text by role and file
+    /// content by origin, so it must pin the turn exactly as a `read` of that
+    /// file would. `sources` are the minted identities it came from; `unknown`
+    /// says at least one of those files has no identity to mint — a user-scoped
+    /// skill outside the session root, which [`ProvenanceId::from_resolved`]
+    /// refuses by design (REQ-571 ADR-B) — and fails the turn closed whenever
+    /// any boundary is configured.
+    ///
+    /// One entry point rather than a `push_user` followed by a fix-up: the two
+    /// facts arrive together and a caller that performed the first and forgot
+    /// the second would push an unpinned block that reads as ordinary typed
+    /// prose at the choke point.
+    pub fn push_user_from(
+        &mut self,
+        text: impl Into<String>,
+        sources: BTreeSet<ProvenanceId>,
+        unknown: bool,
+    ) {
         let text = text.into();
         self.request.clone_from(&text);
         self.pending_tool_call = false;
         self.blocks.push(ContextBlock {
             role: BlockRole::User,
             text,
-            provenance: Provenance::User,
+            provenance: Provenance::User { sources, unknown },
         });
     }
 
@@ -902,7 +1005,7 @@ impl ContextManager {
     ///
     /// ## The same push paths the live turn used
     ///
-    /// Every block goes back in through [`push_user`](Self::push_user),
+    /// Every block goes back in through [`push_user_from`](Self::push_user_from),
     /// [`push_model`](Self::push_model), or
     /// [`push_tool_result_prov`](Self::push_tool_result_prov) — not by splicing
     /// the vector — so role and egress provenance survive the round trip
@@ -940,7 +1043,12 @@ impl ContextManager {
         let request = std::mem::take(&mut self.request);
         for block in blocks {
             match block.provenance {
-                Provenance::User => self.push_user(block.text),
+                // `push_user_from`, never `push_user`: a carried skill
+                // expansion's sources have to survive every later prompt or the
+                // pin lasts exactly one turn (REQ-585 BR-7, LESSON-501).
+                Provenance::User { sources, unknown } => {
+                    self.push_user_from(block.text, sources, unknown);
+                }
                 Provenance::Model => self.push_model(block.text),
                 Provenance::Tool { tool, provenance } => {
                     self.push_tool_result_prov(tool, provenance, block.text);
@@ -1013,6 +1121,70 @@ impl ContextManager {
                 .map(|b| b.text.len() + RENDER_OVERHEAD_RESERVE_BYTES)
                 .sum::<usize>()
             + fixed
+    }
+
+    /// Whether a route budget could hold `system` plus **one** candidate user
+    /// turn of `text` (REQ-585 BR-8, ADR-11).
+    ///
+    /// The one measurement both of the `/skill` budget checks use — Stage A over
+    /// the expansion with its dynamic-context slots still pending, Stage B over
+    /// the folded outcomes — so the two stages cannot answer the same question
+    /// two different ways. It measures through
+    /// [`tokens_of`](Self::tokens_of)/[`bytes_of`](Self::bytes_of), the
+    /// estimators the pressure path itself runs on; nothing here is a second
+    /// estimator (LESSON-546, LESSON-491).
+    ///
+    /// # The `truncated = true` charge is the guard, not a detail
+    ///
+    /// [`bytes_of`](Self::bytes_of) adds `TRUNCATION_NOTE_BYTES +
+    /// CONTINUATION_USER_TURN.len()` — 142 B — only once truncation *has*
+    /// happened. Measuring a candidate at `false` opens a 142-byte band in which
+    /// a skill turn passes the check, is seeded into a session that has history,
+    /// and is then handed to [`truncate_to_budget`](Self::truncate_to_budget):
+    /// that drops history down to one block, sets `truncated`, and the 142 B
+    /// nobody charged now push the estimate over. The in-place clamp then fires
+    /// on the **last** block — which is the skill expansion — and middle-elides
+    /// it. That is precisely what BR-8 forbids ("never middle-elided into
+    /// something the user did not invoke") and BR-4 forbids ("carried whole or
+    /// refused"). Charging the surcharge up front closes the band, and it is the
+    /// same correction [`attempt_compaction`](Self::attempt_compaction) already
+    /// makes for the same reason.
+    ///
+    /// # Why it measures the seed and not the conversation
+    ///
+    /// System plus the single candidate block, never the replayed history:
+    /// BR-8(c) says an expansion that fits while the *assembled* conversation
+    /// does not is ordinary context pressure, and dropping older turns to make
+    /// room stays permitted. Only the expansion itself is carried whole or
+    /// refused.
+    ///
+    /// # Why an associated function, and why a throwaway manager
+    ///
+    /// `tokens_of`/`bytes_of` are private methods, and the caller is
+    /// [`budget`](super::budget) — a different module — so the measurement has
+    /// to live here. The throwaway manager is safe because [`ContextManager`]
+    /// has **no `Drop` impl**: the armed commit lives on
+    /// [`CarriedTurn`](crate::carry::CarriedTurn), not on the manager, so
+    /// building one to measure with writes nothing to any session.
+    pub fn would_seed_fit(
+        system: &str,
+        text: &str,
+        budget_tokens: usize,
+        budget_bytes: usize,
+    ) -> Fit {
+        let probe = ContextManager::new(system, budget_tokens).with_budget_bytes(budget_bytes);
+        let candidate = [ContextBlock {
+            role: BlockRole::User,
+            text: text.to_owned(),
+            provenance: Provenance::user(),
+        }];
+        let tokens = probe.tokens_of(&candidate);
+        let bytes = probe.bytes_of(&candidate, true);
+        Fit {
+            tokens,
+            bytes,
+            fits: tokens <= budget_tokens && bytes <= budget_bytes,
+        }
     }
 
     /// Whether the context has crossed the **soft** compaction threshold — a
@@ -3913,7 +4085,19 @@ mod tests {
     #[test]
     fn per_block_provenance_survives_the_commit_and_replay_round_trip() {
         let mut first = ContextManager::new("HEAD", 10_000);
-        first.push_user("read the config");
+        // **Seam 3 of three (REQ-585 BR-7, ADR-9).** The user block is a skill
+        // expansion, so this round trip now also pins the arm in
+        // `replay_blocks` that used to call `push_user(text)` and drop the
+        // sources on every later turn — LESSON-501's shape exactly: state that
+        // outlives its creator sheds the invariant silently, and a pin that
+        // lasted one turn is worse than none because the first turn looks right.
+        first.push_user_from(
+            "run the release checklist",
+            [fixture_id(".claude/skills/release/SKILL.md")]
+                .into_iter()
+                .collect(),
+            false,
+        );
         first.push_model("reading");
         first.push_tool_result("read", Some(fixture_id("src/lib.rs")), "code");
         first.push_tool_result_prov("shell", ToolProvenance::Unknown, "ran a command");
@@ -3933,6 +4117,18 @@ mod tests {
             .map(|b| b.provenance.clone())
             .collect();
         assert_eq!(after, before, "provenance must ride through the round trip");
+        // Named rather than left to the vector compare, so a replay that sheds
+        // the skill's sources says which fact it lost.
+        assert_eq!(
+            after[0],
+            Provenance::User {
+                sources: [fixture_id(".claude/skills/release/SKILL.md")]
+                    .into_iter()
+                    .collect(),
+                unknown: false,
+            },
+            "a carried skill expansion must still name the file it came from"
+        );
         assert_eq!(
             context_provenance(&second),
             egress_before,
@@ -4203,5 +4399,212 @@ mod tests {
         assert!(ctx.estimated_tokens() <= 1_000_000);
         // The compacted history is what this turn will commit forward (BR-4).
         assert_eq!(ctx.blocks().last().unwrap().text, "and now the next prompt");
+    }
+
+    // -- prompt text that carries file provenance (REQ-585 BR-7, ADR-9) -------
+    //
+    // The invariant "a skill expansion pins the turn exactly as a `read` of its
+    // file would" is enforced at THREE seams, and LESSON-502 is explicit that a
+    // green suite certifies only the seams that have a test which goes red when
+    // that seam's arm is removed. So there is one named test per seam and they
+    // do not overlap:
+    //
+    //   1. `DroppedProvenance::absorb`  — the two tests immediately below, which
+    //      read `dropped_provenance()` directly and touch neither replay nor the
+    //      choke point.
+    //   2. `completion::context_provenance` —
+    //      `context_provenance_unions_tool_result_and_skill_expansion_sources`
+    //      and `a_user_block_whose_sources_cannot_be_minted_makes_the_context_unknown`,
+    //      in `completion.rs`, over a context that has dropped nothing.
+    //   3. `ContextManager::replay_blocks` —
+    //      `per_block_provenance_survives_the_commit_and_replay_round_trip`,
+    //      which drops nothing and compares before/after so a seam-2 deletion
+    //      leaves it green.
+    // ------------------------------------------------------------------
+
+    const SKILL_ID: &str = ".claude/skills/release/SKILL.md";
+
+    /// **Seam 1 of three.** A skill expansion that the budget gate drops must
+    /// leave the file it came from in the accumulator. `absorb` used to
+    /// early-return on every non-`Tool` block because "user and model text
+    /// carries no file provenance of its own"; that is now false for user text,
+    /// and a dropped skill block that shed its sources would let a `local-only`
+    /// skill body egress on the next turn — the exact hole
+    /// [`DroppedProvenance`] exists to close for tool results.
+    #[test]
+    fn a_dropped_user_block_leaves_the_files_its_text_came_from() {
+        let mut ctx = ContextManager::new("HEAD", 1_000_000).with_budget_bytes(2_000);
+        ctx.push_user_from(
+            format!("release checklist\n{}", "x".repeat(1_500)),
+            [fixture_id(SKILL_ID)].into_iter().collect(),
+            false,
+        );
+        ctx.push_model("y".repeat(1_500));
+        ctx.push_user("and now the next prompt");
+
+        let report = ctx.truncate_to_budget();
+        assert!(
+            report.dropped_blocks >= 1,
+            "non-vacuity: the gate dropped nothing, so nothing was absorbed"
+        );
+        assert!(
+            !ctx.blocks()
+                .iter()
+                .any(|b| b.text.starts_with("release checklist")),
+            "non-vacuity: the skill block must be the one that went"
+        );
+        assert!(
+            ctx.dropped_provenance()
+                .sources()
+                .contains(&fixture_id(SKILL_ID)),
+            "a dropped skill expansion shed the file it came from: {:?}",
+            ctx.dropped_provenance()
+        );
+        assert!(!ctx.dropped_provenance().is_unknown());
+    }
+
+    /// The other half of seam 1's arm, mutated separately because it is a
+    /// separate line: an *unpinnable* skill expansion (a user-scoped skill whose
+    /// path has no repo-relative identity) has an empty source set, so only the
+    /// `unknown` bit can survive its drop. Absorbing the set and forgetting the
+    /// bit would fail closed for exactly one turn.
+    #[test]
+    fn a_dropped_unpinnable_user_block_leaves_the_unknown_bit_behind() {
+        let mut ctx = ContextManager::new("HEAD", 1_000_000).with_budget_bytes(2_000);
+        ctx.push_user_from("x".repeat(1_500), BTreeSet::new(), true);
+        ctx.push_model("y".repeat(1_500));
+        ctx.push_user("and now the next prompt");
+
+        let report = ctx.truncate_to_budget();
+        assert!(
+            report.dropped_blocks >= 1,
+            "non-vacuity: the gate dropped nothing, so nothing was absorbed"
+        );
+        assert!(
+            ctx.dropped_provenance().is_unknown(),
+            "a dropped unpinnable expansion stopped failing the session closed"
+        );
+        assert!(ctx.dropped_provenance().sources().is_empty());
+    }
+
+    // -- measuring a candidate turn before it is committed (BR-8, ADR-11) -----
+
+    /// The candidate a [`ContextManager::would_seed_fit`] test measures, as
+    /// `bytes_of` sees it. One helper rather than the arithmetic spelled out
+    /// twice, so the "with the charge" and "without the charge" figures below
+    /// cannot drift apart.
+    fn seed_bytes(system: &str, text: &str, truncated: bool) -> usize {
+        let probe = ContextManager::new(system, 1_000_000);
+        probe.bytes_of(
+            &[ContextBlock {
+                role: BlockRole::User,
+                text: text.to_owned(),
+                provenance: Provenance::user(),
+            }],
+            truncated,
+        )
+    }
+
+    /// The measurement is system + the one candidate block, in **both**
+    /// currencies, through the estimators the pressure path itself runs on — no
+    /// second estimator (LESSON-546, LESSON-491). A seed that fits says so, and
+    /// a breach of *either* currency alone is a refusal.
+    #[test]
+    fn would_seed_fit_measures_the_seed_in_both_currencies() {
+        const SYSTEM: &str = "HEAD";
+        let text = "a short skill body";
+
+        let roomy = ContextManager::would_seed_fit(SYSTEM, text, 10_000, 100_000);
+        assert!(roomy.fits);
+        assert_eq!(roomy.bytes, seed_bytes(SYSTEM, text, true));
+        assert_eq!(roomy.tokens, approx_tokens(SYSTEM) + approx_tokens(text));
+
+        // Bytes alone can refuse it…
+        let tight_bytes = ContextManager::would_seed_fit(SYSTEM, text, 10_000, roomy.bytes - 1);
+        assert!(!tight_bytes.fits);
+        // …and so can tokens alone.
+        let tight_tokens = ContextManager::would_seed_fit(SYSTEM, text, roomy.tokens - 1, 100_000);
+        assert!(!tight_tokens.fits);
+
+        // Exactly at the budget is a fit, not a refusal.
+        let exact = ContextManager::would_seed_fit(SYSTEM, text, roomy.tokens, roomy.bytes);
+        assert!(exact.fits);
+    }
+
+    /// **The `truncated = true` charge is the guard, not a detail (ADR-11).**
+    ///
+    /// `bytes_of` adds `TRUNCATION_NOTE_BYTES + CONTINUATION_USER_TURN.len()` —
+    /// 142 B — only once truncation has happened. That opens a 142-byte band in
+    /// which a skill expansion passes an un-surcharged check, is replayed into a
+    /// session that has history, and is then handed to `truncate_to_budget`:
+    /// history goes, `truncated` is set, the surcharge nobody charged lands, and
+    /// the in-place clamp fires on the **last** block — which is the skill
+    /// expansion. BR-8 forbids exactly that ("never middle-elided into something
+    /// the user did not invoke") and BR-4 forbids it again ("carried whole or
+    /// refused").
+    ///
+    /// Both halves are asserted here: the candidate really does sit inside the
+    /// band (so the test is not vacuous), and the clamp really is what would
+    /// have happened to it.
+    #[test]
+    fn a_skill_seed_in_a_full_session_is_refused_rather_than_clamped() {
+        const SYSTEM: &str = "HEAD";
+        const BUDGET_TOKENS: usize = 1_000_000;
+        let body = "x".repeat(4_000);
+        // Sized into the band: over the surcharged measurement, under the
+        // un-surcharged one.
+        let budget_bytes = seed_bytes(SYSTEM, &body, false) + 8;
+
+        // Non-vacuity, first half: without the charge this candidate passes.
+        assert!(
+            seed_bytes(SYSTEM, &body, false) <= budget_bytes,
+            "the fixture must sit inside the band, or the charge is untested"
+        );
+        assert_eq!(
+            seed_bytes(SYSTEM, &body, true) - seed_bytes(SYSTEM, &body, false),
+            TRUNCATION_NOTE_BYTES + CONTINUATION_USER_TURN.len(),
+            "the band this test measures is the truncation surcharge"
+        );
+
+        let fit = ContextManager::would_seed_fit(SYSTEM, &body, BUDGET_TOKENS, budget_bytes);
+        assert!(
+            !fit.fits,
+            "a skill seed inside the truncation band must be refused, not admitted \
+             ({} B against {budget_bytes} B)",
+            fit.bytes
+        );
+        assert_eq!(fit.bytes, seed_bytes(SYSTEM, &body, true));
+
+        // Non-vacuity, second half — and the reason the refusal exists. Had it
+        // been admitted, this is what the session would have done to it.
+        let mut ctx = ContextManager::new(SYSTEM, BUDGET_TOKENS).with_budget_bytes(budget_bytes);
+        for i in 0..4 {
+            ctx.push_model(format!("earlier turn {i}"));
+        }
+        ctx.push_user_from(
+            body.clone(),
+            [fixture_id(SKILL_ID)].into_iter().collect(),
+            false,
+        );
+        let report = ctx.truncate_to_budget();
+
+        assert!(
+            report.dropped_blocks >= 1,
+            "the history should have gone first"
+        );
+        assert!(
+            ctx.was_truncated(),
+            "…which is what lands the 142-byte surcharge"
+        );
+        assert!(
+            report.newest_user_elided && report.elided_bytes > 0,
+            "the block the clamp lands on is the skill expansion itself: {report:?}"
+        );
+        assert!(
+            ctx.blocks()
+                .last()
+                .is_some_and(|b| b.text.len() < body.len()),
+            "the skill expansion must have been middle-elided for this test to mean anything"
+        );
     }
 }
