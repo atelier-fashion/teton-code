@@ -2191,13 +2191,24 @@ mod tests {
     /// prompt it measured carries `Session root: ` at all, so the row cannot be
     /// dropped and leave the sweep passing on the smaller shape.
     ///
-    /// **Recorded headroom at REQ-586:** the worst prompt is 6,096 bytes,
-    /// `spent` is 9,372, and the margin is **868** — against BUG-181's
+    /// **Recorded headroom at REQ-585:** the worst prompt is 6,122 bytes,
+    /// `spent` is 9,398, and the margin is **842** — against BUG-181's
     /// 10,240-byte overhead, with the floor still 48 and the overhead still
-    /// 10 KiB (AC-13: neither moved for this REQ). Every figure above this
+    /// 10 KiB (neither moved for REQ-585 or REQ-586). Every figure above this
     /// paragraph predates BUG-181 and was measured against the 9,216 it
-    /// replaced; this branch's tip before the docs task was 6,078 / 9,354 /
-    /// **886**.
+    /// replaced.
+    ///
+    /// REQ-585 spent **52** of it on one sentence: BUG-181's guide line said
+    /// Teton loads nothing from `.claude/`, which REQ-585 made false, so BR-9
+    /// amended it to name what *is* loaded (skills and commands) and what
+    /// still is not (CLAUDE.md, agents, hooks).
+    ///
+    /// **REQ-586's recorded pair was 26 B high on both shapes** (6,096 /
+    /// 6,049 against a measured 6,070 / 6,023 at the same tree). Corrected
+    /// here, in `harness::tools::web`'s twin, and in
+    /// `docs/manual-verification.md`, which records how to re-measure: these
+    /// tests print only on failure, so pad the guide by a known amount, read
+    /// the `N-byte system prompt` the failure names, and subtract.
     ///
     /// This REQ spent **18** of that, and it is the ADR-11 trade working: the
     /// budget vocabulary is 3.4 KB of prose and it entered the prompt as one

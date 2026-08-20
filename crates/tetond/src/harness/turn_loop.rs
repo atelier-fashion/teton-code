@@ -3354,19 +3354,36 @@ mod tests {
     /// line** (the guide is sized per sentence and a second line about
     /// commands is a decision, not drift), it names **`/help`** as the roster
     /// (the one pointer a model can give a user without seeing the table),
-    /// it says **nothing is loaded** from both `.claude/` and `~/.claude` (the
-    /// two places another agent's skills, commands, `CLAUDE.md`, agents and
-    /// hooks live — naming one would leave the other to be affirmed), and it
-    /// says **only the user runs** the commands. It sits **before** step 1 so a
-    /// model reading top-down has it before the first recipe.
+    /// it names both `.claude/` and `~/.claude` (the two places another agent's
+    /// skills, commands, `CLAUDE.md`, agents and hooks live — naming one would
+    /// leave the other to be affirmed) and says **what is and is not loaded**
+    /// from them, and it says **only the user runs** the commands. It sits
+    /// **before** step 1 so a model reading top-down has it before the first
+    /// recipe.
     ///
     /// Why equality on the pointer and the two paths rather than on the whole
-    /// line: REQ-585 (skills as `/` commands) amends this sentence on purpose —
-    /// skills *will* be loaded and listed by `/help` — and the amendment must
-    /// update this test, not delete it. The three anchors are the parts that
-    /// stay true across that amendment; the "loads nothing" phrase is the part
-    /// REQ-585 will re-word, and it is asserted separately so the failure names
-    /// it.
+    /// line: REQ-585 (skills as `/` commands) amended this sentence on purpose
+    /// — skills and commands from those two places *are* now loaded and listed
+    /// by `/help` — and the amendment had to update this test, not delete it.
+    /// The three anchors are the parts that stayed true across it; BUG-181's
+    /// "loads nothing from" was the half that changed, and it was asserted
+    /// separately so that this test's failure named the phrase and the fix was
+    /// a re-word.
+    ///
+    /// That half is now **two** needles rather than one, because since REQ-585
+    /// the sentence carries two claims where BUG-181's carried one: what Teton
+    /// loads from those roots (skills and commands) and what it still does not
+    /// (`CLAUDE.md`, agents, hooks). Drop either and the sentence is false in
+    /// one of the two directions — a model beside a Claude Code tree denies
+    /// the skills it does have, or affirms the three things it does not. The
+    /// same rule applies to the next feature that changes this fact: re-word
+    /// the needles with the sentence.
+    ///
+    /// What is deliberately **not** pinned here: the skill roster (REQ-585
+    /// OQ-2). The names are `/help`'s and the `skill` tool's to carry; the
+    /// guide names the pointer and nothing that grows with the user's
+    /// `~/.claude` tree, which is the only shape the two prompt-margin tests
+    /// can bound.
     #[test]
     fn the_system_prompt_states_what_the_session_can_run_and_from_where() {
         let capability: Vec<&str> = SELF_CONFIG_GUIDE
@@ -3391,15 +3408,29 @@ mod tests {
                  (BUG-181).\nline: {line}"
             );
         }
-        // The half REQ-585 re-words. Asserted on its own so that amendment's
-        // failure names this phrase and nothing else.
-        assert!(
-            line.contains("loads nothing from"),
-            "the capability sentence no longer says Teton loads nothing from those \
-             places. If skills are now loaded (REQ-585 BR-9), re-word this phrase and this \
-             assertion together — the pointer at `/help` and the two paths above must \
-             survive the amendment.\nline: {line}"
-        );
+        // The half REQ-585 re-worded (BR-9). BUG-181's sentence said Teton
+        // "loads nothing from" those two places; skills and commands found
+        // under them are now loaded and listed by `/help`, so the phrase moved
+        // rather than went away — and it moved to *two* needles, because the
+        // amended sentence has to be true in both directions. Asserted on
+        // their own, as BUG-181 asserted its phrase, so the next amendment's
+        // failure names the clause and nothing else.
+        for phrase in [
+            "loads skills and commands from",
+            "no CLAUDE.md, agents or hooks",
+        ] {
+            assert!(
+                line.contains(phrase),
+                "the capability sentence no longer says `{phrase}`. Since REQ-585 it has to \
+                 say both halves: skills and commands from `.claude/` and `~/.claude` are \
+                 loaded and listed by `/help`, and `CLAUDE.md`, agents and hooks still are \
+                 not. Drop the first and a model denies the skills the session does have; \
+                 drop the second and a model beside a Claude Code tree affirms the three it \
+                 does not (BUG-181's defect, in whichever direction the tree points). If \
+                 the wording changed deliberately, re-word these needles with the \
+                 sentence — do not delete them.\nline: {line}"
+            );
+        }
         // Before the first numbered step: a model reading top-down meets the
         // capability fact before the first setup recipe (the REQ-579 A1–A3
         // finding — the model follows the numbered steps, so what precedes them

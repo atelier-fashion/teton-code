@@ -2110,7 +2110,7 @@ one, so before this REQ it was guaranteed to be cut.
    pressure line. Until REQ-585 ships there is nothing to type here; leave the
    box open rather than closing it on the smaller claim.
 
-## Recorded resident-prompt headroom after REQ-586
+## Recorded resident-prompt headroom after REQ-585
 
 The number REQ-587 should read before it writes a resident sentence. Measured
 on this branch's tip with the two margin tests
@@ -2120,18 +2120,46 @@ against BUG-181's 10,240-byte body overhead and the unmoved 48-byte floor:
 
 | shape | worst prompt | spent | margin |
 |---|---|---|---|
-| opted-out (no web tool) — the tighter | 6,096 | 9,372 | **868** |
-| opted-in (web tool docs + schema) | 6,049 | 9,325 | **915** |
+| opted-out (no web tool) — the tighter | 6,122 | 9,398 | **842** |
+| opted-in (web tool docs + schema) | 6,075 | 9,351 | **889** |
 
-Before this task the same two were 6,078 / 9,354 / **886** and 6,031 / 9,307 /
-**933**. REQ-586 spent **18 bytes** of resident prompt, and that is the whole
-of its cost: nine for `context` in the `teton_docs` topic index, nine more for
-the same word in the tool's schema. The 3.4 KB `context` topic, the `window:`
-column, the doctor advisories, the budget clause and the pressure lines are
-tool results and CLI surfaces, which the prompt does not pay for (ADR-11).
-Neither the overhead nor the floor moved (AC-13). The description is now
-**exactly** at its 120-character ceiling, so a sixth topic buys its name by
-shortening the sentence in front of the index.
+**How to read these off the tests, because neither prints when green.** Both
+assertions report `worst`, the escaping term and the overhead only in their
+failure message, so the figures above were taken by appending a known number
+of filler bytes to `crates/tetond/src/harness/self_config.md` (the guide is
+embedded verbatim, so a byte added there is a byte added to every shape),
+running the two tests, reading the `N-byte system prompt` each one names, and
+subtracting the filler. A 1,000-byte pad trips both; the pad is then removed.
+This is the two-minute measurement LESSON-543 says to run *before* writing a
+resident sentence, not after.
+
+Before this task the same two were 6,070 / 9,346 / **894** and 6,023 / 9,299 /
+**941**. REQ-585 spent **52 bytes**, and that is the whole of its resident
+cost: BR-9's amendment to the guide's capability sentence, which grew from 186
+to 238 bytes when "loads nothing from `.claude/` or `~/.claude`" became "loads
+skills and commands from `.claude/` and `~/.claude` but nothing else there".
+The skill roster is deliberately **not** in the guide (OQ-2) — a resident line
+that grew with the user's `~/.claude` tree is the one shape these two tests
+cannot bound — and the registry, the `/help` section, the invocation preamble
+and the refusal messages are surfaces and turn-scoped text, which the resident
+prompt does not pay for. Neither the overhead nor the floor moved.
+
+**A 26-byte correction to REQ-586's recorded figures.** That REQ recorded
+6,096 / 9,372 / **868** and 6,049 / 9,325 / **915**; re-measured here, its own
+tip is 6,070 and 6,023. `self_config.md`, `turn_loop.rs` and `harness/tools/`
+are byte-identical between REQ-586's merge commit (`c9e9265`) and this
+branch's tip before this task (`57e733f`), and
+the gap between the two shapes (47 bytes) is unchanged, so both recorded
+numbers were 26 high rather than anything having shrunk since. The prose
+figures in `egress/redact.rs` and `harness/tools/web.rs` still carry the old
+pair; treat this table as the measured one. REQ-586's account of *what it
+spent* stands: 18 bytes, nine for `context` in the `teton_docs` topic index
+and nine for the same word in the tool's schema, with the 3.4 KB `context`
+topic, the `window:` column, the doctor advisories, the budget clause and the
+pressure lines all tool results and CLI surfaces the prompt does not pay for
+(ADR-11). That description is still **exactly** at its 120-character ceiling,
+so a sixth topic buys its name by shortening the sentence in front of the
+index.
 
 ## Sign-off
 
