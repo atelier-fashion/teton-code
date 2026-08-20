@@ -332,3 +332,152 @@ async fn no_ledger_row_carries_prompt_or_credential_content() {
     let events = cost_sink.records.lock().unwrap();
     assert!(!events[0].model.contains("sk-live"));
 }
+
+// ---------------------------------------------------------------------------
+// REQ-585 AC-19 — a skill invocation is a prompt turn, and the ledger agrees
+// ---------------------------------------------------------------------------
+//
+// "The invocation's turn appears in `/cost` with the same attribution a typed
+// prompt gets" is a claim about the ledger, and this is the only file that can
+// make it. It is deliberately **not** made in `teton/tests/cli_e2e.rs`: that
+// suite's scripted tier is local, a local turn attaches no `CostAttribution`
+// (`a_call_without_attribution_is_not_billed`, above), so every session there
+// ends with an empty ledger and a `/cost` assertion would pass whatever the
+// skill path did.
+//
+// Two halves, and they are the two things a user could be wrong about:
+//
+// 1. a skill turn that goes out is billed **exactly like** a typed one — same
+//    row count, same attribution, and no trace of the skill in the row (BR-7:
+//    the ledger holds token counts and routing metadata, never content);
+// 2. a skill turn its own file's boundary pinned (AC-11a) is billed **nothing**,
+//    because it never reached the forward point.
+//
+// The skill body here is a *shape*, not a fixture read off disk — what the
+// expander really produces is `provenance_egress`'s to prove. What this file
+// owns is what the meter does with a turn that carries one.
+
+/// A skill expansion's shape: the preamble naming the file, the substituted
+/// body, and a dynamic command's output inside the untrusted envelope.
+const SKILL_EXPANSION: &str =
+    "Running the skill `status` (user, ~/.claude/skills/status/SKILL.md).\n\
+                               Report on the repo.\n\
+                               <tool-result trust=\"untrusted\">SKILL-DYNAMIC-OUTPUT</tool-result>";
+
+/// The identity a project skill file mints — what pins the turn in AC-11(a).
+const SKILL_ID: &str = ".claude/skills/status/SKILL.md";
+
+#[tokio::test]
+async fn a_skill_turns_forward_is_billed_exactly_as_a_typed_prompts_is() {
+    let script = [(1200u64, 300u64), (1200, 300)];
+    let transport = ScriptedTransport::with_script(&script);
+    let (ledger, cost_sink) = ledger();
+    let egress =
+        Egress::new(transport, Vec::new(), Arc::new(NoopSink)).with_cost_meter(ledger.clone());
+
+    // The same session, the same phase, the same model: the only difference
+    // between the two calls is what the turn was made of.
+    let ctx = EgressContext::new("deepseek")
+        .with_session("sess-skill")
+        .with_cost(CostAttribution::new("deepseek-v4-pro").with_phase(Phase::Implement));
+
+    for (body, provenance) in [
+        ("Report on the repo.", Provenance::empty()),
+        (SKILL_EXPANSION, Provenance::tainted_by(source_id(SKILL_ID))),
+    ] {
+        let resp = egress
+            .send(request(body), &provenance, &ctx)
+            .await
+            .expect("no boundary is configured, so both turns are allowed");
+        drain(resp.body).await;
+    }
+
+    let rows = ledger.all_records().expect("read rows");
+    assert_eq!(
+        rows.len(),
+        2,
+        "one CostRecord per forward — a skill turn is a turn"
+    );
+    // Same attribution, field for field. Asserted as an equality between the
+    // two rows rather than against a literal, because "the same as a typed
+    // prompt's" is the criterion: a skill path that grew its own phase, its own
+    // session key or its own model would differ here whatever the literal said.
+    let typed = &rows[0];
+    let skilled = &rows[1];
+    assert_eq!(skilled.session_id, typed.session_id);
+    assert_eq!(skilled.phase, typed.phase);
+    assert_eq!(skilled.phase, Some(Phase::Implement));
+    assert_eq!(skilled.provider_id, typed.provider_id);
+    assert_eq!(skilled.model, typed.model);
+    assert_eq!((skilled.input_tokens, skilled.output_tokens), script[1]);
+    assert_eq!(cost_sink.records.lock().unwrap().len(), 2);
+
+    // BR-7: the row carries counts and routing, and nothing the skill was made
+    // of — not the body, not the file it came from, not what its command
+    // printed. Read off **both** forms the fact travels in: the stored row and
+    // the `cost_recorded` event every attached client receives. A row that held
+    // content would leak it to whichever of the two a reader looked at.
+    let stored: Vec<String> = rows.iter().map(|row| format!("{row:?}")).collect();
+    let published: Vec<String> = cost_sink
+        .records
+        .lock()
+        .unwrap()
+        .iter()
+        .map(|record| serde_json::to_string(record).expect("a cost record serializes"))
+        .collect();
+    for rendered in stored.iter().chain(published.iter()) {
+        for leak in [
+            "Report on the repo",
+            "SKILL-DYNAMIC-OUTPUT",
+            ".claude/skills",
+            "SKILL.md",
+        ] {
+            assert!(
+                !rendered.contains(leak),
+                "a cost row carries `{leak}`: {rendered}"
+            );
+        }
+    }
+
+    // And the report attributes it where a typed turn would be attributed.
+    let report = ledger.report().expect("report");
+    let phases: Vec<&str> = report.per_phase.iter().map(|g| g.key.as_str()).collect();
+    assert_eq!(
+        phases,
+        vec!["implement"],
+        "both turns land in the session's phase, and nowhere else"
+    );
+}
+
+#[tokio::test]
+async fn a_skill_turn_pinned_by_its_own_file_is_billed_nothing() {
+    let transport = ScriptedTransport::with_script(&[(1000, 500)]);
+    let (ledger, cost_sink) = ledger();
+    // The boundary that covers the skill file itself — AC-11(a)'s shape.
+    let boundaries = vec![PrivacyBoundary {
+        path_glob: ".claude/**".to_owned(),
+        mode: BoundaryMode::LocalOnly,
+    }];
+    let egress =
+        Egress::new(transport, boundaries, Arc::new(NoopSink)).with_cost_meter(ledger.clone());
+
+    let ctx = EgressContext::new("deepseek")
+        .with_session("sess-skill-pinned")
+        .with_cost(CostAttribution::new("deepseek-v4-pro").with_phase(Phase::Implement));
+    let err = egress
+        .send(
+            request(SKILL_EXPANSION),
+            &Provenance::tainted_by(source_id(SKILL_ID)),
+            &ctx,
+        )
+        .await
+        .expect_err("a skill under a local-only boundary pins the turn");
+    assert!(matches!(err, EgressError::PrivacyBlocked { .. }));
+
+    assert!(
+        ledger.all_records().expect("read").is_empty(),
+        "a pinned skill turn never reached the forward point, so `/cost` must \
+         show nothing for it"
+    );
+    assert!(cost_sink.records.lock().unwrap().is_empty());
+}

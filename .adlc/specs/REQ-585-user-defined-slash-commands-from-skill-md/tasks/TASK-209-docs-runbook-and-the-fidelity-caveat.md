@@ -1,7 +1,7 @@
 ---
 id: TASK-209
 title: "Say what it does and what it does not: the docs topic, the README, the runbook, the caveat"
-status: draft
+status: complete
 parent: REQ-585
 created: 2026-08-20
 updated: 2026-08-20

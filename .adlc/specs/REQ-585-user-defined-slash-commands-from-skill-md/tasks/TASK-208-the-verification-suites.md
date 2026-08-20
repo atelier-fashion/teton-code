@@ -1,7 +1,7 @@
 ---
 id: TASK-208
 title: "The suites that can actually see it: e2e, pty, egress capture, pressure silence, cost"
-status: draft
+status: complete
 parent: REQ-585
 created: 2026-08-20
 updated: 2026-08-20

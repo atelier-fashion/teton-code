@@ -798,3 +798,333 @@ fn a_report_with_nothing_in_it_is_the_one_that_says_nothing() {
     }
     .is_quiet());
 }
+
+// ---------------------------------------------------------------------------
+// REQ-585 AC-16 — the four route shapes, and the silence a refusal keeps
+// ---------------------------------------------------------------------------
+//
+// REQ-586 made the budget a property of the **route attempt**. REQ-585 BR-8 is
+// what a skill turn does when it does not fit one: it is refused whole, before
+// any model call, with a message naming the skill, its size, the budget and the
+// bound — never elided into something the user did not invoke. That refusal is a
+// decision about a *route*, so the shapes it has to be right for are route
+// shapes, and the honest way to build one is the way a user builds one: a
+// `[providers.capabilities] max_context` in a real config, read by a real
+// daemon.
+//
+// Hence the harness below. The rest of this file drives the turn loop in
+// process, which is the right instrument for "a report became an event"; it
+// cannot express "this provider declares a 4,096-token window", because nothing
+// in process reads a config. So these four legs spawn the shipped binary.
+//
+// | route | budget | expected |
+// |---|---|---|
+// | `max_context = 128000` | ≈250 KB | the skill expands and reaches the provider |
+// | `max_context = 0` | the default pair, stated | refused, `bound: unknown window`, remedy named |
+// | `max_context = 4096` | floored to (2,048 / 16 KiB) | refused, and the message says it was floored |
+// | the local tier | (4,096 / 32 KiB) | refused, `bound: local engine` |
+//
+// **And the silence (BR-8c).** A refused turn emits **no** `context_pressure`
+// event of any kind — not a drop, not an elision, not a "nothing was clamped"
+// notice. That is asserted as a drained-and-empty listing on each of the three
+// refusals, and it is non-vacuous in this file above all others: the tests at
+// the top of it are the ones that show what a turn which *is* clamped publishes
+// through the same channel.
+//
+// Stage A versus Stage B — which of the two measurements refused — is
+// `tetond/tests/skill_turn.rs`'s, and so are the client-side bytes. What is
+// here is the route matrix and the silence.
+
+#[path = "e2e/harness.rs"]
+mod daemon_harness;
+
+use std::time::Duration;
+
+use daemon_harness::{
+    openai_turn, remote_provider_block, remote_provider_block_with_window, tier_block, Daemon,
+    DaemonOptions, MockProvider, MockResponse, Workspace,
+};
+
+/// The marker the fixture skill's body carries, so "the expansion reached the
+/// provider" is a claim about bytes rather than about a call count.
+const BIG_SKILL_MARKER: &str = "BIG-SKILL-BODY-MARKER";
+
+/// A ~40 KB skill body: comfortably inside a 128k window's ≈250 KB budget and
+/// comfortably outside every other budget in the table above (the default pair
+/// is 32 KiB, the floored pair 16 KiB).
+///
+/// Sized in **bytes**, because for a prose body the byte half of REQ-586's pair
+/// binds first — the correction the REQ's own description records.
+fn big_skill_body() -> String {
+    let mut body = format!("{BIG_SKILL_MARKER}\n");
+    while body.len() < 40_000 {
+        body.push_str("padding padding padding padding padding padding padding\n");
+    }
+    body
+}
+
+/// A workspace whose repo holds one project skill with the oversized body.
+fn workspace_with_big_skill(tag: &str) -> Workspace {
+    let ws = Workspace::new(tag);
+    let dir = ws.repo.join(".claude/skills/big");
+    std::fs::create_dir_all(&dir).expect("create the skill directory");
+    std::fs::write(
+        dir.join("SKILL.md"),
+        format!(
+            "---\ndescription: the oversized skill\n---\n{}",
+            big_skill_body()
+        ),
+    )
+    .expect("write the skill file");
+    ws
+}
+
+/// A deterministic machine: no probe may pick a model or spend the budget.
+fn probe_16gb() -> DaemonOptions {
+    DaemonOptions::default()
+        .env("TETON_PROBE_RAM_BYTES", (16u64 << 30).to_string())
+        .env("TETON_PROBE_DISK_BYTES", "500000000000")
+        .env("TETON_PROBE_GPU", "apple-silicon")
+}
+
+/// Every tier bound to `provider`, so whichever category the expansion
+/// classifies to, the route is the one under test.
+fn all_tiers(provider: &str) -> String {
+    ["reflex", "scan", "build", "think"]
+        .iter()
+        .map(|tier| tier_block(tier, provider))
+        .collect()
+}
+
+/// The `-32023` a skill refusal carries: no provider saw this turn, so it is not
+/// REQ-586's `-32022`.
+const SKILL_EXPANSION_TOO_LARGE: i64 =
+    teton_protocol::jsonrpc::error_code::SKILL_EXPANSION_TOO_LARGE;
+
+/// Invoke `/big` over the socket and return the full response.
+fn invoke_big(client: &mut daemon_harness::Client, session: &str) -> serde_json::Value {
+    client.call(
+        "session/prompt",
+        serde_json::json!({
+            "session_id": session,
+            "prompt": [],
+            "skill": { "name": "big", "raw_arguments": "" },
+        }),
+    )
+}
+
+/// Assert that a refused turn published nothing about context pressure (BR-8c).
+fn assert_pressure_silent(client: &daemon_harness::Client, leg: &str) {
+    let pressure = client.events_named("context_pressure");
+    assert!(
+        pressure.is_empty(),
+        "the {leg} refusal published a context_pressure event — a turn that was \
+         refused was not clamped, and saying otherwise describes a turn that \
+         never ran: {pressure:?}"
+    );
+}
+
+/// **AC-16's positive route: a declared 128k window carries the whole
+/// expansion, and nothing is clamped on the way.**
+///
+/// The control for the three refusals below, and the "assembled prompt" leg:
+/// what the provider received is searched for the body's own marker, so a turn
+/// that reached the wire carrying a *shortened* expansion would fail here rather
+/// than pass as "it was sent".
+#[test]
+fn a_skill_that_fits_a_declared_window_reaches_the_provider_whole_and_clamps_nothing() {
+    let provider = MockProvider::start(
+        vec![MockResponse::ok(openai_turn(
+            "Read it all.",
+            None,
+            9_000,
+            20,
+        ))],
+        MockResponse::ok(openai_turn("Done.", None, 10, 5)),
+    );
+    let ws = workspace_with_big_skill("skillfit-128k");
+    let mut config = remote_provider_block_with_window(
+        "frontier",
+        &provider.openai_endpoint(),
+        "claude-opus-4",
+        128_000,
+    );
+    config.push_str("[[providers]]\nid = \"local\"\nkind = \"local\"\n\n");
+    config.push_str(&all_tiers("frontier"));
+    ws.write_config(&config);
+    // A live local tier so the first-run consent gate is not in the way; every
+    // turn here routes remotely.
+    let script = ws.write_script("unused: this turn runs remotely");
+    let daemon = Daemon::spawn(&ws, probe_16gb().script(script));
+    let mut client = daemon.connect();
+
+    let session = client.create_session("freeform", None);
+    let turn = invoke_big(&mut client, &session);
+    assert_eq!(
+        turn["result"]["stop_reason"].as_str(),
+        Some("end_turn"),
+        "a skill inside its route's budget must run: {turn}\ndaemon log:\n{}",
+        daemon.log()
+    );
+
+    // More than one request is expected and not asserted against: a session's
+    // first turn also spends the title-naming attempt on the same text
+    // (`skill_turn::a_skill_turn_spends_the_naming_attempt_on_the_expansion`),
+    // and that one is a *duty* with a duty's own small budget. What matters is
+    // that the turn itself carried the body whole, so the assertion is over the
+    // request that carried the most of it.
+    let requests = provider.requests();
+    assert!(!requests.is_empty(), "nothing reached the provider at all");
+    let bodies: Vec<String> = requests
+        .iter()
+        .map(|body| String::from_utf8_lossy(body).into_owned())
+        .collect();
+    let turn = bodies
+        .iter()
+        .max_by_key(|body| body.matches("padding padding").count())
+        .expect("at least one request");
+    assert!(
+        turn.contains(BIG_SKILL_MARKER),
+        "the provider never received the expansion"
+    );
+    assert!(
+        turn.matches("padding padding").count() > 100,
+        "the expansion reached the provider shortened — BR-8 carries a skill \
+         whole or refuses it, and never in between; the fullest request held \
+         {} padded lines",
+        turn.matches("padding padding").count()
+    );
+    client.drain_events(Duration::from_millis(300));
+    assert_pressure_silent(&client, "128k");
+}
+
+/// **AC-16's `max_context = 0` route.** A provider that declares no window gets
+/// the default pair *stated* rather than silently assumed, so an oversized skill
+/// is refused with `bound: unknown window` — and the message names the key the
+/// user would go and write.
+#[test]
+fn an_undeclared_window_refuses_the_skill_and_names_the_key_to_set() {
+    let provider = MockProvider::start(Vec::new(), MockResponse::ok(openai_turn("x", None, 1, 1)));
+    let ws = workspace_with_big_skill("skillfit-unknown");
+    // `max_context = 0` is the explicit "unknown", which is not the same
+    // document as no capabilities table at all.
+    let mut config = remote_provider_block_with_window(
+        "frontier",
+        &provider.openai_endpoint(),
+        "claude-opus-4",
+        0,
+    );
+    config.push_str("[[providers]]\nid = \"local\"\nkind = \"local\"\n\n");
+    config.push_str(&all_tiers("frontier"));
+    ws.write_config(&config);
+    let script = ws.write_script("unused: this turn is refused before any call");
+    let daemon = Daemon::spawn(&ws, probe_16gb().script(script));
+    let mut client = daemon.connect();
+
+    let session = client.create_session("freeform", None);
+    let turn = invoke_big(&mut client, &session);
+    let message = turn["error"]["message"].as_str().unwrap_or_default();
+    assert_eq!(
+        turn["error"]["code"].as_i64(),
+        Some(SKILL_EXPANSION_TOO_LARGE),
+        "an oversized skill on an unknown window must be refused: {turn}"
+    );
+    assert!(
+        message.contains("`/big` does not fit this route's context budget"),
+        "the refusal must name the skill: {message}"
+    );
+    assert!(
+        message.contains(&format!("bound: {}", BudgetBound::DefaultUnknown.words())),
+        "the bound must be spoken, never spelled the wire way: {message}"
+    );
+    assert!(
+        message.contains("set `capabilities.max_context` for `frontier`"),
+        "the bound a new user meets must carry its remedy: {message}"
+    );
+    assert_eq!(
+        provider.request_count(),
+        0,
+        "nothing was sent and no provider saw this turn"
+    );
+    client.drain_events(Duration::from_millis(300));
+    assert_pressure_silent(&client, "unknown-window");
+}
+
+/// **AC-16's floored route — the shipped Ollama recipe's shape.** A declared
+/// `max_context = 4096` derives a pair below REQ-586's floor and is raised to
+/// (2,048 / 16 KiB): a budget *larger* than the declaration allows. The refusal
+/// says so, because the bound alone cannot.
+#[test]
+fn a_floored_window_refuses_the_skill_and_says_the_declaration_is_not_in_force() {
+    let provider = MockProvider::start(Vec::new(), MockResponse::ok(openai_turn("x", None, 1, 1)));
+    let ws = workspace_with_big_skill("skillfit-floored");
+    let mut config = remote_provider_block_with_window(
+        "frontier",
+        &provider.openai_endpoint(),
+        "claude-opus-4",
+        4_096,
+    );
+    config.push_str("[[providers]]\nid = \"local\"\nkind = \"local\"\n\n");
+    config.push_str(&all_tiers("frontier"));
+    ws.write_config(&config);
+    let script = ws.write_script("unused: this turn is refused before any call");
+    let daemon = Daemon::spawn(&ws, probe_16gb().script(script));
+    let mut client = daemon.connect();
+
+    let session = client.create_session("freeform", None);
+    let turn = invoke_big(&mut client, &session);
+    let message = turn["error"]["message"].as_str().unwrap_or_default();
+    assert_eq!(
+        turn["error"]["code"].as_i64(),
+        Some(SKILL_EXPANSION_TOO_LARGE),
+        "an oversized skill on a floored window must be refused: {turn}"
+    );
+    assert!(
+        message.contains("floored"),
+        "a floored route must say the declared ceiling is not in force: {message}"
+    );
+    assert_eq!(provider.request_count(), 0, "no provider saw this turn");
+    client.drain_events(Duration::from_millis(300));
+    assert_pressure_silent(&client, "floored-window");
+}
+
+/// **AC-16's local route.** The tier with no declaration to read at all: the
+/// budget is the local pair and the bound is spoken as `local engine` — the
+/// sentence the dogfood runbook records (AC-20d).
+#[test]
+fn the_local_route_refuses_an_oversized_skill_and_names_the_local_engine() {
+    let ws = workspace_with_big_skill("skillfit-local");
+    let mut config = String::from("[[providers]]\nid = \"local\"\nkind = \"local\"\n\n");
+    config.push_str(&remote_provider_block(
+        "frontier",
+        "http://127.0.0.1:9/v1/chat/completions",
+        "claude-opus-4",
+    ));
+    config.push_str(&all_tiers("local"));
+    ws.write_config(&config);
+    let script = ws.write_script("unused: this turn is refused before any call");
+    let daemon = Daemon::spawn(&ws, probe_16gb().script(script));
+    let mut client = daemon.connect();
+
+    let session = client.create_session("freeform", None);
+    let turn = invoke_big(&mut client, &session);
+    let message = turn["error"]["message"].as_str().unwrap_or_default();
+    assert_eq!(
+        turn["error"]["code"].as_i64(),
+        Some(SKILL_EXPANSION_TOO_LARGE),
+        "an oversized skill on the local tier must be refused: {turn}\n\
+         daemon log:\n{}",
+        daemon.log()
+    );
+    assert!(
+        message.contains(&format!("bound: {}", BudgetBound::LocalEngine.words())),
+        "the local tier's bound must be spoken as `local engine`: {message}"
+    );
+    assert!(
+        !message.contains("local_engine"),
+        "the snake_case wire spelling must never reach a sentence a user reads: \
+         {message}"
+    );
+    client.drain_events(Duration::from_millis(300));
+    assert_pressure_silent(&client, "local");
+}

@@ -891,3 +891,267 @@ async fn every_spelling_settles_identically_to_the_canonical_one() {
 
     std::fs::remove_dir_all(&repo).ok();
 }
+
+// ---------------------------------------------------------------------------
+// REQ-585 AC-11(b) / AC-11(c) — a skill that ran a command, at the choke point
+// ---------------------------------------------------------------------------
+//
+// BR-7's second half. A dynamic-context command's output is `shell` output: the
+// daemon cannot attribute it to a file set, so it enters the expansion with
+// nothing that can be pinned. On a boundary-configured machine that fails
+// closed, so an invocation that ran **any** command pins its turn to the local
+// tier — exactly as [`shell_cat_of_a_boundary_file_blocks_the_next_remote_turn`]
+// above pins a `shell` result's, and for the same reason.
+//
+// The two cases are a pair on purpose (LESSON-520): (b) is a refusal and (c) is
+// the send that makes it mean something. Without (c), "nothing left the machine"
+// would also be true of a harness that could not send at all; without (b), (c)
+// would be a turn nobody claimed should have been stopped.
+//
+// The expansion is built by the real expander over a real `SKILL.md`, and the
+// commands are run by the real runner, so what reaches the wire in (c) is the
+// product's own bytes rather than a string this file composed.
+
+/// The skill AC-11(b)/(c) are written against: a body that names its argument
+/// and inlines one command's output.
+const CTX_SKILL: &str = "---\ndescription: the context skill\n---\n\
+                         About $ARGUMENTS:\n\n!`echo DYNAMIC-OUTPUT-MARKER`\n";
+
+/// A sibling with the same shape and **no** dynamic context — the control that
+/// isolates "a command ran" as the cause of (b)'s refusal.
+const STATIC_SKILL: &str = "---\ndescription: the static skill\n---\n\
+                            About $ARGUMENTS: STATIC-BODY-MARKER\n";
+
+/// The expansion of one fixture skill, with its dynamic commands actually run,
+/// plus whether the result can be pinned — the two values
+/// `DaemonRuntime::run_prompt_turn` carries into the seed.
+///
+/// `unknown` is `sources-could-not-mint  ||  any command ran`, which is the
+/// daemon's own line (`skill.unknown |= outcomes.iter().any(did_run)`). A
+/// project skill under the root mints, so in these fixtures the second disjunct
+/// is the only one that can be true — which is what makes (b) a claim about the
+/// *command* rather than about where the file lives (that is AC-11(a)'s, in
+/// `egress_capture.rs`).
+fn ran_expansion(repo: &std::path::Path, name: &str, arguments: &str) -> (String, bool) {
+    let registry = tetond::skills::discover(
+        None,
+        repo,
+        teton_protocol::methods::RootKind::Project,
+        &tetond::skills::RealFs,
+    );
+    let skill = registry
+        .dispatchable(name)
+        .unwrap_or_else(|| panic!("the fixture must register `{name}`"));
+    let expansion = tetond::skills::expand(skill, arguments, &format!(".claude/…/{name}"));
+    let outcomes = tetond::skills::run_all(repo, expansion.commands(), 10_000);
+    let ran = outcomes.iter().any(tetond::skills::DynamicOutcome::did_run);
+    (expansion.fold(&outcomes), ran)
+}
+
+/// A repo holding the two fixture skills beside the boundary file.
+fn skill_repo() -> PathBuf {
+    let repo = temp_repo();
+    for (name, body) in [("ctx", CTX_SKILL), ("static", STATIC_SKILL)] {
+        let dir = repo.join(".claude/skills").join(name);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("SKILL.md"), body).unwrap();
+    }
+    repo
+}
+
+/// Drive one remote turn over a caller-seeded context and a caller-chosen
+/// boundary set, and report what the transport saw.
+///
+/// A single scripted reply with no tool call: the whole claim is about the
+/// **first** request, which is the one carrying the skill expansion. (The
+/// fixtures above need two turns because their provenance arrives on a tool
+/// result; a skill's arrives with the seed.)
+async fn drive_seeded_turn(
+    repo: &std::path::Path,
+    session_id: &SessionId,
+    boundary_set: Vec<PrivacyBoundary>,
+    ctx: &mut ContextManager,
+) -> (
+    Result<tetond::harness::TurnOutcome, HarnessError>,
+    Vec<Vec<u8>>,
+    usize,
+    Vec<teton_protocol::events::PrivacyBlock>,
+) {
+    let transport = CaptureSse::with_bodies(vec![sse_turn("Understood.", None)]);
+    let capture = transport.clone();
+
+    let bus = Arc::new(EventBus::new());
+    let egress = Egress::new(transport, boundary_set, bus.clone());
+    let provider = OpenAiCompatAdapter::new(OpenAiCompatConfig::new(
+        "deepseek",
+        "https://api.deepseek.com/v1/chat/completions",
+    ));
+    let mut source = RemoteProviderSource::new(
+        &provider,
+        &egress,
+        "deepseek",
+        "deepseek-chat",
+        session_id.clone(),
+        ResolvedEffort::effort(EffortLevel::High),
+    );
+
+    let config = scripted_config();
+    let tools = ToolRegistry::with_builtins();
+    let tool_ctx = ToolContext::new(repo);
+    let pending = Arc::new(PendingPermissions::new());
+    let gate = PermissionGate::new(
+        session_id.clone(),
+        PermissionConfig::permissive(),
+        Arc::clone(&bus),
+        Arc::clone(&pending),
+    );
+    let events = SessionEvents::new(Arc::clone(&bus), session_id.clone());
+    let mut hook = NoopProvenanceHook;
+    let mut sub = bus.subscribe(256);
+
+    let result = run_session_turn_with_source(
+        &mut source,
+        &tools,
+        &tool_ctx,
+        &gate,
+        &events,
+        ctx,
+        &config,
+        &mut hook,
+        &DutyRoute::unresolved("no digest route in this test"),
+        &DutyRoute::unresolved("no compact route in this test"),
+        &ToolDuties {
+            triage: &DutyRoute::unresolved("no triage route in this test"),
+            shell: &DutyRoute::unresolved("no shell route in this test"),
+        },
+    )
+    .await;
+
+    let mut blocks = Vec::new();
+    while let Ok(Some(env)) =
+        tokio::time::timeout(std::time::Duration::from_millis(50), sub.recv()).await
+    {
+        if let Event::PrivacyBlock(pb) = env.event {
+            blocks.push(pb);
+        }
+    }
+    (result, capture.captured(), capture.calls(), blocks)
+}
+
+/// **AC-11(b).** A skill that ran **any** dynamic command pins its turn local
+/// wherever **any** boundary is configured — the boundary need have nothing to
+/// do with the command, because the output has no identity for a glob to be
+/// compared against in the first place.
+///
+/// The control runs first and on the same boundary set: the sibling skill with
+/// no dynamic context genuinely reaches the wire. So the refusal below is "a
+/// command ran", not "this repo has a boundary".
+#[tokio::test]
+async fn a_skill_that_ran_a_command_blocks_the_remote_turn_under_any_boundary() {
+    let repo = skill_repo();
+
+    // The control: same repo, same boundary, no dynamic context.
+    let (still, ran) = ran_expansion(&repo, "static", "the control");
+    assert!(!ran, "fixture: the control skill runs no command");
+    let mut ctx = ContextManager::new(scripted_system(), scripted_config().context_budget_tokens);
+    ctx.push_user_from(still, std::collections::BTreeSet::new(), false);
+    let (result, captured, calls, blocks) = drive_seeded_turn(
+        &repo,
+        &SessionId::from("skill-static"),
+        boundaries(),
+        &mut ctx,
+    )
+    .await;
+    assert!(
+        result.is_ok() && calls == 1 && blocks.is_empty(),
+        "a skill with no dynamic context must still reach the provider under a \
+         boundary it does not touch: {result:?}, {calls} call(s), {blocks:?}"
+    );
+    assert!(
+        contains_bytes(&captured[0], "STATIC-BODY-MARKER"),
+        "the control never put the expansion on the wire, so the refusal below \
+         would say nothing"
+    );
+
+    // The claim.
+    let (expansion, ran) = ran_expansion(&repo, "ctx", "the real one");
+    assert!(
+        ran && expansion.contains("DYNAMIC-OUTPUT-MARKER"),
+        "fixture: the command must actually have run and been folded in"
+    );
+    let mut ctx = ContextManager::new(scripted_system(), scripted_config().context_budget_tokens);
+    // The seed the daemon builds: a project skill mints, and the ran command is
+    // what marks the block unpinnable.
+    ctx.push_user_from(expansion, std::collections::BTreeSet::new(), ran);
+    assert!(
+        context_provenance(&ctx).is_unknown(),
+        "an invocation that ran a command must taint the context as unknown \
+         provenance, exactly as a `shell` result does"
+    );
+    let (result, captured, calls, blocks) =
+        drive_seeded_turn(&repo, &SessionId::from("skill-ctx"), boundaries(), &mut ctx).await;
+
+    match &result {
+        Err(e) if e.is_privacy_blocked() => {}
+        other => panic!("expected a privacy block, got {other:?}"),
+    }
+    assert_eq!(calls, 0, "not one packet may leave: {calls} call(s)");
+    assert!(
+        captured.is_empty(),
+        "the transport was asked to send something"
+    );
+    assert_eq!(blocks.len(), 1, "exactly one privacy_block: {blocks:?}");
+    std::fs::remove_dir_all(&repo).ok();
+}
+
+/// **AC-11(c).** With no boundary configured, the choke point does not inspect —
+/// so a skill that ran a command reaches the remote provider, and the payload
+/// the provider received **is the expansion**.
+///
+/// Not "a request went out": the captured body is searched for the three things
+/// the expander actually produced — the preamble naming the file, the argument
+/// string substituted into the body, and the command's stdout inside the
+/// untrusted envelope the fold splices it into. A turn that reached the wire
+/// carrying something else would satisfy a call count and fails this.
+#[tokio::test]
+async fn with_no_boundary_a_skills_expansion_reaches_the_provider_as_the_payload() {
+    let repo = skill_repo();
+    let (expansion, ran) = ran_expansion(&repo, "ctx", "teton  code \"repo\"");
+    assert!(ran, "fixture: the command must actually have run");
+
+    let mut ctx = ContextManager::new(scripted_system(), scripted_config().context_budget_tokens);
+    ctx.push_user_from(expansion.clone(), std::collections::BTreeSet::new(), ran);
+    let (result, captured, calls, blocks) = drive_seeded_turn(
+        &repo,
+        &SessionId::from("skill-open"),
+        // The whole difference from the test above.
+        Vec::new(),
+        &mut ctx,
+    )
+    .await;
+
+    assert!(result.is_ok(), "no boundary, no refusal: {result:?}");
+    assert_eq!(calls, 1, "exactly one request went out");
+    assert!(blocks.is_empty(), "nothing to block: {blocks:?}");
+
+    let body = &captured[0];
+    for fragment in [
+        // The preamble the expander writes, naming the file the body came from.
+        ".claude/…/ctx",
+        // BR-4: the arguments reach `$ARGUMENTS` with both interior spaces and
+        // both quotes intact. (JSON-escaped on the wire, hence the escapes.)
+        "About teton  code \\\"repo\\\":",
+        // The command's stdout, folded into the body.
+        "DYNAMIC-OUTPUT-MARKER",
+        // …inside the envelope every built-in result gets.
+        "trust=\\\"untrusted\\\"",
+    ] {
+        assert!(
+            contains_bytes(body, fragment),
+            "the payload is not the expansion — `{fragment}` is missing from \
+             what the provider received:\n{}",
+            String::from_utf8_lossy(body)
+        );
+    }
+    std::fs::remove_dir_all(&repo).ok();
+}
