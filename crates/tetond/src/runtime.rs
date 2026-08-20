@@ -164,7 +164,7 @@ use crate::egress::{
 };
 use crate::harness::budget::RouteBudget;
 use crate::harness::completion::{context_provenance, RemoteProviderSource};
-use crate::harness::context::NoopProvenanceHook;
+use crate::harness::context::{NoopProvenanceHook, PressureReport};
 use crate::harness::tools::web::{register_web_tool, tier_name, SeamError, WebLookupSeam};
 use crate::harness::turn_loop::{pressure_kind, run_session_turn_with_source, HarnessError};
 use crate::harness::{
@@ -3138,13 +3138,7 @@ impl DaemonRuntime {
                 // seam also runs from `Drop`, where there is no event handle
                 // and no one left to tell (LESSON-501).
                 let pressure = conversation.commit_reporting();
-                if !pressure.is_quiet() {
-                    stream_events.context_pressure(
-                        &pressure,
-                        pressure_kind(&pressure),
-                        &route.budget,
-                    );
-                }
+                publish_commit_pressure(&stream_events, &pressure, &route.budget);
                 Ok(result)
             }
             Err(err) => {
@@ -5427,21 +5421,43 @@ impl DaemonRuntime {
         // **example model**, carried silently by the setup UI — so it is
         // written only when the chosen model is that example, matched as the
         // (example_model, window) pair so a stale client's old catalog cannot
-        // smuggle a superseded figure under a current model name. Any other
-        // model writes `0`: "unknown", stated in the preview's
-        // `max_context = 0` line rather than defaulted silently. `None` — no
-        // recipe behind the candidate, or a client predating the field —
-        // preserves whatever the config already holds, which is the
-        // pre-REQ-586 behaviour exactly (ADR-7 field-wise merge).
-        let max_context = candidate.max_context.map(|window| {
-            let is_the_recipes_own_example = crate::provider_recipes::recipe_catalog()
+        // smuggle a superseded figure under a current model name.
+        //
+        // Every other case contributes **no answer**, exactly like the cap
+        // below: `None` preserves whatever the config already holds (ADR-7's
+        // field-wise merge). That covers a candidate with no recipe behind it, a
+        // client predating the field, and — the case this spelling exists for —
+        // a hand-typed model. The setup UI always sends `Some(recipe_window)`,
+        // so writing `Some(0)` for a model that is not the recipe's example
+        // would let `/provider setup kimi` with a hand-typed model silently
+        // un-declare a window the user had already set with
+        // `provider add kimi --max-context 128000`, dropping that route's budget
+        // ~20× with nothing said. This flow asks no window question about a
+        // model it does not recognize, and a question this flow does not ask is
+        // not an answer of "unknown" (verify M4).
+        //
+        // For a **fresh** record the outcome is unchanged: capabilities default
+        // to 0, so the preview still renders `max_context = 0` and the window is
+        // still stated as unknown rather than defaulted silently.
+        //
+        // ## The pair is matched across the whole catalog, deliberately
+        //
+        // The lookup is by (example_model, window) over every recipe rather than
+        // over "the recipe whose `id_suggestion` is this candidate's id". A
+        // recipe id is a *suggestion* and ids are the user's namespace
+        // (`ProviderRecipe::id_suggestion`), so Kimi registered under the id
+        // `work-model` is an ordinary registration and must still get Kimi's
+        // window. What is being trusted is a fact about the **model**, and a
+        // model name is the same fact whatever row it is stored in. So the pin
+        // this guard provides is against a *superseded figure* — an old client
+        // sending a current model name with last year's window — and not against
+        // a cross-vendor pairing, which is a correct pairing carrying a correct
+        // window.
+        let max_context = candidate.max_context.and_then(|window| {
+            let is_a_recipes_own_example = crate::provider_recipes::recipe_catalog()
                 .iter()
                 .any(|recipe| recipe.example_model == model && recipe.max_context == window);
-            if is_the_recipes_own_example {
-                window
-            } else {
-                0
-            }
+            is_a_recipes_own_example.then_some(window)
         });
 
         // The candidate, built by identity — see the section above.
@@ -9328,6 +9344,45 @@ fn refit_for_reroute(
     }
     let report = conversation.rebudget(next);
     events.context_pressure(&report, ContextPressureKind::RefitOnReroute, next);
+}
+
+/// Publish what the **commit's** own budget gate took, if it took anything
+/// (REQ-586 BR-10, ADR-3).
+///
+/// [`CarriedTurn::commit_now`] re-asserts the budget one last time so that "a
+/// stored conversation fits the budget" is an invariant of the store rather
+/// than a property the last writer happened to leave behind. It runs from
+/// `Drop` as well as from the success arm, so it can hold no `SessionEvents`
+/// and cannot emit: it reports, and this publishes (LESSON-501).
+///
+/// ## Why this is a named function and not two lines at the call site
+///
+/// It is the one branch of the REQ that no end-to-end fixture can reach, and it
+/// is worth being explicit about why rather than leaving a reader to assume it
+/// is covered. The turn loop gates **both** its `Ok` exits (BUG-157: the
+/// `EndTurn` arm and the `max_turns` arm each run `truncate_to_budget` on the
+/// way out), and nothing appends to the manager between that gate and this
+/// commit — so a turn that *completed* always arrives here already fitting, and
+/// the report is quiet. The paths where the commit gate really bites are the
+/// cancellation ones, and those reach it through `Drop`, where the report is
+/// discarded because there is no client left waiting on the news.
+///
+/// So the branch is a **backstop**, live the day a new `Ok` exit is added to
+/// the loop or a new post-turn append lands between the two gates — which is
+/// exactly when a silent between-turns drop would otherwise ship. A backstop
+/// that no test can drive is a backstop nobody can change safely, so the
+/// decision is lifted here where a unit test *can* state it:
+/// `the_commit_publishes_a_clamp_and_says_nothing_about_a_quiet_one`.
+///
+/// It is deliberately not `turn_loop`'s `announce_pressure`: that one also
+/// writes a turn notice into the model's own output stream when the clamp
+/// landed on the user's newest message, which is the right thing mid-turn and
+/// the wrong thing here — this runs after the turn's last token, with nothing
+/// left to append it to.
+fn publish_commit_pressure(events: &SessionEvents, report: &PressureReport, budget: &RouteBudget) {
+    if !report.is_quiet() {
+        events.context_pressure(report, pressure_kind(report), budget);
+    }
 }
 
 /// The local tier's canonical provider id when the config declares no explicit
@@ -26564,11 +26619,24 @@ provider_id = \"deepseek\"
 
     /// REQ-586: the budget follows the route attempt.
     ///
-    /// Three claims that live in `run_prompt_turn` and nowhere else: a reroute
-    /// re-fits the turn's context to the window it is about to be sent to and
-    /// says so; a route change that moves no window says nothing; and a
-    /// provider's own "too big" answer ends the turn typed, without touching
-    /// the machinery that exists for providers that *failed*.
+    /// Three claims: a reroute re-fits the turn's context to the window it is
+    /// about to be sent to and says so; a route change that moves no window
+    /// says nothing; and a provider's own "too big" answer ends the turn typed,
+    /// without touching the machinery that exists for providers that *failed*.
+    ///
+    /// The first two are pinned here at [`refit_for_reroute`], the shared
+    /// helper both of `run_prompt_turn`'s reroute arms call — so what these
+    /// tests own is the *helper's* rule, not the arms' wiring to it. That
+    /// wiring is a separate claim and it is covered separately: the two e2e
+    /// legs — `e2e/privacy_fixes.rs` for the privacy-block → local-pin arm and
+    /// `e2e/ac_matrix.rs` for the provider-failure → fallback arm — drive the
+    /// whole daemon and assert the `refit_on_reroute` line lands *before* the
+    /// retried attempt's `route_decided`, positionally, rather than merely
+    /// somewhere in the stream. The third test below is itself an e2e leg — it
+    /// drives
+    /// `run_prompt_turn` against a socket, because health, `provider_degraded`
+    /// and the client's error code only run when the refusal has travelled the
+    /// whole adapter → egress → source → loop path.
     mod route_budget {
         use super::*;
         use crate::carry::CarriedTurn;
@@ -26786,6 +26854,165 @@ provider_id = \"deepseek\"
                 .conversation_snapshot(&session_id)
                 .blocks()
                 .is_empty());
+        }
+
+        /// **BR-10, verify M7-b.** The commit's publish speaks for a clamp and
+        /// stays silent for a quiet report — and it carries the commit's own
+        /// numbers, not the loop's.
+        ///
+        /// [`publish_commit_pressure`]'s own doc says why this is a unit test
+        /// rather than a leg of an end-to-end fixture: a turn that *completed*
+        /// cannot reach it with anything to say, because the loop gates both of
+        /// its `Ok` exits and nothing appends between that gate and the commit.
+        /// That made the branch unguardable in practice — `if false &&
+        /// !pressure.is_quiet()` at the seam left the whole `tetond` package
+        /// green, and the fixture AC-11 drives it through
+        /// (`conversation_carry.rs`) was calling the report-discarding
+        /// `commit()` so it could not have caught it either way. Both halves are
+        /// fixed: the fixture now commits the daemon's way, and the decision
+        /// itself is stated here.
+        ///
+        /// The kind is asserted too, because the commit is the one caller that
+        /// must **not** pass a kind of its own: an identical report is
+        /// `RefitOnReroute` at a reroute arm and `BlocksDropped` here, and
+        /// getting that from [`pressure_kind`] is what keeps the commit from
+        /// inventing a fourth vocabulary.
+        #[tokio::test]
+        async fn the_commit_publishes_a_clamp_and_says_nothing_about_a_quiet_one() {
+            let (_sessions, session_id) = one_freeform_session();
+            let bus = Arc::new(EventBus::new());
+            let mut sub = bus.subscribe(64);
+            let events = SessionEvents::new(Arc::clone(&bus), session_id.clone());
+            let budget = remote_budget(128_000);
+
+            // A quiet report — the ordinary case, since `truncate_to_budget`
+            // runs on every commit — says nothing at all.
+            publish_commit_pressure(&events, &PressureReport::default(), &budget);
+            assert!(
+                pressure(&mut sub).await.is_empty(),
+                "a commit that clamped nothing announced a clamp"
+            );
+
+            // A report that dropped blocks is the BR-10 news, with the numbers
+            // of the route the turn ran under.
+            let dropped = PressureReport {
+                dropped_blocks: 3,
+                ..PressureReport::default()
+            };
+            publish_commit_pressure(&events, &dropped, &budget);
+            let published = pressure(&mut sub).await;
+            assert_eq!(published.len(), 1, "{published:#?}");
+            assert_eq!(published[0].kind, ContextPressureKind::BlocksDropped);
+            assert_eq!(published[0].dropped_blocks, 3);
+            assert_eq!(published[0].budget_tokens, budget.budget_tokens as u64);
+            assert_eq!(published[0].budget_bytes, budget.budget_bytes as u64);
+            assert_eq!(published[0].bound, budget.bound);
+
+            // …and a pure in-place clamp is the other kind, off the same
+            // classifier the loop's gates use.
+            let elided = PressureReport {
+                elided_bytes: 4_096,
+                newest_user_elided: true,
+                ..PressureReport::default()
+            };
+            publish_commit_pressure(&events, &elided, &budget);
+            let published = pressure(&mut sub).await;
+            assert_eq!(published.len(), 1, "{published:#?}");
+            assert_eq!(published[0].kind, ContextPressureKind::BlockElided);
+            assert_eq!(published[0].elided_bytes, 4_096);
+            assert!(published[0].newest_user_elided);
+        }
+
+        /// **Verify M7-a.** `build_router` passes `[privacy] redact` into the
+        /// derivation, so an opted-in machine's large-window route is bounded
+        /// by what the scan can read whole.
+        ///
+        /// AC-6's own test builds a `Router` and calls `.with_redact_scan(flag)`
+        /// on it explicitly, which proves `budget_for` honours the flag and
+        /// nothing about how the flag gets there. The single line
+        /// `.with_redact_scan(config.privacy.redact)` in [`build_router`] is
+        /// what makes `[privacy] redact = true` a *budget* on the daemon, and
+        /// replacing it with `false` left the entire `tetond` package green.
+        ///
+        /// What that mutation costs is not subtle: every opted-in machine on a
+        /// 128k provider would derive `BudgetBound::Window` — a 253,952-byte
+        /// budget, well over `REDACT_INPUT_MAX_BYTES` — assemble a body that
+        /// size, and have the gate refuse it fail-closed as `ScanUnavailable`.
+        /// That is the REQ-562/REQ-577 collision this REQ exists not to
+        /// reintroduce, arriving as a privacy error on a turn whose only fault
+        /// is its size.
+        ///
+        /// The third leg closes AC-6's untested clause: `[web] tier = search`
+        /// installs the *search* redaction gate, which deliberately does not
+        /// read `[privacy] redact` (BR-14) — and does not scan provider
+        /// payloads either. So the provider route's bound follows `redact`
+        /// alone, and a search-tier machine with the scan off is `window`.
+        #[test]
+        fn build_router_makes_the_privacy_flag_the_routes_bound() {
+            use teton_core::config::{PrivacyConfig, WebConfig, WebTier};
+            use teton_protocol::events::BudgetBound;
+
+            /// A remote provider big enough that its window-derived byte budget
+            /// is over the scannable bound — which is the only shape where the
+            /// two answers differ.
+            fn config_with(redact: bool, tier: WebTier) -> Config {
+                Config {
+                    providers: vec![ModelProvider {
+                        id: "wide".to_owned(),
+                        kind: ProviderKind::OpenaiCompatible,
+                        endpoint: Some("https://example.invalid/v1/chat/completions".to_owned()),
+                        model: Some("wide-model".to_owned()),
+                        auth_ref: None,
+                        capabilities: ProviderCapabilities {
+                            max_context: 128_000,
+                            ..ProviderCapabilities::default()
+                        },
+                    }],
+                    default_provider: Some("wide".to_owned()),
+                    privacy: PrivacyConfig { redact },
+                    web: WebConfig {
+                        tier,
+                        ..WebConfig::default()
+                    },
+                    ..Config::default()
+                }
+            }
+
+            let scanning = build_router(&config_with(true, WebTier::Off), true, &BTreeMap::new())
+                .budget_for(Some("wide"));
+            assert_eq!(
+                scanning.bound,
+                BudgetBound::RedactScan,
+                "`[privacy] redact = true` must reach the derivation through \
+                 `build_router`, or an opted-in machine assembles a body the \
+                 gate then refuses as unscannable: {scanning:?}"
+            );
+
+            let unscanned = build_router(&config_with(false, WebTier::Off), true, &BTreeMap::new())
+                .budget_for(Some("wide"));
+            assert_eq!(
+                unscanned.bound,
+                BudgetBound::Window,
+                "with the scan off the same route is window-bound: {unscanned:?}"
+            );
+            assert!(
+                unscanned.budget_bytes > scanning.budget_bytes,
+                "the two legs must differ, or neither says anything: {} vs {}",
+                unscanned.budget_bytes,
+                scanning.budget_bytes
+            );
+
+            // AC-6's search clause: the search gate is switched by `[web] tier`
+            // and not by `[privacy] redact`, and it does not scan the provider
+            // payload — so it moves no provider route's bound.
+            let searching =
+                build_router(&config_with(false, WebTier::Search), true, &BTreeMap::new())
+                    .budget_for(Some("wide"));
+            assert_eq!(
+                searching, unscanned,
+                "`[web] tier = search` with `redact = false` must leave the \
+                 provider route window-bound: {searching:?}"
+            );
         }
 
         /// A provider bound to every tier at `endpoint`, declaring a 128k

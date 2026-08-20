@@ -873,6 +873,209 @@ fn a_fresh_setup_writes_the_recipe_window_into_the_capabilities_table() {
     );
 }
 
+/// The window this build's `kimi` recipe declares, and the model it declares it
+/// for — read from the catalog rather than retyped, so a re-verified vendor
+/// figure re-verifies the two tests below.
+fn kimi_recipe() -> (String, u32) {
+    let recipe = tetond::provider_recipes::recipe_catalog()
+        .into_iter()
+        .find(|r| r.id_suggestion == "kimi")
+        .expect("the build ships a kimi recipe");
+    (recipe.example_model, recipe.max_context)
+}
+
+/// **Verify M4 (REQ-586 BR-3 / ADR-7).** `/provider setup` over a provider that
+/// already declares a window, with a **hand-typed** model, leaves that window
+/// exactly where it was.
+///
+/// The failure this closes is a silent 20× budget cut on the dogfood path. The
+/// setup UI carries the recipe's figure on every candidate — it always sends
+/// `Some(recipe_window)` — and the daemon writes it only when the chosen model
+/// is the recipe's example. Mapping every other model to `Some(0)` made that
+/// "unknown" a **write** under ADR-7's field-wise merge, so
+/// `provider add kimi --max-context 128000` followed by `/provider setup kimi`
+/// with any model the recipe does not name reset the stored window to unknown
+/// and dropped that route's budget from 84,650 words to 4,096, with nothing on
+/// the wire and nothing in the preview to say so.
+///
+/// It is the replace case, which is the one both existing window tests miss:
+/// `a_fresh_setup_writes_the_recipe_window_into_the_capabilities_table` and
+/// `a_replacement_is_previewed_as_one_and_leaves_every_other_byte_alone`
+/// between them cover "a new id, recipe model" and "an existing id, no field at
+/// all". The leg that bit is "an existing id, field present, model unknown".
+///
+/// Asserted on the preview *and* on the file, because BR-9 is the claim that
+/// those are the same thing: a preview that showed `200000` over a commit that
+/// wrote `0` would be the worse failure of the two.
+#[test]
+fn a_setup_with_a_hand_typed_model_leaves_a_declared_window_alone() {
+    let ws = Workspace::new("provider-setup-window-preserve");
+    ws.write_config(SEEDED_WITH_KIMI);
+    let script = ws.write_script(NO_TURNS);
+    let daemon = Daemon::spawn(&ws, probe().script(script));
+    let mut client = daemon.connect();
+    let session = client.create_session("freeform", None);
+
+    let (example_model, recipe_window) = kimi_recipe();
+    // A model the catalog does not name — the case a user reaches by typing
+    // their own instead of taking the offered one.
+    const HAND_TYPED: &str = "kimi-k2-0905-preview";
+    assert_ne!(
+        HAND_TYPED, example_model,
+        "this test is only meaningful for a model the recipe does not name"
+    );
+    // The seed's own declaration, quoted out of the fixture so the two cannot
+    // drift, and distinct from the recipe figure the candidate carries.
+    assert!(SEEDED_WITH_KIMI.contains("max_context = 200000"));
+    assert_ne!(
+        recipe_window, 200_000,
+        "the seeded window must differ from the recipe's, or 'preserved' and \
+         'written' look the same"
+    );
+
+    let mut candidate = kimi(HAND_TYPED);
+    // Exactly what the setup UI sends: the recipe's figure, always.
+    candidate["max_context"] = json!(recipe_window);
+    let previewed = client.call(
+        "provider/setup_preview",
+        json!({ "session_id": session, "candidate": candidate }),
+    );
+    let toml = previewed["result"]["toml"]
+        .as_str()
+        .unwrap_or_else(|| panic!("the preview must render the candidate rows: {previewed}"));
+    assert!(
+        toml.contains("max_context = 200000"),
+        "the preview must show the window the user already declared:\n{toml}"
+    );
+    assert!(
+        !toml.contains("max_context = 0"),
+        "the preview un-declared a window this flow never asked about:\n{toml}"
+    );
+    assert!(
+        !toml.contains(&format!("max_context = {recipe_window}")),
+        "a hand-typed model must not inherit the recipe's figure either — the \
+         window is a fact about the model:\n{toml}"
+    );
+
+    let digest = digest_of(&previewed);
+    let committed = client.call(
+        "provider/setup_commit",
+        json!({ "session_id": session, "candidate": candidate, "expect_digest": digest }),
+    );
+    assert_eq!(
+        committed["result"]["applied"].as_bool(),
+        Some(true),
+        "the commit must apply: {committed}\ndaemon log:\n{}",
+        daemon.log()
+    );
+
+    let written = std::fs::read_to_string(&ws.config_path).expect("the config was written");
+    assert!(
+        written.contains("model = \"kimi-k2-0905-preview\""),
+        "the setup really did re-register the row:\n{written}"
+    );
+    assert!(
+        written.contains("max_context = 200000"),
+        "the declared window must survive a setup that never asked about it:\n{written}"
+    );
+    assert!(
+        !written.contains("max_context = 0"),
+        "the setup wrote `unknown` over a window the user had declared:\n{written}"
+    );
+}
+
+/// **Verify M4, the related half (test auditor m-7).** The recipe match is over
+/// the **whole catalog**, and that is the rule rather than an oversight.
+///
+/// The guard is a (example_model, window) **pair** lookup: what it pins is that
+/// a stale client cannot smuggle a superseded figure under a current model name.
+/// It deliberately does not additionally require the candidate's id to be the
+/// recipe's `id_suggestion`, so a candidate registering Moonshot's model under
+/// the id `grok` is accepted and gets Moonshot's window.
+///
+/// That is correct, not lenient. `ProviderRecipe::id_suggestion` is documented
+/// as "a suggestion, not a reservation: ids are the user's namespace", so the
+/// same vendor registered under `work-model`, `cheap`, or a second row for a
+/// second key is an ordinary registration — and the window being written is a
+/// fact about the **model**, which is the same fact whatever row holds it. An
+/// id-scoped lookup would refuse a legitimate registration in order to prevent
+/// a candidate from claiming a window its model really has.
+///
+/// Pinned here so that tightening it later is a decision someone makes rather
+/// than a behaviour that drifts.
+#[test]
+fn a_recipe_window_follows_the_model_not_the_id_it_is_registered_under() {
+    let ws = Workspace::new("provider-setup-window-cross-vendor");
+    ws.write_config(&fresh_config());
+    let script = ws.write_script(NO_TURNS);
+    let daemon = Daemon::spawn(&ws, probe().script(script));
+    let mut client = daemon.connect();
+    let session = client.create_session("freeform", None);
+
+    let (example_model, recipe_window) = kimi_recipe();
+    // Moonshot's model and Moonshot's window, registered under a different id
+    // with that id's own keychain reference — the shape a user reaches by
+    // editing the suggested id in the setup flow.
+    let candidate = json!({
+        "id": "work-model",
+        "kind": "openai-compatible",
+        "endpoint": "https://api.moonshot.ai/v1/chat/completions",
+        "model": example_model,
+        "key_ref": "keychain://teton/work-model",
+        "max_context": recipe_window,
+        "bindings": [{ "tier": "think", "provider_id": "work-model" }],
+    });
+    let previewed = client.call(
+        "provider/setup_preview",
+        json!({ "session_id": session, "candidate": candidate }),
+    );
+    let toml = previewed["result"]["toml"]
+        .as_str()
+        .unwrap_or_else(|| panic!("the preview must render the candidate rows: {previewed}"));
+    assert!(
+        toml.contains(&format!("max_context = {recipe_window}")),
+        "the model's own window must be recorded whatever id it is stored \
+         under:\n{toml}"
+    );
+
+    let digest = digest_of(&previewed);
+    let committed = client.call(
+        "provider/setup_commit",
+        json!({ "session_id": session, "candidate": candidate, "expect_digest": digest }),
+    );
+    assert_eq!(
+        committed["result"]["applied"].as_bool(),
+        Some(true),
+        "the commit must apply: {committed}\ndaemon log:\n{}",
+        daemon.log()
+    );
+    let written = std::fs::read_to_string(&ws.config_path).expect("the config was written");
+    assert!(
+        written.contains(&format!("max_context = {recipe_window}")),
+        "the window the preview showed is the window the file holds:\n{written}"
+    );
+
+    // And the pair really is a pair: the same model with a *different* window —
+    // the stale-catalog shape — writes nothing at all.
+    let mut stale = candidate.clone();
+    stale["id"] = json!("stale-client");
+    stale["key_ref"] = json!("keychain://teton/stale-client");
+    stale["max_context"] = json!(recipe_window / 2);
+    stale["bindings"] = json!([{ "tier": "think", "provider_id": "stale-client" }]);
+    let previewed = client.call(
+        "provider/setup_preview",
+        json!({ "session_id": session, "candidate": stale }),
+    );
+    let toml = previewed["result"]["toml"]
+        .as_str()
+        .unwrap_or_else(|| panic!("the preview must render the candidate rows: {previewed}"));
+    assert!(
+        !toml.contains(&format!("max_context = {}", recipe_window / 2)),
+        "a window this build's catalog does not pair with this model was \
+         written anyway:\n{toml}"
+    );
+}
+
 // ---------------------------------------------------------------------------
 // (5) AC-11 / BR-12 — the presence gate
 // ---------------------------------------------------------------------------

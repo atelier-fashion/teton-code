@@ -950,9 +950,20 @@ const UNRELATED_400_BODY: &str =
     r#"{"error":{"message":"invalid model: no such model `test-model`"}}"#;
 
 fn drive_400(adapter: &dyn Provider, body: &'static str, effort: ResolvedEffort) -> ProviderError {
-    let transport = ErrorBodyTransport::new(400, body);
+    drive_4xx(adapter, 400, body, effort)
+}
+
+/// The same drive at an arbitrary 4xx — what makes "the sniff is 400-only" a
+/// claim about the adapter rather than only about the classifier.
+fn drive_4xx(
+    adapter: &dyn Provider,
+    status: u16,
+    body: &'static str,
+    effort: ResolvedEffort,
+) -> ProviderError {
+    let transport = ErrorBodyTransport::new(status, body);
     match block_on(adapter.stream_turn(request_with(effort), &transport)) {
-        Ok(_) => panic!("a 400 must not open a stream"),
+        Ok(_) => panic!("a {status} must not open a stream"),
         Err(err) => err,
     }
 }
@@ -997,6 +1008,69 @@ fn each_adapter_maps_its_vendor_spelling_to_context_length_exceeded() {
                 !msg.contains("213717") && !msg.contains("131000") && !msg.contains("too long"),
                 "no provider body in the error: {msg}"
             );
+        }
+    }
+}
+
+/// **Verify M3.** The sniff is 400-only, at the adapter: every vendor spelling
+/// under a 401, a 403 or a 429 keeps the classification it had before this REQ,
+/// and keeps its failure class.
+///
+/// The status is part of the claim — every spelling above was read off a `400
+/// Bad Request`, and a request that overflows the window is a malformed
+/// request. Reading the sentence out of any 4xx costs both directions: a
+/// credential fault would be reported to the user as "your context is too big",
+/// and a rate limit would lose its `Retry`. Worse, because
+/// `ContextLengthExceeded` carries no `FailureClass`, either would also skip
+/// `record_health` and failover — so an endpoint answering any 4xx with "prompt
+/// is too long" would keep itself in the route with its standing untouched, and
+/// every later turn's full assembled context would keep going to it.
+///
+/// Driven through `stream_turn` rather than only through the classifier because
+/// the status the sniff reads is the one the *adapter* took off the response,
+/// and both adapters funnel every `status >= 400` into one call.
+#[test]
+fn no_status_but_400_can_be_a_context_length_refusal_on_either_adapter() {
+    let bodies: [&'static str; 4] = [
+        ANTHROPIC_TOO_LONG_BODY,
+        OPENAI_TOO_LONG_BODY,
+        COMPAT_CODE_ONLY_BODY,
+        MOONSHOT_TOO_LONG_BODY,
+    ];
+    let adapters: [&dyn Provider; 2] = [&anthropic(), &openai()];
+    // Status, and the action the pre-REQ-586 classification carries for it.
+    let statuses = [
+        (401, FailureAction::Fail),
+        (403, FailureAction::Fail),
+        (429, FailureAction::Retry),
+    ];
+    for adapter in adapters {
+        for body in bodies {
+            for (status, action) in statuses {
+                let err = drive_4xx(
+                    adapter,
+                    status,
+                    body,
+                    ResolvedEffort::omit(EffortOmission::ShapeNone),
+                );
+                assert_eq!(
+                    err,
+                    ProviderError::ClientError { status },
+                    "a {status} carrying a context-length sentence must stay a \
+                     client error"
+                );
+                assert_eq!(
+                    err.decision().map(|d| d.action),
+                    Some(action),
+                    "a {status} carrying a context-length sentence lost its \
+                     failure action"
+                );
+                assert!(
+                    err.failure_class().is_some(),
+                    "a {status} carrying a context-length sentence stopped \
+                     counting against the provider's health"
+                );
+            }
         }
     }
 }

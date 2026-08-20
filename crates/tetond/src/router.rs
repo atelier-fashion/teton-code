@@ -1284,13 +1284,6 @@ impl Router {
         }
     }
 
-    /// Spend the resolution's fallback: the route is now *running on* it, so a
-    /// further failure has nowhere left to go and must say so rather than fail
-    /// over to itself and loop.
-    ///
-    /// Called from exactly one place — the [`FailureAction::Fallback`] arm — and
-    /// that is the whole point. "The fallback has been used" is a fact about
-    /// having switched providers, so only the switch may assert it.
     /// The forced reduced BR-6 harness profile for `failed`, used when a
     /// failure reveals weak tool-calling regardless of the declared tier.
     ///
@@ -1330,6 +1323,13 @@ impl Router {
             .with_route_budget(self.budget_for(Some(failed)))
     }
 
+    /// Spend the resolution's fallback: the route is now *running on* it, so a
+    /// further failure has nowhere left to go and must say so rather than fail
+    /// over to itself and loop.
+    ///
+    /// Called from exactly one place — the [`FailureAction::Fallback`] arm — and
+    /// that is the whole point. "The fallback has been used" is a fact about
+    /// having switched providers, so only the switch may assert it.
     fn consume_fallback(mut route: Route) -> Route {
         if let Some(resolution) = route.resolution.as_mut() {
             resolution.fallback_id = None;

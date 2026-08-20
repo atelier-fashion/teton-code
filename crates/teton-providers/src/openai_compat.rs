@@ -179,10 +179,14 @@ impl Provider for OpenAiCompatAdapter {
             // what was actually sent, and a refusal claim made without that is a
             // guess (crate::classify_client_error short-circuits when the
             // request carried no reasoning field at all).
-            // REQ-586 BR-2: the same classifier reads the bounded head of every
-            // 4xx for the vendor's exact "context length exceeded" spelling and
-            // returns the class-less `ContextLengthExceeded`, which the daemon
-            // reports as a typed outcome rather than retrying or failing over.
+            // REQ-586 BR-2: the same classifier reads the bounded head of a
+            // **400** for the vendor's exact "context length exceeded" spelling
+            // and returns the class-less `ContextLengthExceeded`, which the
+            // daemon reports as a typed outcome rather than retrying or failing
+            // over. Only a 400 — a 401/403/429 carrying the same sentence keeps
+            // the classification it already had, because the class-less variant
+            // would skip health, failover and backoff for a fault that needs
+            // all three.
             return Err(crate::classify_client_error(
                 resp.status,
                 resp.body,

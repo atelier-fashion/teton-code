@@ -287,6 +287,37 @@ const ANTHROPIC_CONTEXT_LENGTH_MESSAGE: &str = "prompt is too long";
 /// rule says a spelling is pinned when an adapter can actually receive it.
 const MOONSHOT_CONTEXT_LENGTH_MESSAGE: &str = "token length too long";
 
+/// The **only** status a context-length refusal is read out of (REQ-586 BR-2,
+/// verify M3).
+///
+/// Every spelling above was read off a vendor's `400 Bad Request` body, and a
+/// request that overflows the model's window is a malformed request — there is
+/// no vendor that reports it as anything else. The status is therefore part of
+/// the claim, not incidental to it, and the sniff is gated on it.
+///
+/// The failure this closes is specific and bad in both directions. The variant
+/// this classifier returns carries **no** [`FailureClass`], so it skips
+/// `record_health`, `on_provider_failure` and failover entirely — that is
+/// exactly right for a 400 the provider answered correctly, and exactly wrong
+/// for anything else:
+///
+/// - A **401/403** — a revoked, wrong, or expired key — whose body happens to
+///   contain `maximum context length` or `prompt is too long` would be reported
+///   to the user as "your context is too big", sending them to shrink a
+///   conversation when the fix is their credential.
+/// - A **429** would lose [`FailureAction::Retry`]: no backoff, no rate-limit
+///   degradation, just a class-less refusal.
+/// - And because none of those change the provider's standing, a misbehaving or
+///   hostile endpoint could keep itself in the route indefinitely by answering
+///   *any* 4xx with "prompt is too long" — every subsequent turn's full
+///   assembled context still going to it.
+///
+/// That is not a hypothetical body shape: gateways (LiteLLM, OpenRouter, vLLM)
+/// relay an upstream vendor's error document under a status of their own
+/// choosing, so a context-length sentence under a 401 or a 429 is a body these
+/// adapters can really receive.
+const CONTEXT_LENGTH_REFUSAL_STATUS: u16 = 400;
+
 /// Whether a 400 body names the reasoning field this request sent (REQ-559
 /// BR-12).
 ///
@@ -369,6 +400,10 @@ async fn read_error_head(mut body: ByteStream) -> Vec<u8> {
 /// effort refusal, and a context-length refusal on that path must still come
 /// back typed (ADR-8). The effort sniff runs first — it is the more specific
 /// claim and the only one that needs `sent` — then the context-length sniff.
+///
+/// The context-length sniff is additionally gated on the status being exactly
+/// [`CONTEXT_LENGTH_REFUSAL_STATUS`] — see there for why a 401, a 403 or a 429
+/// carrying the same sentence must keep the classification it already had.
 pub(crate) async fn classify_client_error(
     status: u16,
     body: ByteStream,
@@ -385,7 +420,7 @@ pub(crate) async fn classify_client_error(
             };
         }
     }
-    if body_names_context_length(&head) {
+    if status == CONTEXT_LENGTH_REFUSAL_STATUS && body_names_context_length(&head) {
         return ProviderError::ContextLengthExceeded {
             provider_id: provider_id.to_owned(),
         };
@@ -487,12 +522,15 @@ pub enum ProviderError {
     /// The provider refused the request as exceeding its context window
     /// (REQ-586 BR-2 / ADR-8).
     ///
-    /// A 400 whose body carries one of the exact vendor spellings in
-    /// [`body_names_context_length`], and **only** that. An unrelated 400 stays a
+    /// A **400** — [`CONTEXT_LENGTH_REFUSAL_STATUS`], the only status any vendor
+    /// reports an overflowed window under — whose body carries one of the exact
+    /// vendor spellings in [`body_names_context_length`], and **only** that. An
+    /// unrelated 400, and *any* other 4xx whatever its body says, stays a
     /// [`ProviderError::ClientError`] — narrow on purpose, in the
     /// [`ProviderError::EffortRefused`] posture, because this error bypasses the
-    /// retry / fallback / degrade machinery entirely and a misread 400 would
-    /// hide a real provider fault behind a budget report.
+    /// retry / fallback / degrade machinery entirely and a misread 4xx would
+    /// hide a real provider fault (a revoked key, a rate limit) behind a budget
+    /// report, with no health change to move later turns off it.
     ///
     /// It names the provider and nothing else: the window and the assembled
     /// size are facts the daemon holds (the route budget), not facts the adapter
@@ -824,6 +862,66 @@ mod tests {
                 Some(FailureAction::Fallback),
                 "{sent:?}"
             );
+        }
+    }
+
+    /// **Verify M3.** The sniff is 400-only: the *same* vendor spellings under a
+    /// 401, a 403 or a 429 keep the classification they had before this REQ.
+    ///
+    /// The two that matter are both in the loop. A 401/403 is a credential
+    /// fault: `ClientError`, `FailureAction::Fail`, and the user is told to fix
+    /// their key rather than to shrink a conversation that was never the
+    /// problem. A 429 is a rate limit: `FailureAction::Retry`, so the backoff
+    /// and the rate-limit degradation still happen. Both matter twice over
+    /// because `ContextLengthExceeded` carries no [`FailureClass`] at all — an
+    /// endpoint answering any 4xx with "prompt is too long" would otherwise keep
+    /// itself in the route with its health untouched, and every later turn's
+    /// full assembled context would keep going to it.
+    ///
+    /// Gateways (LiteLLM, OpenRouter, vLLM) relay an upstream vendor's error
+    /// document under a status of their own, so these are bodies the adapters
+    /// can really receive rather than a shape invented for a test.
+    #[test]
+    fn only_a_400_can_be_a_context_length_refusal() {
+        /// Status, the action the pre-REQ-586 classification carries, a label.
+        const NON_400: [(u16, FailureAction, &str); 4] = [
+            (401, FailureAction::Fail, "a revoked or wrong key"),
+            (403, FailureAction::Fail, "a key without access"),
+            (429, FailureAction::Retry, "a rate limit"),
+            (404, FailureAction::Fallback, "a missing route"),
+        ];
+        for (status, action, why) in NON_400 {
+            for (label, body) in CONTEXT_LENGTH_BODIES {
+                for sent in [
+                    ResolvedEffort::effort(EffortLevel::High),
+                    ResolvedEffort::omit(EffortOmission::ShapeNone),
+                ] {
+                    let err = futures::executor::block_on(classify_client_error(
+                        status,
+                        body_stream(body),
+                        "p",
+                        sent,
+                    ));
+                    assert_eq!(
+                        err,
+                        ProviderError::ClientError { status },
+                        "{status} ({why}) with `{label}` in the body must stay a \
+                         client error"
+                    );
+                    assert_eq!(
+                        err.decision().map(|d| d.action),
+                        Some(action),
+                        "{status} ({why}) with `{label}` in the body lost its \
+                         failure action"
+                    );
+                    assert!(
+                        err.failure_class().is_some(),
+                        "{status} ({why}) with `{label}` in the body stopped \
+                         counting against the provider's health"
+                    );
+                    assert!(!err.is_context_length_exceeded(), "{status} / {label}");
+                }
+            }
         }
     }
 

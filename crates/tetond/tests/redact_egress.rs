@@ -1056,8 +1056,10 @@ async fn a_context_budget_full_payload_is_scanned_across_windows_and_forwards() 
 ///
 /// ## Bytes per word
 ///
-/// The filler is prose at ≈ 6.4 B/word (65-byte sentence, 10 words). The word
-/// figure is incidental here — the redact scan is byte-denominated and it is
+/// The filler is prose at ≈ 5.8 B/word — a 64-byte sentence of 11 whitespace
+/// words, measured rather than eyeballed (REQ-586 AC F-19 exists to make a
+/// fixture-density claim like this one checkable). The word figure is
+/// incidental here — the redact scan is byte-denominated and it is
 /// `budget_bytes` the bound moves (BR-4) — but it is stated so that a later
 /// reader can see this fixture is not accidentally testing the word guard.
 #[tokio::test]
@@ -1141,8 +1143,12 @@ async fn a_redact_scanned_128k_route_assembles_a_body_the_scan_reads_whole_and_f
     );
     let egress = choke_point(&capture, &sink, Arc::clone(&gate));
 
-    // 65 bytes, 10 whitespace words — ≈ 6.4 B/word.
+    // 64 bytes, 11 whitespace words — ≈ 5.8 B/word. Both figures are asserted
+    // below rather than trusted: a filler whose density drifted would move
+    // which of the two guards this leg is standing on.
     const SENTENCE: &str = "the retry helper reads the manifest and writes one report line. ";
+    assert_eq!(SENTENCE.len(), 64);
+    assert_eq!(SENTENCE.split_whitespace().count(), 11);
     let context = SENTENCE.repeat(scanned.budget_bytes / SENTENCE.len());
     assert!(
         context.len() > REDACT_CHUNK_MAX_BYTES,

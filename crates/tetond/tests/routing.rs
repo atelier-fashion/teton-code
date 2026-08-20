@@ -587,9 +587,16 @@ async fn a_malformed_tool_call_degrades_in_place_rather_than_failing() {
     // and re-fitting a context that already fits — then telling the user their
     // context was re-fitted — would be a clamp that never happened.
     //
-    // Pinned two ways, because either alone is weak. The pairs are byte-equal,
-    // which is the condition `runtime::refit_for_reroute` returns on, so the
-    // refit is unreachable rather than merely unobserved…
+    // The load-bearing assertion is the pair equality below, and it is the
+    // whole of it: byte-equal pairs are the condition `runtime::refit_for_reroute`
+    // returns on, so the refit is **unreachable** rather than merely
+    // unobserved. Watching this router's own degrade path for a
+    // `context_pressure` would prove nothing — `emit_provider_degraded`
+    // publishes one event and it is a `provider_degraded`; the router has no
+    // code path that can publish context pressure under any mutation. The
+    // silence of the *runtime* arm is a separate claim, pinned where that arm
+    // lives, by
+    // `runtime.rs::a_degrade_that_keeps_the_window_refits_nothing_and_says_nothing`.
     assert_eq!(
         (
             route.budget.budget_tokens,
@@ -606,21 +613,15 @@ async fn a_malformed_tool_call_degrades_in_place_rather_than_failing() {
         "the pair moved, so the runtime would re-fit and announce a \
          degrade that changed no window"
     );
-    // …and the whole degrade path, announcement included, publishes nothing of
-    // the kind.
+    // Non-vacuity: the degrade this test is about really was a degrade the
+    // daemon would announce, rather than an outcome that fell through.
     router.emit_provider_degraded(&bus, None, degraded);
     let events = collect_events(&mut sub).await;
     assert!(
         events
             .iter()
             .any(|e| matches!(e.event, Event::ProviderDegraded(_))),
-        "non-vacuity: the degrade really was announced"
-    );
-    assert!(
-        !events
-            .iter()
-            .any(|e| matches!(e.event, Event::ContextPressure(_))),
-        "an in-place degrade announced context pressure: {events:#?}"
+        "the degrade really was announced"
     );
 }
 

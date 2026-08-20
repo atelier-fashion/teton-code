@@ -737,15 +737,23 @@ const KIMI_TOO_LONG: &str =
     r#"{"error":{"type":"invalid_request_error","message":"Input token length too long"}}"#;
 
 /// A prompt of `words` distinct whitespace-separated words at **4 bytes each**
-/// (three base-36 characters and a separator).
+/// (three base-36 characters and a separator, so exactly `4 × words − 1`).
 ///
 /// Two properties the AC needs and a lorem-ipsum string would not give it.
-/// The density is pinned below the remote byte guard (2 B/token → ≈3 B/word of
-/// budget), so a prompt that fits the *word* budget also fits the byte one and
-/// the test is about the number AC-2 names rather than about the guard that
-/// happened to bind first. And every word is distinct, so "the body contains
-/// all of it" is a real claim: a middle elision removes words that are nowhere
-/// else in the string, where a repeated filler would still look whole.
+///
+/// The density is **fixed and known**, which is what lets a caller state which
+/// of the two guards its fixture is standing on. It is deliberately *not* below
+/// the remote pair's implied ratio: a remote route budgets `usable × 2 / 3`
+/// words against `usable × 2` bytes, i.e. ≈ 3 B per word of budget, so a prompt
+/// at 4 B/word sized to fill the *word* budget would overflow the byte one by a
+/// third. Nothing here is sized that way — every caller sits far under both —
+/// and each one asserts the byte fit against the route's own
+/// `context_budget_bytes` rather than inferring it from this density (REQ-586
+/// AC F-19: a fixture-honesty claim is one a reader can check).
+///
+/// And every word is distinct, so "the body contains all of it" is a real
+/// claim: a middle elision removes words that are nowhere else in the string,
+/// where a repeated filler would still look whole.
 fn distinct_words(words: usize) -> String {
     const ALPHABET: &[u8] = b"abcdefghijklmnopqrstuvwxyz0123456789";
     assert!(
@@ -889,10 +897,11 @@ async fn a_128k_route_assembles_a_20000_word_prompt_whole_and_the_default_pair_c
     const WORDS: usize = 20_000;
     let prompt = distinct_words(WORDS);
     assert_eq!(prompt.split_whitespace().count(), WORDS);
-    assert!(
-        prompt.len() <= WORDS * 4,
-        "the fixture must stay under 4 B/word or the byte guard binds first"
-    );
+    // The generator's shape, stated rather than assumed: 3 characters and a
+    // separator per word. It is not a claim about which guard binds — that is
+    // the `context_budget_bytes` assertion below, and it is the one that would
+    // have to move if this density ever did.
+    assert_eq!(prompt.len(), WORDS * 4 - 1);
 
     // ---- the 128k route: whole, one request, quiet ----
     let config = route_config(128_000);

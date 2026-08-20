@@ -152,6 +152,26 @@
 //!   `a_commit_carries_the_truncation_note_and_the_dropped_provenance` red;
 //! - **`Drop` stops checking `std::thread::panicking()`** —
 //!   `a_panicking_turn_commits_nothing_while_an_aborted_one_commits` red.
+//!
+//! # REQ-586 verify (2026-08-19): the fixture commits the daemon's way
+//!
+//! [`Carry::prompt_under`] called `CarriedTurn::commit()` — the
+//! **report-discarding** twin of the `commit_reporting()` +
+//! `context_pressure(..)` pair `DaemonRuntime::run_prompt_turn` runs. So the
+//! BR-10 commit seam this file's AC-11 leg is named for was never exercised
+//! here at all, and the one event that leg asserts came from the turn loop's
+//! own gate. It now commits and publishes exactly as dispatch does, which is
+//! the same LESSON-451 rule as mutation 1 above: a fixture standing in for the
+//! dispatch has to run the dispatch's protocol, or the seam it stands in for is
+//! untested.
+//!
+//! What that revealed is worth recording rather than hiding: the commit's
+//! report is **quiet on every completed turn**, because the loop gates both of
+//! its `Ok` exits (BUG-157) and nothing appends between that gate and the
+//! commit. So AC-11's count stays 1 — asserted below as "the loop's gate, not
+//! twice over by the commit's" — and the commit branch's own rule is stated
+//! where a test can reach it, in `runtime.rs`'s
+//! `the_commit_publishes_a_clamp_and_says_nothing_about_a_quiet_one`.
 
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
@@ -171,6 +191,7 @@ use tetond::cost::{CostLedger, LocalUsageMeter, NoopCostSink, PriceTable};
 use tetond::harness::budget::derive;
 use tetond::harness::compact::COMPACT_OUTPUT_CONTRACT;
 use tetond::harness::context::{approx_tokens, APPROX_BYTES_PER_TOKEN};
+use tetond::harness::turn_loop::pressure_kind;
 use tetond::harness::{
     build_system_prompt, run_session_turn_with_source, BudgetInputs, DutyRoute, HarnessConfig,
     HarnessError, LocalEngineSource, NoopProvenanceHook, PendingPermissions, PermissionConfig,
@@ -636,8 +657,23 @@ impl Carry {
         )
         .await;
 
+        // Committed exactly as `DaemonRuntime::run_prompt_turn` commits — the
+        // **reporting** variant, with the report published through this turn's
+        // `SessionEvents` (REQ-586 BR-10, verify M7-b).
+        //
+        // `commit()` — the report-discarding twin — is the right default for a
+        // caller with no event handle, and it is what this fixture used to
+        // call. That made AC-11 below silently unable to see the commit seam at
+        // all: `if false && !pressure.is_quiet()` at the daemon's own publish
+        // left the whole `tetond` package green, because the one event AC-11
+        // asserted came from the turn loop's gate and no fixture anywhere drove
+        // the commit's. A fixture that drives the daemon's turn has to commit
+        // the daemon's way, or the seam it is standing in for is untested.
         if outcome.is_ok() {
-            conversation.commit();
+            let pressure = conversation.commit_reporting();
+            if !pressure.is_quiet() {
+                events.context_pressure(&pressure, pressure_kind(&pressure), &config.budget);
+            }
         } else {
             conversation.abandon();
         }
@@ -1408,10 +1444,22 @@ async fn a_conversation_assembled_on_a_128k_route_survives_a_local_turns_smaller
         .expect("a session that outgrew its new route compacts, it does not fail");
 
     let pressure = drain_pressure(&mut events);
+    // Exactly one, and it is the **loop's** gate rather than the commit's.
+    //
+    // Both are live in this fixture: `prompt_under` commits the daemon's way
+    // (`commit_reporting`, published through the turn's `SessionEvents`), so a
+    // commit that clamped anything would show up here as a second event. It
+    // does not, and that is the shape rather than an accident — the loop gates
+    // both of its exits (BUG-157), so a turn that *completed* arrives at the
+    // commit already fitting. The commit gate is the backstop for the
+    // cancellation paths, which reach it through `Drop` and publish nothing;
+    // `runtime.rs::the_commit_publishes_a_clamp_and_says_nothing_about_a_quiet_one`
+    // is what states its rule, because no completed turn can.
     assert_eq!(
         pressure.len(),
         1,
-        "one clamp on the way down, announced once: {pressure:?}"
+        "one clamp on the way down, announced once — and by the loop's gate, \
+         not twice over by the commit's: {pressure:?}"
     );
     let event = &pressure[0];
     assert_eq!(event.kind, ContextPressureKind::BlocksDropped);
