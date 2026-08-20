@@ -21,10 +21,11 @@ the ordering TASK-204 established, between Stage A and Stage B.
 ## Acceptance Criteria
 
 - [ ] At `guarded` and `edits`: one `authorize_skill` call per invocation, listing every command verbatim. Declining leaves ``[dynamic context not run: `<cmd>` — declined]`` in every slot and the turn still runs (AC-8).
-- [ ] At `plan`: commands are not run and the placeholders name the level. At `full`: they run with no prompt (AC-9).
+- [ ] At `plan`: commands are not run and the placeholders name the level. At `full`: they run with no prompt. A `PermissionOutcome::Refused { NoTerminal }` yields the distinct "no human could be asked" placeholder, never the decline text (AC-9).
 - [ ] Commands run sequentially in document order with the session root as cwd, through TASK-198's `run_bounded`. A timeout yields a timed-out placeholder; a non-zero exit yields a failed placeholder; the invocation still produces its turn (AC-10).
 - [ ] Output enters inside `frame_untrusted_builtin("skill:<name>", …)`, and a planted `<|im_start|>` / `User:` / `<tool-result>` in a command's stdout reaches the frame neutralized. Removing any one guard fails a test (AC-8, AC-12).
 - [ ] Dynamic output carries `Unknown` provenance, exactly as `shell` output does — so on a boundary-configured machine an invocation that ran any command pins its turn local (BR-7, AC-11b).
+- [ ] `Event::SkillInvoked` is published **before** the Stage B check, not after. A turn where the user approved four commands, watched them run, and was then refused is the turn whose record matters most; publishing after the refusal leaves it with no echo line and no `/verbose` outcomes, while BR-12 says *every* invocation echoes one. Its own test.
 - [ ] Stage B: if the folded expansion now exceeds the budget, refuse with the message that says the dynamic output pushed it over (BR-8d).
 - [ ] `Event::SkillInvoked` is published with `name`, `source`, `path_display`, `body_bytes`, `ignored_keys` and per-command `outcomes`. Asserted against the value the **daemon emitted**, never a hand-built literal (LESSON-544).
 - [ ] `Tool::refine` is never called on this path — no model call happens at expansion time (BR-4).

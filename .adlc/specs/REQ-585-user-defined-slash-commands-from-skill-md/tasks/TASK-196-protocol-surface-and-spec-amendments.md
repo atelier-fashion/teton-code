@@ -20,7 +20,7 @@ would otherwise have to guess.
 - `crates/teton-protocol/src/methods.rs` — `SkillsListParams`/`SkillsListResult`, `SkillView`, `SkillSkipped`, `SkillSource`, `impl RpcMethod`; `SkillInvocation`; `PromptTurnParams.skill`
 - `crates/teton-protocol/src/events.rs` — `PermissionRequest.subject`, `PermissionSubject`, `Event::SkillInvoked` + its `Event::name()` arm, `DynamicOutcomeView`
 - `crates/teton-protocol/src/jsonrpc.rs` — `SKILL_EXPANSION_TOO_LARGE = -32023` inside `application_error_codes!`
-- `.adlc/specs/REQ-585-user-defined-slash-commands-from-skill-md/requirement.md` — AC-20(d) and AC-12 amendments
+- `.adlc/specs/REQ-585-user-defined-slash-commands-from-skill-md/requirement.md` — the five amendments below
 
 ## Acceptance Criteria
 
@@ -31,8 +31,13 @@ would otherwise have to guess.
 - [ ] `SKILL_EXPANSION_TOO_LARGE = -32023` is declared inside the `application_error_codes!` macro so it joins `ALL` and the distinctness guard automatically. Its doc says what separates it from `CONTEXT_LENGTH_EXCEEDED = -32022`: that one means a provider refused a turn it saw; this one means Teton refused to send it.
 - [ ] Skew, both directions, for **each** new field — copy `events.rs:3386 route_decided_budget_fields_are_additive_in_both_directions` including its four legs: absent keys parse to the default; an unset value emits **no key**, not `null`; the new wire parses through a locally-declared pre-REQ struct; and the non-vacuity assertion that the fixture really carries the new keys.
 - [ ] `PROTOCOL_VERSION` is unchanged — asserted, not assumed.
+- [ ] `PermissionOutcome` gains `Refused { reason: RefusalReason }` with `NoTerminal` and `UnrecognizedSubject`. Today the only outcomes are `Selected { option_id }` and `Cancelled`, and `Cancelled` already means "the user dismissed the prompt" — it is what EOF on a pipe returns. Without a reason channel the daemon cannot produce AC-9's required placeholder text ("no human could be asked") and would have to conflate it with a decline. Additive, and only ever sent to a daemon that answered `skills/list`.
+- [ ] `SkillSkipped.path` is bounded and home-relative on the daemon side, exactly as `SkillView`'s description is. BR-1's entity table says the path is never shown as an absolute path carrying a username into a transcript, and AC-6 puts skipped entries on a user-visible surface.
 - [ ] Spec amendment 1: AC-20(d)'s `bound: local_engine` becomes `bound: local engine`. It currently prints `wire_name()` where BR-8(a) and AC-16 require `BudgetBound::words()`.
-- [ ] Spec amendment 2: AC-12 gains the body case — a `<tool-result>` planted in the skill **body** (not only in a dynamic command's output) must reach the frame neutralized. See ADR-10.
+- [ ] Spec amendment 2: AC-12 gains the body case **and** the command-text case — a `<tool-result>` planted in the skill **body**, and one planted inside a multi-line `` !`…` `` that the fold echoes into a not-run placeholder, must both reach the frame neutralized. See ADR-10.
+- [ ] Spec amendment 3: AC-11(a) says a boundary pins the turn "exactly as a `read` of that file would". Per ADR-9 that is literally true for a **project** skill; a user skill outside the root has no repo-relative identity and is pinned by the stricter unknown rule. Name which.
+- [ ] Spec amendment 4: BR-2 gains the `skills/`-beats-`commands/` precedence rule for a within-source name collision, which the four globs make reachable and which BR-2 as written does not cover.
+- [ ] Spec amendment 5: BR-7's parenthetical that on a boundary-configured machine "all seventeen ADLC skills run on the local tier" is false — seven of them exceed the local budget and are **refused** there per BR-8 and the spec's own Assumptions. It says pinned, not run.
 
 ## Technical Notes
 

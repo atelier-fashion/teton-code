@@ -46,8 +46,8 @@ skills/list ──────────────────────�
 type "/status foo"
 classify(line, &snapshot) → Input::Skill  (BR-10)
 session/prompt { prompt: [], skill } ►   run_prompt_turn
-                                          ├─ route + budget      (REQ-586)
                                           ├─ expand(registry, name, args)  (BR-4)
+                                          ├─ route + budget, over the EXPANSION
                                           ├─ REFUSE if body-only over budget (BR-8d)
                                           ├─ authorize("skill:<src>:<name>")  (BR-6)
    ◄──────────────── PermissionRequest { subject: SkillDynamicContext }
@@ -55,11 +55,28 @@ session/prompt { prompt: [], skill } ►   run_prompt_turn
 permission/respond ─────────────────►
                                           ├─ run_bounded × N, in order   (BR-6)
                                           ├─ fold outcomes → final text
-                                          ├─ REFUSE if now over budget   (BR-8d)
    ◄──────────────── SkillInvoked { … }    │                              (BR-12)
+                                          ├─ REFUSE if now over budget   (BR-8d)
                                           └─ CarriedTurn::begin(text, sources) (BR-7)
    ◄──────────────── turn events, cost row
 ```
+
+**Expansion precedes routing, and that ordering is load-bearing.** The freeform
+route is decided by `dispatch_route(..., &prompt)` (`crates/tetond/src/runtime.rs:2830`),
+which runs the classifier *over the prompt text*, and `spawn_title_session(...,
+&prompt)` (`:2858`) spends the session's one naming attempt on the same string.
+Since a skill turn's `prompt` is empty (ADR-3), expanding after routing would
+classify and name every skill invocation from `""` — BR-4's "the turn then takes
+the same classifier and routing a typed prompt takes" would be false, and on a
+machine with per-category bindings `/analyze` could be routed to the local tier
+and then refused by its own budget check. The expansion is available before
+routing (it needs only the registry and the raw argument string), so it is built
+first and handed to both.
+
+Routing sees the **body-only** expansion, before dynamic output is folded in.
+That is deliberate: the classifier reads the skill's instructions, which is what
+determines the work, and the alternative would make the route depend on the
+output of commands the route's own permission level decides whether to run.
 
 The refusal sits **between** route resolution and `CarriedTurn::begin`
 (`crates/tetond/src/runtime.rs:2935`). That call both pushes the user block and
@@ -127,9 +144,17 @@ not an error. Every other new wire element is additive
 **Why.** An empty snapshot makes `classify` incapable of returning
 `Input::Skill`, so a new CLI against an old daemon behaves byte-for-byte as it
 does today and never sends `PromptTurnParams.skill`. The capability is proven
-by a successful call rather than asserted from a version number — and it is the
-same property that makes ADR-6's fail-closed consent sound: the only client that
-can *receive* a skill consent request is one that asked for skills.
+by a successful call rather than asserted from a version number.
+
+**What this handshake does *not* buy — corrected in Phase 3.** It is tempting to
+argue that only a client which asked for skills can receive a skill consent
+request. That is false: `permission_request` is delivered to **every** connection
+attached to the session, and **any** connection that may drive may answer it
+(only monitors are refused). Two attached clients is a supported, consented
+topology (REQ-570), so a pre-REQ-585 client attached alongside a new one would
+see the request, understand no `subject`, and call `prompter.ask` — on a pipe,
+turning the next stdin line into a `y` that authorizes shell commands. ADR-7
+therefore enforces the property instead of inheriting it.
 
 **Guard.** Skew tests in both directions, copying
 `events.rs:3386 route_decided_budget_fields_are_additive_in_both_directions`
@@ -154,15 +179,18 @@ pub struct PromptTurnParams {
 }
 ```
 
-The daemon rejects `INVALID_PARAMS` when both are empty **and** when both are
-populated.
+The daemon rejects `INVALID_PARAMS` when **both** are populated — a combination
+that was never valid, so nothing is narrowed. It does **not** newly reject a
+both-empty request: `flatten_prompt(&[])` returns `""` and such a turn runs
+today, and rejecting it would narrow an existing method for third-party clients
+while `PROTOCOL_VERSION` is asserted unchanged.
 
-**Why.** `serde` ignores unknown fields, so a middle box or an older daemon that
-drops `skill` would otherwise silently send whatever was in `prompt`. Requiring
-`prompt` to be empty for a skill turn makes that failure loud: the request dies
-as invalid instead of shipping the raw `/name args` line to a model. The client
-never composes the body, which also keeps the untrusted bytes on the side of the
-seam that sanitizes them (LESSON-517).
+**Why the client sends `prompt: []`.** The failure mode worth designing against
+is a raw `/name args` line reaching a model. It cannot happen, because the CLI
+never puts the typed line in `prompt` at all — a dropped `skill` field yields a
+visible empty turn, not a leaked command line. The client also never composes
+the body, which keeps the untrusted bytes on the side of the seam that sanitizes
+them (LESSON-517).
 
 `raw_arguments` is the rest of the line **verbatim** — this is the one place the
 session does not use REQ-582 ADR-2's tokenization (BR-4), so it must not be
@@ -257,6 +285,15 @@ the collision to project-vs-project, and dropping project grants at `/cd` closes
 it — the grant map is carried state, and carried state sheds its invariants
 silently (LESSON-501).
 
+**Within one source, `skills/` beats `commands/`.** BR-2 defines precedence for
+reserved-vs-skill and project-vs-user and stops there, but the four globs make
+`~/.claude/skills/status/SKILL.md` and `~/.claude/commands/status.md` a legal
+pair: same name, same source, and — fatally for this ADR — the same key
+`skill:user:status`. A remembered grant would authorize whichever file won, and
+would silently move to the other if the winner ever changed. `skills/` wins, the
+`commands/` entry is listed as shadowed, and REQ-555's "one spelling reaches one
+handler" holds.
+
 **What must not happen**, each with its own test: a `shell` allow-always must not
 answer a skill request; a skill allow-always must not answer `shell`; a grant on
 one skill must not answer another; `authorize`'s `debug_assert!` against web
@@ -290,11 +327,28 @@ recognize the request **without parsing the key**; `OPTION_ID_ENABLE_PERMANENT`
 is the shipped precedent for "the one value a client may select by string, and
 everything else by typed kind", and its doc says why.
 
-**Fail-closed.** `#[serde(other)] Unrecognized` means a future subject a client
-does not know maps to a variant it *can* see, and the client refuses rather than
-falling through to `prompter.ask`. An *older* client sees no field at all — and
-under ADR-2 an older client never asks for skills, so it can never receive this
-request. Both halves are asserted.
+**Delivery is addressed, not broadcast.** A skill consent is delivered **only to
+the connection that sent the invocation**, and only that connection may answer
+it. This is not a refinement — it is the guard, because an older client attached
+to the same session would otherwise receive a request it cannot recognize and
+answer it by reading stdin (ADR-2). BUG-177 already established connection-
+targeted delivery for the replay path; this reuses that shape. It is also the
+right semantics on its own terms: the person who typed `/status` is the person
+who should approve its commands.
+
+**Fail-closed on top of that.** `#[serde(other)] Unrecognized` means a future
+subject a client does not know maps to a variant it *can* see, and the client
+refuses rather than falling through to `prompter.ask`. Both halves are asserted:
+that an unaddressed connection never receives the request, and that a recognized-
+but-unknown subject is refused.
+
+**A refusal carries a reason.** `PermissionOutcome` today is `Selected { option_id }`
+or `Cancelled`, and `Cancelled` already means "the user dismissed the prompt"
+(it is what EOF on a pipe returns). AC-9 requires the placeholders to say *no
+human could be asked*, which the daemon cannot know from either. `PermissionOutcome`
+therefore gains `Refused { reason: RefusalReason }` with `NoTerminal` and
+`UnrecognizedSubject` — additive, and only ever sent to a daemon that answered
+`skills/list`.
 
 ## ADR-8 — The pipe rule is a pure two-input predicate consulted before `prompter.ask`
 
@@ -326,7 +380,12 @@ as an answer (`cli_e2e.rs:1830` is the existing "does not eat a line" template).
 ```rust
 enum Provenance {
     System,
-    User { sources: BTreeSet<ProvenanceId> },   // was a unit variant
+    // was a unit variant. Two fields, not one: `unknown` cannot be encoded in
+    // the set, because the empty set already means *ordinary typed prompt text*
+    // — the state every existing `push_user` caller is in. `DroppedProvenance`
+    // carries the same pair for the same reason: "unknown" and "these files"
+    // are both true at once.
+    User { sources: BTreeSet<ProvenanceId>, unknown: bool },
     Model,
     Tool { tool: String, provenance: ToolProvenance },
 }
@@ -358,9 +417,8 @@ session has no repo-relative identity, so `from_resolved` returns
 
 **Decision:** do not widen `from_resolved` and do not reach for `claimed` (its
 doc says appearing in a first-party path is a bug). A user skill whose id cannot
-be minted is recorded as **`ToolProvenance::Unknown`-equivalent** for the user
-block — i.e. the turn fails closed whenever any boundary is configured, exactly
-as `shell` output does. That is stricter than the spec's letter and correct in
+be minted sets `unknown: true` on its user block — the turn then fails closed
+whenever any boundary is configured, exactly as `shell` output does. That is stricter than the spec's letter and correct in
 the charter's direction: the alternative is a file outside the root silently
 counting as unpinnable. BR-7's "exactly as a `read` would" therefore holds
 literally for project skills and *more strictly* for user skills; AC-11(a) is
@@ -389,6 +447,17 @@ envelope inside one block. The expander is a new frame author and takes the
 frame author's duty. **AC-12 is amended** to cover the body case, not just the
 dynamic-output case.
 
+**The duty covers everything the fold splices, not just the body.** The
+not-run placeholder embeds the command text verbatim, and the scanner's grammar
+puts no restriction on what sits between the backticks — so a project skill
+(repo content, which the spec's Assumptions say may be authored by someone other
+than the user) carrying a *multi-line* `` !`…` `` whose second line is a
+flush-left `</tool-result>` forges the same close. The inversion is what makes
+it sharp: `plan` — the level where **no command runs** — is the level where the
+raw command bytes reach the model. So `fold` neutralizes envelope tags in every
+string it splices, and the echoed command is additionally rendered on one line
+and bounded, the way every other file-supplied string on a surface is.
+
 ## ADR-11 — Two budget checks, one measurement, one new error code
 
 **Decision.** `error_code::SKILL_EXPANSION_TOO_LARGE = -32023`, distinct from
@@ -401,7 +470,21 @@ REQ-586's `CONTEXT_LENGTH_EXCEEDED = -32022`.
 
 Both measure through **one** function, `ContextManager::would_seed_fit(system,
 text, budget) -> Fit`, implemented over the existing `tokens_of`/`bytes_of` —
-the same estimators the pressure path uses. Nothing re-derives a budget:
+the same estimators the pressure path uses — and it charges the measurement with
+**`truncated = true`**.
+
+That last word is the whole guard. `bytes_of(blocks, truncated)` adds
+`TRUNCATION_NOTE_BYTES + CONTINUATION_USER_TURN.len()` = 142 B only when
+`truncated` is set (`crates/tetond/src/harness/context.rs:987-1016`). A skill
+turn in a session with history passes an un-surcharged check, is replayed, and
+then `truncate_to_budget` drops history down to one block and sets `truncated`
+— adding 142 B nobody charged. The clamp then fires on the **last** block, which
+is the skill expansion, and middle-elides it: exactly what BR-8 forbids
+("never middle-elided into something the user did not invoke") and BR-4 forbids
+("carried whole or refused"). Charging the surcharge up front closes the band,
+and it is the same correction `attempt_compaction` already makes for the same
+reason (`context.rs:1184`: measured `with truncated forced true on both sides`).
+A second, direct assertion backs it up: the skill block is never clamped. Nothing re-derives a budget:
 `Router::budget_for` stays the single `budget::derive` caller.
 
 **Why Stage A does not charge the worst case.** It could reserve `MAX_OUTPUT_CHARS`
@@ -441,6 +524,12 @@ empty, copying
 base) → blank → `skills — arguments are passed through as typed:` → one row per
 skill → the diagnostic line → blank → `ARGUMENT_FOOTER` → `ESCAPE_FOOTER`.
 `ARGUMENT_FOOTER` is qualified to name the built-in rows it describes.
+
+**An empty registry renders no section at all** — no header, no `0 skills` line.
+That is the default state of every user with no `~/.claude`, and it is the state
+ADR-2 produces against an old daemon, where the claim is that `/help` is
+byte-for-byte what it is today. A section announcing nothing would make that
+claim false for the majority of users.
 
 **Why both.** `ARGUMENT_FOOTER` says quotes are not interpreted and arguments
 split on whitespace; BR-4 makes that false for skill rows. Leaving it unqualified
@@ -512,7 +601,15 @@ leaves the producer unguarded — the assertion must run against the value the
 daemon actually emitted.
 
 `path_display` is `session_root::display_for` (home-relative), bounded with
-`bounded_field`. The body is never printed.
+`bounded_field`. The body is never printed. The **skipped** entries' paths are
+bounded the same way — an unreadable `/Users/jane/.claude/skills/broken/SKILL.md`
+must not carry a username into a transcript (BR-1's entity table).
+
+**The event is published before Stage B, not after.** A turn where the user
+approved four commands, watched them run, and was then refused is precisely the
+turn whose record matters most; emitting after the refusal would leave it with
+no echo line and no `/verbose` outcomes, while BR-12 says *every* invocation
+echoes one.
 
 ---
 
@@ -531,15 +628,43 @@ daemon actually emitted.
 
 ## Amendments this design makes to the spec
 
-Both are contradictions the implementer would otherwise have to guess at, and
-both are carried by TASK-196:
+Each is a place the spec as written cannot be implemented as written. All are
+carried by TASK-196, which is the one task that edits `requirement.md`:
 
 1. **AC-20(d)** says `bound: local_engine`; BR-8(a) and AC-16 say the bound is
    spoken. It becomes `bound: local engine`.
 2. **AC-12** covers a `<tool-result>` planted in a dynamic command's *output*.
-   Per ADR-10 it must also cover one planted in the **body**, because the
-   expander concatenates file text with a harness-authored envelope inside one
-   block.
+   Per ADR-10 it must also cover one planted in the **body**, and one planted in
+   a multi-line `` !`…` `` command that the fold echoes into a placeholder.
+3. **AC-11(a)** says a skill file under a `local-only` boundary pins the turn
+   "exactly as a `read` of that file would". Per ADR-9 that holds literally for
+   a **project** skill; a user skill outside the root has no repo-relative
+   identity and is pinned by the stricter unknown rule. The AC names which.
+4. **BR-2** defines precedence for reserved-vs-skill and project-vs-user but not
+   for `skills/` vs `commands/` **within one source**, which the four globs make
+   reachable. `skills/` wins; see ADR-6.
+5. **BR-7's** parenthetical that on a boundary-configured machine "all seventeen
+   ADLC skills run on the local tier" is false and contradicts BR-8 plus the
+   spec's own Assumptions: seven of the seventeen exceed the local budget and
+   are **refused** there, not run. The sentence says pinned, not run.
+
+## What Phase 3's adversary pass changed
+
+Eleven findings survived refutation; nine changed this document. The four that
+changed a decision rather than a detail:
+
+- **Expansion now precedes routing.** The freeform classifier and the session
+  namer both read `&prompt`, ~100 lines before where the expansion was going to
+  be built — so every skill turn would have been classified and named from `""`.
+- **The consent is addressed, not broadcast.** `permission_request` reaches every
+  attached connection and any driver may answer it, so the handshake could not
+  carry the fail-closed property ADR-7 was resting on it.
+- **`would_seed_fit` charges `truncated = true`.** A 142-byte surcharge appears
+  only after replay, and the block it pushes over the line is the skill
+  expansion itself.
+- **`Provenance::User` needs two fields.** The empty set already means ordinary
+  typed text, so it could not double as the unpinnable marker without pinning
+  every prompt on every boundary-configured machine.
 
 ## Risks
 
