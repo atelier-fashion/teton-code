@@ -337,6 +337,41 @@ pub enum SkillSource {
     Project,
 }
 
+/// The permission key a skill's dynamic context asks under: `skill:<source>:<name>`.
+///
+/// **One home, because two crates enforce one rule.** The daemon mints the key
+/// and drops the project-scoped ones when the session root moves (ADR-6); the
+/// client memoizes "allow for this session" answers under the *same* string and
+/// has to forget them at the same moment. Those are the two halves of one
+/// decision, and a decision with two stores needs one invalidation rule — so
+/// the spelling and the predicate live here, above both, rather than being
+/// written out twice and drifting.
+#[must_use]
+pub fn skill_permission_key(source: SkillSource, name: &str) -> String {
+    format!("{}{name}", skill_permission_key_prefix(source))
+}
+
+/// The `skill:<source>:` prefix every key of one source shares.
+#[must_use]
+pub fn skill_permission_key_prefix(source: SkillSource) -> String {
+    let word = match source {
+        SkillSource::User => "user",
+        SkillSource::Project => "project",
+    };
+    format!("skill:{word}:")
+}
+
+/// True when `key` is a **project** skill's dynamic-context key — the grants a
+/// root move invalidates, on either side of the wire.
+///
+/// A user skill's file is the same file whatever the session root is, so its
+/// grant survives; a project skill's name means a different file in a different
+/// repo, which is the whole of ADR-6's argument.
+#[must_use]
+pub fn is_project_skill_key(key: &str) -> bool {
+    key.starts_with(&skill_permission_key_prefix(SkillSource::Project))
+}
+
 /// One registered skill, as a client sees it (REQ-585 BR-3, ADR-1).
 ///
 /// This is the whole of what the CLI holds: enough to classify a `/name` line

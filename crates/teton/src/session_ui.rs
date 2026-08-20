@@ -76,6 +76,30 @@ impl SessionGrants {
         self.allow_always.insert(tool.to_owned());
     }
 
+    /// Forget every **project** skill grant, because the session root moved.
+    ///
+    /// The other half of ADR-6, and the half a daemon-side test cannot see.
+    /// `PermissionGate::drop_project_skill_grants` forgets the daemon's copy on
+    /// `/cd`; this store holds the same key, is consulted *before* any prompt is
+    /// drawn, and answers `allow_always` on its own. Without this, the daemon
+    /// re-asks after a root move and the client auto-answers from a grant the
+    /// user gave in a different repo — one `auto-allow` line, no commands
+    /// shown, and the daemon then re-remembers it under the new root. That is
+    /// exactly the harm ADR-6 exists to prevent, one hop across the seam.
+    ///
+    /// User skills are kept: `~/.claude/skills/<name>` is the same file
+    /// whatever the root is. The predicate is
+    /// [`teton_protocol::methods::is_project_skill_key`] rather than a literal
+    /// prefix, so the two stores cannot drift about which keys expire.
+    pub fn forget_project_skills(&mut self) -> usize {
+        let before = self.allow_always.len() + self.reject_always.len();
+        self.allow_always
+            .retain(|key| !teton_protocol::methods::is_project_skill_key(key));
+        self.reject_always
+            .retain(|key| !teton_protocol::methods::is_project_skill_key(key));
+        before - (self.allow_always.len() + self.reject_always.len())
+    }
+
     /// Remember a deny-for-session grant.
     pub fn reject_always(&mut self, tool: &str) {
         self.reject_always.insert(tool.to_owned());
@@ -900,6 +924,14 @@ pub fn render_event(
                         // refresh, and re-fetching on another session's move
                         // would ask for a root this client never had.
                         state.skills_stale = true;
+                        // …and the answers the user gave about *this* root's
+                        // skills. The daemon drops its copy inside
+                        // `set_session_cwd`; this is the same moment on this
+                        // side of the wire, under the same own-session
+                        // condition, because a grant consulted before the
+                        // prompt is drawn would otherwise auto-answer for a
+                        // repo the user never approved.
+                        state.grants.forget_project_skills();
                     }
                     surface.line(
                         LineKind::Notice,
@@ -7713,6 +7745,59 @@ mod skill_tests {
         assert!(
             !state.take_skills_stale(),
             "reading clears it: one move, one fetch"
+        );
+    }
+
+    /// **ADR-6's client half.** A root move forgets the answers the user gave
+    /// about *this* root's skills, and keeps the ones that are still about the
+    /// same file.
+    ///
+    /// This store is consulted *before* any prompt is drawn, so a grant that
+    /// outlived its root does not merely linger — it silently answers. The
+    /// daemon drops its copy inside `set_session_cwd` and then re-asks; without
+    /// this, the re-ask is auto-answered from a different repo's approval, one
+    /// `auto-allow` line goes by, the commands are never shown, and the daemon
+    /// re-remembers the grant under the new root. The daemon-side test cannot
+    /// see any of that, because by then the request never reaches a human.
+    #[test]
+    fn a_root_move_forgets_the_project_skill_grants_and_keeps_the_others() {
+        use teton_protocol::methods::{skill_permission_key, SkillSource};
+
+        let mut surface = RecordingSurface::new();
+        let mut state = SessionState::new();
+        state.session_id = Some(SessionId::from("s1"));
+
+        let project = skill_permission_key(SkillSource::Project, "deploy");
+        let user = skill_permission_key(SkillSource::User, "status");
+        state.grants.allow_always(&project);
+        state.grants.allow_always(&user);
+        state.grants.allow_always("shell");
+        state
+            .grants
+            .reject_always(&skill_permission_key(SkillSource::Project, "canary"));
+
+        render_event(&root_moved("s1"), &mut surface, &mut state);
+
+        assert!(
+            !state.grants.is_allow_always(&project),
+            "a project skill's grant outlived the root that gave its name meaning",
+        );
+        assert!(
+            !state
+                .grants
+                .is_reject_always(&skill_permission_key(SkillSource::Project, "canary")),
+            "a project skill's refusal outlived it too — the same key names another file now",
+        );
+        // Kept: `~/.claude/skills/status` is the same file whatever the root
+        // is, and `shell` is not root-scoped at all. Forgetting these would
+        // re-ask questions whose answers are still true.
+        assert!(
+            state.grants.is_allow_always(&user),
+            "a user skill's grant is still about its file"
+        );
+        assert!(
+            state.grants.is_allow_always("shell"),
+            "`shell` is not root-scoped"
         );
     }
 

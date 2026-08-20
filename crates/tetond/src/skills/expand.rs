@@ -252,6 +252,16 @@ impl Expansion<Pending> {
 ///
 /// The flag is what BR-4's `ARGUMENTS:` fallback keys on, and it is set by an
 /// out-of-range `$9` as much as by a `$1` that hit — the body *asked* for its
+/// The ceiling substitution stops at, well above any route's budget.
+///
+/// Not a product limit — a route's budget is the product limit, and Stage A is
+/// what enforces it. This exists only so an expansion that is *going* to be
+/// refused cannot exhaust the daemon's memory on its way to being measured. Two
+/// megabytes is ~64× the local byte budget and ~30× the largest shipped skill,
+/// so nothing a user could plausibly want reaches it, and everything that does
+/// reach it fails Stage A on the next statement.
+const EXPANSION_CEILING_BYTES: usize = 2 * 1024 * 1024;
+
 /// arguments positionally, so appending them again would be a second copy.
 fn substitute(body: &str, raw_arguments: &str) -> (String, bool) {
     let tokens: Vec<&str> = raw_arguments.split_whitespace().collect();
@@ -260,6 +270,22 @@ fn substitute(body: &str, raw_arguments: &str) -> (String, bool) {
     let mut cursor = 0usize;
 
     while let Some(rel) = body[cursor..].find('$') {
+        // Every *input* here is bounded and the *product* was not. The body is
+        // capped at `SKILL_MAX_BYTES` (64 KiB) and the argument string only by
+        // the RPC frame (~4 MiB), but each `$ARGUMENTS` copies the whole
+        // argument — and a 64 KiB body holds thousands of them. So one
+        // `session/prompt` could ask for tens of gigabytes, allocated *before*
+        // Stage A ever measured anything, in a daemon every session shares
+        // (REQ-585 verify).
+        //
+        // Stopping here rather than at the budget check is the point: the
+        // budget check cannot run on a string that was never allocated. What is
+        // emitted so far is already past any route's ceiling, so Stage A
+        // refuses it with the message it would have anyway.
+        if out.len() > EXPANSION_CEILING_BYTES {
+            out.push_str(&body[cursor..]);
+            return (out, saw_placeholder);
+        }
         let at = cursor + rel;
         out.push_str(&body[cursor..at]);
         let rest = &body[at + 1..];
@@ -334,6 +360,44 @@ fn not_run(command: &Command, reason: &str) -> String {
 
 #[cfg(test)]
 mod tests {
+    /// A body that multiplies its argument cannot ask for unbounded memory
+    /// before anything has measured it.
+    ///
+    /// Every input is bounded — the body at `SKILL_MAX_BYTES`, the argument at
+    /// the RPC frame — and the *product* was not: each `$ARGUMENTS` copies the
+    /// whole argument, and a 64 KiB body holds thousands of them. The budget
+    /// check cannot save a string that was never allocated, and the daemon is
+    /// shared by every session, so the ceiling has to bite inside `substitute`.
+    #[test]
+    fn a_body_that_multiplies_its_argument_stops_at_the_ceiling() {
+        let body = "$ARGUMENTS".repeat(4_000);
+        let argument = "x".repeat(64 * 1024);
+        // Unbounded, this asks for 4,000 x 64 KiB = 256 MiB.
+        let (out, saw) = substitute(&body, &argument);
+        assert!(saw, "it substituted before it stopped");
+        assert!(
+            out.len() <= EXPANSION_CEILING_BYTES + argument.len() + body.len(),
+            "substitution ran past its ceiling: {} bytes",
+            out.len()
+        );
+        // And what it produced is still far past any route's budget, so Stage A
+        // refuses it with the message it would have had anyway.
+        assert!(out.len() > crate::harness::budget::LOCAL_BUDGET_BYTES);
+    }
+
+    /// The ceiling never fires on anything a user could plausibly want: the
+    /// largest shipped skill is ~50 KiB and the local byte budget is 32 KiB.
+    #[test]
+    fn an_ordinary_expansion_is_nowhere_near_the_ceiling() {
+        let body = "Analyze $ARGUMENTS and report.\n".repeat(1_000);
+        let (out, _) = substitute(&body, "the teton-code repo");
+        assert!(
+            out.len() < EXPANSION_CEILING_BYTES / 8,
+            "{} bytes",
+            out.len()
+        );
+    }
+
     use super::*;
 
     use std::path::PathBuf;

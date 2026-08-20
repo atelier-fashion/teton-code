@@ -334,7 +334,10 @@ impl SkillRegistry {
 /// grant must not free a model-issued `shell` call.
 #[must_use]
 pub fn permission_key_for(source: SkillSource, name: &str) -> String {
-    format!("skill:{}:{name}", source_word(source))
+    // Delegated, not re-spelled: the client memoizes an answer under this exact
+    // string and must forget it at the same moment the daemon does, so the
+    // spelling lives above both crates (`teton_protocol::methods`).
+    teton_protocol::methods::skill_permission_key(source, name)
 }
 
 /// The wire and key spelling of a source: `user` or `project`.

@@ -2272,14 +2272,39 @@ fn the_two_refusals_bracket_the_consent_seam_and_precede_the_seed() {
         .collect();
     assert_eq!(
         raises.len(),
+        4,
+        "`run_prompt_turn` raises `-32023` at exactly four places: BR-8's two \
+         stages, and the two reroute arms that would otherwise clamp the \
+         expansion instead of refusing it"
+    );
+
+    // Two of them are the stages, and they are above the seed — that is BR-8(c).
+    let before: Vec<usize> = raises.iter().copied().filter(|at| *at < seed).collect();
+    assert_eq!(
+        before.len(),
         2,
-        "BR-8 has exactly two stages, so `run_prompt_turn` raises `-32023` twice"
+        "BR-8's two stages both refuse above `CarriedTurn::begin`, which pushes \
+         the user block and arms the drop-commit (BR-8c)"
     );
-    assert!(
-        raises.iter().all(|raise| *raise < seed),
-        "a refusal is raised below `CarriedTurn::begin`, which has already pushed \
-         the user block and armed the drop-commit (BR-8c)"
-    );
+
+    // The other two are *necessarily* below it, and that is not a violation of
+    // the same rule — it is a different situation. A mid-turn reroute swaps in
+    // a smaller budget after the turn was assembled, and the choice there is
+    // between refusing whole and middle-eliding the expansion in place. BR-8
+    // and BR-4 both say refuse. The block is already in the conversation by
+    // then, put there by the attempt that is being abandoned; what this
+    // prevents is the model being handed a mangled version of an instruction
+    // set the user did invoke.
+    let after: Vec<usize> = raises.iter().copied().filter(|at| *at > seed).collect();
+    assert_eq!(after.len(), 2, "both reroute arms guard the expansion");
+    for raise in &after {
+        let window = &body[raise.saturating_sub(400)..*raise];
+        assert!(
+            window.contains("skill_would_not_survive_refit"),
+            "a refusal below the seed must come from the refit guard, not from a \
+             stage that lost its position"
+        );
+    }
 }
 
 /// **Expansion precedes routing**, as a structural fact to go with the
@@ -2381,8 +2406,17 @@ fn no_model_call_happens_at_expansion_time() {
         "the dynamic context must run through the extracted runner (ADR-14), \
          which is the caller that has no duty attached to it"
     );
+    // Code, not prose *about* code. The claim is that the seam does not reach
+    // for the shell tool; a comment explaining why it does not is the opposite
+    // of a violation, and scanning it as one would make the honest thing to
+    // write the thing that fails.
+    let seam_code: String = seam
+        .lines()
+        .filter(|line| !line.trim_start().starts_with("//"))
+        .collect::<Vec<_>>()
+        .join("\n");
     assert!(
-        !seam.contains("ShellTool"),
+        !seam_code.contains("ShellTool"),
         "the seam reached for the `shell` tool itself, which carries `refine` \
          and the whole model-call path with it"
     );

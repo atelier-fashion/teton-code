@@ -114,6 +114,10 @@ pub enum ReadError {
     },
     /// Not valid UTF-8.
     NotUtf8,
+    /// The file itself is a symlink. Refused for the reason every entry
+    /// symlink is refused — and reported separately so the diagnostic says
+    /// *why* rather than blaming a permission the user has.
+    SymlinkLeaf,
 }
 
 /// The filesystem, as discovery is allowed to see it.
@@ -167,10 +171,36 @@ impl DirLister for RealFs {
     }
 
     fn read(&self, file: &Path) -> Result<String, ReadError> {
-        let metadata = std::fs::metadata(file).map_err(|error| match error.kind() {
+        // `symlink_metadata`, not `metadata`: the entry rule refuses a symlink
+        // and this leaf must be refused by the same rule.
+        //
+        // Under `Shape::Skills` the *entry* is the directory, so `consider`'s
+        // symlink check never sees `<dir>/SKILL.md` — and `metadata` follows.
+        // Two things went wrong through that hole, and only the first is about
+        // walk cost, which is what the module doc used to argue about:
+        //
+        // 1. **The jail.** `.claude/skills/x/SKILL.md -> ~/.ssh/id_rsa` in a
+        //    cloned repo put that file's bytes into a prompt. `ReadTool`
+        //    resolves a link and refuses a target outside the root; discovery
+        //    did neither.
+        // 2. **One file, two identities.** `ProvenanceId::from_resolved` is
+        //    documented as taking a *canonical* path, and was handed the link.
+        //    So `SKILL.md -> ../../../.env` minted the id
+        //    `.claude/skills/x/SKILL.md`, which no `local_only = [".env"]` glob
+        //    matches — BR-7's "pins exactly as a `read` would" was false for
+        //    precisely the shape that most needed it (LESSON-503: mint an id at
+        //    the scope that resolves it).
+        //
+        // Refusing is the cheaper of the two fixes and the consistent one: the
+        // rule the rest of this module states is already "a symlinked entry is
+        // not followed", and a skill file is an entry.
+        let metadata = std::fs::symlink_metadata(file).map_err(|error| match error.kind() {
             std::io::ErrorKind::NotFound => ReadError::NotFound,
             _ => ReadError::Denied,
         })?;
+        if metadata.file_type().is_symlink() {
+            return Err(ReadError::SymlinkLeaf);
+        }
         if !metadata.is_file() {
             return Err(ReadError::NotRegular);
         }
@@ -356,6 +386,10 @@ fn read_or_name(
         Ok(text) => return Some(text),
         Err(ReadError::NotFound | ReadError::NotRegular) => return None,
         Err(ReadError::Denied) => SkipReason::Unreadable,
+        // The same verdict a symlinked entry earns, for the same reason: the
+        // rule is about what discovery declines to follow, and a `SKILL.md`
+        // that is a link is a link.
+        Err(ReadError::SymlinkLeaf) => SkipReason::SymlinkEntry,
         Err(ReadError::Oversize { bytes }) => SkipReason::Oversize { bytes },
         Err(ReadError::NotUtf8) => SkipReason::NotUtf8,
     };

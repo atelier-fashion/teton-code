@@ -1445,11 +1445,32 @@ impl ContextManager {
         let mut sources = BTreeSet::new();
         let mut unknown = false;
         for block in &self.blocks {
-            if let Provenance::Tool { provenance, .. } = &block.provenance {
-                match provenance {
+            match &block.provenance {
+                Provenance::Tool { provenance, .. } => match provenance {
                     ToolProvenance::Sources(paths) => sources.extend(paths.iter().cloned()),
                     ToolProvenance::Unknown => unknown = true,
+                },
+                // **The fourth seam** (REQ-585 verify). ADR-9 named three places
+                // that had to learn a user block can carry file provenance —
+                // `absorb`, `context_provenance`, `replay_blocks` — and this was
+                // not one of them, so a compacted skill expansion arrived here
+                // as an ordinary user block and contributed nothing.
+                //
+                // That laundered a summary of a `local-only` file into clean
+                // provenance, and it defeated its own backstop:
+                // `CarriedTurn::commit_now` taints the session from
+                // `context_provenance`, but reads it *after* this compaction has
+                // run, so the taint never fired either. The module's promise
+                // one screen above — "a summary of a secret is a secret" — was
+                // false for exactly the block type this REQ introduced.
+                Provenance::User {
+                    sources: block_sources,
+                    unknown: block_unknown,
+                } => {
+                    sources.extend(block_sources.iter().cloned());
+                    unknown |= *block_unknown;
                 }
+                Provenance::System | Provenance::Model => {}
             }
         }
         Some(ContextBlock {

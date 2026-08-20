@@ -3109,12 +3109,20 @@ impl DaemonRuntime {
         // ``[dynamic context not run: `<cmd>` — <reason>]`` (BR-6).
         skill.text = expansion.fold(&outcomes);
 
-        // BR-7: output that came from a command carries what `shell` output
+        // BR-7: anything that came from a command carries what `shell` output
         // carries — nothing that can be pinned. On a boundary-configured machine
-        // that fails closed, so an invocation that ran **any** command pins its
-        // turn to the local tier, exactly as a `shell` result does. Recorded on
-        // the block the seed below builds, which is what egress inspects.
-        skill.unknown |= outcomes.iter().any(DynamicOutcome::did_run);
+        // that fails closed, so an invocation that **spawned** any command pins
+        // its turn to the local tier, exactly as a `shell` result does. Recorded
+        // on the block the seed below builds, which is what egress inspects.
+        //
+        // `spawned`, not `did_run`: a command that ran and exited non-zero, or
+        // timed out, produces no output but still reports a *value the command
+        // chose*, and `fold` writes that value into the prompt (`exited 2`).
+        // Asking about output left a side channel that pinned nothing — one bit
+        // per command about a boundary-protected file, in a turn free to route
+        // remote. `ShellTool::run` tags every spawned arm the same way, and the
+        // claim above is parity with it.
+        skill.unknown |= outcomes.iter().any(DynamicOutcome::spawned);
 
         events.publish(
             Some(session_id.clone()),
@@ -3559,6 +3567,33 @@ impl DaemonRuntime {
         // turn, the typed text otherwise. One block either way — `push_user_from`
         // with an empty set and `unknown: false` is byte-identical to the
         // `push_user` every typed turn has always taken.
+        // What a **reroute** has to re-ask, carried past the move below.
+        //
+        // Both stages measured against the budget of the route this turn
+        // started on. A mid-turn reroute — the privacy pin, or a provider
+        // fallback — swaps in a smaller one, and `refit_for_reroute` then
+        // *clamps* the conversation: `truncate_to_budget` drops history until
+        // one block is left and middle-elides that block, which by then is the
+        // skill expansion. BR-8 says a skill turn is never middle-elided into
+        // something the user did not invoke, and BR-4 says carried whole or
+        // refused.
+        //
+        // It is not a corner: BR-7 makes the privacy pin the *expected* path
+        // for any invocation that ran a dynamic command on a boundary-configured
+        // machine, which is every ADLC skill. The name and the text are cloned
+        // because the seed below consumes them, and a clone of one expansion is
+        // the price of not shortening it behind the user's back.
+        // The system prompt rides along for the same reason: it is consumed by
+        // `CarriedTurn::begin` below, and the refusal has to measure the same
+        // pair Stage A and Stage B did — system plus expansion.
+        let skill_refit: Option<(String, String, String)> = skill_turn
+            .as_ref()
+            .map(|skill| (skill.name.clone(), skill.text.clone(), system.clone()));
+
+        // The seed, and its provenance (BR-7, ADR-9): the expansion for a skill
+        // turn, the typed text otherwise. One block either way — `push_user_from`
+        // with an empty set and `unknown: false` is byte-identical to the
+        // `push_user` every typed turn has always taken.
         let (prompt, prompt_sources, prompt_unknown) = match skill_turn {
             Some(skill) => (skill.text, skill.sources, skill.unknown),
             None => (prompt, BTreeSet::new(), false),
@@ -3652,6 +3687,14 @@ impl DaemonRuntime {
                     // arriving over-window at a tier that has no fallback left.
                     let previous = route.budget.clone();
                     route = router.resolve_local_pin(reroute_after_block_reason(detail));
+                    if let Some(message) =
+                        skill_would_not_survive_refit(skill_refit.as_ref(), &route)
+                    {
+                        break 'turn Err(RpcError::new(
+                            error_code::SKILL_EXPANSION_TOO_LARGE,
+                            message,
+                        ));
+                    }
                     refit_for_reroute(&mut conversation, &stream_events, &previous, &route.budget);
                     rerouted_local = true;
                     continue;
@@ -3750,6 +3793,14 @@ impl DaemonRuntime {
                             // provider's pair (see `refit_for_reroute`).
                             let previous = route.budget.clone();
                             route = next;
+                            if let Some(message) =
+                                skill_would_not_survive_refit(skill_refit.as_ref(), &route)
+                            {
+                                break 'turn Err(RpcError::new(
+                                    error_code::SKILL_EXPANSION_TOO_LARGE,
+                                    message,
+                                ));
+                            }
                             refit_for_reroute(
                                 &mut conversation,
                                 &stream_events,
@@ -10165,6 +10216,36 @@ fn reroute_after_block_reason(detail: BlockDetail) -> String {
 /// can. Saying it re-fitted anyway is the same untruth
 /// [`ContextPressureKind::DidNotFit`] exists to close, one call site along, so
 /// the over-budget answer wins here exactly as it does in
+/// Whether a **skill** turn would be middle-elided by the refit a reroute is
+/// about to perform — and if so, the refusal to raise instead.
+///
+/// `None` for a typed prompt, which keeps REQ-586 BR-7's loud elision, and
+/// `None` for a skill turn that still fits: the refit then runs as it always
+/// has, dropping *history* to make room, which is ordinary pressure.
+///
+/// This exists because both budget stages ran against the route the turn
+/// started on. A reroute swaps in a smaller budget, and `truncate_to_budget`
+/// clamps the newest block once history is gone — which for a skill turn is the
+/// expansion itself. BR-8: never middle-elided into something the user did not
+/// invoke. BR-4: carried whole or refused.
+fn skill_would_not_survive_refit(
+    skill: Option<&(String, String, String)>,
+    route: &crate::router::Route,
+) -> Option<String> {
+    let (name, text, system) = skill?;
+    match skill_fit(
+        SkillStage::WithDynamicContext,
+        name,
+        system,
+        text,
+        &route.harness.budget,
+        route.provider_id.as_ref().map(|id| id.0.as_str()),
+    ) {
+        SkillFit::Fits => None,
+        SkillFit::TooLarge { message } => Some(message),
+    }
+}
+
 /// [`pressure_kind`](crate::harness::turn_loop::pressure_kind).
 fn refit_for_reroute(
     conversation: &mut CarriedTurn,

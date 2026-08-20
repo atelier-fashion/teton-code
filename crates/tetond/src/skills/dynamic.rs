@@ -261,9 +261,38 @@ impl DynamicOutcome {
     }
 
     /// True when this outcome carries output to inline.
+    ///
+    /// **Not the same question as [`Self::spawned`]**, and the difference is
+    /// load-bearing in both directions: this one decides whether there is text
+    /// to splice, that one decides whether the turn can still be pinned. A
+    /// failing command has no output and still ran.
     #[must_use]
     pub fn did_run(&self) -> bool {
         matches!(self, Self::Ran { .. })
+    }
+
+    /// True when a process was actually started — output or not.
+    ///
+    /// This is the provenance question, and it is deliberately wider than
+    /// [`Self::did_run`]. `ShellTool::run` tags **every** arm that spawned
+    /// something with `.with_unknown_provenance()` — success, non-zero exit,
+    /// timeout and lost alike — because a shell command runs arbitrary code and
+    /// the daemon cannot know which files its result was derived from. A
+    /// *result* is not only its stdout: an exit status is a value the command
+    /// chose.
+    ///
+    /// Asking `did_run` here instead opened a side channel that pinned nothing.
+    /// A body of `` !`grep -q AKIA secrets/prod.env && exit 1 || exit 2` ``
+    /// produces no output, so the turn stayed pinnable, while the placeholder
+    /// carried `exited 1` / `exited 2` — one bit per command about a
+    /// `local-only` file — into a turn that then routed remote (REQ-585
+    /// verify). `TimedOut` is the same channel with a sleep.
+    #[must_use]
+    pub fn spawned(&self) -> bool {
+        match self {
+            Self::Ran { .. } | Self::Failed { .. } | Self::TimedOut => true,
+            Self::NotRun { .. } => false,
+        }
     }
 
     /// Whether the `shell` tool's ceiling threw information away — i.e. the
