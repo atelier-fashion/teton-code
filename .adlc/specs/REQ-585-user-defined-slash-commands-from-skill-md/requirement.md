@@ -550,8 +550,16 @@ client's own echo line is the record.
   unknown window` and the message names `capabilities.max_context`; on a route
   with `max_context = 4096` (the shipped Ollama recipe, floored to
   `(2,048, 16,384)`) **both** `/proceed` and `/status` are refused and the
-  message says the declared window was floored; and a refused turn emits **no**
-  `context_pressure` event of any kind (BR-8c). (daemon unit; BR-8)
+  message says the declared window was floored — but **at different stages**,
+  and the test asserts which: `/proceed`'s body alone exceeds the budget, so it
+  is refused at Stage A before consent is spent; `/status`'s body *fits* (about
+  12.5 KB with the system prompt, against 16 KB) and it is refused at Stage B
+  once its dynamic-context output is folded in. Stated that way because the
+  `/status` half depends on what its commands print, so an AC that only said
+  "both are refused" would pass vacuously on a machine where they print little
+  and would hide a Stage-A regression on one where they print a lot; and a
+  refused turn emits **no** `context_pressure` event of any kind (BR-8c).
+  (daemon unit; BR-8)
 - [ ] AC-17: `/analyze` with an `analyze` entry that was skipped prints the
   skipped reason; with no entry at all prints the pre-REQ
   `unknown command: `/analyze`` bytes — pinned in `cli_e2e` beside the
