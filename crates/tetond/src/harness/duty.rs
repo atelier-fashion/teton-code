@@ -435,7 +435,14 @@ impl DutyKind {
 /// [`REDACT_CHUNK_MAX_BYTES`](crate::egress::redact::REDACT_CHUNK_MAX_BYTES),
 /// which reads this constant rather than restating it, and the measured render
 /// guard in [`crate::harness::redact::scan`] that stands behind it, per chunk.
-pub(crate) const DUTY_REQUEST_BYTES_PER_TOKEN: usize = 2;
+///
+/// REQ-586 makes it the **byte floor of the remote context budget** as well
+/// ([`crate::harness::budget::derive`]: `budget_bytes = usable × this`), which
+/// is why it is `pub` rather than `pub(crate)` — AC-3's corpus test
+/// (`tests/token_corpus.rs`) checks `max(words × 3/2, bytes / floor) ≥ tokens`
+/// against a reference tokenizer and must *read* the floor rather than restate
+/// the 2 (TASK-192's one-home pass).
+pub const DUTY_REQUEST_BYTES_PER_TOKEN: usize = 2;
 
 /// Ceiling on the `max_tokens` any duty asks a provider for.
 ///

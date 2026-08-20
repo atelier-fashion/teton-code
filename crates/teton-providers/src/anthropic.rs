@@ -22,6 +22,11 @@ use serde_json::{json, Value};
 use teton_core::{ResolvedEffort, ToolCallTier};
 
 /// Default Anthropic context window used when none is configured.
+///
+/// Overridden by the config record's capabilities at construction (runtime.rs
+/// `build_provider` calls [`AnthropicAdapter::with_capabilities`] with the
+/// record's profile); `0` there means unknown, and REQ-586 BR-3 has the daemon
+/// say so rather than silently fall back to this figure.
 const DEFAULT_MAX_CONTEXT: u32 = 200_000;
 /// The Messages API version header value.
 const ANTHROPIC_VERSION: &str = "2023-06-01";
@@ -185,6 +190,14 @@ impl Provider for AnthropicAdapter {
             // what was actually sent, and a refusal claim made without that is a
             // guess (crate::classify_client_error short-circuits when the
             // request carried no reasoning field at all).
+            // REQ-586 BR-2: the same classifier reads the bounded head of a
+            // **400** for the vendor's exact "context length exceeded" spelling
+            // and returns the class-less `ContextLengthExceeded`, which the
+            // daemon reports as a typed outcome rather than retrying or failing
+            // over. Only a 400 — a 401/403/429 carrying the same sentence keeps
+            // the classification it already had, because the class-less variant
+            // would skip health, failover and backoff for a fault that needs
+            // all three.
             return Err(crate::classify_client_error(
                 resp.status,
                 resp.body,

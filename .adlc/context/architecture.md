@@ -309,6 +309,16 @@
   the 9 KiB overhead untouched; the task that measures a composed artifact
   runs after every task that writes to it (REQ-583 ADR-2, ASSUME-008,
   LESSON-541, LESSON-491).
+- **A per-route fact is derived once, where the route is decided, and every
+  surface reads that value** — the context budget joins effort as the second
+  instance (`RouteBudget` beside `ResolvedEffort`): one pure function over
+  plain data (`harness/budget.rs`), one caller (`Router::budget_for`), and the
+  result stamped into the route so `route_decided`, `/verbose`, `/doctor`, the
+  `context_pressure` event and every refusal read the same number and the same
+  bound rather than each deriving one. A fact that changes when a turn is
+  **rerouted mid-turn** is re-derived and re-applied before the next model
+  call, and the change is published as news, not applied in silence
+  (REQ-586 ADR-1/ADR-2/ADR-3, LESSON-456).
 
 ## ADRs
 
@@ -489,7 +499,12 @@ assert is reachable (LESSON-444).
 **Consequences**: every boot re-verifies and re-benchmarks before the tier opens
 (~tens of seconds for large models — a caching policy is deferred); the harness's
 context budgets and the engine window must be kept currency-compatible
-(LESSON-446) — enforced since PR #5 by byte-denominated twins on every harness
+(LESSON-446) — and since REQ-586 that compatibility is **per route**: the
+remote pair is derived from the provider's declared window with pinned
+allowances (words × 3/2, bytes at the 2 B/token floor) while the local pair is
+unchanged, so "the engine window" is whichever engine the *attempt* was routed
+to, and a mid-turn reroute re-fits the context before the next call —
+enforced since PR #5 by byte-denominated twins on every harness
 budget (`HarnessConfig::context_budget_bytes`, `SUMMARIZER_INPUT_MAX_BYTES`),
 with the summarizer's engine-failure fallback degrading to bounded mechanical
 truncation, reported and logged, never a silent raw fold (LESSON-447);

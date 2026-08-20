@@ -917,6 +917,235 @@ fn an_undeclared_byom_endpoint_sends_the_effort_field_on_its_first_call() {
 }
 
 // ---------------------------------------------------------------------------
+// REQ-586 BR-2 / ADR-8: the context-length refusal (AC-3)
+// ---------------------------------------------------------------------------
+
+/// Anthropic's 400 for a prompt that exceeds the window, in its documented
+/// envelope ("prompt is too long" — verified 2026-08-19).
+const ANTHROPIC_TOO_LONG_BODY: &str = r#"{"type":"error","error":{"type":"invalid_request_error","message":"prompt is too long: 213717 tokens > 200000 maximum"},"request_id":"req_011CSHoEeqs5C35K2UUqR7Fy"}"#;
+
+/// OpenAI's 400 as it arrives on the wire — pretty-printed, `code:
+/// "context_length_exceeded"`, and the "maximum context length" message
+/// (verified 2026-08-19).
+const OPENAI_TOO_LONG_BODY: &str = "{\n  \"error\": {\n    \"message\": \"This model's maximum context length is 128000 tokens. However, your messages resulted in 131000 tokens. Please reduce the length of the messages.\",\n    \"type\": \"invalid_request_error\",\n    \"param\": \"messages\",\n    \"code\": \"context_length_exceeded\"\n  }\n}";
+
+/// A compact compat body carrying only the code, as a proxy or self-hosted
+/// endpoint that reuses OpenAI's code but not its wording would send.
+const COMPAT_CODE_ONLY_BODY: &str = r#"{"error":{"message":"Input too long for this endpoint","type":"invalid_request_error","param":null,"code":"context_length_exceeded"}}"#;
+
+/// Moonshot/Kimi's 400 for a prompt that exceeds the window, in the envelope
+/// their error reference documents — `type` + `message`, no `code` at all
+/// (verified 2026-08-19, <https://platform.kimi.ai/docs/api/errors>).
+///
+/// The case that matters most: Kimi is the dogfood provider, it is reached
+/// through the OpenAI-compatible adapter, and its body carries **neither**
+/// OpenAI spelling — so before this const it classified as a plain
+/// `ClientError { 400 }` and cost the provider a health downgrade for a
+/// request that was merely too big.
+const MOONSHOT_TOO_LONG_BODY: &str =
+    r#"{"error":{"type":"invalid_request_error","message":"Input token length too long"}}"#;
+
+/// An unrelated 400 — neither vendor's spelling — which must keep today's path.
+const UNRELATED_400_BODY: &str =
+    r#"{"error":{"message":"invalid model: no such model `test-model`"}}"#;
+
+fn drive_400(adapter: &dyn Provider, body: &'static str, effort: ResolvedEffort) -> ProviderError {
+    drive_4xx(adapter, 400, body, effort)
+}
+
+/// The same drive at an arbitrary 4xx — what makes "the sniff is 400-only" a
+/// claim about the adapter rather than only about the classifier.
+fn drive_4xx(
+    adapter: &dyn Provider,
+    status: u16,
+    body: &'static str,
+    effort: ResolvedEffort,
+) -> ProviderError {
+    let transport = ErrorBodyTransport::new(status, body);
+    match block_on(adapter.stream_turn(request_with(effort), &transport)) {
+        Ok(_) => panic!("a {status} must not open a stream"),
+        Err(err) => err,
+    }
+}
+
+/// AC-3 / BR-2. Each adapter maps its vendor's spelling to the **typed**,
+/// class-less `ContextLengthExceeded` naming the provider — so the daemon can
+/// end the turn with a report instead of a retry, a fallback, or a health
+/// change. Driven on the `Omit` path (`sample_request`'s baseline) **and** on a
+/// request that sent effort, because the effort sniff short-circuits on `Omit`
+/// and ADR-8 says the head is read for every 400 regardless.
+#[test]
+fn each_adapter_maps_its_vendor_spelling_to_context_length_exceeded() {
+    let cases: [(&str, &dyn Provider, &'static str); 4] = [
+        ("anthropic", &anthropic(), ANTHROPIC_TOO_LONG_BODY),
+        ("deepseek", &openai(), OPENAI_TOO_LONG_BODY),
+        ("deepseek", &openai(), COMPAT_CODE_ONLY_BODY),
+        // REQ-586 TASK-189: the dogfood provider's own spelling.
+        ("deepseek", &openai(), MOONSHOT_TOO_LONG_BODY),
+    ];
+    for (expected_id, adapter, body) in cases {
+        for effort in [
+            ResolvedEffort::omit(EffortOmission::ShapeNone),
+            ResolvedEffort::omit(EffortOmission::RefusedThisSession),
+            ResolvedEffort::effort(EffortLevel::High),
+        ] {
+            let err = drive_400(adapter, body, effort);
+            match &err {
+                ProviderError::ContextLengthExceeded { provider_id } => {
+                    assert_eq!(provider_id, expected_id, "{effort:?}");
+                }
+                other => panic!("expected the typed refusal, got {other:?} ({effort:?})"),
+            }
+            assert!(err.is_context_length_exceeded());
+            assert!(!err.is_effort_refused());
+            // Class-less: not handed to retry / fallback / degrade.
+            assert_eq!(err.failure_class(), None, "{effort:?}");
+            assert_eq!(err.decision(), None, "{effort:?}");
+            // The message names the provider and carries no response body.
+            let msg = err.to_string();
+            assert!(msg.contains(expected_id), "{msg}");
+            assert!(
+                !msg.contains("213717") && !msg.contains("131000") && !msg.contains("too long"),
+                "no provider body in the error: {msg}"
+            );
+        }
+    }
+}
+
+/// **Verify M3.** The sniff is 400-only, at the adapter: every vendor spelling
+/// under a 401, a 403 or a 429 keeps the classification it had before this REQ,
+/// and keeps its failure class.
+///
+/// The status is part of the claim — every spelling above was read off a `400
+/// Bad Request`, and a request that overflows the window is a malformed
+/// request. Reading the sentence out of any 4xx costs both directions: a
+/// credential fault would be reported to the user as "your context is too big",
+/// and a rate limit would lose its `Retry`. Worse, because
+/// `ContextLengthExceeded` carries no `FailureClass`, either would also skip
+/// `record_health` and failover — so an endpoint answering any 4xx with "prompt
+/// is too long" would keep itself in the route with its standing untouched, and
+/// every later turn's full assembled context would keep going to it.
+///
+/// Driven through `stream_turn` rather than only through the classifier because
+/// the status the sniff reads is the one the *adapter* took off the response,
+/// and both adapters funnel every `status >= 400` into one call.
+#[test]
+fn no_status_but_400_can_be_a_context_length_refusal_on_either_adapter() {
+    let bodies: [&'static str; 4] = [
+        ANTHROPIC_TOO_LONG_BODY,
+        OPENAI_TOO_LONG_BODY,
+        COMPAT_CODE_ONLY_BODY,
+        MOONSHOT_TOO_LONG_BODY,
+    ];
+    let adapters: [&dyn Provider; 2] = [&anthropic(), &openai()];
+    // Status, and the action the pre-REQ-586 classification carries for it.
+    let statuses = [
+        (401, FailureAction::Fail),
+        (403, FailureAction::Fail),
+        (429, FailureAction::Retry),
+    ];
+    for adapter in adapters {
+        for body in bodies {
+            for (status, action) in statuses {
+                let err = drive_4xx(
+                    adapter,
+                    status,
+                    body,
+                    ResolvedEffort::omit(EffortOmission::ShapeNone),
+                );
+                assert_eq!(
+                    err,
+                    ProviderError::ClientError { status },
+                    "a {status} carrying a context-length sentence must stay a \
+                     client error"
+                );
+                assert_eq!(
+                    err.decision().map(|d| d.action),
+                    Some(action),
+                    "a {status} carrying a context-length sentence lost its \
+                     failure action"
+                );
+                assert!(
+                    err.failure_class().is_some(),
+                    "a {status} carrying a context-length sentence stopped \
+                     counting against the provider's health"
+                );
+            }
+        }
+    }
+}
+
+/// The narrowness is the point. An unrelated 400 on either adapter is **still**
+/// a generic `ClientError { 400 }` classified `Fallback` — the sniff moves no
+/// existing outcome.
+#[test]
+fn an_unrelated_400_on_either_adapter_keeps_todays_fallback_path() {
+    let adapters: [&dyn Provider; 2] = [&anthropic(), &openai()];
+    for adapter in adapters {
+        for effort in [
+            ResolvedEffort::omit(EffortOmission::ShapeNone),
+            ResolvedEffort::effort(EffortLevel::High),
+        ] {
+            let err = drive_400(adapter, UNRELATED_400_BODY, effort);
+            assert!(
+                matches!(err, ProviderError::ClientError { status: 400 }),
+                "{}: {err:?} ({effort:?})",
+                adapter.id()
+            );
+            assert!(!err.is_context_length_exceeded());
+            assert_eq!(
+                err.decision().map(|d| d.action),
+                Some(FailureAction::Fallback),
+                "{}: {effort:?}",
+                adapter.id()
+            );
+        }
+    }
+}
+
+/// The other vendor's spelling is still recognized by either adapter — the
+/// classifier is shared (one implementation, lib.rs `classify_client_error`),
+/// so a proxy that fronts Anthropic behind an OpenAI-shaped endpoint, or the
+/// reverse, cannot slip a context-length refusal past the daemon as a generic
+/// 400.
+#[test]
+fn the_context_length_classifier_is_shared_across_adapters() {
+    let err = drive_400(
+        &openai(),
+        ANTHROPIC_TOO_LONG_BODY,
+        ResolvedEffort::omit(EffortOmission::ShapeNone),
+    );
+    assert!(err.is_context_length_exceeded(), "{err:?}");
+    let err = drive_400(
+        &anthropic(),
+        OPENAI_TOO_LONG_BODY,
+        ResolvedEffort::omit(EffortOmission::ShapeNone),
+    );
+    assert!(err.is_context_length_exceeded(), "{err:?}");
+}
+
+/// Moonshot's *other* size refusal is a different failure and must keep the
+/// generic path: `total message size N exceeds limit 2097152` is the 2 MB
+/// request-body cap, not the token window, and compaction by word count does
+/// not reliably fix it. Typing it as a context-length outcome would end the
+/// turn with a budget report for a fault the budget cannot explain — the
+/// narrowness ADR-8 asks for, on the one provider that sends both.
+#[test]
+fn moonshots_request_body_size_cap_is_not_a_context_length_refusal() {
+    const BODY_SIZE_CAP: &str = r#"{"error":{"type":"invalid_request_error","message":"total message size 5943865 exceeds limit 2097152"}}"#;
+    let err = drive_400(
+        &openai(),
+        BODY_SIZE_CAP,
+        ResolvedEffort::omit(EffortOmission::ShapeNone),
+    );
+    assert!(!err.is_context_length_exceeded(), "{err:?}");
+    assert!(
+        matches!(err, ProviderError::ClientError { status: 400 }),
+        "{err:?}"
+    );
+}
+
+// ---------------------------------------------------------------------------
 // The endpoint contract (BUG-170)
 // ---------------------------------------------------------------------------
 

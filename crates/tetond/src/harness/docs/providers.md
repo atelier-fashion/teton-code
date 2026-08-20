@@ -34,6 +34,7 @@ below, take the URL from their own `curl` example, not their `base_url` line.
 Every `--model` below is an example, not a recommendation — substitute whatever
 the vendor serves; `--model` is required for every remote kind. The tier in each
 routing line is a suggestion too; topic `policy` says what the four mean.
+Windows: topic `context`.
 
 Anthropic. The Messages API, so the path is `/v1/messages` rather than the
 `/chat/completions` every other recipe here uses:

@@ -1060,6 +1060,35 @@ impl Client {
         !self.events_named(name).is_empty()
     }
 
+    /// The index of the first observed event at or after `from` satisfying
+    /// `pred`.
+    ///
+    /// Positional, and anchored, because an *ordering* claim about one turn's
+    /// second route cannot be made with [`Self::events_named`]: a session's
+    /// stream carries other `route_decided`s that are genuinely local and
+    /// genuinely earlier (the `title` duty's, for one), so "the first local
+    /// route" is not "the route this turn was moved onto". Anchoring the search
+    /// at the event that caused the move — a `privacy_block`, a
+    /// `provider_degraded` — is what makes the answer a position rather than a
+    /// guess.
+    pub fn event_index_from(&self, from: usize, pred: impl Fn(&Value) -> bool) -> Option<usize> {
+        self.events
+            .iter()
+            .enumerate()
+            .skip(from)
+            .find(|(_, e)| pred(e))
+            .map(|(i, _)| i)
+    }
+
+    /// The names of every observed event, in order — for a failure message that
+    /// says what *did* arrive rather than only what did not.
+    pub fn event_names(&self) -> Vec<&str> {
+        self.events
+            .iter()
+            .filter_map(|e| e.get("event").and_then(Value::as_str))
+            .collect()
+    }
+
     // -- convenience wrappers over common methods --
 
     /// Create a session and return its id.
@@ -1896,6 +1925,31 @@ pub fn remote_provider_block(id: &str, endpoint: &str, model: &str) -> String {
     format!(
         "[[providers]]\nid = \"{id}\"\nkind = \"openai-compatible\"\n\
          endpoint = \"{endpoint}\"\nmodel = \"{model}\"\n\n"
+    )
+}
+
+/// The same row, declaring the provider's context window (REQ-586 BR-3).
+///
+/// The window rides a nested `[providers.capabilities]` table, which is the one
+/// shape TOML allows here: a sub-table binds to the array element above it, so
+/// it has to be written *between* this element's keys and the next array header
+/// — which is why it lives inside the builder rather than being appended by a
+/// caller that would have to know the document order.
+///
+/// A separate builder rather than an `Option<u32>` on
+/// [`remote_provider_block`]: `max_context = 0` is not the same document as no
+/// capabilities table at all (`0` is the explicit "unknown"), and a fixture that
+/// means "this provider declares nothing" should not have to spell a zero.
+pub fn remote_provider_block_with_window(
+    id: &str,
+    endpoint: &str,
+    model: &str,
+    max_context: u32,
+) -> String {
+    format!(
+        "[[providers]]\nid = \"{id}\"\nkind = \"openai-compatible\"\n\
+         endpoint = \"{endpoint}\"\nmodel = \"{model}\"\n\
+         [providers.capabilities]\nmax_context = {max_context}\n\n"
     )
 }
 

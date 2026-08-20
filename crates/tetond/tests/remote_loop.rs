@@ -49,6 +49,7 @@ fn source_id(path: &str) -> ProvenanceId {
     ProvenanceId::claimed(path).expect("fixture path must be a provenance id")
 }
 
+use tetond::harness::budget::{derive, BudgetInputs};
 use tetond::harness::{
     build_system_prompt, run_session_turn_with_source, ContextManager, DutyRoute, HarnessConfig,
     HarnessError, NoopProvenanceHook, PendingPermissions, PermissionConfig, PermissionGate,
@@ -679,4 +680,451 @@ async fn a_native_tool_call_with_no_prose_never_replays_an_empty_assistant_turn(
     assert_eq!(rows[0].reasoning_tokens, Some(20));
 
     std::fs::remove_dir_all(&repo).ok();
+}
+
+// --------------------------------------------------------------------------
+// REQ-586 AC-2 / AC-3: the budget is the route's, and an overflow is typed
+// --------------------------------------------------------------------------
+
+/// A transport that answers **every** request with a 400 naming the context
+/// window, and counts them.
+///
+/// The counting is the point: BR-2 says a context-length refusal does not
+/// retry, and a transport that answered a second request with something usable
+/// would let a swallowed refusal look like a completed turn.
+#[derive(Clone)]
+struct RefuseOversized {
+    calls: Arc<AtomicUsize>,
+    body: &'static str,
+}
+
+impl RefuseOversized {
+    fn new(body: &'static str) -> Self {
+        Self {
+            calls: Arc::new(AtomicUsize::new(0)),
+            body,
+        }
+    }
+
+    fn calls(&self) -> usize {
+        self.calls.load(Ordering::SeqCst)
+    }
+}
+
+#[async_trait]
+impl Transport for RefuseOversized {
+    async fn execute(
+        &self,
+        _request: TransportRequest,
+    ) -> Result<TransportResponse, TransportError> {
+        self.calls.fetch_add(1, Ordering::SeqCst);
+        let body = self.body;
+        Ok(TransportResponse {
+            location: None,
+            status: 400,
+            body: Box::pin(futures::stream::once(async move {
+                Ok(body.as_bytes().to_vec())
+            })),
+        })
+    }
+}
+
+/// Moonshot/Kimi's documented overflow body (`platform.kimi.ai/docs/api/errors`,
+/// verified 2026-08-19) — the dogfood provider's own spelling, driven here
+/// through the whole daemon-side path rather than only through the adapter's
+/// unit tests.
+const KIMI_TOO_LONG: &str =
+    r#"{"error":{"type":"invalid_request_error","message":"Input token length too long"}}"#;
+
+/// A prompt of `words` distinct whitespace-separated words at **4 bytes each**
+/// (three base-36 characters and a separator, so exactly `4 × words − 1`).
+///
+/// Two properties the AC needs and a lorem-ipsum string would not give it.
+///
+/// The density is **fixed and known**, which is what lets a caller state which
+/// of the two guards its fixture is standing on. It is deliberately *not* below
+/// the remote pair's implied ratio: a remote route budgets `usable × 2 / 3`
+/// words against `usable × 2` bytes, i.e. ≈ 3 B per word of budget, so a prompt
+/// at 4 B/word sized to fill the *word* budget would overflow the byte one by a
+/// third. Nothing here is sized that way — every caller sits far under both —
+/// and each one asserts the byte fit against the route's own
+/// `context_budget_bytes` rather than inferring it from this density (REQ-586
+/// AC F-19: a fixture-honesty claim is one a reader can check).
+///
+/// And every word is distinct, so "the body contains all of it" is a real
+/// claim: a middle elision removes words that are nowhere else in the string,
+/// where a repeated filler would still look whole.
+fn distinct_words(words: usize) -> String {
+    const ALPHABET: &[u8] = b"abcdefghijklmnopqrstuvwxyz0123456789";
+    assert!(
+        words <= ALPHABET.len().pow(3),
+        "the three-character alphabet cannot mint {words} distinct words"
+    );
+    let mut out = String::with_capacity(words * 4);
+    for i in 0..words {
+        if i > 0 {
+            out.push(' ');
+        }
+        out.push(ALPHABET[(i / 1_296) % 36] as char);
+        out.push(ALPHABET[(i / 36) % 36] as char);
+        out.push(ALPHABET[i % 36] as char);
+    }
+    out
+}
+
+/// The `HarnessConfig` a route to a provider with `window` tokens runs under —
+/// built through the **one** derivation the router uses, never by setting the
+/// pair by hand (BR-8, AC-12).
+fn route_config(window: u32) -> HarnessConfig {
+    HarnessConfig::for_strong_model().with_route_budget(derive(BudgetInputs {
+        window,
+        cap: 0,
+        // ADR-1's reservation: the `max_tokens` the adapters actually send.
+        reservation: HarnessConfig::default().gen_params.max_tokens,
+        is_local: false,
+        redact_scan: false,
+        provider_id: Some("kimi"),
+    }))
+}
+
+/// Seed a manager against `config`'s whole budget — pair and window label —
+/// exactly as [`CarriedTurn::begin`] does for a real turn.
+fn seeded(config: &HarnessConfig, system: String, prompt: &str) -> ContextManager {
+    let mut ctx = ContextManager::new(system, config.context_budget_tokens)
+        .with_budget_bytes(config.context_budget_bytes)
+        .with_window_label(config.budget.window_label.clone());
+    ctx.push_user(prompt);
+    ctx
+}
+
+/// Everything one remote turn needs besides its source.
+struct LoopRig {
+    tools: ToolRegistry,
+    tool_ctx: ToolContext,
+    gate: PermissionGate,
+    events: SessionEvents,
+    bus: Arc<EventBus>,
+}
+
+fn loop_rig(session_id: &SessionId) -> LoopRig {
+    let bus = Arc::new(EventBus::new());
+    let gate = PermissionGate::new(
+        session_id.clone(),
+        PermissionConfig::permissive(),
+        Arc::clone(&bus),
+        Arc::new(PendingPermissions::new()),
+    );
+    LoopRig {
+        tools: ToolRegistry::with_builtins(),
+        tool_ctx: ToolContext::new(std::env::temp_dir()),
+        gate,
+        events: SessionEvents::new(Arc::clone(&bus), session_id.clone()),
+        bus,
+    }
+}
+
+async fn drive(
+    source: &mut dyn tetond::harness::CompletionSource,
+    rig: &LoopRig,
+    ctx: &mut ContextManager,
+    config: &HarnessConfig,
+) -> Result<tetond::harness::TurnOutcome, HarnessError> {
+    let mut hook = NoopProvenanceHook;
+    run_session_turn_with_source(
+        source,
+        &rig.tools,
+        &rig.tool_ctx,
+        &rig.gate,
+        &rig.events,
+        ctx,
+        config,
+        &mut hook,
+        &DutyRoute::unresolved("no digest route in this test"),
+        &DutyRoute::unresolved("no compact route in this test"),
+        &ToolDuties {
+            triage: &DutyRoute::unresolved("no triage route in this test"),
+            shell: &DutyRoute::unresolved("no shell route in this test"),
+        },
+    )
+    .await
+}
+
+/// Every `context_pressure` in `events`.
+fn pressure_events(
+    events: &[teton_protocol::events::EventEnvelope],
+) -> Vec<teton_protocol::events::ContextPressure> {
+    events
+        .iter()
+        .filter_map(|e| match &e.event {
+            Event::ContextPressure(cp) => Some(*cp),
+            _ => None,
+        })
+        .collect()
+}
+
+/// Everything the turn streamed into its own output, concatenated — the path
+/// BR-7's newest-block notice shares with the model's prose, which is the
+/// point of putting it there rather than only on the event stream.
+fn streamed_text(events: &[teton_protocol::events::EventEnvelope]) -> String {
+    events
+        .iter()
+        .filter_map(|e| match &e.event {
+            Event::SessionUpdate(su) => match &su.update {
+                SessionUpdatePayload::AgentMessageChunk { text } => Some(text.as_str()),
+                _ => None,
+            },
+            _ => None,
+        })
+        .collect()
+}
+
+/// **AC-2, both halves.** The same 20,000-word prompt against two budgets: on
+/// a 128k route it is assembled **whole**, in one request, with nothing dropped
+/// and nothing elided; on the default (local) pair it is clamped, and the clamp
+/// is announced.
+///
+/// The A/B is the assertion. Run alone, the first half only shows that *some*
+/// configuration passes a big prompt through, which a hard-coded budget would
+/// also do; run against the same prompt, the same loop and the same transport,
+/// the only thing that differs is the pair the route derived — which is BR-1's
+/// whole claim.
+///
+/// The second half runs the local *pair* rather than the local *engine*
+/// deliberately: swapping the tier as well would leave two variables moving,
+/// and AC-2's claim is about the budget, not about who serves the turn.
+#[tokio::test]
+async fn a_128k_route_assembles_a_20000_word_prompt_whole_and_the_default_pair_clamps_it() {
+    const WORDS: usize = 20_000;
+    let prompt = distinct_words(WORDS);
+    assert_eq!(prompt.split_whitespace().count(), WORDS);
+    // The generator's shape, stated rather than assumed: 3 characters and a
+    // separator per word. It is not a claim about which guard binds — that is
+    // the `context_budget_bytes` assertion below, and it is the one that would
+    // have to move if this density ever did.
+    assert_eq!(prompt.len(), WORDS * 4 - 1);
+
+    // ---- the 128k route: whole, one request, quiet ----
+    let config = route_config(128_000);
+    assert!(
+        config.context_budget_tokens > WORDS,
+        "a 128k window must budget more than 20,000 words, or this proves nothing"
+    );
+    assert!(
+        config.context_budget_bytes > prompt.len(),
+        "and more than the fixture's bytes, so the word budget is what is under test"
+    );
+
+    let transport = ScriptedSseTransport::with_bodies(vec![sse_turn(&["ack"], None, 21_000, 2)]);
+    let egress = Egress::new(
+        transport.clone(),
+        Vec::new(),
+        Arc::new(tetond::egress::NoopSink),
+    )
+    .with_cost_meter(ledger());
+    let provider = OpenAiCompatAdapter::new(OpenAiCompatConfig::new(
+        "kimi",
+        "https://api.moonshot.ai/v1/chat/completions",
+    ));
+    let session_id = SessionId::from("wide-window");
+    let mut source = RemoteProviderSource::new(
+        &provider,
+        &egress,
+        "kimi",
+        "kimi-k2",
+        session_id.clone(),
+        ResolvedEffort::effort(EffortLevel::High),
+    );
+    let rig = loop_rig(&session_id);
+    let mut sub = rig.bus.subscribe(256);
+    let mut ctx = seeded(
+        &config,
+        build_system_prompt(&rig.tools, &config),
+        prompt.as_str(),
+    );
+    drive(&mut source, &rig, &mut ctx, &config)
+        .await
+        .expect("a prompt inside the route's budget must complete");
+
+    let requests = transport.requests();
+    assert_eq!(requests.len(), 1, "one request, not a compacted retry");
+    let sent = requests[0]["messages"]
+        .as_array()
+        .expect("the adapter sends a messages array")
+        .iter()
+        .filter_map(|m| m["content"].as_str())
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(
+        sent.contains(&prompt),
+        "the 20,000-word prompt did not reach the provider whole: {} bytes of \
+         message content against a {}-byte prompt",
+        sent.len(),
+        prompt.len()
+    );
+    let quiet = collect_events(&mut sub).await;
+    assert!(
+        pressure_events(&quiet).is_empty(),
+        "nothing was dropped or elided, so nothing may be announced"
+    );
+    assert!(
+        !streamed_text(&quiet).contains("did not fit"),
+        "and the turn's own output carries no clamp notice either"
+    );
+
+    // ---- the default pair: the same prompt, clamped and announced ----
+    let local = HarnessConfig::default();
+    assert!(
+        local.context_budget_bytes < prompt.len(),
+        "the fixture must not fit the default pair, or the clamp never fires"
+    );
+    let transport = ScriptedSseTransport::with_bodies(vec![sse_turn(&["ack"], None, 4_000, 2)]);
+    let egress = Egress::new(
+        transport.clone(),
+        Vec::new(),
+        Arc::new(tetond::egress::NoopSink),
+    )
+    .with_cost_meter(ledger());
+    let session_id = SessionId::from("narrow-window");
+    let mut source = RemoteProviderSource::new(
+        &provider,
+        &egress,
+        "kimi",
+        "kimi-k2",
+        session_id.clone(),
+        ResolvedEffort::effort(EffortLevel::High),
+    );
+    let rig = loop_rig(&session_id);
+    let mut sub = rig.bus.subscribe(256);
+    let mut ctx = seeded(
+        &local,
+        build_system_prompt(&rig.tools, &local),
+        prompt.as_str(),
+    );
+    drive(&mut source, &rig, &mut ctx, &local)
+        .await
+        .expect("a clamped turn still completes — BR-4 degrades, it does not fail");
+
+    let sent = transport.requests()[0]["messages"]
+        .as_array()
+        .expect("messages")
+        .iter()
+        .filter_map(|m| m["content"].as_str())
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(
+        !sent.contains(&prompt),
+        "the default pair sent 20,000 words whole — the budget bounded nothing"
+    );
+
+    let published = collect_events(&mut sub).await;
+    let pressure = pressure_events(&published);
+    let elision = pressure
+        .iter()
+        .find(|p| p.newest_user_elided)
+        .unwrap_or_else(|| panic!("the clamp landed on the user's own message: {pressure:#?}"));
+    assert!(elision.elided_bytes > 0);
+    assert_eq!(
+        elision.budget_tokens, local.context_budget_tokens as u64,
+        "the event carries the word budget the gate enforced"
+    );
+    assert_eq!(
+        elision.budget_bytes, local.context_budget_bytes as u64,
+        "and the byte budget, which is the one that actually bound here"
+    );
+    assert_eq!(elision.bound, local.budget.bound);
+
+    // BR-7's second surface. An elision of the newest *user* block is the one
+    // case where the model answers a prompt the user did not send, so it is
+    // reported in the turn the user is reading — not only on an event stream a
+    // client may render in a status line, or not at all.
+    let notice = streamed_text(&published);
+    assert!(
+        notice.contains("your message did not fit") && notice.contains(&local.budget.window_label),
+        "the newest-block elision was not reported in the turn's output: {notice}"
+    );
+    assert!(
+        !notice.contains(&prompt[..64]),
+        "the notice must state what happened, never quote what was cut"
+    );
+}
+
+/// **AC-3's typed outcome, at the loop.** A provider that answers 400 with a
+/// context-length body ends the turn with
+/// [`HarnessError::ContextLengthExceeded`] carrying both numbers, after
+/// **exactly one** request.
+///
+/// The variant matters as much as the numbers: the daemon's fallback arm
+/// matches `HarnessError::Remote`, so a refusal that arrived wearing that shape
+/// would be retried against a fallback provider and would cost the refusing
+/// provider a health downgrade. Asserted here rather than left to the runtime,
+/// because this is the frame that decides it.
+#[tokio::test]
+async fn a_context_length_refusal_ends_the_turn_typed_after_one_request() {
+    let transport = RefuseOversized::new(KIMI_TOO_LONG);
+    let egress = Egress::new(
+        transport.clone(),
+        Vec::new(),
+        Arc::new(tetond::egress::NoopSink),
+    )
+    .with_cost_meter(ledger());
+    let provider = OpenAiCompatAdapter::new(OpenAiCompatConfig::new(
+        "kimi",
+        "https://api.moonshot.ai/v1/chat/completions",
+    ));
+    let session_id = SessionId::from("too-big");
+    let mut source = RemoteProviderSource::new(
+        &provider,
+        &egress,
+        "kimi",
+        "kimi-k2",
+        session_id.clone(),
+        ResolvedEffort::effort(EffortLevel::High),
+    );
+
+    // A window the daemon believes is 128k while the provider disagrees — the
+    // shape a wrong `capabilities.max_context` or a denser-than-estimated
+    // prompt actually takes.
+    let config = route_config(128_000);
+    let rig = loop_rig(&session_id);
+    let mut ctx = seeded(
+        &config,
+        build_system_prompt(&rig.tools, &config),
+        &distinct_words(2_000),
+    );
+    let err = drive(&mut source, &rig, &mut ctx, &config)
+        .await
+        .expect_err("a refused turn must not report success");
+
+    match &err {
+        HarnessError::ContextLengthExceeded {
+            provider_id,
+            assembled_tokens,
+            budget_tokens,
+        } => {
+            assert_eq!(provider_id, "kimi");
+            assert_eq!(*budget_tokens, config.context_budget_tokens);
+            assert!(
+                *assembled_tokens >= 2_000,
+                "the report must name what was actually assembled, got {assembled_tokens}"
+            );
+        }
+        other => panic!("expected the typed refusal, got {other:?}"),
+    }
+    assert!(
+        !matches!(err, HarnessError::Remote(_)),
+        "a context-length refusal must not wear the shape the daemon retries \
+         and downgrades health for"
+    );
+    assert_eq!(
+        transport.calls(),
+        1,
+        "no retry: resending the same bytes cannot succeed"
+    );
+    // Content-free, per conventions.md: the provider's body never rides the
+    // error out.
+    let sentence = err.to_string();
+    assert!(
+        !sentence.contains("Input token length"),
+        "the provider's own prose leaked into the error: {sentence}"
+    );
 }

@@ -116,10 +116,10 @@ use teton_inference::probe::{decide, GpuClass, HardwareProfile, TierDecision, GI
 use teton_inference::{ChatFormat, Completion, Engine, EngineError, GenParams, MockEngine};
 
 use teton_protocol::events::{
-    BlockCause, CapabilityDeadEnd, ContextCleared, Event, ModelLifecycle, ModelLifecycleStage,
-    PrivacyAction, ProviderTested, SessionRootChanged, SessionTitled, TierWarming, TurnQueued,
-    WebCapabilityState as WireWebCapabilityState, WebLookup, WebSetupCompleted, WebTaintOverridden,
-    WebTier as WireWebTier,
+    BlockCause, CapabilityDeadEnd, ContextCleared, ContextPressureKind, Event, ModelLifecycle,
+    ModelLifecycleStage, PrivacyAction, ProviderTested, SessionRootChanged, SessionTitled,
+    TierWarming, TurnQueued, WebCapabilityState as WireWebCapabilityState, WebLookup,
+    WebSetupCompleted, WebTaintOverridden, WebTier as WireWebTier,
 };
 use teton_protocol::jsonrpc::{error_code, RpcError};
 use teton_protocol::methods::{
@@ -162,10 +162,11 @@ use crate::egress::{
     EgressError, HttpTransport, LookupContext, LookupOutcome, LookupRecord, LookupRecorder,
     LookupRequest, Provenance, RedactionGate, RedactionVerdict, TaintView,
 };
+use crate::harness::budget::RouteBudget;
 use crate::harness::completion::{context_provenance, RemoteProviderSource};
-use crate::harness::context::NoopProvenanceHook;
+use crate::harness::context::{NoopProvenanceHook, PressureReport};
 use crate::harness::tools::web::{register_web_tool, tier_name, SeamError, WebLookupSeam};
-use crate::harness::turn_loop::{run_session_turn_with_source, HarnessError};
+use crate::harness::turn_loop::{pressure_kind, run_session_turn_with_source, HarnessError};
 use crate::harness::{
     build_system_prompt, ContextManager, DutyKind, DutyRoute, LocalEngineSource,
     PendingPermissions, PermissionGate, SessionEvents, ToolContext, ToolDuties, ToolRegistry,
@@ -2487,6 +2488,46 @@ impl DaemonRuntime {
             .collect()
     }
 
+    /// The big-window notice a provider's **recorded** window earns, or `None`
+    /// (REQ-586 OQ-6 as amended, TASK-194).
+    ///
+    /// Asked after `config/set` applied a `RegisterProvider`, so the figures
+    /// describe what was actually stored rather than what the client sent: the
+    /// merge is field-wise, and a registration that names no window inherits
+    /// the one the config already held (ADR-7). A provider that vanished
+    /// between the write and this read, or one below the threshold, answers
+    /// `None` — which renders nothing, exactly as today.
+    ///
+    /// **A local entry answers `None` however large its window.** Its turns run
+    /// on the engine on this machine, under the local pair, whatever
+    /// `max_context` says — which is why `provider list` renders such a row as
+    /// `(local engine)` and why `/doctor` does not advise it to set a window.
+    /// A notice naming a per-call figure and a worst-case spend for it would be
+    /// the exact class of untruth this task is closing, and it would name money
+    /// where none is spent.
+    ///
+    /// The sentence itself is `harness::budget`'s, shared byte for byte with
+    /// `/provider setup`'s preview warning: one composer, so the two surfaces
+    /// that record a window cannot come to word it differently (BR-8). (That
+    /// flow refuses a local candidate outright, so this is the only path where
+    /// the kind has to be asked about at all.)
+    #[must_use]
+    pub fn provider_budget_notice(&self, provider_id: &ProviderId) -> Option<String> {
+        let config = self.config.lock().expect("config mutex poisoned");
+        let provider = config
+            .providers
+            .iter()
+            .find(|provider| provider.id == provider_id.0)?;
+        if !provider.kind.is_remote() {
+            return None;
+        }
+        crate::harness::budget::big_window_notice(
+            provider.capabilities.max_context,
+            provider.capabilities.context_budget_cap,
+            config.privacy.redact,
+        )
+    }
+
     /// Apply a `config/set` mutation, validate, and persist it.
     ///
     /// ## Registration is stricter than loading, deliberately (BUG-155)
@@ -2958,7 +2999,14 @@ impl DaemonRuntime {
                             failed_reroute_block_sentence(detail),
                         ));
                     }
+                    // REQ-586 BR-1: the budget follows the route. The local
+                    // pin's window is a fraction of the remote one this turn
+                    // was assembled against, so the context is re-fitted here —
+                    // after the route is chosen, before the retry — rather than
+                    // arriving over-window at a tier that has no fallback left.
+                    let previous = route.budget.clone();
                     route = router.resolve_local_pin(reroute_after_block_reason(detail));
+                    refit_for_reroute(&mut conversation, &stream_events, &previous, &route.budget);
                     rerouted_local = true;
                     continue;
                 }
@@ -2984,6 +3032,42 @@ impl DaemonRuntime {
                         turn_id,
                         stop_reason: outcome.stop_reason,
                     });
+                }
+                // REQ-586 BR-2 / ADR-8: the provider answered that the
+                // request does not fit its window. A **typed outcome**, and
+                // therefore ahead of every `Remote` arm below: this is not a
+                // provider failure and must not be run through the machinery
+                // that treats one.
+                //
+                // No `record_health` — a provider that correctly reported its
+                // own limit is not unhealthy, and downgrading it would move
+                // *later* turns off a provider that is working. No
+                // `on_provider_failure` — a fallback would send the same bytes
+                // to a window that may be smaller, and would emit a
+                // `provider_degraded` blaming the provider for the daemon's
+                // sizing. And no retry, because nothing about resending
+                // unchanged bytes can succeed.
+                //
+                // The sentence carries the three numbers a user can act on and
+                // no response body (BR-11): the provider, what was assembled,
+                // and the budget the route was running under. A wide gap
+                // between the last two says the declared window is wrong; a
+                // narrow one says this content tokenizes denser than the
+                // estimator assumed.
+                Err(HarnessError::ContextLengthExceeded {
+                    provider_id,
+                    assembled_tokens,
+                    budget_tokens,
+                }) => {
+                    break 'turn Err(RpcError::new(
+                        error_code::CONTEXT_LENGTH_EXCEEDED,
+                        format!(
+                            "`{provider_id}` refused this turn as larger than {}: about \
+                             {assembled_tokens} words were assembled against a \
+                             {budget_tokens}-word budget",
+                            route.budget.window_label,
+                        ),
+                    ));
                 }
                 Err(HarnessError::Remote(perr)) if attempts < 2 => {
                     attempts += 1;
@@ -3012,7 +3096,20 @@ impl DaemonRuntime {
                     }
                     match fo.route {
                         Some(next) => {
+                            // REQ-586 BR-1/ADR-2: a fallback provider may
+                            // declare a smaller window than the one that just
+                            // failed, so the same refit runs here. An in-place
+                            // degrade arrives through this arm too and is
+                            // silent by construction — it keeps the failed
+                            // provider's pair (see `refit_for_reroute`).
+                            let previous = route.budget.clone();
                             route = next;
+                            refit_for_reroute(
+                                &mut conversation,
+                                &stream_events,
+                                &previous,
+                                &route.budget,
+                            );
                             continue;
                         }
                         None => {
@@ -3075,7 +3172,12 @@ impl DaemonRuntime {
         // construction: the pre-turn vector was never touched.
         match outcome {
             Ok(result) => {
-                conversation.commit();
+                // REQ-586 BR-10: the commit re-asserts the budget one last
+                // time, and what it took is news like any other clamp. Written
+                // as one call rather than two lines so that the fixture
+                // standing in for this dispatch runs the same protocol — see
+                // [`commit_and_publish`].
+                commit_and_publish(conversation, &stream_events, &route.budget);
                 Ok(result)
             }
             Err(err) => {
@@ -5352,6 +5454,51 @@ impl DaemonRuntime {
             }
         }
 
+        // The window, carried only with the model it describes (REQ-586 BR-3:
+        // no window is ever *guessed* from a model name outside the recipes).
+        // A candidate's `max_context` is the recipe's figure for the recipe's
+        // **example model**, carried silently by the setup UI — so it is
+        // written only when the chosen model is that example, matched as the
+        // (example_model, window) pair so a stale client's old catalog cannot
+        // smuggle a superseded figure under a current model name.
+        //
+        // Every other case contributes **no answer**, exactly like the cap
+        // below: `None` preserves whatever the config already holds (ADR-7's
+        // field-wise merge). That covers a candidate with no recipe behind it, a
+        // client predating the field, and — the case this spelling exists for —
+        // a hand-typed model. The setup UI always sends `Some(recipe_window)`,
+        // so writing `Some(0)` for a model that is not the recipe's example
+        // would let `/provider setup kimi` with a hand-typed model silently
+        // un-declare a window the user had already set with
+        // `provider add kimi --max-context 128000`, dropping that route's budget
+        // ~20× with nothing said. This flow asks no window question about a
+        // model it does not recognize, and a question this flow does not ask is
+        // not an answer of "unknown" (verify M4).
+        //
+        // For a **fresh** record the outcome is unchanged: capabilities default
+        // to 0, so the preview still renders `max_context = 0` and the window is
+        // still stated as unknown rather than defaulted silently.
+        //
+        // ## The pair is matched across the whole catalog, deliberately
+        //
+        // The lookup is by (example_model, window) over every recipe rather than
+        // over "the recipe whose `id_suggestion` is this candidate's id". A
+        // recipe id is a *suggestion* and ids are the user's namespace
+        // (`ProviderRecipe::id_suggestion`), so Kimi registered under the id
+        // `work-model` is an ordinary registration and must still get Kimi's
+        // window. What is being trusted is a fact about the **model**, and a
+        // model name is the same fact whatever row it is stored in. So the pin
+        // this guard provides is against a *superseded figure* — an old client
+        // sending a current model name with last year's window — and not against
+        // a cross-vendor pairing, which is a correct pairing carrying a correct
+        // window.
+        let max_context = candidate.max_context.and_then(|window| {
+            let is_a_recipes_own_example = crate::provider_recipes::recipe_catalog()
+                .iter()
+                .any(|recipe| recipe.example_model == model && recipe.max_context == window);
+            is_a_recipes_own_example.then_some(window)
+        });
+
         // The candidate, built by identity — see the section above.
         let mut config = current.clone();
         apply_update(
@@ -5362,6 +5509,15 @@ impl DaemonRuntime {
                 endpoint: endpoint.clone(),
                 model: Some(model.to_owned()),
                 auth_ref: Some(key_ref.to_owned()),
+                max_context,
+                // The flow asks no cap question, so it contributes no answer —
+                // the `SetTierBinding` fallback reasoning, one field over: a
+                // question this flow does not ask is not an answer of "none",
+                // and `None` leaves a hand-authored cap exactly where it was.
+                context_budget_cap: None,
+                // A snapshot field, never an update one: the daemon derives it
+                // and a client never declares it (TASK-194 2b).
+                floored_budget: None,
             }),
         );
         for binding in &candidate.bindings {
@@ -5484,8 +5640,30 @@ impl DaemonRuntime {
             .iter()
             .find(|provider| provider.id == id)
             .map(existing_provider);
-        let warnings =
-            self.provider_setup_warnings(replaces.as_ref(), model, &endpoint, &dial_host);
+        // The window this registration will have **recorded**, read back off the
+        // candidate config rather than off `candidate.max_context`: the merge
+        // above is field-wise, so a `None` answer preserves a window the config
+        // already held, and that preserved figure is the one the user is about
+        // to live with (ADR-7). Same for the cap, which this flow never asks
+        // about and can therefore only inherit.
+        let recorded = config
+            .providers
+            .iter()
+            .find(|provider| provider.id == id)
+            .map_or((0, 0), |provider| {
+                (
+                    provider.capabilities.max_context,
+                    provider.capabilities.context_budget_cap,
+                )
+            });
+        let warnings = self.provider_setup_warnings(
+            replaces.as_ref(),
+            model,
+            &endpoint,
+            &dial_host,
+            recorded,
+            config.privacy.redact,
+        );
 
         Ok(RenderedProviderSetup {
             toml,
@@ -5511,12 +5689,21 @@ impl DaemonRuntime {
     /// renders them owns how they look, and a daemon that shipped escape codes
     /// down this wire would put them through a sanitizer built to strip exactly
     /// that.
+    ///
+    /// `recorded_window` is the `(max_context, context_budget_cap)` pair this
+    /// registration will have **recorded** — read off the candidate config
+    /// after the merge, not off the candidate — and `redact_scan` is
+    /// `[privacy] redact`. Both feed the REQ-586 big-window notice, and both
+    /// are passed in rather than read here so this stays a pure composer over
+    /// facts its caller already holds under the config lock.
     fn provider_setup_warnings(
         &self,
         replaces: Option<&ExistingProvider>,
         model: &str,
         endpoint: &str,
         dial_host: &str,
+        recorded_window: (u32, u32),
+        redact_scan: bool,
     ) -> Vec<String> {
         let mut warnings = Vec::new();
         // BR-14 / BUG-155's class: a replace is stated, never silent — but it is
@@ -5567,6 +5754,18 @@ impl DaemonRuntime {
                  machine.)"
             ));
         }
+        // REQ-586 OQ-6 as amended: the window is still the consent, and this is
+        // where its size is said. Composed by `harness::budget` — the same
+        // derivation a turn runs under, never a second arithmetic here
+        // (LESSON-456) — and byte-identical to what `teton provider add
+        // --max-context` prints off `config/set`, because it is the same
+        // function.
+        let (window, cap) = recorded_window;
+        warnings.extend(crate::harness::budget::big_window_notice(
+            window,
+            cap,
+            redact_scan,
+        ));
         warnings
     }
 
@@ -8997,6 +9196,14 @@ fn probe_outcome(
                  this test does not send"
             ),
         },
+        // REQ-586 TASK-185: the probe's fixed payload cannot exceed a window; folded like EffortRefused
+        ProviderError::ContextLengthExceeded { .. } => ProviderTestOutcome::Refused {
+            status: 400,
+            reason: format!(
+                "HTTP 400 from `{host}` — the vendor refused the request as exceeding its \
+                 context window, which this test's fixed payload cannot do"
+            ),
+        },
         // Cannot occur: empty provenance and a constant payload, with no
         // redaction gate installed. Nothing left the machine if it does.
         ProviderError::PrivacyBlocked(_) => ProviderTestOutcome::Unreachable {
@@ -9178,6 +9385,143 @@ fn reroute_after_block_reason(detail: BlockDetail) -> String {
     )
 }
 
+/// Re-fit a turn's context to the route it is about to take, and publish the
+/// change (REQ-586 BR-1, ADR-2/ADR-3).
+///
+/// The mid-turn seam both reroute arms share — a privacy block pinning the turn
+/// local, and a provider failure falling over to a fallback. `previous` is the
+/// budget the last attempt ran under, `next` the one the next attempt will:
+/// called after the new route is chosen and **before** the retry, so the
+/// context that reaches the next model call already fits the window it is being
+/// sent to. Without it, a 60,000-word conversation assembled on a 128k route
+/// arrives at a 4k local pin over-window and the reroute that was supposed to
+/// rescue the turn kills it.
+///
+/// ## The refit itself is the news
+///
+/// The event fires whenever the **pair changed**, even when the report is
+/// quiet. "Your turn moved to a window a quarter the size and nothing had to be
+/// cut" is exactly as much a budget change as one that dropped ten blocks, and
+/// a client that only heard about the lossy case could not explain why the next
+/// `route_decided` carries different numbers. The order is deliberate — choose
+/// route, refit, announce, retry — so this event precedes the new route's
+/// `route_decided` rather than trailing it.
+///
+/// ## The in-place degrade is silent, by construction
+///
+/// A `MalformedToolCall` degrade continues on the *same* provider under the
+/// reduced harness profile, and ADR-2 has `degraded_harness_config` keep that
+/// provider's window — so `next` and `previous` carry the same pair, this
+/// returns before touching the manager, and no `context_pressure` is published.
+/// That is the right answer rather than a lucky one: nothing was re-budgeted, so
+/// there is nothing to say. The window *label* still follows the route, which
+/// costs nothing and keeps the in-prompt marker honest if a same-pair reroute
+/// ever crosses providers.
+///
+/// ## A refit that did not fit is not a refit
+///
+/// The kind is passed rather than derived (see `SessionEvents::context_pressure`)
+/// because only this arm knows the gate ran because of a *reroute* — but
+/// "re-fitted to the N-word budget" is a claim about the outcome, and a refit
+/// onto a much smaller route can finish still over budget just as a loop gate
+/// can. Saying it re-fitted anyway is the same untruth
+/// [`ContextPressureKind::DidNotFit`] exists to close, one call site along, so
+/// the over-budget answer wins here exactly as it does in
+/// [`pressure_kind`](crate::harness::turn_loop::pressure_kind).
+fn refit_for_reroute(
+    conversation: &mut CarriedTurn,
+    events: &SessionEvents,
+    previous: &RouteBudget,
+    next: &RouteBudget,
+) {
+    conversation.set_window_label(&next.window_label);
+    if next.budget_tokens == previous.budget_tokens && next.budget_bytes == previous.budget_bytes {
+        return;
+    }
+    let report = conversation.rebudget(next);
+    let kind = if report.over_budget {
+        ContextPressureKind::DidNotFit
+    } else {
+        ContextPressureKind::RefitOnReroute
+    };
+    events.context_pressure(&report, kind, next);
+}
+
+/// The whole success-arm commit protocol: hand the session what the turn's
+/// manager holds, and announce what the commit's own budget gate took on the way
+/// (REQ-586 BR-10).
+///
+/// One function because it is one decision made in two places — the daemon's
+/// dispatch, and the `conversation_carry.rs` fixture that stands in for it. Two
+/// lines at each call site is how the fixture came to run a *different*
+/// protocol from the dispatch twice over: first by calling the
+/// report-discarding `commit()`, then by inlining its own copy of the publish.
+/// Both times the fixture stayed green while the real seam was neutered
+/// (LESSON-451). With one implementation, a dispatch that stopped publishing
+/// would have to stop committing too, and the commit is guarded everywhere.
+///
+/// Consumes the turn, because committing is the end of it.
+pub fn commit_and_publish(conversation: CarriedTurn, events: &SessionEvents, budget: &RouteBudget) {
+    let report = conversation.commit_reporting();
+    publish_commit_pressure(events, &report, budget);
+}
+
+/// Publish what the **commit's** own budget gate took, if it took anything
+/// (REQ-586 BR-10, ADR-3).
+///
+/// [`CarriedTurn::commit_now`] re-asserts the budget one last time so that "a
+/// stored conversation fits the budget" is an invariant of the store rather
+/// than a property the last writer happened to leave behind. It runs from
+/// `Drop` as well as from the success arm, so it can hold no `SessionEvents`
+/// and cannot emit: it reports, and this publishes (LESSON-501).
+///
+/// ## Why this is a named function and not two lines at the call site
+///
+/// So that the one caller in this file and the fixture that stands in for it
+/// run the *same* protocol. `conversation_carry.rs` used to inline
+/// `commit_reporting()` plus its own `if !is_quiet() { context_pressure(..) }`,
+/// which is LESSON-451 in miniature: a fixture re-implementing the dispatch
+/// tests its own copy, and the copy stayed green while the real one was
+/// neutered. It is `pub` for that reason and no other.
+///
+/// ## A completed turn *can* reach here with something to say
+///
+/// This used to say it could not, and the claim was true until TASK-194. The
+/// turn loop gates both of its `Ok` exits (BUG-157) and nothing appends between
+/// that gate and this commit, so a completed turn never arrives here having
+/// *dropped or elided* anything — that much still holds. But
+/// [`PressureReport::over_budget`] is recomputed on every
+/// `truncate_to_budget` call and counts toward `is_quiet()`, and a context the
+/// gate cannot fit does not become fittable by being gated again: a turn under
+/// a budget smaller than its own system prompt completes, reaches this line,
+/// and the report is **not** quiet. So this is a live branch on the success
+/// path, not only a backstop for a future `Ok` exit — and
+/// `an_unfittable_turn_still_publishes_the_commits_own_report`
+/// (`conversation_carry.rs`) drives it end to end, with
+/// `the_commit_publishes_a_clamp_and_says_nothing_about_a_quiet_one` below
+/// stating the decision directly.
+///
+/// The cancellation paths still reach the commit through `Drop`, where the
+/// report is discarded because there is no client left waiting on the news;
+/// that half of the old note was and remains correct.
+///
+/// It is deliberately not `turn_loop`'s `announce_pressure`: that one also
+/// writes a turn notice into the model's own output stream when the clamp
+/// landed on the user's newest message, which is the right thing mid-turn and
+/// the wrong thing here — this runs after the turn's last token, with nothing
+/// left to append it to. It also carries that loop's per-turn over-budget latch,
+/// which is scoped to one run of the loop; the commit is a separate seam whose
+/// single report is its own news.
+pub fn publish_commit_pressure(
+    events: &SessionEvents,
+    report: &PressureReport,
+    budget: &RouteBudget,
+) {
+    if !report.is_quiet() {
+        events.context_pressure(report, pressure_kind(report), budget);
+    }
+}
+
 /// The local tier's canonical provider id when the config declares no explicit
 /// `[[providers]]` entry for it (REQ-557 ADR-D).
 ///
@@ -9308,6 +9652,12 @@ fn build_router(
 
     let mut router = Router::new(table, default_provider)
         .with_judgment_default(config.judgment_default)
+        // REQ-586 BR-4 / ADR-1: the router derives each route's byte budget,
+        // and on this daemon that budget must fit what the redaction scan can
+        // read whole. It is the same `config.privacy.redact` `redaction_gate`
+        // consults before installing the gate — one field, so the bound and
+        // the gate cannot disagree about whether anything is scanning.
+        .with_redact_scan(config.privacy.redact)
         // REQ-559 BR-2/BR-8: one global level, read from the persisted config so
         // it is configuration-visible rather than a constant compiled in here.
         // The session override (ADR-I) is layered on by the caller that has a
@@ -9788,6 +10138,28 @@ fn snapshot_from_config(
                 endpoint: p.endpoint.clone(),
                 model: p.model.clone(),
                 auth_ref: p.auth_ref.clone(),
+                // REQ-586 ADR-7: always populated — `Some(0)` is "unknown" /
+                // "no cap", stated rather than hidden (BR-3), and `None` is
+                // reserved for a snapshot from a daemon predating the fields,
+                // so a live daemon never emits it.
+                max_context: Some(p.capabilities.max_context),
+                context_budget_cap: Some(p.capabilities.context_budget_cap),
+                // TASK-194 2b: whether this provider's declaration actually
+                // survives the derivation, answered by the **router's** budget
+                // for it — the same `budget_for` every route attempt runs
+                // through, so `/doctor` reports the floor a turn would really
+                // get rather than a client's guess at one (BR-8, AC-12).
+                // `Some` only when the floor bit, so a snapshot of ordinary
+                // providers is byte-identical to today's.
+                floored_budget: {
+                    let budget = router.budget_for(Some(p.id.as_str()));
+                    budget
+                        .floored
+                        .then_some(teton_protocol::methods::FlooredBudget {
+                            budget_tokens: budget.budget_tokens as u64,
+                            budget_bytes: budget.budget_bytes as u64,
+                        })
+                },
             })
             .collect(),
         tiers: Tier::ALL
@@ -9948,6 +10320,21 @@ fn apply_update(config: &mut Config, update: ConfigUpdate) {
                 .iter()
                 .find(|p| p.id == id)
                 .map_or_else(ProviderCapabilities::default, |p| p.capabilities);
+            // REQ-586 ADR-7: the two window fields are the one exception to
+            // "capabilities are not settable over this RPC", and they merge
+            // **field-wise** — `Some(v)` writes (`0` included: it is the
+            // config's own "unknown" / "no cap" spelling, and un-declaring a
+            // window is a write, not an absence), `None` preserves what is
+            // stored. An older client's re-registration therefore cannot zero
+            // a declared window, and the rest of the profile still rides the
+            // BUG-155 lookup above untouched.
+            let capabilities = ProviderCapabilities {
+                max_context: pc.max_context.unwrap_or(capabilities.max_context),
+                context_budget_cap: pc
+                    .context_budget_cap
+                    .unwrap_or(capabilities.context_budget_cap),
+                ..capabilities
+            };
             let provider = ModelProvider {
                 id,
                 kind: to_core_kind(pc.kind),
@@ -11442,6 +11829,7 @@ permission_allow = [\"fetch_user_url\"]
             "read",
             &"word ".repeat(500),
             50,
+            50 * crate::harness::context::APPROX_BYTES_PER_TOKEN,
             &crate::harness::ToolProvenance::none(),
         )
         .await;
@@ -11663,6 +12051,9 @@ permission_allow = [\"fetch_user_url\"]
                 endpoint: Some("https://api.deepseek.com/v1/chat/completions".to_owned()),
                 model: Some("deepseek-chat".to_owned()),
                 auth_ref: Some("keychain:deepseek".to_owned()),
+                max_context: None,
+                context_budget_cap: None,
+                floored_budget: None,
             }),
         );
         apply_update(
@@ -11692,6 +12083,31 @@ permission_allow = [\"fetch_user_url\"]
         assert_eq!(snap.providers.len(), 1);
         assert_eq!(snap.providers[0].kind, ProtoProviderKind::OpenaiCompatible);
         assert_eq!(snap.privacy[0].mode, PrivacyMode::LocalOnly);
+        // REQ-586 ADR-7: the snapshot ALWAYS populates the window fields — a
+        // provider with no capabilities table reads `Some(0)` ("unknown" /
+        // "no cap"), never `None`, which is reserved for a daemon predating
+        // the fields.
+        assert_eq!(snap.providers[0].max_context, Some(0));
+        assert_eq!(snap.providers[0].context_budget_cap, Some(0));
+
+        // And a declared window round-trips: registered over the wire,
+        // projected back out as the same figures.
+        apply_update(
+            &mut config,
+            ConfigUpdate::RegisterProvider(ProviderConfig {
+                id: ProviderId::from("deepseek"),
+                kind: ProtoProviderKind::OpenaiCompatible,
+                endpoint: Some("https://api.deepseek.com/v1/chat/completions".to_owned()),
+                model: Some("deepseek-chat".to_owned()),
+                auth_ref: Some("keychain:deepseek".to_owned()),
+                max_context: Some(131_072),
+                context_budget_cap: Some(65_536),
+                floored_budget: None,
+            }),
+        );
+        let snap = snapshot_from_config(&config, &router_for_config(&config), false);
+        assert_eq!(snap.providers[0].max_context, Some(131_072));
+        assert_eq!(snap.providers[0].context_budget_cap, Some(65_536));
     }
 
     /// **The snapshot reports whether the redaction scan is enabled** (REQ-562;
@@ -11750,6 +12166,9 @@ permission_allow = [\"fetch_user_url\"]
                 endpoint: Some("https://api.deepseek.com/v1/chat/completions".to_owned()),
                 model: Some("deepseek-chat".to_owned()),
                 auth_ref: None,
+                max_context: None,
+                context_budget_cap: None,
+                floored_budget: None,
             }),
         );
         config
@@ -11888,6 +12307,9 @@ permission_allow = [\"fetch_user_url\"]
                 endpoint: Some("https://api.anthropic.com".to_owned()),
                 model: None,
                 auth_ref: None,
+                max_context: None,
+                context_budget_cap: None,
+                floored_budget: None,
             }),
         );
         let before = config.clone();
@@ -11922,6 +12344,9 @@ permission_allow = [\"fetch_user_url\"]
                 endpoint: Some("https://api.anthropic.com".to_owned()),
                 model: Some("claude-opus-5".to_owned()),
                 auth_ref: None,
+                max_context: None,
+                context_budget_cap: None,
+                floored_budget: None,
             }),
         );
         *runtime.config.lock().expect("config") = usable;
@@ -12186,6 +12611,9 @@ permission_allow = [\"fetch_user_url\"]
                 endpoint: Some(endpoint.to_owned()),
                 model: Some("test-model".to_owned()),
                 auth_ref: None,
+                max_context: None,
+                context_budget_cap: None,
+                floored_budget: None,
             })
         };
         apply_update(
@@ -12201,6 +12629,54 @@ permission_allow = [\"fetch_user_url\"]
             config.providers[0].endpoint.as_deref(),
             Some("https://b.example/v1/chat/completions")
         );
+    }
+
+    /// **REQ-586 AC-5 (daemon half): the window fields merge field-wise on
+    /// re-registration** (ADR-7, tracer gotcha #6).
+    ///
+    /// `None` preserves — an older client's re-registration cannot zero a
+    /// declared window — and `Some` writes, `0` included, because `0` is the
+    /// config's own "unknown" / "no cap" spelling and un-declaring is a write,
+    /// not an absence. The rest of the capability profile rides the BUG-155
+    /// lookup, which this merge builds on rather than replaces.
+    #[test]
+    fn re_registration_merges_the_window_fields_field_wise() {
+        let register = |max_context: Option<u32>, cap: Option<u32>| {
+            ConfigUpdate::RegisterProvider(ProviderConfig {
+                id: ProviderId::from("kimi"),
+                kind: ProtoProviderKind::OpenaiCompatible,
+                endpoint: Some("https://api.moonshot.ai/v1/chat/completions".to_owned()),
+                model: Some("kimi-k3".to_owned()),
+                auth_ref: None,
+                max_context,
+                context_budget_cap: cap,
+                floored_budget: None,
+            })
+        };
+
+        let mut config = Config::default();
+        apply_update(&mut config, register(Some(200_000), Some(40_000)));
+        assert_eq!(config.providers[0].capabilities.max_context, 200_000);
+        assert_eq!(config.providers[0].capabilities.context_budget_cap, 40_000);
+
+        // AC-5's exact case: a request without the fields preserves the stored
+        // values instead of zeroing them.
+        apply_update(&mut config, register(None, None));
+        assert_eq!(config.providers.len(), 1);
+        assert_eq!(config.providers[0].capabilities.max_context, 200_000);
+        assert_eq!(config.providers[0].capabilities.context_budget_cap, 40_000);
+
+        // One field written, the other preserved: the merge is per FIELD, not
+        // per request.
+        apply_update(&mut config, register(Some(128_000), None));
+        assert_eq!(config.providers[0].capabilities.max_context, 128_000);
+        assert_eq!(config.providers[0].capabilities.context_budget_cap, 40_000);
+
+        // And `Some(0)` is a write — the "unknown" / "no cap" spelling —
+        // never a preserve.
+        apply_update(&mut config, register(Some(0), Some(0)));
+        assert_eq!(config.providers[0].capabilities.max_context, 0);
+        assert_eq!(config.providers[0].capabilities.context_budget_cap, 0);
     }
 
     /// E-5: the consent gate must not switch itself off the moment a real engine
@@ -12369,6 +12845,9 @@ permission_allow = [\"fetch_user_url\"]
             reason: resolution.reason.clone(),
             outcome: resolution.outcome,
             harness: Default::default(),
+            // REQ-586: the route carries its harness's budget — the default
+            // (local) pair here, since this fixture's harness is the default.
+            budget: crate::harness::turn_loop::HarnessConfig::default().budget,
             effort: None,
             resolution: Some(resolution),
         };
@@ -12392,6 +12871,7 @@ permission_allow = [\"fetch_user_url\"]
             reason: "No provider is bound to the 'build' tier.".to_owned(),
             outcome: RouteOutcome::NoPolicy,
             harness: Default::default(),
+            budget: crate::harness::turn_loop::HarnessConfig::default().budget,
             // No provider was selected, so there was nothing to resolve against.
             effort: None,
             resolution: None,
@@ -15625,13 +16105,14 @@ permission_allow = [\"fetch_user_url\"]
                     ("title", crate::harness::title::title_prompt(REQUEST)),
                     (
                         "compact",
-                        crate::harness::compact::compact_prompt(&[
-                            crate::harness::context::ContextBlock {
+                        crate::harness::compact::compact_prompt(
+                            &[crate::harness::context::ContextBlock {
                                 role: crate::harness::context::BlockRole::User,
                                 text: "do the thing".to_owned(),
                                 provenance: crate::harness::context::Provenance::User,
-                            },
-                        ]),
+                            }],
+                            crate::harness::compact::COMPACT_PROMPT_BUDGET_BYTES,
+                        ),
                     ),
                 ] {
                     let out = engine
@@ -15923,7 +16404,10 @@ permission_allow = [\"fetch_user_url\"]
 
                 let duty = engine
                     .complete(
-                        &crate::harness::compact::compact_prompt(&blocks),
+                        &crate::harness::compact::compact_prompt(
+                            &blocks,
+                            crate::harness::compact::COMPACT_PROMPT_BUDGET_BYTES,
+                        ),
                         &params,
                         &mut |_| true,
                     )
@@ -15946,10 +16430,11 @@ permission_allow = [\"fetch_user_url\"]
             /// away from the duty it is meant to answer.
             #[test]
             fn the_stand_in_recognizes_the_contract_the_prompt_carries() {
-                assert!(
-                    crate::harness::compact::compact_prompt(pressured().blocks())
-                        .contains(COMPACT_OUTPUT_CONTRACT)
-                );
+                assert!(crate::harness::compact::compact_prompt(
+                    pressured().blocks(),
+                    crate::harness::compact::COMPACT_PROMPT_BUDGET_BYTES,
+                )
+                .contains(COMPACT_OUTPUT_CONTRACT));
             }
         }
 
@@ -20912,6 +21397,7 @@ provider_id = \"deepseek\"
                     tier: WireTier::Think,
                     provider_id: ProviderId::from("kimi"),
                 }],
+                max_context: None,
             }
         }
 
@@ -21645,6 +22131,91 @@ fallback_id = \"local\"
                     rendered.full_text
                 );
             }
+        }
+
+        /// **The setup flow records the recipe's window — for the recipe's own
+        /// example model** (REQ-586 BR-3, AC-5, ADR-7).
+        ///
+        /// The candidate's `max_context` is read from the daemon's own catalog
+        /// rather than typed here, so a re-verified vendor figure re-verifies
+        /// this test instead of breaking it. The preview's `max_context = N`
+        /// line is the user's view of what a commit would record.
+        #[test]
+        fn a_candidate_on_the_recipes_example_model_records_the_recipes_window() {
+            let (runtime, _path) = runtime_seeded("provider-setup-window-recorded", SEEDED);
+            let window = crate::provider_recipes::recipe_catalog()
+                .iter()
+                .find(|r| r.id_suggestion == "kimi")
+                .map(|r| r.max_context)
+                .expect("the catalog ships a kimi recipe");
+            assert!(
+                window > 0,
+                "the recipe contract test pins a non-zero window"
+            );
+
+            let candidate = ProviderSetupCandidate {
+                max_context: Some(window),
+                ..kimi()
+            };
+            let rendered = derive(&runtime, &candidate).expect("previews");
+            assert_eq!(
+                rendered
+                    .candidate_config
+                    .providers
+                    .iter()
+                    .find(|p| p.id == "kimi")
+                    .map(|p| p.capabilities.max_context),
+                Some(window),
+                "the chosen model IS the recipe's example, so the recipe's window is \
+                 recorded"
+            );
+            assert!(
+                rendered
+                    .full_text
+                    .contains(&format!("max_context = {window}")),
+                "the preview must show the window a commit would record:\n{}",
+                rendered.full_text
+            );
+        }
+
+        /// **A substituted model does not inherit the recipe's window**
+        /// (REQ-586 BR-3: no window is ever guessed from a model name outside
+        /// the recipes).
+        ///
+        /// The carried figure describes the recipe's example model. A user who
+        /// named their own model gets `0` — "unknown", visible in the
+        /// preview's `max_context = 0` line — never a neighbouring model's
+        /// window recorded as fact.
+        #[test]
+        fn a_candidate_on_a_substituted_model_records_the_window_as_unknown() {
+            let (runtime, _path) = runtime_seeded("provider-setup-window-substituted", SEEDED);
+            let window = crate::provider_recipes::recipe_catalog()
+                .iter()
+                .find(|r| r.id_suggestion == "kimi")
+                .map(|r| r.max_context)
+                .expect("the catalog ships a kimi recipe");
+
+            let candidate = ProviderSetupCandidate {
+                model: "kimi-k2.5-turbo".to_owned(),
+                max_context: Some(window),
+                ..kimi()
+            };
+            let rendered = derive(&runtime, &candidate).expect("previews");
+            assert_eq!(
+                rendered
+                    .candidate_config
+                    .providers
+                    .iter()
+                    .find(|p| p.id == "kimi")
+                    .map(|p| p.capabilities.max_context),
+                Some(0),
+                "a substituted model must not inherit the example model's window"
+            );
+            assert!(
+                rendered.full_text.contains("max_context = 0"),
+                "the unknown window is stated in the preview, not hidden:\n{}",
+                rendered.full_text
+            );
         }
 
         // -- the preview: the warnings ----------------------------------------
@@ -26206,6 +26777,676 @@ provider_id = \"deepseek\"
         }
     }
 
+    /// REQ-586: the budget follows the route attempt.
+    ///
+    /// Three claims: a reroute re-fits the turn's context to the window it is
+    /// about to be sent to and says so; a route change that moves no window
+    /// says nothing; and a provider's own "too big" answer ends the turn typed,
+    /// without touching the machinery that exists for providers that *failed*.
+    ///
+    /// The first two are pinned here at [`refit_for_reroute`], the shared
+    /// helper both of `run_prompt_turn`'s reroute arms call — so what these
+    /// tests own is the *helper's* rule, not the arms' wiring to it. That
+    /// wiring is a separate claim and it is covered separately: the two e2e
+    /// legs — `e2e/privacy_fixes.rs` for the privacy-block → local-pin arm and
+    /// `e2e/ac_matrix.rs` for the provider-failure → fallback arm — drive the
+    /// whole daemon and assert the `refit_on_reroute` line lands *before* the
+    /// retried attempt's `route_decided`, positionally, rather than merely
+    /// somewhere in the stream. The third test below is itself an e2e leg — it
+    /// drives
+    /// `run_prompt_turn` against a socket, because health, `provider_degraded`
+    /// and the client's error code only run when the refusal has travelled the
+    /// whole adapter → egress → source → loop path.
+    mod route_budget {
+        use super::*;
+        use crate::carry::CarriedTurn;
+        use crate::harness::budget::{derive, BudgetInputs, RouteBudget};
+        use crate::sessions::SessionRegistry;
+        use std::io::{Read, Write};
+        use std::net::TcpListener;
+        use teton_protocol::events::{ContextPressure, ContextPressureKind};
+
+        /// ADR-1's reservation — the `max_tokens` the adapters send.
+        const RESERVATION: u32 = 1_024;
+
+        fn remote_budget(window: u32) -> RouteBudget {
+            derive(BudgetInputs {
+                window,
+                cap: 0,
+                reservation: RESERVATION,
+                is_local: false,
+                redact_scan: false,
+                provider_id: Some("kimi"),
+            })
+        }
+
+        /// A turn holding `blocks` model turns of `words` words each, seeded
+        /// against `budget`.
+        fn turn_of(
+            sessions: &SessionRegistry,
+            session_id: &SessionId,
+            budget: &RouteBudget,
+            blocks: usize,
+            words: usize,
+        ) -> CarriedTurn {
+            let config = crate::harness::turn_loop::HarnessConfig::for_strong_model()
+                .with_route_budget(budget.clone());
+            let mut turn = CarriedTurn::begin(
+                sessions,
+                session_id,
+                "SYSTEM HEAD",
+                &config,
+                Arc::new(SessionTaint::new()),
+                Vec::new(),
+                "the opening prompt",
+            );
+            let filler = vec!["lorem"; words].join(" ");
+            for _ in 0..blocks {
+                turn.ctx_mut().push_model(filler.clone());
+            }
+            turn
+        }
+
+        fn one_freeform_session() -> (SessionRegistry, SessionId) {
+            let sessions = SessionRegistry::new();
+            let session = sessions
+                .create(SessionMode::Freeform, None, None)
+                .expect("a freeform session needs no phase");
+            let id = session.session_id.clone();
+            (sessions, id)
+        }
+
+        /// Every `context_pressure` published on `bus` since `sub` was taken.
+        async fn pressure(sub: &mut crate::broadcast::Subscription) -> Vec<ContextPressure> {
+            let mut out = Vec::new();
+            while let Ok(Some(env)) =
+                tokio::time::timeout(Duration::from_millis(50), sub.recv()).await
+            {
+                if let Event::ContextPressure(cp) = env.event {
+                    out.push(cp);
+                }
+            }
+            out
+        }
+
+        /// **BR-1 / AC-15.** A reroute to a smaller window re-fits the turn's
+        /// context *before* the next attempt and publishes the refit.
+        ///
+        /// The failure this prevents is the one AC-15 describes: a turn
+        /// assembled against a 128k provider is privacy-blocked, pinned to the
+        /// local tier, and — without this — hands a 60,000-word context to a
+        /// 4,096-word window. The reroute meant to rescue the turn is what kills
+        /// it, and the user sees a second failure with no account of the first.
+        #[tokio::test]
+        async fn a_reroute_to_a_smaller_window_refits_the_context_and_publishes_it() {
+            let (sessions, session_id) = one_freeform_session();
+            let bus = Arc::new(EventBus::new());
+            let mut sub = bus.subscribe(64);
+            let events = SessionEvents::new(Arc::clone(&bus), session_id.clone());
+
+            let wide = remote_budget(128_000);
+            let local = derive(BudgetInputs::local());
+            // Enough conversation to overflow the local pair several times over
+            // while sitting comfortably inside the wide one.
+            let mut turn = turn_of(&sessions, &session_id, &wide, 12, 2_000);
+            let before = turn.ctx().estimated_tokens();
+            assert!(
+                before > local.budget_tokens && before < wide.budget_tokens,
+                "the fixture must fit the wide window and not the narrow one \
+                 ({before} words)"
+            );
+
+            refit_for_reroute(&mut turn, &events, &wide, &local);
+
+            assert!(
+                turn.ctx().estimated_tokens() <= local.budget_tokens
+                    && turn.ctx().estimated_bytes() <= local.budget_bytes,
+                "the context still does not fit the route it is about to be sent to"
+            );
+            let published = pressure(&mut sub).await;
+            assert_eq!(published.len(), 1, "{published:#?}");
+            let event = published[0];
+            assert_eq!(event.kind, ContextPressureKind::RefitOnReroute);
+            assert!(event.dropped_blocks > 0, "{event:?}");
+            // Both currencies, from the route the turn is moving TO — a client
+            // told the old numbers could not explain what just happened.
+            assert_eq!(event.budget_tokens, local.budget_tokens as u64);
+            assert_eq!(event.budget_bytes, local.budget_bytes as u64);
+            assert_eq!(event.bound, local.bound);
+
+            turn.abandon();
+        }
+
+        /// **BR-1, the quiet half.** A reroute whose new window happens to hold
+        /// everything already there is still announced: the *budget* changed,
+        /// and the next `route_decided` will carry different numbers with no
+        /// account of why.
+        #[tokio::test]
+        async fn a_refit_with_nothing_to_cut_is_still_the_news() {
+            let (sessions, session_id) = one_freeform_session();
+            let bus = Arc::new(EventBus::new());
+            let mut sub = bus.subscribe(64);
+            let events = SessionEvents::new(Arc::clone(&bus), session_id.clone());
+
+            let wide = remote_budget(128_000);
+            let narrower = remote_budget(32_000);
+            let mut turn = turn_of(&sessions, &session_id, &wide, 2, 50);
+
+            refit_for_reroute(&mut turn, &events, &wide, &narrower);
+
+            let published = pressure(&mut sub).await;
+            assert_eq!(published.len(), 1, "{published:#?}");
+            assert_eq!(published[0].kind, ContextPressureKind::RefitOnReroute);
+            assert_eq!(
+                (published[0].dropped_blocks, published[0].elided_bytes),
+                (0, 0),
+                "nothing was cut, which is exactly what the line should say"
+            );
+            assert_eq!(published[0].budget_tokens, narrower.budget_tokens as u64);
+
+            turn.abandon();
+        }
+
+        /// **AC-15c / ADR-2.** The in-place degrade keeps the failed provider's
+        /// window, so it re-fits nothing and announces nothing.
+        ///
+        /// The counterpart to the two tests above, and the reason
+        /// `refit_for_reroute` compares pairs rather than trusting its callers:
+        /// the degrade arrives through the *same* `route = next` arm as a
+        /// fallback, so "the degrade is quiet" has to be a property of the
+        /// budget it carries, not of which line of the runtime called.
+        #[tokio::test]
+        async fn a_degrade_that_keeps_the_window_refits_nothing_and_says_nothing() {
+            let (sessions, session_id) = one_freeform_session();
+            let bus = Arc::new(EventBus::new());
+            let mut sub = bus.subscribe(64);
+            let events = SessionEvents::new(Arc::clone(&bus), session_id.clone());
+
+            let wide = remote_budget(128_000);
+            let mut turn = turn_of(&sessions, &session_id, &wide, 12, 2_000);
+            let before = turn.ctx().estimated_tokens();
+
+            refit_for_reroute(&mut turn, &events, &wide, &wide.clone());
+
+            assert!(
+                pressure(&mut sub).await.is_empty(),
+                "an in-place degrade announced a re-fit that never happened"
+            );
+            assert_eq!(
+                turn.ctx().estimated_tokens(),
+                before,
+                "and it must not have touched the conversation either"
+            );
+
+            turn.abandon();
+        }
+
+        /// **BR-10.** The commit's own budget gate reports what it took, so the
+        /// between-turns drop can be published where the events handle lives.
+        ///
+        /// The seam's whole reason for existing: `commit_now` runs from `Drop`
+        /// as well as from the success arm, so it cannot hold a `SessionEvents`
+        /// and cannot emit. If it swallowed its report instead of returning it,
+        /// a session whose retained conversation no longer fits the next turn's
+        /// window would lose its oldest turns with nothing said — the exact
+        /// silence BR-7 forbids, at the one gate the loop's three do not cover.
+        #[test]
+        fn the_commit_reports_the_blocks_it_dropped_to_fit() {
+            let (sessions, session_id) = one_freeform_session();
+            // A conversation assembled on a wide route meeting the local pair,
+            // which is BR-10's scenario in miniature.
+            let turn = turn_of(
+                &sessions,
+                &session_id,
+                &derive(BudgetInputs::local()),
+                40,
+                500,
+            );
+            let report = turn.commit_reporting();
+            assert!(
+                report.dropped_blocks > 0,
+                "the commit re-asserted the budget but reported nothing: {report:?}"
+            );
+            assert!(!report.is_quiet());
+            // And the write still happened — the report is a by-product of the
+            // commit, not a replacement for it.
+            assert!(!sessions
+                .conversation_snapshot(&session_id)
+                .blocks()
+                .is_empty());
+        }
+
+        /// **BR-10, verify M7-b.** The commit's publish speaks for a clamp and
+        /// stays silent for a quiet report — and it carries the commit's own
+        /// numbers, not the loop's.
+        ///
+        /// [`publish_commit_pressure`]'s own doc says why this is a unit test
+        /// rather than a leg of an end-to-end fixture: a turn that *completed*
+        /// cannot reach it with anything to say, because the loop gates both of
+        /// its `Ok` exits and nothing appends between that gate and the commit.
+        /// That made the branch unguardable in practice — `if false &&
+        /// !pressure.is_quiet()` at the seam left the whole `tetond` package
+        /// green, and the fixture AC-11 drives it through
+        /// (`conversation_carry.rs`) was calling the report-discarding
+        /// `commit()` so it could not have caught it either way. Both halves are
+        /// fixed: the fixture now commits the daemon's way, and the decision
+        /// itself is stated here.
+        ///
+        /// The kind is asserted too, because the commit is the one caller that
+        /// must **not** pass a kind of its own: an identical report is
+        /// `RefitOnReroute` at a reroute arm and `BlocksDropped` here, and
+        /// getting that from [`pressure_kind`] is what keeps the commit from
+        /// inventing a fourth vocabulary.
+        #[tokio::test]
+        async fn the_commit_publishes_a_clamp_and_says_nothing_about_a_quiet_one() {
+            let (_sessions, session_id) = one_freeform_session();
+            let bus = Arc::new(EventBus::new());
+            let mut sub = bus.subscribe(64);
+            let events = SessionEvents::new(Arc::clone(&bus), session_id.clone());
+            let budget = remote_budget(128_000);
+
+            // A quiet report — the ordinary case, since `truncate_to_budget`
+            // runs on every commit — says nothing at all.
+            publish_commit_pressure(&events, &PressureReport::default(), &budget);
+            assert!(
+                pressure(&mut sub).await.is_empty(),
+                "a commit that clamped nothing announced a clamp"
+            );
+
+            // A report that dropped blocks is the BR-10 news, with the numbers
+            // of the route the turn ran under.
+            let dropped = PressureReport {
+                dropped_blocks: 3,
+                ..PressureReport::default()
+            };
+            publish_commit_pressure(&events, &dropped, &budget);
+            let published = pressure(&mut sub).await;
+            assert_eq!(published.len(), 1, "{published:#?}");
+            assert_eq!(published[0].kind, ContextPressureKind::BlocksDropped);
+            assert_eq!(published[0].dropped_blocks, 3);
+            assert_eq!(published[0].budget_tokens, budget.budget_tokens as u64);
+            assert_eq!(published[0].budget_bytes, budget.budget_bytes as u64);
+            assert_eq!(published[0].bound, budget.bound);
+
+            // …and a pure in-place clamp is the other kind, off the same
+            // classifier the loop's gates use.
+            let elided = PressureReport {
+                elided_bytes: 4_096,
+                newest_user_elided: true,
+                ..PressureReport::default()
+            };
+            publish_commit_pressure(&events, &elided, &budget);
+            let published = pressure(&mut sub).await;
+            assert_eq!(published.len(), 1, "{published:#?}");
+            assert_eq!(published[0].kind, ContextPressureKind::BlockElided);
+            assert_eq!(published[0].elided_bytes, 4_096);
+            assert!(published[0].newest_user_elided);
+
+            // …and the third: the gate ran and could do nothing, which is its
+            // own kind rather than an elision of zero bytes (TASK-194 2a). The
+            // zero used to *be* the report, which meant a reader was told a
+            // block had been shortened when none had.
+            let did_not_fit = PressureReport {
+                over_budget: true,
+                ..PressureReport::default()
+            };
+            publish_commit_pressure(&events, &did_not_fit, &budget);
+            let published = pressure(&mut sub).await;
+            assert_eq!(published.len(), 1, "{published:#?}");
+            assert_eq!(published[0].kind, ContextPressureKind::DidNotFit);
+            assert_eq!(published[0].dropped_blocks, 0);
+            assert_eq!(published[0].elided_bytes, 0);
+        }
+
+        /// **TASK-194 2b.** The event carries whether the bound it names is
+        /// actually in force.
+        ///
+        /// A cap of 500 on a 200k provider derives below the floor, so the pair
+        /// is raised and the turn gets *more* than the cap asked for. Reporting
+        /// `bound: user cap` with nothing beside it is a line claiming a ceiling
+        /// the turn is not running under — and it is read off the route's own
+        /// budget here, never recomputed by comparing the pair to a floor.
+        #[tokio::test]
+        async fn a_floored_bound_says_so_on_the_event() {
+            let (_sessions, session_id) = one_freeform_session();
+            let bus = Arc::new(EventBus::new());
+            let mut sub = bus.subscribe(64);
+            let events = SessionEvents::new(Arc::clone(&bus), session_id.clone());
+            let dropped = PressureReport {
+                dropped_blocks: 1,
+                ..PressureReport::default()
+            };
+
+            let honoured = remote_budget(128_000);
+            assert!(!honoured.floored);
+            publish_commit_pressure(&events, &dropped, &honoured);
+            let published = pressure(&mut sub).await;
+            assert!(!published[0].bound_floored, "{published:#?}");
+
+            let floored = derive(BudgetInputs {
+                window: 200_000,
+                cap: 500,
+                reservation: RESERVATION,
+                is_local: false,
+                redact_scan: false,
+                provider_id: Some("kimi"),
+            });
+            assert_eq!(floored.bound, teton_protocol::events::BudgetBound::UserCap);
+            publish_commit_pressure(&events, &dropped, &floored);
+            let published = pressure(&mut sub).await;
+            assert!(
+                published[0].bound_floored,
+                "a cap the floor overruled must be reported as overruled: {published:#?}"
+            );
+            assert!(published[0].budget_tokens > 500);
+        }
+
+        /// **Verify M7-a.** `build_router` passes `[privacy] redact` into the
+        /// derivation, so an opted-in machine's large-window route is bounded
+        /// by what the scan can read whole.
+        ///
+        /// AC-6's own test builds a `Router` and calls `.with_redact_scan(flag)`
+        /// on it explicitly, which proves `budget_for` honours the flag and
+        /// nothing about how the flag gets there. The single line
+        /// `.with_redact_scan(config.privacy.redact)` in [`build_router`] is
+        /// what makes `[privacy] redact = true` a *budget* on the daemon, and
+        /// replacing it with `false` left the entire `tetond` package green.
+        ///
+        /// What that mutation costs is not subtle: every opted-in machine on a
+        /// 128k provider would derive `BudgetBound::Window` — a 253,952-byte
+        /// budget, well over `REDACT_INPUT_MAX_BYTES` — assemble a body that
+        /// size, and have the gate refuse it fail-closed as `ScanUnavailable`.
+        /// That is the REQ-562/REQ-577 collision this REQ exists not to
+        /// reintroduce, arriving as a privacy error on a turn whose only fault
+        /// is its size.
+        ///
+        /// The third leg closes AC-6's untested clause: `[web] tier = search`
+        /// installs the *search* redaction gate, which deliberately does not
+        /// read `[privacy] redact` (BR-14) — and does not scan provider
+        /// payloads either. So the provider route's bound follows `redact`
+        /// alone, and a search-tier machine with the scan off is `window`.
+        #[test]
+        fn build_router_makes_the_privacy_flag_the_routes_bound() {
+            use teton_core::config::{PrivacyConfig, WebConfig, WebTier};
+            use teton_protocol::events::BudgetBound;
+
+            /// A remote provider big enough that its window-derived byte budget
+            /// is over the scannable bound — which is the only shape where the
+            /// two answers differ.
+            fn config_with(redact: bool, tier: WebTier) -> Config {
+                Config {
+                    providers: vec![ModelProvider {
+                        id: "wide".to_owned(),
+                        kind: ProviderKind::OpenaiCompatible,
+                        endpoint: Some("https://example.invalid/v1/chat/completions".to_owned()),
+                        model: Some("wide-model".to_owned()),
+                        auth_ref: None,
+                        capabilities: ProviderCapabilities {
+                            max_context: 128_000,
+                            ..ProviderCapabilities::default()
+                        },
+                    }],
+                    default_provider: Some("wide".to_owned()),
+                    privacy: PrivacyConfig { redact },
+                    web: WebConfig {
+                        tier,
+                        ..WebConfig::default()
+                    },
+                    ..Config::default()
+                }
+            }
+
+            let scanning = build_router(&config_with(true, WebTier::Off), true, &BTreeMap::new())
+                .budget_for(Some("wide"));
+            assert_eq!(
+                scanning.bound,
+                BudgetBound::RedactScan,
+                "`[privacy] redact = true` must reach the derivation through \
+                 `build_router`, or an opted-in machine assembles a body the \
+                 gate then refuses as unscannable: {scanning:?}"
+            );
+
+            let unscanned = build_router(&config_with(false, WebTier::Off), true, &BTreeMap::new())
+                .budget_for(Some("wide"));
+            assert_eq!(
+                unscanned.bound,
+                BudgetBound::Window,
+                "with the scan off the same route is window-bound: {unscanned:?}"
+            );
+            assert!(
+                unscanned.budget_bytes > scanning.budget_bytes,
+                "the two legs must differ, or neither says anything: {} vs {}",
+                unscanned.budget_bytes,
+                scanning.budget_bytes
+            );
+
+            // AC-6's search clause: the search gate is switched by `[web] tier`
+            // and not by `[privacy] redact`, and it does not scan the provider
+            // payload — so it moves no provider route's bound.
+            let searching =
+                build_router(&config_with(false, WebTier::Search), true, &BTreeMap::new())
+                    .budget_for(Some("wide"));
+            assert_eq!(
+                searching, unscanned,
+                "`[web] tier = search` with `redact = false` must leave the \
+                 provider route window-bound: {searching:?}"
+            );
+        }
+
+        /// **TASK-194 2b, `/doctor`'s half.** The snapshot's `floored_budget`
+        /// is filled in by the daemon for a declaration the floor overruled, and
+        /// left out for one it honoured.
+        ///
+        /// The CLI's rendering of the cell is guarded against a synthetic
+        /// [`teton_protocol::methods::ProviderConfig`] with the field already
+        /// populated, which says nothing about the line in
+        /// [`snapshot_from_config`] that populates it. **Both** mutations
+        /// therefore survived the workspace: never `Some` (the cell silently
+        /// disappears from `/doctor` for every floored provider) and always
+        /// `Some` (every ordinary provider grows a line claiming its window was
+        /// overruled when it was not).
+        ///
+        /// The pair is asserted, not just the presence: the whole point of the
+        /// cell is to name the budget actually in force beside a cap that is
+        /// not, so a `Some` carrying the *cap's* numbers would be the same
+        /// untruth one field along. And it is read through `router.budget_for`,
+        /// the seam every route attempt runs through — a snapshot deriving its
+        /// own answer could disagree with the turn.
+        #[test]
+        fn the_doctor_snapshot_names_a_floored_budget_and_only_a_floored_one() {
+            fn config_capped_at(cap: u32) -> Config {
+                Config {
+                    providers: vec![ModelProvider {
+                        id: "wide".to_owned(),
+                        kind: ProviderKind::OpenaiCompatible,
+                        endpoint: Some("https://example.invalid/v1/chat/completions".to_owned()),
+                        model: Some("wide-model".to_owned()),
+                        auth_ref: None,
+                        capabilities: ProviderCapabilities {
+                            max_context: 200_000,
+                            context_budget_cap: cap,
+                            ..ProviderCapabilities::default()
+                        },
+                    }],
+                    default_provider: Some("wide".to_owned()),
+                    ..Config::default()
+                }
+            }
+
+            // A 500-token cap on a 200k window derives nothing usable and lands
+            // on the floor, so the snapshot must say the declaration below is
+            // not what runs.
+            let config = config_capped_at(500);
+            let router = router_for_config(&config);
+            let snap = snapshot_from_config(&config, &router, false);
+            let row = snap
+                .providers
+                .iter()
+                .find(|p| p.id.0 == "wide")
+                .expect("the registered provider has a row");
+            assert_eq!(row.context_budget_cap, Some(500), "the cap is recorded");
+            let floored = row
+                .floored_budget
+                .expect("a cap the floor overruled must be named in the snapshot");
+            let in_force = router.budget_for(Some("wide"));
+            assert!(in_force.floored, "{in_force:?}");
+            assert_eq!(
+                (floored.budget_tokens, floored.budget_bytes),
+                (in_force.budget_tokens as u64, in_force.budget_bytes as u64),
+                "the cell must carry the pair actually in force, which is \
+                 *larger* than the cap asked for — repeating the cap would be \
+                 the same untruth the field exists to close"
+            );
+            assert!(floored.budget_tokens > 500);
+
+            // The twin, differing only in the cap: an honoured declaration adds
+            // no cell at all, so an ordinary `/doctor` is byte-identical.
+            let honoured = config_capped_at(0);
+            let snap = snapshot_from_config(&honoured, &router_for_config(&honoured), false);
+            let row = snap
+                .providers
+                .iter()
+                .find(|p| p.id.0 == "wide")
+                .expect("the registered provider has a row");
+            assert_eq!(
+                row.floored_budget, None,
+                "a window the floor never touched must not grow a line saying \
+                 it was overruled: {row:?}"
+            );
+        }
+
+        /// A provider bound to every tier at `endpoint`, declaring a 128k
+        /// window it will then refuse a request against.
+        fn refusing_provider_config(endpoint: &str) -> Config {
+            Config {
+                providers: vec![ModelProvider {
+                    id: "kimi".to_owned(),
+                    kind: ProviderKind::OpenaiCompatible,
+                    endpoint: Some(endpoint.to_owned()),
+                    model: Some("kimi-k2".to_owned()),
+                    auth_ref: None,
+                    capabilities: ProviderCapabilities {
+                        max_context: 128_000,
+                        ..ProviderCapabilities::default()
+                    },
+                }],
+                tiers: Tier::ALL
+                    .iter()
+                    .map(|tier| TierBinding {
+                        tier: *tier,
+                        provider_id: "kimi".to_owned(),
+                        // No fallback at all: if the arm below ever asked for
+                        // one, the absence would surface as a *different* error
+                        // code and this test would fail loudly rather than
+                        // silently passing on a fallback that could not be
+                        // built.
+                        fallback_id: None,
+                    })
+                    .collect(),
+                ..Config::default()
+            }
+        }
+
+        /// **AC-3, at the runtime.** A provider answering the vendor's
+        /// context-length 400 ends the turn with the typed
+        /// `CONTEXT_LENGTH_EXCEEDED`, and the provider's standing with the
+        /// router is exactly what it was before.
+        ///
+        /// Driven against a real socket rather than a mocked source, because the
+        /// claim is about `run_prompt_turn`'s arms — health, `provider_degraded`,
+        /// and the code the client receives — and those only run when the error
+        /// has travelled the whole adapter → egress → source → loop path. The
+        /// body is Moonshot's own spelling: Kimi is the dogfood provider and the
+        /// spelling it sends is the one that was not pinned before this REQ.
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn a_context_length_refusal_changes_no_health_and_degrades_nothing() {
+            const BODY: &str = r#"{"error":{"type":"invalid_request_error","message":"Input token length too long"}}"#;
+            let listener = TcpListener::bind("127.0.0.1:0").expect("bind a mock vendor");
+            let addr = listener.local_addr().expect("mock vendor address");
+            let hits = Arc::new(AtomicUsize::new(0));
+            let served = Arc::clone(&hits);
+            std::thread::spawn(move || {
+                for stream in listener.incoming() {
+                    let Ok(mut stream) = stream else { break };
+                    served.fetch_add(1, Ordering::SeqCst);
+                    // Enough of the request to know it arrived; the response is
+                    // fixed either way.
+                    let mut buf = [0u8; 4096];
+                    let _ = stream.read(&mut buf);
+                    let _ = stream.write_all(
+                        format!(
+                            "HTTP/1.1 400 Bad Request\r\nContent-Type: application/json\r\n\
+                             Content-Length: {}\r\nConnection: close\r\n\r\n{BODY}",
+                            BODY.len()
+                        )
+                        .as_bytes(),
+                    );
+                    let _ = stream.flush();
+                }
+            });
+
+            let runtime = Arc::new(DaemonRuntime::minimal());
+            *runtime.config.lock().expect("config mutex") =
+                refusing_provider_config(&format!("http://{addr}/v1/chat/completions"));
+            let events = Arc::new(EventBus::new());
+            let mut sub = events.subscribe(256);
+            let sessions = SessionRegistry::new();
+            let session_id = sessions
+                .create(SessionMode::Structured, Some(ProtoPhase::Implement), None)
+                .expect("a structured session takes a phase")
+                .session_id;
+
+            let before = runtime.health_snapshot();
+            let err = runtime
+                .run_prompt_turn(
+                    &events,
+                    &sessions,
+                    session_id.clone(),
+                    SessionMode::Structured,
+                    Some(ProtoPhase::Implement),
+                    None,
+                    "a prompt the provider will say is too large".to_owned(),
+                    ClientPresence::unwatched(),
+                )
+                .await
+                .expect_err("a refused turn must not report success");
+
+            // Typed, and naming what the user can act on.
+            assert_eq!(err.code, error_code::CONTEXT_LENGTH_EXCEEDED, "{err:?}");
+            assert!(err.message.contains("kimi"), "{}", err.message);
+            assert!(err.message.contains("word budget"), "{}", err.message);
+            assert!(
+                !err.message.contains("Input token length"),
+                "the provider's own body leaked into the turn error: {}",
+                err.message
+            );
+
+            // No health change: a provider that correctly reported its own limit
+            // is not unhealthy, and downgrading it here would move *later* turns
+            // off a provider that works.
+            assert_eq!(
+                runtime.health_snapshot(),
+                before,
+                "the refusal changed the provider's standing with the router"
+            );
+            // And no `provider_degraded`: nothing failed over, so nothing may
+            // tell the user their provider was demoted.
+            let mut degraded = Vec::new();
+            while let Ok(Some(env)) =
+                tokio::time::timeout(Duration::from_millis(100), sub.recv()).await
+            {
+                if let Event::ProviderDegraded(pd) = env.event {
+                    degraded.push(pd);
+                }
+            }
+            assert!(degraded.is_empty(), "{degraded:#?}");
+            assert!(
+                hits.load(Ordering::SeqCst) >= 1,
+                "non-vacuity: the daemon really did reach the mock vendor"
+            );
+        }
+    }
+
     /// REQ-580: a turn that meets a warming local tier is **held** for it, not
     /// refused — and every way the hold can end is pinned here.
     ///
@@ -26596,6 +27837,7 @@ provider_id = \"deepseek\"
                     reason: String::new(),
                     outcome: RouteOutcome::Primary,
                     harness: Default::default(),
+                    budget: crate::harness::turn_loop::HarnessConfig::default().budget,
                     effort: None,
                     resolution: None,
                 }

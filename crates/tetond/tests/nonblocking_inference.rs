@@ -169,7 +169,15 @@ async fn a_slow_summarization_does_not_stall_an_unrelated_task() {
             // The `digest` duty on the local tier — the route the daemon resolves
             // when `digest` (or its `scan` tier) is bound to the local provider.
             let route = DutyRoute::local(DIGEST_DUTY, "local", engine);
-            summarize_if_large(&route, "grep", &big, 50, &ToolProvenance::none()).await
+            summarize_if_large(
+                &route,
+                "grep",
+                &big,
+                50,
+                50 * tetond::harness::context::APPROX_BYTES_PER_TOKEN,
+                &ToolProvenance::none(),
+            )
+            .await
         }
     });
 

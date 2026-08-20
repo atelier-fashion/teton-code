@@ -59,16 +59,19 @@ pub const DOCS_TOOL_NAME: &str = "teton_docs";
 pub const MAX_TOPIC_BYTES: usize = 4096;
 
 /// Every bundled topic, as `(name, body)`, in the order a reader should meet
-/// them: how to connect a provider, where work is then routed, the separate
-/// web opt-in, and how to read the diagnostic when one of those is wrong.
+/// them: how to connect a provider, where work is then routed, what each turn
+/// is assembled under, the separate web opt-in, and how to read the diagnostic
+/// when one of those is wrong.
 ///
-/// A `&[(&str, &str)]` rather than four constants because every rule below —
+/// A `&[(&str, &str)]` rather than a constant apiece because every rule below —
 /// the ceiling sweep, the topic index, the unknown-topic error — is a statement
-/// about the *set*, and a set spelled out four times is one a fifth topic can be
-/// added to without.
+/// about the *set*, and a set spelled out five times is one a sixth topic can be
+/// added to without. `context` (REQ-586 ADR-11) is the design paying off: the
+/// budget vocabulary is a page, and it cost the resident prompt nine bytes.
 const TOPICS: &[(&str, &str)] = &[
     ("providers", include_str!("../docs/providers.md")),
     ("policy", include_str!("../docs/policy.md")),
+    ("context", include_str!("../docs/context.md")),
     ("web", include_str!("../docs/web.md")),
     ("doctor", include_str!("../docs/doctor.md")),
 ];
@@ -80,7 +83,7 @@ const TOPICS: &[(&str, &str)] = &[
 /// are `const` — and because a hand-written second spelling is what
 /// `the_description_indexes_every_bundled_topic` can compare against, the same
 /// golden posture the recipe catalog takes.
-const TOPIC_INDEX: &str = "providers, policy, web, doctor";
+const TOPIC_INDEX: &str = "providers, policy, context, web, doctor";
 
 /// The longest echo of a caller-supplied topic any message here will carry.
 ///
@@ -122,12 +125,21 @@ pub(crate) fn bounded_topic_echo(topic: &str) -> String {
 ///
 /// It ends with the topic index because the index *is* the affordance: a model
 /// deciding whether this tool answers the question in front of it is matching
-/// the subject it was asked about against these four words. BUG-168's lesson
+/// the subject it was asked about against these five words. BUG-168's lesson
 /// applies — a capability the prompt does not name outright is one the local
-/// tier does not reach for.
+/// tier does not reach for. The fifth word, `context`, cost nine characters
+/// here for a 3.4 KB topic (REQ-586 ADR-11) — the trade this module exists to
+/// make.
+///
+/// The sentence in front of the index paid for it. `setup and troubleshooting`
+/// named nothing `docs` does not already imply, and it was the only clause
+/// here that was not a topic name; dropping it took the description from the
+/// ceiling to 26 characters under it. **Spend that on names**: the index is
+/// the affordance, the sentence is the frame around it, and the next two
+/// topics should come out of this margin rather than out of `MAX_DESCRIPTION_CHARS`.
 const DESCRIPTION: &str = concat!(
-    "Read Teton's own setup and troubleshooting docs, bundled in this binary. ",
-    "topics: providers, policy, web, doctor"
+    "Read Teton's own docs, bundled in this binary. ",
+    "topics: providers, policy, context, web, doctor"
 );
 
 /// The body of `topic`, or `None` when nothing by that name is bundled.
@@ -241,6 +253,20 @@ mod tests {
     /// derived universe. The scan now anchors on the test module itself and
     /// pins that with a regression test, so the placement is convention, not a
     /// constraint.
+    ///
+    /// **Spent and left, as of REQ-586.** The `context` topic's nine characters
+    /// (`, context`) first took [`DESCRIPTION`] to exactly 120 — legal, and no
+    /// headroom at all with a `projects` tool (REQ-584) and a `skill` tool
+    /// (REQ-587) queued behind this one. So the room was bought where the
+    /// review said to buy it: the sentence in front of the index lost `setup
+    /// and troubleshooting`, 26 characters that named nothing the index does
+    /// not already carry. **Spent: 94. Left: 26** — room for roughly two more
+    /// topic names.
+    ///
+    /// A sixth topic spends that margin, not this number: the two margin tests
+    /// measure the prompt this description sits in, and their headroom is what
+    /// the bundled guide is competing for. When the margin is gone, shorten the
+    /// frame again or make the case for a bigger ceiling out loud.
     pub(super) const MAX_DESCRIPTION_CHARS: usize = 120;
 
     fn ctx() -> ToolContext {
@@ -266,7 +292,7 @@ mod tests {
     fn every_topic_serves_its_whole_bundled_body() {
         assert_eq!(
             TOPICS.len(),
-            4,
+            5,
             "the topic roster changed: {:?}",
             TOPICS.iter().map(|(name, _)| *name).collect::<Vec<_>>()
         );
@@ -324,8 +350,8 @@ mod tests {
         }
     }
 
-    /// **AC-3, the didactic half (BR-8).** An unknown topic names all four valid
-    /// ones, so the recovery is the model's next turn rather than the user's.
+    /// **AC-3, the didactic half (BR-8).** An unknown topic names every valid
+    /// one, so the recovery is the model's next turn rather than the user's.
     #[test]
     fn an_unknown_topic_is_answered_with_the_valid_ones() {
         let outcome = call("pricing");
@@ -532,16 +558,18 @@ mod tests {
     /// coupling is written down here rather than left to hold by luck.
     #[test]
     fn the_topic_ceiling_stays_under_the_summarize_threshold() {
-        use crate::harness::context::APPROX_BYTES_PER_TOKEN;
         use crate::harness::turn_loop::HarnessConfig;
 
-        let threshold_bytes =
-            HarnessConfig::default().summarize_threshold_tokens * APPROX_BYTES_PER_TOKEN;
+        // The byte twin is read off the config rather than recomputed from the
+        // word threshold (REQ-586 BR-6, gotcha #3): the two thresholds scale
+        // from two different currencies on a remote route, so a topic must clear
+        // the byte one the harness will actually apply.
+        let threshold_bytes = HarnessConfig::default().summarize_threshold_bytes;
         assert!(
             MAX_TOPIC_BYTES < threshold_bytes,
             "the per-topic ceiling is {MAX_TOPIC_BYTES} bytes and the default harness \
              summarizes a tool result past {threshold_bytes} bytes \
-             ({} tokens × {APPROX_BYTES_PER_TOKEN}). A topic at the ceiling would be \
+             ({} tokens). A topic at the ceiling would be \
              summarized instead of served — a model call, and on a remote tier a model call \
              carrying the body, which is not what `teton_docs` promises. Lower \
              `MAX_TOPIC_BYTES`, or raise the threshold deliberately and say why here.",

@@ -864,6 +864,9 @@ mod tests {
             endpoint: endpoint.map(str::to_owned),
             model: Some("kimi-k3".to_owned()),
             auth_ref: Some(format!("keychain://teton/{id}")),
+            max_context: None,
+            context_budget_cap: None,
+            floored_budget: None,
         }
     }
 

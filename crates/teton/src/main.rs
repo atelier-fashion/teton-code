@@ -214,6 +214,19 @@ pub(crate) enum ProviderAction {
         /// Required for remote kinds; never inferred from the provider id.
         #[arg(long)]
         model: Option<String>,
+        /// The provider's context window in tokens, e.g. `128000` (REQ-586
+        /// BR-3). Declares what `teton doctor` and `teton provider list` show
+        /// as `window:` and what a turn's context budget is derived from;
+        /// omitted, the daemon keeps whatever it already holds and an unknown
+        /// window runs under the default budget, stated rather than hidden.
+        #[arg(long, value_name = "TOKENS")]
+        max_context: Option<u32>,
+        /// A ceiling on the context budget, in tokens, below the window
+        /// (REQ-586 BR-5) — the knob for "use this provider, but do not send it
+        /// 128k of context every turn". A cap at or above the window is inert,
+        /// not invalid, and doctor says so.
+        #[arg(long, value_name = "TOKENS")]
+        context_budget_cap: Option<u32>,
     },
     /// List configured providers.
     List,
@@ -505,7 +518,19 @@ fn main() -> ExitCode {
                 kind,
                 endpoint,
                 model,
-            } => run_provider_add(&paths, &id, kind.into(), endpoint, model),
+                max_context,
+                context_budget_cap,
+            } => run_provider_add(
+                &paths,
+                &id,
+                kind.into(),
+                endpoint,
+                model,
+                WindowFlags {
+                    max_context,
+                    context_budget_cap,
+                },
+            ),
             ProviderAction::List => run_provider_list(&paths),
             ProviderAction::Test { id } => run_provider_test(
                 &paths,
@@ -608,6 +633,8 @@ pub(crate) fn run_mirrored_command(
                 kind,
                 endpoint,
                 model,
+                max_context,
+                context_budget_cap,
             } => {
                 // ADR-3: the refusals are outcomes here, not `bail!`s — one
                 // Error line, and the session carries on. The consent mode is
@@ -627,6 +654,10 @@ pub(crate) fn run_mirrored_command(
                     kind.into(),
                     endpoint,
                     model,
+                    WindowFlags {
+                        max_context,
+                        context_budget_cap,
+                    },
                     consent,
                     keychain.as_ref(),
                 )? {
@@ -1831,6 +1862,7 @@ pub(crate) fn doctor_report_on(
         Ok(cfg) => {
             render_config(&cfg.snapshot.providers, ctx.surface);
             advise_on_base_url_endpoints(&cfg.snapshot.providers, ctx.surface);
+            advise_on_context_windows(&cfg.snapshot.providers, ctx.surface);
         }
         Err(err) if err.code == error_code::METHOD_NOT_FOUND => ctx.surface.line(
             LineKind::Notice,
@@ -2084,6 +2116,7 @@ fn run_provider_add(
     kind: ProviderKind,
     endpoint: Option<String>,
     model: Option<String>,
+    window: WindowFlags,
 ) -> anyhow::Result<()> {
     // Before `ensure_connected`, because it always was: a `provider add` with no
     // `--model` has never started a daemon in order to refuse.
@@ -2103,6 +2136,7 @@ fn run_provider_add(
         kind,
         endpoint,
         model,
+        window,
         AddConsent::Shell,
         keychain.as_ref(),
     )? {
@@ -2143,6 +2177,7 @@ pub(crate) fn provider_add_on(
     kind: ProviderKind,
     endpoint: Option<String>,
     model: Option<String>,
+    window: WindowFlags,
     consent: AddConsent,
     keychain: &dyn Keychain,
 ) -> anyhow::Result<Result<(), ProviderAddRefusal>> {
@@ -2204,7 +2239,7 @@ pub(crate) fn provider_add_on(
     // "nothing was changed and no credential was read" — true here, since the
     // key is not asked for until the step after this one. A refusal rather than
     // an `Err` so a mistyped `--endpoint` does not end the session (m7).
-    let settled = match settle_registration(id, kind, endpoint, model, &mut *ctx.surface) {
+    let settled = match settle_registration(id, kind, endpoint, model, window, &mut *ctx.surface) {
         Ok(settled) => settled,
         Err(refused) => return Ok(Err(ProviderAddRefusal::Endpoint(format!("{refused:#}")))),
     };
@@ -3235,6 +3270,25 @@ struct SettledRegistration {
     /// The absolute request URL to persist — the value the echo named.
     endpoint: Option<String>,
     model: Option<String>,
+    /// What the two REQ-586 flags declared, carried unread to the payload.
+    window: WindowFlags,
+}
+
+/// What `--max-context` / `--context-budget-cap` declared on this registration
+/// (REQ-586 BR-3/BR-5, ADR-9).
+///
+/// One value rather than two more arguments on a chain that is already five
+/// deep, and `None` on either field means exactly what it means on the wire:
+/// *not stated here*, so the daemon preserves whatever it holds (ADR-7's
+/// field-wise merge). That is why this is not `u32` with a `0` default — a `0`
+/// travels as "unknown", which would let `provider add --model …` on an
+/// existing provider silently erase a window somebody had declared.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) struct WindowFlags {
+    /// `capabilities.max_context`, in tokens.
+    pub(crate) max_context: Option<u32>,
+    /// `capabilities.context_budget_cap`, in tokens.
+    pub(crate) context_budget_cap: Option<u32>,
 }
 
 /// The registration and the keychain reference it carries.
@@ -3254,6 +3308,7 @@ fn settle_registration(
     kind: ProviderKind,
     endpoint: Option<String>,
     model: Option<String>,
+    window: WindowFlags,
     surface: &mut dyn Surface,
 ) -> anyhow::Result<SettledRegistration> {
     let endpoint = settle_endpoint(id, kind, endpoint, surface)?;
@@ -3262,6 +3317,7 @@ fn settle_registration(
         kind,
         endpoint,
         model,
+        window,
     })
 }
 
@@ -3280,6 +3336,7 @@ fn registration_params(
         settled.kind,
         settled.endpoint.clone(),
         settled.model.clone(),
+        settled.window,
         keychain,
         secret,
     )?;
@@ -3407,6 +3464,7 @@ fn build_provider_registration(
     kind: ProviderKind,
     endpoint: Option<String>,
     model: Option<String>,
+    window: WindowFlags,
     keychain: &dyn Keychain,
     secret: Option<&str>,
 ) -> anyhow::Result<ProviderConfig> {
@@ -3420,6 +3478,12 @@ fn build_provider_registration(
         endpoint,
         model,
         auth_ref,
+        // REQ-586 ADR-9/ADR-7: the flags travel exactly as typed. `None` — the
+        // flag was not given — preserves whatever the daemon stores, so a
+        // re-registration that says nothing about the window cannot zero one.
+        max_context: window.max_context,
+        context_budget_cap: window.context_budget_cap,
+        floored_budget: None,
     })
 }
 
@@ -3449,17 +3513,29 @@ fn report_registration_outcome(
         // The keychain sentence is claimed only when a key was stored — a local
         // provider stored nothing, and the old unconditional line told it a
         // key was in the keychain under ref `—`.
-        Ok(res) if res.applied => surface.line(
-            LineKind::Info,
-            &match prior {
-                Some(_) => format!(
-                    "provider `{id}` registered ({}). Key stored in the OS keychain (ref {auth}); \
-                     no key written to disk.",
-                    kind_label(kind)
-                ),
-                None => format!("provider `{id}` registered ({}).", kind_label(kind)),
-            },
-        ),
+        Ok(res) if res.applied => {
+            surface.line(
+                LineKind::Info,
+                &match prior {
+                    Some(_) => format!(
+                        "provider `{id}` registered ({}). Key stored in the OS keychain (ref \
+                         {auth}); no key written to disk.",
+                        kind_label(kind)
+                    ),
+                    None => format!("provider `{id}` registered ({}).", kind_label(kind)),
+                },
+            );
+            // REQ-586 OQ-6 as amended: a registration that recorded a big
+            // context window says its size once, here, and only here on this
+            // path. The **daemon** composed the sentence — every figure in it
+            // is `budget::derive`'s, which is not a thing a thin client may
+            // re-derive (BR-8) — so this renders the answer and words nothing
+            // of its own. `None` (no big window, or a daemon predating the
+            // field) prints nothing at all, which is today's output.
+            if let Some(notice) = res.budget_notice.as_deref() {
+                surface.line(LineKind::Notice, notice);
+            }
+        }
         Ok(_) => {
             surface.line(
                 LineKind::Notice,
@@ -3653,14 +3729,170 @@ fn render_config(providers: &[ProviderConfig], surface: &mut dyn Surface) {
             (_, ProviderKind::Local) => "(see `teton model status`)".to_owned(),
             _ => "UNUSABLE — no model; re-add with `--model <name>`".to_owned(),
         };
+        let window = window_column(provider);
         surface.line(
             LineKind::Info,
             &format!(
-                "  {} [{}]  {model}  {endpoint}  auth: {auth}",
+                "  {} [{}]  {model}  {endpoint}  auth: {auth}  {window}",
                 provider.id,
                 kind_label(provider.kind)
             ),
         );
+    }
+}
+
+/// The `window:` column one provider row carries (REQ-586 BR-3, ADR-9).
+///
+/// Three states and a fourth that is not a state at all, kept apart because a
+/// user acts differently on each:
+///
+/// * `window: 128k` — the provider declared one.
+/// * `window: unknown — …` — the daemon holds `0`. The budget is *defaulted*,
+///   and BR-3 is that this is stated rather than silently applied, with the
+///   remedy in the same line.
+/// * `window: not reported` — the field is absent, which only an older daemon
+///   produces (the daemon always populates it, `Some(0)` for unknown). Saying
+///   "unknown" here would blame the config for a client/daemon skew, the
+///   distinction `effort_ui`'s "predates the setting" line already draws.
+/// * `(local engine)` — a local row's budget is the local pair whatever any
+///   window says, so "unknown" would be both untrue and un-actionable: there is
+///   no `capabilities.max_context` worth setting on it.
+fn window_column(provider: &ProviderConfig) -> String {
+    if matches!(provider.kind, ProviderKind::Local) {
+        return "(local engine)".to_owned();
+    }
+    match provider.max_context {
+        Some(0) => {
+            "window: unknown — context budget defaulted (set capabilities.max_context)".to_owned()
+        }
+        Some(tokens) => format!("window: {}", window_figure(tokens)),
+        None => "window: not reported".to_owned(),
+    }
+}
+
+/// A context window rendered for a column: `128k`, `1m`, `1.05m`, `512`.
+///
+/// **A figure, not a sentence.** The daemon's `RouteBudget::window_label` is
+/// the *phrase* the in-prompt elision marker names a window with ("the local
+/// context window"); this renders the number a listing column compares. One
+/// name for the two would be two meanings for one word, both introduced by
+/// REQ-586.
+///
+/// Rounded on purpose — this is a listing, and `131k` next to `200k` compares at
+/// a glance where `131072` does not. Millions keep up to two decimals because
+/// the shipped recipes hold both 1,000,000 and 1,050,000, and rounding those to
+/// one `1m` would render two different windows as the same number. The exact
+/// figure is in `config.toml`, which is also where it is edited.
+fn window_figure(tokens: u32) -> String {
+    let tokens = u64::from(tokens);
+    if tokens >= 1_000_000 {
+        // Hundredths of a million, rounded, then trimmed: 100 → `1m`,
+        // 105 → `1.05m`, 150 → `1.5m`.
+        let hundredths = (tokens + 5_000) / 10_000;
+        let (whole, frac) = (hundredths / 100, hundredths % 100);
+        return match frac {
+            0 => format!("{whole}m"),
+            f if f % 10 == 0 => format!("{whole}.{}m", f / 10),
+            f => format!("{whole}.{f:02}m"),
+        };
+    }
+    if tokens >= 1_000 {
+        return format!("{}k", (tokens + 500) / 1_000);
+    }
+    tokens.to_string()
+}
+
+/// Doctor's pass over what the configured providers say about their windows
+/// (REQ-586 BR-3/BR-5, ADR-9).
+///
+/// The [`advise_on_base_url_endpoints`] shape, one class over: a
+/// [`LineKind::Notice`] per provider with something to act on, nothing at all
+/// for the rest, and no change to doctor's status — a defaulted budget and an
+/// inert cap are both valid configs that are merely not doing what their author
+/// probably meant.
+///
+/// **Remote rows only.** A local row's budget is the local engine's whatever it
+/// declares, so advising one to set `capabilities.max_context` would send a user
+/// to edit a key that changes nothing.
+fn advise_on_context_windows(providers: &[ProviderConfig], surface: &mut dyn Surface) {
+    for provider in providers {
+        if matches!(provider.kind, ProviderKind::Local) {
+            continue;
+        }
+        let id = &provider.id;
+        if provider.max_context == Some(0) {
+            surface.line(
+                LineKind::Notice,
+                &format!(
+                    "provider `{id}`: no context window is declared, so turns routed to it run \
+                     under the default context budget rather than its own. Set \
+                     `capabilities.max_context` for `{id}` — `teton provider add {id} … \
+                     --max-context <tokens>`, or the `max_context` key under \
+                     `[providers.capabilities]` in config.toml. This is advice, not a fault: \
+                     the config is valid and the budget is stated, not guessed."
+                ),
+            );
+        }
+        // An inert cap is the other half of the same misreading — a ceiling
+        // written to bound the budget that sits at or above the window it was
+        // meant to bound, so it never binds. Only sayable when both figures are
+        // known: an unknown window has the line above instead.
+        if let (Some(cap), Some(window)) = (provider.context_budget_cap, provider.max_context) {
+            if cap > 0 && window > 0 && cap >= window {
+                surface.line(
+                    LineKind::Notice,
+                    &format!(
+                        "provider `{id}`: `context_budget_cap` is {} and the declared window is \
+                         {} — a cap at or above the window never binds, so it is inert rather \
+                         than invalid. Lower it below the window, or drop the key.",
+                        window_figure(cap),
+                        window_figure(window)
+                    ),
+                );
+            }
+        }
+        // The third misreading in the family, and the only one where the config
+        // is doing *less* than it says: a declaration that derives below the
+        // smallest budget which can still hold the harness's own system prompt
+        // is raised to that floor, so the turn gets **more** room than the
+        // declaration asked for. `/verbose` says so per turn; this is the same
+        // fact where a user goes to fix it (TASK-194 2b).
+        //
+        // Both figures are the daemon's: whether the floor bit, and the pair
+        // that is in force instead. Neither is computable from this snapshot —
+        // the floor depends on the generation reservation and the two budget
+        // ratios, which have one home, in the daemon (BR-8, LESSON-456).
+        if let Some(floored) = provider.floored_budget {
+            let instead = format!(
+                "turns to it get {} words / {} instead",
+                teton_protocol::events::thousands(floored.budget_tokens),
+                teton_protocol::events::bytes_figure(floored.budget_bytes)
+            );
+            // Which declaration was floored is which one the user would edit.
+            // A cap only binds below the window; at or above it the inert-cap
+            // line above is the right sentence and this one names the window.
+            let declared = match (provider.context_budget_cap, provider.max_context) {
+                (Some(cap), Some(window)) if cap > 0 && window > 0 && cap < window => {
+                    format!("`context_budget_cap` is {}", window_figure(cap))
+                }
+                _ => match provider.max_context {
+                    Some(window) if window > 0 => {
+                        format!("the declared window is {}", window_figure(window))
+                    }
+                    _ => "the declared budget".to_owned(),
+                },
+            };
+            surface.line(
+                LineKind::Notice,
+                &format!(
+                    "provider `{id}`: {declared}, which is below the smallest budget that can \
+                     hold the harness's own system prompt — so it is floored rather than \
+                     honored, and {instead}. A budget under that floor could assemble no turn \
+                     at all; the provider's own refusal is what reports a prompt that is \
+                     genuinely too long."
+                ),
+            );
+        }
     }
 }
 
@@ -3945,9 +4177,15 @@ mod tests {
                         kind,
                         endpoint,
                         model,
+                        max_context,
+                        context_budget_cap,
                     },
             }) => {
                 assert_eq!(id, "deepseek");
+                // REQ-586: the flags are optional and default to "not stated",
+                // which is what preserves a stored window on a re-registration.
+                assert_eq!(max_context, None);
+                assert_eq!(context_budget_cap, None);
                 assert!(matches!(kind, CliProviderKind::OpenaiCompatible));
                 assert_eq!(endpoint.as_deref(), Some("https://api.deepseek.com"));
                 assert_eq!(ProviderKind::from(kind), ProviderKind::OpenaiCompatible);
@@ -4013,6 +4251,9 @@ mod tests {
             endpoint: Some("https://example.invalid".to_owned()),
             model: model.map(str::to_owned),
             auth_ref: None,
+            max_context: None,
+            context_budget_cap: None,
+            floored_budget: None,
         };
 
         let mut surface = RecordingSurface::new();
@@ -4040,6 +4281,356 @@ mod tests {
             !rendered.contains("on-device [local]  UNUSABLE"),
             "a local provider without a model is normal, not unusable: {rendered}"
         );
+    }
+
+    /// **AC-4, the three window states and the fourth thing that is not one.**
+    ///
+    /// Each row of the listing says what the daemon knows about that provider's
+    /// context window, and the four spellings are four different situations a
+    /// user acts on differently — which is the whole of BR-3: an unknown window
+    /// is *stated*, not silently defaulted.
+    ///
+    /// `not reported` is the case `cli_e2e` cannot reach: the shipped daemon
+    /// always populates the field (`Some(0)` for unknown), so an absent one only
+    /// comes from a daemon older than the field, and this suite is where a
+    /// client/daemon skew can be fed to the renderer at all.
+    #[test]
+    fn every_row_says_what_is_known_about_its_context_window() {
+        use teton_protocol::methods::ProviderConfig;
+
+        let provider = |id: &str, kind: ProviderKind, max_context: Option<u32>| ProviderConfig {
+            id: ProviderId::from(id),
+            kind,
+            endpoint: Some("https://example.invalid".to_owned()),
+            model: Some("a-model".to_owned()),
+            auth_ref: None,
+            max_context,
+            context_budget_cap: None,
+            floored_budget: None,
+        };
+
+        let mut surface = RecordingSurface::new();
+        render_config(
+            &[
+                provider("declared", ProviderKind::Anthropic, Some(128_000)),
+                provider("silent", ProviderKind::OpenaiCompatible, Some(0)),
+                provider("old-daemon", ProviderKind::OpenaiCompatible, None),
+                provider("on-device", ProviderKind::Local, Some(0)),
+            ],
+            &mut surface,
+        );
+        let rows: Vec<&str> = surface.lines_of(LineKind::Info);
+        let row = |id: &str| -> &str {
+            rows.iter()
+                .find(|line| line.contains(id))
+                .unwrap_or_else(|| panic!("no row for `{id}` in {rows:#?}"))
+        };
+
+        assert!(row("declared").ends_with("window: 128k"), "{rows:#?}");
+        assert!(
+            row("silent").ends_with(
+                "window: unknown — context budget defaulted (set capabilities.max_context)"
+            ),
+            "an unknown window names the key that fixes it: {rows:#?}"
+        );
+        assert!(
+            row("old-daemon").ends_with("window: not reported"),
+            "an absent field is a daemon that predates it, not an unset window: {rows:#?}"
+        );
+        // The local row carries a `Some(0)` exactly as the daemon would send it,
+        // and must still not be told to set a key that would change nothing: its
+        // budget is the local engine's whatever any window says.
+        assert!(row("on-device").ends_with("(local engine)"), "{rows:#?}");
+        assert!(
+            !row("on-device").contains("unknown"),
+            "a local row has no unknown window to report: {rows:#?}"
+        );
+    }
+
+    /// The column's arithmetic, including the pair the shipped recipes hold —
+    /// 1,000,000 and 1,050,000 — which a one-`m`-fits-all rounding would render
+    /// as the same window.
+    #[test]
+    fn a_window_is_labelled_in_thousands_or_millions_and_exactly_below_a_thousand() {
+        for (tokens, want) in [
+            (128_000_u32, "128k"),
+            (200_000, "200k"),
+            (131_072, "131k"),
+            (500_000, "500k"),
+            (1_000_000, "1m"),
+            (1_050_000, "1.05m"),
+            (1_500_000, "1.5m"),
+            (4_096, "4k"),
+            (999, "999"),
+            (1, "1"),
+        ] {
+            assert_eq!(window_figure(tokens), want, "{tokens}");
+        }
+    }
+
+    /// **AC-4's advisory half.** Doctor says the two things a listing column can
+    /// only imply: that a defaulted budget has a remedy, and that a cap which
+    /// cannot bind is inert rather than in force.
+    ///
+    /// The negative halves matter as much: a local row is not advised (there is
+    /// no key on it worth setting), and a cap **below** its window is doing
+    /// exactly what it was written to do, so advising on it would be a scold.
+    #[test]
+    fn doctor_advises_on_an_unknown_window_and_an_inert_cap_but_not_on_the_local_tier() {
+        use teton_protocol::methods::ProviderConfig;
+
+        let provider = |id: &str,
+                        kind: ProviderKind,
+                        max_context: Option<u32>,
+                        context_budget_cap: Option<u32>| ProviderConfig {
+            id: ProviderId::from(id),
+            kind,
+            endpoint: Some("https://example.invalid".to_owned()),
+            model: Some("a-model".to_owned()),
+            auth_ref: None,
+            max_context,
+            context_budget_cap,
+            floored_budget: None,
+        };
+
+        let mut surface = RecordingSurface::new();
+        advise_on_context_windows(
+            &[
+                provider("silent", ProviderKind::OpenaiCompatible, Some(0), None),
+                provider(
+                    "inert",
+                    ProviderKind::Anthropic,
+                    Some(200_000),
+                    Some(200_000),
+                ),
+                provider(
+                    "capped",
+                    ProviderKind::Anthropic,
+                    Some(200_000),
+                    Some(40_000),
+                ),
+                provider("declared", ProviderKind::Anthropic, Some(128_000), None),
+                provider("on-device", ProviderKind::Local, Some(0), None),
+            ],
+            &mut surface,
+        );
+        let notices = surface.lines_of(LineKind::Notice);
+
+        let about = |id: &str| -> Vec<&str> {
+            let needle = format!("`{id}`");
+            notices
+                .iter()
+                .copied()
+                .filter(|line| line.contains(&needle))
+                .collect()
+        };
+
+        let silent = about("silent");
+        assert_eq!(silent.len(), 1, "{notices:#?}");
+        assert!(
+            silent[0].contains("capabilities.max_context"),
+            "{silent:#?}"
+        );
+        assert!(silent[0].contains("--max-context"), "{silent:#?}");
+
+        let inert = about("inert");
+        assert_eq!(inert.len(), 1, "{notices:#?}");
+        assert!(inert[0].contains("never binds"), "{inert:#?}");
+        assert!(inert[0].contains("200k"), "{inert:#?}");
+
+        for quiet in ["capped", "declared", "on-device"] {
+            assert!(
+                about(quiet).is_empty(),
+                "`{quiet}` has nothing to act on: {notices:#?}"
+            );
+        }
+    }
+
+    /// **TASK-194 2b, doctor's half.** A cap the daemon could not honor is
+    /// named as floored, with the pair that runs instead — and a cap that *is*
+    /// honored earns nothing new.
+    ///
+    /// The untruth this closes: a `context_budget_cap` of 500 on a 200k
+    /// provider derives below the smallest budget that can hold the harness's
+    /// own system prompt, so the pair is raised and every turn gets more room
+    /// than the cap asked for — while doctor said `window: 200k`, the inert-cap
+    /// line stayed silent (the cap *is* below the window), and `/verbose` said
+    /// `bound: user cap`. Three surfaces, none of them wrong on its own terms,
+    /// and no way to learn the cap was not in force.
+    ///
+    /// Both figures come off the snapshot, because neither is computable here:
+    /// whether the floor bit depends on the generation reservation and the two
+    /// budget ratios, which have one home and it is in the daemon (BR-8).
+    #[test]
+    fn doctor_says_when_a_declaration_was_floored_rather_than_honored() {
+        use teton_protocol::methods::{FlooredBudget, ProviderConfig};
+
+        let provider =
+            |id: &str,
+             max_context: Option<u32>,
+             context_budget_cap: Option<u32>,
+             floored_budget: Option<FlooredBudget>| ProviderConfig {
+                id: ProviderId::from(id),
+                kind: ProviderKind::Anthropic,
+                endpoint: Some("https://example.invalid".to_owned()),
+                model: Some("a-model".to_owned()),
+                auth_ref: None,
+                max_context,
+                context_budget_cap,
+                floored_budget,
+            };
+        let floor = Some(FlooredBudget {
+            budget_tokens: 2_048,
+            budget_bytes: 16_384,
+        });
+
+        let mut surface = RecordingSurface::new();
+        advise_on_context_windows(
+            &[
+                provider("sub-floor-cap", Some(200_000), Some(500), floor),
+                provider("sub-floor-window", Some(4_096), None, floor),
+                provider("honoured", Some(200_000), Some(40_000), None),
+            ],
+            &mut surface,
+        );
+        let notices = surface.lines_of(LineKind::Notice);
+        let about = |id: &str| -> Vec<&str> {
+            let needle = format!("`{id}`");
+            notices
+                .iter()
+                .copied()
+                .filter(|line| line.contains(&needle))
+                .collect()
+        };
+
+        let capped = about("sub-floor-cap");
+        assert_eq!(capped.len(), 1, "{notices:#?}");
+        assert!(
+            capped[0].contains("`context_budget_cap` is 500"),
+            "{capped:#?}"
+        );
+        assert!(
+            capped[0].contains("floored rather than honored"),
+            "{capped:#?}"
+        );
+        assert!(
+            capped[0].contains("2,048 words / 16 KB"),
+            "the pair in force is named, not only the fact: {capped:#?}"
+        );
+
+        // The same floor from the window's own side names the window, because
+        // that is the declaration a user would edit.
+        let windowed = about("sub-floor-window");
+        assert_eq!(windowed.len(), 1, "{notices:#?}");
+        assert!(
+            windowed[0].contains("the declared window is 4k"),
+            "{windowed:#?}"
+        );
+
+        // A cap doing exactly what it was written to do earns nothing.
+        assert!(about("honoured").is_empty(), "{notices:#?}");
+    }
+
+    /// **AC-5, the CLI half at the seam that matters**: what `--max-context` and
+    /// `--context-budget-cap` were typed as is what the `config/set` payload
+    /// carries, and what was *not* typed travels as `None` — the value the
+    /// daemon's field-wise merge reads as "preserve what is stored" (ADR-7).
+    ///
+    /// Driven through [`registration_params`] rather than through the flag
+    /// struct alone, because the defect this forecloses is the payload builder
+    /// dropping a field the parser accepted.
+    #[test]
+    fn the_declared_window_reaches_the_registration_payload_and_an_undeclared_one_stays_none() {
+        let keychain = MockKeychain::new();
+        let mut surface = RecordingSurface::new();
+
+        let settled = settle_registration(
+            "kimi",
+            ProviderKind::OpenaiCompatible,
+            Some("https://api.moonshot.ai/v1/chat/completions".to_owned()),
+            Some("kimi-k3".to_owned()),
+            WindowFlags {
+                max_context: Some(128_000),
+                context_budget_cap: Some(40_000),
+            },
+            &mut surface,
+        )
+        .expect("a structurally complete registration settles");
+        let prepared = registration_params(&settled, &keychain, Some("sk-typed"))
+            .expect("the mock keychain stores");
+        let ConfigUpdate::RegisterProvider(config) = prepared.params.update else {
+            panic!("provider add registers a provider");
+        };
+        assert_eq!(config.max_context, Some(128_000));
+        assert_eq!(config.context_budget_cap, Some(40_000));
+
+        let bare = settle_registration(
+            "kimi",
+            ProviderKind::OpenaiCompatible,
+            Some("https://api.moonshot.ai/v1/chat/completions".to_owned()),
+            Some("kimi-k3".to_owned()),
+            WindowFlags::default(),
+            &mut surface,
+        )
+        .expect("settles");
+        let prepared =
+            registration_params(&bare, &keychain, Some("sk-typed")).expect("the mock stores");
+        let ConfigUpdate::RegisterProvider(config) = prepared.params.update else {
+            panic!("provider add registers a provider");
+        };
+        assert_eq!(
+            (config.max_context, config.context_budget_cap),
+            (None, None),
+            "a flag nobody typed must not be an assertion that the window is unknown"
+        );
+    }
+
+    /// The flags parse, as `u32`, and a non-number is a parse error rather than
+    /// a silently-ignored word.
+    #[test]
+    fn provider_add_parses_the_window_flags() {
+        let cli = parse(&[
+            "teton",
+            "provider",
+            "add",
+            "kimi",
+            "--kind",
+            "openai-compatible",
+            "--endpoint",
+            "https://api.moonshot.ai/v1/chat/completions",
+            "--model",
+            "kimi-k3",
+            "--max-context",
+            "128000",
+            "--context-budget-cap",
+            "40000",
+        ]);
+        match cli.command {
+            Some(Command::Provider {
+                action:
+                    ProviderAction::Add {
+                        max_context,
+                        context_budget_cap,
+                        ..
+                    },
+            }) => {
+                assert_eq!(max_context, Some(128_000));
+                assert_eq!(context_budget_cap, Some(40_000));
+            }
+            other => panic!("unexpected parse: {other:?}"),
+        }
+
+        assert!(Cli::try_parse_from([
+            "teton",
+            "provider",
+            "add",
+            "kimi",
+            "--kind",
+            "anthropic",
+            "--max-context",
+            "128k",
+        ])
+        .is_err());
     }
 
     /// A snapshot shaped like the one a REQ-557-migrated install produces:
@@ -4706,6 +5297,7 @@ mod tests {
             ProviderKind::Anthropic,
             Some("https://api.anthropic.com".to_owned()),
             Some("claude-opus-5".to_owned()),
+            WindowFlags::default(),
             &keychain,
             Some("sk-super-secret"),
         )
@@ -4759,9 +5351,16 @@ mod tests {
     #[test]
     fn local_provider_registration_needs_no_secret() {
         let keychain = MockKeychain::new();
-        let config =
-            build_provider_registration("local", ProviderKind::Local, None, None, &keychain, None)
-                .unwrap();
+        let config = build_provider_registration(
+            "local",
+            ProviderKind::Local,
+            None,
+            None,
+            WindowFlags::default(),
+            &keychain,
+            None,
+        )
+        .unwrap();
         assert!(config.auth_ref.is_none());
         assert!(keychain.stored_secret("local").is_none());
     }
@@ -5156,7 +5755,11 @@ mod tests {
 
     /// `config/set`'s "applied" answer.
     fn applied() -> serde_json::Value {
-        serde_json::to_value(ConfigSetResult { applied: true }).expect("a set result serializes")
+        serde_json::to_value(ConfigSetResult {
+            applied: true,
+            budget_notice: None,
+        })
+        .expect("a set result serializes")
     }
 
     /// Run `provider_add_on` for [`ADD_ID`] under the session's consent mode,
@@ -5198,6 +5801,7 @@ mod tests {
                 ProviderKind::OpenaiCompatible,
                 Some(ADD_ENDPOINT.to_owned()),
                 Some(ADD_MODEL.to_owned()),
+                WindowFlags::default(),
                 AddConsent::Session { assume_yes },
                 keychain,
             )
@@ -5532,6 +6136,7 @@ mod tests {
                 ProviderKind::OpenaiCompatible,
                 Some(ADD_ENDPOINT.to_owned()),
                 Some(ADD_MODEL.to_owned()),
+                WindowFlags::default(),
                 AddConsent::Shell,
                 &kc,
             )
@@ -5970,6 +6575,7 @@ mod tests {
                 kind,
                 supplied.map(str::to_owned),
                 Some("a-model".to_owned()),
+                WindowFlags::default(),
                 &mut surface,
             )
             .expect("a structurally complete registration settles");
@@ -6182,6 +6788,9 @@ mod tests {
             endpoint: Some("https://alice:hunter2@gw.example.com/v1".to_owned()),
             model: Some("a-model".to_owned()),
             auth_ref: None,
+            max_context: None,
+            context_budget_cap: None,
+            floored_budget: None,
         })
         .expect("a bare `/v1` base URL is advised on");
         assert!(
@@ -6213,6 +6822,9 @@ mod tests {
             endpoint: endpoint.map(str::to_owned),
             model: Some("a-model".to_owned()),
             auth_ref: None,
+            max_context: None,
+            context_budget_cap: None,
+            floored_budget: None,
         };
 
         // Counts are assertable here because this table is the test's own. The
@@ -6385,6 +6997,7 @@ mod tests {
             // fixture that spells a product fact by hand is a second copy of it.
             Some(ANTHROPIC_DEFAULT_ENDPOINT.to_owned()),
             Some("claude-opus-5".to_owned()),
+            WindowFlags::default(),
             kc,
             Some(secret),
         )
@@ -6399,6 +7012,73 @@ mod tests {
             error_code::INVALID_PARAMS,
             "provider `opus` is a remote provider and must set an `endpoint`",
         ))
+    }
+
+    /// **TASK-194 (OQ-6 as amended), the CLI half.** A registration that
+    /// recorded a big window prints the daemon's notice once, and one that did
+    /// not prints nothing new.
+    ///
+    /// The sentence is the *daemon's*: every figure in it is
+    /// `harness::budget::derive`'s, which a thin client may not repeat (BR-8,
+    /// AC-12). So this asserts the rendering — one line, on the applied path,
+    /// through the `Surface` seam — and the daemon's own tests assert the
+    /// words. `None` is both "no big window" and "a daemon predating the
+    /// field", and both must leave today's output untouched.
+    #[test]
+    fn a_recorded_big_window_prints_the_daemons_notice_once() {
+        let kc = MockKeychain::new();
+        let applied = |budget_notice: Option<String>| -> Result<ConfigSetResult, RpcError> {
+            Ok(ConfigSetResult {
+                applied: true,
+                budget_notice,
+            })
+        };
+        let render = |outcome| {
+            let mut surface = RecordingSurface::new();
+            report_registration_outcome(
+                outcome,
+                "kimi",
+                ProviderKind::OpenaiCompatible,
+                "keychain://teton/kimi",
+                None,
+                &kc,
+                &mut surface,
+            );
+            surface
+        };
+
+        let quiet = render(applied(None));
+        assert!(
+            quiet.lines_of(LineKind::Notice).is_empty(),
+            "a registration with no big window says nothing new: {:?}",
+            quiet.calls
+        );
+        assert!(quiet.any_line_contains(LineKind::Info, "provider `kimi` registered"));
+
+        let notice = "a 1,000,000-token context window is recorded, and so on.";
+        let loud = render(applied(Some(notice.to_owned())));
+        assert_eq!(
+            loud.lines_of(LineKind::Notice),
+            vec![notice],
+            "the daemon's sentence, once, verbatim: {:?}",
+            loud.calls
+        );
+        assert!(
+            loud.any_line_contains(LineKind::Info, "provider `kimi` registered"),
+            "and the registration line is still the registration line"
+        );
+
+        // A rejected registration recorded nothing, so it says nothing about a
+        // window either — the notice rides the applied arm alone.
+        let refused = render(Ok(ConfigSetResult {
+            applied: false,
+            budget_notice: Some(notice.to_owned()),
+        }));
+        assert!(
+            !refused.any_line_contains(LineKind::Notice, "context window is recorded"),
+            "{:?}",
+            refused.calls
+        );
     }
 
     /// AC: the exact BUG-170 sequence — prompt, store, register, refuse — now
@@ -6561,7 +7241,10 @@ mod tests {
         let mut surface = RecordingSurface::new();
 
         report_registration_outcome(
-            Ok(ConfigSetResult { applied: true }),
+            Ok(ConfigSetResult {
+                applied: true,
+                budget_notice: None,
+            }),
             "opus",
             ProviderKind::Anthropic,
             &auth,
@@ -6580,7 +7263,10 @@ mod tests {
         // the old unconditional sentence reported a key under ref `—`.
         let mut local_surface = RecordingSurface::new();
         report_registration_outcome(
-            Ok(ConfigSetResult { applied: true }),
+            Ok(ConfigSetResult {
+                applied: true,
+                budget_notice: None,
+            }),
             "local2",
             ProviderKind::Local,
             "—",
@@ -6629,7 +7315,10 @@ mod tests {
 
         let mut surface = RecordingSurface::new();
         report_registration_outcome(
-            Ok(ConfigSetResult { applied: false }),
+            Ok(ConfigSetResult {
+                applied: false,
+                budget_notice: None,
+            }),
             "opus",
             ProviderKind::Anthropic,
             &auth,

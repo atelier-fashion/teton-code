@@ -2572,6 +2572,83 @@ effort_ladder = ["low", "high", "xhigh", "max"]
         assert_eq!(round, cfg);
     }
 
+    // ---- REQ-586: per-provider context budget cap ---------------------------
+
+    /// REQ-586 BR-5: a declared `context_budget_cap` loads, survives a
+    /// serialize → load round trip, and — because zero is "no cap" — a record
+    /// without one writes **no line** for it, so the canonical
+    /// `[providers.capabilities]` rendering of every existing record is
+    /// unchanged (the REQ-574 preservation witnesses list those keys byte for
+    /// byte).
+    ///
+    /// No `validate()` rule, deliberately: a cap above the window is inert,
+    /// not invalid (architecture ADR-7 — the derivation takes the minimum, so
+    /// it cannot bind), and REQ-557 ADR-E keeps `validate` structural-only. So
+    /// the over-window case is asserted to load, validate and leave the
+    /// provider usable, rather than asserted to refuse.
+    #[test]
+    fn a_declared_context_budget_cap_round_trips_and_zero_writes_no_line() {
+        let src = r#"
+[[providers]]
+id = "kimi"
+kind = "openai-compatible"
+endpoint = "https://api.moonshot.example"
+model = "kimi-k2.6"
+auth_ref = "keychain:kimi"
+
+[providers.capabilities]
+max_context = 131072
+context_budget_cap = 65536
+"#;
+        let cfg = Config::load(src).expect("must load");
+        let caps = cfg.providers[0].capabilities;
+        assert_eq!(caps.max_context, 131_072);
+        assert_eq!(caps.context_budget_cap, 65_536);
+
+        let text = toml::to_string(&cfg).expect("serialize");
+        assert!(
+            text.contains("context_budget_cap = 65536"),
+            "a declared cap must be visible in the written config, got:\n{text}",
+        );
+        let round = Config::load(&text).expect("reload");
+        assert_eq!(round, cfg);
+
+        // Pre-REQ-586 bytes: no cap key at all reads as "no cap", and writes
+        // back out without one — the canonical rendering did not grow a line.
+        let cfg = Config::load(PRE_REQ_559_TOML).expect("pre-REQ-586 config must load");
+        assert_eq!(cfg.providers[0].capabilities.context_budget_cap, 0);
+        let text = toml::to_string(&cfg).expect("serialize");
+        assert!(
+            !text.contains("context_budget_cap"),
+            "zero is \"no cap\" and no cap is no line, got:\n{text}",
+        );
+        assert!(
+            text.contains("max_context = 200000"),
+            "the window is still written out as it always was, got:\n{text}",
+        );
+
+        // A cap above the window is inert, not invalid: it loads, it
+        // validates, and the provider stays usable.
+        let src = r#"
+[[providers]]
+id = "kimi"
+kind = "openai-compatible"
+endpoint = "https://api.moonshot.example"
+model = "kimi-k2.6"
+auth_ref = "keychain:kimi"
+
+[providers.capabilities]
+max_context = 32000
+context_budget_cap = 1000000
+"#;
+        let cfg = Config::load(src).expect("an over-window cap must not refuse startup");
+        assert_eq!(cfg.providers[0].capabilities.context_budget_cap, 1_000_000);
+        assert!(
+            cfg.unusable_providers().is_empty(),
+            "an inert cap is not a reason to stop serving turns",
+        );
+    }
+
     /// A declared default that vanishes from a written-out config whenever it
     /// holds its default value is the hidden constant configuration-visibility
     /// rules out — the same reason `judgment_default` is unconditional.

@@ -3178,8 +3178,29 @@ async fn handle_config_set(daemon: &Daemon, conn: &ConnState, id: Id, params: Va
         Ok(params) => params,
         Err(_) => return error_string(id, error_code::INVALID_PARAMS, "invalid params"),
     };
+    // The id, read before the update is moved onto the apply: the notice below
+    // describes what was **recorded**, which only the applied config knows.
+    let registered = match &params.update {
+        teton_protocol::methods::ConfigUpdate::RegisterProvider(provider) => {
+            Some(provider.id.clone())
+        }
+        _ => None,
+    };
     match daemon.runtime.apply_config_update(params.update) {
-        Ok(()) => ok_string(id, &ConfigSetResult { applied: true }),
+        Ok(()) => ok_string(
+            id,
+            &ConfigSetResult {
+                applied: true,
+                // REQ-586 OQ-6 as amended: a registration that records a big
+                // context window says so once, and `teton provider add
+                // --max-context` is the surface that gets it here. Composed by
+                // the daemon because every figure in it is the budget
+                // derivation's, and a thin client re-deriving a budget is the
+                // second source BR-8 forbids.
+                budget_notice: registered
+                    .and_then(|provider| daemon.runtime.provider_budget_notice(&provider)),
+            },
+        ),
         Err(err) => error_from(id, err),
     }
 }

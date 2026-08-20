@@ -81,6 +81,12 @@ pub enum ToolCallTier {
     None,
 }
 
+/// `skip_serializing_if` predicate for [`ProviderCapabilities::context_budget_cap`]:
+/// zero is "no cap", and no cap is no line.
+fn is_zero(v: &u32) -> bool {
+    *v == 0
+}
+
 /// Capability profile of a provider; consulted by the router and adapter layer.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 pub struct ProviderCapabilities {
@@ -91,8 +97,23 @@ pub struct ProviderCapabilities {
     #[serde(default)]
     pub parallel_calls: bool,
     /// Maximum context window in tokens (`0` means "unknown / unset").
+    ///
+    /// REQ-586: the window is what a remote route's context budget derives
+    /// from. `0` = unknown → the default budget applies, and the fact is
+    /// stated in `/doctor` and `/provider list` rather than hidden (BR-3).
     #[serde(default)]
     pub max_context: u32,
+    /// A user ceiling on the context budget, in tokens, below the window
+    /// (REQ-586 BR-5). `0` means "no cap"; the effective budget derives from
+    /// `min(window, cap)`, so a cap above the window is inert, not invalid
+    /// (architecture ADR-7) — [`crate::config::Config::validate`] stays
+    /// structural-only.
+    ///
+    /// Skipped from the serialized form when zero, so the canonical
+    /// `[providers.capabilities]` rendering of a record without a cap does not
+    /// grow a line — REQ-574's preservation witnesses list the rendered keys.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub context_budget_cap: u32,
     /// Which reasoning field(s) this provider's request body accepts (REQ-559
     /// BR-4). `None` means **not declared**, and
     /// [`crate::effort::default_shape_for`] supplies the per-kind default —

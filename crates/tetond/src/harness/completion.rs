@@ -44,7 +44,8 @@ use crate::cost::{CostAttribution, LocalUsageMeter};
 use crate::egress::{Egress, EgressContext, Provenance};
 
 use super::context::{
-    ContextManager, MessageRole, PreparedPrompt, Provenance as CtxProvenance, ToolProvenance,
+    approx_tokens, ContextManager, MessageRole, PreparedPrompt, Provenance as CtxProvenance,
+    ToolProvenance,
 };
 use super::digest::tool_result_provenance;
 use super::render;
@@ -489,6 +490,55 @@ impl<'a, T: Transport> RemoteProviderSource<'a, T> {
         self
     }
 
+    /// The size of what this attempt actually sent, in the harness's own word
+    /// estimator (REQ-586 BR-2).
+    ///
+    /// Measured off the **prepared prompt** rather than off the
+    /// [`ContextManager`], for two reasons. It is what a remote request is
+    /// built from — system field plus the role-typed messages, which is exactly
+    /// the payload the provider counted — and it is what this frame can reach:
+    /// `produce_turn` is handed a prompt, never the manager that assembled it,
+    /// and threading one in to read a number would hand every completion source
+    /// a mutable handle on the conversation to serve an error path.
+    ///
+    /// The same [`approx_tokens`] the budget gate measures with, so the figure
+    /// this reports and the budget it is reported against are in one currency —
+    /// a report mixing a word estimate with a BPE count would make every
+    /// refusal look like a wildly wrong window.
+    fn assembled_words(prompt: &PreparedPrompt) -> usize {
+        approx_tokens(&prompt.system)
+            + prompt
+                .messages
+                .iter()
+                .map(|m| approx_tokens(&m.text))
+                .sum::<usize>()
+    }
+
+    /// The typed report for a provider that refused the request as too big for
+    /// its window (REQ-586 BR-2, ADR-8) — **the one home** of the mapping.
+    ///
+    /// Written once because there are two ways into it and they must not
+    /// diverge: the first attempt, and the REQ-559 BR-12 retry with no
+    /// reasoning field. The retry used to propagate with `?`, and
+    /// [`HarnessError::Remote`] is `#[from] ProviderError`, so a
+    /// context-length refusal on *that* call became `Remote(..)` — a
+    /// class-less error the runtime's retry arm cannot act on, which the user
+    /// saw as `INTERNAL_ERROR "provider failed unrecoverably"` instead of the
+    /// window/size report the same refusal produces one line earlier (verify
+    /// M2). The prompt is too big for the window whether or not the request
+    /// carried an effort field.
+    fn context_length_exceeded(
+        &self,
+        prompt: &PreparedPrompt,
+        config: &HarnessConfig,
+    ) -> HarnessError {
+        HarnessError::ContextLengthExceeded {
+            provider_id: self.provider_id.to_string(),
+            assembled_tokens: Self::assembled_words(prompt),
+            budget_tokens: config.context_budget_tokens,
+        }
+    }
+
     /// Say on the daemon's stderr that this provider failed the turn, and how.
     ///
     /// BUG-178 was diagnosed by replaying the request by hand, because the one
@@ -622,7 +672,37 @@ impl<T: Transport> CompletionSource for RemoteProviderSource<'_, T> {
                 // is boundary-checked and metered on its own terms (BR-13 —
                 // effort changes nothing about egress).
                 let transport = self.egress.scoped(provenance.clone(), egress_ctx());
-                self.provider.stream_turn(fallback, &transport).await?
+                // Matched, never `?`-ed: the arm below this one types a
+                // context-length refusal, and `?` would route the *retry's*
+                // identical refusal through `#[from] ProviderError` into
+                // `Remote(..)` — an error with no failure class, which the
+                // runtime cannot retry, cannot fail over, and reports as an
+                // opaque internal error (verify M2).
+                match self.provider.stream_turn(fallback, &transport).await {
+                    Ok(stream) => stream,
+                    Err(err) if err.is_context_length_exceeded() => {
+                        return Err(self.context_length_exceeded(prompt, config));
+                    }
+                    Err(err) => return Err(err.into()),
+                }
+            }
+            // REQ-586 BR-2 / ADR-8: the request was too big for the window.
+            // Typed here, at the seam that holds both halves of the report —
+            // the adapter knows only that the provider refused, and the loop
+            // above knows only that a turn ended, but *this* frame has the
+            // assembled prompt and the route's budget side by side.
+            //
+            // No `note_failure`, and not because the call would print nothing
+            // (a class-less error is already filtered there): the line's whole
+            // subject is "provider `x` failed the turn", and this provider did
+            // not fail. The daemon reports the size mismatch instead.
+            //
+            // Open time only, mirroring the effort refusal beside it: a
+            // context-length refusal is a 400 on the request, which is answered
+            // before a single event flows. A mid-stream error is a different
+            // fault and keeps the `Remote` path it has today.
+            Err(err) if err.is_context_length_exceeded() => {
+                return Err(self.context_length_exceeded(prompt, config));
             }
             Err(err) => {
                 self.note_failure("before it answered", &err);
@@ -790,7 +870,7 @@ mod tests {
     use crate::fixture_id;
     use std::sync::Arc;
 
-    use crate::harness::context::ToolProvenance;
+    use crate::harness::context::{StructuredMessage, ToolProvenance};
     use async_trait::async_trait;
     use serde_json::json;
     use teton_inference::{Completion, GenParams, MockEngine};
@@ -1055,6 +1135,127 @@ mod tests {
             })));
             Ok(Box::pin(futures::stream::iter(events)))
         }
+    }
+
+    /// A provider that refuses the reasoning-effort field on its first call and
+    /// the request's **size** on its second — the two refusals REQ-559 BR-12
+    /// and REQ-586 BR-2 put back to back on one turn.
+    ///
+    /// Both are real: an effort refusal is answered by exactly one retry with
+    /// no reasoning field, and that retry carries the same oversized prompt, so
+    /// a provider whose window the context busts refuses it again for the other
+    /// reason. Every request's effort is recorded, so the test can tell the
+    /// retry from the first attempt.
+    #[derive(Default)]
+    struct RefusesEffortThenSize {
+        seen: Mutex<Vec<ResolvedEffort>>,
+    }
+
+    #[async_trait]
+    impl Provider for RefusesEffortThenSize {
+        fn id(&self) -> &str {
+            "refuser"
+        }
+        fn capabilities(&self) -> CapabilityProfile {
+            CapabilityProfile::default()
+        }
+        async fn stream_turn(
+            &self,
+            request: TurnRequest,
+            _transport: &dyn Transport,
+        ) -> Result<TurnStream, ProviderError> {
+            let mut seen = self.seen.lock().expect("call log mutex");
+            seen.push(request.effort);
+            if seen.len() == 1 {
+                return Err(ProviderError::EffortRefused {
+                    provider_id: "refuser".to_owned(),
+                    requested: teton_core::EffortLevel::High,
+                    clamped: teton_core::EffortLevel::High,
+                });
+            }
+            Err(ProviderError::ContextLengthExceeded {
+                provider_id: "refuser".to_owned(),
+            })
+        }
+    }
+
+    /// **Verify M2.** A context-length refusal that arrives on the REQ-559
+    /// effort-retry is the *same* typed outcome it is on the first attempt.
+    ///
+    /// The retry used to propagate with `?`, and [`HarnessError::Remote`] is
+    /// `#[from] ProviderError`, so this refusal became `Remote(..)`. That is
+    /// the arm the runtime treats as "this provider failed the turn" — and
+    /// `ContextLengthExceeded` deliberately has **no** failure class, so the
+    /// runtime's `Remote(perr) if attempts < 2` arm found nothing to act on and
+    /// the user got `INTERNAL_ERROR "provider failed unrecoverably"` instead of
+    /// the window/size report. The variant is the whole assertion: the numbers
+    /// were never the part that broke.
+    #[tokio::test]
+    async fn a_context_length_refusal_on_the_effort_retry_stays_typed() {
+        let provider = RefusesEffortThenSize::default();
+        let egress = Egress::new(NullTransport, Vec::new(), Arc::new(NoopSink));
+        let mut source = RemoteProviderSource::new(
+            &provider,
+            &egress,
+            "refuser",
+            "model-x",
+            "sess-under-test",
+            ResolvedEffort::effort(teton_core::EffortLevel::High),
+        );
+        let tools = ToolRegistry::with_builtins();
+        let exposed = tools.exposed_names(None);
+        let config = HarnessConfig::default();
+        let prompt = PreparedPrompt {
+            flat: String::new(),
+            system: "one two three".to_owned(),
+            messages: vec![StructuredMessage {
+                role: MessageRole::User,
+                text: "four five six seven".to_owned(),
+            }],
+        };
+
+        let err = source
+            .produce_turn(
+                &prompt,
+                &Provenance::empty(),
+                &config,
+                &tools,
+                &exposed,
+                &mut |_| {},
+            )
+            .await
+            .expect_err("a refused turn must not report success");
+
+        match &err {
+            HarnessError::ContextLengthExceeded {
+                provider_id,
+                assembled_tokens,
+                budget_tokens,
+            } => {
+                assert_eq!(provider_id, "refuser");
+                assert_eq!(*budget_tokens, config.context_budget_tokens);
+                assert_eq!(
+                    *assembled_tokens, 7,
+                    "the report names what this attempt actually assembled"
+                );
+            }
+            other => panic!(
+                "a context-length refusal on the retry must stay typed; as \
+                 `Remote` the daemon reports it as an opaque internal error: \
+                 {other:?}"
+            ),
+        }
+
+        // Non-vacuity: the retry really is the call that refused. One request
+        // with the effort field, one without, and nothing after it.
+        let seen = provider.seen.lock().expect("call log mutex");
+        assert_eq!(seen.len(), 2, "{seen:?}");
+        assert!(matches!(seen[0], ResolvedEffort::Effort { .. }), "{seen:?}");
+        assert!(matches!(seen[1], ResolvedEffort::Omit { .. }), "{seen:?}");
+        assert!(
+            source.effort_was_refused(),
+            "the session memo still records the effort refusal that happened"
+        );
     }
 
     /// Drive one remote turn over `provider` and return it with what streamed.

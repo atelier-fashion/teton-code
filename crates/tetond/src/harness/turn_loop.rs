@@ -39,7 +39,8 @@ use serde_json::Value;
 
 use teton_inference::{ChatFormat, Engine, EngineError, GenParams};
 use teton_protocol::events::{
-    CapabilityDeadEnd, Event, PrefixCache, SessionUpdate, SessionUpdatePayload, ToolCallStatus,
+    CapabilityDeadEnd, ContextPressure, ContextPressureKind, Event, PrefixCache, SessionUpdate,
+    SessionUpdatePayload, ToolCallStatus,
 };
 use teton_protocol::methods::{SessionRoot, StopReason};
 use teton_protocol::{ProviderId, SessionId};
@@ -47,11 +48,15 @@ use teton_providers::{BlockDetail, HarnessProfile, ProviderError, ToolCall};
 
 use crate::broadcast::EventBus;
 
+use super::budget::{
+    self, BudgetInputs, RouteBudget, LOCAL_BUDGET_BYTES, LOCAL_BUDGET_TOKENS,
+    LOCAL_DIGEST_THRESHOLD_BYTES, LOCAL_DIGEST_THRESHOLD_TOKENS,
+};
 use super::compact::COMPACT_DUTY;
 use super::completion::{
     context_provenance, CompletionSource, LocalEngineSource, SourceTurn, TurnDecision,
 };
-use super::context::{summarize_if_large, ContextManager, ProvenanceHook, APPROX_BYTES_PER_TOKEN};
+use super::context::{summarize_if_large, ContextManager, PressureReport, ProvenanceHook};
 use super::digest::DIGEST_DUTY;
 use super::duty::DutyRoute;
 use super::permissions::{PermissionDecision, PermissionGate};
@@ -131,6 +136,38 @@ pub enum HarnessError {
     /// classifies it from that state rather than the loop guessing here.
     #[error("no tier could serve this turn")]
     NoTierAvailable,
+    /// The provider refused the request as larger than its context window
+    /// (REQ-586 BR-2, ADR-8).
+    ///
+    /// Deliberately **not** [`Remote`](Self::Remote), even though it arrives as
+    /// a [`ProviderError`]: that arm means "this provider failed", and it is the
+    /// arm that records health and asks the router for a fallback. Neither is
+    /// right here. The provider did not fail — it answered correctly about its
+    /// own limit — and a fallback would send the same bytes to a window that may
+    /// be smaller. So it leaves the loop as its own variant and the daemon ends
+    /// the turn with a report.
+    ///
+    /// It carries the two numbers the report needs and the adapter could not
+    /// know: how big the context this daemon assembled actually was, and what
+    /// budget the route was running under. The gap between them is the whole
+    /// diagnosis — a wide gap says the declared `max_context` is wrong, a narrow
+    /// one says the estimator undercounted this content (the base64 class AC-3
+    /// documents). No response body and no prompt text, per conventions.md.
+    #[error(
+        "provider `{provider_id}` refused the turn: about {assembled_tokens} words \
+         were assembled against a {budget_tokens}-word budget"
+    )]
+    ContextLengthExceeded {
+        /// The provider that refused, as [`ProviderError::ContextLengthExceeded`]
+        /// named it (a `String` there — the providers crate has no `ProviderId`).
+        provider_id: String,
+        /// The assembled context's size in the harness's own word estimator —
+        /// what this daemon believed it was sending.
+        assembled_tokens: usize,
+        /// The route's word budget, from the [`HarnessConfig`] the attempt ran
+        /// under — never re-derived here (BR-8).
+        budget_tokens: usize,
+    },
 }
 
 impl HarnessError {
@@ -171,22 +208,44 @@ pub struct HarnessConfig {
     pub max_turns: u32,
     /// Token budget for the assembled context, in whitespace-approximated
     /// tokens ([`super::context::approx_tokens`]).
+    ///
+    /// **Not hand-set on a routed turn** (REQ-586): the router derives it from
+    /// the route's window with [`super::budget::derive`] and stamps it through
+    /// [`with_route_budget`](Self::with_route_budget) on every route decision,
+    /// which overwrites whatever a caller wrote here. Setting it directly is
+    /// for the transport-free offline path and for tests; everywhere else the
+    /// pair, the thresholds and [`budget`](Self::budget) travel together.
     pub context_budget_tokens: usize,
-    /// Byte budget for the assembled context — the engine-window currency.
+    /// Byte budget for the assembled context — the window currency.
     ///
     /// The whitespace-token budget undercounts dense content (a minified
     /// single-line file is a handful of "words" but tens of thousands of real
     /// BPE tokens), so the context is bounded in bytes too: bytes are a
     /// conservative proxy for BPE tokens (code averages ≳2 bytes per token).
-    /// The default, `context_budget_tokens` × [`super::context::APPROX_BYTES_PER_TOKEN`],
-    /// keeps a full assembled prompt within the local engine's 16,384-token
-    /// window (`LOCAL_ENGINE_N_CTX` in the daemon's runtime) with headroom;
-    /// size it to `n_ctx` when configuring a different engine.
+    ///
+    /// The default is the local pair — `LOCAL_BUDGET_TOKENS` ×
+    /// [`APPROX_BYTES_PER_TOKEN`](super::context::APPROX_BYTES_PER_TOKEN),
+    /// which keeps a full assembled prompt within the local engine's
+    /// 16,384-token window (`LOCAL_ENGINE_N_CTX`) with headroom. A **remote**
+    /// route's bytes are not that bridge: [`super::budget::derive`] takes them
+    /// from the route's window at the 2 B/token BPE floor
+    /// (`DUTY_REQUEST_BYTES_PER_TOKEN`), because on a 128k window `words × 8`
+    /// would be a byte budget nothing measured. Like the word half, this is
+    /// stamped by [`with_route_budget`](Self::with_route_budget) on the next
+    /// route decision, so hand-sizing it for a different engine holds only
+    /// until then.
     pub context_budget_bytes: usize,
     /// Tool results larger than this (in approx tokens, or its byte twin) are
     /// condensed through the `digest` category (REQ-558) before they enter
     /// context — locally, or wherever `digest` is bound.
     pub summarize_threshold_tokens: usize,
+    /// The byte twin of [`summarize_threshold_tokens`](Self::summarize_threshold_tokens)
+    /// (REQ-586 BR-6): on the default route it is the same 12,000 bytes the
+    /// twin used to be recomputed as at the call site; on a remote route it
+    /// scales with `budget_bytes` — never `words × 8`, which would let a
+    /// dense (minified JSON, base64) result slide in raw at the edge of the
+    /// byte budget.
+    pub summarize_threshold_bytes: usize,
     /// Cap on tools exposed to the model (`None` = all).
     pub max_tools: Option<u32>,
     /// Require a verification step after an edit before the turn may end.
@@ -224,17 +283,27 @@ pub struct HarnessConfig {
     /// (`HarnessConfig::default()` and the `..Default::default()` literals in
     /// the tests) keeps the prompt it had.
     pub session_root: Option<teton_protocol::methods::SessionRoot>,
+    /// The route-budget fact this config runs under (REQ-586 BR-8): the pair
+    /// above, what bound it, and the window's name for the elision marker —
+    /// derived once by [`super::budget::derive`] where the route is decided
+    /// and stamped here via [`with_route_budget`](Self::with_route_budget).
+    /// The default is the local derivation, which is also the
+    /// unresolvable-route case (`bound: local_engine`).
+    pub budget: RouteBudget,
 }
 
 impl Default for HarnessConfig {
     fn default() -> Self {
-        // The weak-model native shape.
-        let context_budget_tokens = 4_096;
+        // The weak-model native shape. The pair and thresholds read the
+        // `LOCAL_*` constants from `harness::budget` — their one home
+        // (REQ-586, LESSON-456) — and `budget` carries the local derivation
+        // built from the same constants (the AC pins the two equal).
         Self {
             max_turns: 12,
-            context_budget_tokens,
-            context_budget_bytes: context_budget_tokens * APPROX_BYTES_PER_TOKEN,
-            summarize_threshold_tokens: 1_500,
+            context_budget_tokens: LOCAL_BUDGET_TOKENS,
+            context_budget_bytes: LOCAL_BUDGET_BYTES,
+            summarize_threshold_tokens: LOCAL_DIGEST_THRESHOLD_TOKENS,
+            summarize_threshold_bytes: LOCAL_DIGEST_THRESHOLD_BYTES,
             max_tools: Some(5),
             require_verification: true,
             // Agent turns need room for prose plus a complete tool call. The
@@ -252,6 +321,7 @@ impl Default for HarnessConfig {
             // Unsupplied: no environment block until the daemon's turn path
             // probes the root and sets it (REQ-583).
             session_root: None,
+            budget: budget::derive(BudgetInputs::local()),
         }
     }
 }
@@ -279,6 +349,42 @@ impl HarnessConfig {
             require_verification: profile.require_verification,
             ..Self::default()
         }
+    }
+
+    /// Stamp a route's derived budget onto this config (REQ-586 BR-1/BR-8):
+    /// the pair, both `digest` thresholds, and the budget fact itself — the
+    /// router's one entry point (`Router::harness_config_for`, ADR-1), so a
+    /// config's five budget-bearing fields cannot disagree with the
+    /// [`RouteBudget`] every surface reads.
+    #[must_use]
+    pub fn with_route_budget(mut self, budget: RouteBudget) -> Self {
+        self.context_budget_tokens = budget.budget_tokens;
+        self.context_budget_bytes = budget.budget_bytes;
+        self.summarize_threshold_tokens = budget.digest_threshold_tokens;
+        self.summarize_threshold_bytes = budget.digest_threshold_bytes;
+        self.budget = budget;
+        self
+    }
+
+    /// Both digest thresholds set past anything a result can reach, so tool
+    /// results enter context **whole**.
+    ///
+    /// The two thresholds are one decision in two currencies (LESSON-446), and
+    /// since REQ-586 BR-6 they are two independent fields: a caller that sets
+    /// only `summarize_threshold_tokens` and takes the other from
+    /// [`Default`] gets the *default* byte twin, which digests exactly the
+    /// results it meant to keep — silently, because the suite stays green
+    /// while the fixture stops testing what it names. That is how
+    /// `conversation_carry`'s compaction fixture stopped pressing its budget
+    /// (found in TASK-189's verification, REQ-586). Production never has the
+    /// problem — every route goes through
+    /// [`with_route_budget`](Self::with_route_budget), which sets both — so
+    /// the guard that matters is making the *intent* sayable in one call.
+    #[must_use]
+    pub fn without_digest(mut self) -> Self {
+        self.summarize_threshold_tokens = usize::MAX;
+        self.summarize_threshold_bytes = usize::MAX;
+        self
     }
 }
 
@@ -413,6 +519,52 @@ impl SessionEvents {
         );
     }
 
+    /// Announce what the context gate did to fit this turn's budget (REQ-586
+    /// BR-7, ADR-3).
+    ///
+    /// A narrow typed emitter for [`Self::prefix_cache`]'s reason, and the one
+    /// place a [`PressureReport`] becomes news: the [`ContextManager`] holds no
+    /// event handle (its commit runs from `Drop`), so it reports and the call
+    /// site publishes.
+    ///
+    /// `budget` is the route's own [`RouteBudget`] — the value
+    /// [`super::budget::derive`] produced where the route was decided — so the
+    /// numbers on this event, on `route_decided`, and in the in-prompt elision
+    /// marker are one value rather than three readings of it (BR-8, AC-12).
+    /// **Both currencies always**: on a remote route the byte guard is what
+    /// binds for prose and code, so a client told only the word figure would
+    /// overstate what fits.
+    ///
+    /// `kind` is passed rather than derived from `report` because only the
+    /// caller knows *why* the gate ran: an identical report is
+    /// [`ContextPressureKind::BlocksDropped`] at a loop gate and
+    /// [`ContextPressureKind::RefitOnReroute`] at a reroute arm, and the
+    /// difference is the whole of what the line tells the user.
+    pub fn context_pressure(
+        &self,
+        report: &PressureReport,
+        kind: ContextPressureKind,
+        budget: &RouteBudget,
+    ) {
+        self.bus.publish(
+            Some(self.session_id.clone()),
+            Event::ContextPressure(ContextPressure {
+                kind,
+                dropped_blocks: report.dropped_blocks as u64,
+                elided_bytes: report.elided_bytes as u64,
+                newest_user_elided: report.newest_user_elided,
+                budget_tokens: budget.budget_tokens as u64,
+                budget_bytes: budget.budget_bytes as u64,
+                bound: budget.bound,
+                // Read off the route's budget beside the bound it qualifies,
+                // never re-derived: a pressure line naming `user cap` for a
+                // budget the floor raised above that cap would be reporting a
+                // ceiling that is not in force (TASK-194 2b).
+                bound_floored: budget.floored,
+            }),
+        );
+    }
+
     fn agent_message(&self, text: &str) {
         self.emit(SessionUpdatePayload::AgentMessageChunk {
             text: text.to_owned(),
@@ -436,6 +588,119 @@ impl SessionEvents {
                 ToolCallStatus::Failed
             },
         });
+    }
+}
+
+/// Which kind of pressure a budget gate's report describes (REQ-586 BR-7).
+///
+/// One classifier, so the loop's three gates and the carry commit cannot come
+/// to disagree about what to call the same report. A report that is *both* — the
+/// gate drops oldest-first and then clamps whatever is left — is announced as a
+/// drop, because losing whole turns is the larger fact; `elided_bytes` rides
+/// along in the payload either way, so nothing is hidden by the choice.
+///
+/// [`ContextPressureKind::RefitOnReroute`] is deliberately not reachable from
+/// here: a refit is named by *why* the gate ran, which only the reroute arm
+/// knows, and a report that happens to look identical is a different piece of
+/// news.
+///
+/// A gate that finished **still over budget** ([`PressureReport::over_budget`],
+/// verify m1) is [`ContextPressureKind::DidNotFit`] whatever else it did, and
+/// that check comes **first** (TASK-194 2a).
+///
+/// It used to ride as an elision with `elided_bytes: 0`, with a zero for a tell,
+/// which is worse than the silence BR-7 rules out: an event announced under the
+/// wrong name tells the reader something that did not happen. The ordering is
+/// the same defect one step along — the other three lines all end "to fit the
+/// N-word budget", and a gate that dropped three blocks and *still* did not fit
+/// did not drop them to fit. What it did drop rides in `dropped_blocks` and
+/// `elided_bytes` either way, so the choice hides nothing; it only decides
+/// which fact leads, and "the provider is about to be handed more than the
+/// route's budget" is the one that changes what a reader should expect next.
+#[must_use]
+pub fn pressure_kind(report: &PressureReport) -> ContextPressureKind {
+    if report.over_budget {
+        ContextPressureKind::DidNotFit
+    } else if report.dropped_blocks > 0 {
+        ContextPressureKind::BlocksDropped
+    } else {
+        ContextPressureKind::BlockElided
+    }
+}
+
+/// Publish what one of the loop's budget gates just did — and, when the clamp
+/// landed on the user's own newest message, say so in the turn's output as well
+/// (REQ-586 BR-7).
+///
+/// Quiet reports are dropped here rather than at each gate: `truncate_to_budget`
+/// runs unconditionally on every iteration and on every exit, so the
+/// overwhelming majority of calls have nothing to announce, and a client that
+/// received a `context_pressure` per iteration could not tell the one that
+/// mattered from the noise.
+///
+/// The extra sentence exists for exactly one case. Dropping older turns costs
+/// the model memory it can ask about again; clamping the **newest user block**
+/// means the model is answering a prompt the user did not send, and an event a
+/// client may render in a status line is not where that belongs. It travels the
+/// same [`SessionEvents::agent_message`] path the turn's prose does, so it lands
+/// in the transcript the user is actually reading. It names the window and a
+/// byte count and nothing else — never a fragment of what was cut (BR-11).
+///
+/// ## `over_budget` is a state, so it is announced on the edge
+///
+/// The other three kinds each describe something the gate **did** on this call:
+/// blocks it dropped, a block it shortened, a re-fit it performed. Those are
+/// events, and every one of them is news.
+/// [`ContextPressureKind::DidNotFit`] is not — it is the *condition the context
+/// is in*, re-measured by a gate that runs at the top of every iteration and
+/// again on the way out (TASK-194 2a). A turn that cannot fit its budget is
+/// still not fitting it one iteration later, and reporting that afresh each
+/// time is the per-iteration noise the quiet gate above exists to prevent: one
+/// over-budget turn published two of these through this loop, and a turn that
+/// takes its `max_turns` of tool iterations would publish twenty-six.
+///
+/// So `said_it_did_not_fit` latches the **transition into** the state: the first
+/// gate that cannot fit says so, its repeats are silent, and any gate that
+/// reports a fitting outcome — a drop, an elision, or nothing at all — clears
+/// the latch, because the context left the state and going back into it is a new
+/// fact rather than a repeat. The suppressed reports lose nothing a reader
+/// needs: what the gate managed rides in `dropped_blocks`/`elided_bytes` on the
+/// line that *did* go out, and the drops those later gates make are the same
+/// unwinnable budget being fought again.
+///
+/// The latch is a local of [`run_session_turn_with_source`], beside its turn
+/// counter, so "once per turn" is a property of the loop's own scope rather than
+/// of a reset someone has to remember — the arrangement `context.rs`'s own
+/// per-turn compaction gate uses, one seam over. The newest-user notice is inside the announce
+/// because it can only ever be reached by the **first** gate — after that the
+/// last block is a model turn or a tool result, never the user's message — so
+/// the latch can never swallow it.
+fn announce_pressure(
+    events: &SessionEvents,
+    report: &PressureReport,
+    budget: &RouteBudget,
+    said_it_did_not_fit: &mut bool,
+) {
+    if report.is_quiet() {
+        *said_it_did_not_fit = false;
+        return;
+    }
+    if report.over_budget {
+        if *said_it_did_not_fit {
+            return;
+        }
+        *said_it_did_not_fit = true;
+    } else {
+        *said_it_did_not_fit = false;
+    }
+    events.context_pressure(report, pressure_kind(report), budget);
+    if report.newest_user_elided {
+        events.agent_message(&format!(
+            "\n\n[note: your message did not fit {} — its middle was elided \
+             ({} bytes) before this turn was assembled, so I am answering a \
+             shortened version of it.]\n",
+            budget.window_label, report.elided_bytes,
+        ));
     }
 }
 
@@ -578,6 +843,11 @@ pub async fn run_session_turn_with_source(
     // request cannot change underneath it.
     let request = latest_request(ctx);
     let mut turns = 0u32;
+    // The BR-7 latch, beside the counter it is scoped with: `over_budget` is a
+    // *state* the gate re-measures on every iteration and on the way out, so it
+    // is announced on the edge rather than once per sample. See
+    // `announce_pressure`. Per prompt by construction — this fn is one turn.
+    let mut said_it_did_not_fit = false;
     let mut edited = false;
     let mut verified = false;
     let mut nudged = false;
@@ -592,7 +862,16 @@ pub async fn run_session_turn_with_source(
             // one. Fixing a postcondition at one of its two exits would leave it
             // false at the other, and the next reader would reasonably believe
             // it held.
-            ctx.truncate_to_budget();
+            // BR-7: and what it took is announced, not swallowed. This exit
+            // is the one a user is least likely to expect a clamp on, because
+            // nothing about "the turn hit its ceiling" says the conversation
+            // was also cut.
+            announce_pressure(
+                events,
+                &ctx.truncate_to_budget(),
+                &config.budget,
+                &mut said_it_did_not_fit,
+            );
             return Ok(TurnOutcome {
                 stop_reason: StopReason::MaxTurnRequests,
                 turns,
@@ -633,7 +912,16 @@ pub async fn run_session_turn_with_source(
                  context was truncated deterministically instead"
             );
         }
-        ctx.truncate_to_budget();
+        // BR-7: never silent. This is the gate that fires on a carried
+        // conversation meeting a smaller route (BR-10) and on a tool result
+        // that outgrew the budget, so it is where most of this event comes
+        // from.
+        announce_pressure(
+            events,
+            &ctx.truncate_to_budget(),
+            &config.budget,
+            &mut said_it_did_not_fit,
+        );
 
         // ---- model call ----
         // The egress provenance of the assembled context travels with the turn so
@@ -745,7 +1033,15 @@ pub async fn run_session_turn_with_source(
                 // copy. `final_text` is returned whole below and has already been
                 // streamed, so what the user receives is untouched — only what
                 // the next turn carries is bounded, which is the point.
-                ctx.truncate_to_budget();
+                // BR-7: announced like the other two. What the user
+                // received is untouched (`final_text` was streamed whole and is
+                // returned below); this says what the *next* turn will carry.
+                announce_pressure(
+                    events,
+                    &ctx.truncate_to_budget(),
+                    &config.budget,
+                    &mut said_it_did_not_fit,
+                );
                 return Ok(TurnOutcome {
                     stop_reason: StopReason::EndTurn,
                     turns,
@@ -948,6 +1244,7 @@ pub async fn run_session_turn_with_source(
                                 &name,
                                 &folded,
                                 config.summarize_threshold_tokens,
+                                config.summarize_threshold_bytes,
                                 &provenance,
                             )
                             .await;
@@ -2056,6 +2353,126 @@ mod tests {
         }
     }
 
+    /// **BR-7, verify.** A turn that cannot fit its budget says so **once**,
+    /// however many gates re-measure it.
+    ///
+    /// `over_budget` is not something the gate did, it is the condition the
+    /// context is in — and `truncate_to_budget` runs at the top of every
+    /// iteration and again on the way out, so an unfittable turn re-reports it
+    /// at each one. Measured before the latch: this exact fixture published
+    /// **two** `did_not_fit` lines for one turn, and a turn using its 25 tool
+    /// iterations would have published twenty-six, none of them gated by
+    /// `/verbose`. BR-7 wants the fact said; it does not want it said
+    /// twenty-six times.
+    ///
+    /// The fixture is deliberately multi-gate and deliberately *not* uniformly
+    /// over budget:
+    ///
+    /// * gates 1 and 2 both cannot fit, and the second one **drops blocks while
+    ///   failing** — which is why "suppress only a report that carries nothing
+    ///   else" would not have closed this: the repeats are not empty, they are
+    ///   the same unwinnable budget being fought again;
+    /// * gate 3 (the `EndTurn` exit) *does* fit, and its drop is real news that
+    ///   must still go out — so the latch is proved to bound the over-budget
+    ///   line rather than to mute the gate.
+    #[tokio::test]
+    async fn an_unfittable_turn_says_so_once_however_many_gates_run() {
+        /// Small enough that the 1 KiB clamp floor cannot reach it, so every
+        /// gate that runs while blocks remain finishes still over budget.
+        const BUDGET_BYTES: usize = 512;
+
+        let session_id = SessionId::from("did-not-fit-once");
+        let bus = Arc::new(EventBus::new());
+        let mut sub = bus.subscribe(256);
+        let gate = PermissionGate::new(
+            session_id.clone(),
+            PermissionConfig::permissive(),
+            Arc::clone(&bus),
+            Arc::new(PendingPermissions::new()),
+        );
+        let events = SessionEvents::new(Arc::clone(&bus), session_id);
+        let config = HarnessConfig {
+            max_turns: 12,
+            ..HarnessConfig::default()
+        };
+        let tools = ToolRegistry::with_builtins();
+        let tool_ctx = ToolContext::new(std::env::temp_dir());
+        let mut hook = NoopProvenanceHook;
+
+        let mut ctx = ContextManager::new("sys", 1_000_000).with_budget_bytes(BUDGET_BYTES);
+        ctx.push_user("do the thing");
+        for i in 0..5 {
+            ctx.push_user(format!("block {i} {}", "x".repeat(1_000)));
+        }
+        assert!(
+            ctx.estimated_bytes() > BUDGET_BYTES,
+            "non-vacuity: the turn must start unable to fit"
+        );
+
+        // Tool call, then an answer: three gates run — the top of each
+        // iteration, and the `EndTurn` exit.
+        let mut source = PaddedToolThenEndSource { calls: 0, pad: 0 };
+        let outcome = run_session_turn_with_source(
+            &mut source,
+            &tools,
+            &tool_ctx,
+            &gate,
+            &events,
+            &mut ctx,
+            &config,
+            &mut hook,
+            &DutyRoute::unresolved("no digest route in this test"),
+            &DutyRoute::unresolved("no compact route in this test"),
+            &ToolDuties {
+                triage: &DutyRoute::unresolved("no triage route in this test"),
+                shell: &DutyRoute::unresolved("no shell route in this test"),
+            },
+        )
+        .await
+        .expect("a turn that cannot fit still completes");
+        assert_eq!(
+            outcome.turns, 2,
+            "fixture drifted — the point is that more than one gate ran"
+        );
+
+        let mut published = Vec::new();
+        while let Some(envelope) = sub.try_recv() {
+            if let teton_protocol::events::Event::ContextPressure(pressure) = envelope.event {
+                published.push(pressure);
+            }
+        }
+        let did_not_fit: Vec<_> = published
+            .iter()
+            .filter(|p| p.kind == ContextPressureKind::DidNotFit)
+            .collect();
+        assert_eq!(
+            did_not_fit.len(),
+            1,
+            "one turn, one over-budget line: {published:#?}"
+        );
+        assert!(
+            did_not_fit[0].dropped_blocks > 0,
+            "the surviving line is the first gate's, which carries what it \
+             managed to drop: {:?}",
+            did_not_fit[0]
+        );
+
+        // …and the latch bounds that one line only. The exit gate fitted the
+        // context and dropped a block doing it, which is news of a different
+        // kind and still goes out.
+        let dropped: Vec<_> = published
+            .iter()
+            .filter(|p| p.kind == ContextPressureKind::BlocksDropped)
+            .collect();
+        assert_eq!(
+            dropped.len(),
+            1,
+            "a gate that *did* fit the context must still announce what it \
+             took — the latch is over the over-budget state, not over the \
+             gate: {published:#?}"
+        );
+    }
+
     /// A source that calls a tool once, in one of the two shapes a source can
     /// deliver a call in: embedded in its text the way the local tier's reply
     /// is (`call_in_text: true` — prose then the call), or beside the text the
@@ -2394,6 +2811,54 @@ mod tests {
             !displayed.contains("now do something else"),
             "the fabricated flat turn was displayed: {displayed:?}"
         );
+    }
+
+    /// **TASK-194 2a.** One classifier, four kinds, and the one that means "it
+    /// still does not fit" wins over the two that mean "here is how it was made
+    /// to fit".
+    ///
+    /// The defect: an over-budget gate rode as [`ContextPressureKind::BlockElided`]
+    /// with `elided_bytes: 0`, and the zero was the only tell. A reader was told
+    /// a block had been shortened when none had — and, for the mixed report, that
+    /// blocks had been dropped "to fit" a budget the turn then exceeded anyway.
+    /// BR-7's claim is that nothing is clamped in silence; an event under the
+    /// wrong name is worse than silence, because it is believed.
+    #[test]
+    fn a_gate_that_could_not_fit_the_context_is_its_own_kind() {
+        let report = |dropped_blocks, elided_bytes, over_budget| PressureReport {
+            dropped_blocks,
+            elided_bytes,
+            newest_user_elided: false,
+            over_budget,
+        };
+        // The three that fit.
+        assert_eq!(
+            pressure_kind(&report(3, 0, false)),
+            ContextPressureKind::BlocksDropped
+        );
+        assert_eq!(
+            pressure_kind(&report(0, 900, false)),
+            ContextPressureKind::BlockElided
+        );
+        assert_eq!(
+            pressure_kind(&report(2, 900, false)),
+            ContextPressureKind::BlocksDropped,
+            "a report that is both leads with the larger fact"
+        );
+        // And the one that does not, whatever else the gate managed.
+        for (dropped, elided) in [(0, 0), (3, 0), (0, 900), (3, 900)] {
+            assert_eq!(
+                pressure_kind(&report(dropped, elided, true)),
+                ContextPressureKind::DidNotFit,
+                "dropped {dropped}, elided {elided}"
+            );
+        }
+        // Non-vacuity: every one of those reports is news, so each really does
+        // reach a surface (the gates drop quiet ones before they get here).
+        for over_budget in [true, false] {
+            assert!(!report(1, 0, over_budget).is_quiet());
+        }
+        assert!(!report(0, 0, true).is_quiet());
     }
 
     #[test]
@@ -4072,7 +4537,7 @@ mod tests {
                 "step {i}: reading yet another file to fill the budget"
             ));
         }
-        ctx.truncate_to_budget();
+        let _ = ctx.truncate_to_budget();
 
         assert!(
             !ctx.blocks()

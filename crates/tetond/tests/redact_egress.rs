@@ -69,7 +69,7 @@ use teton_core::policy::ProviderHealth;
 use teton_core::ProvenanceId;
 use teton_inference::{Completion, Engine, EngineError, GenParams};
 use teton_protocol::events::{
-    BlockCause, Event, FindingKind as WireFindingKind, PrivacyAction, PrivacyBlock,
+    BlockCause, BudgetBound, Event, FindingKind as WireFindingKind, PrivacyAction, PrivacyBlock,
     ProvenanceRejected,
 };
 use teton_protocol::{ProviderId, SessionId};
@@ -84,11 +84,12 @@ use teton_providers::{
 use tetond::egress::provenance::{assembled_provenance, ContextBlock};
 use tetond::egress::redact::{
     decide, EgressDecision, Outcome, RedactionGate, RedactionVerdict, REDACT_CHUNK_MAX_BYTES,
-    REDACT_INPUT_MAX_BYTES,
+    REDACT_INPUT_MAX_BYTES, REDACT_SCANNABLE_CONTEXT_BYTES,
 };
 use tetond::egress::{Egress, EgressContext, EgressError, NoopSink, PrivacyEventSink, Provenance};
+use tetond::harness::budget::derive;
 use tetond::harness::redact::{scan, REDACTION_OUTPUT_CONTRACT};
-use tetond::harness::{DutyRoute, REDACT_DUTY};
+use tetond::harness::{BudgetInputs, DutyRoute, REDACT_DUTY};
 use tetond::router::Router;
 
 /// Mint the identity of a fixture file (REQ-571 ADR-A).
@@ -1019,6 +1020,233 @@ async fn a_context_budget_full_payload_is_scanned_across_windows_and_forwards() 
         capture.captured().len(),
         1,
         "and nothing more reached the wire"
+    );
+}
+
+// ===========================================================================
+// REQ-586 AC-6 — the redact scan bounds a big route's byte budget, and a turn
+// that fills the bounded budget is scanned rather than refused
+// ===========================================================================
+
+/// **REQ-586 AC-6 / BR-4.** On a machine with `[privacy] redact = true`, a
+/// 128k provider's byte budget is [`REDACT_SCANNABLE_CONTEXT_BYTES`] — and a
+/// turn that fills it reaches the wire, scanned across windows, rather than
+/// dying as `ScanUnavailable`.
+///
+/// ## Why this is an egress test and not another arithmetic one
+///
+/// `harness::budget::derive` is pinned as arithmetic in its own module. What
+/// that cannot show is the thing AC-6 is actually about: the bound and the cap
+/// are two numbers in two modules, and "the budget is small enough" is only
+/// true if a body assembled *at* the budget is a body the redactor will read.
+/// So the budget is derived here by the production function and then spent —
+/// the whole of it — through the real choke point, the real chunked scan and a
+/// real engine. Nothing in this file restates 89,127.
+///
+/// ## The mutation this is TASK-192's target for
+///
+/// The second leg is `with_redact_scan(false)`'s answer for the same provider:
+/// remove the router's redact-scan input (or `derive`'s clamp) and the route
+/// carries [`BudgetBound::Window`], whose byte budget is 253,952 — **over**
+/// [`REDACT_INPUT_MAX_BYTES`]. A turn that filled *that* budget is refused
+/// unscanned, fail-closed, which is the REQ-562/REQ-577 collision this REQ
+/// exists not to reintroduce. The two legs are one test because the claim is a
+/// comparison: it is not that a big body scans, it is that the bound is what
+/// makes it one the scanner can take.
+///
+/// ## Bytes per word
+///
+/// The filler is prose at ≈ 5.8 B/word — a 64-byte sentence of 11 whitespace
+/// words, measured rather than eyeballed (REQ-586 AC F-19 exists to make a
+/// fixture-density claim like this one checkable). The word figure is
+/// incidental here — the redact scan is byte-denominated and it is
+/// `budget_bytes` the bound moves (BR-4) — but it is stated so that a later
+/// reader can see this fixture is not accidentally testing the word guard.
+#[tokio::test]
+async fn a_redact_scanned_128k_route_assembles_a_body_the_scan_reads_whole_and_forwards() {
+    /// The provider window AC-6 names, and the reservation every route
+    /// subtracts (`HarnessConfig::default().gen_params.max_tokens`).
+    const WINDOW: u32 = 128_000;
+    const RESERVATION: u32 = 1_024;
+
+    let inputs = |redact_scan: bool| BudgetInputs {
+        window: WINDOW,
+        cap: 0,
+        reservation: RESERVATION,
+        is_local: false,
+        redact_scan,
+        provider_id: Some("frontier"),
+    };
+    let scanned = derive(inputs(true));
+    let unscanned = derive(inputs(false));
+
+    // The bound is the scan's, and it is the byte half it moved: the word
+    // budget is the same window-derived number on both routes (BR-4).
+    assert_eq!(scanned.bound, BudgetBound::RedactScan);
+    assert_eq!(scanned.budget_bytes, REDACT_SCANNABLE_CONTEXT_BYTES);
+    assert_eq!(unscanned.bound, BudgetBound::Window);
+    assert_eq!(
+        scanned.budget_tokens, unscanned.budget_tokens,
+        "the scan bounds bytes; the words stay window-derived"
+    );
+    // And the comparison the second leg rests on, stated before it is spent.
+    assert!(
+        scanned.budget_bytes < REDACT_INPUT_MAX_BYTES
+            && unscanned.budget_bytes > REDACT_INPUT_MAX_BYTES,
+        "AC-6 is vacuous unless the unbounded budget is one the redactor \
+         refuses: bounded {} vs unbounded {} against a {REDACT_INPUT_MAX_BYTES}-byte cap",
+        scanned.budget_bytes,
+        unscanned.budget_bytes
+    );
+
+    // **The wiring, not only the arithmetic** (added by TASK-192's sweep: the
+    // mutation `budget_for` ignoring `with_redact_scan` left every assertion
+    // above green, because both legs call `derive` themselves). What makes
+    // `[privacy] redact = true` a *budget* is the router passing that flag
+    // down, so the same two pairs are demanded of `Router::budget_for` — the
+    // call the daemon actually makes. A router that drops the flag hands this
+    // 128k route the 253,952-byte pair, which is the unscannable one leg 2
+    // refuses.
+    let router_for = |redact_scan: bool| {
+        Router::new(CategoryTable::new(), Some("frontier".to_owned()))
+            .with_provider(
+                "frontier",
+                ProviderKind::OpenaiCompatible,
+                "claude-opus-4",
+                CapabilityProfile {
+                    max_context: WINDOW,
+                    ..CapabilityProfile::default()
+                },
+                ProviderHealth::Healthy,
+            )
+            .with_redact_scan(redact_scan)
+    };
+    assert_eq!(
+        router_for(true).budget_for(Some("frontier")),
+        scanned,
+        "the redact-scan flag must reach the derivation through the router, \
+         not only through this test"
+    );
+    assert_eq!(
+        router_for(false).budget_for(Some("frontier")),
+        unscanned,
+        "and with the scan off the same route is window-bound"
+    );
+
+    // --- Leg 1: a body filling the bounded budget is scanned and forwards. ---
+    let capture = CaptureTransport::default();
+    let sink = Arc::new(CapturingSink::default());
+    let engine = engine_pair("NONE");
+    let gate = Arc::new(
+        TestGate::new(router_with_local_tier(Some(CANONICAL_LOCAL_ID)))
+            .serving(Arc::clone(&engine.engine)),
+    );
+    let egress = choke_point(&capture, &sink, Arc::clone(&gate));
+
+    // 64 bytes, 11 whitespace words — ≈ 5.8 B/word. Both figures are asserted
+    // below rather than trusted: a filler whose density drifted would move
+    // which of the two guards this leg is standing on.
+    const SENTENCE: &str = "the retry helper reads the manifest and writes one report line. ";
+    assert_eq!(SENTENCE.len(), 64);
+    assert_eq!(SENTENCE.split_whitespace().count(), 11);
+    let context = SENTENCE.repeat(scanned.budget_bytes / SENTENCE.len());
+    assert!(
+        context.len() > REDACT_CHUNK_MAX_BYTES,
+        "a body at this bound spans several engine windows, or the chunking \
+         leg below proves nothing: {}",
+        context.len()
+    );
+    let (request, provenance) = clean_provenance_payload(&context);
+    let body = request.body.clone();
+    assert!(
+        body.len() <= REDACT_INPUT_MAX_BYTES,
+        "a body assembled at the bound must fit the cap it is derived from: \
+         {} against {REDACT_INPUT_MAX_BYTES}",
+        body.len()
+    );
+
+    egress
+        .send(request, &provenance, &ctx())
+        .await
+        .expect("a turn that fills the redact-bounded budget must reach the wire");
+
+    assert_eq!(capture.captured().len(), 1);
+    assert_eq!(
+        capture.captured()[0].body,
+        body,
+        "byte-for-byte: v1 detects, it never substitutes"
+    );
+    let verdict = gate.only_verdict();
+    assert_eq!(verdict.outcome(), Outcome::Clean);
+    assert!(
+        verdict.scanned(),
+        "a forward on this path must be a scan that ran, not one that could not"
+    );
+    assert!(
+        engine.redact_calls() > 1,
+        "a body at the bound is several engine windows wide and is scanned in \
+         several calls; {} would be a gate that stopped looking",
+        engine.redact_calls()
+    );
+
+    // The discrimination: the same body with a credential planted past the
+    // first window still blocks, so the scan really did read all of it.
+    let planted = format!("{context} {PATTERN_SENTINEL} at the end.");
+    let at = planted.find(PATTERN_SENTINEL).expect("fixture");
+    assert!(
+        at > REDACT_CHUNK_MAX_BYTES,
+        "the planted credential must sit past the first window"
+    );
+    let (request, provenance) = clean_provenance_payload(&planted);
+    let err = egress
+        .send(request, &provenance, &ctx())
+        .await
+        .expect_err("a credential past the first window must still block");
+    assert!(
+        matches!(
+            err,
+            EgressError::PrivacyBlocked {
+                cause: BlockCause::Redaction { .. },
+                ..
+            }
+        ),
+        "{err:?}"
+    );
+    assert_eq!(capture.captured().len(), 1, "and nothing more left");
+
+    // --- Leg 2: the same route without the bound assembles an unscannable
+    // body. This is the mutation `with_redact_scan` exists to prevent. ---
+    let capture = CaptureTransport::default();
+    let sink = Arc::new(CapturingSink::default());
+    let engine = engine_pair("NONE");
+    let gate = Arc::new(
+        TestGate::new(router_with_local_tier(Some(CANONICAL_LOCAL_ID)))
+            .serving(Arc::clone(&engine.engine)),
+    );
+    let egress = choke_point(&capture, &sink, Arc::clone(&gate));
+
+    let unbounded = SENTENCE.repeat(unscanned.budget_bytes / SENTENCE.len());
+    let (request, provenance) = clean_provenance_payload(&unbounded);
+    let err = egress
+        .send(request, &provenance, &ctx())
+        .await
+        .expect_err("a body filling the window-derived budget is unscannable");
+    assert!(
+        matches!(
+            err,
+            EgressError::PrivacyBlocked {
+                cause: BlockCause::ScanUnavailable,
+                ..
+            }
+        ),
+        "the un-bounded budget must die as unscannable — that is the turn AC-6 \
+         promises never happens because of its size: {err:?}"
+    );
+    assert!(capture.captured().is_empty());
+    assert_eq!(
+        engine.redact_calls(),
+        0,
+        "and it never reached a model: the cap short-circuits"
     );
 }
 

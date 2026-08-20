@@ -18,7 +18,10 @@ use std::sync::Arc;
 use teton_core::entities::PrivacyBoundary;
 use teton_protocol::SessionId;
 
-use crate::harness::context::{BlockRole, ContextManager, Provenance, RetainedContext};
+use crate::harness::budget::RouteBudget;
+use crate::harness::context::{
+    BlockRole, ContextManager, PressureReport, Provenance, RetainedContext,
+};
 use crate::harness::reply::prose_before_tool_call;
 use crate::harness::turn_loop::HarnessConfig;
 use crate::runtime::{context_is_sensitive, taint_pin_line, SessionTaint, TAINT_BY_CONTEXT};
@@ -104,8 +107,13 @@ impl CarriedTurn {
         boundaries: Vec<PrivacyBoundary>,
         prompt: impl Into<String>,
     ) -> Self {
+        // REQ-586 BR-1/BR-7: the pair AND the window it is a budget *for*, from
+        // the one `RouteBudget` the router derived — so the in-prompt elision
+        // marker names this route's window rather than the local engine's, and
+        // the three facts cannot be seeded from two different routes.
         let mut ctx = ContextManager::new(system, harness.context_budget_tokens)
-            .with_budget_bytes(harness.context_budget_bytes);
+            .with_budget_bytes(harness.context_budget_bytes)
+            .with_window_label(harness.budget.window_label.clone());
         ctx.replay(sessions.conversation_snapshot(session_id).into_retained());
         ctx.push_user(prompt);
         Self {
@@ -139,9 +147,53 @@ impl CarriedTurn {
     }
 
     /// The turn completed: the conversation becomes what the manager holds.
-    pub fn commit(mut self) {
+    ///
+    /// Discards the commit's own [`PressureReport`]. That is the right default
+    /// for a caller with no `SessionEvents` handle — the acceptance fixtures —
+    /// and explicitly wrong for the daemon, which owes BR-10 the news; it takes
+    /// [`Self::commit_reporting`] instead. Both run the identical write.
+    pub fn commit(self) {
+        let _ = self.commit_reporting();
+    }
+
+    /// The turn completed, and the commit's own budget gate says what it took
+    /// (REQ-586 BR-10, ADR-3).
+    ///
+    /// The between-turns half of "nothing is clamped in silence": a
+    /// conversation assembled on a 128k route and committed under a 4k one
+    /// loses its oldest blocks *here*, at a seam that runs from `Drop` and so
+    /// can hold no event handle. It reports; `run_prompt_turn` publishes
+    /// (LESSON-501).
+    pub fn commit_reporting(mut self) -> PressureReport {
         self.armed = false;
-        self.commit_now(false, false);
+        self.commit_now(false, false)
+    }
+
+    /// Re-budget this turn's context to the route it is about to take, and
+    /// re-fit it (REQ-586 BR-1, ADR-3).
+    ///
+    /// The mid-turn reroute seam, on the guard rather than on the manager
+    /// because a `RouteBudget` is one fact and setting it in two calls is how
+    /// the marker comes to name a window the budget is no longer against: the
+    /// label and both currencies move together or not at all.
+    pub fn rebudget(&mut self, budget: &RouteBudget) -> PressureReport {
+        self.set_window_label(&budget.window_label);
+        self.ctx_mut()
+            .rebudget(budget.budget_tokens, budget.budget_bytes)
+    }
+
+    /// Name the window this turn's context is budgeted against (REQ-586 BR-7).
+    ///
+    /// Goes through the owned `Option` because [`ContextManager`]'s label is a
+    /// consuming builder — the manager is seeded once in the ordinary case, and
+    /// this is the one path that renames it mid-turn.
+    ///
+    /// # Panics
+    ///
+    /// As [`Self::ctx`].
+    pub fn set_window_label(&mut self, window_label: &str) {
+        let ctx = self.ctx.take().expect("the turn context was taken");
+        self.ctx = Some(ctx.with_window_label(window_label));
     }
 
     /// The turn failed: the conversation stays exactly as the turn found it.
@@ -222,12 +274,12 @@ impl CarriedTurn {
     ///
     /// `panicking` is the one state that writes nothing: a panicking turn is a
     /// failed turn (BR-6), not a cancelled one.
-    fn commit_now(&mut self, cancelled: bool, panicking: bool) {
+    fn commit_now(&mut self, cancelled: bool, panicking: bool) -> PressureReport {
         let Some(mut ctx) = self.ctx.take() else {
-            return;
+            return PressureReport::default();
         };
         if panicking {
-            return;
+            return PressureReport::default();
         }
         // Read before the manager is shrunk or consumed, and before any trim:
         // the pin is about what this turn's context *was*, not about what
@@ -245,7 +297,14 @@ impl CarriedTurn {
         // of the last writer. Unconditional and ahead of the trim, for the same
         // reason the loop's own gate is unconditional: what enforces a budget is
         // never allowed to be skipped by a path.
-        ctx.truncate_to_budget();
+        // The report goes back to the runtime, which publishes the
+        // between-turns drop as `context_pressure` (BR-10): the commit runs
+        // from `Drop` and holds no `SessionEvents`, so the seam re-asserts the
+        // invariant and the news is published where the handle lives
+        // (LESSON-501). On the `Drop` path there is no one to hand it to and it
+        // is discarded — a cancelled turn's clamp is not news the user is still
+        // waiting on.
+        let pressure = ctx.truncate_to_budget();
         let pending_call = ctx.pending_tool_call();
         let mut retained = ctx.into_retained();
         if cancelled && pending_call {
@@ -256,6 +315,7 @@ impl CarriedTurn {
         // whole daemon.
         self.sessions
             .try_commit_conversation(&self.session_id, retained);
+        pressure
     }
 }
 
@@ -311,7 +371,10 @@ impl Drop for CarriedTurn {
         // and a turn that panicked halfway through assembling a tool result
         // would commit that half as though the user had walked away from it.
         let panicking = std::thread::panicking();
-        self.commit_now(true, panicking);
+        // Nothing to publish to: a drop is either a cancelled turn (whose
+        // client has gone) or a panicking one, and neither has a caller left to
+        // render a pressure line for.
+        let _ = self.commit_now(true, panicking);
     }
 }
 

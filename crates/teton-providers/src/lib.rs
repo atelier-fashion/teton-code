@@ -230,13 +230,139 @@ pub struct TurnRequest {
 }
 
 /// How many bytes of a 400 response body are read to decide whether it is a
-/// REQ-559 BR-12 effort refusal.
+/// REQ-559 BR-12 effort refusal or a REQ-586 BR-2 context-length refusal.
 ///
 /// Bounded because the body is provider-controlled and this is an error path:
 /// a provider that answered 400 with a megabyte of prose must not cost the
 /// daemon a megabyte of allocation to classify. Every observed vendor error body
 /// names the offending parameter in its first few hundred bytes.
 const EFFORT_REFUSAL_SNIFF_BYTES: usize = 4096;
+
+/// The OpenAI-compatible `error.code` value for a request that exceeds the
+/// model's context window, as the quoted JSON string token so that both the
+/// compact (`"code":"context_length_exceeded"`) and the pretty-printed
+/// (`"code": "context_length_exceeded"`) bodies OpenAI and its imitators send
+/// match. Verified against vendor docs 2026-08-19 (OpenAI chat/completions 400
+/// `invalid_request_error`, `param: "messages"`, `code:
+/// "context_length_exceeded"`).
+const OPENAI_CONTEXT_LENGTH_CODE: &str = "\"context_length_exceeded\"";
+
+/// The OpenAI-compatible message spelling: `This model's maximum context length
+/// is N tokens. However, …`. Carried by endpoints that reuse OpenAI's wording
+/// but not its `code` (DeepSeek, vLLM). Verified against vendor docs 2026-08-19.
+const OPENAI_CONTEXT_LENGTH_MESSAGE: &str = "maximum context length";
+
+/// The Anthropic Messages API spelling: a 400 `invalid_request_error` whose
+/// message is `prompt is too long: N tokens > M maximum`. Verified against
+/// vendor docs 2026-08-19 (platform.claude.com, "Context window overflow
+/// behavior": "If the input alone already exceeds the model's context window,
+/// the API returns a 400 `invalid_request_error` ("prompt is too long")").
+const ANTHROPIC_CONTEXT_LENGTH_MESSAGE: &str = "prompt is too long";
+
+/// The Moonshot/Kimi platform spelling: a 400 `invalid_request_error` whose
+/// message is `Input token length too long`, glossed by the vendor as "The
+/// input tokens exceed the model's maximum context limit". Verified against
+/// vendor docs 2026-08-19 (<https://platform.kimi.ai/docs/api/errors>, "Common
+/// Error Codes"; the CN mirror is `platform.kimi.com/docs/api/errors`).
+///
+/// Pinned because **Kimi is the dogfood provider** and Moonshot does not send
+/// either OpenAI spelling: `context_length_exceeded` appears nowhere in their
+/// published docs corpus or their OpenAPI document, so without this const a
+/// Kimi overflow would fall through to `ClientError { 400 }` — a health
+/// downgrade and a failover for a request that is simply too big, which is the
+/// exact outcome BR-2 exists to prevent.
+///
+/// The leading `Input` is deliberately **not** part of the match: the vendor's
+/// table heads the column "Typical message" rather than promising the byte
+/// string, so the fragment is the part that carries the meaning and survives a
+/// re-worded prefix — the same posture as
+/// [`OPENAI_CONTEXT_LENGTH_MESSAGE`], which is likewise a fragment of a longer
+/// sentence.
+///
+/// Moonshot's *Kimi Code* subscription endpoint (`kimi-for-coding`) words the
+/// same refusal differently — `Invalid request: Your request exceeded model
+/// token limit: N (requested: M)` — and is left unpinned on purpose: it is a
+/// different product surface from the OpenAI-compatible
+/// `/v1/chat/completions` this crate's adapters call, and ADR-8's narrowness
+/// rule says a spelling is pinned when an adapter can actually receive it.
+const MOONSHOT_CONTEXT_LENGTH_MESSAGE: &str = "token length too long";
+
+/// The llama.cpp `llama-server` spelling: a 400 whose body is
+/// `{"error":{"code":400,"message":"the request exceeds the available context
+/// size. try increasing the context size or enable context shift",
+/// "type":"exceed_context_size_error","n_prompt_tokens":…,"n_ctx":…}}`.
+/// Verified 2026-08-19 against two independent reproductions of the real body
+/// (`continuedev/continue` #9797 — HTTP 400, "the request exceeds the available
+/// context size, try increasing it"; `oobabooga/textgen` #7257 — the JSON
+/// above), the wording differing between builds only in the trailing advice.
+///
+/// Pinned because the **local-engine class is what
+/// `budget::MIN_BUDGET_BYTES` names as the live sub-floor case**: a route whose
+/// declared window derives below the floor runs under a budget larger than it
+/// declared, and the floor's whole justification is that the provider's typed
+/// refusal is what reports the overflow. `llama-server` behind an
+/// OpenAI-compatible endpoint sends none of the four spellings above, so without
+/// this const that route took `ClientError { 400 }` → `Fallback` → a health
+/// downgrade for a request that was simply too big.
+///
+/// The fragment is the middle of the sentence, not its start: the two observed
+/// builds differ in the tail ("try increasing it" vs "try increasing the
+/// context size or enable context shift") and the type token
+/// (`exceed_context_size_error`) is newer than the message. `exceeds the
+/// available context size` is the part both carry and the part that means it —
+/// the [`OPENAI_CONTEXT_LENGTH_MESSAGE`] posture.
+///
+/// **Not a complete backstop for this class, and the floor's docs say so.**
+/// Two gaps are known and neither is guessed at here:
+///
+/// * some `llama-server` builds put `400` in the JSON while answering with a
+///   different HTTP status ("the actual HTTP status code is not 400" —
+///   `oobabooga/textgen` #7257), and the sniff is deliberately
+///   [`TYPED_REFUSAL_STATUS`]-only, so those bodies stay
+///   `ClientError`;
+/// * **Ollama** — the shipped 4,096 recipe `MIN_BUDGET_BYTES` cites — is a
+///   different server from `llama-server` and its documented
+///   `/v1/chat/completions` behaviour on an over-long prompt is to *truncate*
+///   rather than refuse. There is no wording to pin, so none is invented.
+const LLAMA_CPP_CONTEXT_LENGTH_MESSAGE: &str = "exceeds the available context size";
+
+/// The **only** status either typed refusal is read out of — a context-length
+/// refusal (REQ-586 BR-2, verify M3) or an effort refusal (REQ-559 BR-12).
+///
+/// Every spelling either sniff matches was read off a `400 Bad Request` body:
+/// a request that overflows the model's window is a malformed request, and so is
+/// one naming a reasoning field the endpoint does not take. There is no upstream
+/// that reports either as anything else. The status is therefore part of the
+/// claim, not incidental to it, and **both** sniffs are gated on it — the effort
+/// half arrived one fix pass later than the context-length half, which is the
+/// same defect in the same shape: a sniff that reads a body without asking what
+/// the status meant.
+///
+/// The failure this closes is specific and bad in both directions. Both variants
+/// this classifier returns carry **no** [`FailureClass`], so they skip
+/// `record_health`, `on_provider_failure` and failover entirely — that is
+/// exactly right for a 400 the provider answered correctly, and exactly wrong
+/// for anything else:
+///
+/// - A **401/403** — a revoked, wrong, or expired key — whose body happens to
+///   contain `maximum context length` or `prompt is too long` would be reported
+///   to the user as "your context is too big", sending them to shrink a
+///   conversation when the fix is their credential.
+/// - A **429** would lose [`FailureAction::Retry`]: no backoff, no rate-limit
+///   degradation, just a class-less refusal.
+/// - And because none of those change the provider's standing, a misbehaving or
+///   hostile endpoint could keep itself in the route indefinitely by answering
+///   *any* 4xx with "prompt is too long" — every subsequent turn's full
+///   assembled context still going to it. `reasoning_effort` in a 401 body buys
+///   the same immunity, and additionally poisons the session's effort memo, so
+///   the provider silently stops being sent a level it accepts (BR-6's
+///   misattribution family).
+///
+/// That is not a hypothetical body shape: gateways (LiteLLM, OpenRouter, vLLM)
+/// relay an upstream vendor's error document under a status of their own
+/// choosing, so a context-length sentence under a 401 or a 429 is a body these
+/// adapters can really receive.
+const TYPED_REFUSAL_STATUS: u16 = 400;
 
 /// Whether a 400 body names the reasoning field this request sent (REQ-559
 /// BR-12).
@@ -258,8 +384,37 @@ pub fn body_names_the_effort_field(body: &[u8]) -> bool {
     text.contains("reasoning_effort") || text.contains("output_config")
 }
 
+/// Whether a 400 body says the request exceeded the model's context window
+/// (REQ-586 BR-2 / ADR-8).
+///
+/// The [`body_names_the_effort_field`] posture: **exact vendor spellings only**,
+/// no general parse. A false positive here turns an ordinary client error into
+/// a typed outcome the daemon neither retries nor fails over nor counts against
+/// the provider's health — so the sniff matches the five spellings the four
+/// upstreams actually send and nothing that merely resembles a size complaint.
+/// The set is what has been **verified**, never what seems likely: a provider
+/// whose refusal is worded some other way keeps `ClientError`, and
+/// `budget::MIN_BUDGET_BYTES` names the one that does.
+/// Like the effort sniff it reads only the bounded `read_error_head` prefix; the
+/// matched text never leaves this function (conventions: no provider prose in
+/// errors).
+#[must_use]
+pub fn body_names_context_length(body: &[u8]) -> bool {
+    let head = &body[..body.len().min(EFFORT_REFUSAL_SNIFF_BYTES)];
+    let Ok(text) = std::str::from_utf8(head) else {
+        // A non-UTF-8 error body tells us nothing. Not a context-length
+        // refusal — "unclassifiable" falls to the general 4xx path.
+        return false;
+    };
+    text.contains(OPENAI_CONTEXT_LENGTH_CODE)
+        || text.contains(OPENAI_CONTEXT_LENGTH_MESSAGE)
+        || text.contains(ANTHROPIC_CONTEXT_LENGTH_MESSAGE)
+        || text.contains(MOONSHOT_CONTEXT_LENGTH_MESSAGE)
+        || text.contains(LLAMA_CPP_CONTEXT_LENGTH_MESSAGE)
+}
+
 /// Read a bounded prefix of an error body so a 400 can be classified (REQ-559
-/// BR-12), then discard the rest.
+/// BR-12, REQ-586 BR-2), then discard the rest.
 ///
 /// Only ever called on a 4xx, where the body is an error document rather than a
 /// turn. The cap is [`EFFORT_REFUSAL_SNIFF_BYTES`]; a stream error while reading
@@ -277,25 +432,42 @@ async fn read_error_head(mut body: ByteStream) -> Vec<u8> {
     out
 }
 
-/// The BR-12 classification for a 4xx: an effort refusal, or the general client
-/// error. Shared by both adapters so the rule has one implementation.
+/// The classification for a 4xx: a REQ-559 BR-12 effort refusal, a REQ-586
+/// BR-2 context-length refusal, or the general client error. Shared by both
+/// adapters so each rule has one implementation.
 ///
 /// `sent` is what the request actually carried, and it names **both** levels —
 /// which is what lets this layer satisfy BR-12's "names the provider, the
 /// requested level, and the clamped level" without ever seeing the setting.
 ///
 /// A provider that was sent **no** reasoning field cannot be refusing one, so
-/// the check short-circuits. That is also what makes the daemon's retry
+/// the effort check short-circuits. That is also what makes the daemon's retry
 /// non-looping by construction: the retry sends `Omit`, and an `Omit` request
-/// can never be classified as a refusal.
+/// can never be classified as an effort refusal.
+///
+/// The bounded head is read for **every** 4xx, not only when effort was sent:
+/// the request that overflows the window may well be the `Omit` retry of an
+/// effort refusal, and a context-length refusal on that path must still come
+/// back typed (ADR-8). The effort sniff runs first — it is the more specific
+/// claim and the only one that needs `sent` — then the context-length sniff.
+///
+/// Both are gated on the status being exactly [`TYPED_REFUSAL_STATUS`], by one
+/// check ahead of them rather than a condition on each — see there for why a
+/// 401, a 403 or a 429 carrying either sentence must keep the classification it
+/// already had.
 pub(crate) async fn classify_client_error(
     status: u16,
     body: ByteStream,
     provider_id: &str,
     sent: ResolvedEffort,
 ) -> ProviderError {
+    let head = read_error_head(body).await;
+    // One gate, ahead of both sniffs: neither typed outcome may be reached from
+    // a status that means something else. See [`TYPED_REFUSAL_STATUS`].
+    if status != TYPED_REFUSAL_STATUS {
+        return ProviderError::ClientError { status };
+    }
     if let ResolvedEffort::Effort { level, requested } = sent {
-        let head = read_error_head(body).await;
         if body_names_the_effort_field(&head) {
             return ProviderError::EffortRefused {
                 provider_id: provider_id.to_owned(),
@@ -303,6 +475,11 @@ pub(crate) async fn classify_client_error(
                 clamped: level,
             };
         }
+    }
+    if body_names_context_length(&head) {
+        return ProviderError::ContextLengthExceeded {
+            provider_id: provider_id.to_owned(),
+        };
     }
     ProviderError::ClientError { status }
 }
@@ -398,6 +575,36 @@ pub enum ProviderError {
         /// The level actually sent, after the per-provider clamp.
         clamped: EffortLevel,
     },
+    /// The provider refused the request as exceeding its context window
+    /// (REQ-586 BR-2 / ADR-8).
+    ///
+    /// A **400** — [`TYPED_REFUSAL_STATUS`], the only status any vendor
+    /// reports an overflowed window under — whose body carries one of the exact
+    /// vendor spellings in [`body_names_context_length`], and **only** that. An
+    /// unrelated 400, and *any* other 4xx whatever its body says, stays a
+    /// [`ProviderError::ClientError`] — narrow on purpose, in the
+    /// [`ProviderError::EffortRefused`] posture, because this error bypasses the
+    /// retry / fallback / degrade machinery entirely and a misread 4xx would
+    /// hide a real provider fault (a revoked key, a rate limit) behind a budget
+    /// report, with no health change to move later turns off it.
+    ///
+    /// It names the provider and nothing else: the window and the assembled
+    /// size are facts the daemon holds (the route budget), not facts the adapter
+    /// can see, so the daemon's `HarnessError::ContextLengthExceeded` is where
+    /// they are added. It carries **no response body and no prompt text** —
+    /// conventions.md forbids provider prose in error messages.
+    ///
+    /// It has no [`FailureClass`]: the request is too big for the window, which
+    /// retrying or failing over cannot fix — a fallback provider with the same
+    /// or a smaller window would refuse the same bytes, and a provider that
+    /// correctly reported its limit is not unhealthy. The harness reports it
+    /// as a typed outcome naming the window and the assembled size; no health
+    /// change, no `on_provider_failure`.
+    #[error("provider `{provider_id}` refused the request as exceeding its context window")]
+    ContextLengthExceeded {
+        /// The provider that refused.
+        provider_id: String,
+    },
     /// The request could not be built (serialization / configuration problem).
     /// This is a local programmer/config error, not a provider failure, so it
     /// has no [`FailureClass`].
@@ -418,8 +625,12 @@ pub enum ProviderError {
 }
 
 impl ProviderError {
-    /// Map to a [`FailureClass`], or `None` for [`ProviderError::Build`] (a
-    /// local error, not a provider failure).
+    /// Map to a [`FailureClass`], or `None` for the variants the retry /
+    /// fallback / degrade machinery must not act on: [`ProviderError::Build`]
+    /// (a local error), [`ProviderError::PrivacyBlocked`],
+    /// [`ProviderError::EffortRefused`] and
+    /// [`ProviderError::ContextLengthExceeded`] (typed outcomes the daemon
+    /// handles out-of-band).
     #[must_use]
     pub fn failure_class(&self) -> Option<FailureClass> {
         Some(match self {
@@ -429,18 +640,19 @@ impl ProviderError {
             ProviderError::ServerError { status } => FailureClass::ServerError { status: *status },
             ProviderError::MalformedResponse => FailureClass::MalformedResponse,
             ProviderError::MalformedToolCall { .. } => FailureClass::MalformedToolCall,
-            // A privacy block is not a provider failure and must never be
-            // retried/fallen-back-on: the daemon handles it out-of-band by
-            // rerouting to the local tier (REQ-544 M-1).
-            // Neither is a failure the retry / fallback / degrade machinery
-            // should act on. A privacy block is handled out-of-band by
-            // rerouting to the local tier (REQ-544 M-1); an effort refusal by a
-            // single retry with no reasoning field, remembered for the session
-            // (REQ-559 BR-12 / ADR-F). Handing either to `classify` would
-            // degrade a provider that is working fine.
+            // None of these is a failure the retry / fallback / degrade
+            // machinery should act on. A privacy block is handled out-of-band
+            // by rerouting to the local tier (REQ-544 M-1); an effort refusal
+            // by a single retry with no reasoning field, remembered for the
+            // session (REQ-559 BR-12 / ADR-F); a context-length refusal by a
+            // typed report naming the window and the assembled size, with no
+            // retry and no health change (REQ-586 BR-2 / ADR-8) — the same
+            // bytes would overflow a fallback too. Handing any of them to
+            // `classify` would degrade a provider that is working fine.
             ProviderError::Build(_)
             | ProviderError::PrivacyBlocked(_)
-            | ProviderError::EffortRefused { .. } => return None,
+            | ProviderError::EffortRefused { .. }
+            | ProviderError::ContextLengthExceeded { .. } => return None,
         })
     }
 
@@ -451,6 +663,14 @@ impl ProviderError {
     #[must_use]
     pub const fn is_effort_refused(&self) -> bool {
         matches!(self, ProviderError::EffortRefused { .. })
+    }
+
+    /// Whether this is the REQ-586 BR-2 context-length refusal, which the
+    /// daemon answers with a typed outcome naming the window and the assembled
+    /// size — no retry, no failover, no change to the provider's health.
+    #[must_use]
+    pub const fn is_context_length_exceeded(&self) -> bool {
+        matches!(self, ProviderError::ContextLengthExceeded { .. })
     }
 
     /// Whether this error is an egress privacy block (BR-1) — a distinct,
@@ -566,6 +786,284 @@ mod tests {
         // Build is a local error, not a provider failure.
         assert_eq!(ProviderError::Build("x".into()).failure_class(), None);
         assert_eq!(ProviderError::Build("x".into()).decision(), None);
+        // REQ-586 BR-2: a context-length refusal is a typed outcome, not a
+        // failure — the machinery must never retry, fail over or degrade on it.
+        let too_long = ProviderError::ContextLengthExceeded {
+            provider_id: "p".into(),
+        };
+        assert_eq!(too_long.failure_class(), None);
+        assert_eq!(too_long.decision(), None);
+        assert!(too_long.is_context_length_exceeded());
+        assert!(!too_long.is_effort_refused());
+        assert!(!ProviderError::Timeout.is_context_length_exceeded());
+    }
+
+    // -----------------------------------------------------------------------
+    // REQ-586 BR-2 / ADR-8: the context-length sniff
+    // -----------------------------------------------------------------------
+
+    /// A one-chunk error body, as the adapters hand it to the classifier.
+    fn body_stream(body: &str) -> ByteStream {
+        let chunks = vec![Ok::<Vec<u8>, TransportError>(body.as_bytes().to_vec())];
+        Box::pin(futures::stream::iter(chunks))
+    }
+
+    /// The vendor spellings, each in the envelope its upstream actually
+    /// sends: OpenAI's pretty-printed body (space after the colon), a compact
+    /// compat body carrying only the code, a compat body carrying only the
+    /// message (DeepSeek/vLLM wording), Anthropic's message, and
+    /// `llama-server`'s — the local-engine class `budget::MIN_BUDGET_BYTES`
+    /// names as the sub-floor case, whose body carries none of the four above.
+    const CONTEXT_LENGTH_BODIES: [(&str, &str); 5] = [
+        (
+            "openai pretty-printed code",
+            "{\n  \"error\": {\n    \"message\": \"This model's maximum context length is 128000 tokens. However, your messages resulted in 131000 tokens. Please reduce the length of the messages.\",\n    \"type\": \"invalid_request_error\",\n    \"param\": \"messages\",\n    \"code\": \"context_length_exceeded\"\n  }\n}",
+        ),
+        (
+            "compat compact code only",
+            r#"{"error":{"message":"Input too long for this endpoint","type":"invalid_request_error","param":null,"code":"context_length_exceeded"}}"#,
+        ),
+        (
+            "compat message only",
+            r#"{"error":{"message":"This model's maximum context length is 65536 tokens. However, you requested 70000 tokens (60000 in the messages, 10000 in the completion). Please reduce the length of the messages or completion.","type":"invalid_request_error","param":null,"code":"invalid_request_error"}}"#,
+        ),
+        (
+            "anthropic prompt is too long",
+            r#"{"type":"error","error":{"type":"invalid_request_error","message":"prompt is too long: 213717 tokens > 200000 maximum"},"request_id":"req_011CSHoEeqs5C35K2UUqR7Fy"}"#,
+        ),
+        (
+            "llama.cpp exceed_context_size_error",
+            r#"{"error":{"code":400,"message":"the request exceeds the available context size. try increasing the context size or enable context shift","type":"exceed_context_size_error","n_prompt_tokens":14429,"n_ctx":8192}}"#,
+        ),
+    ];
+
+    /// The other `llama-server` build's wording, which differs in the trailing
+    /// advice — pinned separately so the const stays the fragment both carry
+    /// rather than drifting toward one build's whole sentence.
+    #[test]
+    fn both_observed_llama_server_wordings_name_context_length() {
+        for body in [
+            r#"{"error":{"code":400,"message":"the request exceeds the available context size, try increasing it","type":"server_error"}}"#,
+            r#"{"error":{"code":400,"message":"the request exceeds the available context size. try increasing the context size or enable context shift","type":"exceed_context_size_error"}}"#,
+        ] {
+            assert!(body_names_context_length(body.as_bytes()), "{body}");
+        }
+    }
+
+    #[test]
+    fn each_vendor_spelling_names_context_length() {
+        for (label, body) in CONTEXT_LENGTH_BODIES {
+            assert!(body_names_context_length(body.as_bytes()), "{label}");
+        }
+    }
+
+    /// The sniff is exact: a 400 that merely talks about size, tokens, or
+    /// length in other words is **not** a context-length refusal, and neither
+    /// is a non-UTF-8 body.
+    #[test]
+    fn resembling_a_size_complaint_is_not_enough() {
+        let unrelated: [&str; 5] = [
+            r#"{"error":{"message":"invalid model: no such model `test-model`"}}"#,
+            r#"{"error":{"message":"max_tokens: 999999 > 8192, which is the maximum allowed for this model","type":"invalid_request_error"}}"#,
+            r#"{"error":{"message":"Request too large for gpt-4o on tokens per min (TPM): Limit 30000, Requested 40000.","type":"tokens","code":"rate_limit_exceeded"}}"#,
+            r#"{"error":{"message":"context length exceeded"}}"#,
+            r#"{"type":"error","error":{"type":"request_too_large","message":"Request exceeds the maximum allowed number of bytes."}}"#,
+        ];
+        for body in unrelated {
+            assert!(!body_names_context_length(body.as_bytes()), "{body}");
+        }
+        assert!(!body_names_context_length(&[0xff, 0xfe, 0x22, 0x63]));
+        assert!(!body_names_context_length(b""));
+    }
+
+    /// Every spelling classifies to the typed, class-less variant naming the
+    /// provider — on a request that sent effort **and** on the `Omit` retry
+    /// path, which is the one the effort sniff short-circuits and which ADR-8
+    /// says must still read the head.
+    #[test]
+    fn a_400_with_a_vendor_spelling_is_the_typed_context_length_refusal() {
+        let sent_shapes = [
+            ResolvedEffort::effort(EffortLevel::High),
+            ResolvedEffort::omit(EffortOmission::ShapeNone),
+            ResolvedEffort::omit(EffortOmission::RefusedThisSession),
+        ];
+        for (label, body) in CONTEXT_LENGTH_BODIES {
+            for sent in sent_shapes {
+                let err = futures::executor::block_on(classify_client_error(
+                    400,
+                    body_stream(body),
+                    "p",
+                    sent,
+                ));
+                assert_eq!(
+                    err,
+                    ProviderError::ContextLengthExceeded {
+                        provider_id: "p".into()
+                    },
+                    "{label} / {sent:?}"
+                );
+                assert_eq!(err.failure_class(), None, "{label} / {sent:?}");
+                assert_eq!(err.decision(), None, "{label} / {sent:?}");
+                // No provider prose in the message (conventions.md).
+                let msg = err.to_string();
+                assert!(msg.contains("`p`"), "{msg}");
+                assert!(
+                    !msg.contains("maximum")
+                        && !msg.contains("too long")
+                        && !msg.contains("tokens"),
+                    "no body text in the error: {msg}"
+                );
+            }
+        }
+    }
+
+    /// An unrelated 400 takes today's path: `ClientError { 400 }`, classified
+    /// `Fallback`. Adding the sniff must not move a single existing outcome.
+    #[test]
+    fn an_unrelated_400_still_classifies_fallback() {
+        for sent in [
+            ResolvedEffort::effort(EffortLevel::High),
+            ResolvedEffort::omit(EffortOmission::ShapeNone),
+        ] {
+            let err = futures::executor::block_on(classify_client_error(
+                400,
+                body_stream(r#"{"error":{"message":"invalid model: no such model `test-model`"}}"#),
+                "p",
+                sent,
+            ));
+            assert_eq!(err, ProviderError::ClientError { status: 400 }, "{sent:?}");
+            assert_eq!(
+                err.decision().map(|d| d.action),
+                Some(FailureAction::Fallback),
+                "{sent:?}"
+            );
+        }
+    }
+
+    /// **Verify M3.** Both sniffs are 400-only: the *same* vendor spellings —
+    /// context-length **and** effort — under a 401, a 403 or a 429 keep the
+    /// classification they had before the sniffs existed.
+    ///
+    /// The two that matter are both in the loop. A 401/403 is a credential
+    /// fault: `ClientError`, `FailureAction::Fail`, and the user is told to fix
+    /// their key rather than to shrink a conversation that was never the
+    /// problem. A 429 is a rate limit: `FailureAction::Retry`, so the backoff
+    /// and the rate-limit degradation still happen. Both matter twice over
+    /// because `ContextLengthExceeded` carries no [`FailureClass`] at all — an
+    /// endpoint answering any 4xx with "prompt is too long" would otherwise keep
+    /// itself in the route with its health untouched, and every later turn's
+    /// full assembled context would keep going to it.
+    ///
+    /// Gateways (LiteLLM, OpenRouter, vLLM) relay an upstream vendor's error
+    /// document under a status of their own, so these are bodies the adapters
+    /// can really receive rather than a shape invented for a test.
+    ///
+    /// The **effort** leg is the same argument for the same shape, added a fix
+    /// pass later: [`ProviderError::EffortRefused`] is likewise class-less, and
+    /// it additionally writes the session's refusal memo — so a 401 whose body
+    /// happens to say `reasoning_effort` would both immunize the endpoint and
+    /// silently stop sending a level the provider accepts. REQ-559's spellings
+    /// were every one of them read off a 400.
+    #[test]
+    fn no_status_but_400_can_be_a_typed_refusal() {
+        /// Status, the action the pre-REQ-586 classification carries, a label.
+        const NON_400: [(u16, FailureAction, &str); 4] = [
+            (401, FailureAction::Fail, "a revoked or wrong key"),
+            (403, FailureAction::Fail, "a key without access"),
+            (429, FailureAction::Retry, "a rate limit"),
+            (404, FailureAction::Fallback, "a missing route"),
+        ];
+        for (status, action, why) in NON_400 {
+            for (label, body) in CONTEXT_LENGTH_BODIES {
+                for sent in [
+                    ResolvedEffort::effort(EffortLevel::High),
+                    ResolvedEffort::omit(EffortOmission::ShapeNone),
+                ] {
+                    let err = futures::executor::block_on(classify_client_error(
+                        status,
+                        body_stream(body),
+                        "p",
+                        sent,
+                    ));
+                    assert_eq!(
+                        err,
+                        ProviderError::ClientError { status },
+                        "{status} ({why}) with `{label}` in the body must stay a \
+                         client error"
+                    );
+                    assert_eq!(
+                        err.decision().map(|d| d.action),
+                        Some(action),
+                        "{status} ({why}) with `{label}` in the body lost its \
+                         failure action"
+                    );
+                    assert!(
+                        err.failure_class().is_some(),
+                        "{status} ({why}) with `{label}` in the body stopped \
+                         counting against the provider's health"
+                    );
+                    assert!(!err.is_context_length_exceeded(), "{status} / {label}");
+                }
+            }
+
+            // …and the effort half, on a request that really did send a level:
+            // the body names the field, the status says the request never got
+            // as far as being read.
+            let err = futures::executor::block_on(classify_client_error(
+                status,
+                body_stream(
+                    r#"{"error":{"message":"Unrecognized request argument supplied: reasoning_effort"}}"#,
+                ),
+                "p",
+                ResolvedEffort::clamped(EffortLevel::Xhigh, EffortLevel::High),
+            ));
+            assert_eq!(
+                err,
+                ProviderError::ClientError { status },
+                "{status} ({why}) naming the reasoning field must stay a client \
+                 error"
+            );
+            assert!(
+                !err.is_effort_refused(),
+                "{status} ({why}) must not poison the session's effort memo"
+            );
+            assert_eq!(
+                err.decision().map(|d| d.action),
+                Some(action),
+                "{status} ({why}) naming the reasoning field lost its failure \
+                 action"
+            );
+            assert!(
+                err.failure_class().is_some(),
+                "{status} ({why}) naming the reasoning field stopped counting \
+                 against the provider's health"
+            );
+        }
+    }
+
+    /// The effort sniff keeps precedence: a body naming the reasoning field on
+    /// a request that sent one is the effort refusal, even if it also mentions
+    /// the context window — the more specific claim wins, and the daemon's
+    /// `Omit` retry will surface the context-length refusal if it is real.
+    #[test]
+    fn the_effort_sniff_runs_before_the_context_length_sniff() {
+        let body =
+            r#"{"error":{"message":"reasoning_effort is not supported; prompt is too long"}}"#;
+        let err = futures::executor::block_on(classify_client_error(
+            400,
+            body_stream(body),
+            "p",
+            ResolvedEffort::clamped(EffortLevel::Xhigh, EffortLevel::High),
+        ));
+        assert!(err.is_effort_refused(), "{err:?}");
+        // And the same body on the Omit retry is the context-length refusal.
+        let err = futures::executor::block_on(classify_client_error(
+            400,
+            body_stream(body),
+            "p",
+            ResolvedEffort::omit(EffortOmission::RefusedThisSession),
+        ));
+        assert!(err.is_context_length_exceeded(), "{err:?}");
     }
 
     #[test]

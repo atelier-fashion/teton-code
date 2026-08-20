@@ -1345,7 +1345,7 @@ mod tests {
         );
         ctx.push_user("x".repeat(1_500));
         ctx.push_user("and now this");
-        ctx.truncate_to_budget();
+        let _ = ctx.truncate_to_budget();
         assert!(ctx.was_truncated(), "fixture: the turn must have truncated");
 
         reg.commit_conversation(&s.session_id, ctx.into_retained());

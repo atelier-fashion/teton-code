@@ -244,6 +244,16 @@ struct Answers {
     key: String,
     /// The tiers to route, zero or more (BR-7).
     bindings: Vec<TierBinding>,
+    /// The window the chosen recipe declares for its **example** model, in
+    /// tokens — carried, never asked about (REQ-586 ADR-9, OQ-1's lean).
+    ///
+    /// It is the recipe's figure and nothing else: the daemon writes it only
+    /// when the model actually pinned is that example (`derive_provider_setup`
+    /// matches the pair), so a user who types their own model over the
+    /// suggestion records `0` — "unknown", stated in the preview — rather than
+    /// a window somebody else's model has. Guessing one from a model name is
+    /// exactly what BR-3 forbids.
+    max_context: u32,
 }
 
 /// Redacts the key.
@@ -260,6 +270,7 @@ impl std::fmt::Debug for Answers {
             .field("model", &self.model)
             .field("key", &"<redacted>")
             .field("bindings", &self.bindings)
+            .field("max_context", &self.max_context)
             .finish()
     }
 }
@@ -286,6 +297,10 @@ impl Answers {
             model: self.model.clone(),
             key_ref,
             bindings: self.bindings.clone(),
+            // REQ-586 ADR-9: the recipe's window rides along silently — the
+            // flow asks no question about it, and the daemon decides whether
+            // the pinned model is the one it describes.
+            max_context: Some(self.max_context),
         }
     }
 
@@ -736,6 +751,7 @@ fn collect(
         model,
         key: key.to_owned(),
         bindings,
+        max_context: entry.max_context,
     })
 }
 
@@ -1683,6 +1699,7 @@ mod tests {
                 endpoint: None,
                 example_model: "claude-opus-5".to_owned(),
                 notes: None,
+                max_context: 131_072,
             },
             ProviderRecipeEntry {
                 id_suggestion: "kimi".to_owned(),
@@ -1692,6 +1709,7 @@ mod tests {
                 endpoint: Some("https://api.moonshot.ai/v1/chat/completions".to_owned()),
                 example_model: "kimi-k3".to_owned(),
                 notes: None,
+                max_context: 131_072,
             },
             ProviderRecipeEntry {
                 id_suggestion: "deepseek".to_owned(),
@@ -1701,6 +1719,7 @@ mod tests {
                 endpoint: Some("https://api.deepseek.com/chat/completions".to_owned()),
                 example_model: "deepseek-v4-pro".to_owned(),
                 notes: Some("a sentence about pricing".to_owned()),
+                max_context: 131_072,
             },
         ]
     }
@@ -1717,6 +1736,7 @@ mod tests {
                 endpoint: Some("https://one.sentinel.example/v1/chat/completions".to_owned()),
                 example_model: "sentinel-model-1".to_owned(),
                 notes: None,
+                max_context: 131_072,
             },
             ProviderRecipeEntry {
                 id_suggestion: "sentinel-two".to_owned(),
@@ -1726,6 +1746,7 @@ mod tests {
                 endpoint: Some("https://two.sentinel.example/v1/chat/completions".to_owned()),
                 example_model: "sentinel-model-2".to_owned(),
                 notes: None,
+                max_context: 131_072,
             },
         ]
     }
@@ -2297,6 +2318,7 @@ mod tests {
                 model: "kimi-k3".to_owned(),
                 key: PLANTED_KEY.to_owned(),
                 bindings: Vec::new(),
+                max_context: 131_072,
             }
         );
         assert!(!answers.contains(PLANTED_KEY), "{answers}");

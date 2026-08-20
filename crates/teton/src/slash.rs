@@ -594,7 +594,8 @@ const COMMANDS: &[CommandSpec] = &[
         name: "provider add",
         aliases: &[],
         summary: "Register a provider by hand: /provider add <id> --kind <kind> --endpoint <url> \
-                  --model <name>; the key is asked for, never typed on the line.",
+                  --model <name> [--max-context <tokens>]; the key is asked for, never typed on \
+                  the line.",
         args: Args::Cli,
         mirror: Some(cli_rows::PROVIDER_ADD),
         handler: cli_rows::handle_provider_add,

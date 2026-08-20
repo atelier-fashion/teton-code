@@ -2876,12 +2876,16 @@ mod tests {
         let announce = || {
             Some(RouteDecided {
                 effort: None,
+                budget_tokens: None,
+                budget_bytes: None,
+                bound: None,
                 category: Some(Category::Redact),
                 tier: Some(Tier::Scan),
                 phase: None,
                 provider_id: ProviderId::from("local"),
                 model: None,
                 reason: "Routing the 'redact' category to the local tier.".to_owned(),
+                bound_floored: None,
             })
         };
         let drain = |sub: &mut crate::broadcast::Subscription| -> usize {

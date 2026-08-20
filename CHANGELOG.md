@@ -18,6 +18,80 @@ unchanged. What belongs here is what an *upgrade* does to a machine that was
 already running — above all, anything that changes where data goes without the
 user having asked for it.
 
+## [Unreleased]
+
+### Added
+
+- **A turn is assembled to fit the model it is routed to (REQ-586).** Every
+  turn — local or remote — used to run under one budget sized for the local
+  engine: 4,096 words and 32,768 bytes, whatever window the provider actually
+  had. A prompt that did not fit had its oldest blocks dropped and its newest
+  message middle-elided in place, and nothing told you. The budget is now a
+  property of the **route**, derived once where the route is decided:
+
+  - **Declare a window.** `teton provider add … --max-context <tokens>`, with
+    an optional `--context-budget-cap <tokens>` to hold a large window to a
+    smaller budget. `/provider setup` records the window from the shipped
+    recipe when you take that recipe's example model, and `config/set` carries
+    both keys. The recipes now ship verified windows: Anthropic
+    `claude-opus-5` 1,000,000, OpenAI `gpt-5.6` 1,050,000, Moonshot `kimi-k3`
+    1,000,000, DeepSeek `deepseek-v4-pro` 1,000,000, xAI `grok-4.6` 500,000,
+    and Ollama `llama3.2` 4,096 — Ollama's *served* default, not the model
+    card's 128k, and a declared window below the local default legitimately
+    yields a smaller budget.
+  - **Two currencies, and the bound is named.** A remote budget is
+    `(window − 1,024) × 2/3` words and `(window − 1,024) × 2` bytes; on a
+    remote route it is the byte guard that binds for prose and for code.
+    `/verbose` ends the route line with
+    `· budget 665,984 words / 2 MB (bound: window)` — one of `window`,
+    `unknown window`, `redact scan`, `user cap`, `local engine`.
+  - **Nothing is clamped in silence.** A new `context_pressure` event, and one
+    CLI line that is never gated by `/verbose`, whenever blocks are dropped, a
+    block is elided in place, or the context is re-fitted after a mid-turn
+    reroute. An elided *newest* message is additionally a notice in the turn's
+    own output. The in-prompt elision marker now names the route's window
+    instead of always saying "local context window".
+  - **`teton doctor` and `teton provider list` show the window.** A `window:`
+    column on every provider row — `1m`, `unknown — context budget defaulted
+    (set capabilities.max_context)`, or `(local engine)` — plus a doctor
+    advisory for a provider that declares none, and for a
+    `context_budget_cap` at or above its window (inert rather than invalid).
+  - **A provider's "context length exceeded" is a typed outcome** (RPC
+    `-32022`) naming the window and the assembled size. It does not retry, it
+    does not fail over, and it does not count against the provider's health.
+  - **`teton_docs context`** is a new bundled topic carrying all of the above,
+    including the number worth knowing: the budget bounds one model **call**,
+    and a single prompt may make up to 25 of them.
+
+  With `[privacy] redact = true` the byte budget is additionally held to what
+  the redact scan can cover (≈89 KB) and the bound reads `redact scan`; the
+  word figure stays window-derived.
+
+### Changed
+
+- **The `digest` threshold scales with the route (REQ-586).** A tool result is
+  condensed above the same ≈36.6% of the route's budget it has always been,
+  rather than a fixed 1,500 words / 12,000 bytes — capped on every route at
+  20,000 words / 160 KiB, so one enormous result is still digested. The local
+  tier's numbers are byte-identical to before. Compaction still fires at 70%
+  of either budget, and the `compact` duty's own prompt stays bounded to the
+  local engine's window as the conversation grows.
+
+### Upgrade notes
+
+- Nothing here changes where data goes, and no config is rewritten: a provider
+  with no declared window behaves exactly as it did, under the default budget
+  — the difference is that Teton now says so instead of leaving you to guess.
+- The protocol fields are **additive** and `PROTOCOL_VERSION` has not moved,
+  so mixed builds degrade rather than break. An older **CLI** against this
+  daemon ignores `max_context`, `context_budget_cap`, `budget_tokens`,
+  `budget_bytes` and `bound`, and drops the `context_pressure` event; its
+  route line is byte-for-byte the pre-REQ-586 one. An older **daemon** behind
+  this CLI reports no window at all, and the row reads `window: not reported`
+  rather than claiming one is unset. And an older client re-registering a
+  provider cannot zero a window you declared: the registration merges these
+  fields, so an absent value preserves what is stored.
+
 ## [0.1.23] - 2026-08-19
 
 ### Added

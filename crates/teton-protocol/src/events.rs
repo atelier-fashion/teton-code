@@ -29,7 +29,9 @@
 //! makes against a registered provider. REQ-583 adds `session_root_changed`
 //! (BR-7), which announces that a live session's root moved on the user's
 //! `/cd` — always beside a `context_cleared`, since the move clears the
-//! conversation.
+//! conversation. REQ-586 adds `context_pressure` (BR-7), which announces that
+//! the context gate dropped blocks, elided one in place, or re-fitted the
+//! conversation to a new route's budget — nothing is clamped in silence.
 //!
 //! This list is an index, not decoration: a new variant of [`Event`] that is not
 //! named here makes the paragraph above wrong.
@@ -181,6 +183,9 @@ pub enum Event {
     ProviderTested(ProviderTested),
     /// The user moved a live session's root with `/cd` (REQ-583 BR-7).
     SessionRootChanged(SessionRootChanged),
+    /// The context gate dropped, elided, or re-fitted conversation to a
+    /// turn's budget (REQ-586 BR-7).
+    ContextPressure(ContextPressure),
 }
 
 impl Event {
@@ -218,6 +223,7 @@ impl Event {
             Event::TurnQueued(_) => "turn_queued",
             Event::ProviderTested(_) => "provider_tested",
             Event::SessionRootChanged(_) => "session_root_changed",
+            Event::ContextPressure(_) => "context_pressure",
         }
     }
 }
@@ -407,6 +413,45 @@ pub struct RouteDecided {
     /// (BR-6).
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub effort: Option<ResolvedEffort>,
+    /// The word budget this route attempt's context was fitted to (REQ-586
+    /// BR-8) — the `HarnessConfig` pair's token half, as the router derived it
+    /// for this attempt, never recomputed by a surface.
+    ///
+    /// `Option` is for **wire additivity only**, exactly as [`Self::effort`]:
+    /// a daemon that has this field always populates it, a frame from a daemon
+    /// predating it carries no key and reads `None`, and a client predating it
+    /// ignores a key serde does not require it to know — so this moves neither
+    /// [`crate::PROTOCOL_VERSION`] nor [`crate::PROTOCOL_VERSION_MIN`].
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub budget_tokens: Option<u64>,
+    /// The byte budget of the same attempt — the pair's other half. Both
+    /// currencies ride the event because on a remote route the byte guard is
+    /// what binds for prose and code, and the word figure alone would overstate
+    /// what fits (architecture "Derivation"). Same additivity as
+    /// [`Self::budget_tokens`].
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub budget_bytes: Option<u64>,
+    /// Which constraint bound the budget (REQ-586 BR-8) — computed once, where
+    /// the route is decided, and what `/verbose`, `/doctor`, `context_pressure`
+    /// and every refusal read. Same additivity as [`Self::budget_tokens`].
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub bound: Option<BudgetBound>,
+    /// Whether the derivation had to **raise** this attempt's pair to its floor
+    /// — so [`Self::bound`] names what the user declared, and the budget above
+    /// is larger than that declaration asked for (REQ-586 TASK-194 2b).
+    ///
+    /// The floor is the smallest budget that can still hold the harness's own
+    /// system prompt. A `context_budget_cap` of 500 on a 200k provider derives
+    /// *below* it, so the pair is raised and the turn gets more room than the
+    /// cap asked for — a bound reported as `user cap` with nothing beside it
+    /// would be a surface claiming a ceiling that is not in force. Rendered as
+    /// a clause on the `/verbose` route line and on every pressure line; the
+    /// remedy (`/doctor`'s advisory) reads the same fact off the snapshot.
+    ///
+    /// Same additivity as [`Self::budget_tokens`]: a daemon that has this field
+    /// always populates it, and `None` means a daemon that predates it.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub bound_floored: Option<bool>,
 }
 
 // ---------------------------------------------------------------------------
@@ -2086,6 +2131,231 @@ pub struct SessionRootChanged {
 }
 
 // ---------------------------------------------------------------------------
+// context_pressure (REQ-586)
+// ---------------------------------------------------------------------------
+
+/// Which constraint bound a route attempt's context budget (REQ-586 BR-8).
+///
+/// One fact with one source: the router computes this where it decides the
+/// route, stamps it on [`RouteDecided`], and every surface — `/verbose`,
+/// `/doctor`, [`ContextPressure`], the refusal texts — reads that value rather
+/// than re-deriving it (LESSON-456: one classifier per fact). The precedence
+/// among the variants is the router's to state and test; this enum only names
+/// the outcomes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum BudgetBound {
+    /// The provider's declared context window, less the generation
+    /// reservation, is what bound the budget — the ordinary remote case.
+    Window,
+    /// The provider declared no window (`capabilities.max_context = 0`), so the
+    /// default pair applies — stated, never silent (BR-3).
+    DefaultUnknown,
+    /// `[privacy] redact = true`, and the bytes the redact scan can cover bound
+    /// the budget below what the window would have allowed (BR-4).
+    RedactScan,
+    /// The user's `capabilities.context_budget_cap` sat below the window and is
+    /// what bound the budget (BR-5).
+    UserCap,
+    /// The route is the local engine; its budget is the local pair regardless
+    /// of any declared window.
+    LocalEngine,
+}
+
+impl BudgetBound {
+    /// The wire spelling, identical to the serialized tag — [`Event::name`]'s
+    /// arrangement, one level down.
+    ///
+    /// Snake_case, because that is what the field carries; the words a person
+    /// is shown are [`BudgetBound::words`]. Kept as its own accessor so a
+    /// surface that needs the token — a log line, a machine-read `/doctor`
+    /// row — asks for it rather than reaching for `serde_json` to get a
+    /// string out of a five-way enum.
+    #[must_use]
+    pub const fn wire_name(&self) -> &'static str {
+        match self {
+            BudgetBound::Window => "window",
+            BudgetBound::DefaultUnknown => "default_unknown",
+            BudgetBound::RedactScan => "redact_scan",
+            BudgetBound::UserCap => "user_cap",
+            BudgetBound::LocalEngine => "local_engine",
+        }
+    }
+
+    /// The words the bound is **said** in: `unknown window`, not
+    /// `default_unknown`.
+    ///
+    /// One table, and it lives here rather than in the CLI because both sides
+    /// need it. The client words the `/verbose` route line and every
+    /// `context_pressure` line; the daemon words the refusals that name the
+    /// bound — REQ-585 BR-8's oversized-skill refusal is the first, and it
+    /// runs in `tetond`, which cannot reach a `teton` helper. A second table
+    /// over there would be the mirrored-predicate shape LESSON-528 is about:
+    /// identical today, and identical only until one of them is edited.
+    ///
+    /// Each spelling names the thing a user would go and change — a bound of
+    /// `unknown window` is a `capabilities.max_context` that was never set,
+    /// which is why the wire's `default_unknown` is not what is printed. The
+    /// phrases are lower-case fragments, so a caller may set them in a
+    /// sentence (`bound: user cap`) or after a colon without re-casing them.
+    #[must_use]
+    pub const fn words(&self) -> &'static str {
+        match self {
+            BudgetBound::Window => "window",
+            BudgetBound::DefaultUnknown => "unknown window",
+            BudgetBound::RedactScan => "redact scan",
+            BudgetBound::UserCap => "user cap",
+            BudgetBound::LocalEngine => "local engine",
+        }
+    }
+}
+
+/// A count with thousands separators: `4096` → `4,096` — **the one home** of
+/// how a budget's word figure is spelled (REQ-586 BR-8, LESSON-456).
+///
+/// Budgets are five- and six-digit numbers a reader compares at a glance ("did
+/// that turn really only get 4k?"), and an ungrouped `132650` is the one shape
+/// that cannot be read at a glance.
+///
+/// It lives beside [`BudgetBound::words`] and for the same reason: **both ends
+/// spell these figures**. The client words the `/verbose` route line and every
+/// `context_pressure` line; the daemon words the big-window notice its provider
+/// registration surfaces carry (`harness::budget::big_window_notice`), and it
+/// runs in `tetond`, which cannot reach a `teton` helper. Two private
+/// formatters for one figure is the mirrored-predicate shape LESSON-528 is
+/// about — identical today, and identical only until one of them is edited.
+#[must_use]
+pub fn thousands(n: u64) -> String {
+    let digits = n.to_string();
+    let mut out = String::with_capacity(digits.len() + digits.len() / 3);
+    let first = digits.len() % 3;
+    for (at, ch) in digits.chars().enumerate() {
+        if at > 0 && at % 3 == first {
+            out.push(',');
+        }
+        out.push(ch);
+    }
+    out
+}
+
+/// A byte figure for a budget line: `900 B`, `33 KB`, `4.2 MB` — **the one
+/// home** of how a budget's byte figure is spelled (REQ-586 BR-8).
+///
+/// Named for what it *is* rather than for its first caller: `budget_bytes` is
+/// the wire field's name (and one call site hands it `elided_bytes`, which is
+/// not a budget at all), so a formatter wearing that name read as an accessor.
+///
+/// **Decimal** units, and labelled as such. The CLI's `firstrun::format_bytes`
+/// is the other byte formatter in the workspace and stays where it is: it
+/// renders an *exact* download size in the binary units the daemon's own
+/// sentences use, where the tenth of a GiB is a fact about a file. A budget is
+/// an approximation with a safety ratio already baked into it, so it is rounded
+/// to whole KB and never claims a precision the number has not got — and
+/// rounding a 1024-based number under a `KB` label is the exact confusion that
+/// formatter's doc warns about, which is why this one divides by 1000.
+///
+/// Shared for [`thousands`]' reason: the daemon composes the same figures.
+#[must_use]
+pub fn bytes_figure(bytes: u64) -> String {
+    if bytes < 1_000 {
+        return format!("{bytes} B");
+    }
+    if bytes < 1_000_000 {
+        return format!("{} KB", (bytes + 500) / 1_000);
+    }
+    let tenths = (bytes + 50_000) / 100_000;
+    match tenths % 10 {
+        0 => format!("{} MB", tenths / 10),
+        frac => format!("{}.{frac} MB", tenths / 10),
+    }
+}
+
+/// What the context gate did to earn a [`ContextPressure`] event (REQ-586
+/// BR-7).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ContextPressureKind {
+    /// Older blocks were dropped from the assembled context to fit the budget.
+    BlocksDropped,
+    /// A single block was middle-elided in place because it alone exceeded the
+    /// budget.
+    BlockElided,
+    /// The conversation was re-fitted after a reroute or fallback moved the
+    /// turn to a route with a different budget (BR-1).
+    RefitOnReroute,
+    /// The gate ran and the context **still does not fit** either budget — the
+    /// turn is being sent over budget (REQ-586 verify m1, TASK-194 2a).
+    ///
+    /// Two arms of `truncate_to_budget` deliberately stop short: the in-place
+    /// clamp floors the last block's room at 1 KiB, and the drop loop stops at
+    /// one block whatever the word estimate says. Both are the right
+    /// degradation — a turn that cannot fit beats a turn with no content — and
+    /// neither may be silent.
+    ///
+    /// It has its own name because it used to ride as [`Self::BlockElided`]
+    /// with `elided_bytes: 0`, which is worse than silence: BR-7's whole claim
+    /// is that nothing is clamped without being said, and an event announced
+    /// under the wrong name says something that did not happen. A client
+    /// predating this variant drops the frame rather than mis-rendering it —
+    /// the same fail-closed choice the enum's snake_case tag makes everywhere
+    /// else — so no reader is ever told the wrong story about a context that
+    /// did not fit.
+    DidNotFit,
+}
+
+/// The context gate dropped, elided, or re-fitted conversation to a turn's
+/// budget (REQ-586 BR-7).
+///
+/// Emitted whenever `truncate_to_budget` dropped at least one block, elided a
+/// block in place, or re-fitted the context after a reroute — nothing is
+/// clamped in silence, on any tier. The CLI renders one line, never gated by
+/// `/verbose` (the [`ContextCleared`] precedent: the reset is the news), and an
+/// elision of the **newest user block** is additionally a turn notice, because
+/// that is the case where the model would answer a prompt the user did not
+/// send.
+///
+/// `budget_tokens`, `budget_bytes` and `bound` repeat the route's figures from
+/// [`RouteDecided`] so a client can render the line from this event alone,
+/// without correlating it back to the route frame.
+///
+/// The session is named by [`EventEnvelope::session_id`], not by a field here:
+/// [`Event`] is internally tagged and flattened, so a `session_id` on this
+/// struct would emit the key twice and fail to deserialize — the same shape
+/// [`ContextCleared`], [`SessionTitled`] and [`PrefixCache`] document.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ContextPressure {
+    /// What the gate did.
+    pub kind: ContextPressureKind,
+    /// How many blocks were dropped; `0` for an elision or a refit that dropped
+    /// none.
+    pub dropped_blocks: u64,
+    /// How many bytes an in-place elision removed; `0` when nothing was elided.
+    pub elided_bytes: u64,
+    /// Whether the block elided was the newest user block — the case the CLI
+    /// additionally reports as a turn notice (BR-7).
+    pub newest_user_elided: bool,
+    /// The word budget the context was fitted to.
+    pub budget_tokens: u64,
+    /// The byte budget the context was fitted to.
+    pub budget_bytes: u64,
+    /// Which constraint bound that budget — the route's, read off
+    /// [`RouteDecided::bound`], never re-derived here.
+    pub bound: BudgetBound,
+    /// Whether the derivation had to **raise** the pair to its floor, so the
+    /// bound above could not be honored as declared (REQ-586 TASK-194 2b).
+    ///
+    /// See [`RouteDecided::bound_floored`] for what the floor is and why a
+    /// bound that says `user cap` beside a budget larger than that cap is the
+    /// untruth this field exists to close.
+    ///
+    /// `#[serde(default)]` rather than `Option`: this event's other fields are
+    /// all required, and `false` is exactly what a frame from a daemon
+    /// predating the field means — that daemon floored nothing it could report.
+    #[serde(default)]
+    pub bound_floored: bool,
+}
+
+// ---------------------------------------------------------------------------
 // attach_consent_requested / attach_refused (REQ-569)
 // ---------------------------------------------------------------------------
 
@@ -2376,6 +2646,10 @@ mod tests {
             model: Some("opus".to_owned()),
             reason: "architecture phase routes to the frontier tier".to_owned(),
             effort: Some(ResolvedEffort::effort(crate::effort::EffortLevel::Xhigh)),
+            budget_tokens: Some(132_650),
+            budget_bytes: Some(397_952),
+            bound: Some(BudgetBound::Window),
+            bound_floored: None,
         }));
         // Flattened: envelope metadata and the payload share one object.
         assert_eq!(wire["event"], "route_decided");
@@ -2387,6 +2661,11 @@ mod tests {
         // REQ-559 AC-4: the event names the effective effort.
         assert_eq!(wire["effort"]["kind"], "effort");
         assert_eq!(wire["effort"]["level"], "xhigh");
+        // REQ-586 BR-8: the event names the budget and its bound, in the flat
+        // object, under the spec's snake_case spellings.
+        assert_eq!(wire["budget_tokens"], 132_650);
+        assert_eq!(wire["budget_bytes"], 397_952);
+        assert_eq!(wire["bound"], "window");
     }
 
     #[test]
@@ -2403,6 +2682,10 @@ mod tests {
                     model: None,
                     reason: "r".to_owned(),
                     effort: None,
+                    budget_tokens: None,
+                    budget_bytes: None,
+                    bound: None,
+                    bound_floored: None,
                 }),
                 "route_decided",
             ),
@@ -2579,6 +2862,19 @@ mod tests {
                 }),
                 "session_root_changed",
             ),
+            (
+                Event::ContextPressure(ContextPressure {
+                    kind: ContextPressureKind::BlocksDropped,
+                    dropped_blocks: 3,
+                    elided_bytes: 0,
+                    newest_user_elided: false,
+                    budget_tokens: 4_096,
+                    budget_bytes: 32_768,
+                    bound: BudgetBound::LocalEngine,
+                    bound_floored: false,
+                }),
+                "context_pressure",
+            ),
         ];
 
         for (event, expected) in cases {
@@ -2713,6 +3009,216 @@ mod tests {
         assert!(wire["root"].get("vcs_branch").is_none(), "{wire}");
     }
 
+    /// **REQ-586 BR-7's wire half.** A clamp reaches a client as a flat
+    /// `context_pressure` object naming its session, what the gate did, how
+    /// much, and the budget it fitted to with its bound — and survives the
+    /// round trip unchanged.
+    ///
+    /// `session_id` is asserted on the wire object rather than on the payload
+    /// for [`ContextCleared`]'s reason: the envelope is what carries it, and
+    /// `envelope_wire` round-trips before returning, so re-adding `session_id`
+    /// to [`ContextPressure`] fails here on the duplicate key rather than
+    /// reaching a client. The payload's own keys are asserted absent of a
+    /// `session_id` for the same reason, from the other side.
+    ///
+    /// All three kinds ride along, spelled out, so a fourth has to be added
+    /// here by hand — and the zero counts survive as numbers rather than being
+    /// skipped as defaults, because "re-fitted and dropped nothing" is a real
+    /// report.
+    #[test]
+    fn context_pressure_round_trips_under_its_wire_name() {
+        let pressure = ContextPressure {
+            kind: ContextPressureKind::BlocksDropped,
+            dropped_blocks: 3,
+            elided_bytes: 0,
+            newest_user_elided: false,
+            budget_tokens: 4_096,
+            budget_bytes: 32_768,
+            bound: BudgetBound::LocalEngine,
+            bound_floored: false,
+        };
+        round_trip(&pressure);
+
+        let wire = envelope_wire(Event::ContextPressure(pressure));
+        assert_eq!(wire["event"], "context_pressure");
+        assert_eq!(wire["session_id"], "s1");
+        assert_eq!(wire["kind"], "blocks_dropped");
+        assert_eq!(wire["dropped_blocks"], 3);
+        assert_eq!(wire["elided_bytes"], 0);
+        assert_eq!(wire["newest_user_elided"], false);
+        assert_eq!(wire["budget_tokens"], 4_096);
+        assert_eq!(wire["budget_bytes"], 32_768);
+        assert_eq!(wire["bound"], "local_engine");
+        let payload = serde_json::to_value(pressure).unwrap();
+        assert!(
+            payload.get("session_id").is_none(),
+            "the envelope names the session, the payload must not: {payload}"
+        );
+
+        assert_eq!(Event::ContextPressure(pressure).name(), "context_pressure");
+
+        // The elision of the newest user block — the case that is additionally
+        // a turn notice — and the refit, which may have dropped nothing.
+        for (kind, spelling) in [
+            (ContextPressureKind::BlockElided, "block_elided"),
+            (ContextPressureKind::RefitOnReroute, "refit_on_reroute"),
+        ] {
+            let pressure = ContextPressure {
+                kind,
+                dropped_blocks: 0,
+                elided_bytes: 1_024,
+                newest_user_elided: true,
+                budget_tokens: 84_650,
+                budget_bytes: 253_952,
+                bound: BudgetBound::RedactScan,
+                bound_floored: false,
+            };
+            round_trip(&pressure);
+            let wire = envelope_wire(Event::ContextPressure(pressure));
+            assert_eq!(wire["kind"], spelling, "{wire}");
+            assert_eq!(
+                wire["dropped_blocks"], 0,
+                "a refit that dropped nothing must still say so on the wire"
+            );
+            assert_eq!(wire["elided_bytes"], 1_024);
+            assert_eq!(wire["newest_user_elided"], true);
+            assert_eq!(wire["bound"], "redact_scan");
+        }
+    }
+
+    /// **The one home's golden table** (REQ-586 BR-8): both figure formatters,
+    /// at every boundary that decides a unit.
+    ///
+    /// It lives here because [`thousands`] and [`bytes_figure`] live here. When
+    /// they were lifted out of the CLI so the daemon and the CLI could not word
+    /// the same figure two ways, the table pinning them stayed behind in
+    /// `session_ui.rs` — so `cargo test -p teton-protocol` was green with the KB
+    /// rounding removed, and the only thing standing between a wrong budget
+    /// figure and a release was a test in a different crate. A formatter and the
+    /// numbers that pin it belong in one place.
+    ///
+    /// The boundaries are the point, not the samples: 999/1,000 is where `B`
+    /// becomes `KB`, 999,999 is the one that must **not** round up into `MB`
+    /// (`1000 KB`, deliberately), 1,000,000 is where `MB` starts, and 32,768 is
+    /// the default byte budget — the figure a reader sees most often.
+    #[test]
+    fn budget_figures_are_grouped_and_scaled() {
+        assert_eq!(thousands(0), "0");
+        assert_eq!(thousands(999), "999");
+        assert_eq!(thousands(4_096), "4,096");
+        assert_eq!(thousands(132_650), "132,650");
+        assert_eq!(thousands(1_050_000), "1,050,000");
+
+        assert_eq!(bytes_figure(0), "0 B");
+        assert_eq!(bytes_figure(999), "999 B");
+        assert_eq!(bytes_figure(1_000), "1 KB");
+        assert_eq!(bytes_figure(32_768), "33 KB");
+        assert_eq!(bytes_figure(999_999), "1000 KB");
+        assert_eq!(bytes_figure(1_000_000), "1 MB");
+        assert_eq!(bytes_figure(4_200_000), "4.2 MB");
+    }
+
+    /// **TASK-194 2a/2b, both directions of the additive rule.**
+    ///
+    /// `did_not_fit` is a fourth kind with its own wire spelling — the case
+    /// that used to ride as `block_elided` with a zero for a tell — and
+    /// `bound_floored` is a fifth field with a `false` default. The two
+    /// directions are asserted rather than assumed, and they are **not
+    /// symmetric**, which the name says out loud:
+    ///
+    /// * **older daemon → this client**: additive and lossless. A frame with no
+    ///   `bound_floored` key reads `false`, so the line renders exactly as it
+    ///   did before.
+    /// * **newer daemon → older client**: the frame is *dropped*. An
+    ///   unrecognized `kind` is a refusal to deserialize, never a silent
+    ///   coercion into a neighbouring variant — the fail-closed half of BR-7,
+    ///   since a client that cannot name what happened must say nothing rather
+    ///   than say the wrong thing, and it is why `did_not_fit` needed a new
+    ///   spelling instead of reusing one. It is also a real cost, recorded as
+    ///   this REQ's forward-compat residual: a released client predating the
+    ///   variant shows a user *nothing* for an over-budget turn. Nothing is a
+    ///   worse answer than the old wrong one only if the wrong one was
+    ///   actionable, and "a block was elided by 0 bytes" was not.
+    #[test]
+    fn a_context_that_did_not_fit_has_its_own_kind_and_an_older_client_drops_the_frame() {
+        let pressure = ContextPressure {
+            kind: ContextPressureKind::DidNotFit,
+            dropped_blocks: 0,
+            elided_bytes: 0,
+            newest_user_elided: false,
+            budget_tokens: 2_048,
+            budget_bytes: 16_384,
+            bound: BudgetBound::UserCap,
+            bound_floored: true,
+        };
+        round_trip(&pressure);
+        let wire = envelope_wire(Event::ContextPressure(pressure));
+        assert_eq!(wire["kind"], "did_not_fit");
+        assert_eq!(wire["bound_floored"], true);
+        // No two kinds share a spelling — the whole point of the new one.
+        let spellings: Vec<String> = [
+            ContextPressureKind::BlocksDropped,
+            ContextPressureKind::BlockElided,
+            ContextPressureKind::RefitOnReroute,
+            ContextPressureKind::DidNotFit,
+        ]
+        .into_iter()
+        .map(|kind| serde_json::to_value(kind).unwrap().to_string())
+        .collect();
+        let unique: std::collections::HashSet<&String> = spellings.iter().collect();
+        assert_eq!(unique.len(), spellings.len(), "{spellings:?}");
+
+        // Older daemon: no `bound_floored` key at all.
+        let older: ContextPressure = serde_json::from_str(
+            r#"{"kind":"block_elided","dropped_blocks":0,"elided_bytes":9,
+                "newest_user_elided":false,"budget_tokens":4096,"budget_bytes":32768,
+                "bound":"window"}"#,
+        )
+        .expect("a frame predating the field still parses");
+        assert!(!older.bound_floored);
+
+        // Older client: a kind it does not know is refused, never folded into
+        // one it does.
+        assert!(serde_json::from_str::<ContextPressureKind>("\"did_not_fit\"").is_ok());
+        assert!(serde_json::from_str::<ContextPressureKind>("\"a_kind_from_the_future\"").is_err());
+    }
+
+    /// **TASK-194 2b, the route line's half.** `bound_floored` rides
+    /// `route_decided` beside the bound it qualifies, and a frame from a daemon
+    /// predating it carries no key and reads `None` — the `effort` rule, one
+    /// field over.
+    #[test]
+    fn route_decided_carries_whether_its_bound_was_floored() {
+        let decided = RouteDecided {
+            category: None,
+            tier: None,
+            phase: None,
+            provider_id: crate::ProviderId::from("kimi"),
+            model: None,
+            reason: "r".to_owned(),
+            effort: None,
+            budget_tokens: Some(2_048),
+            budget_bytes: Some(16_384),
+            bound: Some(BudgetBound::UserCap),
+            bound_floored: Some(true),
+        };
+        round_trip(&decided);
+        let wire = serde_json::to_value(&decided).unwrap();
+        assert_eq!(wire["bound_floored"], true);
+
+        let quiet = RouteDecided {
+            bound_floored: None,
+            ..decided.clone()
+        };
+        let wire = serde_json::to_value(&quiet).unwrap();
+        assert!(
+            wire.get("bound_floored").is_none(),
+            "an unstated fact writes no key: {wire}"
+        );
+        let back: RouteDecided = serde_json::from_value(wire).unwrap();
+        assert_eq!(back.bound_floored, None);
+    }
+
     #[test]
     fn session_update_variants_round_trip() {
         round_trip(&SessionUpdate {
@@ -2750,6 +3256,74 @@ mod tests {
         });
     }
 
+    /// **BR-8's one home, both halves.** Every bound has a wire spelling that
+    /// *is* the serde tag and a human spelling that is not it.
+    ///
+    /// The golden pair is written out again here rather than read off the
+    /// accessors, which is the whole point: a table compared against itself
+    /// asserts nothing. The `match` is exhaustive and has no wildcard, so a
+    /// sixth variant cannot be added without being given both spellings here
+    /// — and the assertions below then demand that the production ones agree.
+    ///
+    /// `words()` is checked to be free of `_` because the failure mode this
+    /// guards is a variant whose human spelling was filled in by pasting the
+    /// wire token: legal, compiling, and shown to a user as `default_unknown`.
+    #[test]
+    fn every_budget_bound_carries_its_wire_name_and_its_words() {
+        const fn golden(bound: BudgetBound) -> (&'static str, &'static str) {
+            match bound {
+                BudgetBound::Window => ("window", "window"),
+                BudgetBound::DefaultUnknown => ("default_unknown", "unknown window"),
+                BudgetBound::RedactScan => ("redact_scan", "redact scan"),
+                BudgetBound::UserCap => ("user_cap", "user cap"),
+                BudgetBound::LocalEngine => ("local_engine", "local engine"),
+            }
+        }
+
+        let all = [
+            BudgetBound::Window,
+            BudgetBound::DefaultUnknown,
+            BudgetBound::RedactScan,
+            BudgetBound::UserCap,
+            BudgetBound::LocalEngine,
+        ];
+        let mut wire_names = Vec::new();
+        let mut said = Vec::new();
+        for bound in all {
+            let (wire, words) = golden(bound);
+            assert_eq!(bound.wire_name(), wire, "{bound:?}");
+            assert_eq!(bound.words(), words, "{bound:?}");
+            assert!(
+                !words.contains('_'),
+                "`{words}` reads like a wire token, not like something to say to a \
+                 person: {bound:?}"
+            );
+
+            // The wire half is the tag, in both directions — an accessor that
+            // drifted from the `serde` rename would be a `/doctor` row or a
+            // log line naming a bound no client can parse.
+            let json = serde_json::to_string(&bound).unwrap();
+            assert_eq!(json, format!("\"{wire}\""));
+            let back: BudgetBound = serde_json::from_str(&json).unwrap();
+            assert_eq!(back, bound);
+            round_trip(&bound);
+
+            wire_names.push(wire);
+            said.push(words);
+        }
+
+        wire_names.sort_unstable();
+        wire_names.dedup();
+        said.sort_unstable();
+        said.dedup();
+        assert_eq!(wire_names.len(), all.len(), "two bounds share a wire name");
+        assert_eq!(
+            said.len(),
+            all.len(),
+            "two bounds are said the same way, so a user cannot tell which knob to reach for"
+        );
+    }
+
     #[test]
     fn route_decided_round_trips() {
         round_trip(&RouteDecided {
@@ -2760,7 +3334,105 @@ mod tests {
             model: Some("deepseek-coder".to_owned()),
             reason: "implement phase routes to the configured cheap tier".to_owned(),
             effort: Some(ResolvedEffort::effort(crate::effort::EffortLevel::High)),
+            budget_tokens: None,
+            budget_bytes: None,
+            bound: None,
+            bound_floored: None,
         });
+
+        // REQ-586: the budget pair and its bound ride the same frame, and every
+        // bound survives the wire under its own spelling — the list is spelled
+        // out so a sixth variant has to be added here by hand.
+        for (bound, spelling) in [
+            (BudgetBound::Window, "window"),
+            (BudgetBound::DefaultUnknown, "default_unknown"),
+            (BudgetBound::RedactScan, "redact_scan"),
+            (BudgetBound::UserCap, "user_cap"),
+            (BudgetBound::LocalEngine, "local_engine"),
+        ] {
+            let decided = RouteDecided {
+                category: Some(Category::Edit),
+                tier: Some(Tier::Build),
+                phase: None,
+                provider_id: ProviderId::from("deepseek"),
+                model: Some("deepseek-coder".to_owned()),
+                reason: "implement phase routes to the configured cheap tier".to_owned(),
+                effort: Some(ResolvedEffort::effort(crate::effort::EffortLevel::High)),
+                budget_tokens: Some(84_650),
+                budget_bytes: Some(253_952),
+                bound: Some(bound),
+                bound_floored: None,
+            };
+            round_trip(&decided);
+            let wire: serde_json::Value =
+                serde_json::from_str(&serde_json::to_string(&decided).unwrap()).unwrap();
+            assert_eq!(wire["budget_tokens"], 84_650);
+            assert_eq!(wire["budget_bytes"], 253_952);
+            assert_eq!(wire["bound"], spelling, "{wire}");
+        }
+    }
+
+    /// REQ-586's additivity, both directions, for the three new `route_decided`
+    /// keys — the `effort` rule re-applied rather than assumed inherited.
+    ///
+    /// A frame from a daemon predating the budget carries no key and reads
+    /// `None`; a build that has never heard of the keys still reads a frame
+    /// that carries them (modelled by the pre-REQ-586 shape of the reader).
+    /// Serde ignores unknown fields by default and no type here opts out, but
+    /// the posture is what keeps [`crate::PROTOCOL_VERSION`] still, so it is
+    /// asserted — the same claim `a_client_predating_the_cause_field_…` makes
+    /// for `PrivacyBlock`.
+    #[test]
+    fn route_decided_budget_fields_are_additive_in_both_directions() {
+        // A pre-REQ-586 frame: no budget, no bound — absent, not an error.
+        let decided: RouteDecided = serde_json::from_str(
+            r#"{"phase":"review","provider_id":"anthropic","reason":"because"}"#,
+        )
+        .unwrap();
+        assert_eq!(decided.budget_tokens, None);
+        assert_eq!(decided.budget_bytes, None);
+        assert_eq!(decided.bound, None);
+        // And a frame that never populated them emits no key at all, rather
+        // than `null` — the same wire an older daemon writes.
+        let wire = serde_json::to_value(&decided).unwrap();
+        assert!(wire.get("budget_tokens").is_none(), "{wire}");
+        assert!(wire.get("budget_bytes").is_none(), "{wire}");
+        assert!(wire.get("bound").is_none(), "{wire}");
+
+        // The other direction: a reader built before the fields.
+        #[derive(Deserialize)]
+        struct PreBudgetRouteDecided {
+            provider_id: ProviderId,
+            reason: String,
+            effort: Option<ResolvedEffort>,
+        }
+        let wire = serde_json::to_string(&RouteDecided {
+            category: Some(Category::Edit),
+            tier: Some(Tier::Build),
+            phase: None,
+            provider_id: ProviderId::from("kimi"),
+            model: Some("kimi-k3".to_owned()),
+            reason: "implement routes to the cheap tier".to_owned(),
+            effort: Some(ResolvedEffort::effort(crate::effort::EffortLevel::High)),
+            budget_tokens: Some(84_650),
+            budget_bytes: Some(253_952),
+            bound: Some(BudgetBound::UserCap),
+            bound_floored: None,
+        })
+        .unwrap();
+        assert!(
+            wire.contains(r#""budget_tokens":84650"#)
+                && wire.contains(r#""budget_bytes":253952"#)
+                && wire.contains(r#""bound":"user_cap""#),
+            "the fixture must actually carry the new keys: {wire}"
+        );
+        let old: PreBudgetRouteDecided = serde_json::from_str(&wire).unwrap();
+        assert_eq!(old.provider_id, ProviderId::from("kimi"));
+        assert_eq!(old.reason, "implement routes to the cheap tier");
+        assert_eq!(
+            old.effort,
+            Some(ResolvedEffort::effort(crate::effort::EffortLevel::High))
+        );
     }
 
     /// REQ-558 AC-8: the four things a decision must name travel together, and
@@ -2780,6 +3452,10 @@ mod tests {
             effort: Some(ResolvedEffort::omit(
                 crate::effort::EffortOmission::ShapeNone,
             )),
+            budget_tokens: None,
+            budget_bytes: None,
+            bound: None,
+            bound_floored: None,
         };
         round_trip(&decided);
         let wire: serde_json::Value =
