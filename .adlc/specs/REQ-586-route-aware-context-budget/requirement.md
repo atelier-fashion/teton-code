@@ -644,6 +644,18 @@ adds the numbers and the per-turn budget line from `route_decided`.
 
 ## Deferred (found in implementation)
 
+- **`ContextPressureKind` is not forward-compatible.** It is a plain
+  snake_case serde enum, so a client that does not know a kind refuses the
+  frame rather than degrading — a *lost* pressure line, not a mis-rendered
+  one. No released client is affected: `context_pressure` and every kind it
+  carries (including `did_not_fit`) ship in the same release, and a client
+  predating the event drops the whole envelope at `classify` as it always
+  did. It matters the day a *sixth* kind is added to a shipped enum. The
+  honest fix is a custom `Deserialize` with an `Unknown(String)` catch-all
+  (the shape `Event` itself would want too); pinned meanwhile by
+  `a_context_that_did_not_fit_has_its_own_kind_and_degrades_both_ways`
+  (TASK-194).
+
 - **A clamped newest-user block can be dropped by the same turn's exit gate.**
   Observed in TASK-193's AC-10 fixture: the in-place clamp fills the byte
   budget exactly, so appending the model's reply makes the exit gate drop the
