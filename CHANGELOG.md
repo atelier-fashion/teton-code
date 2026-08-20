@@ -22,6 +22,55 @@ user having asked for it.
 
 ### Added
 
+- **The `/` commands you already wrote, discovered and run (REQ-585).** A
+  session now reads `~/.claude/skills/*/SKILL.md`, `~/.claude/commands/*.md`
+  and the same two under the session root's `.claude/` — four globs, one level
+  deep, no recursion — and registers one `/name` per file. **On a machine with
+  a `~/.claude/skills` tree this is new commands appearing in a session that
+  did not have them**: against the seventeen-skill ADLC toolkit, all
+  seventeen register and none is skipped. A built-in row always wins a name it
+  shares; the skill is listed as shadowed rather than dispatched.
+
+  - **An invocation is one prompt turn.** `/name <rest>` expands to the file's
+    body with `$ARGUMENTS` replaced by the rest of the line **as typed** (not
+    split, quotes not interpreted) and `$1`…`$N` by its whitespace-split
+    tokens, preceded by one line naming the command and its file; a body with
+    no placeholder gets a closing `ARGUMENTS: <rest>`. From there it is an
+    ordinary prompt: same classifier, routing, permission level, egress choke
+    point and cost row. `/help` lists every skill with its source and closes
+    with what was found and skipped, and why.
+  - **Dynamic context asks, under the skill's own key.** A `` !`cmd` `` in a
+    body inlines that command's output at expansion time. It runs under
+    `skill:<source>:<name>` — **never** the `shell` tool's key, so an existing
+    "allow always" on `shell` does not silently authorize it and a grant on one
+    skill frees nothing else. At the default `guarded` (and at `edits`) the
+    session lists every command of the invocation and asks **once**; `plan`
+    does not run them; `full` runs them; piped into a session at a level that
+    would ask, they are refused without a line of stdin being read. Anything
+    not run leaves `` [dynamic context not run: `cmd` — reason] `` in the
+    prompt, so the model is told rather than misled. Project-skill grants are
+    dropped when `/cd` moves the root.
+  - **Nothing in a skill file changes the session.** Frontmatter other than
+    `name`, `description` and `argument-hint` — `allowed-tools`, `model`,
+    `effort`, `context`, `agent`, `hooks`, `disable-model-invocation` — is
+    inert and listed by `/verbose`. `CLAUDE.md`, agents and hooks are still not
+    loaded. The model cannot invoke a skill; only you can.
+  - **Carried whole or refused, never shortened.** A skill turn that does not
+    fit its route's budget (REQ-586) is refused before anything is sent, naming
+    the skill, its size, the budget and the bound — and the body alone is
+    checked *before* consent is asked, so nobody approves four commands and is
+    then told the turn was refused.
+  - **`teton_docs skills`** is a new bundled topic, carrying the above and the
+    fidelity note below.
+
+  **Fidelity, stated rather than faked.** Teton does not translate Claude Code
+  tool names and does not rewrite a body's references to `Agent`, `Task`,
+  `Skill`, `Workflow` or subagents — there is nothing behind them here.
+  Prompt-template skills work. A skill that dispatches subagents or invokes
+  other skills (`/proceed`, `/sprint`, `/analyze`) degrades to what one model
+  with `read`/`edit`/`glob`/`grep`/`shell` can do, and **stalls** at its first
+  "invoke the skill" step.
+
 - **A turn is assembled to fit the model it is routed to (REQ-586).** Every
   turn — local or remote — used to run under one budget sized for the local
   engine: 4,096 words and 32,768 bytes, whatever window the provider actually
@@ -79,9 +128,22 @@ user having asked for it.
 
 ### Upgrade notes
 
-- Nothing here changes where data goes, and no config is rewritten: a provider
-  with no declared window behaves exactly as it did, under the default budget
-  — the difference is that Teton now says so instead of leaving you to guess.
+- **REQ-585 adds commands, not settings.** No config is rewritten and nothing
+  is watched: discovery is four globs at launch and on `/cd`, a missing
+  directory costs nothing, and a machine with no `~/.claude` sees a `/help`
+  byte-identical to the one it has now. Nothing in a discovered file can change
+  a permission level, a route or a boundary.
+- **One privacy consequence to know before you invoke one.** A skill file rides
+  its turn as a source, and dynamic-context output is unattributed exactly as
+  `shell` output is — so on a machine with a privacy boundary configured, an
+  invocation that ran a dynamic command **pins that turn to this machine**.
+  Every one of the ADLC toolkit's seventeen skills runs one (the ethos
+  include), so on such a machine they are all pinned to the local tier; the
+  seven that exceed the local budget are then refused there rather than served
+  remotely. There is no "run without dynamic context" option in this version.
+- **REQ-586 moves no data and rewrites no config**: a provider with no declared
+  window behaves exactly as it did, under the default budget — the difference
+  is that Teton now says so instead of leaving you to guess.
 - The protocol fields are **additive** and `PROTOCOL_VERSION` has not moved,
   so mixed builds degrade rather than break. An older **CLI** against this
   daemon ignores `max_context`, `context_budget_cap`, `budget_tokens`,

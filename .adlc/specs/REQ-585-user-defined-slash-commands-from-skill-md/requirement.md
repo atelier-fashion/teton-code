@@ -600,9 +600,14 @@ client's own echo line is the record.
   evidence; (d) on the local tier `/analyze` is refused with the BR-8 message
   naming `bound: local engine` — the spoken form `BudgetBound::words()`
   produces, never the snake_case wire spelling (BR-8a, AC-16); (e) unattended:
-  `printf '/status\n' | teton --permissions full` runs the dynamic context
-  without a prompt and produces the report, and the same at `guarded` produces
-  placeholders and still completes; (f) if the machine has a `local-only` boundary configured, (a)
+  `printf '/permissions full\n/status\n' | teton` runs the dynamic context
+  without a prompt and produces the report, and the same without that first
+  line (at `guarded`) produces placeholders and still completes. Spelled that
+  way because **`--permissions` is not a flag** — `teton`'s globals are `--yes`
+  and `--verbose` — so the obvious-looking invocation would send an unattended
+  runner to a parse error at the one moment nobody can be asked anything. The
+  durable form is `[permissions] default_level = "full"` in the config, and the
+  refusal line names both; (f) if the machine has a `local-only` boundary configured, (a)
   and (b) run on the local tier and the runbook says why (BR-7). (manual;
   BR-8, BR-11, BR-13)
 

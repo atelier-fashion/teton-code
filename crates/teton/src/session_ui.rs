@@ -2696,8 +2696,8 @@ fn refusal_line(req: &PermissionRequest, reason: RefusalReason) -> String {
     match reason {
         RefusalReason::NoTerminal => format!(
             "{subject} was refused without asking: this session's input is not a terminal, so \
-             nobody could be asked — run the session at `--permissions full` to allow it \
-             unattended."
+             nobody could be asked — send `/permissions full` ahead of it, or set \
+             `[permissions] default_level`, to allow it unattended."
         ),
         RefusalReason::UnrecognizedSubject => format!(
             "{subject} was refused without asking: this build does not recognize what it is \
@@ -7420,9 +7420,25 @@ mod skill_tests {
             "it reports what was checked: {}",
             notices[0]
         );
+        // The remedy has to be something that exists. `--permissions` is not a
+        // flag — `teton`'s globals are `--yes` and `--verbose` — so a line
+        // naming one would send an unattended user to a parse error at the one
+        // moment they cannot be asked anything. Both spellings below are real:
+        // a `/permissions full` line piped ahead of the invocation, and the
+        // config key a runner sets once.
         assert!(
-            notices[0].contains("--permissions full"),
+            notices[0].contains("/permissions full"),
             "it names the unattended remedy: {}",
+            notices[0]
+        );
+        assert!(
+            notices[0].contains("[permissions] default_level"),
+            "it names the durable remedy too: {}",
+            notices[0]
+        );
+        assert!(
+            !notices[0].contains("--permissions"),
+            "the remedy named a flag that does not exist: {}",
             notices[0]
         );
     }

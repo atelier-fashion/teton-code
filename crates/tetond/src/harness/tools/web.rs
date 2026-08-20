@@ -2261,10 +2261,11 @@ mod tests {
     /// prompt's alone) and the row is byte-identical; this sweep now also
     /// checks that its widest prompt carries the block at all.
     ///
-    /// **Recorded headroom at REQ-585:** 6,075 bytes, `spent` 9,351, margin
-    /// **889** — against BUG-181's 10,240-byte overhead, which every figure
-    /// above predates. REQ-585 spent the **52** both shapes pay, BR-9's
-    /// amended capability sentence. This shape stays the looser of the two by
+    /// **Recorded headroom at REQ-585:** 6,091 bytes, `spent` 9,367, margin
+    /// **873** — against BUG-181's 10,240-byte overhead, which every figure
+    /// above predates. REQ-585 spent the **68** both shapes pay: 52 on BR-9's
+    /// amended capability sentence, 16 on the `skills` topic's name where
+    /// `teton_docs` renders it twice. This shape stays the looser of the two by
     /// the same 47 B it always has, and the account of what was bought — and
     /// the note that REQ-586's recorded pair was 26 B high on both shapes — is
     /// `egress::redact`'s twin of this paragraph.

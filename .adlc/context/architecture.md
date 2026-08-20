@@ -342,6 +342,43 @@
   fact, one call per paired decision — needs a **test**, because a checklist
   recorded in a task file has no schedule and no owner (LESSON-545,
   LESSON-546).
+- **User-authored prompt text is a first-class provenance source** — prompt
+  text carried no file provenance at all until a `/`-command's expansion had to
+  pin its turn exactly as a `read` of the same file would. `Provenance::User`
+  therefore carries two fields, not one (`sources` **and** `unknown`): the empty
+  set already means *ordinary typed text*, the state every existing caller is
+  in, so it could not double as the unpinnable marker without pinning every
+  prompt on every boundary-configured machine. A file with no root-relative
+  identity — a user skill outside the session root — sets `unknown` and fails
+  closed, rather than `ProvenanceId::from_resolved` being widened to mint an id
+  it has no root for. The invariant lives at three seams (dropped-block absorb,
+  the context-provenance union, and replay) and is pinned at each, because a
+  multi-seam invariant needs a test at every seam and carried state sheds its
+  invariants silently on the round trip (REQ-585 ADR-9, LESSON-501, LESSON-502).
+- **A remembered grant is keyed by the whole question — the name *and* where it
+  came from** — a permission key is what a "for this session" answer is written
+  under, so it must encode everything that made the question answerable.
+  Dynamic context asks under `skill:<source>:<name>`, never the `shell` tool's
+  key: an allow-always on `shell` must not un-ask a skill's commands, and a
+  skill's grant must free nothing the model issues later. The **source** is in
+  the key because a bare name means a different file after `/cd`, and project
+  grants are dropped outright when the root moves; within one source `skills/`
+  beats `commands/` so that one key can never name two files. Each of those
+  crossings is a test, not a comment (REQ-585 ADR-6, LESSON-495, LESSON-501).
+- **Bounded discovery generalizes to a second, non-recursive lister — with an
+  observation seam this time** — REQ-583 gave the recursive walkers a *policy*
+  seam (`WalkPolicy`, `WalkBudget`); skill discovery needs the other kind. It is
+  a purpose-built `DirLister` (one level, no recursion, no `..`) behind a
+  **recording** seam, so "nothing else was opened" is asserted from what the
+  lister was asked for rather than inferred from a budget — reusing the walker
+  would have turned a reach test into a budget test and stopped asserting the
+  thing it exists to prove. The narrowings are deliberate and each is pinned: a
+  **root** may be a symlink and is followed (the dogfood machine's
+  `~/.claude/skills` is one) while an **entry** under a root never is; entries
+  are sorted by name *before* the per-root cap, because listing order belongs to
+  the filesystem and not to the test (LESSON-540); a missing directory is the
+  normal case and produces no diagnostic, while everything found and not
+  registered is named with a typed reason (REQ-585 ADR-4, LESSON-481).
 
 ## ADRs
 
