@@ -24,6 +24,13 @@ provenance. TASK-205 adds the consent and the commands.
 - `crates/tetond/src/server.rs` — `spawn_prompt_turn` / `flatten_prompt` carry the invocation
 - `crates/tetond/tests/skill_turn.rs` — the ordering and refusal suite
 
+**Inherited from TASK-203, which could not reach them from `server.rs`:**
+
+### Inherited seams (both need `DaemonRuntime`, which `server.rs` cannot reach)
+
+- [ ] **`drop_project_skill_grants` is called on `/cd`.** TASK-201 landed it in `crates/tetond/src/harness/permissions.rs`; nothing calls it. The session's `PermissionGate` lives behind a private `session_gates` and `permission_gate_for` needs a `&Config`, so the call site is inside `DaemonRuntime::set_session_cwd`. A grant remembered under `skill:project:<name>` in one repo must not authorize another repo's commands after the root moves — the registry is rebuilt and the name now means a different file (ADR-6, LESSON-501).
+- [ ] **The skills rebuild moves inside `DaemonRuntime::set_session_cwd`, ahead of the `session_root_changed` publish.** It currently runs in `server.rs` *after* the runtime returns, so a second attached client that reacts to that event within microseconds reads the pre-move registry. Same-connection ordering is already safe (the reader loop is serial); this closes the cross-client window. `rebuild_session_skills`'s doc in `server.rs` carries the pointer.
+
 ## Acceptance Criteria
 
 - [ ] `PromptTurnParams` validation: both populated ⇒ `INVALID_PARAMS` (a combination that was never valid, so nothing is narrowed). A both-empty request is **not** newly rejected — `flatten_prompt(&[])` returns `""` and such a turn runs today, and rejecting it would narrow an existing method for third-party clients while `PROTOCOL_VERSION` is asserted unchanged. The raw-`/name args`-reaching-a-model failure is already impossible: the CLI never puts the typed line in `prompt` (ADR-3).

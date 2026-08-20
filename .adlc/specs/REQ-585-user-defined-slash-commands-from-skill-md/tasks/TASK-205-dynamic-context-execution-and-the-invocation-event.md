@@ -16,10 +16,13 @@ the ordering TASK-204 established, between Stage A and Stage B.
 ## Files to Create/Modify
 
 - `crates/tetond/src/runtime.rs` — the consent call, `run_all`, the fold, the `SkillInvoked` publish, Stage B
+- `crates/tetond/src/server.rs` — an implementer of `AddressedPermissionDelivery`, and `permission/respond` calling `resolve_from`
+- `crates/tetond/src/consent.rs` — only if `ConsentSurfaces` needs a public "send to exactly this connection" method
 - `crates/tetond/tests/skill_turn.rs` — the level matrix, the timeout/failure legs, the frame legs
 
 ## Acceptance Criteria
 
+- [ ] **Wire TASK-201's addressed-delivery seam — without it nothing asks anyone.** `AddressedPermissionDelivery` is defined and tested in `permissions.rs` but has no implementer, so `authorize_skill` currently returns `SkillConsent::Unanswerable` at `guarded`/`edits`: fail-closed, no prompt, nothing on the bus. Two edits: (a) an implementer that builds the frame with `routed_event_frame(daemon, Some(session), Event::PermissionRequest(req))` (`server.rs:~3332` — the BUG-177 shape, whose `seq` comes from `EventBus::next_seq` so a routed frame cannot collide with a broadcast one) and `try_send`s it to that one connection, passed in via `PermissionGate::with_addressed_delivery`; (b) `permission/respond` calling `pending.resolve_from(&id, outcome, connection)` — the existing `resolve` now **refuses** addressed waiters because it cannot name who answered. `ConsentSurfaces` is the natural registry but its `deliver` is private and route-predicated, so it may need a small public addition.
 - [ ] At `guarded` and `edits`: one `authorize_skill` call per invocation, listing every command verbatim. Declining leaves ``[dynamic context not run: `<cmd>` — declined]`` in every slot and the turn still runs (AC-8).
 - [ ] At `plan`: commands are not run and the placeholders name the level. At `full`: they run with no prompt. A `PermissionOutcome::Refused { NoTerminal }` yields the distinct "no human could be asked" placeholder, never the decline text (AC-9).
 - [ ] Commands run sequentially in document order with the session root as cwd, through TASK-198's `run_bounded`. A timeout yields a timed-out placeholder; a non-zero exit yields a failed placeholder; the invocation still produces its turn (AC-10).
