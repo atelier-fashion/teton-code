@@ -40,6 +40,29 @@
 //!
 //! The one thing keyed on the *tier* rather than the key is the fifth prompt
 //! option, `enable_permanent` — see [`options_for`].
+//!
+//! ## A second key family, and a prompt that is *addressed* (REQ-585)
+//!
+//! A skill's dynamic context — the `` !`command` `` slots in a `SKILL.md` body —
+//! is the second subject that is not a tool. It asks under
+//! `skill:<source>:<name>` ([`is_skill_permission_key`], ADR-6) and never under
+//! `shell`, so that one "allow for this session" answered at a skill prompt
+//! cannot free every later model-issued shell call, and an earlier allow-always
+//! on `shell` cannot silently un-ask a skill's commands. [`authorize_skill`] is
+//! its entry point, for the same reason [`PermissionGate::authorize_web`] is
+//! web's: it carries what the generic door cannot.
+//!
+//! [`PermissionGate::authorize_skill`] differs from every other prompt this
+//! module raises in one further way, and it is a security property rather than a
+//! nicety: the request is **addressed to the connection that sent the
+//! invocation**, and only that connection may answer it. Everything else here is
+//! published on the bus, which reaches every connection attached to the session
+//! — a supported topology (REQ-570) that would otherwise put a skill's consent
+//! in front of a pre-REQ-585 client, which understands no
+//! [`PermissionSubject`](teton_protocol::events::PermissionSubject), falls
+//! through to its own `prompter.ask`, and on a pipe turns the user's next stdin
+//! line into a `y` that authorizes shell commands. See
+//! [`AddressedPermissionDelivery`] and [`PendingPermissions::resolve_from`].
 
 use std::collections::hash_map::Entry;
 use std::collections::HashMap;
@@ -50,17 +73,19 @@ use tokio::sync::oneshot;
 
 use teton_core::config::WebTier;
 use teton_protocol::events::{
-    Event, PermissionOption, PermissionOptionKind, PermissionRequest, WebConsentDecided,
-    WebConsentScope, OPTION_ID_ENABLE_PERMANENT,
+    Event, PermissionOption, PermissionOptionKind, PermissionRequest, PermissionSubject,
+    WebConsentDecided, WebConsentScope, OPTION_ID_ENABLE_PERMANENT,
 };
-use teton_protocol::methods::PermissionOutcome;
+use teton_protocol::methods::{PermissionOutcome, RefusalReason};
 use teton_protocol::permissions::PermissionLevel;
 use teton_protocol::{RequestId, SessionId};
 
 use crate::broadcast::EventBus;
 use crate::egress::to_protocol_web_tier;
+use crate::grants::ConnectionId;
 use crate::harness::tools::web::{permission_key_for, tier_name, WEB_PERMISSION_KEYS};
 use crate::harness::tools::DOCS_TOOL_NAME;
+use crate::skills::{permission_key_for as skill_permission_key_for, SkillSource};
 
 /// Policy for a single tool.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -80,6 +105,52 @@ pub enum PermissionDecision {
     Allowed,
     /// The call is cancelled; the model is told and must not retry it.
     Denied,
+}
+
+/// The resolved answer for one skill invocation's dynamic context (REQ-585
+/// BR-6), and **why** — which a [`PermissionDecision`] cannot carry.
+///
+/// A skill's not-run placeholder names its reason to the user and to the model
+/// (`[dynamic context not run: `<cmd>` — <reason>]`), and the four ways to not
+/// run are four different sentences that must not be collapsed into one. AC-9
+/// is explicit that a piped session's placeholders say *no human could be
+/// asked* rather than *declined*: a `Denied` that meant both would force the
+/// caller to re-derive the difference from state the gate had in hand and threw
+/// away, which is the re-derivation-at-a-distance shape LESSON-501 names.
+///
+/// This is a **separate type** rather than two more [`PermissionDecision`]
+/// variants on purpose. Every tool call in the daemon matches that enum
+/// exhaustively, and a decision a tool path cannot act on is not a decision it
+/// should be made to handle; the extra facts exist for exactly one caller.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SkillConsent {
+    /// Every command of the invocation may run.
+    Allowed,
+    /// The **level** settled it and nobody was asked (`plan`). The sentence
+    /// comes from [`PermissionGate::denial_note`], so the daemon's and the
+    /// client's account of one refusal cannot drift (LESSON-456).
+    DeniedByLevel,
+    /// A **human** decided against it — rejected once, rejected for the
+    /// session, or the prompt was dismissed.
+    Declined,
+    /// The client refused **without asking anyone** (BR-11): no terminal to ask
+    /// at, or a subject this client does not recognize. Nobody declined
+    /// anything, and the placeholder must not say they did.
+    Refused(RefusalReason),
+    /// The question could never be put to the connection that asked it — no
+    /// addressed-delivery route was wired, the connection would not take the
+    /// frame, or it went away before answering. Fail-closed, and distinct from
+    /// [`Self::Declined`] for the same reason [`Self::Refused`] is.
+    Unanswerable,
+}
+
+impl SkillConsent {
+    /// Whether the commands may run. The one question every caller asks; the
+    /// variants exist for the sentence the *other* answer earns.
+    #[must_use]
+    pub const fn is_allowed(self) -> bool {
+        matches!(self, Self::Allowed)
+    }
 }
 
 /// A remembered, session-scoped answer for a tool.
@@ -348,6 +419,20 @@ fn allow_read_only(cfg: &mut PermissionConfig) {
 struct Waiter {
     /// The session whose tool call is blocked on this answer.
     owner: SessionId,
+    /// The **one** connection this prompt was addressed to, when it was
+    /// addressed to one (REQ-585 ADR-7).
+    ///
+    /// `None` is the shape every pre-REQ-585 prompt has and keeps: published on
+    /// the bus, and answerable by any connection the server's
+    /// [`PendingPermissions::owner_of`] check admits. `Some` is strictly
+    /// narrower — the request never went on the bus, and no other connection may
+    /// answer it, which is what [`PendingPermissions::resolve_from`] enforces.
+    ///
+    /// It is recorded here, beside the owner, for the reason the owner is: once
+    /// the waiter is registered this map is the only record of who the question
+    /// was put to, and a fact re-derived later is a fact derived where the
+    /// knowledge no longer exists (LESSON-501).
+    addressee: Option<ConnectionId>,
     /// Resolved by [`PendingPermissions::resolve`]; dropping it denies.
     tx: oneshot::Sender<PermissionOutcome>,
 }
@@ -406,7 +491,15 @@ impl PendingPermissions {
     /// protects: the *owner* recorded for a live request id can never be
     /// rewritten by a later registration, so the authorization subject of a
     /// pending prompt is fixed the moment it is raised.
-    fn register(&self, id: RequestId, owner: SessionId) -> oneshot::Receiver<PermissionOutcome> {
+    ///
+    /// `addressee` is `Some` only for a request that is routed to one
+    /// connection rather than published (REQ-585 ADR-7); see [`Waiter`].
+    fn register(
+        &self,
+        id: RequestId,
+        owner: SessionId,
+        addressee: Option<ConnectionId>,
+    ) -> oneshot::Receiver<PermissionOutcome> {
         let (tx, rx) = oneshot::channel();
         let mut waiters = self
             .waiters
@@ -414,7 +507,11 @@ impl PendingPermissions {
             .expect("pending permissions mutex poisoned");
         match waiters.entry(id) {
             Entry::Vacant(slot) => {
-                slot.insert(Waiter { owner, tx });
+                slot.insert(Waiter {
+                    owner,
+                    addressee,
+                    tx,
+                });
             }
             Entry::Occupied(existing) => {
                 // request_id is `perm-N`, never content — safe to log (conventions).
@@ -451,16 +548,93 @@ impl PendingPermissions {
     /// waiter was present. This is the entry point the server's
     /// `permission/respond` handler calls — *after* it has checked
     /// [`Self::owner_of`], because this call consumes the waiter.
+    ///
+    /// **An addressed prompt is never resolved through here** (REQ-585 ADR-7).
+    /// This entry point names no answering connection, so it cannot establish
+    /// that the answer came from the connection the question was put to — and
+    /// for a skill's dynamic context that is the whole guard, not a refinement.
+    /// Such a waiter is left standing (as [`Self::owner_of`]'s refusal path
+    /// leaves it standing, so whoever may rightfully answer still can) and this
+    /// answers `false`. Callers that know their connection use
+    /// [`Self::resolve_from`].
     pub fn resolve(&self, id: &RequestId, outcome: PermissionOutcome) -> bool {
-        let waiter = self
-            .waiters
-            .lock()
-            .expect("pending permissions mutex poisoned")
-            .remove(id);
+        self.deliver(id, outcome, None)
+    }
+
+    /// Deliver `answering`'s answer, honouring an addressed prompt's addressee
+    /// (REQ-585 ADR-7).
+    ///
+    /// For an ordinary broadcast prompt this is [`Self::resolve`] with the
+    /// answering connection recorded but unused — the delivery policy for those
+    /// is attachment, and the server checks it against [`Self::owner_of`]. For
+    /// an **addressed** prompt it is the enforcement point: an answer from any
+    /// connection other than the addressee is refused, the waiter is left
+    /// standing for the connection that was actually asked, and this answers
+    /// `false`.
+    ///
+    /// Refusing rather than ignoring matters in one specific direction. Two
+    /// clients attached to one session is a consented topology (REQ-570), so
+    /// the second client is not an attacker — it is an older build that saw a
+    /// request it could not understand. Leaving its answer inert is what keeps
+    /// its `prompter.ask` from having authorized a shell command; and leaving
+    /// the prompt standing is what keeps the real client's answer arriving
+    /// afterwards from finding nothing to answer.
+    pub fn resolve_from(
+        &self,
+        id: &RequestId,
+        outcome: PermissionOutcome,
+        answering: ConnectionId,
+    ) -> bool {
+        self.deliver(id, outcome, Some(answering))
+    }
+
+    /// The body of both entry points. `answering` is `None` when the caller
+    /// cannot name a connection at all, which an addressed waiter treats
+    /// exactly as it treats the wrong one.
+    fn deliver(
+        &self,
+        id: &RequestId,
+        outcome: PermissionOutcome,
+        answering: Option<ConnectionId>,
+    ) -> bool {
+        let waiter = {
+            let mut waiters = self
+                .waiters
+                .lock()
+                .expect("pending permissions mutex poisoned");
+            // Checked and removed under one lock: an entitled answer and an
+            // unentitled one racing on the same id must not both find a waiter.
+            let entitled = match waiters.get(id) {
+                None => return false,
+                // Unaddressed: the pre-REQ-585 delivery policy, unchanged.
+                Some(waiter) => match waiter.addressee {
+                    None => true,
+                    Some(addressee) => answering == Some(addressee),
+                },
+            };
+            if !entitled {
+                return false;
+            }
+            waiters.remove(id)
+        };
         match waiter {
             Some(waiter) => waiter.tx.send(outcome).is_ok(),
             None => false,
         }
+    }
+
+    /// Forget a waiter without answering it.
+    ///
+    /// For the one path that registers a waiter and then discovers there is
+    /// nobody to ask: an addressed request whose connection would not take the
+    /// frame. Registering first is what keeps an answer that arrives before the
+    /// publish from finding no waiter, so the failure has to be undone here
+    /// rather than avoided by publishing first.
+    fn withdraw(&self, id: &RequestId) {
+        self.waiters
+            .lock()
+            .expect("pending permissions mutex poisoned")
+            .remove(id);
     }
 
     /// Number of prompts currently awaiting an answer.
@@ -492,6 +666,85 @@ pub trait WebTierPersistence: Send + Sync {
     /// # Errors
     /// A human-readable sentence naming what stopped the write.
     fn persist_web_tier(&self, tier: WebTier) -> Result<(), String>;
+}
+
+/// Where an **addressed** permission request is delivered (REQ-585 ADR-7).
+///
+/// A seam rather than a connection registry handle for the reason
+/// [`WebTierPersistence`] is one: this module is the permission *model*, and it
+/// knows that one request goes to exactly one connection and nothing about how
+/// a connection is reached. The daemon implements it over the outbound frame
+/// channels it already routes REQ-569's consent prompts and BUG-177's lifecycle
+/// replay through; a test implements it over a channel and can assert who was
+/// asked without a socket.
+///
+/// **Why a seam at all, rather than the [`EventBus`] this module already
+/// holds.** The bus is a fan-out: everything published on it reaches every
+/// connection attached to the session, and any of them may answer. That is
+/// correct for a tool call and wrong for a skill's dynamic context, because a
+/// pre-REQ-585 client attached to the same session — a supported topology
+/// (REQ-570) — would receive a request carrying a
+/// [`PermissionSubject`](teton_protocol::events::PermissionSubject) it has
+/// never heard of, fall through to its own `prompter.ask`, and on a pipe read
+/// the user's next stdin line as the answer. So the request must not be
+/// published at all, and a gate with no route to address it asks **nobody**
+/// (`SkillConsent::Unanswerable`) rather than falling back to the bus.
+pub trait AddressedPermissionDelivery: Send + Sync {
+    /// Put `request` in front of `connection` and no one else.
+    ///
+    /// Answers whether the frame was accepted. `false` — no such live
+    /// connection, or an outbound channel that would not take it — is a prompt
+    /// nobody will ever see, and the gate turns it into a refusal rather than
+    /// waiting for an answer that cannot come.
+    fn deliver(
+        &self,
+        connection: ConnectionId,
+        session_id: &SessionId,
+        request: PermissionRequest,
+    ) -> bool;
+}
+
+/// The connection a request is addressed to, and what it is about.
+///
+/// The two travel together because neither is meaningful alone: a subject with
+/// no addressee would be broadcast (the hole ADR-7 closes), and an addressee
+/// with no subject would be a request the addressed client cannot recognize
+/// without parsing the permission key, which BR-11 forbids.
+struct Addressed {
+    connection: ConnectionId,
+    subject: PermissionSubject,
+}
+
+/// How one decision was settled — the decision itself, plus *who* settled it.
+///
+/// [`PermissionGate::authorize`] narrows this to a [`PermissionDecision`],
+/// because a tool call can act on nothing more. [`PermissionGate::authorize_skill`]
+/// does not: the sentence a not-run placeholder carries is exactly this
+/// distinction (REQ-585 AC-9), and it is known here and nowhere later.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Settled {
+    /// The level's table answered; nobody was asked.
+    ByLevel(PermissionDecision),
+    /// A remembered session grant answered — a human, earlier.
+    ByGrant(PermissionDecision),
+    /// A human answered this prompt.
+    ByHuman(PermissionDecision),
+    /// The client refused without asking anyone (BR-11).
+    Refused(RefusalReason),
+    /// Nobody could be asked: no route to the addressee, or it went away.
+    Unanswerable,
+}
+
+impl Settled {
+    /// What the caller may do, with the provenance dropped.
+    const fn decision(self) -> PermissionDecision {
+        match self {
+            Self::ByLevel(decision) | Self::ByGrant(decision) | Self::ByHuman(decision) => decision,
+            // Every non-answer denies. This is the safe default the whole
+            // module is built on, stated once.
+            Self::Refused(_) | Self::Unanswerable => PermissionDecision::Denied,
+        }
+    }
 }
 
 /// Where a gate's policy table comes from (REQ-560).
@@ -566,6 +819,14 @@ pub struct PermissionGate {
     /// achieved. An unwired sink is a gate that cannot promise permanence, not a
     /// gate that lies about it.
     web_persistence: Option<Arc<dyn WebTierPersistence>>,
+    /// Where an addressed request is routed (REQ-585 ADR-7).
+    ///
+    /// `None` on a gate nobody wired one into — which, unlike
+    /// [`Self::web_persistence`], is not a degraded prompt but **no prompt**:
+    /// there is no honest fallback, because the fallback would be the bus, and
+    /// the bus is what ADR-7 exists to keep a skill consent off. Such a gate
+    /// answers [`SkillConsent::Unanswerable`] and asks nobody.
+    addressed: Option<Arc<dyn AddressedPermissionDelivery>>,
 }
 
 impl PermissionGate {
@@ -620,6 +881,7 @@ impl PermissionGate {
             events,
             pending,
             web_persistence: None,
+            addressed: None,
         }
     }
 
@@ -700,6 +962,16 @@ impl PermissionGate {
         self
     }
 
+    /// Wire the route an addressed request is delivered on (REQ-585 ADR-7).
+    ///
+    /// Without it [`Self::authorize_skill`] asks nobody — see
+    /// [`AddressedPermissionDelivery`] for why that is the only safe absence.
+    #[must_use]
+    pub fn with_addressed_delivery(mut self, route: Arc<dyn AddressedPermissionDelivery>) -> Self {
+        self.addressed = Some(route);
+        self
+    }
+
     /// Decide whether `tool_name` may run, prompting the client if the policy is
     /// `ask` and no session grant already answers.
     ///
@@ -707,7 +979,29 @@ impl PermissionGate {
     /// resolve to [`PermissionDecision::Denied`] — the safe default.
     ///
     /// Web lookups do not come through here: they carry a tier, and
-    /// [`Self::authorize_web`] is the entry point that takes one.
+    /// [`Self::authorize_web`] is the entry point that takes one. Skills do not
+    /// either: they carry a subject and an addressee, and
+    /// [`Self::authorize_skill`] is the entry point that takes those.
+    ///
+    /// ## What the guard below asserts, and what it deliberately does not
+    ///
+    /// Each specialized entry point exists because it carries something this
+    /// one cannot, and each guards the misroute **at the door that would drop
+    /// it**. The web guard lives here, because a web key arriving here is a
+    /// consent event with a missing tier; the skill guard lives in
+    /// [`Self::authorize_skill`], because what goes wrong there is a skill
+    /// consent asked under somebody else's key, and *that* is a fact only the
+    /// skill door has the name and source to check.
+    ///
+    /// So this assertion stays narrow on purpose: it fires for a web key and
+    /// **does not** fire for a skill key. A guard whose precondition is untested
+    /// is a guard whose claim is untested (LESSON-504), so both directions are
+    /// asserted — see
+    /// [`the_generic_door_refuses_a_web_key_and_admits_a_skill_key`](tests::the_generic_door_refuses_a_web_key_and_admits_a_skill_key).
+    /// Widening it to reject `skill:` keys would turn a read of a remembered
+    /// grant, or any future generic caller holding a key string, into a panic
+    /// for no gain: an addressed request cannot be raised from here in the first
+    /// place, because this path has no addressee to raise it to.
     pub async fn authorize(
         &self,
         tool_name: &str,
@@ -724,6 +1018,114 @@ impl PermissionGate {
              `authorize_web`, which carries the tier the decision is about"
         );
         self.decide(tool_name, description, None).await
+    }
+
+    /// Decide whether one skill invocation's dynamic context may run — **one
+    /// question, every command** (REQ-585 BR-6, ADR-6, ADR-7).
+    ///
+    /// ## One prompt per invocation, never one per command
+    ///
+    /// `commands` is the whole invocation, in document order, already
+    /// substituted (BR-4 puts substitution before execution precisely so the
+    /// consent shows what will run). A prompt per command is REQ-560 BR-2's
+    /// named anti-pattern, and it is why the commands ride
+    /// [`PermissionSubject::SkillDynamicContext`] as a list rather than a
+    /// description string: `Surface::line` destroys newlines, so a one-line
+    /// description could not list three commands verbatim (ADR-7).
+    ///
+    /// ## `key` is the skill's own, and never `shell`
+    ///
+    /// A remembered answer is attached to its key, not to the question that
+    /// produced it, and every later request whose key matches inherits it
+    /// (LESSON-495). Under `shell` this would run both ways: one "allow for this
+    /// session" answered at a skill prompt would free every later model-issued
+    /// shell call, and an earlier allow-always on `shell` would silently un-ask
+    /// a skill's commands. The key also carries the **source**, because after a
+    /// `/cd` the bare name would denote a different file — see
+    /// [`Self::drop_project_skill_grants`] for the other half of that.
+    ///
+    /// `key` is taken as a parameter and *checked* against `(source, skill)`
+    /// rather than derived here, so the caller's key and the gate's key are
+    /// provably the same string rather than two spellings that happen to agree.
+    ///
+    /// ## The prompt is addressed to `addressee`, and only it may answer
+    ///
+    /// Not a refinement — the guard. See [`AddressedPermissionDelivery`].
+    pub async fn authorize_skill(
+        &self,
+        key: &str,
+        skill: &str,
+        source: SkillSource,
+        commands: Vec<String>,
+        addressee: ConnectionId,
+    ) -> SkillConsent {
+        // The misroute this door drops, guarded at this door: a skill consent
+        // asked under a key that is not the skill's own — `shell` above all —
+        // is a grant remembered against the wrong question, and nothing
+        // downstream can tell that from a legitimate one.
+        debug_assert!(
+            is_skill_permission_key(key),
+            "`{key}` is not a skill consent key; a skill's dynamic context must \
+             ask under `skill:<source>:<name>` and never under a tool's name"
+        );
+        debug_assert_eq!(
+            key,
+            skill_permission_key_for(source, skill),
+            "the key a skill's consent is remembered under must be the key its \
+             own name and source mint"
+        );
+
+        let addressed = Addressed {
+            connection: addressee,
+            subject: PermissionSubject::SkillDynamicContext {
+                skill: skill.to_owned(),
+                source,
+                commands,
+            },
+        };
+
+        // No `description`: the subject already carries the skill, its source
+        // and every command, and a sentence restating them would be a second
+        // spelling of one fact for the two to drift apart at (LESSON-456).
+        match self.settle(key, None, None, Some(addressed)).await {
+            Settled::ByLevel(PermissionDecision::Allowed)
+            | Settled::ByGrant(PermissionDecision::Allowed)
+            | Settled::ByHuman(PermissionDecision::Allowed) => SkillConsent::Allowed,
+            Settled::ByLevel(PermissionDecision::Denied) => SkillConsent::DeniedByLevel,
+            Settled::ByGrant(PermissionDecision::Denied)
+            | Settled::ByHuman(PermissionDecision::Denied) => SkillConsent::Declined,
+            Settled::Refused(reason) => SkillConsent::Refused(reason),
+            Settled::Unanswerable => SkillConsent::Unanswerable,
+        }
+    }
+
+    /// Forget every remembered grant belonging to a **project** skill (REQ-585
+    /// ADR-6), answering how many were dropped.
+    ///
+    /// Called on `/cd`. The grant map is state carried past the thing that gave
+    /// it meaning, and carried state sheds its invariants silently (LESSON-501):
+    /// `skill:project:deploy` named one repo's file when the user consented to
+    /// it and names another repo's file the instant the session root moves. The
+    /// source in the key narrows the collision to project-vs-project; dropping
+    /// these closes it.
+    ///
+    /// **Every** grant, not just the allowing ones. A `reject_always` recorded
+    /// against one repo's `deploy` is an answer about that file too, and the
+    /// worst it costs to drop is one question the user is asked again — which is
+    /// the direction to be wrong in.
+    ///
+    /// User grants are deliberately kept: `~/.claude` does not move when the
+    /// session root does, so `skill:user:status` names the same file it named
+    /// when it was answered.
+    pub fn drop_project_skill_grants(&self) -> usize {
+        let prefix = skill_key_prefix(SkillSource::Project);
+        let mut grants = self
+            .grants
+            .lock()
+            .expect("permission grants mutex poisoned");
+        let before = grants.len();
+        grants.retain(|key, _| !key.starts_with(&prefix));
+        before - grants.len()
     }
 
     /// Decide whether a web lookup at `tier` may run (REQ-563 BR-3/BR-4).
@@ -774,6 +1176,25 @@ impl PermissionGate {
         description: Option<String>,
         web: Option<WebTier>,
     ) -> PermissionDecision {
+        self.settle(tool_name, description, web, None)
+            .await
+            .decision()
+    }
+
+    /// [`Self::decide`] with the provenance of the answer kept (REQ-585 AC-9)
+    /// and, when `addressed` is `Some`, the request routed to one connection
+    /// instead of published (ADR-7).
+    ///
+    /// Everything about the ordering below is [`Self::decide`]'s and unchanged:
+    /// the level is read once at the top, grants are consulted after it, and
+    /// nothing re-reads the level across the await.
+    async fn settle(
+        &self,
+        tool_name: &str,
+        description: Option<String>,
+        web: Option<WebTier>,
+        addressed: Option<Addressed>,
+    ) -> Settled {
         // ## Level before grants (REQ-560 BR-5)
         //
         // A grant is an answer to a question the level decides whether to ask,
@@ -795,8 +1216,8 @@ impl PermissionGate {
         // Nothing is published for a policy answer: `allow` and `deny` rows are
         // configuration, and no one decided anything just now.
         match self.effective_table().policy_for(tool_name) {
-            PermissionPolicy::Allow => return PermissionDecision::Allowed,
-            PermissionPolicy::Deny => return PermissionDecision::Denied,
+            PermissionPolicy::Allow => return Settled::ByLevel(PermissionDecision::Allowed),
+            PermissionPolicy::Deny => return Settled::ByLevel(PermissionDecision::Denied),
             PermissionPolicy::Ask => {}
         }
 
@@ -808,43 +1229,78 @@ impl PermissionGate {
         // turn one decision into a stream of them.
         if let Some(grant) = self.session_grant(tool_name) {
             return match grant {
-                RememberedGrant::AllowAlways => PermissionDecision::Allowed,
-                RememberedGrant::RejectAlways => PermissionDecision::Denied,
+                RememberedGrant::AllowAlways => Settled::ByGrant(PermissionDecision::Allowed),
+                RememberedGrant::RejectAlways => Settled::ByGrant(PermissionDecision::Denied),
             };
         }
 
-        // Register the waiter, publish the prompt, then await — no lock is held
+        // An addressed request has exactly one recipient, and a gate with no
+        // route to it has nowhere to ask. Checked **before** a waiter is
+        // registered, so the fail-closed path leaves no entry behind — and
+        // never by falling back to the bus, which is the one thing addressing
+        // exists to prevent (ADR-7).
+        let route = match &addressed {
+            Some(_) => match &self.addressed {
+                Some(route) => Some(Arc::clone(route)),
+                None => return Settled::Unanswerable,
+            },
+            None => None,
+        };
+
+        // Register the waiter, deliver the prompt, then await — no lock is held
         // across the await.
         let request_id = self.pending.next_request_id();
         // The owning session travels with the waiter, so the answer that comes
         // back can be authorized against it (REQ-569 BR-9): this gate is the
-        // only place that knows whose tool call is about to block.
+        // only place that knows whose tool call is about to block. So does the
+        // addressee, for the same reason and with a stricter consequence — an
+        // answer from anyone else is refused (REQ-585 ADR-7).
+        let addressee = addressed.as_ref().map(|a| a.connection);
         let rx = self
             .pending
-            .register(request_id.clone(), self.session_id.clone());
+            .register(request_id.clone(), self.session_id.clone(), addressee);
 
-        self.events.publish(
-            Some(self.session_id.clone()),
-            Event::PermissionRequest(PermissionRequest {
-                request_id,
-                tool_name: tool_name.to_owned(),
-                description,
-                // REQ-585 TASK-201 populates this for a skill's dynamic
-                // context, which is the one request a client must be able to
-                // recognize without parsing the key (BR-11). Every request
-                // this entry point raises is a tool call, and has no subject.
-                subject: None,
-                options: options_for(web),
-            }),
-        );
+        let request = PermissionRequest {
+            request_id: request_id.clone(),
+            tool_name: tool_name.to_owned(),
+            description,
+            // Present only for a request a client must be able to recognize
+            // **without parsing the key** (REQ-585 BR-11). Every request raised
+            // for a tool call is a tool call, and has no subject.
+            subject: addressed.map(|a| a.subject),
+            options: options_for(web),
+        };
+
+        match route {
+            // Addressed: routed to one connection, never published. A frame the
+            // connection will not take is a prompt nobody will ever see, so the
+            // waiter is withdrawn rather than left parked on an answer that
+            // cannot come.
+            Some(route) => {
+                if !route.deliver(
+                    addressee.expect("a route implies an addressee"),
+                    &self.session_id,
+                    request,
+                ) {
+                    self.pending.withdraw(&request_id);
+                    return Settled::Unanswerable;
+                }
+            }
+            None => self.events.publish(
+                Some(self.session_id.clone()),
+                Event::PermissionRequest(request),
+            ),
+        }
 
         match rx.await {
             Ok(outcome) => self.interpret(tool_name, outcome, web),
             // Client disconnected before answering: deny (never run unapproved).
             // Not a consent decision — nobody decided it — so nothing is
             // published; a `web_consent_decided { granted: false }` here would
-            // record a refusal the user never gave.
-            Err(_) => PermissionDecision::Denied,
+            // record a refusal the user never gave. For the same reason it is
+            // not a *decline* either: the caller is told nobody could be asked
+            // (REQ-585 AC-9), not that someone said no.
+            Err(_) => Settled::Unanswerable,
         }
     }
 
@@ -855,19 +1311,20 @@ impl PermissionGate {
         tool_name: &str,
         outcome: PermissionOutcome,
         web: Option<WebTier>,
-    ) -> PermissionDecision {
+    ) -> Settled {
         // A client that refused fail-closed did not make a consent decision —
         // nobody decided it. Deny, remember nothing, and publish nothing, for
         // the same reason the disconnect arm above publishes nothing: a
         // `web_consent_decided { granted: false }` here would record a refusal
         // the user never gave.
         //
-        // REQ-585 TASK-201 carries the `reason` through to the caller, so a
+        // The `reason` rides out to the caller in [`Settled::Refused`], so a
         // skill's not-run placeholder can say *no human could be asked* rather
-        // than *declined* (AC-9). Until then the reason is dropped here and
-        // nowhere else, which is the one place to look for it.
-        if let PermissionOutcome::Refused { .. } = outcome {
-            return PermissionDecision::Denied;
+        // than *declined* (REQ-585 AC-9). A tool call cannot use it and
+        // [`Settled::decision`] drops it there — dropped where it is useless,
+        // never before the one caller that needs it.
+        if let PermissionOutcome::Refused { reason } = outcome {
+            return Settled::Refused(reason);
         }
 
         let (decision, scope) = match outcome {
@@ -913,7 +1370,7 @@ impl PermissionGate {
                 }),
             );
         }
-        decision
+        Settled::ByHuman(decision)
     }
 
     /// Write `tier` through the persistence seam, answering with the scope the
@@ -1019,6 +1476,54 @@ pub fn is_web_permission_key(tool_name: &str) -> bool {
     WEB_PERMISSION_KEYS.contains(&tool_name)
 }
 
+/// Whether `key` is a skill's dynamic-context consent key (REQ-585 BR-6,
+/// ADR-6).
+///
+/// **One key per skill *and per source*, and never `shell`** — the same
+/// argument [`is_web_permission_key`] makes for having three keys instead of
+/// one, applied to a family that is open rather than closed. A remembered answer
+/// is not attached to the question that produced it; it is attached to its key,
+/// and every later request whose key matches inherits that answer whether or not
+/// a human would call it the same question (LESSON-495). So:
+///
+/// - not `shell`, in **both** directions — an earlier allow-always on `shell`
+///   would silently un-ask a skill's commands, and one "allow for this session"
+///   answered at a skill prompt would free every later model-issued shell call;
+/// - not one key for all skills — "may `/status` run its commands?" and "may
+///   `/deploy` run its commands?" are different sentences with different
+///   commands under them;
+/// - and the **source** is in the key, because `skill:analyze` names one repo's
+///   file before a `/cd` and another repo's file after it. That narrows the
+///   collision to project-vs-project, which
+///   [`PermissionGate::drop_project_skill_grants`] then closes.
+///
+/// The prefixes are taken from the one function that mints these keys
+/// ([`crate::skills::permission_key_for`]) rather than spelled again here, so
+/// the recognizer and the minter cannot drift into disagreeing about what a
+/// skill key looks like — which, on a predicate that gates
+/// [`PermissionGate::authorize_skill`]'s guard, would be a misrouted consent
+/// nothing downstream could detect.
+#[must_use]
+pub fn is_skill_permission_key(key: &str) -> bool {
+    // Both sources, listed: `SkillSource` is a closed two-variant enum, and a
+    // third would have to be added here to be recognized — a visible edit
+    // rather than a key family that silently stops matching.
+    [SkillSource::User, SkillSource::Project]
+        .into_iter()
+        .any(|source| {
+            key.strip_prefix(skill_key_prefix(source).as_str())
+                // A bare `skill:user:` names no skill; a grant under it would be
+                // an answer to no question.
+                .is_some_and(|name| !name.is_empty())
+        })
+}
+
+/// The `skill:<source>:` prefix every key from `source` starts with, minted by
+/// the one mapping that mints the keys themselves.
+fn skill_key_prefix(source: SkillSource) -> String {
+    skill_permission_key_for(source, "")
+}
+
 /// The options offered on a prompt: the four standard ones, plus the persistent
 /// enable when `web` names the tier a decision could be written down at.
 ///
@@ -1028,6 +1533,13 @@ pub fn is_web_permission_key(tool_name: &str) -> bool {
 /// That is also why the fifth option is web-only rather than universal — there
 /// is no `[shell] tier` to write, and an "always" that quietly edited config
 /// would be a much larger promise than the one the prompt makes.
+///
+/// A skill's dynamic context gets the standard four for exactly that reason
+/// (REQ-585): there is no `[skills] tier` either, and "never ask about
+/// `/deploy` on this machine again" is a durable grant over file-supplied shell
+/// commands in a file the daemon re-reads every session — a promise a consent
+/// prompt has no business making. The absence is asserted rather than assumed,
+/// because it is the kind of option that gets added for symmetry.
 fn options_for(web: Option<WebTier>) -> Vec<PermissionOption> {
     let mut options = vec![
         PermissionOption {
@@ -1080,6 +1592,7 @@ fn options_for(web: Option<WebTier>) -> Vec<PermissionOption> {
 mod tests {
     use super::*;
 
+    use crate::grants::GrantRegistry;
     use crate::harness::tools::web::{
         permission_key_for, PERMISSION_KEY_FETCH_ANY_URL, PERMISSION_KEY_FETCH_USER_URL,
         PERMISSION_KEY_SEARCH,
@@ -1207,26 +1720,198 @@ mod tests {
     /// REQ-560 OQ-2: an MCP tool's name is server-supplied, so no level may
     /// enumerate it — and none has to. The name below appears nowhere in the
     /// daemon, which is exactly the point.
+    /// **Extended by REQ-585 (ADR-6), not replaced.** A skill's consent key is
+    /// the second name no level enumerates, and it must ride the same default
+    /// — `guarded` ask, `edits` ask, `plan` deny, `full` allow — so that
+    /// [`table_for`] and [`READ_ONLY_TOOLS`] need no skill row at all. Asserted
+    /// here, beside the MCP case, because it is the *same* claim about the same
+    /// mechanism: a level's `default` **is** its answer to a name it has never
+    /// heard of, and a skill name is user-supplied for the same reason an MCP
+    /// tool name is server-supplied. Giving skills their own row would be the
+    /// beginning of the enumeration REQ-560 ADR-A refuses.
     #[test]
     fn an_unknown_server_supplied_tool_is_classified_by_the_levels_default() {
         let unknown = "mcp__some_server__some_tool_nobody_declared";
+        let skill = skill_permission_key_for(SkillSource::User, "status");
+        for name in [unknown, skill.as_str()] {
+            assert_eq!(
+                table_for(PermissionLevel::Guarded).policy_for(name),
+                PermissionPolicy::Ask,
+                "`{name}` at guarded"
+            );
+            assert_eq!(
+                table_for(PermissionLevel::Edits).policy_for(name),
+                PermissionPolicy::Ask,
+                "`{name}` at edits"
+            );
+            // Fail-closed at the level whose promise is that nothing changes.
+            assert_eq!(
+                table_for(PermissionLevel::Plan).policy_for(name),
+                PermissionPolicy::Deny,
+                "`{name}` at plan"
+            );
+            assert_eq!(
+                table_for(PermissionLevel::Full).policy_for(name),
+                PermissionPolicy::Allow,
+                "`{name}` at full"
+            );
+        }
+    }
+
+    /// **The key family recognizer, in both directions** (REQ-585 ADR-6).
+    ///
+    /// The negative half is the load-bearing one: `shell` is what the key must
+    /// never be, and `web_*` is the neighbouring family whose own guard must not
+    /// start catching this one.
+    #[test]
+    fn only_a_sourced_skill_key_reads_as_a_skill_key() {
+        for source in [SkillSource::User, SkillSource::Project] {
+            let key = skill_permission_key_for(source, "status");
+            assert!(is_skill_permission_key(&key), "`{key}` is a skill key");
+            assert!(
+                !is_web_permission_key(&key),
+                "`{key}` must not read as a web key"
+            );
+        }
+        for other in [
+            "shell",
+            "edit",
+            "read",
+            // The source is not optional: a key that dropped it is not a skill
+            // key, because it is not a key this daemon could have minted.
+            "skill:status",
+            // Nor is a prefix with no skill behind it.
+            "skill:user:",
+            "skill:",
+            // Nor a name that merely starts the same way.
+            "skillful:user:status",
+            PERMISSION_KEY_SEARCH,
+        ] {
+            assert!(
+                !is_skill_permission_key(other),
+                "`{other}` must not read as a skill key"
+            );
+        }
+    }
+
+    /// **REQ-585 ADR-6 / LESSON-504: the generic door's guard, in both
+    /// directions.**
+    ///
+    /// A guard whose precondition is untested is a guard whose claim is
+    /// untested. Two claims, and they are separate: the web assertion still
+    /// fires (so a web key cannot reach [`PermissionGate::decide`] without its
+    /// tier), and it does **not** fire for a skill key (so the new family did
+    /// not silently widen a predicate the web path depends on being exact
+    /// about). The positive half lives in
+    /// [`the_generic_door_admits_a_skill_key`] because a `should_panic` test
+    /// cannot also assert what happens when nothing panics.
+    #[cfg(debug_assertions)]
+    #[tokio::test]
+    #[should_panic(expected = "must be authorized through `authorize_web`")]
+    async fn the_generic_door_refuses_a_web_key_and_admits_a_skill_key() {
+        let (_bus, _pending, gate) = gate(PermissionConfig::with_default(PermissionPolicy::Allow));
+        let _ = gate.authorize(PERMISSION_KEY_SEARCH, None).await;
+    }
+
+    /// The other direction of
+    /// [`the_generic_door_refuses_a_web_key_and_admits_a_skill_key`]: a skill
+    /// key through [`PermissionGate::authorize`] does not trip the web guard.
+    ///
+    /// It is not how a skill's dynamic context is authorized — that is
+    /// [`PermissionGate::authorize_skill`], which carries the addressee this
+    /// door has no way to name — but reading a policy row or a remembered grant
+    /// by key must not be a panic, and widening the web guard would make it one.
+    #[tokio::test]
+    async fn the_generic_door_admits_a_skill_key() {
+        let (_bus, _pending, gate) = gate(PermissionConfig::with_default(PermissionPolicy::Allow));
         assert_eq!(
-            table_for(PermissionLevel::Guarded).policy_for(unknown),
-            PermissionPolicy::Ask
+            gate.authorize(&skill_permission_key_for(SkillSource::User, "status"), None)
+                .await,
+            PermissionDecision::Allowed
+        );
+    }
+
+    /// **The skill door's own guard** (REQ-585 ADR-6): a skill consent asked
+    /// under a key that is not the skill's own is the exact defect the key
+    /// exists to prevent, and `shell` is the one it would be.
+    ///
+    /// Placed at that door rather than at [`PermissionGate::authorize`]'s,
+    /// because only this door holds the name and source the key must agree with.
+    #[cfg(debug_assertions)]
+    #[tokio::test]
+    #[should_panic(expected = "is not a skill consent key")]
+    async fn the_skill_door_refuses_a_key_that_is_not_the_skills_own() {
+        let (_bus, _pending, gate) = gate(PermissionConfig::with_default(PermissionPolicy::Allow));
+        let _ = gate
+            .authorize_skill(
+                "shell",
+                "status",
+                SkillSource::User,
+                vec!["git status".to_owned()],
+                GrantRegistry::new().next_connection_id(),
+            )
+            .await;
+    }
+
+    /// A key of the right *shape* still has to be the key this skill's own name
+    /// and source mint — otherwise one skill's answer is remembered against
+    /// another's question (LESSON-495).
+    #[cfg(debug_assertions)]
+    #[tokio::test]
+    #[should_panic(expected = "its own name and source mint")]
+    async fn the_skill_door_refuses_another_skills_key() {
+        let (_bus, _pending, gate) = gate(PermissionConfig::with_default(PermissionPolicy::Allow));
+        let _ = gate
+            .authorize_skill(
+                &skill_permission_key_for(SkillSource::Project, "canary"),
+                "status",
+                SkillSource::User,
+                vec!["git status".to_owned()],
+                GrantRegistry::new().next_connection_id(),
+            )
+            .await;
+    }
+
+    /// **REQ-585 ADR-6: `/cd` drops the project grants and keeps the user
+    /// ones.**
+    ///
+    /// The unit half — that the sweep is by key prefix and nothing else.
+    /// `skill_consent_matrix.rs` asserts the consequence: that a dropped grant
+    /// makes the next invocation ask again.
+    #[test]
+    fn dropping_project_skill_grants_keeps_every_other_remembered_answer() {
+        let (_bus, _pending, gate) = gate(PermissionConfig::coding_defaults());
+        let project = skill_permission_key_for(SkillSource::Project, "deploy");
+        let user = skill_permission_key_for(SkillSource::User, "deploy");
+        gate.remember(&project, RememberedGrant::AllowAlways);
+        // A refusal is a grant too, and it is about the same moved file.
+        gate.remember(
+            &skill_permission_key_for(SkillSource::Project, "canary"),
+            RememberedGrant::RejectAlways,
+        );
+        gate.remember(&user, RememberedGrant::AllowAlways);
+        gate.remember("shell", RememberedGrant::AllowAlways);
+
+        assert_eq!(gate.drop_project_skill_grants(), 2);
+
+        assert_eq!(gate.remembered(&project), None);
+        assert_eq!(
+            gate.remembered(&skill_permission_key_for(SkillSource::Project, "canary")),
+            None,
+            "a project reject_always is about the moved file too"
         );
         assert_eq!(
-            table_for(PermissionLevel::Edits).policy_for(unknown),
-            PermissionPolicy::Ask
-        );
-        // Fail-closed at the level whose promise is that nothing changes.
-        assert_eq!(
-            table_for(PermissionLevel::Plan).policy_for(unknown),
-            PermissionPolicy::Deny
+            gate.remembered(&user),
+            Some(RememberedGrant::AllowAlways),
+            "`~/.claude` does not move when the session root does"
         );
         assert_eq!(
-            table_for(PermissionLevel::Full).policy_for(unknown),
-            PermissionPolicy::Allow
+            gate.remembered("shell"),
+            Some(RememberedGrant::AllowAlways),
+            "the sweep is a skill-key sweep, not a grant reset"
         );
+        // Idempotent: a second `/cd` with nothing left to drop drops nothing.
+        assert_eq!(gate.drop_project_skill_grants(), 0);
     }
 
     /// REQ-560 ADR-C: a standing config consent relaxes an `ask` and never
@@ -1828,8 +2513,8 @@ mod tests {
     fn a_colliding_registration_cannot_steal_the_owner_of_a_live_request() {
         let pending = PendingPermissions::new();
         let id = RequestId::from("perm-0");
-        let mut first = pending.register(id.clone(), SessionId::from("s1"));
-        let mut second = pending.register(id.clone(), SessionId::from("s2"));
+        let mut first = pending.register(id.clone(), SessionId::from("s1"), None);
+        let mut second = pending.register(id.clone(), SessionId::from("s2"), None);
 
         assert_eq!(
             pending.owner_of(&id),
