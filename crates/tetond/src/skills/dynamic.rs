@@ -1,0 +1,566 @@
+//! Dynamic context: the `` !`cmd` `` scanner, the typed outcome, and the one
+//! I/O edge that turns commands into outcomes (REQ-585 BR-6, BR-14).
+//!
+//! # The grammar, in full
+//!
+//! A dynamic-context slot is `` !`…` ``: a `!` immediately followed by a
+//! backtick, then every byte up to the **next** backtick. That is the whole
+//! grammar. In particular:
+//!
+//! - **No nesting.** The first backtick after the opener closes the run; a
+//!   backtick inside a command cannot be quoted into the command text.
+//! - **No escape.** There is no way to write a literal `` !` `` that the
+//!   scanner will not take, and none is invented here: BR-13 says the body is
+//!   passed as written, and an escape syntax is a rewrite of the body under a
+//!   different name.
+//! - **An unterminated run is not a command.** `` !`ls `` with no closing
+//!   backtick is literal body text and reaches the model as the author typed
+//!   it. Nothing is run, nothing is asked for, and no diagnostic is minted —
+//!   a body is prose, and prose containing a stray backtick is not an error.
+//! - **An empty run is not a command.** `` !`` `` (or one holding only
+//!   whitespace) has nothing to run, so it stays literal rather than becoming
+//!   a slot that would put an empty line in a consent prompt.
+//!
+//! # Where the split falls
+//!
+//! [`scan`] is pure — it is the half BR-14 requires to be unit-testable with
+//! no daemon and no terminal — and [`run_all`] is the single I/O edge, one
+//! [`run_bounded`] call per command, in document order. Nothing here calls
+//! `Tool::refine`: that fires the `shell` duty, which is a model call, and
+//! BR-4 forbids a model call at expansion time.
+
+use std::path::Path;
+use std::process::ExitStatus;
+
+use crate::harness::tools::shell::{cap_output, run_bounded, BoundedRun};
+
+/// The opener: a `!` immediately followed by a backtick.
+const OPEN: &str = "!`";
+
+/// One `` !`cmd` `` occurrence's command text, verbatim **after**
+/// `$ARGUMENTS`/`$N` substitution (BR-4 precedes BR-6).
+///
+/// A newtype rather than a bare `String` because these strings are handed to a
+/// shell and listed in a consent prompt; a function that takes `&[Command]`
+/// cannot be passed a list of anything else by accident.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Command {
+    text: String,
+}
+
+impl Command {
+    /// The command a slot holds.
+    #[must_use]
+    pub fn new(text: impl Into<String>) -> Self {
+        Self { text: text.into() }
+    }
+
+    /// The command text, exactly as it will be run and as the consent prompt
+    /// lists it.
+    ///
+    /// **Verbatim, and deliberately so.** Every surface that *renders* this
+    /// string — the fold's not-run placeholder in particular — bounds and
+    /// defuses it there, at the frame it is being spliced into (ADR-10). Doing
+    /// it here instead would change the command that runs.
+    #[must_use]
+    pub fn as_str(&self) -> &str {
+        &self.text
+    }
+}
+
+/// One span of a scanned body: literal text, or the *n*th command's slot.
+///
+/// `at_line_start` records whether the chunk began at a line start **in the
+/// body** — offset 0, or just past a `\n`. The expander needs it because
+/// `neutralize_envelope_tags` treats offset 0 of whatever it is handed as a
+/// line start, and a chunk that begins mid-line (right after a
+/// `` !`cmd` `` that had text before it on the same line) would otherwise be
+/// defused at a position that is not a line start at all.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum Piece {
+    /// Body text to splice as-is.
+    Text {
+        /// The chunk.
+        text: String,
+        /// Whether the chunk starts at a line start in the body.
+        at_line_start: bool,
+    },
+    /// The slot of the command at this index in the scan's command list.
+    Slot(usize),
+}
+
+/// Split `body` into literal pieces and the ordered command list.
+///
+/// Pure. Commands come out in **document order**, and the slot indices are
+/// positions in that list — so the fold cannot put one command's output in
+/// another's place without the index disagreeing.
+pub(crate) fn scan(body: &str) -> (Vec<Piece>, Vec<Command>) {
+    let mut pieces = Vec::new();
+    let mut commands: Vec<Command> = Vec::new();
+    // The literal chunk that has not been pushed yet starts here …
+    let mut chunk_start = 0usize;
+    // … and the next opener is looked for from here. The two differ only while
+    // a run is being skipped (an empty command), where the bytes stay literal.
+    let mut cursor = 0usize;
+
+    while let Some(rel) = body[cursor..].find(OPEN) {
+        let opener = cursor + rel;
+        let text_start = opener + OPEN.len();
+        let Some(close_rel) = body[text_start..].find('`') else {
+            // Unterminated: the rest of the body is literal text.
+            break;
+        };
+        let close = text_start + close_rel;
+        let text = &body[text_start..close];
+        if text.trim().is_empty() {
+            // Not a command. Leave the bytes in the literal chunk and resume
+            // after the opening backtick, so a later opener still scans.
+            cursor = text_start;
+            continue;
+        }
+        push_text(&mut pieces, body, chunk_start, opener);
+        pieces.push(Piece::Slot(commands.len()));
+        commands.push(Command::new(text));
+        chunk_start = close + 1;
+        cursor = close + 1;
+    }
+    push_text(&mut pieces, body, chunk_start, body.len());
+    (pieces, commands)
+}
+
+/// Push `body[from..to]` as a literal piece, unless it is empty.
+fn push_text(pieces: &mut Vec<Piece>, body: &str, from: usize, to: usize) {
+    if from >= to {
+        return;
+    }
+    pieces.push(Piece::Text {
+        text: body[from..to].to_owned(),
+        at_line_start: from == 0 || body.as_bytes()[from - 1] == b'\n',
+    });
+}
+
+/// What one dynamic command came to.
+///
+/// Typed, never prose a renderer parses (BR-6). The four arms are the four
+/// things the fold has to say differently: output to inline, a command that
+/// **never ran** and why, one that ran and **failed**, and one killed on the
+/// deadline. A command's failure never fails the invocation — every arm
+/// produces a turn.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DynamicOutcome {
+    /// The command ran, exited zero, and this is its stdout — trimmed of
+    /// trailing whitespace and capped by [`cap_output`].
+    Ran {
+        /// The captured stdout.
+        output: String,
+    },
+    /// The command was **not run**, for a reason that is not the command's
+    /// own: the permission level, the answer, the missing terminal, or a
+    /// failure to start at all. `reason` is the `<reason>` half of the
+    /// placeholder.
+    NotRun {
+        /// Why it did not run.
+        reason: String,
+    },
+    /// The command ran and did not exit zero. `status` is the rendered exit
+    /// (`exited 1`); the output is **not** carried — BR-6 says a failed
+    /// command leaves a placeholder in its place.
+    Failed {
+        /// The rendered exit status.
+        status: String,
+    },
+    /// The deadline passed and the process group was killed.
+    TimedOut,
+}
+
+impl DynamicOutcome {
+    /// The outcome for a command the user declined (AC-8's wording, which is
+    /// pinned by that AC's placeholder text).
+    #[must_use]
+    pub fn declined() -> Self {
+        Self::NotRun {
+            reason: "declined".to_owned(),
+        }
+    }
+
+    /// The outcome at the `plan` permission level, where no command runs and
+    /// the placeholder names the level (AC-9).
+    #[must_use]
+    pub fn not_run_at_plan() -> Self {
+        Self::NotRun {
+            reason: "plan permission level".to_owned(),
+        }
+    }
+
+    /// The outcome on a pipe at a level that would ask: the client refuses
+    /// without reading stdin, so nobody was asked (BR-11, AC-9).
+    ///
+    /// Distinct from [`Self::declined`] on purpose — "you said no" and "there
+    /// was nobody to ask" are different facts about the same missing output.
+    #[must_use]
+    pub fn no_terminal() -> Self {
+        Self::NotRun {
+            reason: "no terminal, so no human could be asked".to_owned(),
+        }
+    }
+
+    /// True when this outcome carries output to inline.
+    #[must_use]
+    pub fn did_run(&self) -> bool {
+        matches!(self, Self::Ran { .. })
+    }
+
+    /// The `<reason>` half of the not-run placeholder, or `None` for the arm
+    /// that has output instead.
+    #[must_use]
+    pub fn reason(&self) -> Option<&str> {
+        match self {
+            Self::Ran { .. } => None,
+            Self::NotRun { reason } => Some(reason),
+            Self::Failed { status } => Some(status),
+            Self::TimedOut => Some("timed out"),
+        }
+    }
+}
+
+/// Run every command in order under the `shell` tool's jail, environment
+/// scrub, `PATH` floor, process group and deadline — the single I/O edge of
+/// this feature (BR-6, BR-14).
+///
+/// Sequential and in document order, because that is the order the user
+/// consented to and the order the body reads in. `timeout_ms` is per command,
+/// as it is for the `shell` tool.
+///
+/// The gate is **not** here: this function runs what it is given. Deciding
+/// whether it may run at all is the caller's, under the skill's own permission
+/// key (ADR-6), and a caller that decided *no* builds the [`DynamicOutcome`]s
+/// itself rather than calling this.
+#[must_use]
+pub fn run_all(root: &Path, commands: &[Command], timeout_ms: u64) -> Vec<DynamicOutcome> {
+    commands
+        .iter()
+        .map(|command| run_one(root, command, timeout_ms))
+        .collect()
+}
+
+/// One command's trip through [`run_bounded`], typed for the fold.
+fn run_one(root: &Path, command: &Command, timeout_ms: u64) -> DynamicOutcome {
+    match run_bounded(root, command.as_str(), timeout_ms) {
+        BoundedRun::Completed { status, stdout, .. } if status.success() => {
+            // stdout only. BR-6 says stdout enters the expansion; a command
+            // whose diagnostics matter can redirect them itself (`2>&1`), and
+            // inlining stderr would put a linter's warnings in a prompt the
+            // author asked for a file listing in.
+            let text = String::from_utf8_lossy(&stdout).trim_end().to_owned();
+            let (output, _raw_chars) = cap_output(text);
+            DynamicOutcome::Ran { output }
+        }
+        BoundedRun::Completed { status, .. } => DynamicOutcome::Failed {
+            status: describe_status(status),
+        },
+        BoundedRun::TimedOut => DynamicOutcome::TimedOut,
+        // Never started: the jail root could not be resolved, or `sh` could
+        // not be launched.
+        BoundedRun::SpawnFailed(reason) => DynamicOutcome::NotRun { reason },
+        // Started, and its output never arrived. It *ran*, so it is not a
+        // not-run: the machine did something and we cannot say what.
+        BoundedRun::Lost(reason) => DynamicOutcome::Failed { status: reason },
+    }
+}
+
+/// How an exit reads in a placeholder.
+fn describe_status(status: ExitStatus) -> String {
+    match status.code() {
+        Some(code) => format!("exited {code}"),
+        None => "killed by a signal".to_owned(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    use std::path::PathBuf;
+
+    /// The counter, not the timestamp, guarantees uniqueness: `SystemTime::now()`
+    /// can return the same value for two calls within one clock tick.
+    fn temp_root(tag: &str) -> PathBuf {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static NEXT: AtomicU64 = AtomicU64::new(0);
+        let dir = std::env::temp_dir().join(format!(
+            "teton-skill-dynamic-{tag}-{}-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos(),
+            NEXT.fetch_add(1, Ordering::Relaxed)
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    fn texts(pieces: &[Piece]) -> Vec<String> {
+        pieces
+            .iter()
+            .map(|piece| match piece {
+                Piece::Text { text, .. } => text.clone(),
+                Piece::Slot(index) => format!("<slot {index}>"),
+            })
+            .collect()
+    }
+
+    /// The scanner's whole grammar, in one table: document order, the pieces
+    /// either side of each slot, and the two runs that are **not** commands.
+    #[test]
+    fn the_scanner_takes_document_order_and_leaves_a_non_command_literal() {
+        let (pieces, commands) = scan("a !`one` b !`two` c");
+        assert_eq!(
+            commands,
+            vec![Command::new("one"), Command::new("two")],
+            "document order, verbatim"
+        );
+        assert_eq!(
+            texts(&pieces),
+            vec!["a ", "<slot 0>", " b ", "<slot 1>", " c"]
+        );
+
+        // Unterminated: not a command, and the bytes survive.
+        let (pieces, commands) = scan("before !`ls -la after");
+        assert!(commands.is_empty(), "an unterminated run is not a command");
+        assert_eq!(texts(&pieces), vec!["before !`ls -la after"]);
+
+        // Empty and whitespace-only runs: not commands either, and a later
+        // opener still scans.
+        let (pieces, commands) = scan("x !`` y !`   ` z !`ls` w");
+        assert_eq!(commands, vec![Command::new("ls")]);
+        assert_eq!(
+            texts(&pieces),
+            vec!["x !`` y !`   ` z ", "<slot 0>", " w"],
+            "the non-command bytes stay literal"
+        );
+    }
+
+    /// No nesting and no escape: the first backtick closes the run, and a
+    /// backslash is a byte like any other (BR-13 — the body is passed as
+    /// written, so there is no escape syntax to honour).
+    #[test]
+    fn the_first_backtick_closes_the_run_and_nothing_escapes_it() {
+        let (_, commands) = scan("!`echo `nested`` tail");
+        assert_eq!(
+            commands,
+            vec![Command::new("echo ")],
+            "the first backtick closes; what follows is body text"
+        );
+
+        let (_, commands) = scan(r"!`echo \` still` tail");
+        assert_eq!(
+            commands,
+            vec![Command::new(r"echo \")],
+            "a backslash escapes nothing"
+        );
+    }
+
+    /// A chunk knows whether it began at a line start, which is the fact the
+    /// expander's envelope defusing depends on (ADR-10).
+    #[test]
+    fn a_chunk_records_whether_it_began_at_a_line_start() {
+        let (pieces, _) = scan("head !`one`tail\nnext !`two`\nlast");
+        let flags: Vec<bool> = pieces
+            .iter()
+            .filter_map(|piece| match piece {
+                Piece::Text { at_line_start, .. } => Some(*at_line_start),
+                Piece::Slot(_) => None,
+            })
+            .collect();
+        assert_eq!(
+            flags,
+            vec![true, false, false],
+            "offset 0 is a line start; text resuming after a slot is not"
+        );
+
+        let (pieces, _) = scan("!`one`\nx");
+        let flags: Vec<bool> = pieces
+            .iter()
+            .filter_map(|piece| match piece {
+                Piece::Text { at_line_start, .. } => Some(*at_line_start),
+                Piece::Slot(_) => None,
+            })
+            .collect();
+        assert_eq!(
+            flags,
+            vec![false],
+            "the chunk opens with the newline itself"
+        );
+    }
+
+    /// **BR-6.** The commands run *sequentially, in document order* — asserted
+    /// through a side effect, because that is the only way the claim is
+    /// falsifiable: a runner that executes them backwards and then reorders the
+    /// outcomes to match produces an identical list, and an assertion on the
+    /// list alone would go on passing.
+    ///
+    /// The cwd is the session root, which is what makes the relative path work.
+    #[test]
+    fn a_later_command_sees_an_earlier_commands_effect() {
+        let root = temp_root("sequence");
+        let outcomes = run_all(
+            &root,
+            &[
+                Command::new("echo one >> log"),
+                Command::new("echo two >> log"),
+                Command::new("cat log"),
+            ],
+            10_000,
+        );
+        assert_eq!(
+            outcomes[2],
+            DynamicOutcome::Ran {
+                output: "one\ntwo".to_owned()
+            },
+            "the commands did not run in document order: {outcomes:?}"
+        );
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// The I/O edge: in order, one outcome per command, each arm typed —
+    /// and a failing command does not stop the ones after it (BR-6, AC-10).
+    #[test]
+    fn run_all_runs_in_document_order_and_types_every_outcome() {
+        let root = temp_root("order");
+        let outcomes = run_all(
+            &root,
+            &[
+                Command::new("echo first"),
+                Command::new("exit 3"),
+                Command::new("echo third 1>&2"),
+                Command::new("echo last"),
+            ],
+            10_000,
+        );
+        assert_eq!(outcomes.len(), 4, "one outcome per command");
+        assert_eq!(
+            outcomes[0],
+            DynamicOutcome::Ran {
+                output: "first".to_owned()
+            }
+        );
+        assert_eq!(
+            outcomes[1],
+            DynamicOutcome::Failed {
+                status: "exited 3".to_owned()
+            },
+            "a non-zero exit is a failure, not output"
+        );
+        assert_eq!(
+            outcomes[2],
+            DynamicOutcome::Ran {
+                output: String::new()
+            },
+            "stderr is not inlined; the command still succeeded"
+        );
+        assert_eq!(
+            outcomes[3],
+            DynamicOutcome::Ran {
+                output: "last".to_owned()
+            },
+            "a failure never stops the commands after it"
+        );
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// A runaway command is killed on the deadline and the rest still run
+    /// (AC-10 at this layer; the turn-level half is TASK-205's).
+    #[test]
+    fn a_command_past_the_deadline_times_out_and_the_next_one_still_runs() {
+        let root = temp_root("timeout");
+        let started = std::time::Instant::now();
+        let outcomes = run_all(
+            &root,
+            &[Command::new("sleep 10"), Command::new("echo after")],
+            200,
+        );
+        assert_eq!(outcomes[0], DynamicOutcome::TimedOut);
+        assert_eq!(
+            outcomes[1],
+            DynamicOutcome::Ran {
+                output: "after".to_owned()
+            }
+        );
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(3),
+            "killed promptly, nowhere near the 10s sleep"
+        );
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// The output the expansion inlines is **capped**: `run_bounded` returns
+    /// raw streams, and this is the caller that has to apply the ceiling
+    /// (TASK-198 AC — leaving the cap in `render_output` would inline uncapped
+    /// command output into a prompt).
+    #[test]
+    fn a_long_running_commands_output_is_capped_before_it_reaches_the_expansion() {
+        let root = temp_root("cap");
+        let outcomes = run_all(
+            &root,
+            &[Command::new("head -c 20000 /dev/zero | tr '\\0' x")],
+            10_000,
+        );
+        let DynamicOutcome::Ran { output } = &outcomes[0] else {
+            panic!("expected a ran outcome, got {:?}", outcomes[0]);
+        };
+        assert!(
+            output.chars().count() < 20_000,
+            "20,000 characters reached the prompt uncapped"
+        );
+        assert!(
+            output.contains("output truncated"),
+            "the cap says how much it threw away: {output:.80}"
+        );
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// A root that does not exist means the command **never started** — a
+    /// not-run, not a failure, because the two get different placeholders.
+    #[test]
+    fn a_command_that_never_started_is_a_not_run() {
+        let outcome = run_one(
+            Path::new("/nonexistent-teton-skill-root"),
+            &Command::new("echo hi"),
+            10_000,
+        );
+        assert!(
+            matches!(&outcome, DynamicOutcome::NotRun { reason } if reason.contains("failed to start")),
+            "expected a not-run, got {outcome:?}"
+        );
+    }
+
+    /// The three constructors the turn path uses, and the one property that
+    /// matters about them: they are three different sentences.
+    #[test]
+    fn the_not_run_reasons_are_three_distinct_sentences() {
+        assert_eq!(DynamicOutcome::declined().reason(), Some("declined"));
+        assert_eq!(
+            DynamicOutcome::not_run_at_plan().reason(),
+            Some("plan permission level")
+        );
+        assert_eq!(
+            DynamicOutcome::no_terminal().reason(),
+            Some("no terminal, so no human could be asked")
+        );
+        assert_eq!(DynamicOutcome::TimedOut.reason(), Some("timed out"));
+        assert_eq!(
+            DynamicOutcome::Ran {
+                output: "x".to_owned()
+            }
+            .reason(),
+            None,
+            "the arm with output has no reason"
+        );
+        assert!(DynamicOutcome::Ran {
+            output: String::new()
+        }
+        .did_run());
+        assert!(!DynamicOutcome::declined().did_run());
+    }
+}

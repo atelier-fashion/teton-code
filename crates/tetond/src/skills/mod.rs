@@ -15,7 +15,10 @@
 //! module holds the half of that with no I/O in it beyond a seam: the shapes
 //! ([`Skill`], [`SkillRegistry`], [`Skipped`]), the name rule, the permission
 //! key, and the two bounds. [`discovery`] turns four directory listings into a
-//! registry; [`frontmatter`] turns one file's bytes into a header and a body.
+//! registry; [`frontmatter`] turns one file's bytes into a header and a body;
+//! [`expand`] turns a registry row and a typed argument string into the one
+//! [`Expansion`] a turn is composed from; [`dynamic`] holds the `` !`cmd` ``
+//! grammar and the single I/O edge that runs those commands.
 //!
 //! # Nothing here is a setting
 //!
@@ -33,6 +36,8 @@
 //! three non-harness callers reach for does not belong inside the harness.
 
 pub mod discovery;
+pub mod dynamic;
+pub mod expand;
 pub mod frontmatter;
 
 use std::fmt;
@@ -41,6 +46,8 @@ use std::path::{Path, PathBuf};
 use teton_protocol::methods::RootKind;
 
 pub use discovery::{discover, DirLister, Entry, ListError, ReadError, RealFs};
+pub use dynamic::{run_all, Command, DynamicOutcome};
+pub use expand::{expand, Expansion, Pending, PENDING_PLACEHOLDER};
 
 /// Which of the two discovery roots a skill was found under.
 ///
