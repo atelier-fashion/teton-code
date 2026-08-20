@@ -85,7 +85,7 @@
 use teton_protocol::events::{bytes_figure, thousands, BudgetBound};
 use teton_providers::capability::NATIVE_MAX_ITERATIONS;
 
-use super::context::APPROX_BYTES_PER_TOKEN;
+use super::context::{ContextManager, Fit, APPROX_BYTES_PER_TOKEN};
 use super::duty::DUTY_REQUEST_BYTES_PER_TOKEN;
 use crate::egress::redact::REDACT_SCANNABLE_CONTEXT_BYTES;
 
@@ -580,6 +580,199 @@ pub fn big_window_notice(window: u32, cap: u32, redact_scan: bool) -> Option<Str
         thousands(budget.budget_tokens.saturating_mul(calls) as u64),
         bytes_figure(budget.budget_bytes.saturating_mul(calls) as u64),
     ))
+}
+
+/// Which of BR-8's two budget checks is speaking (ADR-11).
+///
+/// The stages measure the **same** candidate through the same function; what
+/// differs is what has been substituted into it, and therefore what a user can
+/// do about the answer. Naming which one refused is a spec requirement, not a
+/// nicety (BR-8d): a body that cannot fit is refused *before* the session asks
+/// for consent, so nobody approves four commands, watches them run, and is then
+/// told the turn was refused — and when the refusal does land after the
+/// commands, the message has to say that their output is what spent the room.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SkillStage {
+    /// **Stage A** — before consent, over the expansion with a `[dynamic
+    /// context pending]` placeholder standing in each `` !`command` `` slot.
+    Body,
+    /// **Stage B** — after the dynamic-context outcomes are folded in.
+    ///
+    /// Reached only once [`SkillStage::Body`] has already answered
+    /// [`SkillFit::Fits`] (TASK-204 owns that ordering), which is what entitles
+    /// this stage's clause to say the body itself fit.
+    WithDynamicContext,
+}
+
+impl SkillStage {
+    /// The clause naming what was measured — the whole of the stage
+    /// distinction, in one place so the two spellings cannot collapse into one.
+    const fn measured_clause(self) -> &'static str {
+        match self {
+            SkillStage::Body => "the body alone, with the system prompt, comes to",
+            SkillStage::WithDynamicContext => {
+                "the body fits, but its dynamic context output pushed the turn to"
+            }
+        }
+    }
+}
+
+/// Whether a skill turn may be sent on this route (REQ-585 BR-8, ADR-11).
+///
+/// [`SkillFit::TooLarge`] carries the refusal already composed, because the
+/// figures in the sentence are the ones the measurement just produced: a caller
+/// that had to re-measure to write the message would be the second estimator
+/// ADR-11 exists to prevent.
+#[must_use]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SkillFit {
+    /// Both currencies land inside the route's budget; the turn proceeds.
+    Fits,
+    /// The expansion does not fit. The caller raises this under
+    /// `error_code::SKILL_EXPANSION_TOO_LARGE` and sends nothing — `-32023`
+    /// and not `-32022`, because no provider has seen this turn.
+    TooLarge {
+        /// BR-8's sentence: the skill, its size, the budget, the spoken bound,
+        /// and which stage refused.
+        message: String,
+    },
+}
+
+/// Measure one skill expansion against the route's **stamped** budget and, if it
+/// does not fit, compose BR-8's refusal (ADR-11).
+///
+/// # Nothing is derived here
+///
+/// `budget` is the [`RouteBudget`] the router stamped on the route
+/// (`Router::budget_for` stays the single [`derive`] caller, AC-12). This
+/// function reads it and never recomputes it: a refusal that named a budget the
+/// turn was not actually running under would be the second source BR-8 exists
+/// to prevent, and it is exactly the failure REQ-586's own verify M1 found on
+/// `/verbose`.
+///
+/// # Nothing is estimated here either
+///
+/// The measurement is [`ContextManager::would_seed_fit`] — the estimators the
+/// pressure path itself runs on, charging the truncation surcharge up front so
+/// a seed inside the 142-byte band is refused rather than admitted and then
+/// middle-elided (see that function's own doc; BR-8 forbids the elision).
+///
+/// # What can reach the sentence
+///
+/// Only integers this daemon measured, two literal key names, the skill's name,
+/// and — on the `unknown window` arm alone — the provider id, through
+/// `sanitized_provider_id`. **No provider response body**, because none is an
+/// input: the check runs before anything is dispatched, so there is no remote
+/// answer in scope to leak. That is the whole difference between `-32023` and
+/// REQ-586's `-32022`, and it is pinned negatively by
+/// `a_skill_refusal_carries_no_provider_response_body`, as REQ-586 pinned its
+/// sibling (`runtime.rs`'s `!err.message.contains("Input token length")`).
+///
+/// `skill` is a registered skill's name, which the registry has already
+/// validated against `^[a-z0-9][a-z0-9_-]{0,63}$` (TASK-195) — stated rather
+/// than re-checked, because a second copy of that predicate here would be
+/// LESSON-528's shape: the precondition belongs at the seam that establishes
+/// it, and mirroring the body without it is what drifts.
+pub fn skill_fit(
+    stage: SkillStage,
+    skill: &str,
+    system: &str,
+    expansion: &str,
+    budget: &RouteBudget,
+    provider_id: Option<&str>,
+) -> SkillFit {
+    let fit = ContextManager::would_seed_fit(
+        system,
+        expansion,
+        budget.budget_tokens,
+        budget.budget_bytes,
+    );
+    if fit.fits {
+        return SkillFit::Fits;
+    }
+    SkillFit::TooLarge {
+        message: skill_refusal(stage, skill, fit, budget, provider_id),
+    }
+}
+
+/// BR-8's sentence — **the composer, and the only one** (LESSON-456).
+///
+/// Private, and reachable only through [`skill_fit`], so the message cannot be
+/// written without the measurement whose figures it quotes.
+fn skill_refusal(
+    stage: SkillStage,
+    skill: &str,
+    fit: Fit,
+    budget: &RouteBudget,
+    provider_id: Option<&str>,
+) -> String {
+    format!(
+        "`/{skill}` does not fit this route's context budget: {} about {} words / {}, and the \
+         budget is {} words / {} ({}). Nothing was sent and no provider saw this turn — a skill \
+         expansion is carried whole or refused, never shortened into something you did not \
+         invoke.",
+        stage.measured_clause(),
+        thousands(fit.tokens as u64),
+        bytes_figure(fit.bytes as u64),
+        thousands(budget.budget_tokens as u64),
+        bytes_figure(budget.budget_bytes as u64),
+        bound_clause(budget, provider_id),
+    )
+}
+
+/// The bound **spoken**, with whatever qualifies it (BR-8a, BR-8b) — the
+/// parenthetical a new user meets reads
+/// ``bound: unknown window — set `capabilities.max_context` for `kimi` ``.
+///
+/// Three rules, each of which REQ-586 shipped the fact for:
+///
+/// * The words come from [`BudgetBound::words`] in `teton-protocol`, never
+///   [`BudgetBound::wire_name`]. That table lives in the protocol crate
+///   expressly so this refusal — which runs in `tetond`, and cannot reach a
+///   `teton` helper — reads the same adjectives the client's `/verbose` and
+///   pressure lines do. A local match over `BudgetBound` here would be the
+///   mirrored-predicate shape of LESSON-528: identical today, and identical
+///   only until one of them is edited.
+/// * A **floored** route says so. [`RouteBudget::floored`] is carried beside
+///   the bound precisely because the bound alone cannot report that a declared
+///   ceiling is not in force: Ollama's shipped `max_context = 4096` derives
+///   (2,048, 16,384) and would otherwise read `bound: window` beside a budget
+///   *larger* than the window it declared.
+/// * The `unknown window` arm carries the remedy, because that is the bound a
+///   new user meets and `capabilities.max_context` is the line they would go
+///   and write (BR-8a's own example).
+///
+/// The two qualifiers are appended independently rather than as an either/or:
+/// [`derive`] never sets `floored` on the [`BudgetBound::DefaultUnknown`] arm
+/// (that pair is the answer, not a clamp), and a clause that quietly dropped
+/// one because the other was present would be a rule waiting for that to change.
+///
+/// The wording of the floored half is the client's, from `session_ui`'s
+/// `bound_clause` — one vocabulary for one fact, even though the sentence around
+/// it differs. (Only the wording: the *fact* has one home, in [`derive`], and
+/// nothing here compares a pair against a floor of its own.)
+fn bound_clause(budget: &RouteBudget, provider_id: Option<&str>) -> String {
+    let mut clause = format!("bound: {}", budget.bound.words());
+    if budget.floored {
+        clause.push_str(
+            " — floored: below the smallest budget that holds the system prompt, so this budget \
+             is already larger than the declaration allows",
+        );
+    }
+    if budget.bound == BudgetBound::DefaultUnknown {
+        // A remote route always has an id in practice — the window came from
+        // `capability_of(id)` — so the `None` arm is defensive, and says the
+        // remedy without inventing a name for the provider, exactly as
+        // `provider_label` falls back rather than emitting a nameless marker.
+        match provider_id {
+            Some(id) => clause.push_str(&format!(
+                " — set `capabilities.max_context` for `{}`",
+                sanitized_provider_id(id)
+            )),
+            None => clause.push_str(" — set `capabilities.max_context` for this provider"),
+        }
+    }
+    clause
 }
 
 #[cfg(test)]
@@ -1244,6 +1437,525 @@ mod tests {
             quiet,
             vec![("ollama".to_owned(), 4_096)],
             "only the small locally-served window is quiet"
+        );
+    }
+
+    // -- BR-8's refusal: the message and its measurement (ADR-11) -------------
+
+    /// The harness's own system prompt — what a skill turn is really measured
+    /// against, not a stand-in, because the AC-16 rows below are claims about
+    /// real routes carrying the real corpus.
+    fn real_system_prompt() -> String {
+        crate::harness::turn_loop::build_system_prompt(
+            &crate::harness::tools::ToolRegistry::with_builtins(),
+            &HarnessConfig::default(),
+        )
+    }
+
+    /// What `bytes_of` adds to `system.len() + text.len()` for a one-block
+    /// candidate: 64 B of render reserve on the block, 64 B of fixed reserve,
+    /// and the 142 B truncation surcharge `would_seed_fit` charges up front
+    /// (`context.rs`, ADR-11). Spelled here so the size assertions below are an
+    /// independent arithmetic check rather than a re-run of the estimator.
+    const SEED_OVERHEAD_BYTES: usize = 64 + 64 + 142;
+
+    /// The measured size of `~/.claude/skills/status/SKILL.md` in the ADLC
+    /// toolkit on 2026-08-20 — 768 whitespace words.
+    const STATUS_BODY_BYTES: usize = 5_323;
+
+    /// The measured size of `~/.claude/skills/proceed/SKILL.md` on the same
+    /// day: 49.8 KiB, the largest skill BR-8's 64 KiB discovery cap admits.
+    const PROCEED_BODY_BYTES: usize = 51_037;
+
+    /// What `/status`'s four `` !`command` `` slots really produce in this
+    /// repository, measured the same day: the ethos include (3,812 B) plus
+    /// `ls .adlc/specs/` (1,536 B), `ls .adlc/bugs/` (2,074 B) and the branch
+    /// name. The figure matters because it is what refuses `/status` on the
+    /// Ollama-shaped route *after* its body has already fit.
+    const STATUS_DYNAMIC_OUTPUT_BYTES: usize = 7_462;
+
+    /// A skill body of `bytes` bytes at the ADLC corpus's measured density —
+    /// ≈7 bytes per whitespace word (`/status` 5,323 B / 768 words;
+    /// `/proceed` 51,037 B / 7,222 words).
+    ///
+    /// Synthesized rather than read from `~/.claude/skills`: this suite is a
+    /// pure unit test of the composer, and a test that reached into the
+    /// developer's home directory would pass or fail on whether the toolkit
+    /// happened to be installed.
+    fn corpus_body(bytes: usize) -> String {
+        let mut body = "abcdef ".repeat(bytes / 7);
+        while body.len() < bytes {
+            body.push('x');
+        }
+        body
+    }
+
+    /// The refusal for a candidate that must not fit — the message, with the
+    /// verdict asserted on the way through so no test below can be green
+    /// against a route that admitted the turn.
+    fn refusal(
+        stage: SkillStage,
+        skill: &str,
+        system: &str,
+        text: &str,
+        budget: &RouteBudget,
+        provider_id: Option<&str>,
+    ) -> String {
+        match skill_fit(stage, skill, system, text, budget, provider_id) {
+            SkillFit::TooLarge { message } => message,
+            SkillFit::Fits => {
+                panic!("`/{skill}` was admitted on a route this test needs it refused on")
+            }
+        }
+    }
+
+    /// **AC-16, the four route shapes, against the real corpus.**
+    ///
+    /// The arithmetic, done by hand (system prompt 6,979 B / 753 words on the
+    /// built-in registry; `SEED_OVERHEAD_BYTES` = 270):
+    ///
+    /// | route | budget | `/status` (5,323 B) | `/proceed` (51,037 B) |
+    /// |---|---|---|---|
+    /// | local tier | 4,096 w / 32,768 B | 12,572 B ✓ | 58,286 B ✗ |
+    /// | `max_context = 128000` | 84,650 w / 253,952 B | ✓ | 58,286 B ✓ |
+    /// | `max_context = 0` | 4,096 w / 32,768 B | ✓ | 58,286 B ✗ |
+    /// | `max_context = 4096` | 2,048 w / 16,384 B | 12,572 B ✓ | ✗ |
+    ///
+    /// The last row is BR-8(d) in one line, and why the stages exist: on the
+    /// Ollama-shaped route `/status`'s **body** fits with room to spare, so it
+    /// reaches consent and its commands run — and it is their 7,462 bytes of
+    /// output that refuse it (asserted in
+    /// `the_message_says_which_stage_refused`). AC-16's "both refused" holds
+    /// there, at Stage B.
+    #[test]
+    fn the_ac16_route_shapes_admit_and_refuse_the_real_corpus() {
+        let system = real_system_prompt();
+        let status = corpus_body(STATUS_BODY_BYTES);
+        let proceed = corpus_body(PROCEED_BODY_BYTES);
+
+        let rows: &[(&str, RouteBudget, &str, &String, bool)] = &[
+            (
+                "local tier",
+                derive(BudgetInputs::local()),
+                "status",
+                &status,
+                true,
+            ),
+            (
+                "local tier",
+                derive(BudgetInputs::local()),
+                "proceed",
+                &proceed,
+                false,
+            ),
+            (
+                "max_context = 128000",
+                derive(remote(128_000, 0, false)),
+                "proceed",
+                &proceed,
+                true,
+            ),
+            (
+                "max_context = 0",
+                derive(remote(0, 0, false)),
+                "proceed",
+                &proceed,
+                false,
+            ),
+            (
+                "max_context = 4096",
+                derive(remote(4_096, 0, false)),
+                "proceed",
+                &proceed,
+                false,
+            ),
+            (
+                // BR-8(d): the body is what Stage A measures, and this one fits.
+                "max_context = 4096",
+                derive(remote(4_096, 0, false)),
+                "status",
+                &status,
+                true,
+            ),
+        ];
+
+        for (route, budget, skill, body, expect_fits) in rows {
+            let fit = skill_fit(SkillStage::Body, skill, &system, body, budget, Some("kimi"));
+            assert_eq!(
+                fit == SkillFit::Fits,
+                *expect_fits,
+                "{route} / `/{skill}`: {fit:?} against a {} word / {} byte budget",
+                budget.budget_tokens,
+                budget.budget_bytes
+            );
+        }
+    }
+
+    /// The refusal names the four things BR-8 asks for — the skill, its size,
+    /// the budget, and the bound — with every figure through `thousands()` and
+    /// `bytes_figure()` and nothing spelled locally.
+    ///
+    /// The size is checked against arithmetic done here, not against a second
+    /// call to the estimator: `system + body + SEED_OVERHEAD_BYTES`, which
+    /// includes the 142-byte truncation surcharge. Measuring the candidate at
+    /// `truncated = false` — the band ADR-11 closes — moves the figure and
+    /// fails this test.
+    #[test]
+    fn the_refusal_names_the_skill_its_size_the_budget_and_the_bound() {
+        let system = real_system_prompt();
+        let proceed = corpus_body(PROCEED_BODY_BYTES);
+        let budget = derive(BudgetInputs::local());
+        let message = refusal(
+            SkillStage::Body,
+            "proceed",
+            &system,
+            &proceed,
+            &budget,
+            None,
+        );
+
+        // The skill.
+        assert!(message.contains("`/proceed`"), "{message}");
+        // Its size, in both currencies.
+        let words = crate::harness::context::approx_tokens(&system)
+            + crate::harness::context::approx_tokens(&proceed);
+        let bytes = system.len() + proceed.len() + SEED_OVERHEAD_BYTES;
+        assert!(
+            message.contains(&format!(
+                "about {} words / {}",
+                thousands(words as u64),
+                bytes_figure(bytes as u64)
+            )),
+            "the measured size, surcharge included ({words} words / {bytes} B): {message}"
+        );
+        // The budget — the local pair, `4,096 words / 33 KB`.
+        assert!(
+            message.contains(&format!(
+                "the budget is {} words / {}",
+                thousands(LOCAL_BUDGET_TOKENS as u64),
+                bytes_figure(LOCAL_BUDGET_BYTES as u64)
+            )),
+            "{message}"
+        );
+        // The bound.
+        assert!(message.contains("bound: local engine"), "{message}");
+        // And the sentence that makes `-32023` different from `-32022`.
+        assert!(
+            message.contains("no provider saw this turn"),
+            "a refusal that reads like a provider's answer is the collapse \
+             ADR-11 forbids: {message}"
+        );
+    }
+
+    /// **BR-8(a): the bound is spoken, never spelled.**
+    ///
+    /// `BudgetBound::words()` and never `wire_name()`. Two of the five arms
+    /// differ between the tables, and both are asserted in both directions —
+    /// the words present, the wire spelling absent — so swapping the accessor
+    /// fails here rather than shipping `bound: default_unknown` to a user who
+    /// has no such key to go and edit.
+    #[test]
+    fn the_bound_is_spoken_never_spelled() {
+        let system = real_system_prompt();
+        let proceed = corpus_body(PROCEED_BODY_BYTES);
+
+        let local = refusal(
+            SkillStage::Body,
+            "proceed",
+            &system,
+            &proceed,
+            &derive(BudgetInputs::local()),
+            None,
+        );
+        assert!(local.contains("bound: local engine"), "{local}");
+        assert!(
+            !local.contains("local_engine"),
+            "the wire spelling reached a user: {local}"
+        );
+
+        let unknown = refusal(
+            SkillStage::Body,
+            "proceed",
+            &system,
+            &proceed,
+            &derive(remote(0, 0, false)),
+            Some("kimi"),
+        );
+        assert!(unknown.contains("bound: unknown window"), "{unknown}");
+        assert!(
+            !unknown.contains("default_unknown"),
+            "the wire spelling reached a user: {unknown}"
+        );
+
+        // Non-vacuity: the two spellings really are different strings, so the
+        // assertions above are not both satisfiable by one accessor.
+        assert_ne!(
+            BudgetBound::DefaultUnknown.words(),
+            BudgetBound::DefaultUnknown.wire_name()
+        );
+        assert_ne!(
+            BudgetBound::LocalEngine.words(),
+            BudgetBound::LocalEngine.wire_name()
+        );
+    }
+
+    /// **BR-8(a): the bound a new user meets carries its remedy.**
+    ///
+    /// `max_context = 0` is the unconfigured provider, so the message says the
+    /// key to write and which provider to write it for — the id through
+    /// `sanitized_provider_id`, because it is a config-supplied string reaching
+    /// a message (ADR-009 rule 2).
+    #[test]
+    fn an_unknown_window_refusal_carries_the_remedy_and_the_id() {
+        let system = real_system_prompt();
+        let proceed = corpus_body(PROCEED_BODY_BYTES);
+        let message = refusal(
+            SkillStage::Body,
+            "proceed",
+            &system,
+            &proceed,
+            &derive(remote(0, 0, false)),
+            Some("kimi"),
+        );
+        assert!(message.contains("capabilities.max_context"), "{message}");
+        assert!(message.contains("for `kimi`"), "{message}");
+
+        // The remedy belongs to this bound alone: a route whose window *is*
+        // declared has nothing to set, and telling it to would name a key that
+        // is already there.
+        let declared = refusal(
+            SkillStage::Body,
+            "proceed",
+            &system,
+            &proceed,
+            &derive(remote(4_096, 0, false)),
+            Some("kimi"),
+        );
+        assert!(!declared.contains("capabilities.max_context"), "{declared}");
+
+        // The defensive arm still says what to set, without inventing a name.
+        let nameless = refusal(
+            SkillStage::Body,
+            "proceed",
+            &system,
+            &proceed,
+            &derive(remote(0, 0, false)),
+            None,
+        );
+        assert!(
+            nameless.contains("`capabilities.max_context` for this provider"),
+            "{nameless}"
+        );
+    }
+
+    /// **BR-8(b): a floored route says the ceiling it names is not in force.**
+    ///
+    /// The Ollama-shaped route is the live case: `max_context = 4096` derives
+    /// (2,048, 16,384) — a budget *larger* than the 4,096-token window that was
+    /// declared. Without the clause the message reads `bound: window` beside a
+    /// figure the window does not allow, and the reader's only sound conclusion
+    /// is that the surface is broken.
+    #[test]
+    fn a_floored_route_says_the_declared_ceiling_is_not_in_force() {
+        let system = real_system_prompt();
+        let proceed = corpus_body(PROCEED_BODY_BYTES);
+        let budget = derive(remote(4_096, 0, false));
+
+        // Non-vacuity: this really is the shape the clause exists for.
+        assert!(budget.floored, "the fixture must be a floored route");
+        assert_eq!(budget.bound, BudgetBound::Window);
+        assert!(
+            budget.budget_bytes > (4_096 - RESERVATION) as usize * 2,
+            "the floor raised the pair above what the window derives, which is \
+             the fact `bound` alone cannot report"
+        );
+
+        let message = refusal(
+            SkillStage::Body,
+            "proceed",
+            &system,
+            &proceed,
+            &budget,
+            Some("ollama"),
+        );
+        assert!(message.contains("bound: window"), "{message}");
+        assert!(
+            message.contains("floored"),
+            "a floored budget was reported as though the declaration were in \
+             force: {message}"
+        );
+        assert!(
+            message.contains("larger than the declaration allows"),
+            "the clause has to say which way the floor moved the figure: {message}"
+        );
+
+        // And an unfloored route says nothing about a floor.
+        let roomy = refusal(
+            SkillStage::Body,
+            "proceed",
+            &system,
+            &proceed,
+            &derive(remote(0, 0, false)),
+            Some("kimi"),
+        );
+        assert!(!roomy.contains("floored"), "{roomy}");
+    }
+
+    /// **BR-8(d) / ADR-11: the message says which stage refused.**
+    ///
+    /// The two are different remedies. A body that cannot fit is refused before
+    /// consent and needs a bigger route or a smaller skill; a body that fit and
+    /// was then pushed over by its own `` !`command` `` output is a turn whose
+    /// commands already ran, and saying otherwise sends the user to change the
+    /// wrong thing.
+    ///
+    /// Both fixtures are the Ollama-shaped route, because that is where the
+    /// distinction is real on the live corpus: `/status`'s body fits its
+    /// 16,384-byte budget with 3,812 bytes to spare, and its dynamic context
+    /// produces 7,462.
+    #[test]
+    fn the_message_says_which_stage_refused() {
+        let system = real_system_prompt();
+        let budget = derive(remote(4_096, 0, false));
+        let status = corpus_body(STATUS_BODY_BYTES);
+        let with_output = format!("{status}\n{}", corpus_body(STATUS_DYNAMIC_OUTPUT_BYTES));
+
+        // Non-vacuity, and BR-8(d)'s whole point: Stage A admits this body, so
+        // the user is asked for consent and the commands run.
+        assert_eq!(
+            skill_fit(
+                SkillStage::Body,
+                "status",
+                &system,
+                &status,
+                &budget,
+                Some("ollama")
+            ),
+            SkillFit::Fits,
+            "`/status`'s body fits this route; if it stops fitting, this test \
+             is no longer about the second stage"
+        );
+
+        let body_alone = refusal(
+            SkillStage::Body,
+            "proceed",
+            &system,
+            &corpus_body(PROCEED_BODY_BYTES),
+            &budget,
+            Some("ollama"),
+        );
+        let after_output = refusal(
+            SkillStage::WithDynamicContext,
+            "status",
+            &system,
+            &with_output,
+            &budget,
+            Some("ollama"),
+        );
+
+        assert!(body_alone.contains("the body alone"), "{body_alone}");
+        assert!(
+            !body_alone.contains("dynamic context"),
+            "a body-stage refusal blamed output that never ran: {body_alone}"
+        );
+
+        assert!(
+            after_output.contains("its dynamic context output pushed the turn to"),
+            "{after_output}"
+        );
+        assert!(
+            !after_output.contains("the body alone"),
+            "a refusal after the commands ran blamed the body: {after_output}"
+        );
+    }
+
+    /// **The refusal carries no provider response body**, pinned negatively as
+    /// REQ-586 pinned its sibling
+    /// (`runtime.rs`'s `a_context_length_refusal_changes_no_health_and_degrades_nothing`:
+    /// `!err.message.contains("Input token length")`).
+    ///
+    /// Nothing remote is *in scope* here — the check runs before anything is
+    /// dispatched — so the pin is aimed at the one channel that does exist: the
+    /// provider id, which a user's config could spell as anything at all. It is
+    /// spelled here as the vendor refusal body itself, so the assertion is the
+    /// sibling's assertion, and it fails the moment the id stops going through
+    /// `sanitized_provider_id`.
+    #[test]
+    fn a_skill_refusal_carries_no_provider_response_body() {
+        let system = real_system_prompt();
+        let proceed = corpus_body(PROCEED_BODY_BYTES);
+        let message = refusal(
+            SkillStage::Body,
+            "proceed",
+            &system,
+            &proceed,
+            &derive(remote(0, 0, false)),
+            Some("Input token length too long"),
+        );
+        assert!(
+            !message.contains("Input token length"),
+            "a provider's own words reached a refusal no provider saw: {message}"
+        );
+        // Non-vacuity: the id did reach the sentence — sanitized, as one token.
+        assert!(
+            message.contains("`Input_token_length_too_long`"),
+            "{message}"
+        );
+        assert!(
+            !message.contains('\n'),
+            "the refusal is one line; an id cannot forge a second: {message}"
+        );
+    }
+
+    /// **The refusal reports the budget the turn is running under, not one it
+    /// derived for itself** (AC-12, BR-8).
+    ///
+    /// The fixture is a `RouteBudget` no `BudgetInputs` produces — one word,
+    /// one byte, bound `local engine`. Anything that re-derived from the route
+    /// instead of reading the stamped value would print the local pair, and
+    /// would then be a second source for the one fact this module exists to
+    /// decide once (REQ-586 verify M1 is what that looks like in production).
+    #[test]
+    fn the_refusal_reports_the_stamped_budget_never_a_re_derived_one() {
+        let stamped = RouteBudget {
+            budget_tokens: 1,
+            budget_bytes: 1,
+            bound: BudgetBound::LocalEngine,
+            window_label: LOCAL_WINDOW_LABEL.to_owned(),
+            digest_threshold_tokens: 1,
+            digest_threshold_bytes: 1,
+            floored: false,
+        };
+        let message = refusal(
+            SkillStage::Body,
+            "status",
+            "HEAD",
+            "a skill body",
+            &stamped,
+            None,
+        );
+        assert!(message.contains("the budget is 1 words / 1 B"), "{message}");
+        assert!(
+            !message.contains(&thousands(LOCAL_BUDGET_TOKENS as u64)),
+            "the local pair appeared beside a budget that is not it: {message}"
+        );
+    }
+
+    /// A turn that fits composes nothing: `SkillFit::Fits` carries no message,
+    /// so there is no path by which a fitting skill acquires a refusal to print.
+    #[test]
+    fn a_fitting_expansion_composes_no_refusal() {
+        let system = real_system_prompt();
+        assert_eq!(
+            skill_fit(
+                SkillStage::Body,
+                "status",
+                &system,
+                &corpus_body(STATUS_BODY_BYTES),
+                &derive(BudgetInputs::local()),
+                None,
+            ),
+            SkillFit::Fits
         );
     }
 }
