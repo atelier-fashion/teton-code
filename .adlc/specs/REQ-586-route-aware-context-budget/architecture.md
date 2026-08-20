@@ -95,7 +95,7 @@ derive(inputs):
   if inputs.is_local                 → default pair, bound = LocalEngine
   elif inputs.window == 0            → default pair, bound = DefaultUnknown
   else:
-    usable   = window − reservation (saturating; if 0 → default pair, DefaultUnknown)
+    usable   = window − reservation (saturating)
     tokens   = usable × 2 / 3                      (REMOTE_TOKENS_PER_WORD)
     bytes    = usable × 2                           (REMOTE_BYTES_PER_TOKEN_FLOOR)
     bound    = Window
@@ -105,7 +105,23 @@ derive(inputs):
                                     bytes = REDACT_SCANNABLE_CONTEXT_BYTES; bound = RedactScan
                                     (applies LAST; words stay; the byte guard binds — BR-4)
   digest thresholds = fraction × (tokens, bytes), capped by DIGEST_ABSOLUTE_CEILING
+  clamp    = both currencies floored at MIN_BUDGET_TOKENS / MIN_BUDGET_BYTES
+                                    (2,048 / 16,384 — half the local pair; the smallest
+                                     budget that can still hold the harness's own system
+                                     prompt, measured at 5,979 B). A window or cap below
+                                     the floor keeps its own bound (Window / UserCap) and
+                                     is NEVER reported as DefaultUnknown — the derivation
+                                     must never *raise* a declared ceiling, and it must
+                                     never claim a provider declared nothing when it did.
+                                     Honest cost, documented at the constant: a sub-floor
+                                     cap admits more than it asked for, because no budget
+                                     that holds the system prompt can honor it; the typed
+                                     context_length_exceeded is the backstop (REQ-586
+                                     verify, correctness + test-coverage review).
   window_label = "the local context window" | "<id>'s context window (Nk)" | "the redact-scannable window"
+                 (the id is charset-sanitized and length-bounded where the label is built —
+                  ADR-009 rule 2: the elision marker is harness-authored frame written into
+                  a block's own text, downstream of neutralize_envelope_tags)
 ```
 
 Precedence is stated and tested pairwise: `LocalEngine` > `DefaultUnknown`
