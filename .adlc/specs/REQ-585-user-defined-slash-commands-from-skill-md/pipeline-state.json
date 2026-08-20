@@ -3,9 +3,29 @@
   "branch": "feat/REQ-585-user-defined-slash-commands",
   "startedAt": "2026-08-20T07:12:20Z",
   "completed": false,
-  "currentPhase": 0,
-  "completedPhases": [],
-  "phaseHistory": [],
+  "currentPhase": 3,
+  "completedPhases": [
+    0,
+    1,
+    2
+  ],
+  "phaseHistory": [
+    {
+      "phase": 0,
+      "name": "Create Worktree",
+      "completedAt": "2026-08-20T07:12:32Z"
+    },
+    {
+      "phase": 1,
+      "name": "Validate Spec",
+      "completedAt": "2026-08-20T12:10:07Z"
+    },
+    {
+      "phase": 2,
+      "name": "Architect",
+      "completedAt": "2026-08-20T13:05:00Z"
+    }
+  ],
   "integrationBranch": "main",
   "repos": {
     "teton-code": {
@@ -14,9 +34,9 @@
       "worktree": "/Users/brettluelling/Documents/GitHub/teton-code/.worktrees/REQ-585",
       "branch": "feat/REQ-585-user-defined-slash-commands",
       "touched": true,
-      "prUrl": null,
-      "prNumber": null,
-      "prCreatedAt": null,
+      "prUrl": "https://github.com/atelier-fashion/teton-code/pull/195",
+      "prNumber": 195,
+      "prCreatedAt": "2026-08-20T07:12:23Z",
       "merged": false,
       "snapshotBranch": null,
       "snapshotPR": null
