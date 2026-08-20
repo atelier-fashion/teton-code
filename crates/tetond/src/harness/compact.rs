@@ -77,6 +77,7 @@
 //! |---|---|
 //! | **link 1** — `compact_if_pressured` returns declined before ever asking the duty | `harness::context::tests::a_routed_compaction_replaces_the_blocks_it_forgets`, `…::compaction_runs_ahead_of_the_hard_gate_not_at_it`, `runtime::tests::dispatch::compact::a_performed_compaction_announces_its_route_and_a_declined_one_does_not`, and every other compaction test in `harness::context` |
 //! | **link 2** (parse) — `read_compaction` keeps the numbers it managed to read instead of failing the whole answer | `harness::compact::tests::a_partly_readable_answer_is_no_answer_at_all`, `harness::context::tests::a_half_readable_compaction_is_not_half_applied` |
+//! | **link 3** (apply) — the accepted range is taken from the conversation (`blocks.len() − 1`) instead of from the offer (`CompactOffer::droppable`) | `harness::context::tests::an_answer_naming_a_block_that_was_never_offered_is_refused_not_applied` — **and nothing else**, which is how a bounded offer came to accept an answer about blocks it never rendered (verify C1) |
 //! | **link 3** (apply) — the over-budget candidate is committed instead of rejected | `harness::context::tests::an_over_budget_compaction_is_rejected_rather_than_rescued` |
 //! | **link 3** (apply) — the no-shrink refusal is removed | `harness::context::tests::a_compaction_that_does_not_shrink_the_context_is_rejected` |
 //! | **link 3** (apply) — the forget set is applied but no replacement block is inserted | `harness::context::tests::a_routed_compaction_replaces_the_blocks_it_forgets` + 4 others |
@@ -264,11 +265,24 @@ const FORGET_MARKER: &str = "FORGET:";
 /// The marker introducing the paragraph that replaces them.
 const SUMMARY_MARKER: &str = "SUMMARY:";
 
-/// The note appended to the block the duty may not forget.
+/// The note appended to the block the duty may not forget — the **aside**, on
+/// the numbered line itself.
 ///
-/// Written once because it appears in two places now: inline after the last
-/// block when the whole conversation was offered, and inside
-/// [`offer_footer`] when only a prefix of it was.
+/// The protected block is named twice in a prompt that offers it, and the two
+/// wordings are deliberately not one string (verify D2). This one is an aside
+/// hanging off a line the reader is already on ("this block"); [`offer_footer`]
+/// says the same thing as a *sentence about a numbered block* ("block 200 is
+/// the step in progress and cannot be forgotten"), because it has to be
+/// readable when block 200 was never rendered — which is the case the footer
+/// exists for. Composing both from one fragment would make one of them read as
+/// a fragment.
+///
+/// Neither is a fact anything is derived from: the protection is enforced by
+/// [`CompactOffer::droppable`] and [`read_compaction`], whatever the prompt
+/// said, so a drift between these two sentences costs a badly-phrased question
+/// and never a wrongly-applied answer. Both spellings are pinned verbatim —
+/// the aside by `the_duty_prompt_numbers_every_block_and_protects_the_last`,
+/// the sentence by `a_two_hundred_block_conversation_still_fits_the_duty_prompt`.
 const PROTECTED_BLOCK_NOTE: &str = "   (the step in progress — this block cannot be forgotten)\n";
 
 /// The line that tells the duty exactly which slice of the conversation it was
@@ -285,6 +299,63 @@ fn offer_footer(offered: usize, total: usize) -> String {
         "(offered blocks 1..{offered} of {total}; block {total} is the step in progress and \
          cannot be forgotten)\n"
     )
+}
+
+/// A rendered `compact` offer: the prompt, and **how much of the conversation
+/// it actually showed** (REQ-586 verify, C1).
+///
+/// The two travel together because the second is what bounds the first's
+/// answer. Once the offer became a bounded prefix (BR-6), "how many blocks may
+/// this answer name" stopped being a fact about the conversation and became a
+/// fact about the *prompt*: a duty shown blocks 1..24 of 200 that answers
+/// `FORGET: 1..150` has written about blocks nobody rendered, and applying it
+/// would delete 126 blocks the duty never saw and replace them with a summary
+/// written from the 24 it did. Both post-checks (over-budget, no-shrink) pass
+/// for that answer — the context genuinely got smaller — so nothing downstream
+/// would catch it.
+///
+/// [`Self::droppable`] is therefore the one number [`read_compaction`] should
+/// ever be given, and it is computed here, beside the loop that decided how
+/// much to render, rather than at the call site from `blocks.len()`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CompactOffer {
+    prompt: String,
+    offered: usize,
+    total: usize,
+}
+
+impl CompactOffer {
+    /// The rendered duty prompt.
+    #[must_use]
+    pub fn prompt(&self) -> &str {
+        &self.prompt
+    }
+
+    /// How many of the conversation's blocks the prompt rendered.
+    #[must_use]
+    pub const fn offered(&self) -> usize {
+        self.offered
+    }
+
+    /// How many blocks the duty's answer may name — the leading blocks of the
+    /// offer, minus the step in progress.
+    ///
+    /// `min(offered, total − 1)`, and both halves are load-bearing: the offer
+    /// bounds it because a block that was never rendered cannot have been
+    /// chosen, and `total − 1` bounds it because the newest block is the step
+    /// the turn is working on — the one block neither the duty nor
+    /// `truncate_to_budget` may take. When the whole conversation fits (every
+    /// pre-REQ-586 render, and every small one since) `offered == total` and
+    /// this is exactly the `blocks.len() − 1` the apply step used to pass.
+    #[must_use]
+    pub const fn droppable(&self) -> usize {
+        let protected = self.total.saturating_sub(1);
+        if self.offered < protected {
+            self.offered
+        } else {
+            protected
+        }
+    }
 }
 
 /// One compaction the duty asked for, already checked against the list it was
@@ -361,8 +432,18 @@ pub const fn worth_compacting(blocks: usize) -> bool {
 /// A conversation whose *first* block already overflows the budget still offers
 /// that block — one over-budget prompt that the engine refuses is a degraded
 /// fold, whereas an empty list is an unanswerable question every time.
+///
+/// ## The offer is also what bounds the answer (verify C1)
+///
+/// The returned [`CompactOffer`] carries the offered count, and
+/// [`CompactOffer::droppable`] is the range [`read_compaction`] must be given.
+/// Rendering a prefix while accepting an answer about the whole conversation
+/// is the one way a bounded offer can *lose* a conversation rather than
+/// compact it: every block between the end of the offer and the largest number
+/// the answer named would be deleted unseen, and replaced by a summary written
+/// from the prefix alone.
 #[must_use]
-pub fn compact_prompt(blocks: &[ContextBlock], prompt_budget_bytes: usize) -> String {
+pub fn compact_offer(blocks: &[ContextBlock], prompt_budget_bytes: usize) -> CompactOffer {
     let mut prompt = String::new();
     prompt.push_str(
         "Below is a numbered list of the blocks of one conversation between a person and an \
@@ -406,7 +487,25 @@ pub fn compact_prompt(blocks: &[ContextBlock], prompt_budget_bytes: usize) -> St
     if total > 0 {
         prompt.push_str(&offer_footer(offered, total));
     }
-    prompt
+    CompactOffer {
+        prompt,
+        offered,
+        total,
+    }
+}
+
+/// The rendered prompt alone — [`compact_offer`] for a caller that will not
+/// apply an answer.
+///
+/// The stand-in engine's recognizer and the prompt-shape tests want the string
+/// and nothing else. A caller that *applies* what the duty answers must take
+/// the whole [`CompactOffer`] instead: the accepted range is a fact about this
+/// prompt (how much of the conversation it rendered), not about the
+/// conversation, and re-deriving it from `blocks.len()` is exactly the drop C1
+/// found.
+#[must_use]
+pub fn compact_prompt(blocks: &[ContextBlock], prompt_budget_bytes: usize) -> String {
+    compact_offer(blocks, prompt_budget_bytes).prompt
 }
 
 /// How many blocks a compact prompt offered.
@@ -740,7 +839,8 @@ mod tests {
         // Non-vacuity: rendered whole, this conversation is far past the window.
         assert!(blocks.len() * COMPACT_BLOCK_MAX_BYTES > COMPACT_PROMPT_BUDGET_BYTES);
 
-        let prompt = compact_prompt(&blocks, COMPACT_PROMPT_BUDGET_BYTES);
+        let offer = compact_offer(&blocks, COMPACT_PROMPT_BUDGET_BYTES);
+        let prompt = offer.prompt();
 
         assert!(
             prompt.len() <= COMPACT_PROMPT_BUDGET_BYTES,
@@ -748,7 +848,24 @@ mod tests {
             prompt.len(),
             COMPACT_PROMPT_BUDGET_BYTES
         );
-        let offered = offered_block_count(&prompt);
+        let offered = offered_block_count(prompt);
+        // **Verify C1.** What the answer may name is bounded by what the prompt
+        // showed, not by what the conversation holds: on a partial offer the
+        // two are 175 blocks apart, and every one of those blocks would be
+        // deleted unseen by an answer resolved against the conversation.
+        assert_eq!(
+            offer.offered(),
+            offered,
+            "the rendered list and the reported count are one fact"
+        );
+        assert_eq!(offer.droppable(), offer.offered());
+        assert!(
+            offer.droppable() < blocks.len() - 1,
+            "a partial offer must accept less than the whole conversation: \
+             {} against {}",
+            offer.droppable(),
+            blocks.len() - 1
+        );
         assert!(
             (1..200).contains(&offered),
             "a partial offer is still an offer, and an empty one is not: {offered}"

@@ -21,10 +21,30 @@
 //! tokens ([`approx_tokens`]) and UTF-8 bytes. The token heuristic undercounts
 //! pathological content — a minified single-line file is a handful of "words"
 //! but tens of thousands of real BPE tokens — so every budget here carries a
-//! byte-denominated twin sized to the local engine's window (bytes are a
-//! conservative proxy for BPE tokens: code averages ≳2 bytes per BPE token).
-//! This is what keeps one dense block from pushing an assembled prompt past the
-//! engine window and killing the turn.
+//! byte-denominated twin (bytes are a conservative proxy for BPE tokens: code
+//! averages ≳2 bytes per BPE token). This is what keeps one dense block from
+//! pushing an assembled prompt past the window and killing the turn.
+//!
+//! ## The pair is the **route's**, and it can change mid-turn (REQ-586)
+//!
+//! Both halves used to be sized to the local engine's window, because there was
+//! one window. Since REQ-586 the pair comes from
+//! [`harness::budget::derive`](super::budget::derive) for the route the turn is
+//! taking — 32,768 bytes on the local tier, ≈250 KB on a 128k remote one — and
+//! three things here follow from that:
+//!
+//! - [`ContextManager::rebudget`] sets a new pair and re-runs the gate without
+//!   re-seeding, for the reroute arms (a privacy block pinning a turn local, a
+//!   provider failure falling back to a smaller window).
+//! - [`ContextManager::truncate_to_budget`] returns a [`PressureReport`] — what
+//!   it dropped, what it clamped, whether the clamped block was the user's own
+//!   newest message, and whether the context still does not fit — because the
+//!   manager holds no events handle and BR-7 forbids a silent clamp.
+//! - The in-prompt elision marker names the route's window rather than the
+//!   local engine's: the manager carries a `window_label`
+//!   ([`ContextManager::with_window_label`], from `RouteBudget::window_label`)
+//!   and the gate's clamp renders it, while the six duty callers of
+//!   [`truncate_middle`] keep [`DEFAULT_WINDOW_LABEL`].
 //!
 //! Every context block carries a [`Provenance`] tag. That tag is the seam
 //! TASK-007's egress choke point plugs into: a [`ProvenanceHook`] is invoked for
@@ -38,7 +58,7 @@ use std::collections::BTreeSet;
 use teton_core::ProvenanceId;
 
 use super::compact::{
-    compact_prompt, read_compaction, under_pressure, worth_compacting, worth_compacting_again,
+    compact_offer, read_compaction, under_pressure, worth_compacting, worth_compacting_again,
     Compaction, COMPACT_PROMPT_BUDGET_BYTES,
 };
 use super::completion::context_provenance;
@@ -474,17 +494,38 @@ pub struct PressureReport {
     /// user did not send, which BR-7 makes a turn notice rather than only an
     /// event.
     pub newest_user_elided: bool,
+    /// Whether the gate finished with the context still over one of its
+    /// budgets (REQ-586 verify, m1).
+    ///
+    /// [`ContextManager::truncate_to_budget`] does not hold
+    /// `estimated_bytes() <= budget_bytes` unconditionally: the in-place clamp
+    /// floors the last block's room at 1 KiB so a degenerate configuration
+    /// cannot clamp it to nothing, and the drop loop stops at one block
+    /// whatever the word estimate says. Both are deliberate — a turn that
+    /// cannot fit is better than a turn with no content — but a report that
+    /// stayed silent about it would let an over-budget context reach the
+    /// provider with no `context_pressure` at all, which BR-7 forbids.
+    ///
+    /// Stated as "over" rather than "fits" so that [`Default`] — the report of
+    /// a gate that had nothing to do — is still the quiet one.
+    pub over_budget: bool,
 }
 
 impl PressureReport {
-    /// Whether nothing happened — no block dropped and nothing elided.
+    /// Whether nothing happened — no block dropped, nothing elided, and the
+    /// context inside both budgets.
     ///
     /// The call sites' guard against announcing a non-event: `truncate_to_budget`
     /// runs unconditionally on every loop iteration and on every commit, so the
     /// overwhelming majority of reports are quiet ones.
+    ///
+    /// [`over_budget`](Self::over_budget) counts as news even when the gate did
+    /// nothing else: it means the *next* thing that happens is a provider being
+    /// handed more than the route's budget, which is the one case BR-7 exists
+    /// to make impossible to miss.
     #[must_use]
     pub const fn is_quiet(&self) -> bool {
-        self.dropped_blocks == 0 && self.elided_bytes == 0
+        self.dropped_blocks == 0 && self.elided_bytes == 0 && !self.over_budget
     }
 }
 
@@ -1109,15 +1150,21 @@ impl ContextManager {
         // 128k conversation rendered whole would refuse over-window and degrade
         // to the deterministic drop on every fold. A partial offer still
         // compacts — the answer is block numbers.
-        let prompt = compact_prompt(&self.blocks, COMPACT_PROMPT_BUDGET_BYTES);
-        let answer = match route.perform(&prompt, &provenance).await {
+        let offer = compact_offer(&self.blocks, COMPACT_PROMPT_BUDGET_BYTES);
+        let answer = match route.perform(offer.prompt(), &provenance).await {
             Ok(answer) => answer,
             Err(error) => return CompactionOutcome::degraded(error),
         };
-        // The most recent block is the step in progress, so only the blocks
-        // before it are offered — the same block `truncate_to_budget` refuses to
-        // drop, refused here too rather than left for the gate to notice.
-        let compaction = match read_compaction(&answer, self.blocks.len() - 1) {
+        // The accepted range is the **offer's**, not the conversation's (REQ-586
+        // verify C1): a bounded prompt shows a prefix, and a number past its end
+        // names a block this duty never saw. Accepting it would delete every
+        // block between the end of the offer and that number — unseen, and
+        // replaced by a summary written from the prefix alone — with both
+        // post-checks below still passing, because a context that lost 126
+        // blocks did get smaller. `droppable()` also carries the older half of
+        // the rule: the most recent block is the step in progress, the same
+        // block `truncate_to_budget` refuses to drop.
+        let compaction = match read_compaction(&answer, offer.droppable()) {
             Ok(compaction) => compaction,
             Err(error) => return CompactionOutcome::degraded(error),
         };
@@ -1283,6 +1330,18 @@ impl ContextManager {
     /// matter what any single block carries: the turn degrades instead of
     /// handing the engine an over-window prompt it can only refuse.
     ///
+    /// ## It does not *promise* to fit, and says so when it does not (verify m1)
+    ///
+    /// Two arms here stop short of the budget on purpose, and this method used
+    /// to claim the postcondition anyway. The clamp floors the last block's
+    /// room at 1 KiB, so a configuration whose system prompt is near or over
+    /// the whole byte budget ends over budget rather than with a block clamped
+    /// to nothing; and the drop loop stops at one block, so a single block of
+    /// very short words can stay over the *word* budget with the bytes fitting.
+    /// Both are the right degradation, and neither may be silent:
+    /// [`PressureReport::over_budget`] carries the fact, `is_quiet` counts it
+    /// as news, and the gate announces it (BR-7).
+    ///
     /// ## It re-baselines the regrowth mark (REQ-561 verify)
     ///
     /// This method only ever makes the context *smaller*, and the size it leaves
@@ -1361,6 +1420,10 @@ impl ContextManager {
         if let Some(committed) = self.compaction.committed_bytes {
             self.compaction.committed_bytes = Some(committed.min(self.estimated_bytes()));
         }
+        // The final check, in both currencies: whatever the two floors above
+        // left behind is what the provider is about to be handed (verify m1).
+        report.over_budget = self.estimated_bytes() > self.budget_bytes
+            || self.estimated_tokens() > self.budget_tokens;
         report
     }
 
@@ -2607,6 +2670,63 @@ mod tests {
         assert!(ctx.blocks().last().unwrap().text.starts_with("39"));
     }
 
+    /// **Verify m1.** The gate has two floors it will not clamp past, and a
+    /// context that ends over budget because of them is *news*, not a clean
+    /// fit.
+    ///
+    /// Both arms leave `dropped_blocks == 0` and `elided_bytes == 0`, which is
+    /// exactly the report that used to read as "nothing happened, everything
+    /// fits" — `is_quiet()` was true, `announce_pressure` returned early, and
+    /// an over-budget context went to the provider with no `context_pressure`
+    /// event at all (BR-7 forbids precisely that).
+    #[test]
+    fn a_context_the_gate_could_not_fit_is_not_a_quiet_one() {
+        // (a) The byte floor: a system prompt larger than the whole byte
+        // budget, so the clamp's `room.max(1_024)` leaves the estimate over.
+        let mut ctx = ContextManager::new("x".repeat(5_000), 1_000_000).with_budget_bytes(1_000);
+        ctx.push_user("hello");
+
+        let report = ctx.truncate_to_budget();
+
+        assert_eq!(report.dropped_blocks, 0, "there was nothing to drop");
+        assert_eq!(report.elided_bytes, 0, "and nothing worth clamping");
+        assert!(
+            ctx.estimated_bytes() > 1_000,
+            "non-vacuity: the postcondition this method used to claim really \
+             does not hold here ({} bytes against 1,000)",
+            ctx.estimated_bytes()
+        );
+        assert!(report.over_budget, "{report:?}");
+        assert!(
+            !report.is_quiet(),
+            "a context the gate could not fit is the one thing that must never \
+             be announced as a clean turn: {report:?}"
+        );
+
+        // (b) The word currency: the drop loop stops at one block, so a single
+        // block of very short words stays over the word budget with the bytes
+        // comfortably inside it — the clamp never fires and the old report
+        // said nothing at all.
+        let mut ctx = ContextManager::new("sys", 10).with_budget_bytes(1_000_000);
+        ctx.push_user("a b c d e f g h i j k l m n o p");
+
+        let report = ctx.truncate_to_budget();
+
+        assert_eq!((report.dropped_blocks, report.elided_bytes), (0, 0));
+        assert!(ctx.estimated_tokens() > 10, "{}", ctx.estimated_tokens());
+        assert!(ctx.estimated_bytes() < 1_000_000);
+        assert!(report.over_budget, "{report:?}");
+        assert!(!report.is_quiet(), "{report:?}");
+
+        // And the ordinary case is still quiet: this must not turn every gate
+        // call into an announcement.
+        let mut ctx = ContextManager::new("sys", 10_000).with_budget_bytes(100_000);
+        ctx.push_user("a short question");
+        let report = ctx.truncate_to_budget();
+        assert!(!report.over_budget);
+        assert_eq!(report, PressureReport::default());
+    }
+
     /// **BR-7 / AC-10, the marker.** The sentence the model reads names the
     /// window the turn actually ran against.
     #[test]
@@ -2919,6 +3039,113 @@ mod tests {
             "a compaction that fit its budget leaves the hard gate nothing to do"
         );
         assert!(ctx.estimated_bytes() <= TEST_BUDGET_BYTES);
+    }
+
+    /// **Verify C1.** A bounded offer bounds the *accepted* range too: an
+    /// answer naming a block the prompt never rendered is refused whole, not
+    /// applied.
+    ///
+    /// The drop this guards is silent and total. `compact_prompt` renders the
+    /// oldest blocks that fit ≈24.5 KB and states the slice it showed, but the
+    /// apply step used to resolve the answer against `blocks.len() − 1` — so on
+    /// this fixture's own shape (200 blocks, ~24 offered) a duty answering
+    /// `FORGET: 1..150` would have had **every one** of blocks 25..150 deleted
+    /// unseen and replaced by a paragraph written from the 24 that were shown.
+    /// Both post-checks pass for that answer (a context that lost 126 blocks
+    /// really is smaller, and really does fit), so nothing downstream could
+    /// have caught it.
+    ///
+    /// The non-vacuity is the second assertion: the very same answer parses
+    /// **fine** against the old range, which is what makes this a test of the
+    /// range and not of the parser.
+    ///
+    /// The budget here is 100 KB rather than [`TEST_BUDGET_BYTES`] on purpose,
+    /// and it is what makes the mutation *commit*: the survivors of a
+    /// `FORGET: 1..150` fit 100 KB comfortably, so the over-budget and
+    /// no-shrink checks both pass and the wrong answer is applied. Against a
+    /// 4 KB budget the same mutation is caught by the over-budget check for a
+    /// reason that has nothing to do with the offer, which would make this test
+    /// pass for the wrong reason.
+    #[tokio::test]
+    async fn an_answer_naming_a_block_that_was_never_offered_is_refused_not_applied() {
+        let mut ctx = ContextManager::new("sys", 1_000_000).with_budget_bytes(100_000);
+        for i in 0..200 {
+            ctx.push_user(format!("block {i} {}", "x".repeat(1_000)));
+        }
+        assert!(
+            ctx.under_compaction_pressure(),
+            "the fixture must be pressured or the duty is never asked: {} bytes",
+            ctx.estimated_bytes()
+        );
+        let offered = compact_offer(ctx.blocks(), COMPACT_PROMPT_BUDGET_BYTES).offered();
+        assert!(
+            (2..150).contains(&offered),
+            "this fixture needs a genuinely partial offer with room past its \
+             end for the duty to name: {offered} of 200"
+        );
+
+        // An answer about the oldest 150 blocks: in range for the conversation,
+        // out of range for the prompt that was actually rendered.
+        let answer = forget_first(150);
+        assert!(
+            read_compaction(&answer, ctx.blocks().len() - 1).is_ok(),
+            "non-vacuity: this answer is exactly what the pre-fix apply step \
+             accepted — the range is the whole difference"
+        );
+
+        let (route, calls) = stub(StubAnswer::Says(answer));
+        let out = ctx.compact_if_pressured(&route).await;
+
+        assert_eq!(calls.load(AtomicOrdering::SeqCst), 1, "the duty was asked");
+        assert!(
+            out.degraded,
+            "an answer written about blocks nobody rendered is not an answer to \
+             the question that was asked"
+        );
+        assert!(
+            out.reason
+                .as_deref()
+                .is_some_and(|why| why.contains("may not forget")),
+            "the refusal must say which block it could not accept: {:?}",
+            out.reason
+        );
+        assert_eq!(out.dropped_blocks, 0);
+        assert_eq!(
+            ctx.blocks().len(),
+            200,
+            "nothing may be forgotten on a refused answer — this is the \
+             conversation-loss C1 found"
+        );
+        assert!(
+            ctx.blocks()[24].text.starts_with("block 24 "),
+            "and the blocks past the end of the offer are the ones still here"
+        );
+    }
+
+    /// The other half of C1: when the whole conversation fits the prompt, the
+    /// accepted range is exactly what it was before REQ-586 — `blocks.len() −
+    /// 1`, the step in progress protected and everything else droppable.
+    ///
+    /// A fix that bounded the range too tightly would be just as wrong as one
+    /// that bounded it too loosely, and every conversation short enough to
+    /// render whole (which is most of them) takes this path.
+    #[test]
+    fn a_whole_conversation_offers_every_block_but_the_step_in_progress() {
+        let ctx = conversation(5, 1_000);
+        let offer = compact_offer(ctx.blocks(), COMPACT_PROMPT_BUDGET_BYTES);
+        assert_eq!(offer.offered(), 5, "the whole conversation was rendered");
+        assert_eq!(
+            offer.droppable(),
+            ctx.blocks().len() - 1,
+            "the pre-REQ-586 range, unchanged"
+        );
+        // And a degenerate conversation has nothing to forget rather than an
+        // underflowing range.
+        let one = conversation(1, 10);
+        assert_eq!(
+            compact_offer(one.blocks(), COMPACT_PROMPT_BUDGET_BYTES).droppable(),
+            0
+        );
     }
 
     /// **AC-14.** The duty stubbed three ways — never returns, returns garbage,

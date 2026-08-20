@@ -46,17 +46,20 @@ use teton_protocol::events::{
 use teton_protocol::SessionId;
 
 use tetond::broadcast::EventBus;
+use tetond::carry::CarriedTurn;
 use tetond::harness::budget::derive;
 use tetond::harness::compact::{
     compact_prompt, offered_block_count, COMPACT_OUTPUT_CONTRACT, COMPACT_PROMPT_BUDGET_BYTES,
 };
 use tetond::harness::context::PressureReport;
 use tetond::harness::{
-    run_session_turn_with_source, BudgetInputs, ContextManager, DutyRoute, HarnessConfig,
-    LocalEngineSource, NoopProvenanceHook, PendingPermissions, PermissionConfig, PermissionGate,
-    RouteBudget, SessionEvents, ToolContext, ToolDuties, ToolRegistry, COMPACT_DUTY, DIGEST_DUTY,
-    SHELL_DUTY, TRIAGE_DUTY,
+    build_system_prompt, run_session_turn_with_source, BudgetInputs, ContextManager, DutyRoute,
+    HarnessConfig, LocalEngineSource, NoopProvenanceHook, PendingPermissions, PermissionConfig,
+    PermissionGate, RouteBudget, SessionEvents, ToolContext, ToolDuties, ToolRegistry,
+    COMPACT_DUTY, DIGEST_DUTY, SHELL_DUTY, TRIAGE_DUTY,
 };
+use tetond::runtime::SessionTaint;
+use tetond::sessions::SessionRegistry;
 
 /// The system head these fixtures budget against.
 ///
@@ -688,6 +691,91 @@ async fn a_two_hundred_block_conversation_on_a_big_route_compacts_through_the_lo
         blocks.len(),
         200 - outcome.dropped_blocks + 1,
         "the forgotten blocks were replaced by exactly one summary"
+    );
+}
+
+// ===========================================================================
+// BR-7 — the seeding path stamps the label, not just the fixtures
+// ===========================================================================
+
+/// **Verify M7-a.** The window label reaches the marker through the path
+/// production actually takes: [`CarriedTurn::begin`].
+///
+/// Every other marker test in this suite (and the fixture above) seeds a
+/// [`ContextManager`] by hand with `.with_window_label(..)`, which is a
+/// re-implementation of one line of `CarriedTurn::begin` — so deleting that
+/// line from `carry.rs` left the whole package green while every real turn's
+/// marker went back to naming the local engine's window on a remote route.
+/// This test never calls `with_window_label`: it hands `begin` a
+/// [`HarnessConfig`] carrying the route's [`RouteBudget`] and reads the marker
+/// out of the prompt the engine was served, which is the only way the stamp can
+/// have got there.
+///
+/// ## The shape
+///
+/// A deliberately narrow remote window (8,000 provider tokens → 4,650 words /
+/// 13,952 bytes), so one pasted block busts it and is clamped in place with the
+/// marker. The whole conversation is the new prompt — nothing carried — because
+/// what is under test is the seeding, not the replay.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_marker_names_the_routes_window_when_the_turn_is_seeded_by_carried_turn() {
+    let fixture = Fixture::new("carryseed", "I answered the shortened version.");
+    let budget = derive(BudgetInputs {
+        window: 8_000,
+        cap: 0,
+        reservation: 1_024,
+        is_local: false,
+        redact_scan: false,
+        provider_id: Some("kimi"),
+    });
+    assert_eq!(budget.window_label, "kimi's context window");
+    let config = HarnessConfig::default().with_route_budget(budget.clone());
+
+    // Seeded exactly as `DaemonRuntime::run_prompt_turn` seeds a turn: the head
+    // rebuilt from this turn's tools and route, the budgets and the window
+    // label taken from `config` by `begin` itself.
+    let sessions = SessionRegistry::new();
+    let mut conversation = CarriedTurn::begin(
+        &sessions,
+        &fixture.session,
+        build_system_prompt(&fixture.tools, &config),
+        &config,
+        Arc::new(SessionTaint::new()),
+        Vec::new(),
+        format!("review this paste:\n{}", filler(6_000)),
+    );
+    // Non-vacuity: the pasted block really is over the route's byte budget, so
+    // the clamp has to fire and a marker has to be written.
+    assert!(
+        conversation.ctx().estimated_bytes() > budget.budget_bytes,
+        "{} bytes against {}",
+        conversation.ctx().estimated_bytes(),
+        budget.budget_bytes
+    );
+
+    let mut sub = fixture.bus.subscribe(1_024);
+    fixture.turn(conversation.ctx_mut(), &config).await;
+    let published = drain(&mut sub);
+    conversation.abandon();
+
+    let prompt = fixture.prompt(0);
+    assert!(
+        prompt.contains("kimi's context window"),
+        "a turn seeded by `CarriedTurn::begin` must carry the route's window \
+         label into the marker; nothing in this test stamps it by hand: {}",
+        &prompt[..prompt.len().min(400)]
+    );
+    assert!(
+        !prompt.contains("the local context window"),
+        "…and must not fall back to the local engine's name on a remote route"
+    );
+    assert!(
+        published
+            .pressure
+            .iter()
+            .any(|p| p.newest_user_elided && p.bound == BudgetBound::Window),
+        "the clamp landed on the user's own message and is announced: {:?}",
+        published.pressure
     );
 }
 

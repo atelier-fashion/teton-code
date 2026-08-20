@@ -208,17 +208,32 @@ pub struct HarnessConfig {
     pub max_turns: u32,
     /// Token budget for the assembled context, in whitespace-approximated
     /// tokens ([`super::context::approx_tokens`]).
+    ///
+    /// **Not hand-set on a routed turn** (REQ-586): the router derives it from
+    /// the route's window with [`super::budget::derive`] and stamps it through
+    /// [`with_route_budget`](Self::with_route_budget) on every route decision,
+    /// which overwrites whatever a caller wrote here. Setting it directly is
+    /// for the transport-free offline path and for tests; everywhere else the
+    /// pair, the thresholds and [`budget`](Self::budget) travel together.
     pub context_budget_tokens: usize,
-    /// Byte budget for the assembled context — the engine-window currency.
+    /// Byte budget for the assembled context — the window currency.
     ///
     /// The whitespace-token budget undercounts dense content (a minified
     /// single-line file is a handful of "words" but tens of thousands of real
     /// BPE tokens), so the context is bounded in bytes too: bytes are a
     /// conservative proxy for BPE tokens (code averages ≳2 bytes per token).
-    /// The default, `context_budget_tokens` × [`super::context::APPROX_BYTES_PER_TOKEN`],
-    /// keeps a full assembled prompt within the local engine's 16,384-token
-    /// window (`LOCAL_ENGINE_N_CTX` in the daemon's runtime) with headroom;
-    /// size it to `n_ctx` when configuring a different engine.
+    ///
+    /// The default is the local pair — `LOCAL_BUDGET_TOKENS` ×
+    /// [`APPROX_BYTES_PER_TOKEN`](super::context::APPROX_BYTES_PER_TOKEN),
+    /// which keeps a full assembled prompt within the local engine's
+    /// 16,384-token window (`LOCAL_ENGINE_N_CTX`) with headroom. A **remote**
+    /// route's bytes are not that bridge: [`super::budget::derive`] takes them
+    /// from the route's window at the 2 B/token BPE floor
+    /// (`DUTY_REQUEST_BYTES_PER_TOKEN`), because on a 128k window `words × 8`
+    /// would be a byte budget nothing measured. Like the word half, this is
+    /// stamped by [`with_route_budget`](Self::with_route_budget) on the next
+    /// route decision, so hand-sizing it for a different engine holds only
+    /// until then.
     pub context_budget_bytes: usize,
     /// Tool results larger than this (in approx tokens, or its byte twin) are
     /// condensed through the `digest` category (REQ-558) before they enter
@@ -583,6 +598,12 @@ impl SessionEvents {
 /// here: a refit is named by *why* the gate ran, which only the reroute arm
 /// knows, and a report that happens to look identical is a different piece of
 /// news.
+///
+/// A report that is *neither* — the gate could not fit the context at all
+/// ([`PressureReport::over_budget`], verify m1) — is announced as an elision
+/// with `elided_bytes: 0`, and that zero is the tell. There is no wire variant
+/// for "did not fit" and the alternative is silence, which is the one thing
+/// BR-7 rules out; the budget figures on the payload say what it did not fit.
 #[must_use]
 pub fn pressure_kind(report: &PressureReport) -> ContextPressureKind {
     if report.dropped_blocks > 0 {
