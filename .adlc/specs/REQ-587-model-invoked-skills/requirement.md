@@ -4,7 +4,7 @@ title: "Model-invoked skills — a `skill` tool lets the model expand a register
 status: draft
 deployable: true
 created: 2026-08-19
-updated: 2026-08-19
+updated: 2026-08-20
 component: "daemon/harness"
 domain: "harness"
 stack: ["rust", "daemon", "cli", "json-rpc"]
@@ -174,7 +174,18 @@ _Shapes below are illustrative — the field names and variant names are what
 | REQ-585's `skill_invoked`-shaped notice (additive field) | every expansion, user- or model-triggered | + `invoked_by: user \| model`; a model invocation additionally has the `tool_call` / `tool_call_update` events every tool call has, titled `skill <name>` (bounded echo) |
 | `skill_refused` (new, additive — or the same notice with a `refused` variant) | a model invocation refused for any typed reason | name, reason, and the reason's fields (`size`, `budget`, `bound` for `over_budget`; the cap for `per_turn_cap`) |
 
-Older clients ignore unknown events and fields (the REQ-573 additive rule);
+Older clients ignore unknown events and *fields* — but **not** unknown
+`PermissionSubject` variants: REQ-585 shipped that enum closed with
+`#[serde(other)] Unrecognized`, and that arm is a **refusal**, not an ignore
+(ADR-7's fail-closed rule). A new *variant* for BR-4's acknowledgment is
+therefore refused unconditionally by a REQ-585-vintage client — project skills
+are never model-invocable there, and AC-6's "next step named" names a step that
+client cannot perform. A new *field* on the existing `SkillDynamicContext`
+variant (BR-5's `invoked_by`) is ignored instead, which is worse in its own
+way: the human sees a consent listing shell commands with no indication a model
+chose them, the single fact the field exists to carry. Two clients on one
+session is a consented topology (REQ-570), so this is skew that happens
+(the REQ-573 additive rule);
 the CLI renders each as one line (BR-9).
 
 ### Permissions
@@ -356,7 +367,25 @@ the CLI renders each as one line (BR-9).
   once per invocation with every command listed verbatim — **after**
   `$ARGUMENTS`/`$N` substitution with the model-supplied arguments (REQ-585
   AC-5) and with the consent text saying the model invoked the skill, so the
-  human at `guarded`/`edits` sees exactly what will run and who asked. A
+  human at `guarded`/`edits` sees exactly what will run and who asked.
+
+  **The consent is addressed, and the tool path has no addressee today — this
+  is the rented seam most likely to be missed.** REQ-585 shipped
+  `authorize_skill(…, addressee: ConnectionId)` with the addressee
+  **required**, because a broadcast prompt would reach a client that turns a
+  piped `y` into shell consent (ADR-7). A gate with no route to address asks
+  **nobody** and answers `SkillConsent::Unanswerable`. But a `ConnectionId`
+  reaches `run_prompt_turn` as `invoker` and is consumed once, *before* the
+  turn loop; `ToolContext` carries no session and no connection, and the
+  loop's own `gate.authorize` takes none. So a model invocation has nothing to
+  address and would take the `Unanswerable` arm — no prompt ever drawn, three
+  placeholders reading "nobody could be asked", **byte-identical to the piped
+  case**. That degradation is silent, fail-closed, and satisfies BR-11's
+  letter, so an implementation can ship without ever asking anyone. The
+  addressee of a model-triggered consent is **the connection that submitted
+  the prompt turn**, and it must be threaded to the tool call site. An
+  invocation with no addressable connection yields `Unanswerable` and **says
+  so distinctly**, never wearing the decline text. A
   declined, denied, failed or timed-out command leaves REQ-585's explicit
   placeholder; at `plan` nothing runs and the placeholders name the level; at
   `full` they run without asking — the unattended posture REQ-585 BR-11
@@ -364,10 +393,23 @@ the CLI renders each as one line (BR-9).
   ethos include and its gates chooses `full`, as it does for every `shell`
   call. On piped stdin at a level that asks, the client refuses without
   reading a line and the placeholders say no human could be asked. Two
-  consequences are stated rather than hidden. First, **no new privilege**: the
-  commands a model-triggered skill can cause to run are a subset of what the
-  model could already run with `shell` at the same level — the skill's key
-  just asks about them as a set, with the skill named. Second, **remembered
+  consequences are stated rather than hidden. First, **no new privilege — in
+  the *content* dimension, and only that one**: the commands a model-triggered
+  skill can cause to run are a subset of what the model could already run with
+  `shell` at the same level, and the skill's key just asks about them as a set
+  with the skill named. In the **count and wall-time** dimension the claim is
+  false, and the gap is an open bug against the landlord: **BUG-185** records
+  that REQ-585 caps neither the number of `` !`…` `` slots in a body nor the
+  invocation's total wall time, and runs them sequentially at 30 s each inside
+  one non-cancellable `spawn_blocking` that holds the session claim. A model
+  `shell` call costs one loop iteration per command, so `max_turns` bounds it;
+  a `skill` call costs one iteration and runs N commands with N unbounded, and
+  BR-6's cap of 12 multiplies that — with no prompt at all at `full`, which is
+  AC-15(d)'s prescribed unattended posture. A cloned repo's 400-slot body,
+  invoked twelve times, is hours of blocking-pool time and `SESSION_BUSY` for
+  every later prompt. **This REQ does not close BUG-185, and must not ship
+  claiming it did**: either the slot cap and invocation deadline land first, or
+  this REQ's Deferred names the residual explicitly. Second, **remembered
   grants and model-chosen arguments**: "allow for this session" under a
   skill's key answers later *model* invocations of that skill too (that is
   what a session grant means), which is sound when the commands do not depend
@@ -436,11 +478,35 @@ the CLI renders each as one line (BR-9).
   fraction elsewhere) through a model call, and its failure arm truncates
   mechanically — a skill of 2,800 words (`/architect` with its ethos include)
   would otherwise reach the model as a few lines about itself. A procedure
-  condensed is not the procedure; the size check above is the only size
-  rule. The top-of-loop budget gate (REQ-567 BR-4) then does what it does —
+  condensed is not the procedure.
+
+  **Two checks, not one, and the stage is part of the refusal.** REQ-585
+  shipped `SkillStage::{Body, WithDynamicContext}`: Stage A measures before
+  consent is spent, with a `[dynamic context pending]` placeholder in each
+  slot; Stage B measures the folded text. BR-5 keeps dynamic context on the
+  model path, so a single check either under-measures (before the commands
+  run) or spends the user's consent on a call that is then refused.
+  `over_budget` therefore carries **which stage** refused, as
+  `skill_refusal`'s `measured_clause` already does, or the model cannot tell
+  the two apart. The top-of-loop budget gate (REQ-567 BR-4) then does what it does —
   `compact` at 70%, `truncate_to_budget` as the backstop — **loudly**
   (REQ-586 BR-7's `context_pressure`), and the expansion, being the newest
-  block, is never the one elided when it fit by the check above. Compaction
+  block, is never the one elided when it fit by the check above.
+
+  **The reroute seam is the exception REQ-585 built a guard for, and that
+  guard is blind to this REQ.** A mid-turn reroute — the privacy pin, or a
+  provider fallback — swaps in a smaller budget after the turn was assembled,
+  and `refit_for_reroute` then clamps the newest block, which is the
+  expansion. REQ-585 closed that with `skill_would_not_survive_refit`, but it
+  reads `skill_turn`, which is populated only for a **user-typed** `/name`. A
+  model-invoked expansion returns `None` and is middle-elided silently — the
+  precise failure this BR exists to prevent, at the one seam already
+  understood to threaten it. The guard must take the turn's model-invoked
+  expansions too (a list, not one value). Where it fires today it does
+  `break 'turn Err(RpcError)`, ending the whole prompt turn; BR-6 and BR-9 say
+  a refusal is a typed outcome the model can relay, so **this REQ must say
+  which refusals are tool results and which end the turn**, and a reroute
+  refusal of a model invocation is a tool result. Compaction
   may later condense an *older* expansion (a `/proceed` body after three
   gates); that is the intended response to pressure, and the recovery path
   is re-invocation — zero-cost, budget permitting, and why the cap in BR-6
@@ -476,7 +542,7 @@ the CLI renders each as one line (BR-9).
   sentence, no second line containing "ask", no `teton …` shell form, and the
   resident prompt's byte headroom — which BR-2's roster also draws on, so the
   two are re-counted **together**, the amended sentence and the tool doc in
-  one prompt-margin run against today's ≈ 0.84 KB of headroom (informed by
+  one prompt-margin run against today's measured 778 usable bytes (informed by
   BUG-181, LESSON-543, REQ-585 BR-9,
   REQ-579 — the model hands off what it cannot run).
 - [ ] BR-9: **A model invocation is a tool call in every ledger, and it is
@@ -505,9 +571,18 @@ the CLI renders each as one line (BR-9).
   call time — the registry holds every body from discovery (REQ-585 BR-1,
   BR-14: a pure function of the files read) — so it is zero-I/O in the jail's
   sense, like `teton_docs`; unlike `teton_docs` its result carries the skill
-  file's path as provenance (REQ-585 BR-7's machinery), so a skill file under
-  a `local-only` boundary pins the turn exactly as `/name` does, and a
-  dynamic command's `Unknown` provenance pins as `shell` output does. `read`,
+  file's provenance (REQ-585 BR-7's machinery) — and that is **two rules, not
+  one**, because REQ-585 ADR-9 refused to widen the id minter. A **project**
+  skill is under the root, mints a root-relative `ProvenanceId`, and pins the
+  turn exactly as `/name` does. A **user** skill at `~/.claude/skills/…` has no
+  root-relative identity in a repo-rooted session, so its block is marked
+  `unknown` and pins the turn wherever **any** boundary is configured — related
+  to the file or not, and stricter than a `read` of the same bytes. A dynamic
+  command that **spawned** pins as `shell` output does. The consequence is
+  worth stating plainly rather than discovering in the runbook: on a
+  boundary-configured machine, *every* model invocation of one of the seventeen
+  `~/.claude` ADLC skills pins its turn to the local tier — which for the seven
+  that exceed the local budget means **refused** there, not run. `read`,
   `glob` and `grep` get **no exemption** for `~/.claude/…` or for the skill's
   directory: an allowlist of paths outside the root would be a second
   classifier of "what may be read" (LESSON-456), a surface the model can
@@ -639,9 +714,11 @@ the CLI renders each as one line (BR-9).
   third-party content and stays out of the repo) expands whole — no `digest`
   `route_decided`
   event, no elision, the body present verbatim in the next prompt; on the
-  local route it is refused `over_budget` with `bound: local_engine` naming
+  local route it is refused `over_budget` with `bound: local engine` naming
   the skill, size and budget; on a remote route with `max_context = 0` the
-  refusal says `bound: default_unknown` and names `capabilities.max_context`;
+  refusal says `bound: unknown window` and names `capabilities.max_context`
+  — the spoken forms `BudgetBound::words()` produces, never `wire_name()`'s
+  `local_engine` / `default_unknown` (BR-7);
   the digest-bypass assertion runs on the **default budget route** — the
   threshold at its 1,500-word default, where the fold would bite — where
   a 2,800-word fixture (the `architect` + ethos shape) above
@@ -653,26 +730,54 @@ the CLI renders each as one line (BR-9).
 - [ ] AC-9: The guide's capability sentence says who runs what per BR-8;
   `the_system_prompt_states_what_the_session_can_run_and_from_where` is
   updated, not deleted — one `/help` line, both paths, the re-worded
-  who-runs anchor asserted, before step 1, present in both shapes; the
+  who-runs anchor asserted, before step 1, present in both shapes, **and the
+  two needles REQ-585 BR-9 added and this AC previously omitted**:
+  `loads skills and commands from` and `no CLAUDE.md, agents or hooks`. Both
+  are asserted verbatim today, so BR-8's amended sentence must keep them or
+  re-word them deliberately — deleting either passes CI and silently removes
+  a guard; the
   `asking`-line count is still 1; no `teton …` form; the `cli_rows.rs`
   cross-check is green. (unit; BR-8)
 - [ ] AC-10: A model invocation raises `tool_call` with title `skill
   validate` (a 300-character name argument is echoed bounded), the session
-  prints the BR-9 echo line with `invoked by the model`, a refusal prints one
+  prints the BR-9 echo line with `invoked by the model` — in the shipped
+  spellings, not this spec's illustration: `teton_protocol::format_bytes`
+  (so `KiB`), and **both** counts whenever they differ (`3 dynamic commands,
+  1 run`), which AC-5's declined path produces routinely — a refusal prints one
   line naming the reason, `/verbose` shows path, flags, dynamic outcomes and
-  the turn's count, `/cost` rows are unchanged in shape and the next model
-  call's input tokens include the expansion. (`cli_e2e`; BR-9)
+  the turn's count. (`cli_e2e`; BR-9)
+
+  The **cost half runs elsewhere, and this split is not stylistic**:
+  `/cost` rows unchanged in shape, and the next model call's input tokens
+  including the expansion, are asserted in `crates/tetond/tests/skill_turn.rs`
+  against a remote `Vendor` mock. `cli_e2e`'s scripted tier is local and local
+  turns produce no billed row, so a cost assertion there is vacuous — which is
+  not a hypothetical: **BUG-183** is open against REQ-585's AC-19 for exactly
+  this, and records that deleting the whole `skills/` module leaves both of
+  its cost tests green. BR-9's headline claim (the expansion priced on every
+  subsequent model call, worst case ×25) is the one most needing a real remote
+  instrument, so it gets one. (daemon remote-loop fixture; BR-9)
 - [ ] AC-11: From a repo-rooted session `read ~/.claude/skills/validate/SKILL.md`
   is refused with REQ-583's jail message, byte-identical to today, while
   `skill { name: "validate" }` returns the body; a body referencing a
   companion file in its directory leaves that file unreadable and the
   refusal is the same. Egress-capture, with a remote provider bound to the
-  turn's tier: (a) a user skill under a `local-only` boundary invoked by the
-  model pins the turn local and nothing leaves — exactly as `/name` does
-  (REQ-585 AC-11a); (b) with any boundary configured, a model invocation
-  whose dynamic command ran pins local (`Unknown`); (c) with no boundary the
-  expansion reaches the provider inside the turn's request. (`cli_e2e` +
-  egress-capture; BR-10)
+  turn's tier, and the two file cases are **separate legs** because REQ-585
+  ADR-9 made them separate facts: (a) a **project** skill under a `local-only`
+  boundary invoked by the model pins the turn local and nothing leaves — it is
+  under the root, so `from_resolved` mints a root-relative id the glob matches,
+  exactly as `/name` does; (a2) a **user** skill at `~/.claude/skills/…` has
+  **no root-relative identity at all** in a repo-rooted session —
+  `from_resolved` refuses by design and the block is marked `unknown` — so it
+  pins the turn wherever **any** boundary is configured, related to the file or
+  not. That is stricter than a `read` of the same bytes and is the shipped
+  rule, not an approximation of (a); (b) with any boundary configured, a model
+  invocation whose dynamic command **spawned** pins local (`Unknown`) — the
+  predicate is `DynamicOutcome::spawned`, not `did_run`, because an exit status
+  is a value the command chose and REQ-585's verify closed that side channel; a
+  test written to "ran" exercises only the `Ran` arm and would pass if the
+  predicate regressed; (c) with no boundary the expansion reaches the provider
+  inside the turn's request. (`cli_e2e` + egress-capture; BR-10)
 - [ ] AC-12: `/help` marks `delta` `(model-only)` in the not-dispatchable
   shape and the diagnostic line counts it; `/delta` refuses with a hint
   naming `user-invocable: false`; `/beta` dispatches as REQ-585 says;
@@ -692,8 +797,15 @@ the CLI renders each as one line (BR-9).
   --workspace --no-fail-fast` green. (BR-12)
 - [ ] AC-15: **Dogfood, by hand, recorded in `docs/manual-verification.md`:**
   in the teton-code repo with the ADLC toolkit installed (its
-  `~/.claude/skills` a symlink) and the Kimi provider declared at
-  `max_context = 128000` (REQ-586 AC-14), (a) the user types `/proceed
+  `~/.claude/skills` a symlink), the Kimi provider at the window the shipped
+  recipe records — `max_context = 1000000`; a hand-lowered `128000` is equally
+  valid and the runbook records which was used — and **no privacy boundary
+  configured**. That last precondition is not optional and is why it is stated:
+  every ADLC skill lives under `~/.claude`, BR-10 makes a user skill's block
+  unpinnable, and an unpinnable block pins the turn under *any* boundary — so
+  on a boundary-configured machine every leg below routes to the local tier
+  and the large ones are refused there. A machine that has one runs leg (g)
+  instead. (a) the user types `/proceed
   REQ-587`: the expansion lands, the model reaches Phase 1 and calls `skill {
   name: "validate", arguments: "REQ-587" }` — the echo line shows `skill
   validate … invoked by the model` — the `/validate` body lands and the model
@@ -719,10 +831,31 @@ the CLI renders each as one line (BR-9).
   on the local tier the model's `skill { name: "proceed" }` is refused with
   `bound: local_engine` and `skill { name: "status" }` expands. (manual; BR-2,
   BR-4, BR-5, BR-7, BR-8)
-- [ ] AC-16: **The web `gates_itself` pin and the cap-exempt set stay
+- [ ] AC-16: **The bundled `skills` docs topic no longer contradicts this
+  REQ.** `crates/tetond/src/harness/docs/skills.md` is what the model reads
+  when it asks what skills are, and it currently says — compiled into the same
+  binary that would hand it a `skill` tool — *"The model **cannot invoke a
+  skill**: name it and let the user type it"*, that every frontmatter key
+  beyond three is *"inert"* (BR-3 makes two meaningful), and that a
+  skill-invoking skill *"stalls at its first 'invoke the skill' step"* (this
+  REQ is what unstalls it). Its provenance paragraph is also the pre-BR-10
+  rule. That is BUG-181's defect with the sign flipped, on the surface REQ-577
+  shipped so the model would stop guessing. The topic is amended on all four
+  points and **still fits `MAX_TOPIC_BYTES`** — which is the hard part: it is
+  4,087 of 4,096 bytes today, so the amendment buys its room by cutting, not
+  by moving the ceiling. (unit; BR-2, BR-3, BR-10)
+- [ ] AC-17: **The web `gates_itself` pin and the cap-exempt set stay
   enumerated.** Whatever OQ-1 and BR-11 resolve to, the tests that enumerate
   the exempt set and the self-gating set name every member with its stated
-  reason, and adding `skill` to either without a reason fails the build.
+  reason, and adding `skill` to either without a reason fails the build —
+  **which needs a mechanism this AC must name, because none exists today**.
+  The exempt set's reasons live in a doc comment and the enforcing test
+  asserts membership and counts, not reasons; the self-gating pin asserts
+  `gates_itself() == (name == WEB_TOOL_NAME)`, which amending to two tools
+  simply relaxes. Nothing can fail a build for missing prose. The shipped
+  pattern that *does* work is `RESERVED_SKILL_NAMES`: a declared table, and a
+  test asserting it is exactly the derivation. Adopt that shape — a table of
+  `(tool, reason)` the registry is checked against — or drop the claim.
   (unit; BR-2, BR-11)
 
 ## External Dependencies
@@ -739,6 +872,15 @@ the CLI renders each as one line (BR-9).
   roster** (or this REQ re-sizes it with the arithmetic re-stated) — stated
   here so the two do not land with a resident prompt larger than the bound
   assumes.
+- **The ceiling move has two consumers, and only one is chunk arithmetic.**
+  Since REQ-586 BR-4 promoted it, `REDACT_BODY_OVERHEAD_BYTES` also feeds a
+  *production* budget: `REDACT_SCANNABLE_CONTEXT_BYTES = (108,280 − overhead)
+  × 10/11` = **89,127** today. Moving 10 → 11 KiB drops it to **88,196** — a
+  931-byte cut to the byte budget of every `redact = true` remote route, which
+  is precisely the budget BR-7's `over_budget` refusal measures against
+  (`bound: redact scan`). The existing test still passes, so the change is
+  silent. AC-3's "arithmetic re-stated" therefore means **both** directions:
+  the chunk count that must stay 4, and the scannable bound that shrinks.
 - **REQ-584** (read-only `projects` tool; spec PR #185, drafted, not
   merged) is a sibling claim on the same two surfaces this REQ draws on: its
   tool is cap-exempt and its doc is resident prompt. Whichever of REQ-584
@@ -757,7 +899,11 @@ the CLI renders each as one line (BR-9).
 
 ## Assumptions
 
-- **The harness today** (verified 2026-08-19 against `main` at 59894bf):
+- **The harness today** (originally verified 2026-08-19 against `main` at
+  59894bf — **which predates both REQ-586 and REQ-585's merges**; re-verified
+  2026-08-20 against `main` at `76fa8f4` during this REQ's re-validation, with
+  the corrections below applied inline. Any claim in this block that this REQ
+  reasons from was checked against that tree, not against the 08-19 one):
   `Tool` is `name` / `description` / `input_schema` / `run(&ToolContext,
   &Value) -> ToolOutcome` / `gates_itself` (default `false`; `web` is the
   only `true`, pinned by `the_web_tool_is_the_only_tool_that_gates_itself`)
@@ -797,13 +943,21 @@ the CLI renders each as one line (BR-9).
   block, the verification clause, the web clause, `SELF_CONFIG_GUIDE` and
   `tools.docs(config.max_tools)`, which renders `- name: description\n
   arguments: schema` per exposed tool; the capability sentence is line 4 of
-  `self_config.md` (186 bytes) and its pinning test asserts one `/help` line,
-  `.claude/`, `~/.claude`, "only the user runs", "loads nothing from"
+  `self_config.md` (**238 bytes** after REQ-585 BR-9's amendment, not the 186
+  BUG-181 shipped) and its pinning test asserts one `/help` line, `.claude/`,
+  `~/.claude`, "only the user runs", and — replacing BUG-181's
+  "loads nothing from", which is **no longer in the test** — the two needles
+  REQ-585 added: "loads skills and commands from" and
+  "no CLAUDE.md, agents or hooks"
   (separately), position before step 1, presence in both shapes. Headroom:
   BUG-181 measured 9,167 of 9,216 bytes before its sentence and moved
   `REDACT_BODY_OVERHEAD_BYTES` to 10 KiB; with the sentence the widest prompt
-  is estimated at ≈ 9.45 KB escaped, leaving ≈ 0.84 KB above the 48-byte
-  floor — a headroom BR-8's amended sentence and BR-2's tool doc draw on
+  is **measured** (not estimated) at `spent` 9,414 with a worst prompt of
+  6,138, leaving a margin of **826** — of which 48 is the floor, so **778
+  usable**. The ≈ 0.84 KB this spec previously reasoned from was REQ-586's
+  recorded 868, which REQ-585 re-measured and found 26 B high; sizing BR-2's
+  roster from 860 rather than 778 is exactly how AC-3's "at most one reviewed
+  ceiling move" becomes two, with REQ-584 contending for the same constant — a headroom BR-8's amended sentence and BR-2's tool doc draw on
   together, so the margin is re-counted with both in place, never one at a
   time. A `skill` tool doc (one sentence, a two-field schema, a roster at a
   256–512-byte cap) is ≈ 0.6–0.9 KB before escaping, so BR-2 expects one
@@ -1010,7 +1164,7 @@ toward `per_turn_cap`, only expansions seed the repeat rule — BR-6/AC-7
 (W-10); BR-8's illustrative sentence keeps the pinning anchors (`.claude/`,
 `~/.claude`, the CLAUDE.md/agents/hooks negative space, "only the user
 runs" as "only the user runs the built-in ones") and the headroom is
-re-counted with the sentence and the tool doc together, ≈ 0.84 KB today
+re-counted with the sentence and the tool doc together — 778 usable bytes today
 (I-11); AC-15(d) drops the nonexistent `--permissions` flag for REQ-560's
 `/permissions` session command, with REQ-585 AC-20(e) noted as needing the
 same fix (I-12); `for_strong_model`'s 40 marked test-only, production
