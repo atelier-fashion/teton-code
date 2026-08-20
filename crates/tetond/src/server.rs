@@ -1928,6 +1928,31 @@ fn spawn_prompt_turn(
         return None;
     }
 
+    // REQ-585 ADR-3: exactly one of `prompt`/`skill`. A request carrying both is
+    // a combination that was never valid, so refusing it narrows nothing — and
+    // it is the one shape the daemon cannot resolve, since the two would
+    // disagree about what this turn's text is.
+    //
+    // A both-**empty** request is deliberately NOT refused: `flatten_prompt(&[])`
+    // returns `""` and such a turn runs today, so rejecting it would narrow an
+    // existing method for third-party clients while `PROTOCOL_VERSION` is
+    // asserted unchanged. The failure worth designing against — a raw
+    // `/name args` line reaching a model — is already impossible: the CLI never
+    // puts the typed line in `prompt` at all, so a dropped `skill` field yields
+    // a visible empty turn rather than a leaked command line.
+    //
+    // A shape check, reading no session state, so it is no more of an existence
+    // oracle than the `serde` failure above.
+    if !params.prompt.is_empty() && params.skill.is_some() {
+        let _ = out_tx.try_send(error_string(
+            id,
+            error_code::INVALID_PARAMS,
+            "`prompt` and `skill` are exclusive: a turn is typed text or a `/name` \
+             invocation, never both",
+        ));
+        return None;
+    }
+
     // REQ-568 BR-4, and its position is the requirement: ahead of the registry
     // lookup below, ahead of the lifetime claim, ahead of the spawn. A refused
     // prompt starts no task and touches no runtime state — so a connection that
@@ -1953,6 +1978,12 @@ fn spawn_prompt_turn(
     };
 
     let prompt = flatten_prompt(&params.prompt);
+    // REQ-585: the invocation travels **beside** the flattened prompt, not
+    // through it — a skill turn has no `PromptBlock`s to flatten, and
+    // `raw_arguments` is the rest of the typed line verbatim (ADR-3), so it must
+    // not be re-joined from tokens or folded into a text block anywhere on this
+    // path. The daemon expands it; the client never composes a body.
+    let skill = params.skill;
     let runtime = Arc::clone(&daemon.runtime);
     let events = Arc::clone(&daemon.events);
     // The turn carries the registry, not just the summary read out of it: the
@@ -1988,6 +2019,7 @@ fn spawn_prompt_turn(
                 summary.phase,
                 summary.cwd.clone(),
                 prompt,
+                skill,
                 presence,
             )
             .await;
@@ -4168,19 +4200,20 @@ fn handle_session_set_cwd(daemon: &Daemon, conn: &ConnState, id: Id, params: Val
     if !conn.may_drive(&params.session_id) {
         return error_string(id, error_code::NOT_ATTACHED, NOT_ATTACHED_MESSAGE);
     }
-    match daemon
-        .runtime
-        .set_session_cwd(&params, &daemon.sessions, &daemon.events)
-    {
-        Ok(result) => {
-            // REQ-585 BR-1/AC-14: the project half of the registry is derived
-            // from the root, so the root moving re-derives it. Here rather than
-            // inside the runtime's move because this is where the daemon's
-            // discovery seam is (`Daemon::skills_fs`), and after the move
-            // because it reads the root the session now stands on.
-            rebuild_session_skills(daemon, &params.session_id, Some(&params.cwd));
-            ok_string(id, &result)
-        }
+    // REQ-585 BR-1/AC-14: the project half of the registry is derived from the
+    // root, so the root moving re-derives it — **inside** the move, ahead of the
+    // `session_root_changed` publish, so a second attached client reacting to
+    // that event cannot read the pre-move registry. The seam
+    // (`Daemon::skills_fs`) still belongs to the daemon and is handed in; only
+    // the timing moved. Dropping the stale `skill:project:*` grants happens
+    // there too, where the session's gate is reachable (ADR-6).
+    match daemon.runtime.set_session_cwd(
+        &params,
+        &daemon.sessions,
+        &daemon.events,
+        daemon.skills_fs.as_ref(),
+    ) {
+        Ok(result) => ok_string(id, &result),
         Err(err) => error_from(id, err),
     }
 }
@@ -4188,46 +4221,40 @@ fn handle_session_set_cwd(daemon: &Daemon, conn: &ConnState, id: Id, params: Val
 /// Derive this session's skill registry from the root it stands on and store it
 /// (REQ-585 BR-1, ADR-1).
 ///
-/// **Two callers, ever**: [`handle_session_create`] and
-/// [`handle_session_set_cwd`]. There is no third, and that is the cost
-/// criterion rather than an accident — discovery is four directory listings and
+/// **Two derivation sites, ever**: this function, from
+/// [`handle_session_create`], and the identical derivation inside
+/// [`DaemonRuntime::set_session_cwd`], which owns the `/cd` half because the
+/// rebuild has to land *before* `session_root_changed` reaches a second
+/// attached client. There is no third, and that is the cost criterion rather
+/// than an accident — discovery is four directory listings and
 /// one file read per candidate, so a turn that re-derived it would pay that
 /// while a user waits, for an answer that cannot have changed unless the root
 /// did. The consequence is a snapshot, stated where the type is
 /// ([`SkillRegistry`]): a skill file written mid-session is picked up at the
 /// next `/cd`, and there is no watcher.
 ///
-/// The registry is built from the **probed** root ([`DaemonRuntime::session_root_for`]),
-/// never from the stored path alone, because discovery needs two things and the
-/// probe carries both: the path the four globs hang off, and the
-/// [`RootKind`](teton_protocol::methods::RootKind) that decides whether there is
-/// a project pair at all. A session whose root *is* `$HOME` must reach
-/// `~/.claude/skills` once, not twice — every skill otherwise registers under
-/// both sources, shadowing itself, with two permission keys for one file
-/// (AC-3). Deriving that kind here with a path comparison of our own would be a
-/// second spelling of a decision REQ-583 already owns (LESSON-528).
+/// This function is the **probe** and the daemon's seam; the derivation itself
+/// is `DaemonRuntime::store_session_skills`, which both call sites share so the
+/// four globs are spelled once. What is added here is the reading of the root
+/// ([`DaemonRuntime::session_root_for`]) and the `Daemon`-shaped arguments a
+/// handler has in hand.
 ///
-/// `set_skills` answering `false` — a session that vanished between the create
-/// and this call — is nothing to act on: there is no record to hold a registry,
-/// and no id anyone can query it with.
-///
-/// **The `/cd` half is not complete without dropping the project grants.** A
-/// remembered `skill:project:<name>` grant authorizes a file under the old
-/// root, and a rebuilt registry beside a stale grant is exactly LESSON-501's
-/// shape — carried state that sheds its invariants silently. That drop is
-/// `PermissionGate::drop_project_skill_grants` (REQ-585 TASK-201), and it has
-/// to happen where the session's gate is reachable, which is inside
-/// [`DaemonRuntime::set_session_cwd`] rather than here: `session_gates` is
-/// private to the runtime and minting a gate needs the config.
+/// **The `/cd` half is not complete without dropping the project grants**, and
+/// that is the other reason the move owns it. A remembered
+/// `skill:project:<name>` grant authorizes a file under the old root, and a
+/// rebuilt registry beside a stale grant is exactly LESSON-501's shape —
+/// carried state that sheds its invariants silently. That drop reaches
+/// `PermissionGate::drop_project_skill_grants` (REQ-585 TASK-201) through
+/// `DaemonRuntime::drop_project_skill_grants`, which needs the private
+/// `session_gates` map. A *fresh* session has no grants and no gate, which is
+/// why this function has nothing to drop.
 fn rebuild_session_skills(daemon: &Daemon, session_id: &SessionId, cwd: Option<&Path>) {
-    let probed = daemon.runtime.session_root_for(cwd);
-    let registry = crate::skills::discover(
-        crate::session_root::home().as_deref(),
-        &probed.path,
-        probed.view.kind,
+    DaemonRuntime::store_session_skills(
+        &daemon.sessions,
+        session_id,
+        &daemon.runtime.session_root_for(cwd),
         daemon.skills_fs.as_ref(),
     );
-    daemon.sessions.set_skills(session_id, registry);
 }
 
 /// The `/name` commands this session dispatches (`skills/list`, REQ-585 BR-3,

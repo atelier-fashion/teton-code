@@ -1,7 +1,7 @@
 ---
 id: TASK-204
 title: "run_prompt_turn: expand, refuse before consent, seed with provenance — in that order"
-status: draft
+status: complete
 parent: REQ-585
 created: 2026-08-20
 updated: 2026-08-20
