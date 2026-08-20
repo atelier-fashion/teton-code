@@ -342,6 +342,15 @@
   fact, one call per paired decision — needs a **test**, because a checklist
   recorded in a task file has no schedule and no owner (LESSON-545,
   LESSON-546).
+- **A decision with two stores needs one invalidation rule, and it lives above
+  both.** REQ-585's skill grants expire when the session root moves — the
+  daemon drops `skill:project:*` inside `set_session_cwd`, and the CLI's own
+  `SessionGrants` memo, which is consulted *before* any prompt is drawn, drops
+  the same keys on the same event. The predicate and the key's spelling live in
+  `teton-protocol` rather than in either consumer, so the two cannot come to
+  disagree about which keys expire. Expiring only the daemon's copy left the
+  client auto-answering from a grant given in a different repo, with a
+  daemon-side test that passed (ASSUME-017).
 - **User-authored prompt text is a first-class provenance source** — prompt
   text carried no file provenance at all until a `/`-command's expansion had to
   pin its turn exactly as a `read` of the same file would. `Provenance::User`

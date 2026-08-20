@@ -1,7 +1,7 @@
 ---
 id: REQ-585
 title: "User-defined slash commands from SKILL.md — the session discovers Claude Code-style skills and runs `/name` as a prompt expansion"
-status: approved
+status: complete
 deployable: true
 created: 2026-08-19
 updated: 2026-08-20
@@ -790,6 +790,22 @@ client's own echo line is the record.
   `teton` subcommands do not expand skills).
 - The VS Code extension (phase 2 client; it inherits whatever OQ-1 puts in
   the daemon).
+
+## Follow-ups filed at wrapup
+
+Found by the Phase 5 verify panel, not fixed in this REQ, and each filed rather
+than left as a comment:
+
+- **BUG-183** — AC-19's cost-attribution tests never touch the skill path, and
+  their central assertion is implied by their own setup. The only AC in this
+  REQ whose test would pass with the feature deleted.
+- **BUG-184** — skill discovery runs on the connection's synchronous reader
+  loop, where a macOS TCC dialog can park it.
+- **BUG-185** — one consent buys an unbounded number of dynamic commands, and
+  the invocation has no deadline of its own.
+- **BUG-186** — `NotRunReason` and the wire `DynamicOutcome` are closed enums
+  travelling daemon→client, so a future variant silently drops the whole
+  `skill_invoked` event on an older client.
 
 ## Deferred
 
