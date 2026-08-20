@@ -898,6 +898,10 @@ pub fn prompt_turn_params(session_id: &SessionId, text: &str) -> PromptTurnParam
         prompt: vec![PromptBlock::Text {
             text: text.to_owned(),
         }],
+        // A typed line is never a skill invocation. REQ-585 TASK-206 adds the
+        // sibling constructor that populates this instead of `prompt`; the two
+        // are mutually exclusive and the daemon refuses a request carrying both.
+        skill: None,
     }
 }
 

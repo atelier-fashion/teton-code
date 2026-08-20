@@ -532,6 +532,32 @@ pub mod error_code {
         /// knows why" codes — because those resolve by waiting and this one
         /// resolves only by sending less.
         CONTEXT_LENGTH_EXCEEDED = -32022;
+        /// Teton refused to send a skill turn because its expansion does not
+        /// fit the route's budget (REQ-585 BR-8, architecture ADR-11).
+        ///
+        /// **The difference from [`CONTEXT_LENGTH_EXCEEDED`] is who refused.**
+        /// That one means a *provider* rejected a turn it saw: the bytes left
+        /// the machine, the window is the provider's, and the daemon is
+        /// relaying someone else's answer. This one means *Teton* refused to
+        /// send it at all — the check runs before `CarriedTurn::begin`, so
+        /// nothing was assembled, nothing was dispatched, and no provider has
+        /// an opinion about it. Collapsing them would tell a user their
+        /// provider rejected something it never received, and would make
+        /// AC-16's "a typed outcome, not a clamped turn" uncheckable.
+        ///
+        /// The alternative to refusing is the one BR-8 forbids: a skill body
+        /// middle-elided into something the user did not invoke. So this is
+        /// **not** a failure to route around — retrying, failing over, or
+        /// re-deriving a budget all send the same expansion — and it is not a
+        /// health signal. The remedy is a smaller skill or a bigger declared
+        /// window, and the accompanying message names the skill, its size, the
+        /// budget and the bound it was measured against, spoken through
+        /// `BudgetBound::words()` and never the wire spelling (BR-8a).
+        ///
+        /// It is raised at two stages that the message tells apart (ADR-11):
+        /// before consent, when the body alone does not fit, and after the
+        /// dynamic outcomes are folded in, when their output pushed it over.
+        SKILL_EXPANSION_TOO_LARGE = -32023;
     }
 }
 
@@ -578,6 +604,47 @@ mod tests {
     fn the_provider_setup_code_is_the_next_free_one_and_renumbers_nothing() {
         assert_eq!(error_code::PROVIDER_SETUP_INVALID, -32021);
         assert_eq!(error_code::WEB_SETUP_INVALID, -32020);
+    }
+
+    /// REQ-585's code does the same: the next free number, moving nobody.
+    ///
+    /// Pinned for the two tests above's reason — the distinctness sweep catches
+    /// a *collision* and says nothing about a code renumbered into a free slot,
+    /// which is the change that silently reclassifies every error an
+    /// already-installed client knows. Its neighbour matters more here than
+    /// usual: [`error_code::CONTEXT_LENGTH_EXCEEDED`] is the code this one
+    /// exists to be told apart from, so the two are asserted together and a
+    /// renumbering that merged them has to edit this line.
+    #[test]
+    fn the_skill_expansion_code_is_the_next_free_one_and_renumbers_nothing() {
+        assert_eq!(error_code::SKILL_EXPANSION_TOO_LARGE, -32023);
+        assert_eq!(error_code::CONTEXT_LENGTH_EXCEEDED, -32022);
+        assert_ne!(
+            error_code::SKILL_EXPANSION_TOO_LARGE,
+            error_code::CONTEXT_LENGTH_EXCEEDED,
+            "a provider refusing a turn it saw and Teton refusing to send one \
+             are different answers with different remedies"
+        );
+    }
+
+    /// The declaration really did land inside `application_error_codes!`, so
+    /// the distinctness sweep and the range sweep cover it without anyone
+    /// extending a second list.
+    ///
+    /// This is the non-vacuity assertion for the two sweeps above: a constant
+    /// written *outside* the macro would compile, would be usable, and would be
+    /// invisible to both of them — which is exactly the "hand-maintained roster
+    /// that falls behind" failure the macro exists to prevent.
+    #[test]
+    fn the_skill_expansion_code_joins_the_generated_roster() {
+        assert!(
+            error_code::ALL.contains(&(
+                "SKILL_EXPANSION_TOO_LARGE",
+                error_code::SKILL_EXPANSION_TOO_LARGE
+            )),
+            "the code must be declared inside `application_error_codes!`, not beside it: {:?}",
+            error_code::ALL
+        );
     }
 
     #[test]

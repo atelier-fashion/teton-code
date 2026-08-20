@@ -210,8 +210,14 @@ client's own echo line is the record.
   before the table is consulted). A skill with a reserved name is never
   dispatchable: the built-in runs, byte-for-byte as today, and the skill is
   listed as shadowed. Between a project skill and a user skill of the same
-  name, the project skill wins and the user skill is listed as shadowed
-  (informed by REQ-582, LESSON-537).
+  name, the project skill wins and the user skill is listed as shadowed.
+  **Within one source, `skills/` beats `commands/`**: the four globs make
+  `~/.claude/skills/status/SKILL.md` and `~/.claude/commands/status.md` a legal
+  pair — same name, same source, and therefore the same permission key — so a
+  remembered grant would authorize whichever file won and would silently move
+  to the other if the winner ever changed. The `skills/` entry dispatches and
+  the `commands/` entry is listed as shadowed, so one spelling still reaches
+  one handler (informed by REQ-582, LESSON-537, LESSON-495).
 - [ ] BR-3: **`/help` lists skills from the registry that dispatches them.**
   REQ-555 BR-7 extends: a skill cannot be dispatchable without appearing in
   `/help`, and `/help` cannot list a dispatchable skill the table does not
@@ -303,10 +309,13 @@ client's own echo line is the record.
   any boundary is configured. The consequence is stated rather than hidden:
   **on a boundary-configured machine, every skill invocation that ran a
   dynamic command pins its turn local** — all seventeen ADLC skills run the
-  ethos include, so on such a machine they all run on the local tier. The
-  egress choke point sees the expansion as it sees any prompt text (redact
-  scan where configured). This is a BR-1-of-the-charter claim and carries an
-  egress-capture test (informed by REQ-563).
+  ethos include, so on such a machine they are all **pinned** to the local
+  tier. Pinned is not run: seven of the seventeen exceed the local budget and
+  are refused there (BR-8, and this spec's own Assumptions), so on that machine
+  those seven are refused rather than served, and the pin is what forces the
+  refusal. The egress choke point sees the expansion as it sees any prompt
+  text (redact scan where configured). This is a BR-1-of-the-charter claim and
+  carries an egress-capture test (informed by REQ-563).
 - [ ] BR-8: **Bounded, and never silently truncated — on REQ-586's budget.**
   A body over 64 KiB is skipped at discovery with its reason (the largest
   ADLC skill, `proceed`, is 49.8 KiB — a cap that admits the real corpus and
@@ -482,18 +491,33 @@ client's own echo line is the record.
   a command that exits non-zero yields a failed placeholder. (daemon unit;
   BR-6)
 - [ ] AC-11: Egress-capture: with a remote provider bound to the tier the
-  turn routes to, (a) a skill file under a `local-only` boundary pins the
-  turn local and nothing leaves the machine — exactly as a `read` of that
-  file would pin it; (b) with a boundary configured anywhere and a skill that
-  ran any dynamic command, the turn is pinned local because that output's
-  provenance is `Unknown`, exactly as a `shell` result's is; (c) with no
+  turn routes to, (a) a **project** skill file under a `local-only` boundary
+  pins the turn local and nothing leaves the machine — exactly as a `read` of
+  that file would pin it, because it sits under the session root and mints a
+  root-relative provenance id; a **user** skill at `~/.claude/skills/…` in a
+  repo-rooted session has no root-relative identity, so no id can be minted and
+  its block is marked unpinnable, which pins the turn local whenever *any*
+  boundary is configured — stricter than the `read`, and the AC asserts the two
+  separately rather than folding them (architecture ADR-9); (b) with a boundary
+  configured anywhere and a skill that ran any dynamic command, the turn is
+  pinned local because that output's provenance is `Unknown`, exactly as a
+  `shell` result's is; (c) with no
   boundary configured, a skill that ran dynamic commands reaches the remote
   provider and the payload is the expansion. (egress-capture; BR-7)
 - [ ] AC-12: A skill body that plants `User:`, `Assistant:` and `<|im_start|>`
   reaches the frame neutralized by the guards a typed prompt gets; a
   `<tool-result>` planted in a dynamic command's *output* reaches the frame
-  neutralized by the envelope; a test removing any one guard fails. (daemon
-  unit; BR-5)
+  neutralized by the envelope; a `<tool-result>` planted in the **body**
+  reaches it neutralized too — the expansion is one user block holding
+  file-supplied prose *concatenated with* a harness-authored envelope, so a
+  flush-left `</tool-result>` in the body would close the envelope of the
+  dynamic block spliced after it, and the expander is a frame author with a
+  frame author's duty (architecture ADR-10); and a flush-left `</tool-result>`
+  on the second line of a multi-line `` !`…` `` reaches it neutralized where
+  the fold echoes that command verbatim into a not-run placeholder — the
+  inversion is the point: `plan`, the level at which no command runs, is the
+  level at which the raw command bytes reach the model. A test removing any
+  one guard fails. (daemon unit; BR-5)
 - [ ] AC-13: A skill whose frontmatter says `allowed-tools: Bash(*)`,
   `model: opus`, `effort: max` registers; the session's permission level,
   effort and the turn's route are exactly what they would be for typed text;
@@ -554,10 +578,11 @@ client's own echo line is the record.
   caveat); `/proceed REQ-585` expands and the point at which it stalls (the
   first "invoke the skill" step) is recorded as the Deferred follow-ups'
   evidence; (d) on the local tier `/analyze` is refused with the BR-8 message
-  naming `bound: local_engine`; (e) unattended: `printf '/status\n' | teton
-  --permissions full` runs the dynamic context without a prompt and produces
-  the report, and the same at `guarded` produces placeholders and still
-  completes; (f) if the machine has a `local-only` boundary configured, (a)
+  naming `bound: local engine` — the spoken form `BudgetBound::words()`
+  produces, never the snake_case wire spelling (BR-8a, AC-16); (e) unattended:
+  `printf '/status\n' | teton --permissions full` runs the dynamic context
+  without a prompt and produces the report, and the same at `guarded` produces
+  placeholders and still completes; (f) if the machine has a `local-only` boundary configured, (a)
   and (b) run on the local tier and the runbook says why (BR-7). (manual;
   BR-8, BR-11, BR-13)
 

@@ -829,6 +829,11 @@ impl PermissionGate {
                 request_id,
                 tool_name: tool_name.to_owned(),
                 description,
+                // REQ-585 TASK-201 populates this for a skill's dynamic
+                // context, which is the one request a client must be able to
+                // recognize without parsing the key (BR-11). Every request
+                // this entry point raises is a tool call, and has no subject.
+                subject: None,
                 options: options_for(web),
             }),
         );

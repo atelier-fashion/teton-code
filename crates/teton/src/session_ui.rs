@@ -464,6 +464,13 @@ pub fn render_event(
             render_session_update(&su.update, env.session_id.as_ref(), surface, state);
             EventOutcome::Rendered
         }
+        // REQ-585 TASK-207 renders BR-12's echo line here. Until then the
+        // event is accepted and drawn as nothing rather than matched by a
+        // wildcard: a `_` arm would swallow the *next* new event too, and this
+        // one is meant to fail loudly the day it is forgotten — TASK-207's
+        // acceptance criteria and TASK-208's `cli_e2e` byte assertion both
+        // require a line here.
+        Event::SkillInvoked(_) => EventOutcome::Rendered,
         Event::RouteDecided(rd) => {
             if state.verbose {
                 surface.line(LineKind::Notice, &format_route(rd));
@@ -3169,6 +3176,7 @@ mod tests {
             request_id: RequestId::from("r1"),
             tool_name: tool.to_owned(),
             description: Some("run `cargo test`".to_owned()),
+            subject: None,
             options: vec![
                 PermissionOption {
                     option_id: "allow_once".to_owned(),
