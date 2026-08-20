@@ -2094,7 +2094,13 @@ fn doctor_advises_on_an_undeclared_window_and_an_inert_cap_and_stays_green() {
     );
 }
 
-/// **AC-5, the CLI half: `--max-context` is a flag, not a hand edit.**
+/// **AC-5, the CLI half: `--max-context` and `--context-budget-cap` are flags,
+/// not hand edits.**
+///
+/// Both flags in one registration, because the cap has been tested at every
+/// seam separately — parse to payload, payload to file, file to bound — and
+/// nowhere end to end. A cap that parsed and never reached the record would
+/// leave all three legs green.
 ///
 /// Registering a **local** provider because that is the one kind this suite can
 /// register end to end: every remote kind reads a credential, and the CLI's
@@ -2124,6 +2130,8 @@ fn provider_add_records_a_declared_window_in_the_daemons_config() {
             "local",
             "--max-context",
             "128000",
+            "--context-budget-cap",
+            "40000",
         ],
         "",
     );
@@ -2137,6 +2145,12 @@ fn provider_add_records_a_declared_window_in_the_daemons_config() {
     assert!(
         written.contains("max_context = 128000"),
         "the window typed on the command line must reach the stored record; config:\n{written}"
+    );
+    assert!(
+        written.contains("context_budget_cap = 40000"),
+        "the cap typed on the command line must reach the stored record too — it is the \
+         cost knob, and a flag that parses without being written is a knob that does \
+         nothing; config:\n{written}"
     );
 
     let listed = daemon.run_cli(&teton, &["provider", "list"]);

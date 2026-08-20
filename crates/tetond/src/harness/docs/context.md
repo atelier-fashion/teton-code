@@ -30,6 +30,11 @@ decided. `/verbose` prints it on the route line —
 - `redact scan` — the byte budget is held to what the scan covers (below).
 - `local engine` — a local-tier route.
 
+Those are the words the bound is printed in. On the wire the same five are
+snake_case (`default_unknown` is what a user reads as `unknown window`), so a
+script reading `route_decided` or `context_pressure` matches the wire spelling
+and a person reads the words above.
+
 ## Declaring a window
 
     teton provider add <id> … --max-context 128000 [--context-budget-cap <n>]
@@ -65,6 +70,6 @@ lowers the ceiling, and `teton cost` is where the spend shows up.
 
 The redact scan reads the **whole** outbound body, so a scanned route cannot
 assemble one the scan would refuse. The byte budget is bounded at ≈89 KB and
-the bound reads `redact_scan`; the word figure stays window-derived. This
+the bound reads `redact scan`; the word figure stays window-derived. This
 applies only when `redact` is on — it is off by default, and the web tier's
 own scan covers lookups, not the turn body.

@@ -1327,7 +1327,7 @@ fn format_context_pressure(pressure: &ContextPressure) -> String {
             } else {
                 "an older message"
             },
-            budget_bytes(pressure.elided_bytes),
+            bytes_figure(pressure.elided_bytes),
         ),
         // A reroute moved the turn to a route with a different budget, so the
         // retained conversation was re-fitted to it. The drop count trails
@@ -1361,14 +1361,13 @@ fn older_blocks(blocks: u64) -> String {
 /// table, read by the route line and by every pressure line — the bound is one
 /// fact with one source (BR-8), and two tables of adjectives for it would be
 /// the mirrored-predicate shape LESSON-528 is about.
+///
+/// The table itself is [`BudgetBound::words`], in the protocol crate, because
+/// the daemon words the same bound in its refusals (REQ-585 BR-8) and cannot
+/// reach into this one. This function stays as the name the rendering here
+/// reads and as a `fn` item `map` can be handed.
 fn bound_words(bound: BudgetBound) -> &'static str {
-    match bound {
-        BudgetBound::Window => "window",
-        BudgetBound::DefaultUnknown => "unknown window",
-        BudgetBound::RedactScan => "redact scan",
-        BudgetBound::UserCap => "user cap",
-        BudgetBound::LocalEngine => "local engine",
-    }
+    bound.words()
 }
 
 /// A count with thousands separators: `4096` → `4,096`.
@@ -1391,6 +1390,10 @@ fn thousands(n: u64) -> String {
 
 /// A byte figure for a budget line: `900 B`, `33 KB`, `4.2 MB`.
 ///
+/// Named for what it *is* rather than for its first caller: `budget_bytes` is
+/// the wire field's name (and one call site here hands it `elided_bytes`, which
+/// is not a budget at all), so a formatter wearing it read as an accessor.
+///
 /// **Decimal** units, and labelled as such. `firstrun`'s [`firstrun::format_bytes`]
 /// is the other byte formatter in this crate and stays where it is: it renders
 /// an *exact* download size in the binary units the daemon's own sentences use,
@@ -1399,7 +1402,7 @@ fn thousands(n: u64) -> String {
 /// never claims a precision the number has not got — and rounding a 1024-based
 /// number under a `KB` label is the exact confusion that formatter's doc warns
 /// about, which is why this one divides by 1000.
-fn budget_bytes(bytes: u64) -> String {
+fn bytes_figure(bytes: u64) -> String {
     if bytes < 1_000 {
         return format!("{bytes} B");
     }
@@ -2436,7 +2439,7 @@ fn budget_clause(rd: &RouteDecided) -> Option<String> {
     Some(format!(
         " · budget {} words / {} (bound: {})",
         thousands(tokens),
-        budget_bytes(bytes),
+        bytes_figure(bytes),
         bound_words(bound)
     ))
 }
@@ -3441,13 +3444,13 @@ mod tests {
         assert_eq!(thousands(132_650), "132,650");
         assert_eq!(thousands(1_050_000), "1,050,000");
 
-        assert_eq!(budget_bytes(0), "0 B");
-        assert_eq!(budget_bytes(999), "999 B");
-        assert_eq!(budget_bytes(1_000), "1 KB");
-        assert_eq!(budget_bytes(32_768), "33 KB");
-        assert_eq!(budget_bytes(999_999), "1000 KB");
-        assert_eq!(budget_bytes(1_000_000), "1 MB");
-        assert_eq!(budget_bytes(4_200_000), "4.2 MB");
+        assert_eq!(bytes_figure(0), "0 B");
+        assert_eq!(bytes_figure(999), "999 B");
+        assert_eq!(bytes_figure(1_000), "1 KB");
+        assert_eq!(bytes_figure(32_768), "33 KB");
+        assert_eq!(bytes_figure(999_999), "1000 KB");
+        assert_eq!(bytes_figure(1_000_000), "1 MB");
+        assert_eq!(bytes_figure(4_200_000), "4.2 MB");
     }
 
     /// A divergent hit says so: the prefill was bigger than the turn's delta

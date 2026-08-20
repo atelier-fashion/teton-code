@@ -3752,19 +3752,25 @@ fn window_column(provider: &ProviderConfig) -> String {
         Some(0) => {
             "window: unknown — context budget defaulted (set capabilities.max_context)".to_owned()
         }
-        Some(tokens) => format!("window: {}", window_label(tokens)),
+        Some(tokens) => format!("window: {}", window_figure(tokens)),
         None => "window: not reported".to_owned(),
     }
 }
 
 /// A context window rendered for a column: `128k`, `1m`, `1.05m`, `512`.
 ///
+/// **A figure, not a sentence.** The daemon's `RouteBudget::window_label` is
+/// the *phrase* the in-prompt elision marker names a window with ("the local
+/// context window"); this renders the number a listing column compares. One
+/// name for the two would be two meanings for one word, both introduced by
+/// REQ-586.
+///
 /// Rounded on purpose — this is a listing, and `131k` next to `200k` compares at
 /// a glance where `131072` does not. Millions keep up to two decimals because
 /// the shipped recipes hold both 1,000,000 and 1,050,000, and rounding those to
 /// one `1m` would render two different windows as the same number. The exact
 /// figure is in `config.toml`, which is also where it is edited.
-fn window_label(tokens: u32) -> String {
+fn window_figure(tokens: u32) -> String {
     let tokens = u64::from(tokens);
     if tokens >= 1_000_000 {
         // Hundredths of a million, rounded, then trimmed: 100 → `1m`,
@@ -3826,8 +3832,8 @@ fn advise_on_context_windows(providers: &[ProviderConfig], surface: &mut dyn Sur
                         "provider `{id}`: `context_budget_cap` is {} and the declared window is \
                          {} — a cap at or above the window never binds, so it is inert rather \
                          than invalid. Lower it below the window, or drop the key.",
-                        window_label(cap),
-                        window_label(window)
+                        window_figure(cap),
+                        window_figure(window)
                     ),
                 );
             }
@@ -4301,7 +4307,7 @@ mod tests {
             (999, "999"),
             (1, "1"),
         ] {
-            assert_eq!(window_label(tokens), want, "{tokens}");
+            assert_eq!(window_figure(tokens), want, "{tokens}");
         }
     }
 

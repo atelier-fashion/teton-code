@@ -397,15 +397,30 @@ adds the numbers and the per-turn budget line from `route_decided`.
   not only the test.)*
 - [x] AC-7: The scannable bound is computed from the same constants as
   `REDACT_TOTAL_CAP_CHUNKS` with the overhead and escaping terms modelled; a
-  test asserts a body at the bound fits under `REDACT_INPUT_MAX_BYTES`, that
-  changing either constant alone fails it, and that the overhead term the
-  bound reads is a production constant (not `#[cfg(test)]`); the default-budget
-  margin test is unchanged and green. (unit; BR-4, BR-11)
+  test asserts a body at the bound fits under `REDACT_INPUT_MAX_BYTES` and
+  that the overhead term the bound reads is a production constant (not
+  `#[cfg(test)]`); the default-budget margin test is unchanged and green.
+  (unit; BR-4, BR-11)
   *(`redact.rs::the_scannable_bound_plus_overhead_and_escaping_fits_under_the_cap`
-  — the bound modelled from the same constants, red if either moves alone,
-  and the overhead term asserted to be a production constant;
+  — the bound modelled from the same constants;
   `redact.rs::the_total_cap_clears_the_harness_context_budget_with_margin`
   unchanged and green.)*
+  **What this test does and does not pin (re-worded in verify).** It pins the
+  *shape* of the derivation — that the bound is `(cap − overhead) × divisor /
+  (divisor + 1)` and not a copied literal, and that a dropped escaping term or
+  an inverted bound is red. It does **not** fail when a single input moves:
+  the bound is an expression over those constants, so it re-derives with them
+  and every inequality here holds by construction. A reviewer proved it —
+  moving `REDACT_BODY_OVERHEAD_BYTES` from 10 to 12 KiB leaves the package
+  green. The inputs are pinned by the margin test
+  (`the_total_cap_clears_the_harness_context_budget_with_margin`) instead, and
+  the "production constant, not `#[cfg(test)]`" clause is a compile-time
+  consequence of reading the constant rather than an assertion. **The overhead
+  is pinned only from below** — the margin test asserts the real prompt spends
+  *less* than it, and nothing asserts a ceiling until the overhead is large
+  enough to break `cap >= 2 × body` (≈21 KiB). Growing it inside that range
+  silently shrinks every scanned route's byte budget with nothing red. A
+  ceiling on it is the follow-up, not a change made here.
 - [x] AC-8: `context_budget_cap = 40000` on a 200k provider bounds the
   budget to the cap and `/verbose` says `bound: user_cap`; absent, the window
   binds. (unit + `cli_e2e`; BR-5)
@@ -572,7 +587,7 @@ adds the numbers and the per-turn budget line from `route_decided`.
 
 ## Open Questions
 
-- [ ] OQ-1: **How does a user declare a window?** `/provider add
+- [x] OQ-1: **How does a user declare a window?** `/provider add
   --max-context <n>` and a `/provider setup` question (with the recipe's
   value as the default) are the obvious shapes; `config/set` cannot reach
   capabilities today (no wire field, no `ConfigUpdate` variant) and gains the
@@ -580,6 +595,12 @@ adds the numbers and the per-turn budget line from `route_decided`.
   it, `/provider setup` records it from the recipe, `/provider add` takes a
   flag, `config/set` accepts the new field, and `/doctor` nags when it is
   zero.
+  **Resolved as the lean, all four surfaces:** `provider add --max-context
+  <n> [--context-budget-cap <n>]`, `/provider setup` recording the recipe's
+  window when the chosen model is that recipe's example model, and
+  `config/set` carrying both keys through the same gate every provider-record
+  write meets. `/doctor` advises on a window of zero and on a cap that cannot
+  bind (AC-4).
 - [ ] OQ-2: **Should the redact chunk cap scale so an opted-in machine can
   use a big window past ≈89 KB?** More chunks = more local model calls per
   send (latency; the scan as a whole is bounded at one `DUTY_DEADLINE`, so
@@ -589,6 +610,15 @@ adds the numbers and the per-turn budget line from `route_decided`.
 - [ ] OQ-3: **Derive the local budget from the engine's `n_ctx`?** *Lean:*
   not here — REQ-564's prefix-cache work and the local prompt-processing
   cost make that a measured decision; keep the default and revisit.
+  **One fact for whoever measures it:** the local pair is the only pair that
+  does not subtract the generation reservation before applying the 2 B/token
+  floor. `LOCAL_BUDGET_BYTES` is 32,768, which is `LOCAL_ENGINE_N_CTX`
+  (16,384) × 2 exactly — the *whole* engine window, with no room left for the
+  reply — where a remote pair takes the reservation off the window first
+  (BR-2). The word half (4,096) is well under it, so nothing overflows today;
+  the point is that the byte half is not conservative in the way the remote
+  halves are, and a measured decision should start from that rather than
+  from the assumption that the two derivations agree.
 - [ ] OQ-4: **Refuse or elide a typed oversized prompt?** This REQ makes the
   elision loud; REQ-585 refuses for skill turns. *Lean:* keep eliding typed
   prompts (a pasted log should not fail the turn) and revisit if the notice
@@ -602,11 +632,15 @@ adds the numbers and the per-turn budget line from `route_decided`.
   is the consent, and a default cap is a surprise in the other direction;
   state the worst case in the docs, make the cap one line, and spec a spend
   cap (Deferred) if dogfood bills say so.
-- [ ] OQ-7: **Should the `digest` threshold have an absolute ceiling on big
+- [x] OQ-7: **Should the `digest` threshold have an absolute ceiling on big
   routes** (e.g. never carry a >20k-word single tool result raw, even on
   200k)? *Lean:* yes — an **absolute** word/byte ceiling chosen against the
   AC-3 corpus (never more than N words raw on any route), on top of BR-6's
   proportional rule; decide N in `/architect` with the corpus.
+  **Resolved as the lean.** `DIGEST_ABSOLUTE_CEILING_TOKENS` = 20,000 words
+  and `DIGEST_ABSOLUTE_CEILING_BYTES` = 160 KiB, applied with `.min()` on top
+  of the proportional rule, so a 1m-token route's threshold stops climbing
+  where a raw fold stops being worth its place in the window.
 
 ## Deferred (found in implementation)
 

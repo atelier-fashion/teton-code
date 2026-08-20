@@ -130,8 +130,15 @@ pub(crate) fn bounded_topic_echo(topic: &str) -> String {
 /// tier does not reach for. The fifth word, `context`, cost nine characters
 /// here for a 3.4 KB topic (REQ-586 ADR-11) — the trade this module exists to
 /// make.
+///
+/// The sentence in front of the index paid for it. `setup and troubleshooting`
+/// named nothing `docs` does not already imply, and it was the only clause
+/// here that was not a topic name; dropping it took the description from the
+/// ceiling to 26 characters under it. **Spend that on names**: the index is
+/// the affordance, the sentence is the frame around it, and the next two
+/// topics should come out of this margin rather than out of `MAX_DESCRIPTION_CHARS`.
 const DESCRIPTION: &str = concat!(
-    "Read Teton's own setup and troubleshooting docs, bundled in this binary. ",
+    "Read Teton's own docs, bundled in this binary. ",
     "topics: providers, policy, context, web, doctor"
 );
 
@@ -247,12 +254,19 @@ mod tests {
     /// pins that with a regression test, so the placement is convention, not a
     /// constraint.
     ///
-    /// **At the ceiling since REQ-586.** The `context` topic's nine characters
-    /// (`, context`) take [`DESCRIPTION`] to exactly 120 — legal, and the last
-    /// word this list gets for free. A sixth topic has to buy its name by
-    /// shortening the sentence in front of the index, not by moving this
-    /// number: the two margin tests measure the prompt this description sits
-    /// in, and their headroom is what the bundled guide is competing for.
+    /// **Spent and left, as of REQ-586.** The `context` topic's nine characters
+    /// (`, context`) first took [`DESCRIPTION`] to exactly 120 — legal, and no
+    /// headroom at all with a `projects` tool (REQ-584) and a `skill` tool
+    /// (REQ-587) queued behind this one. So the room was bought where the
+    /// review said to buy it: the sentence in front of the index lost `setup
+    /// and troubleshooting`, 26 characters that named nothing the index does
+    /// not already carry. **Spent: 94. Left: 26** — room for roughly two more
+    /// topic names.
+    ///
+    /// A sixth topic spends that margin, not this number: the two margin tests
+    /// measure the prompt this description sits in, and their headroom is what
+    /// the bundled guide is competing for. When the margin is gone, shorten the
+    /// frame again or make the case for a bigger ceiling out loud.
     pub(super) const MAX_DESCRIPTION_CHARS: usize = 120;
 
     fn ctx() -> ToolContext {

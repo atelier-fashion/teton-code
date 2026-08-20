@@ -2146,6 +2146,54 @@ pub enum BudgetBound {
     LocalEngine,
 }
 
+impl BudgetBound {
+    /// The wire spelling, identical to the serialized tag — [`Event::name`]'s
+    /// arrangement, one level down.
+    ///
+    /// Snake_case, because that is what the field carries; the words a person
+    /// is shown are [`BudgetBound::words`]. Kept as its own accessor so a
+    /// surface that needs the token — a log line, a machine-read `/doctor`
+    /// row — asks for it rather than reaching for `serde_json` to get a
+    /// string out of a five-way enum.
+    #[must_use]
+    pub const fn wire_name(&self) -> &'static str {
+        match self {
+            BudgetBound::Window => "window",
+            BudgetBound::DefaultUnknown => "default_unknown",
+            BudgetBound::RedactScan => "redact_scan",
+            BudgetBound::UserCap => "user_cap",
+            BudgetBound::LocalEngine => "local_engine",
+        }
+    }
+
+    /// The words the bound is **said** in: `unknown window`, not
+    /// `default_unknown`.
+    ///
+    /// One table, and it lives here rather than in the CLI because both sides
+    /// need it. The client words the `/verbose` route line and every
+    /// `context_pressure` line; the daemon words the refusals that name the
+    /// bound — REQ-585 BR-8's oversized-skill refusal is the first, and it
+    /// runs in `tetond`, which cannot reach a `teton` helper. A second table
+    /// over there would be the mirrored-predicate shape LESSON-528 is about:
+    /// identical today, and identical only until one of them is edited.
+    ///
+    /// Each spelling names the thing a user would go and change — a bound of
+    /// `unknown window` is a `capabilities.max_context` that was never set,
+    /// which is why the wire's `default_unknown` is not what is printed. The
+    /// phrases are lower-case fragments, so a caller may set them in a
+    /// sentence (`bound: user cap`) or after a colon without re-casing them.
+    #[must_use]
+    pub const fn words(&self) -> &'static str {
+        match self {
+            BudgetBound::Window => "window",
+            BudgetBound::DefaultUnknown => "unknown window",
+            BudgetBound::RedactScan => "redact scan",
+            BudgetBound::UserCap => "user cap",
+            BudgetBound::LocalEngine => "local engine",
+        }
+    }
+}
+
 /// What the context gate did to earn a [`ContextPressure`] event (REQ-586
 /// BR-7).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -2962,6 +3010,74 @@ mod tests {
                 }],
             },
         });
+    }
+
+    /// **BR-8's one home, both halves.** Every bound has a wire spelling that
+    /// *is* the serde tag and a human spelling that is not it.
+    ///
+    /// The golden pair is written out again here rather than read off the
+    /// accessors, which is the whole point: a table compared against itself
+    /// asserts nothing. The `match` is exhaustive and has no wildcard, so a
+    /// sixth variant cannot be added without being given both spellings here
+    /// — and the assertions below then demand that the production ones agree.
+    ///
+    /// `words()` is checked to be free of `_` because the failure mode this
+    /// guards is a variant whose human spelling was filled in by pasting the
+    /// wire token: legal, compiling, and shown to a user as `default_unknown`.
+    #[test]
+    fn every_budget_bound_carries_its_wire_name_and_its_words() {
+        const fn golden(bound: BudgetBound) -> (&'static str, &'static str) {
+            match bound {
+                BudgetBound::Window => ("window", "window"),
+                BudgetBound::DefaultUnknown => ("default_unknown", "unknown window"),
+                BudgetBound::RedactScan => ("redact_scan", "redact scan"),
+                BudgetBound::UserCap => ("user_cap", "user cap"),
+                BudgetBound::LocalEngine => ("local_engine", "local engine"),
+            }
+        }
+
+        let all = [
+            BudgetBound::Window,
+            BudgetBound::DefaultUnknown,
+            BudgetBound::RedactScan,
+            BudgetBound::UserCap,
+            BudgetBound::LocalEngine,
+        ];
+        let mut wire_names = Vec::new();
+        let mut said = Vec::new();
+        for bound in all {
+            let (wire, words) = golden(bound);
+            assert_eq!(bound.wire_name(), wire, "{bound:?}");
+            assert_eq!(bound.words(), words, "{bound:?}");
+            assert!(
+                !words.contains('_'),
+                "`{words}` reads like a wire token, not like something to say to a \
+                 person: {bound:?}"
+            );
+
+            // The wire half is the tag, in both directions — an accessor that
+            // drifted from the `serde` rename would be a `/doctor` row or a
+            // log line naming a bound no client can parse.
+            let json = serde_json::to_string(&bound).unwrap();
+            assert_eq!(json, format!("\"{wire}\""));
+            let back: BudgetBound = serde_json::from_str(&json).unwrap();
+            assert_eq!(back, bound);
+            round_trip(&bound);
+
+            wire_names.push(wire);
+            said.push(words);
+        }
+
+        wire_names.sort_unstable();
+        wire_names.dedup();
+        said.sort_unstable();
+        said.dedup();
+        assert_eq!(wire_names.len(), all.len(), "two bounds share a wire name");
+        assert_eq!(
+            said.len(),
+            all.len(),
+            "two bounds are said the same way, so a user cannot tell which knob to reach for"
+        );
     }
 
     #[test]
