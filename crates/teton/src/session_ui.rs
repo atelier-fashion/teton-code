@@ -997,6 +997,9 @@ fn render_skill_invoked(invoked: &SkillInvoked, surface: &mut dyn Surface, verbo
     surface.line(LineKind::Info, &format!("  {}", invoked.path_display));
     // Only when there were any: BR-5's ignored keys are news about *this* file,
     // and "ignored frontmatter: " with nothing after it is a line about nothing.
+    if let Some(note) = &invoked.name_note {
+        surface.line(LineKind::Notice, &format!("  {note}"));
+    }
     if !invoked.ignored_keys.is_empty() {
         surface.line(
             LineKind::Info,
@@ -7485,6 +7488,7 @@ mod skill_tests {
             path_display: "~/.claude/skills/status/SKILL.md".to_owned(),
             body_bytes: 5_432,
             ignored_keys: vec!["allowed-tools".to_owned(), "model".to_owned()],
+            name_note: None,
             outcomes,
         }
     }

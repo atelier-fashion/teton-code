@@ -2675,6 +2675,16 @@ pub struct SkillInvoked {
     /// what was inert rather than leaving a user to infer it from behaviour
     /// (BR-5: `allowed-tools`, `model`, `effort`, … are read and ignored).
     pub ignored_keys: Vec<String>,
+    /// A frontmatter `name` that disagrees with the file's own name, said out
+    /// loud rather than silently ignored (BR-2).
+    ///
+    /// The spelling that dispatches is the directory or the file stem, always —
+    /// one spelling reaches one handler, REQ-555's rule. A file that declares a
+    /// different one is not wrong, it is *misleading*, and the author is the
+    /// person best placed to fix it. Additive: absent for every skill whose
+    /// declaration agrees, which is nearly all of them.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub name_note: Option<String>,
     /// One entry per `` !`command` `` in the body, in document order.
     ///
     /// Empty for a skill with no dynamic context — which is a real state, not
@@ -3084,6 +3094,7 @@ mod tests {
                     path_display: "~/.claude/skills/status/SKILL.md".to_owned(),
                     body_bytes: 5_432,
                     ignored_keys: vec!["allowed-tools".to_owned()],
+                    name_note: None,
                     outcomes: vec![DynamicOutcomeView {
                         command: "git branch --show-current".to_owned(),
                         outcome: DynamicOutcome::Ran {
@@ -3806,6 +3817,7 @@ mod tests {
             path_display: "~/.claude/skills/status/SKILL.md".to_owned(),
             body_bytes: 5_432,
             ignored_keys: vec!["allowed-tools".to_owned(), "model".to_owned()],
+            name_note: None,
             outcomes: vec![
                 DynamicOutcomeView {
                     command: "cat ~/.claude/adlc/ETHOS.md".to_owned(),
@@ -3880,6 +3892,7 @@ mod tests {
             path_display: ".claude/commands/beta.md".to_owned(),
             body_bytes: 118,
             ignored_keys: vec![],
+            name_note: None,
             outcomes: vec![],
         };
         round_trip(&plain);

@@ -1844,10 +1844,17 @@ fn skill_row(view: &SkillView) -> String {
 /// pin): a row rendered without a mark is a row [`classify`] returns
 /// [`Input::Skill`] for, and a row with one is a row it does not.
 fn shadow_reason(view: &SkillView) -> Option<String> {
-    if let Some(reason) = &view.shadowed {
-        return Some(reason.clone());
+    // This crate's own sentence first, where it has one. The daemon marks a
+    // reserved name too (it must — a client without a command table would
+    // otherwise dispatch one), but it knows only *that* the table claims the
+    // name, not whether it is a row, an alias or a family word. Preferring the
+    // wire's generic mark here would trade `the built-in `/quit`` for `a
+    // built-in command of the same name` on the one surface that can be
+    // specific.
+    if let Some(claim) = table_claim(&view.name) {
+        return Some(claim.words());
     }
-    table_claim(&view.name).map(TableClaim::words)
+    view.shadowed.clone()
 }
 
 /// How a source is spelled wherever this client names one.
@@ -3698,6 +3705,52 @@ mod tests {
             rows.iter()
                 .any(|row| row.contains("the `teton` command line")),
             "`teton`'s mark did not name why it is unreachable: {rows:#?}",
+        );
+    }
+
+    /// The wire's reserved list and this crate's derivation are the same set.
+    ///
+    /// `tetond` cannot read `COMMANDS`, so BR-2's reserved half is enforced
+    /// daemon-side from `teton_protocol::methods::RESERVED_SKILL_NAMES` — a
+    /// list. This is what keeps the list honest: add a row to `COMMANDS`
+    /// without adding its spelling there and this fails, in the crate that owns
+    /// the row. Without it the daemon's copy is exactly the hand-written second
+    /// home LESSON-546 is about.
+    #[test]
+    fn the_wire_reserved_list_is_this_crates_derivation() {
+        use std::collections::BTreeSet;
+
+        // Only the spellings a skill *could* have. A skill name is
+        // `^[a-z0-9][a-z0-9_-]{0,63}$`, so `boundary add` can never collide
+        // with one — the daemon has nothing to defend against there, and
+        // listing it on the wire would reserve a name nobody can type.
+        let derived: BTreeSet<&str> = reserved_names()
+            .into_iter()
+            .filter(|name| {
+                let mut chars = name.chars();
+                chars
+                    .next()
+                    .is_some_and(|c| c.is_ascii_lowercase() || c.is_ascii_digit())
+                    && name.chars().all(|c| {
+                        c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-' || c == '_'
+                    })
+            })
+            .collect();
+        let on_the_wire: BTreeSet<&str> = teton_protocol::methods::RESERVED_SKILL_NAMES
+            .iter()
+            .copied()
+            .collect();
+
+        let missing: Vec<_> = derived.difference(&on_the_wire).collect();
+        assert!(
+            missing.is_empty(),
+            "the table claims names the daemon would let a skill take: {missing:?}"
+        );
+        let extra: Vec<_> = on_the_wire.difference(&derived).collect();
+        assert!(
+            extra.is_empty(),
+            "the wire reserves names no row claims, so a legal skill name is \
+             refused for no reason: {extra:?}"
         );
     }
 

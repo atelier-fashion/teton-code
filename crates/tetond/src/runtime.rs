@@ -1479,6 +1479,10 @@ struct SkillTurn {
     /// The frontmatter keys this daemon read and ignored (BR-5), listed by
     /// `/verbose` and inert everywhere else.
     ignored_keys: Vec<String>,
+    /// A frontmatter `name` that disagrees with the file's own (BR-2), carried
+    /// so `/verbose` can say it. The dispatching spelling is never in doubt —
+    /// this is a note to the author, not a second name.
+    name_note: Option<String>,
     /// The skill file's identity, for the seeded user block (BR-7, ADR-9). A
     /// project skill is under the root and mints cleanly.
     sources: BTreeSet<ProvenanceId>,
@@ -2986,6 +2990,7 @@ impl DaemonRuntime {
             ),
             body_bytes: skill.body.len() as u64,
             ignored_keys: skill.ignored_keys.clone(),
+            name_note: skill.name_note.clone(),
             sources,
             unknown,
         })
@@ -3132,6 +3137,7 @@ impl DaemonRuntime {
                 path_display: skill.path_display.clone(),
                 body_bytes: skill.body_bytes,
                 ignored_keys: skill.ignored_keys.clone(),
+                name_note: skill.name_note.clone(),
                 outcomes: commands
                     .iter()
                     .zip(outcomes.iter())

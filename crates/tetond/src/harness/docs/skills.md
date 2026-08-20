@@ -60,7 +60,8 @@ after, and the message says which:
     `/proceed` does not fit this route's context budget: … about 9,000 words /
     60.6 KB against 4,096 words / 32 KB (bound: local engine).
 
-The remedy is a route with a declared window.
+The remedy is a route with a big enough window. Declaring one is not enough:
+a small declaration is floored, and the message says so.
 
 ## Provenance
 

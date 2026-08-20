@@ -337,6 +337,52 @@ pub enum SkillSource {
     Project,
 }
 
+/// Every name the built-in command table claims, so a skill can never take one.
+///
+/// **Why this lives above both crates.** BR-2 says a reserved name always wins,
+/// and the table that defines "reserved" is `teton`'s `COMMANDS` — which
+/// `tetond` cannot read, because the daemon does not depend on the CLI. So the
+/// client enforced it and the daemon did not, and `SkillRegistry::dispatchable`
+/// happily answered for a skill named `cost`. That is invisible while the only
+/// client is `teton`, and it is a hole the moment a second one exists: a
+/// `session/prompt { skill: { name: "cost" } }` from a client carrying no table
+/// runs a repo-supplied `.claude/skills/cost/SKILL.md`, and the spec's own
+/// Assumptions say project skills may be authored by someone other than the
+/// user. ADR-1's rule is that every rule with teeth lives in the daemon; this
+/// one had none there (REQ-585 verify).
+///
+/// **It is a list here and a derivation there.** `teton::slash::table_claim`
+/// still derives the same set from `COMMANDS` — rows, aliases, the first word
+/// of every multi-word row, and `teton` — and a test asserts the two agree in
+/// both directions, so adding a row without adding it here fails in the crate
+/// that owns the row. A hand-written list nothing checks is LESSON-546's shape;
+/// a hand-written list a derivation is checked against is a wire contract.
+pub const RESERVED_SKILL_NAMES: &[&str] = &[
+    "boundary",
+    "cd",
+    "clear",
+    "cost",
+    "doctor",
+    "effort",
+    "exit",
+    "help",
+    "model",
+    "permissions",
+    "policy",
+    "provider",
+    "quit",
+    "teton",
+    "verbose",
+    "web",
+];
+
+/// True when the built-in command table claims `name`, so no skill may dispatch
+/// under it (BR-2).
+#[must_use]
+pub fn is_reserved_skill_name(name: &str) -> bool {
+    RESERVED_SKILL_NAMES.contains(&name)
+}
+
 /// The permission key a skill's dynamic context asks under: `skill:<source>:<name>`.
 ///
 /// **One home, because two crates enforce one rule.** The daemon mints the key

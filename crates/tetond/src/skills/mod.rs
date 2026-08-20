@@ -161,6 +161,17 @@ pub enum ShadowedBy {
     /// remembered grant would authorize whichever file happened to win and move
     /// silently to the other if that ever changed (ADR-6, LESSON-495).
     SkillsDirectory,
+    /// A built-in command of the same name (BR-2's third case).
+    ///
+    /// Decided here rather than only in the client, which is where it used to
+    /// live: `SkillRegistry::dispatchable` answered for a skill named `cost`,
+    /// so a client that does not carry `teton`'s table — the phase-2 one, or
+    /// any third party — could dispatch a repo-supplied `.claude/skills/cost`
+    /// by name. ADR-1's rule is that every rule with teeth lives in the daemon,
+    /// and this one had none here (REQ-585 verify). The names come from
+    /// `teton_protocol::methods::RESERVED_SKILL_NAMES`, which `teton` asserts is
+    /// its own derivation from `COMMANDS`.
+    Builtin,
 }
 
 impl fmt::Display for ShadowedBy {
@@ -168,6 +179,12 @@ impl fmt::Display for ShadowedBy {
         match self {
             Self::ProjectSkill => f.write_str("a project skill of the same name"),
             Self::SkillsDirectory => f.write_str("the skills/ entry of the same name"),
+            // Deliberately not naming *which* built-in: the daemon knows only
+            // that the table claims the name, not whether it is a row, an alias
+            // or a family word. The client, which has the table, replaces this
+            // with the specific sentence (`table_claim`'s `words()`); a client
+            // without one still gets a true mark.
+            Self::Builtin => f.write_str("a built-in command of the same name"),
         }
     }
 }
@@ -383,6 +400,13 @@ pub fn is_valid_skill_name(name: &str) -> bool {
 fn assemble(candidates: Vec<Skill>, skipped: Vec<Skipped>) -> SkillRegistry {
     let mut skills: Vec<Skill> = Vec::with_capacity(candidates.len());
     for mut candidate in candidates {
+        // The table wins before any file does — a skill can never take a
+        // built-in's name, whatever the other files say (BR-2).
+        if teton_protocol::methods::is_reserved_skill_name(&candidate.name) {
+            candidate.shadowed = Some(ShadowedBy::Builtin);
+            skills.push(candidate);
+            continue;
+        }
         if let Some(winner) = skills
             .iter()
             .find(|s| s.name == candidate.name && s.is_dispatchable())

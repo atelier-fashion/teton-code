@@ -2388,7 +2388,7 @@ Window used      : 1,000,000 (shipped recipe) | 128,000 (hand-lowered)   <-- cir
 (e) recipe used for `full`                   : /permissions line | config default_level
 (e) full: dynamic context ran unattended     : yes / no
 (e) guarded on a pipe: refused, placeholders, turn completed : yes / no
-(e) the refusal's remedy names a flag that does not exist    : confirmed / not seen
+(e) remedy names `/permissions full` + `[permissions] default_level`, not `--permissions` : yes / no
 (e) no stdin line was consumed               : yes / no
 (f) boundary configured on this machine      : yes / no
 (f) (a) and (b) ran on the local tier        : yes / no

@@ -862,3 +862,58 @@ fn absent_roots_are_free_and_silent() {
     assert!(registry.is_empty());
     assert_eq!(no_home.listed().len(), 2);
 }
+
+/// **BR-2's third shadowing case, daemon-side.**
+///
+/// A skill can never take a built-in's name — and that has to be true *here*,
+/// not only in the client. `SkillRegistry::dispatchable` used to answer for a
+/// skill named `cost`, so a client carrying no command table could dispatch a
+/// repo-supplied `.claude/skills/cost/SKILL.md` by name over the wire. The
+/// spec's own Assumptions say a project skill may be authored by someone other
+/// than the user, so that is a repo choosing what `/cost` means for any client
+/// that is not `teton`.
+///
+/// The list is `teton_protocol::methods::RESERVED_SKILL_NAMES`, which `teton`
+/// asserts is exactly its own derivation from `COMMANDS`.
+#[test]
+fn a_skill_named_after_a_built_in_is_shadowed_by_the_daemon_not_only_by_the_client() {
+    let fixture = Fixture::new();
+    for name in ["cost", "provider", "teton", "help"] {
+        fixture.write(
+            &format!("repo/.claude/skills/{name}/SKILL.md"),
+            &skill_file(&format!("shadow {name}"), "Body.\n"),
+        );
+    }
+    // The control: a name no row claims still dispatches, so this is a test
+    // about the reserved set and not about project skills in general.
+    fixture.write(
+        "repo/.claude/skills/deploy/SKILL.md",
+        &skill_file("deploy something", "Body.\n"),
+    );
+
+    let registry = discover(
+        Some(&fixture.home()),
+        &fixture.repo(),
+        RootKind::Project,
+        &RecordingFs::default(),
+    );
+
+    for name in ["cost", "provider", "teton", "help"] {
+        let skill = registry
+            .skills()
+            .iter()
+            .find(|s| s.name == name)
+            .unwrap_or_else(|| panic!("`{name}` was dropped rather than listed"));
+        assert!(
+            !skill.is_dispatchable(),
+            "`/{name}` dispatches a file over the wire, whatever table the client has",
+        );
+    }
+    assert!(
+        registry
+            .skills()
+            .iter()
+            .any(|s| s.name == "deploy" && s.is_dispatchable()),
+        "the control name stopped dispatching, so this test says nothing",
+    );
+}
