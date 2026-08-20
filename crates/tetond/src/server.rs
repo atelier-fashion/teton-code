@@ -112,8 +112,9 @@ use tokio::task::JoinHandle;
 
 use teton_protocol::events::{
     AttachConsentRequested, AttachRefused, AttachRefusedReason, ConsentScope, DaemonClientAttach,
-    Event, EventEnvelope, PhaseTransition, ProviderSetupCompleted, ProviderSetupRejected,
-    SessionGrantMinted, WebSetupRejected, EVENT_METHOD, SUBSCRIPTION_LAGGED_METHOD,
+    Event, EventEnvelope, PermissionRequest, PhaseTransition, ProviderSetupCompleted,
+    ProviderSetupRejected, SessionGrantMinted, WebSetupRejected, EVENT_METHOD,
+    SUBSCRIPTION_LAGGED_METHOD,
 };
 use teton_protocol::handshake::{self, HandshakeParams, HandshakeResult};
 use teton_protocol::jsonrpc::{error_code, Id, Notification, Response, RpcError};
@@ -143,6 +144,7 @@ use crate::consent::{
     ConsentOutcome, ConsentRoute, ConsentSurfaces, PendingConsents, CONSENT_TIMEOUT,
 };
 use crate::grants::{monitor_witness, ConnectionId, Grant, GrantRegistry};
+use crate::harness::permissions::AddressedPermissionDelivery;
 use crate::lifetime::LifetimeSupervisor;
 use crate::peer::{is_descendant_of, Ancestry, KernelParentOf, MAX_ANCESTRY_DEPTH};
 use crate::runtime::{ClientPresence, DaemonRuntime};
@@ -296,7 +298,13 @@ pub struct Daemon {
     pub consents: PendingConsents,
     /// Every live connection a consent prompt can be rendered at (BR-6's
     /// routing question, which no single connection can answer for itself).
-    pub surfaces: ConsentSurfaces,
+    ///
+    /// Behind an `Arc` since REQ-585: the daemon's
+    /// [`AddressedPermissionDelivery`] route holds the **same** registry this
+    /// field names, so a skill consent is put in front of the connection this
+    /// daemon actually has live rather than a copy of one (LESSON-484 — one
+    /// definition, in one place).
+    pub surfaces: Arc<ConsentSurfaces>,
     /// Verified human presence, bound to one connection and one request
     /// (REQ-570 BR-6).
     ///
@@ -366,14 +374,16 @@ impl Daemon {
             PolicySource::Default,
             Arc::clone(&events),
         ));
+        let runtime = Arc::new(DaemonRuntime::minimal());
+        let surfaces = wire_addressed_delivery(&runtime, &events);
         Self {
             sessions: SessionRegistry::new(),
             events,
-            runtime: Arc::new(DaemonRuntime::minimal()),
+            runtime,
             lifetime,
             grants: GrantRegistry::new(),
             consents: PendingConsents::new(),
-            surfaces: ConsentSurfaces::new(),
+            surfaces,
             attestations: AttestationRegistry::new(),
             verifier: crate::attest::default_verifier(),
             skills_fs: Arc::new(RealFs),
@@ -485,6 +495,7 @@ impl Daemon {
         runtime: Arc<DaemonRuntime>,
         lifetime: Arc<LifetimeSupervisor>,
     ) -> Self {
+        let surfaces = wire_addressed_delivery(&runtime, &events);
         Self {
             sessions: SessionRegistry::new(),
             events,
@@ -492,7 +503,7 @@ impl Daemon {
             lifetime,
             grants: GrantRegistry::new(),
             consents: PendingConsents::new(),
-            surfaces: ConsentSurfaces::new(),
+            surfaces,
             attestations: AttestationRegistry::new(),
             verifier: crate::attest::default_verifier(),
             skills_fs: Arc::new(RealFs),
@@ -1996,6 +2007,9 @@ fn spawn_prompt_turn(
     // turn rather than being run over.
     let daemon = Arc::clone(daemon);
     let out = out_tx.clone();
+    // Read off the connection here, where it exists: the turn runs on its own
+    // task and `ConnState` does not travel with it (REQ-585 ADR-7).
+    let invoker = conn.id;
 
     // REQ-565 BR-2: the turn pins the daemon for its whole execution. Taken here
     // rather than inside the task so the claim exists before `spawn` returns —
@@ -2020,6 +2034,10 @@ fn spawn_prompt_turn(
                 summary.cwd.clone(),
                 prompt,
                 skill,
+                // REQ-585 ADR-7: the connection that typed the `/name`, so its
+                // dynamic-context consent is put in front of that client and
+                // answerable by nobody else.
+                Some(invoker),
                 presence,
             )
             .await;
@@ -3096,7 +3114,16 @@ fn handle_permission_respond(daemon: &Daemon, conn: &ConnState, id: Id, params: 
             return error_string(id, error_code::NOT_ATTACHED, NOT_ATTACHED_MESSAGE);
         }
     }
-    pending.resolve(&params.request_id, params.outcome);
+    // `resolve_from`, never `resolve` (REQ-585 ADR-7): an **addressed** waiter
+    // — a skill's dynamic-context consent — may only be answered by the
+    // connection the question was put to, and `resolve` names no connection at
+    // all, so it now refuses such a waiter outright. Naming the answering
+    // connection here is what lets the entitled answer through and leaves an
+    // older client's fall-through `prompter.ask` inert, with the prompt still
+    // standing for the client that was actually asked. Every pre-REQ-585 prompt
+    // is unaddressed and is unaffected: its delivery policy is attachment, and
+    // the `may_drive` check above is where that is enforced.
+    pending.resolve_from(&params.request_id, params.outcome, conn.id);
     ok_string(id, &PermissionRespondResult {})
 }
 
@@ -3408,11 +3435,83 @@ fn handle_session_create(daemon: &Daemon, conn: &ConnState, id: Id, params: Valu
 /// is not news to anyone who receives it, because the requester is the
 /// connection that named it and the other recipients are attached to it.
 fn routed_event_frame(daemon: &Daemon, session_id: Option<SessionId>, event: Event) -> String {
-    let envelope = EventEnvelope::new(daemon.events.next_seq(), session_id, event);
+    routed_frame(&daemon.events, session_id, event)
+}
+
+/// [`routed_event_frame`] over the bus alone.
+///
+/// The daemon's fourth routed event — REQ-585's addressed permission request —
+/// is built by [`AddressedRoute`], which holds the bus and the surface registry
+/// and deliberately **not** the [`Daemon`] that owns them: the daemon holds the
+/// runtime, the runtime holds the route, and a route holding the daemon back
+/// would close that ring into a leak. Splitting the body rather than duplicating
+/// it is what keeps the sequence number coming from one place — `next_seq`, the
+/// bus's own counter — so a routed frame still cannot collide with a broadcast
+/// one on the same connection (BUG-177).
+fn routed_frame(events: &EventBus, session_id: Option<SessionId>, event: Event) -> String {
+    let envelope = EventEnvelope::new(events.next_seq(), session_id, event);
     // Infallible for these payloads (plain strings and closed enums); a
     // hypothetical failure costs the prompt a delivery, which the bounded
     // window already turns into a refusal.
     serde_json::to_string(&Notification::new(EVENT_METHOD, envelope)).unwrap_or_default()
+}
+
+/// The daemon's implementation of REQ-585 ADR-7's addressed delivery: put one
+/// [`PermissionRequest`] in front of one connection, and nobody else.
+///
+/// **Without this the feature asks nobody.** [`PermissionGate::authorize_skill`]
+/// answers `SkillConsent::Unanswerable` on a gate with no route, deliberately —
+/// the only honest fallback would be the event bus, and the bus is what
+/// addressing exists to keep a skill consent off (a pre-REQ-585 client attached
+/// to the same session would receive a subject it cannot recognize and answer it
+/// by reading stdin).
+///
+/// It holds the two things the model layer must not know about — the live
+/// surface registry and the bus's sequence counter — and nothing else.
+struct AddressedRoute {
+    surfaces: Arc<ConsentSurfaces>,
+    events: Arc<EventBus>,
+}
+
+impl AddressedPermissionDelivery for AddressedRoute {
+    fn deliver(
+        &self,
+        connection: ConnectionId,
+        session_id: &SessionId,
+        request: PermissionRequest,
+    ) -> bool {
+        // Session-scoped on the envelope, exactly as the published form is: the
+        // frame carries the same shape a client already parses, and only its
+        // *delivery* is narrowed (ADR-7). The `seq` comes from the bus, so this
+        // frame cannot wear a number a broadcast one on this connection will
+        // also wear (BUG-177's shape).
+        let frame = routed_frame(
+            &self.events,
+            Some(session_id.clone()),
+            Event::PermissionRequest(request),
+        );
+        self.surfaces.deliver_to(connection, &frame)
+    }
+}
+
+/// Build the surface registry this daemon will use and install the addressed
+/// route over it on `runtime`, answering with the registry.
+///
+/// One function, called by both constructors, because a daemon that forgot to
+/// wire it is a daemon whose skill consents are silently unanswerable — a
+/// fail-closed hole with no error message anywhere. `set` is best-effort: two
+/// daemons over one runtime is not a production shape, and the first one's route
+/// is as good as the second's.
+fn wire_addressed_delivery(
+    runtime: &Arc<DaemonRuntime>,
+    events: &Arc<EventBus>,
+) -> Arc<ConsentSurfaces> {
+    let surfaces = Arc::new(ConsentSurfaces::new());
+    runtime.install_addressed_delivery(Arc::new(AddressedRoute {
+        surfaces: Arc::clone(&surfaces),
+        events: Arc::clone(events),
+    }));
+    surfaces
 }
 
 /// Tell the surfaces a request was offered to how it ended (BR-5).

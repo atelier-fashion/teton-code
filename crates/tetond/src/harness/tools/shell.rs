@@ -111,6 +111,16 @@ const TIMEOUT_CONSENT_HINT: &str = " On macOS a consent dialog for a protected f
 /// (REQ-561 ADR-5).
 pub(crate) const MAX_OUTPUT_CHARS: usize = 8_000;
 
+/// The timeout a `shell` call gets when it names none — and, since REQ-585, the
+/// deadline a skill's dynamic-context command runs under (BR-6: "the `shell`
+/// tool's jail, timeout and output cap").
+///
+/// A named constant rather than a literal inside [`ShellTool::default`] for
+/// [`MAX_OUTPUT_CHARS`]'s reason: the skill path is a second consumer of the
+/// same figure, and a second consumer that restated it would be two spellings of
+/// one deadline (LESSON-528).
+pub(crate) const DEFAULT_TIMEOUT_MS: u64 = 30_000;
+
 /// Runs shell commands under a timeout, cwd jail, and scrubbed environment.
 #[derive(Debug, Clone, Copy)]
 pub struct ShellTool {
@@ -123,7 +133,7 @@ pub struct ShellTool {
 impl Default for ShellTool {
     fn default() -> Self {
         Self {
-            default_timeout_ms: 30_000,
+            default_timeout_ms: DEFAULT_TIMEOUT_MS,
             max_timeout_ms: 120_000,
         }
     }
@@ -596,15 +606,27 @@ fn looks_like_credential_url(value: &str) -> bool {
 /// The input is the merged body rather than the two streams because the cap is
 /// over what the model will read, `[stderr] ` label included — capping the
 /// streams separately would admit twice the ceiling.
-pub(crate) fn cap_output(merged: String) -> (String, usize) {
+///
+/// # The third element
+///
+/// **Whether the ceiling fired** — a third answer, for the reason the second is
+/// one. REQ-585's `skill_invoked` reports it (`truncated`, so a surface can say
+/// the model is reading a prefix), and it is the branch this function has
+/// already taken: a caller that re-derived it would need the comparison, which
+/// means a second copy of the ceiling in a second file — the very thing
+/// [`the_output_cap_has_exactly_one_home`](tests::the_output_cap_has_exactly_one_home)
+/// forbids. It is not recoverable from the pair alone: a capped body's length
+/// and the length it reports are two independent numbers that can coincide.
+pub(crate) fn cap_output(merged: String) -> (String, usize, bool) {
     let raw_output_chars = merged.chars().count();
     if raw_output_chars <= MAX_OUTPUT_CHARS {
-        return (merged, raw_output_chars);
+        return (merged, raw_output_chars, false);
     }
     let truncated: String = merged.chars().take(MAX_OUTPUT_CHARS).collect();
     (
         format!("{truncated}\n{}", truncation_notice(raw_output_chars)),
         raw_output_chars,
+        true,
     )
 }
 
@@ -626,7 +648,7 @@ fn render_output(command: &str, status: ExitStatus, stdout: &[u8], stderr: &[u8]
     // [`cap_output`] takes before it truncates, because that number is the one
     // the `shell` duty's size trigger is decided on and the capped text can no
     // longer show it (REQ-561 ADR-5, LESSON-443).
-    let (body, raw_output_chars) = cap_output(merged);
+    let (body, raw_output_chars, _truncated) = cap_output(merged);
 
     let code = status.code();
     let status_line = match code {
@@ -1222,21 +1244,24 @@ mod tests {
         // Under the cap: the body is handed back untouched, and the length is
         // its own.
         let short = "hello\n[stderr] boom\n".to_owned();
-        let (text, raw) = cap_output(short.clone());
+        let (text, raw, truncated) = cap_output(short.clone());
         assert_eq!(text, short, "an uncapped body must not be rewritten");
         assert_eq!(raw, short.chars().count());
+        assert!(!truncated, "a body under the cap threw nothing away");
 
         // Exactly at the cap is not past it — the boundary the duty's trigger
         // sits on (`worth_interpreting` is `>`, not `>=`).
         let at_the_cap = "x".repeat(MAX_OUTPUT_CHARS);
-        let (text, raw) = cap_output(at_the_cap.clone());
+        let (text, raw, truncated) = cap_output(at_the_cap.clone());
         assert_eq!(text, at_the_cap, "at the cap is not past it");
         assert_eq!(raw, MAX_OUTPUT_CHARS);
+        assert!(!truncated, "at the cap is not past it, so nothing was cut");
 
         // Over it: the text is clamped and the *reported* length is the pre-cap
         // one, which the clamped text can no longer show.
         let over = MAX_OUTPUT_CHARS + 1_000;
-        let (text, raw) = cap_output("x".repeat(over));
+        let (text, raw, truncated) = cap_output("x".repeat(over));
+        assert!(truncated, "a body past the cap reports that it was cut");
         assert_eq!(
             raw, over,
             "the reported length must be what the command produced, not what survived the cap"

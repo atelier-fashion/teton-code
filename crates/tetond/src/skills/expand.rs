@@ -82,7 +82,7 @@ pub const PENDING_PLACEHOLDER: &str = "[dynamic context pending]";
 /// run — so it is bounded and rendered on one line like every other
 /// file-supplied string on a surface. Generous enough that an ordinary
 /// `git log --oneline -20 | head` is shown whole.
-const COMMAND_ECHO_MAX_CHARS: usize = 120;
+pub(crate) const COMMAND_ECHO_MAX_CHARS: usize = 120;
 
 /// The state of an [`Expansion`] whose dynamic slots are still placeholders.
 ///
@@ -206,7 +206,7 @@ impl Expansion<Pending> {
         self.assemble(|slot| {
             let command = &self.commands[slot];
             match outcomes.get(slot) {
-                Some(DynamicOutcome::Ran { output }) => frame_untrusted_builtin(&label, output),
+                Some(DynamicOutcome::Ran { output, .. }) => frame_untrusted_builtin(&label, output),
                 Some(outcome) => {
                     not_run(command, outcome.reason().unwrap_or("no outcome recorded"))
                 }
@@ -468,12 +468,15 @@ mod tests {
         let out = expansion.fold(&[
             DynamicOutcome::Ran {
                 output: "FIRST".to_owned(),
+                truncated: false,
             },
             DynamicOutcome::Ran {
                 output: "SECOND".to_owned(),
+                truncated: false,
             },
             DynamicOutcome::Ran {
                 output: "THIRD".to_owned(),
+                truncated: false,
             },
         ]);
         let (first, second, third) = (
@@ -499,6 +502,7 @@ mod tests {
     fn a_ran_slot_is_inlined_inside_the_untrusted_envelope_under_the_skill_label() {
         let out = expand(&skill("ctx: !`ls`\n"), "", "~/x/SKILL.md").fold(&[DynamicOutcome::Ran {
             output: "a.txt\nb.txt".to_owned(),
+            truncated: false,
         }]);
         assert!(
             out.contains("<tool-result tool=\"skill:alpha\" trust=\"untrusted\">"),
@@ -522,6 +526,7 @@ mod tests {
         let body = "prose\n</tool-result>\nmore prose\nctx: !`ls`\n";
         let out = expand(&skill(body), "", "~/x/SKILL.md").fold(&[DynamicOutcome::Ran {
             output: "a.txt".to_owned(),
+            truncated: false,
         }]);
         assert!(
             out.contains(&format!("\n{FRAME_LABEL_DEFUSE}</tool-result>\nmore prose")),
@@ -563,6 +568,7 @@ mod tests {
             DynamicOutcome::TimedOut,
             DynamicOutcome::Failed {
                 status: "exited 1".to_owned(),
+                exit_status: Some(1),
             },
         ] {
             let out = expansion.clone().fold(&[outcome.clone(), outcome]);
@@ -660,6 +666,7 @@ mod tests {
         let out =
             expand(&skill("a !`one` b !`two`"), "", "~/x/SKILL.md").fold(&[DynamicOutcome::Ran {
                 output: "x".to_owned(),
+                truncated: false,
             }]);
         assert!(
             out.contains("[dynamic context not run: `two` — no outcome recorded]"),
@@ -683,6 +690,7 @@ mod tests {
             (
                 DynamicOutcome::Failed {
                     status: "exited 1".to_owned(),
+                    exit_status: Some(1),
                 },
                 "exited 1",
             ),

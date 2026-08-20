@@ -153,6 +153,16 @@ pub enum DynamicOutcome {
     Ran {
         /// The captured stdout.
         output: String,
+        /// Whether the `shell` tool's ceiling threw information away, so the
+        /// model is reading a **prefix**.
+        ///
+        /// Recorded here, from [`cap_output`]'s own answer, rather than
+        /// re-derived by a reader: the ceiling lives in exactly one module and
+        /// a caller that compared against it would be a second copy of it
+        /// (`the_output_cap_has_exactly_one_home`). It is also not recoverable
+        /// from `output` alone — a capped body's length and the length it was
+        /// cut from are independent numbers.
+        truncated: bool,
     },
     /// The command was **not run**, for a reason that is not the command's
     /// own: the permission level, the answer, the missing terminal, or a
@@ -168,6 +178,15 @@ pub enum DynamicOutcome {
     Failed {
         /// The rendered exit status.
         status: String,
+        /// The exit code behind `status`, or `None` when a signal killed the
+        /// process (or the run was lost) and there is no code to report.
+        ///
+        /// Carried **beside** the rendered form rather than recovered from it.
+        /// [`crate::runtime`] reports this number on the wire
+        /// (`skill_invoked`'s `exit_status`), and a reader that re-read it out
+        /// of `status` would be a second parser of this module's own sentence
+        /// — the shape LESSON-529 names, one layer down.
+        exit_status: Option<i32>,
     },
     /// The deadline passed and the process group was killed.
     TimedOut,
@@ -197,10 +216,47 @@ impl DynamicOutcome {
     ///
     /// Distinct from [`Self::declined`] on purpose — "you said no" and "there
     /// was nobody to ask" are different facts about the same missing output.
+    ///
+    /// It is also the outcome when the question could not be **put** to anyone
+    /// at all — no addressed-delivery route, a connection that would not take
+    /// the frame, or a client that went away before answering
+    /// ([`SkillConsent::Unanswerable`](crate::harness::permissions::SkillConsent::Unanswerable)).
+    /// Those differ in *why* there was nobody at the other end, and not in the
+    /// sentence the model is owed: no human could be asked.
     #[must_use]
     pub fn no_terminal() -> Self {
         Self::NotRun {
             reason: "no terminal, so no human could be asked".to_owned(),
+        }
+    }
+
+    /// The outcome when the client refused because it did not recognize the
+    /// request's subject (ADR-7's fail-closed rule).
+    ///
+    /// A fourth sentence rather than a reuse of [`Self::no_terminal`], because
+    /// this client had a terminal and chose not to guess: telling the model
+    /// there was no terminal would name the wrong remedy (upgrade the client,
+    /// not find a human).
+    #[must_use]
+    pub fn unrecognized_subject() -> Self {
+        Self::NotRun {
+            reason: "the client did not recognize the request, so nobody was asked".to_owned(),
+        }
+    }
+
+    /// The outcome when consent was **given** and the command still never
+    /// started — the shell was missing, the jail root would not resolve, the
+    /// spawn failed.
+    ///
+    /// Not a closed door, and deliberately worded so it cannot be mistaken for
+    /// one: every other `NotRun` sentence answers "who said no", and this one
+    /// says the answer was yes and the machine could not carry it out. Calling
+    /// it a failure instead would tell the model it was attempted and exited,
+    /// which points a reader at the wrong fix.
+    #[must_use]
+    pub fn could_not_start() -> Self {
+        Self::NotRun {
+            reason: "it could not be started on this machine".to_owned(),
         }
     }
 
@@ -210,6 +266,23 @@ impl DynamicOutcome {
         matches!(self, Self::Ran { .. })
     }
 
+    /// Whether the `shell` tool's ceiling threw information away — i.e. the
+    /// model is reading a **prefix** of what the command printed.
+    ///
+    /// A read of what [`cap_output`] already answered ([`Self::Ran`]'s
+    /// `truncated`), never a re-derivation: the ceiling has one home and a
+    /// reader that compared against it would be a second one.
+    #[must_use]
+    pub fn output_truncated(&self) -> bool {
+        matches!(
+            self,
+            Self::Ran {
+                truncated: true,
+                ..
+            }
+        )
+    }
+
     /// The `<reason>` half of the not-run placeholder, or `None` for the arm
     /// that has output instead.
     #[must_use]
@@ -217,7 +290,7 @@ impl DynamicOutcome {
         match self {
             Self::Ran { .. } => None,
             Self::NotRun { reason } => Some(reason),
-            Self::Failed { status } => Some(status),
+            Self::Failed { status, .. } => Some(status),
             Self::TimedOut => Some("timed out"),
         }
     }
@@ -252,11 +325,12 @@ fn run_one(root: &Path, command: &Command, timeout_ms: u64) -> DynamicOutcome {
             // inlining stderr would put a linter's warnings in a prompt the
             // author asked for a file listing in.
             let text = String::from_utf8_lossy(&stdout).trim_end().to_owned();
-            let (output, _raw_chars) = cap_output(text);
-            DynamicOutcome::Ran { output }
+            let (output, _raw_chars, truncated) = cap_output(text);
+            DynamicOutcome::Ran { output, truncated }
         }
         BoundedRun::Completed { status, .. } => DynamicOutcome::Failed {
             status: describe_status(status),
+            exit_status: status.code(),
         },
         BoundedRun::TimedOut => DynamicOutcome::TimedOut,
         // Never started: the jail root could not be resolved, or `sh` could
@@ -264,7 +338,10 @@ fn run_one(root: &Path, command: &Command, timeout_ms: u64) -> DynamicOutcome {
         BoundedRun::SpawnFailed(reason) => DynamicOutcome::NotRun { reason },
         // Started, and its output never arrived. It *ran*, so it is not a
         // not-run: the machine did something and we cannot say what.
-        BoundedRun::Lost(reason) => DynamicOutcome::Failed { status: reason },
+        BoundedRun::Lost(reason) => DynamicOutcome::Failed {
+            status: reason,
+            exit_status: None,
+        },
     }
 }
 
@@ -416,7 +493,8 @@ mod tests {
         assert_eq!(
             outcomes[2],
             DynamicOutcome::Ran {
-                output: "one\ntwo".to_owned()
+                output: "one\ntwo".to_owned(),
+                truncated: false,
             },
             "the commands did not run in document order: {outcomes:?}"
         );
@@ -442,27 +520,31 @@ mod tests {
         assert_eq!(
             outcomes[0],
             DynamicOutcome::Ran {
-                output: "first".to_owned()
+                output: "first".to_owned(),
+                truncated: false,
             }
         );
         assert_eq!(
             outcomes[1],
             DynamicOutcome::Failed {
-                status: "exited 3".to_owned()
+                status: "exited 3".to_owned(),
+                exit_status: Some(3),
             },
             "a non-zero exit is a failure, not output"
         );
         assert_eq!(
             outcomes[2],
             DynamicOutcome::Ran {
-                output: String::new()
+                output: String::new(),
+                truncated: false,
             },
             "stderr is not inlined; the command still succeeded"
         );
         assert_eq!(
             outcomes[3],
             DynamicOutcome::Ran {
-                output: "last".to_owned()
+                output: "last".to_owned(),
+                truncated: false,
             },
             "a failure never stops the commands after it"
         );
@@ -484,7 +566,8 @@ mod tests {
         assert_eq!(
             outcomes[1],
             DynamicOutcome::Ran {
-                output: "after".to_owned()
+                output: "after".to_owned(),
+                truncated: false,
             }
         );
         assert!(
@@ -506,7 +589,7 @@ mod tests {
             &[Command::new("head -c 20000 /dev/zero | tr '\\0' x")],
             10_000,
         );
-        let DynamicOutcome::Ran { output } = &outcomes[0] else {
+        let DynamicOutcome::Ran { output, .. } = &outcomes[0] else {
             panic!("expected a ran outcome, got {:?}", outcomes[0]);
         };
         assert!(
@@ -551,14 +634,16 @@ mod tests {
         assert_eq!(DynamicOutcome::TimedOut.reason(), Some("timed out"));
         assert_eq!(
             DynamicOutcome::Ran {
-                output: "x".to_owned()
+                output: "x".to_owned(),
+                truncated: false,
             }
             .reason(),
             None,
             "the arm with output has no reason"
         );
         assert!(DynamicOutcome::Ran {
-            output: String::new()
+            output: String::new(),
+            truncated: false,
         }
         .did_run());
         assert!(!DynamicOutcome::declined().did_run());

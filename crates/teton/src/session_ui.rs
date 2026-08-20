@@ -1082,6 +1082,7 @@ fn not_run_words(reason: NotRunReason) -> &'static str {
         NotRunReason::Level => "this session's permission level does not run them",
         NotRunReason::NoTerminal => "no human could be asked",
         NotRunReason::UnrecognizedSubject => "this client did not recognize the request",
+        NotRunReason::CouldNotStart => "it could not be started",
     }
 }
 
@@ -7621,12 +7622,16 @@ mod skill_tests {
     /// collapsing any two of them would tell a user their answer decided
     /// something they were never asked.
     #[test]
-    fn the_four_not_run_reasons_read_as_four_different_sentences() {
+    fn the_not_run_reasons_read_as_different_sentences() {
+        // Every arm, listed exhaustively rather than sampled: a reason added
+        // later that this crate forgets to word would otherwise reach a user
+        // wearing another reason's sentence.
         let mut seen: Vec<&str> = [
             NotRunReason::Declined,
             NotRunReason::Level,
             NotRunReason::NoTerminal,
             NotRunReason::UnrecognizedSubject,
+            NotRunReason::CouldNotStart,
         ]
         .into_iter()
         .map(not_run_words)

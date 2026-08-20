@@ -1,7 +1,7 @@
 ---
 id: TASK-205
 title: "Ask once, run in order, say what did not run — and report the invocation as a typed event"
-status: draft
+status: complete
 parent: REQ-585
 created: 2026-08-20
 updated: 2026-08-20

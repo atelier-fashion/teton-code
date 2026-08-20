@@ -89,7 +89,7 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
 use teton_core::boundary::BoundaryMatcher;
@@ -116,10 +116,12 @@ use teton_inference::probe::{decide, GpuClass, HardwareProfile, TierDecision, GI
 use teton_inference::{ChatFormat, Completion, Engine, EngineError, GenParams, MockEngine};
 
 use teton_protocol::events::{
-    BlockCause, CapabilityDeadEnd, ContextCleared, ContextPressureKind, Event, ModelLifecycle,
-    ModelLifecycleStage, PrivacyAction, ProviderTested, SessionRootChanged, SessionTitled,
-    TierWarming, TurnQueued, WebCapabilityState as WireWebCapabilityState, WebLookup,
-    WebSetupCompleted, WebTaintOverridden, WebTier as WireWebTier,
+    BlockCause, CapabilityDeadEnd, ContextCleared, ContextPressureKind,
+    DynamicOutcome as WireDynamicOutcome, DynamicOutcomeView, Event, ModelLifecycle,
+    ModelLifecycleStage, NotRunReason, PrivacyAction, ProviderTested, SessionRootChanged,
+    SessionTitled, SkillInvoked, TierWarming, TurnQueued,
+    WebCapabilityState as WireWebCapabilityState, WebLookup, WebSetupCompleted, WebTaintOverridden,
+    WebTier as WireWebTier,
 };
 use teton_protocol::jsonrpc::{error_code, RpcError};
 use teton_protocol::methods::{
@@ -128,7 +130,7 @@ use teton_protocol::methods::{
     ModelListResult, ModelSetResult, ModelStatusResult, PrivacyBoundaryConfig, PromptTurnResult,
     ProviderConfig, ProviderHealth as WireProviderHealth, ProviderSetupCandidate,
     ProviderSetupCommitResult, ProviderSetupPlanResult, ProviderSetupPreviewResult,
-    ProviderTestOutcome, ProviderTestResult, SessionClearParams, SessionClearResult,
+    ProviderTestOutcome, ProviderTestResult, RefusalReason, SessionClearParams, SessionClearResult,
     SessionPermissionsParams, SessionPermissionsResult, SessionSetCwdParams, SessionSetCwdResult,
     SkillInvocation, TierBinding as WireTierBinding, TierBindingConfig, TierRouteView, TierSummary,
     WebOverrideParams, WebOverrideResult, WebRefreshOutcome, WebRefreshParams, WebRefreshResult,
@@ -162,9 +164,12 @@ use crate::egress::{
     EgressError, HttpTransport, LookupContext, LookupOutcome, LookupRecord, LookupRecorder,
     LookupRequest, Provenance, RedactionGate, RedactionVerdict, TaintView,
 };
+use crate::grants::ConnectionId;
 use crate::harness::budget::{skill_fit, RouteBudget, SkillFit, SkillStage};
 use crate::harness::completion::{context_provenance, RemoteProviderSource};
 use crate::harness::context::{NoopProvenanceHook, PressureReport};
+use crate::harness::permissions::{AddressedPermissionDelivery, SkillConsent};
+use crate::harness::tools::shell;
 use crate::harness::tools::web::{register_web_tool, tier_name, SeamError, WebLookupSeam};
 use crate::harness::turn_loop::{pressure_kind, run_session_turn_with_source, HarnessError};
 use crate::harness::{
@@ -186,6 +191,8 @@ use crate::router::{
 use crate::selection_store::SelectionStore;
 use crate::session_root::{home, ProbedRoot};
 use crate::sessions::{validate_session_cwd, SessionRegistry, TurnClaimError};
+use crate::skills::expand::COMMAND_ECHO_MAX_CHARS;
+use crate::skills::{Command, DynamicOutcome, Expansion, Pending, SkillSource};
 use crate::web::{UserUrls, WebCache};
 // The module rather than the function: `suggestion_catalog()` on its own would
 // read, in a file this size, as something the runtime computes.
@@ -1437,15 +1444,41 @@ struct SkillTurn {
     /// (`^[a-z0-9][a-z0-9_-]{0,63}$`) — safe to put in a refusal sentence, and
     /// the name [`skill_fit`] quotes.
     name: String,
-    /// The expansion as it stands, with [`crate::skills::PENDING_PLACEHOLDER`]
-    /// in each `` !`command` `` slot.
+    /// The expansion as it stands: [`crate::skills::PENDING_PLACEHOLDER`] in
+    /// each `` !`command` `` slot until the consent seam folds the outcomes in,
+    /// and the finished prompt text afterwards.
     ///
-    /// TASK-205 replaces this at the seam in `run_prompt_turn`, after the
-    /// commands have been consented to and run, with
-    /// [`Expansion::fold`](crate::skills::Expansion::fold)'s output — which is
+    /// Replaced at the seam in `run_prompt_turn`, after the commands have been
+    /// consented to and run, with [`Expansion::fold`]'s output — which is
     /// precisely why Stage B measures this field rather than re-reading Stage
     /// A's answer.
     text: String,
+    /// The expansion value itself, taken at the seam and folded exactly once.
+    ///
+    /// `None` afterwards, and that is the type doing the work: [`Expansion::fold`]
+    /// consumes, so a second fold is not expressible, and BR-4's "built once
+    /// because two copies would disagree" holds one layer up as well — the
+    /// string the user consented to and the string the model receives come from
+    /// one value.
+    expansion: Option<Expansion<Pending>>,
+    /// The gate key this skill's dynamic context asks under
+    /// ([`crate::skills::Skill::permission_key`], ADR-6) — minted with the
+    /// registry row in hand rather than re-derived at the seam, so the key the
+    /// grant is remembered under cannot come from a second reading of the
+    /// registry.
+    permission_key: String,
+    /// Which of the two roots the file came from — half the permission key, and
+    /// what BR-12's echo line names.
+    source: SkillSource,
+    /// The file, home-relative and bounded (`session_root::display_for` +
+    /// `bounded_field`) — the one form allowed on a surface, because an absolute
+    /// path carries a username into a transcript (BR-1's entity table).
+    path_display: String,
+    /// The body's size in bytes, which is what BR-12's echo line renders.
+    body_bytes: u64,
+    /// The frontmatter keys this daemon read and ignored (BR-5), listed by
+    /// `/verbose` and inert everywhere else.
+    ignored_keys: Vec<String>,
     /// The skill file's identity, for the seeded user block (BR-7, ADR-9). A
     /// project skill is under the root and mints cleanly.
     sources: BTreeSet<ProvenanceId>,
@@ -1455,6 +1488,91 @@ struct SkillTurn {
     /// boundary is configured, exactly as `shell` output does, which is stricter
     /// than BR-7's letter and right in the charter's direction (ADR-9).
     unknown: bool,
+}
+
+/// The gate's answer to one invocation, reduced to the fact both readers need:
+/// **which door was closed**, or `None` when the commands may run.
+///
+/// Two arms of [`SkillConsent`] collapse here and it is deliberate.
+/// `Refused(NoTerminal)` and `Unanswerable` differ in *why* there was nobody at
+/// the other end — a client that refused without reading stdin, versus a
+/// question that could not be put to anyone at all — and not in anything the
+/// model or the user can act on: no human was asked. Every other arm keeps its
+/// own door, because AC-9 turns on the difference between "you said no" and
+/// "nobody could be asked", and BR-6 on the difference between either and "the
+/// level does not run them".
+fn closed_door(consent: SkillConsent) -> Option<NotRunReason> {
+    match consent {
+        SkillConsent::Allowed => None,
+        SkillConsent::DeniedByLevel => Some(NotRunReason::Level),
+        SkillConsent::Declined => Some(NotRunReason::Declined),
+        SkillConsent::Refused(RefusalReason::NoTerminal) | SkillConsent::Unanswerable => {
+            Some(NotRunReason::NoTerminal)
+        }
+        SkillConsent::Refused(RefusalReason::UnrecognizedSubject) => {
+            Some(NotRunReason::UnrecognizedSubject)
+        }
+    }
+}
+
+/// The placeholder sentence a closed door earns, from
+/// [`crate::skills::dynamic`]'s own constructors.
+///
+/// The strings live there, beside the grammar and the runner, so the four
+/// sentences a model can read about a missing command are spelled in exactly one
+/// place (LESSON-528).
+fn door_outcome(door: NotRunReason) -> DynamicOutcome {
+    match door {
+        NotRunReason::Declined => DynamicOutcome::declined(),
+        NotRunReason::Level => DynamicOutcome::not_run_at_plan(),
+        NotRunReason::NoTerminal => DynamicOutcome::no_terminal(),
+        NotRunReason::UnrecognizedSubject => DynamicOutcome::unrecognized_subject(),
+        // Never reached from `closed_door`, which only ever answers with the
+        // consent's own doors. It is spelled out rather than left to an
+        // `unreachable!` because `NotRunReason` now also carries the runner's
+        // `CouldNotStart`, which arrives as an *outcome* and not as a door —
+        // and a future caller should meet a sentence here, not a panic.
+        NotRunReason::CouldNotStart => DynamicOutcome::could_not_start(),
+    }
+}
+
+/// One command's typed record for BR-12's event, projected from the outcome the
+/// daemon actually produced (LESSON-544: the wire value is derived from the real
+/// one, never composed beside it).
+///
+/// `door` is `Some` when the consent closed one, and it is what a not-run arm
+/// reports: the daemon-side outcome carries its reason as prose for the model,
+/// and re-reading a [`NotRunReason`] out of that sentence would be a second
+/// parser of the daemon's own words (LESSON-529).
+///
+/// A command the runner could not **start** (`sh` unavailable, an unresolvable
+/// jail root) has no door either, and reports [`NotRunReason::CouldNotStart`].
+/// It is not folded into `Failed`: that would say it was attempted and exited,
+/// which is untrue and points a reader at the wrong fix. It is not folded into
+/// one of the consent's doors either — nobody refused it.
+fn outcome_view(
+    command: &Command,
+    outcome: &DynamicOutcome,
+    door: Option<NotRunReason>,
+) -> DynamicOutcomeView {
+    DynamicOutcomeView {
+        // File-supplied bytes on a surface: bounded and rendered on one line
+        // here, at the same ceiling the fold's echoed placeholder uses (BR-3).
+        command: teton_core::session_root::bounded_field(command.as_str(), COMMAND_ECHO_MAX_CHARS),
+        outcome: match outcome {
+            DynamicOutcome::Ran { output, .. } => WireDynamicOutcome::Ran {
+                output_bytes: output.len() as u64,
+                truncated: outcome.output_truncated(),
+            },
+            DynamicOutcome::NotRun { .. } => WireDynamicOutcome::NotRun {
+                reason: door.unwrap_or(NotRunReason::CouldNotStart),
+            },
+            DynamicOutcome::Failed { exit_status, .. } => WireDynamicOutcome::Failed {
+                exit_status: *exit_status,
+            },
+            DynamicOutcome::TimedOut => WireDynamicOutcome::TimedOut,
+        },
+    }
 }
 
 /// The assembled daemon runtime shared by every client task.
@@ -1607,6 +1725,29 @@ pub struct DaemonRuntime {
     /// as an endpoint-bound authorization header at the egress choke point and
     /// never reaches a log, `CostRecord`, or telemetry.
     secret_resolver: SecretResolver,
+    /// Where an **addressed** permission request is delivered (REQ-585 ADR-7).
+    ///
+    /// Installed once, by [`crate::server::Daemon`]'s constructors, over the
+    /// live surface registry that daemon holds. It lives here because the gate
+    /// is built here ([`Self::permission_gate_for`]) and cached for the
+    /// session's life, while the route is a daemon-wide fact fixed before any
+    /// connection exists.
+    ///
+    /// A [`OnceLock`] rather than a constructor parameter because the ownership
+    /// runs the other way: the daemon holds the runtime, so the runtime cannot
+    /// be handed the daemon's registry until the runtime already exists. Empty
+    /// on a runtime nobody wired one into, which is **no prompt** rather than a
+    /// degraded one — see [`AddressedPermissionDelivery`].
+    addressed_delivery: OnceLock<Arc<dyn AddressedPermissionDelivery>>,
+    /// The per-command deadline a skill's dynamic context runs under (REQ-585
+    /// BR-6: "the `shell` tool's jail, timeout and output cap").
+    ///
+    /// Production is [`shell::DEFAULT_TIMEOUT_MS`] — the same figure a `shell`
+    /// call that names no timeout gets — and it is a field only so a test can
+    /// reach the timed-out arm without waiting out a window sized for a human
+    /// (the argument `Daemon::with_consent_timeout` makes, and
+    /// `ShellTool::with_timeouts` makes for the tool itself).
+    skill_command_timeout_ms: u64,
 }
 
 impl DaemonRuntime {
@@ -1663,7 +1804,43 @@ impl DaemonRuntime {
             data_dir: std::env::temp_dir(),
             provider_health: Mutex::new(BTreeMap::new()),
             secret_resolver: SecretResolver::with_default_backend(),
+            addressed_delivery: OnceLock::new(),
+            skill_command_timeout_ms: shell::DEFAULT_TIMEOUT_MS,
         }
+    }
+
+    /// Install the route an addressed permission request is delivered on
+    /// (REQ-585 ADR-7) — the daemon's one call, made before any connection
+    /// exists.
+    ///
+    /// Idempotent-by-first-writer: a second call is ignored, because two
+    /// daemons over one runtime is not a production shape and the first
+    /// daemon's live surface registry is as good an answer as the second's.
+    ///
+    /// Without it every skill consent answers
+    /// [`SkillConsent::Unanswerable`](crate::harness::permissions::SkillConsent::Unanswerable)
+    /// and no dynamic command runs — fail-closed, which is the only safe
+    /// absence: the fallback would be the event bus, and keeping a skill
+    /// consent *off* the bus is the whole of ADR-7.
+    pub fn install_addressed_delivery(&self, route: Arc<dyn AddressedPermissionDelivery>) {
+        let _ = self.addressed_delivery.set(route);
+    }
+
+    /// Replace the per-command deadline a skill's dynamic context runs under
+    /// (REQ-585 AC-10).
+    ///
+    /// **The observation seam AC-10's turn-level claim is written against.**
+    /// Production takes [`shell::DEFAULT_TIMEOUT_MS`], 30 s — sized for a real
+    /// command — and a test that asserted "a command past the deadline leaves a
+    /// timed-out placeholder and the invocation still produces its turn" by
+    /// waiting that out would spend half a minute proving a branch it can prove
+    /// in milliseconds. A fixture has to say this out loud, exactly as it does
+    /// [`crate::server::Daemon::with_consent_timeout`], so no shipped path can
+    /// be running a shortened deadline.
+    #[must_use]
+    pub fn with_skill_command_timeout(mut self, timeout_ms: u64) -> Self {
+        self.skill_command_timeout_ms = timeout_ms;
+        self
     }
 
     /// [`Self::minimal`] with a **real config file** behind it, loaded (REQ-579
@@ -1841,6 +2018,8 @@ impl DaemonRuntime {
             data_dir: base_dir.to_path_buf(),
             provider_health: Mutex::new(BTreeMap::new()),
             secret_resolver: SecretResolver::with_default_backend(),
+            addressed_delivery: OnceLock::new(),
+            skill_command_timeout_ms: shell::DEFAULT_TIMEOUT_MS,
         })
     }
 
@@ -2779,7 +2958,8 @@ impl DaemonRuntime {
         // this turn produces. Reduced here, at the one surface that has both the
         // path and `home`, so `expand` stays pure (BR-14).
         let display = teton_core::session_root::display_for(&skill.path, home().as_deref());
-        let text = crate::skills::expand(skill, &invocation.raw_arguments, &display).pending_text();
+        let expansion = crate::skills::expand(skill, &invocation.raw_arguments, &display);
+        let text = expansion.pending_text();
 
         // ADR-9's id-minting gap, decided rather than papered over: a project
         // skill is under the root and mints; a user skill at
@@ -2794,9 +2974,163 @@ impl DaemonRuntime {
         Ok(SkillTurn {
             name: skill.name.clone(),
             text,
+            expansion: Some(expansion),
+            permission_key: skill.permission_key(),
+            source: skill.source,
+            // Bounded here, at the one surface that has the path and `home`,
+            // for the reason the preamble's copy is bounded here: BR-12's event
+            // goes to every attached client and into transcripts (ADR-15).
+            path_display: teton_core::session_root::bounded_field(
+                &display,
+                teton_core::session_root::DISPLAY_MAX_CHARS,
+            ),
+            body_bytes: skill.body.len() as u64,
+            ignored_keys: skill.ignored_keys.clone(),
             sources,
             unknown,
         })
+    }
+
+    /// Ask once, run in document order, fold the outcomes back into the
+    /// expansion, and publish the invocation's record (REQ-585 BR-6, BR-12;
+    /// ADR-7, ADR-14, ADR-15).
+    ///
+    /// # One consent, every command
+    ///
+    /// [`PermissionGate::authorize_skill`] is called **once per invocation**,
+    /// with the whole command list in document order and already substituted, so
+    /// the prompt shows what will run. A prompt per command is REQ-560 BR-2's
+    /// named anti-pattern — the shipped ADLC corpus has skills with four `` !`…` ``
+    /// slots, and four prompts for one typed `/name` is a session nobody uses
+    /// twice.
+    ///
+    /// The key is the skill's own (`skill:<source>:<name>`, ADR-6), minted with
+    /// the registry row in hand at [`Self::accept_invocation`] and carried here
+    /// — never `shell`, or one "allow for this session" answered at a skill
+    /// prompt would free every later model-issued shell call (LESSON-495).
+    ///
+    /// # Nothing is re-read across the await
+    ///
+    /// The permission `await` releases this turn to the event loop, and nothing
+    /// below it re-reads a fact the gate settled above it: `decide` snapshots the
+    /// level at the top of its own body for exactly that reason (REQ-560 BR-7),
+    /// and the root, the commands and the expansion were all fixed before the
+    /// question was asked. A `/permissions` landing mid-prompt moves the *next*
+    /// turn.
+    ///
+    /// # The event is published here, and not one line later
+    ///
+    /// BR-12 says *every* invocation echoes one line, so the publish is the last
+    /// thing this function does and the Stage B check is the first thing after
+    /// it. A turn where the user approved four commands, watched them run, and
+    /// was then refused for size is the turn whose record matters most; a publish
+    /// on the far side of that refusal would leave it with no echo line and no
+    /// `/verbose` outcomes (ADR-15).
+    ///
+    /// # No model call happens here (BR-4)
+    ///
+    /// [`crate::skills::run_all`] is `run_bounded`'s second caller, not
+    /// `ShellTool::run`'s — so `Tool::refine`, which fires the `shell` duty and
+    /// *is* a model call, is not on this path (ADR-14).
+    async fn settle_dynamic_context(
+        self: &Arc<Self>,
+        events: &Arc<EventBus>,
+        session_id: &SessionId,
+        gate: &PermissionGate,
+        root: &Path,
+        invoker: Option<ConnectionId>,
+        skill: &mut SkillTurn,
+    ) {
+        // Taken, not borrowed: `fold` consumes, so this value can be spent once
+        // and the type says so (see [`SkillTurn::expansion`]). It is `Some` on
+        // every path into this function, which runs once per turn.
+        let Some(expansion) = skill.expansion.take() else {
+            return;
+        };
+        let commands = expansion.commands().to_vec();
+
+        // A skill with no dynamic context asks nothing. There is no question to
+        // put — a prompt listing zero commands is a prompt about nothing — and
+        // BR-12's line still gets published below with an empty outcome list,
+        // which is a real state ("0 dynamic commands") rather than a missing one.
+        let door = if commands.is_empty() {
+            None
+        } else {
+            let consent = match invoker {
+                Some(connection) => {
+                    gate.authorize_skill(
+                        &skill.permission_key,
+                        &skill.name,
+                        skill.source,
+                        commands.iter().map(|c| c.as_str().to_owned()).collect(),
+                        connection,
+                    )
+                    .await
+                }
+                // No addressable connection — an internal caller, or a fixture.
+                // The question cannot be *put* to anyone, which is precisely the
+                // gate's own fail-closed answer, so it is spelled with the gate's
+                // word rather than with a second one.
+                None => SkillConsent::Unanswerable,
+            };
+            closed_door(consent)
+        };
+
+        let outcomes = match door {
+            // Consent given. Sequential, in document order, with the session
+            // root as cwd and the `shell` tool's jail, scrub, PATH floor,
+            // process group and deadline (ADR-14).
+            None if !commands.is_empty() => {
+                let root = root.to_path_buf();
+                let to_run = commands.clone();
+                let timeout_ms = self.skill_command_timeout_ms;
+                // On the blocking pool: `run_bounded` waits on a child process
+                // for up to the deadline, per command, and a turn that parked an
+                // async worker for that long would stall every other session on
+                // it. A panic inside propagates exactly as an inline call's
+                // would — which is the only way this join can fail, since a
+                // `spawn_blocking` task is never cancelled.
+                tokio::task::spawn_blocking(move || {
+                    crate::skills::run_all(&root, &to_run, timeout_ms)
+                })
+                .await
+                .expect("the dynamic-context runner does not panic")
+            }
+            None => Vec::new(),
+            // A closed door is the same answer for every command of the
+            // invocation, because the question was asked once about all of them.
+            Some(reason) => vec![door_outcome(reason); commands.len()],
+        };
+
+        // The fold is where the output becomes prompt text: a ran slot enters
+        // inside `frame_untrusted_builtin("skill:<name>", …)` — the same
+        // envelope every built-in tool result gets, which neutralizes envelope
+        // tags in its payload — and every other slot becomes an explicit
+        // ``[dynamic context not run: `<cmd>` — <reason>]`` (BR-6).
+        skill.text = expansion.fold(&outcomes);
+
+        // BR-7: output that came from a command carries what `shell` output
+        // carries — nothing that can be pinned. On a boundary-configured machine
+        // that fails closed, so an invocation that ran **any** command pins its
+        // turn to the local tier, exactly as a `shell` result does. Recorded on
+        // the block the seed below builds, which is what egress inspects.
+        skill.unknown |= outcomes.iter().any(DynamicOutcome::did_run);
+
+        events.publish(
+            Some(session_id.clone()),
+            Event::SkillInvoked(SkillInvoked {
+                name: skill.name.clone(),
+                source: skill.source,
+                path_display: skill.path_display.clone(),
+                body_bytes: skill.body_bytes,
+                ignored_keys: skill.ignored_keys.clone(),
+                outcomes: commands
+                    .iter()
+                    .zip(outcomes.iter())
+                    .map(|(command, outcome)| outcome_view(command, outcome, door))
+                    .collect(),
+            }),
+        );
     }
 
     /// Run one prompt turn for `session`, streaming events over `events` and
@@ -2848,6 +3182,13 @@ impl DaemonRuntime {
     // `run_one_attempt` already carries below. `session_cwd` is the caller's
     // pre-claim snapshot of the root; the turn re-reads the registry once it
     // holds the claim and uses the snapshot only if the session is gone.
+    //
+    // `invoker` is the connection that sent this prompt, and it is carried for
+    // exactly one purpose: a skill's dynamic-context consent is **addressed** to
+    // it and answerable by nobody else (REQ-585 ADR-7). `None` is a caller with
+    // no connection at all — an internal driver or a fixture — and it asks
+    // nobody, which is the gate's own fail-closed answer rather than a fallback
+    // to the bus.
     #[allow(clippy::too_many_arguments)]
     pub async fn run_prompt_turn(
         self: &Arc<Self>,
@@ -2859,6 +3200,7 @@ impl DaemonRuntime {
         session_cwd: Option<PathBuf>,
         prompt: String,
         skill: Option<SkillInvocation>,
+        invoker: Option<ConnectionId>,
         mut presence: ClientPresence,
     ) -> Result<PromptTurnResult, RpcError> {
         let turn_id = teton_protocol::TurnId::from(format!(
@@ -2922,7 +3264,7 @@ impl DaemonRuntime {
         //
         // Refusing here is free in BR-8(c)'s sense: nothing has been seeded, no
         // route has been decided, and no event has been published.
-        let skill_turn = match &skill {
+        let mut skill_turn = match &skill {
             Some(invocation) => {
                 Some(self.accept_invocation(sessions, &session_id, &probed, invocation)?)
             }
@@ -3170,20 +3512,26 @@ impl DaemonRuntime {
             );
         }
 
-        // ── TASK-205 SEAM: dynamic-context consent and execution ─────────────
+        // ── REQ-585 BR-6 / BR-12: dynamic-context consent and execution ──────
         //
-        // BR-6's consent and `dynamic::run_all` go **here**, between the two
-        // stages: ask once per invocation under the skill's own permission key,
-        // run the commands in document order, and replace `skill_turn.text` with
-        // `Expansion::fold(&outcomes)`. Until then every slot holds
-        // `skills::PENDING_PLACEHOLDER`, which is exactly what Stage A measured
-        // — so the two stages agree by construction today and Stage B begins to
-        // bite the moment output is folded in, without either check moving.
+        // The TASK-205 seam. One `authorize_skill` for the whole invocation,
+        // `run_all` in document order with the session root as cwd, the outcomes
+        // folded back into `skill_turn.text`, and BR-12's `skill_invoked`
+        // published — in that order, and all of it **between** the two budget
+        // stages.
         //
-        // Stage A is above this seam and must stay there: a body that cannot fit
-        // is refused *before* a user is walked through approving four commands,
+        // Stage A is above this and must stay there: a body that cannot fit is
+        // refused *before* a user is walked through approving four commands,
         // watching them run, and then being told the turn was refused (BR-8d).
+        // Stage B is below it and must stay there: until this seam runs, the
+        // slots hold `skills::PENDING_PLACEHOLDER` — exactly what Stage A
+        // measured — and it is the fold that makes the second measurement a
+        // different one.
         // ─────────────────────────────────────────────────────────────────────
+        if let Some(skill) = &mut skill_turn {
+            self.settle_dynamic_context(events, &session_id, &gate, &probed.path, invoker, skill)
+                .await;
+        }
 
         // ── REQ-585 BR-8 / ADR-11: Stage B — does it still fit with the
         // dynamic-context output folded in? ──────────────────────────────────
@@ -3909,7 +4257,7 @@ impl DaemonRuntime {
             .lock()
             .expect("session gate mutex poisoned");
         Arc::clone(gates.entry(session_id.clone()).or_insert_with(|| {
-            Arc::new(
+            let mut gate =
                 // REQ-560: the gate is created at a *level*, not at a built
                 // table, because the level is what the user can change
                 // mid-session — a table snapshotted here would go stale the
@@ -3930,8 +4278,16 @@ impl DaemonRuntime {
                 // REQ-563 BR-4: the one consent answer that outlives the session
                 // writes through the daemon, never the client. The gate holds
                 // the seam and this is the only place it is filled in.
-                .with_web_persistence(Arc::clone(self) as Arc<dyn WebTierPersistence>),
-            )
+                .with_web_persistence(Arc::clone(self) as Arc<dyn WebTierPersistence>);
+            // REQ-585 ADR-7: and the route a skill's dynamic-context consent is
+            // *addressed* on. Filled in here for the same reason the web sink is
+            // — the gate is built in one place and is cached for the session's
+            // life — and left empty on a runtime nobody wired one into, which
+            // asks nobody rather than falling back to the bus.
+            if let Some(route) = self.addressed_delivery.get() {
+                gate = gate.with_addressed_delivery(Arc::clone(route));
+            }
+            Arc::new(gate)
         }))
     }
 
@@ -17742,6 +18098,7 @@ permission_allow = [\"fetch_user_url\"]
                         None,
                         format!("please summarize {SENTINEL} for me"),
                         None,
+                        None,
                         ClientPresence::unwatched(),
                     )
                     .await
@@ -17801,6 +18158,7 @@ permission_allow = [\"fetch_user_url\"]
                         None,
                         None,
                         "please summarize src/main.rs for me".to_owned(),
+                        None,
                         None,
                         ClientPresence::unwatched(),
                     )
@@ -17864,6 +18222,7 @@ permission_allow = [\"fetch_user_url\"]
                         None,
                         None,
                         format!("please summarize {SENTINEL} for me"),
+                        None,
                         None,
                         ClientPresence::unwatched(),
                     )
@@ -17940,6 +18299,7 @@ permission_allow = [\"fetch_user_url\"]
                         None,
                         "please summarize src/main.rs for me".to_owned(),
                         None,
+                        None,
                         ClientPresence::unwatched(),
                     )
                     .await
@@ -18002,6 +18362,7 @@ permission_allow = [\"fetch_user_url\"]
                         None,
                         None,
                         "please summarize sk-ABCDEFGHIJKLMNOPQRSTUVWX for me".to_owned(),
+                        None,
                         None,
                         ClientPresence::unwatched(),
                     )
@@ -19533,6 +19894,7 @@ permission_allow = [\"fetch_user_url\"]
                             None,
                             None,
                             "what does the tokio page say about task pinning?".to_owned(),
+                            None,
                             None,
                             ClientPresence::unwatched(),
                         )
@@ -25018,6 +25380,7 @@ provider_id = \"deepseek\"
                     cwd,
                     text.to_owned(),
                     None,
+                    None,
                     ClientPresence::unwatched(),
                 )
                 .await
@@ -27804,6 +28167,7 @@ provider_id = \"deepseek\"
                     None,
                     "a prompt the provider will say is too large".to_owned(),
                     None,
+                    None,
                     ClientPresence::unwatched(),
                 )
                 .await
@@ -27970,6 +28334,7 @@ provider_id = \"deepseek\"
                         None,
                         None,
                         "hi".to_owned(),
+                        None,
                         None,
                         presence,
                     )
@@ -28489,6 +28854,54 @@ provider_id = \"deepseek\"
     /// cannot install a local engine. So the classifier's own prompt is read
     /// here, from inside the crate, off an engine that records every string it
     /// was handed.
+    /// The one `NotRun` arm that is **not** a closed door.
+    ///
+    /// A command the runner could not start — no shell, an unresolvable jail
+    /// root, a failed spawn — arrives with consent already **given**, so there
+    /// is no door to name. Reporting it as `Failed` would tell a reader on
+    /// `/verbose` that it was attempted and exited, which is untrue and points
+    /// at the wrong fix; reporting one of the consent's four doors would blame
+    /// a refusal nobody made.
+    mod a_command_that_could_not_start {
+        use super::*;
+        use teton_protocol::events::{DynamicOutcome as WireDynamicOutcome, NotRunReason};
+
+        #[test]
+        fn is_not_a_closed_door_and_is_not_a_failure() {
+            let command = crate::skills::Command::new("definitely-not-a-program");
+            let never_started = crate::skills::DynamicOutcome::could_not_start();
+
+            // No door: consent was given and the machine could not carry it out.
+            let view = outcome_view(&command, &never_started, None);
+            assert!(
+                matches!(
+                    view.outcome,
+                    WireDynamicOutcome::NotRun {
+                        reason: NotRunReason::CouldNotStart
+                    }
+                ),
+                "{:?}",
+                view.outcome
+            );
+
+            // The control: with a door, the door is what is reported — so the
+            // arm above is reached by the *absence* of one, not by the outcome
+            // kind alone.
+            let declined = crate::skills::DynamicOutcome::declined();
+            let view = outcome_view(&command, &declined, Some(NotRunReason::Declined));
+            assert!(
+                matches!(
+                    view.outcome,
+                    WireDynamicOutcome::NotRun {
+                        reason: NotRunReason::Declined
+                    }
+                ),
+                "{:?}",
+                view.outcome
+            );
+        }
+    }
+
     mod skill_turn_readers {
         use super::*;
         use crate::sessions::SessionRegistry;
@@ -28599,6 +29012,7 @@ provider_id = \"deepseek\"
                         name: "marked".to_owned(),
                         raw_arguments: String::new(),
                     }),
+                    None,
                     ClientPresence::unwatched(),
                 )
                 .await

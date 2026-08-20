@@ -669,6 +669,42 @@ impl ConsentSurfaces {
         })
     }
 
+    /// Send `frame` to **exactly one** connection, answering whether it took it
+    /// (REQ-585 ADR-7).
+    ///
+    /// The delivery half of an *addressed* permission request: a skill's
+    /// dynamic-context consent goes to the connection that sent the invocation
+    /// and to nobody else, because a pre-REQ-585 client attached to the same
+    /// session — a supported topology (REQ-570) — would receive a
+    /// [`PermissionSubject`](teton_protocol::events::PermissionSubject) it has
+    /// never heard of, fall through to its own `prompter.ask`, and on a pipe
+    /// read the user's next stdin line as the answer. So there is no route
+    /// predicate here at all: the caller names the one connection, and the
+    /// answering half ([`crate::harness::PendingPermissions::resolve_from`])
+    /// refuses an answer from anyone else.
+    ///
+    /// **[`Surface::may_answer`] is deliberately not consulted**, and that is
+    /// not a relaxation. That flag is REQ-569's *attach-consent* ancestry gate —
+    /// "may this connection approve a stranger's attach to a session it holds" —
+    /// and this is a different question: whether the connection driving its own
+    /// session may be shown a permission prompt about that session's turn. An
+    /// unaddressed prompt for the same turn is published on the bus, where the
+    /// filter is attachment ([`ConnState::may_receive`]), and the *answer* is
+    /// gated on `may_drive`, not on ancestry — so withholding this frame would
+    /// deny a legitimate client its own turn's consent while granting nothing.
+    ///
+    /// `try_send`, never a blocking send, for [`Self::deliver`]'s reason: a
+    /// client too wedged to accept a frame must not stall the turn asking about
+    /// it. A `false` here is a prompt nobody will ever see, which the gate turns
+    /// into a refusal rather than a wait.
+    pub fn deliver_to(&self, connection: ConnectionId, frame: &str) -> bool {
+        self.live
+            .read()
+            .expect("consent surfaces lock poisoned")
+            .get(&connection)
+            .is_some_and(|surface| surface.out.try_send(frame.to_owned()).is_ok())
+    }
+
     /// Send `frame` to every surface entitled to learn how the request ended.
     pub fn deliver_outcome(&self, route: &ConsentRoute, frame: &str) -> usize {
         self.deliver(frame, |connection, attached| {

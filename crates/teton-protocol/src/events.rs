@@ -2759,6 +2759,16 @@ pub enum NotRunReason {
     /// The client did not recognize the request's [`PermissionSubject`] and
     /// refused rather than guessing (ADR-7).
     UnrecognizedSubject,
+    /// Consent was given and the command still never started — the shell was
+    /// missing, the jail root could not be resolved, the spawn failed.
+    ///
+    /// The one arm that is **not** a closed door. It exists because the other
+    /// four are all answers to "who said no", and reporting a command that
+    /// never ran as [`DynamicOutcome::Failed`] instead would tell a reader it
+    /// was attempted and exited — a false statement on `/verbose`, and one that
+    /// points at the wrong fix. What went wrong here is on this machine, not in
+    /// anybody's answer.
+    CouldNotStart,
 }
 
 #[cfg(test)]
