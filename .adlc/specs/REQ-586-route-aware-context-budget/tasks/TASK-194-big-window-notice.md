@@ -155,10 +155,74 @@ catch-all, so serde refuses a tag it does not know. That is the fail-closed
 choice — it can never be mis-rendered as a neighbouring kind — but it is a
 lost line, not a degraded one, and only for binaries built before this change.
 Both directions are pinned by
-`a_context_that_did_not_fit_has_its_own_kind_and_degrades_both_ways`.
+`a_context_that_did_not_fit_has_its_own_kind_and_an_older_client_drops_the_frame`
+(renamed in the fix pass below — the old name claimed graceful degradation in
+both directions, and the new→old direction is a drop).
 
 The positive `provider add` notice is asserted end to end against a real daemon
 in `tetond`'s `provider_setup_flow`, not in `cli_e2e`: that suite can only
 complete a **local** registration (every remote kind reads a credential into
 the machine's own keychain), and a local row earns no notice by design. The
 `cli_e2e` leg asserts that negative.
+
+## Fix pass (2026-08-19, REQ-586 verify)
+
+Two Criticals and four Majors, all in the *fix-pass* code rather than the
+feature, each reproduced by mutation before the fix and re-run after it.
+
+- **X1** `router.rs`'s `bound_floored: Some(self.budget.floored)` was
+  unguarded — the field's only tests hand-built the payload. `Some(false)`
+  survived the workspace, which would have made the whole route-line half of
+  2b dead. Guarded by `a_floored_route_says_so_on_its_route_decided`, which
+  derives a floored route from a config and asserts both directions.
+- **X2** the `/doctor` snapshot's `floored_budget` was unguarded in **both**
+  directions (never-`Some` and always-`Some`). Guarded by
+  `the_doctor_snapshot_names_a_floored_budget_and_only_a_floored_one`.
+- **X3** `over_budget` is a *state* announced through an event gate, so one
+  unfittable turn published one `did_not_fit` per loop gate (2 measured, up to
+  26 at `max_turns`), none of them `/verbose`-gated. `announce_pressure` now
+  latches the **transition into** the state; a fitting report clears the latch.
+  Pinned by `an_unfittable_turn_says_so_once_however_many_gates_run`.
+- **X4/X5** `publish_commit_pressure`'s "no completed turn can reach this"
+  reasoning stopped being true at this task: `over_budget` is recomputed on
+  every gate call and counts toward `is_quiet()`, so a turn under a budget its
+  own system prompt cannot fit completes *and* has something to commit-report.
+  Both comments corrected; the commit's success-arm protocol is now one
+  function (`commit_and_publish`) that the dispatch and the
+  `conversation_carry.rs` fixture both call, so the fixture can no longer run a
+  copy of it. Driven end to end by
+  `an_unfittable_turn_still_publishes_the_commits_own_report`.
+- **X6** the floor's documented backstop did not cover the provider it named.
+  `llama-server`'s spelling (`exceeds the available context size`) was verified
+  against two independent reproductions of the real 400 body and is now pinned
+  as a fifth const with a conformance case. **Ollama** — the shipped 4,096
+  recipe the floor cites — is *not* pinned and is now named as uncovered in
+  `MIN_BUDGET_BYTES` and in the `context` docs topic: its OpenAI-compatible
+  chat endpoint truncates an over-long prompt rather than refusing it, so there
+  is no wording to pin and none was invented.
+- Minors fixed: `refit_for_reroute` no longer claims `RefitOnReroute` for a
+  refit that finished over budget; the **effort** sniff is 400-only like the
+  context-length one (one gate ahead of both, `TYPED_REFUSAL_STATUS`), covered
+  by `no_status_but_400_can_be_a_typed_refusal`; the `bytes_figure`/`thousands`
+  golden table moved to the protocol crate beside the formatters it pins.
+
+### Recorded, not fixed
+
+- **Two notions of "local".** `DaemonRuntime::provider_budget_notice` asks
+  `provider.kind.is_remote()` — a property of the *entry* — while
+  `local_tier_id` answers "which id is the local tier" by first match on
+  `kind == Local`, falling back to the canonical `local` id when nothing else
+  claims it. A config with two `kind = "local"` entries has one local *tier*
+  and two entries that suppress the notice; a remote entry registered under the
+  id `local` is neither. The two answers cannot currently disagree in a way a
+  user would notice (the notice is a cost sentence, and no local entry earns
+  one either way), but they are two derivations of one idea and only one of
+  them is named.
+- **`the_notice_threshold_bounds_no_budget` re-derives rather than pins.** Its
+  "huge window" leg recomputes the expected pair with the same expression
+  `derive` uses (`usable × DEN / NUM`, `usable × DUTY_REQUEST_BYTES_PER_TOKEN`),
+  so a change to the arithmetic moves the assertion with it. The monotonicity
+  legs above it are real; that one agrees with itself. `the_route_budget_is_derived_from_the_routes_own_window`
+  pins literals for the shapes that matter, so this is a gap in a redundant
+  test rather than an unguarded surface.
+

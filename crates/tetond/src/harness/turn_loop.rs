@@ -645,9 +645,53 @@ pub fn pressure_kind(report: &PressureReport) -> ContextPressureKind {
 /// same [`SessionEvents::agent_message`] path the turn's prose does, so it lands
 /// in the transcript the user is actually reading. It names the window and a
 /// byte count and nothing else — never a fragment of what was cut (BR-11).
-fn announce_pressure(events: &SessionEvents, report: &PressureReport, budget: &RouteBudget) {
+///
+/// ## `over_budget` is a state, so it is announced on the edge
+///
+/// The other three kinds each describe something the gate **did** on this call:
+/// blocks it dropped, a block it shortened, a re-fit it performed. Those are
+/// events, and every one of them is news.
+/// [`ContextPressureKind::DidNotFit`] is not — it is the *condition the context
+/// is in*, re-measured by a gate that runs at the top of every iteration and
+/// again on the way out (TASK-194 2a). A turn that cannot fit its budget is
+/// still not fitting it one iteration later, and reporting that afresh each
+/// time is the per-iteration noise the quiet gate above exists to prevent: one
+/// over-budget turn published two of these through this loop, and a turn that
+/// takes its `max_turns` of tool iterations would publish twenty-six.
+///
+/// So `said_it_did_not_fit` latches the **transition into** the state: the first
+/// gate that cannot fit says so, its repeats are silent, and any gate that
+/// reports a fitting outcome — a drop, an elision, or nothing at all — clears
+/// the latch, because the context left the state and going back into it is a new
+/// fact rather than a repeat. The suppressed reports lose nothing a reader
+/// needs: what the gate managed rides in `dropped_blocks`/`elided_bytes` on the
+/// line that *did* go out, and the drops those later gates make are the same
+/// unwinnable budget being fought again.
+///
+/// The latch is a local of [`run_session_turn_with_source`], beside its turn
+/// counter, so "once per turn" is a property of the loop's own scope rather than
+/// of a reset someone has to remember — the arrangement `context.rs`'s own
+/// per-turn compaction gate uses, one seam over. The newest-user notice is inside the announce
+/// because it can only ever be reached by the **first** gate — after that the
+/// last block is a model turn or a tool result, never the user's message — so
+/// the latch can never swallow it.
+fn announce_pressure(
+    events: &SessionEvents,
+    report: &PressureReport,
+    budget: &RouteBudget,
+    said_it_did_not_fit: &mut bool,
+) {
     if report.is_quiet() {
+        *said_it_did_not_fit = false;
         return;
+    }
+    if report.over_budget {
+        if *said_it_did_not_fit {
+            return;
+        }
+        *said_it_did_not_fit = true;
+    } else {
+        *said_it_did_not_fit = false;
     }
     events.context_pressure(report, pressure_kind(report), budget);
     if report.newest_user_elided {
@@ -799,6 +843,11 @@ pub async fn run_session_turn_with_source(
     // request cannot change underneath it.
     let request = latest_request(ctx);
     let mut turns = 0u32;
+    // The BR-7 latch, beside the counter it is scoped with: `over_budget` is a
+    // *state* the gate re-measures on every iteration and on the way out, so it
+    // is announced on the edge rather than once per sample. See
+    // `announce_pressure`. Per prompt by construction — this fn is one turn.
+    let mut said_it_did_not_fit = false;
     let mut edited = false;
     let mut verified = false;
     let mut nudged = false;
@@ -817,7 +866,12 @@ pub async fn run_session_turn_with_source(
             // is the one a user is least likely to expect a clamp on, because
             // nothing about "the turn hit its ceiling" says the conversation
             // was also cut.
-            announce_pressure(events, &ctx.truncate_to_budget(), &config.budget);
+            announce_pressure(
+                events,
+                &ctx.truncate_to_budget(),
+                &config.budget,
+                &mut said_it_did_not_fit,
+            );
             return Ok(TurnOutcome {
                 stop_reason: StopReason::MaxTurnRequests,
                 turns,
@@ -862,7 +916,12 @@ pub async fn run_session_turn_with_source(
         // conversation meeting a smaller route (BR-10) and on a tool result
         // that outgrew the budget, so it is where most of this event comes
         // from.
-        announce_pressure(events, &ctx.truncate_to_budget(), &config.budget);
+        announce_pressure(
+            events,
+            &ctx.truncate_to_budget(),
+            &config.budget,
+            &mut said_it_did_not_fit,
+        );
 
         // ---- model call ----
         // The egress provenance of the assembled context travels with the turn so
@@ -977,7 +1036,12 @@ pub async fn run_session_turn_with_source(
                 // BR-7: announced like the other two. What the user
                 // received is untouched (`final_text` was streamed whole and is
                 // returned below); this says what the *next* turn will carry.
-                announce_pressure(events, &ctx.truncate_to_budget(), &config.budget);
+                announce_pressure(
+                    events,
+                    &ctx.truncate_to_budget(),
+                    &config.budget,
+                    &mut said_it_did_not_fit,
+                );
                 return Ok(TurnOutcome {
                     stop_reason: StopReason::EndTurn,
                     turns,
@@ -2287,6 +2351,126 @@ mod tests {
                 ctx.estimated_bytes().saturating_sub(BUDGET_BYTES)
             );
         }
+    }
+
+    /// **BR-7, verify.** A turn that cannot fit its budget says so **once**,
+    /// however many gates re-measure it.
+    ///
+    /// `over_budget` is not something the gate did, it is the condition the
+    /// context is in — and `truncate_to_budget` runs at the top of every
+    /// iteration and again on the way out, so an unfittable turn re-reports it
+    /// at each one. Measured before the latch: this exact fixture published
+    /// **two** `did_not_fit` lines for one turn, and a turn using its 25 tool
+    /// iterations would have published twenty-six, none of them gated by
+    /// `/verbose`. BR-7 wants the fact said; it does not want it said
+    /// twenty-six times.
+    ///
+    /// The fixture is deliberately multi-gate and deliberately *not* uniformly
+    /// over budget:
+    ///
+    /// * gates 1 and 2 both cannot fit, and the second one **drops blocks while
+    ///   failing** — which is why "suppress only a report that carries nothing
+    ///   else" would not have closed this: the repeats are not empty, they are
+    ///   the same unwinnable budget being fought again;
+    /// * gate 3 (the `EndTurn` exit) *does* fit, and its drop is real news that
+    ///   must still go out — so the latch is proved to bound the over-budget
+    ///   line rather than to mute the gate.
+    #[tokio::test]
+    async fn an_unfittable_turn_says_so_once_however_many_gates_run() {
+        /// Small enough that the 1 KiB clamp floor cannot reach it, so every
+        /// gate that runs while blocks remain finishes still over budget.
+        const BUDGET_BYTES: usize = 512;
+
+        let session_id = SessionId::from("did-not-fit-once");
+        let bus = Arc::new(EventBus::new());
+        let mut sub = bus.subscribe(256);
+        let gate = PermissionGate::new(
+            session_id.clone(),
+            PermissionConfig::permissive(),
+            Arc::clone(&bus),
+            Arc::new(PendingPermissions::new()),
+        );
+        let events = SessionEvents::new(Arc::clone(&bus), session_id);
+        let config = HarnessConfig {
+            max_turns: 12,
+            ..HarnessConfig::default()
+        };
+        let tools = ToolRegistry::with_builtins();
+        let tool_ctx = ToolContext::new(std::env::temp_dir());
+        let mut hook = NoopProvenanceHook;
+
+        let mut ctx = ContextManager::new("sys", 1_000_000).with_budget_bytes(BUDGET_BYTES);
+        ctx.push_user("do the thing");
+        for i in 0..5 {
+            ctx.push_user(format!("block {i} {}", "x".repeat(1_000)));
+        }
+        assert!(
+            ctx.estimated_bytes() > BUDGET_BYTES,
+            "non-vacuity: the turn must start unable to fit"
+        );
+
+        // Tool call, then an answer: three gates run — the top of each
+        // iteration, and the `EndTurn` exit.
+        let mut source = PaddedToolThenEndSource { calls: 0, pad: 0 };
+        let outcome = run_session_turn_with_source(
+            &mut source,
+            &tools,
+            &tool_ctx,
+            &gate,
+            &events,
+            &mut ctx,
+            &config,
+            &mut hook,
+            &DutyRoute::unresolved("no digest route in this test"),
+            &DutyRoute::unresolved("no compact route in this test"),
+            &ToolDuties {
+                triage: &DutyRoute::unresolved("no triage route in this test"),
+                shell: &DutyRoute::unresolved("no shell route in this test"),
+            },
+        )
+        .await
+        .expect("a turn that cannot fit still completes");
+        assert_eq!(
+            outcome.turns, 2,
+            "fixture drifted — the point is that more than one gate ran"
+        );
+
+        let mut published = Vec::new();
+        while let Some(envelope) = sub.try_recv() {
+            if let teton_protocol::events::Event::ContextPressure(pressure) = envelope.event {
+                published.push(pressure);
+            }
+        }
+        let did_not_fit: Vec<_> = published
+            .iter()
+            .filter(|p| p.kind == ContextPressureKind::DidNotFit)
+            .collect();
+        assert_eq!(
+            did_not_fit.len(),
+            1,
+            "one turn, one over-budget line: {published:#?}"
+        );
+        assert!(
+            did_not_fit[0].dropped_blocks > 0,
+            "the surviving line is the first gate's, which carries what it \
+             managed to drop: {:?}",
+            did_not_fit[0]
+        );
+
+        // …and the latch bounds that one line only. The exit gate fitted the
+        // context and dropped a block doing it, which is news of a different
+        // kind and still goes out.
+        let dropped: Vec<_> = published
+            .iter()
+            .filter(|p| p.kind == ContextPressureKind::BlocksDropped)
+            .collect();
+        assert_eq!(
+            dropped.len(),
+            1,
+            "a gate that *did* fit the context must still announce what it \
+             took — the latch is over the over-budget state, not over the \
+             gate: {published:#?}"
+        );
     }
 
     /// A source that calls a tool once, in one of the two shapes a source can

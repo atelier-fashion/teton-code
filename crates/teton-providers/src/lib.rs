@@ -287,16 +287,59 @@ const ANTHROPIC_CONTEXT_LENGTH_MESSAGE: &str = "prompt is too long";
 /// rule says a spelling is pinned when an adapter can actually receive it.
 const MOONSHOT_CONTEXT_LENGTH_MESSAGE: &str = "token length too long";
 
-/// The **only** status a context-length refusal is read out of (REQ-586 BR-2,
-/// verify M3).
+/// The llama.cpp `llama-server` spelling: a 400 whose body is
+/// `{"error":{"code":400,"message":"the request exceeds the available context
+/// size. try increasing the context size or enable context shift",
+/// "type":"exceed_context_size_error","n_prompt_tokens":…,"n_ctx":…}}`.
+/// Verified 2026-08-19 against two independent reproductions of the real body
+/// (`continuedev/continue` #9797 — HTTP 400, "the request exceeds the available
+/// context size, try increasing it"; `oobabooga/textgen` #7257 — the JSON
+/// above), the wording differing between builds only in the trailing advice.
 ///
-/// Every spelling above was read off a vendor's `400 Bad Request` body, and a
-/// request that overflows the model's window is a malformed request — there is
-/// no vendor that reports it as anything else. The status is therefore part of
-/// the claim, not incidental to it, and the sniff is gated on it.
+/// Pinned because the **local-engine class is what
+/// `budget::MIN_BUDGET_BYTES` names as the live sub-floor case**: a route whose
+/// declared window derives below the floor runs under a budget larger than it
+/// declared, and the floor's whole justification is that the provider's typed
+/// refusal is what reports the overflow. `llama-server` behind an
+/// OpenAI-compatible endpoint sends none of the four spellings above, so without
+/// this const that route took `ClientError { 400 }` → `Fallback` → a health
+/// downgrade for a request that was simply too big.
 ///
-/// The failure this closes is specific and bad in both directions. The variant
-/// this classifier returns carries **no** [`FailureClass`], so it skips
+/// The fragment is the middle of the sentence, not its start: the two observed
+/// builds differ in the tail ("try increasing it" vs "try increasing the
+/// context size or enable context shift") and the type token
+/// (`exceed_context_size_error`) is newer than the message. `exceeds the
+/// available context size` is the part both carry and the part that means it —
+/// the [`OPENAI_CONTEXT_LENGTH_MESSAGE`] posture.
+///
+/// **Not a complete backstop for this class, and the floor's docs say so.**
+/// Two gaps are known and neither is guessed at here:
+///
+/// * some `llama-server` builds put `400` in the JSON while answering with a
+///   different HTTP status ("the actual HTTP status code is not 400" —
+///   `oobabooga/textgen` #7257), and the sniff is deliberately
+///   [`TYPED_REFUSAL_STATUS`]-only, so those bodies stay
+///   `ClientError`;
+/// * **Ollama** — the shipped 4,096 recipe `MIN_BUDGET_BYTES` cites — is a
+///   different server from `llama-server` and its documented
+///   `/v1/chat/completions` behaviour on an over-long prompt is to *truncate*
+///   rather than refuse. There is no wording to pin, so none is invented.
+const LLAMA_CPP_CONTEXT_LENGTH_MESSAGE: &str = "exceeds the available context size";
+
+/// The **only** status either typed refusal is read out of — a context-length
+/// refusal (REQ-586 BR-2, verify M3) or an effort refusal (REQ-559 BR-12).
+///
+/// Every spelling either sniff matches was read off a `400 Bad Request` body:
+/// a request that overflows the model's window is a malformed request, and so is
+/// one naming a reasoning field the endpoint does not take. There is no upstream
+/// that reports either as anything else. The status is therefore part of the
+/// claim, not incidental to it, and **both** sniffs are gated on it — the effort
+/// half arrived one fix pass later than the context-length half, which is the
+/// same defect in the same shape: a sniff that reads a body without asking what
+/// the status meant.
+///
+/// The failure this closes is specific and bad in both directions. Both variants
+/// this classifier returns carry **no** [`FailureClass`], so they skip
 /// `record_health`, `on_provider_failure` and failover entirely — that is
 /// exactly right for a 400 the provider answered correctly, and exactly wrong
 /// for anything else:
@@ -310,13 +353,16 @@ const MOONSHOT_CONTEXT_LENGTH_MESSAGE: &str = "token length too long";
 /// - And because none of those change the provider's standing, a misbehaving or
 ///   hostile endpoint could keep itself in the route indefinitely by answering
 ///   *any* 4xx with "prompt is too long" — every subsequent turn's full
-///   assembled context still going to it.
+///   assembled context still going to it. `reasoning_effort` in a 401 body buys
+///   the same immunity, and additionally poisons the session's effort memo, so
+///   the provider silently stops being sent a level it accepts (BR-6's
+///   misattribution family).
 ///
 /// That is not a hypothetical body shape: gateways (LiteLLM, OpenRouter, vLLM)
 /// relay an upstream vendor's error document under a status of their own
 /// choosing, so a context-length sentence under a 401 or a 429 is a body these
 /// adapters can really receive.
-const CONTEXT_LENGTH_REFUSAL_STATUS: u16 = 400;
+const TYPED_REFUSAL_STATUS: u16 = 400;
 
 /// Whether a 400 body names the reasoning field this request sent (REQ-559
 /// BR-12).
@@ -344,8 +390,11 @@ pub fn body_names_the_effort_field(body: &[u8]) -> bool {
 /// The [`body_names_the_effort_field`] posture: **exact vendor spellings only**,
 /// no general parse. A false positive here turns an ordinary client error into
 /// a typed outcome the daemon neither retries nor fails over nor counts against
-/// the provider's health — so the sniff matches the four spellings the three
-/// vendors actually send and nothing that merely resembles a size complaint.
+/// the provider's health — so the sniff matches the five spellings the four
+/// upstreams actually send and nothing that merely resembles a size complaint.
+/// The set is what has been **verified**, never what seems likely: a provider
+/// whose refusal is worded some other way keeps `ClientError`, and
+/// `budget::MIN_BUDGET_BYTES` names the one that does.
 /// Like the effort sniff it reads only the bounded `read_error_head` prefix; the
 /// matched text never leaves this function (conventions: no provider prose in
 /// errors).
@@ -361,6 +410,7 @@ pub fn body_names_context_length(body: &[u8]) -> bool {
         || text.contains(OPENAI_CONTEXT_LENGTH_MESSAGE)
         || text.contains(ANTHROPIC_CONTEXT_LENGTH_MESSAGE)
         || text.contains(MOONSHOT_CONTEXT_LENGTH_MESSAGE)
+        || text.contains(LLAMA_CPP_CONTEXT_LENGTH_MESSAGE)
 }
 
 /// Read a bounded prefix of an error body so a 400 can be classified (REQ-559
@@ -401,9 +451,10 @@ async fn read_error_head(mut body: ByteStream) -> Vec<u8> {
 /// back typed (ADR-8). The effort sniff runs first — it is the more specific
 /// claim and the only one that needs `sent` — then the context-length sniff.
 ///
-/// The context-length sniff is additionally gated on the status being exactly
-/// [`CONTEXT_LENGTH_REFUSAL_STATUS`] — see there for why a 401, a 403 or a 429
-/// carrying the same sentence must keep the classification it already had.
+/// Both are gated on the status being exactly [`TYPED_REFUSAL_STATUS`], by one
+/// check ahead of them rather than a condition on each — see there for why a
+/// 401, a 403 or a 429 carrying either sentence must keep the classification it
+/// already had.
 pub(crate) async fn classify_client_error(
     status: u16,
     body: ByteStream,
@@ -411,6 +462,11 @@ pub(crate) async fn classify_client_error(
     sent: ResolvedEffort,
 ) -> ProviderError {
     let head = read_error_head(body).await;
+    // One gate, ahead of both sniffs: neither typed outcome may be reached from
+    // a status that means something else. See [`TYPED_REFUSAL_STATUS`].
+    if status != TYPED_REFUSAL_STATUS {
+        return ProviderError::ClientError { status };
+    }
     if let ResolvedEffort::Effort { level, requested } = sent {
         if body_names_the_effort_field(&head) {
             return ProviderError::EffortRefused {
@@ -420,7 +476,7 @@ pub(crate) async fn classify_client_error(
             };
         }
     }
-    if status == CONTEXT_LENGTH_REFUSAL_STATUS && body_names_context_length(&head) {
+    if body_names_context_length(&head) {
         return ProviderError::ContextLengthExceeded {
             provider_id: provider_id.to_owned(),
         };
@@ -522,7 +578,7 @@ pub enum ProviderError {
     /// The provider refused the request as exceeding its context window
     /// (REQ-586 BR-2 / ADR-8).
     ///
-    /// A **400** — [`CONTEXT_LENGTH_REFUSAL_STATUS`], the only status any vendor
+    /// A **400** — [`TYPED_REFUSAL_STATUS`], the only status any vendor
     /// reports an overflowed window under — whose body carries one of the exact
     /// vendor spellings in [`body_names_context_length`], and **only** that. An
     /// unrelated 400, and *any* other 4xx whatever its body says, stays a
@@ -752,11 +808,13 @@ mod tests {
         Box::pin(futures::stream::iter(chunks))
     }
 
-    /// The three vendor spellings, each in the envelope its vendor actually
+    /// The vendor spellings, each in the envelope its upstream actually
     /// sends: OpenAI's pretty-printed body (space after the colon), a compact
     /// compat body carrying only the code, a compat body carrying only the
-    /// message (DeepSeek/vLLM wording), and Anthropic's message.
-    const CONTEXT_LENGTH_BODIES: [(&str, &str); 4] = [
+    /// message (DeepSeek/vLLM wording), Anthropic's message, and
+    /// `llama-server`'s — the local-engine class `budget::MIN_BUDGET_BYTES`
+    /// names as the sub-floor case, whose body carries none of the four above.
+    const CONTEXT_LENGTH_BODIES: [(&str, &str); 5] = [
         (
             "openai pretty-printed code",
             "{\n  \"error\": {\n    \"message\": \"This model's maximum context length is 128000 tokens. However, your messages resulted in 131000 tokens. Please reduce the length of the messages.\",\n    \"type\": \"invalid_request_error\",\n    \"param\": \"messages\",\n    \"code\": \"context_length_exceeded\"\n  }\n}",
@@ -773,7 +831,24 @@ mod tests {
             "anthropic prompt is too long",
             r#"{"type":"error","error":{"type":"invalid_request_error","message":"prompt is too long: 213717 tokens > 200000 maximum"},"request_id":"req_011CSHoEeqs5C35K2UUqR7Fy"}"#,
         ),
+        (
+            "llama.cpp exceed_context_size_error",
+            r#"{"error":{"code":400,"message":"the request exceeds the available context size. try increasing the context size or enable context shift","type":"exceed_context_size_error","n_prompt_tokens":14429,"n_ctx":8192}}"#,
+        ),
     ];
+
+    /// The other `llama-server` build's wording, which differs in the trailing
+    /// advice — pinned separately so the const stays the fragment both carry
+    /// rather than drifting toward one build's whole sentence.
+    #[test]
+    fn both_observed_llama_server_wordings_name_context_length() {
+        for body in [
+            r#"{"error":{"code":400,"message":"the request exceeds the available context size, try increasing it","type":"server_error"}}"#,
+            r#"{"error":{"code":400,"message":"the request exceeds the available context size. try increasing the context size or enable context shift","type":"exceed_context_size_error"}}"#,
+        ] {
+            assert!(body_names_context_length(body.as_bytes()), "{body}");
+        }
+    }
 
     #[test]
     fn each_vendor_spelling_names_context_length() {
@@ -865,8 +940,9 @@ mod tests {
         }
     }
 
-    /// **Verify M3.** The sniff is 400-only: the *same* vendor spellings under a
-    /// 401, a 403 or a 429 keep the classification they had before this REQ.
+    /// **Verify M3.** Both sniffs are 400-only: the *same* vendor spellings —
+    /// context-length **and** effort — under a 401, a 403 or a 429 keep the
+    /// classification they had before the sniffs existed.
     ///
     /// The two that matter are both in the loop. A 401/403 is a credential
     /// fault: `ClientError`, `FailureAction::Fail`, and the user is told to fix
@@ -881,8 +957,15 @@ mod tests {
     /// Gateways (LiteLLM, OpenRouter, vLLM) relay an upstream vendor's error
     /// document under a status of their own, so these are bodies the adapters
     /// can really receive rather than a shape invented for a test.
+    ///
+    /// The **effort** leg is the same argument for the same shape, added a fix
+    /// pass later: [`ProviderError::EffortRefused`] is likewise class-less, and
+    /// it additionally writes the session's refusal memo — so a 401 whose body
+    /// happens to say `reasoning_effort` would both immunize the endpoint and
+    /// silently stop sending a level the provider accepts. REQ-559's spellings
+    /// were every one of them read off a 400.
     #[test]
-    fn only_a_400_can_be_a_context_length_refusal() {
+    fn no_status_but_400_can_be_a_typed_refusal() {
         /// Status, the action the pre-REQ-586 classification carries, a label.
         const NON_400: [(u16, FailureAction, &str); 4] = [
             (401, FailureAction::Fail, "a revoked or wrong key"),
@@ -922,6 +1005,39 @@ mod tests {
                     assert!(!err.is_context_length_exceeded(), "{status} / {label}");
                 }
             }
+
+            // …and the effort half, on a request that really did send a level:
+            // the body names the field, the status says the request never got
+            // as far as being read.
+            let err = futures::executor::block_on(classify_client_error(
+                status,
+                body_stream(
+                    r#"{"error":{"message":"Unrecognized request argument supplied: reasoning_effort"}}"#,
+                ),
+                "p",
+                ResolvedEffort::clamped(EffortLevel::Xhigh, EffortLevel::High),
+            ));
+            assert_eq!(
+                err,
+                ProviderError::ClientError { status },
+                "{status} ({why}) naming the reasoning field must stay a client \
+                 error"
+            );
+            assert!(
+                !err.is_effort_refused(),
+                "{status} ({why}) must not poison the session's effort memo"
+            );
+            assert_eq!(
+                err.decision().map(|d| d.action),
+                Some(action),
+                "{status} ({why}) naming the reasoning field lost its failure \
+                 action"
+            );
+            assert!(
+                err.failure_class().is_some(),
+                "{status} ({why}) naming the reasoning field stopped counting \
+                 against the provider's health"
+            );
         }
     }
 

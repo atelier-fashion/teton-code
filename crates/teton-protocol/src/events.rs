@@ -3086,22 +3086,61 @@ mod tests {
         }
     }
 
+    /// **The one home's golden table** (REQ-586 BR-8): both figure formatters,
+    /// at every boundary that decides a unit.
+    ///
+    /// It lives here because [`thousands`] and [`bytes_figure`] live here. When
+    /// they were lifted out of the CLI so the daemon and the CLI could not word
+    /// the same figure two ways, the table pinning them stayed behind in
+    /// `session_ui.rs` — so `cargo test -p teton-protocol` was green with the KB
+    /// rounding removed, and the only thing standing between a wrong budget
+    /// figure and a release was a test in a different crate. A formatter and the
+    /// numbers that pin it belong in one place.
+    ///
+    /// The boundaries are the point, not the samples: 999/1,000 is where `B`
+    /// becomes `KB`, 999,999 is the one that must **not** round up into `MB`
+    /// (`1000 KB`, deliberately), 1,000,000 is where `MB` starts, and 32,768 is
+    /// the default byte budget — the figure a reader sees most often.
+    #[test]
+    fn budget_figures_are_grouped_and_scaled() {
+        assert_eq!(thousands(0), "0");
+        assert_eq!(thousands(999), "999");
+        assert_eq!(thousands(4_096), "4,096");
+        assert_eq!(thousands(132_650), "132,650");
+        assert_eq!(thousands(1_050_000), "1,050,000");
+
+        assert_eq!(bytes_figure(0), "0 B");
+        assert_eq!(bytes_figure(999), "999 B");
+        assert_eq!(bytes_figure(1_000), "1 KB");
+        assert_eq!(bytes_figure(32_768), "33 KB");
+        assert_eq!(bytes_figure(999_999), "1000 KB");
+        assert_eq!(bytes_figure(1_000_000), "1 MB");
+        assert_eq!(bytes_figure(4_200_000), "4.2 MB");
+    }
+
     /// **TASK-194 2a/2b, both directions of the additive rule.**
     ///
     /// `did_not_fit` is a fourth kind with its own wire spelling — the case
     /// that used to ride as `block_elided` with a zero for a tell — and
     /// `bound_floored` is a fifth field with a `false` default. The two
-    /// compatibility legs are asserted rather than assumed:
+    /// directions are asserted rather than assumed, and they are **not
+    /// symmetric**, which the name says out loud:
     ///
-    /// * **older daemon → this client**: a frame with no `bound_floored` key
-    ///   reads `false`, so the line renders exactly as it did before.
-    /// * **newer daemon → older client**: an unrecognized `kind` is a *refusal*
-    ///   to deserialize, not a silent coercion into a neighbouring variant.
-    ///   That is the fail-closed half of BR-7 — a client that cannot name what
-    ///   happened must say nothing rather than say the wrong thing — and it is
-    ///   why `did_not_fit` needed a new spelling instead of reusing one.
+    /// * **older daemon → this client**: additive and lossless. A frame with no
+    ///   `bound_floored` key reads `false`, so the line renders exactly as it
+    ///   did before.
+    /// * **newer daemon → older client**: the frame is *dropped*. An
+    ///   unrecognized `kind` is a refusal to deserialize, never a silent
+    ///   coercion into a neighbouring variant — the fail-closed half of BR-7,
+    ///   since a client that cannot name what happened must say nothing rather
+    ///   than say the wrong thing, and it is why `did_not_fit` needed a new
+    ///   spelling instead of reusing one. It is also a real cost, recorded as
+    ///   this REQ's forward-compat residual: a released client predating the
+    ///   variant shows a user *nothing* for an over-budget turn. Nothing is a
+    ///   worse answer than the old wrong one only if the wrong one was
+    ///   actionable, and "a block was elided by 0 bytes" was not.
     #[test]
-    fn a_context_that_did_not_fit_has_its_own_kind_and_degrades_both_ways() {
+    fn a_context_that_did_not_fit_has_its_own_kind_and_an_older_client_drops_the_frame() {
         let pressure = ContextPressure {
             kind: ContextPressureKind::DidNotFit,
             dropped_blocks: 0,

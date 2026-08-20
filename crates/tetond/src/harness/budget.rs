@@ -137,10 +137,31 @@ pub const LOCAL_BUDGET_BYTES: usize = LOCAL_BUDGET_TOKENS * APPROX_BYTES_PER_TOK
 /// rather than a shape no turn can be assembled in.
 ///
 /// The honest cost, stated: on a window *below* the floor the budget admits
-/// more than the window declares, and the provider's typed
-/// `context_length_exceeded` refusal (BR-2, ADR-8) is what reports that — a
-/// budget that cannot hold the system prompt would fail every turn instead,
-/// and report nothing about why.
+/// more than the window declares, so those turns are sent knowing the provider
+/// may refuse them. A budget that cannot hold the system prompt would fail every
+/// turn instead, and report nothing about why, so the trade is the right one —
+/// but what reports the overflow is **not** uniform, and the difference matters
+/// to the very case cited above:
+///
+/// * A provider whose refusal spelling is pinned in
+///   `teton_providers::body_names_context_length` answers with the typed,
+///   class-less `ContextLengthExceeded` (BR-2, ADR-8): the turn ends saying the
+///   context was too big, and nothing counts against the provider's health.
+///   Four vendors and `llama-server` are pinned there.
+/// * **Ollama is not, and it is the live sub-floor case.** Its
+///   OpenAI-compatible `/v1/chat/completions` is a different server from
+///   `llama-server`, and its documented behaviour on an over-long prompt is to
+///   *truncate* the input rather than refuse it — so a sub-floor Ollama route
+///   does not get a typed refusal at all; it gets an answer to a silently
+///   shortened prompt. If it did refuse, the wording is unverified, and an
+///   unverified spelling is not pinned (a false positive there turns an
+///   ordinary client error into an outcome the daemon neither retries nor fails
+///   over).
+///
+/// So the floor's backstop covers the providers whose refusal is pinned, and the
+/// user-visible guard for the rest is the one this module provides directly:
+/// the derivation records the declaration, runs the floor, and says `floored` on
+/// `route_decided`, `context_pressure` and `/doctor` (TASK-194 2b).
 pub const MIN_BUDGET_BYTES: usize = LOCAL_BUDGET_BYTES / 2;
 
 /// The floor's word half: [`MIN_BUDGET_BYTES`] bridged at

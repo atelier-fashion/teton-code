@@ -156,22 +156,29 @@
 //! # REQ-586 verify (2026-08-19): the fixture commits the daemon's way
 //!
 //! [`Carry::prompt_under`] called `CarriedTurn::commit()` — the
-//! **report-discarding** twin of the `commit_reporting()` +
-//! `context_pressure(..)` pair `DaemonRuntime::run_prompt_turn` runs. So the
-//! BR-10 commit seam this file's AC-11 leg is named for was never exercised
-//! here at all, and the one event that leg asserts came from the turn loop's
-//! own gate. It now commits and publishes exactly as dispatch does, which is
-//! the same LESSON-451 rule as mutation 1 above: a fixture standing in for the
-//! dispatch has to run the dispatch's protocol, or the seam it stands in for is
-//! untested.
+//! **report-discarding** twin of the commit-and-publish pair
+//! `DaemonRuntime::run_prompt_turn` runs. So the BR-10 commit seam this file's
+//! AC-11 leg is named for was never exercised here at all, and the one event
+//! that leg asserts came from the turn loop's own gate. It now runs
+//! [`commit_and_publish`] — the daemon's **own** function, not a two-line copy
+//! of it — which is the same LESSON-451 rule as mutation 1 above: a fixture
+//! standing in for the dispatch has to run the dispatch's protocol, or the seam
+//! it stands in for is untested. (The first version of this fix inlined the
+//! publish and so reproduced the defect one level down: deleting the daemon's
+//! call left this file green.)
 //!
-//! What that revealed is worth recording rather than hiding: the commit's
-//! report is **quiet on every completed turn**, because the loop gates both of
-//! its `Ok` exits (BUG-157) and nothing appends between that gate and the
-//! commit. So AC-11's count stays 1 — asserted below as "the loop's gate, not
-//! twice over by the commit's" — and the commit branch's own rule is stated
-//! where a test can reach it, in `runtime.rs`'s
-//! `the_commit_publishes_a_clamp_and_says_nothing_about_a_quiet_one`.
+//! On an *ordinary* completed turn the commit's report really is quiet — the
+//! loop gates both of its `Ok` exits (BUG-157) and nothing appends between that
+//! gate and the commit — so AC-11's count stays 1, asserted below as "the
+//! loop's gate, not twice over by the commit's". That is a fact about turns
+//! whose context **fits**, and it is not the whole story:
+//! `PressureReport::over_budget` is recomputed on every gate call and counts
+//! toward `is_quiet()`, so a turn under a budget its own system prompt cannot
+//! fit completes, reaches the commit, and the commit has something to say.
+//! [`an_unfittable_turn_still_publishes_the_commits_own_report`] drives exactly
+//! that, and `runtime.rs`'s
+//! `the_commit_publishes_a_clamp_and_says_nothing_about_a_quiet_one` states the
+//! decision directly.
 
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
@@ -191,14 +198,13 @@ use tetond::cost::{CostLedger, LocalUsageMeter, NoopCostSink, PriceTable};
 use tetond::harness::budget::derive;
 use tetond::harness::compact::COMPACT_OUTPUT_CONTRACT;
 use tetond::harness::context::{approx_tokens, APPROX_BYTES_PER_TOKEN};
-use tetond::harness::turn_loop::pressure_kind;
 use tetond::harness::{
     build_system_prompt, run_session_turn_with_source, BudgetInputs, DutyRoute, HarnessConfig,
     HarnessError, LocalEngineSource, NoopProvenanceHook, PendingPermissions, PermissionConfig,
     PermissionGate, SessionEvents, ToolContext, ToolDuties, ToolRegistry, TurnOutcome,
     COMPACT_DUTY, DIGEST_DUTY, SHELL_DUTY, TRIAGE_DUTY,
 };
-use tetond::runtime::SessionTaint;
+use tetond::runtime::{commit_and_publish, SessionTaint};
 use tetond::sessions::SessionRegistry;
 
 /// A window wide enough for the real system prompt plus several carried turns.
@@ -658,8 +664,8 @@ impl Carry {
         .await;
 
         // Committed exactly as `DaemonRuntime::run_prompt_turn` commits — the
-        // **reporting** variant, with the report published through this turn's
-        // `SessionEvents` (REQ-586 BR-10, verify M7-b).
+        // **reporting** variant, published through the daemon's own
+        // `publish_commit_pressure` (REQ-586 BR-10, verify M7-b).
         //
         // `commit()` — the report-discarding twin — is the right default for a
         // caller with no event handle, and it is what this fixture used to
@@ -667,13 +673,18 @@ impl Carry {
         // all: `if false && !pressure.is_quiet()` at the daemon's own publish
         // left the whole `tetond` package green, because the one event AC-11
         // asserted came from the turn loop's gate and no fixture anywhere drove
-        // the commit's. A fixture that drives the daemon's turn has to commit
-        // the daemon's way, or the seam it is standing in for is untested.
+        // the commit's.
+        //
+        // Calling the daemon's own function rather than re-typing its two
+        // lines is the second half of that fix, and the same LESSON-451 rule
+        // one level down: the first attempt inlined `if !pressure.is_quiet() {
+        // events.context_pressure(..) }` here, which is a *copy* of the
+        // dispatch's publish — so neutering the real one still left this file
+        // green, and the fixture was testing itself. `commit_and_publish` is
+        // the whole success-arm protocol, so this fixture and
+        // `run_prompt_turn` cannot come to run different ones.
         if outcome.is_ok() {
-            let pressure = conversation.commit_reporting();
-            if !pressure.is_quiet() {
-                events.context_pressure(&pressure, pressure_kind(&pressure), &config.budget);
-            }
+            commit_and_publish(conversation, &events, &config.budget);
         } else {
             conversation.abandon();
         }
@@ -1532,6 +1543,85 @@ async fn a_conversation_assembled_on_a_128k_route_survives_a_local_turns_smaller
     assert!(
         last.prompt.contains("[earlier conversation truncated"),
         "the model must be told that history is missing"
+    );
+}
+
+/// **REQ-586 BR-10, verify.** A turn that **completed** and could not fit its
+/// budget reaches the commit's own gate with something to say, and the commit
+/// says it.
+///
+/// This is the test `publish_commit_pressure` used to document as impossible.
+/// The reasoning was sound when it was written and stopped being true at
+/// TASK-194: the loop gates both of its `Ok` exits, so a completed turn never
+/// arrives at the commit having *dropped or elided* anything — but
+/// `PressureReport::over_budget` is recomputed on every gate call and counts
+/// toward `is_quiet()`, and a context the gate could not fit is not made
+/// fittable by gating it again. A budget below the harness's own system prompt
+/// is the shape that produces it, and it is not a contrivance: it is exactly
+/// what `budget::MIN_BUDGET_BYTES` exists to keep a *route* from ever deriving.
+///
+/// What the "impossible" claim cost is the point of writing this down. The
+/// branch was documented as unreachable on the success path and therefore
+/// guarded only by a unit test over the function itself, so deleting the
+/// daemon's **call** to it — and with it every between-turns clamp report on a
+/// live over-budget session — left the `tetond` package green.
+///
+/// Two lines go out for this turn, and the count is the assertion:
+/// the loop's own over-budget latch (`turn_loop::announce_pressure`) bounds its
+/// three gates to **one** `did_not_fit`, so the second can only be the
+/// commit's. Deleting the publish takes it back to one.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_unfittable_turn_still_publishes_the_commits_own_report() {
+    let carry = Carry::new(&["Answered."], true, "req586-commit-didnotfit");
+
+    // A pair no context can meet: the system head alone is several KB, so every
+    // gate — the loop's two and the commit's one — finishes over budget. Built
+    // by hand rather than through `derive`, because `derive`'s floor exists
+    // precisely to stop a *route* from being budgeted this way (M1).
+    let mut unfittable = derive(BudgetInputs::local());
+    unfittable.budget_tokens = 200;
+    unfittable.budget_bytes = 1_000;
+    let config = carry
+        .config
+        .clone()
+        .with_route_budget(unfittable.clone())
+        .without_digest();
+    assert!(
+        carry.system().len() > config.context_budget_bytes,
+        "non-vacuity: the system head ({} bytes) must not fit the {}-byte \
+         budget, or nothing here is over budget",
+        carry.system().len(),
+        config.context_budget_bytes
+    );
+
+    let session = carry.session();
+    let mut events = carry.bus.subscribe(256);
+    carry
+        .prompt_under(&session, "a question that will not fit", &config)
+        .await
+        .expect("a turn that cannot fit its budget is still served");
+
+    let published = drain_pressure(&mut events);
+    let did_not_fit: Vec<&ContextPressure> = published
+        .iter()
+        .filter(|p| p.kind == ContextPressureKind::DidNotFit)
+        .collect();
+    assert_eq!(
+        did_not_fit.len(),
+        2,
+        "the loop says it once and the commit says it once — one of these is \
+         the seam `publish_commit_pressure` is: {published:#?}"
+    );
+    for event in &did_not_fit {
+        assert_eq!(event.budget_tokens, unfittable.budget_tokens as u64);
+        assert_eq!(event.budget_bytes, unfittable.budget_bytes as u64);
+        assert_eq!(event.bound, unfittable.bound);
+    }
+    // The commit still *committed* — the report is a by-product of the write,
+    // never a replacement for it.
+    assert!(
+        !carry.retained_text(&session).is_empty(),
+        "the turn's work was stored"
     );
 }
 

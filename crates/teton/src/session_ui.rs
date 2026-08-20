@@ -3563,22 +3563,22 @@ mod tests {
         );
     }
 
-    /// The two figure formatters, at the boundaries that decide a unit.
+    /// The two figure formatters, at the boundaries that decide a unit — and
+    /// that this crate's wrappers really do reach them.
+    ///
+    /// The golden table itself lives beside the implementations, in
+    /// `teton_protocol::events` (verify: it stayed here when they moved, so
+    /// dropping the KB rounding survived `cargo test -p teton-protocol`). What
+    /// is asserted *here* is the delegation: a wrapper that grew a second
+    /// implementation would pass the protocol crate's table and fail this.
     #[test]
-    fn budget_figures_are_grouped_and_scaled() {
-        assert_eq!(thousands(0), "0");
-        assert_eq!(thousands(999), "999");
-        assert_eq!(thousands(4_096), "4,096");
-        assert_eq!(thousands(132_650), "132,650");
-        assert_eq!(thousands(1_050_000), "1,050,000");
-
-        assert_eq!(bytes_figure(0), "0 B");
-        assert_eq!(bytes_figure(999), "999 B");
-        assert_eq!(bytes_figure(1_000), "1 KB");
-        assert_eq!(bytes_figure(32_768), "33 KB");
-        assert_eq!(bytes_figure(999_999), "1000 KB");
-        assert_eq!(bytes_figure(1_000_000), "1 MB");
-        assert_eq!(bytes_figure(4_200_000), "4.2 MB");
+    fn the_figure_wrappers_delegate_to_the_protocols_formatters() {
+        for n in [0u64, 999, 4_096, 132_650, 1_050_000] {
+            assert_eq!(thousands(n), events::thousands(n));
+        }
+        for bytes in [0u64, 999, 1_000, 32_768, 999_999, 1_000_000, 4_200_000] {
+            assert_eq!(bytes_figure(bytes), events::bytes_figure(bytes));
+        }
     }
 
     /// A divergent hit says so: the prefill was bigger than the turn's delta

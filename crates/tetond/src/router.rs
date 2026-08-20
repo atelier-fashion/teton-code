@@ -2455,6 +2455,88 @@ mod tests {
         assert_eq!(nowhere, HarnessConfig::default().budget);
     }
 
+    /// **TASK-194 2b, the producer's half.** A route the floor overruled says so
+    /// on its own `route_decided`, derived end to end from a config rather than
+    /// asserted against a hand-built payload.
+    ///
+    /// The client's rendering of this field is guarded against a
+    /// `RouteDecided { bound_floored: Some(true) }` built by hand
+    /// (`session_ui.rs`), and the wire's additive default against a literal
+    /// frame (`events.rs`) — neither of which touches the line that *puts* the
+    /// value there. `Some(self.budget.floored)` → `Some(false)` therefore left
+    /// the whole workspace green, and with it the entire route-line half of
+    /// TASK-194 2b: every floored route would announce `bound: user cap` beside
+    /// a budget larger than that cap, which is exactly the untruth the field
+    /// exists to close.
+    ///
+    /// Both directions, because only one of them was ever caught. A 500-token
+    /// cap on a declared 200k window derives 500 − 1,024 → 0 usable and lands on
+    /// the floor; the same window uncapped does not go near it. The two routes
+    /// differ in nothing but the cap, so the assertion is about the floor rather
+    /// than about the fixture.
+    #[test]
+    fn a_floored_route_says_so_on_its_route_decided() {
+        fn router_capped_at(cap: u32) -> Router {
+            Router::new(
+                CategoryTable::new()
+                    .with_local_provider("local")
+                    .with_tier(tier(CoreTier::Think, "wide", None)),
+                None,
+            )
+            .with_provider(
+                "wide",
+                ProviderKind::OpenaiCompatible,
+                "wide-model",
+                CapabilityProfile {
+                    max_context: 200_000,
+                    context_budget_cap: cap,
+                    ..native()
+                },
+                ProviderHealth::Healthy,
+            )
+        }
+
+        // Sub-floor: the cap is recorded, the floor is what runs, and the event
+        // says the ceiling it names is not the one in force.
+        let route = router_capped_at(500).resolve(CoreCategory::Design);
+        assert!(
+            route.budget.floored,
+            "a 500-token cap must derive below the floor, or this test is \
+             asserting nothing: {:?}",
+            route.budget
+        );
+        let decided = route.route_decided().expect("a provider was selected");
+        assert_eq!(
+            decided.bound,
+            Some(BudgetBound::UserCap),
+            "the bound still names what the user set — that is what they would \
+             go and change"
+        );
+        assert_eq!(
+            decided.bound_floored,
+            Some(true),
+            "…and the route line must say that cap is not in force: {decided:?}"
+        );
+        assert!(
+            decided.budget_tokens > Some(500),
+            "the turn really did get more than the cap asked for, which is the \
+             whole reason the flag exists: {decided:?}"
+        );
+
+        // The twin, differing only in the cap: an honoured ceiling reports
+        // `Some(false)`, never `None` and never the floored answer.
+        let route = router_capped_at(0).resolve(CoreCategory::Design);
+        assert!(!route.budget.floored, "{:?}", route.budget);
+        let decided = route.route_decided().expect("a provider was selected");
+        assert_eq!(decided.bound, Some(BudgetBound::Window));
+        assert_eq!(
+            decided.bound_floored,
+            Some(false),
+            "a daemon that derived a route always answers the question — `None` \
+             on this wire means a daemon predating REQ-586: {decided:?}"
+        );
+    }
+
     /// **ADR-2 / AC-15**: a degrade changes the profile, not the window.
     ///
     /// `Degrade` is the one mid-turn re-config that must *not* move the budget:

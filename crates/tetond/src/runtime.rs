@@ -3173,12 +3173,11 @@ impl DaemonRuntime {
         match outcome {
             Ok(result) => {
                 // REQ-586 BR-10: the commit re-asserts the budget one last
-                // time, and what it took is news like any other clamp. It is
-                // published here rather than inside the commit because that
-                // seam also runs from `Drop`, where there is no event handle
-                // and no one left to tell (LESSON-501).
-                let pressure = conversation.commit_reporting();
-                publish_commit_pressure(&stream_events, &pressure, &route.budget);
+                // time, and what it took is news like any other clamp. Written
+                // as one call rather than two lines so that the fixture
+                // standing in for this dispatch runs the same protocol — see
+                // [`commit_and_publish`].
+                commit_and_publish(conversation, &stream_events, &route.budget);
                 Ok(result)
             }
             Err(err) => {
@@ -9418,6 +9417,17 @@ fn reroute_after_block_reason(detail: BlockDetail) -> String {
 /// there is nothing to say. The window *label* still follows the route, which
 /// costs nothing and keeps the in-prompt marker honest if a same-pair reroute
 /// ever crosses providers.
+///
+/// ## A refit that did not fit is not a refit
+///
+/// The kind is passed rather than derived (see `SessionEvents::context_pressure`)
+/// because only this arm knows the gate ran because of a *reroute* — but
+/// "re-fitted to the N-word budget" is a claim about the outcome, and a refit
+/// onto a much smaller route can finish still over budget just as a loop gate
+/// can. Saying it re-fitted anyway is the same untruth
+/// [`ContextPressureKind::DidNotFit`] exists to close, one call site along, so
+/// the over-budget answer wins here exactly as it does in
+/// [`pressure_kind`](crate::harness::turn_loop::pressure_kind).
 fn refit_for_reroute(
     conversation: &mut CarriedTurn,
     events: &SessionEvents,
@@ -9429,7 +9439,31 @@ fn refit_for_reroute(
         return;
     }
     let report = conversation.rebudget(next);
-    events.context_pressure(&report, ContextPressureKind::RefitOnReroute, next);
+    let kind = if report.over_budget {
+        ContextPressureKind::DidNotFit
+    } else {
+        ContextPressureKind::RefitOnReroute
+    };
+    events.context_pressure(&report, kind, next);
+}
+
+/// The whole success-arm commit protocol: hand the session what the turn's
+/// manager holds, and announce what the commit's own budget gate took on the way
+/// (REQ-586 BR-10).
+///
+/// One function because it is one decision made in two places — the daemon's
+/// dispatch, and the `conversation_carry.rs` fixture that stands in for it. Two
+/// lines at each call site is how the fixture came to run a *different*
+/// protocol from the dispatch twice over: first by calling the
+/// report-discarding `commit()`, then by inlining its own copy of the publish.
+/// Both times the fixture stayed green while the real seam was neutered
+/// (LESSON-451). With one implementation, a dispatch that stopped publishing
+/// would have to stop committing too, and the commit is guarded everywhere.
+///
+/// Consumes the turn, because committing is the end of it.
+pub fn commit_and_publish(conversation: CarriedTurn, events: &SessionEvents, budget: &RouteBudget) {
+    let report = conversation.commit_reporting();
+    publish_commit_pressure(events, &report, budget);
 }
 
 /// Publish what the **commit's** own budget gate took, if it took anything
@@ -9443,29 +9477,46 @@ fn refit_for_reroute(
 ///
 /// ## Why this is a named function and not two lines at the call site
 ///
-/// It is the one branch of the REQ that no end-to-end fixture can reach, and it
-/// is worth being explicit about why rather than leaving a reader to assume it
-/// is covered. The turn loop gates **both** its `Ok` exits (BUG-157: the
-/// `EndTurn` arm and the `max_turns` arm each run `truncate_to_budget` on the
-/// way out), and nothing appends to the manager between that gate and this
-/// commit — so a turn that *completed* always arrives here already fitting, and
-/// the report is quiet. The paths where the commit gate really bites are the
-/// cancellation ones, and those reach it through `Drop`, where the report is
-/// discarded because there is no client left waiting on the news.
+/// So that the one caller in this file and the fixture that stands in for it
+/// run the *same* protocol. `conversation_carry.rs` used to inline
+/// `commit_reporting()` plus its own `if !is_quiet() { context_pressure(..) }`,
+/// which is LESSON-451 in miniature: a fixture re-implementing the dispatch
+/// tests its own copy, and the copy stayed green while the real one was
+/// neutered. It is `pub` for that reason and no other.
 ///
-/// So the branch is a **backstop**, live the day a new `Ok` exit is added to
-/// the loop or a new post-turn append lands between the two gates — which is
-/// exactly when a silent between-turns drop would otherwise ship. A backstop
-/// that no test can drive is a backstop nobody can change safely, so the
-/// decision is lifted here where a unit test *can* state it:
-/// `the_commit_publishes_a_clamp_and_says_nothing_about_a_quiet_one`.
+/// ## A completed turn *can* reach here with something to say
+///
+/// This used to say it could not, and the claim was true until TASK-194. The
+/// turn loop gates both of its `Ok` exits (BUG-157) and nothing appends between
+/// that gate and this commit, so a completed turn never arrives here having
+/// *dropped or elided* anything — that much still holds. But
+/// [`PressureReport::over_budget`] is recomputed on every
+/// `truncate_to_budget` call and counts toward `is_quiet()`, and a context the
+/// gate cannot fit does not become fittable by being gated again: a turn under
+/// a budget smaller than its own system prompt completes, reaches this line,
+/// and the report is **not** quiet. So this is a live branch on the success
+/// path, not only a backstop for a future `Ok` exit — and
+/// `an_unfittable_turn_still_publishes_the_commits_own_report`
+/// (`conversation_carry.rs`) drives it end to end, with
+/// `the_commit_publishes_a_clamp_and_says_nothing_about_a_quiet_one` below
+/// stating the decision directly.
+///
+/// The cancellation paths still reach the commit through `Drop`, where the
+/// report is discarded because there is no client left waiting on the news;
+/// that half of the old note was and remains correct.
 ///
 /// It is deliberately not `turn_loop`'s `announce_pressure`: that one also
 /// writes a turn notice into the model's own output stream when the clamp
 /// landed on the user's newest message, which is the right thing mid-turn and
 /// the wrong thing here — this runs after the turn's last token, with nothing
-/// left to append it to.
-fn publish_commit_pressure(events: &SessionEvents, report: &PressureReport, budget: &RouteBudget) {
+/// left to append it to. It also carries that loop's per-turn over-budget latch,
+/// which is scoped to one run of the loop; the commit is a separate seam whose
+/// single report is its own news.
+pub fn publish_commit_pressure(
+    events: &SessionEvents,
+    report: &PressureReport,
+    budget: &RouteBudget,
+) {
     if !report.is_quiet() {
         events.context_pressure(report, pressure_kind(report), budget);
     }
@@ -27179,6 +27230,88 @@ provider_id = \"deepseek\"
                 searching, unscanned,
                 "`[web] tier = search` with `redact = false` must leave the \
                  provider route window-bound: {searching:?}"
+            );
+        }
+
+        /// **TASK-194 2b, `/doctor`'s half.** The snapshot's `floored_budget`
+        /// is filled in by the daemon for a declaration the floor overruled, and
+        /// left out for one it honoured.
+        ///
+        /// The CLI's rendering of the cell is guarded against a synthetic
+        /// [`teton_protocol::methods::ProviderConfig`] with the field already
+        /// populated, which says nothing about the line in
+        /// [`snapshot_from_config`] that populates it. **Both** mutations
+        /// therefore survived the workspace: never `Some` (the cell silently
+        /// disappears from `/doctor` for every floored provider) and always
+        /// `Some` (every ordinary provider grows a line claiming its window was
+        /// overruled when it was not).
+        ///
+        /// The pair is asserted, not just the presence: the whole point of the
+        /// cell is to name the budget actually in force beside a cap that is
+        /// not, so a `Some` carrying the *cap's* numbers would be the same
+        /// untruth one field along. And it is read through `router.budget_for`,
+        /// the seam every route attempt runs through — a snapshot deriving its
+        /// own answer could disagree with the turn.
+        #[test]
+        fn the_doctor_snapshot_names_a_floored_budget_and_only_a_floored_one() {
+            fn config_capped_at(cap: u32) -> Config {
+                Config {
+                    providers: vec![ModelProvider {
+                        id: "wide".to_owned(),
+                        kind: ProviderKind::OpenaiCompatible,
+                        endpoint: Some("https://example.invalid/v1/chat/completions".to_owned()),
+                        model: Some("wide-model".to_owned()),
+                        auth_ref: None,
+                        capabilities: ProviderCapabilities {
+                            max_context: 200_000,
+                            context_budget_cap: cap,
+                            ..ProviderCapabilities::default()
+                        },
+                    }],
+                    default_provider: Some("wide".to_owned()),
+                    ..Config::default()
+                }
+            }
+
+            // A 500-token cap on a 200k window derives nothing usable and lands
+            // on the floor, so the snapshot must say the declaration below is
+            // not what runs.
+            let config = config_capped_at(500);
+            let router = router_for_config(&config);
+            let snap = snapshot_from_config(&config, &router, false);
+            let row = snap
+                .providers
+                .iter()
+                .find(|p| p.id.0 == "wide")
+                .expect("the registered provider has a row");
+            assert_eq!(row.context_budget_cap, Some(500), "the cap is recorded");
+            let floored = row
+                .floored_budget
+                .expect("a cap the floor overruled must be named in the snapshot");
+            let in_force = router.budget_for(Some("wide"));
+            assert!(in_force.floored, "{in_force:?}");
+            assert_eq!(
+                (floored.budget_tokens, floored.budget_bytes),
+                (in_force.budget_tokens as u64, in_force.budget_bytes as u64),
+                "the cell must carry the pair actually in force, which is \
+                 *larger* than the cap asked for — repeating the cap would be \
+                 the same untruth the field exists to close"
+            );
+            assert!(floored.budget_tokens > 500);
+
+            // The twin, differing only in the cap: an honoured declaration adds
+            // no cell at all, so an ordinary `/doctor` is byte-identical.
+            let honoured = config_capped_at(0);
+            let snap = snapshot_from_config(&honoured, &router_for_config(&honoured), false);
+            let row = snap
+                .providers
+                .iter()
+                .find(|p| p.id.0 == "wide")
+                .expect("the registered provider has a row");
+            assert_eq!(
+                row.floored_budget, None,
+                "a window the floor never touched must not grow a line saying \
+                 it was overruled: {row:?}"
             );
         }
 
