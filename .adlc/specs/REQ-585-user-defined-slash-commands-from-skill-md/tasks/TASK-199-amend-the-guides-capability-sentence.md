@@ -1,7 +1,7 @@
 ---
 id: TASK-199
 title: "Amend BUG-181's capability sentence so it is true again, inside the resident prompt's headroom"
-status: draft
+status: complete
 parent: REQ-585
 created: 2026-08-20
 updated: 2026-08-20

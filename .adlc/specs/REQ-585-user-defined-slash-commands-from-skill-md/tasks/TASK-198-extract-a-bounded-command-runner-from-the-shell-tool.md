@@ -1,7 +1,7 @@
 ---
 id: TASK-198
 title: "Extract the shell tool's spawn body so dynamic context is a second caller, not a second implementation"
-status: draft
+status: complete
 parent: REQ-585
 created: 2026-08-20
 updated: 2026-08-20

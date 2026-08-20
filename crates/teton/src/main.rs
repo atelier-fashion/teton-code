@@ -1196,9 +1196,22 @@ fn run_session(
             }
             // Slash commands are intercepted before any RPC is built (BR-1), so
             // a command never reaches the model, the transcript, or the meter.
-            let prompt_text = match slash::classify(text) {
+            // REQ-585: the registry the classifier reads. Nothing fetches it
+            // yet — TASK-207 replaces this with the `skills/list` snapshot
+            // held on `UiContext` and refreshed on `session_root_changed`.
+            let skills = slash::SkillSnapshot::empty();
+            let prompt_text = match slash::classify(text, &skills) {
+                // Unreachable while the snapshot above is empty: `classify`
+                // yields this arm only for a name the registry dispatches, and
+                // an empty registry dispatches none. Spelled as a panic rather
+                // than a silent `continue` because a `continue` here is a typed
+                // line that vanishes — the one failure a user cannot see and a
+                // test would not catch (LESSON-511).
+                slash::Input::Skill { name, .. } => {
+                    unreachable!("empty skill registry dispatched `/{name}`")
+                }
                 slash::Input::Command { name, args } => {
-                    match slash::dispatch(name, args, &mut conn, &mut ctx)? {
+                    match slash::dispatch(name, args, &skills, &mut conn, &mut ctx)? {
                         slash::CommandOutcome::Continue => continue,
                         // `/quit` leaves through the same post-loop path Ctrl-D
                         // takes — session-end cost summary, no `process::exit`
@@ -1229,7 +1242,14 @@ fn run_session(
                     // first, so `teton model set qwen --yes` cannot hand the
                     // row "qwen --yes" as a model name (verify M2).
                     ctx.surface.line(LineKind::Notice, &cli_line_note(name));
-                    match slash::run_cli_line(name, args, shell_flags, &mut conn, &mut ctx)? {
+                    match slash::run_cli_line(
+                        name,
+                        args,
+                        shell_flags,
+                        &skills,
+                        &mut conn,
+                        &mut ctx,
+                    )? {
                         slash::CommandOutcome::Continue => continue,
                         slash::CommandOutcome::Quit => break,
                     }

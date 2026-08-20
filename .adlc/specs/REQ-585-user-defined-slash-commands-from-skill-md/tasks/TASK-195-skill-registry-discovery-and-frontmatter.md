@@ -1,7 +1,7 @@
 ---
 id: TASK-195
 title: "Skill registry: the four globs behind a recording lister, and a total frontmatter parser"
-status: draft
+status: complete
 parent: REQ-585
 created: 2026-08-20
 updated: 2026-08-20

@@ -1,7 +1,7 @@
 ---
 id: TASK-202
 title: "The refusal: a spoken bound, a floored clause, and a code that is not the provider's"
-status: draft
+status: complete
 parent: REQ-585
 created: 2026-08-20
 updated: 2026-08-20

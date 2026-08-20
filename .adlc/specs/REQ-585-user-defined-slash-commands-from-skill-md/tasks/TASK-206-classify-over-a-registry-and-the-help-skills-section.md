@@ -1,7 +1,7 @@
 ---
 id: TASK-206
 title: "classify takes the snapshot, built-ins match first, and /help grows a section that cannot contradict its footer"
-status: draft
+status: complete
 parent: REQ-585
 created: 2026-08-20
 updated: 2026-08-20
