@@ -5,7 +5,7 @@ status: draft
 parent: REQ-585
 created: 2026-08-20
 updated: 2026-08-20
-dependencies: []
+dependencies: [TASK-197]
 ---
 
 ## Description
@@ -33,3 +33,4 @@ its first caller.
 
 - Pure refactor. No behaviour change, no new tests beyond what proves the extraction is faithful. If a test has to change, the extraction is wrong.
 - Keep it `pub(crate)` in the `shell` module rather than promoting it to `tools::mod` — the caller set is exactly two and the jail semantics are the shell tool's.
+- **Sequenced behind TASK-197 on purpose.** TASK-197 changes `CarriedTurn::begin`'s signature across six production and three test call sites. Parallel implementers share one worktree (LESSON-541), so a concurrent `tetond` task would see a workspace that does not compile through no fault of its own. TASK-197 is not a functional dependency — it is a compile-stability one, and it is the only such edge in this REQ.

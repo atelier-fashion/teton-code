@@ -404,6 +404,14 @@ text, budget) -> Fit`, implemented over the existing `tokens_of`/`bytes_of` —
 the same estimators the pressure path uses. Nothing re-derives a budget:
 `Router::budget_for` stays the single `budget::derive` caller.
 
+**Why Stage A does not charge the worst case.** It could reserve `MAX_OUTPUT_CHARS`
+per command and refuse everything that would not fit at maximum output — no user
+would ever approve a turn that is then refused. It does not, because every ADLC
+skill's dynamic context is an `ls`/`grep`/`cat` producing tens of bytes, and
+reserving 8,000 characters each would refuse the entire real corpus on a small
+route. BR-8(d) describes the after-refusal path explicitly, so paying it in the
+rare case is the spec's own choice, and Stage B's message says which stage refused.
+
 **Why a separate code.** `-32022` means *a provider refused this turn*; the
 remedy is the provider's window. `-32023` means *Teton refused to send it*; the
 remedy is a smaller skill or a bigger declared window. Collapsing them would

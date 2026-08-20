@@ -30,7 +30,7 @@ outcomes fold back into.
 - [ ] Substitution runs **before** the scanner, so a `$ARGUMENTS` inside a `` !`…` `` is substituted in the command the consent prompt shows and in the command that runs (AC-5, BR-4/BR-6 ordering).
 - [ ] Commands are collected in **document order** and run sequentially in that order.
 - [ ] `DynamicOutcome` is typed: `Ran { output }` / `NotRun { reason }` / `Failed { status }` / `TimedOut`. `fold` renders a not-run/failed/timed-out slot as ``[dynamic context not run: `<command>` — <reason>]`` and a ran slot as the output inside `frame_untrusted_builtin(&format!("skill:{name}"), out)`. A command's failure never fails the invocation (BR-6, AC-10).
-- [ ] **ADR-10**: `expand` runs `render::neutralize_envelope_tags` over the **body** before any envelope is spliced into it. A flush-left `</tool-result>` in a skill body must not close the envelope of a dynamic block that follows it in the same user block. Pinned as its own test; removing the call fails it (AC-12 as amended by TASK-196).
+- [ ] **ADR-10**: `expand` runs `render::neutralize_envelope_tags` over the **body** before any envelope is spliced into it. A flush-left `</tool-result>` in a skill body must not close the envelope of a dynamic block that follows it in the same user block. Pinned as its own test; removing the call fails it (BR-5, AC-12 as amended by TASK-196).
 - [ ] `expand` and `fold` are pure — no clock, no filesystem, no terminal. `run_all` is the single I/O edge and takes the runner from TASK-198 (AC-18, BR-14).
 - [ ] Mutation table: removing the substitution-before-scan ordering, the `ARGUMENTS:` fallback, the envelope neutralization, or the document-order guarantee each fails a named test.
 

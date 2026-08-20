@@ -5,7 +5,7 @@ status: draft
 parent: REQ-585
 created: 2026-08-20
 updated: 2026-08-20
-dependencies: []
+dependencies: [TASK-197]
 ---
 
 ## Description
@@ -15,7 +15,7 @@ directory listings, one level deep, behind a seam that records every path
 opened (AC-7), and parse `SKILL.md` frontmatter with a deliberately narrow flat
 parser that either succeeds whole or skips the file with a named reason.
 
-No daemon, no terminal, no clock. Everything here is unit-testable.
+No daemon, no terminal, no clock. Everything here is unit-testable — the registry half of AC-18 and BR-14.
 
 ## Files to Create/Modify
 
@@ -47,3 +47,4 @@ No daemon, no terminal, no clock. Everything here is unit-testable.
 - Frontmatter parser: copy the posture of `teton_core::config::parse_search_auth` (`crates/teton-core/src/config.rs:551`) — `Option`/`Result` return, no half-parse, and its doc comment's argument for the narrowness. There is **no YAML crate in the workspace** and this is not the REQ that adds one.
 - Fixture style: hand-built under `/tmp` with a short name and a `Drop` cleanup (`crates/tetond/tests/e2e/harness.rs:474 Workspace::new`); symlinks via `std::os::unix::fs::symlink` as in `crates/tetond/tests/symlink_posture.rs:78-160`.
 - The "root followed, entry not" rule is *narrower* than the walker's blanket refusal, so it gets its own pin in `crates/tetond/tests/symlink_posture.rs` rather than riding an existing walker test.
+- **Sequenced behind TASK-197 on purpose.** TASK-197 changes `CarriedTurn::begin`'s signature across six production and three test call sites. Parallel implementers share one worktree (LESSON-541), so a concurrent `tetond` task would see a workspace that does not compile through no fault of its own. TASK-197 is not a functional dependency — it is a compile-stability one, and it is the only such edge in this REQ.

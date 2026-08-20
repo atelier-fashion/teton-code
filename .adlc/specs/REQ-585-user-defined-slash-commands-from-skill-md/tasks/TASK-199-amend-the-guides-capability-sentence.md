@@ -5,7 +5,7 @@ status: draft
 parent: REQ-585
 created: 2026-08-20
 updated: 2026-08-20
-dependencies: []
+dependencies: [TASK-197]
 ---
 
 ## Description
@@ -38,3 +38,4 @@ The pinning test was written to fail loudly on exactly this edit. Update it.
 
 - Draft the sentence to a byte budget first, then edit. The margin tests report the exact spend; measure with `cargo test -p tetond the_total_cap_clears` rather than estimating.
 - One sentence. The prohibition against a second line containing "ask" is a real constraint of the guide, not a style note.
+- **Sequenced behind TASK-197 on purpose.** TASK-197 changes `CarriedTurn::begin`'s signature across six production and three test call sites. Parallel implementers share one worktree (LESSON-541), so a concurrent `tetond` task would see a workspace that does not compile through no fault of its own. TASK-197 is not a functional dependency — it is a compile-stability one, and it is the only such edge in this REQ.
