@@ -1,7 +1,7 @@
 ---
 id: TASK-200
 title: "One expansion value: substitution, the preamble, the dynamic-command scanner, and the fold"
-status: draft
+status: complete
 parent: REQ-585
 created: 2026-08-20
 updated: 2026-08-20

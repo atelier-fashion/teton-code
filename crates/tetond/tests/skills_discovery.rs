@@ -497,6 +497,64 @@ fn a_frontmatter_name_that_differs_is_a_note_and_never_a_second_spelling() {
 // BR-1 / AC-6 — every declined entry is counted and named
 // ---------------------------------------------------------------------------
 
+/// BR-2's naming rule travels **with** the diagnostic instead of being read
+/// back off the path.
+///
+/// Every shape the four globs can produce, including the two that name nothing:
+/// a root-level refusal names no single skill, and neither does an entry under
+/// `commands/` that could never have been one. The two that matter for BR-10's
+/// hint are the invalid spelling (the user typed something; they have to be
+/// told why it is not there) and the symlinked `commands/<name>.md`, whose name
+/// the path alone cannot give back — discovery refuses it before it is ever a
+/// `.md` file that was opened.
+#[test]
+fn a_skipped_entry_carries_the_name_it_would_have_dispatched_under() {
+    let fixture = Fixture::new();
+    fixture.write("home/.claude/commands/Deploy Prod.md", "body\n");
+    fixture.write(
+        "home/.claude/commands/broken.md",
+        "---\ntools:\n  - Bash\n---\nbody\n",
+    );
+    fixture.write(
+        "home/.claude/commands/target.md",
+        &skill_file("target", "fine"),
+    );
+    symlink(
+        fixture.path("home/.claude/commands/target.md"),
+        fixture.path("home/.claude/commands/linked.md"),
+    )
+    .unwrap();
+    fixture.write(
+        "home/.claude/skills/Bad Name/SKILL.md",
+        &skill_file("bad", "misnamed directory"),
+    );
+
+    let registry = discover(
+        Some(&fixture.home()),
+        &fixture.repo(),
+        RootKind::Project,
+        &RecordingFs::default(),
+    );
+    let named = |needle: &str| {
+        registry
+            .skipped()
+            .iter()
+            .find(|entry| entry.path.to_string_lossy().contains(needle))
+            .unwrap_or_else(|| panic!("no diagnostic mentioning `{needle}`"))
+            .name
+            .clone()
+    };
+
+    // The spelling that is *why* it was skipped is the spelling reported —
+    // even though nobody can type it. Dropping it would leave the user who
+    // typed `/deploy` with nothing to go on.
+    assert_eq!(named("Deploy Prod.md"), Some("Deploy Prod".to_owned()));
+    assert_eq!(named("broken.md"), Some("broken".to_owned()));
+    assert_eq!(named("Bad Name"), Some("Bad Name".to_owned()));
+    // The one the path alone cannot give back.
+    assert_eq!(named("linked.md"), Some("linked".to_owned()));
+}
+
 /// Each reason, in the words BR-1 promises, against the file that earned it —
 /// and, in the same fixture, the two things that are **normal** and produce no
 /// diagnostic at all: a directory with no `SKILL.md`, and a root that is not

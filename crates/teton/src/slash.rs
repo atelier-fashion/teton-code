@@ -357,10 +357,22 @@ impl SkillSnapshot {
     }
 
     /// The skipped entry a typed name would have been, or `None` (AC-17).
+    ///
+    /// Matches the **carried** `name`, not one re-derived from the path.
+    /// BR-2's naming rule (directory for `skills/`, stem for `commands/`)
+    /// belongs to discovery, which is the only place that knows which of the
+    /// four roots an entry came from; a copy here would be a second home for
+    /// it in the crate that cannot see them (LESSON-546). It is also strictly
+    /// weaker — a symlinked `commands/<name>.md` is refused before it is ever
+    /// a file that was opened, and its path alone cannot give the name back.
     fn skipped_named(&self, name: &str) -> Option<&SkillSkipped> {
         self.skipped
             .iter()
-            .find(|entry| skipped_name(&entry.path) == Some(name))
+            // Never on an empty name: a root-level diagnostic (an unreadable
+            // directory, a truncated listing) names no skill and carries the
+            // empty string, which would otherwise match a bare `/` and answer
+            // for a line nobody meant to type.
+            .find(|entry| !entry.name.is_empty() && entry.name == name)
     }
 
     /// How many registered skills came from each root, as `/help`'s diagnostic
@@ -385,33 +397,6 @@ impl From<SkillsListResult> for SkillSnapshot {
         }
     }
 }
-
-/// The name a skipped entry *would* have had, read off its path.
-///
-/// [`SkillSkipped`] carries `(path, reason)` and no name — the entity model's
-/// shape, because a skipped entry is a file rather than a skill — so the one
-/// place that has to match a typed name against one re-derives it the way
-/// discovery names a skill (BR-2): `<dir>/SKILL.md` is named for its directory,
-/// `<dir>/<stem>.md` for its stem.
-///
-/// The residual is recorded rather than hidden: an entry skipped *because* its
-/// name is invalid is matched by the invalid spelling, which is the spelling
-/// nobody can type, so it answers with the unchanged unknown-command hint. That
-/// is the right answer — there is no command by that name and never could be —
-/// but it is an answer this function reaches by luck rather than by intent.
-fn skipped_name(path: &str) -> Option<&str> {
-    let file = path.rsplit('/').next()?;
-    if file == SKILL_FILE {
-        let dir = path
-            .strip_suffix(SKILL_FILE)
-            .map(|dir| dir.trim_end_matches('/'))?;
-        return dir.rsplit('/').next().filter(|name| !name.is_empty());
-    }
-    file.strip_suffix(".md").filter(|name| !name.is_empty())
-}
-
-/// The file a `skills/<name>/` directory is a skill *by* (BR-1).
-const SKILL_FILE: &str = "SKILL.md";
 
 /// What the entry loop does once a command has run.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -3856,10 +3841,12 @@ mod tests {
             vec![
                 SkillSkipped {
                     path: "~/.claude/skills/broken/SKILL.md".to_owned(),
+                    name: "broken".to_owned(),
                     reason: "malformed frontmatter".to_owned(),
                 },
                 SkillSkipped {
                     path: "~/.claude/commands/huge.md".to_owned(),
+                    name: "huge".to_owned(),
                     reason: "over 64 KiB (67,184 B)".to_owned(),
                 },
             ],
@@ -4019,6 +4006,7 @@ mod tests {
             Vec::new(),
             vec![SkillSkipped {
                 path: "~/.claude/skills/analyze/SKILL.md".to_owned(),
+                name: "analyze".to_owned(),
                 reason: "malformed frontmatter".to_owned(),
             }],
         );
@@ -4044,25 +4032,49 @@ mod tests {
             Vec::new(),
             vec![SkillSkipped {
                 path: "~/.claude/commands/cost.md".to_owned(),
+                name: "cost".to_owned(),
                 reason: "not UTF-8".to_owned(),
             }],
         );
         assert_eq!(skipped_skill_hint("cost", &owned), None);
     }
 
-    /// A skipped entry is `(path, reason)` on the wire, so the name a user
-    /// types is matched by re-deriving it from the path the way discovery names
-    /// a skill (BR-2): a directory for `SKILL.md`, a stem for `commands/*.md`.
+    /// A skipped entry is matched by the **name discovery carried**, not by one
+    /// this crate read back off the path.
+    ///
+    /// BR-2's naming rule belongs to discovery, which is the only place that
+    /// knows which of the four roots an entry came from. A copy here would be a
+    /// second home for it in the crate that cannot see them (LESSON-546), and a
+    /// strictly weaker one: the two entries below are the cases a path-reader
+    /// gets wrong. A symlinked `commands/status.md` is refused before it is
+    /// ever a file that was opened, and an entry skipped *because* its name is
+    /// invalid is named by the invalid spelling — which is what the user typed
+    /// and what they have to be told about.
     #[test]
-    fn a_skipped_entry_is_named_by_its_path() {
-        assert_eq!(
-            skipped_name("~/.claude/skills/analyze/SKILL.md"),
-            Some("analyze")
+    fn a_skipped_entry_is_matched_by_the_name_discovery_carried() {
+        let snapshot = registry(
+            Vec::new(),
+            vec![
+                SkillSkipped {
+                    path: "~/.claude/commands/status.md".to_owned(),
+                    name: "status".to_owned(),
+                    reason: "symlink not followed".to_owned(),
+                },
+                SkillSkipped {
+                    path: "~/.claude/skills".to_owned(),
+                    name: String::new(),
+                    reason: "unreadable (permission denied)".to_owned(),
+                },
+            ],
         );
-        assert_eq!(skipped_name(".claude/commands/beta.md"), Some("beta"));
-        assert_eq!(skipped_name("SKILL.md"), None);
-        assert_eq!(skipped_name("~/.claude/commands/.md"), None);
-        assert_eq!(skipped_name("~/.claude/skills/x/notes.txt"), None);
+
+        let hint = skipped_skill_hint("status", &snapshot).expect("a skipped name says why");
+        assert!(hint.contains("symlink not followed"), "{hint}");
+
+        // A root-level diagnostic names no skill, and the empty name must not
+        // become a wildcard that answers for every typed line.
+        assert_eq!(skipped_skill_hint("", &snapshot), None);
+        assert_eq!(skipped_skill_hint("anything", &snapshot), None);
     }
 
     /// BR-4: a skill is handed its line **as typed** — interior whitespace runs

@@ -1,7 +1,7 @@
 ---
 id: TASK-203
 title: "The registry has a lifetime: built at session create, rebuilt at /cd, queryable over the wire"
-status: draft
+status: complete
 parent: REQ-585
 created: 2026-08-20
 updated: 2026-08-20

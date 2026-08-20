@@ -125,12 +125,14 @@ use teton_protocol::methods::{
     ProviderSetupPlanParams, ProviderSetupPreviewParams, ProviderTestParams, RpcMethod,
     SessionAttachParams, SessionAttachResult, SessionClearParams, SessionCreateParams,
     SessionCreateResult, SessionListParams, SessionListResult, SessionPermissionsParams,
-    SessionSetCwdParams, SessionSummary, WebOverrideParams, WebRefreshParams, WebSetupCommitParams,
+    SessionSetCwdParams, SessionSummary, SkillSkipped, SkillView, SkillsListParams,
+    SkillsListResult, WebOverrideParams, WebRefreshParams, WebSetupCommitParams,
     WebSetupPlanParams, WebSetupPreviewParams,
 };
 use teton_protocol::{RequestId, SessionId};
 
 use teton_core::lifetime::{BlockingActivity, PolicySource, ShutdownPolicy};
+use teton_core::session_root::{bounded_field, display_for};
 
 use crate::attest::{
     AttestationRefusal, AttestationRegistry, MechanismAvailability, PresenceVerifier,
@@ -145,6 +147,7 @@ use crate::lifetime::LifetimeSupervisor;
 use crate::peer::{is_descendant_of, Ancestry, KernelParentOf, MAX_ANCESTRY_DEPTH};
 use crate::runtime::{ClientPresence, DaemonRuntime};
 use crate::sessions::{self, validate_session_cwd, SessionCreateError, SessionRegistry};
+use crate::skills::{DirLister, RealFs, SkillRegistry};
 
 /// Depth of a client's outbound message queue (responses + events).
 const OUTBOUND_CAPACITY: usize = 1024;
@@ -324,6 +327,20 @@ pub struct Daemon {
     /// [`Daemon::new`] both take the constant — and a fixture has to say
     /// [`Daemon::with_consent_timeout`] out loud to change it.
     pub consent_timeout: std::time::Duration,
+    /// The filesystem a session's skill discovery reads through (REQ-585
+    /// BR-1, ADR-4).
+    ///
+    /// A field for [`Self::verifier`]'s reason: the claim REQ-585 makes about
+    /// discovery is a claim about *what was not opened* and *how often* — four
+    /// listings at `session/create`, four more at `/cd`, and none per turn —
+    /// and neither half is observable from outside the process. Behind the
+    /// [`DirLister`] seam a fixture records every path handed to it, so "a
+    /// two-turn session listed the four roots once" is a decidable fact rather
+    /// than a comment.
+    ///
+    /// Production never sets it: [`RealFs`] is what both constructors take, and
+    /// a fixture has to say [`Daemon::with_skill_lister`] out loud.
+    pub skills_fs: Arc<dyn DirLister + Send + Sync>,
     /// The window a connection's grant-announcement allowance is counted over
     /// (R3, [`GRANT_ANNOUNCEMENTS_PER_WINDOW`]).
     ///
@@ -359,6 +376,7 @@ impl Daemon {
             surfaces: ConsentSurfaces::new(),
             attestations: AttestationRegistry::new(),
             verifier: crate::attest::default_verifier(),
+            skills_fs: Arc::new(RealFs),
             consent_timeout: CONSENT_TIMEOUT,
             grant_announcement_window: GRANT_ANNOUNCEMENT_WINDOW,
             // `Embedded`, for the same reason `ShutdownPolicy::Never` is above:
@@ -414,6 +432,23 @@ impl Daemon {
         self
     }
 
+    /// Replaces the filesystem a session's skill discovery reads through
+    /// (REQ-585 ADR-4).
+    ///
+    /// **The observation seam the cost criterion is written against.** Whether
+    /// discovery was paid once or once per turn cannot be read off a registry —
+    /// both produce the same rows — so the assertion has to be made against
+    /// what was *opened*, and only a recording [`DirLister`] can say that.
+    ///
+    /// A fixture has to name this out loud, exactly as it does
+    /// [`Self::with_presence_verifier`]: production takes [`RealFs`] in both
+    /// constructors, so no shipped path can be reading a stand-in filesystem.
+    #[must_use]
+    pub fn with_skill_lister(mut self, fs: Arc<dyn DirLister + Send + Sync>) -> Self {
+        self.skills_fs = fs;
+        self
+    }
+
     /// Replaces the window a connection's grant announcements are rate-limited
     /// over (R3).
     ///
@@ -460,6 +495,7 @@ impl Daemon {
             surfaces: ConsentSurfaces::new(),
             attestations: AttestationRegistry::new(),
             verifier: crate::attest::default_verifier(),
+            skills_fs: Arc::new(RealFs),
             // The production answer, and taken here rather than passed in so
             // `main` cannot ship a daemon that forgot to state it: this daemon
             // is its own process, and the children it spawns are what BR-4
@@ -2391,6 +2427,10 @@ fn dispatch(
         ProviderSetupPreviewParams::METHOD => {
             Some(handle_provider_setup_preview(daemon, conn, id, params))
         }
+        // REQ-585 ADR-2: `skills/list` is a read of a stored snapshot — no
+        // human, no network, no filesystem — so it stays on the synchronous
+        // path beside the other session-scoped reads.
+        SkillsListParams::METHOD => Some(handle_skills_list(daemon, conn, id, params)),
         SessionPermissionsParams::METHOD => {
             Some(handle_session_permissions(daemon, conn, id, params))
         }
@@ -3266,6 +3306,13 @@ fn handle_session_create(daemon: &Daemon, conn: &ConnState, id: Id, params: Valu
             // also writes to).
             conn.record_created(summary.session_id.clone());
 
+            // REQ-585 BR-1: the session's skills, discovered once, here. Before
+            // the response, so the `skills/list` the client sends on reading it
+            // cannot arrive ahead of the registry it is asking for; and after
+            // the create, because the registry is stored against the id that
+            // create just minted.
+            rebuild_session_skills(daemon, &summary.session_id, summary.cwd.as_deref());
+
             // Broadcast a session-scoped event so attached peers learn of the
             // new session. Entering a structured session's first phase is a
             // phase transition from nothing to that phase.
@@ -4125,8 +4172,187 @@ fn handle_session_set_cwd(daemon: &Daemon, conn: &ConnState, id: Id, params: Val
         .runtime
         .set_session_cwd(&params, &daemon.sessions, &daemon.events)
     {
-        Ok(result) => ok_string(id, &result),
+        Ok(result) => {
+            // REQ-585 BR-1/AC-14: the project half of the registry is derived
+            // from the root, so the root moving re-derives it. Here rather than
+            // inside the runtime's move because this is where the daemon's
+            // discovery seam is (`Daemon::skills_fs`), and after the move
+            // because it reads the root the session now stands on.
+            rebuild_session_skills(daemon, &params.session_id, Some(&params.cwd));
+            ok_string(id, &result)
+        }
         Err(err) => error_from(id, err),
+    }
+}
+
+/// Derive this session's skill registry from the root it stands on and store it
+/// (REQ-585 BR-1, ADR-1).
+///
+/// **Two callers, ever**: [`handle_session_create`] and
+/// [`handle_session_set_cwd`]. There is no third, and that is the cost
+/// criterion rather than an accident — discovery is four directory listings and
+/// one file read per candidate, so a turn that re-derived it would pay that
+/// while a user waits, for an answer that cannot have changed unless the root
+/// did. The consequence is a snapshot, stated where the type is
+/// ([`SkillRegistry`]): a skill file written mid-session is picked up at the
+/// next `/cd`, and there is no watcher.
+///
+/// The registry is built from the **probed** root ([`DaemonRuntime::session_root_for`]),
+/// never from the stored path alone, because discovery needs two things and the
+/// probe carries both: the path the four globs hang off, and the
+/// [`RootKind`](teton_protocol::methods::RootKind) that decides whether there is
+/// a project pair at all. A session whose root *is* `$HOME` must reach
+/// `~/.claude/skills` once, not twice — every skill otherwise registers under
+/// both sources, shadowing itself, with two permission keys for one file
+/// (AC-3). Deriving that kind here with a path comparison of our own would be a
+/// second spelling of a decision REQ-583 already owns (LESSON-528).
+///
+/// `set_skills` answering `false` — a session that vanished between the create
+/// and this call — is nothing to act on: there is no record to hold a registry,
+/// and no id anyone can query it with.
+///
+/// **The `/cd` half is not complete without dropping the project grants.** A
+/// remembered `skill:project:<name>` grant authorizes a file under the old
+/// root, and a rebuilt registry beside a stale grant is exactly LESSON-501's
+/// shape — carried state that sheds its invariants silently. That drop is
+/// `PermissionGate::drop_project_skill_grants` (REQ-585 TASK-201), and it has
+/// to happen where the session's gate is reachable, which is inside
+/// [`DaemonRuntime::set_session_cwd`] rather than here: `session_gates` is
+/// private to the runtime and minting a gate needs the config.
+fn rebuild_session_skills(daemon: &Daemon, session_id: &SessionId, cwd: Option<&Path>) {
+    let probed = daemon.runtime.session_root_for(cwd);
+    let registry = crate::skills::discover(
+        crate::session_root::home().as_deref(),
+        &probed.path,
+        probed.view.kind,
+        daemon.skills_fs.as_ref(),
+    );
+    daemon.sessions.set_skills(session_id, registry);
+}
+
+/// The `/name` commands this session dispatches (`skills/list`, REQ-585 BR-3,
+/// ADR-1/ADR-2).
+///
+/// **This method is the capability handshake** (ADR-2): a client calls it after
+/// `session/create` and again after every `session_root_changed`, and a daemon
+/// that does not have it answers `METHOD_NOT_FOUND`, which the client reads as
+/// an empty snapshot rather than as an error. Nothing here has to know that —
+/// the point of proving a capability by a successful call is that the answer is
+/// the same shape either way.
+///
+/// Gated on [`ConnState::may_drive`], exactly as [`handle_session_permissions`]
+/// is and for its reason: this is a read of a session's content — file-authored
+/// descriptions from a repo the connection may have no business seeing — and a
+/// looser gate here would make the refusal an oracle for which sessions exist
+/// (ADR-B). The length check comes first, so an attacker-chosen id is not
+/// hashed through the attachment set before it is refused (BUG-166 residual).
+///
+/// It answers from the stored snapshot and opens nothing: the discovery this
+/// reports was paid at [`rebuild_session_skills`]'s two call sites.
+fn handle_skills_list(daemon: &Daemon, conn: &ConnState, id: Id, params: Value) -> String {
+    let params: SkillsListParams = match serde_json::from_value(params) {
+        Ok(params) => params,
+        Err(_) => return error_string(id, error_code::INVALID_PARAMS, "invalid params"),
+    };
+    if let Some(refusal) = refuse_unmintable_session_id(&id, &params.session_id) {
+        return refusal;
+    }
+    if !conn.may_drive(&params.session_id) {
+        return error_string(id, error_code::NOT_ATTACHED, NOT_ATTACHED_MESSAGE);
+    }
+    let registry = daemon.sessions.skills(&params.session_id);
+    ok_string(
+        id,
+        &skills_list_result(&registry, crate::session_root::home().as_deref()),
+    )
+}
+
+/// The ceiling, in characters, on a skill's `description` — 200.
+///
+/// The requirement's figure (BR-1's entity table), chosen against the corpus it
+/// has to render: 5 of the 17 shipped ADLC skill descriptions are longer than
+/// this, and every one of them is a paragraph that would take a `/help` row off
+/// the screen. Counted in characters rather than bytes for
+/// [`bounded_field`](teton_core::session_root::bounded_field)'s reason — the row
+/// is for a person, and a CJK description should get its full 200.
+const SKILL_DESCRIPTION_MAX_CHARS: usize = 200;
+
+/// The ceiling, in characters, on a skill's `argument-hint`.
+///
+/// The one-line display ceiling REQ-583 already sized for a person, reused
+/// rather than a fresh number: the hint shares a `/help` row with the
+/// description and is by nature a few words (`[path]`, `<REQ-id> [--force]`).
+const SKILL_HINT_MAX_CHARS: usize = teton_core::session_root::DISPLAY_MAX_CHARS;
+
+/// The ceiling, in characters, on the name a *skipped* entry carries.
+///
+/// [`crate::skills::MAX_NAME_LEN`], because a name that passed
+/// `is_valid_skill_name` fits it exactly — but an entry skipped *for* its name
+/// never passed anything, so the bound is what stops a 4,000-character
+/// directory name from riding a diagnostic onto a screen.
+const SKILL_SKIPPED_NAME_MAX_CHARS: usize = crate::skills::MAX_NAME_LEN;
+
+/// The wire view of a registry: every row, bounded and neutralized **here**,
+/// before it leaves the process (REQ-585 BR-3, LESSON-517).
+///
+/// Descriptions, hints, skipped paths and skipped names are all *file bytes* —
+/// written by whoever owns the repo the session stands in, which is not always
+/// the person reading the screen. They are bounded at the wire rather than at
+/// the renderer because there is more than one renderer: the CLI defuses again
+/// through `Surface::line` (ADR-009's two-ends shape), and the phase-2 VS Code
+/// client will not have that function at all. A 4,000-character description
+/// with a bidi override in it must therefore be harmless *as protocol*, not
+/// merely as terminal output.
+///
+/// The one field that is **not** bounded here is [`SkillView::name`], and the
+/// asymmetry is the point: a registered name matched
+/// `^[a-z0-9][a-z0-9_-]{0,63}$` before discovery would register it (BR-2), so it
+/// is ASCII, one line and at most 64 characters by construction. Bounding it
+/// again would say the invariant is not trusted, in the one place it is
+/// actually enforced.
+fn skills_list_result(registry: &SkillRegistry, home: Option<&Path>) -> SkillsListResult {
+    SkillsListResult {
+        skills: registry
+            .skills()
+            .iter()
+            .map(|skill| SkillView {
+                name: skill.name.clone(),
+                source: skill.source,
+                description: skill
+                    .description
+                    .as_deref()
+                    .map(|text| bounded_field(text, SKILL_DESCRIPTION_MAX_CHARS)),
+                argument_hint: skill
+                    .argument_hint
+                    .as_deref()
+                    .map(|hint| bounded_field(hint, SKILL_HINT_MAX_CHARS)),
+                // The daemon knows the two contests it can see; the third — a
+                // reserved built-in name — is the client's, so this says what
+                // *this* side found and never `None` where it found something.
+                shadowed: skill.shadowed.map(|by| by.to_string()),
+            })
+            .collect(),
+        skipped: registry
+            .skipped()
+            .iter()
+            .map(|entry| SkillSkipped {
+                name: bounded_field(
+                    &entry.name.clone().unwrap_or_default(),
+                    SKILL_SKIPPED_NAME_MAX_CHARS,
+                ),
+                // BR-1's entity table: never an absolute path. A refusal that
+                // said `/Users/jane/.claude/skills/broken/SKILL.md` would carry
+                // a username into a transcript and, through `/help`, into a
+                // screenshot.
+                path: bounded_field(
+                    &display_for(&entry.path, home),
+                    teton_core::session_root::DISPLAY_MAX_CHARS,
+                ),
+                // The daemon's own words, from the daemon's own enum: no file
+                // bytes reach this string (BR-1's named reasons).
+                reason: entry.reason.to_string(),
+            })
+            .collect(),
     }
 }
 
@@ -9946,10 +10172,17 @@ mod tests {
         let mut sub = daemon.events.subscribe(16);
         let oversized = SessionId::from(format!("sess-{}", "a".repeat(4096)).as_str());
 
+        // REQ-585 ADR-2: `skills/list` joins the sweep, and joins **both**
+        // loops. Its params are `{session_id}` alone, so it is well-formed
+        // under either helper's shape — which is the property worth asserting
+        // twice: serde ignores the extra keys, so what refuses the call is the
+        // length check rather than a parse failure wearing its code
+        // (LESSON-502).
         for method in [
             WebSetupPlanParams::METHOD,
             WebSetupPreviewParams::METHOD,
             WebSetupCommitParams::METHOD,
+            SkillsListParams::METHOD,
         ] {
             let refused = route_setup(
                 &daemon,
@@ -9975,6 +10208,7 @@ mod tests {
             ProviderSetupPlanParams::METHOD,
             ProviderSetupPreviewParams::METHOD,
             ProviderSetupCommitParams::METHOD,
+            SkillsListParams::METHOD,
         ] {
             let refused = route_setup(
                 &daemon,
@@ -10063,11 +10297,16 @@ mod tests {
                 serde_json::json!({"session_id": session_id})
             }
         };
+        // REQ-585: `skills/list` joins for `session/permissions`' reason — it is
+        // a *read* behind the same gate, and reading a session's commands is
+        // reading that session. This loop is where its gate leg is asserted:
+        // the setup sweep above only pins the length check.
         for method in [
             WebOverrideParams::METHOD,
             SessionPermissionsParams::METHOD,
             SessionClearParams::METHOD,
             SessionSetCwdParams::METHOD,
+            SkillsListParams::METHOD,
         ] {
             let refused = dispatch(
                 &daemon,

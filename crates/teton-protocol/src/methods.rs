@@ -383,6 +383,29 @@ pub struct SkillView {
 /// not a skill.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SkillSkipped {
+    /// The name this entry **would have dispatched under**, empty when it names
+    /// no skill at all (a root-level refusal or truncation, or an entry whose
+    /// spelling was never a candidate).
+    ///
+    /// Named by the daemon rather than re-derived from [`Self::path`] by every
+    /// client that needs it. BR-2's rule — a `skills/` entry is named by its
+    /// directory, a `commands/` entry by its file stem — belongs to the side
+    /// that owns discovery; a client re-deriving it from a display path is a
+    /// second home for that rule in a crate that cannot see the four roots, and
+    /// two spellings of one decision are identical only until one of them is
+    /// edited (LESSON-528).
+    ///
+    /// **Untrusted, and bounded as such**: unlike [`SkillView::name`] — which is
+    /// dispatchable and therefore matched `^[a-z0-9][a-z0-9_-]{0,63}$` before it
+    /// was registered — this is whatever the filesystem spelled, *including* the
+    /// invalid spellings that are why the entry was skipped. The daemon
+    /// neutralizes and bounds it exactly as it does the description.
+    ///
+    /// Additive (REQ-585 ADR-2): a result from a daemon predating the field
+    /// carries no key and reads empty, and an entry that names nothing emits no
+    /// key rather than `""`.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub name: String,
     /// The file, **home-relative** (`session_root::display_for`) and bounded,
     /// exactly as [`SkillView`]'s description is.
     ///
@@ -4062,6 +4085,7 @@ mod tests {
                 },
             ],
             skipped: vec![SkillSkipped {
+                name: "broken".to_owned(),
                 path: "~/.claude/skills/broken/SKILL.md".to_owned(),
                 reason: "malformed frontmatter".to_owned(),
             }],
@@ -4093,6 +4117,77 @@ mod tests {
         assert!(bare.get("description").is_none(), "{bare}");
         assert!(bare.get("argument_hint").is_none(), "{bare}");
         assert!(bare.get("shadowed").is_none(), "{bare}");
+    }
+
+    /// REQ-585 TASK-203: `SkillSkipped.name` is additive in both directions —
+    /// the `route_decided` budget rule re-applied to the one field this task
+    /// adds, rather than assumed inherited.
+    ///
+    /// The field exists so BR-2's naming rule ("a `skills/` entry is named by
+    /// its directory, a `commands/` entry by its stem") has one home, on the
+    /// side that owns discovery. That makes the skew question real: a client
+    /// that already re-derives the name from the path will keep working against
+    /// a daemon that has never sent one, and a daemon that sends one must not
+    /// break a reader built before it.
+    ///
+    /// Four legs, as the rule asks: an absent key parses, an empty name emits
+    /// **no** key rather than `""`, the new wire parses through a
+    /// locally-declared pre-REQ struct, and the fixture that proves the third
+    /// leg is checked for actually carrying the key (LESSON-502 — the vacuity
+    /// is the failure mode).
+    #[test]
+    fn a_skipped_entrys_name_is_additive_in_both_directions() {
+        // A result from a daemon predating the field: no `name` key at all.
+        let older: SkillsListResult = serde_json::from_str(
+            r#"{"skills":[],"skipped":[
+                {"path":"~/.claude/skills/broken/SKILL.md","reason":"malformed frontmatter"}]}"#,
+        )
+        .expect("a result from a daemon predating the field must still parse");
+        assert_eq!(older.skipped[0].name, "");
+        assert_eq!(older.skipped[0].reason, "malformed frontmatter");
+
+        // And an entry that names nothing — a root-level refusal — writes no
+        // key, rather than an empty string a client would render as a name.
+        let unnamed = serde_json::to_value(&older).unwrap();
+        assert!(
+            unnamed["skipped"][0].get("name").is_none(),
+            "an entry that names no skill emits no key: {unnamed}"
+        );
+
+        // The other direction: a reader built before the field.
+        #[derive(Deserialize)]
+        struct PreNameSkillSkipped {
+            path: String,
+            reason: String,
+        }
+        #[derive(Deserialize)]
+        struct PreNameSkillsListResult {
+            skipped: Vec<PreNameSkillSkipped>,
+        }
+        let wire = serde_json::to_string(&SkillsListResult {
+            skills: Vec::new(),
+            skipped: vec![SkillSkipped {
+                name: "broken".to_owned(),
+                path: "~/.claude/skills/broken/SKILL.md".to_owned(),
+                reason: "malformed frontmatter".to_owned(),
+            }],
+        })
+        .unwrap();
+        assert!(
+            wire.contains(r#""name":"broken""#),
+            "the fixture must actually carry the new key: {wire}"
+        );
+        let old: PreNameSkillsListResult =
+            serde_json::from_str(&wire).expect("a client predating the field still reads the list");
+        assert_eq!(old.skipped[0].path, "~/.claude/skills/broken/SKILL.md");
+        assert_eq!(old.skipped[0].reason, "malformed frontmatter");
+
+        assert_eq!(
+            crate::PROTOCOL_VERSION,
+            crate::ProtocolVersion(2),
+            "a named skipped entry is one more optional field, so the negotiated \
+             version does not move"
+        );
     }
 
     /// REQ-585's additivity for `PromptTurnParams.skill`, both directions —

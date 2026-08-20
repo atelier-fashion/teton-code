@@ -229,6 +229,7 @@ pub fn discover(
             Err(ListError::Denied) => {
                 skipped.push(Skipped {
                     path: root.dir.clone(),
+                    name: None,
                     reason: SkipReason::Unreadable,
                 });
                 continue;
@@ -244,6 +245,7 @@ pub fn discover(
             entries.truncate(MAX_ENTRIES_PER_ROOT);
             skipped.push(Skipped {
                 path: root.dir.clone(),
+                name: None,
                 reason: SkipReason::RootTruncated,
             });
         }
@@ -278,8 +280,17 @@ fn consider(
     // discovery declines to follow, and the user whose `commands/` is a tree of
     // symlinks needs to be told that rather than left with an empty `/help`.
     if skip_symlink_entry(entry.file_type) {
+        // Named where the shape can name it: a symlinked `commands/status.md`
+        // is the reason `/status` is missing, and saying so is the whole point
+        // of naming a refusal (BR-1, BR-10).
+        let name = entry
+            .file_name
+            .to_str()
+            .and_then(|entry_name| root.shape.name_of(entry_name))
+            .map(str::to_owned);
         skipped.push(Skipped {
             path,
+            name,
             reason: SkipReason::SymlinkEntry,
         });
         return;
@@ -306,7 +317,7 @@ fn consider(
             // dominate: a `.git` or a `node_modules` under a `skills/` root
             // must not be reported as an invalid name.
             let file = path.join("SKILL.md");
-            let Some(text) = read_or_name(&file, fs, skipped) else {
+            let Some(text) = read_or_name(&file, name, fs, skipped) else {
                 return;
             };
             register(name, root.source, file, &text, candidates, skipped);
@@ -317,11 +328,12 @@ fn consider(
             if !is_valid_skill_name(name) {
                 skipped.push(Skipped {
                     path,
+                    name: Some(name.to_owned()),
                     reason: SkipReason::InvalidName,
                 });
                 return;
             }
-            let Some(text) = read_or_name(&path, fs, skipped) else {
+            let Some(text) = read_or_name(&path, name, fs, skipped) else {
                 return;
             };
             register(name, root.source, path, &text, candidates, skipped);
@@ -334,7 +346,12 @@ fn consider(
 /// `NotFound` and `NotRegular` produce no diagnostic: both mean "there is no
 /// skill file here", and the second one means it **without having opened**
 /// anything — the FIFO case.
-fn read_or_name(file: &Path, fs: &dyn DirLister, skipped: &mut Vec<Skipped>) -> Option<String> {
+fn read_or_name(
+    file: &Path,
+    name: &str,
+    fs: &dyn DirLister,
+    skipped: &mut Vec<Skipped>,
+) -> Option<String> {
     let reason = match fs.read(file) {
         Ok(text) => return Some(text),
         Err(ReadError::NotFound | ReadError::NotRegular) => return None,
@@ -344,6 +361,7 @@ fn read_or_name(file: &Path, fs: &dyn DirLister, skipped: &mut Vec<Skipped>) -> 
     };
     skipped.push(Skipped {
         path: file.to_path_buf(),
+        name: Some(name.to_owned()),
         reason,
     });
     None
@@ -362,6 +380,7 @@ fn register(
     if !is_valid_skill_name(name) {
         skipped.push(Skipped {
             path,
+            name: Some(name.to_owned()),
             reason: SkipReason::InvalidName,
         });
         return;
@@ -371,6 +390,7 @@ fn register(
         // the parser returns none (ADR-5).
         skipped.push(Skipped {
             path,
+            name: Some(name.to_owned()),
             reason: SkipReason::MalformedFrontmatter,
         });
         return;

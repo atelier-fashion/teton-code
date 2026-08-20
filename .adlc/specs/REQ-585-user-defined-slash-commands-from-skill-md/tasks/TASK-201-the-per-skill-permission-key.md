@@ -1,7 +1,7 @@
 ---
 id: TASK-201
 title: "One consent per invocation, under the skill's own key — and project grants die at /cd"
-status: draft
+status: complete
 parent: REQ-585
 created: 2026-08-20
 updated: 2026-08-20

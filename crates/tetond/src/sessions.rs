@@ -33,6 +33,7 @@ use teton_protocol::methods::SessionSummary;
 use teton_protocol::{Phase, SessionId, SessionMode, TurnId};
 
 use crate::harness::context::{ContextBlock, RetainedContext};
+use crate::skills::SkillRegistry;
 
 /// One session as the registry holds it: what clients see, plus what only the
 /// registry needs to know.
@@ -65,6 +66,20 @@ struct SessionRecord {
     /// turn is in flight: a busy error that cannot name its cause is the generic
     /// turn failure LESSON-456 is about.
     in_flight_turn: Option<TurnId>,
+    /// The `/name` commands this session dispatches (REQ-585 BR-1, ADR-1).
+    ///
+    /// A **snapshot** of four directory listings, built when the session is
+    /// created and rebuilt when its root moves — never re-derived per turn and
+    /// never watched (see [`SkillRegistry`]). It lives here, beside the root it
+    /// was derived from, because half of it *is* a fact about that root: a
+    /// project skill is `<session-root>/.claude/…`, so a registry stored
+    /// anywhere else would be a second thing to move on `/cd`.
+    ///
+    /// Behind an [`Arc`] so a query — `skills/list`, and the turn that expands a
+    /// skill — clones a pointer rather than every registered body under the
+    /// registry lock (LESSON-448's rule at a smaller scale: a lock held across a
+    /// deep copy is a lock every other session waits on).
+    skills: Arc<SkillRegistry>,
 }
 
 /// One session's conversation: the ordered blocks the harness retained, turn
@@ -490,6 +505,13 @@ impl SessionRegistry {
                 title_attempted: false,
                 conversation: Conversation::default(),
                 in_flight_turn: None,
+                // Empty until the caller discovers one ([`Self::set_skills`]).
+                // The build needs the session's *probed* root — its path and
+                // its `RootKind` — which is the server's to derive and not this
+                // registry's to know; nothing can observe the gap, because the
+                // id being returned here is the first anyone learns of the
+                // session, and reaching it needs that id.
+                skills: Arc::new(SkillRegistry::default()),
             });
         Ok(summary)
     }
@@ -633,6 +655,59 @@ impl SessionRegistry {
         };
         record.summary.cwd = Some(cwd);
         true
+    }
+
+    /// Replace this session's skill registry (REQ-585 BR-1, ADR-1).
+    ///
+    /// Called twice in a session's life and nowhere else: once when it is
+    /// created, and again when its root moves (`session/set_cwd`), because half
+    /// the registry is derived from that root. **Not** per turn and not per
+    /// query — discovery is four directory listings and a file read per
+    /// candidate, and a session that paid that on every prompt would be paying
+    /// it while a user waits, for an answer that cannot have changed unless the
+    /// root did. The consequence is stated where the type is
+    /// ([`SkillRegistry`]): a file written after the session started is not
+    /// picked up until the next `/cd`.
+    ///
+    /// Unconditional, like [`Self::set_cwd`] beside it: a root moves as often as
+    /// the user asks, and each move re-derives this. `false` only for a session
+    /// the registry does not have.
+    pub fn set_skills(&self, id: &SessionId, skills: SkillRegistry) -> bool {
+        let mut sessions = self
+            .sessions
+            .lock()
+            .expect("session registry mutex poisoned");
+        let Some(record) = sessions
+            .iter_mut()
+            .find(|record| &record.summary.session_id == id)
+        else {
+            return false;
+        };
+        record.skills = Arc::new(skills);
+        true
+    }
+
+    /// This session's skill registry, as `skills/list` reports it and as a turn
+    /// expanding a `/name` line reads it.
+    ///
+    /// A cloned [`Arc`], so the lock is held for a pointer bump rather than for
+    /// a copy of every registered body (LESSON-448).
+    ///
+    /// A session the registry does not have answers **empty**, for
+    /// [`Self::conversation_snapshot`]'s reason: a session that does not exist
+    /// dispatches no commands, and an empty registry is exactly the state ADR-2
+    /// already requires every consumer to handle — it is what a machine with no
+    /// `~/.claude` has, and what a new client synthesizes from an old daemon's
+    /// `METHOD_NOT_FOUND`.
+    #[must_use]
+    pub fn skills(&self, id: &SessionId) -> Arc<SkillRegistry> {
+        self.sessions
+            .lock()
+            .expect("session registry mutex poisoned")
+            .iter()
+            .find(|record| &record.summary.session_id == id)
+            .map(|record| Arc::clone(&record.skills))
+            .unwrap_or_default()
     }
 
     /// This session's retained conversation, as the next turn replays it
@@ -952,6 +1027,97 @@ mod tests {
         assert!(
             !reg.set_cwd(&SessionId::from("sess-ghost"), PathBuf::from("/x")),
             "a session the registry never had cannot be moved"
+        );
+    }
+
+    /// A throwaway tree holding one `commands/<name>.md`, removed on drop.
+    ///
+    /// [`SkillRegistry`] has exactly two constructors — `Default` and
+    /// [`crate::skills::discover`] — and deliberately no test-only builder
+    /// (LESSON-544: a fixture that reaches past the constructor leaves the
+    /// constructor unguarded). So a registry a test can tell apart from another
+    /// one is a real directory with a real file in it.
+    struct SkillTree {
+        root: PathBuf,
+    }
+
+    impl SkillTree {
+        fn holding(name: &str) -> Self {
+            use std::sync::atomic::{AtomicUsize, Ordering};
+            static SEQ: AtomicUsize = AtomicUsize::new(0);
+            let seq = SEQ.fetch_add(1, Ordering::SeqCst);
+            let root = PathBuf::from("/tmp")
+                .join(format!("tsess{:x}{seq:x}", std::process::id() & 0xffff));
+            let commands = root.join(".claude").join("commands");
+            std::fs::create_dir_all(&commands).unwrap();
+            std::fs::write(commands.join(format!("{name}.md")), "body\n").unwrap();
+            Self { root }
+        }
+
+        fn registry(&self) -> SkillRegistry {
+            crate::skills::discover(
+                None,
+                &self.root,
+                teton_protocol::methods::RootKind::Project,
+                &crate::skills::RealFs,
+            )
+        }
+    }
+
+    impl Drop for SkillTree {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.root);
+        }
+    }
+
+    /// REQ-585 BR-1: a session holds one skill registry, replaced wholesale
+    /// when its root moves — the `/cd` shape, at the store.
+    ///
+    /// Replacement rather than a merge, for the reason the conversation is
+    /// replaced rather than appended to: after a `/cd` the project half of the
+    /// old registry names files under a root the session no longer stands on,
+    /// and a merge would leave those rows dispatchable.
+    #[test]
+    fn a_sessions_skill_registry_is_stored_and_replaced_whole() {
+        let before = SkillTree::holding("alpha");
+        let after = SkillTree::holding("beta");
+        let names = |registry: &SkillRegistry| -> Vec<String> {
+            registry
+                .skills()
+                .iter()
+                .map(|skill| skill.name.clone())
+                .collect()
+        };
+
+        let reg = SessionRegistry::new();
+        let session = reg
+            .create(SessionMode::Freeform, None, Some(before.root.clone()))
+            .unwrap();
+        assert!(
+            reg.skills(&session.session_id).is_empty(),
+            "a freshly created session holds no registry until one is discovered \
+             for it — the empty state ADR-2 already requires every consumer to \
+             handle"
+        );
+
+        assert!(reg.set_skills(&session.session_id, before.registry()));
+        assert_eq!(names(&reg.skills(&session.session_id)), vec!["alpha"]);
+
+        assert!(reg.set_skills(&session.session_id, after.registry()));
+        assert_eq!(
+            names(&reg.skills(&session.session_id)),
+            vec!["beta"],
+            "the second discovery replaces the first whole: a row from the root \
+             the session has left must not survive the move"
+        );
+
+        assert!(
+            !reg.set_skills(&SessionId::from("sess-ghost"), before.registry()),
+            "a session the registry never had holds nothing"
+        );
+        assert!(
+            reg.skills(&SessionId::from("sess-ghost")).is_empty(),
+            "and answers empty rather than inventing a record"
         );
     }
 

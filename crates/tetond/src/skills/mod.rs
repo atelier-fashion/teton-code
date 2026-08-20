@@ -181,6 +181,20 @@ impl fmt::Display for ShadowedBy {
 pub struct Skipped {
     /// What was skipped.
     pub path: PathBuf,
+    /// The spelling this entry would have been typed as, when discovery got far
+    /// enough to know one — `None` for a whole root (refused, or truncated),
+    /// which names no single skill.
+    ///
+    /// Carried rather than re-derived from [`Skipped::path`]. BR-2's naming
+    /// rule (directory name for `skills/`, file stem for `commands/`) belongs
+    /// to discovery, and a reader that reconstructs it owns a second copy that
+    /// can disagree — LESSON-546's shape. It is also strictly weaker: the path
+    /// cannot express the name of a symlinked `commands/<name>` entry, which
+    /// discovery refuses before it ever becomes a `.md` file it opened.
+    ///
+    /// **Untrusted.** In the [`SkipReason::InvalidName`] case this *is* the
+    /// invalid spelling, so every surface bounds it (BR-3).
+    pub name: Option<String>,
     /// Why.
     pub reason: SkipReason,
 }
