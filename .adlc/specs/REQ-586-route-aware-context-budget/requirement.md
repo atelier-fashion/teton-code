@@ -1,10 +1,10 @@
 ---
 id: REQ-586
 title: "A turn's context budget follows its route — remote tiers get the provider's window, bounded by what the redact scan can cover, and nothing is clamped in silence"
-status: approved
+status: complete
 deployable: true
 created: 2026-08-19
-updated: 2026-08-19
+updated: 2026-08-20
 component: "daemon/harness"
 domain: "harness"
 stack: ["rust", "daemon", "llm-providers", "json-rpc"]
@@ -654,7 +654,7 @@ adds the numbers and the per-turn budget line from `route_decided`.
   honest fix is a custom `Deserialize` with an `Unknown(String)` catch-all
   (the shape `Event` itself would want too); pinned meanwhile by
   `a_context_that_did_not_fit_has_its_own_kind_and_degrades_both_ways`
-  (TASK-194).
+  (TASK-194). Filed at wrapup as **REQ-588**, together with the spend cap.
 
 - **A clamped newest-user block can be dropped by the same turn's exit gate.**
   Observed in TASK-193's AC-10 fixture: the in-place clamp fills the byte
@@ -664,8 +664,8 @@ adds the numbers and the per-turn budget line from `route_decided`.
   REQ makes it **honest** (two `context_pressure` events, the second naming
   the drop) rather than silent, which is BR-7's whole claim; making it not
   *happen* — reserving room for the reply before clamping, or refusing the
-  turn as an oversized skill turn is refused — is a follow-up REQ, not this
-  one.
+  turn as an oversized skill turn is refused — is **BUG-182**, filed at
+  wrapup.
 
 ## Out of Scope
 
@@ -680,8 +680,8 @@ adds the numbers and the per-turn budget line from `route_decided`.
 
 ## Deferred
 
-- A per-session or per-turn **spend cap** (the cost guard this REQ names
-  as missing; OQ-6).
+- A per-session or per-turn **spend cap** (the cost guard this REQ names as
+  missing; OQ-6) — filed at wrapup as **REQ-588**.
 - Scan-latency budget / chunk-cap scaling for opted-in machines (OQ-2).
 - Engine-derived local budget (OQ-3).
 - `docs/manual-verification.md` REQ-586 runbook (AC-14) — needs a release

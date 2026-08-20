@@ -319,6 +319,29 @@
   **rerouted mid-turn** is re-derived and re-applied before the next model
   call, and the change is published as news, not applied in silence
   (REQ-586 ADR-1/ADR-2/ADR-3, LESSON-456).
+- **Three consequences of the route-aware budget the next author must hold**
+  (REQ-586 verify): (a) the **router reads `[privacy] redact`** — an egress
+  fact reaching routing, correct because one per-turn `Config` feeds both
+  `build_router(…).with_redact_scan` and `redaction_gate`, so a bound and the
+  gate it anticipates cannot disagree; re-reading the config for one of them
+  would break that, so don't. (b) The system prompt's byte overhead is now a
+  **production input to a user-visible budget** — `REDACT_BODY_OVERHEAD_BYTES`
+  stopped being test-only, so *adding a tool description raises the overhead
+  and shrinks every redact-scanning route's context by the same bytes*; it
+  belongs beside the "measure the composed artifact last" rule above. (c) The
+  context budget is the **only per-turn input-token bound that exists** —
+  there is no spend cap; with 1M-token windows shipping, one prompt can carry
+  ≈25M input tokens across its iterations, `context_budget_cap` is the sole
+  knob, and a notice (not a cap) is what fires when a big window is recorded.
+- **A fact that crosses a seam is tested on both sides and once across** — a
+  renderer test that builds the wire value by hand proves the consumer and
+  says nothing about the line that produces it. Four producers shipped
+  unguarded in one REQ and each survived the whole suite under mutation; the
+  grep that finds them is "a test constructing a wire type with a struct
+  literal" (LESSON-544). Its sibling: a rule worth enforcing — one home per
+  fact, one call per paired decision — needs a **test**, because a checklist
+  recorded in a task file has no schedule and no owner (LESSON-545,
+  LESSON-546).
 
 ## ADRs
 
