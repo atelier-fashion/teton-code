@@ -407,9 +407,21 @@ client's own echo line is the record.
   chooses `full` for the session, the same choice it makes for every `shell`
   call, and `plan` refuses on a pipe as it does on a TTY.
 - [ ] BR-12: **Observable, not noisy.** Every invocation echoes one line
-  naming the skill, its source and size, and how many dynamic commands ran
-  (`/status → skill status (user, 5.3 KB, 4 dynamic commands)`); the body is
-  never printed (it is in the file). `/verbose` adds the home-relative path,
+  naming the skill, its source and size, and its dynamic commands
+  (`/status → skill status (user, 5.3 KiB, 4 dynamic commands)`); the body is
+  never printed (it is in the file). Two spellings, decided in implementation
+  and recorded here: the size is rendered by `teton_protocol::format_bytes`,
+  the product's one byte formatter — which the daemon's own skip reasons
+  already speak (`over 64 KiB (67,184 B)`) — so the unit is `KiB`, and a
+  second spelling of a size inside one feature would be worse than a suffix
+  that differs from this illustration. And the line reports **both** numbers
+  whenever they differ (`4 dynamic commands, none run`; `3 dynamic commands,
+  1 run`): after a decline, a `plan` denial or a pipe refusal every command is
+  a placeholder in the prompt rather than output, and a bare count would put
+  the one line the user sees at odds with what the model actually got, with
+  the record that resolves it behind `/verbose`. A command that started and
+  failed **ran** — the model has its placeholder and the fact that it was
+  attempted. `/verbose` adds the home-relative path,
   the ignored frontmatter keys and each dynamic command's typed outcome. The
   turn appears in `/cost` as the prompt turn it is.
 - [ ] BR-13: **The body is passed as written; fidelity is stated, not

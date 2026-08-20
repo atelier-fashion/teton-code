@@ -1149,14 +1149,21 @@ fn after_words(line: &str, count: usize) -> &str {
     rest.trim()
 }
 
-/// Build the `prompt/turn` request a classified prompt line becomes.
+/// Build the `prompt/turn` request a classified **prompt** line becomes.
 ///
-/// The **one** place the entry loop turns a line into a request, so what reaches
+/// The one place the entry loop turns a *prompt* into a request, so what reaches
 /// the daemon is the classifier's output and nothing else: a plain line arrives
 /// byte-identically to what was typed (AC-7) and an escaped line arrives with
 /// exactly the leading pair collapsed (AC-7b). `text` is the payload of an
 /// [`Input::Prompt`] or [`Input::EscapedPrompt`]; a command never reaches here
 /// at all (BR-1).
+///
+/// An [`Input::Skill`] does not reach here either, and has no sibling
+/// constructor beside this one: its request carries **no prompt at all**
+/// (REQ-585 ADR-3 — `prompt: vec![]` and a `skill` naming the invocation), so
+/// there is no line for a builder to turn into content. The entry loop composes
+/// it at the same place it calls this, from the classifier's own `name` and
+/// `raw_arguments`.
 #[must_use]
 pub fn prompt_turn_params(session_id: &SessionId, text: &str) -> PromptTurnParams {
     PromptTurnParams {
@@ -1164,9 +1171,8 @@ pub fn prompt_turn_params(session_id: &SessionId, text: &str) -> PromptTurnParam
         prompt: vec![PromptBlock::Text {
             text: text.to_owned(),
         }],
-        // A typed line is never a skill invocation. REQ-585 TASK-206 adds the
-        // sibling constructor that populates this instead of `prompt`; the two
-        // are mutually exclusive and the daemon refuses a request carrying both.
+        // A typed line is never a skill invocation. The two fields are mutually
+        // exclusive and the daemon refuses a request carrying both (ADR-3).
         skill: None,
     }
 }
@@ -1844,8 +1850,14 @@ fn shadow_reason(view: &SkillView) -> Option<String> {
     table_claim(&view.name).map(TableClaim::words)
 }
 
-/// How a source is spelled in a `/help` row and in the diagnostic line.
-fn source_word(source: SkillSource) -> &'static str {
+/// How a source is spelled wherever this client names one.
+///
+/// `/help`'s rows and diagnostic line, the consent prompt's subject block, and
+/// BR-12's echo line all read it: one spelling of "user"/"project", so a user
+/// who approved `skill \`status\` (user)` reads the same word back in
+/// `/status → skill status (user, …)`. A second copy in `session_ui` would be
+/// two homes for one vocabulary (LESSON-546).
+pub(crate) fn source_word(source: SkillSource) -> &'static str {
     match source {
         SkillSource::User => "user",
         SkillSource::Project => "project",
@@ -1910,24 +1922,19 @@ fn toggle_verbose(ctx: &mut UiContext<'_>) {
 
 /// The `/help` handler.
 ///
-/// # The registry is not threaded here yet, and that is a hand-off, not a
-/// default
-///
-/// [`render_help`] takes the session's [`SkillSnapshot`] and renders its section
-/// from it (ADR-12); a [`Handler`] takes a connection, a [`UiContext`] and a
-/// string, and the snapshot belongs on the context beside the other things the
-/// session knows about itself. That field is `client.rs`'s, which TASK-207 owns
-/// along with the `skills/list` fetch that fills it — so until it lands, this
-/// row renders with the empty snapshot, which is exactly the "no `~/.claude`"
-/// and "old daemon" state ADR-2 already requires to be byte-for-byte today's
-/// `/help`. One line changes here when the field exists:
-/// `render_help(ctx.surface, ctx.skills)`.
+/// The section is rendered from the session's own snapshot (ADR-12), which is
+/// the same value [`classify`] dispatches from — BR-3's "a skill cannot be
+/// dispatchable without appearing in `/help`" holds because there is one list,
+/// not because two readers agree. An empty snapshot renders no section at all,
+/// which is the state of a user with no `~/.claude` and the state ADR-2 leaves
+/// a new CLI in against an old daemon: `/help` is then byte-for-byte what it
+/// was before this REQ.
 fn handle_help(
     _conn: &mut Connection,
     ctx: &mut UiContext<'_>,
     _args: &str,
 ) -> anyhow::Result<CommandOutcome> {
-    render_help(ctx.surface, &SkillSnapshot::empty());
+    render_help(ctx.surface, &ctx.skills);
     Ok(CommandOutcome::Continue)
 }
 
@@ -2954,6 +2961,9 @@ mod tests {
             auto_accept_model: false,
             typed_input: true,
             session_id: None,
+            // Empty by default; a test that needs a registry assigns
+            // `ctx.skills` itself (REQ-585 — `/help` renders from the field).
+            skills: SkillSnapshot::empty(),
         }
     }
 
@@ -5676,6 +5686,64 @@ mod tests {
         );
         assert_eq!(after_words("provider list", 2), "");
         assert_eq!(after_words("anything", 0), "anything");
+    }
+
+    /// **REQ-585 ADR-12 / AC-14.** `/help` renders its section from the
+    /// **session's own** snapshot — the same value [`classify`] dispatches from
+    /// — so a `/cd` that re-derived the registry is reflected without a
+    /// restart, and BR-3's "a skill cannot be dispatchable without appearing in
+    /// `/help`" holds because there is one list rather than two readers who
+    /// agree today. Rendering from a locally-built empty snapshot instead would
+    /// leave `/help` claiming the session has no skills while `/alpha` ran one.
+    ///
+    /// Driven through [`dispatch`] rather than [`render_help`] directly,
+    /// because the claim is about the *row*, not the renderer — and it asserts
+    /// the row issues no RPC, which is the `assert_no_turn_ran` posture `/help`
+    /// has always had.
+    #[test]
+    fn help_renders_the_sessions_own_snapshot() {
+        let snapshot = registry(
+            vec![described(
+                "alpha",
+                SkillSource::User,
+                "[topic]",
+                "Draft a note.",
+            )],
+            Vec::new(),
+        );
+        let (mut conn, peer) = Connection::scripted(&[]);
+        let mut surface = RecordingSurface::new();
+        let mut state = SessionState::new();
+        let mut prompter = ScriptedPrompter::new(&[]);
+        {
+            let mut ctx = session_ctx(&mut surface, &mut state, &mut prompter);
+            ctx.skills = snapshot.clone();
+            // The registry argument is `dispatch`'s own (it feeds BR-10's
+            // hint); `/help` must read the one on the context, so this one is
+            // deliberately empty. Reading the argument instead fails here.
+            let outcome =
+                dispatch("help", "", &no_skills(), &mut conn, &mut ctx).expect("/help renders");
+            assert_eq!(outcome, CommandOutcome::Continue);
+        }
+
+        let lines: Vec<String> = surface
+            .lines_of(LineKind::Info)
+            .iter()
+            .map(|line| (*line).to_owned())
+            .collect();
+        assert!(
+            lines.iter().any(|line| line == SKILLS_HEADER),
+            "the session's snapshot renders a section: {lines:?}"
+        );
+        assert_eq!(
+            skill_rows(&lines),
+            skill_rows(&help_lines(&snapshot)),
+            "the row is the one the renderer draws for this snapshot"
+        );
+        assert!(
+            crate::client::methods_written(&peer).is_empty(),
+            "/help issues no RPC and runs no turn"
+        );
     }
 
     /// AC-6's third clause, at the seam that produces it: a recognized line with

@@ -34,6 +34,7 @@ is a suite that stops matching the product.
 - [ ] AC-11(b): any dynamic command + any configured boundary ⇒ pinned local, copying `provenance_egress.rs:350 shell_cat_of_a_boundary_file_blocks_the_next_remote_turn`.
 - [ ] AC-11(c): no boundary ⇒ the expansion reaches the remote provider and the captured payload **is** the expansion.
 - [ ] AC-16: the four route shapes via `remote_provider_block_with_window` (`e2e/harness.rs:1943`) — 128000, 0, 4096 — plus the local route; and the drain-and-assert-empty for `context_pressure`.
+- [ ] The echo line's byte pin uses the shipped spellings, not BR-12's illustration: `teton_protocol::format_bytes` (so `KiB`), and both numbers whenever they differ (`4 dynamic commands, none run`; `3 dynamic commands, 1 run`). BR-12 records why.
 - [ ] AC-19: the attribution half runs in `cost_attribution.rs` (`:134 every_egress_call_yields_exactly_one_attributed_cost_record`), **not** `cli_e2e` — `cli_e2e`'s scripted tier is local and local turns produce no billed row, so a `/cost` assertion there would be vacuous.
 - [ ] AC-6's EPERM leg skips itself under root (`libc::geteuid() == 0`), with the skip stated in the test body.
 - [ ] Every fixture's ordering is deterministic across filesystems: entries sorted by name, no reliance on `read_dir` order (LESSON-540 — two REQ-583 tests passed on APFS and failed on ext4 for exactly this).

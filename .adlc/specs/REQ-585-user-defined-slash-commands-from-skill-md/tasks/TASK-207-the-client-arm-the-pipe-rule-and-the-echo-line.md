@@ -1,7 +1,7 @@
 ---
 id: TASK-207
 title: "The client: send the invocation, refuse a consent it cannot answer, and say one line about it"
-status: draft
+status: complete
 parent: REQ-585
 created: 2026-08-20
 updated: 2026-08-20
@@ -30,7 +30,7 @@ second line must not become a `y`.
 - [ ] The client selects on `PermissionSubject`, never on the key string. `req.tool_name`'s `skill:<source>:<name>` shape is not parsed anywhere in `teton` — asserted by a source-level check in the test suite, in the style of `boundary_coverage.rs`'s source scans.
 - [ ] Consent rendering: one `Surface::line` per command, so "three commands listed verbatim" survives `defused`'s newline destruction.
 - [ ] At `full` there is nothing to ask: dynamic context runs on a pipe exactly as on a TTY. That is the automation posture (BR-11).
-- [ ] AC-19 / BR-12: one echo line rendered from `Event::SkillInvoked` — `/status → skill status (user, 5.3 KB, 4 dynamic commands)`. The body is never printed. `/verbose` adds the home-relative path, the ignored frontmatter keys, and each command's typed outcome.
+- [ ] AC-19 / BR-12: one echo line rendered from `Event::SkillInvoked` — `/status → skill status (user, 5.3 KiB, 4 dynamic commands)`. The body is never printed. `/verbose` adds the home-relative path, the ignored frontmatter keys, and each command's typed outcome.
 - [ ] The echo line respects the existing TTY gates: `cli_e2e.rs:863 assert_no_turn_ran` stays true for `/help` and for a shadowed or skipped name, and the pipe-bytes pins at `cli_e2e.rs:5361` / `:5706` are unchanged.
 - [ ] Mutation table: calling `prompter.ask` before the gate, treating `Unrecognized` as answerable, and sniffing the key string each fail a named test.
 
