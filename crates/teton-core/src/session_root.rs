@@ -188,6 +188,101 @@ pub fn display_for(path: &Path, home: Option<&Path>) -> String {
     path.display().to_string()
 }
 
+/// The spelling of `path` a permission **key** is matched on: [`display_for`]'s
+/// home-relative shape, made injective.
+///
+/// [`display_for`] ends in `Path::display`, which renders every byte that is
+/// not part of a valid UTF-8 sequence as `U+FFFD`. That is right for a line a
+/// person reads and wrong for a string that is *compared*: two roots differing
+/// only in such bytes render identically, so one key would be minted for both
+/// and a grant for one repository would answer for another — precisely the harm
+/// the per-root scope exists to prevent
+/// (`teton_protocol::methods::project_skill_trust_key`).
+///
+/// This keeps that readable shape and escapes exactly what the display would
+/// have lost: every byte outside a valid UTF-8 sequence becomes `%XX`, and a
+/// literal `%` becomes `%25` so an escape can never be confused with a path
+/// that spelled one out. The mapping is therefore **injective** — distinct
+/// roots give distinct strings — while a path holding no `%` and no invalid
+/// byte, which is very nearly every path, comes back exactly what
+/// [`display_for`] returns. The two agree on the common case on purpose: the
+/// key stays the readable `project_skill_trust:~/dev/teton` a client can show.
+///
+/// Home-relative for [`display_for`]'s own reason: the key reaches a client
+/// that may render it on a refusal line, and `/Users/jane/dev/teton` there
+/// carries a username into a transcript (REQ-585 BR-1's entity table). A hash
+/// of the raw bytes would settle identity too, but it could not be *shown* —
+/// and it would trade an exact answer for a collision probability this needs no
+/// part of.
+#[must_use]
+pub fn key_form_for(path: &Path, home: Option<&Path>) -> String {
+    if let Some(home) = home.filter(|home| !home.as_os_str().is_empty()) {
+        if let Ok(rest) = path.strip_prefix(home) {
+            return if rest.as_os_str().is_empty() {
+                "~".to_owned()
+            } else {
+                format!("~/{}", escaped(rest))
+            };
+        }
+    }
+    escaped(path)
+}
+
+/// `path`'s bytes rendered so that bytes → string is injective: `%XX` for every
+/// byte a UTF-8 decode rejects, `%25` for a `%` the path spelled itself.
+fn escaped(path: &Path) -> String {
+    let bytes = path.as_os_str().as_encoded_bytes();
+    let mut out = String::with_capacity(bytes.len());
+    let mut rest = bytes;
+    loop {
+        match std::str::from_utf8(rest) {
+            Ok(text) => {
+                push_escaping_percent(&mut out, text);
+                return out;
+            }
+            Err(err) => {
+                let (valid, invalid) = rest.split_at(err.valid_up_to());
+                // `valid_up_to` is a UTF-8 boundary by construction, so this
+                // decode cannot fail; `unwrap_or_default` keeps the guarantee
+                // without a panic in the shipped binary.
+                push_escaping_percent(&mut out, std::str::from_utf8(valid).unwrap_or_default());
+                // `None` is "input ended mid-sequence": every remaining byte is
+                // unusable, so escape the lot. `max(1)` is not reachable — an
+                // error implies at least one bad byte — and it is what makes the
+                // loop's termination hold by construction rather than by proof.
+                let bad = err
+                    .error_len()
+                    .unwrap_or(invalid.len())
+                    .max(1)
+                    .min(invalid.len());
+                for byte in &invalid[..bad] {
+                    push_hex_escape(&mut out, *byte);
+                }
+                rest = &invalid[bad..];
+            }
+        }
+    }
+}
+
+/// `text` appended to `out`, with `%` escaped so it cannot spell an escape.
+fn push_escaping_percent(out: &mut String, text: &str) {
+    for ch in text.chars() {
+        if ch == '%' {
+            out.push_str("%25");
+        } else {
+            out.push(ch);
+        }
+    }
+}
+
+/// `%XX`, upper-case and always two digits.
+fn push_hex_escape(out: &mut String, byte: u8) {
+    const HEX: &[u8; 16] = b"0123456789ABCDEF";
+    out.push('%');
+    out.push(HEX[usize::from(byte >> 4)] as char);
+    out.push(HEX[usize::from(byte & 0x0F)] as char);
+}
+
 /// `s`, made safe to print mid-line in a refusal, a banner line or a notice
 /// (ADR-2 bounding) — bounded in **characters**, the unit a person reads.
 ///
@@ -638,6 +733,109 @@ mod tests {
             display_for(Path::new("/opt/x"), Some(Path::new(""))),
             "/opt/x"
         );
+    }
+
+    // ---- key_form_for (REQ-587 BR-4: a key is matched, so it must be exact) ----
+
+    /// The coincidence the readable key rests on: for a path with no `%` and no
+    /// invalid byte — very nearly every path — the key form *is* the display, so
+    /// the ordinary acknowledgment key stays `project_skill_trust:~/dev/teton`.
+    #[test]
+    fn the_key_form_is_the_display_for_an_ordinary_path() {
+        let home = Path::new("/Users/someone");
+        for path in [
+            "/Users/someone",
+            "/Users/someone/dev/teton",
+            "/opt/elsewhere",
+            "/Users/someone/Documents/GitHub/teton-code",
+        ] {
+            let path = Path::new(path);
+            assert_eq!(
+                key_form_for(path, Some(home)),
+                display_for(path, Some(home)),
+                "{path:?}"
+            );
+        }
+    }
+
+    /// The defect this form exists for. Two distinct repositories whose paths
+    /// differ only in bytes `Path::display` cannot show render **identically** —
+    /// so a key minted from the display would be one key for both, and the
+    /// session grant answering for one would answer for the other.
+    #[cfg(unix)]
+    #[test]
+    fn two_roots_the_display_cannot_tell_apart_get_two_key_forms() {
+        use std::ffi::OsStr;
+        use std::os::unix::ffi::OsStrExt;
+
+        let home = Path::new("/Users/someone");
+        let a = PathBuf::from(OsStr::from_bytes(b"/Users/someone/dev/\xF0repo"));
+        let b = PathBuf::from(OsStr::from_bytes(b"/Users/someone/dev/\xF1repo"));
+
+        // The premise: the display really does lose them both to U+FFFD.
+        assert_eq!(display_for(&a, Some(home)), display_for(&b, Some(home)));
+        assert!(display_for(&a, Some(home)).contains(char::REPLACEMENT_CHARACTER));
+
+        // The fix: the key form keeps them apart, and says which byte it was.
+        assert_ne!(key_form_for(&a, Some(home)), key_form_for(&b, Some(home)));
+        assert_eq!(key_form_for(&a, Some(home)), "~/dev/%F0repo");
+        assert_eq!(key_form_for(&b, Some(home)), "~/dev/%F1repo");
+    }
+
+    /// A path that spells `%F0` out in ASCII is a *different* path from one
+    /// holding the byte `0xF0`, and the escape must not collapse them. This is
+    /// why a literal `%` is itself escaped.
+    #[cfg(unix)]
+    #[test]
+    fn a_path_that_spells_an_escape_is_not_confused_with_one() {
+        use std::ffi::OsStr;
+        use std::os::unix::ffi::OsStrExt;
+
+        let home = Path::new("/Users/someone");
+        let spelled = PathBuf::from("/Users/someone/dev/%F0repo");
+        let raw = PathBuf::from(OsStr::from_bytes(b"/Users/someone/dev/\xF0repo"));
+
+        assert_eq!(key_form_for(&spelled, Some(home)), "~/dev/%25F0repo");
+        assert_eq!(key_form_for(&raw, Some(home)), "~/dev/%F0repo");
+        assert_ne!(
+            key_form_for(&spelled, Some(home)),
+            key_form_for(&raw, Some(home))
+        );
+    }
+
+    /// Trailing bytes that end mid-sequence are the `error_len() == None` arm:
+    /// every remaining byte is unusable, and the loop must escape the lot rather
+    /// than spin on them.
+    #[cfg(unix)]
+    #[test]
+    fn a_root_ending_mid_sequence_escapes_every_remaining_byte() {
+        use std::ffi::OsStr;
+        use std::os::unix::ffi::OsStrExt;
+
+        let home = Path::new("/Users/someone");
+        let truncated = PathBuf::from(OsStr::from_bytes(b"/Users/someone/dev/repo\xE2\x82"));
+        assert_eq!(key_form_for(&truncated, Some(home)), "~/dev/repo%E2%82");
+    }
+
+    /// The key reaches a client that may print it on a refusal line, so it
+    /// carries no username — the reason it is home-relative at all, and a
+    /// property the escaping must not quietly spend (REQ-585 BR-1).
+    #[cfg(unix)]
+    #[test]
+    fn the_key_form_of_a_root_under_home_carries_no_username() {
+        use std::ffi::OsStr;
+        use std::os::unix::ffi::OsStrExt;
+
+        let home = Path::new("/Users/jane");
+        let lossy = PathBuf::from(OsStr::from_bytes(b"/Users/jane/dev/\xF0repo"));
+        for form in [
+            key_form_for(&lossy, Some(home)),
+            key_form_for(Path::new("/Users/jane/dev/teton"), Some(home)),
+        ] {
+            assert!(!form.contains("/Users/"), "{form}");
+            assert!(!form.contains("jane"), "{form}");
+            assert!(form.starts_with('~'), "{form}");
+        }
     }
 
     // ---- bounded_field / middle_elide (ADR-2 bounding) ----

@@ -445,11 +445,23 @@ pub const PROJECT_SKILL_TRUST_KEY_PREFIX: &str = "project_skill_trust:";
 /// posture for this question — `guarded`/`edits` ask, `plan` denies, `full`
 /// allows.
 ///
-/// `root` is the session root's **home-relative display**
-/// (`session_root::display_for`), never an absolute path: a client that does
+/// `root` is the session root's **home-relative key form**
+/// (`session_root::key_form_for`), never an absolute path: a client that does
 /// not recognize the subject renders the request's key on its refusal line, and
 /// `/Users/jane/dev/teton` on that line carries a username into a transcript
 /// (REQ-585 BR-1's entity table).
+///
+/// The key form and not the *display*, and the difference is load-bearing.
+/// `display_for` ends in `Path::display`, which renders every byte outside a
+/// valid UTF-8 sequence as `U+FFFD`: two roots differing only in such bytes
+/// render identically, and minting from that string would collapse them onto
+/// **one** key — a grant for one repository answering for another, which is the
+/// same harm the paragraph below refuses to introduce by truncation, arriving
+/// through the input instead. `key_form_for` keeps the readable shape and
+/// escapes what the display would have lost, so distinct roots give distinct
+/// keys. The two spellings coincide for any path holding no `%` and no invalid
+/// byte, so the ordinary key is still the `project_skill_trust:~/dev/teton` a
+/// person can read.
 ///
 /// The root is **not** truncated here. A key is matched, never read: two long
 /// roots sharing a prefix must not collapse onto one key, or a grant for one

@@ -1432,9 +1432,19 @@ impl PermissionGate {
              asks under `project_skill_trust:<root>` and never under a skill's \
              own key or a tool's name"
         );
-        debug_assert_eq!(
-            key,
-            project_skill_trust_key(root),
+        // The display and the key are two renderings of one root, and this door
+        // is handed both rather than deriving one from the other — it cannot.
+        // `root` is `display_for`'s spelling, which is lossy; `key` is minted
+        // from `key_form_for`'s, which is injective. That gap is the whole
+        // point: a root whose bytes are not valid UTF-8 has a display that names
+        // it ambiguously and a key that does not. The two agree exactly when the
+        // display is faithful, so that is what is checked here, and the pairing
+        // itself is guaranteed where both are minted — `harness/tools/skill.rs`,
+        // the one place either is computed (ASSUME-017).
+        debug_assert!(
+            root.contains(char::REPLACEMENT_CHARACTER)
+                || root.contains('%')
+                || key == project_skill_trust_key(root),
             "the key the acknowledgment is remembered under must be the key this \
              root mints, or the user answers about one repository and the grant \
              is kept for another"

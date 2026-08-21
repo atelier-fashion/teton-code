@@ -63,7 +63,7 @@ use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
 use serde_json::{json, Value};
-use teton_core::session_root::{bounded_field, display_for, DISPLAY_MAX_CHARS};
+use teton_core::session_root::{bounded_field, display_for, key_form_for, DISPLAY_MAX_CHARS};
 use teton_core::ProvenanceId;
 use teton_protocol::events::{
     Event, InvokedBy, NotRunReason, ProjectSkillTrustEntry, SkillInvoked, TurnInvocations,
@@ -1122,13 +1122,27 @@ impl SkillTool {
 
     /// BR-4's project-skill acknowledgment, under its own key (ADR-7).
     async fn acknowledge_project(&self, ctx: &ToolContext, name: &str) -> Result<(), Refusal> {
-        // The **untruncated** home-relative display. Untruncated because a key
-        // is matched and never read: two long roots sharing a prefix must not
-        // collapse onto one key, or a grant for one repository would answer for
-        // another. Home-relative because the subject reaches a client that may
-        // render the key on a refusal line, and an absolute path carries a
-        // username into a transcript.
+        // Two renderings of one root, from one path, here — the only place both
+        // are minted, so they cannot drift apart (ASSUME-017).
+        //
+        // `root` is what the user reads in the prompt. `key` is what the grant
+        // is matched on, and it is deliberately *not* the display: `display_for`
+        // ends in `Path::display`, so a root whose bytes are not valid UTF-8
+        // renders with `U+FFFD` and two distinct repositories can render
+        // identically — one key for both, and a grant for one answering for the
+        // other. `key_form_for` keeps the same readable shape and escapes what
+        // the display would have lost, which makes it injective; for a path with
+        // no `%` and no invalid byte the two strings are identical, so the
+        // common key stays the `project_skill_trust:~/dev/teton` a client can
+        // show.
+        //
+        // Both are **untruncated**, because a key is matched and never read: two
+        // long roots sharing a prefix must not collapse onto one key. Both are
+        // home-relative, because the subject reaches a client that may render
+        // the key on a refusal line and an absolute path carries a username into
+        // a transcript.
         let root = display_for(ctx.repo_root(), home().as_deref());
+        let key = project_skill_trust_key(&key_form_for(ctx.repo_root(), home().as_deref()));
         let Some(connection) = self.invoker else {
             return Err(Refusal::ProjectNotAcknowledged {
                 name: name.to_owned(),
@@ -1139,13 +1153,7 @@ impl SkillTool {
         let shadows = shadows_user_skill(&self.registry, name);
         let consent = self
             .gate
-            .authorize_project_skill_trust(
-                &project_skill_trust_key(&root),
-                &root,
-                &entries,
-                shadows,
-                connection,
-            )
+            .authorize_project_skill_trust(&key, &root, &entries, shadows, connection)
             .await;
         match closed_door(consent) {
             None => Ok(()),
