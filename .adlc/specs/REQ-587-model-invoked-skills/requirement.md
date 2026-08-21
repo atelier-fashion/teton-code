@@ -1,7 +1,7 @@
 ---
 id: REQ-587
 title: "Model-invoked skills — a `skill` tool lets the model expand a registered skill into its own turn as a tool result, under REQ-585's registry, keys and provenance, so `/proceed` reaches its gates"
-status: draft
+status: approved
 deployable: true
 created: 2026-08-19
 updated: 2026-08-20

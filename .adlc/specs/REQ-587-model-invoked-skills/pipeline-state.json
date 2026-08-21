@@ -3,15 +3,21 @@
   "branch": "feat/REQ-587-model-invoked-skills",
   "startedAt": "2026-08-20T22:30:00Z",
   "completed": false,
-  "currentPhase": 1,
+  "currentPhase": 2,
   "completedPhases": [
-    0
+    0,
+    1
   ],
   "phaseHistory": [
     {
       "phase": 0,
       "name": "Create Worktree",
       "completedAt": "2026-08-20T22:32:00Z"
+    },
+    {
+      "phase": 1,
+      "name": "Validate Spec",
+      "completedAt": "2026-08-20T22:40:00Z"
     }
   ],
   "integrationBranch": "main",
