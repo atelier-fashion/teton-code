@@ -32,6 +32,11 @@
 use std::path::Path;
 use std::process::ExitStatus;
 
+use teton_protocol::events::NotRunReason;
+
+use teton_protocol::methods::RefusalReason;
+
+use crate::harness::permissions::SkillConsent;
 use crate::harness::tools::shell::{cap_output, run_bounded, BoundedRun};
 
 /// The opener: a `!` immediately followed by a backtick.
@@ -322,6 +327,59 @@ impl DynamicOutcome {
             Self::Failed { status, .. } => Some(status),
             Self::TimedOut => Some("timed out"),
         }
+    }
+}
+
+/// The gate's answer to one invocation, reduced to the fact every reader needs:
+/// **which door was closed**, or `None` when the commands may run.
+///
+/// Two arms of [`SkillConsent`] collapse here and it is deliberate.
+/// `Refused(NoTerminal)` and `Unanswerable` differ in *why* there was nobody at
+/// the other end — a client that refused without reading stdin, versus a
+/// question that could not be put to anyone at all — and not in anything the
+/// model or the user can act on: no human was asked. Every other arm keeps its
+/// own door, because REQ-585 AC-9 turns on the difference between "you said no"
+/// and "nobody could be asked", and BR-6 on the difference between either and
+/// "the level does not run them".
+///
+/// **Here rather than at one caller** (REQ-587). The user-typed `/name` path
+/// (`runtime::settle_dynamic_context`) and the model's `skill` tool
+/// ([`crate::harness::tools::skill`]) ask the same gate the same question and
+/// must read the same answer out of it; a second copy of this match is how the
+/// two callers come to disagree about what a decline is (LESSON-528). It lives
+/// beside the placeholder constructors it feeds for the same reason those live
+/// here: one home for the four sentences a model can read about a command that
+/// did not run.
+#[must_use]
+pub fn closed_door(consent: SkillConsent) -> Option<NotRunReason> {
+    match consent {
+        SkillConsent::Allowed => None,
+        SkillConsent::DeniedByLevel => Some(NotRunReason::Level),
+        SkillConsent::Declined => Some(NotRunReason::Declined),
+        SkillConsent::Refused(RefusalReason::NoTerminal) | SkillConsent::Unanswerable => {
+            Some(NotRunReason::NoTerminal)
+        }
+        SkillConsent::Refused(RefusalReason::UnrecognizedSubject) => {
+            Some(NotRunReason::UnrecognizedSubject)
+        }
+    }
+}
+
+/// The placeholder sentence a closed door earns, from this module's own
+/// constructors.
+#[must_use]
+pub fn door_outcome(door: NotRunReason) -> DynamicOutcome {
+    match door {
+        NotRunReason::Declined => DynamicOutcome::declined(),
+        NotRunReason::Level => DynamicOutcome::not_run_at_plan(),
+        NotRunReason::NoTerminal => DynamicOutcome::no_terminal(),
+        NotRunReason::UnrecognizedSubject => DynamicOutcome::unrecognized_subject(),
+        // Never reached from `closed_door`, which only ever answers with the
+        // consent's own doors. It is spelled out rather than left to an
+        // `unreachable!` because `NotRunReason` now also carries the runner's
+        // `CouldNotStart`, which arrives as an *outcome* and not as a door —
+        // and a future caller should meet a sentence here, not a panic.
+        NotRunReason::CouldNotStart => DynamicOutcome::could_not_start(),
     }
 }
 

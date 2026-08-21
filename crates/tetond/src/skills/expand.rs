@@ -75,7 +75,8 @@ use std::marker::PhantomData;
 use teton_core::session_root::{bounded_field, DISPLAY_MAX_CHARS};
 
 use super::dynamic::{self, Command, DynamicOutcome, Piece};
-use super::Skill;
+use super::{Skill, SkillSource};
+use crate::harness::permissions::{skill_grant_key, ArgumentInterpolation};
 use crate::harness::render;
 use crate::harness::turn_loop::frame_untrusted_builtin;
 
@@ -127,6 +128,14 @@ pub struct Expansion<State = Pending> {
     /// The final `ARGUMENTS: <rest>` line, when the body had no placeholder
     /// and there were arguments to carry.
     trailer: Option<String>,
+    /// Whether any `` !`…` `` in the **unsubstituted** body named
+    /// `$ARGUMENTS`/`$N` (REQ-587 BR-5, OQ-9).
+    ///
+    /// Recorded here because this is the last moment it is knowable: after
+    /// substitution a command carries no trace of having interpolated, and the
+    /// grant key that must encode it is minted downstream, by two different
+    /// callers. See [`Expansion::grant_key`].
+    interpolation: ArgumentInterpolation,
     state: PhantomData<State>,
 }
 
@@ -179,7 +188,31 @@ pub fn expand(skill: &Skill, raw_arguments: &str, path_display: &str) -> Expansi
         pieces,
         commands,
         trailer,
+        interpolation: commands_interpolate(&skill.body),
         state: PhantomData,
+    }
+}
+
+/// Whether any command in the **unsubstituted** `body` names `$ARGUMENTS` or
+/// `$N` (REQ-587 BR-5).
+///
+/// Asked of the same [`substitute`] that performs the replacement, over the
+/// same [`dynamic::scan`] that finds the commands, rather than by a second
+/// grammar for `$`: a predicate that disagreed with the substituter about what
+/// counts as a placeholder would key a grant on a command set the substituter
+/// then changed anyway (LESSON-528). The empty argument string is deliberate —
+/// the question is whether the body *asked*, not what the answer happened to be
+/// — and matches `saw_placeholder`'s own rule, which an out-of-range `$9` sets
+/// as much as a `$1` that hit.
+fn commands_interpolate(body: &str) -> ArgumentInterpolation {
+    let (_, commands) = dynamic::scan(body);
+    if commands
+        .iter()
+        .any(|command| substitute(command.as_str(), "").1)
+    {
+        ArgumentInterpolation::Substituted
+    } else {
+        ArgumentInterpolation::None
     }
 }
 
@@ -188,6 +221,32 @@ impl Expansion<Pending> {
     #[must_use]
     pub fn commands(&self) -> &[Command] {
         &self.commands
+    }
+
+    /// Whether this body's commands interpolated the arguments (REQ-587 BR-5).
+    #[must_use]
+    pub fn argument_interpolation(&self) -> ArgumentInterpolation {
+        self.interpolation
+    }
+
+    /// The key this invocation's dynamic-context grant is remembered under —
+    /// **the** mint, for both callers (REQ-587 BR-5, OQ-9).
+    ///
+    /// A method on the expansion rather than a call each caller composes,
+    /// because the two inputs a caller cannot supply correctly on its own live
+    /// here: the *substituted* command set, and whether the body interpolated
+    /// at all. A caller that minted `skill.permission_key()` instead keeps
+    /// REQ-585's behaviour with nothing red — the gate accepts either spelling
+    /// and pins whichever it is given — so the mint is put where the facts are
+    /// and both callers reach for one function.
+    #[must_use]
+    pub fn grant_key(&self, source: SkillSource) -> String {
+        let commands: Vec<String> = self
+            .commands
+            .iter()
+            .map(|command| command.as_str().to_owned())
+            .collect();
+        skill_grant_key(source, &self.name, &commands, self.interpolation)
     }
 
     /// BR-4's frame for the **user** path: the one line that introduces the

@@ -130,7 +130,7 @@ use teton_protocol::methods::{
     ModelListResult, ModelSetResult, ModelStatusResult, PrivacyBoundaryConfig, PromptTurnResult,
     ProviderConfig, ProviderHealth as WireProviderHealth, ProviderSetupCandidate,
     ProviderSetupCommitResult, ProviderSetupPlanResult, ProviderSetupPreviewResult,
-    ProviderTestOutcome, ProviderTestResult, RefusalReason, SessionClearParams, SessionClearResult,
+    ProviderTestOutcome, ProviderTestResult, SessionClearParams, SessionClearResult,
     SessionPermissionsParams, SessionPermissionsResult, SessionSetCwdParams, SessionSetCwdResult,
     SkillInvocation, TierBinding as WireTierBinding, TierBindingConfig, TierRouteView, TierSummary,
     WebOverrideParams, WebOverrideResult, WebRefreshOutcome, WebRefreshParams, WebRefreshResult,
@@ -191,6 +191,7 @@ use crate::router::{
 use crate::selection_store::SelectionStore;
 use crate::session_root::{home, ProbedRoot};
 use crate::sessions::{validate_session_cwd, SessionRegistry, TurnClaimError};
+use crate::skills::dynamic::{closed_door, door_outcome};
 use crate::skills::expand::COMMAND_ECHO_MAX_CHARS;
 use crate::skills::{Command, DynamicOutcome, Expansion, Pending, SkillSource};
 use crate::web::{UserUrls, WebCache};
@@ -1492,52 +1493,6 @@ struct SkillTurn {
     /// boundary is configured, exactly as `shell` output does, which is stricter
     /// than BR-7's letter and right in the charter's direction (ADR-9).
     unknown: bool,
-}
-
-/// The gate's answer to one invocation, reduced to the fact both readers need:
-/// **which door was closed**, or `None` when the commands may run.
-///
-/// Two arms of [`SkillConsent`] collapse here and it is deliberate.
-/// `Refused(NoTerminal)` and `Unanswerable` differ in *why* there was nobody at
-/// the other end — a client that refused without reading stdin, versus a
-/// question that could not be put to anyone at all — and not in anything the
-/// model or the user can act on: no human was asked. Every other arm keeps its
-/// own door, because AC-9 turns on the difference between "you said no" and
-/// "nobody could be asked", and BR-6 on the difference between either and "the
-/// level does not run them".
-fn closed_door(consent: SkillConsent) -> Option<NotRunReason> {
-    match consent {
-        SkillConsent::Allowed => None,
-        SkillConsent::DeniedByLevel => Some(NotRunReason::Level),
-        SkillConsent::Declined => Some(NotRunReason::Declined),
-        SkillConsent::Refused(RefusalReason::NoTerminal) | SkillConsent::Unanswerable => {
-            Some(NotRunReason::NoTerminal)
-        }
-        SkillConsent::Refused(RefusalReason::UnrecognizedSubject) => {
-            Some(NotRunReason::UnrecognizedSubject)
-        }
-    }
-}
-
-/// The placeholder sentence a closed door earns, from
-/// [`crate::skills::dynamic`]'s own constructors.
-///
-/// The strings live there, beside the grammar and the runner, so the four
-/// sentences a model can read about a missing command are spelled in exactly one
-/// place (LESSON-528).
-fn door_outcome(door: NotRunReason) -> DynamicOutcome {
-    match door {
-        NotRunReason::Declined => DynamicOutcome::declined(),
-        NotRunReason::Level => DynamicOutcome::not_run_at_plan(),
-        NotRunReason::NoTerminal => DynamicOutcome::no_terminal(),
-        NotRunReason::UnrecognizedSubject => DynamicOutcome::unrecognized_subject(),
-        // Never reached from `closed_door`, which only ever answers with the
-        // consent's own doors. It is spelled out rather than left to an
-        // `unreachable!` because `NotRunReason` now also carries the runner's
-        // `CouldNotStart`, which arrives as an *outcome* and not as a door —
-        // and a future caller should meet a sentence here, not a panic.
-        NotRunReason::CouldNotStart => DynamicOutcome::could_not_start(),
-    }
 }
 
 /// One command's typed record for BR-12's event, projected from the outcome the

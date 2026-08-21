@@ -107,7 +107,7 @@ use crate::broadcast::EventBus;
 use crate::egress::to_protocol_web_tier;
 use crate::grants::ConnectionId;
 use crate::harness::tools::web::{permission_key_for, tier_name, WEB_PERMISSION_KEYS};
-use crate::harness::tools::DOCS_TOOL_NAME;
+use crate::harness::tools::{DOCS_TOOL_NAME, SKILL_TOOL_NAME};
 use crate::skills::{permission_key_for as skill_permission_key_for, SkillSource};
 
 /// Policy for a single tool.
@@ -346,10 +346,14 @@ impl Default for PermissionConfig {
 /// dynamic context ([`PermissionGate::authorize_skill`], BR-5) — so the tool's
 /// own row being `allow` withholds nothing.
 ///
-/// Spelled as a literal because the tool does not exist yet: TASK-216 ships
-/// `SKILL_TOOL_NAME` beside `SkillTool` and should replace this string with it,
-/// so the registry's name and the permission row cannot drift.
-const READ_ONLY_TOOLS: &[&str] = &["read", "glob", "grep", DOCS_TOOL_NAME, "skill"];
+/// Spelled as the constant the registry registers under
+/// ([`SKILL_TOOL_NAME`], REQ-587 TASK-216), never as a literal: this row and
+/// the tool's name are two halves of one fact, and a literal here would let the
+/// tool be renamed into a row that no longer matches it — at which point the
+/// level table's `default` takes over and `plan` denies the tool outright,
+/// silently, which is exactly the `teton_docs` failure LESSON-524 records.
+/// `the_permission_row_and_the_registrys_name_are_one_value` pins it.
+const READ_ONLY_TOOLS: &[&str] = &["read", "glob", "grep", DOCS_TOOL_NAME, SKILL_TOOL_NAME];
 
 /// Expand a [`PermissionLevel`] into the policy table the gate enforces.
 ///
@@ -2430,6 +2434,47 @@ mod tests {
                 "{level}: the `skill` tool must not ask and must not be denied —                  BR-11's constraint is that no level ever raises an \"allow                  `skill`?\" prompt"
             );
         }
+    }
+
+    /// **The row and the registry's name are one value (REQ-587 TASK-216).**
+    ///
+    /// [`READ_ONLY_TOOLS`] used to spell `skill` as a bare literal, because the
+    /// tool did not exist when the row was written. The two are halves of one
+    /// fact, and a literal is how they drift: rename the tool and the row stops
+    /// matching it, at which point the level table's `default` takes over and
+    /// `plan` **denies** the tool outright — silently, since an exposure test
+    /// asserts the tool is in the list and being *callable* is a different
+    /// claim. That is the `teton_docs` failure REQ-577 found live (LESSON-524),
+    /// and this is the assertion that would have caught it.
+    #[tokio::test]
+    async fn the_permission_row_and_the_registrys_name_are_one_value() {
+        use crate::harness::tools::{SkillTool, Tool};
+
+        assert!(
+            READ_ONLY_TOOLS.contains(&SKILL_TOOL_NAME),
+            "the `skill` tool is not in the read-only set: {READ_ONLY_TOOLS:?}"
+        );
+        // Non-vacuity, and the drift itself: the row must be the name the tool
+        // *answers to*, not a second spelling that happens to match today.
+        let (_bus, _pending, gate) = gate(PermissionConfig::with_default(PermissionPolicy::Ask));
+        let tool = SkillTool::new(
+            Arc::new(crate::skills::SkillRegistry::default()),
+            Arc::new(gate),
+            None,
+            tokio::runtime::Handle::current(),
+            1_000,
+        );
+        assert_eq!(
+            tool.name(),
+            SKILL_TOOL_NAME,
+            "the constant the permission row reads and the name the tool registers \
+             under have diverged"
+        );
+        assert_eq!(
+            table_for(PermissionLevel::Plan).policy_for(tool.name()),
+            PermissionPolicy::Allow,
+            "`plan` denies the name the model actually calls"
+        );
     }
 
     /// **BR-5 / OQ-9: the grant key follows the substituted commands, and only

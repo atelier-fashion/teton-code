@@ -345,15 +345,28 @@ impl SkillSnapshot {
     }
 
     /// The skill a `/name` line reaches, or `None` — the **only** way a skill
-    /// is looked up (BR-2).
+    /// is looked up (BR-2, REQ-587 BR-3).
     ///
-    /// A shadowed entry is listed and never returned: `shadowed` names what
-    /// owns the spelling instead, and honouring it here is what keeps `/help`'s
-    /// mark and the dispatcher from disagreeing.
+    /// A row the user may not type is listed and never returned, whichever of
+    /// the two reasons applies: something else owns the spelling, or the file
+    /// said `user-invocable: false`. [`user_dispatch`] is the one predicate that
+    /// answers the user's question, and asking it here is what keeps `/help`'s
+    /// mark and the dispatcher from disagreeing — a row `/help` marks is a row
+    /// this function declines, from the same call.
     fn dispatchable(&self, name: &str) -> Option<&SkillView> {
         self.skills
             .iter()
-            .find(|view| view.name == name && view.shadowed.is_none())
+            .find(|view| view.name == name && user_dispatch(view) == UserDispatch::Allowed)
+    }
+
+    /// The registered row of this name, marked or not (REQ-587 BR-3).
+    ///
+    /// [`Self::dispatchable`] answers "may the user type this?"; this answers
+    /// "does the session have a row spelled this at all?", which is the question
+    /// [`model_only_hint`] has to ask in order to say *why* a listed name did
+    /// not run.
+    fn listed(&self, name: &str) -> Option<&SkillView> {
+        self.skills.iter().find(|view| view.name == name)
     }
 
     /// The skipped entry a typed name would have been, or `None` (AC-17).
@@ -1182,12 +1195,19 @@ pub fn prompt_turn_params(session_id: &SessionId, text: &str) -> PromptTurnParam
 /// The table is consulted through [`resolve`]; a line that resolves to no row
 /// renders one hint and issues no RPC (BR-2).
 ///
-/// `registry` is the session's snapshot, and it is read for exactly one thing
-/// (REQ-585 BR-10 / AC-17): a name discovery *found and did not register* says
-/// why, rather than "unknown command". A name with no entry at all takes the
-/// pre-REQ branch with the pre-REQ bytes, and a *shadowed* name never arrives
-/// here at all — the row or the project skill ran (BR-2), which is why there is
-/// no shadow branch to word.
+/// `registry` is the session's snapshot, and it is read for exactly two things,
+/// both of them a name this session **has** and did not run:
+///
+/// * a name discovery *found and did not register* says why, rather than
+///   "unknown command" (REQ-585 BR-10 / AC-17);
+/// * a name it registered as **model-only** says which flag made it so
+///   (REQ-587 BR-3 / AC-12) — the one refusal that has to name a line of the
+///   user's own file, because nothing else on any surface would tell them why a
+///   skill they can see in `/help` does not run.
+///
+/// A name with no entry at all takes the pre-REQ branch with the pre-REQ bytes,
+/// and a *shadowed* name never arrives here at all — the row or the project
+/// skill ran (BR-2), which is why there is no shadow branch to word.
 ///
 /// # Errors
 ///
@@ -1200,6 +1220,10 @@ pub fn dispatch(
     ctx: &mut UiContext<'_>,
 ) -> anyhow::Result<CommandOutcome> {
     if let Some(hint) = skipped_skill_hint(name, registry) {
+        render_rejection(&hint, ctx.surface);
+        return Ok(CommandOutcome::Continue);
+    }
+    if let Some(hint) = model_only_hint(name, registry) {
         render_rejection(&hint, ctx.surface);
         return Ok(CommandOutcome::Continue);
     }
@@ -1246,6 +1270,46 @@ fn skipped_skill_hint(name: &str, registry: &SkillSnapshot) -> Option<String> {
         "`{}` is a skill that was skipped: {} — {HELP_HINT}",
         typed_token(name),
         entry.reason,
+    ))
+}
+
+/// The line a **model-only** name gets instead of "unknown command"
+/// (REQ-587 BR-3, AC-12), or `None` when this is not that case.
+///
+/// It names the frontmatter key, because that is the only actionable fact: the
+/// file is the user's own (or their repository's), the flag is one line of it,
+/// and a refusal that said only "unknown command" would send the author looking
+/// for a typo in a name that is spelled correctly and listed in `/help` two
+/// lines above.
+///
+/// The same three guards [`skipped_skill_hint`] applies, for the same reasons —
+/// a table-claimed name is the row's, and a name this session does not list at
+/// all keeps the pre-REQ bytes. The third is [`user_dispatch`] rather than the
+/// flag: a project skill that both shadows a user skill *and* says
+/// `user-invocable: false` is refused as **shadowed** long before it reaches
+/// here, and answering it with the flag would name the wrong file.
+///
+/// The two-flag row is worded apart from the one-flag row for
+/// [`dispatch_mark`]'s reason: "nobody may run this" and "only the model may
+/// run this" are different states of the author's file, and one sentence for
+/// both would tell the author of a two-flag file that the model is using a skill
+/// no roster contains.
+fn model_only_hint(name: &str, registry: &SkillSnapshot) -> Option<String> {
+    if table_claim(name).is_some() {
+        return None;
+    }
+    let view = registry.listed(name)?;
+    if user_dispatch(view) != UserDispatch::ModelOnly {
+        return None;
+    }
+    let who = if view.model_invocable {
+        "only the model may invoke it"
+    } else {
+        "nobody may invoke it — its frontmatter also says `disable-model-invocation: true`"
+    };
+    Some(format!(
+        "`{}` is a skill whose frontmatter says `user-invocable: false`, so {who} — {HELP_HINT}",
+        typed_token(name),
     ))
 }
 
@@ -1804,12 +1868,12 @@ fn render_skills_section(surface: &mut dyn Surface, registry: &SkillSnapshot) {
     surface.line(LineKind::Info, &skills_diagnostic(registry));
 }
 
-/// One `/help` skill row: `/name [hint] — description (source)`, with a
-/// shadowed entry marked inside the same parenthetical (AC-1).
+/// One `/help` skill row: `/name [hint] — description (source)`, with a row the
+/// user may not type marked inside the same parenthetical (AC-1, REQ-587 AC-12).
 ///
-/// The shadow mark shares the source's parentheses rather than taking an
-/// em-dash of its own, because the description already owns that punctuation
-/// and a row with both would read as two sentences about different things.
+/// The mark shares the source's parentheses rather than taking an em-dash of its
+/// own, because the description already owns that punctuation and a row with
+/// both would read as two sentences about different things.
 ///
 /// **What counts as shadowed is not only what the daemon said.** A row the
 /// client's own table claims is marked too ([`claimed_by_a_row`]) — BR-3's rule
@@ -1829,20 +1893,93 @@ fn skill_row(view: &SkillView) -> String {
     }
     row.push_str(" (");
     row.push_str(source_word(view.source));
-    if let Some(reason) = shadow_reason(view) {
-        row.push_str(", shadowed by ");
-        row.push_str(&reason);
+    if let Some(mark) = dispatch_mark(view) {
+        row.push_str(", ");
+        row.push_str(&mark);
     }
     row.push(')');
     row
 }
 
-/// What owns a skill's name instead of the skill, or `None` when the skill owns
-/// it and dispatches.
+/// Why `/help` says the user cannot type this row, or `None` when they can
+/// (REQ-587 BR-3, AC-12).
 ///
-/// The one predicate `/help` and [`classify`] share (BR-3's both-directions
-/// pin): a row rendered without a mark is a row [`classify`] returns
-/// [`Input::Skill`] for, and a row with one is a row it does not.
+/// **Rendered from [`user_dispatch`] and from nothing else**, which is what
+/// fixes the precedence at this surface: a row that is both shadowed and
+/// model-only reads `shadowed by …`, because the name belongs to another file
+/// entirely and "model-only" would name a capability *this* row does not have
+/// either. A mark composed here from `!view.user_invocable` would call another
+/// file's name a model-only skill
+/// (`shadowing_wins_over_model_only_in_the_mark` fails on exactly that).
+///
+/// BR-3's third state gets its **own** words rather than borrowing the second's.
+/// A row both flags deny is listed, invocable by nobody, and is a named
+/// diagnostic rather than a silent drop — so calling it `model-only` would tell
+/// a reader the model can reach a file the model cannot reach, and leave the
+/// author of a two-flag file with nothing on any surface to act on. This is the
+/// only surface that renders the combination at all: `classify` refuses the name
+/// either way, and the daemon's roster simply omits it.
+///
+/// `model_invocable` is read here and nowhere else in the composition: it
+/// answers a *different* question ("may the model?"), and it is asked only once
+/// [`user_dispatch`] has already answered the user's with `ModelOnly`.
+fn dispatch_mark(view: &SkillView) -> Option<String> {
+    match user_dispatch(view) {
+        UserDispatch::Allowed => None,
+        UserDispatch::Shadowed(by) => Some(format!("shadowed by {by}")),
+        UserDispatch::ModelOnly if view.model_invocable => Some("model-only".to_owned()),
+        UserDispatch::ModelOnly => Some("invocable by nobody".to_owned()),
+    }
+}
+
+/// Whether the **user** may reach a listed row by typing `/name`, and why not
+/// when they may not (REQ-587 BR-3).
+///
+/// The client's copy of `Skill::user_dispatch`, which is where TASK-212 decided
+/// this: the user's question is three-valued, not two, and the two facts ride
+/// the wire **separately and verbatim** ([`SkillView::shadowed`] and
+/// [`SkillView::user_invocable`]) precisely so that a client composes them here
+/// rather than being handed a pre-composed sentence it would have to re-parse
+/// (LESSON-529).
+///
+/// The order is the decision, not a detail: **shadowing wins**. Only once
+/// nothing owns the spelling is `user-invocable: false` the reason, so no
+/// surface can read "model-only" off a row whose name resolves to a different
+/// file. One composition, consulted by [`SkillSnapshot::dispatchable`],
+/// [`dispatch_mark`] and [`model_only_hint`] alike — three surfaces, one answer,
+/// which is the whole of BR-3's both-directions pin.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum UserDispatch {
+    /// `/name` reaches this file.
+    Allowed,
+    /// Something else owns the spelling (BR-2), in the words that surface says
+    /// it.
+    Shadowed(String),
+    /// `user-invocable: false`. Listed and marked, refused from `/name`, and
+    /// still the model's — unless [`SkillView::model_invocable`] is false too,
+    /// which [`dispatch_mark`] words differently and `classify` refuses the
+    /// same way.
+    ModelOnly,
+}
+
+/// [`UserDispatch`] for one row.
+fn user_dispatch(view: &SkillView) -> UserDispatch {
+    match shadow_reason(view) {
+        Some(by) => UserDispatch::Shadowed(by),
+        None if !view.user_invocable => UserDispatch::ModelOnly,
+        None => UserDispatch::Allowed,
+    }
+}
+
+/// What owns a skill's name instead of the skill, or `None` when the skill owns
+/// it.
+///
+/// The **shadowing** half of [`user_dispatch`], and only that half — this is the
+/// client's copy of `Skill::shadow_reason`, and it stays two-valued for the
+/// daemon's reason: folding `user-invocable: false` in here would render
+/// "model-only" inside a sentence that reads `shadowed by …` at every surface
+/// that draws one. Owning the name and being the user's to type are two
+/// questions; [`user_dispatch`] is where they compose, in that order.
 fn shadow_reason(view: &SkillView) -> Option<String> {
     // This crate's own sentence first, where it has one. The daemon marks a
     // reserved name too (it must — a client without a command table would
@@ -2876,7 +3013,9 @@ mod tests {
         SkillSnapshot::from(SkillsListResult { skills, skipped })
     }
 
-    /// One registered skill, with everything optional left out.
+    /// One registered skill, with everything optional left out: the ordinary
+    /// row, invocable from both doors, which is what a file declaring neither
+    /// of BR-3's flags registers as.
     fn skill(name: &str, source: SkillSource) -> SkillView {
         SkillView {
             name: name.to_owned(),
@@ -2884,9 +3023,37 @@ mod tests {
             description: None,
             argument_hint: None,
             shadowed: None,
-            // TASK-212 replaces this: the fixture predates BR-3's two flags.
-            model_invocable: false,
+            model_invocable: true,
             user_invocable: true,
+        }
+    }
+
+    /// A `user-invocable: false` row: BR-3's third state, listed and marked,
+    /// refused from `/name`, and still the model's.
+    fn model_only(name: &str, source: SkillSource) -> SkillView {
+        SkillView {
+            user_invocable: false,
+            ..skill(name, source)
+        }
+    }
+
+    /// A row **both** flags deny — listed, invocable by nobody. Representable,
+    /// on the wire (`both_invocation_flags_reach_the_client`), and rendered by
+    /// exactly one surface.
+    fn invocable_by_nobody(name: &str, source: SkillSource) -> SkillView {
+        SkillView {
+            model_invocable: false,
+            ..model_only(name, source)
+        }
+    }
+
+    /// A `disable-model-invocation: true` row: hidden from the model, and an
+    /// ordinary row to every surface `/help` and [`classify`] own — the fixture
+    /// that keeps the two flags from being read as one.
+    fn user_only(name: &str, source: SkillSource) -> SkillView {
+        SkillView {
+            model_invocable: false,
+            ..skill(name, source)
         }
     }
 
@@ -3897,6 +4064,186 @@ mod tests {
         assert_eq!(lines.len(), start + 8, "{lines:#?}");
     }
 
+    /// **REQ-587 AC-12 / BR-3: a row the user may not type is marked in the
+    /// source parenthetical, and the two reasons are worded apart.**
+    ///
+    /// Four rows in one fixture, because BR-3's states are only distinguishable
+    /// side by side: an ordinary row; a `disable-model-invocation: true` row,
+    /// which is an **ordinary** row to this surface (that flag is about the
+    /// model, and a mark here would tell the user they cannot type a name they
+    /// can); a model-only row; and the row both flags deny, which is listed,
+    /// invocable by nobody, and rendered nowhere else — `classify` refuses it
+    /// like any other model-only name and the daemon's roster simply omits it,
+    /// so `/help` is the only surface that can name the combination at all.
+    ///
+    /// Pinned as literal lines, for `help_lists_every_skill_…`'s reason: the
+    /// mark rides inside the parentheses the source already owns, and a
+    /// `contains` would survive it drifting into an em-dash aside of its own or
+    /// losing the source word beside it.
+    #[test]
+    fn help_marks_the_rows_the_user_may_not_type_and_words_the_two_reasons_apart() {
+        let snapshot = registry(
+            vec![
+                skill("alpha", SkillSource::User),
+                user_only("beta", SkillSource::User),
+                model_only("delta", SkillSource::Project),
+                invocable_by_nobody("mute", SkillSource::User),
+            ],
+            Vec::new(),
+        );
+        let lines = help_lines(&snapshot);
+
+        assert_eq!(
+            skill_rows(&lines),
+            vec![
+                "/alpha (user)".to_owned(),
+                "/beta (user)".to_owned(),
+                "/delta (project, model-only)".to_owned(),
+                "/mute (user, invocable by nobody)".to_owned(),
+            ],
+        );
+        // Listed **and counted**: a row nobody may invoke is a named diagnostic
+        // rather than a silent drop, so it is in the totals like every other
+        // registered row — it was never skipped.
+        assert!(
+            lines
+                .iter()
+                .any(|line| line == "4 skills (user 3, project 1); 0 skipped"),
+            "{lines:#?}"
+        );
+        // And the mark is the dispatcher's own answer, read from the other end:
+        // exactly the unmarked rows classify as skills.
+        for (name, dispatches) in [
+            ("/alpha", true),
+            ("/beta", true),
+            ("/delta", false),
+            ("/mute", false),
+        ] {
+            assert_eq!(
+                matches!(classify(name, &snapshot), Input::Skill { .. }),
+                dispatches,
+                "`{name}`"
+            );
+        }
+    }
+
+    /// **TASK-212's precedence, at the surface that renders it: shadowing
+    /// wins.**
+    ///
+    /// A row that is both shadowed and model-only reads `shadowed by …` and
+    /// never `model-only` — the name belongs to another file entirely, so
+    /// "model-only" would name a capability *this* row does not have either, and
+    /// would point the reader at their own frontmatter for a collision it does
+    /// not explain.
+    ///
+    /// **Mutation.** Render the mark from a re-derived predicate —
+    /// `if !view.user_invocable { "model-only" }` at [`skill_row`], or a
+    /// `shadow_reason` that folded the flag in — and both rows here change.
+    /// Both shadowing sources are covered, because they arrive by different
+    /// routes: the daemon marks what it can see, and the client's own table
+    /// claims what `tetond` has no `COMMANDS` to know about.
+    #[test]
+    fn shadowing_wins_over_model_only_in_the_mark() {
+        let by_daemon = SkillView {
+            shadowed: Some("the project skill".to_owned()),
+            ..model_only("analyze", SkillSource::User)
+        };
+        // Unmarked by the daemon, and claimed by this crate's table: the skew
+        // case ADR-2 describes, where the client is the one that is right.
+        let by_table = model_only("cost", SkillSource::User);
+        let snapshot = registry(vec![by_daemon, by_table], Vec::new());
+
+        assert_eq!(
+            skill_rows(&help_lines(&snapshot)),
+            vec![
+                "/analyze (user, shadowed by the project skill)".to_owned(),
+                "/cost (user, shadowed by the built-in `/cost`)".to_owned(),
+            ],
+        );
+        // The refusal follows the same order: neither name is answered with the
+        // flag, because the flag is not why the user cannot reach the file.
+        assert_eq!(model_only_hint("analyze", &snapshot), None);
+        assert_eq!(model_only_hint("cost", &snapshot), None);
+    }
+
+    /// **AC-12's `/delta` half.** A model-only name does not dispatch, and the
+    /// refusal names the line of the user's own file that made it so — the only
+    /// actionable fact about a name that is spelled correctly and listed in
+    /// `/help` two lines above.
+    ///
+    /// The two-flag row gets its own sentence for [`dispatch_mark`]'s reason:
+    /// telling the author of a `disable-model-invocation: true` file that "only
+    /// the model may invoke it" would name a door that file closed.
+    #[test]
+    fn a_model_only_name_does_not_dispatch_and_the_hint_names_the_flag() {
+        let snapshot = registry(
+            vec![
+                model_only("delta", SkillSource::User),
+                invocable_by_nobody("mute", SkillSource::User),
+            ],
+            Vec::new(),
+        );
+
+        assert!(
+            matches!(classify("/delta", &snapshot), Input::Command { name, .. } if name == "delta"),
+            "a model-only name is still a command line, and still names no row",
+        );
+        assert_eq!(
+            model_only_hint("delta", &snapshot).as_deref(),
+            Some(
+                "`/delta` is a skill whose frontmatter says `user-invocable: false`, so only \
+                 the model may invoke it — type /help for the commands this session knows."
+            ),
+        );
+        assert_eq!(
+            model_only_hint("mute", &snapshot).as_deref(),
+            Some(
+                "`/mute` is a skill whose frontmatter says `user-invocable: false`, so nobody \
+                 may invoke it — its frontmatter also says `disable-model-invocation: true` — \
+                 type /help for the commands this session knows."
+            ),
+        );
+        // An ordinary row, and a name this session does not have, keep the bytes
+        // they have always had: this branch adds a case, it does not reword one.
+        assert_eq!(model_only_hint("frobnicate", &snapshot), None);
+        assert_eq!(
+            model_only_hint(
+                "delta",
+                &registry(vec![skill("delta", SkillSource::User)], vec![])
+            ),
+            None,
+        );
+
+        // Through `dispatch`, which is where it reaches a user: one line, and
+        // no RPC — a refusal this client composes never asks the daemon.
+        let (mut conn, peer) = Connection::scripted(&[]);
+        let mut surface = RecordingSurface::new();
+        let mut state = SessionState::new();
+        let mut prompter = ScriptedPrompter::new(&[]);
+        {
+            let mut ctx = session_ctx(&mut surface, &mut state, &mut prompter);
+            let outcome = dispatch("delta", "", &snapshot, &mut conn, &mut ctx)
+                .expect("a refusal is not an error");
+            assert_eq!(outcome, CommandOutcome::Continue);
+        }
+        let errors = surface.lines_of(LineKind::Error);
+        assert_eq!(errors.len(), 1, "one line, not a paragraph: {errors:?}");
+        assert!(
+            errors[0].contains("`user-invocable: false`"),
+            "{}",
+            errors[0]
+        );
+        assert!(
+            !errors[0].contains("unknown command"),
+            "the name is known — it is listed in /help: {}",
+            errors[0]
+        );
+        assert!(
+            crate::client::methods_written(&peer).is_empty(),
+            "a client-side refusal issued an RPC"
+        );
+    }
+
     /// BR-1's "counted and named": the diagnostic line names what discovery
     /// dropped and why, and it renders even when nothing registered — a user
     /// whose only skill file is broken has to be able to see that.
@@ -3928,38 +4275,46 @@ mod tests {
         );
     }
 
-    /// BR-3, both directions, scoped to **unshadowed** rows (LESSON-524: the
+    /// BR-3, both directions, scoped to **unmarked** rows (LESSON-524: the
     /// likely repair for a red both-directions pin is to relax it rather than
     /// to scope it, so the scope is written into the test's name and its
     /// comment rather than discovered later).
     ///
     /// Forward: every name `classify` returns `Input::Skill` for appears as a
-    /// `/help` row. Backward: every `/help` skill row that is **not** marked
-    /// shadowed classifies as `Input::Skill`. The unqualified backward claim is
-    /// false for the shadowed rows AC-2 mandates — they are listed and do not
-    /// dispatch, which is the point of listing them — and BR-3's claim is about
-    /// dispatchable skills.
+    /// `/help` row. Backward: every `/help` skill row that carries **no mark**
+    /// classifies as `Input::Skill`. The unqualified backward claim is false for
+    /// the shadowed rows AC-2 mandates and for REQ-587's model-only ones — they
+    /// are listed and do not dispatch, which is the point of listing them — and
+    /// BR-3's claim is about dispatchable skills.
+    ///
+    /// "Marked" is read off the **rendered** row as "the source parenthetical
+    /// carries more than the source", not as a search for today's two mark
+    /// spellings: a third mark added later inherits this pin instead of
+    /// silently escaping it.
     #[test]
-    fn every_dispatchable_skill_is_a_help_row_and_every_unshadowed_row_dispatches() {
+    fn every_dispatchable_skill_is_a_help_row_and_every_unmarked_row_dispatches() {
         let snapshot = registry(
             vec![
                 described("alpha", SkillSource::User, "[topic]", "Draft a note."),
                 skill("beta", SkillSource::User),
                 shadowed("cost", SkillSource::User, "the built-in `/cost`"),
                 shadowed("analyze", SkillSource::User, "the project skill"),
+                model_only("delta", SkillSource::User),
+                invocable_by_nobody("mute", SkillSource::Project),
                 skill("gamma", SkillSource::Project),
             ],
             Vec::new(),
         );
+        let unmarked = |row: &str| row.ends_with("(user)") || row.ends_with("(project)");
         let lines = help_lines(&snapshot);
         let rows = skill_rows(&lines);
-        assert_eq!(rows.len(), 5, "every registered skill is listed: {rows:#?}");
+        assert_eq!(rows.len(), 7, "every registered skill is listed: {rows:#?}");
 
-        // Forward, and it is the **unshadowed** row that has to be there: a
-        // name that dispatches while `/help` marks it shadowed is the same
-        // disagreement read from the other end, and a bare "a row exists"
-        // check would pass it (a shadowed skill made dispatchable keeps its
-        // row and only loses its mark).
+        // Forward, and it is the **unmarked** row that has to be there: a name
+        // that dispatches while `/help` marks it is the same disagreement read
+        // from the other end, and a bare "a row exists" check would pass it (a
+        // shadowed skill made dispatchable keeps its row and only loses its
+        // mark).
         for view in &snapshot.skills {
             let line = format!("/{}", view.name);
             if matches!(classify(&line, &snapshot), Input::Skill { .. }) {
@@ -3970,20 +4325,20 @@ mod tests {
                         panic!("`{line}` dispatches and is not in /help: {rows:#?}")
                     });
                 assert!(
-                    !row.contains("shadowed by"),
-                    "`{line}` dispatches and /help calls it shadowed: {row}",
+                    unmarked(row),
+                    "`{line}` dispatches and /help marks it not dispatchable: {row}",
                 );
             }
         }
 
         // Backward, over the rendered rows rather than over the fixture: the
         // section is read back the way a user reads it.
-        let mut unshadowed = 0;
+        let mut plain = 0;
         for row in &rows {
-            if row.contains("shadowed by") {
+            if !unmarked(row) {
                 continue;
             }
-            unshadowed += 1;
+            plain += 1;
             let name = row
                 .split_whitespace()
                 .next()
@@ -3994,7 +4349,7 @@ mod tests {
                 "/help lists `{name}` as dispatchable and it does not dispatch",
             );
         }
-        assert_eq!(unshadowed, 3, "the fixture must exercise both sides");
+        assert_eq!(plain, 3, "the fixture must exercise both sides");
     }
 
     /// ADR-12: `help_family` never sees a skill.

@@ -49,12 +49,19 @@ use teton_inference::ChatFormat;
 /// match, so listing only the latter left the MCP envelope forgeable on the
 /// output side while the input side already defused it — the gap BUG-149
 /// closes.
+/// `<skill-body` is the REQ-587 BR-4 instructions frame the `skill` tool writes
+/// around an expansion ([`super::tools::skill::SkillFrame`]). A model that emits
+/// one flush-left is claiming the harness handed it a skill body it never
+/// invoked — the fabrication axis, with the frame that says *follow this*
+/// instead of the one that says *this is data*, which makes it the more
+/// valuable one to forge, not the less.
 pub(super) const FLAT_ANCHORED_MARKERS: &[&str] = &[
     "User:",
     "Assistant:",
     "Tool (",
     "<tool-result",
     "<mcp-tool-result",
+    "<skill-body",
 ];
 
 /// Line-anchored fabrication markers for the ChatML rendering (REQ-554 BR-4,
@@ -71,6 +78,7 @@ pub(super) const FLAT_ANCHORED_MARKERS: &[&str] = &[
 pub(super) const CHATML_ANCHORED_MARKERS: &[&str] = &[
     "<tool-result",
     "<mcp-tool-result",
+    "<skill-body",
     super::context::TOOL_RESULT_LABEL_PREFIX,
 ];
 

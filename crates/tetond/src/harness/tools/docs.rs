@@ -613,6 +613,36 @@ mod tests {
         );
     }
 
+    /// **AC-16, seventh passage: the `skill` tool is not always there.**
+    ///
+    /// TASK-220 could not state this for want of room — the topic was 16 bytes
+    /// under the ceiling — and left it reading as though `skill` is present in
+    /// every session. BR-2 registers it only when the registry holds at least
+    /// one model-invocable skill, so on a machine with none the model is
+    /// otherwise told about a tool that is not in its own schema, which is
+    /// BUG-181's defect in the other direction: the topic and the tool set
+    /// disagreeing, with the topic winning.
+    ///
+    /// The clause was paid for by cutting elsewhere in the same file. The
+    /// ceiling did not move and `every_bundled_topic_is_under_the_ceiling` still
+    /// guards it.
+    #[test]
+    fn the_skills_topic_says_the_tool_is_registered_conditionally() {
+        let topic = skills_topic();
+        assert_states(
+            &topic,
+            "The `skill` tool exists only when some skill is model-invocable",
+            "the tool is conditionally registered, so a session with no \
+             model-invocable skill has no `skill` tool at all (BR-2)",
+        );
+        assert_states(
+            &topic,
+            "with none it is absent",
+            "the consequence is stated as absence rather than as an empty list — a \
+             model that reads about a tool missing from its own schema guesses (BR-2)",
+        );
+    }
+
     /// **AC-3, the didactic half (BR-8).** An unknown topic names every valid
     /// one, so the recovery is the model's next turn rather than the user's.
     #[test]

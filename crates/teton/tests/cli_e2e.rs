@@ -5856,6 +5856,23 @@ fn skill_file(description: &str, hint: Option<&str>, body: &str) -> String {
     out
 }
 
+/// [`skill_file`] with extra frontmatter lines between the delimiters — the
+/// two REQ-587 BR-3 flags, and any future key a fixture needs to declare.
+///
+/// A builder rather than four literal files: the flags are `key: value` lines
+/// under REQ-585's flat parser, and a fixture that hand-wrote the header would
+/// drift from the one `skill_file` writes for every other test here.
+fn skill_file_with(description: &str, frontmatter: &[&str], body: &str) -> String {
+    let mut out = format!("---\ndescription: {description}\n");
+    for line in frontmatter {
+        out.push_str(line);
+        out.push('\n');
+    }
+    out.push_str("---\n");
+    out.push_str(body);
+    out
+}
+
 /// A project fixture under `root`: a `Cargo.toml` (so the root classifies as a
 /// project) and nothing else.
 fn project_at(root: &Path, name: &str) -> PathBuf {
@@ -6053,6 +6070,124 @@ fn slash_help_lists_the_discovered_skills_with_their_sources_and_the_diagnostic(
             "`{footer}` vanished from /help; listing:\n{full:#?}"
         );
     }
+}
+
+/// **REQ-587 AC-12: `/help` marks the rows the user may not type, and typing
+/// one names the flag that made it so.**
+///
+/// End to end, through a real daemon that reads the two frontmatter flags: the
+/// mark is only honest if the flags survive discovery, the wire and the render,
+/// and the unit tests upstream of this one can each be green while any of those
+/// three drops a key ([`both_invocation_flags_reach_the_client`] is the
+/// daemon-side half of the same claim).
+///
+/// Four rows, because BR-3's states are only distinguishable side by side:
+///
+/// * `alpha` declares neither flag — the ordinary row, unmarked;
+/// * `beta` declares `disable-model-invocation: true` — hidden from the model
+///   and **unmarked here**, because that flag says nothing about the user;
+/// * `delta` declares `user-invocable: false` — model-only, marked;
+/// * `mute` declares both — listed, invocable by nobody, and this is the only
+///   surface in the product that renders the combination.
+#[test]
+fn slash_help_marks_a_model_only_skill_and_typing_it_names_the_flag() {
+    let daemon_bin = daemon_bin();
+    let teton = teton_bin();
+
+    let home = SkillTree::new("m");
+    home.write(
+        ".claude/skills/alpha/SKILL.md",
+        &skill_file("the alpha skill", Some("[target]"), "Alpha body.\n"),
+    );
+    home.write(
+        ".claude/commands/beta.md",
+        &skill_file_with(
+            "the beta skill",
+            &["disable-model-invocation: true"],
+            "Beta body.\n",
+        ),
+    );
+    home.write(
+        ".claude/commands/delta.md",
+        &skill_file_with(
+            "the delta skill",
+            &["user-invocable: false"],
+            "Delta body.\n",
+        ),
+    );
+    home.write(
+        ".claude/commands/mute.md",
+        &skill_file_with(
+            "the mute skill",
+            &["user-invocable: false", "disable-model-invocation: true"],
+            "Mute body.\n",
+        ),
+    );
+
+    let daemon = TestDaemon::spawn_scripted_with_env(
+        &daemon_bin,
+        TURN_REPLIES,
+        &[("HOME", home.path().to_str().unwrap())],
+    );
+    let project = project_at(&daemon.root, "proj");
+    let (stdout, stderr, status) = daemon.run_cli_from(
+        &teton,
+        &["--cwd", project.to_str().unwrap()],
+        "/help\n/delta\n/mute\n/beta\n",
+        None,
+        &[("HOME", home.path())],
+    );
+    assert!(status.success(), "stdout:\n{stdout}\nstderr:\n{stderr}");
+
+    let listing = help_listing(&stdout, "`/help`");
+    assert_eq!(
+        skill_rows(&listing, "`/help`"),
+        vec![
+            "/alpha [target] — the alpha skill (user)".to_owned(),
+            "/beta — the beta skill (user)".to_owned(),
+            "/delta — the delta skill (user, model-only)".to_owned(),
+            "/mute — the mute skill (user, invocable by nobody)".to_owned(),
+        ],
+        "a row the user may not type must say which kind of row it is, and a \
+         row only the *model* may not reach must not be marked at all; \
+         listing:\n{listing:#?}"
+    );
+    // Registered and counted, never skipped: BR-3's flags are a named state of
+    // a file discovery accepted, not a reason to drop it.
+    assert_eq!(
+        skills_diagnostic(&listing, "`/help`"),
+        "4 skills (user 4, project 0); 0 skipped",
+        "listing:\n{listing:#?}"
+    );
+
+    // Typed: the refusal names the line of the user's own file, because the
+    // name is spelled correctly and listed in `/help` four lines above.
+    assert!(
+        stdout.contains(&format!(
+            "`/delta` is a skill whose frontmatter says `user-invocable: false`, so only the \
+             model may invoke it — {HELP_HINT}"
+        )),
+        "output:\n{stdout}"
+    );
+    assert!(
+        stdout.contains(&format!(
+            "`/mute` is a skill whose frontmatter says `user-invocable: false`, so nobody may \
+             invoke it — its frontmatter also says `disable-model-invocation: true` — {HELP_HINT}"
+        )),
+        "the two-flag row must not be told that the model may run it; output:\n{stdout}"
+    );
+    assert!(
+        !stdout.contains("unknown command: `/delta`"),
+        "a listed name answered as if the session had never heard of it; \
+         output:\n{stdout}"
+    );
+    // …and `disable-model-invocation` costs the user nothing: `/beta` still
+    // dispatches, which is what keeps the two flags from being read as one.
+    assert!(
+        stdout.contains("/beta → skill beta (user,"),
+        "a skill hidden from the model must still dispatch for the user; \
+         output:\n{stdout}"
+    );
 }
 
 /// **AC-2: a skill may not take a name the table has claimed.**

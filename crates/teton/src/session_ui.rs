@@ -76,27 +76,38 @@ impl SessionGrants {
         self.allow_always.insert(tool.to_owned());
     }
 
-    /// Forget every **project** skill grant, because the session root moved.
+    /// Forget every grant a **session root move** invalidates (ADR-6,
+    /// REQ-587 ASSUME-017).
     ///
     /// The other half of ADR-6, and the half a daemon-side test cannot see.
-    /// `PermissionGate::drop_project_skill_grants` forgets the daemon's copy on
-    /// `/cd`; this store holds the same key, is consulted *before* any prompt is
+    /// `PermissionGate::drop_project_skill_grants` (a REQ-585 name its own doc
+    /// records as narrower than what it now sweeps) forgets the daemon's copy on
+    /// `/cd`; this store holds the same keys, is consulted *before* any prompt is
     /// drawn, and answers `allow_always` on its own. Without this, the daemon
     /// re-asks after a root move and the client auto-answers from a grant the
     /// user gave in a different repo — one `auto-allow` line, no commands
     /// shown, and the daemon then re-remembers it under the new root. That is
     /// exactly the harm ADR-6 exists to prevent, one hop across the seam.
     ///
-    /// User skills are kept: `~/.claude/skills/<name>` is the same file
-    /// whatever the root is. The predicate is
-    /// [`teton_protocol::methods::is_project_skill_key`] rather than a literal
-    /// prefix, so the two stores cannot drift about which keys expire.
-    pub fn forget_project_skills(&mut self) -> usize {
+    /// **Two families expire, and the predicate is shared rather than spelled.**
+    /// [`teton_protocol::methods::expires_on_session_root_change`] is the one
+    /// invalidation rule, above both crates: a project skill's dynamic-context
+    /// grant *and* REQ-587 BR-4's project-skill acknowledgment. A copy here that
+    /// knew only the first would keep the acknowledgment across a `/cd` while
+    /// the daemon dropped it — and the acknowledgment is the one grant whose
+    /// auto-answer costs a whole repository's skills reaching the model as
+    /// instructions with nobody shown anything. That is REQ-585's finding 2 on
+    /// the key ASSUME-017 was written for, which is why the rule lives in
+    /// `teton_protocol` and not in either store.
+    ///
+    /// User skills are kept: `~/.claude/skills/<name>` is the same file whatever
+    /// the root is.
+    pub fn forget_root_scoped_grants(&mut self) -> usize {
         let before = self.allow_always.len() + self.reject_always.len();
         self.allow_always
-            .retain(|key| !teton_protocol::methods::is_project_skill_key(key));
+            .retain(|key| !teton_protocol::methods::expires_on_session_root_change(key));
         self.reject_always
-            .retain(|key| !teton_protocol::methods::is_project_skill_key(key));
+            .retain(|key| !teton_protocol::methods::expires_on_session_root_change(key));
         before - (self.allow_always.len() + self.reject_always.len())
     }
 
@@ -924,14 +935,15 @@ pub fn render_event(
                         // refresh, and re-fetching on another session's move
                         // would ask for a root this client never had.
                         state.skills_stale = true;
-                        // …and the answers the user gave about *this* root's
-                        // skills. The daemon drops its copy inside
-                        // `set_session_cwd`; this is the same moment on this
-                        // side of the wire, under the same own-session
-                        // condition, because a grant consulted before the
-                        // prompt is drawn would otherwise auto-answer for a
-                        // repo the user never approved.
-                        state.grants.forget_project_skills();
+                        // …and the answers the user gave about *this* root:
+                        // its skills' commands, and REQ-587 BR-4's
+                        // acknowledgment that the model may run them at all.
+                        // The daemon drops its copy inside `set_session_cwd`;
+                        // this is the same moment on this side of the wire,
+                        // under the same own-session condition, because a grant
+                        // consulted before the prompt is drawn would otherwise
+                        // auto-answer for a repo the user never approved.
+                        state.grants.forget_root_scoped_grants();
                     }
                     surface.line(
                         LineKind::Notice,
@@ -1011,7 +1023,16 @@ fn render_skill_invoked(invoked: &SkillInvoked, surface: &mut dyn Surface, verbo
     }
 }
 
-/// BR-12's echo line: `/status → skill status (user, 5.3 KiB, 4 dynamic commands)`.
+/// BR-12's echo line: `/status → skill status (user, 5.3 KiB, 4 dynamic commands)`,
+/// or REQ-587 BR-9's `skill status (user, 5.3 KiB, 4 dynamic commands) — invoked
+/// by the model`.
+///
+/// **The `/name →` prefix is the user's typed line, so a model invocation does
+/// not carry one.** Nobody typed `/status`; printing it would put a line in the
+/// transcript that reads exactly like the user's own, which is the one
+/// distinction BR-9's suffix exists to draw. The parenthetical is identical in
+/// both, deliberately: same facts, same order, same units, so the two lines are
+/// comparable at a glance and only the attribution differs.
 ///
 /// The count is how many dynamic commands the invocation **had**, not how many
 /// succeeded: `outcomes` carries one entry per `` !`…` `` in the body whatever
@@ -1054,12 +1075,16 @@ fn skill_echo_line(invoked: &SkillInvoked) -> String {
     } else {
         format!("{count} dynamic commands, {ran} run")
     };
-    format!(
-        "/{name} → skill {name} ({source}, {size}, {dynamic})",
-        name = invoked.name,
+    let name = &invoked.name;
+    let body = format!(
+        "skill {name} ({source}, {size}, {dynamic})",
         source = slash::source_word(invoked.source),
         size = teton_protocol::format_bytes(invoked.body_bytes),
-    )
+    );
+    match invoked.invoked_by {
+        events::InvokedBy::User => format!("/{name} → {body}"),
+        events::InvokedBy::Model => format!("{body} — invoked by the model"),
+    }
 }
 
 /// One `/verbose` line for one dynamic command and what became of it.
@@ -2482,10 +2507,13 @@ pub(crate) enum ConsentGate {
 ///   answering from the next stdin line is behaviour a shipped script depends
 ///   on. BR-11's narrowing is about the *skill* consent and nothing else; a gate
 ///   that generalized it would be a silent change to every tool prompt.
-/// - **A skill's dynamic context needs a terminal.** This is the narrowing, and
-///   it is the whole of it. At `full` the daemon asks nothing, so a piped
-///   session still runs dynamic context exactly as a TTY does — that is the
-///   automation posture, and it is why this gate never sees those turns.
+/// - **Every skill subject needs a terminal.** This is the narrowing, and it is
+///   the whole of it: a skill's dynamic context (REQ-585 BR-6) and REQ-587
+///   BR-4's project-skill acknowledgment, which is the same rule applied to the
+///   question one step earlier. At `full` the daemon asks neither, so a piped
+///   session still runs dynamic context and still expands a non-shadowing
+///   project skill exactly as a TTY does — that is the automation posture, and
+///   it is why this gate never sees those turns.
 /// - **An unrecognized subject is refused, terminal or not.** A client that does
 ///   not know what it is being asked cannot render the question, so there is
 ///   nothing to put to the user even at a terminal; falling through to `ask`
@@ -2493,7 +2521,7 @@ pub(crate) enum ConsentGate {
 ///   in the direction that can only cost a skill invocation, never a swallowed
 ///   prompt line.
 ///
-/// Pure, so all six rows are unit-tested without a terminal, a pipe or a
+/// Pure, so all eight rows are unit-tested without a terminal, a pipe or a
 /// daemon: the rows that matter are the ones a test process cannot otherwise
 /// reach.
 #[must_use]
@@ -2508,16 +2536,22 @@ pub(crate) fn consent_gate(subject: Option<&PermissionSubject>, typed_input: boo
                 ConsentGate::RefuseNoTerminal
             }
         }
-        // TASK-219 OWNS THIS ARM AND MUST REPLACE IT. Placeholder only, and
-        // deliberately the fail-closed one: `render_consent_subject` cannot
-        // draw this subject yet, and the third rule above says a question this
-        // client cannot render is one it may not put to a human — answering
-        // would be reading a line for a prompt nobody was shown. BR-4's real
-        // rule is the `SkillDynamicContext` row (ask at a terminal, refuse
-        // without reading stdin on a pipe), which TASK-219 writes together with
-        // the renderer. Unreachable today: no daemon mints this subject until
-        // TASK-215.
-        Some(PermissionSubject::ProjectSkillTrust { .. }) => ConsentGate::RefuseUnrecognized,
+        // REQ-587 BR-4, and the same row as the one above it: this client can
+        // draw the question (`render_consent_subject` names the root and lists
+        // the set), so at a terminal it is asked — and on a pipe it is refused
+        // **without reading a line**, for the reason BR-11 gave the first skill
+        // subject. Nothing about this question is more answerable from a pipe
+        // than a command list is: it grants no effect, but what it grants is
+        // repository text reaching the model labelled *instructions*, and a
+        // pasted `y` becoming that consent is LESSON-537's shape on the one
+        // question that has no human in the loop by construction.
+        Some(PermissionSubject::ProjectSkillTrust { .. }) => {
+            if typed_input {
+                ConsentGate::Answerable
+            } else {
+                ConsentGate::RefuseNoTerminal
+            }
+        }
     }
 }
 
@@ -2689,30 +2723,27 @@ pub fn resolve_permission(
 /// matched rather than wildcarded so that adding a subject variant is a
 /// compile error here, where the question is drawn, and not a silently blank
 /// prompt.
+///
+/// Both skill subjects are drawn on the **refusing** path too, above the
+/// refusal line: a piped session is told what was refused, not merely that
+/// something was. That is the one place the wildcard would have been invisible —
+/// a blank arm renders nothing and asserts nothing, and the request would still
+/// be refused with the right reason.
 fn render_consent_subject(subject: Option<&PermissionSubject>, surface: &mut dyn Surface) {
     match subject {
-        // TASK-219 OWNS THE `ProjectSkillTrust` ARM AND MUST REPLACE IT: BR-4's
-        // prompt names the root and lists the project's model-invocable skills,
-        // marking each shadowing entry. It renders nothing here only because
-        // `consent_gate` refuses the subject outright until that task lands, so
-        // this blank arm is never on an asking path — the invariant the
-        // `Unrecognized` arm already relies on.
-        None
-        | Some(PermissionSubject::Unrecognized | PermissionSubject::ProjectSkillTrust { .. }) => {}
+        None | Some(PermissionSubject::Unrecognized) => {}
         Some(PermissionSubject::SkillDynamicContext {
             skill,
             source,
             commands,
-            // TASK-219 renders who asked here (BR-5: the consent says the model
-            // invoked the skill). Bound and ignored, not `..`, so the field
-            // stays visible to that task.
-            invoked_by: _,
+            invoked_by,
         }) => {
             surface.line(
                 LineKind::Prompt,
                 &format!(
-                    "  skill `{skill}` ({}) wants to run {} dynamic-context command{}:",
+                    "  skill `{skill}` ({}){} wants to run {} dynamic-context command{}:",
                     slash::source_word(*source),
+                    invoker_clause(*invoked_by),
                     commands.len(),
                     if commands.len() == 1 { "" } else { "s" },
                 ),
@@ -2724,6 +2755,69 @@ fn render_consent_subject(subject: Option<&PermissionSubject>, surface: &mut dyn
                 );
             }
         }
+        // REQ-587 BR-4's acknowledgment: the root, then the named set, one
+        // `Surface::line` per entry for the reason the command list is one per
+        // line — `line` defuses, and defusing destroys newlines.
+        Some(PermissionSubject::ProjectSkillTrust { root, skills, more }) => {
+            surface.line(
+                LineKind::Prompt,
+                &format!(
+                    "  the model wants to run this repository's skills as instructions: {root}",
+                ),
+            );
+            for entry in skills {
+                surface.line(
+                    LineKind::Prompt,
+                    &format!("    {}", project_skill_entry(entry)),
+                );
+            }
+            // Only when the daemon left some out. The tail is the *count* it
+            // sent, never a re-count of a list this side bounded: the bound is
+            // the daemon's, at the door that mints the subject, and "and some
+            // more" is a different fact from "+5 more" to someone being asked
+            // to trust the whole set.
+            if *more > 0 {
+                surface.line(LineKind::Prompt, &format!("    +{more} more"));
+            }
+        }
+    }
+}
+
+/// How the acknowledgment prompt names one project skill (REQ-587 BR-4, AC-6).
+///
+/// A shadowing entry reads `validate (project — shadows your user skill)`, which
+/// is the spelling the daemon's expansion frame uses for the same fact on the
+/// other side of the wire. Both are *rendered* from
+/// [`events::ProjectSkillTrustEntry::shadows_user_skill`]; neither is a re-parse
+/// of the other's prose (LESSON-529), which is why the wire carries a flag and
+/// not a pre-marked name.
+///
+/// An ordinary entry is its bare name. Every entry in this list is a project
+/// skill — the line above says so — so `(project)` on each of them would be the
+/// same word twenty times over, and the source is only worth saying where it
+/// contrasts with the user skill this one is taking the name from.
+fn project_skill_entry(entry: &events::ProjectSkillTrustEntry) -> String {
+    if entry.shadows_user_skill {
+        format!("{} (project — shadows your user skill)", entry.name)
+    } else {
+        entry.name.clone()
+    }
+}
+
+/// The clause BR-5 adds to a skill consent: **who asked**.
+///
+/// "You asked for `deploy`" and "the model decided to run `deploy`" are
+/// different questions carrying the same command list, and the human at
+/// `guarded` is entitled to know which one is on the screen.
+///
+/// A user invocation adds nothing, so REQ-585's prompt keeps its bytes exactly —
+/// the words it renders are the words `pty_e2e` already pins. The model's clause
+/// is the vocabulary [`skill_echo_line`] uses for the same fact, so a user who
+/// answered a prompt reads the same phrase back in the echo line that follows.
+fn invoker_clause(invoked_by: events::InvokedBy) -> &'static str {
+    match invoked_by {
+        events::InvokedBy::User => "",
+        events::InvokedBy::Model => ", invoked by the model,",
     }
 }
 
@@ -2746,6 +2840,15 @@ fn refusal_line(req: &PermissionRequest, reason: RefusalReason) -> String {
     let subject = match &req.subject {
         Some(PermissionSubject::SkillDynamicContext { skill, .. }) => {
             format!("skill `{skill}`'s dynamic context")
+        }
+        // REQ-587 BR-4. Named from the subject like the row above it: the key
+        // would say `project_skill_trust:~/dev/teton`, which names the same root
+        // in the vocabulary of a log rather than of a question. The fallback
+        // below still renders the key for a subject this build cannot read, and
+        // that remains the right answer there — it is the only thing such a
+        // request is known by.
+        Some(PermissionSubject::ProjectSkillTrust { root, .. }) => {
+            format!("running `{root}`'s skills as instructions")
         }
         _ => format!("`{}`", req.tool_name),
     };
@@ -7191,8 +7294,13 @@ mod skill_tests {
     }
 
     /// The subject a skill consent carries: three commands, already substituted,
-    /// in document order (ADR-7).
+    /// in document order (ADR-7), for a skill the **user** typed.
     fn skill_subject(skill: &str) -> PermissionSubject {
+        skill_subject_from(skill, events::InvokedBy::User)
+    }
+
+    /// [`skill_subject`], with who asked (REQ-587 BR-5).
+    fn skill_subject_from(skill: &str, invoked_by: events::InvokedBy) -> PermissionSubject {
         PermissionSubject::SkillDynamicContext {
             skill: skill.to_owned(),
             source: SkillSource::User,
@@ -7201,8 +7309,38 @@ mod skill_tests {
                 "git status --short".to_owned(),
                 "grep -c '' README.md".to_owned(),
             ],
-            // TASK-215/219 replace this: the fixture predates BR-9's invoker.
-            invoked_by: events::InvokedBy::User,
+            invoked_by,
+        }
+    }
+
+    /// BR-4's acknowledgment subject, as the daemon mints one: the root
+    /// home-relative, the named set in registry order with the shadowing entry
+    /// marked, and the tail as a count.
+    fn trust_subject(more: u32) -> PermissionSubject {
+        PermissionSubject::ProjectSkillTrust {
+            root: "~/dev/teton".to_owned(),
+            skills: vec![
+                events::ProjectSkillTrustEntry {
+                    name: "validate".to_owned(),
+                    shadows_user_skill: true,
+                },
+                events::ProjectSkillTrustEntry {
+                    name: "canary".to_owned(),
+                    shadows_user_skill: false,
+                },
+            ],
+            more,
+        }
+    }
+
+    /// The acknowledgment as the daemon raises it: under
+    /// `project_skill_trust:<root>`, never a skill's key and never a tool's
+    /// name, and with no `description` — the subject carries the facts.
+    fn trust_permission_request(subject: Option<PermissionSubject>) -> PermissionRequest {
+        PermissionRequest {
+            request_id: RequestId::from("r-trust"),
+            tool_name: teton_protocol::methods::project_skill_trust_key("~/dev/teton"),
+            ..skill_permission_request(subject)
         }
     }
 
@@ -7248,13 +7386,14 @@ mod skill_tests {
 
     // ----------------------------------------------------------------- gate
 
-    /// **ADR-8's truth table.** All six rows of a two-input predicate, pinned
+    /// **ADR-8's truth table.** All eight rows of a two-input predicate, pinned
     /// the way `cli_rows::write_gate`'s are — because the two rows that matter
     /// (a pipe, and a subject from the future) are the ones a test process
     /// cannot reach through a real terminal.
     #[test]
     fn the_consent_gate_is_a_truth_table_over_the_subject_and_the_terminal() {
         let skill = skill_subject("status");
+        let trust = trust_subject(0);
         let unknown = unrecognized_subject();
         for (case, subject, typed_input, expected) in [
             (
@@ -7279,6 +7418,21 @@ mod skill_tests {
             (
                 "a skill's dynamic context, on a pipe: refuse (BR-11)",
                 Some(&skill),
+                false,
+                ConsentGate::RefuseNoTerminal,
+            ),
+            (
+                "the project-skill acknowledgment, at a terminal: ask (BR-4)",
+                Some(&trust),
+                true,
+                ConsentGate::Answerable,
+            ),
+            (
+                "the project-skill acknowledgment, on a pipe: refuse — and \
+                 `RefuseNoTerminal`, not `RefuseUnrecognized`: this build knows \
+                 exactly what it is being asked and there is simply nobody to \
+                 ask (the placeholder arm TASK-210 left fails here)",
+                Some(&trust),
                 false,
                 ConsentGate::RefuseNoTerminal,
             ),
@@ -7337,6 +7491,137 @@ mod skill_tests {
             !grants.is_allow_always("skill:user:status")
                 && !grants.is_reject_always("skill:user:status"),
             "a refusal nobody answered records no session grant"
+        );
+    }
+
+    /// **REQ-587 BR-4's pipe rule, and the negative pin is the one that
+    /// matters.** A piped session at a level that would ask refuses the
+    /// acknowledgment **without reading a line** — the `y` a paste would have
+    /// left queued is still queued afterwards, and arrives as the user's next
+    /// *prompt* line rather than as consent for a repository's skills to reach
+    /// the model as instructions.
+    ///
+    /// **Mutation.** Treat the new subject as answerable on a pipe — the
+    /// `Answerable` row, or `prompter.ask` moved above the gate — and
+    /// `prompter.asked` is 1 here. Answer it `RefuseUnrecognized` instead, as
+    /// TASK-210's placeholder did, and the outcome assertion fails: the reason
+    /// is what tells the daemon whether anybody could have been asked, and
+    /// "this build does not know what it is asking" is false of a build that
+    /// draws the question two tests below.
+    #[test]
+    fn a_piped_project_skill_acknowledgment_is_refused_without_reading_a_line() {
+        let req = trust_permission_request(Some(trust_subject(0)));
+        let mut surface = RecordingSurface::new();
+        let mut prompter = ScriptedPrompter::new(&["y"]);
+        let mut grants = SessionGrants::default();
+
+        let resp = resolve_permission(&req, &mut surface, &mut prompter, &mut grants, false);
+
+        assert_eq!(
+            prompter.asked, 0,
+            "the gate ran before `ask`: {:?}",
+            prompter.questions
+        );
+        assert_eq!(
+            resp.outcome,
+            PermissionOutcome::Refused {
+                reason: RefusalReason::NoTerminal
+            },
+            "a refusal is never the cancellation a dismissed prompt produces, \
+             and never `UnrecognizedSubject` for a question this build can draw"
+        );
+        assert!(
+            !grants.is_allow_always(&req.tool_name) && !grants.is_reject_always(&req.tool_name),
+            "a refusal nobody answered records no session grant"
+        );
+        // Refused, and *said* — with the root named from the subject rather
+        // than from the key, and the unattended remedy BR-4 gives.
+        let notices = surface.lines_of(LineKind::Notice);
+        assert_eq!(notices.len(), 1, "one line, not a paragraph: {notices:?}");
+        assert!(
+            notices[0].contains("`~/dev/teton`") && notices[0].contains("not a terminal"),
+            "{}",
+            notices[0]
+        );
+        assert!(
+            notices[0].contains("/permissions full"),
+            "the model is to be told the user must acknowledge or run at full: {}",
+            notices[0]
+        );
+        // What was refused is still shown: a piped session is told which
+        // repository and which skills, not merely that something was refused.
+        let shown = surface.lines_of(LineKind::Prompt);
+        assert!(
+            shown.iter().any(|line| line.contains("~/dev/teton"))
+                && shown.iter().any(|line| line.contains("validate")),
+            "the subject block did not render on the refusing path: {shown:?}"
+        );
+    }
+
+    /// **BR-4's prompt bytes.** The root, the named set in registry order, the
+    /// shadowing entry marked in the spelling the daemon's expansion frame uses
+    /// for the same fact, and the bounded tail as `+N more`.
+    ///
+    /// One `Surface::line` per entry, for the command list's mechanical reason:
+    /// `line` defuses, and defusing destroys newlines, so a joined list would
+    /// arrive as one run-on line.
+    #[test]
+    fn the_acknowledgment_names_the_root_marks_shadowing_and_counts_the_tail() {
+        let req = trust_permission_request(Some(trust_subject(5)));
+        let mut surface = RecordingSurface::new();
+        let mut prompter = ScriptedPrompter::new(&["y"]);
+        let mut grants = SessionGrants::default();
+
+        let resp = resolve_permission(&req, &mut surface, &mut prompter, &mut grants, true);
+
+        assert_eq!(prompter.asked, 1, "at a terminal it is asked");
+        assert_eq!(
+            resp.outcome,
+            PermissionOutcome::Selected {
+                option_id: "allow_once".to_owned()
+            }
+        );
+        let lines = surface.lines_of(LineKind::Prompt);
+        let at = lines
+            .iter()
+            .position(|line| line.contains("this repository's skills"))
+            .unwrap_or_else(|| panic!("no acknowledgment block: {lines:?}"));
+        assert_eq!(
+            &lines[at..at + 4],
+            [
+                "  the model wants to run this repository's skills as instructions: ~/dev/teton",
+                "    validate (project — shadows your user skill)",
+                "    canary",
+                "    +5 more",
+            ],
+            "{lines:?}"
+        );
+        // The root is home-relative wherever it is rendered: BR-1's entity
+        // table, and the reason the daemon sends a display and not a path.
+        assert!(
+            !lines.iter().any(|line| line.contains("/Users/")),
+            "a username reached the prompt: {lines:?}"
+        );
+    }
+
+    /// A complete list has no tail line: `+0 more` is a line about nothing, and
+    /// the count is the daemon's fact rather than a re-count of what this side
+    /// was handed.
+    #[test]
+    fn a_complete_acknowledgment_list_prints_no_tail() {
+        let req = trust_permission_request(Some(trust_subject(0)));
+        let mut surface = RecordingSurface::new();
+        let mut prompter = ScriptedPrompter::new(&["y"]);
+        let mut grants = SessionGrants::default();
+        resolve_permission(&req, &mut surface, &mut prompter, &mut grants, true);
+
+        assert!(
+            !surface
+                .lines_of(LineKind::Prompt)
+                .iter()
+                .any(|line| line.contains("more")),
+            "{:?}",
+            surface.lines_of(LineKind::Prompt)
         );
     }
 
@@ -7459,6 +7744,42 @@ mod skill_tests {
         );
     }
 
+    /// **REQ-587 BR-5: the consent says who asked.** "You asked for `status`"
+    /// and "the model decided to run `status`" are different questions carrying
+    /// the same command list, and the human at `guarded` is entitled to know
+    /// which one is on the screen.
+    ///
+    /// The user's line is asserted **verbatim and unchanged**, because
+    /// `pty_e2e` pins those bytes against a real terminal: BR-9's attribution is
+    /// an inserted clause on the model's line, never a rewording of REQ-585's.
+    #[test]
+    fn a_skill_consent_says_when_the_model_was_the_one_that_asked() {
+        let ask = |invoked_by| {
+            let req = skill_permission_request(Some(skill_subject_from("status", invoked_by)));
+            let mut surface = RecordingSurface::new();
+            let mut prompter = ScriptedPrompter::new(&["y"]);
+            let mut grants = SessionGrants::default();
+            resolve_permission(&req, &mut surface, &mut prompter, &mut grants, true);
+            surface
+                .lines_of(LineKind::Prompt)
+                .iter()
+                .find(|line| line.contains("dynamic-context command"))
+                .expect("the block names the skill and the count")
+                .to_string()
+        };
+
+        assert_eq!(
+            ask(events::InvokedBy::User),
+            "  skill `status` (user) wants to run 3 dynamic-context commands:",
+            "REQ-585's prompt keeps its bytes; `pty_e2e` pins them",
+        );
+        assert_eq!(
+            ask(events::InvokedBy::Model),
+            "  skill `status` (user), invoked by the model, wants to run 3 \
+             dynamic-context commands:",
+        );
+    }
+
     /// The refusal says what was checked and names the remedy, because a
     /// refusal without one is a dead end — and the remedy is BR-11's stated
     /// automation posture, not an invitation to type at a terminal.
@@ -7503,8 +7824,17 @@ mod skill_tests {
 
     // --------------------------------------------------------- echo line
 
-    /// One invocation, as the daemon publishes it.
+    /// One invocation, as the daemon publishes it — the **user**-typed one,
+    /// which is REQ-585's whole world and every byte of it is still pinned.
     fn invoked(outcomes: Vec<DynamicOutcomeView>) -> SkillInvoked {
+        invoked_by(outcomes, events::InvokedBy::User)
+    }
+
+    /// [`invoked`], with who issued it (REQ-587 BR-9).
+    fn invoked_by(
+        outcomes: Vec<DynamicOutcomeView>,
+        invoked_by: events::InvokedBy,
+    ) -> SkillInvoked {
         SkillInvoked {
             name: "status".to_owned(),
             source: SkillSource::User,
@@ -7513,8 +7843,7 @@ mod skill_tests {
             ignored_keys: vec!["allowed-tools".to_owned(), "model".to_owned()],
             name_note: None,
             outcomes,
-            // TASK-219 replaces this: the fixture predates BR-9's invoker.
-            invoked_by: events::InvokedBy::User,
+            invoked_by,
         }
     }
 
@@ -7557,6 +7886,58 @@ mod skill_tests {
         assert_eq!(
             surface.lines_of(LineKind::Notice),
             vec!["/status → skill status (user, 5.3 KiB, 4 dynamic commands)"]
+        );
+    }
+
+    /// **REQ-587 BR-9 / AC-10, in the shipped spellings.** A model invocation
+    /// echoes one line saying so — `teton_protocol::format_bytes`, so `KiB` and
+    /// not the spec's illustrative `KB`, and **both** counts whenever they
+    /// differ, which AC-5's declined path produces routinely.
+    ///
+    /// It carries **no `/status →` prefix**: nobody typed that line, and a
+    /// transcript that showed one would read exactly like the user's own — the
+    /// single distinction the suffix exists to draw. The parenthetical is
+    /// byte-identical to the user line's, which is the other half of the claim.
+    #[test]
+    fn a_model_invocation_says_so_and_carries_no_typed_prefix() {
+        let outcomes = vec![
+            ran("ls -1", 120),
+            DynamicOutcomeView {
+                command: "date".to_owned(),
+                outcome: DynamicOutcome::NotRun {
+                    reason: NotRunReason::Declined,
+                },
+            },
+            DynamicOutcomeView {
+                command: "git status".to_owned(),
+                outcome: DynamicOutcome::NotRun {
+                    reason: NotRunReason::Declined,
+                },
+            },
+        ];
+        let mut surface = RecordingSurface::new();
+        let mut state = SessionState::new();
+        render_event(
+            &envelope(Event::SkillInvoked(invoked_by(
+                outcomes.clone(),
+                events::InvokedBy::Model,
+            ))),
+            &mut surface,
+            &mut state,
+        );
+
+        assert_eq!(
+            surface.lines_of(LineKind::Notice),
+            vec!["skill status (user, 5.3 KiB, 3 dynamic commands, 1 run) — invoked by the model"],
+        );
+        assert_eq!(surface.calls.len(), 1, "still one line, and never the body");
+
+        // The same invocation typed by the user: the prefix returns, the suffix
+        // goes, and everything between them is the same bytes.
+        let user = skill_echo_line(&invoked(outcomes));
+        assert_eq!(
+            user,
+            "/status → skill status (user, 5.3 KiB, 3 dynamic commands, 1 run)",
         );
     }
 
@@ -7834,7 +8215,10 @@ mod skill_tests {
     /// see any of that, because by then the request never reaches a human.
     #[test]
     fn a_root_move_forgets_the_project_skill_grants_and_keeps_the_others() {
-        use teton_protocol::methods::{skill_permission_key, SkillSource};
+        use teton_protocol::methods::{
+            expires_on_session_root_change, project_skill_trust_key, skill_permission_key,
+            SkillSource,
+        };
 
         let mut surface = RecordingSurface::new();
         let mut state = SessionState::new();
@@ -7842,15 +8226,41 @@ mod skill_tests {
 
         let project = skill_permission_key(SkillSource::Project, "deploy");
         let user = skill_permission_key(SkillSource::User, "status");
+        // REQ-587 BR-4 / ASSUME-017: the acknowledgment is the second family a
+        // root move invalidates, and the one whose survival costs most.
+        let acknowledgment = project_skill_trust_key("~/dev/before");
         state.grants.allow_always(&project);
         state.grants.allow_always(&user);
         state.grants.allow_always("shell");
+        state.grants.allow_always(&acknowledgment);
         state
             .grants
             .reject_always(&skill_permission_key(SkillSource::Project, "canary"));
 
         render_event(&root_moved("s1"), &mut surface, &mut state);
 
+        // **The two stores expire the same keys at the same moment.** This
+        // client's memo is consulted *before* any prompt is drawn, so a key it
+        // keeps and the daemon drops is not a stale entry — it is an
+        // `auto-allow` line answering the new root's question with the old
+        // root's answer, with no human shown anything. Asserted against the
+        // shared predicate rather than against a list of keys, so a family
+        // added to one side cannot be forgotten on this one.
+        for key in [&project, &acknowledgment] {
+            assert!(
+                expires_on_session_root_change(key),
+                "`{key}` is one of the keys a `/cd` invalidates",
+            );
+            assert!(
+                !state.grants.is_allow_always(key),
+                "`{key}` outlived the root that gave it meaning, and this store \
+                 answers before a prompt is drawn",
+            );
+        }
+        assert!(
+            !expires_on_session_root_change(&user) && !expires_on_session_root_change("shell"),
+            "the kept half is kept because the rule says so, not by coincidence",
+        );
         assert!(
             !state.grants.is_allow_always(&project),
             "a project skill's grant outlived the root that gave its name meaning",

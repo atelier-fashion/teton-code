@@ -52,13 +52,15 @@
     "teton-code"
   ],
   "phase4": {
-    "currentTask": "TIER-1: TASK-212, TASK-215",
+    "currentTask": "TIER-2: TASK-216, TASK-219",
     "completedTasks": [
       "TASK-210",
       "TASK-211",
       "TASK-213",
       "TASK-214",
-      "TASK-220"
+      "TASK-220",
+      "TASK-212",
+      "TASK-215"
     ],
     "failedTasks": []
   }

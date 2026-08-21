@@ -54,6 +54,7 @@ pub mod grep;
 pub mod mcp;
 pub mod read;
 pub mod shell;
+pub mod skill;
 pub mod walk;
 pub mod web;
 
@@ -64,7 +65,65 @@ pub use grep::GrepTool;
 pub use mcp::{register_mcp_tools, McpToolHandle};
 pub use read::ReadTool;
 pub use shell::ShellTool;
+pub use skill::{register_skill_tool, SkillTool, SKILL_TOOL_NAME};
 pub use web::{register_web_tool, WebTool, WEB_TOOL_NAME};
+
+// ---------------------------------------------------------------------------
+// The cap-exempt reason table (ADR-10)
+// ---------------------------------------------------------------------------
+
+/// Every tool exempt from the degraded-profile `max_tools` cut, with the
+/// **stated, distinct reason** its exemption was granted for (ADR-10).
+///
+/// A declared table rather than prose in a doc comment, in
+/// `RESERVED_SKILL_NAMES`' shape: AC-17 asserts that adding a tool to the exempt
+/// set "without a reason fails the build", and prose cannot fail a build. The
+/// enforcing test cross-checks this table against the registry in **both**
+/// directions, so a tool registered `register_cap_exempt` without a row here is
+/// red, and a row here for a tool nothing registers is red too.
+///
+/// The membership rule is that the reason is *distinct*. A reason that merely
+/// repeats an existing member's is a sign the cap is being argued with rather
+/// than an exemption being earned — which is why the reasons are values that can
+/// be compared, and the test compares them.
+pub const CAP_EXEMPT_TOOLS: &[(&str, &str)] = &[
+    (
+        DOCS_TOOL_NAME,
+        "self-serving product knowledge, needed most exactly where the cap bites: the \
+         profiles the cap applies to are the ones whose model does not know Teton's own \
+         setup surface (REQ-577 BR-7)",
+    ),
+    (
+        WEB_TOOL_NAME,
+        "the user's opt-in must survive the cap: the capability exists only because \
+         someone turned it on, and a setting that silently stops applying on some \
+         providers is a setting that lies (REQ-563)",
+    ),
+    (
+        SKILL_TOOL_NAME,
+        "the only path to text outside the jail, whose opt-in is the install: a \
+         capability that exists because the user installed skills must not be silently \
+         withheld by a cap whose limit equals the built-in count (REQ-587 BR-2)",
+    ),
+];
+
+/// Every tool that raises its **own** permission prompt inside [`Tool::run`],
+/// with the reason (ADR-10).
+///
+/// The self-gating pin used to read `gates_itself() == (name == WEB_TOOL_NAME)`,
+/// and amending that equality to name two tools *relaxes* it — which is the
+/// complaint AC-17 makes. A table keeps the pin an equality against a declared
+/// set: a tool that starts answering `true` without a row here fails, exactly as
+/// a second `web` would have before.
+///
+/// The surface is fail-open — a tool that answers `true` is **not** authorized
+/// by the loop — so membership is the thing worth declaring.
+pub const SELF_GATING_TOOLS: &[(&str, &str)] = &[(
+    WEB_TOOL_NAME,
+    "fetch and search are separately consented tiers, a lookup above the ceiling is \
+     refused before any prompt, and a cache hit performs no egress and must not prompt \
+     at all — three facts only the tool holds (REQ-563 BR-3)",
+)];
 
 /// Shared execution context for every tool: the session-root jail.
 ///
@@ -1534,14 +1593,21 @@ mod tests {
     /// The fixture now starts from a registry that *already* carries one exempt
     /// tool — `with_builtins` registers `teton_docs` that way — which is the
     /// case worth pinning: the arithmetic must hold for a set, not for the one
-    /// exemption that happened to exist when it was written.
+    /// exemption that happened to exist when it was written. REQ-587 adds a
+    /// third member (`skill`, ADR-10), so the count is **eight**: five capped
+    /// built-ins plus three exempt.
     #[test]
     fn a_cap_exempt_tool_is_never_displaced_by_the_max_tools_cut() {
         // The registration order the daemon uses: built-ins (including the
-        // cap-exempt `teton_docs`), then MCP, then the cap-exempt web tool.
+        // cap-exempt `teton_docs`), then MCP, then the two cap-exempt optional
+        // tools. Stubs rather than the real ones, because this test is about
+        // the registry's arithmetic and not about either tool's construction;
+        // `the_cap_exempt_table_is_the_registrys_exempt_set` drives the real
+        // `register_skill_tool`.
         let mut reg = ToolRegistry::with_builtins();
         reg.register(Arc::new(StubTool("mcp")));
-        reg.register_cap_exempt(Arc::new(StubTool("web")));
+        reg.register_cap_exempt(Arc::new(StubTool(WEB_TOOL_NAME)));
+        reg.register_cap_exempt(Arc::new(StubTool(SKILL_TOOL_NAME)));
 
         let exposed = reg.exposed_names(Some(5));
         for builtin in ["read", "edit", "grep", "glob", "shell"] {
@@ -1555,18 +1621,23 @@ mod tests {
             "the cap must still bound optional (non-exempt) tools: {exposed:?}"
         );
         assert!(
-            exposed.contains(&"web"),
+            exposed.contains(&WEB_TOOL_NAME),
             "an explicitly opted-in cap-exempt tool was cut: {exposed:?}"
         );
         assert!(
             exposed.contains(&DOCS_TOOL_NAME),
             "the built-in cap-exempt tool was cut: {exposed:?}"
         );
+        assert!(
+            exposed.contains(&SKILL_TOOL_NAME),
+            "the `skill` tool is cap-exempt with its own stated reason (REQ-587 BR-2, \
+             ADR-10) and was cut: {exposed:?}"
+        );
         assert_eq!(
             exposed.len(),
-            7,
+            8,
             "exemption raises the effective budget by exactly the number of exempt \
-             tools — five capped built-ins plus two exempt: {exposed:?}"
+             tools — five capped built-ins plus three exempt: {exposed:?}"
         );
 
         // docs mirror exposed_names. Matched on the rendered entry, because
@@ -1574,7 +1645,163 @@ mod tests {
         // otherwise answer for the web tool's own line.
         let docs = reg.docs(Some(5));
         assert!(docs.contains("- web:"), "{docs}");
+        assert!(docs.contains(&format!("- {SKILL_TOOL_NAME}:")), "{docs}");
         assert!(docs.contains(&format!("- {DOCS_TOOL_NAME}:")), "{docs}");
+        assert!(!docs.contains("- mcp:"), "{docs}");
+    }
+
+    /// A registry holding one model-invocable skill, built from a throwaway
+    /// tree — never a read of `~/.claude`, which would make these assertions a
+    /// property of the developer's machine (LESSON-540).
+    fn skill_registry(tag: &str) -> Arc<crate::skills::SkillRegistry> {
+        let home = temp_root(&format!("skills-home-{tag}"));
+        let dir = home.join(".claude").join("skills").join("alpha");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("SKILL.md"), "---\nname: alpha\n---\nbody\n").unwrap();
+        let registry = Arc::new(crate::skills::discover(
+            Some(&home),
+            &temp_root(&format!("skills-root-{tag}")),
+            RootKind::Plain,
+            &crate::skills::RealFs,
+        ));
+        assert!(
+            registry.invocable_by_model("alpha").is_some(),
+            "the fixture registry holds nothing the model may invoke, so every \
+             assertion below would be about an unregistered tool"
+        );
+        registry
+    }
+
+    /// A permission gate, for the one tool constructor here that takes one.
+    fn tool_gate() -> Arc<super::super::permissions::PermissionGate> {
+        use super::super::permissions::{
+            PendingPermissions, PermissionConfig, PermissionGate, PermissionPolicy,
+        };
+        Arc::new(PermissionGate::new(
+            teton_protocol::SessionId::from("tools-mod-test"),
+            PermissionConfig::with_default(PermissionPolicy::Allow),
+            Arc::new(crate::broadcast::EventBus::new()),
+            Arc::new(PendingPermissions::new()),
+        ))
+    }
+
+    /// The daemon's registration order, with the **real** `skill` tool and a
+    /// stand-in for `web`: built-ins, then MCP, then the two optional
+    /// cap-exempt tools, last.
+    fn daemon_shaped_registry(tag: &str) -> ToolRegistry {
+        let mut reg = ToolRegistry::with_builtins();
+        reg.register(Arc::new(StubTool("mcp")));
+        reg.register_cap_exempt(Arc::new(StubTool(WEB_TOOL_NAME)));
+        assert!(
+            register_skill_tool(
+                &mut reg,
+                skill_registry(tag),
+                tool_gate(),
+                None,
+                tokio::runtime::Handle::current(),
+                1_000,
+            ),
+            "the fixture registry holds a model-invocable skill, so registration is \
+             the condition's `true` arm"
+        );
+        reg
+    }
+
+    /// **ADR-10: the cap-exempt set is a declared table with a stated reason
+    /// per member, cross-checked against the registry.**
+    ///
+    /// AC-17 asserts that adding a tool to the exempt set "without a reason
+    /// fails the build", and before this table nothing could do that: the
+    /// reasons were prose in a doc comment and the enforcing test asserted a
+    /// membership and a count. This is `RESERVED_SKILL_NAMES`' shape — a
+    /// declared table plus a test asserting it is exactly the derivation.
+    ///
+    /// The derivation is `exposed_names(Some(0))`: under a cap of zero the only
+    /// tools left standing are the exempt ones, so the exempt set is observable
+    /// through the registry's own public surface rather than through a private
+    /// field. Equality in both directions — a tool registered
+    /// `register_cap_exempt` with no row here is red, and a row here for a tool
+    /// nothing registers is red too.
+    #[tokio::test]
+    async fn the_cap_exempt_table_is_the_registrys_exempt_set() {
+        let reg = daemon_shaped_registry("exempt-table");
+        let declared: Vec<&str> = CAP_EXEMPT_TOOLS.iter().map(|(name, _)| *name).collect();
+        assert_eq!(
+            reg.exposed_names(Some(0)),
+            declared,
+            "the exempt set and its reason table disagree. Every exemption is granted \
+             for a stated reason (ADR-10): add the row, or drop the \
+             `register_cap_exempt`."
+        );
+
+        // The membership *rule*, not just the membership: an exemption is
+        // granted for a reason that is its own. A reason repeating an existing
+        // member's is a sign the cap is being argued with rather than an
+        // exemption being earned.
+        for (name, reason) in CAP_EXEMPT_TOOLS {
+            assert!(
+                !reason.trim().is_empty(),
+                "`{name}` is exempt for no stated reason"
+            );
+        }
+        for (index, (name, reason)) in CAP_EXEMPT_TOOLS.iter().enumerate() {
+            for (other, other_reason) in &CAP_EXEMPT_TOOLS[index + 1..] {
+                assert_ne!(
+                    reason, other_reason,
+                    "`{name}` and `{other}` are exempt for the same stated reason"
+                );
+                assert_ne!(name, other, "`{name}` has two rows");
+            }
+        }
+    }
+
+    /// **AC-4's exposure arithmetic, at the three caps that say different
+    /// things.**
+    ///
+    /// `Some(5)` is the degraded profile the daemon actually derives — the cap
+    /// whose limit *equals* the built-in count, so a non-exempt sixth tool never
+    /// survives it (LESSON-496). `None` is the strong profile. `Some(0)` is the
+    /// arm a reader gets wrong: the cap bounds only **non-exempt**
+    /// registrations, so the exempt tools are still exposed there, exactly as
+    /// `teton_docs` is today.
+    #[tokio::test]
+    async fn the_skill_tool_is_exposed_at_every_cap_ac4_names() {
+        let reg = daemon_shaped_registry("ac4");
+
+        let capped = reg.exposed_names(Some(5));
+        assert_eq!(
+            capped,
+            vec![
+                "read",
+                "edit",
+                "grep",
+                "glob",
+                "shell",
+                DOCS_TOOL_NAME,
+                WEB_TOOL_NAME,
+                SKILL_TOOL_NAME
+            ],
+            "under the degraded cap the five built-ins, `teton_docs`, the opted-in web \
+             tool and `skill` are all exposed — and the non-exempt MCP tool is not"
+        );
+
+        let strong = reg.exposed_names(None);
+        assert!(strong.contains(&SKILL_TOOL_NAME), "{strong:?}");
+        assert!(
+            strong.contains(&"mcp"),
+            "no cap means every tool: {strong:?}"
+        );
+
+        assert_eq!(
+            reg.exposed_names(Some(0)),
+            vec![DOCS_TOOL_NAME, WEB_TOOL_NAME, SKILL_TOOL_NAME],
+            "a cap of zero bounds the non-exempt registrations only; the exempt tools \
+             are present exactly as `teton_docs` is today"
+        );
+
+        // The docs the model reads mirror `exposed_names` at the cap that bites.
+        let docs = reg.docs(Some(5));
+        assert!(docs.contains(&format!("- {SKILL_TOOL_NAME}:")), "{docs}");
         assert!(!docs.contains("- mcp:"), "{docs}");
     }
 
