@@ -55,6 +55,12 @@ use teton_inference::ChatFormat;
 /// invoked — the fabrication axis, with the frame that says *follow this*
 /// instead of the one that says *this is data*, which makes it the more
 /// valuable one to forge, not the less.
+/// `<skill-arguments` ([`super::tools::skill::ARGS_OPEN_TAG`]) is the sub-frame
+/// that marks a region of an expansion as the **caller's** argument text rather
+/// than the file's instructions. It is listed for the same reason and with the
+/// opposite payoff: a model that emits one is not claiming to hold a skill body
+/// but re-drawing the line inside one the harness already wrote, which is how a
+/// forged region ends up outside the "this is data" sentence.
 pub(super) const FLAT_ANCHORED_MARKERS: &[&str] = &[
     "User:",
     "Assistant:",
@@ -62,6 +68,7 @@ pub(super) const FLAT_ANCHORED_MARKERS: &[&str] = &[
     "<tool-result",
     "<mcp-tool-result",
     "<skill-body",
+    "<skill-arguments",
 ];
 
 /// Line-anchored fabrication markers for the ChatML rendering (REQ-554 BR-4,
@@ -79,6 +86,7 @@ pub(super) const CHATML_ANCHORED_MARKERS: &[&str] = &[
     "<tool-result",
     "<mcp-tool-result",
     "<skill-body",
+    "<skill-arguments",
     super::context::TOOL_RESULT_LABEL_PREFIX,
 ];
 

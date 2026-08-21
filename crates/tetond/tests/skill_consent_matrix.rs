@@ -40,6 +40,8 @@
 //! | BR-4 (level posture) | [`the_level_default_governs_the_acknowledgment_at_every_level`] |
 //! | BR-4 (shadowing asks even at `full`) | [`a_shadowing_project_skill_is_acknowledged_even_at_full`] |
 //! | BR-4 (bounded list) | [`the_acknowledgment_names_twenty_skills_and_counts_the_rest`] |
+//! | BR-4 (the bound never drops the disclosure) | [`a_shadowing_skill_is_never_the_entry_the_bound_drops`] |
+//! | ADR-7 (each door keeps its key family in **release** too) | [`each_skill_door_refuses_the_others_key_in_every_build_profile`] |
 //! | BR-4 (per root) | [`an_acknowledgment_for_one_root_does_not_answer_another_root`] |
 //! | BR-4 (isolation) | [`a_shell_grant_does_not_answer_the_acknowledgment`], [`an_acknowledgment_does_not_answer_a_skills_dynamic_context`] |
 //! | ASSUME-017 (`/cd`) | [`the_acknowledgment_is_dropped_when_the_session_root_moves`] |
@@ -69,6 +71,8 @@
 //! | let a shadowing acknowledgment override `plan`'s `deny` | [`a_shadowing_project_skill_is_acknowledged_even_at_full`] |
 //! | key the acknowledgment on something other than the root | [`an_acknowledgment_for_one_root_does_not_answer_another_root`] |
 //! | list the project's skills unbounded | [`the_acknowledgment_names_twenty_skills_and_counts_the_rest`] |
+//! | bound the list in registry order, dropping a shadowing entry | [`a_shadowing_skill_is_never_the_entry_the_bound_drops`] |
+//! | make either door's key-family guard a `debug_assert!` again | [`each_skill_door_refuses_the_others_key_in_every_build_profile`] |
 //! | report every consent as the user's | [`the_consent_reports_the_caller_that_invoked_the_skill`] |
 //!
 //! ## What this file cannot prove (TASK-215)
@@ -1550,6 +1554,83 @@ async fn the_acknowledgment_names_twenty_skills_and_counts_the_rest() {
     answerer.stop();
 }
 
+/// **BR-4: the bound can never drop a shadowing entry — the disclosure is what
+/// the grant is answered from.**
+///
+/// [`LevelAllow::DoesNotSettle`] makes a shadowing invocation ask even at
+/// `full`, but the answer is remembered per **root**, so a remembered grant
+/// answers every later invocation under that key — including one of a skill the
+/// prompt never named. Registry order alone let the disclosure be truncated
+/// away and the grant settle anyway:
+///
+/// > A repository ships twenty-one model-invocable project skills, one named
+/// > `validate` to shadow the user's, with twenty alphabetically-earlier names
+/// > ahead of it. At `guarded` the model first invokes a benign one; the prompt
+/// > lists twenty **unmarked** names and `+1 more`; the user allows for the
+/// > session. The next `skill { name: "validate" }` is auto-answered from that
+/// > grant and the model gets the repository's body where it asked for the
+/// > user's.
+///
+/// That is the surprise BR-4's `full` exception exists to prevent, arriving
+/// through the bound instead of through the level. Shadowing entries are
+/// therefore hoisted before the truncation.
+///
+/// Two things are asserted, and the second is the one a naive fix loses: the
+/// shadowing entry survives, **and** registry order still decides among equals,
+/// so the prompt is reproducible for a given registry rather than reshuffled.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_shadowing_skill_is_never_the_entry_the_bound_drops() {
+    let conns = connections(1);
+    let Session {
+        gate,
+        pending,
+        bus_watch: _bus_watch,
+        routed,
+    } = session_at(PermissionLevel::Guarded, "ack-bounded-shadow", &conns);
+    let answerer = Answerer::spawn(routed, Arc::clone(&pending), vec![selected("allow_once")]);
+
+    // Twenty benign names ahead of the one that shadows — the registry order a
+    // repository gets for free by naming its shadowing skill anything late in
+    // the alphabet.
+    let mut skills: Vec<_> = (0..20)
+        .map(|n| entry(&format!("aa-{n:02}"), false))
+        .collect();
+    skills.push(entry("validate", true));
+
+    assert_eq!(
+        acknowledge(&gate, "~/dev/teton", &skills, true, conns[0]).await,
+        SkillConsent::Allowed
+    );
+
+    match answerer.prompts().remove(0).request.subject {
+        Some(PermissionSubject::ProjectSkillTrust { skills, more, .. }) => {
+            assert_eq!(skills.len(), 20, "still bounded");
+            assert_eq!(more, 1, "still counted");
+            assert_eq!(
+                skills.first().map(|e| e.name.as_str()),
+                Some("validate"),
+                "the shadowing entry must be inside the twenty the user is \
+                 shown: a grant given against a list of unmarked names goes on \
+                 to answer for the shadowed one"
+            );
+            assert!(skills[0].shadows_user_skill, "and it is still marked");
+            assert_eq!(
+                skills[1..]
+                    .iter()
+                    .map(|e| e.name.clone())
+                    .collect::<Vec<String>>(),
+                (0..19)
+                    .map(|n| format!("aa-{n:02}"))
+                    .collect::<Vec<String>>(),
+                "registry order still decides among equals — a sort that \
+                 reshuffled the rest would make one registry draw two prompts"
+            );
+        }
+        other => panic!("expected a project-skill-trust subject, got {other:?}"),
+    }
+    answerer.stop();
+}
+
 // ---------------------------------------------------------------------------
 // REQ-587 — what must *not* happen
 // ---------------------------------------------------------------------------
@@ -2004,4 +2085,122 @@ async fn the_consent_reports_the_caller_that_invoked_the_skill() {
         }
         answerer.stop();
     }
+}
+
+/// **ADR-7 in the shipped binary: each door refuses the other's key family, and
+/// it does so in *every* build profile.**
+///
+/// The separation is the whole reason there are three doors. It was enforced by
+/// a pair of `debug_assert!`s, which are compiled out of a release build — so
+/// what actually held the line in the binary users run was that each door
+/// happens to have exactly one production caller that mints correctly, and the
+/// permissions module doc presented the assertions as the mechanism. This
+/// repository already carries a recorded lesson about guards that degrade to
+/// allow on the shipped build; this is the guard that would catch the *next*
+/// caller minting the wrong key, and CI (a debug build) could never see it stop
+/// working.
+///
+/// So the family checks are ordinary refusals, and this test asserts an
+/// **answer** rather than a panic — the same test in debug and release, and the
+/// reason it lives here rather than only beside the doors: `permissions.rs`'s
+/// legs run in-crate, and a `#[should_panic]` there cannot say what a release
+/// build does.
+///
+/// The session is at `full` on purpose. That is the level whose `allow` row
+/// settles every question outright, so a door with its guard removed answers
+/// `Allowed` here — which is exactly the mutation, and exactly what fails.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn each_skill_door_refuses_the_others_key_in_every_build_profile() {
+    let conns = connections(1);
+    let Session {
+        gate,
+        pending,
+        bus_watch: _bus_watch,
+        routed,
+    } = session_at(PermissionLevel::Full, "door-families", &conns);
+    // Scripted to allow, so a guard that let one of these through would be
+    // answered `Allowed` rather than merely going unanswered.
+    let answerer = Answerer::spawn(
+        routed,
+        Arc::clone(&pending),
+        vec![selected("allow_always"), selected("allow_always")],
+    );
+
+    // The acknowledgment's key through the door that asks whether a skill's
+    // commands may run.
+    let acknowledgment = project_skill_trust_key("~/dev/teton");
+    assert_eq!(
+        tokio::time::timeout(
+            PROMPT_WAIT,
+            gate.authorize_skill(
+                &acknowledgment,
+                "validate",
+                SkillSource::Project,
+                vec!["./validate.sh".to_owned()],
+                InvokedBy::Model,
+                conns[0],
+            ),
+        )
+        .await
+        .expect("a refused key is answered without a prompt"),
+        SkillConsent::Unanswerable,
+        "BR-4's question must not be remembered under the question `may \
+         /validate's commands run` — and `full` must not settle it on the way"
+    );
+
+    // A skill's own key through the door that asks whether the model may run
+    // this repository's skills at all — the mirror image.
+    assert_eq!(
+        tokio::time::timeout(
+            PROMPT_WAIT,
+            gate.authorize_project_skill_trust(
+                &permission_key_for(SkillSource::Project, "validate"),
+                "~/dev/teton",
+                &[entry("validate", true)],
+                false,
+                conns[0],
+            ),
+        )
+        .await
+        .expect("a refused key is answered without a prompt"),
+        SkillConsent::Unanswerable,
+        "a `y` to `/validate`'s commands must not become a `y` to running this \
+         repository's skills as instructions"
+    );
+
+    assert_eq!(
+        answerer.count(),
+        0,
+        "a misrouted key is refused at the door; nobody is asked, and no answer \
+         is remembered under it"
+    );
+
+    // Falsification: the same gate, the same level, each door with its *own*
+    // key — both settle at `full`, so the two refusals above are the guards and
+    // not a gate that has stopped answering.
+    assert_eq!(
+        acknowledge(
+            &gate,
+            "~/dev/teton",
+            &[entry("validate", false)],
+            false,
+            conns[0]
+        )
+        .await,
+        SkillConsent::Allowed
+    );
+    assert_eq!(
+        invoke_as(
+            &gate,
+            "validate",
+            SkillSource::Project,
+            &["./validate.sh"],
+            ArgumentInterpolation::None,
+            InvokedBy::Model,
+            conns[0],
+        )
+        .await,
+        SkillConsent::Allowed
+    );
+    answerer.stop();
 }

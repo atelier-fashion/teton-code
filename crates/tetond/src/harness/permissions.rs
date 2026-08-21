@@ -70,11 +70,20 @@
 //! from either of the two above: not "may these commands run?" but "may the
 //! model run **this repository's** skills as instructions at all?" (BR-4). It is
 //! a third entry point rather than a widened [`PermissionGate::authorize_skill`]
-//! because that function's two `debug_assert!`s require its key to be a skill
-//! key *and* to equal the key `(source, name)` mints, and an acknowledgment key
-//! — [`project_skill_trust_key`], deliberately not `skill:` — is neither.
-//! Widening them would loosen a guard that is pinned in both directions
+//! because that function guards its key twice — the key must be a skill key
+//! *and* equal the key `(source, name)` mints — and an acknowledgment key —
+//! [`project_skill_trust_key`], deliberately not `skill:` — is neither.
+//! Widening those guards would loosen something pinned in both directions
 //! (architecture ADR-7).
+//!
+//! Each door's **family** check is an ordinary `if` that refuses, not a
+//! `debug_assert!`. That distinction is the whole of what enforces the
+//! separation in a shipped build: an assertion is compiled out, so a release
+//! `authorize_skill` would take an acknowledgment key and a release
+//! `authorize_project_skill_trust` would take a skill's — with nothing red in
+//! CI, because CI runs the debug build where the assertion holds. The exact-key
+//! equalities remain assertions, because they police a lockstep between a
+//! minter and its guard rather than a caller reaching the wrong door.
 //!
 //! The other half of REQ-587 lands *inside* the skill door: when any command in
 //! a body interpolates `$ARGUMENTS`/`$N`, the grant is remembered under a key
@@ -161,10 +170,17 @@ pub enum SkillConsent {
     /// at, or a subject this client does not recognize. Nobody declined
     /// anything, and the placeholder must not say they did.
     Refused(RefusalReason),
-    /// The question could never be put to the connection that asked it — no
-    /// addressed-delivery route was wired, the connection would not take the
-    /// frame, or it went away before answering. Fail-closed, and distinct from
+    /// The question could never be put to anyone — no addressed-delivery route
+    /// was wired, the connection would not take the frame, it went away before
+    /// answering, or the daemon reached a skill door under a key that door must
+    /// not remember an answer against (REQ-587). Fail-closed, and distinct from
     /// [`Self::Declined`] for the same reason [`Self::Refused`] is.
+    ///
+    /// The last cause is the daemon's own defect rather than the client's, which
+    /// is why it lands here and not on [`Self::Refused`]: that variant's
+    /// `RefusalReason` describes what a *client* did, and neither of its two
+    /// values would be a true account of a misrouted key. The stderr line at
+    /// the refusing door is the diagnostic.
     Unanswerable,
 }
 
@@ -838,15 +854,43 @@ const MAX_LISTED_PROJECT_SKILLS: usize = 20;
 /// A `u32` because the wire field is one; a repository with more than four
 /// billion skills has a different problem, and saturating is the only honest
 /// answer that cannot panic.
+///
+/// ## Shadowing entries survive the bound, because they are the disclosure
+///
+/// [`LevelAllow::DoesNotSettle`] makes a shadowing invocation ask even at
+/// `full`, but the answer is remembered per **root**, so the grant that answer
+/// leaves behind covers every later invocation under this key — including one of
+/// a skill the prompt never named. Registry order alone would then let the
+/// disclosure be truncated away and the grant settle anyway: a repository with
+/// twenty-one model-invocable skills, one named `validate` to shadow the user's
+/// and twenty alphabetically-earlier names ahead of it, shows the user twenty
+/// unmarked names and `+1 more`; they allow for the session at `guarded`; the
+/// next `skill { name: "validate" }` is auto-answered and the model gets the
+/// repository's body where it asked for the user's. That is the surprise BR-4's
+/// `full` exception exists to prevent, arriving through the bound instead of
+/// through the level.
+///
+/// So shadowing entries are hoisted to the front and the bound is applied after.
+/// The sort is **stable**, so registry order still decides within each group and
+/// the prompt is reproducible for a given registry.
+///
+/// The narrower alternative — refusing to record a session grant whenever
+/// `more > 0` and an unlisted entry shadows — was declined: it makes the grant's
+/// durability depend on how many skills a repository happens to ship, which is
+/// a rule a user cannot predict from what they were shown, and it needs the
+/// answer-recording path to carry facts about the prompt's contents. Hoisting
+/// makes an unlisted shadowing entry impossible below twenty-one *shadowing*
+/// skills, and above that the prompt still names twenty marked ones, so the user
+/// is never told the set is clean when it is not.
 fn bound_listed_skills(skills: &[ProjectSkillTrustEntry]) -> (Vec<ProjectSkillTrustEntry>, u32) {
-    let listed = skills
-        .iter()
-        .take(MAX_LISTED_PROJECT_SKILLS)
-        .cloned()
-        .collect();
+    let mut ordered: Vec<ProjectSkillTrustEntry> = skills.to_vec();
+    // `sort_by_key` is stable, and `false < true`, so `!shadows` puts the
+    // shadowing entries first and leaves registry order intact inside each half.
+    ordered.sort_by_key(|entry| !entry.shadows_user_skill);
     let more =
-        u32::try_from(skills.len().saturating_sub(MAX_LISTED_PROJECT_SKILLS)).unwrap_or(u32::MAX);
-    (listed, more)
+        u32::try_from(ordered.len().saturating_sub(MAX_LISTED_PROJECT_SKILLS)).unwrap_or(u32::MAX);
+    ordered.truncate(MAX_LISTED_PROJECT_SKILLS);
+    (ordered, more)
 }
 
 /// Whether a skill body's commands interpolate the invocation's arguments
@@ -1335,12 +1379,41 @@ impl PermissionGate {
         // An **acknowledgment** key fails this too, and that is the point:
         // `project_skill_trust:<root>` is deliberately not a `skill:` key, so
         // BR-4's question cannot be smuggled through this door (ADR-7).
-        debug_assert!(
-            is_skill_permission_key(key),
-            "`{key}` is not a skill consent key; a skill's dynamic context must \
-             ask under `skill:<source>:<name>` and never under a tool's name, \
-             and never under the project-skill acknowledgment's key"
-        );
+        //
+        // A **hard return, not a `debug_assert!`** (REQ-587 verify). The
+        // family check was an assertion, which is compiled out of the shipped
+        // binary — so what enforced ADR-7's separation in release was that each
+        // door happens to have one production caller that mints correctly, and
+        // the module doc above presented the assertions as the mechanism. This
+        // repository already carries a lesson about guards that degrade to
+        // allow on the release build (BR-10(b)); this is one `starts_with`, and
+        // it is the guard that catches the *next* caller minting the wrong key,
+        // with nothing red in CI to catch it otherwise.
+        //
+        // `Unanswerable` and not `Declined` or `Refused`: nobody was asked and
+        // nobody decided, which is REQ-585 AC-9's distinction, and of the two
+        // no-one-was-asked arms this is the daemon's. `Refused` carries a
+        // `RefusalReason`, and both of its variants describe what a *client*
+        // did (no terminal, unrecognized subject); a key this daemon minted
+        // wrong is neither, and dressing it as one would put a false account of
+        // the client in front of the user. `Unanswerable` says what is true —
+        // this question could not be put to anyone, because any answer would be
+        // remembered against the wrong question. The stderr line is the
+        // diagnostic, since the placeholder that arm renders is worded for the
+        // no-terminal case.
+        //
+        // The exact-equality check below stays an assertion: the *family* is
+        // what a wrong caller gets wrong, and the digest spelling is a lockstep
+        // only a debug build can usefully police (see `is_grant_key_for`).
+        if !is_skill_permission_key(key) {
+            eprintln!(
+                "tetond: refusing a skill consent asked under `{key}`, which is \
+                 not a skill consent key — a skill's dynamic context must ask \
+                 under `skill:<source>:<name>`, never under a tool's name and \
+                 never under the project-skill acknowledgment's key (ADR-7)"
+            );
+            return SkillConsent::Unanswerable;
+        }
         debug_assert!(
             is_grant_key_for(key, source, skill, &commands),
             "the key a skill's consent is remembered under must be one this \
@@ -1426,12 +1499,47 @@ impl PermissionGate {
         // "the model may run this repository's skills" under the question "may
         // `/deploy`'s commands run", and nothing downstream could tell the two
         // apart — the mirror image of the guard one function up.
-        debug_assert!(
-            is_project_acknowledgment_key(key),
-            "`{key}` is not a project-skill acknowledgment key; BR-4's question \
-             asks under `project_skill_trust:<root>` and never under a skill's \
-             own key or a tool's name"
-        );
+        //
+        // A hard return for the same reason it is one there: an assertion is
+        // absent from the shipped binary, and this door accepts **any** string
+        // without it. See [`Self::authorize_skill`] for why the answer is
+        // `Unanswerable` and why the exact-equality check below stays an
+        // assertion.
+        if !is_project_acknowledgment_key(key) {
+            eprintln!(
+                "tetond: refusing a project-skill acknowledgment asked under \
+                 `{key}`, which is not an acknowledgment key — BR-4's question \
+                 asks under `project_skill_trust:<root>`, never under a skill's \
+                 own key or a tool's name (ADR-7)"
+            );
+            return SkillConsent::Unanswerable;
+        }
+        // The root reaches this door as a **display** string
+        // (`session_root::display_for`), and a display is lossy: a path whose
+        // bytes are not valid UTF-8 renders with U+FFFD, so two distinct roots
+        // can render identically and mint **one** key. The key's own doc
+        // (`project_skill_trust_key`) says that must not happen — a grant for
+        // one repository answering for another is the whole harm the per-root
+        // scope exists to prevent.
+        //
+        // The real fix is to key on the raw `OsStr` bytes and keep the display
+        // for the prompt, which is a change at the *caller* that mints both
+        // (`harness/tools/skill.rs`). Until it lands, this door refuses a root
+        // it cannot key faithfully rather than remembering an answer under an
+        // ambiguous name: fail-closed costs a repository with an
+        // invalid-UTF-8 path its model-invocable project skills — the user's own
+        // `/name` is unaffected, since it does not come through this door — and
+        // the alternative costs correctness of the grant.
+        if root.contains(char::REPLACEMENT_CHARACTER) {
+            eprintln!(
+                "tetond: refusing the project-skill acknowledgment for `{root}` — \
+                 the session root's display carries U+FFFD, so it cannot \
+                 distinguish this repository from another whose path differs \
+                 only in bytes the display cannot show, and the grant would be \
+                 remembered under a name shared by both (BR-4)"
+            );
+            return SkillConsent::Unanswerable;
+        }
         debug_assert_eq!(
             key,
             project_skill_trust_key(root),
@@ -2267,12 +2375,22 @@ mod tests {
     ///
     /// Placed at that door rather than at [`PermissionGate::authorize`]'s,
     /// because only this door holds the name and source the key must agree with.
-    #[cfg(debug_assertions)]
+    ///
+    /// **Release semantics** (REQ-587 verify). This was a `#[should_panic]` over
+    /// a `debug_assert!`, which is a guard that exists only in the build CI
+    /// runs: in release the door took `shell` and the level's `allow` settled
+    /// it. The family check is now an ordinary refusal, so this test asserts an
+    /// **answer** and carries no `cfg(debug_assertions)` — it is the same test
+    /// in both profiles.
+    ///
+    /// The table's default is `Allow` deliberately: that is what the door would
+    /// answer with the guard removed, so the assertion below cannot pass for a
+    /// second reason (this gate has no addressed route, but the level settles
+    /// above the route check, so an un-guarded call reaches `Allowed`).
     #[tokio::test]
-    #[should_panic(expected = "is not a skill consent key")]
     async fn the_skill_door_refuses_a_key_that_is_not_the_skills_own() {
         let (_bus, _pending, gate) = gate(PermissionConfig::with_default(PermissionPolicy::Allow));
-        let _ = gate
+        let consent = gate
             .authorize_skill(
                 "shell",
                 "status",
@@ -2282,6 +2400,17 @@ mod tests {
                 GrantRegistry::new().next_connection_id(),
             )
             .await;
+        assert_eq!(
+            consent,
+            SkillConsent::Unanswerable,
+            "a skill consent asked under `shell` must be refused by the door, in \
+             every build profile — an assertion here is absent from the shipped \
+             binary"
+        );
+        assert!(
+            !consent.is_allowed(),
+            "the level's `allow` settled a misrouted consent"
+        );
     }
 
     /// A key of the right *shape* still has to be the key this skill's own name
@@ -2312,14 +2441,13 @@ mod tests {
     /// `project_skill_trust:<root>` is deliberately not a `skill:` key, so the
     /// skill door's *first* guard rejects it — which is the mechanical reason a
     /// third door exists rather than a widened one. An implementation that
-    /// "simplified" BR-4 by reusing `authorize_skill` fails here on the first
-    /// debug build.
-    #[cfg(debug_assertions)]
+    /// "simplified" BR-4 by reusing `authorize_skill` fails here — in **any**
+    /// build, since REQ-587's verify turned that guard from an assertion into a
+    /// refusal.
     #[tokio::test]
-    #[should_panic(expected = "is not a skill consent key")]
     async fn the_skill_door_refuses_the_project_acknowledgment_key() {
         let (_bus, _pending, gate) = gate(PermissionConfig::with_default(PermissionPolicy::Allow));
-        let _ = gate
+        let consent = gate
             .authorize_skill(
                 &project_skill_trust_key("~/dev/teton"),
                 "status",
@@ -2329,26 +2457,95 @@ mod tests {
                 GrantRegistry::new().next_connection_id(),
             )
             .await;
+        assert_eq!(
+            consent,
+            SkillConsent::Unanswerable,
+            "BR-4's question must not be smuggled through the door that asks \
+             whether a skill's commands may run"
+        );
     }
 
     /// The mirror image, and the half that keeps the third door from becoming a
     /// second way to ask the *first* question: a skill's own key here would
     /// remember "the model may run this repository's skills" under "may
     /// `/deploy`'s commands run".
-    #[cfg(debug_assertions)]
+    ///
+    /// A refusal rather than an assertion, for the reason
+    /// [`the_skill_door_refuses_a_key_that_is_not_the_skills_own`] gives — and
+    /// this door had the wider hole of the two: without the family check it
+    /// accepted *any* string at all, including one that is neither key family.
     #[tokio::test]
-    #[should_panic(expected = "is not a project-skill acknowledgment key")]
     async fn the_acknowledgment_door_refuses_a_skills_own_key() {
         let (_bus, _pending, gate) = gate(PermissionConfig::with_default(PermissionPolicy::Allow));
-        let _ = gate
-            .authorize_project_skill_trust(
-                &skill_permission_key_for(SkillSource::Project, "deploy"),
+        let keys: [String; 4] = [
+            skill_permission_key_for(SkillSource::Project, "deploy"),
+            "shell".to_owned(),
+            String::new(),
+            // The bare prefix names no root, so it is not an acknowledgment key
+            // either — a grant under it would be an answer to no question.
+            project_skill_trust_key(""),
+        ];
+        for key in keys {
+            let consent = gate
+                .authorize_project_skill_trust(
+                    &key,
+                    "~/dev/teton",
+                    &[],
+                    false,
+                    GrantRegistry::new().next_connection_id(),
+                )
+                .await;
+            assert_eq!(
+                consent,
+                SkillConsent::Unanswerable,
+                "`{key}` must not be a key BR-4's answer is remembered under, in \
+                 any build profile"
+            );
+        }
+    }
+
+    /// **REQ-587 verify: a root the key cannot faithfully name is refused.**
+    ///
+    /// The acknowledgment's key is built from the session root's *display*, and
+    /// `Path::display` renders bytes that are not valid UTF-8 as U+FFFD — so two
+    /// distinct roots can render identically and mint one key, which is the
+    /// grant-for-another-repository harm the per-root scope exists to prevent.
+    ///
+    /// Until the caller keys on the raw `OsStr` bytes, the door refuses rather
+    /// than remembering an answer under an ambiguous name. The control leg is
+    /// what makes this about the ambiguity and not about the root being unusual:
+    /// the same root without the replacement character is allowed by the same
+    /// gate at the same level.
+    #[tokio::test]
+    async fn a_root_whose_display_cannot_name_it_is_not_acknowledged() {
+        let (_bus, _pending, gate) = gate(PermissionConfig::with_default(PermissionPolicy::Allow));
+        let lossy = "~/dev/te\u{FFFD}ton";
+        assert_eq!(
+            gate.authorize_project_skill_trust(
+                &project_skill_trust_key(lossy),
+                lossy,
+                &[],
+                false,
+                GrantRegistry::new().next_connection_id(),
+            )
+            .await,
+            SkillConsent::Unanswerable,
+            "a display that cannot distinguish this repository from another must \
+             not become the name a session grant is remembered under"
+        );
+        assert!(
+            gate.authorize_project_skill_trust(
+                &project_skill_trust_key("~/dev/teton"),
                 "~/dev/teton",
                 &[],
                 false,
                 GrantRegistry::new().next_connection_id(),
             )
-            .await;
+            .await
+            .is_allowed(),
+            "the control: a root the display can name is acknowledged normally, \
+             so the refusal above is about the ambiguity"
+        );
     }
 
     /// The acknowledgment's second guard, pinned in the same direction

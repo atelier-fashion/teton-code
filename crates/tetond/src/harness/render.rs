@@ -255,6 +255,17 @@ const MAX_SPECIAL_TOKEN_SPAN_BYTES: usize = 64;
 /// repository's `SKILL.md` closes its own frame flush-left and its remaining
 /// bytes read as harness prose (BUG-148's shape, one layer over).
 ///
+/// The `skill` tool's **argument sub-frame** is here for the third reason, and
+/// it is the inverse of the second: `<skill-arguments`
+/// ([`super::tools::skill::ARGS_OPEN_TAG`]) delimits the *caller's* argument
+/// text inside an expansion, and says that region is data rather than
+/// instructions. The instructions frame vouches for the skill **file's** bytes;
+/// this one un-vouches for the bytes the caller spliced into them. A model-
+/// supplied argument that could close it flush-left would put its remaining
+/// payload back under the outer frame's sentence — which is the whole promotion
+/// path REQ-587 opens from `UntrustedData` to `Expansion`, so the closing
+/// spelling matters here more than anywhere else in this list.
+///
 /// It is `<`-prefixed deliberately. [`starts_with_frame_label`]'s cheap reject
 /// admits only `U`/`A`/`T` — every *existing* transcript label happens to open
 /// with one of those bytes — so a **prose** frame label would be silently
@@ -269,6 +280,8 @@ const UNTRUSTED_ENVELOPE_TAGS: &[&str] = &[
     "</mcp-tool-result",
     "<skill-body",
     "</skill-body",
+    "<skill-arguments",
+    "</skill-arguments",
 ];
 
 /// Inserted at a line start to defuse a frame label there (BUG-148).
@@ -1049,12 +1062,22 @@ mod tests {
         // a later REQ that *does* introduce a spelling fails here and is sent to
         // update both sides rather than one.
         //
-        // **REQ-587 is that later REQ, and it did both sides.** The `skill`
-        // tool's BR-4 instructions frame is a marker the harness writes, so
-        // ADR-009 obliges the harness to defuse it (`</skill-body` on the input
-        // alphabet) and obliges the reply gate to refuse a model that fabricates
-        // it (`<skill-body` in both output sets). The three assertions below
-        // moved together, which is the only way this pin is worth anything.
+        // **REQ-587 is that later REQ, and it did both sides — twice.** The
+        // `skill` tool writes two markers, so ADR-009 obliges the harness to
+        // defuse both and obliges the reply gate to refuse a model that
+        // fabricates either:
+        //
+        // * `<skill-body` is BR-4's instructions frame around an expansion —
+        //   the frame that says *follow this*;
+        // * `<skill-arguments` is the sub-frame inside it that marks the
+        //   **caller's** argument text as data. It is the inverse claim and it
+        //   needs the same two-sided treatment for a sharper reason: the outer
+        //   frame vouches for the skill file's bytes, and a caller who could
+        //   close the inner one flush-left would put its own payload back under
+        //   that vouch.
+        //
+        // The three assertions below moved together, which is the only way this
+        // pin is worth anything.
         assert_eq!(
             UNTRUSTED_ENVELOPE_TAGS,
             &[
@@ -1064,6 +1087,8 @@ mod tests {
                 "</mcp-tool-result",
                 "<skill-body",
                 "</skill-body",
+                "<skill-arguments",
+                "</skill-arguments",
             ],
             "the input envelope alphabet grew — add the spelling to BOTH output \
              marker sets and extend the bidirectional coverage tests above"
@@ -1077,6 +1102,7 @@ mod tests {
                 "<tool-result",
                 "<mcp-tool-result",
                 "<skill-body",
+                "<skill-arguments",
             ],
             "the flat fabrication markers changed"
         );
@@ -1086,6 +1112,7 @@ mod tests {
                 "<tool-result",
                 "<mcp-tool-result",
                 "<skill-body",
+                "<skill-arguments",
                 super::super::context::TOOL_RESULT_LABEL_PREFIX,
             ],
             "the ChatML fabrication markers changed"

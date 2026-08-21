@@ -342,8 +342,10 @@ pub enum SkillSource {
 /// **Why this lives above both crates.** BR-2 says a reserved name always wins,
 /// and the table that defines "reserved" is `teton`'s `COMMANDS` — which
 /// `tetond` cannot read, because the daemon does not depend on the CLI. So the
-/// client enforced it and the daemon did not, and `SkillRegistry::dispatchable`
-/// happily answered for a skill named `cost`. That is invisible while the only
+/// client enforced it and the daemon did not, and the daemon's name resolver —
+/// then one function, since split into
+/// `SkillRegistry::{dispatchable_by_user, invocable_by_model}` (REQ-587 ADR-12)
+/// — happily answered for a skill named `cost`. That is invisible while the only
 /// client is `teton`, and it is a hole the moment a second one exists: a
 /// `session/prompt { skill: { name: "cost" } }` from a client carrying no table
 /// runs a repo-supplied `.claude/skills/cost/SKILL.md`, and the spec's own
@@ -435,10 +437,12 @@ pub const PROJECT_SKILL_TRUST_KEY_PREFIX: &str = "project_skill_trust:";
 /// answer the other.
 ///
 /// It is **not a skill key**, and that is load-bearing rather than cosmetic:
-/// `authorize_skill` `debug_assert!`s that its key is a skill key *and* that it
-/// equals the key `(source, name)` mints, and an acknowledgment satisfies
-/// neither. ADR-7 opens a third gate door rather than widening two guards that
-/// are pinned in both directions.
+/// `authorize_skill` requires its key to be a skill key *and* to equal the key
+/// `(source, name)` mints, and an acknowledgment satisfies neither. ADR-7 opens
+/// a third gate door rather than widening two guards that are pinned in both
+/// directions. The family half of each guard is an ordinary refusal rather than
+/// a `debug_assert!`, so it is present in the shipped binary too (REQ-587
+/// verify).
 ///
 /// It is also absent from the permission **level table**, on purpose: an
 /// unenumerated key falls to the level's default, which is exactly BR-4's
@@ -456,6 +460,22 @@ pub const PROJECT_SKILL_TRUST_KEY_PREFIX: &str = "project_skill_trust:";
 /// repository would answer for another — precisely the harm the per-root scope
 /// exists to prevent. Bounding belongs to what is *rendered*, not to what is
 /// *compared*.
+///
+/// # The display is lossy, and that is a known gap in this key
+///
+/// `display_for` ends in `Path::display`, which renders bytes that are not valid
+/// UTF-8 as `U+FFFD`. Two roots differing only in such bytes therefore render
+/// identically and mint **one** key here — the same collapse the paragraph above
+/// refuses to introduce by truncation, arriving through the input instead.
+///
+/// The fix is to key on the raw `OsStr` bytes (or a hash of them) and keep the
+/// display for the prompt, which is a change where the two are *minted* — the
+/// caller that computes `display_for(ctx.repo_root(), …)` and passes it here —
+/// not in this function, which never sees a path. Until that lands,
+/// `PermissionGate::authorize_project_skill_trust` refuses a root whose display
+/// carries `U+FFFD` rather than remembering an answer under an ambiguous name,
+/// and `expires_on_session_root_change` bounds the exposure further: the key
+/// does not outlive the root it was answered for.
 #[must_use]
 pub fn project_skill_trust_key(root: &str) -> String {
     format!("{PROJECT_SKILL_TRUST_KEY_PREFIX}{root}")

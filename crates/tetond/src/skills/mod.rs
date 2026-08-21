@@ -76,7 +76,7 @@ use std::path::{Path, PathBuf};
 
 use teton_protocol::methods::RootKind;
 
-pub use discovery::{discover, DirLister, Entry, ListError, ReadError, RealFs};
+pub use discovery::{discover, provenance_of, DirLister, Entry, ListError, ReadError, RealFs};
 pub use dynamic::{run_all, Command, DynamicOutcome};
 pub use expand::{expand, Expansion, Pending, PENDING_PLACEHOLDER};
 
@@ -171,14 +171,17 @@ pub struct Skill {
     pub shadowed: Option<ShadowedBy>,
 }
 
+// NB: there is deliberately no `Skill::permission_key()` (REQ-587 BR-5).
+// REQ-585 shipped one, and it read as *the* key a skill's dynamic context runs
+// under. BR-5 made that false: the key a grant is remembered under is
+// `Expansion::grant_key`, which carries a digest of the **substituted** command
+// set whenever the arguments had a hand in it, and only the expansion holds
+// those facts. A method on the row that answered the *base* key was a spelling
+// both call sites could reach for and neither would notice using — the gate
+// accepts either and pins whichever it is given, so the mistake keeps REQ-585's
+// behaviour with nothing red. [`permission_key_for`] is still here for the
+// surfaces whose question really is "the base key for this (source, name)".
 impl Skill {
-    /// The permission-gate key this skill's dynamic context runs under
-    /// (ADR-6). See [`permission_key_for`].
-    #[must_use]
-    pub fn permission_key(&self) -> String {
-        permission_key_for(self.source, &self.name)
-    }
-
     /// True when nothing shadows this row — i.e. this file owns its name.
     ///
     /// **Exactly that, and not "may be invoked".** REQ-587 BR-3's two flags are
@@ -294,7 +297,9 @@ pub enum ShadowedBy {
     /// A built-in command of the same name (BR-2's third case).
     ///
     /// Decided here rather than only in the client, which is where it used to
-    /// live: `SkillRegistry::dispatchable` answered for a skill named `cost`,
+    /// live: the registry's user-facing resolver — [`SkillRegistry::
+    /// dispatchable_by_user`], spelled `dispatchable` at the time — answered
+    /// for a skill named `cost`,
     /// so a client that does not carry `teton`'s table — the phase-2 one, or
     /// any third party — could dispatch a repo-supplied `.claude/skills/cost`
     /// by name. ADR-1's rule is that every rule with teeth lives in the daemon,
@@ -376,8 +381,17 @@ pub enum SkipReason {
     MalformedFrontmatter,
     /// The directory name or file stem does not match [`is_valid_skill_name`].
     InvalidName,
-    /// The entry is a symlink. Roots are followed; entries are not (BR-1).
+    /// The entry is a symlink. A user root is followed; entries are not (BR-1).
     SymlinkEntry,
+    /// A **project** root resolves outside the session root (REQ-587 BR-10).
+    ///
+    /// Reported against the root, like [`Self::RootTruncated`], and never for a
+    /// **user** root: `~/.claude/skills` being a symlink into a checked-out
+    /// toolkit is the shape the follow-the-root exemption exists for, and it is
+    /// the home directory's shape, not a repository's. A cloned repo's
+    /// `.claude/commands -> ../../..` is refused here rather than registering
+    /// every `*.md` under the target as a project skill the model may call.
+    EscapingRoot,
     /// Something else already owns this name.
     Shadowed {
         /// What owns it.
@@ -402,6 +416,7 @@ impl fmt::Display for SkipReason {
             Self::MalformedFrontmatter => f.write_str("malformed frontmatter"),
             Self::InvalidName => f.write_str("invalid name"),
             Self::SymlinkEntry => f.write_str("symlink not followed"),
+            Self::EscapingRoot => f.write_str("resolves outside the session root"),
             Self::Shadowed { by } => write!(f, "shadowed by {by}"),
             Self::RootTruncated => {
                 write!(f, "root truncated at {MAX_ENTRIES_PER_ROOT} entries")

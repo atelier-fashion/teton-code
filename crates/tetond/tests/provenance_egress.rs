@@ -41,7 +41,15 @@ use async_trait::async_trait;
 
 use teton_core::entities::{BoundaryMode, PrivacyBoundary};
 use teton_protocol::events::{Event, WebLookupOutcome};
-use teton_protocol::{SessionId, SessionMode};
+use teton_protocol::jsonrpc::RpcError;
+use teton_protocol::methods::{
+    ConfigUpdate, PrivacyBoundaryConfig, PromptTurnResult, ProviderConfig, SkillInvocation,
+    TierBindingConfig,
+};
+use teton_protocol::{
+    Phase as ProtoPhase, PrivacyMode, ProviderId, ProviderKind as ProtoProviderKind, SessionId,
+    SessionMode, Tier as ProtoTier,
+};
 use teton_providers::transport::{Transport, TransportError, TransportRequest, TransportResponse};
 use teton_providers::{OpenAiCompatAdapter, OpenAiCompatConfig};
 
@@ -54,8 +62,9 @@ use tetond::harness::{
     PermissionConfig, PermissionGate, RemoteProviderSource, SessionEvents, ToolContext, ToolDuties,
     ToolRegistry,
 };
-use tetond::runtime::{SessionTaint, WebTaintOverride};
+use tetond::runtime::{ClientPresence, DaemonRuntime, SessionTaint, WebTaintOverride};
 use tetond::sessions::SessionRegistry;
+use tetond::skills::RealFs;
 
 /// The boundary-file secret that must never reach the capture transport.
 const SECRET: &str = "API_KEY=sk-live-DO-NOT-LEAK-provctl-Zx9";
@@ -1594,4 +1603,284 @@ async fn with_no_boundary_a_model_invoked_expansion_reaches_the_provider() {
         );
     }
     std::fs::remove_dir_all(&repo).ok();
+}
+
+// ---------------------------------------------------------------------------
+// REQ-587 verify — the naming duty is inside the boundary, not beside it
+//
+// Everything above drives the harness loop directly, because that is where a
+// tool result's provenance is decided. The claim below is about a **duty** that
+// the loop never sees: `title` is started by `DaemonRuntime::run_prompt_turn`,
+// on its own task, and it sends its own request through its own route. So this
+// section drives the daemon, and it asserts on the one instrument that can
+// settle "nothing left the machine" — the title route's own transport.
+//
+// This is deliberately not a check on the `Provenance` value the call site
+// computes. REQ-585 shipped this same defect once already and a call-site
+// assertion is what it would have passed.
+// ---------------------------------------------------------------------------
+
+/// A mock OpenAI-compatible vendor on a real socket, counting what it served.
+///
+/// Real, rather than a `Transport` double, because a `DutyRoute`'s transport is
+/// built by the daemon from a registered provider (`build_remote_transport`) and
+/// there is no seam to inject one — and because only a socket can settle "no
+/// packet left".
+struct TitleVendor {
+    endpoint: String,
+    hits: Arc<AtomicUsize>,
+    bodies: Arc<Mutex<Vec<String>>>,
+}
+
+impl TitleVendor {
+    fn start(reply: String) -> Self {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind a mock vendor");
+        let addr = listener.local_addr().expect("mock vendor address");
+        let hits = Arc::new(AtomicUsize::new(0));
+        let bodies = Arc::new(Mutex::new(Vec::new()));
+        let served = Arc::clone(&hits);
+        let captured = Arc::clone(&bodies);
+        std::thread::spawn(move || {
+            use std::io::{Read, Write};
+            for stream in listener.incoming() {
+                let Ok(mut stream) = stream else { break };
+                let mut raw = Vec::new();
+                let mut buf = [0u8; 65_536];
+                while let Ok(read) = stream.read(&mut buf) {
+                    if read == 0 {
+                        break;
+                    }
+                    raw.extend_from_slice(&buf[..read]);
+                    if raw.windows(4).any(|w| w == b"\r\n\r\n") && read < buf.len() {
+                        break;
+                    }
+                }
+                captured
+                    .lock()
+                    .unwrap()
+                    .push(String::from_utf8_lossy(&raw).into_owned());
+                // Counted **after** the body has been read, so a hit means a
+                // request arrived whole rather than that a socket was opened.
+                served.fetch_add(1, Ordering::SeqCst);
+                let raw = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\n\
+                     Content-Length: {}\r\nConnection: close\r\n\r\n{reply}",
+                    reply.len()
+                );
+                let _ = stream.write_all(raw.as_bytes());
+                let _ = stream.flush();
+            }
+        });
+        Self {
+            endpoint: format!("http://{addr}/v1/chat/completions"),
+            hits,
+            bodies,
+        }
+    }
+
+    fn hits(&self) -> usize {
+        self.hits.load(Ordering::SeqCst)
+    }
+
+    fn bodies(&self) -> Vec<String> {
+        self.bodies.lock().unwrap().clone()
+    }
+}
+
+/// A distinctive fragment of the skill body, so a captured payload can be
+/// recognized as *the expansion* rather than merely as a request.
+const NOTES_BODY_MARKER: &str = "NOTES-SKILL-BODY-MARKER";
+
+/// A repo whose one project skill sits under a `local-only` tree.
+///
+/// The skill is a **project** skill on purpose. It mints a real repo-relative id
+/// (`.claude/skills/notes/SKILL.md`), so the boundary below has something exact
+/// to match and the refusal is a boundary decision rather than the fail-closed
+/// `unknown` arm — which a user skill would take under *any* boundary and which
+/// would therefore prove less about where the value came from.
+fn notes_skill_repo() -> PathBuf {
+    let repo = temp_repo();
+    let dir = repo.join(".claude/skills/notes");
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(
+        dir.join("SKILL.md"),
+        format!(
+            "---\ndescription: the notes skill\n---\n\n\
+             {NOTES_BODY_MARKER}: summarize the working notes for this repository \
+             and say what is left to do.\n"
+        ),
+    )
+    .unwrap();
+    repo
+}
+
+/// The boundary that covers the skill file itself — a repository that keeps its
+/// own `.claude/` tree on the machine.
+fn claude_tree_is_local_only() -> Vec<PrivacyBoundaryConfig> {
+    vec![PrivacyBoundaryConfig {
+        path_glob: ".claude/**".to_owned(),
+        mode: PrivacyMode::LocalOnly,
+    }]
+}
+
+/// Run one `/notes` turn on a daemon whose **`reflex`** tier — and therefore the
+/// `title` duty — is bound to its own remote vendor, and report what that
+/// vendor saw.
+///
+/// Two vendors, on two sockets, because one counter cannot tell a turn's request
+/// from a duty's. The turn-serving tiers point at the first; `reflex` points at
+/// the second, and in this fixture nothing else can reach it: `route` makes no
+/// model call for a **structured** session (`dispatch_route`'s `Structured` arm
+/// resolves from the phase), and `redact` — the third `reflex` category — is off
+/// unless `[privacy] redact` is set, which `DaemonRuntime::minimal` leaves at its
+/// default. So a hit on the second vendor is the naming duty and nothing else.
+async fn drive_named_skill_turn(
+    boundary_set: Vec<PrivacyBoundaryConfig>,
+) -> (TitleVendor, Result<PromptTurnResult, RpcError>) {
+    let repo = notes_skill_repo();
+    let turns = TitleVendor::start(sse_turn("Understood.", None));
+    let titles = TitleVendor::start(sse_turn("Working notes review", None));
+
+    let runtime = Arc::new(DaemonRuntime::minimal());
+    for (id, endpoint) in [("mock", &turns.endpoint), ("titler", &titles.endpoint)] {
+        runtime
+            .apply_config_update(ConfigUpdate::RegisterProvider(ProviderConfig {
+                id: ProviderId::from(id),
+                kind: ProtoProviderKind::OpenaiCompatible,
+                endpoint: Some(endpoint.clone()),
+                model: Some(format!("{id}-1")),
+                auth_ref: None,
+                max_context: Some(128_000),
+                context_budget_cap: None,
+                floored_budget: None,
+            }))
+            .expect("registering a provider");
+    }
+    for (tier, provider) in [
+        (ProtoTier::Scan, "mock"),
+        (ProtoTier::Build, "mock"),
+        (ProtoTier::Think, "mock"),
+        // The whole point of the fixture: a user who bound `reflex` remotely on
+        // purpose gets what they asked for, and BR-10 still applies to it.
+        (ProtoTier::Reflex, "titler"),
+    ] {
+        runtime
+            .apply_config_update(ConfigUpdate::SetTierBinding(TierBindingConfig {
+                tier,
+                provider_id: ProviderId::from(provider),
+                fallback_id: None,
+            }))
+            .expect("binding a tier");
+    }
+    for boundary in boundary_set {
+        runtime
+            .apply_config_update(ConfigUpdate::SetPrivacyBoundary(boundary))
+            .expect("setting a boundary");
+    }
+
+    let sessions = SessionRegistry::new();
+    let session_id = sessions
+        .create(
+            SessionMode::Structured,
+            Some(ProtoPhase::Implement),
+            Some(repo.clone()),
+        )
+        .expect("a structured session takes a phase")
+        .session_id;
+    // The registry exactly as `session/create` derives it, with **no** home:
+    // this binary must not register whatever skills the developer's machine
+    // happens to have (LESSON-540).
+    let probed = runtime.session_root_for(Some(&repo));
+    sessions.set_skills(
+        &session_id,
+        tetond::skills::discover(None, &probed.path, probed.view.kind, &RealFs),
+    );
+
+    let events = Arc::new(EventBus::new());
+    let result = runtime
+        .run_prompt_turn(
+            &events,
+            &sessions,
+            session_id,
+            SessionMode::Structured,
+            Some(ProtoPhase::Implement),
+            Some(repo.clone()),
+            String::new(),
+            Some(SkillInvocation {
+                name: "notes".to_owned(),
+                raw_arguments: String::new(),
+            }),
+            None,
+            ClientPresence::unwatched(),
+        )
+        .await;
+
+    // The naming runs on a task the turn does not wait for (BR-3), so the count
+    // is read after a bounded settle rather than immediately. The *positive*
+    // leg polls until the hit lands and the negative leg waits the same ceiling
+    // before reading zero, so "nothing was sent" and "nothing had time to be
+    // sent" are not the same measurement.
+    for _ in 0..100 {
+        if titles.hits() > 0 {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+
+    std::fs::remove_dir_all(&repo).ok();
+    (titles, result)
+}
+
+/// **REQ-587 verify, C2.** A skill turn does not hand the expansion to the
+/// naming duty for delivery to a remote provider.
+///
+/// `run_prompt_turn` starts the `title` duty on the session's first substantive
+/// prompt, and for a skill turn the text it is named after is
+/// `SkillTurn::text` — the skill file's bytes. `title_route` resolves that duty
+/// **remotely** unless the session is already tainted, which on the first prompt
+/// it is not, and `harness::title` puts up to 2 KiB of its input in the request.
+/// So the provenance handed to `Egress::send` is the only thing standing between
+/// a `local-only` file and a provider — and `Egress::send` short-circuits on an
+/// empty provenance *before* it looks at a boundary.
+///
+/// This is REQ-585's Critical, in the same function: that REQ moved the naming
+/// later so a refused expansion would not spend it, and left the hard-coded
+/// `Provenance::empty()` where it was.
+///
+/// **The instrument is the transport, not the call site.** A test that read the
+/// `Provenance` value `spawn_title_session` was handed would have passed on
+/// REQ-585's build too, for a duty that was sending the file anyway.
+///
+/// **Mutation:** restore `Provenance::empty()` at the skill call site and this
+/// fails — the vendor is asked to serve a request carrying the body.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_skill_turns_expansion_never_reaches_the_naming_dutys_provider() {
+    // The control leg first, and it is the load-bearing half: with no boundary
+    // configured the naming duty genuinely fires, genuinely reaches this
+    // vendor, and the request it sends genuinely carries the skill file's
+    // prose. Without it, "zero requests" below would be satisfied by a fixture
+    // that cannot send at all (LESSON-479).
+    let (open, _) = drive_named_skill_turn(Vec::new()).await;
+    assert_eq!(
+        open.hits(),
+        1,
+        "with no boundary the naming duty must reach its provider, or the \
+         refusal asserted below is about a fixture rather than about a guard"
+    );
+    let sent = open.bodies().join("\n");
+    assert!(
+        sent.contains(NOTES_BODY_MARKER),
+        "non-vacuity: what the naming duty sends is the *expansion*, which is \
+         why its provenance has to be the expansion's:\n{sent}"
+    );
+
+    // The same turn, the same skill, on a machine whose `.claude/` tree is
+    // `local-only`.
+    let (guarded, _) = drive_named_skill_turn(claude_tree_is_local_only()).await;
+    assert_eq!(
+        guarded.hits(),
+        0,
+        "the naming duty put the skill body on the wire: {:?}",
+        guarded.bodies()
+    );
 }

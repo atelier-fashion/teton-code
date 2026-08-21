@@ -27,15 +27,36 @@
 //! REQ-583 shipped **policy** seams (`WalkPolicy`, `WalkBudget`); this is an
 //! **observation** seam, and it is new on purpose.
 //!
-//! # Roots are followed. Entries are not.
+//! # A **user** root is followed. A **project** root is bounded. Entries are not
+//! followed at all.
 //!
-//! The four roots are opened with no symlink check: the dogfood machine's
-//! `~/.claude/skills` *is* a symlink into a checked-out toolkit, and a rule
-//! that refused it would refuse the feature's own author. Every **entry** a
-//! listing returns is refused if its `file_type()` says symlink, reusing
-//! [`crate::harness::tools::skip_symlink_entry`] so the predicate keeps one
-//! home. `DirEntry::file_type` has `lstat` semantics — it does **not** traverse
-//! — which is precisely why the check can be made without opening anything.
+//! The rule has three clauses and the first two used to be one, which is the
+//! hole REQ-587's verify found.
+//!
+//! A **user** root (`~/.claude/skills`, `~/.claude/commands`) is opened with no
+//! symlink check: the dogfood machine's `~/.claude/skills` *is* a symlink into a
+//! checked-out toolkit, and a rule that refused it would refuse the feature's
+//! own author. That reason is about the **home** directory, which the person at
+//! the keyboard owns.
+//!
+//! A **project** root (`<session-root>/.claude/skills`, `…/commands`) is
+//! repository content. Two of the four roots are built from `session_root`, so
+//! under the old blanket exemption a cloned repo shipping
+//! `.claude/commands -> ../../..` — git stores a symlink verbatim — had every
+//! lowercase-stemmed `*.md` under the target registered as a **project** skill:
+//! in the roster, in the resident prompt, and callable by the model, while a
+//! `read` of the same bytes is refused by REQ-583's jail. That is precisely the
+//! *second classifier of what may be read* BR-10 says must not exist. So a
+//! project root is [`DirLister::canonicalize`]d before it is listed and refused
+//! when it does not resolve **under the session root**, with the refusal named
+//! ([`SkipReason::EscapingRoot`]) rather than silent. Nothing about the dogfood
+//! reason above extends to a repository's directory.
+//!
+//! Every **entry** a listing returns is refused if its `file_type()` says
+//! symlink, reusing [`crate::harness::tools::skip_symlink_entry`] so the
+//! predicate keeps one home. `DirEntry::file_type` has `lstat` semantics — it
+//! does **not** traverse — which is precisely why the check can be made without
+//! opening anything.
 //!
 //! This is *narrower* than the walkers' blanket refusal, so it is pinned by its
 //! own test rather than riding theirs.
@@ -44,6 +65,17 @@
 //! entry fully determines: `<dir>/SKILL.md`. Following that link enumerates
 //! nothing — the danger a symlink poses to a walk is unbounded *ground*, and a
 //! fixed leaf name is not ground.
+//!
+//! # The path a row carries is the path as spelled, not as resolved
+//!
+//! A registered [`Skill`] keeps the path discovery walked to it, because that is
+//! the path the user recognizes and the one every surface renders. It is
+//! therefore **not** guaranteed canonical: a project root may still be a symlink
+//! *within* the repository (`.claude/skills -> vendor/skills`), which the check
+//! above permits. Minting a provenance id off that spelling is the "one file,
+//! two identities" bug the leaf comment below names, so the mint resolves the
+//! path first and fails closed when it cannot — see
+//! [`provenance_of`], which is the one home for that rule.
 
 use std::ffi::OsString;
 use std::io::Read;
@@ -141,6 +173,28 @@ pub trait DirLister {
     ///
     /// [`ReadError`], one variant per user-visible sentence.
     fn read(&self, file: &Path) -> Result<String, ReadError>;
+
+    /// `path` with every symlink component followed, or `None` when it does not
+    /// resolve (it is missing, or a component of it is unreadable).
+    ///
+    /// The one method here that neither lists nor reads. It exists because
+    /// [`discover`] has a question about a **project** root that `list` cannot
+    /// answer: `read_dir` follows, and `DirEntry::file_type` — the `lstat` the
+    /// entry rule uses — is about entries *inside* a directory, so nothing on
+    /// the old seam could see that the directory itself was a link out of the
+    /// repository. It resolves paths; it enumerates nothing, which is why it
+    /// does not widen what this trait can be asked to do.
+    ///
+    /// **This one has a default**, unlike the two above, and the default is the
+    /// real filesystem's answer. A `DirLister` double exists to script what
+    /// *listing* and *reading* return; a double that also had to script path
+    /// resolution would be scripting the check itself, and the first thing an
+    /// under-specified double would do is resolve everything to itself — which
+    /// is the permissive answer. Overriding is possible and deliberate;
+    /// forgetting to override gets the safe behaviour.
+    fn canonicalize(&self, path: &Path) -> Option<PathBuf> {
+        std::fs::canonicalize(path).ok()
+    }
 }
 
 /// The production [`DirLister`]: the real filesystem.
@@ -228,10 +282,10 @@ impl DirLister for RealFs {
 /// Build the registry for a session rooted at `session_root`, for a user whose
 /// home is `home`.
 ///
-/// Pure over the seam: given the same listings and bytes it returns the same
-/// registry, on any filesystem, in any order. Everything that could vary —
-/// listing order, which entries survive the cap, the order of the rows — is
-/// decided here rather than inherited from the filesystem.
+/// Pure over the seam: given the same listings, bytes and resolutions it returns
+/// the same registry, on any filesystem, in any order. Everything that could
+/// vary — listing order, which entries survive the cap, the order of the rows —
+/// is decided here rather than inherited from the filesystem.
 ///
 /// `root_kind` is the session root's classification, and `RootKind::Home` skips
 /// the project pair entirely: a session whose root *is* `$HOME` reaches
@@ -248,9 +302,34 @@ pub fn discover(
     let mut candidates: Vec<Skill> = Vec::new();
     let mut skipped: Vec<Skipped> = Vec::new();
 
+    // The session root as the filesystem resolves it, taken once. The
+    // containment test below must compare two paths of the same kind, and
+    // `session_root` arrives as the registry stores it — `ProbedRoot::probe`
+    // deliberately never canonicalizes, so on macOS a session opened at
+    // `/tmp/repo` is stored that way while everything under it resolves through
+    // `/private`. Comparing the resolved root against the unresolved one would
+    // refuse every project root on that machine.
+    let boundary = fs.canonicalize(session_root);
+
     // In precedence order (project before user, `skills/` before `commands/`),
     // so the first candidate registered under a name is the one that wins it.
     for root in roots(home, session_root, root_kind) {
+        // **Before the listing**, because `read_dir` follows and there is no
+        // undoing it: a project root that resolves out of the repository is
+        // refused, and refused by name. A **user** root is not asked — see the
+        // module doc for why that exemption is the home directory's and not the
+        // repository's.
+        if root.source == SkillSource::Project
+            && !resolves_under(fs, &root.dir, boundary.as_deref())
+        {
+            skipped.push(Skipped {
+                path: root.dir.clone(),
+                name: None,
+                reason: SkipReason::EscapingRoot,
+            });
+            continue;
+        }
+
         let mut entries = match fs.list(&root.dir) {
             Ok(entries) => entries,
             // A root that is not there is the ordinary state of three of the
@@ -286,6 +365,77 @@ pub fn discover(
     }
 
     assemble(candidates, skipped)
+}
+
+/// One skill file's repo-relative identity for the egress provenance channel,
+/// or `None` when it has none (REQ-585 BR-7, REQ-587 BR-10 / ADR-8).
+///
+/// **The** mint for a skill body, so the user path and the model path cannot
+/// come to disagree about which file a block came from.
+///
+/// `None` is **fail-closed**, and every caller must spell it that way: as
+/// `unknown: true` on a seed block, or `ToolProvenance::Unknown` on a tool
+/// outcome. It is the ordinary answer for a **user** skill, which has no
+/// repo-relative identity in a repo-rooted session (ADR-9 refused to widen the
+/// minter), and it is the safe answer in the two cases below.
+///
+/// # Why the path is resolved first
+///
+/// [`teton_core::ProvenanceId::from_resolved`] is documented as taking a
+/// **canonical** path, and [`Skill::path`] is not one: it is the path discovery
+/// walked to the file, kept because that is the spelling a user recognizes. A
+/// project root may be a symlink *within* the repository
+/// (`.claude/skills -> vendor/skills`), which [`discover`] permits, and minting
+/// off the spelling would give one file two identities — the id would read
+/// `.claude/skills/x/SKILL.md` for a file that lives at
+/// `vendor/skills/x/SKILL.md`, so a `vendor/**` boundary would match nothing and
+/// BR-7's *"pins exactly as a `read` would"* would be false for precisely the
+/// shape that most needs it (LESSON-503: mint an id at the scope that resolves
+/// it). It is the same defect the `RealFs::read` comment above names at the leaf,
+/// one level up.
+///
+/// `root` is resolved too, because it arrives as the session registry stores it
+/// and `ProbedRoot::probe` deliberately never canonicalizes: comparing a
+/// resolved file against an unresolved root would strip nothing on any machine
+/// where the session root is reached through a link (`/tmp` on macOS), turning
+/// every project skill unknown. A root that will not resolve is used as given —
+/// the *file's* resolution is the half that closes the hole.
+///
+/// A file that no longer resolves at all — moved or deleted since discovery
+/// built the snapshot — answers `None` rather than minting an id for a path
+/// nothing is at.
+#[must_use]
+pub fn provenance_of(root: &Path, skill: &Skill) -> Option<teton_core::ProvenanceId> {
+    let root = std::fs::canonicalize(root).unwrap_or_else(|_| root.to_path_buf());
+    let resolved = std::fs::canonicalize(&skill.path).ok()?;
+    teton_core::ProvenanceId::from_resolved(&root, &resolved).ok()
+}
+
+/// Whether `dir` resolves to a path at or under `boundary` — the containment
+/// test a **project** root must pass before it is listed (BR-10).
+///
+/// Three answers, and each of the two `None`s is deliberate:
+///
+/// - `dir` does not resolve at all → **true**, deferring to the listing. This is
+///   the ordinary state of both project roots on a repository with no `.claude/`
+///   in it, which is most of them, and a refusal here would put a diagnostic on
+///   every such session. `list` answers `NotFound` a line later and continues in
+///   silence, which is the behaviour BR-1 specifies; a root that exists but
+///   cannot be resolved fails `list` too and is named `Unreadable` there. In
+///   neither case has anything been enumerated.
+/// - `boundary` is `None` — the session root itself does not resolve → **false**.
+///   Fail closed: there is nothing to compare against, so the question cannot be
+///   answered, and an unanswerable containment question is not a yes. (Reaching
+///   this with a resolving `dir` would take a root that vanished between the two
+///   calls.)
+///
+/// `Path::starts_with` is component-wise, so `/repo-other` does not pass for a
+/// boundary of `/repo` — the string-prefix bug this would otherwise have.
+fn resolves_under(fs: &dyn DirLister, dir: &Path, boundary: Option<&Path>) -> bool {
+    let Some(resolved) = fs.canonicalize(dir) else {
+        return true;
+    };
+    boundary.is_some_and(|boundary| resolved.starts_with(boundary))
 }
 
 /// Decide one listed entry: register it, name why it was skipped, or pass over

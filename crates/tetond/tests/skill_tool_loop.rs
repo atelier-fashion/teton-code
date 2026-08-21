@@ -586,9 +586,13 @@ async fn the_thirteenth_call_of_a_turn_is_refused_by_the_cap_and_the_next_prompt
             capped[0].name.as_str(),
             capped[0].turn_invocations.map(|t| (t.count, t.cap))
         ),
-        ("step", Some((CAP as u32 + 1, CAP as u32))),
-        "the record names the skill the call named, and the count that refused \
-         it: {published:?}"
+        ("step", Some((CAP as u32, CAP as u32))),
+        "the record names the skill the call named, and the count that refused it \
+         — clamped at the ceiling it is rendered against, because `/verbose` prints \
+         `invocation {{count}} of {{cap}} this turn` and `13 of 12` is a sentence \
+         about nothing. The counter itself keeps counting past the cap (BR-6a's \
+         bound is what makes a loop of refusals finite); only the display is \
+         bounded: {published:?}"
     );
     assert!(
         capped[0].outcomes.is_empty(),

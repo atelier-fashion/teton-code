@@ -6648,6 +6648,14 @@ fn verbose_shows_the_invocation_line_with_its_path_and_per_command_outcomes() {
 /// the other side: a typed invocation spends none of the per-turn cap, and a
 /// renderer that printed `0 of 12` here would name a budget the user is not
 /// drawing on.
+///
+/// The third skill (`/gamma`) is BR-3's **typo** case, and it needs the whole
+/// product to be honest: the daemon reads a value that is not a boolean, takes
+/// the safe reading, names the key as unhonored, and only the client can tell
+/// the reader which of the two things happened. A renderer that quoted the
+/// canonical literal here would show an author a line their file does not
+/// contain — and a unit test on either half alone cannot see that, because each
+/// half is doing exactly what it was asked to.
 #[test]
 fn a_typed_invocation_names_the_swap_and_its_flags_and_counts_no_turn_budget() {
     let daemon_bin = daemon_bin();
@@ -6672,6 +6680,19 @@ fn a_typed_invocation_names_the_swap_and_its_flags_and_counts_no_turn_budget() {
             "Beta body.\n",
         ),
     );
+    // The same flag with a value no parser reads as a boolean. BR-3's safe
+    // reading hides this file from the model exactly as beta's `true` does — the
+    // *outcome* is identical — while the file itself said something else
+    // entirely, and `/verbose` is where the author of the typo finds out which
+    // of the two happened.
+    home.write(
+        ".claude/commands/gamma.md",
+        &skill_file_with(
+            "the gamma skill",
+            &["disable-model-invocation: yes"],
+            "Gamma body.\n",
+        ),
+    );
 
     let daemon = TestDaemon::spawn_scripted_with_env(
         &daemon_bin,
@@ -6689,7 +6710,7 @@ fn a_typed_invocation_names_the_swap_and_its_flags_and_counts_no_turn_budget() {
     let (stdout, stderr, status) = daemon.run_cli_from(
         &teton,
         &["--cwd", project.to_str().unwrap()],
-        "/verbose\n/validate\n/beta\n",
+        "/verbose\n/validate\n/beta\n/gamma\n",
         None,
         &[("HOME", home.path())],
     );
@@ -6708,6 +6729,25 @@ fn a_typed_invocation_names_the_swap_and_its_flags_and_counts_no_turn_budget() {
         stdout.contains("  hidden from the model (`disable-model-invocation: true`)"),
         "`/verbose` must name the flag this build honored, in the file's own \
          spelling; output:\n{stdout}"
+    );
+    // BR-3's *other* reading of the same key, through the whole product: the
+    // daemon parses `yes`, takes the safe value, names the key as unhonored, and
+    // the client words the two cases apart. The old line quoted
+    // `disable-model-invocation: true` at an author who wrote `yes` — a line
+    // their file does not contain — one line above `ignored frontmatter:
+    // disable-model-invocation`, which alone reads as "this key did nothing".
+    assert!(
+        stdout.contains(
+            "  hidden from the model (`disable-model-invocation` was not `true` or \
+             `false`, so the safe reading hid it)"
+        ),
+        "a file whose flag value is not a boolean must be told so, and told \
+         which reading was taken; output:\n{stdout}"
+    );
+    assert!(
+        stdout.contains("  ignored frontmatter: disable-model-invocation"),
+        "the unhonored key is still named, now explained by the line above it \
+         rather than contradicted by it; output:\n{stdout}"
     );
     // The flags line reports what the file *wrote*: neither skill declared
     // `user-invocable`, so neither is called model-only anywhere.
@@ -6950,10 +6990,19 @@ fn a_model_invocation_echoes_its_line_and_a_refused_one_says_so_instead() {
         "nobody typed `/small`; a model invocation must not render as the \
          user's own line; output:\n{stdout}"
     );
+    // The `12` is `tetond::harness::tools::skill::PER_TURN_INVOCATION_CAP`,
+    // spelled rather than read: the `teton` crate cannot depend on `tetond`, and
+    // a whole-CLI test reads the daemon's ceiling off the wire like any client.
+    // The literal is therefore correct and brittle in the same breath, so the
+    // message names the constant that moved rather than leaving a reader to
+    // wonder where `12` came from.
     assert!(
         stdout.contains("  invocation 1 of 12 this turn"),
         "`/verbose` shows the turn's count against the cap for a model \
-         invocation; output:\n{stdout}"
+         invocation — the `12` here is `PER_TURN_INVOCATION_CAP` \
+         (`tetond::harness::tools::skill`), spelled because this crate cannot \
+         depend on that one; if that constant moved, this literal follows it. \
+         output:\n{stdout}"
     );
     // AC-10's `tool_call` title: `skill <name>`, so the status line says which
     // skill the model reached for rather than only that *something* did.

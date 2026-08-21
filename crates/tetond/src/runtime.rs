@@ -2910,25 +2910,32 @@ impl DaemonRuntime {
         // ADR-9's id-minting gap, decided rather than papered over: a project
         // skill is under the root and mints; a user skill at
         // `~/.claude/skills/x/SKILL.md` in a repo-rooted session has no
-        // repo-relative identity, and `from_resolved` refuses rather than
-        // inventing one. `unknown` is what carries that refusal forward.
-        let (sources, unknown) = match ProvenanceId::from_resolved(&probed.path, &skill.path) {
-            Ok(id) => (BTreeSet::from([id]), false),
-            Err(_) => (BTreeSet::new(), true),
+        // repo-relative identity, and the minter refuses rather than inventing
+        // one. `unknown` is what carries that refusal forward.
+        //
+        // Through `skills::provenance_of`, not `ProvenanceId::from_resolved`
+        // directly (REQ-587 verify): `from_resolved` takes a **canonical** path
+        // and `skill.path` is the path discovery walked to the file, which a
+        // symlinked-but-in-repo project root leaves non-canonical. That helper
+        // is the one home for resolving both sides, and it fails closed.
+        let (sources, unknown) = match crate::skills::provenance_of(&probed.path, skill) {
+            Some(id) => (BTreeSet::from([id]), false),
+            None => (BTreeSet::new(), true),
         };
 
         Ok(SkillTurn {
             name: skill.name.clone(),
             text,
             // REQ-587 BR-5: **the** mint, from the expansion, before the value
-            // is moved into the turn. `skill.permission_key()` is the tempting
-            // spelling and it is the silent one — the gate accepts either and
-            // pins whichever it is given, so a plain key here would keep
-            // REQ-585's behaviour (one answer covering every argument list this
-            // skill is ever invoked with) with nothing red. The two facts a
+            // is moved into the turn. `permission_key_for(skill.source, …)` is
+            // the tempting spelling and it is the silent one — the gate accepts
+            // either and pins whichever it is given, so a plain key here would
+            // keep REQ-585's behaviour (one answer covering every argument list
+            // this skill is ever invoked with) with nothing red. The two facts a
             // caller cannot supply correctly on its own — the *substituted*
-            // command set, and whether the body interpolated at all — live on
-            // the expansion, which is why the mint does.
+            // command set, and whether the arguments had a hand in it — live on
+            // the expansion, which is why the mint does. The `Skill` method that
+            // used to offer the tempting spelling on the row itself is gone.
             permission_key: expansion.grant_key(skill.source),
             expansion: Some(expansion),
             source: skill.source,
@@ -3410,6 +3417,12 @@ impl DaemonRuntime {
                 &config,
                 &session_id,
                 routed_text,
+                // A typed prompt is the user's own bytes, read from no file, so
+                // there is nothing for a boundary to be compared against. This
+                // is the one call site for which the empty value is a statement
+                // rather than an omission — the skill call site below is the
+                // other one, and it says something different.
+                Provenance::empty(),
             );
         }
 
@@ -3537,7 +3550,24 @@ impl DaemonRuntime {
         // session may be named after it. Deferred to here rather than run with
         // the typed prompts above, because the naming duty is a model call and
         // a refused turn must not have reached one (BR-8).
-        if skill_turn.is_some() {
+        //
+        // **With the expansion's own provenance** (REQ-587 verify). `routed_text`
+        // here is `SkillTurn::text` — the skill file's bytes — and the duty sends
+        // a bounded copy of it to a route `title_route` resolves *remotely*
+        // unless the session is already tainted, which on the session's first
+        // substantive prompt it is not. `Provenance::empty()` short-circuits
+        // `Egress::send` before any boundary check, so passing it here would ship
+        // a `local-only` skill body (or a user skill's fail-closed `unknown`) off
+        // the machine through the one duty the turn does not wait for.
+        //
+        // The values are read off the turn rather than recomputed, and they are
+        // this text's provenance *at this point in the function*: the commands
+        // have not run yet, so `routed_text` still carries
+        // `PENDING_PLACEHOLDER` where their output will go and no command has
+        // contributed anything for `unknown` to account for. The seam below OR's
+        // in `spawned` before the user block is seeded, which is the same rule
+        // applied to a longer string — not a second reading of this one.
+        if let Some(skill) = skill_turn.as_ref() {
             let _ = self.spawn_title_session(
                 events,
                 sessions,
@@ -3545,6 +3575,7 @@ impl DaemonRuntime {
                 &config,
                 &session_id,
                 routed_text,
+                expansion_provenance(&skill.sources, skill.unknown),
             );
         }
 
@@ -7082,9 +7113,26 @@ impl DaemonRuntime {
     /// REQ. This function therefore returns nothing; there is no outcome a caller
     /// could act on that would be better than proceeding with the turn.
     ///
-    /// The provenance handed to the duty is [`Provenance::empty`]: the content
-    /// being sent is the user's own typed request, which was derived from no file
-    /// (LESSON-432 — the call site is what knows where its content came from).
+    /// ## The provenance is the **caller's**, and that is REQ-587's correction
+    ///
+    /// `provenance` is the egress provenance of `prompt` — the content this duty
+    /// is about to send — and it is a parameter for the reason LESSON-432 gives:
+    /// the call site is what knows where its content came from. This function
+    /// used to hard-code [`Provenance::empty`], which was right while there was
+    /// only one caller: a typed prompt is the user's own bytes and touched no
+    /// file. REQ-585 added a second caller whose `prompt` is a **skill
+    /// expansion** — a file's contents, plus whatever its dynamic commands
+    /// printed — and REQ-587's verify found the hard-coded value still here.
+    /// `Egress::send` short-circuits on an empty provenance before any boundary
+    /// check, so `title` — which `title_route` resolves **remotely** unless the
+    /// session is already tainted, and which fires on the session's first
+    /// substantive prompt, before any taint exists — was putting up to
+    /// `TITLE_REQUEST_MAX_BYTES` of that file on the wire.
+    ///
+    /// The typed-prompt call sites still pass [`Provenance::empty`], and that
+    /// stays correct for them; what changed is that it is now something a caller
+    /// states rather than something this function assumes on every caller's
+    /// behalf.
     ///
     /// ## The naming is **detached**; the turn never waits on it (REQ-561 verify)
     ///
@@ -7109,6 +7157,7 @@ impl DaemonRuntime {
     /// Returns the spawned task so a test can await it. **Production drops it**:
     /// a title that has not landed yet is a session with no title, which is BR-3's
     /// degraded state and costs the turn nothing.
+    #[allow(clippy::too_many_arguments)]
     fn spawn_title_session(
         &self,
         events: &Arc<EventBus>,
@@ -7117,6 +7166,7 @@ impl DaemonRuntime {
         config: &Config,
         session_id: &SessionId,
         prompt: &str,
+        provenance: Provenance,
     ) -> Option<tokio::task::JoinHandle<()>> {
         if !crate::harness::title::worth_titling(prompt) {
             return None;
@@ -7132,8 +7182,7 @@ impl DaemonRuntime {
         let session_id = session_id.clone();
         let prompt = prompt.to_owned();
         Some(tokio::spawn(async move {
-            let Ok(title) =
-                crate::harness::title::name_session(&route, &prompt, &Provenance::empty()).await
+            let Ok(title) = crate::harness::title::name_session(&route, &prompt, &provenance).await
             else {
                 return;
             };
@@ -10786,6 +10835,32 @@ fn health_record_after_failure(class: FailureClass, now: Instant) -> Option<Heal
         // Healthy downgrade is not a thing.
         ProviderHealth::Healthy => Some(HealthRecord::healthy()),
     }
+}
+
+/// The egress [`Provenance`] of a skill expansion, from the two values
+/// [`SkillTurn`] carries (REQ-587 BR-10, ADR-8).
+///
+/// The pair — a minted id set and a fail-closed bit — is the shape
+/// `ContextManager::push_user_from` takes, because that is how the *seed* block
+/// records where a turn's text came from. A **duty** does not push a block; it
+/// sends a string, and the choke point in front of it wants a `Provenance`. This
+/// is the one conversion between the two, so a duty and the seed cannot come to
+/// describe one string two ways.
+///
+/// A **project** skill mints one id and is compared against the boundary globs
+/// like any `read`. A **user** skill has no repo-relative identity, arrives with
+/// `unknown` set, and is refused wherever any boundary is configured — stricter
+/// than a `read` of the same bytes, which is BR-10's stated consequence and not
+/// an accident of this function.
+fn expansion_provenance(sources: &BTreeSet<ProvenanceId>, unknown: bool) -> Provenance {
+    let mut provenance = Provenance::empty();
+    for id in sources {
+        provenance.merge(&Provenance::tainted_by(id.clone()));
+    }
+    if unknown {
+        provenance.mark_unknown();
+    }
+    provenance
 }
 
 /// Whether the assembled context in `ctx` carries content that must pin the
@@ -16677,9 +16752,17 @@ permission_allow = [\"fetch_user_url\"]
                 let config = runtime.config.lock().expect("config mutex").clone();
                 let router =
                     build_router(&config, runtime.local_tier_available(), &BTreeMap::new());
-                if let Some(handle) =
-                    runtime.spawn_title_session(bus, sessions, &router, &config, session, prompt)
-                {
+                if let Some(handle) = runtime.spawn_title_session(
+                    bus,
+                    sessions,
+                    &router,
+                    &config,
+                    session,
+                    prompt,
+                    // These fixtures name a session after a **typed** prompt,
+                    // which is the call site the empty value belongs to.
+                    Provenance::empty(),
+                ) {
                     handle.await.expect("the titling task must not panic");
                 }
             }
@@ -17228,7 +17311,15 @@ permission_allow = [\"fetch_user_url\"]
                 });
 
                 let handle = runtime
-                    .spawn_title_session(&bus, &sessions, &router, &cfg, &session, REQUEST)
+                    .spawn_title_session(
+                        &bus,
+                        &sessions,
+                        &router,
+                        &cfg,
+                        &session,
+                        REQUEST,
+                        Provenance::empty(),
+                    )
                     .expect("the fixture must claim the title");
 
                 assert!(

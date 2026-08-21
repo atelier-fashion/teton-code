@@ -1084,8 +1084,9 @@ fn render_invocation_detail(invoked: &SkillInvoked, surface: &mut dyn Surface) {
 /// "invocable by the user and the model" over a file that declared no flag at
 /// all would report an absence as a declaration.
 ///
-/// The key is quoted in the file's own spelling, because the actionable half of
-/// "model-only" is which line of which file said so.
+/// The key is named because the actionable half of "model-only" is which line
+/// of which file said so — and a **value** this build could not read is worded
+/// apart from one it could ([`model_flag_clause`]).
 fn declared_flags_line(invoked: &SkillInvoked) -> Option<String> {
     match (invoked.user_invocable, invoked.model_invocable) {
         (true, true) => None,
@@ -1093,20 +1094,61 @@ fn declared_flags_line(invoked: &SkillInvoked) -> Option<String> {
         // row not at all — it answers "may you type this?", and the answer is
         // yes — so this line is the only place the flag is ever named, and the
         // two surfaces are not in disagreement about anything.
-        (true, false) => {
-            Some("  hidden from the model (`disable-model-invocation: true`)".to_owned())
-        }
+        (true, false) => Some(format!(
+            "  hidden from the model ({})",
+            model_flag_clause(invoked)
+        )),
+        // `user-invocable` needs no such split: its safe reading is the
+        // *unchanged* one (the user keeps `/name`), so a `false` here can only
+        // have come from the literal the clause quotes.
         (false, model_invocable) => Some(format!(
-            "  {} (`user-invocable: false`{})",
+            "  {} (`{USER_INVOCATION_KEY}: false`{})",
             slash::model_only_words(model_invocable),
             if model_invocable {
-                ""
+                String::new()
             } else {
-                ", `disable-model-invocation: true`"
+                format!(", {}", model_flag_clause(invoked))
             },
         )),
     }
 }
+
+/// BR-3's negative flag, as this build read it: the literal the file wrote, or
+/// — when the value was not a boolean — what it was read as instead.
+///
+/// **A typo must not be quoted back as a declaration.** BR-3's safe reading
+/// hides a file whose `disable-model-invocation` value is neither `true` nor
+/// `false`, so an author who wrote `yes` is hidden from the model *and* was
+/// shown, until this split existed, a line quoting `disable-model-invocation:
+/// true` — a line their file does not contain — one line above
+/// `ignored frontmatter: disable-model-invocation`, which on its own reads as
+/// "this key did nothing". Two lines, contradicting each other, and the one
+/// that was true was the one that sounded harmless.
+///
+/// The malformed case is recognized from [`SkillInvoked::ignored_keys`] rather
+/// than from a new wire field, because that list is already exactly the daemon's
+/// answer to "which keys did this file write that I did not honor": its parser
+/// names the flag there precisely when the value was unreadable, and an honored
+/// `true` never appears in it. The file's raw value is not on the wire, so the
+/// clause names the key and the reading rather than quoting bytes it does not
+/// have.
+fn model_flag_clause(invoked: &SkillInvoked) -> String {
+    if invoked
+        .ignored_keys
+        .iter()
+        .any(|key| key == MODEL_INVOCATION_KEY)
+    {
+        format!("`{MODEL_INVOCATION_KEY}` was not `true` or `false`, so the safe reading hid it")
+    } else {
+        format!("`{MODEL_INVOCATION_KEY}: true`")
+    }
+}
+
+/// The frontmatter key that hides a skill from the model (BR-3).
+const MODEL_INVOCATION_KEY: &str = "disable-model-invocation";
+
+/// The frontmatter key that keeps a skill out of the user's `/name` (BR-3).
+const USER_INVOCATION_KEY: &str = "user-invocable";
 
 /// BR-9's `/verbose` count: what this turn has spent of the per-turn cap.
 ///
@@ -1249,11 +1291,16 @@ fn skill_refusal_line(invoked: &SkillInvoked, reason: &str) -> String {
 ///
 /// # The set is open, and the unknown arm is the load-bearing one
 ///
-/// Six of the daemon's ids are not published yet and more will exist than this
-/// build knows, exactly as `PermissionSubject::Unrecognized` anticipates for
-/// subjects. An id this build cannot word must still produce a **readable
-/// line** — BUG-186 is open against dropping an event a client does not fully
-/// understand, and a refusal that renders blank is the worst of the three
+/// Two of the daemon's ids cannot reach this arm at all — `unknown_skill` and
+/// `invalid_arguments` — because neither names a registry row and the daemon
+/// publishes no record for a call it cannot attribute to a file (its
+/// `registered_row` returns `None`). They are worded here anyway, because
+/// "which reasons publish" is the daemon's to change and this map costs nothing
+/// for being complete. Every other id it raises does publish, and more will
+/// exist than this build knows, exactly as `PermissionSubject::Unrecognized`
+/// anticipates for subjects. An id this build cannot word must still produce a
+/// **readable line** — BUG-186 is open against dropping an event a client does
+/// not fully understand, and a refusal that renders blank is the worst of the three
 /// outcomes here (worse than an awkward line, and much worse than a wrong one,
 /// because nothing on the surface says the call happened at all).
 ///
@@ -8100,6 +8147,22 @@ mod skill_tests {
         }
     }
 
+    /// [`flagged`] for a file whose `disable-model-invocation` value this build
+    /// could **not** read — `disable-model-invocation: yes`, say.
+    ///
+    /// The wire shape is BR-3's safe reading exactly as the daemon publishes it:
+    /// the model is shut out (`model_invocable: false`), the user's door is
+    /// whatever the other flag said, and the key is named on `ignored_keys`
+    /// because the value was not honored. That list is the *only* signal the
+    /// event carries that a typo rather than a declaration produced this row —
+    /// the raw value is not on the wire.
+    fn flagged_unreadable(user_invocable: bool) -> SkillInvoked {
+        SkillInvoked {
+            ignored_keys: vec!["disable-model-invocation".to_owned()],
+            ..flagged(user_invocable, false)
+        }
+    }
+
     fn ran(command: &str, bytes: u64) -> DynamicOutcomeView {
         DynamicOutcomeView {
             command: command.to_owned(),
@@ -8289,6 +8352,87 @@ mod skill_tests {
             flags_line(true, true),
             None,
             "a default is not a declaration"
+        );
+    }
+
+    /// **BR-3's named diagnostic must not name the opposite of what happened.**
+    ///
+    /// A file writing `disable-model-invocation: yes` is hidden from the model —
+    /// that is BR-3's safe reading of a value the parser cannot read — *and* has
+    /// its key on the `ignored frontmatter` line, because the daemon did not
+    /// honor the value it was given. Quoting `disable-model-invocation: true`
+    /// back at that author shows them a line their file does not contain, one
+    /// line above a line that on its own reads "this key had no effect"; of the
+    /// two, the harmless-sounding one is the false one, and the author of the
+    /// typo is exactly the reader this block exists for.
+    ///
+    /// Both `/verbose` lines are asserted **together**, because the failure was
+    /// never in either line alone — it was in what they say side by side.
+    ///
+    /// **Mutation.** Return the literal unconditionally from
+    /// `model_flag_clause` (the shape before this split) and the first two
+    /// assertions fail; drop the malformed branch's reference to the reading it
+    /// took and the third does.
+    #[test]
+    fn verbose_tells_an_unreadable_flag_value_apart_from_the_literal_that_hid_the_file() {
+        let block = |invoked: SkillInvoked| -> Vec<String> {
+            let mut surface = RecordingSurface::new();
+            let mut state = SessionState::new();
+            state.verbose = true;
+            render_event(
+                &envelope(Event::SkillInvoked(invoked)),
+                &mut surface,
+                &mut state,
+            );
+            surface
+                .lines_of(LineKind::Info)
+                .iter()
+                .map(|line| (*line).to_owned())
+                .collect()
+        };
+
+        let typo = block(flagged_unreadable(true));
+        assert!(
+            typo.iter().any(|line| line
+                == "  hidden from the model (`disable-model-invocation` was not `true` or \
+                    `false`, so the safe reading hid it)"),
+            "the file wrote `yes`; the line must say the value was not a boolean \
+             and name the reading it took: {typo:?}"
+        );
+        assert!(
+            !typo
+                .iter()
+                .any(|line| line.contains("`disable-model-invocation: true`")),
+            "a value the file never wrote was quoted back at its author: {typo:?}"
+        );
+        // And the key is still on the ignored line — the daemon's own
+        // diagnostic, which is now explained rather than contradicted.
+        assert!(
+            typo.iter()
+                .any(|line| line == "  ignored frontmatter: disable-model-invocation"),
+            "the unhonored key must still be named: {typo:?}"
+        );
+
+        // The two-flag file, whose model flag is the unreadable one: the
+        // `user-invocable` half is a literal (its safe reading is the unchanged
+        // one, so `false` can only have been written) and the other is not.
+        let both = block(flagged_unreadable(false));
+        assert!(
+            both.iter().any(|line| line
+                == "  invocable by nobody (`user-invocable: false`, \
+                    `disable-model-invocation` was not `true` or `false`, so the safe \
+                    reading hid it)"),
+            "the two flags must be quoted as each was written: {both:?}"
+        );
+
+        // The honored value still reads as the declaration it is — the reverse
+        // mutation, which would tell every author their `true` was a typo.
+        let honored = block(flagged(true, false));
+        assert!(
+            honored
+                .iter()
+                .any(|line| line == "  hidden from the model (`disable-model-invocation: true`)"),
+            "a file that wrote the literal must be quoted verbatim: {honored:?}"
         );
     }
 
@@ -8947,15 +9091,16 @@ mod skill_tests {
 /// A source-level scan of the whole `teton` crate, in the style of
 /// `tetond/tests/boundary_coverage.rs`'s.
 ///
-/// The claim ADR-7 makes is a **negative** one — `req.tool_name`'s
-/// `skill:<source>:<name>` shape is not parsed anywhere in this crate — and a
-/// negative claim about code that does not exist cannot be asserted by running
-/// anything. So it is asserted about the source itself, embedded with
+/// The claim ADR-7 makes is a **negative** one — neither shape `req.tool_name`
+/// can take for this feature (`skill:<source>:<name>` and REQ-587's
+/// `project_skill_trust:<root>`) is parsed or composed anywhere in this crate —
+/// and a negative claim about code that does not exist cannot be asserted by
+/// running anything. So it is asserted about the source itself, embedded with
 /// `include_str!` at compile time rather than read from disk, which is BUG-159's
 /// trap: a scan that opens files at runtime passes vacuously from a directory
 /// that is not the crate.
 ///
-/// The rule this guards is not "the key is unimportant" — it is the grant key,
+/// The rule this guards is not "the key is unimportant" — each is a grant key,
 /// and [`SessionGrants`] uses it as an **opaque** one, whole, hashed, never
 /// split. What a client may not do is *select behaviour* by its shape: BR-11
 /// says the key is an implementation detail, and a client sniffing an unstable
@@ -8966,6 +9111,9 @@ mod skill_tests {
 #[cfg(test)]
 mod key_scan {
     use std::collections::BTreeSet;
+    use teton_protocol::methods::{
+        skill_permission_key_prefix, SkillSource, PROJECT_SKILL_TRUST_KEY_PREFIX,
+    };
 
     /// Every production source file of this crate. A fixed list, because
     /// `include_str!` takes a literal path — and
@@ -8994,10 +9142,37 @@ mod key_scan {
         ("web_setup_ui.rs", include_str!("web_setup_ui.rs")),
     ];
 
-    /// A string literal that opens with the grant key's prefix — `"skill:` —
-    /// which is what `starts_with`, `strip_prefix`, `split` and `format!` all
-    /// need in order to take the key apart or to build one.
-    const KEY_LITERAL: &str = "\"skill:";
+    /// The string literals a client would have to write in order to take one of
+    /// this feature's grant keys apart **or to build one**: an opening quote
+    /// followed by a key family's prefix, which is what `starts_with`,
+    /// `strip_prefix`, `split` and `format!` all need.
+    ///
+    /// **Both families, and neither of them spelled here.** REQ-587 minted a
+    /// second key beside REQ-585's `skill:<source>:<name>` — the project-skill
+    /// acknowledgment's `project_skill_trust:<root>` (ADR-7) — and a scan that
+    /// knew only the first would pass a client that matched the second by
+    /// string. The [`DECOMPOSITIONS`] half catches a `starts_with` on either,
+    /// but not a `format!` that *builds* one, so the literal needle is the only
+    /// guard on that half of the mutation and it has to cover both keys.
+    ///
+    /// The prefixes are read off the protocol's own definitions rather than
+    /// re-typed, so a rename of either key reaches this scan through the
+    /// compiler instead of through somebody's grep (LESSON-546).
+    fn key_literals() -> Vec<String> {
+        // `skill:` — the root both source prefixes share, taken off one of them
+        // rather than written out: a client matching the bare family root is
+        // the mutation this catches, and a needle of `"skill:user:` would miss
+        // it.
+        let source_prefix = skill_permission_key_prefix(SkillSource::User);
+        let family = source_prefix
+            .split_once(':')
+            .expect("the skill permission key is `skill:<source>:<name>`")
+            .0;
+        vec![
+            format!("\"{family}:"),
+            format!("\"{PROJECT_SKILL_TRUST_KEY_PREFIX}"),
+        ]
+    }
 
     /// Ways to decompose the key once it is in hand. `as_str`, `clone` and a
     /// bare `{}` are absent on purpose: passing the key along whole, hashing it
@@ -9038,15 +9213,17 @@ mod key_scan {
     }
 
     /// **ADR-7 / BR-11.** No production line of this crate builds or takes apart
-    /// the `skill:<source>:<name>` permission key. A client that sniffed it
-    /// would mis-fire the one way that costs a stdin line, and the typed
-    /// `PermissionSubject` exists precisely so that it never has to.
+    /// either permission key this feature mints — `skill:<source>:<name>` or
+    /// `project_skill_trust:<root>`. A client that sniffed one would mis-fire
+    /// the one way that costs a stdin line, and the typed `PermissionSubject`
+    /// exists precisely so that it never has to.
     #[test]
     fn no_production_source_parses_the_skill_permission_key() {
+        let literals = key_literals();
         let mut offences: Vec<String> = Vec::new();
         for (file, text) in CRATE_SOURCES {
             for (index, line) in code_lines(production_half(text)) {
-                if line.contains(KEY_LITERAL) {
+                if literals.iter().any(|needle| line.contains(needle)) {
                     offences.push(format!("{file}:{}: {}", index + 1, line.trim()));
                 }
                 for needle in DECOMPOSITIONS {
@@ -9103,22 +9280,48 @@ mod key_scan {
         );
     }
 
-    /// The scan is not vacuous: it really would fire.
+    /// The scan is not vacuous: it really would fire, **on both key families
+    /// and on both shapes of the mutation**.
     ///
-    /// Both needles are exercised against text shaped like the mutation they
-    /// exist to catch — a client that recognized a skill consent by reading its
-    /// key — so a later edit that broke `production_half`, `code_lines` or the
-    /// needle list is a failure here rather than a green scan of nothing.
+    /// Every needle is exercised against text shaped like the mutation it
+    /// exists to catch — a client that recognized a consent by reading its key,
+    /// and a client that composed one — so a later edit that broke
+    /// `production_half`, `code_lines` or [`key_literals`] is a failure here
+    /// rather than a green scan of nothing.
+    ///
+    /// The `format!` rows are the ones [`DECOMPOSITIONS`] cannot see: nothing is
+    /// taken apart there, so the literal needle is the whole guard, and before
+    /// REQ-587 extended it a client building a `project_skill_trust:` key passed
+    /// this module untouched.
     #[test]
     fn the_scan_would_catch_a_client_that_sniffed_the_key() {
-        let sniffing = "    if req.tool_name.starts_with(\"skill:\") {\n        ask();\n    }\n";
-        let hits: Vec<&str> = code_lines(production_half(sniffing))
-            .filter(|(_, line)| {
-                line.contains(KEY_LITERAL) || DECOMPOSITIONS.iter().any(|n| line.contains(n))
-            })
-            .map(|(_, line)| line)
-            .collect();
-        assert_eq!(hits.len(), 1, "the mutation is caught: {hits:?}");
+        let literals = key_literals();
+        let offending_lines = |source: &str| -> Vec<String> {
+            code_lines(production_half(source))
+                .filter(|(_, line)| {
+                    literals.iter().any(|needle| line.contains(needle))
+                        || DECOMPOSITIONS.iter().any(|n| line.contains(n))
+                })
+                .map(|(_, line)| line.to_owned())
+                .collect()
+        };
+
+        for mutation in [
+            // Reading a skill key's shape …
+            "    if req.tool_name.starts_with(\"skill:\") {\n        ask();\n    }\n",
+            // … and the acknowledgment key's, which is the family REQ-587 added.
+            "    if req.tool_name.starts_with(\"project_skill_trust:\") {\n        ask();\n    }\n",
+            // Building either, which no decomposition needle can catch.
+            "    let key = format!(\"skill:{source}:{name}\");\n",
+            "    let key = format!(\"project_skill_trust:{root}\");\n",
+        ] {
+            let hits = offending_lines(mutation);
+            assert_eq!(
+                hits.len(),
+                1,
+                "the mutation is caught: {mutation:?} → {hits:?}"
+            );
+        }
 
         // And a comment saying the same words is not an offence.
         let prose = "    /// The key's `skill:<source>:<name>` shape (`\"skill:`) is not parsed.\n";

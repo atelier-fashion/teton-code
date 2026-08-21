@@ -87,7 +87,6 @@ use teton_providers::capability::NATIVE_MAX_ITERATIONS;
 
 use super::context::{ContextManager, Fit, APPROX_BYTES_PER_TOKEN};
 use super::duty::DUTY_REQUEST_BYTES_PER_TOKEN;
-use super::tools::ToolOutcome;
 use crate::egress::redact::REDACT_SCANNABLE_CONTEXT_BYTES;
 
 /// The default context budget in whitespace-approximated tokens — **the one
@@ -324,10 +323,14 @@ fn sanitized_provider_id(id: &str) -> String {
 /// label reading `` `kimi`'s context window `` and a
 /// [`RouteBudget::provider_id`] of `kimi` cannot come to disagree if neither is
 /// written without the other. The alternative a reader reaches for — recovering
-/// the id by stripping `"'s context window"` off the label — is the drift the
-/// label's own doc exists to prevent, and it is *wrong* besides: the redact
-/// clamp renames the window without changing whose window it is, so a parsed id
-/// would go `None` on precisely the route BR-4 clamps.
+/// the id by stripping `"'s context window"` off the label — reads a machine
+/// fact out of a human-facing sentence, and that sentence gets reworded.
+///
+/// The redact clamp is where the two spellings genuinely part company: it
+/// renames the window without changing whose window it is, so a parsed id goes
+/// `None` on a route that has a provider. **No refusal reachable today is
+/// different for it** — see [`RouteBudget::provider_id`] for why, and for why
+/// the pair is minted together anyway.
 ///
 /// Defensive `None` arm: a remote route always has an id in practice (the
 /// window came from `capability_of(id)`); an id-less caller gets the default
@@ -451,11 +454,35 @@ pub struct RouteBudget {
     ///
     /// Both come out of [`labelled_provider`], and
     /// `the_window_label_names_the_provider_the_field_carries_and_neither_is_parsed_from_the_other`
-    /// pins that. The redact clamp is where a parse would break: it renames the
-    /// window to `"the redact-scannable window"` without changing whose window
-    /// it is, so a stripped-suffix id would answer `None` for a route that has
-    /// a provider — and the refusal would drop the remedy on a *clamped* remote
-    /// route, which is one of the two the user most needs it on.
+    /// pins that.
+    ///
+    /// **The honest form of that claim, corrected in verify.** An earlier
+    /// version of this doc said a `strip_suffix("'s context window")`
+    /// implementation would drop the remedy from a clamped remote route's
+    /// refusal. It would not, and the control flow is one screen away: the
+    /// remedy is appended by [`bound_clause`] only when the bound is
+    /// [`BudgetBound::DefaultUnknown`], and [`derive`]'s `DefaultUnknown` arm
+    /// **returns early**, above the redact clamp. So the one bound that renders
+    /// the remedy can never wear [`REDACT_WINDOW_LABEL`], and on every row
+    /// reachable today a parse and this field compose byte-identical refusals.
+    /// A guard argued from a consequence that cannot happen is a guard nobody
+    /// can check, which is worse than no argument.
+    ///
+    /// **Why the pair is still minted together.** Two reasons, both about
+    /// tomorrow rather than today:
+    ///
+    /// * The redact clamp really does rename the window without changing whose
+    ///   window it is, so the label and the id genuinely disagree on that row —
+    ///   `Some("kimi")` beside `"the redact-scannable window"`. Nothing renders
+    ///   the remedy there *yet*. The moment a second bound does — a
+    ///   `RedactScan` route is exactly one whose user might want to raise
+    ///   `capabilities.max_context` — a parse-based id would go silently `None`
+    ///   on it, and the test row that discriminates the two is already written.
+    /// * Recovering a machine fact by parsing a human-facing string couples the
+    ///   fact to the sentence's wording. `window_label` is prose: it is written
+    ///   into an elided block's own text and into refusals, and it is reworded
+    ///   by whoever is improving that prose, who has no reason to know an id
+    ///   was being read out of it. That break is silent in both directions.
     pub provider_id: Option<String>,
 }
 
@@ -693,7 +720,7 @@ pub enum SkillFit {
     /// `error_code::SKILL_EXPANSION_TOO_LARGE` and sends nothing — `-32023`
     /// and not `-32022`, because no provider has seen that turn; a
     /// model-invoked call renders it as a tool result instead
-    /// ([`SkillFit::into_tool_result`]).
+    /// ([`SkillFit::into_tool_refusal`]).
     TooLarge {
         /// BR-8's sentence: the skill, its size, the budget, the spoken bound,
         /// which stage refused, and — through [`SkillCaller`] — who asked.
@@ -702,7 +729,8 @@ pub enum SkillFit {
 }
 
 impl SkillFit {
-    /// The refusal rendered as a **tool result** (REQ-587 BR-6/BR-9, ADR-2).
+    /// The refusal's **text**, for a caller that is going to push it as a tool
+    /// result (REQ-587 BR-6/BR-9, ADR-2).
     ///
     /// Every raise site REQ-585 shipped turns [`SkillFit::TooLarge`] into an
     /// `RpcError` and ends the prompt turn, which is the right answer for a
@@ -711,17 +739,27 @@ impl SkillFit {
     /// inside a turn that is still going, and ending the turn there would take
     /// the conversation down with the call — so the refusal is a typed outcome
     /// the model reads and relays, exactly as a rejected edit or a jailed read
-    /// already is.
+    /// already is. [`Fits`] renders as nothing, because a fitting expansion has
+    /// no refusal to print.
     ///
-    /// `is_error` because the call did not do what it was asked to do; the loop
-    /// folds it into context as it folds any other failed tool call. [`Fits`]
-    /// renders as nothing, because a fitting expansion has no refusal to print.
+    /// # Why a `String` and not a `ToolOutcome`
+    ///
+    /// This returned `ToolOutcome::error(message)` and both call sites read only
+    /// its `.content`. That is not merely dead weight — the value it carried was
+    /// **wrong**: `ToolOutcome::error` defaults to
+    /// [`ResultDisposition::Data`](super::tools::ResultDisposition::Data), and a
+    /// caller that ever folded it would have got the one classification ADR-1
+    /// forbids for a `skill` result, name-keyed off `UNTRUSTED_OUTPUT_TOOLS`.
+    /// Neither of the loop's two budget refusals goes through the fold at all —
+    /// they are raised before the dispatch and after it but before the push —
+    /// so there is no disposition for this to carry honestly, and the type says
+    /// so rather than carrying a plausible default nobody reads.
     ///
     /// [`Fits`]: SkillFit::Fits
-    pub fn into_tool_result(self) -> Option<ToolOutcome> {
+    pub fn into_tool_refusal(self) -> Option<String> {
         match self {
             SkillFit::Fits => None,
-            SkillFit::TooLarge { message } => Some(ToolOutcome::error(message)),
+            SkillFit::TooLarge { message } => Some(message),
         }
     }
 }
@@ -1165,14 +1203,25 @@ mod tests {
     /// `window_label`, which is exactly why the tempting implementation is to
     /// strip `"'s context window"` back off it.
     ///
-    /// **The redact row is why that is wrong**, and it is the row this test
-    /// exists for. The clamp renames the window without changing whose window
-    /// it is: the label becomes `"the redact-scannable window"` while the route
-    /// is still `kimi`'s and `capabilities.max_context` for `kimi` is still the
-    /// line a user would go and write. A parsed id answers `None` there — the
-    /// remedy silently dropped from a clamped remote route's refusal — so the
-    /// two facts are minted together by `labelled_provider` and asserted
-    /// together here.
+    /// **The redact row is where the two spellings part company**, and it is the
+    /// row this test exists for. The clamp renames the window without changing
+    /// whose window it is: the label becomes `"the redact-scannable window"`
+    /// while the route is still `kimi`'s and `capabilities.max_context` for
+    /// `kimi` is still the line a user would go and write. A parsed id answers
+    /// `None` there while this field answers `Some("kimi")`.
+    ///
+    /// **What that row does *not* prove, stated so nobody has to re-derive it.**
+    /// No refusal reachable today differs between the two implementations.
+    /// `bound_clause` appends the remedy only on [`BudgetBound::DefaultUnknown`],
+    /// and [`derive`]'s `DefaultUnknown` arm returns *above* the clamp — so the
+    /// one bound that quotes an id can never wear [`REDACT_WINDOW_LABEL`], and a
+    /// `strip_suffix` implementation would compose byte-identical sentences on
+    /// every row below. This test pins a **fact**, not a user-visible
+    /// consequence: the label and the id disagree here, so the day a second
+    /// bound renders the remedy — a `RedactScan` route's user has every reason
+    /// to want `capabilities.max_context` raised — the parse is already known to
+    /// answer `None` on it. That, and the ordinary reason not to read a machine
+    /// fact out of prose someone else is free to reword.
     ///
     /// The general invariant is checked over every row besides: the label is in
     /// the provider form **iff** it is that provider's id spelled out, and a
@@ -1213,7 +1262,9 @@ mod tests {
                 "kimi's context window",
             ),
             (
-                // The discriminating row. A stripped-suffix id is `None` here.
+                // The row where the label and the field disagree: a
+                // stripped-suffix id is `None` here and this field is not.
+                // No refusal renders differently for it today — see the doc.
                 "the redact clamp renames the window, not the provider",
                 remote(128_000, 0, true),
                 Some("kimi"),
@@ -1232,8 +1283,10 @@ mod tests {
             assert_eq!(
                 got.provider_id.as_deref(),
                 *expected_id,
-                "{name}: the refusal quotes this id, and reading it off \
-                 `window_label` answers `None` on the redact row"
+                "{name}: this is the id BR-7's refusal quotes, and it is minted \
+                 beside the label rather than read back out of it — on the \
+                 redact row the two genuinely differ, and every row here is one \
+                 a reworded label would silently break"
             );
             assert_eq!(got.window_label, *expected_label, "{name}");
 
@@ -1270,6 +1323,94 @@ mod tests {
         let got = derive(hostile);
         assert_eq!(got.provider_id.as_deref(), Some("ki_mi_1_"));
         assert_eq!(got.window_label, "ki_mi_1_'s context window");
+    }
+
+    /// **The corrected half of the argument above, made checkable.**
+    ///
+    /// The field's doc used to claim that reading the id back off
+    /// `window_label` would drop BR-7's remedy from a clamped remote route's
+    /// refusal. It cannot: [`bound_clause`] appends the remedy only on
+    /// [`BudgetBound::DefaultUnknown`], and [`derive`]'s `DefaultUnknown` arm
+    /// returns **above** the redact clamp, so the bound that quotes an id can
+    /// never wear [`REDACT_WINDOW_LABEL`].
+    ///
+    /// Two legs, because the correction has two halves and only one of them is
+    /// about today.
+    ///
+    /// * The control-flow fact, asserted directly: an *undeclared* window on a
+    ///   `redact = true` route is still `DefaultUnknown` and still wears its
+    ///   provider's name. Moving that early return below the clamp — the one
+    ///   edit that would make the retracted claim true — fails here, which is
+    ///   why the retraction is safe to write down.
+    /// * The consequence, asserted by composing both refusals: over every row
+    ///   the table above reaches, a `strip_suffix` id and this field produce
+    ///   **byte-identical** sentences. So the pair is minted together on drift
+    ///   grounds (see [`RouteBudget::provider_id`]) and not because a user can
+    ///   see the difference today. A guard sold on a consequence that cannot
+    ///   happen is one nobody can check.
+    #[test]
+    fn no_reachable_bound_both_quotes_a_provider_id_and_wears_the_redact_label() {
+        let undeclared_and_clamped = derive(remote(0, 0, true));
+        assert_eq!(
+            undeclared_and_clamped.bound,
+            BudgetBound::DefaultUnknown,
+            "the undeclared-window arm returns before the redact clamp; if it \
+             stops doing so, the bound that quotes an id can wear the redact \
+             label and reading the id off the label really would drop the remedy"
+        );
+        assert_ne!(
+            undeclared_and_clamped.window_label, REDACT_WINDOW_LABEL,
+            "the one bound whose clause names a provider must never wear the \
+             label that hides which provider it is"
+        );
+
+        // Same rows as the table above, plus the clamped-and-undeclared one.
+        let rows: &[(&str, BudgetInputs<'_>)] = &[
+            ("local", BudgetInputs::local()),
+            ("undeclared window", remote(0, 0, false)),
+            ("undeclared window, redact", remote(0, 0, true)),
+            ("declared window", remote(128_000, 0, false)),
+            ("user cap", remote(200_000, 40_000, false)),
+            ("redact clamp", remote(128_000, 0, true)),
+            (
+                "id-less remote",
+                BudgetInputs {
+                    provider_id: None,
+                    ..remote(128_000, 0, false)
+                },
+            ),
+        ];
+        for (name, inputs) in rows {
+            let budget = derive(*inputs);
+            let parsed = budget.window_label.strip_suffix("'s context window");
+            let fit = Fit {
+                tokens: 9_999,
+                bytes: 99_999,
+                fits: false,
+            };
+            let from_field = skill_refusal(
+                SkillCaller::Model,
+                SkillStage::Body,
+                "architect",
+                fit,
+                &budget,
+                budget.provider_id.as_deref(),
+            );
+            let from_parse = skill_refusal(
+                SkillCaller::Model,
+                SkillStage::Body,
+                "architect",
+                fit,
+                &budget,
+                parsed,
+            );
+            assert_eq!(
+                from_field, from_parse,
+                "{name}: the retracted claim was that these differ; if they ever \
+                 do, the field's doc has a user-visible consequence to name and \
+                 should say so"
+            );
+        }
     }
 
     /// **Verify M1.** The derivation never *raises* a budget the window did
@@ -2446,19 +2587,15 @@ mod tests {
         );
         let message = message_of(fit.clone());
 
-        let outcome = fit
-            .into_tool_result()
+        let refusal = fit
+            .into_tool_refusal()
             .expect("a refusal must render as a tool result");
-        assert!(
-            outcome.is_error,
-            "the call did not do what it was asked to do"
-        );
         assert_eq!(
-            outcome.content, message,
+            refusal, message,
             "the tool result is the composed refusal, not a second sentence"
         );
         assert_eq!(
-            SkillFit::Fits.into_tool_result(),
+            SkillFit::Fits.into_tool_refusal(),
             None,
             "a fitting expansion has no refusal to print"
         );

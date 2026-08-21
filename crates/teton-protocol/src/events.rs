@@ -2914,17 +2914,28 @@ pub struct SkillInvoked {
     /// flag would make every client re-derive one, and there is nothing on the
     /// event to derive it from. The value is the same stable id the model
     /// reads at the head of its refusal sentence — `over_budget`,
-    /// `per_turn_cap`, `repeated`, `unknown_skill` — so the human and the model
-    /// are told the same word, and a suite asserts an id rather than a phrase
-    /// that reads differently next month.
+    /// `per_turn_cap`, `repeated`, `not_model_invocable` — so the human and the
+    /// model are told the same word, and a suite asserts an id rather than a
+    /// phrase that reads differently next month.
+    ///
+    /// `unknown_skill` is deliberately **not** among those examples: it is one
+    /// of the two ids this field can never carry. A refusal record describes a
+    /// registry row — a source, a path, a size — and `unknown_skill` names no
+    /// row, so the daemon publishes nothing rather than a hollow record that
+    /// would have to invent one. `invalid_arguments` is the other, for the same
+    /// reason from the other end: the call whose parse failed named no skill.
     ///
     /// **Daemon-authored, never file-authored**, which is what makes a `String`
     /// safe here on `name_note`'s precedent: the ids come from the daemon's own
     /// typed refusal set, and the publish site bounds the value like every
     /// other string on this event. It is a `String` rather than a closed enum
-    /// because the refusal set is still growing inside REQ-587 — a variant per
-    /// reason, six of them unpublished today, would be a wire commitment made
-    /// ahead of the behaviour.
+    /// because the refusal set is still growing — the daemon raises its reasons
+    /// from several layers (the tool, the turn's bookkeeping, the loop's budget
+    /// stages), and a variant per reason would be a wire commitment made ahead
+    /// of a set that is not settled. Two of today's ids (`unknown_skill`,
+    /// `invalid_arguments`) are not published on this event at all, for the
+    /// reason above; the rest are, and the next one added will be too, without
+    /// a wire change.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub refused: Option<String>,
 }

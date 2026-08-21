@@ -66,6 +66,15 @@ const SECRET: &str = "API_KEY=sk-live-DO-NOT-LEAK-skillbnd-Qw4";
 /// from "the tool refused and said so".
 const BODY_MARKER: &str = "MARKER-skill-body-reached-the-model";
 
+/// A marker the skill file's **frontmatter** carries, so the roster legs can
+/// tell "the catalogue landed" from "something else did".
+///
+/// It is `description:` and not body text on purpose: the roster and every
+/// refusal that carries it emit this string out of `SKILL.md` without any body
+/// ever being expanded, which is exactly the file-authored content ADR-8's
+/// argument was never applied to.
+const LISTING_MARKER: &str = "MARKER-skill-description-reached-the-model";
+
 /// The one prompt every fixture here opens with.
 const PROMPT: &str = "Run the validation skill and summarize what it says.";
 
@@ -188,7 +197,10 @@ impl Fixture {
         std::fs::create_dir_all(&dir).unwrap();
         std::fs::write(
             dir.join("SKILL.md"),
-            format!("---\nname: {name}\n---\n{BODY_MARKER}\nDo the thing.\n"),
+            format!(
+                "---\nname: {name}\ndescription: {LISTING_MARKER}\n---\n\
+                 {BODY_MARKER}\nDo the thing.\n"
+            ),
         )
         .unwrap();
     }
@@ -233,15 +245,23 @@ struct Run {
     provenance_len: usize,
 }
 
-/// Drive turn 1 (the model's `skill` call) and turn 2 (the one that would carry
-/// its result to the wire) with `glob` as the session's only boundary.
+/// Drive turn 1 (the model's `skill` call for `name`) and turn 2 with `glob` as
+/// the session's only boundary.
 async fn run_skill_call(fx: &Fixture, name: &str, glob: Option<&str>) -> Run {
+    run_skill_args(fx, &format!(r#"{{"name":"{name}"}}"#), glob).await
+}
+
+/// Drive turn 1 (the model's `skill` call, with `args` verbatim as its argument
+/// object) and turn 2 (the one that would carry its result to the wire) with
+/// `glob` as the session's only boundary.
+///
+/// Taken as a raw string rather than a name, because the non-expansion results
+/// are reached by argument objects a name cannot express: `{}` is the roster,
+/// and a name nothing registers is `unknown_skill`.
+async fn run_skill_args(fx: &Fixture, args: &str, glob: Option<&str>) -> Run {
     let session_id = SessionId::from("skillbnd");
     let transport = CaptureSse::with_bodies(vec![
-        sse_turn(
-            "Invoking the skill.",
-            Some(("c1", "skill", &format!(r#"{{"name":"{name}"}}"#))),
-        ),
+        sse_turn("Invoking the skill.", Some(("c1", "skill", args))),
         sse_turn("should never send", None),
     ]);
     let capture = transport.clone();
@@ -489,4 +509,133 @@ async fn a_user_skill_reaches_the_provider_when_no_boundary_is_configured() {
         "both turns reached the transport: {} requests",
         run.calls
     );
+}
+
+// ---------------------------------------------------------------------------
+// BR-10 at the other three doors — the roster and the refusals that carry it
+// ---------------------------------------------------------------------------
+
+/// The `listed`/refusal reply really landed in context — the positive control
+/// the negative claims below need (LESSON-479).
+fn assert_the_roster_landed(run: &Run) {
+    use tetond::harness::context::Provenance;
+    let folded = run
+        .ctx
+        .blocks()
+        .iter()
+        .rev()
+        .find(|b| matches!(b.provenance, Provenance::Tool { .. }))
+        .map(|b| b.text.clone())
+        .expect("the skill result was folded into context");
+    assert!(
+        folded.contains(LISTING_MARKER),
+        "the file-authored description never reached the model, so this test asserts \
+         nothing about what its provenance protects: {folded}"
+    );
+    assert!(
+        !folded.contains("<skill-body"),
+        "a roster is a catalogue, not an expansion — the instructions frame belongs \
+         to neither of these two results: {folded}"
+    );
+}
+
+/// **The roster a listing call returns pins the turn to the files it names.**
+///
+/// ADR-8's fail-open argument was applied to the *expansion* only. The `listed`
+/// reply is built with `ToolOutcome::ok` and carried `Sources(∅)` — "touched no
+/// repo file" — while emitting every model-invocable skill's `name`,
+/// `argument_hint` and `description` straight out of `SKILL.md`. With a
+/// `.claude/**` boundary configured, `skill {}` therefore handed back every
+/// skill file's description with an empty source set, clearing
+/// `context_provenance` so the next remote call carried it off the machine.
+///
+/// The boundary here names the skill directory, which is what makes the claim
+/// testable: only a minted, root-relative id can match a glob.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_listing_pins_the_turn_to_the_skill_files_it_names() {
+    let fx = Fixture::new("listing");
+    fx.skill(&fx.repo(), "validate");
+
+    let run = run_skill_args(&fx, "{}", Some(".claude/**")).await;
+    assert_the_roster_landed(&run);
+
+    assert!(
+        !run.provenance_is_unknown,
+        "every listed row is a project skill under the root, so the roster mints"
+    );
+    assert_eq!(
+        run.provenance_len, 1,
+        "exactly the one file the roster's one row was read from"
+    );
+    match &run.result {
+        Err(e) if e.is_privacy_blocked() => {}
+        other => panic!(
+            "the roster carries file-authored bytes and must pin the turn exactly as \
+             the body does: {other:?}"
+        ),
+    }
+    assert_eq!(run.blocks.len(), 1, "exactly one privacy_block");
+    assert_eq!(run.calls, 1, "turn 2 must never reach the transport");
+    for body in &run.captured {
+        assert!(
+            !contains_bytes(body, LISTING_MARKER),
+            "a skill file's description leaked into captured egress"
+        );
+    }
+}
+
+/// **A typed refusal that carries the roster carries its provenance too.**
+///
+/// `unknown_skill` folds [`render_listing`]'s output into its own sentence, so
+/// it is the same file-authored bytes reaching the model through a different
+/// door — and `ToolOutcome::error` has the same `Sources(∅)` default
+/// `ToolOutcome::ok` does. A refusal is where a reader is least likely to look
+/// for a leak, which is the reason it gets its own leg rather than a comment.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_refusal_that_carries_the_roster_pins_the_turn_too() {
+    let fx = Fixture::new("refusal");
+    fx.skill(&fx.repo(), "validate");
+
+    let run = run_skill_args(&fx, r#"{"name":"no-such-skill"}"#, Some(".claude/**")).await;
+    assert_the_roster_landed(&run);
+
+    assert!(
+        !run.provenance_is_unknown,
+        "the refusal names the same project file the roster does"
+    );
+    assert_eq!(run.provenance_len, 1);
+    match &run.result {
+        Err(e) if e.is_privacy_blocked() => {}
+        other => panic!("a refusal carrying the roster carries its files: {other:?}"),
+    }
+    assert_eq!(run.blocks.len(), 1, "exactly one privacy_block");
+    assert_eq!(run.calls, 1, "turn 2 must never reach the transport");
+    for body in &run.captured {
+        assert!(
+            !contains_bytes(body, LISTING_MARKER),
+            "a skill file's description leaked into captured egress through a refusal"
+        );
+    }
+}
+
+/// **The control for the two legs above: with no boundary, the roster reaches
+/// the provider.**
+///
+/// Without it both refusals would be satisfied by a build that refused every
+/// second turn for any reason at all (LESSON-479).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_listing_reaches_the_provider_when_no_boundary_is_configured() {
+    let fx = Fixture::new("listctl");
+    fx.skill(&fx.repo(), "validate");
+
+    let run = run_skill_args(&fx, "{}", None).await;
+    assert_the_roster_landed(&run);
+
+    assert!(
+        run.result.is_ok(),
+        "with no boundary configured the turn carrying a roster goes out: {:?}",
+        run.result
+    );
+    assert!(run.blocks.is_empty(), "no boundary, no privacy_block");
+    assert_eq!(run.calls, 2, "both turns reached the transport");
 }

@@ -4213,6 +4213,91 @@ mod tests {
         assert_eq!(model_only_hint("cost", &snapshot), None);
     }
 
+    /// **The mirror's contract, enumerated: all eight combinations of the three
+    /// facts a dispatch answer is drawn from.**
+    ///
+    /// [`user_dispatch`] is this crate's copy of `tetond`'s
+    /// `Skill::user_dispatch` (`crates/tetond/src/skills/mod.rs`) — the same
+    /// three-valued answer, over the same two facts, in the same order:
+    /// **shadowing wins over model-only**. It cannot be one shared function.
+    /// `Skill` is the daemon's type, holds a `PathBuf` into the daemon's world
+    /// and never crosses the wire; the two facts ride `SkillView` *separately*
+    /// exactly so that a client composes them rather than re-parsing a
+    /// pre-composed sentence (LESSON-529). For the same reason this is not a
+    /// bridge test: nothing in this crate can construct a `Skill` to ask it the
+    /// same question.
+    ///
+    /// So the rule is written down instead. Every row's answer is spelled out
+    /// rather than computed, so a one-sided change to the *rule* — swapping the
+    /// two arms, folding a third fact in — reddens here while the daemon's own
+    /// unit suite stays green. That is LESSON-528's shape, met as far as one
+    /// side can meet it.
+    ///
+    /// `model_invocable` appears in the table and in **no** expected value: it
+    /// answers the model's question, not the user's, and a `user_dispatch` that
+    /// consulted it would make one of each pair of rows disagree with the other.
+    ///
+    /// The last block is the precondition the client **adds**: [`shadow_reason`]
+    /// asks this crate's command table before it reads the daemon's mark, so a
+    /// name a built-in owns is `Shadowed` here on a row the daemon left
+    /// unmarked. `tetond` has no `COMMANDS` to consult and cannot make that
+    /// call, which is why the mirror is not — and cannot be — an exact copy.
+    #[test]
+    fn user_dispatch_answers_all_eight_flag_combinations_as_the_daemons_rule_does() {
+        // A name no built-in claims, so the daemon's mark is the only shadowing
+        // source in the table below. Asserted rather than assumed: if the table
+        // ever claimed this word, every row would pass for the wrong reason.
+        const NAME: &str = "zeta";
+        const BY: &str = "the project skill";
+        assert!(
+            table_claim(NAME).is_none(),
+            "the command table's own claim would answer every row of the table"
+        );
+
+        for (shadowed, user_invocable, model_invocable, expected) in [
+            (false, true, true, UserDispatch::Allowed),
+            (false, true, false, UserDispatch::Allowed),
+            (false, false, true, UserDispatch::ModelOnly),
+            (false, false, false, UserDispatch::ModelOnly),
+            (true, true, true, UserDispatch::Shadowed(BY.to_owned())),
+            (true, true, false, UserDispatch::Shadowed(BY.to_owned())),
+            (true, false, true, UserDispatch::Shadowed(BY.to_owned())),
+            (true, false, false, UserDispatch::Shadowed(BY.to_owned())),
+        ] {
+            let view = SkillView {
+                shadowed: shadowed.then(|| BY.to_owned()),
+                user_invocable,
+                model_invocable,
+                ..skill(NAME, SkillSource::User)
+            };
+            assert_eq!(
+                user_dispatch(&view),
+                expected,
+                "shadowed={shadowed}, user_invocable={user_invocable}, \
+                 model_invocable={model_invocable}: the daemon's \
+                 `Skill::user_dispatch` answers this row the same way",
+            );
+        }
+
+        // The client's extra precondition, on both the ordinary and the
+        // model-only row: the table is consulted first, so the answer is
+        // `Shadowed` where the daemon — seeing `shadowed: None` — would say
+        // `Allowed` and `ModelOnly`.
+        let claim = UserDispatch::Shadowed("the built-in `/cost`".to_owned());
+        assert_eq!(
+            user_dispatch(&skill("cost", SkillSource::User)),
+            claim,
+            "a name this crate's table owns is shadowed even when the daemon \
+             did not mark it (ADR-2's skew case)",
+        );
+        assert_eq!(
+            user_dispatch(&model_only("cost", SkillSource::User)),
+            claim,
+            "and the table's claim outranks the flag, in the same order the \
+             daemon's copy ranks its own mark",
+        );
+    }
+
     /// **AC-12's `/delta` half.** A model-only name does not dispatch, and the
     /// refusal names the line of the user's own file that made it so — the only
     /// actionable fact about a name that is spelled correctly and listed in
