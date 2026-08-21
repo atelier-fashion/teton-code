@@ -398,6 +398,116 @@ async fn skills_list_reports_the_sessions_registry_with_sources_and_skips() {
     let _ = std::fs::remove_file(&socket);
 }
 
+/// **REQ-587 BR-3 — both invocation flags cross the wire.**
+///
+/// The client marks a model-only row `(model-only)` in `/help`, and it can only
+/// do that from these two keys. A `skills_list_result` that dropped either one
+/// leaves that mark inert with nothing red anywhere: the roster the daemon
+/// builds for the model is built from the *registry*, not from this result, so
+/// every daemon-side test would still pass while `/help` quietly stopped
+/// telling anyone which skills they cannot type.
+///
+/// The **absences** are asserted too, because both keys are additive
+/// (`skip_serializing_if`) and an absent key is a value: `model_invocable` is
+/// absent for a hidden skill and `user_invocable` absent for an ordinary one,
+/// which is what keeps an ordinary row's bytes what REQ-585 wrote.
+///
+/// **Mutation**: hard-code either field in `skills_list_result` — the shape
+/// TASK-210's placeholder had — and one of the four `Some(…)` assertions here
+/// fails.
+#[tokio::test]
+async fn both_invocation_flags_reach_the_client() {
+    let _home = fixture_home();
+    let repo = Tree::new("flags");
+    repo.write(
+        ".claude/skills/alpha/SKILL.md",
+        &skill_file("alpha", "invocable by both", "[path]"),
+    );
+    // Hidden from the model, still the user's.
+    repo.write(
+        ".claude/commands/beta.md",
+        "---\ndisable-model-invocation: true\n---\nBody of beta.\n",
+    );
+    // Model-only: the state that exists only because the two questions are
+    // asked separately.
+    repo.write(
+        ".claude/commands/delta.md",
+        "---\nuser-invocable: false\n---\nBody of delta.\n",
+    );
+    // A flag whose *value* is not a boolean literal: the file still registers,
+    // the safe reading applies, and the key is named as ignored rather than
+    // silently obeyed.
+    repo.write(
+        ".claude/commands/typo.md",
+        "---\nuser-invocable: yes\n---\nBody of typo.\n",
+    );
+
+    let socket = temp_socket("skills-flags");
+    let listener = server::bind_listener(&socket).unwrap();
+    let server_task = tokio::spawn(server::serve(listener, Arc::new(Daemon::new())));
+
+    let mut client = TestClient::connect(&socket).await;
+    client.handshake().await;
+    let session = client.create_session_at(repo.path()).await;
+    let listed = client.skills_list(&session).await;
+
+    let row = |name: &str| -> Value {
+        listed["skills"]
+            .as_array()
+            .expect("a result carries a skills array")
+            .iter()
+            .find(|view| view["name"].as_str() == Some(name))
+            .unwrap_or_else(|| panic!("`{name}` must be listed: {listed}"))
+            .clone()
+    };
+
+    let alpha = row("alpha");
+    assert_eq!(
+        alpha["model_invocable"].as_bool(),
+        Some(true),
+        "an ordinary skill is the model's: {alpha}"
+    );
+    assert!(
+        alpha.get("user_invocable").is_none(),
+        "…and its `user_invocable` is the absent default, so an ordinary row's \
+         bytes are the ones REQ-585 wrote: {alpha}"
+    );
+
+    let beta = row("beta");
+    assert!(
+        beta.get("model_invocable").is_none(),
+        "`disable-model-invocation: true` writes no key, because absent already \
+         means not model-invocable: {beta}"
+    );
+    assert!(
+        beta.get("user_invocable").is_none(),
+        "and the flag says nothing about the user: {beta}"
+    );
+
+    let delta = row("delta");
+    assert_eq!(
+        delta["user_invocable"].as_bool(),
+        Some(false),
+        "the model-only state has to reach the client or `/help` cannot mark \
+         it: {delta}"
+    );
+    assert_eq!(
+        delta["model_invocable"].as_bool(),
+        Some(true),
+        "…and a skill the user may not type is still the model's — the whole \
+         point of the third state: {delta}"
+    );
+
+    let typo = row("typo");
+    assert!(
+        typo.get("user_invocable").is_none(),
+        "a value that is not a boolean leaves the user's `/name` alone: {typo}"
+    );
+
+    server_task.abort();
+    let _ = std::fs::remove_file(&socket);
+}
+
 /// **BR-3 / LESSON-517: what reaches the client is already bounded and
 /// neutralized.**
 ///

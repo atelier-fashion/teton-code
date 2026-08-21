@@ -443,6 +443,12 @@ fn register(
         description: parsed.description,
         argument_hint: parsed.argument_hint,
         body: parsed.body,
+        // Carried, never re-derived: the frontmatter is read once, and BR-3's
+        // safe readings for an unparseable value live in that one place. A row
+        // that arrived here with a flag dropped would be a skill the model may
+        // run because a field defaulted (REQ-587 BR-3).
+        model_invocable: parsed.model_invocable,
+        user_invocable: parsed.user_invocable,
         ignored_keys: parsed.ignored_keys,
         name_note,
         shadowed: None,
@@ -514,6 +520,81 @@ mod tests {
         let read = crate::with_deadline("RealFs::read on a FIFO", move || RealFs.read(&fifo));
         assert_eq!(read, Err(ReadError::NotRegular));
         std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// One file's bytes, as `register` turns them into a candidate row.
+    fn registered(text: &str) -> Skill {
+        let mut candidates = Vec::new();
+        let mut skipped = Vec::new();
+        register(
+            "alpha",
+            SkillSource::User,
+            PathBuf::from("/h/.claude/commands/alpha.md"),
+            text,
+            &mut candidates,
+            &mut skipped,
+        );
+        assert!(skipped.is_empty(), "the file must register: {skipped:?}");
+        candidates.pop().expect("exactly one candidate")
+    }
+
+    /// **REQ-587 BR-3, carried.** `disable-model-invocation` reaches the row.
+    ///
+    /// Both directions on purpose: a `model_invocable` hard-coded to either
+    /// constant on the way through — the shape "the flag was dropped" takes,
+    /// since `Skill` has no `Default` to omit it into — fails one leg or the
+    /// other.
+    #[test]
+    fn the_model_invocation_flag_reaches_the_registered_row() {
+        assert!(
+            !registered("---\ndisable-model-invocation: true\n---\nbody").model_invocable,
+            "a file that hides itself from the model must arrive hidden"
+        );
+        assert!(registered("---\ndisable-model-invocation: false\n---\nbody").model_invocable);
+        assert!(
+            registered("# no frontmatter at all\n").model_invocable,
+            "the majority case — no header — is the model's"
+        );
+    }
+
+    /// The same, for `user-invocable`, which defaults the other way.
+    #[test]
+    fn the_user_invocation_flag_reaches_the_registered_row() {
+        let model_only = registered("---\nuser-invocable: false\n---\nbody");
+        assert!(!model_only.user_invocable, "the flag must arrive");
+        assert!(
+            model_only.is_dispatchable() && !model_only.dispatchable_by_user(),
+            "and it must be the *third* state: it owns its name (ADR-12) and \
+             the user still may not type it"
+        );
+        assert!(
+            model_only.invocable_by_model(),
+            "model-only means the model reaches it"
+        );
+
+        assert!(registered("---\nuser-invocable: true\n---\nbody").user_invocable);
+        assert!(registered("# no frontmatter at all\n").user_invocable);
+    }
+
+    /// A flag whose *value* is not a boolean does not skip the file: it
+    /// registers, with the safe reading and the key named where `/verbose`
+    /// renders it (BR-3, `frontmatter`'s module doc).
+    #[test]
+    fn a_bad_flag_value_registers_the_file_and_names_the_key() {
+        let skill = registered("---\nuser-invocable: yes\n---\nbody");
+        assert!(
+            skill.user_invocable,
+            "the safe reading: the user keeps `/name`"
+        );
+        assert_eq!(skill.ignored_keys, vec!["user-invocable"]);
+        assert_eq!(skill.body, "body");
+
+        let skill = registered("---\ndisable-model-invocation: sure\n---\nbody");
+        assert!(
+            !skill.model_invocable,
+            "the safe reading: a typo can never widen what the model may run"
+        );
+        assert_eq!(skill.ignored_keys, vec!["disable-model-invocation"]);
     }
 
     /// `list` tells a missing root from a refused one — the distinction that

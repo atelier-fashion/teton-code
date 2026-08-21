@@ -7610,6 +7610,10 @@ mod skill_tests {
     /// **BR-12's `/verbose` clause.** The path, the ignored frontmatter keys and
     /// one line per command's typed outcome — added under the echo line, and
     /// only under `/verbose`.
+    ///
+    /// `allowed-tools` and `model` are still inert under REQ-587: BR-3 shrank
+    /// REQ-585 BR-5's list by exactly two keys, and neither of them is one of
+    /// these.
     #[test]
     fn verbose_adds_the_path_the_ignored_keys_and_one_line_per_outcome() {
         let event = Event::SkillInvoked(invoked(vec![
@@ -7690,6 +7694,46 @@ mod skill_tests {
         assert!(
             !surface.any_line_contains(LineKind::Info, "ignored frontmatter"),
             "{:?}",
+            surface.lines_of(LineKind::Info)
+        );
+    }
+
+    /// **Which keys a build honors is the daemon's answer, and this line is a
+    /// renderer.**
+    ///
+    /// REQ-587 BR-3 takes `disable-model-invocation` and `user-invocable` out
+    /// of the inert list — *when the daemon could read their values*. A value
+    /// it could not read leaves the key named here, which is how a user who
+    /// wrote `user-invocable: yes` learns the line did nothing; the same bytes
+    /// arrive from a REQ-585-vintage daemon, for which they are simply true.
+    ///
+    /// So the client filters nothing. A filter here would be a second home for
+    /// a rule the daemon owns, and the stale one against a daemon of any other
+    /// vintage (LESSON-528) — it would swallow exactly the diagnostic BR-3
+    /// promises instead of a silent ignore.
+    #[test]
+    fn verbose_names_the_keys_the_daemon_called_ignored_and_filters_none_of_them() {
+        let mut event = invoked(vec![ran("date", 8)]);
+        event.ignored_keys = vec![
+            "user-invocable".to_owned(),
+            "disable-model-invocation".to_owned(),
+        ];
+        let mut surface = RecordingSurface::new();
+        let mut state = SessionState::new();
+        state.verbose = true;
+        render_event(
+            &envelope(Event::SkillInvoked(event)),
+            &mut surface,
+            &mut state,
+        );
+
+        assert!(
+            surface.any_line_contains(
+                LineKind::Info,
+                "  ignored frontmatter: user-invocable, disable-model-invocation"
+            ),
+            "the daemon named two keys it did not honor and both must reach the \
+             user, in the daemon's order: {:?}",
             surface.lines_of(LineKind::Info)
         );
     }

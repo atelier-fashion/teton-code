@@ -2945,12 +2945,18 @@ impl DaemonRuntime {
             ));
         }
         let registry = sessions.skills(session_id);
-        let Some(skill) = registry.dispatchable(&invocation.name) else {
+        // `dispatchable_by_user`, which is this caller's question: `skill/invoke`
+        // is the *user* typing `/name`, so REQ-587 BR-3's `user-invocable:
+        // false` is refused here and not only by the client that usually
+        // refuses it first (ADR-1 — a rule enforced only in the client is a
+        // rule the next client does not have).
+        let Some(skill) = registry.dispatchable_by_user(&invocation.name) else {
             return Err(RpcError::new(
                 error_code::INVALID_PARAMS,
                 format!(
-                    "no skill `/{}` in this session — `skills/list` is what this session \
-                     dispatches, and a name it does not list (or lists as shadowed) is not \
+                    "no skill `/{}` you can dispatch in this session — `skills/list` is \
+                     what this session dispatches, and a name it does not list, lists as \
+                     shadowed, or lists as `user-invocable: false` (model-only) is not \
                      one of them",
                     invocation.name
                 ),
@@ -3075,6 +3081,12 @@ impl DaemonRuntime {
                         &skill.name,
                         skill.source,
                         commands.iter().map(|c| c.as_str().to_owned()).collect(),
+                        // This path is REQ-585's user-typed `/name`, and only
+                        // that: `SkillTurn` is `Some` for a slash command and
+                        // nothing else. The model's invocations reach the gate
+                        // from inside the turn loop (TASK-217/TASK-218) and pass
+                        // `InvokedBy::Model` there.
+                        teton_protocol::events::InvokedBy::User,
                         connection,
                     )
                     .await
@@ -29255,6 +29267,7 @@ provider_id = \"deepseek\"
                     "audit",
                     SkillSource::Project,
                     vec!["./audit.sh".to_owned()],
+                    teton_protocol::events::InvokedBy::User,
                     conn
                 )
                 .await,
@@ -29266,6 +29279,7 @@ provider_id = \"deepseek\"
                     "status",
                     SkillSource::User,
                     vec!["git status".to_owned()],
+                    teton_protocol::events::InvokedBy::User,
                     conn
                 )
                 .await,
@@ -29306,7 +29320,7 @@ provider_id = \"deepseek\"
             // reacting to that event cannot read the pre-move answer.
             let registry = sessions.skills(&session_id);
             assert!(
-                registry.dispatchable("overthere").is_some(),
+                registry.dispatchable_by_user("overthere").is_some(),
                 "the move did not re-derive the project half of the registry: {:?}",
                 registry
                     .skills()

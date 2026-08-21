@@ -242,11 +242,14 @@ fn to_hex(bytes: &[u8]) -> String {
 
 /// Compute the lowercase-hex SHA-256 digest of `data`.
 ///
-/// Production code hashes files, not buffers, so [`sha256_file`] is what the
-/// download and install paths call. This one-shot helper exists for fixtures —
-/// including the daemon's install-pipeline suite, which builds a catalog entry
-/// whose `sha256` must be the *real* digest of the artifact its double serves,
-/// so that every verification in those tests runs the genuine check.
+/// The download and install paths hash *files*, so [`sha256_file`] is what they
+/// call. This one-shot buffer helper has two callers. The daemon's
+/// install-pipeline suite builds a catalog entry whose `sha256` must be the
+/// *real* digest of the artifact its double serves, so that every verification
+/// in those tests runs the genuine check. And since REQ-587 BR-5 it is a
+/// production caller too: `harness::permissions::skill_grant_key` digests a
+/// skill's substituted command set so that one set of arguments cannot be
+/// answered by a grant remembered for another.
 #[must_use]
 pub fn sha256_hex(data: &[u8]) -> String {
     let mut hasher = Sha256::new();

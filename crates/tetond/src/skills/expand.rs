@@ -453,6 +453,10 @@ mod tests {
             description: None,
             argument_hint: None,
             body: body.to_owned(),
+            // An ordinary row: the expander is reached the same way whoever
+            // invoked it, and BR-3's flags are decided before it is asked.
+            model_invocable: true,
+            user_invocable: true,
             ignored_keys: Vec::new(),
             name_note: None,
             shadowed: None,

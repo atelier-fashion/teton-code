@@ -934,7 +934,7 @@ fn expansion_of(
         &tetond::skills::RealFs,
     );
     let skill = registry
-        .dispatchable(name)
+        .dispatchable_by_user(name)
         .unwrap_or_else(|| panic!("the fixture must register `{name}`"));
     let display = teton_core::session_root::display_for(&skill.path, home);
     let expansion = tetond::skills::expand(skill, "", &display);

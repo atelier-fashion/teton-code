@@ -391,7 +391,7 @@ fn a_project_skill_beats_a_user_skill_and_the_loser_is_listed_as_shadowed() {
         "both rows are listed"
     );
     let winner = registry
-        .dispatchable("analyze")
+        .dispatchable_by_user("analyze")
         .expect("one row dispatches the name");
     assert_eq!(winner.source, SkillSource::Project);
     assert_eq!(winner.description.as_deref(), Some("the project copy"));
@@ -437,7 +437,7 @@ fn within_one_source_the_skills_directory_beats_the_commands_file() {
 
     assert_eq!(names(&registry), vec!["status", "status"]);
     let winner = registry
-        .dispatchable("status")
+        .dispatchable_by_user("status")
         .expect("exactly one row dispatches");
     assert_eq!(
         winner.path,
@@ -483,10 +483,10 @@ fn a_frontmatter_name_that_differs_is_a_note_and_never_a_second_spelling() {
 
     assert_eq!(names(&registry), vec!["deploy"]);
     assert!(
-        registry.dispatchable("shipit").is_none(),
+        registry.dispatchable_by_user("shipit").is_none(),
         "the declared name is not a spelling anything dispatches"
     );
-    let skill = registry.dispatchable("deploy").unwrap();
+    let skill = registry.dispatchable_by_user("deploy").unwrap();
     assert_eq!(
         skill.name_note.as_deref(),
         Some("frontmatter name `shipit` differs; this command dispatches as `/deploy`")
@@ -700,7 +700,9 @@ fn a_command_file_with_no_frontmatter_is_all_body() {
         &RecordingFs::default(),
     );
 
-    let skill = registry.dispatchable("deploy").expect("it registered");
+    let skill = registry
+        .dispatchable_by_user("deploy")
+        .expect("it registered");
     assert_eq!(skill.body, body);
     assert_eq!(skill.description, None);
     assert!(skill.ignored_keys.is_empty());

@@ -940,7 +940,7 @@ fn ran_expansion(repo: &std::path::Path, name: &str, arguments: &str) -> (String
         &tetond::skills::RealFs,
     );
     let skill = registry
-        .dispatchable(name)
+        .dispatchable_by_user(name)
         .unwrap_or_else(|| panic!("the fixture must register `{name}`"));
     let expansion = tetond::skills::expand(skill, arguments, &format!(".claude/…/{name}"));
     let outcomes = tetond::skills::run_all(repo, expansion.commands(), 10_000);

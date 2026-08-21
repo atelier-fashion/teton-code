@@ -27,10 +27,44 @@
 //!    `key: value` where the key matches `^[a-z][a-z0-9-]*$`. An indented
 //!    continuation, a nested block, a list item, a bare word — anything else ⇒
 //!    [`Malformed`].
-//! 4. `name`, `description` and `argument-hint` are read. Every other key lands
-//!    in [`Parsed::ignored_keys`] and is inert (BR-5): a skill file grants
-//!    nothing, so `allowed-tools`, `model` and `hooks` are *listed*, never
-//!    honored.
+//! 4. `name`, `description`, `argument-hint` and the two **invocation flags**
+//!    — `disable-model-invocation` and `user-invocable` (REQ-587 BR-3) — are
+//!    read. Every other key lands in [`Parsed::ignored_keys`] and is inert
+//!    (REQ-585 BR-5): a skill file grants nothing, so `allowed-tools`, `model`
+//!    and `hooks` are *listed*, never honored.
+//!
+//! # A bad value is not a malformed file
+//!
+//! [`parse`] is **total**, and a *shape* it cannot read is refused whole (next
+//! section). A *value* it cannot read, on a key it knows, is a different thing
+//! and is answered differently: the file still registers, the flag takes its
+//! **safe** reading, and the key is named in [`Parsed::ignored_keys`] — which
+//! is the honest word for what happened (the key was not honored) and reaches
+//! the one surface that renders that list, `/verbose`'s `ignored frontmatter:`
+//! line. Refusing the file instead would let one typo take a working `/name`
+//! away from its user; ignoring it silently would let one typo decide what the
+//! model may run.
+//!
+//! The two safe readings are deliberately **asymmetric**, because the two flags
+//! widen in opposite directions:
+//!
+//! ```text
+//! key                       absent      true          false         anything else
+//! disable-model-invocation  model may   model may not model may     model may NOT, named
+//! user-invocable            user may    user may      user may not  user MAY, named
+//! ```
+//!
+//! In both rows the unreadable value lands on the **narrower** capability for
+//! the model and the **unchanged** one for the user: a typo in a repository's
+//! frontmatter can hide a skill from the model, and can never hand the model
+//! one the user meant to keep to themselves, nor take `/name` away from a user
+//! who has it today.
+//!
+//! Only the two literals `true` and `false` are boolean, unquoted or wrapped in
+//! one matching pair of quotes (the `unquote` step runs first, so
+//! `user-invocable: "false"` is the literal). `True`, `yes`, `1` and the empty
+//! value are not — this parser has never guessed at a value's intent, and a key
+//! that decides what a model may run is the last place to start.
 //!
 //! # Why malformed is total
 //!
@@ -47,7 +81,7 @@
 //! skipped, with a reason the user can act on.
 
 /// A file's frontmatter and its body.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Parsed {
     /// The `name` key, if declared. It does **not** decide the dispatchable
     /// spelling — the directory or stem does (BR-2) — and a `name` that
@@ -57,13 +91,56 @@ pub struct Parsed {
     pub description: Option<String>,
     /// The `argument-hint` key, if declared.
     pub argument_hint: Option<String>,
+    /// Whether the model may invoke this skill through the `skill` tool
+    /// (REQ-587 BR-3).
+    ///
+    /// `false` exactly when `disable-model-invocation` read `true` — the key is
+    /// a **negative**, so this field is its inverse rather than its literal —
+    /// or read a value that is not a boolean literal at all, which is the safe
+    /// reading (see the module doc's table).
+    pub model_invocable: bool,
+    /// Whether the user may dispatch this skill by typing `/name` (REQ-587
+    /// BR-3).
+    ///
+    /// `false` exactly when `user-invocable` read `false`. A value that is not
+    /// a boolean literal leaves it `true`, which is the safe reading in this
+    /// direction: a typo must not take a working command away from the person
+    /// who wrote it.
+    pub user_invocable: bool,
     /// Every other key, in the order it appeared. Inert; listed by `/verbose`
     /// so a user who wrote `model: opus` learns it did nothing rather than
     /// believing it did something.
+    ///
+    /// An invocation flag whose *value* this parser could not read is named
+    /// here too, for the same reason and in the same words: the key was not
+    /// honored. It is the only way either flag reaches this list — a flag that
+    /// parsed left it with REQ-587 BR-3.
     pub ignored_keys: Vec<String>,
     /// Everything after the closing delimiter, verbatim — including a leading
     /// blank line (BR-13: the body is passed as written).
     pub body: String,
+}
+
+impl Default for Parsed {
+    /// A file with no frontmatter at all: no keys, nothing ignored, and **both
+    /// invocation flags on**.
+    ///
+    /// Hand-written because that last clause is the whole point and `derive`
+    /// cannot say it: `bool::default()` is `false`, which would make every
+    /// `.claude/commands/*.md` on the machine — the majority case, which
+    /// declares no frontmatter whatsoever — invisible to the model and
+    /// undispatchable by its owner.
+    fn default() -> Self {
+        Self {
+            name: None,
+            description: None,
+            argument_hint: None,
+            model_invocable: true,
+            user_invocable: true,
+            ignored_keys: Vec::new(),
+            body: String::new(),
+        }
+    }
 }
 
 /// A frontmatter block this parser will not read.
@@ -104,6 +181,8 @@ pub fn parse(text: &str) -> Result<Parsed, Malformed> {
     }
 
     let mut parsed = Parsed::default();
+    let mut seen_model_flag = false;
+    let mut seen_user_flag = false;
     // The opening delimiter was line 1, so the block's first line is line 2 —
     // the numbers a user reads off their editor's gutter.
     for (line_number, line) in (2..).zip(lines) {
@@ -149,12 +228,42 @@ pub fn parse(text: &str) -> Result<Parsed, Malformed> {
             "name" => set_once(&mut parsed.name, value),
             "description" => set_once(&mut parsed.description, value),
             "argument-hint" => set_once(&mut parsed.argument_hint, value),
-            other => {
-                let other = other.to_owned();
-                if !parsed.ignored_keys.contains(&other) {
-                    parsed.ignored_keys.push(other);
+            // The same first-occurrence-wins rule, spelled with a `seen` flag
+            // because the answer is a `bool` and there is no `None` in it to
+            // test. A repeat decides nothing — including nothing about the
+            // diagnostic: `user-invocable: false` followed by
+            // `user-invocable: yes` is answered, so the second line is not a
+            // key that went unhonored.
+            "disable-model-invocation" => {
+                if !seen_model_flag {
+                    seen_model_flag = true;
+                    parsed.model_invocable = match boolean(&value) {
+                        // A negative key: `true` is the hiding value, so the
+                        // stored answer is its inverse.
+                        Some(hidden) => !hidden,
+                        None => {
+                            name_ignored(&mut parsed.ignored_keys, key);
+                            // The safe reading: hidden from the model.
+                            false
+                        }
+                    };
                 }
             }
+            "user-invocable" => {
+                if !seen_user_flag {
+                    seen_user_flag = true;
+                    parsed.user_invocable = match boolean(&value) {
+                        Some(allowed) => allowed,
+                        None => {
+                            name_ignored(&mut parsed.ignored_keys, key);
+                            // The safe reading in this direction is the
+                            // *unchanged* one: the user keeps `/name`.
+                            true
+                        }
+                    };
+                }
+            }
+            other => name_ignored(&mut parsed.ignored_keys, other),
         }
     }
 
@@ -169,6 +278,33 @@ pub fn parse(text: &str) -> Result<Parsed, Malformed> {
 fn set_once(slot: &mut Option<String>, value: String) {
     if slot.is_none() {
         *slot = Some(value);
+    }
+}
+
+/// Name `key` in the ignored list, once.
+///
+/// One home for that list's two writers — the keys this parser does not read at
+/// all, and an invocation flag whose value it could not read — so a user who
+/// wrote both sees one line in one order and never the same key twice.
+fn name_ignored(keys: &mut Vec<String>, key: &str) {
+    if !keys.iter().any(|seen| seen == key) {
+        keys.push(key.to_owned());
+    }
+}
+
+/// The two boolean literals, and nothing else.
+///
+/// `None` is "this is not a boolean", which the caller answers with the flag's
+/// safe reading and a named key — never with a refusal of the file, and never
+/// with a guess. `True`, `yes`, `on`, `1` and an empty value all land here on
+/// purpose: the rest of this parser stores values verbatim, so the one place it
+/// interprets one is the one place a lenient reading could silently widen what
+/// a model may run (REQ-587 BR-3).
+fn boolean(value: &str) -> Option<bool> {
+    match value {
+        "true" => Some(true),
+        "false" => Some(false),
+        _ => None,
     }
 }
 
@@ -319,20 +455,128 @@ mod tests {
         );
     }
 
-    /// Every key that is not one of the three is listed and does nothing. This
-    /// is BR-5's whole claim: a skill file is content, not configuration.
+    /// Every key that is not one of the five is listed and does nothing. This
+    /// is REQ-585 BR-5's claim, minus the two keys REQ-587 BR-3 made
+    /// meaningful: a skill file is still content and not configuration, and
+    /// `allowed-tools`, `model` and `hooks` still grant nothing.
     #[test]
     fn every_other_key_is_listed_and_inert() {
         let parsed = parse(
-            "---\nname: x\nallowed-tools: Bash\nmodel: opus\ndisable-model-invocation: true\nmodel: sonnet\n---\nbody",
+            "---\nname: x\nallowed-tools: Bash\nmodel: opus\nhooks: none\nmodel: sonnet\n---\nbody",
         )
         .unwrap();
         assert_eq!(
             parsed.ignored_keys,
-            vec!["allowed-tools", "model", "disable-model-invocation"],
+            vec!["allowed-tools", "model", "hooks"],
             "in file order, each named once"
         );
         assert_eq!(parsed.name.as_deref(), Some("x"));
+        assert!(
+            parsed.model_invocable && parsed.user_invocable,
+            "a file that declares neither flag is invocable by both"
+        );
+    }
+
+    /// **REQ-587 BR-3.** The two invocation flags are read, and reading them is
+    /// exactly what takes them out of the inert list.
+    ///
+    /// The negative key is the one worth pinning both ways: the field is the
+    /// *inverse* of `disable-model-invocation`, so a reading that forgot the
+    /// negation would pass a fixture that only ever wrote `true`.
+    #[test]
+    fn the_two_invocation_flags_are_read_and_leave_the_ignored_list() {
+        let hidden = parse(
+            "---\nname: beta\ndisable-model-invocation: true\nuser-invocable: true\n---\nbody",
+        )
+        .unwrap();
+        assert!(!hidden.model_invocable, "`true` hides it from the model");
+        assert!(hidden.user_invocable, "and says nothing about the user");
+
+        let model_only = parse("---\nname: delta\nuser-invocable: false\n---\nbody").unwrap();
+        assert!(!model_only.user_invocable, "`false` is model-only");
+        assert!(
+            model_only.model_invocable,
+            "a model-only skill is the model's — that is the whole state"
+        );
+
+        let both_said_out_loud =
+            parse("---\ndisable-model-invocation: false\nuser-invocable: true\n---\nbody").unwrap();
+        assert!(both_said_out_loud.model_invocable);
+        assert!(both_said_out_loud.user_invocable);
+
+        for parsed in [&hidden, &model_only, &both_said_out_loud] {
+            assert!(
+                parsed.ignored_keys.is_empty(),
+                "a flag that parsed is honored, not listed as ignored: {:?}",
+                parsed.ignored_keys
+            );
+        }
+
+        // Both flags off is a real state — invocable by nobody — and it parses
+        // like any other, because refusing it here would hide it rather than
+        // name it (BR-3).
+        let nobody =
+            parse("---\ndisable-model-invocation: true\nuser-invocable: false\n---\nbody").unwrap();
+        assert!(!nobody.model_invocable && !nobody.user_invocable);
+    }
+
+    /// **BR-3's safe values, which are asymmetric on purpose.** A value that is
+    /// not a boolean literal is not a malformed *file*: the header still parses,
+    /// the flag takes the reading that cannot widen what the model may run, and
+    /// the key is named — so a typo is visible instead of silent.
+    #[test]
+    fn a_flag_value_that_is_not_a_boolean_takes_the_safe_reading_and_is_named() {
+        for value in ["yes", "True", "1", "", "  ", "maybe"] {
+            let text = format!("---\ndisable-model-invocation: {value}\n---\nbody");
+            let parsed = parse(&text).expect("a bad value is not a malformed file");
+            assert!(
+                !parsed.model_invocable,
+                "`disable-model-invocation: {value}` must read as hidden"
+            );
+            assert_eq!(
+                parsed.ignored_keys,
+                vec!["disable-model-invocation"],
+                "and must be named rather than silently ignored"
+            );
+
+            let text = format!("---\nuser-invocable: {value}\n---\nbody");
+            let parsed = parse(&text).expect("a bad value is not a malformed file");
+            assert!(
+                parsed.user_invocable,
+                "`user-invocable: {value}` must leave the user's `/name` alone"
+            );
+            assert_eq!(parsed.ignored_keys, vec!["user-invocable"]);
+        }
+
+        // The body still arrives, which is the point of not refusing the file.
+        assert_eq!(
+            parse("---\nuser-invocable: nope\n---\nbody").unwrap().body,
+            "body"
+        );
+
+        // `unquote` runs first, so a quoted literal is a literal — the same
+        // nicety `description: "…"` gets, and the reason it is worth a line
+        // here is that the alternative reads as a typo and is not one.
+        let quoted = parse("---\nuser-invocable: \"false\"\n---\n").unwrap();
+        assert!(!quoted.user_invocable);
+        assert!(quoted.ignored_keys.is_empty());
+    }
+
+    /// A repeat decides nothing — including nothing about the diagnostic. The
+    /// second line is not a key that went unhonored; the first line answered.
+    #[test]
+    fn a_repeated_invocation_flag_does_not_change_an_answer_already_given() {
+        let parsed = parse(
+            "---\nuser-invocable: false\nuser-invocable: true\ndisable-model-invocation: true\ndisable-model-invocation: bogus\n---\n",
+        )
+        .unwrap();
+        assert!(!parsed.user_invocable, "the first occurrence won");
+        assert!(!parsed.model_invocable, "the first occurrence won");
+        assert!(
+            parsed.ignored_keys.is_empty(),
+            "the repeat's unreadable value names nothing: {:?}",
+            parsed.ignored_keys
+        );
     }
 
     #[test]

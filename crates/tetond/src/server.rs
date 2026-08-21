@@ -4456,12 +4456,23 @@ fn skills_list_result(registry: &SkillRegistry, home: Option<&Path>) -> SkillsLi
                 // reserved built-in name — is the client's, so this says what
                 // *this* side found and never `None` where it found something.
                 shadowed: skill.shadowed.map(|by| by.to_string()),
-                // TASK-212 replaces these two with the skill's parsed flags.
-                // The literals are REQ-585's world exactly — no `skill` tool
-                // exists yet, and every listed skill is one the user may type —
-                // so both keys stay off the wire and no byte moves.
-                model_invocable: false,
-                user_invocable: true,
+                // REQ-587 BR-3's two flags, **as the file wrote them** and not
+                // composed with `shadowed` above. The composition is the
+                // client's and its order is not open: a row is read as
+                // *shadowed* first and *model-only* only when nothing shadows
+                // it (`Skill::user_dispatch` holds that decision, so `/help`'s
+                // mark cannot pick a different one).
+                //
+                // Composing here instead would put "the user may not type
+                // this" on every shadowed row — the wire spelling of the
+                // model-only state — and a client rendering the mark straight
+                // off the flag would call another file's name a model-only
+                // skill. The flags stay the file's; the *authority* on who may
+                // actually invoke a name is the registry's pair of resolvers
+                // (`dispatchable_by_user` / `invocable_by_model`), daemon-side,
+                // where ADR-1 keeps every rule with teeth.
+                model_invocable: skill.model_invocable,
+                user_invocable: skill.user_invocable,
             })
             .collect(),
         skipped: registry

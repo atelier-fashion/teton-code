@@ -23,11 +23,42 @@
 //! # Nothing here is a setting
 //!
 //! A skill is **user-role content**. Every frontmatter key other than `name`,
-//! `description` and `argument-hint` is inert and is merely *listed*
-//! ([`Skill::ignored_keys`]): a file that says `model: opus` or
+//! `description`, `argument-hint` and the two invocation flags is inert and is
+//! merely *listed* ([`Skill::ignored_keys`]): a file that says `model: opus` or
 //! `allowed-tools: Bash` changes no routing decision, no permission level and
 //! no boundary. That is the whole reason the parser can afford to be as narrow
 //! as it is — nothing it reads can grant anything.
+//!
+//! The two flags REQ-587 BR-3 added ([`Skill::model_invocable`],
+//! [`Skill::user_invocable`]) are not counter-examples: neither grants
+//! anything either. They only ever **narrow** who may reach a body the user
+//! already put on their own disk, and the parser's unreadable-value readings
+//! narrow in the same direction (`frontmatter`'s module doc holds the table).
+//!
+//! # Two resolvers, because there are two questions (REQ-587 ADR-12)
+//!
+//! "May this be invoked" stopped being one question when BR-3 gave a row two
+//! flags, so it is asked through two names and never one:
+//!
+//! | row | `dispatchable_by_user` | `invocable_by_model` |
+//! |---|---|---|
+//! | ordinary | yes | yes |
+//! | `user-invocable: false` — **model-only** | no | yes |
+//! | `disable-model-invocation: true` — hidden from the model | yes | no |
+//! | both flags, or shadowed | no | no |
+//!
+//! [`Skill::is_dispatchable`] keeps its REQ-585 meaning — *nothing shadows this
+//! name* — and **neither flag is folded into it**. Folding `user_invocable`
+//! there is the arm that reads correct and kills the model-only row silently:
+//! `/delta` refuses, `/help` still lists it, and the model's call for it
+//! resolves to nothing, with no assertion anywhere going red. It also loses the
+//! name contest in [`assemble`], which quietly hands `/delta` to a *different
+//! file*.
+//!
+//! For the **user's** question the answer is three-valued, not two — allowed,
+//! shadowed, model-only — and that is [`Skill::user_dispatch`]. Its precedence,
+//! shadowing before model-only, is decided there rather than at each surface
+//! that renders a mark.
 //!
 //! # Why this lives at `src/skills/`, not under `harness/`
 //!
@@ -106,8 +137,29 @@ pub struct Skill {
     /// Everything after the frontmatter block, verbatim (BR-13 — the body is
     /// passed as written).
     pub body: String,
+    /// Whether the model may invoke this skill through the `skill` tool
+    /// (REQ-587 BR-3) — `false` for `disable-model-invocation: true`, and for a
+    /// value of that key this parser could not read.
+    ///
+    /// The **flag as the file wrote it**, not the composed answer: ask
+    /// [`Skill::invocable_by_model`] for whether the model can actually reach
+    /// this row, because a shadowed row's name resolves elsewhere whatever its
+    /// frontmatter says.
+    pub model_invocable: bool,
+    /// Whether the user may dispatch this skill by typing `/name` (REQ-587
+    /// BR-3) — `false` for `user-invocable: false`, which is the *model-only*
+    /// state: listed by `/help`, marked, and refused from `/name`.
+    ///
+    /// The flag as the file wrote it, with the same caveat as
+    /// [`Skill::model_invocable`]: [`Skill::dispatchable_by_user`] is the
+    /// composed answer.
+    pub user_invocable: bool,
     /// Frontmatter keys Teton does not honor, in the order they appeared.
     /// Listed by `/verbose`; otherwise inert.
+    ///
+    /// An invocation flag appears here only when its *value* was not a boolean
+    /// literal — the file registered, the flag took its safe reading, and this
+    /// is where the user is told (`frontmatter`'s module doc).
     pub ignored_keys: Vec<String>,
     /// Set when the frontmatter declared a `name` that is not the one the file
     /// dispatches under — a note for `/verbose`, never a second spelling
@@ -127,20 +179,98 @@ impl Skill {
         permission_key_for(self.source, &self.name)
     }
 
-    /// True when this row may be dispatched — i.e. nothing shadows it.
+    /// True when nothing shadows this row — i.e. this file owns its name.
+    ///
+    /// **Exactly that, and not "may be invoked".** REQ-587 BR-3's two flags are
+    /// deliberately *not* folded in here (ADR-12), and the reason is that this
+    /// predicate has a second caller: [`assemble`] uses it to decide the name
+    /// contest. A model-only row must still **win** its name — it is the file
+    /// that answers `delta` — so folding `user_invocable` in would let a
+    /// lower-precedence file quietly take the spelling for the user while the
+    /// model kept reaching the first one. Ask [`Self::dispatchable_by_user`] or
+    /// [`Self::invocable_by_model`] for who may invoke it.
     #[must_use]
     pub fn is_dispatchable(&self) -> bool {
         self.shadowed.is_none()
     }
 
-    /// The diagnostic this row carries when it is *not* dispatchable, in the
-    /// same vocabulary [`SkipReason`] uses for everything else discovery
+    /// True when the **user** may reach this row by typing `/name`: it owns its
+    /// name and its frontmatter did not say `user-invocable: false`.
+    #[must_use]
+    pub fn dispatchable_by_user(&self) -> bool {
+        matches!(self.user_dispatch(), UserDispatch::Allowed)
+    }
+
+    /// True when the **model** may reach this row through the `skill` tool: it
+    /// owns its name and its frontmatter did not say
+    /// `disable-model-invocation: true`.
+    ///
+    /// The shadowing half is not decoration. A hidden `alpha` that shadows a
+    /// second `alpha` must not let the *loser* answer the model's call for
+    /// `alpha`: the name resolves to one file or to none.
+    #[must_use]
+    pub fn invocable_by_model(&self) -> bool {
+        self.is_dispatchable() && self.model_invocable
+    }
+
+    /// Which of BR-3's three states this row is in, for the **user's**
+    /// question.
+    ///
+    /// One home for the precedence, decided here rather than at each surface
+    /// that renders a mark: **shadowing wins**. A row that is both shadowed and
+    /// model-only reads as shadowed, because that is the stronger and more
+    /// actionable fact — the name belongs to another file entirely, so
+    /// "model-only" would name a capability this row does not have either.
+    ///
+    /// On the wire the two facts ride separately (`SkillView::shadowed` and
+    /// `SkillView::user_invocable`, both verbatim), so a client composing a
+    /// `/help` mark applies this same order and does not need a predicate of
+    /// its own.
+    #[must_use]
+    pub fn user_dispatch(&self) -> UserDispatch {
+        match self.shadowed {
+            Some(by) => UserDispatch::Shadowed(by),
+            None if !self.user_invocable => UserDispatch::ModelOnly,
+            None => UserDispatch::Allowed,
+        }
+    }
+
+    /// The diagnostic this row carries when something else owns its name, in
+    /// the same vocabulary [`SkipReason`] uses for everything else discovery
     /// declined — so `/help`'s row mark and the skipped list cannot drift into
     /// two spellings of one fact.
+    ///
+    /// Answers the **shadowing** question only, and stays `None` for a
+    /// model-only row: BR-3's third state is not a kind of shadowing (nothing
+    /// took the name, and the model still reaches the file), and folding it in
+    /// would put "model-only" into a sentence that reads `shadowed by …` at
+    /// every surface that renders one. [`Self::user_dispatch`] is the
+    /// three-valued answer.
     #[must_use]
     pub fn shadow_reason(&self) -> Option<SkipReason> {
         self.shadowed.map(|by| SkipReason::Shadowed { by })
     }
+}
+
+/// Whether a registered row is the **user's** to type, and why not when it is
+/// not (REQ-587 BR-3).
+///
+/// Three states in one value, because `Option<…>` is two and BR-3 has three:
+/// the shape a caller reaches for when it must tell "another file owns this
+/// name" from "this file is the model's, not yours". See
+/// [`Skill::user_dispatch`] for the precedence between them.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum UserDispatch {
+    /// `/name` reaches this file.
+    Allowed,
+    /// Something else owns the spelling (BR-2). Listed, marked, never
+    /// dispatched.
+    Shadowed(ShadowedBy),
+    /// `user-invocable: false`. Listed and marked, refused from `/name`, and
+    /// still the model's — unless [`Skill::model_invocable`] is false too, in
+    /// which case the row is invocable by nobody, which is a named state and
+    /// not a silent drop.
+    ModelOnly,
 }
 
 /// What beat a skill to its name (BR-2, ADR-6).
@@ -316,13 +446,35 @@ impl SkillRegistry {
         &self.skipped
     }
 
-    /// The skill `name` dispatches to, or `None` when nothing does — including
-    /// when a row of that name exists but is shadowed.
+    /// The skill a **user's** `/name` reaches, or `None` when nothing does —
+    /// including when a row of that name exists but is shadowed, or is
+    /// model-only (REQ-587 BR-3).
+    ///
+    /// Named for its caller rather than for its filter, per ADR-12. REQ-585 had
+    /// one resolver, `dispatchable`, and one caller; BR-3 gives the registry
+    /// two questions whose answers differ for exactly one state, and a resolver
+    /// spelled `dispatchable` is the one the `skill` tool would have reached
+    /// for by reflex — returning `unknown_skill` for every model-only skill,
+    /// with nothing red anywhere.
     #[must_use]
-    pub fn dispatchable(&self, name: &str) -> Option<&Skill> {
+    pub fn dispatchable_by_user(&self, name: &str) -> Option<&Skill> {
         self.skills
             .iter()
-            .find(|skill| skill.name == name && skill.is_dispatchable())
+            .find(|skill| skill.name == name && skill.dispatchable_by_user())
+    }
+
+    /// The skill a **model's** `skill { name }` call reaches, or `None` — the
+    /// other half of ADR-12's pair.
+    ///
+    /// `None` here and `Some` from [`Self::dispatchable_by_user`] is BR-3's
+    /// `disable-model-invocation: true`; the reverse is `user-invocable:
+    /// false`. Both are ordinary registered rows and both are listed by
+    /// `/help`.
+    #[must_use]
+    pub fn invocable_by_model(&self, name: &str) -> Option<&Skill> {
+        self.skills
+            .iter()
+            .find(|skill| skill.name == name && skill.invocable_by_model())
     }
 
     /// True when nothing was found at all — the state a session on a machine
@@ -407,6 +559,11 @@ fn assemble(candidates: Vec<Skill>, skipped: Vec<Skipped>) -> SkillRegistry {
             skills.push(candidate);
             continue;
         }
+        // `is_dispatchable`, and deliberately not `dispatchable_by_user`: the
+        // contest is about who **owns the spelling**, which a model-only row
+        // does. A row that lost this contest is not the model's either
+        // (`invocable_by_model` reads the same predicate), so a name still
+        // resolves to one file or to none, for either caller.
         if let Some(winner) = skills
             .iter()
             .find(|s| s.name == candidate.name && s.is_dispatchable())
@@ -504,6 +661,176 @@ impl Shape {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// An ordinary registered row: it owns its name and both flags are on.
+    fn row(name: &str, source: SkillSource) -> Skill {
+        Skill {
+            name: name.to_owned(),
+            source,
+            path: PathBuf::from("/h/.claude/skills")
+                .join(name)
+                .join("SKILL.md"),
+            description: None,
+            argument_hint: None,
+            body: String::new(),
+            model_invocable: true,
+            user_invocable: true,
+            ignored_keys: Vec::new(),
+            name_note: None,
+            shadowed: None,
+        }
+    }
+
+    /// **ADR-12, both directions on one fixture.** `user-invocable: false` is a
+    /// third state, not a second spelling of "not dispatchable": the user's
+    /// `/delta` must refuse **and** the model's `skill { name: "delta" }` must
+    /// resolve, off the same row.
+    ///
+    /// Every assertion but the middle one stays green if `user_invocable` is
+    /// folded into `is_dispatchable` — the refusal, the listing, and even a
+    /// `/help` mark — which is exactly why the model's half is asserted here
+    /// and not left to the tool's task.
+    #[test]
+    fn a_model_only_skill_refuses_the_user_and_still_resolves_for_the_model() {
+        let mut delta = row("delta", SkillSource::User);
+        delta.user_invocable = false;
+        let registry = assemble(vec![delta], Vec::new());
+
+        assert!(
+            registry.dispatchable_by_user("delta").is_none(),
+            "`/delta` must refuse: the file says the user may not type it"
+        );
+        assert!(
+            registry.invocable_by_model("delta").is_some(),
+            "…and the model must still reach it — this is BR-3's model-only \
+             state, and it is dead the moment `user_invocable` is folded into \
+             `is_dispatchable`"
+        );
+        assert_eq!(registry.skills().len(), 1, "still listed by `/help` (AC-1)");
+
+        let delta = &registry.skills()[0];
+        assert!(
+            delta.is_dispatchable(),
+            "`is_dispatchable` answers the shadowing question only (ADR-12); \
+             nothing shadows this row"
+        );
+        assert_eq!(delta.shadow_reason(), None, "and it carries no shadow mark");
+        assert_eq!(
+            delta.user_dispatch(),
+            UserDispatch::ModelOnly,
+            "the third state, named"
+        );
+    }
+
+    /// The mirror image: `disable-model-invocation: true` takes the model's
+    /// half and leaves the user's alone.
+    #[test]
+    fn a_hidden_skill_refuses_the_model_and_still_dispatches_for_the_user() {
+        let mut beta = row("beta", SkillSource::User);
+        beta.model_invocable = false;
+        let registry = assemble(vec![beta], Vec::new());
+
+        assert!(registry.invocable_by_model("beta").is_none());
+        assert!(registry.dispatchable_by_user("beta").is_some());
+        assert_eq!(registry.skills()[0].user_dispatch(), UserDispatch::Allowed);
+    }
+
+    /// Both flags off is a real state — invocable by nobody — and it is a
+    /// **listed row with a named state**, not a silent drop (BR-3).
+    #[test]
+    fn a_row_both_flags_deny_is_listed_and_invocable_by_nobody() {
+        let mut nobody = row("nobody", SkillSource::Project);
+        nobody.model_invocable = false;
+        nobody.user_invocable = false;
+        let registry = assemble(vec![nobody], Vec::new());
+
+        assert_eq!(registry.skills().len(), 1, "listed, not dropped");
+        assert!(registry.dispatchable_by_user("nobody").is_none());
+        assert!(registry.invocable_by_model("nobody").is_none());
+        assert_eq!(
+            registry.skills()[0].user_dispatch(),
+            UserDispatch::ModelOnly,
+            "the user's half of the answer is still model-only, and the model's \
+             half is a separate question the row answers `false` to"
+        );
+        assert!(
+            registry.skipped().is_empty(),
+            "nothing was skipped: the file registered and can be named"
+        );
+    }
+
+    /// **The fold's second casualty.** A model-only row still *wins* its name
+    /// contest, because it is the file that answers that spelling.
+    ///
+    /// With `user_invocable` inside `is_dispatchable`, the project row stops
+    /// winning, the user's row is never marked shadowed — and `/delta` silently
+    /// becomes a **different file** than the one the model reaches under the
+    /// same name.
+    #[test]
+    fn a_model_only_row_still_wins_its_name_contest() {
+        let mut project = row("delta", SkillSource::Project);
+        project.user_invocable = false;
+        let user = row("delta", SkillSource::User);
+        let registry = assemble(vec![project, user], Vec::new());
+
+        assert_eq!(registry.skills().len(), 2, "both rows are listed");
+        let loser = registry
+            .skills()
+            .iter()
+            .find(|s| s.source == SkillSource::User)
+            .expect("the user row is listed");
+        assert_eq!(
+            loser.shadowed,
+            Some(ShadowedBy::ProjectSkill),
+            "the project row won the spelling even though the user may not type it"
+        );
+        assert!(
+            registry.dispatchable_by_user("delta").is_none(),
+            "so `/delta` reaches nothing at all — never the shadowed file"
+        );
+        assert_eq!(
+            registry.invocable_by_model("delta").map(|s| s.source),
+            Some(SkillSource::Project),
+            "and the model reaches the winner, not the loser"
+        );
+    }
+
+    /// A shadowed row is not the model's either: a name resolves to one file or
+    /// to none, for both callers.
+    #[test]
+    fn a_shadowed_row_is_not_the_models_and_reads_as_shadowed() {
+        let mut winner = row("status", SkillSource::Project);
+        winner.model_invocable = false;
+        let mut loser = row("status", SkillSource::User);
+        loser.user_invocable = false;
+        let registry = assemble(vec![winner, loser], Vec::new());
+
+        assert!(
+            registry.invocable_by_model("status").is_none(),
+            "the winner hid itself from the model; the loser must not answer in \
+             its place"
+        );
+        assert_eq!(
+            registry
+                .dispatchable_by_user("status")
+                .map(|skill| skill.source),
+            Some(SkillSource::Project),
+            "the user still reaches the winner — the loser answers neither \
+             question, whatever its own flags say"
+        );
+
+        let loser = registry
+            .skills()
+            .iter()
+            .find(|s| s.source == SkillSource::User)
+            .expect("listed");
+        assert_eq!(
+            loser.user_dispatch(),
+            UserDispatch::Shadowed(ShadowedBy::ProjectSkill),
+            "shadowing wins over model-only — the precedence every surface \
+             composing a mark reads off this one decision"
+        );
+    }
 
     #[test]
     fn a_name_is_lowercase_ascii_and_at_most_sixty_four_characters() {
