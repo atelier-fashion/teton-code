@@ -17,9 +17,11 @@ reaches a consent raised from inside the loop.
 
 - `crates/tetond/src/runtime.rs` — `build_tools` gains `Arc<SkillRegistry>` and `invoker: Option<ConnectionId>`; the call site passes both
 - `crates/tetond/src/server.rs` — `invoker` already exists at the reader loop; confirm it reaches `build_tools` too
+- `crates/tetond/tests/skill_turn.rs` — the two source-scans this task's signature change breaks (`run_prompt_turn_body()`, `settle_dynamic_context_body()`), widened deliberately
 
 ## Acceptance Criteria
 
+- [ ] `build_tools` calls `register_skill_tool` after the built-ins (TASK-216 shipped the function; this task owns the call site and the two new parameters).
 - [ ] `build_tools` takes the session's `Arc<SkillRegistry>` — the **same snapshot** `accept_invocation` already reads, taken once per turn. Do not re-read it inside the tool: `discovery_is_paid_at_create_and_at_cd_and_never_per_turn` pins that the registry is a snapshot, and one turn / one snapshot is what makes the roster and the resolution provably the same value.
 - [ ] `build_tools` takes `invoker: Option<ConnectionId>` and hands it to `SkillTool`. `ConnectionId` is `Copy`, so the existing consumption at `runtime.rs:~3546` is unaffected — but the parameter must be threaded **past** that line in source order, which today it is not.
 - [ ] **The assertion that matters: an addressable connection reached `authorize_skill` from inside the loop.** Not from a fixture that invents a `ConnectionId` — `skill_consent_matrix.rs` does exactly that and would pass either way. Drive a model-issued call and assert the `Consent` double recorded the *invoking* connection.

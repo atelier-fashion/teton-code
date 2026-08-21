@@ -18,14 +18,16 @@ anything the model invoked.
 
 - `crates/tetond/src/harness/turn_loop.rs` — the admit/refuse between dispatch and the fold
 - `crates/tetond/src/runtime.rs` — `skill_refit` becomes a list; `skill_would_not_survive_refit` takes it
+- `crates/tetond/tests/skill_turn.rs` — the `-32023` bracket pin (`~:2240`), read as a guard that the turn-ending refusals stayed put
 
 ## Acceptance Criteria
 
 - [ ] The check runs in the loop, against `config.budget`, because the tool cannot: `build_tools` runs before `build_system_prompt`, so at construction there is no system prompt to measure against, and the route can be swapped mid-turn.
 - [ ] Two stages, same vocabulary: Stage A before the dynamic-context consent is spent, Stage B after the outcomes fold in, and the refusal **says which**.
-- [ ] The refusal is a **tool result the model can relay**, not an `RpcError` that ends the prompt. All four existing raise sites end the turn; this is the fifth and it is different, deliberately.
-- [ ] **`skill_refit` becomes a list.** It is built from `skill_turn`, which is `Some` only for a user-typed `/name`, so `skill_would_not_survive_refit` returns `None` for every model invocation and `refit_for_reroute` middle-elides the expansion — at the one seam REQ-585 built a guard for. On a boundary-configured machine the privacy pin is the *expected* path, not a corner.
-- [ ] `the_two_refusals_bracket_the_consent_seam_and_precede_the_seed` pins `raises.len() == 4` with a 2/2 split around `CarriedTurn::begin` and a 400-byte window naming the guard. All three move **deliberately** — widen with the reasoning written down, do not relax.
+- [ ] The **Stage A/B** refusal is a tool result the model can relay, raised at the fold where a `ToolCall` id is in hand. It is not a fifth `error_code::SKILL_EXPANSION_TOO_LARGE` raise site in `run_prompt_turn`, so `raises.len() == 4` and its 2/2 split **do not move** — read that pin as a guard that the *turn-ending* refusals stayed put, not as something to widen.
+- [ ] **The reroute arms are the honest exception, and this task scopes them rather than pretending otherwise.** Both `skill_would_not_survive_refit` call sites sit in `run_prompt_turn`'s `'turn` retry loop, *after* `run_session_turn_with_source` returned — there is no `ToolCall` id there and the expansion is already a committed block, so a tool result is not expressible without restructuring the retry, which this REQ does not propose. A model-invoked expansion caught at a reroute therefore **ends the turn** with the existing typed error, and BR-6/BR-9's "never a crash, always relayable" carries a stated exception naming this seam. Do not invent a channel; state the residual and file it.
+- [ ] **`skill_refit` becomes a list**, and the list's entries are `(name, text, system)` triples for expansions *committed this turn* — the guard re-measures each against the new route and refuses the turn on the first that would not survive. ** It is built from `skill_turn`, which is `Some` only for a user-typed `/name`, so `skill_would_not_survive_refit` returns `None` for every model invocation and `refit_for_reroute` middle-elides the expansion — at the one seam REQ-585 built a guard for. On a boundary-configured machine the privacy pin is the *expected* path, not a corner.
+- [ ] `the_two_refusals_bracket_the_consent_seam_and_precede_the_seed` stays at `raises.len() == 4` with its 2/2 split. If an implementation makes it 5, that is the signal a model-path refusal was written as a turn-ender — investigate rather than update the number.
 - [ ] AC-8's digest-bypass leg is **behavioural**, not a source scan: a 2,800-word expansion through the loop on the default-budget route, where the fold would otherwise bite. The existing source pin counts call sites and says nothing about `skill`.
 - [ ] Mutation: moving the check into the tool, leaving `skill_refit` a single value, and making the refusal an `RpcError` each fail a named test.
 
