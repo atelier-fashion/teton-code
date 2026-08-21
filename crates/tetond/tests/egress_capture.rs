@@ -936,9 +936,8 @@ fn expansion_of(
     let skill = registry
         .dispatchable(name)
         .unwrap_or_else(|| panic!("the fixture must register `{name}`"));
-    let display = teton_core::session_root::display_for(&skill.path, home);
     (
-        tetond::skills::expand(skill, "", &display).pending_text(),
+        tetond::skills::expand(skill, "", &skill.path_display).pending_text(),
         skill.path.clone(),
     )
 }

@@ -398,6 +398,61 @@ async fn skills_list_reports_the_sessions_registry_with_sources_and_skips() {
     let _ = std::fs::remove_file(&socket);
 }
 
+/// **BR-1 / BUG-187: a *project* skip crosses the wire relative too.**
+///
+/// The test above proves it for a user skip, whose `~/…` spelling
+/// `display_for` could always produce. This one is the case that could not:
+/// the repo fixture is under `/tmp`, outside this binary's `HOME`, so the wire
+/// carried `/tmp/tstpskip…/.claude/skills/broken/SKILL.md` — the absolute path
+/// of the user's working tree — onto a surface `/help` renders and a
+/// screenshot captures.
+///
+/// **Mutation**: spell the skipped path with the home rule alone and the
+/// assertion below reads back an absolute path.
+#[tokio::test]
+async fn a_skipped_project_entry_crosses_the_wire_relative_to_the_session_root() {
+    let _home = fixture_home();
+    let repo = Tree::new("pskip");
+    repo.write(
+        ".claude/skills/broken/SKILL.md",
+        "---\nname: broken\ndescription: unterminated frontmatter\n",
+    );
+    // The positive control: discovery really reached this root, so the skip
+    // below is the frontmatter's doing (LESSON-479).
+    repo.write(
+        ".claude/skills/fine/SKILL.md",
+        &skill_file("fine", "the positive control", "[path]"),
+    );
+    let socket = temp_socket("skills-pskip");
+    let listener = server::bind_listener(&socket).unwrap();
+    let server_task = tokio::spawn(server::serve(listener, Arc::new(Daemon::new())));
+
+    let mut client = TestClient::connect(&socket).await;
+    client.handshake().await;
+    let session = client.create_session_at(repo.path()).await;
+    let listed = client.skills_list(&session).await;
+
+    assert!(
+        rows(&listed).contains(&("fine".to_owned(), "project".to_owned())),
+        "the positive control registered: {listed}"
+    );
+    let broken = listed["skipped"]
+        .as_array()
+        .expect("a skipped array")
+        .iter()
+        .find(|entry| entry["name"] == "broken")
+        .unwrap_or_else(|| panic!("the malformed project skill is named: {listed}"));
+    assert_eq!(
+        broken["path"].as_str(),
+        Some(".claude/skills/broken/SKILL.md"),
+        "a project skip crosses the wire relative to the session root, never as \
+         the absolute path of the user's working tree: {broken}"
+    );
+
+    server_task.abort();
+    let _ = std::fs::remove_file(&socket);
+}
+
 /// **BR-3 / LESSON-517: what reaches the client is already bounded and
 /// neutralized.**
 ///

@@ -600,10 +600,27 @@ pre-rendered string is LESSON-544: a test that builds the wire value by hand
 leaves the producer unguarded — the assertion must run against the value the
 daemon actually emitted.
 
-`path_display` is `session_root::display_for` (home-relative), bounded with
-`bounded_field`. The body is never printed. The **skipped** entries' paths are
-bounded the same way — an unreadable `/Users/jane/.claude/skills/broken/SKILL.md`
-must not carry a username into a transcript (BR-1's entity table).
+`path_display` is BR-1's display spelling, bounded with `bounded_field`. The
+body is never printed. The **skipped** entries' paths are spelled and bounded
+the same way — an unreadable `/Users/jane/.claude/skills/broken/SKILL.md` must
+not carry a username into a transcript (BR-1's entity table).
+
+**Amended 2026-08-21 (BUG-187).** As shipped this said `session_root::
+display_for` (home-relative) and nothing else, and that helper can only shorten
+a path under `$HOME`: a **project** skill in a session root outside the home
+folder — a CI workspace, a checkout on an external volume, `/tmp` — rendered as
+its full absolute path on the wire event, on the `/verbose` detail line and in
+BR-4's preamble (hence in every remote payload the turn produced). The rule now
+has two halves, chosen by the skill's `source`: a project skill is spelled
+relative to the **session root** (`teton_core::session_root::display_under`), a
+user skill relative to `$HOME` (`display_for`, unchanged). It is derived **once,
+at discovery** and carried on the registry row (`Skill::path_display`,
+`Skipped::path_display`) rather than at each surface, because it needs the
+source, the session root and `HOME` together and no consumer holds all three —
+`skills/list` answers from a stored snapshot with no root at all, which is how
+the gap survived review. `Skill::path` itself stays absolute: it is the
+local-only fact the expander opens and the provenance mint resolves against
+(ADR-9).
 
 **The event is published before Stage B, not after.** A turn where the user
 approved four commands, watched them run, and was then refused is precisely the
