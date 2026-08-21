@@ -53,7 +53,8 @@ use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 
 use teton_protocol::events::{
-    Event, PermissionOption, PermissionRequest, PermissionSubject, OPTION_ID_ENABLE_PERMANENT,
+    Event, InvokedBy, PermissionOption, PermissionRequest, PermissionSubject,
+    OPTION_ID_ENABLE_PERMANENT,
 };
 use teton_protocol::methods::{PermissionOutcome, RefusalReason};
 use teton_protocol::permissions::PermissionLevel;
@@ -384,9 +385,16 @@ async fn one_consent_per_invocation_lists_every_command_verbatim_in_document_ord
             skill,
             source,
             commands: asked,
+            invoked_by,
         }) => {
             assert_eq!(skill, "status");
             assert_eq!(source, SkillSource::User);
+            assert_eq!(
+                invoked_by,
+                InvokedBy::User,
+                "this is a user-typed invocation; a consent that reported the \
+                 model here would be attributing the ask to the wrong caller"
+            );
             assert_eq!(
                 asked,
                 commands.iter().map(|c| (*c).to_owned()).collect::<Vec<_>>(),

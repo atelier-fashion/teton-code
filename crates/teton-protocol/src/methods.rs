@@ -418,6 +418,92 @@ pub fn is_project_skill_key(key: &str) -> bool {
     key.starts_with(&skill_permission_key_prefix(SkillSource::Project))
 }
 
+/// The prefix every project-skill **acknowledgment** key starts with.
+///
+/// Deliberately not `skill:`. See [`project_skill_trust_key`].
+pub const PROJECT_SKILL_TRUST_KEY_PREFIX: &str = "project_skill_trust:";
+
+/// The permission key the project-skill acknowledgment is remembered under:
+/// `project_skill_trust:<root>` (REQ-587 BR-4, architecture ADR-7).
+///
+/// **A different question, so a different key.** `skill:<source>:<name>` asks
+/// "may these commands run?"; this one asks "may the model run *this
+/// repository's* skills as instructions at all?", once per session per root and
+/// before any expansion exists. LESSON-495's rule is that the key encodes the
+/// question and that a remembered answer frees every later request whose key
+/// matches — so folding the two into one string would let a `y` to one question
+/// answer the other.
+///
+/// It is **not a skill key**, and that is load-bearing rather than cosmetic:
+/// `authorize_skill` `debug_assert!`s that its key is a skill key *and* that it
+/// equals the key `(source, name)` mints, and an acknowledgment satisfies
+/// neither. ADR-7 opens a third gate door rather than widening two guards that
+/// are pinned in both directions.
+///
+/// It is also absent from the permission **level table**, on purpose: an
+/// unenumerated key falls to the level's default, which is exactly BR-4's
+/// posture for this question — `guarded`/`edits` ask, `plan` denies, `full`
+/// allows.
+///
+/// `root` is the session root's **home-relative display**
+/// (`session_root::display_for`), never an absolute path: a client that does
+/// not recognize the subject renders the request's key on its refusal line, and
+/// `/Users/jane/dev/teton` on that line carries a username into a transcript
+/// (REQ-585 BR-1's entity table).
+///
+/// The root is **not** truncated here. A key is matched, never read: two long
+/// roots sharing a prefix must not collapse onto one key, or a grant for one
+/// repository would answer for another — precisely the harm the per-root scope
+/// exists to prevent. Bounding belongs to what is *rendered*, not to what is
+/// *compared*.
+#[must_use]
+pub fn project_skill_trust_key(root: &str) -> String {
+    format!("{PROJECT_SKILL_TRUST_KEY_PREFIX}{root}")
+}
+
+/// True when `key` is a project-skill **acknowledgment** key (REQ-587 BR-4).
+///
+/// A bare prefix names no root, and a grant under it would be an answer to no
+/// question — the rule `is_skill_permission_key` already applies to a bare
+/// `skill:project:`.
+#[must_use]
+pub fn is_project_acknowledgment_key(key: &str) -> bool {
+    key.strip_prefix(PROJECT_SKILL_TRUST_KEY_PREFIX)
+        .is_some_and(|root| !root.is_empty())
+}
+
+/// True when a session root move invalidates `key` — **the** invalidation rule,
+/// spelled once above both crates (ASSUME-017).
+///
+/// Two families expire on `/cd`, and no others: a project skill's
+/// dynamic-context grant ([`is_project_skill_key`]) and the project-skill
+/// acknowledgment ([`is_project_acknowledgment_key`]). A user skill's grant
+/// survives, because its file is the same file whatever the session root is.
+///
+/// **Why this is a function and not a `starts_with` at each call site.** The
+/// daemon drops its grants when the root moves; the client drops its
+/// `SessionGrants` memo of the same answers, and it consults that memo *before*
+/// drawing any prompt. When the two disagree about which keys expire, the
+/// client auto-answers the new root's question with the old root's answer and
+/// no human is ever shown anything — ASSUME-017, reached in REQ-585 by writing
+/// the rule out twice. A security decision with two stores needs one
+/// invalidation rule, and the rule belongs above both.
+#[must_use]
+pub fn expires_on_session_root_change(key: &str) -> bool {
+    is_project_skill_key(key) || is_project_acknowledgment_key(key)
+}
+
+/// `serde`'s `default` for a flag whose **absence means yes**.
+fn absent_means_yes() -> bool {
+    true
+}
+
+/// The `skip_serializing_if` companion to [`absent_means_yes`]: the key rides
+/// only when the flag is `false`, so the ordinary row's bytes never change.
+fn is_yes(flag: &bool) -> bool {
+    *flag
+}
+
 /// One registered skill, as a client sees it (REQ-585 BR-3, ADR-1).
 ///
 /// This is the whole of what the CLI holds: enough to classify a `/name` line
@@ -452,6 +538,42 @@ pub struct SkillView {
     /// the row and `classify` must not return it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub shadowed: Option<String>,
+    /// Whether the model may invoke this skill through the `skill` tool
+    /// (REQ-587 BR-3).
+    ///
+    /// `false` for a skill whose frontmatter says `disable-model-invocation:
+    /// true` — absent from the roster, absent from the listing, and a model
+    /// call naming it refused before the expander is asked.
+    ///
+    /// **Absent means `false`**, which is both the compat reading and the safe
+    /// one. A daemon predating REQ-587 has no `skill` tool at all, so nothing
+    /// it lists is model-invocable, and a client defaulting this to `true`
+    /// would print REQ-587's marks for a capability that build does not have.
+    /// It is equally the value BR-3 gives a *malformed* flag — hidden from the
+    /// model, invocable by the user — so a typo in a repository's frontmatter
+    /// can never widen what the model may run.
+    ///
+    /// Both flags `false` is a real state and a named diagnostic rather than a
+    /// silent drop: a skill invocable by nobody.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub model_invocable: bool,
+    /// Whether the user may dispatch this skill by typing `/name` (REQ-587
+    /// BR-3).
+    ///
+    /// `false` for a skill whose frontmatter says `user-invocable: false` —
+    /// model-only, which `/help` **marks** rather than hides (REQ-585 BR-3
+    /// holds: `/help` never shows a *dispatchable* entry the table does not
+    /// resolve, and a model-only entry is not dispatchable by the user), and
+    /// which `classify` refuses with a hint naming the flag.
+    ///
+    /// **Absent means `true`** — the opposite default to
+    /// [`Self::model_invocable`] and for the same two reasons: it is what a
+    /// daemon predating REQ-587 meant by listing a skill at all, and it is
+    /// BR-3's safe value. The wire therefore carries this key only for the
+    /// unusual skill, and every ordinary row is byte-identical to the bytes
+    /// REQ-585 wrote.
+    #[serde(default = "absent_means_yes", skip_serializing_if = "is_yes")]
+    pub user_invocable: bool,
 }
 
 /// One entry discovery found and did not register, with why (REQ-585 BR-1).
@@ -4145,6 +4267,8 @@ mod tests {
                     description: Some("audit the repo".to_owned()),
                     argument_hint: Some("[path]".to_owned()),
                     shadowed: None,
+                    model_invocable: true,
+                    user_invocable: true,
                 },
                 // A project skill with nothing declared but its name — the
                 // `.claude/commands/*.md` shape, which routinely has no
@@ -4155,6 +4279,8 @@ mod tests {
                     description: None,
                     argument_hint: None,
                     shadowed: None,
+                    model_invocable: false,
+                    user_invocable: true,
                 },
                 // Listed, never dispatchable (BR-2).
                 SkillView {
@@ -4163,6 +4289,8 @@ mod tests {
                     description: None,
                     argument_hint: None,
                     shadowed: Some("a built-in command".to_owned()),
+                    model_invocable: false,
+                    user_invocable: true,
                 },
             ],
             skipped: vec![SkillSkipped {
@@ -4193,11 +4321,18 @@ mod tests {
             description: None,
             argument_hint: None,
             shadowed: None,
+            model_invocable: false,
+            user_invocable: true,
         })
         .expect("serializes");
         assert!(bare.get("description").is_none(), "{bare}");
         assert!(bare.get("argument_hint").is_none(), "{bare}");
         assert!(bare.get("shadowed").is_none(), "{bare}");
+        // REQ-587's two flags in their ordinary posture — not model-invocable,
+        // invocable by the user — write **no keys at all**, so an ordinary
+        // row's bytes are exactly the bytes REQ-585 wrote.
+        assert!(bare.get("model_invocable").is_none(), "{bare}");
+        assert!(bare.get("user_invocable").is_none(), "{bare}");
     }
 
     /// REQ-585 TASK-203: `SkillSkipped.name` is additive in both directions —
@@ -4269,6 +4404,166 @@ mod tests {
             "a named skipped entry is one more optional field, so the negotiated \
              version does not move"
         );
+    }
+
+    /// REQ-587 BR-3's two invocability flags, additive in both directions —
+    /// the `SkillSkipped.name` rule re-applied rather than assumed inherited,
+    /// with the **opposite defaults** asserted, because that is the half a
+    /// copied test gets wrong.
+    ///
+    /// Four legs, as the rule asks: an absent key parses to the safe posture,
+    /// an ordinary row emits **no** key rather than `false`/`true`, the new
+    /// wire parses through a locally-declared pre-REQ-587 reader, and the
+    /// fixture that proves the third leg is checked for actually carrying the
+    /// keys (LESSON-502 — the vacuity is the failure mode).
+    #[test]
+    fn skill_view_invocability_flags_are_additive_in_both_directions() {
+        // A row from a daemon predating the flags: neither key present. The two
+        // defaults are not symmetric, and both are the safe reading — that
+        // daemon has no `skill` tool, so nothing it lists is model-invocable,
+        // and it listed the skill at all because the user may type it.
+        let older: SkillView =
+            serde_json::from_str(r#"{"name":"alpha","source":"user","description":"audit"}"#)
+                .expect("a row from a daemon predating the flags must still parse");
+        assert!(!older.model_invocable, "absent means not model-invocable");
+        assert!(older.user_invocable, "absent means the user may type it");
+
+        // And a row in that same posture writes neither key — not
+        // `"model_invocable":false`, not `"user_invocable":true`. Downgrading
+        // either `skip_serializing_if` to a bare `default` fails here.
+        let wire = serde_json::to_value(&older).unwrap();
+        assert!(wire.get("model_invocable").is_none(), "{wire}");
+        assert!(wire.get("user_invocable").is_none(), "{wire}");
+
+        // The other direction: a reader built before the flags.
+        #[derive(Deserialize)]
+        struct PreFlagsSkillView {
+            name: String,
+            source: SkillSource,
+            #[serde(default)]
+            shadowed: Option<String>,
+        }
+        let model_only = SkillView {
+            name: "release".to_owned(),
+            source: SkillSource::Project,
+            description: Some("cut a release".to_owned()),
+            argument_hint: None,
+            shadowed: None,
+            model_invocable: true,
+            user_invocable: false,
+        };
+        round_trip(&model_only);
+        let wire = serde_json::to_string(&model_only).unwrap();
+        assert!(
+            wire.contains(r#""model_invocable":true"#)
+                && wire.contains(r#""user_invocable":false"#),
+            "the fixture must actually carry the new keys: {wire}"
+        );
+        let old: PreFlagsSkillView =
+            serde_json::from_str(&wire).expect("a client predating the flags still reads the row");
+        assert_eq!(old.name, "release");
+        assert_eq!(old.source, SkillSource::Project);
+        // What that client makes of it, stated rather than left to inference:
+        // an unmarked, dispatchable `/help` row. The flag has teeth in the
+        // daemon (ADR-1), so the worst an old client does is offer a row whose
+        // dispatch the daemon refuses — one refusal line, never a wrong
+        // expansion.
+        assert_eq!(old.shadowed, None);
+
+        // BR-3's fourth state: both flags off — invocable by nobody, a named
+        // diagnostic rather than a silent drop — survives the wire, and the
+        // `false` half is the half that rides.
+        let nobody = SkillView {
+            name: "orphan".to_owned(),
+            source: SkillSource::User,
+            description: None,
+            argument_hint: None,
+            shadowed: None,
+            model_invocable: false,
+            user_invocable: false,
+        };
+        round_trip(&nobody);
+        let wire = serde_json::to_value(&nobody).unwrap();
+        assert!(wire.get("model_invocable").is_none(), "{wire}");
+        assert_eq!(wire["user_invocable"], false, "{wire}");
+
+        assert_eq!(
+            crate::PROTOCOL_VERSION,
+            crate::ProtocolVersion(2),
+            "REQ-587 adds optional fields, one subject variant and no method, so the \
+             negotiated version does not move"
+        );
+    }
+
+    /// REQ-587 BR-4 / ADR-7: the acknowledgment key is its **own** family, it
+    /// is nobody's skill key, and one predicate decides what a `/cd` expires.
+    ///
+    /// The three claims are here together because they are one claim about a
+    /// string that two crates and two stores compare. ASSUME-017 is what
+    /// happens when the rule is written out twice: the daemon expired its
+    /// grants, the client's memo did not, and the client answered the new
+    /// root's question with the old root's answer before a human saw anything.
+    #[test]
+    fn the_acknowledgment_key_is_its_own_family_and_expires_with_the_root() {
+        let key = project_skill_trust_key("~/dev/teton");
+        assert_eq!(key, "project_skill_trust:~/dev/teton");
+        assert!(is_project_acknowledgment_key(&key));
+
+        // Not a skill key, in either crate's spelling of that question. The
+        // daemon's `is_skill_permission_key` matches on the `skill:<source>:`
+        // prefixes, and `authorize_skill` `debug_assert!`s its key is one —
+        // which is why ADR-7 opens a third door instead of widening the guard.
+        assert!(!key.starts_with("skill:"), "{key}");
+        assert!(!is_project_skill_key(&key), "{key}");
+        assert!(
+            !is_project_acknowledgment_key(&skill_permission_key(SkillSource::Project, "deploy")),
+            "the two families do not overlap in the other direction either"
+        );
+        assert!(!is_project_acknowledgment_key(&skill_permission_key(
+            SkillSource::User,
+            "status"
+        )));
+        assert!(!is_project_acknowledgment_key("shell"));
+
+        // A bare prefix names no root; a grant under it would be an answer to
+        // no question.
+        assert!(!is_project_acknowledgment_key(
+            PROJECT_SKILL_TRUST_KEY_PREFIX
+        ));
+
+        // Two roots, two keys — never one. The root is not truncated on its way
+        // into a key, because a key is compared and not read: two long roots
+        // sharing a prefix collapsing onto one string would let a grant for one
+        // repository answer for another, which is the harm the per-root scope
+        // exists to prevent.
+        let long_a = format!("~/dev/{}/alpha", "nested/".repeat(40));
+        let long_b = format!("~/dev/{}/beta", "nested/".repeat(40));
+        assert_ne!(
+            project_skill_trust_key(&long_a),
+            project_skill_trust_key(&long_b)
+        );
+        assert!(project_skill_trust_key(&long_a).ends_with("/alpha"));
+
+        // The root rides exactly as the caller spelled it, so the key the
+        // answer is remembered under and the root the prompt showed name one
+        // repository — and a home-relative display stays home-relative, since
+        // an unrecognizing client renders this key on its refusal line.
+        assert!(!project_skill_trust_key("~/dev/teton").contains("/Users/"));
+
+        // One invalidation rule, both families, and only those two: a user
+        // skill's file is the same file whatever the root is, so its grant
+        // survives the move.
+        assert!(expires_on_session_root_change(&key));
+        assert!(expires_on_session_root_change(&skill_permission_key(
+            SkillSource::Project,
+            "deploy"
+        )));
+        assert!(!expires_on_session_root_change(&skill_permission_key(
+            SkillSource::User,
+            "status"
+        )));
+        assert!(!expires_on_session_root_change("shell"));
+        assert!(!expires_on_session_root_change("web_search"));
     }
 
     /// REQ-585's additivity for `PromptTurnParams.skill`, both directions —

@@ -356,6 +356,263 @@ mod tests {
         }
     }
 
+    /// The `skills` topic as a model receives it, with every whitespace run
+    /// collapsed to one space and markdown emphasis markers dropped.
+    ///
+    /// The needle tests below match against this rather than the raw body, for
+    /// two reasons that are both about what the needles are *for*. A claim
+    /// written across a line break is one substring here, so a phrase can be
+    /// pinned as it reads rather than as it happens to wrap; and re-wrapping a
+    /// paragraph at 80 columns — or bolding a word — is a formatting change,
+    /// which must not fail a test about what the topic *asserts*, nor let a
+    /// stale assertion back in wearing `**` (`**stalls**` and `stalls` are the
+    /// same claim).
+    ///
+    /// Served through `run`, like the sweep above, because the claim under test
+    /// is about what reaches the model rather than what is on disk.
+    fn skills_topic() -> String {
+        let served = call("skills");
+        assert!(!served.is_error, "{}", served.content);
+        served
+            .content
+            .replace('*', "")
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ")
+    }
+
+    /// A phrase REQ-587 made false, which must therefore not be in the topic.
+    fn assert_no_stale_claim(topic: &str, phrase: &str, why: &str) {
+        assert!(
+            !topic.contains(phrase),
+            "the `skills` topic still says `{phrase}`, which this build makes false: \
+             {why}. The topic is compiled into the same binary that hands the model a \
+             `skill` tool, so a model reading it is told the opposite of what it can do \
+             (AC-16) — fix crates/tetond/src/harness/docs/skills.md, not this assertion, \
+             and pay for the words by cutting elsewhere in the topic."
+        );
+    }
+
+    /// A phrase that carries a claim the topic has to make.
+    fn assert_states(topic: &str, phrase: &str, claim: &str) {
+        assert!(
+            topic.contains(phrase),
+            "the `skills` topic no longer says `{phrase}`, so it no longer states that \
+             {claim}. The byte ceiling above cannot see this and neither can the length \
+             floor (LESSON-481): if the wording changed on purpose, move the needle with \
+             it — deleting the needle deletes the only thing that notices when the topic \
+             and the product disagree."
+        );
+    }
+
+    /// **AC-16, first passage: the topic no longer denies model invocation.**
+    ///
+    /// It said *"The model cannot invoke a skill: name it and let the user type
+    /// it"*, compiled into the same binary that registers a `skill` tool. A
+    /// model that reads its own documentation and believes it hands the turn
+    /// back to the user instead of calling the tool sitting in its own schema —
+    /// which is BUG-181's defect with the sign flipped, on the surface REQ-577
+    /// shipped so the model would stop guessing.
+    #[test]
+    fn the_skills_topic_does_not_deny_model_invocation() {
+        let topic = skills_topic();
+        assert_no_stale_claim(
+            &topic,
+            "cannot invoke a skill",
+            "BR-1 gives the model a second door into the same expander",
+        );
+        assert_no_stale_claim(
+            &topic,
+            "let the user type it",
+            "a hand-off to the user is exactly the stall this REQ removes",
+        );
+        assert_states(
+            &topic,
+            "the model's `skill { name, args }` is a tool result",
+            "the model invokes a skill by calling the tool, and the expansion comes back \
+             inside the turn it is already in (BR-1, OQ-2)",
+        );
+    }
+
+    /// **AC-16, second passage: two frontmatter flags are no longer inert.**
+    ///
+    /// BR-3 shrinks REQ-585 BR-5's inert list by exactly two keys. The topic has
+    /// to name both and what they do, and — the half a positive needle would
+    /// miss — must not go on listing them among the keys it calls inert.
+    #[test]
+    fn the_skills_topic_does_not_call_the_two_invocation_flags_inert() {
+        let topic = skills_topic();
+        assert_no_stale_claim(
+            &topic,
+            "Frontmatter reads only",
+            "BR-3 makes two more keys meaningful, so the set of keys that are read is no \
+             longer closed at three",
+        );
+        assert_states(
+            &topic,
+            "`disable-model-invocation: true` hides the skill from the model",
+            "the first flag hides a skill from the model completely (BR-3)",
+        );
+        assert_states(
+            &topic,
+            "`user-invocable: false` makes it model-only",
+            "the second flag makes a skill model-only (BR-3)",
+        );
+        assert_states(
+            &topic,
+            "A non-boolean value reads as the safe one",
+            "a value that is not `true`/`false` takes the safe reading, so a typo can \
+             never widen what the model may run (BR-3)",
+        );
+
+        // The inert list itself, read out of the sentence that makes the claim:
+        // a topic that named both flags above and then left them in this
+        // parenthesis would satisfy every needle and still tell the model they
+        // do nothing.
+        let inert = topic
+            .split_once("Every other key (")
+            .and_then(|(_, rest)| rest.split_once(") is inert"))
+            .map(|(list, _)| list)
+            .expect(
+                "the topic no longer names what stays inert; BR-3 shrinks REQ-585's inert \
+                 list by exactly two keys and leaves the rest inert, which is a claim the \
+                 topic still has to carry",
+            );
+        for flag in ["disable-model-invocation", "user-invocable"] {
+            assert!(
+                !inert.contains(flag),
+                "the `skills` topic lists `{flag}` among the inert keys — `{inert}` — and \
+                 BR-3 is precisely that this key is now read. A model told the flag is \
+                 inert will not believe a skill can be hidden from it."
+            );
+        }
+    }
+
+    /// **AC-16, third passage: a skill that invokes skills no longer stalls.**
+    ///
+    /// *"stalls at its first 'invoke the skill' step"* was REQ-585's honest
+    /// limit and is this REQ's entire subject: `/proceed` reaching its first
+    /// gate is the reason the tool exists. What still degrades is a skill that
+    /// dispatches subagents, and the topic keeps saying so.
+    #[test]
+    fn the_skills_topic_does_not_say_a_skill_invoking_skill_stalls() {
+        let topic = skills_topic();
+        assert_no_stale_claim(
+            &topic,
+            " stalls",
+            "the `skill` tool is what unstalls a skill written as skill invocations",
+        );
+        assert_no_stale_claim(
+            &topic,
+            "at its first \"invoke the skill\" step",
+            "the first such step is now a tool call that resolves",
+        );
+        assert_states(
+            &topic,
+            "invokes other skills now runs them",
+            "a skill whose phases are skill invocations reaches them (BR-1)",
+        );
+        assert_states(
+            &topic,
+            "dispatches subagents degrades",
+            "what genuinely still degrades is named, so the model does not pretend a \
+             subagent step ran",
+        );
+    }
+
+    /// **AC-16, fourth passage: BR-10's provenance is two rules, not one.**
+    ///
+    /// REQ-585 ADR-9 refused to widen the id minter, so a project skill and a
+    /// user skill pin a turn by different rules — and the second is stricter
+    /// than a `read` of the same bytes. The consequence for a model invocation
+    /// on a boundary-configured machine is the part BR-10 says to state plainly
+    /// rather than leave to be discovered in a runbook.
+    #[test]
+    fn the_skills_topic_states_both_provenance_rules() {
+        let topic = skills_topic();
+        assert_no_stale_claim(
+            &topic,
+            "the stricter unknown rule",
+            "the pre-BR-10 paragraph folded both rules into one clause about a typed \
+             `/name`, and said nothing about a model invocation",
+        );
+        assert_states(
+            &topic,
+            "Two rules.",
+            "there are two provenance rules and the topic counts them (BR-10)",
+        );
+        assert_states(
+            &topic,
+            "A project skill mints a root-relative source",
+            "rule one: a project skill has a root-relative identity and pins the turn as \
+             reading that file would (BR-10)",
+        );
+        assert_states(
+            &topic,
+            "block is `Unknown` and pins the turn wherever any boundary is configured",
+            "rule two: a user skill has no root-relative identity, so it is `Unknown` and \
+             pins wherever any boundary is set — related to it or not (BR-10)",
+        );
+        assert_states(
+            &topic,
+            "a model invocation of a `~/.claude` skill runs local",
+            "the consequence of rule two for the seventeen `~/.claude` skills, which is \
+             what a runbook would otherwise discover the hard way (BR-10)",
+        );
+    }
+
+    /// **AC-16, fifth passage: the model's toolbox is named, not counted.**
+    ///
+    /// *"one model with five tools"* was REQ-585's shorthand for the five
+    /// built-ins, and this build adds a sixth door the model can open. A bare
+    /// count is what goes stale the next time a tool is registered — and it
+    /// was already silent about `teton_docs` and an opted-in `web` — so the
+    /// topic names the tool that matters here instead.
+    #[test]
+    fn the_skills_topic_does_not_pin_a_tool_count_that_moved() {
+        let topic = skills_topic();
+        assert_no_stale_claim(
+            &topic,
+            "five tools",
+            "the model's toolbox gained `skill`, and the count was never the whole set \
+             anyway (`teton_docs`, and `web` when opted in)",
+        );
+        assert_states(
+            &topic,
+            "tools, `skill` among them",
+            "the tool a skill body may reach for is named rather than counted",
+        );
+    }
+
+    /// **AC-16, sixth passage: an invocation has two callers.**
+    ///
+    /// *"`/name <rest>` is exactly one user-role prompt turn"* is now true of
+    /// one caller of two. The other lands as a tool result inside the turn
+    /// already running, over identical body bytes (AC-2) behind a different
+    /// frame (BR-4, ADR-6) — and a topic silent about the second caller is a
+    /// topic the model cannot act on.
+    #[test]
+    fn the_skills_topic_names_both_callers_of_the_expander() {
+        let topic = skills_topic();
+        assert_no_stale_claim(
+            &topic,
+            "is exactly one user-role prompt turn",
+            "an invocation is no longer only a prompt turn — the model's call lands as a \
+             tool result inside the turn already running",
+        );
+        assert_states(
+            &topic,
+            "Two callers, one expander.",
+            "one registry and one expander are reached by `/name` and by the tool (BR-1)",
+        );
+        assert_states(
+            &topic,
+            "then the same bytes",
+            "the body bytes are identical on both paths; only the frame in front differs \
+             (AC-2, BR-4)",
+        );
+    }
+
     /// **AC-3, the didactic half (BR-8).** An unknown topic names every valid
     /// one, so the recovery is the model's next turn rather than the user's.
     #[test]

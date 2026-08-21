@@ -1081,6 +1081,10 @@ impl PermissionGate {
                 skill: skill.to_owned(),
                 source,
                 commands,
+                // TASK-215 replaces this with the caller's real invoker. A
+                // literal today because this function has no invoker parameter
+                // and its only caller is REQ-585's user-typed `/name` path.
+                invoked_by: teton_protocol::events::InvokedBy::User,
             },
         };
 

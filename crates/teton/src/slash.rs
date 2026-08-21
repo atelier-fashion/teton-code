@@ -2884,6 +2884,9 @@ mod tests {
             description: None,
             argument_hint: None,
             shadowed: None,
+            // TASK-212 replaces this: the fixture predates BR-3's two flags.
+            model_invocable: false,
+            user_invocable: true,
         }
     }
 

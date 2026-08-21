@@ -2508,6 +2508,16 @@ pub(crate) fn consent_gate(subject: Option<&PermissionSubject>, typed_input: boo
                 ConsentGate::RefuseNoTerminal
             }
         }
+        // TASK-219 OWNS THIS ARM AND MUST REPLACE IT. Placeholder only, and
+        // deliberately the fail-closed one: `render_consent_subject` cannot
+        // draw this subject yet, and the third rule above says a question this
+        // client cannot render is one it may not put to a human — answering
+        // would be reading a line for a prompt nobody was shown. BR-4's real
+        // rule is the `SkillDynamicContext` row (ask at a terminal, refuse
+        // without reading stdin on a pipe), which TASK-219 writes together with
+        // the renderer. Unreachable today: no daemon mints this subject until
+        // TASK-215.
+        Some(PermissionSubject::ProjectSkillTrust { .. }) => ConsentGate::RefuseUnrecognized,
     }
 }
 
@@ -2681,11 +2691,22 @@ pub fn resolve_permission(
 /// prompt.
 fn render_consent_subject(subject: Option<&PermissionSubject>, surface: &mut dyn Surface) {
     match subject {
-        None | Some(PermissionSubject::Unrecognized) => {}
+        // TASK-219 OWNS THE `ProjectSkillTrust` ARM AND MUST REPLACE IT: BR-4's
+        // prompt names the root and lists the project's model-invocable skills,
+        // marking each shadowing entry. It renders nothing here only because
+        // `consent_gate` refuses the subject outright until that task lands, so
+        // this blank arm is never on an asking path — the invariant the
+        // `Unrecognized` arm already relies on.
+        None
+        | Some(PermissionSubject::Unrecognized | PermissionSubject::ProjectSkillTrust { .. }) => {}
         Some(PermissionSubject::SkillDynamicContext {
             skill,
             source,
             commands,
+            // TASK-219 renders who asked here (BR-5: the consent says the model
+            // invoked the skill). Bound and ignored, not `..`, so the field
+            // stays visible to that task.
+            invoked_by: _,
         }) => {
             surface.line(
                 LineKind::Prompt,
@@ -7180,6 +7201,8 @@ mod skill_tests {
                 "git status --short".to_owned(),
                 "grep -c '' README.md".to_owned(),
             ],
+            // TASK-215/219 replace this: the fixture predates BR-9's invoker.
+            invoked_by: events::InvokedBy::User,
         }
     }
 
@@ -7490,6 +7513,8 @@ mod skill_tests {
             ignored_keys: vec!["allowed-tools".to_owned(), "model".to_owned()],
             name_note: None,
             outcomes,
+            // TASK-219 replaces this: the fixture predates BR-9's invoker.
+            invoked_by: events::InvokedBy::User,
         }
     }
 

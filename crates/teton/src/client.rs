@@ -2160,6 +2160,9 @@ mod skills_handshake {
             description: Some("Report on the repo.".to_owned()),
             argument_hint: None,
             shadowed: None,
+            // TASK-212 replaces this: the fixture predates BR-3's two flags.
+            model_invocable: false,
+            user_invocable: true,
         }
     }
 

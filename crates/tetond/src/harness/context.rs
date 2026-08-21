@@ -1172,12 +1172,95 @@ impl ContextManager {
         budget_tokens: usize,
         budget_bytes: usize,
     ) -> Fit {
+        Self::would_fit(system, &[text], budget_tokens, budget_bytes)
+    }
+
+    /// Whether a route budget could hold `system` plus the turn's request block
+    /// plus one expansion **appended mid-loop** (REQ-587 BR-7, ADR-2).
+    ///
+    /// [`would_seed_fit`](Self::would_seed_fit)'s sibling, for the caller
+    /// REQ-585 did not have: a model-invoked skill does not *become* the turn,
+    /// it lands inside a turn that is already running, so what it must survive
+    /// is not "am I a legal seed" but "am I still whole after the loop's gate
+    /// has taken everything it is allowed to take".
+    ///
+    /// # The post-truncation worst case, and why that is the whole measurement
+    ///
+    /// [`truncate_to_budget`](Self::truncate_to_budget) drops **history**,
+    /// oldest first, and clamps the newest block only once there is nothing
+    /// older left to drop. So the state an appended expansion has to fit in is
+    /// the one that state converges on: the system prompt, the request the turn
+    /// is serving, and the expansion itself, with `truncated` already charged.
+    /// Everything between them is droppable, and dropping it is the loop doing
+    /// its job (REQ-567 BR-4) rather than a budget breach.
+    ///
+    /// The request block is a **parameter** and not a read of
+    /// [`blocks`](Self::blocks) for two reasons, one mechanical and one about
+    /// the answer. Mechanically, `latest_request` (`turn_loop.rs`) is the one
+    /// place that knows which string that is — it reads [`Self::request`]
+    /// rather than scanning for the newest `User` block, precisely because a
+    /// retry can leave those two disagreeing. And on the answer: charging the
+    /// request is an upper bound on what must survive, since the request block
+    /// is itself droppable; taking it explicitly is what keeps this
+    /// measurement from drifting into a measurement of the *live* conversation
+    /// — which would be a different, and wrong, question. See below.
+    ///
+    /// # It does **not** measure the live block list, and that is the point
+    ///
+    /// [`would_seed_fit`](Self::would_seed_fit)'s own doc states the rule: an
+    /// expansion that fits while the *assembled* conversation does not is
+    /// ordinary context pressure, and dropping older turns to make room stays
+    /// permitted (REQ-585 BR-8c, REQ-587 BR-7). [`bytes_of`](Self::bytes_of) is
+    /// additive over blocks, so *append-fits implies seed-fits*: measuring the
+    /// live list would be strictly stricter than either, and it would **refuse**
+    /// exactly the case REQ-587 AC-8 requires to *fold* — a body that fits
+    /// alone but not beside the conversation so far, where the top-of-loop gate
+    /// is supposed to answer with `context_pressure` and drop history, not with
+    /// a refusal. A refusal there would also be unrecoverable in the one way
+    /// that matters: the conversation cannot shrink itself in response to it.
+    ///
+    /// # `truncated = true`, for [`would_seed_fit`](Self::would_seed_fit)'s reason
+    ///
+    /// [`bytes_of`](Self::bytes_of) adds the 142 B of truncation note plus
+    /// synthetic continuation turn only once truncation *has* happened — which
+    /// is, by construction, the state this measurement is about. A check that
+    /// omitted the surcharge would pass a candidate whose fold then drops one
+    /// block, lands the 142 B nobody charged, and hands the in-place clamp the
+    /// **newest** block, which is the expansion. Middle-eliding a procedure
+    /// into a plausible-looking fragment of itself is what BR-7 exists to
+    /// prevent.
+    pub fn would_append_fit(
+        system: &str,
+        request: &str,
+        candidate: &str,
+        budget_tokens: usize,
+        budget_bytes: usize,
+    ) -> Fit {
+        Self::would_fit(system, &[request, candidate], budget_tokens, budget_bytes)
+    }
+
+    /// The measurement both `would_*_fit` answers are made of: `system` plus
+    /// `texts` as blocks, charged at `truncated = true`, through
+    /// [`tokens_of`](Self::tokens_of)/[`bytes_of`](Self::bytes_of).
+    ///
+    /// One body, so a seed and an append cannot answer the same question two
+    /// different ways — the drift LESSON-546 is about, one function earlier
+    /// than usual. The blocks are `User` because the role is not an input to
+    /// either estimator; what a block costs is its text plus the flat
+    /// [`RENDER_OVERHEAD_RESERVE_BYTES`] reserve, charged per block, which is
+    /// also why an empty request still costs its rendering frame here (a retry
+    /// is exactly when it can read empty, and over-charging a frame refuses
+    /// early, never late).
+    fn would_fit(system: &str, texts: &[&str], budget_tokens: usize, budget_bytes: usize) -> Fit {
         let probe = ContextManager::new(system, budget_tokens).with_budget_bytes(budget_bytes);
-        let candidate = [ContextBlock {
-            role: BlockRole::User,
-            text: text.to_owned(),
-            provenance: Provenance::user(),
-        }];
+        let candidate: Vec<ContextBlock> = texts
+            .iter()
+            .map(|text| ContextBlock {
+                role: BlockRole::User,
+                text: (*text).to_owned(),
+                provenance: Provenance::user(),
+            })
+            .collect();
         let tokens = probe.tokens_of(&candidate);
         let bytes = probe.bytes_of(&candidate, true);
         Fit {
@@ -4626,6 +4709,221 @@ mod tests {
                 .last()
                 .is_some_and(|b| b.text.len() < body.len()),
             "the skill expansion must have been middle-elided for this test to mean anything"
+        );
+    }
+
+    // -- measuring an append: the mid-loop expansion (REQ-587 BR-7, ADR-2) ----
+
+    /// What a [`ContextManager::would_append_fit`] test measures, as `bytes_of`
+    /// sees it: the system prompt, the request block, the candidate block, and
+    /// — at `truncated` — the 142-byte surcharge. [`seed_bytes`]'s sibling, for
+    /// the same reason it exists.
+    fn append_bytes(system: &str, request: &str, candidate: &str, truncated: bool) -> usize {
+        let probe = ContextManager::new(system, 1_000_000);
+        let block = |text: &str| ContextBlock {
+            role: BlockRole::User,
+            text: text.to_owned(),
+            provenance: Provenance::user(),
+        };
+        probe.bytes_of(&[block(request), block(candidate)], truncated)
+    }
+
+    /// The append measurement is system + the **request** + the candidate, in
+    /// both currencies, through the same estimators the seed check uses — and
+    /// the request is really charged, which is the difference between the two.
+    #[test]
+    fn would_append_fit_measures_system_the_request_and_the_candidate() {
+        const SYSTEM: &str = "HEAD";
+        let request = "please summarize this repository";
+        let candidate = "a short skill body";
+
+        let roomy = ContextManager::would_append_fit(SYSTEM, request, candidate, 10_000, 100_000);
+        assert!(roomy.fits);
+        assert_eq!(roomy.bytes, append_bytes(SYSTEM, request, candidate, true));
+        assert_eq!(
+            roomy.tokens,
+            approx_tokens(SYSTEM) + approx_tokens(request) + approx_tokens(candidate)
+        );
+
+        // Bytes alone can refuse it…
+        assert!(
+            !ContextManager::would_append_fit(SYSTEM, request, candidate, 10_000, roomy.bytes - 1)
+                .fits
+        );
+        // …and so can tokens alone.
+        assert!(
+            !ContextManager::would_append_fit(
+                SYSTEM,
+                request,
+                candidate,
+                roomy.tokens - 1,
+                100_000
+            )
+            .fits
+        );
+        // Exactly at the budget is a fit, not a refusal.
+        assert!(
+            ContextManager::would_append_fit(SYSTEM, request, candidate, roomy.tokens, roomy.bytes)
+                .fits
+        );
+
+        // The one difference from the seed: the request block and its rendering
+        // reserve. An implementation that dropped the request would land back on
+        // the seed figure exactly.
+        let seed = ContextManager::would_seed_fit(SYSTEM, candidate, 10_000, 100_000);
+        assert_eq!(
+            roomy.bytes - seed.bytes,
+            request.len() + RENDER_OVERHEAD_RESERVE_BYTES,
+            "the request block is what an append charges that a seed does not"
+        );
+    }
+
+    /// **History is droppable, so an append is measured against the
+    /// post-truncation worst case and not against the live conversation**
+    /// (BR-7, ADR-2; REQ-585 BR-8c).
+    ///
+    /// The case AC-8 requires to *fold*: a body that fits system + request +
+    /// itself, arriving into a conversation that is already over budget.
+    /// `bytes_of` is additive, so measuring the live block list would be
+    /// strictly stricter and would refuse this — and refuse it unrecoverably,
+    /// since a conversation cannot shrink itself in answer to a refusal. What
+    /// is supposed to happen is what the second half asserts: the loop's gate
+    /// drops the history, and the expansion survives whole.
+    #[test]
+    fn history_is_droppable_so_an_append_that_fits_the_worst_case_is_admitted() {
+        const SYSTEM: &str = "HEAD";
+        const BUDGET_TOKENS: usize = 1_000_000;
+        let request = "run the skill";
+        let body = "procedure ".repeat(200);
+        let budget_bytes = append_bytes(SYSTEM, request, &body, true);
+
+        // The conversation this lands in is already over the budget on its own…
+        let mut ctx = ContextManager::new(SYSTEM, BUDGET_TOKENS).with_budget_bytes(budget_bytes);
+        for i in 0..6 {
+            ctx.push_model(format!("earlier turn {i}: {}", "chatter ".repeat(100)));
+        }
+        ctx.push_user(request);
+        assert!(
+            ctx.estimated_bytes() > budget_bytes,
+            "non-vacuity: with room to spare in the live conversation this test \
+             would not distinguish the two measurements ({} B against {budget_bytes} B)",
+            ctx.estimated_bytes()
+        );
+
+        // …and the append is admitted anyway.
+        let fit =
+            ContextManager::would_append_fit(SYSTEM, request, &body, BUDGET_TOKENS, budget_bytes);
+        assert!(
+            fit.fits,
+            "a body that fits system + request + itself is ordinary context \
+             pressure, never a refusal ({} B against {budget_bytes} B)",
+            fit.bytes
+        );
+
+        // The guarantee that verdict stands for: the gate takes the history and
+        // leaves the expansion whole.
+        ctx.push_user(body.clone());
+        let report = ctx.truncate_to_budget();
+        assert!(
+            report.dropped_blocks >= 1,
+            "non-vacuity: the gate dropped nothing, so nothing was made room by"
+        );
+        assert!(
+            ctx.was_truncated(),
+            "…which is what lands the 142-byte charge"
+        );
+        assert!(
+            !report.newest_user_elided && report.elided_bytes == 0,
+            "the expansion must not be the thing that was cut: {report:?}"
+        );
+        assert_eq!(
+            ctx.blocks().last().map(|b| b.text.as_str()),
+            Some(body.as_str()),
+            "the expansion survived the fold verbatim"
+        );
+    }
+
+    /// An append that busts system + request + candidate **is** refused — and
+    /// here the request is what busts it, since the same body fits as a seed.
+    #[test]
+    fn an_append_that_busts_system_plus_request_plus_candidate_is_refused() {
+        const SYSTEM: &str = "HEAD";
+        let request = "context for the model ".repeat(60);
+        let body = "procedure ".repeat(200);
+        let budget_bytes = append_bytes(SYSTEM, &request, &body, true) - 1;
+
+        assert!(
+            seed_bytes(SYSTEM, &body, true) <= budget_bytes,
+            "non-vacuity: the body fits alone, so it is the request that refuses it"
+        );
+
+        let fit =
+            ContextManager::would_append_fit(SYSTEM, &request, &body, 1_000_000, budget_bytes);
+        assert!(
+            !fit.fits,
+            "an expansion that cannot survive beside the turn it answers is refused"
+        );
+        assert_eq!(fit.bytes, append_bytes(SYSTEM, &request, &body, true));
+    }
+
+    /// **The `truncated = true` charge is the guard here too** (ADR-2).
+    ///
+    /// The same 142-byte band [`ContextManager::would_seed_fit`] closes, one
+    /// caller along: measured at `truncated = false` this candidate passes, is
+    /// folded into a conversation with history, and the fold itself lands the
+    /// surcharge — after which the in-place clamp fires on the newest block,
+    /// which is the expansion. Both halves are asserted: the candidate really
+    /// sits inside the band, and the clamp really is what would have happened.
+    #[test]
+    fn an_append_inside_the_truncation_band_is_refused_rather_than_clamped() {
+        const SYSTEM: &str = "HEAD";
+        const BUDGET_TOKENS: usize = 1_000_000;
+        let request = "run the skill";
+        let body = "procedure ".repeat(400);
+        let budget_bytes = append_bytes(SYSTEM, request, &body, false) + 8;
+
+        // Non-vacuity, first half: without the charge this candidate passes.
+        assert!(
+            append_bytes(SYSTEM, request, &body, false) <= budget_bytes,
+            "the fixture must sit inside the band, or the charge is untested"
+        );
+        assert_eq!(
+            append_bytes(SYSTEM, request, &body, true)
+                - append_bytes(SYSTEM, request, &body, false),
+            TRUNCATION_NOTE_BYTES + CONTINUATION_USER_TURN.len(),
+            "the band this test measures is the truncation surcharge"
+        );
+
+        let fit =
+            ContextManager::would_append_fit(SYSTEM, request, &body, BUDGET_TOKENS, budget_bytes);
+        assert!(
+            !fit.fits,
+            "an append inside the truncation band must be refused, not admitted \
+             ({} B against {budget_bytes} B)",
+            fit.bytes
+        );
+
+        // Non-vacuity, second half — and the reason the refusal exists.
+        let mut ctx = ContextManager::new(SYSTEM, BUDGET_TOKENS).with_budget_bytes(budget_bytes);
+        for i in 0..4 {
+            ctx.push_model(format!("earlier turn {i}"));
+        }
+        ctx.push_user(request);
+        ctx.push_user_from(
+            body.clone(),
+            [fixture_id(SKILL_ID)].into_iter().collect(),
+            false,
+        );
+        let report = ctx.truncate_to_budget();
+
+        assert!(
+            report.dropped_blocks >= 1,
+            "the history should have gone first"
+        );
+        assert!(ctx.was_truncated());
+        assert!(
+            report.newest_user_elided && report.elided_bytes > 0,
+            "the block the clamp lands on is the expansion itself: {report:?}"
         );
     }
 }

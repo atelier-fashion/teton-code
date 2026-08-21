@@ -2963,7 +2963,14 @@ impl DaemonRuntime {
         // path and `home`, so `expand` stays pure (BR-14).
         let display = teton_core::session_root::display_for(&skill.path, home().as_deref());
         let expansion = crate::skills::expand(skill, &invocation.raw_arguments, &display);
-        let text = expansion.pending_text();
+        // REQ-587 ADR-6: the frame line is the caller's, and this caller is the
+        // user path — so BR-4's line is supplied here and composed *inside* the
+        // string below. Prepending it around `pending_text` would leave Stage A
+        // and Stage B measuring a string this turn does not send, short by the
+        // frame's length, and `truncate_to_budget` middle-elides what BR-8 says
+        // is carried whole or refused.
+        let frame = expansion.user_frame();
+        let text = expansion.pending_text(&frame);
 
         // ADR-9's id-minting gap, decided rather than papered over: a project
         // skill is under the root and mints; a user skill at
@@ -3112,7 +3119,13 @@ impl DaemonRuntime {
         // envelope every built-in tool result gets, which neutralizes envelope
         // tags in its payload — and every other slot becomes an explicit
         // ``[dynamic context not run: `<cmd>` — <reason>]`` (BR-6).
-        skill.text = expansion.fold(&outcomes);
+        //
+        // The frame is the same line Stage A measured, from the same composer
+        // (REQ-587 ADR-6): this fold changes the slots and nothing else, which
+        // is what entitles Stage B's sentence to say the body itself already
+        // fit.
+        let frame = expansion.user_frame();
+        skill.text = expansion.fold(&frame, &outcomes);
 
         // BR-7: anything that came from a command carries what `shell` output
         // carries — nothing that can be pinned. On a boundary-configured machine
@@ -3143,6 +3156,10 @@ impl DaemonRuntime {
                     .zip(outcomes.iter())
                     .map(|(command, outcome)| outcome_view(command, outcome, door))
                     .collect(),
+                // TASK-216/TASK-217 replace this with the invocation's real
+                // invoker. A literal today because the only path that reaches
+                // here is REQ-585's user-typed `/name` expansion.
+                invoked_by: teton_protocol::events::InvokedBy::User,
             }),
         );
     }

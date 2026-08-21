@@ -945,7 +945,10 @@ fn ran_expansion(repo: &std::path::Path, name: &str, arguments: &str) -> (String
     let expansion = tetond::skills::expand(skill, arguments, &format!(".claude/…/{name}"));
     let outcomes = tetond::skills::run_all(repo, expansion.commands(), 10_000);
     let ran = outcomes.iter().any(tetond::skills::DynamicOutcome::did_run);
-    (expansion.fold(&outcomes), ran)
+    // The user path's frame, which is the one `accept_invocation` supplies
+    // (REQ-587 ADR-6) — the daemon's own line, not a paraphrase of it.
+    let frame = expansion.user_frame();
+    (expansion.fold(&frame, &outcomes), ran)
 }
 
 /// A repo holding the two fixture skills beside the boundary file.

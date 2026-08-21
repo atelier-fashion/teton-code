@@ -937,10 +937,11 @@ fn expansion_of(
         .dispatchable(name)
         .unwrap_or_else(|| panic!("the fixture must register `{name}`"));
     let display = teton_core::session_root::display_for(&skill.path, home);
-    (
-        tetond::skills::expand(skill, "", &display).pending_text(),
-        skill.path.clone(),
-    )
+    let expansion = tetond::skills::expand(skill, "", &display);
+    // The user path's frame, which is the one `accept_invocation` supplies
+    // (REQ-587 ADR-6).
+    let frame = expansion.user_frame();
+    (expansion.pending_text(&frame), skill.path.clone())
 }
 
 /// One skill turn, scoped exactly as the daemon scopes it: the expansion is a

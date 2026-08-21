@@ -87,6 +87,7 @@ use teton_providers::capability::NATIVE_MAX_ITERATIONS;
 
 use super::context::{ContextManager, Fit, APPROX_BYTES_PER_TOKEN};
 use super::duty::DUTY_REQUEST_BYTES_PER_TOKEN;
+use super::tools::ToolOutcome;
 use crate::egress::redact::REDACT_SCANNABLE_CONTEXT_BYTES;
 
 /// The default context budget in whitespace-approximated tokens — **the one
@@ -628,14 +629,98 @@ impl SkillStage {
 pub enum SkillFit {
     /// Both currencies land inside the route's budget; the turn proceeds.
     Fits,
-    /// The expansion does not fit. The caller raises this under
+    /// The expansion does not fit. A user-typed `/name` raises this under
     /// `error_code::SKILL_EXPANSION_TOO_LARGE` and sends nothing — `-32023`
-    /// and not `-32022`, because no provider has seen this turn.
+    /// and not `-32022`, because no provider has seen that turn; a
+    /// model-invoked call renders it as a tool result instead
+    /// ([`SkillFit::into_tool_result`]).
     TooLarge {
         /// BR-8's sentence: the skill, its size, the budget, the spoken bound,
-        /// and which stage refused.
+        /// which stage refused, and — through [`SkillCaller`] — who asked.
         message: String,
     },
+}
+
+impl SkillFit {
+    /// The refusal rendered as a **tool result** (REQ-587 BR-6/BR-9, ADR-2).
+    ///
+    /// Every raise site REQ-585 shipped turns [`SkillFit::TooLarge`] into an
+    /// `RpcError` and ends the prompt turn, which is the right answer for a
+    /// user-typed `/name`: the turn *is* the expansion, so once it is refused
+    /// there is nothing left to run. A model-invoked call is one tool call
+    /// inside a turn that is still going, and ending the turn there would take
+    /// the conversation down with the call — so the refusal is a typed outcome
+    /// the model reads and relays, exactly as a rejected edit or a jailed read
+    /// already is.
+    ///
+    /// `is_error` because the call did not do what it was asked to do; the loop
+    /// folds it into context as it folds any other failed tool call. [`Fits`]
+    /// renders as nothing, because a fitting expansion has no refusal to print.
+    ///
+    /// [`Fits`]: SkillFit::Fits
+    pub fn into_tool_result(self) -> Option<ToolOutcome> {
+        match self {
+            SkillFit::Fits => None,
+            SkillFit::TooLarge { message } => Some(ToolOutcome::error(message)),
+        }
+    }
+}
+
+/// Who asked for the expansion — the half of BR-8's sentence that changes with
+/// the asker (REQ-587 BR-7, ADR-2).
+///
+/// It is a parameter of the composer rather than a second composer because the
+/// figures, the stage clause and the bound are the same facts either way:
+/// [`BudgetBound::words`] stays the one adjective vocabulary and
+/// [`thousands`]/[`bytes_figure`] the one number vocabulary (LESSON-456). What
+/// differs is only what is *true* about the two callers — see
+/// [`SkillCaller::consequence`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SkillCaller {
+    /// The user typed `/name`, and the expansion would have been the turn.
+    User,
+    /// The model called the `skill` tool mid-loop, in a turn already running.
+    Model,
+}
+
+impl SkillCaller {
+    /// How the refused skill is named at the head of the sentence.
+    ///
+    /// A user typed `/proceed` and reads it back in the form they typed. A
+    /// model passed a *name* to a tool and never saw a slash: printing
+    /// `` `/proceed` `` at it would name a surface it cannot use — the built-in
+    /// commands and `/name` are the user's alone (BR-8) — and would invite it to
+    /// tell the user to type something instead of relaying what happened.
+    fn subject(self, skill: &str) -> String {
+        match self {
+            SkillCaller::User => format!("`/{skill}`"),
+            SkillCaller::Model => format!("The `{skill}` skill"),
+        }
+    }
+
+    /// What did **not** happen, and what the reader does about it.
+    ///
+    /// The user arm's *"no provider saw this turn"* is the clause that makes
+    /// `-32023` different from `-32022`, and it is pinned by
+    /// `a_skill_refusal_carries_no_provider_response_body` and by
+    /// `context_pressure.rs`. The model arm cannot borrow it: a provider has
+    /// already seen this turn — it is what produced the call — so repeating the
+    /// clause there would be a false claim in a sentence whose whole job is to
+    /// be the one true account of what happened. What is true instead is that
+    /// nothing was folded, and the model is the one who has to say so.
+    const fn consequence(self) -> &'static str {
+        match self {
+            SkillCaller::User => {
+                "Nothing was sent and no provider saw this turn — a skill expansion is carried \
+                 whole or refused, never shortened into something you did not invoke."
+            }
+            SkillCaller::Model => {
+                "Nothing was folded into this conversation — a skill expansion is carried whole \
+                 or refused, never shortened into a partial procedure. Say what you tried to run \
+                 and that it did not fit."
+            }
+        }
+    }
 }
 
 /// Measure one skill expansion against the route's **stamped** budget and, if it
@@ -691,15 +776,74 @@ pub fn skill_fit(
         return SkillFit::Fits;
     }
     SkillFit::TooLarge {
-        message: skill_refusal(stage, skill, fit, budget, provider_id),
+        message: skill_refusal(SkillCaller::User, stage, skill, fit, budget, provider_id),
+    }
+}
+
+/// Measure one expansion **appended mid-loop** against the route's stamped
+/// budget and, if it does not fit, compose the refusal (REQ-587 BR-7, ADR-2).
+///
+/// [`skill_fit`]'s sibling, and the difference is the question, not the
+/// arithmetic: that one asks whether an expansion could be a legal *seed*, this
+/// one whether it survives as an *append* to a turn that is already running.
+/// The measurement is [`ContextManager::would_append_fit`] — system, the turn's
+/// request block (`latest_request`, threaded in by the loop), the candidate,
+/// charged at `truncated = true`. It is **not** a measurement of the live
+/// conversation, and that function's doc is where the reason lives: history is
+/// droppable, so a body that fits this worst case is folded and any pressure it
+/// creates is answered by the top-of-loop gate, loudly (AC-8).
+///
+/// Everything [`skill_fit`] says about deriving and estimating holds here
+/// unchanged: `budget` is the pair the router stamped, the estimators are the
+/// pressure path's own, and nothing but integers this daemon measured, two
+/// literal key names, the skill's name and (on the `unknown window` arm) the
+/// provider id can reach the sentence.
+///
+/// `caller` is [`SkillCaller::Model`] for the `skill` tool. It is a parameter
+/// rather than a constant here because the *composer* is what is caller-aware
+/// (one sentence, two true endings), not this entry point.
+// Eight, because every one of them is a distinct fact the sentence names and
+// none can be derived from another; the alternative is a struct whose only
+// purpose is to be destructured at the one call site. `run_session_turn_with_source`
+// carries the same allow for the same reason.
+#[allow(clippy::too_many_arguments)]
+pub fn skill_append_fit(
+    caller: SkillCaller,
+    stage: SkillStage,
+    skill: &str,
+    system: &str,
+    request: &str,
+    expansion: &str,
+    budget: &RouteBudget,
+    provider_id: Option<&str>,
+) -> SkillFit {
+    let fit = ContextManager::would_append_fit(
+        system,
+        request,
+        expansion,
+        budget.budget_tokens,
+        budget.budget_bytes,
+    );
+    if fit.fits {
+        return SkillFit::Fits;
+    }
+    SkillFit::TooLarge {
+        message: skill_refusal(caller, stage, skill, fit, budget, provider_id),
     }
 }
 
 /// BR-8's sentence — **the composer, and the only one** (LESSON-456).
 ///
-/// Private, and reachable only through [`skill_fit`], so the message cannot be
-/// written without the measurement whose figures it quotes.
+/// Private, and reachable only through [`skill_fit`] and [`skill_append_fit`],
+/// so the message cannot be written without the measurement whose figures it
+/// quotes.
+///
+/// `caller` supplies the two clauses that are not the same fact for both
+/// askers — how the skill is named, and what did not happen — and nothing else
+/// forks: one stage table, one bound table, one pair of number formatters
+/// (REQ-587 ADR-2).
 fn skill_refusal(
+    caller: SkillCaller,
     stage: SkillStage,
     skill: &str,
     fit: Fit,
@@ -707,16 +851,16 @@ fn skill_refusal(
     provider_id: Option<&str>,
 ) -> String {
     format!(
-        "`/{skill}` does not fit this route's context budget: {} about {} words / {}, and the \
-         budget is {} words / {} ({}). Nothing was sent and no provider saw this turn — a skill \
-         expansion is carried whole or refused, never shortened into something you did not \
-         invoke.",
+        "{} does not fit this route's context budget: {} about {} words / {}, and the budget is \
+         {} words / {} ({}). {}",
+        caller.subject(skill),
         stage.measured_clause(),
         thousands(fit.tokens as u64),
         bytes_figure(fit.bytes as u64),
         thousands(budget.budget_tokens as u64),
         bytes_figure(budget.budget_bytes as u64),
         bound_clause(budget, provider_id),
+        caller.consequence(),
     )
 }
 
@@ -1938,6 +2082,208 @@ mod tests {
         assert!(
             !message.contains(&thousands(LOCAL_BUDGET_TOKENS as u64)),
             "the local pair appeared beside a budget that is not it: {message}"
+        );
+    }
+
+    // -- REQ-587: the append, and a refusal the model can relay (ADR-2) ------
+
+    /// The message a [`SkillFit`] carries, with the verdict asserted on the way
+    /// through so no test below can be green against a route that admitted the
+    /// turn. [`refusal`]'s sibling, for the entry points that take a request.
+    fn message_of(fit: SkillFit) -> String {
+        match fit {
+            SkillFit::TooLarge { message } => message,
+            SkillFit::Fits => {
+                panic!("this route admitted an expansion the test needs it to refuse")
+            }
+        }
+    }
+
+    /// **The sentence is caller-aware, and only where the truth differs.**
+    ///
+    /// A model never typed a slash command, so `` `/proceed` `` would name a
+    /// surface it cannot use; and a provider *has* seen this turn — it is what
+    /// produced the call — so `-32023`'s "no provider saw this turn" would be a
+    /// false claim in the one sentence whose job is to account for what
+    /// happened. Everything else is the same fact for both askers, and is
+    /// asserted here to still be present.
+    #[test]
+    fn a_model_invoked_refusal_names_the_skill_without_a_slash_and_says_what_did_not_happen() {
+        let system = real_system_prompt();
+        let proceed = corpus_body(PROCEED_BODY_BYTES);
+        let message = message_of(skill_append_fit(
+            SkillCaller::Model,
+            SkillStage::Body,
+            "proceed",
+            &system,
+            "summarize this repository",
+            &proceed,
+            &derive(BudgetInputs::local()),
+            None,
+        ));
+
+        assert!(
+            message.starts_with("The `proceed` skill does not fit this route's context budget"),
+            "{message}"
+        );
+        assert!(
+            !message.contains("`/proceed`"),
+            "a model never typed a slash command: {message}"
+        );
+        assert!(
+            !message.contains("you did not invoke"),
+            "the user's clause reached a model-invoked refusal: {message}"
+        );
+        assert!(
+            !message.contains("no provider saw this turn"),
+            "a provider has already seen this turn — it produced the call: {message}"
+        );
+        assert!(
+            message.contains("Nothing was folded into this conversation"),
+            "{message}"
+        );
+
+        // The facts that do not fork with the caller: the stage clause and the
+        // spoken bound, from the same two tables the typed refusal reads.
+        assert!(
+            message.contains("the body alone, with the system prompt, comes to"),
+            "one stage table: {message}"
+        );
+        assert!(message.contains("bound: local engine"), "{message}");
+    }
+
+    /// **One bound table, one number vocabulary** (LESSON-456, ADR-2).
+    ///
+    /// The caller-aware composer forks two clauses; a second copy of the
+    /// composer would fork all of them, and the first thing to drift would be
+    /// the bound — which is the fact REQ-586 spent a whole BR making singular.
+    /// Same route, both callers, byte-identical bound clause and budget pair.
+    #[test]
+    fn the_user_and_model_refusals_share_one_bound_table_and_one_number_vocabulary() {
+        let system = real_system_prompt();
+        let proceed = corpus_body(PROCEED_BODY_BYTES);
+        let budget = derive(remote(0, 0, false));
+
+        let typed = refusal(
+            SkillStage::Body,
+            "proceed",
+            &system,
+            &proceed,
+            &budget,
+            Some("kimi"),
+        );
+        let called = message_of(skill_append_fit(
+            SkillCaller::Model,
+            SkillStage::Body,
+            "proceed",
+            &system,
+            "run it",
+            &proceed,
+            &budget,
+            Some("kimi"),
+        ));
+
+        let bound = "bound: unknown window — set `capabilities.max_context` for `kimi`";
+        assert!(typed.contains(bound), "{typed}");
+        assert!(called.contains(bound), "{called}");
+        assert!(
+            !called.contains("default_unknown"),
+            "the wire spelling reached the model: {called}"
+        );
+
+        let pair = format!(
+            "the budget is {} words / {}",
+            thousands(budget.budget_tokens as u64),
+            bytes_figure(budget.budget_bytes as u64)
+        );
+        assert!(typed.contains(&pair), "{typed}");
+        assert!(called.contains(&pair), "{called}");
+    }
+
+    /// **A model-facing refusal is a typed outcome, not only an `RpcError`**
+    /// (BR-6, BR-9, ADR-2).
+    ///
+    /// Ending the prompt turn is right for a user-typed `/name`, whose turn
+    /// *is* the expansion, and wrong for one tool call inside a turn that is
+    /// still going: it would take the conversation down with the call. The
+    /// refusal the model relays is the refusal that was composed — not a second
+    /// sentence written at the raise site.
+    #[test]
+    fn a_model_invoked_refusal_is_a_tool_result_not_only_an_rpc_error() {
+        let system = real_system_prompt();
+        let fit = skill_append_fit(
+            SkillCaller::Model,
+            SkillStage::WithDynamicContext,
+            "proceed",
+            &system,
+            "run it",
+            &corpus_body(PROCEED_BODY_BYTES),
+            &derive(BudgetInputs::local()),
+            None,
+        );
+        let message = message_of(fit.clone());
+
+        let outcome = fit
+            .into_tool_result()
+            .expect("a refusal must render as a tool result");
+        assert!(
+            outcome.is_error,
+            "the call did not do what it was asked to do"
+        );
+        assert_eq!(
+            outcome.content, message,
+            "the tool result is the composed refusal, not a second sentence"
+        );
+        assert_eq!(
+            SkillFit::Fits.into_tool_result(),
+            None,
+            "a fitting expansion has no refusal to print"
+        );
+    }
+
+    /// **An append charges the turn's request block; a seed does not** —
+    /// the difference between the two entry points, in one route.
+    ///
+    /// The stamped budget is sized to hold this body *exactly* as a seed, so
+    /// `skill_fit` admits it and `skill_append_fit` cannot: what refuses it is
+    /// the request the turn is serving, which is the block the expansion has to
+    /// survive beside once the loop's gate has dropped everything droppable.
+    #[test]
+    fn an_append_charges_the_turns_request_block_where_a_seed_does_not() {
+        const SYSTEM: &str = "HEAD";
+        let body = corpus_body(4_000);
+        let request = corpus_body(2_000);
+
+        let measured = ContextManager::would_seed_fit(SYSTEM, &body, usize::MAX, usize::MAX);
+        let stamped = RouteBudget {
+            budget_tokens: measured.tokens,
+            budget_bytes: measured.bytes,
+            bound: BudgetBound::LocalEngine,
+            window_label: LOCAL_WINDOW_LABEL.to_owned(),
+            digest_threshold_tokens: 1,
+            digest_threshold_bytes: 1,
+            floored: false,
+        };
+
+        assert_eq!(
+            skill_fit(SkillStage::Body, "status", SYSTEM, &body, &stamped, None),
+            SkillFit::Fits,
+            "non-vacuity: this body fits this route as a seed"
+        );
+
+        let refused = message_of(skill_append_fit(
+            SkillCaller::Model,
+            SkillStage::Body,
+            "status",
+            SYSTEM,
+            &request,
+            &body,
+            &stamped,
+            None,
+        ));
+        assert!(
+            refused.starts_with("The `status` skill does not fit"),
+            "{refused}"
         );
     }
 

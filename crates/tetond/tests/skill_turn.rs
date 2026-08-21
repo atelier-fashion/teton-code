@@ -115,8 +115,8 @@ use tokio::time::timeout;
 
 use teton_core::ProvenanceId;
 use teton_protocol::events::{
-    BudgetBound, DynamicOutcome as WireDynamicOutcome, Event, NotRunReason, PermissionOptionKind,
-    PermissionRequest, PermissionSubject, SkillInvoked,
+    BudgetBound, DynamicOutcome as WireDynamicOutcome, Event, InvokedBy, NotRunReason,
+    PermissionOptionKind, PermissionRequest, PermissionSubject, SkillInvoked,
 };
 use teton_protocol::jsonrpc::error_code;
 use teton_protocol::methods::{
@@ -1286,9 +1286,16 @@ async fn one_consent_asks_about_every_command_of_the_invocation_and_never_one_pe
             skill,
             source,
             commands,
+            invoked_by,
         }) => {
             assert_eq!(skill, "three");
             assert_eq!(*source, SkillSource::Project);
+            assert_eq!(
+                *invoked_by,
+                InvokedBy::User,
+                "this is a user-typed `/three`; a consent that reported the model \
+                 here would be attributing the ask to the wrong caller"
+            );
             assert_eq!(
                 commands,
                 &vec![
@@ -2346,6 +2353,16 @@ fn the_expansion_is_built_before_either_reader_of_the_prompt_text() {
 ///
 /// Pinned as a fact about call sites rather than about behaviour, because the
 /// only way to observe it behaviourally is to *have* the bug.
+///
+/// **REQ-587 extends this to the model's path.** A model-invoked expansion is a
+/// *tool result*, so it arrives at the fold — the very call site this test
+/// exists to keep singular. The answer is a branch **inside** that call site
+/// (ADR-1: the bypass reads the result's `ResultDisposition`), and not a second
+/// guarded call, which would be two places to keep in step and would make the
+/// count below say `2`. So the count stays at one and the branch is asserted
+/// beside it: the two halves are one test because either alone is satisfied by
+/// the bug — a single unguarded call site condenses every expansion, and a
+/// guard on one of two call sites leaves the other open.
 #[test]
 fn the_digest_duty_has_one_production_call_site_and_the_turn_path_is_not_it() {
     let fold = production_source("harness/turn_loop.rs");
@@ -2353,6 +2370,25 @@ fn the_digest_duty_has_one_production_call_site_and_the_turn_path_is_not_it() {
         fold.matches("summarize_if_large(").count(),
         1,
         "the tool-result fold is `summarize_if_large`'s one production call site"
+    );
+
+    // The branch, at that one call site. Located by distance rather than by a
+    // window slice so this cannot be satisfied by the phrase appearing in a
+    // doc comment somewhere else in the file.
+    let call_at = fold
+        .find("summarize_if_large(")
+        .expect("the count above found it");
+    let guard_at = fold[..call_at]
+        .rfind("ResultDisposition::Expansion")
+        .expect(
+            "the digest call site is unconditional — every model-invoked skill \
+             expansion is condensed into a summary of itself (REQ-587 BR-7)",
+        );
+    assert!(
+        call_at - guard_at < 400,
+        "the disposition is read {} chars before the digest call; that is far \
+         enough away to be a different decision (REQ-587 ADR-1)",
+        call_at - guard_at
     );
 
     let runtime = production_source("runtime.rs");

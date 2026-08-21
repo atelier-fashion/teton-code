@@ -4456,6 +4456,12 @@ fn skills_list_result(registry: &SkillRegistry, home: Option<&Path>) -> SkillsLi
                 // reserved built-in name — is the client's, so this says what
                 // *this* side found and never `None` where it found something.
                 shadowed: skill.shadowed.map(|by| by.to_string()),
+                // TASK-212 replaces these two with the skill's parsed flags.
+                // The literals are REQ-585's world exactly — no `skill` tool
+                // exists yet, and every listed skill is one the user may type —
+                // so both keys stay off the wire and no byte moves.
+                model_invocable: false,
+                user_invocable: true,
             })
             .collect(),
         skipped: registry
