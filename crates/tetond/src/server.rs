@@ -4344,8 +4344,11 @@ fn handle_session_set_cwd(daemon: &Daemon, conn: &ConnState, id: Id, params: Val
 /// rebuilt registry beside a stale grant is exactly LESSON-501's shape —
 /// carried state that sheds its invariants silently. That drop reaches
 /// `PermissionGate::drop_project_skill_grants` (REQ-585 TASK-201) through
-/// `DaemonRuntime::drop_project_skill_grants`, which needs the private
-/// `session_gates` map. A *fresh* session has no grants and no gate, which is
+/// `DaemonRuntime::drop_grants_expiring_on_root_change`, which needs the
+/// private `session_gates` map — and which sheds more than the gate method's
+/// name says: since REQ-587 TASK-215 the predicate is
+/// `expires_on_session_root_change`, so BR-4's project-skill *acknowledgment*
+/// goes with the grants. A *fresh* session has no grants and no gate, which is
 /// why this function has nothing to drop.
 fn rebuild_session_skills(daemon: &Daemon, session_id: &SessionId, cwd: Option<&Path>) {
     DaemonRuntime::store_session_skills(

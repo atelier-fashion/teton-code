@@ -65,7 +65,9 @@ use async_trait::async_trait;
 use serde_json::{json, Value};
 use teton_core::session_root::{bounded_field, display_for, DISPLAY_MAX_CHARS};
 use teton_core::ProvenanceId;
-use teton_protocol::events::{InvokedBy, NotRunReason, ProjectSkillTrustEntry};
+use teton_protocol::events::{
+    Event, InvokedBy, NotRunReason, ProjectSkillTrustEntry, SkillInvoked, TurnInvocations,
+};
 use teton_protocol::methods::project_skill_trust_key;
 use tokio::runtime::Handle;
 
@@ -74,7 +76,7 @@ use super::super::permissions::{PermissionGate, SkillConsent};
 use super::{ResultDisposition, Tool, ToolContext, ToolOutcome, ToolRegistry};
 use crate::grants::ConnectionId;
 use crate::session_root::home;
-use crate::skills::dynamic::{closed_door, door_outcome};
+use crate::skills::dynamic::{closed_door, door_outcome, outcome_view};
 use crate::skills::{expand, run_all, Skill, SkillRegistry, SkillSource};
 
 /// The name the model calls this tool by.
@@ -202,7 +204,48 @@ pub fn render_roster(registry: &SkillRegistry) -> String {
 /// The model-facing description: BR-2's fixed sentence, then the roster.
 #[must_use]
 pub fn render_description(registry: &SkillRegistry) -> String {
-    format!("{DESCRIPTION_LEAD} {}", render_roster(registry))
+    describe(&render_roster(registry))
+}
+
+/// [`DESCRIPTION_LEAD`] in front of `roster` — the one place the two are joined
+/// (ADR-9).
+///
+/// Split out of [`render_description`] so the *ceiling* the two prompt-margin
+/// sweeps measure (`turn_loop::SkillToolDocs::worst_case`) is assembled by this
+/// function rather than by a second `format!` beside it: two spellings of the
+/// same join are two things that drift while the tests guarding the budget
+/// stay green.
+pub(crate) fn describe(roster: &str) -> String {
+    format!("{DESCRIPTION_LEAD} {roster}")
+}
+
+/// BR-2's argument schema, read by [`SkillTool`] and by the doc-only
+/// `turn_loop::SkillToolDocs` alike.
+///
+/// Pure and shared for the same reason [`describe`] is: `ToolRegistry::docs`
+/// renders the schema into the resident prompt beside the description, so a
+/// second copy of it would be a second set of prompt bytes the margin sweeps
+/// could measure while the shipped tool carried different ones.
+///
+/// `args`, not `arguments` (OQ-2): the local tier's text form already nests the
+/// whole object under `arguments`, so an inner `arguments` key reads back as
+/// `arguments.arguments`.
+pub(crate) fn argument_schema() -> Value {
+    json!({
+        "type": "object",
+        "properties": {
+            "name": {
+                "type": "string",
+                "description": "The skill to run, from this tool's list. Omit to list \
+                                the skills with their descriptions."
+            },
+            "args": {
+                "type": "string",
+                "description": "Free text passed to the skill verbatim, as if typed \
+                                after `/name`. Omit when the skill takes none."
+            }
+        }
+    })
 }
 
 /// The `listed` reply's body: every model-invocable skill with REQ-585's
@@ -810,12 +853,13 @@ impl SkillTool {
         // payload.
         let display = display_for(&skill.path, home().as_deref());
         let expansion = expand(skill, arguments, &display);
-        let frame = SkillFrame::new(
-            skill,
-            shadows_user_skill(&self.registry, &skill.name),
-            &display,
-            arguments,
-        );
+        // One reading, two consumers: BR-4's source clause in the frame the
+        // model reads, and BR-9's `shadows your user skill` on the echo line
+        // the human reads. Two readings of one registry would be two answers
+        // only by accident, but the point of the snapshot is that they cannot
+        // be, so it is asked once.
+        let shadows = shadows_user_skill(&self.registry, &skill.name);
+        let frame = SkillFrame::new(skill, shadows, &display, arguments);
         let opening = frame.opening();
 
         let commands = expansion.commands().to_vec();
@@ -891,9 +935,82 @@ impl SkillTool {
         };
 
         self.turn_state().note_expansion(&skill.name, arguments);
+        self.publish_invocation(skill, &display, &commands, &outcomes, door);
         ToolOutcome::ok(text)
             .with_provenance(provenance)
             .with_disposition(ResultDisposition::Expansion)
+    }
+
+    /// BR-9's record of this invocation, published where the user path
+    /// publishes its own (`runtime.rs`'s `settle_dynamic_context`).
+    ///
+    /// **AC-13's gap, and the reason it needed one.** A model-issued call never
+    /// crosses the user path's seam, so before this existed a model invocation
+    /// raised no `SkillInvoked` at all: the session printed nothing, `/verbose`
+    /// had nothing to add to, and BR-12's "every invocation echoes one line"
+    /// held for exactly half the invocations. Nothing was red, because no test
+    /// can assert the absence of an event nobody had written yet.
+    ///
+    /// Published **after** the fold and before the outcome is returned, which
+    /// is the same position the user path's publish holds relative to its own
+    /// fold: the record describes what the commands did, so it cannot precede
+    /// them, and the loop's own disposition handling must not be able to
+    /// swallow it.
+    ///
+    /// The **body is not here** and never will be (BR-12): the echo line names
+    /// a size and a file, and the file is where the body is.
+    fn publish_invocation(
+        &self,
+        skill: &Skill,
+        display: &str,
+        commands: &[crate::skills::Command],
+        outcomes: &[crate::skills::DynamicOutcome],
+        door: Option<NotRunReason>,
+    ) {
+        // **The session and the bus come off the gate, which is not a shortcut.**
+        // The gate is per session and holds both (`PermissionGate::new`), so a
+        // record published through it is published for the same session the
+        // consent above was asked about, on the same bus — a pair that cannot
+        // come to disagree. It is the opposite of ADR-3's argument about the
+        // *invoker*, and for the opposite reason: a connection is a per-**turn**
+        // fact and the gate would answer with a stale one, while a session and
+        // its bus are exactly what a session-scoped gate is.
+        self.gate.events().publish(
+            Some(self.gate.session_id().clone()),
+            Event::SkillInvoked(SkillInvoked {
+                name: skill.name.clone(),
+                source: skill.source,
+                // Home-relative and bounded, at the one surface holding both
+                // the path and `HOME`: this reaches every attached client and
+                // every transcript, and an absolute path carries a username
+                // into both.
+                path_display: bounded_field(display, DISPLAY_MAX_CHARS),
+                body_bytes: skill.body.len() as u64,
+                ignored_keys: skill.ignored_keys.clone(),
+                name_note: skill.name_note.clone(),
+                // Projected through the **one** projection the user path uses
+                // (`skills::dynamic::outcome_view`), so the two paths' events
+                // are the same event rather than two events that agree today
+                // (LESSON-544).
+                outcomes: commands
+                    .iter()
+                    .zip(outcomes.iter())
+                    .map(|(command, outcome)| outcome_view(command, outcome, door))
+                    .collect(),
+                invoked_by: InvokedBy::Model,
+                shadows_user_skill: shadows_user_skill(&self.registry, &skill.name),
+                model_invocable: skill.model_invocable,
+                user_invocable: skill.user_invocable,
+                // BR-9's `/verbose` count. `Some` here and `None` on the user
+                // path, because the cap bounds the model's invocations within
+                // one prompt turn and a typed `/name` spends none of it. The
+                // count already includes this call: `admit` counts first.
+                turn_invocations: Some(TurnInvocations {
+                    count: self.turn_state().calls() as u32,
+                    cap: PER_TURN_INVOCATION_CAP as u32,
+                }),
+            }),
+        );
     }
 }
 
@@ -911,24 +1028,9 @@ impl Tool for SkillTool {
     }
 
     fn input_schema(&self) -> Value {
-        // `args`, not `arguments` (OQ-2): the local tier's text form already
-        // nests the whole object under `arguments`, so an inner `arguments` key
-        // reads back as `arguments.arguments`.
-        json!({
-            "type": "object",
-            "properties": {
-                "name": {
-                    "type": "string",
-                    "description": "The skill to run, from this tool's list. Omit to list \
-                                    the skills with their descriptions."
-                },
-                "args": {
-                    "type": "string",
-                    "description": "Free text passed to the skill verbatim, as if typed \
-                                    after `/name`. Omit when the skill takes none."
-                }
-            }
-        })
+        // Shared with `SkillToolDocs`, which is what the two prompt-margin
+        // sweeps render: one schema, one set of prompt bytes (ADR-9).
+        argument_schema()
     }
 
     /// This tool raises its own prompts — see [`Tool::gates_itself`] and
@@ -1228,6 +1330,71 @@ mod tests {
             .and_then(|n| n.parse().ok())
             .expect("the collapse names a count");
         assert!(more > 0 && more < 60, "{roster}");
+    }
+
+    /// **ADR-9's byte-identity pin, and the trap it is written against.**
+    ///
+    /// The two prompt-margin sweeps cannot build a real [`SkillTool`] — one of
+    /// them is a sync `#[test]` and the tool holds a gate and a [`Handle`] — so
+    /// they register `turn_loop::SkillToolDocs` instead. The obvious way to
+    /// write that stand-in is a struct with a hand-typed description, and it is
+    /// the trap:
+    /// its bytes and the renderer's would drift independently while the margin
+    /// test stayed green, which is LESSON-481's shape inside the one test that
+    /// exists to prevent it.
+    ///
+    /// So the claim AC-3 makes about "byte-identical" docs is written here, as
+    /// **two tools compared in one test** rather than against a checked-in
+    /// golden: nothing in the tree pins rendered tool docs byte-for-byte, and a
+    /// golden would be a third copy to keep in step. Both prompt surfaces are
+    /// compared, because `ToolRegistry::docs` renders both — a schema that
+    /// diverged would understate the resident cost just as a description would.
+    #[tokio::test]
+    async fn the_doc_only_tool_and_the_real_one_render_one_set_of_prompt_bytes() {
+        use crate::harness::turn_loop::SkillToolDocs;
+
+        let fx = ac1_fixture();
+        let registry = fx.registry();
+        let real = tool(Arc::clone(&registry));
+        let docs = SkillToolDocs::new(&registry);
+
+        assert_eq!(real.name(), docs.name());
+        assert_eq!(
+            real.description(),
+            docs.description(),
+            "the doc-only tool and the shipped one render different descriptions, so the \
+             two prompt-margin sweeps are measuring bytes the model never reads. Both \
+             must come from `render_description` (ADR-9)."
+        );
+        assert_eq!(
+            real.input_schema(),
+            docs.input_schema(),
+            "the doc-only tool and the shipped one render different argument schemas. \
+             `ToolRegistry::docs` puts the schema in the resident prompt beside the \
+             description, so this is prompt bytes the sweeps would miss."
+        );
+        // Non-vacuity: the description under comparison is the real roster, not
+        // an empty one that two paths would agree on for free.
+        assert!(
+            real.description().contains("alpha"),
+            "{}",
+            real.description()
+        );
+
+        // And the ceiling the sweeps actually register is a ceiling: a roster at
+        // `ROSTER_MAX_BYTES` is at least as long as any registry renders.
+        let worst = SkillToolDocs::worst_case();
+        assert_eq!(
+            worst.description().len(),
+            DESCRIPTION_LEAD.len() + 1 + ROSTER_MAX_BYTES,
+            "the worst case is the lead, one space and a roster at the cap: {}",
+            worst.description()
+        );
+        assert!(
+            worst.description().len() >= docs.description().len(),
+            "the worst case is shorter than a four-skill registry renders, so the sweeps \
+             are measuring under the ceiling"
+        );
     }
 
     /// **ADR-5, and the mutation it is written against.** The roster is a

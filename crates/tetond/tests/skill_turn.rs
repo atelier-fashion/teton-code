@@ -42,6 +42,9 @@
 //! | BR-8d: Stage A refuses before consent is spent | [`a_body_that_cannot_fit_is_refused_before_anyone_is_asked_to_approve_anything`] |
 //! | ADR-7: the delivery seam is wired, end to end | [`a_skill_consent_reaches_the_client_that_typed_it_and_is_answerable_by_it`] |
 //! | BR-4: no model call at expansion time | [`no_model_call_happens_at_expansion_time`] |
+//! | **ADR-3: an addressable connection reached `authorize_skill` from inside the loop** | [`a_model_issued_call_addresses_its_consent_to_the_connection_that_submitted_the_turn`] |
+//! | AC-13/BR-12: a model invocation echoes one line too | [`a_model_invocation_publishes_its_own_record_saying_the_model_asked`] |
+//! | BR-5: one skill, two argument lists, two answers | [`two_typed_invocations_with_different_arguments_do_not_share_one_answer`] |
 //!
 //! ## Mutation table
 //!
@@ -67,6 +70,9 @@
 //! | dropping the addressed-delivery wiring (the trait with no implementer) | [`a_skill_consent_reaches_the_client_that_typed_it_and_is_answerable_by_it`] |
 //! | answering an addressed waiter through `resolve` instead of `resolve_from` | [`a_skill_consent_reaches_the_client_that_typed_it_and_is_answerable_by_it`] |
 //! | calling `Tool::refine` on the expansion path | [`no_model_call_happens_at_expansion_time`] |
+//! | dropping `invoker` from `build_tools` (**silent** — nothing else reddens) | [`a_model_issued_call_addresses_its_consent_to_the_connection_that_submitted_the_turn`] |
+//! | dropping the `skill` tool's own `SkillInvoked` publish | [`a_model_invocation_publishes_its_own_record_saying_the_model_asked`] |
+//! | minting `skill.permission_key()` instead of `Expansion::grant_key` | [`two_typed_invocations_with_different_arguments_do_not_share_one_answer`] |
 //!
 //! ## The order claims, and which of them behaviour can now reach
 //!
@@ -515,6 +521,31 @@ struct Vendor {
     endpoint: String,
     hits: Arc<AtomicUsize>,
     bodies: Arc<Mutex<Vec<String>>>,
+    /// SSE bodies to answer with, in order, before falling back to the plain
+    /// `done` completion below.
+    ///
+    /// The whole reason a model-issued `skill` call is reachable from this
+    /// binary at all: the tool is dispatched by the turn loop, and the loop
+    /// dispatches what the **model** asked for. A fixture that called
+    /// `SkillTool::run` directly would be asserting the tool, not the wiring —
+    /// and the wiring is what TASK-217 is (`build_tools`'s two parameters).
+    script: Arc<Mutex<std::collections::VecDeque<String>>>,
+}
+
+/// One SSE body in which the model issues a single tool call.
+fn sse_tool_call(id: &str, tool: &str, arguments: &str) -> String {
+    let call = json!({
+        "choices": [{
+            "delta": { "tool_calls": [{
+                "index": 0,
+                "id": id,
+                "function": { "name": tool, "arguments": arguments }
+            }]}
+        }]
+    });
+    let finish = json!({ "choices": [{ "delta": {}, "finish_reason": "tool_calls" }] });
+    let usage = json!({ "usage": { "prompt_tokens": 5, "completion_tokens": 2 } });
+    format!("data: {call}\n\ndata: {finish}\n\ndata: {usage}\n\ndata: [DONE]\n\n")
 }
 
 impl Vendor {
@@ -523,8 +554,10 @@ impl Vendor {
         let addr = listener.local_addr().expect("mock vendor address");
         let hits = Arc::new(AtomicUsize::new(0));
         let bodies = Arc::new(Mutex::new(Vec::new()));
+        let script: Arc<Mutex<std::collections::VecDeque<String>>> = Arc::default();
         let served = Arc::clone(&hits);
         let captured = Arc::clone(&bodies);
+        let scripted = Arc::clone(&script);
         std::thread::spawn(move || {
             use std::io::{Read, Write};
             for stream in listener.incoming() {
@@ -548,12 +581,18 @@ impl Vendor {
                     .lock()
                     .unwrap()
                     .push(String::from_utf8_lossy(&raw).into_owned());
-                let body = concat!(
-                    "data: {\"choices\":[{\"delta\":{\"content\":\"done\"}}]}\n\n",
-                    "data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n",
-                    "data: {\"usage\":{\"prompt_tokens\":5,\"completion_tokens\":2}}\n\n",
-                    "data: [DONE]\n\n",
-                );
+                // A scripted body when one is queued, and the plain `done`
+                // completion otherwise — so a test that scripts one tool call
+                // gets a turn that ends of its own accord on the next request.
+                let body = scripted.lock().unwrap().pop_front().unwrap_or_else(|| {
+                    concat!(
+                        "data: {\"choices\":[{\"delta\":{\"content\":\"done\"}}]}\n\n",
+                        "data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n",
+                        "data: {\"usage\":{\"prompt_tokens\":5,\"completion_tokens\":2}}\n\n",
+                        "data: [DONE]\n\n",
+                    )
+                    .to_owned()
+                });
                 let _ = stream.write_all(
                     format!(
                         "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\n\
@@ -569,7 +608,17 @@ impl Vendor {
             endpoint: format!("http://{addr}/v1/chat/completions"),
             hits,
             bodies,
+            script,
         }
+    }
+
+    /// Answer the next request with one `skill` tool call.
+    fn will_call_skill(&self, name: &str, args: &str) {
+        self.script.lock().unwrap().push_back(sse_tool_call(
+            "skill-call-1",
+            "skill",
+            &json!({ "name": name, "args": args }).to_string(),
+        ));
     }
 
     fn hits(&self) -> usize {
@@ -2185,6 +2234,293 @@ async fn a_skill_consent_reaches_the_client_that_typed_it_and_is_answerable_by_i
 
     server_task.abort();
     let _ = std::fs::remove_file(&socket);
+}
+
+// ---------------------------------------------------------------------------
+// REQ-587 TASK-217 — the seam whose absence is silent
+// ---------------------------------------------------------------------------
+
+/// A project skill the model may invoke, whose body runs one command.
+///
+/// Project rather than user, deliberately, and it costs a second prompt: this
+/// binary's `HOME` is shared by every test in it, so a user skill written here
+/// would join every other session's registry. The second prompt is not waste —
+/// BR-4's acknowledgment is addressed to the same connection, so the assertion
+/// below gets to make its claim about *both* of the tool's doors.
+fn model_invocable_skill(repo: &Tree, name: &str, body: &str) {
+    repo.write(
+        &format!(".claude/skills/{name}/SKILL.md"),
+        &skill_file("a skill the model may invoke", body),
+    );
+}
+
+/// **ADR-3, and the whole of this task: an addressable connection reached
+/// `authorize_skill` from inside the loop.**
+///
+/// The failure this guards is silent. `build_tools` can register the `skill`
+/// tool without threading the turn's `invoker`, and the result compiles, runs,
+/// and produces `SkillConsent::Unanswerable` — placeholders byte-identical to
+/// REQ-585's tested piped-refusal path — with no test failing, because
+/// `None => Unanswerable` is already shipped, tested behaviour for an internal
+/// caller. A green suite is not evidence.
+///
+/// So the assertion is not "a consent was raised". It is that the consent the
+/// tool raised **from inside a model-issued call** was addressed to the
+/// connection that submitted *this turn*. `skill_consent_matrix.rs` and the
+/// tool's own unit tests invent a `ConnectionId` and would pass either way;
+/// this drives the vendor into issuing the call and reads the addressee off the
+/// double.
+///
+/// Non-vacuity is the second half: the expansion has to actually reach the
+/// provider, or an empty `asked()` would be indistinguishable from a turn in
+/// which no `skill` call happened at all.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_model_issued_call_addresses_its_consent_to_the_connection_that_submitted_the_turn() {
+    let repo = Tree::new("mdlwho");
+    model_invocable_skill(&repo, "wired", "Do it. !`echo wired-through`");
+    let h = Harness::with_window(128_000);
+    let session = h.session_at(repo.path());
+    // Both doors say yes: BR-4's acknowledgment, then BR-5's dynamic context.
+    h.consent
+        .answers(Answer::Select(PermissionOptionKind::AllowOnce));
+    h.vendor.will_call_skill("wired", "");
+
+    h.turn(&session, "use the wired skill", None)
+        .await
+        .expect("the turn runs");
+
+    let asked = h.consent.asked();
+    let addressees = h.consent.addressees();
+    let dynamic_context = asked
+        .iter()
+        .zip(addressees.iter())
+        .find(|(request, _)| {
+            matches!(
+                request.subject,
+                Some(PermissionSubject::SkillDynamicContext { .. })
+            )
+        })
+        .map(|(request, connection)| (request.clone(), *connection));
+
+    let (request, addressee) = dynamic_context.unwrap_or_else(|| {
+        panic!(
+            "`authorize_skill` was never reached from inside the loop — which is \
+             exactly what dropping `invoker` from `build_tools` looks like, and \
+             it is silent: the tool takes the `None => Unanswerable` arm and \
+             writes REQ-585's piped-refusal placeholders. Asked: {asked:?}"
+        )
+    });
+    assert_eq!(
+        addressee, h.connection,
+        "the consent was addressed to somebody other than the connection that \
+         submitted this turn"
+    );
+    assert!(
+        matches!(
+            request.subject,
+            Some(PermissionSubject::SkillDynamicContext {
+                invoked_by: InvokedBy::Model,
+                ..
+            })
+        ),
+        "the prompt must say the model asked, or the human approves a command \
+         list believing they typed it: {:?}",
+        request.subject
+    );
+    // BR-4's acknowledgment travelled to the same connection, on the same run.
+    assert!(
+        addressees
+            .iter()
+            .all(|connection| *connection == h.connection),
+        "every door this tool opened must address this turn's connection: \
+         {addressees:?}"
+    );
+
+    // Non-vacuity: the call was dispatched and its expansion reached the model,
+    // so an empty `asked()` above would have meant "nobody was asked", not
+    // "nothing was invoked".
+    let sent = h.vendor.sent().join("\n");
+    assert!(
+        sent.contains("<skill-body"),
+        "the expansion never reached the provider, so this turn proves nothing \
+         about who was asked: {sent}"
+    );
+    assert!(
+        sent.contains("wired-through"),
+        "the approved command's output never reached the provider: {sent}"
+    );
+}
+
+/// **AC-13 / BR-12: a model invocation echoes one line, like every other one.**
+///
+/// TASK-216 found the gap and could not close it from where it lived: the tool
+/// held no way to publish, so a model-issued invocation raised **no**
+/// `SkillInvoked` at all — the session printed nothing and `/verbose` had
+/// nothing to add to. Nothing was red, because no suite can assert the absence
+/// of an event nobody had written yet.
+///
+/// BR-9's three rendered facts ride the same event (the shadowing fact, the
+/// flags, the turn's count against the cap), so they are asserted here, off the
+/// value the daemon actually emitted rather than a hand-built one (LESSON-544).
+///
+/// **The skill invoked here asks nothing, so this test and the addressee test
+/// above fail for two different reasons.** `homeonly` is the fixture home's
+/// user skill with no dynamic context: no project acknowledgment, no
+/// dynamic-context consent, no door that `invoker` decides. Dropping `invoker`
+/// from `build_tools` reddens the addressee test and leaves this one green;
+/// dropping the publish reddens this one and leaves that one green. A mutation
+/// that reddens both would prove neither.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_model_invocation_publishes_its_own_record_saying_the_model_asked() {
+    let repo = Tree::new("mdlecho");
+    let h = Harness::with_window(128_000);
+    let session = h.session_at(repo.path());
+    // Nothing to answer: if this double is asked anything at all, it declines,
+    // and the assertion below says it was never asked.
+    h.consent
+        .answers(Answer::Select(PermissionOptionKind::RejectOnce));
+    h.vendor.will_call_skill("homeonly", "");
+    let mut sub = h.events.subscribe(256);
+
+    h.turn(&session, "use the wired skill", None)
+        .await
+        .expect("the turn runs");
+
+    let invoked: Vec<SkillInvoked> = drain(&mut sub)
+        .await
+        .into_iter()
+        .filter_map(|event| match event {
+            Event::SkillInvoked(invoked) => Some(invoked),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        invoked.len(),
+        1,
+        "BR-12 says *every* invocation echoes one line; a model-issued one \
+         published {} — dropping the tool's publish is silent, because the \
+         session simply prints nothing",
+        invoked.len()
+    );
+    assert!(
+        h.consent.asked().is_empty(),
+        "a skill with no dynamic context asks nothing, which is what keeps this \
+         test independent of the addressee test above: {:?}",
+        h.consent.asked()
+    );
+    let invoked = &invoked[0];
+    assert_eq!(invoked.invoked_by, InvokedBy::Model);
+    assert_eq!(invoked.name, "homeonly");
+    assert_eq!(invoked.source, SkillSource::User);
+    assert!(
+        invoked.outcomes.is_empty(),
+        "zero dynamic commands is a real state the echo line renders, not a \
+         missing one: {:?}",
+        invoked.outcomes
+    );
+
+    // BR-9's three facts, which no client can derive.
+    assert!(
+        !invoked.shadows_user_skill,
+        "nothing shadows this one, and the field has to say so rather than be absent-and-guessed"
+    );
+    assert!(invoked.model_invocable);
+    assert!(invoked.user_invocable);
+    assert_eq!(
+        invoked.turn_invocations,
+        Some(teton_protocol::events::TurnInvocations { count: 1, cap: 12 }),
+        "AC-10 pins the turn's count against the cap, and it exists nowhere but \
+         in the tool's own per-turn state"
+    );
+
+    // BR-12's other half, unchanged by a second invoker: the body is not here.
+    let wire = serde_json::to_value(invoked).unwrap();
+    assert!(wire.get("body").is_none(), "{wire}");
+    assert!(
+        invoked.path_display.starts_with("~/"),
+        "the path stays home-relative for a model invocation exactly as for a \
+         typed one — who asked does not change what may be printed: {}",
+        invoked.path_display
+    );
+}
+
+/// **BR-5: two invocations of one skill with different arguments do not share
+/// one answer.**
+///
+/// TASK-215 shipped `skill_grant_key`, TASK-216 shipped `Expansion::grant_key`,
+/// and the gate accepts either spelling and pins whichever it is given — so a
+/// caller that kept minting the plain `skill:<source>:<name>` key kept REQ-585's
+/// behaviour with **nothing red**. That is why this is asserted behaviourally
+/// and not by reading a key: one "Allow for this session" answered about
+/// `echo deploying staging` must not silently authorize
+/// `echo deploying production`.
+///
+/// The non-vacuity leg is the third turn. Without it the test would pass
+/// against a build that had simply stopped remembering grants at all.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn two_typed_invocations_with_different_arguments_do_not_share_one_answer() {
+    let repo = Tree::new("digest");
+    repo.write(
+        ".claude/skills/deploy/SKILL.md",
+        &skill_file("deploys a target", "Deploy. !`echo deploying $ARGUMENTS`"),
+    );
+    let h = Harness::with_window(128_000);
+    let session = h.session_at(repo.path());
+    // "Allow for this session" — the answer whose *scope* this test is about.
+    h.consent
+        .answers(Answer::Select(PermissionOptionKind::AllowAlways));
+
+    h.turn(&session, "", Harness::invoke("deploy", "staging"))
+        .await
+        .expect("the first invocation runs");
+    assert_eq!(
+        h.consent.asked().len(),
+        1,
+        "the first invocation asks once: {:?}",
+        h.consent.asked()
+    );
+
+    h.turn(&session, "", Harness::invoke("deploy", "production"))
+        .await
+        .expect("the second invocation runs");
+    let asked = h.consent.asked();
+    assert_eq!(
+        asked.len(),
+        2,
+        "a *different* command list under the same skill name was answered by \
+         the first invocation's grant — which is what minting \
+         `skill.permission_key()` instead of `Expansion::grant_key` does, and \
+         it is silent: {asked:?}"
+    );
+    let commands: Vec<Vec<String>> = asked
+        .iter()
+        .filter_map(|request| match &request.subject {
+            Some(PermissionSubject::SkillDynamicContext { commands, .. }) => Some(commands.clone()),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        commands,
+        vec![
+            vec!["echo deploying staging".to_owned()],
+            vec!["echo deploying production".to_owned()],
+        ],
+        "each prompt shows the substituted commands — which is the same fact \
+         the key is a digest of (BR-5)"
+    );
+
+    // Non-vacuity: the grant *is* remembered, so the two prompts above are two
+    // questions rather than a gate that forgot how to answer.
+    h.turn(&session, "", Harness::invoke("deploy", "production"))
+        .await
+        .expect("the third invocation runs");
+    assert_eq!(
+        h.consent.asked().len(),
+        2,
+        "the same argument list twice must be one question, or this test would \
+         pass against a gate that remembers nothing: {:?}",
+        h.consent.asked()
+    );
 }
 
 // ---------------------------------------------------------------------------

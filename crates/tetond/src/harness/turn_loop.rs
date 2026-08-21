@@ -1739,6 +1739,109 @@ pub(crate) fn worst_case_session_root() -> SessionRoot {
     })
 }
 
+/// A `skill` tool carrying BR-2's **prompt bytes and nothing else**: the
+/// rendered description and the argument schema, with no gate, no runtime
+/// handle, no invoker and no registry (REQ-587 ADR-9).
+///
+/// **Why it exists.** Neither prompt-margin sweep can build the real
+/// [`SkillTool`](super::tools::SkillTool), and the reason is already written
+/// down beside one of them: `egress::redact`'s
+/// `the_total_cap_clears_the_harness_context_budget_with_margin` is a sync
+/// `#[test]`, and its own comment says the *web* tool is measured beside itself
+/// because building one "needs a permission gate and a choke-point seam that do
+/// not belong in this module". `SkillTool` holds a `PermissionGate` and a
+/// `tokio::runtime::Handle`, whose `Handle::current()` panics outside a
+/// runtime, so it has exactly that problem — and a tool those sweeps cannot
+/// build is a tool they do not measure, which is a resident prompt that grows
+/// while the one test guarding a budget three REQs contend for stays green.
+///
+/// **It is not a stub with a hand-typed description.** Both of its prompt
+/// surfaces come from the functions the real tool reaches for
+/// (`skill::render_description`/`skill::describe` and
+/// `skill::argument_schema`), because a hand-typed copy and the renderer drift
+/// independently while the margin test keeps passing — LESSON-481's shape
+/// sitting inside the test that exists to prevent it.
+/// `tools::skill::tests::the_doc_only_tool_and_the_real_one_render_one_set_of_prompt_bytes`
+/// pins that the two are byte-identical.
+///
+/// **Why it lives here rather than in `harness::tools::skill`.** It is a
+/// prompt-measurement fixture, the same category as
+/// [`worst_case_session_root`] above it and with the same two consumers; and
+/// `tests/boundary_coverage.rs` derives "every tool the product ships" from the
+/// `impl Tool for …` blocks in the tools module, on the stated rule that a
+/// test-only fake is not one of them. Keeping it out of that module keeps that
+/// rule exact instead of teaching the scan an exception.
+#[cfg(test)]
+pub(crate) struct SkillToolDocs {
+    /// The rendered description, owned because `Tool::description` borrows from
+    /// `&self` — the real tool's own arrangement.
+    description: String,
+}
+
+#[cfg(test)]
+impl SkillToolDocs {
+    /// The docs `registry` puts in the prompt, rendered exactly as
+    /// `SkillTool::new` renders them.
+    pub(crate) fn new(registry: &crate::skills::SkillRegistry) -> Self {
+        Self {
+            description: super::tools::skill::render_description(registry),
+        }
+    }
+
+    /// The **worst case** the resident prompt can carry: a roster at
+    /// `ROSTER_MAX_BYTES`.
+    ///
+    /// One definition of the ceiling, read by both sweeps — the shape
+    /// [`worst_case_session_root`] already uses — so the two cannot come to
+    /// measure different worst cases.
+    ///
+    /// The roster is synthesized *at* the cap rather than discovered from a
+    /// fixture tree, for two reasons. The cap is what `render_roster` is allowed
+    /// to produce and never exceeds
+    /// (`the_roster_collapses_to_a_named_count_at_its_byte_cap`), so a roster of
+    /// exactly `ROSTER_MAX_BYTES` is the ceiling by derivation rather than by
+    /// transcription; and it needs no filesystem, which is what lets the sync
+    /// sweep in `egress::redact` measure it at all. `ToolRegistry::docs` renders
+    /// the description verbatim with no wrapping, so filler bytes and name bytes
+    /// cost the prompt the same.
+    pub(crate) fn worst_case() -> Self {
+        Self {
+            description: super::tools::skill::describe(
+                &"n".repeat(super::tools::skill::ROSTER_MAX_BYTES),
+            ),
+        }
+    }
+}
+
+#[cfg(test)]
+#[async_trait::async_trait]
+impl super::tools::Tool for SkillToolDocs {
+    fn name(&self) -> &str {
+        super::tools::SKILL_TOOL_NAME
+    }
+
+    fn description(&self) -> &str {
+        &self.description
+    }
+
+    fn input_schema(&self) -> serde_json::Value {
+        super::tools::skill::argument_schema()
+    }
+
+    /// Never reached: the sweeps that register this build a system prompt, they
+    /// do not run a turn. It refuses rather than panicking so that a future
+    /// caller gets a tool result instead of a poisoned test process.
+    fn run(
+        &self,
+        _ctx: &super::tools::ToolContext,
+        _args: &serde_json::Value,
+    ) -> super::tools::ToolOutcome {
+        super::tools::ToolOutcome::error(
+            "the doc-only `skill` tool renders documentation and runs nothing (ADR-9)",
+        )
+    }
+}
+
 /// Build the system prompt: the agent's instructions, Teton's bundled
 /// self-configuration guide, the exposed tool docs, and the tool-call format
 /// the local model must follow.
@@ -3471,6 +3574,17 @@ mod tests {
     /// same rule applies to the next feature that changes this fact: re-word
     /// the needles with the sentence.
     ///
+    /// **REQ-587 is that next feature, and it moved the who-runs anchor rather
+    /// than adding beside it** (BR-8). `only the user runs` was true while no
+    /// tool could run a command; the `skill` tool made it false, so the phrase
+    /// is now scoped — `only the user runs the built-in ones` — and the
+    /// assertion moved *with* it, which is what this test's own failure message
+    /// has always asked for. A fifth needle carries the other half: the model
+    /// runs a skill only through the [`skill`](super::tools::SkillTool) tool,
+    /// and the needle is that clause verbatim. Five needles, not three,
+    /// and the reason each exists is that dropping it passes CI while silently
+    /// removing a guard.
+    ///
     /// What is deliberately **not** pinned here: the skill roster (REQ-585
     /// OQ-2). The names are `/help`'s and the `skill` tool's to carry; the
     /// guide names the pointer and nothing that grows with the user's
@@ -3491,15 +3605,38 @@ mod tests {
             capability.len()
         );
         let line = capability[0];
-        for anchor in [".claude/", "~/.claude", "only the user runs"] {
+        for anchor in [
+            ".claude/",
+            "~/.claude",
+            "only the user runs the built-in ones",
+        ] {
             assert!(
                 line.contains(anchor),
                 "the capability sentence no longer says `{anchor}`. It has to name both \
-                 places other agents load capabilities from and say the user is the one who \
-                 runs commands, or a model beside a skills tree affirms it can use them \
-                 (BUG-181).\nline: {line}"
+                 places other agents load capabilities from and say who runs what, or a \
+                 model beside a skills tree affirms it can use them (BUG-181).\n\
+                 The who-runs anchor is scoped since REQ-587 (BR-8): `only the user runs` \
+                 was true when nothing the model could call ran a command, and the `skill` \
+                 tool made it false. The phrase and this assertion move together — amend \
+                 both, or the sentence and its guard part company.\nline: {line}"
             );
         }
+        // REQ-587's half of the same sentence (BR-8). The scoped anchor above
+        // says the model does not run the *built-in* commands; on its own that
+        // leaves what it does with a skill unsaid, which is the direction
+        // BUG-181's defect ran in — a model beside a skills tree deciding for
+        // itself. The sentence names the one door and says it is the only one,
+        // and this is the needle that fails if the clause is dropped or the
+        // pre-REQ sentence is restored.
+        assert!(
+            line.contains("only through the `skill` tool"),
+            "the capability sentence no longer names the `skill` tool as the model's only \
+             way to run a skill (REQ-587 BR-8). Without it the sentence says who runs the \
+             built-in commands and nothing about the capability this REQ added, so a model \
+             either denies a tool it has or reaches for a command surface it does not. If \
+             the wording changed deliberately, re-word this needle with the \
+             sentence.\nline: {line}"
+        );
         // The half REQ-585 re-worded (BR-9). BUG-181's sentence said Teton
         // "loads nothing from" those two places; skills and commands found
         // under them are now loaded and listed by `/help`, so the phrase moved

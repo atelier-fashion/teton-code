@@ -7844,6 +7844,18 @@ mod skill_tests {
             name_note: None,
             outcomes,
             invoked_by,
+            // TASK-217 landed the three facts BR-9 asks this surface to render
+            // — the shadowing clause on the echo line, and the flags, the
+            // shadowing fact and the turn's count under `/verbose`. Nothing
+            // renders them yet: that is **TASK-219's** own AC, which was blocked
+            // on the fields existing. These are REQ-585's world exactly, which
+            // is correct for the assertions below and is the wrong fixture to
+            // assert a shadowing clause from. Vary them when the rendering
+            // lands.
+            shadows_user_skill: false,
+            model_invocable: true,
+            user_invocable: true,
+            turn_invocations: None,
         }
     }
 

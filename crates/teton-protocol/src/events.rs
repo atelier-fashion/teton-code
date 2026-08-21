@@ -2853,6 +2853,81 @@ pub struct SkillInvoked {
     /// [`PermissionSubject::ProjectSkillTrust`]).
     #[serde(default, skip_serializing_if = "InvokedBy::is_user")]
     pub invoked_by: InvokedBy,
+    /// Whether a **user** skill of this name lost its spelling to this one
+    /// (REQ-587 BR-9).
+    ///
+    /// BR-9's echo line names it — `skill validate (project — shadows your user
+    /// skill, …)` — and `/verbose` repeats it. Carried rather than derived,
+    /// because the only surface that could derive it is the client, and the
+    /// registry snapshot lives on its `UiContext` while `render_event` sees
+    /// only `SessionState`. A renderer that reached for the snapshot would be
+    /// answering a question about *this* invocation from a value that may have
+    /// moved under a `/cd` since.
+    ///
+    /// Additive, and **absent means `false`**: a daemon predating the field
+    /// wrote nothing, and "nothing is shadowed" is the state nearly every
+    /// invocation is in.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub shadows_user_skill: bool,
+    /// Whether the model may reach this skill through the `skill` tool — the
+    /// frontmatter flag as the file wrote it (REQ-587 BR-3, BR-9's `/verbose`).
+    ///
+    /// Additive in the one direction that keeps the wire byte-identical:
+    /// absent means `true`, which is what every skill a pre-REQ-587 daemon
+    /// could report was, because that daemon had no flag to read.
+    #[serde(default = "invocable_by_default", skip_serializing_if = "is_invocable")]
+    pub model_invocable: bool,
+    /// Whether the user may dispatch this skill by typing `/name` — the other
+    /// frontmatter flag, on the same additive terms as
+    /// [`Self::model_invocable`].
+    #[serde(default = "invocable_by_default", skip_serializing_if = "is_invocable")]
+    pub user_invocable: bool,
+    /// How many `skill` calls this turn has spent, and the ceiling
+    /// (REQ-587 BR-6a, BR-9's `/verbose`).
+    ///
+    /// `None` for a user-typed `/name`, and that is a *fact* rather than an
+    /// omission: the per-turn cap bounds the **model's** invocations inside one
+    /// prompt turn, and a human typing a slash command spends none of it. A
+    /// renderer showing "1 of 12" there would be inventing a budget the user
+    /// is not drawing on.
+    ///
+    /// The cap travels with the count because it is a daemon constant: a client
+    /// that hardcoded 12 would print a stale ceiling the day it moves.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub turn_invocations: Option<TurnInvocations>,
+}
+
+/// The serde default for an invocation flag: absent means permitted.
+///
+/// A free function rather than an inline literal because `serde(default = …)`
+/// takes a path, and the same one is named by both flags — one reading of "the
+/// pre-REQ-587 world allowed both".
+fn invocable_by_default() -> bool {
+    true
+}
+
+/// The `skip_serializing_if` predicate both invocation flags use: a permitted
+/// flag writes no key, so an ordinary skill's wire stays byte-identical to the
+/// one REQ-585 wrote.
+#[allow(clippy::trivially_copy_pass_by_ref)]
+fn is_invocable(value: &bool) -> bool {
+    *value
+}
+
+/// A turn's `skill` invocation count against the per-turn cap (REQ-587 BR-6a).
+///
+/// Two numbers rather than two optional fields, so a skew that carried the
+/// count without the ceiling — or the reverse — is not representable. `/verbose`
+/// renders them as one phrase, and they are only ever true together.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TurnInvocations {
+    /// How many `skill` calls this turn has made, **including this one**.
+    ///
+    /// Every call counts — expansion, listing or typed refusal — because a
+    /// refusal that cost nothing would make a loop of refusals unbounded.
+    pub count: u32,
+    /// The most this turn may make.
+    pub cap: u32,
 }
 
 /// What became of one `` !`command` `` (REQ-585 BR-6, BR-12).
@@ -3265,6 +3340,10 @@ mod tests {
                         },
                     }],
                     invoked_by: InvokedBy::User,
+                    shadows_user_skill: false,
+                    model_invocable: true,
+                    user_invocable: true,
+                    turn_invocations: None,
                 }),
                 "skill_invoked",
             ),
@@ -4017,6 +4096,10 @@ mod tests {
             body_bytes: 4_712,
             ignored_keys: vec![],
             name_note: None,
+            shadows_user_skill: false,
+            model_invocable: true,
+            user_invocable: true,
+            turn_invocations: None,
             outcomes: vec![DynamicOutcomeView {
                 command: "git status --short".to_owned(),
                 outcome: DynamicOutcome::Ran {
@@ -4065,6 +4148,105 @@ mod tests {
             crate::ProtocolVersion(2),
             "REQ-587 adds optional fields and one subject variant, so the negotiated \
              version does not move"
+        );
+    }
+
+    /// REQ-587 BR-9: the three facts BR-9 asks the client to render — the
+    /// shadowing fact, the two frontmatter flags, and the turn's invocation
+    /// count against the cap — ride the event additively, on
+    /// [`skill_invoked_says_who_invoked_it_additively`]'s four legs.
+    ///
+    /// They are on the event because no reader can derive them. `render_event`
+    /// sees only `SessionState`; the registry snapshot the shadowing fact and
+    /// the flags would come from lives on the client's `UiContext`, and the
+    /// per-turn count lives in the daemon's tool state and exists nowhere else
+    /// at all.
+    ///
+    /// The **non-vacuity leg** is the one that earns its place, exactly as it
+    /// does for `invoked_by`: a fixture that never set a flag to its
+    /// non-default value would satisfy the old-reader leg by writing no key at
+    /// all, and the test would pass against a build that had dropped the field.
+    #[test]
+    fn skill_invoked_carries_the_shadowing_fact_the_flags_and_the_turn_count_additively() {
+        // Leg one — a pre-REQ-587 event. None of the four keys is written, and
+        // each reads as the world that daemon was in: nothing shadowed, both
+        // invocations permitted (it had no flags to read), and no per-turn cap
+        // (it had no `skill` tool to cap).
+        let invoked: SkillInvoked = serde_json::from_str(
+            r#"{"name":"status","source":"user","path_display":"~/.claude/skills/status/SKILL.md",
+                "body_bytes":118,"ignored_keys":[],"outcomes":[]}"#,
+        )
+        .expect("an event from a daemon predating these fields must still parse");
+        assert!(!invoked.shadows_user_skill);
+        assert!(invoked.model_invocable, "absent must not read as denied");
+        assert!(invoked.user_invocable, "absent must not read as denied");
+        assert_eq!(invoked.turn_invocations, None);
+
+        // Leg two — and the ordinary invocation writes none of them either, so
+        // the wire REQ-585 wrote is the wire this build writes. Downgrading any
+        // of the four `skip_serializing_if`s to a bare `default` fails here.
+        let wire = serde_json::to_value(&invoked).unwrap();
+        for key in [
+            "shadows_user_skill",
+            "model_invocable",
+            "user_invocable",
+            "turn_invocations",
+        ] {
+            assert!(wire.get(key).is_none(), "{key} was written: {wire}");
+        }
+
+        // Leg three — non-vacuity. A model invocation of a shadowing,
+        // model-only project skill carries every one of them, so the legs above
+        // are reached by the values being defaults rather than by the fields
+        // being gone.
+        let loud = SkillInvoked {
+            name: "validate".to_owned(),
+            source: SkillSource::Project,
+            path_display: ".claude/skills/validate/SKILL.md".to_owned(),
+            body_bytes: 4_712,
+            ignored_keys: vec![],
+            name_note: None,
+            outcomes: vec![],
+            invoked_by: InvokedBy::Model,
+            shadows_user_skill: true,
+            model_invocable: true,
+            user_invocable: false,
+            turn_invocations: Some(TurnInvocations { count: 3, cap: 12 }),
+        };
+        let wire = serde_json::to_string(&loud).unwrap();
+        assert!(wire.contains(r#""shadows_user_skill":true"#), "{wire}");
+        assert!(wire.contains(r#""user_invocable":false"#), "{wire}");
+        assert!(
+            !wire.contains(r#""model_invocable""#),
+            "a permitted flag still writes no key: {wire}"
+        );
+        assert!(wire.contains(r#""count":3"#), "{wire}");
+        assert!(
+            wire.contains(r#""cap":12"#),
+            "the cap travels with the count, or a client prints a stale ceiling: {wire}"
+        );
+
+        // Leg four — a reader built before the fields still reads that event.
+        #[derive(Deserialize)]
+        struct PreBr9SkillInvoked {
+            name: String,
+            body_bytes: u64,
+            #[serde(default)]
+            invoked_by: InvokedBy,
+        }
+        let old: PreBr9SkillInvoked =
+            serde_json::from_str(&wire).expect("a client predating the fields still reads it");
+        assert_eq!(old.name, "validate");
+        assert_eq!(old.body_bytes, 4_712);
+        assert_eq!(old.invoked_by, InvokedBy::Model);
+
+        // And BR-12 still holds with three more fields on the event: the body
+        // is never here.
+        let back: SkillInvoked = serde_json::from_str(&wire).unwrap();
+        assert_eq!(back, loud);
+        assert!(
+            serde_json::to_value(&back).unwrap().get("body").is_none(),
+            "{wire}"
         );
     }
 
@@ -4356,6 +4538,10 @@ mod tests {
             body_bytes: 5_432,
             ignored_keys: vec!["allowed-tools".to_owned(), "model".to_owned()],
             name_note: None,
+            shadows_user_skill: false,
+            model_invocable: true,
+            user_invocable: true,
+            turn_invocations: None,
             outcomes: vec![
                 DynamicOutcomeView {
                     command: "cat ~/.claude/adlc/ETHOS.md".to_owned(),
@@ -4434,6 +4620,10 @@ mod tests {
             name_note: None,
             outcomes: vec![],
             invoked_by: InvokedBy::User,
+            shadows_user_skill: false,
+            model_invocable: true,
+            user_invocable: true,
+            turn_invocations: None,
         };
         round_trip(&plain);
         let wire = serde_json::to_value(&plain).unwrap();

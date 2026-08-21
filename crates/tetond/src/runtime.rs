@@ -116,12 +116,10 @@ use teton_inference::probe::{decide, GpuClass, HardwareProfile, TierDecision, GI
 use teton_inference::{ChatFormat, Completion, Engine, EngineError, GenParams, MockEngine};
 
 use teton_protocol::events::{
-    BlockCause, CapabilityDeadEnd, ContextCleared, ContextPressureKind,
-    DynamicOutcome as WireDynamicOutcome, DynamicOutcomeView, Event, ModelLifecycle,
-    ModelLifecycleStage, NotRunReason, PrivacyAction, ProviderTested, SessionRootChanged,
-    SessionTitled, SkillInvoked, TierWarming, TurnQueued,
-    WebCapabilityState as WireWebCapabilityState, WebLookup, WebSetupCompleted, WebTaintOverridden,
-    WebTier as WireWebTier,
+    BlockCause, CapabilityDeadEnd, ContextCleared, ContextPressureKind, Event, ModelLifecycle,
+    ModelLifecycleStage, PrivacyAction, ProviderTested, SessionRootChanged, SessionTitled,
+    SkillInvoked, TierWarming, TurnQueued, WebCapabilityState as WireWebCapabilityState, WebLookup,
+    WebSetupCompleted, WebTaintOverridden, WebTier as WireWebTier,
 };
 use teton_protocol::jsonrpc::{error_code, RpcError};
 use teton_protocol::methods::{
@@ -170,6 +168,7 @@ use crate::harness::completion::{context_provenance, RemoteProviderSource};
 use crate::harness::context::{NoopProvenanceHook, PressureReport};
 use crate::harness::permissions::{AddressedPermissionDelivery, SkillConsent};
 use crate::harness::tools::shell;
+use crate::harness::tools::skill::register_skill_tool;
 use crate::harness::tools::web::{register_web_tool, tier_name, SeamError, WebLookupSeam};
 use crate::harness::turn_loop::{pressure_kind, run_session_turn_with_source, HarnessError};
 use crate::harness::{
@@ -191,9 +190,8 @@ use crate::router::{
 use crate::selection_store::SelectionStore;
 use crate::session_root::{home, ProbedRoot};
 use crate::sessions::{validate_session_cwd, SessionRegistry, TurnClaimError};
-use crate::skills::dynamic::{closed_door, door_outcome};
-use crate::skills::expand::COMMAND_ECHO_MAX_CHARS;
-use crate::skills::{Command, DynamicOutcome, Expansion, Pending, SkillSource};
+use crate::skills::dynamic::{closed_door, door_outcome, outcome_view};
+use crate::skills::{DynamicOutcome, Expansion, Pending, SkillRegistry, SkillSource};
 use crate::web::{UserUrls, WebCache};
 // The module rather than the function: `suggestion_catalog()` on its own would
 // read, in a file this size, as something the runtime computes.
@@ -1463,10 +1461,15 @@ struct SkillTurn {
     /// one value.
     expansion: Option<Expansion<Pending>>,
     /// The gate key this skill's dynamic context asks under
-    /// ([`crate::skills::Skill::permission_key`], ADR-6) — minted with the
-    /// registry row in hand rather than re-derived at the seam, so the key the
-    /// grant is remembered under cannot come from a second reading of the
-    /// registry.
+    /// ([`Expansion::grant_key`], REQ-585 ADR-6 as REQ-587 BR-5 narrows it) —
+    /// minted at [`Self::accept_invocation`] with the registry row *and* the
+    /// expansion in hand, rather than re-derived at the seam, so the key the
+    /// grant is remembered under cannot come from a second reading of either.
+    ///
+    /// It carries the digest of the substituted commands whenever the body
+    /// interpolated its arguments, which is what keeps one "allow for this
+    /// session" answer from covering a *different* command list under the same
+    /// skill name.
     permission_key: String,
     /// Which of the two roots the file came from — half the permission key, and
     /// what BR-12's echo line names.
@@ -1484,6 +1487,18 @@ struct SkillTurn {
     /// so `/verbose` can say it. The dispatching spelling is never in doubt —
     /// this is a note to the author, not a second name.
     name_note: Option<String>,
+    /// Whether a **user** skill of this name lost its spelling to this one —
+    /// BR-9's `shadows your user skill` clause on the echo line.
+    shadows_user_skill: bool,
+    /// The frontmatter invocation flags as the file wrote them (REQ-587 BR-3),
+    /// carried for `/verbose` (BR-9). Read off the registry row at
+    /// [`Self::accept_invocation`], for the reason `shadows_user_skill` is.
+    model_invocable: bool,
+    /// The other flag. `false` here would mean a model-only skill, which this
+    /// path cannot reach — `dispatchable_by_user` refused it above — so it is
+    /// carried rather than assumed, because that is a fact about *this* build's
+    /// resolution and not a property of the field.
+    user_invocable: bool,
     /// The skill file's identity, for the seeded user block (BR-7, ADR-9). A
     /// project skill is under the root and mints cleanly.
     sources: BTreeSet<ProvenanceId>,
@@ -1493,45 +1508,6 @@ struct SkillTurn {
     /// boundary is configured, exactly as `shell` output does, which is stricter
     /// than BR-7's letter and right in the charter's direction (ADR-9).
     unknown: bool,
-}
-
-/// One command's typed record for BR-12's event, projected from the outcome the
-/// daemon actually produced (LESSON-544: the wire value is derived from the real
-/// one, never composed beside it).
-///
-/// `door` is `Some` when the consent closed one, and it is what a not-run arm
-/// reports: the daemon-side outcome carries its reason as prose for the model,
-/// and re-reading a [`NotRunReason`] out of that sentence would be a second
-/// parser of the daemon's own words (LESSON-529).
-///
-/// A command the runner could not **start** (`sh` unavailable, an unresolvable
-/// jail root) has no door either, and reports [`NotRunReason::CouldNotStart`].
-/// It is not folded into `Failed`: that would say it was attempted and exited,
-/// which is untrue and points a reader at the wrong fix. It is not folded into
-/// one of the consent's doors either — nobody refused it.
-fn outcome_view(
-    command: &Command,
-    outcome: &DynamicOutcome,
-    door: Option<NotRunReason>,
-) -> DynamicOutcomeView {
-    DynamicOutcomeView {
-        // File-supplied bytes on a surface: bounded and rendered on one line
-        // here, at the same ceiling the fold's echoed placeholder uses (BR-3).
-        command: teton_core::session_root::bounded_field(command.as_str(), COMMAND_ECHO_MAX_CHARS),
-        outcome: match outcome {
-            DynamicOutcome::Ran { output, .. } => WireDynamicOutcome::Ran {
-                output_bytes: output.len() as u64,
-                truncated: outcome.output_truncated(),
-            },
-            DynamicOutcome::NotRun { .. } => WireDynamicOutcome::NotRun {
-                reason: door.unwrap_or(NotRunReason::CouldNotStart),
-            },
-            DynamicOutcome::Failed { exit_status, .. } => WireDynamicOutcome::Failed {
-                exit_status: *exit_status,
-            },
-            DynamicOutcome::TimedOut => WireDynamicOutcome::TimedOut,
-        },
-    }
 }
 
 /// The assembled daemon runtime shared by every client task.
@@ -2886,8 +2862,7 @@ impl DaemonRuntime {
     /// reaches the model through [`crate::skills::expand`], which defuses it.
     fn accept_invocation(
         &self,
-        sessions: &SessionRegistry,
-        session_id: &SessionId,
+        registry: &SkillRegistry,
         probed: &ProbedRoot,
         invocation: &SkillInvocation,
     ) -> Result<SkillTurn, RpcError> {
@@ -2899,7 +2874,6 @@ impl DaemonRuntime {
                     .to_owned(),
             ));
         }
-        let registry = sessions.skills(session_id);
         // `dispatchable_by_user`, which is this caller's question: `skill/invoke`
         // is the *user* typing `/name`, so REQ-587 BR-3's `user-invocable:
         // false` is refused here and not only by the client that usually
@@ -2946,9 +2920,28 @@ impl DaemonRuntime {
         Ok(SkillTurn {
             name: skill.name.clone(),
             text,
+            // REQ-587 BR-5: **the** mint, from the expansion, before the value
+            // is moved into the turn. `skill.permission_key()` is the tempting
+            // spelling and it is the silent one — the gate accepts either and
+            // pins whichever it is given, so a plain key here would keep
+            // REQ-585's behaviour (one answer covering every argument list this
+            // skill is ever invoked with) with nothing red. The two facts a
+            // caller cannot supply correctly on its own — the *substituted*
+            // command set, and whether the body interpolated at all — live on
+            // the expansion, which is why the mint does.
+            permission_key: expansion.grant_key(skill.source),
             expansion: Some(expansion),
-            permission_key: skill.permission_key(),
             source: skill.source,
+            // BR-9's three rendered facts, read off the registry row here
+            // because this is the surface that has it: the client's snapshot
+            // lives on its `UiContext` and `render_event` cannot see it, and by
+            // the time it could the registry may have moved under a `/cd`.
+            shadows_user_skill: crate::harness::tools::skill::shadows_user_skill(
+                registry,
+                &skill.name,
+            ),
+            model_invocable: skill.model_invocable,
+            user_invocable: skill.user_invocable,
             // Bounded here, at the one surface that has the path and `home`,
             // for the reason the preamble's copy is bounded here: BR-12's event
             // goes to every attached client and into transcripts (ADR-15).
@@ -3123,10 +3116,21 @@ impl DaemonRuntime {
                     .zip(outcomes.iter())
                     .map(|(command, outcome)| outcome_view(command, outcome, door))
                     .collect(),
-                // TASK-216/TASK-217 replace this with the invocation's real
-                // invoker. A literal today because the only path that reaches
-                // here is REQ-585's user-typed `/name` expansion.
+                // A literal, and it stays one: the only path that reaches here
+                // is REQ-585's user-typed `/name` expansion. A model-issued
+                // call never comes through this function — it publishes its own
+                // record from inside the tool (REQ-587 TASK-217), which is the
+                // one surface that has the turn's invocation count.
                 invoked_by: teton_protocol::events::InvokedBy::User,
+                shadows_user_skill: skill.shadows_user_skill,
+                model_invocable: skill.model_invocable,
+                user_invocable: skill.user_invocable,
+                // **`None`, and that is a fact rather than an omission.** BR-6a's
+                // per-turn cap bounds the *model's* invocations inside one
+                // prompt turn; a human typing `/name` spends none of it, and a
+                // `/verbose` line reading "1 of 12" here would name a budget
+                // the user is not drawing on.
+                turn_invocations: None,
             }),
         );
     }
@@ -3262,10 +3266,22 @@ impl DaemonRuntime {
         //
         // Refusing here is free in BR-8(c)'s sense: nothing has been seeded, no
         // route has been decided, and no event has been published.
+        // **The turn's one registry snapshot**, taken here under the claim and
+        // read by both consumers: the `/name` resolution just below, and the
+        // `skill` tool `build_tools` registers further down (REQ-587 ADR-3,
+        // ADR-5). An `Arc` clone off the session registry, not a discovery —
+        // `discovery_is_paid_at_create_and_at_cd_and_never_per_turn` pins that
+        // no turn opens a directory, and this opens none.
+        //
+        // One turn, one snapshot, for the reason the config above is one
+        // snapshot: a `/cd` landing between two reads would leave the roster
+        // the model was shown and the registry its call resolves against
+        // describing two different roots. The claim is held, so no move can
+        // land — which makes the single read a *statement* rather than a race
+        // this happens to win.
+        let skills = sessions.skills(&session_id);
         let mut skill_turn = match &skill {
-            Some(invocation) => {
-                Some(self.accept_invocation(sessions, &session_id, &probed, invocation)?)
-            }
+            Some(invocation) => Some(self.accept_invocation(&skills, &probed, invocation)?),
             None => None,
         };
         // The one reading of "this turn's prompt text". For a skill turn it is
@@ -3431,7 +3447,18 @@ impl DaemonRuntime {
         // turn instead of leaving this one's prompt disagreeing with its own
         // tool set (REQ-572 verify).
         let tools = self
-            .build_tools(&router, events, &session_id, &gate, &config)
+            .build_tools(
+                &router,
+                events,
+                &session_id,
+                &gate,
+                &config,
+                Arc::clone(&skills),
+                // REQ-587 ADR-3: the connection that submitted this turn is the
+                // addressee of any consent the `skill` tool raises. `ConnectionId`
+                // is `Copy`, so the seam below still consumes its own.
+                invoker,
+            )
             .await;
         // BUG-147: jail this session's tools to the CLIENT's working directory.
         // The daemon-global `repo_root` is only a fallback for clients that did
@@ -4095,7 +4122,7 @@ impl DaemonRuntime {
         // spelling of the four globs would be LESSON-528's shape at the seam
         // where the two answers have to agree.
         Self::store_session_skills(sessions, &params.session_id, &moved_to, skills_fs);
-        self.drop_project_skill_grants(&params.session_id);
+        self.drop_grants_expiring_on_root_change(&params.session_id);
 
         let root = moved_to.view;
         let blocks_dropped =
@@ -4188,14 +4215,47 @@ impl DaemonRuntime {
     }
 
     /// Build the tool registry for a turn: the built-ins, any registered MCP
-    /// server tools (ADR-003, namespaced and egress-gated), and — **only** on a
-    /// machine that opted in — the web tool (REQ-563 D-1).
+    /// server tools (ADR-003, namespaced and egress-gated), — **only** on a
+    /// machine that opted in — the web tool (REQ-563 D-1), and — **only** where
+    /// the session's registry holds a model-invocable skill — the `skill` tool
+    /// (REQ-587 BR-2, ADR-3, ADR-4).
     ///
-    /// The web tool goes on **last**, after the MCP tools, and that ordering is
-    /// the BR-6 charter rule expressed as insertion order rather than as a
-    /// special case: [`ToolRegistry::exposed_names`] caps from the front, so a
-    /// degraded provider's `max_tools` cuts the opt-in capability before it cuts
-    /// a server the user configured.
+    /// The web tool goes on **last** among the capped tools, after the MCP
+    /// tools, and that ordering is the BR-6 charter rule expressed as insertion
+    /// order rather than as a special case: [`ToolRegistry::exposed_names`] caps
+    /// from the front, so a degraded provider's `max_tools` cuts the opt-in
+    /// capability before it cuts a server the user configured. The `skill` tool
+    /// is registered cap-**exempt** (ADR-4) and so sits outside that argument
+    /// entirely.
+    ///
+    /// ## `invoker` is the whole of REQ-587 ADR-3, and its absence is silent
+    ///
+    /// `invoker` is the connection that submitted **this turn**, and it is the
+    /// addressee of any consent the `skill` tool raises. It is threaded here
+    /// rather than stored on [`ToolContext`] — the jail type, which dozens of
+    /// fixtures construct and whose subject is the root — or on
+    /// [`PermissionGate`], which is per *session*, so a connection kept there
+    /// is whichever one created the session rather than the one that sent this
+    /// prompt.
+    ///
+    /// Dropping it does not break a build and does not redden a suite: the tool
+    /// takes `authorize_skill`'s `None => Unanswerable` arm and produces
+    /// placeholders byte-identical to REQ-585's tested piped-refusal path,
+    /// because that arm is already correct for an internal caller. What guards
+    /// it is a test that drives a model-issued call and reads the addressee off
+    /// the consent double (`skill_turn.rs`).
+    ///
+    /// ## One turn, one registry snapshot
+    ///
+    /// `skills` is the caller's snapshot — the same `Arc` [`Self::accept_
+    /// invocation`] resolved this turn's `/name` against, taken once in
+    /// [`Self::run_prompt_turn`] — and not a second read of the session
+    /// registry. That is what makes ADR-5's claim true: the roster the tool
+    /// renders into its description and the registry a call resolves against
+    /// are provably one value, so a `/cd` cannot leave the model reading one
+    /// root's names and reaching another root's files. Discovery is not paid
+    /// here and must not be (`discovery_is_paid_at_create_and_at_cd_and_never_
+    /// per_turn`): this is an `Arc` clone, not a walk.
     ///
     /// `config` is the **caller's** snapshot, not a second read of the mutex
     /// (REQ-572 verify): [`Self::run_prompt_turn`] already clones the config to
@@ -4204,6 +4264,7 @@ impl DaemonRuntime {
     /// that said the capability was off while the registry it was handed had the
     /// tool in it. One turn, one snapshot — which is also what makes ADR-1's
     /// "the config **is** the flow state" true per turn rather than per read.
+    #[allow(clippy::too_many_arguments)]
     async fn build_tools(
         self: &Arc<Self>,
         router: &Router,
@@ -4211,6 +4272,8 @@ impl DaemonRuntime {
         session_id: &SessionId,
         gate: &Arc<PermissionGate>,
         config: &Config,
+        skills: Arc<SkillRegistry>,
+        invoker: Option<ConnectionId>,
     ) -> ToolRegistry {
         let mut tools = ToolRegistry::with_builtins();
         if !self.mcp_servers.is_empty() {
@@ -4260,6 +4323,21 @@ impl DaemonRuntime {
                 session_id: session_id.clone(),
             }),
             tokio::runtime::Handle::current(),
+        );
+        // REQ-587 BR-2/ADR-4: `register_skill_tool` is the one place the "at
+        // least one model-invocable skill" condition is expressed, so a session
+        // whose roots hold none has no `skill` tool rather than a tool with an
+        // empty roster. After the built-ins and outside `with_builtins()`,
+        // which `docs_are_capped_by_max_tools_for_degraded_providers` asserts
+        // by equality.
+        register_skill_tool(
+            &mut tools,
+            skills,
+            Arc::clone(gate),
+            // ADR-3. See this function's doc: the parameter is the feature.
+            invoker,
+            tokio::runtime::Handle::current(),
+            self.skill_command_timeout_ms,
         );
         tools
     }
@@ -4365,8 +4443,8 @@ impl DaemonRuntime {
         );
     }
 
-    /// Forget every remembered `skill:project:*` consent for this session, and
-    /// say how many went (REQ-585 ADR-6, TASK-201).
+    /// Forget every remembered consent this session's **root** gave meaning to,
+    /// and say how many went (REQ-585 ADR-6, TASK-201; REQ-587 TASK-215).
     ///
     /// The `/cd` half of the per-skill permission key. `skill:<source>:<name>`
     /// encodes the whole question only for as long as `<name>` means the same
@@ -4374,12 +4452,28 @@ impl DaemonRuntime {
     /// survived would authorize another repo's commands under a name the user
     /// approved somewhere else.
     ///
+    /// **Renamed from `drop_project_skill_grants` (REQ-587 TASK-217), because
+    /// the old name is now narrower than the effect.** TASK-215 widened the
+    /// gate's own drop from a `skill:project:` prefix to
+    /// `expires_on_session_root_change`, the shared predicate, which also
+    /// catches BR-4's project-skill *acknowledgment* — a key that is neither a
+    /// skill grant nor spelled with that prefix. A name that said "project
+    /// skill grants" would leave the next reader believing the acknowledgment
+    /// survives a `/cd`, which is precisely the belief ASSUME-017 was written
+    /// to prevent.
+    ///
+    /// The method it delegates to still carries the REQ-585 name:
+    /// `harness/permissions.rs` is TASK-215's file, and renaming a shipped
+    /// public method from here would be a change made outside the boundary that
+    /// owns its argument. The residue is one hop wide and is named here rather
+    /// than left for a reader to notice.
+    ///
     /// **A missing gate is nothing to do, not a gate to mint.** Reaching for
     /// [`Self::permission_gate_for`] here would create a session's gate at
     /// `/cd` time — snapshotting `[web] permission_allow` earlier than the first
     /// turn does — to then drop zero grants from it. A session that has never
     /// run a turn has remembered no answers.
-    fn drop_project_skill_grants(&self, session_id: &SessionId) -> usize {
+    fn drop_grants_expiring_on_root_change(&self, session_id: &SessionId) -> usize {
         self.session_gates
             .lock()
             .expect("session gate mutex poisoned")
@@ -20146,7 +20240,19 @@ permission_allow = [\"fetch_user_url\"]
                 ));
 
                 let tools = runtime
-                    .build_tools(&router, &events, &session, &gate, &config)
+                    .build_tools(
+                        &router,
+                        &events,
+                        &session,
+                        &gate,
+                        &config,
+                        // No skills and nobody to ask: these fixtures are about the
+                        // MCP and web halves of the registry, and an invented
+                        // `ConnectionId` here would prove nothing about the addressee
+                        // (TASK-217's own test drives a real one through the loop).
+                        Arc::new(crate::skills::SkillRegistry::default()),
+                        None,
+                    )
                     .await;
 
                 assert_eq!(
@@ -20220,7 +20326,19 @@ permission_allow = [\"fetch_user_url\"]
             };
             assert!(
                 runtime
-                    .build_tools(&router, &events, &session, &gate, &snapshot)
+                    .build_tools(
+                        &router,
+                        &events,
+                        &session,
+                        &gate,
+                        &snapshot,
+                        // No skills and nobody to ask: these fixtures are about the
+                        // MCP and web halves of the registry, and an invented
+                        // `ConnectionId` here would prove nothing about the addressee
+                        // (TASK-217's own test drives a real one through the loop).
+                        Arc::new(crate::skills::SkillRegistry::default()),
+                        None,
+                    )
                     .await
                     .get(WEB_TOOL_NAME)
                     .is_some(),
@@ -20231,7 +20349,19 @@ permission_allow = [\"fetch_user_url\"]
             // this, so the same call with the live snapshot has no web tool.
             assert!(
                 runtime
-                    .build_tools(&router, &events, &session, &gate, &live)
+                    .build_tools(
+                        &router,
+                        &events,
+                        &session,
+                        &gate,
+                        &live,
+                        // No skills and nobody to ask: these fixtures are about the
+                        // MCP and web halves of the registry, and an invented
+                        // `ConnectionId` here would prove nothing about the addressee
+                        // (TASK-217's own test drives a real one through the loop).
+                        Arc::new(crate::skills::SkillRegistry::default()),
+                        None,
+                    )
                     .await
                     .get(WEB_TOOL_NAME)
                     .is_none(),
@@ -20612,7 +20742,19 @@ max_page_bytes_from_the_future = 4096
                     Arc::clone(&runtime.pending),
                 ));
                 runtime
-                    .build_tools(&router, &events, &session, &gate, &config)
+                    .build_tools(
+                        &router,
+                        &events,
+                        &session,
+                        &gate,
+                        &config,
+                        // No skills and nobody to ask: these fixtures are about the
+                        // MCP and web halves of the registry, and an invented
+                        // `ConnectionId` here would prove nothing about the addressee
+                        // (TASK-217's own test drives a real one through the loop).
+                        Arc::new(crate::skills::SkillRegistry::default()),
+                        None,
+                    )
                     .await
                     .get(WEB_TOOL_NAME)
                     .is_some()
@@ -29124,7 +29266,7 @@ provider_id = \"deepseek\"
     /// REQ-585 TASK-204 — the two seams TASK-201 and TASK-203 could not reach
     /// from where they lived: the `/cd` grant drop, and the rebuild's position.
     ///
-    /// `skill_consent_matrix.rs` proves `drop_project_skill_grants` **works**;
+    /// `skill_consent_matrix.rs` proves the gate's own drop **works**;
     /// nothing proved anything *calls* it, which is the half that decides
     /// whether a grant survives a move. The gate lives behind a private
     /// `session_gates`, so the witness has to be in-crate.

@@ -2331,6 +2331,23 @@ mod tests {
     /// the same 47 B it always has, and the account of what was bought — and
     /// the note that REQ-586's recorded pair was 26 B high on both shapes — is
     /// `egress::redact`'s twin of this paragraph.
+    ///
+    /// **Recorded headroom at REQ-587:** 7,183 bytes, `spent` 10,459, margin
+    /// **805** — against an overhead raised 10 → 11 KiB by that REQ, with the
+    /// floor unmoved at 48 and this shape still the looser of the two by 47 B.
+    /// Both shapes pay the same **1,092**: 1,010 for the `skill` tool's docs
+    /// and schema at BR-2's worst-case roster, 82 for BR-8's third amendment to
+    /// the guide's capability sentence. The account of the raise — and of the
+    /// 931-byte cut it makes to every scanned route's budget — is
+    /// `egress::redact`'s twin of this paragraph.
+    ///
+    /// **This sweep now registers a `skill` tool too**, at that worst-case
+    /// roster, for the reason ADR-9 gives: `SkillTool` is registered per turn
+    /// from the session's registry, so neither sweep sees it unless it is put
+    /// there, and a sweep that cannot see it passes while the resident prompt
+    /// grows. Both sides of the figure were checked with the pad method
+    /// `docs/manual-verification.md` records: 757 bytes of filler leaves this
+    /// shape at exactly the floor and passes, 758 fails.
     #[tokio::test]
     async fn the_web_tool_docs_clear_the_outbound_body_overhead() {
         use teton_core::capability::{SearchGap, WebCapabilityState};
@@ -2339,7 +2356,7 @@ mod tests {
             MIN_PROMPT_HEADROOM_BYTES, REDACT_BODY_OVERHEAD_BYTES, REDACT_ESCAPING_DIVISOR,
         };
         use crate::harness::turn_loop::{
-            build_system_prompt, worst_case_session_root, HarnessConfig,
+            build_system_prompt, worst_case_session_root, HarnessConfig, SkillToolDocs,
         };
 
         let dir = temp_dir("budget");
@@ -2361,6 +2378,16 @@ mod tests {
             FakeSeam::new() as Arc<dyn WebLookupSeam>,
             Handle::current(),
         ));
+        // And the `skill` tool, at BR-2's worst-case roster (REQ-587 ADR-9).
+        // Registered in **both** sweeps or in neither: this one could build the
+        // real `SkillTool` — it has a runtime and a gate — but its twin in
+        // `egress::redact` is a sync `#[test]` and cannot, and two sweeps
+        // measuring two different worst cases is how they come to disagree
+        // about the budget they share. `SkillToolDocs` renders the shipped
+        // tool's own description and schema, pinned byte-identical by
+        // `skill::tests::the_doc_only_tool_and_the_real_one_render_one_set_of_prompt_bytes`.
+        let skill_docs = Arc::new(SkillToolDocs::worst_case());
+        tools.register_cap_exempt(Arc::clone(&skill_docs) as Arc<dyn Tool>);
 
         let base = HarnessConfig::for_strong_model();
         // Non-vacuity: the tool's docs really are in what is being measured.
@@ -2370,6 +2397,20 @@ mod tests {
         assert!(
             system.contains("\"query\""),
             "the schema is missing:\n{system}"
+        );
+        // The same for the `skill` tool, and for the same reason its twin gives:
+        // dropping the registration above *shrinks* the prompt, so every
+        // arithmetic assertion below would still pass while the sweep measured a
+        // resident prompt the daemon never builds.
+        assert!(
+            system.contains("- skill: "),
+            "the measured prompt carries no `skill` tool docs (REQ-587 ADR-9):\n{system}"
+        );
+        assert!(
+            system.contains(skill_docs.description()),
+            "the `skill` tool's docs are present without its worst-case roster, so the \
+             bytes that grow with the user's installed skills are unmeasured (REQ-587 \
+             BR-2):\n{system}"
         );
 
         // The two states this registry can be in: ready (docs, no clause) and

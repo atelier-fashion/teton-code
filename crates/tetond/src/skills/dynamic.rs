@@ -32,7 +32,7 @@
 use std::path::Path;
 use std::process::ExitStatus;
 
-use teton_protocol::events::NotRunReason;
+use teton_protocol::events::{DynamicOutcomeView, NotRunReason};
 
 use teton_protocol::methods::RefusalReason;
 
@@ -380,6 +380,51 @@ pub fn door_outcome(door: NotRunReason) -> DynamicOutcome {
         // `CouldNotStart`, which arrives as an *outcome* and not as a door —
         // and a future caller should meet a sentence here, not a panic.
         NotRunReason::CouldNotStart => DynamicOutcome::could_not_start(),
+    }
+}
+
+/// One command's typed record for BR-12's event, projected from the outcome the
+/// daemon actually produced (LESSON-544: the wire value is derived from the real
+/// one, never composed beside it).
+///
+/// `door` is `Some` when the consent closed one, and it is what a not-run arm
+/// reports: the daemon-side outcome carries its reason as prose for the model,
+/// and re-reading a [`NotRunReason`] out of that sentence would be a second
+/// parser of the daemon's own words (LESSON-529).
+///
+/// A command the runner could not **start** (`sh` unavailable, an unresolvable
+/// jail root) has no door either, and reports [`NotRunReason::CouldNotStart`].
+/// It is not folded into `Failed`: that would say it was attempted and exited,
+/// which is untrue and points a reader at the wrong fix. It is not folded into
+/// one of the consent's doors either — nobody refused it.
+#[must_use]
+pub fn outcome_view(
+    command: &Command,
+    outcome: &DynamicOutcome,
+    door: Option<NotRunReason>,
+) -> DynamicOutcomeView {
+    DynamicOutcomeView {
+        // File-supplied bytes on a surface: bounded and rendered on one line
+        // here, at the same ceiling the fold's echoed placeholder uses (BR-3).
+        command: teton_core::session_root::bounded_field(
+            command.as_str(),
+            crate::skills::expand::COMMAND_ECHO_MAX_CHARS,
+        ),
+        outcome: match outcome {
+            DynamicOutcome::Ran { output, .. } => teton_protocol::events::DynamicOutcome::Ran {
+                output_bytes: output.len() as u64,
+                truncated: outcome.output_truncated(),
+            },
+            DynamicOutcome::NotRun { .. } => teton_protocol::events::DynamicOutcome::NotRun {
+                reason: door.unwrap_or(NotRunReason::CouldNotStart),
+            },
+            DynamicOutcome::Failed { exit_status, .. } => {
+                teton_protocol::events::DynamicOutcome::Failed {
+                    exit_status: *exit_status,
+                }
+            }
+            DynamicOutcome::TimedOut => teton_protocol::events::DynamicOutcome::TimedOut,
+        },
     }
 }
 

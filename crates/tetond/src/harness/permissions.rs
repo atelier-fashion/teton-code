@@ -1098,6 +1098,24 @@ impl PermissionGate {
         }
     }
 
+    /// The session this gate answers for.
+    ///
+    /// Exposed for a holder that must publish *about* the same session it asks
+    /// about — the `skill` tool's BR-9 echo (REQ-587 TASK-217), which rides the
+    /// gate rather than a second pair of fields precisely so the record and the
+    /// consent cannot come to disagree about which session they belong to.
+    #[must_use]
+    pub fn session_id(&self) -> &SessionId {
+        &self.session_id
+    }
+
+    /// The bus this gate publishes its own prompts on, for the same holder and
+    /// the same reason as [`Self::session_id`].
+    #[must_use]
+    pub fn events(&self) -> &Arc<EventBus> {
+        &self.events
+    }
+
     /// This session's permission level, or `None` on a gate pinned to an exact
     /// table.
     #[must_use]

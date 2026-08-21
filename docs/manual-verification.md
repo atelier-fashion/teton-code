@@ -2112,6 +2112,10 @@ one, so before this REQ it was guaranteed to be cut.
 
 ## Recorded resident-prompt headroom after REQ-585
 
+**Superseded — see "Re-measured at REQ-587" below for the current figures.**
+This section is the record of what REQ-587 inherited and of how the
+measurement is taken; the table in it is REQ-585's tip, not today's.
+
 The number REQ-587 should read before it writes a resident sentence. Measured
 on this branch's tip with the two margin tests
 (`egress::redact::tests::the_total_cap_clears_the_harness_context_budget_with_margin`
@@ -2177,6 +2181,48 @@ off the table above, by arithmetic rather than a second measurement: 6,138 /
 9,414 / **826** and 6,091 / 9,367 / **873** as of TASK-209. The 4.0 KB `skills`
 topic itself, the `/help` section, the consent block, the echo line and the
 refusal message are tool results and CLI surfaces the prompt does not pay for.
+
+## Re-measured at REQ-587 — and the overhead moved
+
+REQ-587 spent **1,092** bytes against the 826 above, so the assumption moved
+rather than the margin absorbing it: `REDACT_BODY_OVERHEAD_BYTES` is **11 KiB**
+(10 → 11, the fourth such raise), the 48-byte floor is untouched, and both
+sweeps now register a `skill` tool at BR-2's worst-case roster.
+
+| shape | worst prompt | spent | margin |
+|---|---|---|---|
+| opted-out (no web tool) — the tighter | 7,230 | 10,506 | **758** |
+| opted-in (web tool docs + schema) | 7,183 | 10,459 | **805** |
+
+Where the 1,092 went, measured rather than reasoned:
+
+| line item | bytes |
+|---|---|
+| the `skill` tool's docs entry (description + schema) at a roster of `ROSTER_MAX_BYTES` = 512 | **1,010** |
+| BR-8's third amendment to the guide's capability sentence (238 → 320 on the file) | **82** |
+
+Verified two-sided on both shapes with the pad method below: **710** bytes of
+filler leaves the tighter shape at exactly the 48-byte floor and passes, 711
+fails; **757** and 758 are the same pair for the looser one. So **710 usable
+bytes** is the figure the next resident sentence reads.
+
+**Two things about this raise that the previous three did not carry.** The
+first is that a resident line now **grows with the user's tree** — the roster
+is the names of every model-invocable skill — which is why it is bounded by a
+byte cap and why both sweeps measure it *at* that cap rather than at whatever
+the developer's `~/.claude` holds. The second is that since REQ-586 the
+overhead has a production reader, so raising it narrowed every
+`[privacy] redact = true` route's byte budget:
+`REDACT_SCANNABLE_CONTEXT_BYTES` dropped **89,127 → 88,196**, a 931-byte cut to
+the budget BR-7's `bound: redact scan` refusal measures against. The chunk
+count is unchanged (2 × (32,768 + 11,264) = 88,064 ≤ 108,280; 88,064 / 27,070 =
+3.25 → 4). Both claims are asserted by
+`egress::redact::tests::the_overhead_raise_restates_the_chunk_count_and_the_scannable_bound`,
+because every other assertion about that bound is an inequality that holds
+either way — the cut is silent unless it is stated.
+
+REQ-584 contends for the same constant. It moves once; whichever REQ lands
+second re-measures against the moved value rather than moving it again.
 
 ## Sign-off
 
