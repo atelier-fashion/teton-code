@@ -163,7 +163,7 @@ use crate::egress::{
     LookupRequest, Provenance, RedactionGate, RedactionVerdict, TaintView,
 };
 use crate::grants::ConnectionId;
-use crate::harness::budget::{skill_fit, RouteBudget, SkillFit, SkillStage};
+use crate::harness::budget::{skill_fit, RouteBudget, SkillCaller, SkillFit, SkillStage};
 use crate::harness::completion::{context_provenance, RemoteProviderSource};
 use crate::harness::context::{NoopProvenanceHook, PressureReport};
 use crate::harness::permissions::{AddressedPermissionDelivery, SkillConsent};
@@ -3515,6 +3515,10 @@ impl DaemonRuntime {
         // below has run.
         if let Some(skill) = &skill_turn {
             if let SkillFit::TooLarge { message } = skill_fit(
+                // BR-8's two stages are the typed turn's, and only the typed
+                // turn's: a model-issued call is measured by the loop's
+                // `skill_append_fit`, never here.
+                SkillCaller::User,
                 SkillStage::Body,
                 &skill.name,
                 &system,
@@ -3573,6 +3577,7 @@ impl DaemonRuntime {
         // `CarriedTurn::begin`, for Stage A's reason.
         if let Some(skill) = &skill_turn {
             if let SkillFit::TooLarge { message } = skill_fit(
+                SkillCaller::User,
                 SkillStage::WithDynamicContext,
                 &skill.name,
                 &system,
@@ -3740,7 +3745,9 @@ impl DaemonRuntime {
                     // arriving over-window at a tier that has no fallback left.
                     let previous = route.budget.clone();
                     route = router.resolve_local_pin(reroute_after_block_reason(detail));
-                    if let Some(message) = skill_would_not_survive_refit(&skill_refit, &route) {
+                    if let Some(message) =
+                        skill_would_not_survive_refit(&skill_refit, typed_refit, &route)
+                    {
                         break 'turn Err(RpcError::new(
                             error_code::SKILL_EXPANSION_TOO_LARGE,
                             message,
@@ -3845,7 +3852,7 @@ impl DaemonRuntime {
                             let previous = route.budget.clone();
                             route = next;
                             if let Some(message) =
-                                skill_would_not_survive_refit(&skill_refit, &route)
+                                skill_would_not_survive_refit(&skill_refit, typed_refit, &route)
                             {
                                 break 'turn Err(RpcError::new(
                                     error_code::SKILL_EXPANSION_TOO_LARGE,
@@ -10360,6 +10367,17 @@ fn reroute_after_block_reason(detail: BlockDetail) -> String {
 /// refuses the turn: the answer does not improve by measuring the rest, and the
 /// sentence names the skill whose room is gone.
 ///
+/// # …and the list says who asked (REQ-587 BR-7)
+///
+/// `typed` is where the typed seed ends and the loop's own expansions begin —
+/// `run_prompt_turn`'s `typed_refit`, the index it already keeps so a second
+/// attempt rebuilds the tail rather than duplicating it. The refusal composer is
+/// caller-aware (`SkillCaller`), so the entry below the index is named `/big`
+/// and everything above it is named ``The `big` skill``. Passing a constant here
+/// is not a cosmetic slip: a model told it typed a slash command is invited to
+/// tell the user to type one back, and `/big` is a surface the model cannot use
+/// (BR-8).
+///
 /// # The refusal ends the turn, and that is a stated exception
 ///
 /// BR-6 and BR-9 say a refusal is a typed outcome the model can relay, and both
@@ -10373,21 +10391,38 @@ fn reroute_after_block_reason(detail: BlockDetail) -> String {
 /// and "never a crash, always relayable" carries this seam as its one exception.
 fn skill_would_not_survive_refit(
     skills: &[(String, String, String)],
+    typed: usize,
     route: &crate::router::Route,
 ) -> Option<String> {
-    skills.iter().find_map(|(name, text, system)| {
-        match skill_fit(
-            SkillStage::WithDynamicContext,
-            name,
-            system,
-            text,
-            &route.harness.budget,
-            route.provider_id.as_ref().map(|id| id.0.as_str()),
-        ) {
-            SkillFit::Fits => None,
-            SkillFit::TooLarge { message } => Some(message),
-        }
-    })
+    skills
+        .iter()
+        .enumerate()
+        .find_map(|(index, (name, text, system))| {
+            // Who asked, read off the boundary the list is already built around
+            // rather than from a second table: entries below `typed` are the
+            // typed seed `skill_turn` supplied, everything above it is what
+            // `model_invoked_expansions` appended. Without this the sentence
+            // told the model it had typed `/name` — the one confusion
+            // `SkillCaller` exists to prevent, on the one surface whose whole
+            // job is to be a true account of what happened.
+            let caller = if index < typed {
+                SkillCaller::User
+            } else {
+                SkillCaller::Model
+            };
+            match skill_fit(
+                caller,
+                SkillStage::WithDynamicContext,
+                name,
+                system,
+                text,
+                &route.harness.budget,
+                route.provider_id.as_ref().map(|id| id.0.as_str()),
+            ) {
+                SkillFit::Fits => None,
+                SkillFit::TooLarge { message } => Some(message),
+            }
+        })
 }
 
 /// Every expansion the **model** committed this turn, as the refit guard's

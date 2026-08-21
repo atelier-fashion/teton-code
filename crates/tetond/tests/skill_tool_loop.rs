@@ -41,6 +41,9 @@
 //! | AC-7: a body that names itself stops at `repeated`, not at the cap | [`a_body_that_names_itself_stops_at_the_repeat_refusal_not_at_the_cap`] |
 //! | AC-8: a 7,222-word expansion enters a 128k route whole | [`a_seven_thousand_word_expansion_enters_a_128k_route_whole_and_unelided`] |
 //! | AC-8: the same fixture on an undeclared window is refused, in the spoken bound | [`the_same_fixture_on_an_undeclared_window_is_refused_in_the_bounds_spoken_form`] |
+//! | BR-9: a typed refusal over a registered row publishes its own record | [`every_tool_raised_refusal_over_a_registered_skill_publishes_a_record`] |
+//! | BR-9: the cap's refusal publishes one too, with the count that refused it | [`the_thirteenth_call_of_a_turn_is_refused_by_the_cap_and_the_next_prompt_starts_over`] |
+//! | BR-9: a refusal with no skill file to describe publishes none | [`every_tool_raised_refusal_over_a_registered_skill_publishes_a_record`] (`unknown_skill`), [`a_run_of_listings_exhausts_the_per_turn_cap`] (no name at all) |
 //!
 //! ## Mutation table
 //!
@@ -53,6 +56,12 @@
 //! | the repeat rule keyed on the name alone, ignoring the arguments | [`a_body_that_names_itself_stops_at_the_repeat_refusal_not_at_the_cap`] |
 //! | the `skill` tool absent, or its expansion never folded | [`a_seven_thousand_word_expansion_enters_a_128k_route_whole_and_unelided`] |
 //! | the refusal spelling `BudgetBound::wire_name` instead of `words` | [`the_same_fixture_on_an_undeclared_window_is_refused_in_the_bounds_spoken_form`] |
+//! | `SkillTool::refuse` dropping its publish (any arm of it) | [`every_tool_raised_refusal_over_a_registered_skill_publishes_a_record`] |
+//! | `refuse` counting the call a second time beside the publish | [`every_tool_raised_refusal_over_a_registered_skill_publishes_a_record`] |
+//! | the record's lookup reaching for `resolve_for_model` instead of `registered_row` | [`every_tool_raised_refusal_over_a_registered_skill_publishes_a_record`] |
+//! | a refusal published with the *file's* dynamic outcomes on it | [`every_tool_raised_refusal_over_a_registered_skill_publishes_a_record`] |
+//! | the cap arm returning before `refuse`, as it did before BR-9's record | [`the_thirteenth_call_of_a_turn_is_refused_by_the_cap_and_the_next_prompt_starts_over`] |
+//! | a record invented for a call that named no skill | [`a_run_of_listings_exhausts_the_per_turn_cap`] |
 //!
 //! ## What is *not* here, and why
 //!
@@ -173,6 +182,30 @@ fn fixture_home() -> &'static Path {
             ".claude/skills/selfnamed/SKILL.md",
             "---\ndescription: a body that names itself\n---\n\n\
              Run `skill { name: \"selfnamed\" }` and then stop.\n",
+        );
+        // BR-3's hidden row, for BR-9's record: registered, with a real source,
+        // path and size, and refused to the model with `not_model_invocable`.
+        // It is **absent from the roster**, so adding it changes no figure the
+        // listing tests read.
+        //
+        // It carries a **dynamic command**, which nothing here ever runs: the
+        // refusal lands at resolution, above `expand_and_fold`. That is what
+        // makes "a refusal carries no outcomes" a claim with something behind
+        // it — a build that projected the *file's* slots onto the refusal record
+        // would put a `1 dynamic command` figure on a turn in which none ran.
+        home.write(
+            ".claude/skills/hidden/SKILL.md",
+            "---\ndescription: the user's to type\ndisable-model-invocation: true\n---\n\n\
+             Hidden body: !`echo never-run`\n",
+        );
+        // BR-2's third shadowing case: a file whose name a built-in command owns
+        // (`RESERVED_SKILL_NAMES`). Registered and listed by `/help` with a
+        // mark, never dispatchable, and refused to the model with
+        // `reserved_name` — the second row `resolve_for_model` refuses by design
+        // and a refusal record must still be able to name.
+        home.write(
+            ".claude/skills/cost/SKILL.md",
+            "---\ndescription: a name a built-in owns\n---\n\nCost body.\n",
         );
         // AC-8's synthetic `/proceed`: the measured word count, with a marker
         // at each end and one in the middle, so "whole" is a claim about the
@@ -533,6 +566,36 @@ async fn the_thirteenth_call_of_a_turn_is_refused_by_the_cap_and_the_next_prompt
         "the last admitted call is the {CAP}th, and the record says so: {published:?}"
     );
 
+    // **And the cap publishes its own record** (BR-9). The refusal is raised by
+    // `TurnState::admit` *before* the call is parsed, so `SkillTool::refuse`
+    // reads the subject back through `call_name` — the one parser — rather than
+    // off the `Refusal`: a capped call that named a skill still gets the record,
+    // carrying the turn count, which for this reason is the evidence for the
+    // refusal itself. It counts nothing: the figures above are unchanged.
+    let capped: Vec<&SkillInvoked> = published
+        .iter()
+        .filter(|invoked| invoked.refused.as_deref() == Some("per_turn_cap"))
+        .collect();
+    assert_eq!(
+        capped.len(),
+        1,
+        "the thirteenth call publishes exactly one refusal record: {published:?}"
+    );
+    assert_eq!(
+        (
+            capped[0].name.as_str(),
+            capped[0].turn_invocations.map(|t| (t.count, t.cap))
+        ),
+        ("step", Some((CAP as u32 + 1, CAP as u32))),
+        "the record names the skill the call named, and the count that refused \
+         it: {published:?}"
+    );
+    assert!(
+        capped[0].outcomes.is_empty(),
+        "nothing ran, so the cap refusal carries no dynamic outcomes: \
+         {published:?}"
+    );
+
     let refusal = tool_results(&h.vendor)
         .into_iter()
         .find(|content| content.contains("per_turn_cap"))
@@ -579,6 +642,7 @@ async fn a_run_of_listings_exhausts_the_per_turn_cap() {
     let repo = Tree::new("list");
     let h = Harness::with_window(Some(128_000));
     let session = h.session_at(repo.path());
+    let mut sub = h.events.subscribe(512);
 
     for _ in 0..=CAP {
         h.vendor.will_call_skill(None, "");
@@ -599,6 +663,20 @@ async fn a_run_of_listings_exhausts_the_per_turn_cap() {
         wire.iter().any(|content| content.contains("per_turn_cap")),
         "the call past the cap must be refused even though it asked for nothing \
          but the catalogue: {wire:#?}"
+    );
+
+    // **And this one publishes nothing, which is the honest answer** (BR-9). A
+    // listing names no skill, so the call past the cap names none either — and
+    // the record BR-9 asks for describes a skill *file*. There is none here to
+    // describe, and a record with an invented `source`, an empty path and a zero
+    // size would read on the session surface like a refusal of something real.
+    // The refusal is still not silent: the model reads it and relays it, and the
+    // session shows the tool call.
+    let published = invocations(&drain(&mut sub).await);
+    assert!(
+        published.is_empty(),
+        "a turn of nameless calls describes no skill file, so it publishes no \
+         `skill_invoked` at all: {published:?}"
     );
 }
 
@@ -697,6 +775,154 @@ async fn a_body_that_names_itself_stops_at_the_repeat_refusal_not_at_the_cap() {
         "the cap is not what stopped a self-naming body — the repeat rule is, \
          and it fires eleven calls earlier: {wire:#?}"
     );
+}
+
+// ---------------------------------------------------------------------------
+// BR-9 — a typed refusal is never silent on the session surface
+// ---------------------------------------------------------------------------
+
+/// **BR-9: a typed refusal the *tool* raises publishes its own record, and the
+/// one that names no registered skill publishes none.**
+///
+/// The Events table says a model invocation refused *for any typed reason* gets
+/// a record, and the client has a rendered sentence for every one of the seven
+/// (`session_ui::refusal_reason_words`). Only the loop's two `over_budget`
+/// refusals ever reached it: everything through `Refusal::into_outcome` was
+/// silent, so a user watching a session saw a `skill <name> [failed]` tool line
+/// and was never told which call it was or why. TASK-222 recorded that gap;
+/// this is the fix, driven from the loop rather than from `SkillTool::invoke`,
+/// because what is under test is that the *published* record reaches the bus.
+///
+/// Five calls, four of them refused, chosen so each exercises a different way
+/// `registered_row` has to find the file a refusal is about:
+///
+/// * `step` twice — `repeated`, over a row the model's own resolver returns;
+/// * `zzz` — `unknown_skill`, over a name **no** row carries, which is the one
+///   reason with a skill named in it and no skill to name. `SkillInvoked`
+///   requires a `source`, a `path_display` and a `body_bytes`, and
+///   `SkillSource` is a closed two-variant enum, so a record here would have to
+///   choose a root the file was never found under. It publishes none;
+/// * `hidden` — `not_model_invocable`, a registered row `resolve_for_model`
+///   refuses **by design**, which is why the record's lookup is not that
+///   resolver;
+/// * `cost` — `reserved_name`, a registered row that is not dispatchable at
+///   all, which is `registered_row`'s other branch.
+///
+/// The negatives are as load-bearing as the positives: a refusal record must
+/// carry **no** outcomes and must say it was refused, or it is byte-identical to
+/// a command-free skill that ran and the session prints a refusal as a success
+/// (that is what the `refused` field is for, and what TASK-219's renderer keys
+/// on). The `hidden` fixture carries a `` !`echo` `` slot nothing here ever
+/// runs, so "no outcomes" is a claim a build that projected the *file's* slots
+/// onto the record would fail rather than one no mutation can reach.
+///
+/// The other two reasons are elsewhere, because they need a different script:
+/// `per_turn_cap` in
+/// [`the_thirteenth_call_of_a_turn_is_refused_by_the_cap_and_the_next_prompt_starts_over`]
+/// (it publishes, naming the skill the capped call named) and
+/// [`a_run_of_listings_exhausts_the_per_turn_cap`] (a capped call that named
+/// nothing publishes nothing). `invalid_arguments` needs a malformed call the
+/// scripting verb here cannot compose; it takes the same door and the same
+/// `call_name` lookup, which for a failed parse yields `None`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn every_tool_raised_refusal_over_a_registered_skill_publishes_a_record() {
+    let repo = Tree::new("refrec");
+    let h = Harness::with_window(Some(128_000));
+    let session = h.session_at(repo.path());
+    let mut sub = h.events.subscribe(512);
+
+    h.vendor.will_call_skill(Some("step"), "once");
+    h.vendor.will_call_skill(Some("step"), "once");
+    h.vendor.will_call_skill(Some("zzz"), "");
+    h.vendor.will_call_skill(Some("hidden"), "");
+    h.vendor.will_call_skill(Some("cost"), "");
+    h.turn(&session, "try every door", None)
+        .await
+        .expect("a refused call is a tool result, and the turn goes on");
+
+    let published = invocations(&drain(&mut sub).await);
+    let refusals: Vec<&SkillInvoked> = published
+        .iter()
+        .filter(|invoked| invoked.refused.is_some())
+        .collect();
+    let reasons: Vec<(&str, &str)> = refusals
+        .iter()
+        .map(|invoked| {
+            (
+                invoked.name.as_str(),
+                invoked.refused.as_deref().unwrap_or_default(),
+            )
+        })
+        .collect();
+    assert_eq!(
+        reasons,
+        vec![
+            ("step", "repeated"),
+            ("hidden", "not_model_invocable"),
+            ("cost", "reserved_name"),
+        ],
+        "each typed refusal over a registered row publishes one record, in the \
+         order the calls were made: {published:?}"
+    );
+
+    // The one with nothing to name publishes nothing — not a hollow record with
+    // an invented source.
+    assert!(
+        published.iter().all(|invoked| invoked.name != "zzz"),
+        "`unknown_skill` names a skill this session does not have, so there is \
+         no file to describe and no record to publish: {published:?}"
+    );
+
+    // A refusal record is not an invocation record.
+    for invoked in &refusals {
+        assert!(
+            invoked.outcomes.is_empty(),
+            "nothing ran, so a refusal carries no dynamic outcomes: {invoked:?}"
+        );
+        assert_eq!(
+            invoked.invoked_by,
+            teton_protocol::events::InvokedBy::Model,
+            "every refusal here is the model's call: {invoked:?}"
+        );
+    }
+
+    // BR-6a's count is untouched: `admit` counted every one of these five calls
+    // on the way in, and publishing a record counts nothing a second time.
+    assert_eq!(
+        published
+            .last()
+            .and_then(|invoked| invoked.turn_invocations)
+            .map(|t| t.count),
+        Some(5),
+        "the five calls of this turn are five, not ten: publishing a refusal \
+         must not count it again: {published:?}"
+    );
+
+    // Non-vacuity: the one call that was *not* refused expanded, so this is a
+    // turn in which the tool worked rather than one in which it was never
+    // reached.
+    assert_eq!(
+        published
+            .iter()
+            .filter(|invoked| invoked.refused.is_none())
+            .count(),
+        1,
+        "exactly one of the five calls expands: {published:?}"
+    );
+    let wire = tool_results(&h.vendor);
+    for reason in [
+        "repeated",
+        "unknown_skill",
+        "not_model_invocable",
+        "reserved_name",
+    ] {
+        let head = format!("ERROR: {reason}:");
+        assert!(
+            wire.iter().any(|content| content.contains(&head)),
+            "the model's half of the refusal is unchanged — `{reason}` is \
+             missing from the wire: {wire:#?}"
+        );
+    }
 }
 
 // ---------------------------------------------------------------------------

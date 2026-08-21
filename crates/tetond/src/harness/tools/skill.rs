@@ -728,11 +728,51 @@ impl Refusal {
     /// `UntrustedData`, never `Data`: a refusal carrying the roster carries
     /// file-authored `description` bytes, and `skill` is out of
     /// `UNTRUSTED_OUTPUT_TOOLS` by design, so `Data` would leave them unframed.
+    ///
+    /// **This composes the *model's* half only.** The human's half is the
+    /// `SkillInvoked` record, published by [`SkillTool::refuse`] — which is the
+    /// one door every arm of [`SkillTool::invoke`] leaves through, so a new
+    /// refusal cannot be added silent.
     #[must_use]
     pub fn into_outcome(self, registry: &SkillRegistry) -> ToolOutcome {
         ToolOutcome::error(self.message(registry))
             .with_disposition(ResultDisposition::UntrustedData)
     }
+}
+
+/// The registry row a refusal's record describes, or `None` when nothing of
+/// that name is registered (REQ-587 BR-9).
+///
+/// **Not a resolver, and named so it cannot be mistaken for one.** ADR-12 gave
+/// the registry exactly two — `dispatchable_by_user` and `invocable_by_model` —
+/// and this is neither: nothing dispatches from it, and a caller reaching for it
+/// to *run* a skill would run one the model may not invoke. Its only question is
+/// which file a refusal line is talking about, and it therefore admits the rows
+/// the model's resolver refuses: a row hidden by `disable-model-invocation`
+/// (`not_model_invocable`) and a row a built-in shadows (`reserved_name`) are
+/// both registered files with a real source, path and size, and a refusal that
+/// could not name them would be the silence this closes.
+///
+/// The dispatchable row wins where a name has more than one, because that is the
+/// file `/help` lists and the one a user recognizes; `assemble` admits at most
+/// one, so this is a tie-break that only ever fires between a winner and a
+/// shadowed loser.
+///
+/// `None` is `unknown_skill`'s answer and the reason it publishes no record.
+/// [`SkillSource`] is a closed two-variant enum and `SkillInvoked::source` is
+/// required, so a record for a name nothing registers would have to *choose* a
+/// root the file was never found under, print a `path_display` of nothing and a
+/// `body_bytes` of zero, and assert a `model_invocable` flag no frontmatter
+/// wrote. A hollow record that reads like a real one is worse on the session
+/// surface than no record beside a `skill <name> [failed]` tool-call line, which
+/// is what that case already shows.
+fn registered_row<'a>(registry: &'a SkillRegistry, name: &str) -> Option<&'a Skill> {
+    let mut rows = registry.skills().iter().filter(|skill| skill.name == name);
+    let first = rows.next()?;
+    if first.is_dispatchable() {
+        return Some(first);
+    }
+    Some(rows.find(|skill| skill.is_dispatchable()).unwrap_or(first))
 }
 
 /// What a closed acknowledgment door reads as in the model's sentence.
@@ -965,6 +1005,65 @@ impl SkillTool {
         self.publish_invocation(skill, &display, &[], &[], None, Some(reason));
     }
 
+    /// Refuse this call: publish BR-9's record, then compose the model's result.
+    ///
+    /// **The one door out of [`Self::invoke`]'s refusal arms**, so that "every
+    /// typed reason gets a record" is a property of the shape rather than of
+    /// five arms each remembering. Before this existed only the *loop's* two
+    /// `over_budget` refusals published, and every reason the **tool** raises —
+    /// `unknown_skill`, `not_model_invocable`, `reserved_name`, `repeated`,
+    /// `per_turn_cap`, `invalid_arguments`, `project_not_acknowledged` — was
+    /// silent on the session surface: the client had a rendered sentence for
+    /// each of the seven (`session_ui::refusal_reason_words`) and the daemon
+    /// reached none of them.
+    ///
+    /// # It counts nothing
+    ///
+    /// [`TurnState::admit`] counted this call on the way in, at the top of
+    /// `invoke`, and it counted it *before* deciding whether to refuse it —
+    /// which is why [`Self::note_loop_refusal`] exists as a separate entry point
+    /// for the loop's refusals, which never reach `admit` at all. Counting here
+    /// too would charge a refused call twice and move the numbers
+    /// `the_thirteenth_call_of_a_turn_is_refused_by_the_cap_and_the_next_prompt_starts_over`
+    /// reads.
+    ///
+    /// # What it publishes, and the two shapes it does not
+    ///
+    /// The record is the same one [`Self::publish_refusal`] writes — no
+    /// commands, no outcomes, `refused` set — so the client renders it through
+    /// the refusal line that opens with the verdict and drops the body size and
+    /// the dynamic-command count, both of which are true of the file and false
+    /// of this turn.
+    ///
+    /// The subject is read back through [`call_name`] — the **one** parser,
+    /// the same reading the loop's Stage B refusal names its skill by — rather
+    /// than off the [`Refusal`] variants, so "which skill is this record about"
+    /// has one answer for all seven reasons instead of a second name source that
+    /// can drift from the first. It also reaches the one refusal raised *before*
+    /// the call is parsed at all: [`Refusal::PerTurnCap`] comes out of
+    /// [`TurnState::admit`] with nothing resolved, and a capped call that did
+    /// name a skill still gets the record BR-9 asks for — with the turn count
+    /// `/verbose` renders, which for the cap is the evidence for the refusal
+    /// itself.
+    ///
+    /// Nothing here fabricates. Two calls have no subject and publish nothing
+    /// rather than a hollow record: a call with no name at all (a listing past
+    /// the cap, and [`Refusal::InvalidArguments`], which *is* the parse
+    /// failing), and a name no registry row carries — `unknown_skill`, whose
+    /// reason is on [`registered_row`].
+    fn refuse(&self, args: &Value, refusal: Refusal) -> ToolOutcome {
+        if let Some(skill) = call_name(args)
+            .as_deref()
+            // Not `resolve_for_model`: two of these reasons are *about* a row
+            // that resolver refuses by design.
+            .and_then(|name| registered_row(&self.registry, name))
+        {
+            let display = display_for(&skill.path, home().as_deref());
+            self.publish_invocation(skill, &display, &[], &[], None, Some(refusal.reason()));
+        }
+        refusal.into_outcome(&self.registry)
+    }
+
     /// The whole orchestration, async because the consent round-trips are.
     ///
     /// Separate from [`Tool::run`] — which is only the sync→async bridge — so
@@ -973,13 +1072,20 @@ impl SkillTool {
     pub(crate) async fn invoke(&self, ctx: &ToolContext, args: &Value) -> ToolOutcome {
         // BR-6a, first and unconditionally: every call counts, including the
         // one this refuses.
-        if let CallVerdict::PerTurnCap = self.turn_state().admit() {
-            return Refusal::PerTurnCap.into_outcome(&self.registry);
+        //
+        // Read into a local rather than matched in place: an `if let` holds its
+        // scrutinee's temporary — here a `MutexGuard` over the turn state — for
+        // the whole block, and `refuse` below takes that same lock to render
+        // BR-9's `/verbose` count. The binding is what makes the guard drop
+        // before the arm runs.
+        let verdict = self.turn_state().admit();
+        if let CallVerdict::PerTurnCap = verdict {
+            return self.refuse(args, Refusal::PerTurnCap);
         }
 
         let call = match Call::parse(args) {
             Ok(call) => call,
-            Err(refusal) => return refusal.into_outcome(&self.registry),
+            Err(refusal) => return self.refuse(args, refusal),
         };
 
         // BR-1: no name is a **listing**, not a refusal.
@@ -990,13 +1096,16 @@ impl SkillTool {
 
         let skill = match resolve_for_model(&self.registry, &name) {
             Ok(skill) => skill,
-            Err(refusal) => return refusal.into_outcome(&self.registry),
+            Err(refusal) => return self.refuse(args, refusal),
         };
 
         // BR-6b, after resolution and before any expansion: a repeat costs a
-        // call but no work.
-        if self.turn_state().is_repeat(&name, &call.args) {
-            return Refusal::Repeated { name }.into_outcome(&self.registry);
+        // call but no work. The answer is read into a local for the reason the
+        // cap check above is: the guard must be dropped before `refuse` asks
+        // for it again.
+        let repeat = self.turn_state().is_repeat(&name, &call.args);
+        if repeat {
+            return self.refuse(args, Refusal::Repeated { name });
         }
 
         // BR-4: repository content reaching the model labelled *instructions*
@@ -1004,7 +1113,7 @@ impl SkillTool {
         // expander is asked, so a refused acknowledgment runs no command.
         if skill.source == SkillSource::Project {
             if let Err(refusal) = self.acknowledge_project(ctx, &name).await {
-                return refusal.into_outcome(&self.registry);
+                return self.refuse(args, refusal);
             }
         }
 

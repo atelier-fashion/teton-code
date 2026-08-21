@@ -4239,26 +4239,39 @@ async fn a_reroute_after_a_committed_model_expansion_refuses_rather_than_eliding
         err.message
     );
     assert!(
-        err.message
-            .contains("big` does not fit this route's context budget"),
+        err.message.contains("`big`")
+            && err
+                .message
+                .contains("does not fit this route's context budget"),
         "the refusal names the skill whose room is gone: {}",
         err.message
     );
-    // **A recorded defect, pinned so it cannot be lost.** `skill_would_not_
-    // survive_refit` calls `skill_fit`, which hard-codes `SkillCaller::User`,
-    // so a *model*-invoked expansion caught at a reroute is described to the
-    // user as `/big` — a slash command nobody typed. The composer is already
-    // caller-aware (`SkillCaller::subject`) and the reroute site is the one
-    // caller that does not pass one; `skill_refit`'s `typed_refit` index
-    // already says which entries are the model's. TASK-222 is the suites and
-    // does not change the production line, so what ships is asserted here with
-    // its name on it. **If you are fixing it: delete this assertion**, keep the
-    // one above, and note the change in the REQ.
+    // **And it names the caller who actually asked.** TASK-222 recorded the
+    // opposite as a defect: `skill_would_not_survive_refit` called `skill_fit`,
+    // which hard-coded `SkillCaller::User`, so a *model*-invoked expansion
+    // caught here was described as `/big` — a slash command nobody typed, and a
+    // surface the model cannot use (BR-8). The guard now reads the caller off
+    // `typed_refit`, the index `run_prompt_turn` already keeps.
+    //
+    // Mutation: put `SkillCaller::User` back at the reroute and this fails.
     assert!(
-        err.message.starts_with("`/big`"),
-        "today the reroute guard names a model-invoked expansion with the user \
-         caller's `/` prefix; if this is now `big`, the defect above is fixed \
-         and this assertion is what you delete: {}",
+        err.message.starts_with("The `big` skill"),
+        "a model-invoked expansion refused at a reroute must be named as the \
+         model's, not as a `/name` the user typed: {}",
+        err.message
+    );
+    assert!(
+        !err.message.contains("`/big`"),
+        "the user caller's slash spelling reached a model-issued call: {}",
+        err.message
+    );
+    // The consequence clause forks with the subject and is the other half of
+    // the same fact: a provider *has* seen this turn — it is what produced the
+    // call — so the user arm's "no provider saw this turn" would be false here.
+    assert!(
+        err.message
+            .contains("Nothing was folded into this conversation"),
+        "the model arm's consequence must travel with the model's subject: {}",
         err.message
     );
     // The expansion really was committed before the reroute — otherwise the
@@ -4279,6 +4292,78 @@ async fn a_reroute_after_a_committed_model_expansion_refuses_rather_than_eliding
         2,
         "the turn continued onto the fallback, so the guard did not fire and \
          the committed expansion was refitted behind the model's back"
+    );
+}
+
+/// **The negative half of the caller fix: a *typed* `/name` refused at the same
+/// reroute is still the user's, and still reads `/big`.**
+///
+/// Threading a caller through the guard has an obvious wrong answer — hand it
+/// `SkillCaller::Model` unconditionally, which turns every one of these
+/// assertions green in the sibling above while telling a user who typed
+/// `/big` that "the `big` skill" did not fit and that they should *say what they
+/// tried to run*. The two tests are the same script with one difference — who
+/// asked — so only a guard that actually reads `typed_refit` passes both.
+///
+/// Same shape as the sibling: a roomy primary, a fallback at the floor, and one
+/// scripted failure between them. The expansion is the *seed* here rather than a
+/// mid-loop fold, so it is in the refit list from the first line of
+/// `run_prompt_turn` — index 0, below `typed_refit`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_reroute_after_a_typed_expansion_still_names_it_as_the_slash_command_the_user_typed() {
+    let repo = Tree::new("rerouteu");
+    model_invocable_skill(&repo, "big", &format!("Head.\n{}\nTail.\n", filler(20_000)));
+    let h = Harness::with_fallback(128_000, 1);
+    let session = h.session_at(repo.path());
+    h.at_level(&session, PermissionLevel::Full);
+    // No `will_call_skill`: the *user* typed it, so the first request already
+    // carries the expansion and the 404 is what follows it.
+    h.vendor.will_fail();
+    h.vendor.will_say("rerouted and finished", 5, 2);
+
+    let err = h
+        .turn(&session, "", Harness::invoke("big", ""))
+        .await
+        .expect_err("the typed expansion cannot survive the fallback's budget");
+
+    assert_eq!(
+        err.code,
+        error_code::SKILL_EXPANSION_TOO_LARGE,
+        "the reroute guard must refuse a typed turn by name too: {}",
+        err.message
+    );
+    assert!(
+        err.message.starts_with("`/big`"),
+        "a user who typed `/big` must read it back in the form they typed: {}",
+        err.message
+    );
+    assert!(
+        !err.message.contains("The `big` skill"),
+        "the model caller's spelling reached a turn the user typed: {}",
+        err.message
+    );
+    // The user arm's consequence, which is the clause that makes `-32023`
+    // different from `-32022` and which the model arm cannot borrow.
+    assert!(
+        err.message
+            .contains("Nothing was sent and no provider saw this turn"),
+        "the user arm's consequence must travel with the user's subject: {}",
+        err.message
+    );
+    // Non-vacuity, exactly as the sibling's: the expansion did reach the
+    // provider on the attempt that failed, so the guard had something to
+    // measure and the fallback was never served.
+    assert!(
+        on_the_wire(&h).contains("Head."),
+        "the typed expansion never reached the provider, so this is a test \
+         about an empty list:\n{}",
+        on_the_wire(&h)
+    );
+    assert_eq!(
+        h.vendor.hits(),
+        1,
+        "the turn continued onto the fallback, so the guard did not fire and \
+         the typed expansion was refitted behind the user's back"
     );
 }
 

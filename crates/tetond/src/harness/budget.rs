@@ -818,7 +818,20 @@ impl SkillCaller {
 /// than re-checked, because a second copy of that predicate here would be
 /// LESSON-528's shape: the precondition belongs at the seam that establishes
 /// it, and mirroring the body without it is what drifts.
+///
+/// # Why `caller` is a parameter here too
+///
+/// BR-8's two stages are the user's alone — a typed `/name` is the only thing
+/// that can be measured as a *seed* before a turn exists — so this took
+/// [`SkillCaller::User`] as a constant. The reroute guard then reached for it
+/// (`runtime.rs`'s `skill_would_not_survive_refit`), and every model-invoked
+/// expansion caught there was described to the model as `/name`: a slash command
+/// nobody typed, on the one surface whose job is to say truthfully what
+/// happened. The constant is therefore a parameter, exactly as
+/// [`skill_append_fit`]'s is, and for the same reason — the *composer* is what
+/// is caller-aware, not the entry point.
 pub fn skill_fit(
+    caller: SkillCaller,
     stage: SkillStage,
     skill: &str,
     system: &str,
@@ -836,7 +849,7 @@ pub fn skill_fit(
         return SkillFit::Fits;
     }
     SkillFit::TooLarge {
-        message: skill_refusal(SkillCaller::User, stage, skill, fit, budget, provider_id),
+        message: skill_refusal(caller, stage, skill, fit, budget, provider_id),
     }
 }
 
@@ -1837,7 +1850,15 @@ mod tests {
         budget: &RouteBudget,
         provider_id: Option<&str>,
     ) -> String {
-        match skill_fit(stage, skill, system, text, budget, provider_id) {
+        match skill_fit(
+            SkillCaller::User,
+            stage,
+            skill,
+            system,
+            text,
+            budget,
+            provider_id,
+        ) {
             SkillFit::TooLarge { message } => message,
             SkillFit::Fits => {
                 panic!("`/{skill}` was admitted on a route this test needs it refused on")
@@ -1916,7 +1937,15 @@ mod tests {
         ];
 
         for (route, budget, skill, body, expect_fits) in rows {
-            let fit = skill_fit(SkillStage::Body, skill, &system, body, budget, Some("kimi"));
+            let fit = skill_fit(
+                SkillCaller::User,
+                SkillStage::Body,
+                skill,
+                &system,
+                body,
+                budget,
+                Some("kimi"),
+            );
             assert_eq!(
                 fit == SkillFit::Fits,
                 *expect_fits,
@@ -2160,6 +2189,7 @@ mod tests {
         // the user is asked for consent and the commands run.
         assert_eq!(
             skill_fit(
+                SkillCaller::User,
                 SkillStage::Body,
                 "status",
                 &system,
@@ -2460,7 +2490,15 @@ mod tests {
         };
 
         assert_eq!(
-            skill_fit(SkillStage::Body, "status", SYSTEM, &body, &stamped, None),
+            skill_fit(
+                SkillCaller::User,
+                SkillStage::Body,
+                "status",
+                SYSTEM,
+                &body,
+                &stamped,
+                None
+            ),
             SkillFit::Fits,
             "non-vacuity: this body fits this route as a seed"
         );
@@ -2488,6 +2526,7 @@ mod tests {
         let system = real_system_prompt();
         assert_eq!(
             skill_fit(
+                SkillCaller::User,
                 SkillStage::Body,
                 "status",
                 &system,

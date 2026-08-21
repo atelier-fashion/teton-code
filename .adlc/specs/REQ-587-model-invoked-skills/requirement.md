@@ -1155,21 +1155,28 @@ the CLI renders each as one line (BR-9).
   retry a way to fold a result back into the loop it just left. Driven, not
   assumed, since TASK-222:
   `skill_turn.rs::a_reroute_after_a_committed_model_expansion_refuses_rather_than_eliding_it`.
-- **Two defects TASK-222 found and recorded rather than fixed**, both pinned by
-  an assertion that names itself so the fixer finds it:
-  - the reroute guard's sentence calls a **model**-invoked expansion `/big`,
-    because `skill_would_not_survive_refit` calls `skill_fit`, which hard-codes
-    `SkillCaller::User`. The composer is already caller-aware and
-    `skill_refit`'s `typed_refit` index already says which entries are the
-    model's, so this is a parameter, not a design change;
-  - a typed refusal the **tool** raises (`unknown_skill`,
-    `not_model_invocable`, `reserved_name`, `invalid_arguments`, `repeated`,
-    `per_turn_cap`, `project_not_acknowledged`) publishes **no** `skill_invoked`
-    record, so the session prints nothing for it. Only the loop's two
-    `over_budget` refusals publish. BR-9 and the Events table say *any* typed
-    reason gets a record, and the client already renders every one of them
-    (`session_ui::refusal_reason_words`), so the renderer has arms the daemon
-    never reaches.
+- **A refusal that names no registered skill carries no record — a decision,
+  not the gap TASK-222 recorded.** Both of that task's defects are fixed: the
+  reroute guard now names the caller who actually asked (`SkillCaller` threaded
+  through `skill_fit`, read off the `typed_refit` index), and every typed
+  refusal the tool raises publishes its `skill_invoked` record through the one
+  door out of `SkillTool::invoke` — `repeated`, `not_model_invocable`,
+  `reserved_name`, `project_not_acknowledged` and `per_turn_cap` all reach the
+  session surface, and the client's `refusal_reason_words` arms are reached
+  rather than dead. Two cases still publish none, because the record describes a
+  skill **file** — a `source` (a closed two-variant enum), a path and a body
+  size — and there is no file behind them: a call that named **nothing** (a
+  listing refused by the cap; `invalid_arguments`, which *is* the parse failing)
+  and `unknown_skill`, whose name no registry row carries, so every identifying
+  field but the model's own spelling would have to be invented. Both are still
+  relayed to the model as typed reasons and both still show as a `skill …
+  [failed]` tool-call line; what is missing is the `refused: …` sentence naming
+  why. Closing it means a record whose subject is a *name* rather than a file —
+  a second event, or an optional `source` — a protocol change this REQ does not
+  propose. Driven, not assumed:
+  `skill_tool_loop.rs::every_tool_raised_refusal_over_a_registered_skill_publishes_a_record`,
+  `…::the_thirteenth_call_of_a_turn_is_refused_by_the_cap_and_the_next_prompt_starts_over`
+  and `…::a_run_of_listings_exhausts_the_per_turn_cap`.
 
 ## Validation
 

@@ -52,7 +52,7 @@
     "teton-code"
   ],
   "phase4": {
-    "currentTask": "TIER-5: TASK-222",
+    "currentTask": "post-tier fixes: reroute caller + tool-raised refusal publish",
     "completedTasks": [
       "TASK-210",
       "TASK-211",
@@ -65,7 +65,8 @@
       "TASK-219",
       "TASK-217",
       "TASK-221",
-      "TASK-218"
+      "TASK-218",
+      "TASK-222"
     ],
     "failedTasks": []
   }

@@ -7072,25 +7072,34 @@ fn on_a_pipe_at_guarded_a_model_issued_project_skill_is_refused_without_eating_t
          succeed; output:\n{stdout}"
     );
 
-    // **A recorded gap, pinned so it cannot be lost.** BR-9 and the spec's
-    // Events table say a model invocation refused *for any typed reason* gets a
-    // record, and the client can already render every one of them
-    // (`session_ui::refusal_reason_words` has arms for `unknown_skill`,
-    // `not_model_invocable`, `reserved_name`, `invalid_arguments`,
-    // `project_not_acknowledged`, `repeated` and `per_turn_cap`). The daemon
-    // publishes a `SkillInvoked` only for the two refusals the **loop** raises
-    // (`SkillTool::note_loop_refusal` / `publish_refusal`, both
-    // `over_budget`); every refusal the **tool** raises returns through
-    // `Refusal::into_outcome`, which publishes nothing. So a user watching this
-    // session is told the permission request was refused and that a tool call
-    // failed, and is never told which skill call it was or why in the tool's own
-    // words. **If you are fixing it: publish from `into_outcome` (or beside
-    // it), delete this assertion and assert the line instead.**
+    // **And the refusal names itself, in the tool's own words** (BR-9, the
+    // Events table). TASK-222 recorded the opposite as a gap: the daemon
+    // published a `SkillInvoked` only for the two refusals the **loop** raises
+    // (`SkillTool::note_loop_refusal` / `publish_refusal`, both `over_budget`),
+    // while every refusal the **tool** raises returned through
+    // `Refusal::into_outcome` and published nothing — so this client had a
+    // rendered sentence for all seven reasons (`session_ui::
+    // refusal_reason_words`) and the daemon reached none of them. It now
+    // publishes from `SkillTool::refuse`, the one door out of `invoke`'s refusal
+    // arms, and this is that record arriving through a real socket at a real
+    // client.
+    //
+    // Mutation: drop the publish from `refuse` and this line disappears.
     assert!(
-        !stdout.contains("refused: skill scratch (project)"),
-        "the daemon now publishes a record for a tool-raised typed refusal — \
-         that is the gap this assertion recorded, so delete it and assert the \
-         `refused: …` line instead; output:\n{stdout}"
+        stdout.contains(
+            "refused: skill scratch (project) — this repository's skills have not been \
+             acknowledged for this session"
+        ),
+        "a typed refusal must say which skill call it was and why, not leave \
+         the user with a failed tool line; output:\n{stdout}"
+    );
+    // A refusal record is **not** an invocation record: the file's size and its
+    // dynamic-command count are true of the file and false of this turn —
+    // nothing of it entered the context — so the line drops both.
+    assert!(
+        !stdout.contains("skill scratch (project, "),
+        "the refusal rendered as the invocation line with a flag on it, which \
+         at a glance reads as a skill that ran; output:\n{stdout}"
     );
     assert!(
         !stdout.contains("PROJECT-BODY-MARKER"),
