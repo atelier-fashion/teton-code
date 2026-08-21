@@ -140,7 +140,7 @@ _Shapes below are illustrative — the field names and variant names are what
 |--------|-------|------|-------------|
 | Skill (discovered command) | name | string | the directory name (`skills/<name>/SKILL.md`) or file stem (`commands/<name>.md`); must match `^[a-z0-9][a-z0-9_-]{0,63}$`; a frontmatter `name` that differs creates no second spelling |
 | Skill | source | `user` / `project` | which of the two roots it was found under; `project` is derived from the session root (REQ-583's `SessionRoot`) and re-derived when it changes; when the project root resolves to the user root (a `home`-kind session), project discovery is skipped rather than duplicating every skill |
-| Skill | path | string | the file actually read; shown home-relative (the `SessionRoot.display` convention), never as an absolute path that carries a username into a transcript or a remote payload |
+| Skill | path | string | the file actually read; **shown relative, never absolute** — a `project` skill relative to the session root (`.claude/skills/x/SKILL.md`), a `user` skill relative to the home folder (`~/.claude/skills/x/SKILL.md`, the `SessionRoot.display` convention), and only where neither base applies whatever is left, bounded. An absolute path carries a username, or the location of the user's working tree, into a transcript or a remote payload. Amended 2026-08-21 (BUG-187): the original row said "home-relative" alone, which no rule could deliver for a session root outside `$HOME` — a CI workspace, an external volume, `/tmp` — where a project skill's path was rendered absolute. The base is chosen by the skill's **source**, not by whichever prefix happens to match: a session rooted at an ancestor of `$HOME` (`/`, `/Users`) must not spell a user skill `Users/jane/.claude/…` |
 | Skill | description | string | from frontmatter; one line, truncated to 200 chars after sanitization (5 of 17 ADLC descriptions are longer); rendered only through the `Surface` seam |
 | Skill | argument_hint | string? | from frontmatter `argument-hint`; shown in `/help` |
 | Skill | body | string | everything after the frontmatter; ≤ 64 KiB or the skill is skipped with a reason |
@@ -240,7 +240,8 @@ client's own echo line is the record.
   REQ-555, REQ-582).
 - [ ] BR-4: **An invocation is one prompt turn on the same path as typed
   text.** `/name <rest>` becomes exactly one user-role prompt turn whose text
-  is: one preamble line naming the command and its home-relative source (`The
+  is: one preamble line naming the command and its source in the entity
+  table's display spelling — relative, never absolute (`The
   user invoked /name (a command defined in <display path>); the instructions
   below are that command's body.`); the body with every `$ARGUMENTS` replaced
   by `<rest>` (interior whitespace preserved, no quote interpretation — the
@@ -421,7 +422,7 @@ client's own echo line is the record.
   the one line the user sees at odds with what the model actually got, with
   the record that resolves it behind `/verbose`. A command that started and
   failed **ran** — the model has its placeholder and the fact that it was
-  attempted. `/verbose` adds the home-relative path,
+  attempted. `/verbose` adds the display path (relative — see the entity table),
   the ignored frontmatter keys and each dynamic command's typed outcome. The
   turn appears in `/cost` as the prompt turn it is.
 - [ ] BR-13: **The body is passed as written; fidelity is stated, not
@@ -460,7 +461,7 @@ client's own echo line is the record.
   once, as `user`. (unit; BR-1, BR-2)
 - [ ] AC-4: `/alpha teton  code "repo"` (two interior spaces, quotes)
   produces exactly one prompt turn whose text is the preamble line (with a
-  home-relative path) followed by the body with `$ARGUMENTS` replaced by
+  relative display path) followed by the body with `$ARGUMENTS` replaced by
   `teton  code "repo"` — interior whitespace and quotes preserved — and no
   model call precedes it; the echo line names the skill, source and size.
   (unit + `cli_e2e`; BR-4, BR-12)
@@ -846,8 +847,8 @@ shadow hint dropped (F-7); the reserved set widened to family words and
 classifier's registry input and trimming stated (F-9); AC-12's body case
 corrected (F-10); OQ-1 updated with the client's display-only root (F-11);
 BR-14/AC-18 reworded (F-13); `$ARGUMENTS`-in-`!` defined (F-14); BR-9
-inherits the guide's constraints and the preamble path is home-relative
-(F-15); System Model shapes labelled illustrative (F-16). OQ-0 was then
+inherits the guide's constraints and the preamble path is relative — stated as
+"home-relative" at the time, amended by BUG-187 (F-15); System Model shapes labelled illustrative (F-16). OQ-0 was then
 decided by the product owner ("big skills are the point, we need them for
 automation"): REQ-586 was drafted the same day, and this spec was re-scoped
 onto it — Description, BR-8, BR-11 (unattended posture), BR-13, AC-16, AC-20,

@@ -2663,10 +2663,18 @@ pub struct SkillInvoked {
     pub name: String,
     /// Which root it came from.
     pub source: SkillSource,
-    /// The file it was read from, **home-relative**
-    /// (`session_root::display_for`) and bounded with `bounded_field` — never
-    /// an absolute path carrying a username into a transcript (BR-1's entity
-    /// table).
+    /// The file it was read from, **relative and bounded** — never an absolute
+    /// path carrying a username, or the location of the user's working tree,
+    /// into a transcript (BR-1's entity table).
+    ///
+    /// Which base it is relative to follows the skill's [`SkillSource`]: a
+    /// `project` skill is spelled from the session root
+    /// (`.claude/skills/x/SKILL.md`), a `user` skill from the home folder
+    /// (`~/.claude/skills/x/SKILL.md`). The daemon derives it at discovery,
+    /// where the source, the root and `HOME` are all in hand, and bounds it
+    /// with `bounded_field` at the wire. Before BUG-187 only the home half
+    /// existed, so a project skill in a checkout outside `$HOME` — a CI
+    /// workspace, an external volume — reached this field absolute.
     pub path_display: String,
     /// The body's size in bytes, which is what BR-12's echo line renders
     /// (`/status → skill status (user, 5.3 KB, 4 dynamic commands)`).
@@ -3858,8 +3866,10 @@ mod tests {
         assert_eq!(wire["name"], "status");
         assert_eq!(wire["source"], "user");
         assert_eq!(wire["body_bytes"], 5_432);
-        // BR-1's entity table: home-relative, never an absolute path carrying a
-        // username into a transcript.
+        // BR-1's entity table: relative, never an absolute path carrying a
+        // username into a transcript. `~/…` here because this row is a **user**
+        // skill; the `project` row below carries the other half of the rule,
+        // spelled from the session root (BUG-187).
         assert_eq!(wire["path_display"], "~/.claude/skills/status/SKILL.md");
         assert!(
             !wire["path_display"]
