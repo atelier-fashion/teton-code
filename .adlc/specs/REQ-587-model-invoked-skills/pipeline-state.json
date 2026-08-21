@@ -52,7 +52,7 @@
     "teton-code"
   ],
   "phase4": {
-    "currentTask": "TIER-4: TASK-218 + TASK-219 follow-up (BR-9 rendering)",
+    "currentTask": "TIER-5: TASK-222",
     "completedTasks": [
       "TASK-210",
       "TASK-211",
@@ -64,7 +64,8 @@
       "TASK-216",
       "TASK-219",
       "TASK-217",
-      "TASK-221"
+      "TASK-221",
+      "TASK-218"
     ],
     "failedTasks": []
   }

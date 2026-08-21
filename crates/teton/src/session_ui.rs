@@ -1001,6 +1001,17 @@ fn format_session_root_changed(root: &SessionRoot) -> String {
 /// spellings on one screen (LESSON-528), and the event carries nothing further
 /// to say: which user file lost the name is not on it.
 ///
+/// **A refused record is one of these events too, and it is not a duplicate.**
+/// BR-9 asks for one line per invocation *and* one line per typed refusal, and
+/// the daemon publishes accordingly: a call the loop refuses before dispatch
+/// (Stage A) publishes only a refusal record, while one refused after its
+/// expansion came back (Stage B) publishes an invocation record — whose commands
+/// really did run, which is why it exists — and then a refusal record for the
+/// same call. This renderer is stateless per event and deliberately stays that
+/// way: it prints the pair as the two lines it is. Folding them would require
+/// remembering the previous event to guess at a relationship the wire does not
+/// state, and would drop the very line BR-9 asks for.
+///
 /// Everything rendered here is either the daemon's own typed value or
 /// file-supplied text the daemon already bounded; `Surface::line` defuses it
 /// again at the frame it is drawn into (ADR-009's two-layer shape).
@@ -1014,6 +1025,28 @@ fn render_skill_invoked(invoked: &SkillInvoked, surface: &mut dyn Surface, verbo
     if !verbose {
         return;
     }
+    // **A refusal gets none of the file detail below.** Every line of it reports
+    // what the invocation *did* — where the body it expanded came from, what its
+    // frontmatter did on the way, what became of each command — and a refused
+    // call did none of that. Printing the block anyway would put a paragraph of
+    // true-sounding provenance under a line saying nothing happened, and in the
+    // Stage B shape (an invocation record, then a refusal record for the same
+    // call) it would print that paragraph twice.
+    //
+    // The turn's count is the exception and is rendered below for both, because
+    // it is the one line here about the **turn** rather than about the file —
+    // and on a `per_turn_cap` refusal it is the evidence for the refusal.
+    if invoked.refused.is_none() {
+        render_invocation_detail(invoked, surface);
+    }
+    if let Some(turn) = invoked.turn_invocations {
+        surface.line(LineKind::Info, &turn_invocations_line(turn));
+    }
+}
+
+/// The `/verbose` block under a *successful* invocation: where the body came
+/// from, what its frontmatter did, and what became of each dynamic command.
+fn render_invocation_detail(invoked: &SkillInvoked, surface: &mut dyn Surface) {
     surface.line(LineKind::Info, &format!("  {}", invoked.path_display));
     // Only when there were any: BR-5's ignored keys are news about *this* file,
     // and "ignored frontmatter: " with nothing after it is a line about nothing.
@@ -1034,12 +1067,6 @@ fn render_skill_invoked(invoked: &SkillInvoked, surface: &mut dyn Surface, verbo
     }
     for view in &invoked.outcomes {
         surface.line(LineKind::Info, &dynamic_outcome_line(view));
-    }
-    // Last, because it is the only line about the *turn* rather than about the
-    // file — and absent entirely on the typed path, where there is no budget to
-    // report (BR-6a).
-    if let Some(turn) = invoked.turn_invocations {
-        surface.line(LineKind::Info, &turn_invocations_line(turn));
     }
 }
 
@@ -1128,6 +1155,11 @@ fn turn_invocations_line(turn: events::TurnInvocations) -> String {
 /// `5.3 KB`; two spellings of a file size in one feature would be worse than
 /// one that differs from an illustration by a unit suffix.
 fn skill_echo_line(invoked: &SkillInvoked) -> String {
+    // BR-9's *other* sentence, and it is a different line rather than this one
+    // with a flag on it — see [`skill_refusal_line`].
+    if let Some(reason) = &invoked.refused {
+        return skill_refusal_line(invoked, reason);
+    }
     let count = invoked.outcomes.len();
     // How many of them actually started. A command that was declined, refused
     // for want of a terminal, denied by the level, or never spawned leaves a
@@ -1166,6 +1198,85 @@ fn skill_echo_line(invoked: &SkillInvoked) -> String {
     match invoked.invoked_by {
         events::InvokedBy::User => format!("/{name} → {body}"),
         events::InvokedBy::Model => format!("{body} — invoked by the model"),
+    }
+}
+
+/// BR-9's second sentence: **one line per typed refusal**, naming the reason.
+///
+/// # It is not the invocation line with a flag on it
+///
+/// A refused record and a skill with no dynamic context are the same bytes
+/// apart from one field — same name, same source, same size, the same empty
+/// `outcomes` — so a refusal rendered as "the invocation line, plus something"
+/// fails in the one direction that matters: at a glance it reads as a skill that
+/// ran. This line therefore opens with the **verdict**, where the successful
+/// line opens with the skill, and it drops every figure that would claim an
+/// expansion happened. The body's size and the dynamic-command count are true of
+/// the *file* and false of this turn — nothing of that file entered the context —
+/// and printing them under the word "refused" is the same lie told quietly.
+///
+/// What is kept is what identifies the call: the name, the source, and BR-9's
+/// shadowing clause, because "which `validate`?" is a question a refusal raises
+/// more sharply than a success does.
+///
+/// # No invoker suffix
+///
+/// The successful line carries `— invoked by the model` because its two invokers
+/// produce two shapes and the typed one opens with a `/name →` prefix this one
+/// never has. Every record carrying `refused` on this build comes from the model
+/// path — a typed refusal is composed client-side by `slash::dispatch` and
+/// publishes no event at all — so the suffix would be a constant on every
+/// refusal line, which BR-9 calls noise rather than observability. If a daemon
+/// ever publishes a user-side refusal the line is still true, and
+/// [`invoker_clause`] is where those words already live.
+fn skill_refusal_line(invoked: &SkillInvoked, reason: &str) -> String {
+    format!(
+        "refused: skill {name} ({source}) — {words}",
+        name = invoked.name,
+        source = slash::source_words(invoked.source, invoked.shadows_user_skill),
+        words = refusal_reason_words(reason),
+    )
+}
+
+/// The daemon's stable refusal id, in words a person reads (REQ-587 BR-9).
+///
+/// **The id keys the record; it is not the sentence.** It is the same token the
+/// model is given at the head of its refusal, so the two audiences are told the
+/// same fact — but `per_turn_cap` spliced into a line for a human is a token,
+/// not a reason, and this client already maps every other typed outcome it
+/// renders ([`not_run_words`], [`dynamic_outcome_words`], `BudgetBound::words`)
+/// rather than printing the wire spelling.
+///
+/// # The set is open, and the unknown arm is the load-bearing one
+///
+/// Six of the daemon's ids are not published yet and more will exist than this
+/// build knows, exactly as `PermissionSubject::Unrecognized` anticipates for
+/// subjects. An id this build cannot word must still produce a **readable
+/// line** — BUG-186 is open against dropping an event a client does not fully
+/// understand, and a refusal that renders blank is the worst of the three
+/// outcomes here (worse than an awkward line, and much worse than a wrong one,
+/// because nothing on the surface says the call happened at all).
+///
+/// So the unknown arm frames the id rather than either hiding it or emitting it
+/// bare: the daemon's own word for what it did is the only information there
+/// is, and quoting it inside a sentence is how a user finds the refusal in a
+/// log — `refusal_line`'s rule for a request whose subject this build cannot
+/// name. It is rendered rather than re-bounded: the value is daemon-authored
+/// and bounded at the publish site, and `Surface::line` defuses it here, which
+/// is the same two-layer treatment the skipped-skill reason already gets.
+fn refusal_reason_words(reason: &str) -> String {
+    match reason {
+        "over_budget" => "the expansion did not fit this turn's context budget".to_owned(),
+        "per_turn_cap" => "this turn has already made as many skill calls as it may".to_owned(),
+        "repeated" => "the same skill and arguments were invoked twice in a row".to_owned(),
+        "unknown_skill" => "this session has no skill of that name".to_owned(),
+        "not_model_invocable" => "its frontmatter says `disable-model-invocation: true`".to_owned(),
+        "reserved_name" => "a built-in command owns that name".to_owned(),
+        "invalid_arguments" => "the call's arguments were not usable".to_owned(),
+        "project_not_acknowledged" => {
+            "this repository's skills have not been acknowledged for this session".to_owned()
+        }
+        other => format!("the daemon reported `{other}`"),
     }
 }
 
@@ -7940,9 +8051,23 @@ mod skill_tests {
             model_invocable: true,
             user_invocable: true,
             turn_invocations: None,
-            // TASK-219 renders this: `Some(reason)` is a refused invocation,
-            // and the echo line has to say so rather than reporting a run.
+            // Not refused: this is the record of a skill that ran. The refused
+            // shape is `refusal` below, and it is deliberately built from this
+            // one — a refused record differs from a command-free successful
+            // record in exactly this field, which is the whole reason the field
+            // exists.
             refused: None,
+        }
+    }
+
+    /// A record of a call the loop **refused**, as either loop stage publishes
+    /// one: no commands, no outcomes, the turn's count, and the reason id.
+    fn refusal(reason: &str, count: u32) -> SkillInvoked {
+        SkillInvoked {
+            outcomes: Vec::new(),
+            turn_invocations: Some(events::TurnInvocations { count, cap: 12 }),
+            refused: Some(reason.to_owned()),
+            ..invoked_by(Vec::new(), events::InvokedBy::Model)
         }
     }
 
@@ -8240,6 +8365,218 @@ mod skill_tests {
         assert!(
             lines.iter().any(|line| line.contains("SKILL.md")),
             "{lines:?}"
+        );
+    }
+
+    /// **BR-9's second sentence: a refusal is its own line, and it is not the
+    /// invocation line wearing a flag.**
+    ///
+    /// The fixture is the point. `refusal(…)` differs from a *successful*
+    /// command-free invocation in exactly one field, which is the shape the
+    /// wire has and the reason `refused` exists — so a renderer that ignored it
+    /// would print "skill status (user, 5.3 KiB, 0 dynamic commands)" for a
+    /// call that put nothing in the turn, and the surface would be reporting
+    /// the opposite of what happened.
+    ///
+    /// Three claims: the line **opens with the verdict**, so a glance at the
+    /// left edge tells the two apart; it carries **neither figure** that would
+    /// imply an expansion; and it names the reason in **words**, never the id.
+    ///
+    /// **Mutation.** Drop the refusal branch from `skill_echo_line` and the
+    /// first three assertions fail; render the refusal as the invocation line
+    /// plus a suffix and the size and count assertions fail.
+    #[test]
+    fn a_refused_call_is_not_rendered_as_an_invocation() {
+        let line = skill_echo_line(&refusal("over_budget", 4));
+
+        assert_eq!(
+            line,
+            "refused: skill status (user) — the expansion did not fit this turn's context budget",
+        );
+        assert!(
+            line.starts_with("refused:"),
+            "the verdict has to be the first thing read, not a suffix: {line}"
+        );
+        // Neither figure: both are true of the file and false of this turn.
+        assert!(
+            !line.contains("KiB") && !line.contains("dynamic command"),
+            "a refusal reported a body size or a command count, which would \
+             describe an expansion that never happened: {line}"
+        );
+        // The id keys the record; the sentence is what a person reads.
+        assert!(!line.contains("over_budget"), "{line}");
+
+        // And the same record, but successful, is the line it has always been —
+        // which is what makes the comparison above a claim about the field
+        // rather than about two unrelated fixtures.
+        let ran_instead = SkillInvoked {
+            refused: None,
+            ..refusal("over_budget", 4)
+        };
+        assert_eq!(
+            skill_echo_line(&ran_instead),
+            "skill status (user, 5.3 KiB, 0 dynamic commands) — invoked by the model",
+        );
+
+        // Through `render_event`, because "a refusal is never silent" is a claim
+        // about what reaches the surface and not about what a formatter returns:
+        // a renderer that swallowed the record would leave the pure function
+        // above green and the session with nothing to show.
+        let mut surface = RecordingSurface::new();
+        let mut state = SessionState::new();
+        let outcome = render_event(
+            &envelope(Event::SkillInvoked(refusal("over_budget", 4))),
+            &mut surface,
+            &mut state,
+        );
+        assert!(matches!(outcome, EventOutcome::Rendered));
+        assert_eq!(surface.lines_of(LineKind::Notice), vec![line.as_str()]);
+    }
+
+    /// **The Stage B pair is two records on purpose, and the session prints two
+    /// lines.**
+    ///
+    /// The tool publishes its invocation record at the end of the expansion —
+    /// correct, because those dynamic commands really did run and `/verbose`
+    /// renders their outcomes — and the loop then refuses to fold the result and
+    /// publishes a second record carrying the reason. That is BR-9's two
+    /// sentences about one call, not a duplicate.
+    ///
+    /// **Mutation.** Read the pair as two invocations (ignore `refused`) and the
+    /// second line's assertion fails; dedupe them to one line — by name, or by
+    /// remembering the previous event — and the count fails. The renderer is
+    /// stateless per event precisely so that neither is expressible without
+    /// adding state that the wire does not justify.
+    #[test]
+    fn the_stage_b_pair_prints_an_invocation_line_and_then_a_refusal_line() {
+        let mut surface = RecordingSurface::new();
+        let mut state = SessionState::new();
+
+        // What the tool published when the expansion came back: its commands ran.
+        let expanded = SkillInvoked {
+            turn_invocations: Some(events::TurnInvocations { count: 4, cap: 12 }),
+            ..invoked_by(vec![ran("git status", 96)], events::InvokedBy::Model)
+        };
+        render_event(
+            &envelope(Event::SkillInvoked(expanded)),
+            &mut surface,
+            &mut state,
+        );
+        // …and what the loop published when it declined to fold it.
+        render_event(
+            &envelope(Event::SkillInvoked(refusal("over_budget", 4))),
+            &mut surface,
+            &mut state,
+        );
+
+        assert_eq!(
+            surface.lines_of(LineKind::Notice),
+            vec![
+                "skill status (user, 5.3 KiB, 1 dynamic command) — invoked by the model",
+                "refused: skill status (user) — the expansion did not fit this turn's context \
+                 budget",
+            ],
+            "one call, two records, two lines — in the order the daemon published \
+             them, and neither folded into the other"
+        );
+    }
+
+    /// **A reason id this build has never heard of still reads.** Six of the
+    /// daemon's ids are unpublished today and the set is open; a client that
+    /// rendered a blank line, or dropped the event, would leave nothing on the
+    /// surface saying the call happened at all — BUG-186's shape, and the
+    /// failure `PermissionSubject::Unrecognized` exists to prevent for subjects.
+    ///
+    /// The id is quoted **inside a sentence**, which is the same answer
+    /// [`refusal_line`] gives for a request whose subject it cannot name: the
+    /// daemon's own word for what it did is the only information there is, and
+    /// it is how a user finds the refusal in a log.
+    #[test]
+    fn an_unrecognized_refusal_id_still_reads_as_a_sentence() {
+        let line = skill_echo_line(&refusal("some_reason_invented_later", 2));
+
+        assert_eq!(
+            line,
+            "refused: skill status (user) — the daemon reported \
+             `some_reason_invented_later`",
+        );
+        assert!(
+            line.starts_with("refused:") && line.len() > "refused: skill status (user) — ".len(),
+            "an unknown id must not render a blank tail: {line:?}"
+        );
+    }
+
+    /// Every published id this build knows reads as a distinct sentence, and
+    /// none of them is its own wire spelling.
+    ///
+    /// Listed exhaustively rather than sampled, on
+    /// [`the_not_run_reasons_read_as_different_sentences`]'s rule: an id added
+    /// to the daemon and forgotten here reaches a user wearing the fallback
+    /// sentence, which is readable but says less than it could.
+    #[test]
+    fn the_refusal_reasons_read_as_different_sentences() {
+        let ids = [
+            "over_budget",
+            "per_turn_cap",
+            "repeated",
+            "unknown_skill",
+            "not_model_invocable",
+            "reserved_name",
+            "invalid_arguments",
+            "project_not_acknowledged",
+        ];
+        let mut seen: Vec<String> = ids.iter().map(|id| refusal_reason_words(id)).collect();
+        for (id, words) in ids.iter().zip(seen.iter()) {
+            assert!(
+                !words.contains(id),
+                "`{id}` reached a user as its own wire spelling: {words}"
+            );
+            assert!(
+                !words.contains("the daemon reported"),
+                "`{id}` fell through to the unknown arm: {words}"
+            );
+        }
+        let total = seen.len();
+        seen.sort();
+        seen.dedup();
+        assert_eq!(seen.len(), total, "two reasons share a sentence: {seen:?}");
+    }
+
+    /// **`/verbose` under a refusal: the turn's count, and none of the file
+    /// detail.**
+    ///
+    /// The detail block reports what the invocation did — the file its body came
+    /// from, what its frontmatter did on the way, what each command did — and a
+    /// refused call did none of it. The count is the exception because it is
+    /// about the *turn*, and on a `per_turn_cap` refusal it is the evidence for
+    /// the refusal itself.
+    #[test]
+    fn verbose_under_a_refusal_adds_the_turn_count_and_no_file_detail() {
+        let mut surface = RecordingSurface::new();
+        let mut state = SessionState::new();
+        state.verbose = true;
+        render_event(
+            &envelope(Event::SkillInvoked(refusal("per_turn_cap", 12))),
+            &mut surface,
+            &mut state,
+        );
+
+        assert_eq!(
+            surface.lines_of(LineKind::Info),
+            vec!["  invocation 12 of 12 this turn"],
+            "the count is the evidence for this refusal, and the file detail \
+             describes an expansion that did not happen"
+        );
+        assert!(
+            !surface.any_line_contains(LineKind::Info, "SKILL.md"),
+            "a refusal claimed a body came from a file"
+        );
+        assert_eq!(
+            surface.lines_of(LineKind::Notice),
+            vec![
+                "refused: skill status (user) — this turn has already made as many skill \
+                  calls as it may"
+            ],
         );
     }
 
