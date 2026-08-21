@@ -2895,6 +2895,38 @@ pub struct SkillInvoked {
     /// that hardcoded 12 would print a stale ceiling the day it moves.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub turn_invocations: Option<TurnInvocations>,
+    /// Why this invocation was **refused**, as the stable reason id the model
+    /// was given — or `None` when it ran (REQ-587 BR-9).
+    ///
+    /// # A refused call and a command-free skill are otherwise the same bytes
+    ///
+    /// Every other field on this event describes a skill that *expanded*: the
+    /// name, the file, the body's size, the commands' outcomes. A refusal
+    /// carries all of them and an empty `outcomes` — which is byte-identical to
+    /// a skill with no dynamic context that ran perfectly. Without this field a
+    /// client renders the two the same, so BR-9's "a refusal is never silent"
+    /// is met by a line that reports the opposite of what happened, which is
+    /// worse than silence.
+    ///
+    /// # The reason, not a bool
+    ///
+    /// BR-9 asks for one line per typed refusal **naming the reason**. A bare
+    /// flag would make every client re-derive one, and there is nothing on the
+    /// event to derive it from. The value is the same stable id the model
+    /// reads at the head of its refusal sentence — `over_budget`,
+    /// `per_turn_cap`, `repeated`, `unknown_skill` — so the human and the model
+    /// are told the same word, and a suite asserts an id rather than a phrase
+    /// that reads differently next month.
+    ///
+    /// **Daemon-authored, never file-authored**, which is what makes a `String`
+    /// safe here on `name_note`'s precedent: the ids come from the daemon's own
+    /// typed refusal set, and the publish site bounds the value like every
+    /// other string on this event. It is a `String` rather than a closed enum
+    /// because the refusal set is still growing inside REQ-587 — a variant per
+    /// reason, six of them unpublished today, would be a wire commitment made
+    /// ahead of the behaviour.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub refused: Option<String>,
 }
 
 /// The serde default for an invocation flag: absent means permitted.
@@ -3344,6 +3376,7 @@ mod tests {
                     model_invocable: true,
                     user_invocable: true,
                     turn_invocations: None,
+                    refused: None,
                 }),
                 "skill_invoked",
             ),
@@ -4100,6 +4133,7 @@ mod tests {
             model_invocable: true,
             user_invocable: true,
             turn_invocations: None,
+            refused: None,
             outcomes: vec![DynamicOutcomeView {
                 command: "git status --short".to_owned(),
                 outcome: DynamicOutcome::Ran {
@@ -4212,6 +4246,7 @@ mod tests {
             model_invocable: true,
             user_invocable: false,
             turn_invocations: Some(TurnInvocations { count: 3, cap: 12 }),
+            refused: None,
         };
         let wire = serde_json::to_string(&loud).unwrap();
         assert!(wire.contains(r#""shadows_user_skill":true"#), "{wire}");
@@ -4244,6 +4279,96 @@ mod tests {
         // is never here.
         let back: SkillInvoked = serde_json::from_str(&wire).unwrap();
         assert_eq!(back, loud);
+        assert!(
+            serde_json::to_value(&back).unwrap().get("body").is_none(),
+            "{wire}"
+        );
+    }
+
+    /// **BR-9's refusal, additively — and the four legs are why the field is a
+    /// field.**
+    ///
+    /// A refused invocation and a skill with no dynamic context that ran
+    /// perfectly carry the *same* bytes on this event: the name, the file, the
+    /// body's size, an empty `outcomes`. So "a refusal is never silent" was met
+    /// by a line that reported the opposite of what happened, which is worse
+    /// than silence — nothing was red, because a client cannot assert a
+    /// distinction the wire does not carry.
+    ///
+    /// The **non-vacuity leg** earns its place exactly as it does for
+    /// `invoked_by` and the BR-9 trio: a fixture that never set `refused` to
+    /// `Some` satisfies the old-reader and byte-identity legs by writing no key
+    /// at all, and would pass against a build that had dropped the field.
+    #[test]
+    fn skill_invoked_says_it_was_refused_and_why_additively() {
+        // Leg one — an event from a daemon predating the field. It ran, because
+        // that daemon published a record only for an invocation that expanded.
+        let invoked: SkillInvoked = serde_json::from_str(
+            r#"{"name":"status","source":"user","path_display":"~/.claude/skills/status/SKILL.md",
+                "body_bytes":118,"ignored_keys":[],"outcomes":[]}"#,
+        )
+        .expect("an event from a daemon predating this field must still parse");
+        assert_eq!(
+            invoked.refused, None,
+            "absent means it ran — the only thing a pre-REQ-587 record could be"
+        );
+
+        // Leg two — an invocation that ran writes no key, so REQ-585's wire is
+        // byte-for-byte the wire this build writes. Downgrading the
+        // `skip_serializing_if` to a bare `default` fails here.
+        let wire = serde_json::to_value(&invoked).unwrap();
+        assert!(
+            wire.get("refused").is_none(),
+            "an invocation that ran must write nothing: {wire}"
+        );
+
+        // Leg three — non-vacuity. A refused model invocation carries the
+        // reason, so the legs above are reached by the value being absent
+        // rather than by the field being gone.
+        let refused = SkillInvoked {
+            name: "architect".to_owned(),
+            source: SkillSource::User,
+            path_display: "~/.claude/skills/architect/SKILL.md".to_owned(),
+            body_bytes: 28_700,
+            ignored_keys: vec![],
+            name_note: None,
+            // Empty — and this is the whole point of the field. Without it
+            // these bytes are a command-free skill that ran.
+            outcomes: vec![],
+            invoked_by: InvokedBy::Model,
+            shadows_user_skill: false,
+            model_invocable: true,
+            user_invocable: true,
+            turn_invocations: Some(TurnInvocations { count: 1, cap: 12 }),
+            refused: Some("over_budget".to_owned()),
+        };
+        let wire = serde_json::to_string(&refused).unwrap();
+        assert!(wire.contains(r#""refused":"over_budget""#), "{wire}");
+        assert!(
+            !wire.contains(r#""refused":true"#),
+            "the reason travels, not a flag: BR-9's line names why, and there \
+             is nothing else on this event to derive it from: {wire}"
+        );
+
+        // Leg four — a reader built before the field still reads that event,
+        // and still gets everything it knew about.
+        #[derive(Deserialize)]
+        struct PreRefusalSkillInvoked {
+            name: String,
+            body_bytes: u64,
+            #[serde(default)]
+            invoked_by: InvokedBy,
+        }
+        let old: PreRefusalSkillInvoked =
+            serde_json::from_str(&wire).expect("a client predating the field still reads it");
+        assert_eq!(old.name, "architect");
+        assert_eq!(old.body_bytes, 28_700);
+        assert_eq!(old.invoked_by, InvokedBy::Model);
+
+        let back: SkillInvoked = serde_json::from_str(&wire).unwrap();
+        assert_eq!(back, refused);
+        // BR-12 still holds with one more field: the body is never here — least
+        // of all on a record whose whole claim is that nothing was folded.
         assert!(
             serde_json::to_value(&back).unwrap().get("body").is_none(),
             "{wire}"
@@ -4542,6 +4667,7 @@ mod tests {
             model_invocable: true,
             user_invocable: true,
             turn_invocations: None,
+            refused: None,
             outcomes: vec![
                 DynamicOutcomeView {
                     command: "cat ~/.claude/adlc/ETHOS.md".to_owned(),
@@ -4624,6 +4750,7 @@ mod tests {
             model_invocable: true,
             user_invocable: true,
             turn_invocations: None,
+            refused: None,
         };
         round_trip(&plain);
         let wire = serde_json::to_value(&plain).unwrap();

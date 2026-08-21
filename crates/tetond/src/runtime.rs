@@ -3131,6 +3131,13 @@ impl DaemonRuntime {
                 // `/verbose` line reading "1 of 12" here would name a budget
                 // the user is not drawing on.
                 turn_invocations: None,
+                // **Never `Some` on this path.** A typed `/name` that reaches
+                // this publish has expanded; BR-8's two stages refuse a turn
+                // that cannot fit by *returning* — Stage A before this runs at
+                // all, Stage B after it — so there is no refused invocation for
+                // this site to describe. The model path is where a refusal has
+                // a record to be attached to, because its turn survives it.
+                refused: None,
             }),
         );
     }
@@ -3603,9 +3610,28 @@ impl DaemonRuntime {
         // The system prompt rides along for the same reason: it is consumed by
         // `CarriedTurn::begin` below, and the refusal has to measure the same
         // pair Stage A and Stage B did — system plus expansion.
-        let skill_refit: Option<(String, String, String)> = skill_turn
+        //
+        // **REQ-587 BR-7: there is more than one of them, and REQ-585's guard
+        // could not see any of the others.** This list was a single `Option`
+        // built from `skill_turn`, which is `Some` only for a user-typed
+        // `/name` — so `skill_would_not_survive_refit` answered `None` for
+        // *every* model invocation and `refit_for_reroute` middle-elided the
+        // expansion, at the one seam REQ-585 built the guard for. On a
+        // boundary-configured machine that privacy pin is the expected path for
+        // any invocation that ran a dynamic command, so this was the common
+        // case, not a corner. The typed turn seeds the list; every expansion
+        // the model commits inside the loop joins it below, and the guard
+        // refuses on the first that would not survive.
+        let refit_system = system.clone();
+        let mut skill_refit: Vec<(String, String, String)> = skill_turn
             .as_ref()
-            .map(|skill| (skill.name.clone(), skill.text.clone(), system.clone()));
+            .map(|skill| (skill.name.clone(), skill.text.clone(), refit_system.clone()))
+            .into_iter()
+            .collect();
+        // Where the typed seed ends and the loop's own expansions begin, so a
+        // second attempt rebuilds the tail rather than appending a duplicate of
+        // it: the tool's per-turn state accumulates across attempts.
+        let typed_refit = skill_refit.len();
 
         // The seed, and its provenance (BR-7, ADR-9): the expansion for a skill
         // turn, the typed text otherwise. One block either way — `push_user_from`
@@ -3667,6 +3693,16 @@ impl DaemonRuntime {
                 )
                 .await;
 
+            // REQ-587 BR-7: what the *loop* committed is only knowable now.
+            // Both reroute arms below sit under this `Err`, so the list is
+            // refreshed here — once, from the tool's own per-turn record of
+            // what it folded — rather than at each guard. The tail is rebuilt
+            // from `typed_refit` because that state accumulates across attempts.
+            if result.is_err() {
+                skill_refit.truncate(typed_refit);
+                skill_refit.extend(model_invoked_expansions(&tools, &refit_system));
+            }
+
             // REQ-544 M-1: a privacy block is NOT a transient failure. It must
             // never be retried against the blocked provider (which would emit
             // duplicate `privacy_block` events and never reroute). Taint the
@@ -3704,9 +3740,7 @@ impl DaemonRuntime {
                     // arriving over-window at a tier that has no fallback left.
                     let previous = route.budget.clone();
                     route = router.resolve_local_pin(reroute_after_block_reason(detail));
-                    if let Some(message) =
-                        skill_would_not_survive_refit(skill_refit.as_ref(), &route)
-                    {
+                    if let Some(message) = skill_would_not_survive_refit(&skill_refit, &route) {
                         break 'turn Err(RpcError::new(
                             error_code::SKILL_EXPANSION_TOO_LARGE,
                             message,
@@ -3811,7 +3845,7 @@ impl DaemonRuntime {
                             let previous = route.budget.clone();
                             route = next;
                             if let Some(message) =
-                                skill_would_not_survive_refit(skill_refit.as_ref(), &route)
+                                skill_would_not_survive_refit(&skill_refit, &route)
                             {
                                 break 'turn Err(RpcError::new(
                                     error_code::SKILL_EXPANSION_TOO_LARGE,
@@ -10300,34 +10334,89 @@ fn reroute_after_block_reason(detail: BlockDetail) -> String {
 /// can. Saying it re-fitted anyway is the same untruth
 /// [`ContextPressureKind::DidNotFit`] exists to close, one call site along, so
 /// the over-budget answer wins here exactly as it does in
-/// Whether a **skill** turn would be middle-elided by the refit a reroute is
-/// about to perform — and if so, the refusal to raise instead.
+/// Whether **any** skill expansion this turn carries would be middle-elided by
+/// the refit a reroute is about to perform — and if so, the refusal to raise
+/// instead.
 ///
-/// `None` for a typed prompt, which keeps REQ-586 BR-7's loud elision, and
-/// `None` for a skill turn that still fits: the refit then runs as it always
-/// has, dropping *history* to make room, which is ordinary pressure.
+/// `None` for a turn carrying none, which keeps REQ-586 BR-7's loud elision for
+/// ordinary text, and `None` when every one of them still fits: the refit then
+/// runs as it always has, dropping *history* to make room, which is ordinary
+/// pressure.
 ///
-/// This exists because both budget stages ran against the route the turn
-/// started on. A reroute swaps in a smaller budget, and `truncate_to_budget`
-/// clamps the newest block once history is gone — which for a skill turn is the
-/// expansion itself. BR-8: never middle-elided into something the user did not
-/// invoke. BR-4: carried whole or refused.
+/// This exists because both budget stages ran against the route the turn started
+/// on. A reroute swaps in a smaller budget, and `truncate_to_budget` clamps the
+/// newest block once history is gone — which for a skill turn is the expansion
+/// itself. BR-8: never middle-elided into something the user did not invoke.
+/// BR-4: carried whole or refused.
+///
+/// # A list, because there is more than one kind of expansion (REQ-587 BR-7)
+///
+/// REQ-585 passed one `Option`, read off `skill_turn` — populated only for a
+/// user-typed `/name`. A model-invoked expansion therefore returned `None` here
+/// and was middle-elided silently, at the exact seam this guard was written for,
+/// and on a boundary-configured machine that pin is the *expected* path rather
+/// than a corner. The entries are `(name, text, system)` triples for every
+/// expansion committed this turn, and the **first** that would not survive
+/// refuses the turn: the answer does not improve by measuring the rest, and the
+/// sentence names the skill whose room is gone.
+///
+/// # The refusal ends the turn, and that is a stated exception
+///
+/// BR-6 and BR-9 say a refusal is a typed outcome the model can relay, and both
+/// of this function's call sites make it a `break 'turn Err(RpcError)` instead.
+/// That is deliberate and scoped rather than an oversight: both sit in
+/// `run_prompt_turn`'s `'turn` retry, *after* `run_session_turn_with_source` has
+/// returned. There is no `ToolCall` id in scope there and the expansion is
+/// already a committed block, so a tool result is not expressible without
+/// restructuring the retry — which REQ-587 does not propose. A model-invoked
+/// expansion caught at a reroute therefore ends the turn with the typed error,
+/// and "never a crash, always relayable" carries this seam as its one exception.
 fn skill_would_not_survive_refit(
-    skill: Option<&(String, String, String)>,
+    skills: &[(String, String, String)],
     route: &crate::router::Route,
 ) -> Option<String> {
-    let (name, text, system) = skill?;
-    match skill_fit(
-        SkillStage::WithDynamicContext,
-        name,
-        system,
-        text,
-        &route.harness.budget,
-        route.provider_id.as_ref().map(|id| id.0.as_str()),
-    ) {
-        SkillFit::Fits => None,
-        SkillFit::TooLarge { message } => Some(message),
-    }
+    skills.iter().find_map(|(name, text, system)| {
+        match skill_fit(
+            SkillStage::WithDynamicContext,
+            name,
+            system,
+            text,
+            &route.harness.budget,
+            route.provider_id.as_ref().map(|id| id.0.as_str()),
+        ) {
+            SkillFit::Fits => None,
+            SkillFit::TooLarge { message } => Some(message),
+        }
+    })
+}
+
+/// Every expansion the **model** committed this turn, as the refit guard's
+/// triples (REQ-587 BR-7).
+///
+/// Read off the `skill` tool's own per-turn record rather than accumulated in
+/// `run_prompt_turn`, because the loop is where a fold happens and the loop is
+/// several frames below this one; the tool is the value both frames hold. It is
+/// the *loop's* record of what it pushed, not the tool's of what it returned —
+/// see `TurnState::note_committed`.
+///
+/// `system` is this turn's prompt, cloned per entry: the refusal has to measure
+/// the same pair the loop's Stage B did, and `build_system_prompt` runs once
+/// per turn, above the loop.
+fn model_invoked_expansions(
+    tools: &crate::harness::tools::ToolRegistry,
+    system: &str,
+) -> Vec<(String, String, String)> {
+    tools
+        .get(crate::harness::tools::skill::SKILL_TOOL_NAME)
+        .and_then(|tool| tool.as_skill())
+        .map(|tool| {
+            tool.turn_state()
+                .committed()
+                .iter()
+                .map(|(name, text)| (name.clone(), text.clone(), system.to_owned()))
+                .collect()
+        })
+        .unwrap_or_default()
 }
 
 /// [`pressure_kind`](crate::harness::turn_loop::pressure_kind).

@@ -49,8 +49,8 @@ use teton_providers::{BlockDetail, HarnessProfile, ProviderError, ToolCall};
 use crate::broadcast::EventBus;
 
 use super::budget::{
-    self, BudgetInputs, RouteBudget, LOCAL_BUDGET_BYTES, LOCAL_BUDGET_TOKENS,
-    LOCAL_DIGEST_THRESHOLD_BYTES, LOCAL_DIGEST_THRESHOLD_TOKENS,
+    self, skill_append_fit, BudgetInputs, RouteBudget, SkillCaller, SkillStage, LOCAL_BUDGET_BYTES,
+    LOCAL_BUDGET_TOKENS, LOCAL_DIGEST_THRESHOLD_BYTES, LOCAL_DIGEST_THRESHOLD_TOKENS,
 };
 use super::compact::COMPACT_DUTY;
 use super::completion::{
@@ -63,6 +63,7 @@ use super::permissions::{PermissionDecision, PermissionGate};
 use super::reply::{append_tool_call, StreamGate};
 use super::shell_duty::SHELL_DUTY;
 use super::tools::docs::bounded_topic_echo;
+use super::tools::skill::{SkillTool, SKILL_TOOL_NAME};
 use super::tools::{
     RefinedOutcome, ResultDisposition, ToolContext, ToolDuties, ToolOutcome, ToolRegistry,
     DOCS_TOOL_NAME, WEB_TOOL_NAME,
@@ -1151,6 +1152,82 @@ pub async fn run_session_turn_with_source(
                         continue;
                     }
                     PermissionDecision::Allowed => {
+                        // ── REQ-587 BR-7 / ADR-2: Stage A ────────────────────
+                        //
+                        // **Here, and not in the tool.** `build_tools` runs
+                        // before `build_system_prompt`, so at construction there
+                        // is no system prompt to measure against; and the route
+                        // can be swapped mid-turn by the privacy pin or a
+                        // provider fallback, so a budget captured then is stale
+                        // by the time a call lands. `config.budget` is the live
+                        // pair and it is in this loop's hand on every iteration.
+                        //
+                        // **Before the dispatch**, because the dispatch is where
+                        // BR-4's acknowledgment and BR-5's dynamic-context
+                        // consent are spent: a body that cannot fit is refused
+                        // before anybody approves four commands, watches them
+                        // run and is then told nothing was folded (BR-8d). The
+                        // `ToolCall` id is already in hand, so the refusal
+                        // leaves by the same door a denied tool does — a tool
+                        // result the model reads and relays, never a turn-ender
+                        // (ADR-2: all four `SKILL_EXPANSION_TOO_LARGE` raises
+                        // stay in `run_prompt_turn`, and this is not a fifth).
+                        //
+                        // The measurement is the post-truncation worst case —
+                        // system, this turn's request block, the candidate, at
+                        // `truncated = true` — never the live block list:
+                        // history is droppable, so an expansion that fits this
+                        // pair is folded and any pressure it creates is answered
+                        // by the top-of-loop gate, loudly (AC-8).
+                        let pending = if name == SKILL_TOOL_NAME {
+                            skill_tool(tools).and_then(|tool| tool.pending_expansion(&arguments))
+                        } else {
+                            None
+                        };
+                        if let Some(pending) = pending {
+                            let fit = skill_append_fit(
+                                SkillCaller::Model,
+                                SkillStage::Body,
+                                &pending.skill,
+                                ctx.system(),
+                                &request,
+                                &pending.text,
+                                &config.budget,
+                                // Off the budget the router stamped, never a
+                                // second reading: BR-7's remedy names the
+                                // provider outright — `set
+                                // capabilities.max_context for <id>` is the
+                                // sentence a new user meets — and this loop
+                                // holds no `Route` to ask. `RouteBudget`
+                                // carries the id beside the label made of it
+                                // (REQ-587), so the model path's refusal is
+                                // the user path's sentence, not a noun short.
+                                config.budget.provider_id.as_deref(),
+                            );
+                            if let Some(refusal) = fit.into_tool_result() {
+                                // BR-6a's count and BR-9's record, both of
+                                // which only the tool can keep — see
+                                // `SkillTool::note_loop_refusal`.
+                                if let Some(tool) = skill_tool(tools) {
+                                    tool.note_loop_refusal(
+                                        &pending.skill,
+                                        budget::OVER_BUDGET_REASON,
+                                    );
+                                }
+                                events.tool_finished(&call.id, false);
+                                // `resolve_pending_call` is deliberately not
+                                // called, exactly as on the denied arm above:
+                                // the tool never ran, so a cancellation landing
+                                // here should still trim the call block
+                                // (REQ-567 OQ-1).
+                                ctx.push_tool_result(
+                                    name.clone(),
+                                    None,
+                                    error_result(&refusal.content),
+                                );
+                                continue;
+                            }
+                        }
                         let outcome = tools.dispatch(&name, tool_ctx, &arguments);
                         // REQ-567 OQ-1: the tool has RUN. Everything from here
                         // to the fold below awaits — the tool's own duty, then
@@ -1164,6 +1241,29 @@ pub async fn run_session_turn_with_source(
                         // work whose result was lost.
                         ctx.resolve_pending_call();
                         events.tool_finished(&call.id, !outcome.is_error);
+
+                        // REQ-587 BR-6b: "the same call expanded again with no
+                        // other tool call **completed** in between". The tool
+                        // cannot see this loop's other dispatches, so the loop
+                        // tells it — here, at the one point a completed
+                        // dispatch is known. A *denied* call completed nothing
+                        // and leaves the seed alone; a call that ran and failed
+                        // did complete, and clears it, because what BR-6b is
+                        // about is whether anything happened between the two
+                        // asks, not whether it succeeded.
+                        //
+                        // Unwired, `skill alpha` → `read` → `skill alpha` in one
+                        // turn was refused `repeated` where BR-6b admits it —
+                        // and BR-6b's own illustration (`/proceed`'s two
+                        // `/validate` passes separated by an `/architect`) is
+                        // admitted either way, because the intervening
+                        // expansion overwrites the seed. So the illustration
+                        // could not have found this.
+                        if name != SKILL_TOOL_NAME {
+                            if let Some(tool) = skill_tool(tools) {
+                                tool.turn_state().note_foreign_tool_completed();
+                            }
+                        }
 
                         if name == "edit" && !outcome.is_error {
                             edited = true;
@@ -1234,7 +1334,7 @@ pub async fn run_session_turn_with_source(
                             events.capability_dead_end(capability);
                         }
                         let folded = if is_error {
-                            format!("ERROR: {content}")
+                            error_result(&content)
                         } else {
                             content
                         };
@@ -1320,6 +1420,83 @@ pub async fn run_session_turn_with_source(
                                 }
                             }
                         };
+                        // ── REQ-587 BR-7 / ADR-2: Stage B ────────────────────
+                        //
+                        // Stage A measured the body with `[dynamic context
+                        // pending]` in each slot; this measures what the
+                        // commands actually produced, and the refusal **says
+                        // which** — `SkillStage`'s two clauses are the whole
+                        // distinction, so a model told its expansion did not fit
+                        // knows whether the body or its command output is what
+                        // spent the room.
+                        //
+                        // Read off the result's `disposition`, never off `name`
+                        // (ADR-1), and raised here rather than after the push:
+                        // once `push_tool_result_prov` has run the expansion is
+                        // in the conversation, and the refusal would then be
+                        // refusing something already folded.
+                        //
+                        // The invocation's own `SkillInvoked` record is already
+                        // published by the tool at this point, which is the
+                        // ordering ADR-15 asks for on the user path too: a turn
+                        // whose commands the user approved and watched run is
+                        // precisely the one whose record matters most.
+                        if disposition == ResultDisposition::Expansion {
+                            // The name through the tool's own parser, because
+                            // Stage A's `PendingExpansion` is spent by now.
+                            let skill = super::tools::skill::call_name(&arguments)
+                                .unwrap_or_else(|| name.clone());
+                            let fit = skill_append_fit(
+                                SkillCaller::Model,
+                                SkillStage::WithDynamicContext,
+                                &skill,
+                                ctx.system(),
+                                &request,
+                                &folded,
+                                &config.budget,
+                                // See Stage A above.
+                                config.budget.provider_id.as_deref(),
+                            );
+                            match fit.into_tool_result() {
+                                Some(refusal) => {
+                                    // Not counted again — `TurnState::admit`
+                                    // already counted this call when the tool
+                                    // ran, and the tool has already published
+                                    // its invocation record. Two things it did
+                                    // *not* know, both settled here: that its
+                                    // expansion would not be folded, so BR-9
+                                    // gets its own refusal line (the published
+                                    // record is true about what the commands
+                                    // did and silent about what happened next,
+                                    // which a session would print as success);
+                                    // and that the repeat seed it left behind
+                                    // is now false, because the model does not
+                                    // hold this expansion (BR-6b).
+                                    if let Some(tool) = skill_tool(tools) {
+                                        tool.turn_state().forget_expansion();
+                                        tool.publish_refusal(&skill, budget::OVER_BUDGET_REASON);
+                                    }
+                                    // No provenance: nothing from the skill file
+                                    // entered the conversation, so nothing pins
+                                    // this turn.
+                                    ctx.push_tool_result(
+                                        name.clone(),
+                                        None,
+                                        error_result(&refusal.content),
+                                    );
+                                    continue;
+                                }
+                                // Admitted. What the loop is about to push is
+                                // what a reroute would have to re-fit, so the
+                                // guard REQ-585 built for a typed `/name` is
+                                // handed this one too (BR-7's reroute seam).
+                                None => {
+                                    if let Some(tool) = skill_tool(tools) {
+                                        tool.turn_state().note_committed(&skill, &folded);
+                                    }
+                                }
+                            }
+                        }
                         // BUG-147: never drop extra tool calls silently — the
                         // model can't tell an ignored call from a lost result
                         // and re-emits the same batch every turn. The notice is
@@ -1888,6 +2065,26 @@ pub fn build_system_prompt(tools: &ToolRegistry, config: &HarnessConfig) -> Stri
     s.push_str("\nAvailable tools:\n");
     s.push_str(&tools.docs(config.max_tools));
     s
+}
+
+/// A failed tool result **as the model reads it** — one spelling, one writer.
+///
+/// The fold below prefixes a failed result with `ERROR: `, and REQ-587's two
+/// budget refusals bypass that fold (they are raised before the dispatch, and
+/// after it but before the push). A second `format!` at either site would be a
+/// second spelling of the same fact, identical today and identical only until
+/// one of them is edited (LESSON-456).
+fn error_result(content: &str) -> String {
+    format!("ERROR: {content}")
+}
+
+/// The session's `skill` tool, when this registry holds one (REQ-587 ADR-2).
+///
+/// `None` on every session with no model-invocable skill, because
+/// `register_skill_tool` does not register the tool then — BR-2's "absent by
+/// construction" — and on every fixture registry that never had one.
+fn skill_tool(tools: &ToolRegistry) -> Option<&SkillTool> {
+    tools.get(SKILL_TOOL_NAME).and_then(|tool| tool.as_skill())
 }
 
 /// The request this turn is serving.

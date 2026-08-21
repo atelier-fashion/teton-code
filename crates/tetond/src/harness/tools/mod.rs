@@ -836,6 +836,23 @@ pub trait Tool: Send + Sync {
         false
     }
 
+    /// This tool **as** the `skill` tool, when it is one (REQ-587 ADR-2).
+    ///
+    /// The loop needs three things only [`skill::SkillTool`] can answer — the
+    /// Stage A candidate to measure before any consent is spent, BR-6b's repeat
+    /// seed, and the record a refusal publishes — and a registry holds
+    /// `Arc<dyn Tool>`, which cannot be downcast without making every tool
+    /// `Any`. A default-`None` accessor names the one tool the loop asks about
+    /// and leaves every other implementation untouched.
+    ///
+    /// It is *not* a general escape hatch: nothing else in the loop reads a
+    /// concrete tool type, and the alternative — threading the tool's handle
+    /// through `run_session_turn_with_source`'s signature and every one of its
+    /// callers — would put the same coupling in more places.
+    fn as_skill(&self) -> Option<&skill::SkillTool> {
+        None
+    }
+
     /// Refine this tool's own `outcome` through the harness duty this tool owns,
     /// given the `request` the turn is serving and the `args` it was called with.
     ///

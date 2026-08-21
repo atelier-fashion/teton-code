@@ -1927,8 +1927,30 @@ fn dispatch_mark(view: &SkillView) -> Option<String> {
     match user_dispatch(view) {
         UserDispatch::Allowed => None,
         UserDispatch::Shadowed(by) => Some(format!("shadowed by {by}")),
-        UserDispatch::ModelOnly if view.model_invocable => Some("model-only".to_owned()),
-        UserDispatch::ModelOnly => Some("invocable by nobody".to_owned()),
+        UserDispatch::ModelOnly => Some(model_only_words(view.model_invocable).to_owned()),
+    }
+}
+
+/// What a row the **user** may not type is called, once that much is settled:
+/// `model-only`, or `invocable by nobody` when the model cannot reach it either
+/// (REQ-587 BR-3).
+///
+/// The second half of [`dispatch_mark`]'s decision, split out because a *second*
+/// surface renders it: BR-9's `/verbose` block names the same file's flags one
+/// line under the echo line, from `SkillInvoked`'s copy of the same two facts
+/// rather than from a [`SkillView`]. Two spellings of this precedence would
+/// disagree only in the case that matters — the file both flags deny, where one
+/// surface would be telling the user the model is running a skill no roster
+/// contains (LESSON-528).
+///
+/// `model_invocable` is read **here and nowhere else** in the composition. It
+/// answers a different question from the user's, and it is asked only after
+/// [`user_dispatch`] has answered the user's with `ModelOnly`.
+pub(crate) fn model_only_words(model_invocable: bool) -> &'static str {
+    if model_invocable {
+        "model-only"
+    } else {
+        "invocable by nobody"
     }
 }
 
@@ -2005,6 +2027,31 @@ pub(crate) fn source_word(source: SkillSource) -> &'static str {
     match source {
         SkillSource::User => "user",
         SkillSource::Project => "project",
+    }
+}
+
+/// [`source_word`], with BR-9's shadowing clause where it applies:
+/// `project — shadows your user skill`.
+///
+/// One spelling in the three places this client names the swap — BR-4's
+/// acknowledgment prompt, BR-9's echo line, and `/verbose` under it — so a user
+/// who acknowledged `validate (project — shadows your user skill)` reads the
+/// same words back when the expansion lands. The daemon has its own copy
+/// (`tools::skill::source_clause`) for the *frame the model reads*, which is a
+/// different audience and deliberately a separate rendering of the same typed
+/// fact (LESSON-529); what must not exist is two copies on **this** side.
+///
+/// A **user** skill never carries the clause, matching that counterpart arm for
+/// arm: the swap BR-4 is about is a repository taking a name from the shelf the
+/// user installed. A same-source name contest (`skills/` beating `commands/`)
+/// is real, and it is `/help`'s `shadowed by` mark rather than this one — the
+/// row that lost is not the row being invoked.
+pub(crate) fn source_words(source: SkillSource, shadows_user_skill: bool) -> String {
+    match (source, shadows_user_skill) {
+        (SkillSource::User, _) | (SkillSource::Project, false) => source_word(source).to_owned(),
+        (SkillSource::Project, true) => {
+            format!("{} — shadows your user skill", source_word(source))
+        }
     }
 }
 

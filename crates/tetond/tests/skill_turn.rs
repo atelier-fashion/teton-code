@@ -45,6 +45,14 @@
 //! | **ADR-3: an addressable connection reached `authorize_skill` from inside the loop** | [`a_model_issued_call_addresses_its_consent_to_the_connection_that_submitted_the_turn`] |
 //! | AC-13/BR-12: a model invocation echoes one line too | [`a_model_invocation_publishes_its_own_record_saying_the_model_asked`] |
 //! | BR-5: one skill, two argument lists, two answers | [`two_typed_invocations_with_different_arguments_do_not_share_one_answer`] |
+//! | **BR-7/ADR-2: the loop refuses a model invocation as a tool result** | [`a_model_invocation_too_large_for_its_route_is_refused_as_a_tool_result_and_the_turn_goes_on`] |
+//! | BR-7: Stage B on the model path, and the sentence says which stage | [`a_model_invocation_whose_command_output_overflows_is_refused_at_stage_b_by_name`] |
+//! | BR-6b: another tool completing in between is not a repeat | [`a_skill_reissued_after_another_tool_ran_is_admitted_and_one_reissued_back_to_back_is_not`] |
+//! | AC-8: an expansion bypasses the `digest` duty, behaviourally | [`an_expansion_past_the_digest_threshold_is_folded_whole_where_an_ordinary_result_is_not`] |
+//! | ADR-2: the decision is the loop's and the tool measures nothing | [`the_budget_check_runs_in_the_loop_and_the_tool_measures_nothing`] |
+//! | BR-7: the reroute guard takes a list, refreshed from the loop | [`the_reroute_guard_is_handed_every_expansion_the_turn_committed_not_only_a_typed_one`] |
+//! | BR-7: the model path's refusal names the provider, not "this provider" | [`a_model_invocation_too_large_for_its_route_is_refused_as_a_tool_result_and_the_turn_goes_on`] |
+//! | BR-9: a refused invocation's record says it was refused, and why | [`a_model_invocation_too_large_for_its_route_is_refused_as_a_tool_result_and_the_turn_goes_on`], [`a_model_invocation_whose_command_output_overflows_is_refused_at_stage_b_by_name`] |
 //!
 //! ## Mutation table
 //!
@@ -73,6 +81,18 @@
 //! | dropping `invoker` from `build_tools` (**silent** — nothing else reddens) | [`a_model_issued_call_addresses_its_consent_to_the_connection_that_submitted_the_turn`] |
 //! | dropping the `skill` tool's own `SkillInvoked` publish | [`a_model_invocation_publishes_its_own_record_saying_the_model_asked`] |
 //! | minting `skill.permission_key()` instead of `Expansion::grant_key` | [`two_typed_invocations_with_different_arguments_do_not_share_one_answer`] |
+//! | **moving the budget check into the `skill` tool** | [`the_budget_check_runs_in_the_loop_and_the_tool_measures_nothing`] |
+//! | making the loop's refusal an `RpcError` that ends the turn | [`a_model_invocation_too_large_for_its_route_is_refused_as_a_tool_result_and_the_turn_goes_on`] |
+//! | dropping the refusal's own `SkillInvoked` publish (BR-9) | [`a_model_invocation_too_large_for_its_route_is_refused_as_a_tool_result_and_the_turn_goes_on`] |
+//! | Stage A raised *after* the dispatch that spends the consent | [`a_model_invocation_too_large_for_its_route_is_refused_as_a_tool_result_and_the_turn_goes_on`] |
+//! | the two stages collapsing into one sentence | [`a_model_invocation_whose_command_output_overflows_is_refused_at_stage_b_by_name`] |
+//! | leaving `TurnState::note_foreign_tool_completed` unwired | [`a_skill_reissued_after_another_tool_ran_is_admitted_and_one_reissued_back_to_back_is_not`] |
+//! | an expansion reaching `digest` or its mechanical-truncation arm | [`an_expansion_past_the_digest_threshold_is_folded_whole_where_an_ordinary_result_is_not`] |
+//! | leaving `skill_refit` a single value read off `skill_turn` | [`the_reroute_guard_is_handed_every_expansion_the_turn_committed_not_only_a_typed_one`] |
+//! | a model-path refusal that names no provider on `default_unknown` | [`a_model_invocation_too_large_for_its_route_is_refused_as_a_tool_result_and_the_turn_goes_on`] |
+//! | publishing a refusal that does not say it was refused | [`a_model_invocation_too_large_for_its_route_is_refused_as_a_tool_result_and_the_turn_goes_on`], [`a_model_invocation_whose_command_output_overflows_is_refused_at_stage_b_by_name`] |
+//! | recovering the provider id by parsing `window_label` | `harness::budget::tests::the_window_label_names_the_provider_the_field_carries_and_neither_is_parsed_from_the_other` |
+//! | dropping `refused`'s `skip_serializing_if` | `teton_protocol::events::tests::skill_invoked_says_it_was_refused_and_why_additively` |
 //!
 //! ## The order claims, and which of them behaviour can now reach
 //!
@@ -361,7 +381,19 @@ impl Harness {
     /// duty is started before any budget exists, and binding it here would put
     /// a bounded copy of the expansion on the wire for a turn BR-8 refuses.
     fn with_window(window: u32) -> Self {
-        Self::assembled(window, DaemonRuntime::minimal())
+        Self::assembled(Some(window), DaemonRuntime::minimal())
+    }
+
+    /// A runtime whose provider declares **no** window, so `budget::derive`
+    /// takes the `default_unknown` arm and the route runs on the default pair —
+    /// 4,096 words / 32 KiB, with the `digest` duty's default 1,500-word
+    /// threshold beneath it.
+    ///
+    /// The route AC-8's bypass has to be proved on: on a declared 128k window
+    /// the threshold scales up past any expansion a fixture can write, so a
+    /// test there would pass on a build with no bypass at all.
+    fn with_default_budget() -> Self {
+        Self::assembled(None, DaemonRuntime::minimal())
     }
 
     /// [`Self::with_window`] with a shortened dynamic-context deadline, so
@@ -369,12 +401,12 @@ impl Harness {
     /// a real `shell` call gets.
     fn with_command_timeout(window: u32, timeout_ms: u64) -> Self {
         Self::assembled(
-            window,
+            Some(window),
             DaemonRuntime::minimal().with_skill_command_timeout(timeout_ms),
         )
     }
 
-    fn assembled(window: u32, runtime: DaemonRuntime) -> Self {
+    fn assembled(window: Option<u32>, runtime: DaemonRuntime) -> Self {
         let (runtime, vendor) = provider_runtime(window, runtime);
         let consent = Arc::new(Consent::new(Arc::clone(runtime.pending())));
         // REQ-585 ADR-7: without this the gate asks nobody. Installed here, once,
@@ -483,7 +515,7 @@ impl Harness {
 /// test needs the same runtime **without** a stand-in consent route installed:
 /// what it asserts is that `Daemon`'s own wiring puts the prompt in front of a
 /// real client.
-fn provider_runtime(window: u32, runtime: DaemonRuntime) -> (Arc<DaemonRuntime>, Vendor) {
+fn provider_runtime(window: Option<u32>, runtime: DaemonRuntime) -> (Arc<DaemonRuntime>, Vendor) {
     fixture_home();
     let vendor = Vendor::start();
     let runtime = Arc::new(runtime);
@@ -494,7 +526,7 @@ fn provider_runtime(window: u32, runtime: DaemonRuntime) -> (Arc<DaemonRuntime>,
             endpoint: Some(vendor.endpoint.clone()),
             model: Some("mock-1".to_owned()),
             auth_ref: None,
-            max_context: Some(window),
+            max_context: window,
             context_budget_cap: None,
             floored_budget: None,
         }))
@@ -618,6 +650,21 @@ impl Vendor {
             "skill-call-1",
             "skill",
             &json!({ "name": name, "args": args }).to_string(),
+        ));
+    }
+
+    /// Answer the next request with one call to some **other** tool.
+    ///
+    /// BR-6b turns on the difference between "nothing happened in between" and
+    /// "another tool call completed in between", and only the model can put a
+    /// foreign call between two `skill` calls — the loop dispatches what it was
+    /// asked for. A fixture that reached into `TurnState` instead would be
+    /// asserting the method, not the wiring.
+    fn will_call_tool(&self, tool: &str, arguments: Value) {
+        self.script.lock().unwrap().push_back(sse_tool_call(
+            "other-call-1",
+            tool,
+            &arguments.to_string(),
         ));
     }
 
@@ -2141,7 +2188,7 @@ async fn a_skill_consent_reaches_the_client_that_typed_it_and_is_answerable_by_i
         ".claude/skills/wired/SKILL.md",
         &skill_file("one command", "Out: !`echo wired-through`\n"),
     );
-    let (runtime, vendor) = provider_runtime(128_000, DaemonRuntime::minimal());
+    let (runtime, vendor) = provider_runtime(Some(128_000), DaemonRuntime::minimal());
     let events = Arc::new(EventBus::new());
     let socket = temp_socket("skill-consent-wiring");
     let listener = server::bind_listener(&socket).unwrap();
@@ -2444,6 +2491,388 @@ async fn a_model_invocation_publishes_its_own_record_saying_the_model_asked() {
     );
 }
 
+// ---------------------------------------------------------------------------
+// TASK-218 — the loop admits or refuses (BR-6, BR-7, BR-9; ADR-2)
+// ---------------------------------------------------------------------------
+
+/// Everything one turn put on the wire, as one searchable string.
+///
+/// The provider is where a *folded* result ends up, so "did the expansion enter
+/// the conversation" and "did the refusal reach the model" are both questions
+/// about what was sent — and asking them of the socket rather than of a context
+/// snapshot is what makes the answer about the whole path.
+fn on_the_wire(h: &Harness) -> String {
+    h.vendor.sent().join("\n")
+}
+
+/// **BR-7 Stage A on the model path: a tool result, and the turn goes on.**
+///
+/// Four claims in one turn, and each is a different mutation:
+///
+/// * the refusal is a **tool result**, not a fifth `-32023` raise — the turn
+///   returns `Ok` and the model is handed a sentence it can relay. Making it an
+///   `RpcError` reddens the very first assertion;
+/// * the check ran **in the loop**, against this route's budget, which is the
+///   only place the system prompt exists to measure against;
+/// * it ran **before the dispatch**, so neither of the tool's two doors was
+///   opened — the consent double here would have said yes to both, so an empty
+///   `asked()` is a statement about ordering rather than about levels;
+/// * BR-9's record was published anyway, because a refusal is never silent.
+///
+/// Non-vacuity is the `<skill-body` assertion: nothing was folded, so a build
+/// that quietly admitted the expansion would fail here rather than pass by
+/// looking similar.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_model_invocation_too_large_for_its_route_is_refused_as_a_tool_result_and_the_turn_goes_on(
+) {
+    let repo = Tree::new("mdlstga");
+    // A body no route in this fixture can hold, plus a command — so a refusal
+    // raised after the dispatch would have spent a consent to get here.
+    model_invocable_skill(
+        &repo,
+        "toobig",
+        // Under `SKILL_MAX_BYTES` (64 KiB), or discovery would drop the row and
+        // the refusal below would be `unknown_skill` — a different test.
+        &format!("{}\n\nOut: !`echo ran-anyway`\n", filler(40_000)),
+    );
+    // The **undeclared** window, deliberately: `default_unknown` is the bound
+    // BR-7 writes the remedy for — "the one a new user meets" — and it is the
+    // only arm whose sentence names the provider, so it is the arm that proves
+    // the loop can name one at all.
+    let h = Harness::with_default_budget();
+    let session = h.session_at(repo.path());
+    // Both doors would say yes. An empty `asked()` below therefore means
+    // nobody was asked, not that somebody said no.
+    h.consent
+        .answers(Answer::Select(PermissionOptionKind::AllowOnce));
+    h.vendor.will_call_skill("toobig", "");
+    let mut sub = h.events.subscribe(256);
+
+    h.turn(&session, "use the toobig skill", None).await.expect(
+        "a model-invoked expansion that does not fit is a tool result the model relays — \
+             a turn-ending `-32023` here is the fifth raise site ADR-2 forbids",
+    );
+
+    let wire = on_the_wire(&h);
+    assert!(
+        wire.contains("does not fit this route's context budget"),
+        "the refusal never reached the model, so it was silent — which BR-6 and \
+         BR-9 both forbid: {wire}"
+    );
+    assert!(
+        wire.contains("the body alone, with the system prompt, comes to"),
+        "Stage A's clause is what tells the model the body itself is what did \
+         not fit; without it the two stages are indistinguishable: {wire}"
+    );
+    assert!(
+        wire.contains("The `toobig` skill does not fit"),
+        "a model never saw a slash — printing `/toobig` at it names a surface \
+         only the user has (BR-8): {wire}"
+    );
+    assert!(
+        !wire.contains("<skill-body"),
+        "nothing may be folded when the expansion is refused: {wire}"
+    );
+    assert!(
+        !wire.contains("ran-anyway"),
+        "the dynamic command must never have run — Stage A refuses before the \
+         dispatch that would spend the consent (BR-8d): {wire}"
+    );
+    assert!(
+        h.consent.asked().is_empty(),
+        "Stage A ran after the consent was spent: a body that cannot fit is \
+         refused before anybody approves anything (BR-8d): {:?}",
+        h.consent.asked()
+    );
+    assert!(
+        wire.contains("bound: unknown window — set `capabilities.max_context` for `mock`"),
+        "BR-7's remedy names the provider outright, and the loop holds no \
+         `Route` to ask — reading it off the stamped `RouteBudget` is what \
+         keeps the model path's sentence from being one noun short of the \
+         user path's: {wire}"
+    );
+
+    // BR-9: a refusal is never silent on the session surface either.
+    let invoked = invocations(&drain(&mut sub).await);
+    assert_eq!(
+        invoked.len(),
+        1,
+        "BR-9 says one line per typed refusal, and a refusal raised by the loop \
+         publishes no record of its own unless the loop asks the tool to: {invoked:?}"
+    );
+    assert_eq!(invoked[0].name, "toobig");
+    assert_eq!(invoked[0].invoked_by, InvokedBy::Model);
+    assert!(
+        invoked[0].outcomes.is_empty(),
+        "no command ran, and the record has to say so rather than describe a \
+         run that never happened: {:?}",
+        invoked[0].outcomes
+    );
+    assert_eq!(
+        invoked[0].refused.as_deref(),
+        Some("over_budget"),
+        "without this the record is byte-identical to a command-free skill that \
+         ran perfectly, and a session prints the refusal as a success — which \
+         BR-9 forbids more plainly than it forbids silence: {:?}",
+        invoked[0]
+    );
+    assert_eq!(
+        invoked[0].turn_invocations,
+        Some(teton_protocol::events::TurnInvocations { count: 1, cap: 12 }),
+        "BR-6a counts refusals too, or a loop of over-budget calls is unbounded"
+    );
+}
+
+/// **BR-7 Stage B on the model path, and the stage is part of the sentence.**
+///
+/// The same body, the same route, twice: at `plan` the commands do not run and
+/// the expansion is folded, and at `full` their output is what pushes the turn
+/// past the budget. So the refusal below is the *output's* doing, and the two
+/// stages are told apart by their own clauses rather than by a shared one.
+///
+/// The record is published before this refusal — by the tool, at the end of its
+/// own run — which is ADR-15's rule on the user path and holds here for the same
+/// reason: a turn whose commands ran and was then refused is the turn whose
+/// record matters most.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_model_invocation_whose_command_output_overflows_is_refused_at_stage_b_by_name() {
+    // Not `stage_b_repo`: the model path measures `system + request +
+    // candidate` where the typed path measures `system + candidate`, and it
+    // carries BR-4's frame besides — so the sizes that bracket the budget are
+    // not the same sizes, and reusing that fixture put Stage A where Stage B
+    // belongs.
+    //
+    // Two skills with the *same* body and different command output, so the
+    // control isolates the one variable: whether the output is what spent the
+    // room. Both sessions run at `full`, where BR-4's acknowledgment is granted
+    // by the level and BR-5's consent asks nothing — a `plan` control would
+    // have been refused at the acknowledgment and proved nothing about size.
+    let repo = Tree::new("mdlstgb");
+    model_invocable_skill(
+        &repo,
+        "light",
+        &format!("{}\n\nOut: !`echo tiny`\n", filler(25_000)),
+    );
+    model_invocable_skill(
+        &repo,
+        "heavy",
+        &format!(
+            // `MAX_OUTPUT_CHARS` caps a dynamic command at 8,000 characters, so
+            // the *body* is what has to be sized to leave less than that much
+            // room: a bigger `head -c` would change nothing.
+            "{}\n\nOut: !`head -c 20000 /dev/zero | tr '\\0' 'x'`\n",
+            filler(25_000)
+        ),
+    );
+    let h = Harness::with_window(20_000);
+    h.consent.unreachable();
+
+    // Control: the same body, a command whose output is a word long.
+    let fits = h.session_at(repo.path());
+    h.at_level(&fits, PermissionLevel::Full);
+    h.vendor.will_call_skill("light", "");
+    h.turn(&fits, "use the light skill", None)
+        .await
+        .expect("the turn runs");
+    assert!(
+        on_the_wire(&h).contains("<skill-body"),
+        "control: a body this size fits this route, so Stage A admits it — \
+         without this leg the refusal below could be Stage A's"
+    );
+
+    let overflows = h.session_at(repo.path());
+    h.at_level(&overflows, PermissionLevel::Full);
+    let mut sub = h.events.subscribe(256);
+    h.vendor.will_call_skill("heavy", "");
+    h.turn(&overflows, "use the heavy skill", None)
+        .await
+        .expect("a Stage B refusal is a tool result too, not a turn-ender");
+
+    let wire = on_the_wire(&h);
+    assert!(
+        wire.contains("the body fits, but its dynamic context output pushed the turn to"),
+        "Stage B's clause is the whole difference between the two checks — a \
+         model told only 'it does not fit' cannot tell which one refused: {wire}"
+    );
+    assert!(
+        !wire
+            .contains("The `heavy` skill does not fit this route's context budget: the body alone"),
+        "the two stages must not share one sentence: {wire}"
+    );
+
+    // BR-9's two sentences, and they are about two different things: what the
+    // invocation *did* (its commands ran, and `/verbose` renders their
+    // outcomes — ADR-15's rule) and that its result was then not folded. The
+    // first record was true when the tool published it and cannot say what the
+    // loop decided afterwards, so the refusal gets its own line rather than a
+    // rewrite of a record that was honest.
+    let invoked = invocations(&drain(&mut sub).await);
+    assert_eq!(
+        invoked.len(),
+        2,
+        "one line per invocation, and one line per typed refusal (BR-9): {invoked:?}"
+    );
+    assert!(
+        matches!(
+            invoked[0].outcomes[0].outcome,
+            WireDynamicOutcome::Ran { .. }
+        ),
+        "the record says the command ran, because it did: {:?}",
+        invoked[0].outcomes
+    );
+    assert_eq!(
+        invoked[0].refused, None,
+        "…and it says nothing about the fold, because when it was published \
+         nothing had been decided: {:?}",
+        invoked[0]
+    );
+    assert_eq!(
+        invoked[1].refused.as_deref(),
+        Some("over_budget"),
+        "a Stage B refusal is as silent as a Stage A one unless it says so: {:?}",
+        invoked[1]
+    );
+    assert_eq!(invoked[1].name, "heavy");
+}
+
+/// **BR-6b's other case — the one its own illustration cannot reach.**
+///
+/// The rule is "the same call expanded again with **no other tool call
+/// completed in between**", and the tool cannot see the loop's other dispatches:
+/// `TurnState::note_foreign_tool_completed` shipped unwired. BR-6b's stated
+/// example — `/proceed`'s two `/validate` passes separated by an `/architect` —
+/// is admitted either way, because the intervening *expansion* overwrites the
+/// seed. So a test written from the illustration passes with the seam dead, and
+/// this one is written from the case it does not cover: a `read` in between.
+///
+/// The second leg is the control. Back to back, with nothing in between, the
+/// same call *is* `repeated` — without it this would pass on a build that had
+/// simply stopped applying the rule at all.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_skill_reissued_after_another_tool_ran_is_admitted_and_one_reissued_back_to_back_is_not()
+{
+    let repo = Tree::new("mdlrept");
+    repo.write(
+        "note.txt",
+        "a file the model reads between two invocations\n",
+    );
+    let h = Harness::with_window(128_000);
+    h.consent
+        .answers(Answer::Select(PermissionOptionKind::AllowOnce));
+
+    // `homeonly` is the fixture home's user skill: no project acknowledgment,
+    // no dynamic context, so nothing between the two calls but the `read`.
+    let separated = h.session_at(repo.path());
+    let mut sub = h.events.subscribe(256);
+    h.vendor.will_call_skill("homeonly", "");
+    h.vendor
+        .will_call_tool("read", json!({ "path": "note.txt" }));
+    h.vendor.will_call_skill("homeonly", "");
+    h.turn(&separated, "read the note between two invocations", None)
+        .await
+        .expect("the turn runs");
+
+    let wire = on_the_wire(&h);
+    assert!(
+        wire.contains("a file the model reads between two invocations"),
+        "non-vacuity: the intervening `read` has to have completed, or this \
+         proves nothing about what completing one does: {wire}"
+    );
+    assert!(
+        !wire.contains("repeated:"),
+        "BR-6b admits a re-invocation once another tool call has completed — \
+         leaving `note_foreign_tool_completed` unwired refuses it, and the \
+         rule's own illustration cannot see that: {wire}"
+    );
+    assert_eq!(
+        invocations(&drain(&mut sub).await).len(),
+        2,
+        "both invocations expanded, so both echo a line"
+    );
+
+    // The control: nothing in between, and the same call is refused.
+    let back_to_back = h.session_at(repo.path());
+    h.vendor.will_call_skill("homeonly", "");
+    h.vendor.will_call_skill("homeonly", "");
+    h.turn(
+        &back_to_back,
+        "invoke it twice with nothing in between",
+        None,
+    )
+    .await
+    .expect("the turn runs");
+    assert!(
+        on_the_wire(&h).contains("repeated:"),
+        "with nothing in between the rule still applies, or the seam was not \
+         wired but deleted"
+    );
+}
+
+/// **AC-8, behaviourally: an expansion bypasses the `digest` duty, and an
+/// ordinary result of the same size does not.**
+///
+/// The existing pin counts `summarize_if_large`'s production call sites and says
+/// nothing about `skill`; this drives a 2,800-word expansion through the loop on
+/// the **default-budget** route, where the duty's 1,500-word threshold is well
+/// under it and the budget still holds it. The control is a `read` of a file of
+/// the same size in the same session shape: it comes back mechanically
+/// truncated, because this fixture binds no `digest` route — which is exactly
+/// the failure arm BR-7 says an expansion must not reach either.
+///
+/// A procedure condensed is not the procedure, so the assertion is on the
+/// **tail** of the body: a middle-elided expansion keeps its opening.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_expansion_past_the_digest_threshold_is_folded_whole_where_an_ordinary_result_is_not() {
+    let repo = Tree::new("mdldgst");
+    // 2,800 words at four bytes each — `/architect` with its ethos include, in
+    // round numbers, and three times the local `digest` threshold.
+    let body = format!("{}\nLAST-STEP-OF-THE-PROCEDURE\n", filler(11_200));
+    model_invocable_skill(&repo, "wide", &body);
+    repo.write(
+        "wide.txt",
+        &format!("{}\nLAST-LINE-OF-THE-FILE\n", filler(11_200)),
+    );
+
+    let h = Harness::with_default_budget();
+    let expansion = h.session_at(repo.path());
+    h.consent
+        .answers(Answer::Select(PermissionOptionKind::AllowOnce));
+    h.vendor.will_call_skill("wide", "");
+    h.turn(&expansion, "run the wide skill", None)
+        .await
+        .expect("the expansion fits this route, so it is folded");
+
+    let wire = on_the_wire(&h);
+    assert!(
+        wire.contains("LAST-STEP-OF-THE-PROCEDURE"),
+        "the expansion reached the model without its tail — condensed or \
+         truncated, a procedure is no longer the procedure (BR-7): {wire}"
+    );
+    assert!(
+        !wire.contains("summarized skill output"),
+        "the `digest` duty condensed the procedure into a summary of itself, \
+         which is the arm BR-7 names first: {wire}"
+    );
+    assert!(
+        !wire.contains("truncated mechanically"),
+        "…and the duty's *failure* arm is fatal in the same way, so the bypass \
+         is the branch, not a guarded call: {wire}"
+    );
+
+    // The control, in its own session so the two results never share a budget.
+    let ordinary = h.session_at(repo.path());
+    h.vendor
+        .will_call_tool("read", json!({ "path": "wide.txt" }));
+    h.turn(&ordinary, "read the wide file", None)
+        .await
+        .expect("the turn runs");
+    assert!(
+        on_the_wire(&h).contains("summarized read output"),
+        "non-vacuity: a result of the same size that is *not* an expansion is \
+         condensed on this very route, or the bypass above bypasses nothing"
+    );
+}
+
 /// **BR-5: two invocations of one skill with different arguments do not share
 /// one answer.**
 ///
@@ -2646,6 +3075,100 @@ fn the_two_refusals_bracket_the_consent_seam_and_precede_the_seed() {
             window.contains("skill_would_not_survive_refit"),
             "a refusal below the seed must come from the refit guard, not from a \
              stage that lost its position"
+        );
+    }
+}
+
+/// **ADR-2's first half, as a fact about where the code is.**
+///
+/// The behavioural tests above show a refusal arriving; they cannot show *who
+/// decided*. Moving the check into the tool would keep every one of them green
+/// — the tool can be handed a budget at construction and refuse with the same
+/// sentence — right up until the day `build_tools` runs before
+/// `build_system_prompt` matters (it always has: there is no system prompt to
+/// measure against yet) or a mid-turn reroute swaps the route out from under a
+/// budget captured a turn earlier. So the location is pinned directly.
+///
+/// The negative half is the load-bearing one: the tool must measure **nothing**.
+#[test]
+fn the_budget_check_runs_in_the_loop_and_the_tool_measures_nothing() {
+    let loop_src = production_source("harness/turn_loop.rs");
+    let calls: Vec<usize> = loop_src
+        .match_indices("skill_append_fit(")
+        .map(|(at, _)| at)
+        .collect();
+    assert_eq!(
+        calls.len(),
+        2,
+        "the loop admits or refuses at exactly two points — BR-7's two stages — \
+         and a third would be a check nobody decided to add"
+    );
+    let stage_a = at(&loop_src, "SkillStage::Body");
+    let stage_b = at(&loop_src, "SkillStage::WithDynamicContext");
+    assert!(
+        stage_a < stage_b,
+        "Stage A measures before the dispatch that spends the consent; Stage B \
+         measures what the commands produced"
+    );
+    assert!(
+        !loop_src.contains("error_code::SKILL_EXPANSION_TOO_LARGE"),
+        "a refusal raised in the loop is a tool result the model relays, never \
+         a typed error that ends the turn (ADR-2) — the four `-32023` raises \
+         all live in `run_prompt_turn`"
+    );
+
+    let tool_src = production_source("harness/tools/skill.rs");
+    for measurement in [
+        "skill_append_fit",
+        "skill_fit(",
+        "would_append_fit",
+        "would_seed_fit",
+        "config.budget",
+    ] {
+        assert!(
+            !tool_src.contains(measurement),
+            "the `skill` tool must make no budget measurement of its own \
+             ({measurement}): at construction there is no system prompt to \
+             measure against, and the route can be swapped mid-turn (ADR-2)"
+        );
+    }
+}
+
+/// **BR-7's reroute seam: the guard REQ-585 built could not see a model
+/// invocation, and now it takes a list.**
+///
+/// `skill_refit` was one `Option`, built from `skill_turn` — populated only for
+/// a user-typed `/name`. So `skill_would_not_survive_refit` answered `None` for
+/// **every** model invocation and `refit_for_reroute` middle-elided the
+/// expansion, at the exact seam the guard exists for; and on a
+/// boundary-configured machine the privacy pin is the expected path for any
+/// invocation that ran a dynamic command, not a corner.
+///
+/// Asserted structurally because the daemon fixture here cannot fail a provider
+/// mid-turn: reaching either arm needs a live reroute after an expansion has
+/// been committed, which needs a local engine (the privacy pin) or a scripted
+/// transport failure (the fallback). What *can* be pinned is that the list is a
+/// list, that it is refreshed from the loop's own record of what it folded, and
+/// that both guards read it after that refresh.
+#[test]
+fn the_reroute_guard_is_handed_every_expansion_the_turn_committed_not_only_a_typed_one() {
+    let body = run_prompt_turn_body();
+    assert!(
+        body.contains("let mut skill_refit: Vec<(String, String, String)>"),
+        "the refit guard's input is a list of `(name, text, system)` triples — \
+         a single value cannot carry both a typed turn and the model's own \
+         expansions"
+    );
+    let refreshed = at(&body, "model_invoked_expansions(");
+    for guard in body
+        .match_indices("skill_would_not_survive_refit(")
+        .map(|(at, _)| at)
+    {
+        assert!(
+            refreshed < guard,
+            "a reroute guard that read the list before the attempt's own \
+             expansions joined it is the guard REQ-585 shipped: blind to \
+             everything the model invoked"
         );
     }
 }

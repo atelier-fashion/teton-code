@@ -317,15 +317,29 @@ fn sanitized_provider_id(id: &str) -> String {
         .collect()
 }
 
-/// What the elision marker calls a remote route's window.
+/// What the elision marker calls a remote route's window, **and the id that
+/// name is made of** — one function, returning both (REQ-587 BR-7).
+///
+/// The two are minted together because they are one fact spelled two ways: a
+/// label reading `` `kimi`'s context window `` and a
+/// [`RouteBudget::provider_id`] of `kimi` cannot come to disagree if neither is
+/// written without the other. The alternative a reader reaches for — recovering
+/// the id by stripping `"'s context window"` off the label — is the drift the
+/// label's own doc exists to prevent, and it is *wrong* besides: the redact
+/// clamp renames the window without changing whose window it is, so a parsed id
+/// would go `None` on precisely the route BR-4 clamps.
 ///
 /// Defensive `None` arm: a remote route always has an id in practice (the
 /// window came from `capability_of(id)`); an id-less caller gets the default
-/// pair's historical name rather than a nameless marker.
-fn provider_label(provider_id: Option<&str>) -> String {
+/// pair's historical name rather than a nameless marker, and no id, because
+/// there is none to name.
+fn labelled_provider(provider_id: Option<&str>) -> (String, Option<String>) {
     match provider_id {
-        Some(id) => format!("{}'s context window", sanitized_provider_id(id)),
-        None => LOCAL_WINDOW_LABEL.to_owned(),
+        Some(id) => {
+            let id = sanitized_provider_id(id);
+            (format!("{id}'s context window"), Some(id))
+        }
+        None => (LOCAL_WINDOW_LABEL.to_owned(), None),
     }
 }
 
@@ -412,6 +426,37 @@ pub struct RouteBudget {
     /// [`BudgetBound::DefaultUnknown`] arms: those return the default pair by
     /// decision rather than by a clamp, and nothing was raised.
     pub floored: bool,
+    /// The provider whose declaration this pair was derived from, sanitized
+    /// exactly as [`Self::window_label`] sanitizes it — `None` on the local
+    /// tier and for an id-less caller (REQ-587 BR-7).
+    ///
+    /// # Why the budget carries it
+    ///
+    /// BR-7's refusal names the remedy a new user meets verbatim:
+    /// `` bound: default_unknown — set `capabilities.max_context` for <id> ``.
+    /// The user path has the id in hand (`run_prompt_turn` holds the `Route`),
+    /// but the **turn loop** does not: `HarnessConfig` carries the budget and
+    /// not who declared it, so a model-invoked refusal could only say "for this
+    /// provider" — the defensive arm, on the one bound the sentence was written
+    /// for. Carrying the id here puts it wherever the pair goes, which is
+    /// exactly the set of places that can quote it.
+    ///
+    /// A `HarnessConfig` field would have gone **stale**: the config is stamped
+    /// once per turn and a mid-turn reroute replaces the route, so the id would
+    /// name the provider that was dropped. This travels with the pair, and the
+    /// pair is re-stamped by [`with_route_budget`](crate::harness::turn_loop::HarnessConfig::with_route_budget)
+    /// on every route decision.
+    ///
+    /// # It is not `window_label` parsed back
+    ///
+    /// Both come out of [`labelled_provider`], and
+    /// `the_window_label_names_the_provider_the_field_carries_and_neither_is_parsed_from_the_other`
+    /// pins that. The redact clamp is where a parse would break: it renames the
+    /// window to `"the redact-scannable window"` without changing whose window
+    /// it is, so a stripped-suffix id would answer `None` for a route that has
+    /// a provider — and the refusal would drop the remedy on a *clamped* remote
+    /// route, which is one of the two the user most needs it on.
+    pub provider_id: Option<String>,
 }
 
 /// Turn a route's window facts into its budget — the one classifier (BR-8,
@@ -419,12 +464,16 @@ pub struct RouteBudget {
 #[must_use]
 pub fn derive(inputs: BudgetInputs<'_>) -> RouteBudget {
     if inputs.is_local {
-        return default_pair(BudgetBound::LocalEngine, LOCAL_WINDOW_LABEL.to_owned());
+        // `None`, deliberately, even when the routing table gave the local tier
+        // a provider id: the local window is not a provider's declaration, so
+        // there is no `capabilities.max_context` for anyone to go and set. The
+        // label says the same thing, which is the invariant.
+        return default_pair(BudgetBound::LocalEngine, labelled_provider(None));
     }
     if inputs.window == 0 {
         return default_pair(
             BudgetBound::DefaultUnknown,
-            provider_label(inputs.provider_id),
+            labelled_provider(inputs.provider_id),
         );
     }
 
@@ -461,10 +510,15 @@ pub fn derive(inputs: BudgetInputs<'_>) -> RouteBudget {
     // The redact clamp applies LAST and names the bound only when it bites
     // (BR-4): the scan is byte-denominated, so only bytes clamp — the word
     // component stays window-derived and the byte guard binds.
-    let mut window_label = provider_label(inputs.provider_id);
+    let (mut window_label, provider_id) = labelled_provider(inputs.provider_id);
     if inputs.redact_scan && budget_bytes > REDACT_SCANNABLE_CONTEXT_BYTES {
         budget_bytes = REDACT_SCANNABLE_CONTEXT_BYTES;
         bound = BudgetBound::RedactScan;
+        // The clamp renames the **window**, not the provider: this route is
+        // still `kimi`'s, and `capabilities.max_context` for `kimi` is still
+        // the line a user would go and write. `provider_id` above is therefore
+        // untouched here — which is also why it cannot be recovered from the
+        // label.
         window_label = REDACT_WINDOW_LABEL.to_owned();
     }
 
@@ -478,12 +532,17 @@ pub fn derive(inputs: BudgetInputs<'_>) -> RouteBudget {
         digest_threshold_tokens,
         digest_threshold_bytes,
         floored,
+        provider_id,
     }
 }
 
 /// The default (local) pair with the given bound and label — the
 /// `LocalEngine`/`DefaultUnknown` arms of [`derive`].
-fn default_pair(bound: BudgetBound, window_label: String) -> RouteBudget {
+/// The label and its id arrive as one value from [`labelled_provider`], so this
+/// constructor cannot be handed a label naming one provider and an id naming
+/// another (REQ-587 BR-7).
+fn default_pair(bound: BudgetBound, labelled: (String, Option<String>)) -> RouteBudget {
+    let (window_label, provider_id) = labelled;
     let (digest_threshold_tokens, digest_threshold_bytes) =
         digest_thresholds(LOCAL_BUDGET_TOKENS, LOCAL_BUDGET_BYTES);
     RouteBudget {
@@ -491,6 +550,7 @@ fn default_pair(bound: BudgetBound, window_label: String) -> RouteBudget {
         budget_bytes: LOCAL_BUDGET_BYTES,
         bound,
         window_label,
+        provider_id,
         digest_threshold_tokens,
         digest_threshold_bytes,
         // The default pair is the answer, not a clamp of a smaller one.
@@ -780,6 +840,21 @@ pub fn skill_fit(
     }
 }
 
+/// BR-7's name for this refusal, and the id [`SkillInvoked::refused`] carries
+/// (REQ-587 BR-9).
+///
+/// It lives beside the composer so the refusal and the word a session prints
+/// for it have one home. It is *not* spliced into the sentence: BR-8's
+/// composer opens with the subject (`` The `architect` skill does not fit… ``)
+/// rather than with a reason token, and that shape is pinned by
+/// `the_refusal_names_the_skill_its_size_the_budget_and_the_bound`. What the id
+/// keys is the **record** — the session line and any suite asserting on it —
+/// in the same vocabulary the tool's own typed refusals use (`per_turn_cap`,
+/// `repeated`, `unknown_skill`).
+///
+/// [`SkillInvoked::refused`]: teton_protocol::events::SkillInvoked::refused
+pub const OVER_BUDGET_REASON: &str = "over_budget";
+
 /// Measure one expansion **appended mid-loop** against the route's stamped
 /// budget and, if it does not fit, compose the refusal (REQ-587 BR-7, ADR-2).
 ///
@@ -1065,6 +1140,123 @@ mod tests {
             assert_eq!(got.budget_bytes, *bytes, "{name}: budget_bytes");
             assert_eq!(got.bound, *bound, "{name}: bound");
         }
+    }
+
+    /// **REQ-587 BR-7: the label names the provider the field carries, and
+    /// neither is derived from the other.**
+    ///
+    /// `RouteBudget` now carries the provider id because BR-7's refusal quotes
+    /// it — `` set `capabilities.max_context` for <id> ``, "the one a new user
+    /// meets" — and the turn loop, which raises that refusal for a model
+    /// invocation, holds no `Route` to ask. The id was already *spelled into*
+    /// `window_label`, which is exactly why the tempting implementation is to
+    /// strip `"'s context window"` back off it.
+    ///
+    /// **The redact row is why that is wrong**, and it is the row this test
+    /// exists for. The clamp renames the window without changing whose window
+    /// it is: the label becomes `"the redact-scannable window"` while the route
+    /// is still `kimi`'s and `capabilities.max_context` for `kimi` is still the
+    /// line a user would go and write. A parsed id answers `None` there — the
+    /// remedy silently dropped from a clamped remote route's refusal — so the
+    /// two facts are minted together by `labelled_provider` and asserted
+    /// together here.
+    ///
+    /// The general invariant is checked over every row besides: the label is in
+    /// the provider form **iff** it is that provider's id spelled out, and a
+    /// route with no id never wears one.
+    #[test]
+    fn the_window_label_names_the_provider_the_field_carries_and_neither_is_parsed_from_the_other()
+    {
+        fn id_less<'a>(window: u32) -> BudgetInputs<'a> {
+            BudgetInputs {
+                provider_id: None,
+                ..remote(window, 0, false)
+            }
+        }
+
+        let rows: &[(&str, BudgetInputs<'_>, Option<&str>, &str)] = &[
+            (
+                "the local tier declares nothing, so there is no id to set",
+                BudgetInputs::local(),
+                None,
+                LOCAL_WINDOW_LABEL,
+            ),
+            (
+                "an undeclared window is the bound BR-7 writes the remedy for",
+                remote(0, 0, false),
+                Some("kimi"),
+                "kimi's context window",
+            ),
+            (
+                "a declared window names its provider",
+                remote(128_000, 0, false),
+                Some("kimi"),
+                "kimi's context window",
+            ),
+            (
+                "a user cap does not change whose window it is",
+                remote(200_000, 40_000, false),
+                Some("kimi"),
+                "kimi's context window",
+            ),
+            (
+                // The discriminating row. A stripped-suffix id is `None` here.
+                "the redact clamp renames the window, not the provider",
+                remote(128_000, 0, true),
+                Some("kimi"),
+                REDACT_WINDOW_LABEL,
+            ),
+            (
+                "an id-less caller gets no id and the historical label",
+                id_less(128_000),
+                None,
+                LOCAL_WINDOW_LABEL,
+            ),
+        ];
+
+        for (name, inputs, expected_id, expected_label) in rows {
+            let got = derive(*inputs);
+            assert_eq!(
+                got.provider_id.as_deref(),
+                *expected_id,
+                "{name}: the refusal quotes this id, and reading it off \
+                 `window_label` answers `None` on the redact row"
+            );
+            assert_eq!(got.window_label, *expected_label, "{name}");
+
+            // The invariant, over whichever row this is: the provider form of
+            // the label is spelled from the field, and only from it.
+            match got.window_label.strip_suffix("'s context window") {
+                Some(named) => assert_eq!(
+                    Some(named),
+                    got.provider_id.as_deref(),
+                    "{name}: the label names a provider the field does not"
+                ),
+                None => assert!(
+                    got.window_label == LOCAL_WINDOW_LABEL
+                        || got.window_label == REDACT_WINDOW_LABEL,
+                    "{name}: a label in neither form is a third spelling nobody \
+                     decided on: {}",
+                    got.window_label
+                ),
+            }
+            if got.provider_id.is_none() {
+                assert!(
+                    !got.window_label.ends_with("'s context window"),
+                    "{name}: a route with no id must never wear one"
+                );
+            }
+        }
+
+        // One sanitization, not two: the field is the same bytes the label is
+        // built from, so a refusal and an elision marker name one provider.
+        let hostile = BudgetInputs {
+            provider_id: Some("ki mi/1\n"),
+            ..remote(128_000, 0, false)
+        };
+        let got = derive(hostile);
+        assert_eq!(got.provider_id.as_deref(), Some("ki_mi_1_"));
+        assert_eq!(got.window_label, "ki_mi_1_'s context window");
     }
 
     /// **Verify M1.** The derivation never *raises* a budget the window did
@@ -2069,6 +2261,7 @@ mod tests {
             digest_threshold_tokens: 1,
             digest_threshold_bytes: 1,
             floored: false,
+            provider_id: None,
         };
         let message = refusal(
             SkillStage::Body,
@@ -2263,6 +2456,7 @@ mod tests {
             digest_threshold_tokens: 1,
             digest_threshold_bytes: 1,
             floored: false,
+            provider_id: None,
         };
 
         assert_eq!(

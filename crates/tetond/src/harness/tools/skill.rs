@@ -462,6 +462,19 @@ impl Call {
     }
 }
 
+/// The skill a `skill` call names, through the **one** parser (REQ-587 ADR-2).
+///
+/// The loop's Stage B needs the name for BR-8's sentence, and by then the
+/// [`PendingExpansion`] that carried it has been consumed by Stage A. Reading it
+/// back through [`Call::parse`] rather than off `args["name"]` is what keeps
+/// "what the tool dispatched" and "what the refusal names" one answer: the
+/// trimming, the empty-string-is-a-listing rule and the non-string arm all live
+/// in the parser.
+#[must_use]
+pub fn call_name(args: &Value) -> Option<String> {
+    Call::parse(args).ok().and_then(|call| call.name)
+}
+
 /// What BR-6's bookkeeping says about one call, before anything is resolved.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CallVerdict {
@@ -486,6 +499,17 @@ pub struct TurnState {
     /// nothing, so retrying the same name after a refusal — after the user
     /// acknowledges the project root, say — is not a repeat.
     last_expansion: Option<(String, String)>,
+    /// Every `(name, text)` the **loop** folded into this turn, in order
+    /// (REQ-587 BR-7, TASK-218).
+    ///
+    /// The reroute guard's input. REQ-585 built that guard around `skill_turn`,
+    /// which is `Some` only for a user-typed `/name`, so a model-invoked
+    /// expansion returned `None` and was middle-elided at the one seam the
+    /// guard exists for. It is recorded here rather than in the loop because
+    /// the reader — `run_prompt_turn`'s `'turn` retry — sits outside the loop
+    /// and holds this registry, and it is `(name, text)` rather than a byte
+    /// count because the refusal re-measures against the *new* route.
+    committed: Vec<(String, String)>,
 }
 
 impl TurnState {
@@ -494,12 +518,41 @@ impl TurnState {
     /// Counting **first**, and counting refusals too, is BR-6a: a refusal that
     /// cost nothing would make a loop of refusals unbounded.
     pub fn admit(&mut self) -> CallVerdict {
-        self.calls += 1;
-        if self.calls > PER_TURN_INVOCATION_CAP {
+        let over_cap = self.cap_would_refuse();
+        self.count();
+        if over_cap {
             CallVerdict::PerTurnCap
         } else {
             CallVerdict::Proceed
         }
+    }
+
+    /// Whether the **next** call would be past the cap, without counting it.
+    ///
+    /// The peek [`SkillTool::pending_expansion`] asks so that the loop's Stage A
+    /// check cannot answer a call the cap owns: BR-6a puts the cap first and
+    /// unconditionally, and a budget refusal raised ahead of it would tell a
+    /// model at call thirteen that its skill was too large when what it
+    /// actually hit was the ceiling.
+    #[must_use]
+    pub fn cap_would_refuse(&self) -> bool {
+        self.calls >= PER_TURN_INVOCATION_CAP
+    }
+
+    /// Count a call the **loop** refused (REQ-587 BR-6a, ADR-2).
+    ///
+    /// The loop's budget refusal never reaches [`Self::admit`] — it is raised
+    /// before the tool is dispatched — and a refusal that cost nothing would
+    /// make a loop of over-budget calls unbounded, which is the exact reason
+    /// BR-6a counts refusals in the first place.
+    pub fn note_loop_refusal(&mut self) {
+        self.count();
+    }
+
+    /// The one writer of the per-turn counter, so the two entry points above
+    /// cannot come to count differently.
+    fn count(&mut self) {
+        self.calls += 1;
     }
 
     /// Whether expanding `(name, args)` now would be BR-6b's back-to-back
@@ -520,14 +573,44 @@ impl TurnState {
     /// (BR-6b's "with no other tool call completed in between").
     ///
     /// The tool cannot see the loop's other dispatches, so this is the loop's
-    /// to call. It is unwired today and the consequence is stated rather than
-    /// hidden: without it, `skill alpha` → `read` → `skill alpha` in one turn is
-    /// refused `repeated` where BR-6b would admit it. The *stated* example —
-    /// `/proceed`'s two `/validate` passes, separated by an `/architect` — is
-    /// admitted either way, because the intervening expansion overwrites the
-    /// seed. Wiring the call site is `turn_loop`'s (TASK-218).
+    /// to call, and TASK-218 wired it: every completed dispatch of a tool that
+    /// is not this one clears the seed. Unwired, `skill alpha` → `read` →
+    /// `skill alpha` in one turn was refused `repeated` where BR-6b admits it —
+    /// and the *stated* example, `/proceed`'s two `/validate` passes separated
+    /// by an `/architect`, is admitted either way, because the intervening
+    /// expansion overwrites the seed. A test written from the illustration
+    /// passes with this seam dead, which is why `skill_turn.rs` pins the case
+    /// the illustration does not cover.
     pub fn note_foreign_tool_completed(&mut self) {
+        self.forget_expansion();
+    }
+
+    /// Drop the repeat seed because the model does not, in fact, hold that
+    /// expansion (REQ-587 BR-6b).
+    ///
+    /// The loop's Stage B arm. The tool expanded successfully and seeded the
+    /// repeat rule, and *then* the loop refused to fold the result — so nothing
+    /// entered the conversation, and telling the model "you already hold the
+    /// expansion of `x`" on its next attempt would be a false sentence. BR-6b's
+    /// own rule is that a refused call left the model with nothing.
+    pub fn forget_expansion(&mut self) {
         self.last_expansion = None;
+    }
+
+    /// Record the expansion the loop just folded into this turn (REQ-587 BR-7).
+    ///
+    /// The **loop's** to call, and for the reason `note_foreign_tool_completed`
+    /// is: what actually entered the conversation is the block the loop pushed,
+    /// not the string this tool returned, and a reroute guard measuring
+    /// anything else would be measuring something the turn is not carrying.
+    pub fn note_committed(&mut self, name: &str, text: &str) {
+        self.committed.push((name.to_owned(), text.to_owned()));
+    }
+
+    /// Every expansion committed this turn, in the order the loop folded them.
+    #[must_use]
+    pub fn committed(&self) -> &[(String, String)] {
+        &self.committed
     }
 
     /// Calls made this turn — the number the cap refusal names.
@@ -535,6 +618,24 @@ impl TurnState {
     pub fn calls(&self) -> usize {
         self.calls
     }
+}
+
+/// The expansion a `skill` call **would** fold, measured before any consent is
+/// spent (REQ-587 BR-7 Stage A, ADR-2).
+///
+/// The loop's Stage A input. It is produced by the tool because only the tool
+/// holds the registry, the expander and BR-6's bookkeeping — and it is *only*
+/// the input: the decision is the loop's, because `build_tools` runs before
+/// `build_system_prompt` and the route can be swapped mid-turn.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PendingExpansion {
+    /// The resolved skill's name — what BR-8's refusal sentence names.
+    pub skill: String,
+    /// Stage A's candidate: the framed body with `[dynamic context pending]`
+    /// standing in each `` !`command` `` slot, closed exactly as the folded
+    /// result will be — so the two stages measure the same *shape* and differ
+    /// only in what the command slots hold.
+    pub text: String,
 }
 
 // ---------------------------------------------------------------------------
@@ -758,6 +859,112 @@ impl SkillTool {
             .expect("the skill turn state is not poisoned")
     }
 
+    /// Stage A's candidate for `args`, or `None` when this call is not an
+    /// expansion (REQ-587 BR-7, ADR-2).
+    ///
+    /// **Pure.** It counts nothing, seeds nothing, asks nobody and runs no
+    /// command: [`expand`] is a pure function of the registry's own bytes, so
+    /// producing the text costs a `String` and no I/O. That is what lets the
+    /// loop measure *before* [`Tool::run`] spends BR-4's acknowledgment and
+    /// BR-5's dynamic-context consent (BR-8d).
+    ///
+    /// The dispatch that follows expands the same body again, and paying for it
+    /// twice is the price of measuring *before* the consent rather than after:
+    /// the alternative is a second, cached expansion that two callers would have
+    /// to agree is still the right one after a `/cd`.
+    ///
+    /// `None` is "some other refusal owns this call", never "it fits". Every
+    /// arm below is a refusal [`Self::invoke`] raises with a *truer* sentence
+    /// than a budget one, in BR-6's own precedence — the cap first and
+    /// unconditionally, then the arguments, then resolution, then the repeat —
+    /// and each is asked through the same function `invoke` asks, so the two
+    /// orderings cannot drift into disagreeing about which refusal wins. A
+    /// listing is `None` for a different reason: it is not a refusal at all,
+    /// and a roster is bounded by [`ROSTER_MAX_BYTES`] rather than by a route's
+    /// budget.
+    ///
+    /// The project acknowledgment is deliberately **not** consulted here. It is
+    /// async, and asking it would spend the very consent Stage A exists to
+    /// protect; the cost is that an over-budget project skill is refused before
+    /// the user is asked to trust the repository, which is the better order
+    /// anyway.
+    #[must_use]
+    pub fn pending_expansion(&self, args: &Value) -> Option<PendingExpansion> {
+        if self.turn_state().cap_would_refuse() {
+            return None;
+        }
+        let call = Call::parse(args).ok()?;
+        let name = call.name?;
+        let skill = resolve_for_model(&self.registry, &name).ok()?;
+        if self.turn_state().is_repeat(&name, &call.args) {
+            return None;
+        }
+        // The same three lines `expand_and_fold` opens with, and the same
+        // reduction of the path at the one surface holding both it and `HOME`.
+        let display = display_for(&skill.path, home().as_deref());
+        let expansion = expand(skill, &call.args, &display);
+        let frame = SkillFrame::new(
+            skill,
+            shadows_user_skill(&self.registry, &name),
+            &display,
+            &call.args,
+        );
+        Some(PendingExpansion {
+            skill: name,
+            text: frame.close(&expansion.pending_text(&frame.opening())),
+        })
+    }
+
+    /// Count and publish a refusal the **loop** raised (REQ-587 BR-6a, BR-9,
+    /// ADR-2).
+    ///
+    /// Two facts the loop cannot record for itself, in the one place that can.
+    ///
+    /// * **The count** (BR-6a). A budget refusal is raised before the tool is
+    ///   dispatched, so it never reaches [`TurnState::admit`] — and a refusal
+    ///   that cost nothing makes a loop of over-budget calls unbounded.
+    /// * **The record** (BR-9). "A refusal is never silent and never a crash",
+    ///   in the same sentence — but a model-issued call that the loop refuses
+    ///   before dispatch publishes no [`SkillInvoked`] at all, so the session
+    ///   surface has nothing to echo. Published through
+    ///   [`Self::publish_invocation`], with **no commands and no outcomes**,
+    ///   because none ran, and with `reason` on the record's `refused` field —
+    ///   without which those bytes are indistinguishable from a command-free
+    ///   skill that ran perfectly, and BR-9's line reports the opposite of what
+    ///   happened.
+    ///
+    /// A name that no longer resolves publishes nothing and still counts: the
+    /// count is BR-6a's bound, which must hold whatever the registry says.
+    pub fn note_loop_refusal(&self, name: &str, reason: &str) {
+        // Before the publish, not after: `publish_invocation` renders BR-9's
+        // `/verbose` count off this same state, and `admit` counts first.
+        self.turn_state().note_loop_refusal();
+        self.publish_refusal(name, reason);
+    }
+
+    /// BR-9's refusal line **without** the count, for a call this tool already
+    /// counted (REQ-587 BR-9).
+    ///
+    /// The loop's Stage B arm. That call was dispatched, so
+    /// [`TurnState::admit`] counted it and this tool already published its
+    /// invocation record — commands, outcomes and all, which ADR-15 requires
+    /// and `/verbose` renders. What that record cannot say is that the result
+    /// was then **not folded**, because the tool did not know: the loop decided
+    /// after it returned. So the refusal gets its own line, which is BR-9's own
+    /// shape — "one line per invocation … and one line per typed refusal" —
+    /// rather than a rewrite of a record that was true when it was published.
+    ///
+    /// A name that no longer resolves publishes nothing, and the counting
+    /// entry point above still counts: BR-6a's bound holds whatever the
+    /// registry says.
+    pub fn publish_refusal(&self, name: &str, reason: &str) {
+        let Ok(skill) = resolve_for_model(&self.registry, name) else {
+            return;
+        };
+        let display = display_for(&skill.path, home().as_deref());
+        self.publish_invocation(skill, &display, &[], &[], None, Some(reason));
+    }
+
     /// The whole orchestration, async because the consent round-trips are.
     ///
     /// Separate from [`Tool::run`] — which is only the sync→async bridge — so
@@ -935,7 +1142,7 @@ impl SkillTool {
         };
 
         self.turn_state().note_expansion(&skill.name, arguments);
-        self.publish_invocation(skill, &display, &commands, &outcomes, door);
+        self.publish_invocation(skill, &display, &commands, &outcomes, door, None);
         ToolOutcome::ok(text)
             .with_provenance(provenance)
             .with_disposition(ResultDisposition::Expansion)
@@ -966,6 +1173,7 @@ impl SkillTool {
         commands: &[crate::skills::Command],
         outcomes: &[crate::skills::DynamicOutcome],
         door: Option<NotRunReason>,
+        refused: Option<&str>,
     ) {
         // **The session and the bus come off the gate, which is not a shortcut.**
         // The gate is per session and holds both (`PermissionGate::new`), so a
@@ -1009,6 +1217,13 @@ impl SkillTool {
                     count: self.turn_state().calls() as u32,
                     cap: PER_TURN_INVOCATION_CAP as u32,
                 }),
+                // BR-9's other half. Without it a refused call and a skill with
+                // no dynamic context are the same bytes — same name, same size,
+                // same empty `outcomes` — and a session prints a refusal as
+                // though it succeeded. Bounded like every other string here:
+                // the ids are this daemon's own, but the bound is a property of
+                // the field rather than of the caller that remembered.
+                refused: refused.map(|reason| bounded_field(reason, DISPLAY_MAX_CHARS)),
             }),
         );
     }
@@ -1048,6 +1263,12 @@ impl Tool for SkillTool {
     /// allows `skill` at every level.
     fn gates_itself(&self) -> bool {
         false
+    }
+
+    /// The one implementation that answers `Some` (REQ-587 ADR-2) — see the
+    /// trait method for why the loop asks.
+    fn as_skill(&self) -> Option<&SkillTool> {
+        Some(self)
     }
 
     fn run(&self, ctx: &ToolContext, args: &Value) -> ToolOutcome {

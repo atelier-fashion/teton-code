@@ -6629,6 +6629,105 @@ fn verbose_shows_the_invocation_line_with_its_path_and_per_command_outcomes() {
     );
 }
 
+/// **REQ-587 BR-9: the echo line names the swap, and `/verbose` names the
+/// flags — end to end, on the path a person can actually type.**
+///
+/// Both facts are new keys on `skill_invoked`, and each has three places to be
+/// dropped between the registry row and the screen: the daemon's publish, the
+/// wire, and the renderer. A unit test on the renderer is green while any of
+/// the first two loses a key, which is why this leg exists at all.
+///
+/// It drives the **typed** path deliberately. The model path is instrumented in
+/// `tetond/tests/skill_turn.rs`, where a real tool call can be made; here the
+/// point is that neither fact is model-only news — `/validate` in a repository
+/// that defines its own reaches the repository's file at every permission level
+/// with no prompt, so this echo line is the only notice the user gets that the
+/// name they typed resolved somewhere else.
+///
+/// The **turn count** is asserted by its absence, which is the same claim from
+/// the other side: a typed invocation spends none of the per-turn cap, and a
+/// renderer that printed `0 of 12` here would name a budget the user is not
+/// drawing on.
+#[test]
+fn a_typed_invocation_names_the_swap_and_its_flags_and_counts_no_turn_budget() {
+    let daemon_bin = daemon_bin();
+    let teton = teton_bin();
+
+    const VALIDATE_BODY: &str = "Validate the repository's way.\n";
+
+    let home = SkillTree::new("n");
+    // The user's own `validate`, which the repository's is about to take the
+    // name from — without this file there is no swap to name.
+    home.write(
+        ".claude/skills/validate/SKILL.md",
+        &skill_file("the user validate", None, "User body.\n"),
+    );
+    // Hidden from the model, still the user's to type: the flag `/help` marks
+    // not at all, and this line is the only place it is ever named.
+    home.write(
+        ".claude/commands/beta.md",
+        &skill_file_with(
+            "the beta skill",
+            &["disable-model-invocation: true"],
+            "Beta body.\n",
+        ),
+    );
+
+    let daemon = TestDaemon::spawn_scripted_with_env(
+        &daemon_bin,
+        TURN_REPLIES,
+        &[("HOME", home.path().to_str().unwrap())],
+    );
+    let project = project_at(&daemon.root, "proj");
+    std::fs::create_dir_all(project.join(".claude/skills/validate")).unwrap();
+    std::fs::write(
+        project.join(".claude/skills/validate/SKILL.md"),
+        skill_file("the project validate", None, VALIDATE_BODY),
+    )
+    .unwrap();
+
+    let (stdout, stderr, status) = daemon.run_cli_from(
+        &teton,
+        &["--cwd", project.to_str().unwrap()],
+        "/verbose\n/validate\n/beta\n",
+        None,
+        &[("HOME", home.path())],
+    );
+    assert!(status.success(), "stdout:\n{stdout}\nstderr:\n{stderr}");
+
+    assert!(
+        stdout.contains(&format!(
+            "/validate → skill validate (project — shadows your user skill, {}, \
+             0 dynamic commands)",
+            teton_protocol::format_bytes(VALIDATE_BODY.len() as u64)
+        )),
+        "the echo line must name the swap in the source slot — the user typed a \
+         name their own shelf has and the repository answered; output:\n{stdout}"
+    );
+    assert!(
+        stdout.contains("  hidden from the model (`disable-model-invocation: true`)"),
+        "`/verbose` must name the flag this build honored, in the file's own \
+         spelling; output:\n{stdout}"
+    );
+    // The flags line reports what the file *wrote*: neither skill declared
+    // `user-invocable`, so neither is called model-only anywhere.
+    assert!(
+        !stdout.contains("model-only") && !stdout.contains("invocable by nobody"),
+        "a file that declared no `user-invocable` key was reported as if it \
+         had; output:\n{stdout}"
+    );
+    // Matched as a **line shape**, not as a phrase: `this turn` occurs in the
+    // route classifier's own sentence, and a substring search would pass on
+    // that instead of on the absence it is asserting.
+    assert!(
+        !stdout
+            .lines()
+            .any(|line| line.trim_start().starts_with("invocation ") && line.contains("this turn")),
+        "a typed invocation was given a per-turn budget it does not draw on; \
+         output:\n{stdout}"
+    );
+}
+
 /// **AC-14: `/cd` re-derives the project skills and leaves the user skills
 /// alone — and `/help` says so without a restart.**
 ///

@@ -30,6 +30,11 @@ line.
 - [ ] The client still parses **no** permission key — the source scan asserting it stays green with the new subject.
 - [ ] Mutation: rendering the mark from a re-derived predicate, and treating the new subject as answerable on a pipe, each fail a named test.
 
+## Deviations from BR-9's literal wording, decided 2026-08-21
+
+- **`/verbose` does not add a second line for the shadowing fact.** BR-9 lists it among what `/verbose` adds, but the echo line above it already carries the swap in the source slot on *every* invocation, verbose or not, and `SkillInvoked` holds nothing further to say — *which* user file lost the name is not on the event. A `/verbose` line would be one fact in two spellings on one screen (LESSON-456). The reasoning is recorded at `render_skill_invoked`'s doc. **Verify should judge this rather than assume it.**
+- **`turn_invocations` renders only on `Some`.** The user path publishes `None`, because a typed `/name` spends none of the per-turn cap, and a placeholder would read like zero. Both arms are pinned.
+
 ## Technical Notes
 
 - `/help`'s row assertions are exact-text: the fixtures at `cli_e2e.rs` and `slash.rs` pin whole rows, so a mark inside the parenthetical moves several goldens. Widen them.

@@ -52,7 +52,7 @@
     "teton-code"
   ],
   "phase4": {
-    "currentTask": "TIER-3: TASK-217, TASK-221 (TASK-219 resumes after 217 for BR-9's wire fields)",
+    "currentTask": "TIER-4: TASK-218 + TASK-219 follow-up (BR-9 rendering)",
     "completedTasks": [
       "TASK-210",
       "TASK-211",
@@ -62,7 +62,9 @@
       "TASK-212",
       "TASK-215",
       "TASK-216",
-      "TASK-219"
+      "TASK-219",
+      "TASK-217",
+      "TASK-221"
     ],
     "failedTasks": []
   }

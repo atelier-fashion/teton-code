@@ -2160,8 +2160,15 @@ mod skills_handshake {
             description: Some("Report on the repo.".to_owned()),
             argument_hint: None,
             shadowed: None,
-            // TASK-212 replaces this: the fixture predates BR-3's two flags.
-            model_invocable: false,
+            // The ordinary row, which after REQ-587 BR-3 is invocable from both
+            // doors: these tests are about a served registry becoming the
+            // session's snapshot, and the fixture should be the case they are
+            // named for. `model_invocable: false` would describe a skill absent
+            // from the model's roster, which is a state worth a fixture of its
+            // own where a mark or a roster is under test — `slash.rs` has those
+            // (`user_only`, `model_only`, `invocable_by_nobody`) — and is a
+            // misleading default here.
+            model_invocable: true,
             user_invocable: true,
         }
     }

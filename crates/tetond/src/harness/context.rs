@@ -1074,6 +1074,22 @@ impl ContextManager {
         self.bytes_of(&self.blocks, self.truncated)
     }
 
+    /// The system prompt this context was assembled under (REQ-587 ADR-2).
+    ///
+    /// The `system` half of [`Self::would_append_fit`]'s pair, for the one
+    /// caller that has to measure a *candidate* against it mid-loop: the turn
+    /// loop's `skill` admit/refuse. Every other reader of the system prompt has
+    /// it in hand already — the daemon built it — but the loop is handed only
+    /// this manager, and re-rendering [`Self::prepare`] to recover the string
+    /// would measure the neutralized, truncation-marked spelling rather than
+    /// the one `build_system_prompt` produced and the user path's `skill_fit`
+    /// measures. Two spellings of one prompt is exactly the second estimator
+    /// ADR-11 exists to prevent.
+    #[must_use]
+    pub fn system(&self) -> &str {
+        &self.system
+    }
+
     /// [`Self::estimated_tokens`] over an arbitrary block sequence.
     ///
     /// Split out so a *candidate* conversation can be measured before it is

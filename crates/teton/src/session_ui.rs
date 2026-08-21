@@ -40,7 +40,7 @@ use teton_protocol::events::{
 };
 use teton_protocol::methods::{
     AttachConsentOutcome, AttachConsentParams, PermissionOutcome, PermissionRespondParams,
-    RefusalReason, SessionRoot,
+    RefusalReason, SessionRoot, SkillSource,
 };
 use teton_protocol::{Phase, RequestId, SessionId};
 
@@ -990,8 +990,16 @@ fn format_session_root_changed(root: &SessionRoot) -> String {
 ///
 /// **The body is never printed** — it is in the file, and BR-12 says so. What
 /// reaches the surface is a summary of the file and, under `/verbose`, where it
-/// lives, what of its frontmatter was inert, and what became of each dynamic
-/// command.
+/// lives, what its frontmatter flags did, what of its frontmatter was inert,
+/// what became of each dynamic command, and what this turn has spent of the
+/// per-turn cap (REQ-587 BR-9).
+///
+/// **The shadowing fact is not repeated here.** BR-9 lists it among what
+/// `/verbose` adds, and the echo line above already carries it in the source
+/// slot — `skill validate (project — shadows your user skill, …)` — on **every**
+/// invocation, verbose or not. A second line under it would be one fact in two
+/// spellings on one screen (LESSON-528), and the event carries nothing further
+/// to say: which user file lost the name is not on it.
 ///
 /// Everything rendered here is either the daemon's own typed value or
 /// file-supplied text the daemon already bounded; `Surface::line` defuses it
@@ -1012,6 +1020,12 @@ fn render_skill_invoked(invoked: &SkillInvoked, surface: &mut dyn Surface, verbo
     if let Some(note) = &invoked.name_note {
         surface.line(LineKind::Notice, &format!("  {note}"));
     }
+    // The keys this build **honored**, above the ones it did not: BR-3 took two
+    // out of BR-5's inert list, and a reader comparing the two lines is reading
+    // the same file's frontmatter sorted by what happened to it.
+    if let Some(line) = declared_flags_line(invoked) {
+        surface.line(LineKind::Info, &line);
+    }
     if !invoked.ignored_keys.is_empty() {
         surface.line(
             LineKind::Info,
@@ -1021,11 +1035,79 @@ fn render_skill_invoked(invoked: &SkillInvoked, surface: &mut dyn Surface, verbo
     for view in &invoked.outcomes {
         surface.line(LineKind::Info, &dynamic_outcome_line(view));
     }
+    // Last, because it is the only line about the *turn* rather than about the
+    // file — and absent entirely on the typed path, where there is no budget to
+    // report (BR-6a).
+    if let Some(turn) = invoked.turn_invocations {
+        surface.line(LineKind::Info, &turn_invocations_line(turn));
+    }
+}
+
+/// What BR-3's two frontmatter flags did to this file, for `/verbose` (BR-9),
+/// or `None` when the file declared neither.
+///
+/// **The words are [`slash::model_only_words`]'s**, which is `/help`'s mark for
+/// the same file. Composing them again here would put "model-only" one line
+/// under an echo line for a skill no roster contains, on exactly the file where
+/// `/help` says `invocable by nobody` — one product, two answers, and the
+/// disagreement only in the case that matters (LESSON-528).
+///
+/// Nothing renders for the ordinary file, on the `ignored frontmatter` line's
+/// own rule: this block reports what *this file wrote*, and a line reading
+/// "invocable by the user and the model" over a file that declared no flag at
+/// all would report an absence as a declaration.
+///
+/// The key is quoted in the file's own spelling, because the actionable half of
+/// "model-only" is which line of which file said so.
+fn declared_flags_line(invoked: &SkillInvoked) -> Option<String> {
+    match (invoked.user_invocable, invoked.model_invocable) {
+        (true, true) => None,
+        // The user's door is open and the model's is shut. `/help` marks this
+        // row not at all — it answers "may you type this?", and the answer is
+        // yes — so this line is the only place the flag is ever named, and the
+        // two surfaces are not in disagreement about anything.
+        (true, false) => {
+            Some("  hidden from the model (`disable-model-invocation: true`)".to_owned())
+        }
+        (false, model_invocable) => Some(format!(
+            "  {} (`user-invocable: false`{})",
+            slash::model_only_words(model_invocable),
+            if model_invocable {
+                ""
+            } else {
+                ", `disable-model-invocation: true`"
+            },
+        )),
+    }
+}
+
+/// BR-9's `/verbose` count: what this turn has spent of the per-turn cap.
+///
+/// **A count against the ceiling, never a bare number.** "3" is unreadable
+/// without the cap and unfalsifiable with it — a reader cannot tell a turn
+/// halfway through its budget from one at the last call it will be allowed, and
+/// the next refusal (`per_turn_cap`) would arrive as a surprise. The cap travels
+/// with the count for the same reason it travels on the wire: a client that
+/// hardcoded 12 would print a stale ceiling the day the daemon moves it.
+///
+/// Never rendered for a `None`, which is the typed path — see
+/// [`render_skill_invoked`].
+fn turn_invocations_line(turn: events::TurnInvocations) -> String {
+    format!("  invocation {} of {} this turn", turn.count, turn.cap)
 }
 
 /// BR-12's echo line: `/status → skill status (user, 5.3 KiB, 4 dynamic commands)`,
 /// or REQ-587 BR-9's `skill status (user, 5.3 KiB, 4 dynamic commands) — invoked
 /// by the model`.
+///
+/// The **source** slot names BR-9's swap where there is one — `skill validate
+/// (project — shadows your user skill, …)` — read off the event's own
+/// `shadows_user_skill` and never re-derived from the session's snapshot: the
+/// registry lives on `UiContext`, `render_event` sees only `SessionState`, and a
+/// snapshot may have moved under a `/cd` since the invocation it would be
+/// answering about. It applies to a typed invocation as readily as to a model
+/// one — `/validate` in a repository that defines its own reaches the
+/// repository's file, and that is the same surprise BR-4 asks about.
 ///
 /// **The `/name →` prefix is the user's typed line, so a model invocation does
 /// not carry one.** Nobody typed `/status`; printing it would put a line in the
@@ -1078,7 +1160,7 @@ fn skill_echo_line(invoked: &SkillInvoked) -> String {
     let name = &invoked.name;
     let body = format!(
         "skill {name} ({source}, {size}, {dynamic})",
-        source = slash::source_word(invoked.source),
+        source = slash::source_words(invoked.source, invoked.shadows_user_skill),
         size = teton_protocol::format_bytes(invoked.body_bytes),
     );
     match invoked.invoked_by {
@@ -2798,7 +2880,11 @@ fn render_consent_subject(subject: Option<&PermissionSubject>, surface: &mut dyn
 /// contrasts with the user skill this one is taking the name from.
 fn project_skill_entry(entry: &events::ProjectSkillTrustEntry) -> String {
     if entry.shadows_user_skill {
-        format!("{} (project — shadows your user skill)", entry.name)
+        format!(
+            "{} ({})",
+            entry.name,
+            slash::source_words(SkillSource::Project, true)
+        )
     } else {
         entry.name.clone()
     }
@@ -7844,18 +7930,48 @@ mod skill_tests {
             name_note: None,
             outcomes,
             invoked_by,
-            // TASK-217 landed the three facts BR-9 asks this surface to render
-            // — the shadowing clause on the echo line, and the flags, the
-            // shadowing fact and the turn's count under `/verbose`. Nothing
-            // renders them yet: that is **TASK-219's** own AC, which was blocked
-            // on the fields existing. These are REQ-585's world exactly, which
-            // is correct for the assertions below and is the wrong fixture to
-            // assert a shadowing clause from. Vary them when the rendering
-            // lands.
+            // The ordinary user-typed row: nobody's name was taken, both doors
+            // are open, and no per-turn budget was spent. Every REQ-585
+            // assertion below runs against exactly this, which is what makes
+            // "those bytes did not move" a claim about the shipped line rather
+            // than about a fixture that happens to avoid the new branches. The
+            // varied ones are built from it by the three helpers under this.
             shadows_user_skill: false,
             model_invocable: true,
             user_invocable: true,
             turn_invocations: None,
+            // TASK-219 renders this: `Some(reason)` is a refused invocation,
+            // and the echo line has to say so rather than reporting a run.
+            refused: None,
+        }
+    }
+
+    /// [`invoked`] of a **project** skill that took a user skill's name — the
+    /// swap BR-9's echo line names and BR-4's acknowledgment asks about.
+    fn shadowing(outcomes: Vec<DynamicOutcomeView>, by: events::InvokedBy) -> SkillInvoked {
+        SkillInvoked {
+            name: "validate".to_owned(),
+            source: SkillSource::Project,
+            path_display: "~/dev/teton/.claude/skills/validate/SKILL.md".to_owned(),
+            shadows_user_skill: true,
+            ..invoked_by(outcomes, by)
+        }
+    }
+
+    /// A model invocation carrying BR-6a's count, as the tool publishes one.
+    fn counted(count: u32, cap: u32) -> SkillInvoked {
+        SkillInvoked {
+            turn_invocations: Some(events::TurnInvocations { count, cap }),
+            ..invoked_by(vec![ran("date", 8)], events::InvokedBy::Model)
+        }
+    }
+
+    /// [`invoked`] with BR-3's two frontmatter flags set as a file wrote them.
+    fn flagged(user_invocable: bool, model_invocable: bool) -> SkillInvoked {
+        SkillInvoked {
+            user_invocable,
+            model_invocable,
+            ..invoked(vec![ran("date", 8)])
         }
     }
 
@@ -7950,6 +8066,180 @@ mod skill_tests {
         assert_eq!(
             user,
             "/status → skill status (user, 5.3 KiB, 3 dynamic commands, 1 run)",
+        );
+    }
+
+    /// **BR-9's shadowing clause, in the source slot.** A project skill that
+    /// took a user skill's name says so on the one line every invocation
+    /// prints: the user asked for `validate` and a file the repository
+    /// substituted answered, which is the same swap BR-4's acknowledgment asks
+    /// about and the daemon's expansion frame names to the model.
+    ///
+    /// It is on the **typed** line too, and that is the case worth having:
+    /// `/validate` in a repository that defines its own reaches the
+    /// repository's file with no prompt at any level, so the echo line is the
+    /// only notice the user gets.
+    ///
+    /// **Mutation.** Drop the clause — `source_word` in place of
+    /// `source_words`, or a `source_words` that ignores its second argument —
+    /// and both assertions here fail.
+    #[test]
+    fn a_shadowing_invocation_names_the_swap_in_the_source_slot() {
+        assert_eq!(
+            skill_echo_line(&shadowing(vec![ran("date", 8)], events::InvokedBy::User)),
+            "/validate → skill validate (project — shadows your user skill, 5.3 KiB, \
+             1 dynamic command)",
+        );
+        assert_eq!(
+            skill_echo_line(&shadowing(vec![ran("date", 8)], events::InvokedBy::Model)),
+            "skill validate (project — shadows your user skill, 5.3 KiB, 1 dynamic command) \
+             — invoked by the model",
+        );
+        // An ordinary project skill takes nobody's name and says nothing about
+        // it: the clause is news, not decoration.
+        let plain = SkillInvoked {
+            shadows_user_skill: false,
+            ..shadowing(Vec::new(), events::InvokedBy::Model)
+        };
+        assert_eq!(
+            skill_echo_line(&plain),
+            "skill validate (project, 5.3 KiB, 0 dynamic commands) — invoked by the model",
+        );
+    }
+
+    /// **The `/verbose` flags line speaks `/help`'s words.** BR-3's two states
+    /// have one home (`slash::model_only_words`), so a file both flags deny
+    /// cannot be `invocable by nobody` in `/help` and `model-only` here — the
+    /// only case where two spellings of that precedence would differ, and the
+    /// case where the difference is a claim that the model is running a skill
+    /// no roster contains.
+    ///
+    /// The literals are pinned in **both** files deliberately: the code has one
+    /// home, and re-spelling it reddens `/help`'s row goldens and this test
+    /// together rather than leaving one surface to drift.
+    ///
+    /// The ordinary file gets **no line**, on the `ignored frontmatter` rule:
+    /// this block reports what the file wrote, and a file that declared no flag
+    /// declared nothing to report.
+    #[test]
+    fn verbose_names_the_flags_in_the_same_words_help_marks_them_with() {
+        let flags_line = |user_invocable, model_invocable| -> Option<String> {
+            let mut surface = RecordingSurface::new();
+            let mut state = SessionState::new();
+            state.verbose = true;
+            render_event(
+                &envelope(Event::SkillInvoked(flagged(
+                    user_invocable,
+                    model_invocable,
+                ))),
+                &mut surface,
+                &mut state,
+            );
+            surface
+                .lines_of(LineKind::Info)
+                .iter()
+                .find(|line| line.contains("invocable") || line.contains("hidden"))
+                .map(|line| (*line).to_owned())
+        };
+
+        assert_eq!(
+            flags_line(false, true).as_deref(),
+            Some("  model-only (`user-invocable: false`)"),
+        );
+        assert_eq!(
+            flags_line(false, false).as_deref(),
+            Some(
+                "  invocable by nobody (`user-invocable: false`, \
+                 `disable-model-invocation: true`)"
+            ),
+        );
+        // The user's door open, the model's shut: `/help` marks this row not at
+        // all, because the user may type it — so this line is the only place
+        // the flag is named, and the two surfaces contradict nothing.
+        assert_eq!(
+            flags_line(true, false).as_deref(),
+            Some("  hidden from the model (`disable-model-invocation: true`)"),
+        );
+        assert_eq!(
+            flags_line(true, true),
+            None,
+            "a default is not a declaration"
+        );
+    }
+
+    /// **BR-9's `/verbose` count, against the cap.** A bare "3" cannot tell a
+    /// turn halfway through its budget from one at its last permitted call, and
+    /// the `per_turn_cap` refusal would then arrive as a surprise. The ceiling
+    /// rides with the count rather than being hardcoded here, so a daemon that
+    /// moves it does not leave this client printing a stale one.
+    ///
+    /// **Mutation.** Drop the line, or render the count without the cap, and
+    /// this fails.
+    #[test]
+    fn verbose_counts_the_turns_invocations_against_the_cap() {
+        let mut surface = RecordingSurface::new();
+        let mut state = SessionState::new();
+        state.verbose = true;
+        render_event(
+            &envelope(Event::SkillInvoked(counted(3, 12))),
+            &mut surface,
+            &mut state,
+        );
+
+        let detail = surface.lines_of(LineKind::Info);
+        assert_eq!(
+            detail.last().copied(),
+            Some("  invocation 3 of 12 this turn"),
+            "the turn's count closes the block, and names the ceiling: {detail:?}"
+        );
+        // The ceiling is the daemon's, not this crate's: a different cap reads
+        // back as a different line.
+        let mut other = RecordingSurface::new();
+        let mut state = SessionState::new();
+        state.verbose = true;
+        render_event(
+            &envelope(Event::SkillInvoked(counted(1, 25))),
+            &mut other,
+            &mut state,
+        );
+        assert_eq!(
+            other.lines_of(LineKind::Info).last().copied(),
+            Some("  invocation 1 of 25 this turn"),
+        );
+    }
+
+    /// **`None` is a fact, and it renders as nothing at all.** The per-turn cap
+    /// bounds the *model's* calls inside one prompt turn; a human typing
+    /// `/name` spends none of it, and the daemon publishes `None` there.
+    ///
+    /// **Mutation.** Render the count for a `None` — `unwrap_or_default()`, a
+    /// `0 of 12`, or an em-dash placeholder — and this fails. Any of them would
+    /// invent a budget the user is not drawing on, and "0 of 12" would read as
+    /// a turn that has spent nothing rather than as a turn with no cap.
+    #[test]
+    fn a_typed_invocation_prints_no_turn_count_because_it_spends_none_of_the_cap() {
+        let mut surface = RecordingSurface::new();
+        let mut state = SessionState::new();
+        state.verbose = true;
+        render_event(
+            &envelope(Event::SkillInvoked(invoked(vec![ran("date", 8)]))),
+            &mut surface,
+            &mut state,
+        );
+
+        let lines = surface.lines_of(LineKind::Info);
+        assert!(
+            !lines.iter().any(|line| line.contains("this turn")
+                || line.contains(" of ")
+                || line.contains("invocation")),
+            "a typed invocation was given a per-turn budget it does not draw \
+             on: {lines:?}"
+        );
+        // Non-vacuity: the same session *does* print the rest of the block, so
+        // this is the absence of one line rather than of the whole thing.
+        assert!(
+            lines.iter().any(|line| line.contains("SKILL.md")),
+            "{lines:?}"
         );
     }
 
