@@ -1,0 +1,33 @@
+---
+id: TASK-217
+title: "Wire the registry, the gate and the invoker into the tool — the seam whose absence is silent"
+status: draft
+parent: REQ-587
+created: 2026-08-20
+updated: 2026-08-20
+dependencies: [TASK-215, TASK-216]
+---
+
+## Description
+
+ADR-3. `build_tools` gains what the tool needs, and the addressee finally
+reaches a consent raised from inside the loop.
+
+## Files to Create/Modify
+
+- `crates/tetond/src/runtime.rs` — `build_tools` gains `Arc<SkillRegistry>` and `invoker: Option<ConnectionId>`; the call site passes both
+- `crates/tetond/src/server.rs` — `invoker` already exists at the reader loop; confirm it reaches `build_tools` too
+
+## Acceptance Criteria
+
+- [ ] `build_tools` takes the session's `Arc<SkillRegistry>` — the **same snapshot** `accept_invocation` already reads, taken once per turn. Do not re-read it inside the tool: `discovery_is_paid_at_create_and_at_cd_and_never_per_turn` pins that the registry is a snapshot, and one turn / one snapshot is what makes the roster and the resolution provably the same value.
+- [ ] `build_tools` takes `invoker: Option<ConnectionId>` and hands it to `SkillTool`. `ConnectionId` is `Copy`, so the existing consumption at `runtime.rs:~3546` is unaffected — but the parameter must be threaded **past** that line in source order, which today it is not.
+- [ ] **The assertion that matters: an addressable connection reached `authorize_skill` from inside the loop.** Not from a fixture that invents a `ConnectionId` — `skill_consent_matrix.rs` does exactly that and would pass either way. Drive a model-issued call and assert the `Consent` double recorded the *invoking* connection.
+- [ ] The failure this guards is silent: without the threading, `authorize_skill` takes the `None => Unanswerable` arm and produces placeholders **byte-identical** to REQ-585's tested piped-refusal path, with no test failing, because that arm is already shipped and tested behaviour for an internal caller. A green suite is not evidence here.
+- [ ] `ToolContext` is **not** touched. It is the jail type — `repo_root`, `display`, `kind`, `walk` — and dozens of fixtures construct it. `PermissionGate` is not touched either: it is per **session**, so a connection stored on it is whichever connection created the session, not the one that submitted this turn.
+- [ ] Mutation: dropping `invoker` from `build_tools` fails the addressee test — and only that test, which is the point.
+
+## Technical Notes
+
+- Precedent, exactly: `WebTool` holds `gate: Arc<PermissionGate>` and `runtime: Handle` and bridges sync→async in `run` with `block_in_place`. `SkillTool` does the same with one more field.
+- `skill_turn.rs`'s source-scans slice `run_prompt_turn` and `settle_dynamic_context` **by signature and by their terminating doc comments**. This task changes one of those signatures, so those scans will break for a reason unrelated to behaviour — widen them deliberately.

@@ -1,0 +1,39 @@
+---
+id: TASK-222
+title: "The suites that can see a model-issued call — and a Vendor that can script one"
+status: draft
+parent: REQ-587
+created: 2026-08-20
+updated: 2026-08-20
+dependencies: [TASK-218, TASK-219, TASK-220]
+---
+
+## Description
+
+The ACs whose only honest harness drives a real model-issued tool call. The
+existing skill suite cannot do that yet, and saying so is half this task.
+
+## Files to Create/Modify
+
+- `crates/tetond/tests/skill_turn.rs` — `Vendor` gains a scripted body queue and per-call usage
+- `crates/tetond/tests/skill_tool_loop.rs` (new) — AC-7, AC-8, AC-13
+- `crates/tetond/tests/fixtures/skills/` (new) — the in-repo `/proceed`-shaped fixture and AC-8's synthetic bodies
+- `crates/tetond/tests/egress_capture.rs`, `provenance_egress.rs` — AC-11's four legs
+- `crates/teton/tests/cli_e2e.rs`, `pty_e2e.rs` — AC-10's surface half, AC-12, AC-5/AC-6's prompt bytes
+- `docs/manual-verification.md` — AC-15's dogfood runbook
+
+## Acceptance Criteria
+
+- [ ] **`Vendor` cannot script a tool call today** — `Vendor::start` answers every connection with one hard-coded SSE body (`"done"`, `finish_reason: stop`, fixed `usage`). Give it a body queue and per-call usage, lifting `remote_loop.rs`'s `sse_turn(content_deltas, tool, prompt_tokens, completion_tokens)`, which already emits the exact `delta.tool_calls[0].function{name,arguments}` + `finish_reason: "tool_calls"` shape. Without this, AC-7's thirteen-call chain and AC-10's token claim are both unwritable.
+- [ ] AC-10's **cost half lives here**, against a remote `Vendor` — not `cli_e2e`, whose scripted tier is local and never metered. BUG-183 records that exact vacuity for REQ-585's AC-19.
+- [ ] AC-11 is **four** legs: (a) a project skill mints and pins as a `read` would; (a2) a user skill has no root-relative identity, is `unknown`, and pins under **any** boundary — stricter, asserted separately; (b) a command that **spawned** pins, not one that `Ran`; (c) no boundary ⇒ the expansion reaches the provider.
+- [ ] **Do not copy `provenance_egress.rs`'s `ran_expansion` verbatim** — it computes `ran` with `did_run` (`Ran` only) while AC-11(b)'s predicate is `spawned` (`Ran | Failed | TimedOut`). Copying it reproduces the narrower predicate the AC explicitly warns about. Fix the helper or state why not.
+- [ ] AC-1's "no consent prompt raised, no dynamic command run" cannot live in `skills_discovery.rs` — that suite has no gate and no consent recorder. It belongs where a `Consent` double exists.
+- [ ] Every fixture is in-repo and deterministic: no test-time read of `~/.claude`, entries sorted, and the EPERM-style legs skip under root with the skip stated.
+- [ ] **AC-15's runbook**, written and marked **OUTSTANDING** — six legs for a human, recording: the Kimi window actually used (the shipped recipe's `max_context = 1000000`, or a hand-lowered `128000` — say which); **no privacy boundary configured**, which is not optional, because every ADLC skill lives under `~/.claude`, BR-10 makes a user skill's block unpinnable, and an unpinnable block pins under *any* boundary — so on a boundary-configured machine every leg routes local and the large ones are refused there. A machine that has one runs the boundary leg instead. Leg (a) records how far one prompt of `/proceed REQ-587` gets and the exact step at which it next stalls (the first "dispatch an agent"), which is the subagent spec's evidence.
+- [ ] **AC-14's workspace half**: `cargo test --workspace --no-fail-fast` green, `cargo clippy --workspace --all-targets` clean, `cargo fmt --all --check` clean.
+- [ ] Mutation table per AC group, each deletion red on a named test.
+
+## Technical Notes
+
+- Three scripting mechanisms exist and are **not** interchangeable: `TETON_LOCAL_SCRIPT` (text-form calls, whole-CLI, never metered), `ScriptedEngine` (text-form, records every prompt handed to the engine — the only instrument for "the body reached the model verbatim"), and `ScriptedSseTransport` + `sse_turn` (the only **native** tool-call emitter, with a real ledger). Pick per AC and say which.
