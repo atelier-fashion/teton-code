@@ -1123,7 +1123,53 @@ the CLI renders each as one line (BR-9).
   trust file (Claude Code's shape) or a config-writing gate option like
   web's `OPTION_ID_ENABLE_PERMANENT` (OQ-3, resolved to session-only in v1).
 - `docs/manual-verification.md` REQ-587 runbook — AC-15 needs a release and
-  the ADLC toolkit on the user's machine.
+  the ADLC toolkit on the user's machine. **Written and marked OUTSTANDING**
+  (TASK-222); six legs, and the "no privacy boundary configured" precondition
+  is stated there with its reason, because a boundary-configured machine
+  measures the boundary rule and reads the result as a broken feature.
+- **BUG-185's residual, unclosed (ADR-11, BR-5).** The spec offered two ways
+  out — land the slot cap and the per-invocation deadline in this REQ, or name
+  the residual here. No task does the first, so this is the second. The
+  multiplier, stated rather than left to be discovered: at `full` — which is
+  AC-15(d)'s prescribed *unattended* posture — a cloned repository's 400-slot
+  body invoked up to `PER_TURN_INVOCATION_CAP` (12) times in one turn is
+  **4,800 sequential 30-second commands** inside a non-cancellable
+  `spawn_blocking` that holds the session claim for the duration. Nothing
+  bounds the *number* of `` !`…` `` slots in one body (only the 64 KiB body cap
+  bounds it indirectly), nothing bounds the total time one invocation may
+  spend, and the runner is `tokio::task::spawn_blocking`, which the turn's
+  cancellation cannot reach. The mitigations that exist are the per-command
+  deadline, the acknowledgment at every level that asks, and the fact that
+  `full` is a choice; none of them bounds the product. Closing it means a slot
+  cap per body and a deadline per invocation, both refusals the model can
+  relay.
+- **The reroute residual — a stated exception to BR-6/BR-9.** A model-invoked
+  expansion caught at a mid-turn reroute **ends the prompt turn** with
+  `error_code::SKILL_EXPANSION_TOO_LARGE` rather than reaching the model as a
+  relayable tool result. Both call sites sit in `run_prompt_turn`'s `'turn`
+  retry loop *after* `run_session_turn_with_source` returned — no `ToolCall` id
+  is in scope there and the expansion is already a committed block — so a tool
+  result is not expressible without restructuring the retry, which this REQ
+  does not propose. It is neither silent nor a crash; it is a turn that ends
+  where the spec would prefer one that continues. Closing it means giving the
+  retry a way to fold a result back into the loop it just left. Driven, not
+  assumed, since TASK-222:
+  `skill_turn.rs::a_reroute_after_a_committed_model_expansion_refuses_rather_than_eliding_it`.
+- **Two defects TASK-222 found and recorded rather than fixed**, both pinned by
+  an assertion that names itself so the fixer finds it:
+  - the reroute guard's sentence calls a **model**-invoked expansion `/big`,
+    because `skill_would_not_survive_refit` calls `skill_fit`, which hard-codes
+    `SkillCaller::User`. The composer is already caller-aware and
+    `skill_refit`'s `typed_refit` index already says which entries are the
+    model's, so this is a parameter, not a design change;
+  - a typed refusal the **tool** raises (`unknown_skill`,
+    `not_model_invocable`, `reserved_name`, `invalid_arguments`, `repeated`,
+    `per_turn_cap`, `project_not_acknowledged`) publishes **no** `skill_invoked`
+    record, so the session prints nothing for it. Only the loop's two
+    `over_budget` refusals publish. BR-9 and the Events table say *any* typed
+    reason gets a record, and the client already renders every one of them
+    (`session_ui::refusal_reason_words`), so the renderer has arms the daemon
+    never reaches.
 
 ## Validation
 

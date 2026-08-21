@@ -926,12 +926,23 @@ const STATIC_SKILL: &str = "---\ndescription: the static skill\n---\n\
 /// plus whether the result can be pinned — the two values
 /// `DaemonRuntime::run_prompt_turn` carries into the seed.
 ///
-/// `unknown` is `sources-could-not-mint  ||  any command ran`, which is the
-/// daemon's own line (`skill.unknown |= outcomes.iter().any(did_run)`). A
+/// `unknown` is `sources-could-not-mint  ||  any command **spawned**`, which is
+/// the daemon's own line (`skill.unknown |= outcomes.iter().any(spawned)`). A
 /// project skill under the root mints, so in these fixtures the second disjunct
 /// is the only one that can be true — which is what makes (b) a claim about the
 /// *command* rather than about where the file lives (that is AC-11(a)'s, in
 /// `egress_capture.rs`).
+///
+/// **`spawned`, not `did_run`, and this helper was written the other way.**
+/// REQ-587 TASK-222 corrected it. `did_run` is the `Ran` arm alone, so a command
+/// that started and exited non-zero — or was killed at the deadline — read as
+/// "no command ran" here while the daemon marked the block unpinnable. The
+/// helper agreed with the daemon on the fixtures it happened to carry (both of
+/// which exit zero) and disagreed with it on the one predicate AC-11(b) exists
+/// to pin: an exit status is a value the command *chose*, and a mirror of the
+/// daemon's rule that drops the failing arms is exactly the side channel
+/// REQ-585's verify closed (LESSON-528's shape — the mirrored predicate that is
+/// identical until one side is edited).
 fn ran_expansion(repo: &std::path::Path, name: &str, arguments: &str) -> (String, bool) {
     let registry = tetond::skills::discover(
         None,
@@ -944,7 +955,7 @@ fn ran_expansion(repo: &std::path::Path, name: &str, arguments: &str) -> (String
         .unwrap_or_else(|| panic!("the fixture must register `{name}`"));
     let expansion = tetond::skills::expand(skill, arguments, &format!(".claude/…/{name}"));
     let outcomes = tetond::skills::run_all(repo, expansion.commands(), 10_000);
-    let ran = outcomes.iter().any(tetond::skills::DynamicOutcome::did_run);
+    let ran = outcomes.iter().any(tetond::skills::DynamicOutcome::spawned);
     // The user path's frame, which is the one `accept_invocation` supplies
     // (REQ-587 ADR-6) — the daemon's own line, not a paraphrase of it.
     let frame = expansion.user_frame();
@@ -1147,6 +1158,432 @@ async fn with_no_boundary_a_skills_expansion_reaches_the_provider_as_the_payload
         // The command's stdout, folded into the body.
         "DYNAMIC-OUTPUT-MARKER",
         // …inside the envelope every built-in result gets.
+        "trust=\\\"untrusted\\\"",
+    ] {
+        assert!(
+            contains_bytes(body, fragment),
+            "the payload is not the expansion — `{fragment}` is missing from \
+             what the provider received:\n{}",
+            String::from_utf8_lossy(body)
+        );
+    }
+    std::fs::remove_dir_all(&repo).ok();
+}
+
+// ---------------------------------------------------------------------------
+// REQ-587 AC-11 — the same four facts, for a **model**-issued invocation
+// ---------------------------------------------------------------------------
+//
+// The legs above seed the expansion the way `run_prompt_turn` seeds a typed
+// `/name`. A model invocation reaches context by a different route entirely: the
+// `skill` tool decides the provenance (`expand_and_fold`'s
+// `match (skill.source, spawned)`), the loop folds the result with it, and only
+// then does the *next* remote call meet the choke point. Nothing above exercises
+// that decision, so a build that returned `Sources(∅)` from the tool — the
+// `ToolOutcome::ok` default, and fail-open for a skill body — would leave every
+// test in this file green while a user skill's bytes left a
+// boundary-configured machine.
+//
+// So these four drive the real tool through the real loop in front of the real
+// `Egress`, and read what the transport saw. They are **four legs and not one**
+// because REQ-585 ADR-9 made them four different facts:
+//
+//   (a)  a project skill under a `local-only` boundary pins, against the file's
+//        own root-relative identity — the same verdict a `read` earns;
+//   (a2) a user skill has **no** root-relative identity, so it pins under *any*
+//        boundary, related or not — stricter than (a), and asserted apart from
+//        it so neither can carry the other;
+//   (b)  a command that **spawned** pins, whatever it exited with;
+//   (c)  with no boundary, the expansion reaches the provider.
+
+/// The two skills the model-path legs invoke, plus a home to put a user one in.
+///
+/// Deterministic and in-repo: every byte here is written by this function, and
+/// nothing reads `~/.claude` (LESSON-540).
+fn model_skill_trees() -> (PathBuf, PathBuf) {
+    let repo = temp_repo();
+    let home = repo.join("home-outside");
+    let write = |path: PathBuf, body: &str| {
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(path, body).unwrap();
+    };
+    // A project skill whose body *is* the boundary file's bytes.
+    write(
+        repo.join(".claude/skills/guarded/SKILL.md"),
+        &format!("---\ndescription: the guarded skill\n---\n\n{SECRET}\n"),
+    );
+    // A project skill the boundary does not cover, with no dynamic context.
+    write(
+        repo.join(".claude/skills/open/SKILL.md"),
+        "---\ndescription: the public skill\n---\n\nPUBLIC-SKILL-BODY\n",
+    );
+    // A project skill whose one command **fails**: `spawned` is true and
+    // `did_run` is false, which is the difference AC-11(b) turns on.
+    write(
+        repo.join(".claude/skills/failing/SKILL.md"),
+        "---\ndescription: a skill whose command exits non-zero\n---\n\n\
+         FAILING-BODY-MARKER: !`echo SPAWNED-MARKER; exit 3`\n",
+    );
+    // A project skill whose one command **succeeds**, for the leg that asserts
+    // what actually reaches the provider: a failed command leaves a `not run`
+    // placeholder rather than output, so it cannot carry the envelope claim.
+    write(
+        repo.join(".claude/skills/ran/SKILL.md"),
+        "---\ndescription: a skill whose command runs\n---\n\n\
+         RAN-BODY-MARKER: !`echo RAN-OUTPUT-MARKER`\n",
+    );
+    // A user skill, outside the root by construction.
+    write(
+        home.join(".claude/skills/usr/SKILL.md"),
+        "---\ndescription: the user skill\n---\n\nUSER-SKILL-BODY\n",
+    );
+    (repo, home)
+}
+
+/// Drive one **model-issued** `skill` call through the loop in front of a real
+/// `Egress` carrying `boundary_set`, and report what the transport saw.
+///
+/// Two scripted remote turns: the first issues the call, the second is the one
+/// that would carry the expansion to the wire — and is refused before a byte
+/// leaves whenever the fold's provenance pins the turn.
+///
+/// The system prompt is built from the **same** registry the loop dispatches
+/// against, which is what makes the `skill` tool's presence a property of one
+/// value rather than of two that happen to agree.
+async fn drive_model_skill_call(
+    repo: &std::path::Path,
+    home: Option<&std::path::Path>,
+    session_id: &SessionId,
+    skill: &str,
+    boundary_set: Vec<PrivacyBoundary>,
+) -> (
+    Result<tetond::harness::TurnOutcome, HarnessError>,
+    Vec<Vec<u8>>,
+    usize,
+    Vec<teton_protocol::events::PrivacyBlock>,
+) {
+    let transport = CaptureSse::with_bodies(vec![
+        sse_turn(
+            "Fetching the skill.",
+            Some((
+                "skill-1",
+                "skill",
+                &serde_json::json!({ "name": skill }).to_string(),
+            )),
+        ),
+        sse_turn("Understood.", None),
+    ]);
+    let capture = transport.clone();
+
+    let bus = Arc::new(EventBus::new());
+    let egress = Egress::new(transport, boundary_set, bus.clone());
+    let provider = OpenAiCompatAdapter::new(OpenAiCompatConfig::new(
+        "deepseek",
+        "https://api.deepseek.com/v1/chat/completions",
+    ));
+    let mut source = RemoteProviderSource::new(
+        &provider,
+        &egress,
+        "deepseek",
+        "deepseek-chat",
+        session_id.clone(),
+        ResolvedEffort::effort(EffortLevel::High),
+    );
+
+    let pending = Arc::new(PendingPermissions::new());
+    let gate = Arc::new(PermissionGate::new(
+        session_id.clone(),
+        PermissionConfig::permissive(),
+        Arc::clone(&bus),
+        Arc::clone(&pending),
+    ));
+
+    let registry = Arc::new(tetond::skills::discover(
+        home,
+        repo,
+        teton_protocol::methods::RootKind::Project,
+        &tetond::skills::RealFs,
+    ));
+    let mut tools = ToolRegistry::with_builtins();
+    assert!(
+        tetond::harness::tools::register_skill_tool(
+            &mut tools,
+            Arc::clone(&registry),
+            Arc::clone(&gate),
+            Some(tetond::grants::GrantRegistry::new().next_connection_id()),
+            tokio::runtime::Handle::current(),
+            10_000,
+        ),
+        "the fixture must register at least one model-invocable skill"
+    );
+
+    let config = scripted_config();
+    let mut ctx = ContextManager::new(
+        build_system_prompt(&tools, &config),
+        config.context_budget_tokens,
+    );
+    ctx.push_user(PROMPT);
+    let tool_ctx = ToolContext::new(repo);
+    let events = SessionEvents::new(Arc::clone(&bus), session_id.clone());
+    let mut hook = NoopProvenanceHook;
+    let mut sub = bus.subscribe(256);
+
+    let result = run_session_turn_with_source(
+        &mut source,
+        &tools,
+        &tool_ctx,
+        &gate,
+        &events,
+        &mut ctx,
+        &config,
+        &mut hook,
+        &DutyRoute::unresolved("no digest route in this test"),
+        &DutyRoute::unresolved("no compact route in this test"),
+        &ToolDuties {
+            triage: &DutyRoute::unresolved("no triage route in this test"),
+            shell: &DutyRoute::unresolved("no shell route in this test"),
+        },
+    )
+    .await;
+
+    let mut blocks = Vec::new();
+    while let Ok(Some(env)) =
+        tokio::time::timeout(std::time::Duration::from_millis(50), sub.recv()).await
+    {
+        if let Event::PrivacyBlock(pb) = env.event {
+            blocks.push(pb);
+        }
+    }
+    (result, capture.captured(), capture.calls(), blocks)
+}
+
+/// **AC-11(a).** A model-invoked **project** skill under a `local-only`
+/// boundary pins the turn local and nothing leaves — against the file's own
+/// root-relative identity, which `ProvenanceId::from_resolved` mints exactly as
+/// it does for a typed `/name`.
+///
+/// The control runs first on the same boundary set: a project skill the
+/// boundary does not cover genuinely reaches the wire carrying its own body, so
+/// the refusal is "this file is guarded" rather than "an egress that refuses
+/// everything" (LESSON-479).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_model_invoked_project_skill_under_a_boundary_pins_the_turn_and_nothing_leaves() {
+    let (repo, home) = model_skill_trees();
+    let guarded = vec![PrivacyBoundary {
+        path_glob: ".claude/skills/guarded/**".to_owned(),
+        mode: BoundaryMode::LocalOnly,
+    }];
+
+    // The control: a project skill outside the boundary.
+    let (result, captured, calls, blocks) = drive_model_skill_call(
+        &repo,
+        Some(&home),
+        &SessionId::from("model-skill-open"),
+        "open",
+        guarded.clone(),
+    )
+    .await;
+    assert!(
+        result.is_ok() && calls == 2 && blocks.is_empty(),
+        "a project skill outside every boundary must still reach the wire: \
+         {result:?}, {calls} call(s), {blocks:?}"
+    );
+    assert!(
+        contains_bytes(&captured[1], "PUBLIC-SKILL-BODY"),
+        "the control never put the expansion on the wire, so the refusal below \
+         would say nothing"
+    );
+
+    // The claim.
+    let (result, captured, calls, blocks) = drive_model_skill_call(
+        &repo,
+        Some(&home),
+        &SessionId::from("model-skill-guarded"),
+        "guarded",
+        guarded,
+    )
+    .await;
+    match &result {
+        Err(e) if e.is_privacy_blocked() => {}
+        other => panic!("a model-invoked skill under a boundary must pin: {other:?}"),
+    }
+    assert_eq!(
+        calls, 1,
+        "only the call that asked for the skill may go out; the one carrying it \
+         must be refused before a byte leaves"
+    );
+    assert_eq!(blocks.len(), 1, "exactly one privacy_block: {blocks:?}");
+    assert_eq!(
+        blocks[0].path, ".claude/skills/guarded/SKILL.md",
+        "the block must name the skill file, exactly as a `read` of it would — \
+         a divergent identity is a block that happened to fire"
+    );
+    for request in &captured {
+        assert!(
+            !contains_bytes(request, SECRET),
+            "boundary bytes reached the wire from a model-invoked expansion"
+        );
+    }
+    std::fs::remove_dir_all(&repo).ok();
+}
+
+/// **AC-11(a2).** A model-invoked **user** skill has no root-relative identity
+/// at all — `from_resolved` refuses rather than inventing one — so its block is
+/// `Unknown` and the turn pins wherever **any** boundary is configured, whether
+/// or not that boundary has anything to do with the file.
+///
+/// Stricter than (a), and stricter than what a `read` of the same bytes would
+/// earn, which is why it is asserted apart: the asymmetry *is* the claim. On the
+/// same egress, under the same unrelated boundary, the project skill above goes
+/// out and this one does not.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_model_invoked_user_skill_pins_the_turn_wherever_any_boundary_exists() {
+    let (repo, home) = model_skill_trees();
+
+    // The contrast: the same unrelated boundary, a project skill, and the wire.
+    let (result, captured, calls, blocks) = drive_model_skill_call(
+        &repo,
+        Some(&home),
+        &SessionId::from("model-skill-project-unrelated"),
+        "open",
+        boundaries(),
+    )
+    .await;
+    assert!(
+        result.is_ok() && calls == 2 && blocks.is_empty(),
+        "a project skill under an unrelated boundary must still reach the wire — \
+         without this the refusal below would say nothing about *user* skills: \
+         {result:?}, {calls} call(s)"
+    );
+    assert!(contains_bytes(&captured[1], "PUBLIC-SKILL-BODY"));
+
+    // The claim: a user skill cannot be pinned, so it is.
+    let (result, captured, calls, blocks) = drive_model_skill_call(
+        &repo,
+        Some(&home),
+        &SessionId::from("model-skill-user"),
+        "usr",
+        // Names nothing this test touches: the point is that it does not have to.
+        boundaries(),
+    )
+    .await;
+    match &result {
+        Err(e) if e.is_privacy_blocked() => {}
+        other => panic!("an unpinnable expansion must fail closed: {other:?}"),
+    }
+    assert_eq!(calls, 1, "the turn carrying the expansion may not go out");
+    assert_eq!(blocks.len(), 1, "exactly one privacy_block: {blocks:?}");
+    assert_eq!(
+        blocks[0].path,
+        tetond::egress::provenance::UNKNOWN_PROVENANCE_PATH,
+        "an unpinnable block is refused against the content-free sentinel, \
+         never against a path it does not have"
+    );
+    for request in &captured {
+        assert!(
+            !contains_bytes(request, "USER-SKILL-BODY"),
+            "the unpinnable expansion leaked past a configured boundary"
+        );
+    }
+    std::fs::remove_dir_all(&repo).ok();
+}
+
+/// **AC-11(b).** A model invocation whose dynamic command **spawned** pins the
+/// turn local under any boundary — and the fixture's command exits **3**.
+///
+/// The predicate is `DynamicOutcome::spawned`, not `did_run`, and the
+/// difference is the whole test: an exit status is a value the command chose,
+/// so a rule that only marked the `Ran` arm would let a body write
+/// `!\`cat secrets/prod.env; exit 1\`` and have the output enter context
+/// pinnable. REQ-585's verify closed that side channel; a test written to "ran"
+/// exercises only the arm that was never the problem and passes on a build
+/// where the predicate regressed.
+///
+/// The control is the project skill with no dynamic context, on the same
+/// boundary: it reaches the wire, so what is being asserted below is "a command
+/// spawned" and not "this repo has a boundary".
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_model_invocation_whose_command_failed_still_pins_the_turn() {
+    let (repo, home) = model_skill_trees();
+
+    let (result, _, calls, blocks) = drive_model_skill_call(
+        &repo,
+        Some(&home),
+        &SessionId::from("model-skill-static"),
+        "open",
+        boundaries(),
+    )
+    .await;
+    assert!(
+        result.is_ok() && calls == 2 && blocks.is_empty(),
+        "the control must reach the provider: {result:?}, {calls} call(s)"
+    );
+
+    let (result, captured, calls, blocks) = drive_model_skill_call(
+        &repo,
+        Some(&home),
+        &SessionId::from("model-skill-failing"),
+        "failing",
+        boundaries(),
+    )
+    .await;
+    match &result {
+        Err(e) if e.is_privacy_blocked() => {}
+        other => panic!(
+            "a command that spawned and exited non-zero must still pin the \
+             turn — `spawned`, not `did_run`: {other:?}"
+        ),
+    }
+    assert_eq!(calls, 1, "not one packet may leave: {calls} call(s)");
+    assert_eq!(blocks.len(), 1, "exactly one privacy_block: {blocks:?}");
+    assert_eq!(
+        blocks[0].path,
+        tetond::egress::provenance::UNKNOWN_PROVENANCE_PATH,
+        "command output has no identity for a glob to be compared against"
+    );
+    for request in &captured {
+        assert!(
+            !contains_bytes(request, "FAILING-BODY-MARKER"),
+            "the pinned expansion reached the wire"
+        );
+    }
+    std::fs::remove_dir_all(&repo).ok();
+}
+
+/// **AC-11(c).** With no boundary configured the choke point does not inspect,
+/// so a model-invoked expansion reaches the provider — and the payload it
+/// received **is the expansion**.
+///
+/// Not "a request went out": the captured body is searched for the frame the
+/// tool wrote, the body the file holds, and the failed command's stdout inside
+/// REQ-585's untrusted envelope. A turn that reached the wire carrying
+/// something else satisfies a call count and fails this.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn with_no_boundary_a_model_invoked_expansion_reaches_the_provider() {
+    let (repo, home) = model_skill_trees();
+    let (result, captured, calls, blocks) = drive_model_skill_call(
+        &repo,
+        Some(&home),
+        &SessionId::from("model-skill-open-wire"),
+        "ran",
+        // The whole difference from the test above.
+        Vec::new(),
+    )
+    .await;
+
+    assert!(result.is_ok(), "no boundary, no refusal: {result:?}");
+    assert_eq!(calls, 2, "both calls went out");
+    assert!(blocks.is_empty(), "nothing to block: {blocks:?}");
+
+    let body = &captured[1];
+    for fragment in [
+        // BR-4's frame, which is what tells the model the block is instructions.
+        "<skill-body skill=\\\"ran\\\"",
+        // The file's own prose…
+        "RAN-BODY-MARKER",
+        // …the command's stdout, folded into the body…
+        "RAN-OUTPUT-MARKER",
+        // …inside the envelope every dynamic-context result gets.
         "trust=\\\"untrusted\\\"",
     ] {
         assert!(

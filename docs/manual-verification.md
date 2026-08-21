@@ -2443,3 +2443,187 @@ Window used      : 1,000,000 (shipped recipe) | 128,000 (hand-lowered)   <-- cir
 (f) OQ-7 noted (no project-skill trust step) : yes / no
 Notes / findings :
 ```
+
+---
+
+# Manual verification runbook — REQ-587 (the model runs a skill)
+
+**Status: OUTSTANDING — nothing below has been executed.** This is a runbook
+written for a person with the ADLC toolkit on their machine; it is not a record
+of a run, and no box in it may be ticked from CI or by an agent.
+
+## What this proves that CI does not
+
+CI reaches every seam it can, and TASK-222 closed the ones that needed a real
+model-issued call: a scripted vendor now drives a thirteen-call chain, a
+committed expansion through a live reroute, the per-call cost rows, and the four
+egress legs. What no mock settles is the thing this REQ exists for — whether a
+**real** model, handed a real `/proceed`, actually calls `skill`, follows the
+body it gets back, and reaches the next gate. A mock provider replies with
+whatever it was scripted to reply with; a model's behaviour is an *observation*,
+never an assertion (LESSON-532).
+
+Two negative results are the point rather than a side effect. Leg (a) records
+**where the run stops** — the first "dispatch an agent" step — which is the
+evidence the subagent spec needs. Leg (e) records what the local tier does with
+a large orchestrator, which is what a machine with no remote provider gets.
+
+## Prerequisites — and one of them is not optional
+
+- The shipped binary or a `--release` build, with `TETON_TEST_SEAMS` unset.
+- The ADLC toolkit installed, `~/.claude/skills` being the symlink into
+  `~/Documents/GitHub/adlc-toolkit`.
+- A Kimi provider with a declared window — **write down which**: the shipped
+  recipe's `max_context = 1000000` (what `/provider setup kimi` records for
+  `kimi-k3`), or a hand-lowered `teton provider add … --max-context 128000`.
+  Both clear what a `/proceed` expansion needs; AC-15 names either, and the
+  sign-off block asks which was used because the two are not interchangeable
+  evidence for leg (a)'s cumulative case.
+- The tier you will type on routed there: `teton policy set-tier build kimi`.
+- **No privacy boundary configured.** This is a precondition, not a
+  convenience, and it is stated because the failure it prevents looks like a
+  feature that does not work. Every ADLC skill lives under `~/.claude`; BR-10
+  makes a user skill's block **unpinnable** (`ProvenanceId::from_resolved`
+  refuses a file outside the session root, by design); and an unpinnable block
+  pins the turn under *any* boundary, related to the file or not. So on a
+  machine with `[[privacy.boundaries]]` set, every leg below routes to the local
+  tier and the large ones are refused there — and you would be recording "the
+  model cannot run `/proceed`" when what you measured was the boundary rule
+  working exactly as `provenance_egress.rs`'s
+  `a_model_invoked_user_skill_pins_the_turn_wherever_any_boundary_exists`
+  says it does. Check with `/doctor` before starting. **A machine that has one
+  configured runs leg (f) instead**, and records that it did.
+- macOS: the first read of a root under `~/Documents` can raise a consent
+  dialog. Answer it; a decline renders `unreadable (permission denied)`, which
+  is correct behaviour and worth noting rather than retrying blindly.
+
+> **A note on AC-15's letters.** The AC's text refers to "leg (g)" for the
+> boundary-configured machine but never defines an (f) or a (g). Leg (f) below
+> is that leg. Renumber the AC or keep this note; do not add a second one.
+
+## Procedure
+
+### (a) `/proceed REQ-587` — how far one prompt gets, and where it stops
+
+1. [ ] Start `teton` in the teton-code repo, `/verbose` on, and confirm the
+       route: `/policy show` names `kimi` for `build`.
+2. [ ] `/help`. Record the skills diagnostic line verbatim (it was
+       `17 skills (user 17, project 0); 0 skipped` when REQ-585 shipped).
+3. [ ] Type `/proceed REQ-587`. Expect the echo line
+       `/proceed → skill proceed (user, <n.n> KiB, 0 dynamic commands)` and the
+       body to land as one prompt turn.
+4. [ ] Watch for the **first model-issued call**: a status line
+       `- skill validate [running]` and then an echo line
+       `skill validate (user, <n.n> KiB, <N> dynamic commands) — invoked by the
+       model`. Record it verbatim. *This line is the whole REQ.*
+5. [ ] Record how many `continue` prompts the run needed. One prompt's 25
+       iterations do not span the pipeline (OQ-8); the count is the number this
+       runbook exists to produce.
+6. [ ] Record **the exact step at which it next stalls**, quoting the line of
+       the skill body it stopped on and the model's own words. It should be the
+       first "dispatch an agent" step (`/proceed` Phase 4). This is the
+       subagent spec's evidence — write the quote down, not a paraphrase.
+7. [ ] Record `/verbose`'s per-invocation lines for one of the calls: the
+       home-relative path, any declared flags, each dynamic outcome, and the
+       `invocation N of 12 this turn` count.
+
+### (b) A scratch skill hidden from the model
+
+1. [ ] Copy any small skill to `~/.claude/skills/scratch-hidden/SKILL.md` and
+       add `disable-model-invocation: true` to its frontmatter.
+2. [ ] In a fresh session, ask the model to list what it can run. Expect
+       `scratch-hidden` **absent** from the roster and from `skill {}`'s listing.
+3. [ ] Ask it to run `scratch-hidden` by name. Expect a typed refusal naming the
+       flag, no expansion, and no dynamic command run. Record the words.
+4. [ ] Type `/scratch-hidden` yourself. It must still dispatch: the flag hides
+       the row from the model and costs the user nothing.
+5. [ ] Delete the scratch copy.
+
+### (c) The two capability questions (BR-8)
+
+1. [ ] Ask *"can you run `/validate`?"*. Expect: yes, through the `skill` tool.
+2. [ ] Ask *"can you run `/help`?"*. Expect: no — the user runs the built-in
+       commands, and it names one for you to type.
+3. [ ] Record both answers verbatim. A model that denies the skills it *does*
+       have, or claims the built-ins it does not, is BUG-181's defect with its
+       sign flipped and is a finding either way.
+
+### (d) Unattended, on a pipe
+
+1. [ ] `printf '/permissions full\n/proceed REQ-587\n' | teton`. Expect the
+       ethos include to run and the first gate to be reached with **no prompt**.
+       There is no `--permissions` flag; the level is set with REQ-560's
+       `/permissions` session command. (REQ-585 AC-20(e) carries the same
+       nonexistent flag and needs the same correction when it is run.)
+2. [ ] The same piped run at the default `guarded`. Expect placeholders where
+       the dynamic context would have been, the refusal naming
+       `/permissions full` and `[permissions] default_level` as the remedies,
+       **no stdin line consumed**, and the run still completing.
+3. [ ] The teton-code repo has no project skills, so the acknowledgment path
+       needs a throwaway root: `mkdir -p /tmp/scratch-root/.claude/skills/scratch`
+       with a one-line `SKILL.md`, then run a piped session there at `guarded`
+       and ask the model to use it. Expect the client to refuse **without
+       reading stdin** and the model to be told the user must acknowledge or run
+       at `full`.
+4. [ ] Note the BUG-185 residual if you see it: at `full` a cloned repository's
+       dynamic context runs unattended, up to 12 invocations per turn, each
+       command with a 30-second deadline inside a non-cancellable
+       `spawn_blocking`. Nothing here reproduces it; record only what you
+       observe.
+
+### (e) On the local tier
+
+1. [ ] Route `build` to the local tier (`teton policy set-tier build local`).
+2. [ ] Ask the model for `skill { name: "proceed" }`. Expect a typed refusal
+       naming the skill, its size, the budget, and **`bound: local engine`** —
+       the spoken form, never `local_engine`.
+3. [ ] Ask it for `skill { name: "status" }`. Expect that one to expand.
+4. [ ] Record both messages verbatim; the pair is what shows the refusal is the
+       budget rather than the tier.
+
+### (f) The boundary-configured machine (AC-15's undefined "leg (g)")
+
+Run **this leg instead of (a)–(e)** if `/doctor` reports a configured privacy
+boundary and you are not willing to remove it.
+
+1. [ ] Confirm the boundary with `/doctor` and record its glob.
+2. [ ] Ask the model to run any `~/.claude` skill. Expect the turn to route to
+       the **local tier** and nothing to reach the provider — a user skill's
+       block is unpinnable and pins under any boundary.
+3. [ ] Ask it for a large one (`proceed`). Expect the local-tier refusal from
+       leg (e), for the same reason.
+4. [ ] Record that this machine ran (f) rather than (a)–(e), so a reader does
+       not read a boundary rule as a broken feature.
+
+## Sign-off
+
+```
+REQ-587 AC-15 verified by : ______________________  date: ____________
+Machine          :               (chip / RAM / OS)
+Build            :               (`teton --version`)
+TETON_TEST_SEAMS confirmed unset : yes / no
+Window used      : 1,000,000 (shipped recipe) | 128,000 (hand-lowered)   <-- circle one
+Privacy boundary configured?     : no (ran a–e) | yes (ran f)   <-- circle one
+/help — skills diagnostic line read          : ______________________________
+(a) first model-issued echo line, verbatim   :
+(a) `continue` prompts needed                : ____
+(a) STALL STEP — body line quoted            :
+(a) STALL STEP — model's words               :
+(a) /verbose showed path, flags, outcomes, count : yes / no
+(b) hidden skill absent from the roster      : yes / no
+(b) model's call refused, flag named         : yes / no  (words:)
+(b) no dynamic command ran                   : yes / no
+(b) `/scratch-hidden` still dispatched for the user : yes / no
+(c) "can you run /validate?" — answer        :
+(c) "can you run /help?" — answer            :
+(d) full on a pipe: reached the gate with no prompt : yes / no
+(d) guarded on a pipe: placeholders, run completed  : yes / no
+(d) no stdin line was consumed               : yes / no
+(d) remedy named `/permissions full` + `[permissions] default_level` : yes / no
+(d) scratch root at guarded: refused without reading stdin : yes / no
+(e) `proceed` refused, `bound: local engine` : yes / no  (message:)
+(e) `status` expanded on the local tier      : yes / no
+(f) boundary glob, if this leg was run       :
+(f) turn routed local, nothing reached the provider : yes / no
+Notes / findings :
+```
