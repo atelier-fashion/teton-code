@@ -4442,6 +4442,21 @@ impl DaemonRuntime {
                 .await;
             }
         }
+        // REQ-584 BR-6. **Unconditional**, unlike the skill tool's "at least one
+        // model-invocable skill": an empty registry is a meaningful answer here
+        // and the one a new machine gives ("no known projects; looked in: …"),
+        // so withholding the tool would send the model back to the disk walk
+        // this exists to replace.
+        //
+        // Registered here — beside the built-ins, before the two conditional
+        // tools — because it is a static knowledge tool in `teton_docs`' class,
+        // and because REQ-563 requires `web` to be registered **last** so it
+        // reads after the built-ins and MCP in the exposed tool docs.
+        crate::harness::tools::register_projects_tool(
+            &mut tools,
+            Arc::clone(self.projects()),
+            home(),
+        );
         // REQ-563 BR-1: `register_web_tool` is the one place the "tier is above
         // off" condition is expressed, so a machine that never opted in has no
         // web tool rather than a web tool behind a flag.

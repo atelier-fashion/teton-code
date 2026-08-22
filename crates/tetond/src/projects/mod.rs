@@ -170,6 +170,118 @@ impl Default for ProjectStore {
     }
 }
 
+/// Build a locator answer: registry first, then the scan **on demand** (BR-3).
+///
+/// The one composition, shared by the `projects` tool and `/projects` — BR-9's
+/// one-renderer rule applies to the *facts* as much as to the wording, and two
+/// assemblies of "which projects, ranked how, scanned when" would drift the way
+/// two renderers would.
+///
+/// The scan runs only when this is called, which is the whole of BR-3: nothing
+/// on the session-create path reaches here, and `ScanObserver` is how AC-4
+/// proves it.
+///
+/// **The scan is skipped when the registry already answers the question.** A
+/// user who asks `projects teton` on a machine that has launched from
+/// `teton-code` should not pay for eleven directory reads to be told what is
+/// already known — and on macOS that read is the one that can raise the
+/// Documents dialog.
+pub fn locator_view(
+    store: &ProjectStore,
+    home: Option<&Path>,
+    budget: scan::ScanBudget,
+    observer: &scan::ScanObserver,
+    query: Option<&str>,
+) -> teton_core::projects::LocatorView {
+    use teton_core::projects::{LocatorRow, LocatorView, LookedIn};
+    use teton_core::session_root::{bounded_field, display_for, DISPLAY_MAX_CHARS, NAME_MAX_CHARS};
+
+    let mut registry = store.snapshot();
+    let mut stopped_early = false;
+    let mut scanned_folders: Vec<(PathBuf, usize)> = Vec::new();
+
+    if registry.rank(query).is_empty() {
+        let known: Vec<_> = registry.iter().collect();
+        let folders = scan::dev_folders(home, &known);
+        let result = scan::scan(&folders, home, budget, observer);
+        stopped_early = result.stopped_early;
+        scanned_folders = result.looked_in.clone();
+        if !result.found.is_empty() {
+            store.record_all(result.found, teton_core::projects::ProjectSource::Scanned);
+            registry = store.snapshot();
+        }
+    }
+
+    let now = now_secs();
+    let ranked = registry.rank(query);
+    // Ambiguity decides the recipe (BR-6): a name two projects answer to cannot
+    // be a `/cd <name>`, so those rows carry their path instead.
+    let mut name_counts: std::collections::BTreeMap<&str, usize> =
+        std::collections::BTreeMap::new();
+    for p in &ranked {
+        *name_counts.entry(p.name.as_str()).or_default() += 1;
+    }
+
+    let matches = ranked
+        .iter()
+        .map(|p| {
+            let display = bounded_field(&display_for(&p.path, home), DISPLAY_MAX_CHARS);
+            let name = bounded_field(&p.name, NAME_MAX_CHARS);
+            let ambiguous = name_counts.get(p.name.as_str()).copied().unwrap_or(0) > 1;
+            LocatorRow {
+                recipe: if ambiguous {
+                    format!("/cd {display}")
+                } else {
+                    format!("/cd {name}")
+                },
+                name,
+                display,
+                source: match p.source {
+                    teton_core::projects::ProjectSource::Launched => "launched",
+                    teton_core::projects::ProjectSource::Scanned => "scanned",
+                    teton_core::projects::ProjectSource::Unknown => "unknown",
+                },
+                last_used: teton_core::projects::relative_time(now, p.last_seen),
+            }
+        })
+        .collect();
+
+    // The folders the answer looked in. From the scan when one ran; otherwise
+    // derived from where the known projects actually are, so a result never
+    // claims to have looked somewhere it did not.
+    let looked_in = if scanned_folders.is_empty() {
+        let mut counts: std::collections::BTreeMap<PathBuf, usize> =
+            std::collections::BTreeMap::new();
+        for p in registry.iter() {
+            if let Some(parent) = p.path.parent() {
+                *counts.entry(parent.to_path_buf()).or_default() += 1;
+            }
+        }
+        counts
+            .into_iter()
+            .map(|(path, count)| LookedIn {
+                display: bounded_field(&display_for(&path, home), DISPLAY_MAX_CHARS),
+                count,
+            })
+            .collect()
+    } else {
+        scanned_folders
+            .into_iter()
+            .map(|(path, count)| LookedIn {
+                display: bounded_field(&display_for(&path, home), DISPLAY_MAX_CHARS),
+                count,
+            })
+            .collect()
+    };
+
+    LocatorView {
+        matches,
+        looked_in,
+        stopped_early,
+        query: query.map(str::to_owned),
+    }
+}
+
 /// Whether `path` is still a directory holding a REQ-583 project marker (BR-2).
 ///
 /// The pruning predicate [`teton_core::projects::ProjectRegistry::prune`] asks

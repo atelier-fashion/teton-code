@@ -66,7 +66,7 @@ use super::tools::docs::bounded_topic_echo;
 use super::tools::skill::{SkillTool, SKILL_TOOL_NAME};
 use super::tools::{
     RefinedOutcome, ResultDisposition, ToolContext, ToolDuties, ToolOutcome, ToolRegistry,
-    DOCS_TOOL_NAME, WEB_TOOL_NAME,
+    DOCS_TOOL_NAME, PROJECTS_TOOL_NAME, WEB_TOOL_NAME,
 };
 use super::triage::TRIAGE_DUTY;
 
@@ -112,6 +112,12 @@ const UNTRUSTED_OUTPUT_TOOLS: &[&str] = &[
     "shell",
     WEB_TOOL_NAME,
     DOCS_TOOL_NAME,
+    // REQ-584 BR-6. Worth its own sentence, because the reflex is that a list
+    // of the user's own project names is trusted: it is not. Every string in a
+    // `projects` result is a **directory name**, and a directory name is chosen
+    // by whoever created the directory — a `git clone` of a hostile repository
+    // picks its own. The tool is Teton's, the content is the filesystem's.
+    PROJECTS_TOOL_NAME,
 ];
 
 /// A failure the loop cannot fold back to the model.

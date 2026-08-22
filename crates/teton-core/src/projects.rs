@@ -292,6 +292,125 @@ pub enum NameResolution<'a> {
     Ambiguous(Vec<&'a KnownProject>),
 }
 
+/// One dev folder the locator looked in, and what it holds.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LookedIn {
+    /// The folder's display spelling (`~`-relative where it applies).
+    pub display: String,
+    /// How many known projects sit under it.
+    pub count: usize,
+}
+
+/// Everything a `projects` answer says (REQ-584 System Model's LocatorView).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct LocatorView {
+    /// The matches, best first, already ranked and bounded by the caller.
+    pub matches: Vec<LocatorRow>,
+    /// The dev folders that exist, with their project counts.
+    pub looked_in: Vec<LookedIn>,
+    /// Whether the scan that produced this stopped at its budget.
+    pub stopped_early: bool,
+    /// The query this answers, for the empty-result sentence.
+    pub query: Option<String>,
+}
+
+/// One rendered match.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LocatorRow {
+    /// The project's name, bounded and neutralised by the caller.
+    pub name: String,
+    /// Its display path, bounded and neutralised by the caller.
+    pub display: String,
+    /// `launched` or `scanned`, in words.
+    pub source: &'static str,
+    /// How long ago it was last used, in words (`2 h ago`).
+    pub last_used: String,
+    /// The recipe that moves the session there — `/cd <name>`, or `/cd <path>`
+    /// when the name is ambiguous (BR-6).
+    pub recipe: String,
+}
+
+/// **The one renderer** for a locator answer (BR-6, BR-9).
+///
+/// The `projects` tool returns this text and `/projects` renders these same
+/// facts — REQ-582's one-renderer rule, and the reason it is here rather than
+/// in either caller: two composers of "where your projects are" would drift the
+/// moment one of them gained a field (LESSON-546).
+///
+/// The CLI may **style** the result — colour, indentation, a header — but the
+/// facts and their wording are this function's.
+#[must_use]
+pub fn render_locator(view: &LocatorView) -> String {
+    let mut out = String::new();
+
+    if view.matches.is_empty() {
+        match &view.query {
+            Some(q) => out.push_str(&format!("no known project matches `{q}`")),
+            None => out.push_str("no known projects yet"),
+        }
+        if view.looked_in.is_empty() {
+            out.push_str("; no development folders were found on this machine.\n");
+        } else {
+            out.push_str("; looked in: ");
+            out.push_str(
+                &view
+                    .looked_in
+                    .iter()
+                    .map(|f| f.display.clone())
+                    .collect::<Vec<_>>()
+                    .join(", "),
+            );
+            out.push_str(".\n");
+        }
+    } else {
+        for row in &view.matches {
+            out.push_str(&format!(
+                "{} — {} ({}, last used {})  →  {}\n",
+                row.name, row.display, row.source, row.last_used, row.recipe
+            ));
+        }
+        if !view.looked_in.is_empty() {
+            out.push_str("\ndevelopment folders: ");
+            out.push_str(
+                &view
+                    .looked_in
+                    .iter()
+                    .map(|f| format!("{} ({})", f.display, f.count))
+                    .collect::<Vec<_>>()
+                    .join(", "),
+            );
+            out.push('\n');
+        }
+    }
+
+    // A budget stop is reported the way a tool walk reports one: a partial
+    // answer that does not say it is partial is the failure REQ-583 exists to
+    // prevent, and this surface is the one a user asks "where is my repo" at.
+    if view.stopped_early {
+        out.push_str(
+            "\nthe scan stopped at its budget, so this list may be incomplete; \
+             launch teton from a project once and it is remembered.\n",
+        );
+    }
+    out
+}
+
+/// How long ago `then` was, in the words the locator uses.
+///
+/// Coarse on purpose — the reader is choosing between projects, not auditing.
+/// Saturating on a `then` in the future (a clock that moved backwards) rather
+/// than underflowing.
+#[must_use]
+pub fn relative_time(now: u64, then: u64) -> String {
+    let secs = now.saturating_sub(then);
+    match secs {
+        0..=59 => "just now".to_owned(),
+        60..=3_599 => format!("{} m ago", secs / 60),
+        3_600..=86_399 => format!("{} h ago", secs / 3_600),
+        _ => format!("{} d ago", secs / 86_400),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
