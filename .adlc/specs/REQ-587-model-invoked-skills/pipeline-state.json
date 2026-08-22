@@ -2,7 +2,7 @@
   "req": "REQ-587",
   "branch": "feat/REQ-587-model-invoked-skills",
   "startedAt": "2026-08-20T22:30:00Z",
-  "completed": false,
+  "completed": true,
   "currentPhase": 8,
   "completedPhases": [
     0,
@@ -12,7 +12,8 @@
     4,
     5,
     6,
-    7
+    7,
+    8
   ],
   "phaseHistory": [
     {
@@ -54,6 +55,11 @@
       "phase": 7,
       "name": "CI green (7/7)",
       "completedAt": "2026-08-22T00:00:00Z"
+    },
+    {
+      "phase": 8,
+      "name": "Wrapup \u2014 merged f2066b0",
+      "completedAt": "2026-08-22T16:01:03Z"
     }
   ],
   "integrationBranch": "main",
@@ -67,7 +73,7 @@
       "prUrl": "https://github.com/atelier-fashion/teton-code/pull/196",
       "prNumber": 196,
       "prCreatedAt": "2026-08-20T22:32:00Z",
-      "merged": false,
+      "merged": true,
       "snapshotBranch": null,
       "snapshotPR": null
     }

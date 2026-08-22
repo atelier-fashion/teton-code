@@ -1,10 +1,10 @@
 ---
 id: REQ-587
 title: "Model-invoked skills — a `skill` tool lets the model expand a registered skill into its own turn as a tool result, under REQ-585's registry, keys and provenance, so `/proceed` reaches its gates"
-status: approved
+status: complete
 deployable: true
 created: 2026-08-19
-updated: 2026-08-20
+updated: 2026-08-22
 component: "daemon/harness"
 domain: "harness"
 stack: ["rust", "daemon", "cli", "json-rpc"]
@@ -1124,6 +1124,15 @@ the CLI renders each as one line (BR-9).
   VS Code extension (it inherits the daemon's behaviour).
 
 ## Deferred
+
+**Filed as bugs at wrapup (2026-08-22), so each is trackable independently of
+this spec:** BUG-188 (the reroute residual), BUG-189 (a refusal that names no
+registered skill carries no record), BUG-190 (the `$ARGUMENTS` splice is not
+sub-framed), BUG-191 (no pty leg for the acknowledgment prompt bytes), BUG-192
+(`user_dispatch` mirrored across the daemon/client boundary). BUG-185 (the slot
+cap and per-invocation deadline) was already open from REQ-585. The prose below
+is the reasoning; the bug files are the tracking.
+
 
 - **Subagent dispatch** (recommended next spec): a bounded child turn-loop
   the model can hand a task to and get a result back from — what `/proceed`

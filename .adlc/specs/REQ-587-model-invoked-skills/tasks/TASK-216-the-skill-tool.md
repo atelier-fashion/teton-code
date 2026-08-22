@@ -4,7 +4,7 @@ title: "The `skill` tool: a roster rendered once, a typed refusal, and a per-tur
 status: complete
 parent: REQ-587
 created: 2026-08-20
-updated: 2026-08-20
+updated: 2026-08-22
 dependencies: [TASK-211, TASK-212, TASK-214]
 ---
 

@@ -4,7 +4,7 @@ title: "Two frontmatter keys stop being inert, and a skill gains a third state"
 status: complete
 parent: REQ-587
 created: 2026-08-20
-updated: 2026-08-20
+updated: 2026-08-22
 dependencies: [TASK-210, TASK-214]
 ---
 

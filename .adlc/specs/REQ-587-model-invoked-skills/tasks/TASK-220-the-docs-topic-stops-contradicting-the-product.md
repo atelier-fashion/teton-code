@@ -4,7 +4,7 @@ title: "The bundled topic says the model cannot invoke a skill — in the binary
 status: complete
 parent: REQ-587
 created: 2026-08-20
-updated: 2026-08-20
+updated: 2026-08-22
 dependencies: []
 ---
 

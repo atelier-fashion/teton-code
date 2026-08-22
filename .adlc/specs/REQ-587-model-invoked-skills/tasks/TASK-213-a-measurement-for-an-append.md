@@ -4,7 +4,7 @@ title: "Would this *append* fit — the measurement `skill_fit` does not make"
 status: complete
 parent: REQ-587
 created: 2026-08-20
-updated: 2026-08-20
+updated: 2026-08-22
 dependencies: []
 ---
 

@@ -4,7 +4,7 @@ title: "A third gate door for the project-skill acknowledgment, and a grant key 
 status: complete
 parent: REQ-587
 created: 2026-08-20
-updated: 2026-08-21
+updated: 2026-08-22
 dependencies: [TASK-210]
 ---
 

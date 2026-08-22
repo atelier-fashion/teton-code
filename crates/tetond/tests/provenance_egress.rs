@@ -1645,13 +1645,33 @@ impl TitleVendor {
             for stream in listener.incoming() {
                 let Ok(mut stream) = stream else { break };
                 let mut raw = Vec::new();
+                // Read by the request's **framing**, never by a guess about
+                // socket chunking (REQ-587 verify). A short read is legal at
+                // any point in a stream, so the old `saw \r\n\r\n && read <
+                // buf.len()` break truncated a body larger than the buffer on
+                // Linux and not on macOS. That is worse here than anywhere
+                // else in the suite: these legs assert what a boundary keeps
+                // **off** the wire, and a truncated capture makes an absence
+                // assertion pass for the wrong reason.
                 let mut buf = [0u8; 65_536];
+                let mut want: Option<usize> = None;
                 while let Ok(read) = stream.read(&mut buf) {
                     if read == 0 {
                         break;
                     }
                     raw.extend_from_slice(&buf[..read]);
-                    if raw.windows(4).any(|w| w == b"\r\n\r\n") && read < buf.len() {
+                    if want.is_none() {
+                        if let Some(end) = raw.windows(4).position(|w| w == b"\r\n\r\n") {
+                            let head = String::from_utf8_lossy(&raw[..end]).to_ascii_lowercase();
+                            let len = head
+                                .lines()
+                                .find_map(|line| line.strip_prefix("content-length:"))
+                                .and_then(|value| value.trim().parse::<usize>().ok())
+                                .unwrap_or(0);
+                            want = Some(end + 4 + len);
+                        }
+                    }
+                    if want.is_some_and(|total| raw.len() >= total) {
                         break;
                     }
                 }
