@@ -2,7 +2,7 @@
   "req": "REQ-571",
   "branch": "feat/REQ-571-canonical-provenance-identity",
   "startedAt": "2026-08-13T18:13:08Z",
-  "completed": false,
+  "completed": true,
   "currentPhase": 8,
   "completedPhases": [
     0,
@@ -12,7 +12,8 @@
     4,
     5,
     6,
-    7
+    7,
+    8
   ],
   "integrationBranch": "main",
   "phaseHistory": [
@@ -55,6 +56,11 @@
       "phase": 7,
       "name": "PR cleanup + CI green (6/6 checks; no stray debug/TODO/secret)",
       "completedAt": "2026-08-13T18:13:08Z"
+    },
+    {
+      "phase": 8,
+      "name": "Wrapup - merged 0a48b1f (PR #121); record reconciled from GitHub 2026-08-22",
+      "completedAt": "2026-08-13T20:08:33Z"
     }
   ],
   "repos": {
@@ -67,7 +73,7 @@
       "prUrl": "https://github.com/atelier-fashion/teton-code/pull/121",
       "prNumber": 121,
       "prCreatedAt": "2026-08-13T16:24:41Z",
-      "merged": false,
+      "merged": true,
       "snapshotBranch": null,
       "snapshotPR": null
     }
@@ -111,6 +117,6 @@
       "provenance_rejected made required \u2014 compiler found an 8th uncovered sink"
     ]
   },
-  "terminal": "pr-ready",
+  "terminal": "merged",
   "terminalNote": "Phase 8 (merge/deploy) is a user-reserved action; halting pr-ready per session scope. No deploy target (OSS lib+daemon, brew-distributed at release-tag time, not per-merge)."
 }
