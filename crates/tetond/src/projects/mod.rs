@@ -550,7 +550,7 @@ mod tests {
         let store = ProjectStore::in_memory();
         let fs = RealFs;
 
-        let mut record_root = |path: &Path| {
+        let record_root = |path: &Path| {
             let id = sessions
                 .create(
                     teton_protocol::SessionMode::Freeform,
@@ -666,7 +666,7 @@ mod tests {
             .expect("session")
             .session_id;
 
-        let mut cd = |raw: &str, path: PathBuf| {
+        let cd = |raw: &str, path: PathBuf| {
             runtime.set_session_cwd(
                 &SessionSetCwdParams {
                     session_id: session.clone(),

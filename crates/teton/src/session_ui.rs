@@ -5023,7 +5023,7 @@ mod tests {
     fn a_matched_project_ends_the_turn_with_the_cd_recipe() {
         let mut surface = RecordingSurface::new();
         let mut state = SessionState::new();
-        let outcome = render_event(
+        render_event(
             &envelope(Event::ProjectMatch(events::ProjectMatch {
                 name: "teton-code".to_owned(),
                 display: "~/Documents/GitHub/teton-code".to_owned(),
