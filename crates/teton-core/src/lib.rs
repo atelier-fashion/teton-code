@@ -54,6 +54,7 @@ pub mod capability;
 pub mod category;
 pub mod config;
 pub mod config_doc;
+pub mod cost_ceiling;
 pub mod effort;
 pub mod endpoint_composition;
 pub mod entities;

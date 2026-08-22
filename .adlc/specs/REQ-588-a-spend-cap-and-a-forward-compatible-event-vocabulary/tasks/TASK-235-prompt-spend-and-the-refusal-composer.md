@@ -1,7 +1,7 @@
 ---
 id: TASK-235
 title: "PromptSpend, SpendBound, and the one refusal sentence"
-status: pending
+status: complete
 parent: REQ-588
 created: 2026-08-22
 updated: 2026-08-22
