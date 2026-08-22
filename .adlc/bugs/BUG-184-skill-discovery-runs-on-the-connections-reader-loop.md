@@ -1,10 +1,10 @@
 ---
 id: BUG-184
 title: "Skill discovery runs on the connection's synchronous reader loop, where a TCC dialog can park it"
-status: open
+status: resolved
 severity: medium
 created: 2026-08-20
-updated: 2026-08-20
+updated: 2026-08-22
 component: "daemon/session"
 domain: "harness"
 stack: ["rust", "daemon"]
@@ -52,3 +52,7 @@ argues about *entry counts* and never about *where the I/O runs*.
 ## Found
 
 REQ-585 Phase 5 verify (architecture review), 2026-08-20.
+
+## Resolution — 2026-08-22
+
+Closed by running discovery inside `runtime::block_in_place_if_multithread`, placed in `DaemonRuntime::store_session_skills` so both call sites are covered and a third cannot forget it. The flavor-guarded `block_in_place` was already duplicated at both verifier sites; it now has one home. ADR-4 amended — it argued about entry counts and never about where the I/O runs.

@@ -1,7 +1,7 @@
 ---
 id: BUG-190
 title: "A `$ARGUMENTS` splice puts the caller's bytes inside the region the frame certifies as instructions"
-status: open
+status: resolved
 severity: medium
 created: 2026-08-22
 updated: 2026-08-22
@@ -70,3 +70,7 @@ that is worse than the disease.
 - `crates/tetond/src/skills/expand.rs` — reasoning recorded on `substitute`'s doc
 - `crates/tetond/src/harness/tools/skill.rs` — `SkillFrame`, the trailer's sub-frame
 - Recorded in `.adlc/specs/REQ-587-model-invoked-skills/requirement.md` Deferred
+
+## Closed — 2026-08-22
+
+Closed by moving the sub-frame to the stage that knows both the line structure and the command spans, as the resolution directed — **not** by exempting the marker. `substitute` now records the exact byte ranges it spliced; `sub_frame_splices` runs after `dynamic::scan` and wraps them inline. Each of the three mechanisms is a fact about the substitution stage and stops applying after `scan`: the marker is inline so no newline is injected, commands are already `Slot`s and out of reach, and the caller cannot forge the close because both spellings are neutralized inside the **recorded caller ranges** at any column rather than the pass being exempted globally. Reuses `render`'s own `<skill-arguments>` pair, which the closing sentence already names. BR-4/BR-6 ordering unchanged. Mutation-checked against the flush-left rule.

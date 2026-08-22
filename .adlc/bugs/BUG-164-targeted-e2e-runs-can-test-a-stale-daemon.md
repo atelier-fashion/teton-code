@@ -1,10 +1,10 @@
 ---
 id: BUG-164
 title: "A targeted e2e run can pass against a stale daemon binary"
-status: open
+status: resolved
 severity: medium
 created: 2026-08-13
-updated: 2026-08-13
+updated: 2026-08-22
 component: "cli"
 domain: "harness"
 stack: ["rust", "cli", "ci"]
@@ -152,3 +152,7 @@ after touching `crates/tetond/src/main.rs`:
 - `crates/teton/tests/cli_e2e.rs` — use the shared helpers; drop the local
   binary-path fns and `daemon_or_skip()`; 24 call sites now take `daemon_bin()`.
 - `crates/teton/tests/pty_e2e.rs` — same, 3 call sites.
+
+## Closed — 2026-08-22
+
+Already implemented in the tree (`crates/teton/tests/common/mod.rs`); only the status was never flipped. Verified by making the daemon stale on purpose: the suite refuses to run and names BUG-164.

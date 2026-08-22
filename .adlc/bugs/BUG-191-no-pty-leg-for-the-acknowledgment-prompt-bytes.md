@@ -1,7 +1,7 @@
 ---
 id: BUG-191
 title: "AC-6 and AC-14 claim a pty leg for the acknowledgment prompt bytes; the pty suite has none"
-status: open
+status: resolved
 severity: low
 created: 2026-08-22
 updated: 2026-08-22
@@ -53,3 +53,7 @@ bytes to expect.
 - `crates/teton/tests/pty_e2e.rs` — the leg to add
 - `crates/teton/src/session_ui.rs` — where the bytes are pinned today
 - Recorded in `.adlc/specs/REQ-587-model-invoked-skills/requirement.md` Deferred
+
+## Closed — 2026-08-22
+
+Closed by adding the pty leg. BR-4's acknowledgment is raised from `SkillTool::invoke` — the model's path — so the fixture uses the scripted local engine's text tool-call form. 22 project skills against `MAX_LISTED_PROJECT_SKILLS` (20), one shadowing a user skill of the same name, draws the root sentence, the shadowing mark, a bare-name entry and the `+2 more` tail in one prompt.
