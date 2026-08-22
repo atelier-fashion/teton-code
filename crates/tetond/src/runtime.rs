@@ -3809,13 +3809,20 @@ impl DaemonRuntime {
                     // arriving over-window at a tier that has no fallback left.
                     let previous = route.budget.clone();
                     route = router.resolve_local_pin(reroute_after_block_reason(detail));
-                    if let Some(message) =
+                    if let Some(refusal) =
                         skill_would_not_survive_refit(&skill_refit, typed_refit, &route)
                     {
-                        break 'turn Err(RpcError::new(
-                            error_code::SKILL_EXPANSION_TOO_LARGE,
-                            message,
-                        ));
+                        if !relay_refit_refusal(
+                            &refusal,
+                            &mut conversation,
+                            &tools,
+                            &mut skill_refit,
+                        ) {
+                            break 'turn Err(RpcError::new(
+                                error_code::SKILL_EXPANSION_TOO_LARGE,
+                                refusal.message,
+                            ));
+                        }
                     }
                     refit_for_reroute(&mut conversation, &stream_events, &previous, &route.budget);
                     rerouted_local = true;
@@ -3915,13 +3922,20 @@ impl DaemonRuntime {
                             // provider's pair (see `refit_for_reroute`).
                             let previous = route.budget.clone();
                             route = next;
-                            if let Some(message) =
+                            if let Some(refusal) =
                                 skill_would_not_survive_refit(&skill_refit, typed_refit, &route)
                             {
-                                break 'turn Err(RpcError::new(
-                                    error_code::SKILL_EXPANSION_TOO_LARGE,
-                                    message,
-                                ));
+                                if !relay_refit_refusal(
+                                    &refusal,
+                                    &mut conversation,
+                                    &tools,
+                                    &mut skill_refit,
+                                ) {
+                                    break 'turn Err(RpcError::new(
+                                        error_code::SKILL_EXPANSION_TOO_LARGE,
+                                        refusal.message,
+                                    ));
+                                }
                             }
                             refit_for_reroute(
                                 &mut conversation,
@@ -10480,11 +10494,91 @@ fn reroute_after_block_reason(detail: BlockDetail) -> String {
 /// restructuring the retry — which REQ-587 does not propose. A model-invoked
 /// expansion caught at a reroute therefore ends the turn with the typed error,
 /// and "never a crash, always relayable" carries this seam as its one exception.
+/// Turn a reroute's refit refusal into something the model can relay, or say it
+/// cannot be done (BUG-188).
+///
+/// Returns `true` when the turn may continue: the expansion has been withdrawn
+/// from the conversation, replaced by the refusal the model reads, and struck
+/// from the guard's list so the next iteration does not re-refuse the block that
+/// is no longer there.
+///
+/// Returns `false` — leaving the caller to end the turn exactly as before — in
+/// the two cases where continuing would be a lie:
+///
+/// * a **typed** `/name`. There is no tool call to answer and no model turn
+///   waiting on one; the user asked for an expansion and the honest reply is
+///   that it did not fit, which is the typed error the client already renders.
+/// * a block that cannot be found. If the committed text is not in the
+///   conversation, it is not in the shape this understands, and continuing over
+///   a conversation that may still hold an unre-fitted expansion is worse than
+///   stopping.
+fn relay_refit_refusal(
+    refusal: &RefitRefusal,
+    conversation: &mut CarriedTurn,
+    tools: &crate::harness::tools::ToolRegistry,
+    skill_refit: &mut Vec<(String, String, String)>,
+) -> bool {
+    if !matches!(refusal.caller, SkillCaller::Model) {
+        return false;
+    }
+    if !withdraw_model_expansion(conversation, &refusal.committed, &refusal.message) {
+        return false;
+    }
+    // The tool's own bookkeeping has to agree with the conversation: BR-6b's
+    // repeat rule seeds off a committed expansion, and leaving this behind would
+    // make the model unable to re-ask for the skill it was just refused.
+    if let Some(tool) = tools
+        .get(crate::harness::tools::skill::SKILL_TOOL_NAME)
+        .and_then(|tool| tool.as_skill())
+    {
+        tool.turn_state().forget_expansion();
+    }
+    // And the guard's list, or the next iteration measures a block the
+    // conversation no longer carries and refuses the turn anyway.
+    skill_refit.retain(|(_, text, _)| text != &refusal.committed);
+    true
+}
+
+/// Withdraw a **model-invoked** expansion the reroute's budget cannot hold, and
+/// hand the model the refusal in its place (BUG-188).
+///
+/// REQ-587 BR-6/BR-9 promise a refusal the model can relay. The two
+/// `skill_would_not_survive_refit` sites sit in `run_prompt_turn`'s `'turn`
+/// retry loop, **after** `run_session_turn_with_source` returned — so the
+/// expansion is already a committed block and there is no `ToolCall` in scope.
+/// REQ-587 shipped the exception rather than closing it; this closes it by
+/// editing the block the loop already committed instead of reaching for a call
+/// id that does not exist there.
+///
+/// **Provenance is absorbed, never shed.** The block's sources go into
+/// `DroppedProvenance` exactly as the budget gate's own drop path does, because
+/// a dropped skill block that shed its sources would let a `local-only` body
+/// egress on the next turn — the hole that accumulator exists to close. The
+/// replacement carries none of its own: nothing of the file is in it.
+///
+/// Returns `false` when no block matched, which leaves the caller to end the
+/// turn as before. That is the honest fallback: if the committed text is not
+/// found, the conversation is not in the shape this understands, and ending the
+/// turn is safer than continuing over a conversation that still holds an
+/// expansion nobody re-fitted.
+fn withdraw_model_expansion(
+    conversation: &mut CarriedTurn,
+    committed: &str,
+    refusal: &str,
+) -> bool {
+    // Matched on exact text: `note_committed` records precisely the string the
+    // loop pushed, and `turn_loop` forbids anything growing that block between
+    // the measurement and the push.
+    conversation
+        .ctx_mut()
+        .withdraw_block(committed, crate::harness::turn_loop::error_result(refusal))
+}
+
 fn skill_would_not_survive_refit(
     skills: &[(String, String, String)],
     typed: usize,
     route: &crate::router::Route,
-) -> Option<String> {
+) -> Option<RefitRefusal> {
     skills
         .iter()
         .enumerate()
@@ -10511,9 +10605,29 @@ fn skill_would_not_survive_refit(
                 route.provider_id.as_ref().map(|id| id.0.as_str()),
             ) {
                 SkillFit::Fits => None,
-                SkillFit::TooLarge { message } => Some(message),
+                SkillFit::TooLarge { message } => Some(RefitRefusal {
+                    // Who asked decides what can be done about it, which is why
+                    // this rides out with the message rather than being
+                    // re-derived against `typed` at each call site (BUG-188).
+                    caller,
+                    committed: text.clone(),
+                    message,
+                }),
             }
         })
+}
+
+/// One expansion a reroute's budget cannot hold, and everything the caller
+/// needs to decide what to do about it (BUG-188).
+struct RefitRefusal {
+    /// Who invoked it. A **model** call can be answered with a tool result the
+    /// turn continues past; a **typed** `/name` has no call to answer, so its
+    /// only honest outcome is ending the turn.
+    caller: SkillCaller,
+    /// The exact text the loop committed, which is how the block is found.
+    committed: String,
+    /// BR-8's sentence, already composed for this caller.
+    message: String,
 }
 
 /// Every expansion the **model** committed this turn, as the refit guard's

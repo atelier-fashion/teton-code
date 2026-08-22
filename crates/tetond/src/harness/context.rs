@@ -962,6 +962,41 @@ impl ContextManager {
     /// the session. There is deliberately no blocks-only exit beside this one:
     /// two ways out is how one of them ends up carrying less than the other.
     #[must_use]
+    /// Withdraw a committed block by its exact text, replacing it with
+    /// `replacement` and shedding nothing (BUG-188).
+    ///
+    /// The seam a mid-turn reroute needs. `run_prompt_turn`'s retry loop finds
+    /// a committed skill expansion no longer fits the route it just moved to,
+    /// and BR-6/BR-9 promise the model a refusal it can relay rather than a
+    /// turn that stops — but by then the expansion is a block and there is no
+    /// `ToolCall` in scope. This edits the block instead.
+    ///
+    /// **The withdrawn block's provenance is absorbed, never dropped on the
+    /// floor**, exactly as [`Self::truncate_to_budget`]'s own drop path absorbs
+    /// it: a skill block that shed its sources here would let a `local-only`
+    /// body egress on the next turn, which is the hole [`DroppedProvenance`]
+    /// exists to close. The replacement carries [`Provenance::Model`]-free,
+    /// file-free `User`-less provenance of its own — nothing of the file is in
+    /// it, so it pins nothing by itself while the accumulator keeps the pin.
+    ///
+    /// Searched from the end, so the most recent wins when one turn folded the
+    /// same skill twice. Returns `false` when nothing matched, which lets the
+    /// caller fall back to ending the turn rather than continuing over a
+    /// conversation it does not recognise.
+    pub fn withdraw_block(&mut self, text: &str, replacement: String) -> bool {
+        let Some(index) = self.blocks.iter().rposition(|block| block.text == text) else {
+            return false;
+        };
+        let withdrawn = self.blocks[index].provenance.clone();
+        self.dropped.absorb(&withdrawn);
+        self.blocks[index].text = replacement;
+        self.blocks[index].provenance = Provenance::Tool {
+            tool: "skill".to_owned(),
+            provenance: ToolProvenance::Sources(std::collections::BTreeSet::new()),
+        };
+        true
+    }
+
     pub fn into_retained(self) -> RetainedContext {
         RetainedContext {
             truncated: self.truncated,
