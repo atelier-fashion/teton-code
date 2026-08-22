@@ -3,7 +3,7 @@
   "branch": "feat/REQ-587-model-invoked-skills",
   "startedAt": "2026-08-20T22:30:00Z",
   "completed": false,
-  "currentPhase": 7,
+  "currentPhase": 8,
   "completedPhases": [
     0,
     1,
@@ -11,7 +11,8 @@
     3,
     4,
     5,
-    6
+    6,
+    7
   ],
   "phaseHistory": [
     {
@@ -47,6 +48,11 @@
     {
       "phase": 6,
       "name": "PR ready for review",
+      "completedAt": "2026-08-22T00:00:00Z"
+    },
+    {
+      "phase": 7,
+      "name": "CI green (7/7)",
       "completedAt": "2026-08-22T00:00:00Z"
     }
   ],
