@@ -108,6 +108,27 @@ pub const SKILL_MAX_BYTES: u64 = 64 * 1024;
 /// not depend on the filesystem's listing order (LESSON-540).
 pub const MAX_ENTRIES_PER_ROOT: usize = 512;
 
+/// The most `` !`command` `` slots one skill body may declare (BUG-185).
+///
+/// Nothing bounded the count before, and `run_all` runs every slot
+/// sequentially with its own 30 s timeout inside one `spawn_blocking`. A body
+/// holding thousands of slots turned **one** approved consent — or one `/name`
+/// at `full`, the documented automation posture — into hours of wall time on a
+/// blocking-pool thread that cannot be cancelled, wedging the session
+/// (`SESSION_BUSY` for every later prompt) and holding the daemon awake through
+/// its `ActivityGuard`.
+///
+/// Refused at **discovery**, in the shape [`MAX_ENTRIES_PER_ROOT`] already uses:
+/// the row never registers, so the file is never invocable and its commands
+/// never reach a consent prompt. That is what also closes the consent-flooding
+/// surface — a hostile project skill cannot list 400 innocuous commands with a
+/// dangerous one buried, because it is not listed at all.
+///
+/// 32 against a shipped maximum of 6 (`template-drift`): generous enough that
+/// no real skill is near it, small enough that the worst case is bounded even
+/// before [`crate::skills::dynamic::INVOCATION_BUDGET_MS`] applies.
+pub const MAX_DYNAMIC_COMMANDS: usize = 32;
+
 /// The longest dispatchable name: 64 characters.
 pub const MAX_NAME_LEN: usize = 64;
 
@@ -417,6 +438,14 @@ pub enum SkipReason {
     /// The root held more than [`MAX_ENTRIES_PER_ROOT`] entries; the rest were
     /// not considered. Reported once, against the root.
     RootTruncated,
+    /// The body declares more than [`MAX_DYNAMIC_COMMANDS`] `` !`command` ``
+    /// slots (BUG-185). Carries the real count, for the reason
+    /// [`Self::Oversize`] carries its byte figure: "too many" without a number
+    /// does not tell the author what to cut.
+    TooManyCommands {
+        /// How many slots the body declares.
+        count: usize,
+    },
 }
 
 impl fmt::Display for SkipReason {
@@ -438,6 +467,10 @@ impl fmt::Display for SkipReason {
             Self::RootTruncated => {
                 write!(f, "root truncated at {MAX_ENTRIES_PER_ROOT} entries")
             }
+            Self::TooManyCommands { count } => write!(
+                f,
+                "declares {count} dynamic commands, over the limit of {MAX_DYNAMIC_COMMANDS}"
+            ),
         }
     }
 }
