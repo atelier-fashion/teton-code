@@ -3557,7 +3557,31 @@ impl DaemonRuntime {
         ));
         // REQ-583 BR-1: the same probed root the jail above was built from — so
         // the environment block and the jail's refusals print one spelling.
-        route.harness.session_root = Some(probed.view);
+        route.harness.session_root = Some(probed.view.clone());
+        // REQ-584 BR-7: known project names for a NON-project root, ranked by
+        // `last_seen` and bounded here, where the registry is. The composer
+        // places them and decides how many fit; deriving them there would put a
+        // filesystem-backed read inside a pure renderer.
+        //
+        // **Reads the stored snapshot only — it never scans** (BR-3): this runs
+        // on every turn, and a turn that did not ask for projects must not pay
+        // for a directory walk, let alone raise the macOS Documents dialog.
+        route.harness.known_projects =
+            if probed.view.kind == teton_protocol::methods::RootKind::Project {
+                Vec::new()
+            } else {
+                self.projects
+                    .snapshot()
+                    .rank(None)
+                    .iter()
+                    .map(|p| {
+                        teton_core::session_root::bounded_field(
+                            &p.name,
+                            teton_core::session_root::NAME_MAX_CHARS,
+                        )
+                    })
+                    .collect()
+            };
         let system = build_system_prompt(&tools, &route.harness);
 
         // ── REQ-585 BR-8 / ADR-11: Stage A — does the BODY fit? ──────────────
