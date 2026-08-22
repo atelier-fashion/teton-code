@@ -121,7 +121,7 @@ mod tests {
     use teton_protocol::events::RouteDecided;
     use teton_protocol::{ProviderId, SessionId, Tier};
 
-    use crate::harness::context::{summarize_if_large, SummarizeOutcome};
+    use crate::harness::context::{summarize_if_large, SummarizeOutcome, APPROX_BYTES_PER_TOKEN};
     use crate::harness::duty::testing::{remote_duty_route, wire, Sent};
     use crate::harness::duty::DutyRoute;
 
@@ -163,8 +163,15 @@ mod tests {
         let chunk = "x".repeat(4096);
         let (route, _sent) = remote_duty_route(DIGEST_DUTY, Vec::new(), &chunk, 64);
 
-        let out =
-            summarize_if_large(&route, "read", &oversized(), 50, &ToolProvenance::none()).await;
+        let out = summarize_if_large(
+            &route,
+            "read",
+            &oversized(),
+            50,
+            50 * APPROX_BYTES_PER_TOKEN,
+            &ToolProvenance::none(),
+        )
+        .await;
 
         // `summarize_if_large` prefixes its own `[summarized … elided]` header,
         // so the summary itself is what the bound governs. The header is short
@@ -217,6 +224,7 @@ mod tests {
             "read",
             &text,
             50,
+            50 * APPROX_BYTES_PER_TOKEN,
             &ToolProvenance::path(fixture_id("src/main.rs")),
         )
         .await;
@@ -248,6 +256,7 @@ mod tests {
             "read",
             &text,
             50,
+            50 * APPROX_BYTES_PER_TOKEN,
             &ToolProvenance::path(fixture_id("secrets/prod.env")),
         )
         .await;
@@ -272,7 +281,15 @@ mod tests {
         let (route, sent) = remote_route(boundaries(), "REMOTE SUMMARY");
         let text = oversized();
 
-        let out = summarize_if_large(&route, "shell", &text, 50, &ToolProvenance::Unknown).await;
+        let out = summarize_if_large(
+            &route,
+            "shell",
+            &text,
+            50,
+            50 * APPROX_BYTES_PER_TOKEN,
+            &ToolProvenance::Unknown,
+        )
+        .await;
 
         assert!(wire(&sent).is_empty(), "unknown provenance was forwarded");
         assert!(out.text.contains("truncated mechanically"));
@@ -286,8 +303,15 @@ mod tests {
     #[tokio::test]
     async fn without_boundaries_an_unknown_provenance_result_is_still_digested() {
         let (route, sent) = remote_route(Vec::new(), "REMOTE SUMMARY");
-        let out =
-            summarize_if_large(&route, "shell", &oversized(), 50, &ToolProvenance::Unknown).await;
+        let out = summarize_if_large(
+            &route,
+            "shell",
+            &oversized(),
+            50,
+            50 * APPROX_BYTES_PER_TOKEN,
+            &ToolProvenance::Unknown,
+        )
+        .await;
         assert!(out.text.contains("REMOTE SUMMARY"));
         assert!(!wire(&sent).is_empty());
     }
@@ -307,6 +331,7 @@ mod tests {
             "read",
             &oversized(),
             50,
+            50 * APPROX_BYTES_PER_TOKEN,
             &ToolProvenance::path(fixture_id("secrets/prod.env")),
         )
         .await;
@@ -346,6 +371,9 @@ mod tests {
             Some(SessionId::from("sess")),
             Some(RouteDecided {
                 effort: None,
+                budget_tokens: None,
+                budget_bytes: None,
+                bound: None,
                 category: Some(Category::Digest),
                 tier: Some(Tier::Scan),
                 phase: None,
@@ -354,6 +382,7 @@ mod tests {
                 reason: "Routing the 'digest' category to 'local' through its 'scan' tier \
                          binding."
                     .to_owned(),
+                bound_floored: None,
             }),
         );
 
@@ -368,8 +397,15 @@ mod tests {
 
         // Under the threshold: returned untouched, so no duty ran and nothing is
         // announced.
-        let small =
-            summarize_if_large(&route, "read", "short output", 100, &ToolProvenance::none()).await;
+        let small = summarize_if_large(
+            &route,
+            "read",
+            "short output",
+            100,
+            100 * APPROX_BYTES_PER_TOKEN,
+            &ToolProvenance::none(),
+        )
+        .await;
         assert_eq!(
             small.text, "short output",
             "the fixture must not be digested"
@@ -381,8 +417,15 @@ mod tests {
         );
 
         // Over it: the duty runs, and now the route is on the wire.
-        let big =
-            summarize_if_large(&route, "read", &oversized(), 50, &ToolProvenance::none()).await;
+        let big = summarize_if_large(
+            &route,
+            "read",
+            &oversized(),
+            50,
+            50 * APPROX_BYTES_PER_TOKEN,
+            &ToolProvenance::none(),
+        )
+        .await;
         assert!(big.text.contains("CONDENSED"), "{}", big.text);
         let decided = announced(&mut sub);
         assert_eq!(decided.len(), 1, "{decided:?}");
@@ -428,6 +471,7 @@ mod tests {
             "read",
             &text,
             threshold_tokens,
+            threshold_tokens * APPROX_BYTES_PER_TOKEN,
             &ToolProvenance::none(),
         )
         .await;
@@ -440,7 +484,7 @@ mod tests {
             &out[..out.len().min(120)]
         );
         assert!(
-            out.len() <= threshold_tokens * super::super::context::APPROX_BYTES_PER_TOKEN + 256,
+            out.len() <= threshold_tokens * APPROX_BYTES_PER_TOKEN + 256,
             "the routing failure folded {} bytes — the raw result leaked through",
             out.len()
         );
@@ -454,8 +498,15 @@ mod tests {
     #[tokio::test]
     async fn an_unresolved_digest_does_not_touch_a_small_result() {
         let route = DutyRoute::unresolved("nothing is bound");
-        let out =
-            summarize_if_large(&route, "read", "short output", 100, &ToolProvenance::none()).await;
+        let out = summarize_if_large(
+            &route,
+            "read",
+            "short output",
+            100,
+            100 * APPROX_BYTES_PER_TOKEN,
+            &ToolProvenance::none(),
+        )
+        .await;
         assert_eq!(out.text, "short output");
         assert_eq!(out.engine_error, None);
     }

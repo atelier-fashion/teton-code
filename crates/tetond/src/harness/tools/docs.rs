@@ -12,10 +12,11 @@
 //!
 //! The bundled guide ([`SELF_CONFIG_GUIDE`](crate::harness::turn_loop)) is the
 //! right vehicle for the always-needed surface, and it is nearly full: the
-//! system prompt sits under a pinned byte ceiling with tens of bytes of
-//! headroom, and BUG-168 already had to shorten one phrase to pay for another.
+//! system prompt sits under a pinned byte ceiling with little headroom — BUG-168
+//! had to shorten one phrase to pay for another, and BUG-181 had to move the
+//! ceiling (with its arithmetic re-checked) to land one capability sentence.
 //! Depth cannot live there. It lives here instead, and the only resident cost is
-//! [`DESCRIPTION`] — one line naming the topic index — so adding a fifth topic
+//! [`DESCRIPTION`] — one line naming the topic index — so adding a sixth topic
 //! later costs the prompt one word rather than a page (BR-10).
 //!
 //! # What a call touches
@@ -58,17 +59,23 @@ pub const DOCS_TOOL_NAME: &str = "teton_docs";
 pub const MAX_TOPIC_BYTES: usize = 4096;
 
 /// Every bundled topic, as `(name, body)`, in the order a reader should meet
-/// them: how to connect a provider, where work is then routed, the separate
-/// web opt-in, and how to read the diagnostic when one of those is wrong.
+/// them: how to connect a provider, where work is then routed, what each turn
+/// is assembled under, the separate web opt-in, the user's own `/` commands, and
+/// how to read the diagnostic when one of those is wrong.
 ///
-/// A `&[(&str, &str)]` rather than four constants because every rule below —
+/// A `&[(&str, &str)]` rather than a constant apiece because every rule below —
 /// the ceiling sweep, the topic index, the unknown-topic error — is a statement
-/// about the *set*, and a set spelled out four times is one a fifth topic can be
-/// added to without.
+/// about the *set*, and a set spelled out once is one a further topic can be
+/// added to without touching a rule. `context` (REQ-586 ADR-11) and `skills`
+/// (REQ-585 BR-13) are the design paying off: a page of budget vocabulary cost
+/// the resident prompt nine bytes, and a page on user-defined commands —
+/// including the half that says what Teton does *not* run — cost it eight.
 const TOPICS: &[(&str, &str)] = &[
     ("providers", include_str!("../docs/providers.md")),
     ("policy", include_str!("../docs/policy.md")),
+    ("context", include_str!("../docs/context.md")),
     ("web", include_str!("../docs/web.md")),
+    ("skills", include_str!("../docs/skills.md")),
     ("doctor", include_str!("../docs/doctor.md")),
 ];
 
@@ -79,7 +86,7 @@ const TOPICS: &[(&str, &str)] = &[
 /// are `const` — and because a hand-written second spelling is what
 /// `the_description_indexes_every_bundled_topic` can compare against, the same
 /// golden posture the recipe catalog takes.
-const TOPIC_INDEX: &str = "providers, policy, web, doctor";
+const TOPIC_INDEX: &str = "providers, policy, context, web, skills, doctor";
 
 /// The longest echo of a caller-supplied topic any message here will carry.
 ///
@@ -121,12 +128,22 @@ pub(crate) fn bounded_topic_echo(topic: &str) -> String {
 ///
 /// It ends with the topic index because the index *is* the affordance: a model
 /// deciding whether this tool answers the question in front of it is matching
-/// the subject it was asked about against these four words. BUG-168's lesson
+/// the subject it was asked about against these six words. BUG-168's lesson
 /// applies — a capability the prompt does not name outright is one the local
-/// tier does not reach for.
+/// tier does not reach for. The fifth word, `context`, cost nine characters
+/// here for a 3.4 KB topic (REQ-586 ADR-11); the sixth, `skills`, cost eight for
+/// a 4.0 KB one (REQ-585) — the trade this module exists to make.
+///
+/// The sentence in front of the index paid for both. `setup and troubleshooting`
+/// named nothing `docs` does not already imply, and it was the only clause
+/// here that was not a topic name; dropping it took the description from the
+/// ceiling to 26 characters under it. **Spend that on names**: the index is
+/// the affordance, the sentence is the frame around it, and `skills` came out
+/// of that margin rather than out of `MAX_DESCRIPTION_CHARS`, which has not
+/// moved. **Spent: 102. Left: 18** — room for one more short name.
 const DESCRIPTION: &str = concat!(
-    "Read Teton's own setup and troubleshooting docs, bundled in this binary. ",
-    "topics: providers, policy, web, doctor"
+    "Read Teton's own docs, bundled in this binary. ",
+    "topics: providers, policy, context, web, skills, doctor"
 );
 
 /// The body of `topic`, or `None` when nothing by that name is bundled.
@@ -175,7 +192,7 @@ impl Tool for DocsTool {
         // than spelled a fourth time. This method returns an **owned** `Value`,
         // so nothing here has to be `const` — and a hand-written list that only
         // the schema carried would be the one copy no golden compares, which is
-        // exactly how a fifth topic ends up reachable from the description and
+        // exactly how a new topic ends up reachable from the description and
         // invisible in the schema the model actually fills.
         json!({
             "type": "object",
@@ -240,6 +257,22 @@ mod tests {
     /// derived universe. The scan now anchors on the test module itself and
     /// pins that with a regression test, so the placement is convention, not a
     /// constraint.
+    ///
+    /// **Spent and left, as of REQ-585.** The `context` topic's nine characters
+    /// (`, context`) first took [`DESCRIPTION`] to exactly 120 — legal, and no
+    /// headroom at all with a `projects` tool (REQ-584) and a `skill` tool
+    /// (REQ-587) queued behind this one. So the room was bought where the
+    /// review said to buy it: the sentence in front of the index lost `setup
+    /// and troubleshooting`, 26 characters that named nothing the index does
+    /// not already carry, leaving 94 spent and 26 free.
+    ///
+    /// REQ-585's `skills` spent eight of those 26 out of the margin, exactly as
+    /// that note said the next topic should, and this number did not move.
+    /// **Spent: 102. Left: 18.** The margin, not the ceiling, is what a seventh
+    /// topic buys its name from: the two margin tests measure the prompt this
+    /// description sits in, and their headroom is what the bundled guide is
+    /// competing for. When the margin is gone, shorten the frame again or make
+    /// the case for a bigger ceiling out loud.
     pub(super) const MAX_DESCRIPTION_CHARS: usize = 120;
 
     fn ctx() -> ToolContext {
@@ -265,7 +298,7 @@ mod tests {
     fn every_topic_serves_its_whole_bundled_body() {
         assert_eq!(
             TOPICS.len(),
-            4,
+            6,
             "the topic roster changed: {:?}",
             TOPICS.iter().map(|(name, _)| *name).collect::<Vec<_>>()
         );
@@ -323,8 +356,343 @@ mod tests {
         }
     }
 
-    /// **AC-3, the didactic half (BR-8).** An unknown topic names all four valid
-    /// ones, so the recovery is the model's next turn rather than the user's.
+    /// The `skills` topic as a model receives it, with every whitespace run
+    /// collapsed to one space and markdown emphasis markers dropped.
+    ///
+    /// The needle tests below match against this rather than the raw body, for
+    /// two reasons that are both about what the needles are *for*. A claim
+    /// written across a line break is one substring here, so a phrase can be
+    /// pinned as it reads rather than as it happens to wrap; and re-wrapping a
+    /// paragraph at 80 columns — or bolding a word — is a formatting change,
+    /// which must not fail a test about what the topic *asserts*, nor let a
+    /// stale assertion back in wearing `**` (`**stalls**` and `stalls` are the
+    /// same claim).
+    ///
+    /// Served through `run`, like the sweep above, because the claim under test
+    /// is about what reaches the model rather than what is on disk.
+    fn skills_topic() -> String {
+        let served = call("skills");
+        assert!(!served.is_error, "{}", served.content);
+        served
+            .content
+            .replace('*', "")
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ")
+    }
+
+    /// A phrase REQ-587 made false, which must therefore not be in the topic.
+    fn assert_no_stale_claim(topic: &str, phrase: &str, why: &str) {
+        assert!(
+            !topic.contains(phrase),
+            "the `skills` topic still says `{phrase}`, which this build makes false: \
+             {why}. The topic is compiled into the same binary that hands the model a \
+             `skill` tool, so a model reading it is told the opposite of what it can do \
+             (AC-16) — fix crates/tetond/src/harness/docs/skills.md, not this assertion, \
+             and pay for the words by cutting elsewhere in the topic."
+        );
+    }
+
+    /// A phrase that carries a claim the topic has to make.
+    fn assert_states(topic: &str, phrase: &str, claim: &str) {
+        assert!(
+            topic.contains(phrase),
+            "the `skills` topic no longer says `{phrase}`, so it no longer states that \
+             {claim}. The byte ceiling above cannot see this and neither can the length \
+             floor (LESSON-481): if the wording changed on purpose, move the needle with \
+             it — deleting the needle deletes the only thing that notices when the topic \
+             and the product disagree."
+        );
+    }
+
+    /// **AC-16, first passage: the topic no longer denies model invocation.**
+    ///
+    /// It said *"The model cannot invoke a skill: name it and let the user type
+    /// it"*, compiled into the same binary that registers a `skill` tool. A
+    /// model that reads its own documentation and believes it hands the turn
+    /// back to the user instead of calling the tool sitting in its own schema —
+    /// which is BUG-181's defect with the sign flipped, on the surface REQ-577
+    /// shipped so the model would stop guessing.
+    #[test]
+    fn the_skills_topic_does_not_deny_model_invocation() {
+        let topic = skills_topic();
+        assert_no_stale_claim(
+            &topic,
+            "cannot invoke a skill",
+            "BR-1 gives the model a second door into the same expander",
+        );
+        assert_no_stale_claim(
+            &topic,
+            "let the user type it",
+            "a hand-off to the user is exactly the stall this REQ removes",
+        );
+        assert_states(
+            &topic,
+            "the model's `skill { name, args }` is a tool result",
+            "the model invokes a skill by calling the tool, and the expansion comes back \
+             inside the turn it is already in (BR-1, OQ-2)",
+        );
+    }
+
+    /// **AC-16, second passage: two frontmatter flags are no longer inert.**
+    ///
+    /// BR-3 shrinks REQ-585 BR-5's inert list by exactly two keys. The topic has
+    /// to name both and what they do, and — the half a positive needle would
+    /// miss — must not go on listing them among the keys it calls inert.
+    #[test]
+    fn the_skills_topic_does_not_call_the_two_invocation_flags_inert() {
+        let topic = skills_topic();
+        assert_no_stale_claim(
+            &topic,
+            "Frontmatter reads only",
+            "BR-3 makes two more keys meaningful, so the set of keys that are read is no \
+             longer closed at three",
+        );
+        assert_states(
+            &topic,
+            "`disable-model-invocation: true` hides the skill from the model",
+            "the first flag hides a skill from the model completely (BR-3)",
+        );
+        assert_states(
+            &topic,
+            "`user-invocable: false` makes it model-only",
+            "the second flag makes a skill model-only (BR-3)",
+        );
+        assert_states(
+            &topic,
+            "A non-boolean value is safe per key",
+            "a value that is not `true`/`false` takes the safe reading, so a typo can \
+             never widen what the model may run (BR-3). Which reading is safe depends on \
+             the flag, and the eighth passage below pins that half",
+        );
+
+        // The inert list itself, read out of the sentence that makes the claim:
+        // a topic that named both flags above and then left them in this
+        // parenthesis would satisfy every needle and still tell the model they
+        // do nothing.
+        let inert = topic
+            .split_once("Every other key (")
+            .and_then(|(_, rest)| rest.split_once(") is inert"))
+            .map(|(list, _)| list)
+            .expect(
+                "the topic no longer names what stays inert; BR-3 shrinks REQ-585's inert \
+                 list by exactly two keys and leaves the rest inert, which is a claim the \
+                 topic still has to carry",
+            );
+        for flag in ["disable-model-invocation", "user-invocable"] {
+            assert!(
+                !inert.contains(flag),
+                "the `skills` topic lists `{flag}` among the inert keys — `{inert}` — and \
+                 BR-3 is precisely that this key is now read. A model told the flag is \
+                 inert will not believe a skill can be hidden from it."
+            );
+        }
+    }
+
+    /// **AC-16, third passage: a skill that invokes skills no longer stalls.**
+    ///
+    /// *"stalls at its first 'invoke the skill' step"* was REQ-585's honest
+    /// limit and is this REQ's entire subject: `/proceed` reaching its first
+    /// gate is the reason the tool exists. What still degrades is a skill that
+    /// dispatches subagents, and the topic keeps saying so.
+    #[test]
+    fn the_skills_topic_does_not_say_a_skill_invoking_skill_stalls() {
+        let topic = skills_topic();
+        assert_no_stale_claim(
+            &topic,
+            " stalls",
+            "the `skill` tool is what unstalls a skill written as skill invocations",
+        );
+        assert_no_stale_claim(
+            &topic,
+            "at its first \"invoke the skill\" step",
+            "the first such step is now a tool call that resolves",
+        );
+        assert_states(
+            &topic,
+            "invokes other skills now runs them",
+            "a skill whose phases are skill invocations reaches them (BR-1)",
+        );
+        assert_states(
+            &topic,
+            "dispatches subagents degrades",
+            "what genuinely still degrades is named, so the model does not pretend a \
+             subagent step ran",
+        );
+    }
+
+    /// **AC-16, fourth passage: BR-10's provenance is two rules, not one.**
+    ///
+    /// REQ-585 ADR-9 refused to widen the id minter, so a project skill and a
+    /// user skill pin a turn by different rules — and the second is stricter
+    /// than a `read` of the same bytes. The consequence for a model invocation
+    /// on a boundary-configured machine is the part BR-10 says to state plainly
+    /// rather than leave to be discovered in a runbook.
+    #[test]
+    fn the_skills_topic_states_both_provenance_rules() {
+        let topic = skills_topic();
+        assert_no_stale_claim(
+            &topic,
+            "the stricter unknown rule",
+            "the pre-BR-10 paragraph folded both rules into one clause about a typed \
+             `/name`, and said nothing about a model invocation",
+        );
+        assert_states(
+            &topic,
+            "Two rules.",
+            "there are two provenance rules and the topic counts them (BR-10)",
+        );
+        assert_states(
+            &topic,
+            "A project skill mints a root-relative source",
+            "rule one: a project skill has a root-relative identity and pins the turn as \
+             reading that file would (BR-10)",
+        );
+        assert_states(
+            &topic,
+            "block is `Unknown` and pins the turn wherever any boundary is configured",
+            "rule two: a user skill has no root-relative identity, so it is `Unknown` and \
+             pins wherever any boundary is set — related to it or not (BR-10)",
+        );
+        assert_states(
+            &topic,
+            "a model invocation of a `~/.claude` skill runs local",
+            "the consequence of rule two for the seventeen `~/.claude` skills, which is \
+             what a runbook would otherwise discover the hard way (BR-10)",
+        );
+    }
+
+    /// **AC-16, fifth passage: the model's toolbox is named, not counted.**
+    ///
+    /// *"one model with five tools"* was REQ-585's shorthand for the five
+    /// built-ins, and this build adds a sixth door the model can open. A bare
+    /// count is what goes stale the next time a tool is registered — and it
+    /// was already silent about `teton_docs` and an opted-in `web` — so the
+    /// topic names the tool that matters here instead.
+    #[test]
+    fn the_skills_topic_does_not_pin_a_tool_count_that_moved() {
+        let topic = skills_topic();
+        assert_no_stale_claim(
+            &topic,
+            "five tools",
+            "the model's toolbox gained `skill`, and the count was never the whole set \
+             anyway (`teton_docs`, and `web` when opted in)",
+        );
+        assert_states(
+            &topic,
+            "tools, `skill` among them",
+            "the tool a skill body may reach for is named rather than counted",
+        );
+    }
+
+    /// **AC-16, sixth passage: an invocation has two callers.**
+    ///
+    /// *"`/name <rest>` is exactly one user-role prompt turn"* is now true of
+    /// one caller of two. The other lands as a tool result inside the turn
+    /// already running, over identical body bytes (AC-2) behind a different
+    /// frame (BR-4, ADR-6) — and a topic silent about the second caller is a
+    /// topic the model cannot act on.
+    #[test]
+    fn the_skills_topic_names_both_callers_of_the_expander() {
+        let topic = skills_topic();
+        assert_no_stale_claim(
+            &topic,
+            "is exactly one user-role prompt turn",
+            "an invocation is no longer only a prompt turn — the model's call lands as a \
+             tool result inside the turn already running",
+        );
+        assert_states(
+            &topic,
+            "Two callers, one expander.",
+            "one registry and one expander are reached by `/name` and by the tool (BR-1)",
+        );
+        assert_states(
+            &topic,
+            "then the same bytes",
+            "the body bytes are identical on both paths; only the frame in front differs \
+             (AC-2, BR-4)",
+        );
+    }
+
+    /// **AC-16, seventh passage: the `skill` tool is not always there.**
+    ///
+    /// TASK-220 could not state this for want of room — the topic was 16 bytes
+    /// under the ceiling — and left it reading as though `skill` is present in
+    /// every session. BR-2 registers it only when the registry holds at least
+    /// one model-invocable skill, so on a machine with none the model is
+    /// otherwise told about a tool that is not in its own schema, which is
+    /// BUG-181's defect in the other direction: the topic and the tool set
+    /// disagreeing, with the topic winning.
+    ///
+    /// The clause was paid for by cutting elsewhere in the same file. The
+    /// ceiling did not move and `every_bundled_topic_is_under_the_ceiling` still
+    /// guards it.
+    #[test]
+    fn the_skills_topic_says_the_tool_is_registered_conditionally() {
+        let topic = skills_topic();
+        assert_states(
+            &topic,
+            "The `skill` tool exists only when some skill is model-invocable",
+            "the tool is conditionally registered, so a session with no \
+             model-invocable skill has no `skill` tool at all (BR-2)",
+        );
+        assert_states(
+            &topic,
+            "with none it is absent",
+            "the consequence is stated as absence rather than as an empty list — a \
+             model that reads about a tool missing from its own schema guesses (BR-2)",
+        );
+    }
+
+    /// **AC-16, eighth passage: the safe reading is per flag, not "user only".**
+    ///
+    /// The flag paragraph used to end *"A non-boolean value reads as the safe
+    /// one — user only"*, which is true of exactly one of the two flags.
+    /// `disable-model-invocation: bogus` does read user-only: `boolean` returns
+    /// `None`, the key is named in `ignored_keys`, and `model_invocable` takes
+    /// `false` while the user keeps `/name`. `user-invocable: bogus` does not:
+    /// the safe reading in that direction is the *unchanged* one, so
+    /// `user_invocable` stays `true` and `model_invocable` is never touched —
+    /// that row is invocable by **both**.
+    ///
+    /// The asymmetry is deliberate and is spelled out on `skills::frontmatter`'s
+    /// module docs: an unreadable value lands on the narrower capability for the
+    /// model and the unchanged one for the user, so a typo can hide a skill from
+    /// the model and can never hand it one the user meant to keep to themselves.
+    /// A topic that flattens that into one answer tells the model it cannot
+    /// invoke a row it can in fact invoke — BUG-181's defect in the shape AC-16
+    /// exists to keep out, on the surface the model reads to find out what it
+    /// is allowed to do.
+    ///
+    /// Paid for by cutting elsewhere in the same file; the ceiling did not move
+    /// and `every_bundled_topic_is_under_the_ceiling` still guards it.
+    #[test]
+    fn the_skills_topic_states_the_safe_reading_is_per_flag() {
+        let topic = skills_topic();
+        assert_no_stale_claim(
+            &topic,
+            "reads as the safe one — user only",
+            "the safe reading is per flag — user-only for `disable-model-invocation`, and \
+             for `user-invocable` the unchanged reading, which leaves that row invocable \
+             by both",
+        );
+        assert_states(
+            &topic,
+            "unreadable `disable-model-invocation` hides it",
+            "an unreadable value on the negative flag takes the narrower reading for the \
+             model, and only for the model (BR-3)",
+        );
+        assert_states(
+            &topic,
+            "unreadable `user-invocable` changes nothing, so it stays invocable by both",
+            "an unreadable value on the positive flag moves neither capability, so that \
+             row is invocable by the user *and* the model — the arm the old wording got \
+             backwards (BR-3)",
+        );
+    }
+
+    /// **AC-3, the didactic half (BR-8).** An unknown topic names every valid
+    /// one, so the recovery is the model's next turn rather than the user's.
     #[test]
     fn an_unknown_topic_is_answered_with_the_valid_ones() {
         let outcome = call("pricing");
@@ -365,7 +733,7 @@ mod tests {
     /// are one request in every sense but `==`. Refusing them costs a whole
     /// turn — the didactic error, then a retry — to teach a casing rule that
     /// carries no meaning. Swept over every bundled topic rather than spot-
-    /// checked on one, so a fifth topic inherits the tolerance.
+    /// checked on one, so a new topic inherits the tolerance.
     #[test]
     fn a_topic_is_matched_past_case_and_surrounding_space() {
         for (name, body) in TOPICS {
@@ -465,7 +833,7 @@ mod tests {
 
     /// **BR-9 / AC-8: every bundled topic is under the ceiling.**
     ///
-    /// Swept over [`TOPICS`] rather than written per topic, so a fifth topic is
+    /// Swept over [`TOPICS`] rather than written per topic, so a new topic is
     /// covered the moment it is added rather than the moment someone remembers.
     /// The floor below is the other half of BUG-159's lesson: an empty or
     /// stub-length body would pass a ceiling check by having nothing in it.
@@ -531,16 +899,18 @@ mod tests {
     /// coupling is written down here rather than left to hold by luck.
     #[test]
     fn the_topic_ceiling_stays_under_the_summarize_threshold() {
-        use crate::harness::context::APPROX_BYTES_PER_TOKEN;
         use crate::harness::turn_loop::HarnessConfig;
 
-        let threshold_bytes =
-            HarnessConfig::default().summarize_threshold_tokens * APPROX_BYTES_PER_TOKEN;
+        // The byte twin is read off the config rather than recomputed from the
+        // word threshold (REQ-586 BR-6, gotcha #3): the two thresholds scale
+        // from two different currencies on a remote route, so a topic must clear
+        // the byte one the harness will actually apply.
+        let threshold_bytes = HarnessConfig::default().summarize_threshold_bytes;
         assert!(
             MAX_TOPIC_BYTES < threshold_bytes,
             "the per-topic ceiling is {MAX_TOPIC_BYTES} bytes and the default harness \
              summarizes a tool result past {threshold_bytes} bytes \
-             ({} tokens × {APPROX_BYTES_PER_TOKEN}). A topic at the ceiling would be \
+             ({} tokens). A topic at the ceiling would be \
              summarized instead of served — a model call, and on a remote tier a model call \
              carrying the body, which is not what `teton_docs` promises. Lower \
              `MAX_TOPIC_BYTES`, or raise the threshold deliberately and say why here.",

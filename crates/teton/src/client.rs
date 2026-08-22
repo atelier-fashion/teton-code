@@ -92,6 +92,56 @@ pub struct UiContext<'a> {
     /// world only through this context, and a handler reaching for an ambient
     /// session id would be a second, invisible seam.
     pub session_id: Option<teton_protocol::SessionId>,
+    /// What this session's `/name` lines may dispatch and what `/help` lists —
+    /// the daemon's `skills/list` answer, held as a snapshot (REQ-585 BR-3,
+    /// ADR-1/ADR-2).
+    ///
+    /// It rides here for `typed_input`'s and `session_id`'s reason: the slash
+    /// handlers touch the world only through this context, and `/help` reading
+    /// a registry from anywhere else would be a second, invisible seam. The
+    /// snapshot is the client's *whole* knowledge of the user's `~/.claude` —
+    /// there is no second reader of those directories in this crate.
+    ///
+    /// **Empty is the load-bearing default**, not a placeholder: it is the state
+    /// of a user with no `~/.claude`, of every passive context, and of a client
+    /// talking to a daemon that answers `skills/list` with `METHOD_NOT_FOUND`
+    /// (ADR-2). An empty snapshot makes [`crate::slash::classify`] incapable of
+    /// returning `Input::Skill`, so no `PromptTurnParams.skill` is ever sent and
+    /// no skill consent can ever arrive — which is what makes "byte-for-byte
+    /// what it is today" true for all three.
+    ///
+    /// Refreshed by [`Connection::refresh_skills`] after `session/create` and
+    /// again after every `session_root_changed`
+    /// ([`SessionState::take_skills_stale`]): a `/cd` re-derives the project
+    /// half, and a name that outlived its snapshot would dispatch a skill the
+    /// session no longer has.
+    pub skills: crate::slash::SkillSnapshot,
+}
+
+/// The snapshot one `skills/list` reply becomes (REQ-585 ADR-2).
+///
+/// Pure, and split out of [`Connection::refresh_skills`] for exactly one
+/// reason: the branch that matters is the one no daemon in a unit test can be
+/// made to take on demand. A
+/// [`METHOD_NOT_FOUND`](teton_protocol::jsonrpc::error_code::METHOD_NOT_FOUND)
+/// reply is the **version handshake failing**, and it must read as *an empty
+/// registry*, never as an error — that is what makes a new CLI against an old
+/// daemon behave byte-for-byte as it does today.
+///
+/// Every other error reads empty too, and deliberately says nothing. A registry
+/// the daemon could not produce is a session with no skills; a line about it at
+/// every session start, and again at every `/cd`, would be chrome about a
+/// capability the user may never have used — the same posture
+/// [`Connection::answer_outstanding_model_proposal`] takes towards a daemon too
+/// old to answer it.
+#[must_use]
+pub(crate) fn snapshot_from_skills_reply(
+    reply: Result<methods::SkillsListResult, RpcError>,
+) -> crate::slash::SkillSnapshot {
+    match reply {
+        Ok(result) => crate::slash::SkillSnapshot::from(result),
+        Err(_) => crate::slash::SkillSnapshot::empty(),
+    }
 }
 
 /// One message read off the socket.
@@ -380,6 +430,13 @@ impl Connection {
                     &mut *ctx.surface,
                     &mut *ctx.prompter,
                     &mut ctx.state.grants,
+                    // REQ-585 BR-11 / ADR-8. The terminal fact is threaded from
+                    // the one edge that read it (`main.rs`'s `IsTerminal` on
+                    // stdin), never recomputed inside the UI: a handler reading
+                    // `std::io::stdin()` itself would be a second, invisible
+                    // seam, and the gate this feeds is precisely the one that
+                    // must not be answerable differently in two places.
+                    ctx.typed_input,
                 );
                 self.send(reply)?;
             }
@@ -511,6 +568,39 @@ impl Connection {
                 Ok(_) => {}
             }
         }
+        Ok(())
+    }
+
+    /// Refresh [`UiContext::skills`] from the daemon (REQ-585 ADR-2).
+    ///
+    /// Called after `session/create` and again after every
+    /// `session_root_changed` — the two moments at which the answer can differ,
+    /// because half of it is derived from the session root and `/cd` moves it.
+    ///
+    /// **This call is the version handshake.** A daemon that does not serve
+    /// `skills/list` leaves the snapshot empty and raises no error, which is the
+    /// whole mechanism: an old daemon therefore classifies no skills, so
+    /// `PromptTurnParams.skill` is never sent to it and the new consent can
+    /// never arrive from it. The capability is proven by a successful call, not
+    /// asserted from a version number, which is why `PROTOCOL_VERSION` does not
+    /// move for any of REQ-585's additions.
+    ///
+    /// A context with no session — a passive one, or the window before
+    /// `session/create` answers — is left empty without a call: there is no
+    /// session whose registry could be asked for.
+    ///
+    /// # Errors
+    ///
+    /// Only if the connection drops. A daemon that *answers* — with a result or
+    /// with any error — leaves a session running; a registry nobody could read
+    /// is a session with no skills, never a session that fails to start.
+    pub fn refresh_skills(&mut self, ctx: &mut UiContext) -> anyhow::Result<()> {
+        let Some(session_id) = ctx.session_id.clone() else {
+            ctx.skills = crate::slash::SkillSnapshot::empty();
+            return Ok(());
+        };
+        let reply = self.call(methods::SkillsListParams { session_id }, ctx)?;
+        ctx.skills = snapshot_from_skills_reply(reply);
         Ok(())
     }
 
@@ -1380,6 +1470,7 @@ mod tests {
             auto_accept_model: false,
             typed_input: true,
             session_id: None,
+            skills: crate::slash::SkillSnapshot::empty(),
         };
 
         let mut teardowns = 0;
@@ -1432,6 +1523,7 @@ mod tests {
             auto_accept_model: false,
             typed_input: true,
             session_id: None,
+            skills: crate::slash::SkillSnapshot::empty(),
         };
         conn.drain_events(&mut ctx, || {}).expect("drain");
         assert!(
@@ -1457,6 +1549,7 @@ mod tests {
             auto_accept_model: false,
             typed_input: true,
             session_id: None,
+            skills: crate::slash::SkillSnapshot::empty(),
         };
 
         let mut teardowns = 0;
@@ -1492,6 +1585,7 @@ mod tests {
             auto_accept_model: false,
             typed_input: true,
             session_id: None,
+            skills: crate::slash::SkillSnapshot::empty(),
         };
         let drained = conn.drain_events(&mut ctx, || {}).expect("not an error");
         assert_eq!(drained.rendered, 0);
@@ -1565,6 +1659,7 @@ mod tests {
                 auto_accept_model: false,
                 typed_input: true,
                 session_id,
+                skills: crate::slash::SkillSnapshot::empty(),
             };
 
             let mut teardowns = 0;
@@ -1826,6 +1921,7 @@ mod tests {
             // process is the same check the real edge makes.
             typed_input: std::io::IsTerminal::is_terminal(&std::io::stdin()),
             session_id: None,
+            skills: crate::slash::SkillSnapshot::empty(),
         };
         conn.answer_outstanding_model_proposal(&mut ctx)
             .expect("the round-trip completes");
@@ -2012,5 +2108,181 @@ mod tests {
 
         // A transport error carries no RpcError at all.
         assert!(!is_shutting_down(&anyhow!("connection reset")));
+    }
+}
+
+// ---------------------------------------------------------------------------
+// REQ-585 ADR-2: `skills/list` is the version handshake
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod skills_handshake {
+    use super::*;
+    use crate::prompt::ScriptedPrompter;
+    use crate::render::RecordingSurface;
+    use crate::slash::{self, SkillSnapshot};
+    use teton_protocol::methods::{SkillSource, SkillView, SkillsListResult};
+    use teton_protocol::SessionId;
+
+    fn session() -> SessionId {
+        SessionId::from("s1")
+    }
+
+    /// A context in a session, at a terminal — the launch shape.
+    macro_rules! ctx {
+        ($surface:ident, $state:ident, $prompter:ident, $session:expr) => {
+            UiContext {
+                surface: &mut $surface,
+                state: &mut $state,
+                prompter: &mut $prompter,
+                answer_permissions: true,
+                answer_model_proposals: true,
+                auto_accept_model: false,
+                typed_input: true,
+                session_id: $session,
+                skills: SkillSnapshot::empty(),
+            }
+        };
+    }
+
+    fn served(skills: Vec<SkillView>) -> Value {
+        serde_json::to_value(SkillsListResult {
+            skills,
+            skipped: Vec::new(),
+        })
+        .expect("the result serializes")
+    }
+
+    fn skill(name: &str) -> SkillView {
+        SkillView {
+            name: name.to_owned(),
+            source: SkillSource::User,
+            description: Some("Report on the repo.".to_owned()),
+            argument_hint: None,
+            shadowed: None,
+            // The ordinary row, which after REQ-587 BR-3 is invocable from both
+            // doors: these tests are about a served registry becoming the
+            // session's snapshot, and the fixture should be the case they are
+            // named for. `model_invocable: false` would describe a skill absent
+            // from the model's roster, which is a state worth a fixture of its
+            // own where a mark or a roster is under test — `slash.rs` has those
+            // (`user_only`, `model_only`, `invocable_by_nobody`) — and is a
+            // misleading default here.
+            model_invocable: true,
+            user_invocable: true,
+        }
+    }
+
+    /// The registry the daemon serves becomes the session's snapshot, and the
+    /// request it answers is the session-scoped `skills/list` — not a second
+    /// reader of `~/.claude` in this crate (ADR-1).
+    #[test]
+    fn a_served_registry_becomes_the_sessions_snapshot() {
+        let (mut conn, peer) = Connection::scripted(&[served(vec![skill("status")])]);
+        let mut surface = RecordingSurface::new();
+        let mut state = session_ui::SessionState::new();
+        let mut prompter = ScriptedPrompter::new(&[]);
+        let mut ctx = ctx!(surface, state, prompter, Some(session()));
+
+        conn.refresh_skills(&mut ctx).expect("the daemon answered");
+
+        assert_eq!(methods_written(&peer), vec!["skills/list".to_owned()]);
+        assert!(
+            matches!(
+                slash::classify("/status now", &ctx.skills),
+                slash::Input::Skill { ref name, .. } if name == "status"
+            ),
+            "the snapshot is what `classify` dispatches from"
+        );
+        conn.assert_all_consumed();
+    }
+
+    /// **ADR-2, the whole mechanism.** A daemon that does not serve
+    /// `skills/list` answers `METHOD_NOT_FOUND`, and that is **an empty
+    /// registry, not an error**: the session starts, `/status` classifies as
+    /// the unknown command it has always been, and `PromptTurnParams.skill` is
+    /// therefore never sent to a daemon that could not understand it. The new
+    /// consent can never arrive from it either, because nothing on that daemon
+    /// ever raises one.
+    ///
+    /// Treating the absent method as a failure fails here — and would have
+    /// turned "your daemon is a version behind" into "your session will not
+    /// start".
+    #[test]
+    fn an_old_daemon_leaves_an_empty_snapshot_and_raises_no_error() {
+        let (mut conn, _peer) = Connection::scripted_replies(vec![Err(RpcError::new(
+            error_code::METHOD_NOT_FOUND,
+            "Method not found",
+        ))]);
+        let mut surface = RecordingSurface::new();
+        let mut state = session_ui::SessionState::new();
+        let mut prompter = ScriptedPrompter::new(&[]);
+        let mut ctx = ctx!(surface, state, prompter, Some(session()));
+
+        conn.refresh_skills(&mut ctx)
+            .expect("an absent method is not an error");
+
+        assert_eq!(ctx.skills, SkillSnapshot::empty());
+        assert!(
+            surface.calls.is_empty(),
+            "and it says nothing: a registry nobody could produce is a session \
+             with no skills, not news: {:?}",
+            surface.calls
+        );
+    }
+
+    /// The composition ADR-2 actually buys, asserted end to end rather than
+    /// inferred: with the empty snapshot an old daemon leaves, no `/` line can
+    /// classify as a skill, so nothing on this path can build a
+    /// `PromptTurnParams` carrying one.
+    #[test]
+    fn an_empty_snapshot_classifies_no_skill_so_no_skill_field_is_ever_sent() {
+        let empty = SkillSnapshot::empty();
+        for line in [
+            "/status",
+            "/status REQ-585",
+            "/analyze the repo",
+            "/proceed",
+        ] {
+            assert!(
+                !matches!(slash::classify(line, &empty), slash::Input::Skill { .. }),
+                "{line:?} must not dispatch a skill against an old daemon"
+            );
+        }
+        // And the only turn builder reachable from those classifications leaves
+        // the field absent, which is what keeps the request byte-identical to a
+        // pre-REQ-585 one.
+        assert!(slash::prompt_turn_params(&session(), "/status")
+            .skill
+            .is_none());
+    }
+
+    /// No session, no registry: `skills/list` is session-scoped, so a passive
+    /// context — or the window before `session/create` answers — asks nothing
+    /// at all rather than asking about a session it does not have.
+    #[test]
+    fn a_context_with_no_session_asks_for_no_registry() {
+        let (mut conn, peer) = Connection::scripted(&[]);
+        let mut surface = RecordingSurface::new();
+        let mut state = session_ui::SessionState::new();
+        let mut prompter = ScriptedPrompter::new(&[]);
+        let mut ctx = ctx!(surface, state, prompter, None);
+
+        conn.refresh_skills(&mut ctx).expect("nothing to ask");
+
+        assert!(methods_written(&peer).is_empty());
+        assert_eq!(ctx.skills, SkillSnapshot::empty());
+    }
+
+    /// Any other refusal reads the same way, and for the same reason: a session
+    /// keeps running with no skills rather than failing to start over a
+    /// registry.
+    #[test]
+    fn a_refused_query_leaves_an_empty_snapshot_too() {
+        let snapshot = snapshot_from_skills_reply(Err(RpcError::new(
+            error_code::INTERNAL_ERROR,
+            "the registry could not be read",
+        )));
+        assert_eq!(snapshot, SkillSnapshot::empty());
     }
 }

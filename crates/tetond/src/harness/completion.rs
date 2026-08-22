@@ -44,7 +44,8 @@ use crate::cost::{CostAttribution, LocalUsageMeter};
 use crate::egress::{Egress, EgressContext, Provenance};
 
 use super::context::{
-    ContextManager, MessageRole, PreparedPrompt, Provenance as CtxProvenance, ToolProvenance,
+    approx_tokens, ContextManager, MessageRole, PreparedPrompt, Provenance as CtxProvenance,
+    ToolProvenance,
 };
 use super::digest::tool_result_provenance;
 use super::render;
@@ -106,18 +107,22 @@ pub struct SourceTurn {
     /// Whether a [`TurnDecision::ToolCall`] on this turn is **already embedded
     /// in [`text`](Self::text)** rather than arriving beside it (REQ-567 OQ-1).
     ///
-    /// The two sources answer differently and the difference is structural, not
-    /// stylistic:
+    /// The answer follows **where the call came from**, and the difference is
+    /// structural, not stylistic:
     ///
     /// - [`LocalEngineSource`] parses the call **out of the reply text**, so the
     ///   text literally ends with the call's JSON.
-    /// - [`RemoteProviderSource`] receives the call as a structured
-    ///   [`TurnEvent::ToolCall`]; the text is prose only — often none at all —
-    ///   and any JSON in it is something the model was *talking about*.
+    /// - [`RemoteProviderSource`] usually receives the call as a structured
+    ///   [`TurnEvent::ToolCall`]; then the text is prose only — often none at
+    ///   all — and any JSON in it is something the model was *talking about*.
+    ///   But a remote model may also *write* its call, in the text grammar the
+    ///   system prompt teaches (BUG-180); with no native call on the turn the
+    ///   source parses the text exactly as the local tier does, and then the
+    ///   text ends with the call just as a local reply's does.
     ///
     /// Either way the block the loop pushes **ends with the call**: the loop
-    /// renders a remote call onto the prose in the reply grammar before it
-    /// pushes (BUG-178 — an assistant turn pushed as the bare prose was empty
+    /// renders a native remote call onto the prose in the reply grammar before
+    /// it pushes (BUG-178 — an assistant turn pushed as the bare prose was empty
     /// whenever the model said nothing first, and every remote provider refuses
     /// an empty assistant turn on the next request). This flag says who put the
     /// call there, so the loop knows whether it still has to; the trailing
@@ -169,11 +174,12 @@ pub trait CompletionSource: Send {
     ///
     /// Defaults to [`ChatFormat::Flat`], which is right for every source that is
     /// not a local text engine. [`RemoteProviderSource`] stays `Flat` on purpose:
-    /// fabrication markers are a *local text parsing* concern — a remote turn's
-    /// tool calls arrive as structured [`TurnEvent::ToolCall`] events and its
-    /// prose as `TextDelta`s, so there is no transcript rendering in the text for
-    /// a marker to describe, and the provider owns its own wire format. The
-    /// default also keeps every test source compiling unchanged.
+    /// fabrication markers are a *transcript rendering* concern — a remote
+    /// provider is shown role-typed messages and owns its own wire format, so
+    /// there is no template frame in its text for a ChatML marker to describe.
+    /// (Its text may still carry a tool call in the reply grammar, BUG-180, and
+    /// the flat gate already holds that back — the grammar is format-agnostic.)
+    /// The default also keeps every test source compiling unchanged.
     fn chat_format(&self) -> ChatFormat {
         ChatFormat::Flat
     }
@@ -484,6 +490,55 @@ impl<'a, T: Transport> RemoteProviderSource<'a, T> {
         self
     }
 
+    /// The size of what this attempt actually sent, in the harness's own word
+    /// estimator (REQ-586 BR-2).
+    ///
+    /// Measured off the **prepared prompt** rather than off the
+    /// [`ContextManager`], for two reasons. It is what a remote request is
+    /// built from — system field plus the role-typed messages, which is exactly
+    /// the payload the provider counted — and it is what this frame can reach:
+    /// `produce_turn` is handed a prompt, never the manager that assembled it,
+    /// and threading one in to read a number would hand every completion source
+    /// a mutable handle on the conversation to serve an error path.
+    ///
+    /// The same [`approx_tokens`] the budget gate measures with, so the figure
+    /// this reports and the budget it is reported against are in one currency —
+    /// a report mixing a word estimate with a BPE count would make every
+    /// refusal look like a wildly wrong window.
+    fn assembled_words(prompt: &PreparedPrompt) -> usize {
+        approx_tokens(&prompt.system)
+            + prompt
+                .messages
+                .iter()
+                .map(|m| approx_tokens(&m.text))
+                .sum::<usize>()
+    }
+
+    /// The typed report for a provider that refused the request as too big for
+    /// its window (REQ-586 BR-2, ADR-8) — **the one home** of the mapping.
+    ///
+    /// Written once because there are two ways into it and they must not
+    /// diverge: the first attempt, and the REQ-559 BR-12 retry with no
+    /// reasoning field. The retry used to propagate with `?`, and
+    /// [`HarnessError::Remote`] is `#[from] ProviderError`, so a
+    /// context-length refusal on *that* call became `Remote(..)` — a
+    /// class-less error the runtime's retry arm cannot act on, which the user
+    /// saw as `INTERNAL_ERROR "provider failed unrecoverably"` instead of the
+    /// window/size report the same refusal produces one line earlier (verify
+    /// M2). The prompt is too big for the window whether or not the request
+    /// carried an effort field.
+    fn context_length_exceeded(
+        &self,
+        prompt: &PreparedPrompt,
+        config: &HarnessConfig,
+    ) -> HarnessError {
+        HarnessError::ContextLengthExceeded {
+            provider_id: self.provider_id.to_string(),
+            assembled_tokens: Self::assembled_words(prompt),
+            budget_tokens: config.context_budget_tokens,
+        }
+    }
+
     /// Say on the daemon's stderr that this provider failed the turn, and how.
     ///
     /// BUG-178 was diagnosed by replaying the request by hand, because the one
@@ -517,7 +572,7 @@ impl<T: Transport> CompletionSource for RemoteProviderSource<'_, T> {
         provenance: &Provenance,
         config: &HarnessConfig,
         tools: &ToolRegistry,
-        _exposed: &[&str],
+        exposed: &[&str],
         on_token: &mut (dyn for<'s> FnMut(&'s str) + Send),
     ) -> Result<SourceTurn, HarnessError> {
         // REQ-544 M-8: map the structured context to a real system prompt plus
@@ -617,7 +672,37 @@ impl<T: Transport> CompletionSource for RemoteProviderSource<'_, T> {
                 // is boundary-checked and metered on its own terms (BR-13 —
                 // effort changes nothing about egress).
                 let transport = self.egress.scoped(provenance.clone(), egress_ctx());
-                self.provider.stream_turn(fallback, &transport).await?
+                // Matched, never `?`-ed: the arm below this one types a
+                // context-length refusal, and `?` would route the *retry's*
+                // identical refusal through `#[from] ProviderError` into
+                // `Remote(..)` — an error with no failure class, which the
+                // runtime cannot retry, cannot fail over, and reports as an
+                // opaque internal error (verify M2).
+                match self.provider.stream_turn(fallback, &transport).await {
+                    Ok(stream) => stream,
+                    Err(err) if err.is_context_length_exceeded() => {
+                        return Err(self.context_length_exceeded(prompt, config));
+                    }
+                    Err(err) => return Err(err.into()),
+                }
+            }
+            // REQ-586 BR-2 / ADR-8: the request was too big for the window.
+            // Typed here, at the seam that holds both halves of the report —
+            // the adapter knows only that the provider refused, and the loop
+            // above knows only that a turn ended, but *this* frame has the
+            // assembled prompt and the route's budget side by side.
+            //
+            // No `note_failure`, and not because the call would print nothing
+            // (a class-less error is already filtered there): the line's whole
+            // subject is "provider `x` failed the turn", and this provider did
+            // not fail. The daemon reports the size mismatch instead.
+            //
+            // Open time only, mirroring the effort refusal beside it: a
+            // context-length refusal is a 400 on the request, which is answered
+            // before a single event flows. A mid-stream error is a different
+            // fault and keeps the `Remote` path it has today.
+            Err(err) if err.is_context_length_exceeded() => {
+                return Err(self.context_length_exceeded(prompt, config));
             }
             Err(err) => {
                 self.note_failure("before it answered", &err);
@@ -659,9 +744,42 @@ impl<T: Transport> CompletionSource for RemoteProviderSource<'_, T> {
             }
         }
 
-        let decision = tool_call.unwrap_or_else(|| TurnDecision::EndTurn {
-            final_text: text.trim().to_owned(),
-        });
+        // BUG-180: a provider that sent no native call may still have *called*
+        // — in the text grammar the system prompt teaches every model and the
+        // carried history shows it on every prior call (`append_tool_call`,
+        // BUG-178). That text is read by the same `parse_reply` the local tier
+        // uses, so a call the loop dispatches is recognized by one grammar
+        // whichever source produced it (LESSON-494). Left unparsed, the call
+        // was the turn's *answer*: the gate hid it as tool-shaped, nothing ran,
+        // nothing rendered, and the bare JSON was committed as the assistant's
+        // reply — a silent empty turn.
+        //
+        // A native call still wins outright and leaves the text alone: on that
+        // path the prose is prose, however call-shaped some JSON in it may
+        // look (REQ-567 OQ-1), and the loop renders the call onto it. Only the
+        // *absence* of a native call makes the text the place to look.
+        let (decision, call_in_text, dropped_calls) = match tool_call {
+            Some(call) => (call, false, dropped_calls),
+            None => {
+                let parsed = parse_reply(&text, exposed);
+                let decision = match parsed.turn {
+                    ParsedTurn::ToolCall { name, arguments } => {
+                        TurnDecision::ToolCall { name, arguments }
+                    }
+                    ParsedTurn::EndTurn(final_text) => TurnDecision::EndTurn { final_text },
+                    // An unknown tool or non-object arguments: folded back as
+                    // the correction the local tier gets, never accepted as an
+                    // answer.
+                    ParsedTurn::Malformed(reason) => TurnDecision::Malformed { reason },
+                };
+                // The call *is* the text: keep through its end, drop whatever
+                // the model went on to write past it, and say so with
+                // `call_in_text` so the loop does not render the call twice.
+                text.truncate(parsed.clean_len);
+                let call_in_text = matches!(decision, TurnDecision::ToolCall { .. });
+                (decision, call_in_text, parsed.dropped_calls)
+            }
+        };
         Ok(SourceTurn {
             text,
             decision,
@@ -671,30 +789,40 @@ impl<T: Transport> CompletionSource for RemoteProviderSource<'_, T> {
             // source has no prefix cache", which is a different fact from a
             // miss and must not be reported as one.
             cache: None,
-            // REQ-567 OQ-1: never. A remote call arrives as a structured
-            // `TurnEvent::ToolCall` and is assembled above from *that*, not from
-            // the stream's `TextDelta`s — so `text` is prose the user watched
-            // stream, however tool-call-shaped some JSON in it may look. The
-            // loop renders the call onto it before the block is pushed
-            // (BUG-178), which is why this stays an honest `false` rather than
-            // this source doing the rendering: the guarantee that a tool-call
+            // REQ-567 OQ-1 / BUG-180: `true` only for a text-form call this
+            // source parsed out of the prose — the call is already at the
+            // text's end, where `clean_len` left it. A native call arrives as a
+            // structured `TurnEvent::ToolCall` beside prose that does not
+            // contain it, so the loop renders it on before the block is pushed
+            // (BUG-178) and this stays `false`: the guarantee that a tool-call
             // block carries its call belongs at the one seam every source
-            // passes through, not in each source's own report.
-            call_in_text: false,
+            // passes through, and this flag only says who put it there.
+            call_in_text,
         })
     }
 }
 
 /// The egress [`Provenance`] of the context currently assembled in `ctx`: the
-/// union of every tool result's [`ToolProvenance`].
+/// union of every block that carries file provenance.
 ///
 /// This is the loop → egress bridge for BR-1 (REQ-544 C-1). A tool result tagged
 /// with the files it touched contributes those paths; a result with UNKNOWN
 /// provenance (a `shell` command) makes the whole context's provenance unknown,
-/// which egress fail-closes; system/user/model blocks carry no file provenance.
-/// The remote source hands the result to [`Egress::scoped`], so a turn whose
-/// context touched a `local-only` file — or ran an unparseable shell command — is
-/// blocked before a byte leaves.
+/// which egress fail-closes. The remote source hands the result to
+/// [`Egress::scoped`], so a turn whose context touched a `local-only` file — or
+/// ran an unparseable shell command — is blocked before a byte leaves.
+///
+/// ## A user block can carry file provenance too (REQ-585 BR-7)
+///
+/// System and model blocks carry none, and user blocks used to be in that list.
+/// They are not any more: a `/skill` invocation expands a `SKILL.md` into the
+/// user turn, so that turn is prompt text by role and *file content* by origin
+/// and has to pin the turn exactly as a `read` of the same file would. Its
+/// sources fold in through the identical mapping the tool results use, and a
+/// skill whose file has no mintable identity — a user-scoped skill outside the
+/// session root — folds in as `Unknown` and fail-closes, the strictest reading
+/// and the one that keeps a file outside the root from silently counting as
+/// unpinnable (ADR-9).
 ///
 /// ## Forgotten blocks are counted too (REQ-567 BR-3)
 ///
@@ -710,12 +838,29 @@ impl<T: Transport> CompletionSource for RemoteProviderSource<'_, T> {
 pub fn context_provenance(ctx: &ContextManager) -> Provenance {
     let mut prov = Provenance::empty();
     for block in ctx.blocks() {
-        if let CtxProvenance::Tool { provenance, .. } = &block.provenance {
-            // One per-result mapping, shared with the `digest` duty (which scopes
-            // a *single* result rather than the whole context). Two spellings of
-            // "what does this tool result mean to egress" is how one of them ends
-            // up laxer than the other.
-            prov.merge(&tool_result_provenance(provenance));
+        match &block.provenance {
+            CtxProvenance::Tool { provenance, .. } => {
+                // One per-result mapping, shared with the `digest` duty (which
+                // scopes a *single* result rather than the whole context). Two
+                // spellings of "what does this tool result mean to egress" is
+                // how one of them ends up laxer than the other.
+                prov.merge(&tool_result_provenance(provenance));
+            }
+            // Through that same mapping, for that same reason: a skill
+            // expansion's files mean to egress exactly what a `read` of them
+            // means. The empty-set/`!unknown` case — ordinary typed prompt text
+            // — contributes nothing and takes neither branch.
+            CtxProvenance::User { sources, unknown } => {
+                if !sources.is_empty() {
+                    prov.merge(&tool_result_provenance(&ToolProvenance::Sources(
+                        sources.clone(),
+                    )));
+                }
+                if *unknown {
+                    prov.merge(&tool_result_provenance(&ToolProvenance::Unknown));
+                }
+            }
+            CtxProvenance::System | CtxProvenance::Model => {}
         }
     }
     // Through the same mapping, for the same reason: the forgotten blocks are
@@ -753,9 +898,10 @@ mod tests {
     use crate::fixture_id;
     use std::sync::Arc;
 
-    use crate::harness::context::ToolProvenance;
+    use crate::harness::context::{StructuredMessage, ToolProvenance};
     use async_trait::async_trait;
     use serde_json::json;
+    use std::collections::BTreeSet;
     use teton_inference::{Completion, GenParams, MockEngine};
     use teton_providers::{
         CapabilityProfile, ProviderError, StopReason, ToolCall, TransportError, TransportRequest,
@@ -964,6 +1110,482 @@ mod tests {
         );
     }
 
+    // ---- BUG-180: a remote provider's text-form tool call -----------------
+
+    /// A provider that streams **only text** — `chunks`, in order, then a
+    /// terminal `Completed` — and never a structured `TurnEvent::ToolCall`.
+    /// This is the shape of a model that obeyed the system prompt's "reply with
+    /// ONLY a JSON object" over the API's native tool field (BUG-180: Kimi K3,
+    /// `edit`-routed, 2026-08-19). Each call to `stream_turn` serves the next
+    /// scripted reply, so one provider can drive a whole loop turn.
+    struct TextOnlyProvider {
+        replies: Mutex<std::collections::VecDeque<Vec<&'static str>>>,
+    }
+
+    impl TextOnlyProvider {
+        fn scripted(replies: Vec<Vec<&'static str>>) -> Self {
+            Self {
+                replies: Mutex::new(replies.into_iter().collect()),
+            }
+        }
+    }
+
+    #[async_trait]
+    impl Provider for TextOnlyProvider {
+        fn id(&self) -> &str {
+            "text-only"
+        }
+        fn capabilities(&self) -> CapabilityProfile {
+            CapabilityProfile::default()
+        }
+        async fn stream_turn(
+            &self,
+            _request: TurnRequest,
+            _transport: &dyn Transport,
+        ) -> Result<TurnStream, ProviderError> {
+            let chunks = self
+                .replies
+                .lock()
+                .expect("script mutex poisoned")
+                .pop_front()
+                .expect("the script ran out of replies");
+            let mut events: Vec<Result<TurnEvent, ProviderError>> = chunks
+                .into_iter()
+                .map(|c| Ok(TurnEvent::TextDelta(c.to_owned())))
+                .collect();
+            events.push(Ok(TurnEvent::Completed(TurnCompletion {
+                usage: TokenUsage {
+                    input_tokens: 9,
+                    output_tokens: 3,
+                    reasoning_tokens: None,
+                },
+                // What a provider reports for a reply it considers prose.
+                stop_reason: StopReason::EndTurn,
+            })));
+            Ok(Box::pin(futures::stream::iter(events)))
+        }
+    }
+
+    /// A provider that refuses the reasoning-effort field on its first call and
+    /// the request's **size** on its second — the two refusals REQ-559 BR-12
+    /// and REQ-586 BR-2 put back to back on one turn.
+    ///
+    /// Both are real: an effort refusal is answered by exactly one retry with
+    /// no reasoning field, and that retry carries the same oversized prompt, so
+    /// a provider whose window the context busts refuses it again for the other
+    /// reason. Every request's effort is recorded, so the test can tell the
+    /// retry from the first attempt.
+    #[derive(Default)]
+    struct RefusesEffortThenSize {
+        seen: Mutex<Vec<ResolvedEffort>>,
+    }
+
+    #[async_trait]
+    impl Provider for RefusesEffortThenSize {
+        fn id(&self) -> &str {
+            "refuser"
+        }
+        fn capabilities(&self) -> CapabilityProfile {
+            CapabilityProfile::default()
+        }
+        async fn stream_turn(
+            &self,
+            request: TurnRequest,
+            _transport: &dyn Transport,
+        ) -> Result<TurnStream, ProviderError> {
+            let mut seen = self.seen.lock().expect("call log mutex");
+            seen.push(request.effort);
+            if seen.len() == 1 {
+                return Err(ProviderError::EffortRefused {
+                    provider_id: "refuser".to_owned(),
+                    requested: teton_core::EffortLevel::High,
+                    clamped: teton_core::EffortLevel::High,
+                });
+            }
+            Err(ProviderError::ContextLengthExceeded {
+                provider_id: "refuser".to_owned(),
+            })
+        }
+    }
+
+    /// **Verify M2.** A context-length refusal that arrives on the REQ-559
+    /// effort-retry is the *same* typed outcome it is on the first attempt.
+    ///
+    /// The retry used to propagate with `?`, and [`HarnessError::Remote`] is
+    /// `#[from] ProviderError`, so this refusal became `Remote(..)`. That is
+    /// the arm the runtime treats as "this provider failed the turn" — and
+    /// `ContextLengthExceeded` deliberately has **no** failure class, so the
+    /// runtime's `Remote(perr) if attempts < 2` arm found nothing to act on and
+    /// the user got `INTERNAL_ERROR "provider failed unrecoverably"` instead of
+    /// the window/size report. The variant is the whole assertion: the numbers
+    /// were never the part that broke.
+    #[tokio::test]
+    async fn a_context_length_refusal_on_the_effort_retry_stays_typed() {
+        let provider = RefusesEffortThenSize::default();
+        let egress = Egress::new(NullTransport, Vec::new(), Arc::new(NoopSink));
+        let mut source = RemoteProviderSource::new(
+            &provider,
+            &egress,
+            "refuser",
+            "model-x",
+            "sess-under-test",
+            ResolvedEffort::effort(teton_core::EffortLevel::High),
+        );
+        let tools = ToolRegistry::with_builtins();
+        let exposed = tools.exposed_names(None);
+        let config = HarnessConfig::default();
+        let prompt = PreparedPrompt {
+            flat: String::new(),
+            system: "one two three".to_owned(),
+            messages: vec![StructuredMessage {
+                role: MessageRole::User,
+                text: "four five six seven".to_owned(),
+            }],
+        };
+
+        let err = source
+            .produce_turn(
+                &prompt,
+                &Provenance::empty(),
+                &config,
+                &tools,
+                &exposed,
+                &mut |_| {},
+            )
+            .await
+            .expect_err("a refused turn must not report success");
+
+        match &err {
+            HarnessError::ContextLengthExceeded {
+                provider_id,
+                assembled_tokens,
+                budget_tokens,
+            } => {
+                assert_eq!(provider_id, "refuser");
+                assert_eq!(*budget_tokens, config.context_budget_tokens);
+                assert_eq!(
+                    *assembled_tokens, 7,
+                    "the report names what this attempt actually assembled"
+                );
+            }
+            other => panic!(
+                "a context-length refusal on the retry must stay typed; as \
+                 `Remote` the daemon reports it as an opaque internal error: \
+                 {other:?}"
+            ),
+        }
+
+        // Non-vacuity: the retry really is the call that refused. One request
+        // with the effort field, one without, and nothing after it.
+        let seen = provider.seen.lock().expect("call log mutex");
+        assert_eq!(seen.len(), 2, "{seen:?}");
+        assert!(matches!(seen[0], ResolvedEffort::Effort { .. }), "{seen:?}");
+        assert!(matches!(seen[1], ResolvedEffort::Omit { .. }), "{seen:?}");
+        assert!(
+            source.effort_was_refused(),
+            "the session memo still records the effort refusal that happened"
+        );
+    }
+
+    /// Drive one remote turn over `provider` and return it with what streamed.
+    async fn remote_turn_over(provider: &TextOnlyProvider) -> (SourceTurn, String) {
+        let egress = Egress::new(NullTransport, Vec::new(), Arc::new(NoopSink));
+        let mut source = RemoteProviderSource::new(
+            provider,
+            &egress,
+            "text-only",
+            "model-x",
+            "sess-under-test",
+            ResolvedEffort::effort(teton_core::EffortLevel::High),
+        );
+        let tools = ToolRegistry::with_builtins();
+        let exposed = tools.exposed_names(None);
+        let prompt = flat_prompt("prompt");
+        let mut streamed = String::new();
+        let turn = source
+            .produce_turn(
+                &prompt,
+                &Provenance::empty(),
+                &HarnessConfig::default(),
+                &tools,
+                &exposed,
+                &mut |t| streamed.push_str(t),
+            )
+            .await
+            .expect("remote turn");
+        (turn, streamed)
+    }
+
+    /// **BUG-180.** The model wrote its call in the text grammar the system
+    /// prompt teaches and sent no native call. Before the fix this was
+    /// `EndTurn` with the JSON as the answer — which the display gate then hid,
+    /// so the user saw an empty turn and no tool ran. It is a tool call,
+    /// recognized by the same grammar the local tier uses, and the text ends
+    /// with it (`call_in_text`) so the loop does not render it on twice.
+    #[tokio::test]
+    async fn a_remote_text_form_tool_call_is_a_call_not_an_answer() {
+        let provider = TextOnlyProvider::scripted(vec![vec![
+            "{\"tool\": \"shell\", ",
+            "\"arguments\": {\"command\": \"ls -la ~/.claude/skills\"}}",
+            // A continuation past the call — a fabricated result, say — is
+            // cut from the text exactly as a local reply's would be.
+            "\nTool (shell):\nfake listing\n",
+        ]]);
+        let (turn, _streamed) = remote_turn_over(&provider).await;
+
+        match &turn.decision {
+            TurnDecision::ToolCall { name, arguments } => {
+                assert_eq!(name, "shell");
+                assert_eq!(arguments, &json!({ "command": "ls -la ~/.claude/skills" }));
+            }
+            other => panic!("a text-form call must be dispatched, got {other:?}"),
+        }
+        assert!(
+            turn.call_in_text,
+            "the call is in the text, so the loop must not append it again"
+        );
+        assert!(
+            turn.text.ends_with("\"ls -la ~/.claude/skills\"}}"),
+            "the text is cut at the call's end, got {:?}",
+            turn.text
+        );
+        assert!(
+            !turn.text.contains("fake listing"),
+            "the continuation past the call never reaches context"
+        );
+        assert_eq!(turn.dropped_calls, 0);
+        // The usage still comes from the terminal event, unchanged.
+        assert_eq!(turn.usage.output_tokens, 3);
+    }
+
+    /// **BUG-180.** A text-form call to a tool that does not exist is a
+    /// correction for the model, not the turn's answer — the same `Malformed`
+    /// path a local reply takes, under the same turn ceiling.
+    #[tokio::test]
+    async fn a_remote_text_form_call_to_an_unknown_tool_is_malformed() {
+        let provider =
+            TextOnlyProvider::scripted(vec![vec!["{\"tool\":\"teleport\",\"arguments\":{}}"]]);
+        let (turn, _) = remote_turn_over(&provider).await;
+        match &turn.decision {
+            TurnDecision::Malformed { reason } => {
+                assert!(reason.contains("teleport"), "{reason}");
+            }
+            other => panic!("an unknown tool must be folded back, got {other:?}"),
+        }
+        assert!(
+            !turn.call_in_text,
+            "no call was accepted, so none is embedded"
+        );
+    }
+
+    /// **BUG-180, the other direction.** Prose is still prose: an object the
+    /// model merely *quotes*, with no `tool`/`name` key, does not become a
+    /// call, and the turn ends with the whole text as its answer.
+    #[tokio::test]
+    async fn remote_prose_quoting_a_non_call_object_still_ends_the_turn() {
+        let provider = TextOnlyProvider::scripted(vec![vec![
+            "The config is:\n",
+            "{\"port\": 8080}",
+            "\nas requested.",
+        ]]);
+        let (turn, streamed) = remote_turn_over(&provider).await;
+        assert_eq!(
+            turn.decision,
+            TurnDecision::EndTurn {
+                final_text: "The config is:\n{\"port\": 8080}\nas requested.".to_owned()
+            }
+        );
+        assert_eq!(turn.text, "The config is:\n{\"port\": 8080}\nas requested.");
+        assert_eq!(streamed, turn.text, "prose streams through untouched");
+        assert!(!turn.call_in_text);
+    }
+
+    /// **BUG-180, precedence.** A native call still wins outright, and the
+    /// prose beside it is left alone however call-shaped some JSON in it may
+    /// look (REQ-567 OQ-1): the loop renders the native call onto the prose,
+    /// so the source must not also read a call out of it.
+    #[tokio::test]
+    async fn a_native_call_wins_and_leaves_call_shaped_prose_alone() {
+        struct NativeWithQuotedJson;
+
+        #[async_trait]
+        impl Provider for NativeWithQuotedJson {
+            fn id(&self) -> &str {
+                "native"
+            }
+            fn capabilities(&self) -> CapabilityProfile {
+                CapabilityProfile::default()
+            }
+            async fn stream_turn(
+                &self,
+                _request: TurnRequest,
+                _transport: &dyn Transport,
+            ) -> Result<TurnStream, ProviderError> {
+                let events: Vec<Result<TurnEvent, ProviderError>> = vec![
+                    Ok(TurnEvent::TextDelta(
+                        "Cargo says {\"name\": \"serde\", \"version\": \"1\"} here. ".to_owned(),
+                    )),
+                    Ok(TurnEvent::ToolCall(ToolCall {
+                        id: "call-a".to_owned(),
+                        name: "read".to_owned(),
+                        arguments: json!({ "path": "Cargo.toml" }),
+                    })),
+                    Ok(TurnEvent::Completed(TurnCompletion {
+                        usage: TokenUsage::default(),
+                        stop_reason: StopReason::ToolUse,
+                    })),
+                ];
+                Ok(Box::pin(futures::stream::iter(events)))
+            }
+        }
+
+        let provider = NativeWithQuotedJson;
+        let egress = Egress::new(NullTransport, Vec::new(), Arc::new(NoopSink));
+        let mut source = RemoteProviderSource::new(
+            &provider,
+            &egress,
+            "native",
+            "model-x",
+            "sess-under-test",
+            ResolvedEffort::effort(teton_core::EffortLevel::High),
+        );
+        let tools = ToolRegistry::with_builtins();
+        let exposed = tools.exposed_names(None);
+        let turn = source
+            .produce_turn(
+                &flat_prompt("prompt"),
+                &Provenance::empty(),
+                &HarnessConfig::default(),
+                &tools,
+                &exposed,
+                &mut |_| {},
+            )
+            .await
+            .expect("remote turn");
+        assert_eq!(
+            turn.decision,
+            TurnDecision::ToolCall {
+                name: "read".to_owned(),
+                arguments: json!({ "path": "Cargo.toml" }),
+            }
+        );
+        assert!(!turn.call_in_text, "a native call is not in the text");
+        assert_eq!(
+            turn.text, "Cargo says {\"name\": \"serde\", \"version\": \"1\"} here. ",
+            "the prose beside a native call is untouched"
+        );
+    }
+
+    /// **BUG-180, through the loop.** What the user saw on 2026-08-19: a turn
+    /// that ended with nothing on screen and no tool run. Driven here by a real
+    /// [`RemoteProviderSource`] over a provider that writes its call as text:
+    /// the tool status line is presented, the tool runs, the model is called
+    /// again with the result, and the raw JSON never reaches the user.
+    #[tokio::test]
+    async fn a_remote_text_form_call_runs_the_tool_instead_of_ending_the_turn_silently() {
+        use crate::broadcast::EventBus;
+        use crate::harness::context::{BlockRole, NoopProvenanceHook};
+        use crate::harness::duty::DutyRoute;
+        use crate::harness::permissions::{PendingPermissions, PermissionConfig, PermissionGate};
+        use crate::harness::tools::{ToolContext, ToolDuties};
+        use crate::harness::turn_loop::{run_session_turn_with_source, SessionEvents};
+        use teton_protocol::events::{Event, SessionUpdate, SessionUpdatePayload};
+        use teton_protocol::methods::StopReason as TurnStop;
+
+        let provider = TextOnlyProvider::scripted(vec![
+            vec!["{\"tool\":\"read\",\"arguments\":{\"path\":\"nope.txt\"}}"],
+            vec!["Done."],
+        ]);
+        let egress = Egress::new(NullTransport, Vec::new(), Arc::new(NoopSink));
+        let mut source = RemoteProviderSource::new(
+            &provider,
+            &egress,
+            "text-only",
+            "model-x",
+            "bug180",
+            ResolvedEffort::effort(teton_core::EffortLevel::High),
+        );
+
+        let session_id = SessionId::from("bug180");
+        let bus = Arc::new(EventBus::new());
+        let mut sub = bus.subscribe(256);
+        let gate = PermissionGate::new(
+            session_id.clone(),
+            PermissionConfig::permissive(),
+            Arc::clone(&bus),
+            Arc::new(PendingPermissions::new()),
+        );
+        let events = SessionEvents::new(Arc::clone(&bus), session_id);
+        let config = HarnessConfig::default();
+        let tools = ToolRegistry::with_builtins();
+        let tool_ctx = ToolContext::new(std::env::temp_dir());
+        let mut hook = NoopProvenanceHook;
+        let mut ctx = ContextManager::new("sys", config.context_budget_tokens);
+        ctx.push_user("show me the skills");
+
+        let outcome = run_session_turn_with_source(
+            &mut source,
+            &tools,
+            &tool_ctx,
+            &gate,
+            &events,
+            &mut ctx,
+            &config,
+            &mut hook,
+            &DutyRoute::unresolved("no digest route in this test"),
+            &DutyRoute::unresolved("no compact route in this test"),
+            &ToolDuties {
+                triage: &DutyRoute::unresolved("no triage route in this test"),
+                shell: &DutyRoute::unresolved("no shell route in this test"),
+            },
+        )
+        .await
+        .expect("the turn completes");
+
+        assert_eq!(outcome.stop_reason, TurnStop::EndTurn);
+        assert_eq!(
+            outcome.turns, 2,
+            "the tool ran and the model was called again"
+        );
+        assert_eq!(outcome.final_text, "Done.");
+
+        // The tool status line presented the call, and the JSON never streamed.
+        let mut titles = Vec::new();
+        let mut shown = String::new();
+        while let Some(env) = sub.try_recv() {
+            match &env.event {
+                Event::SessionUpdate(SessionUpdate {
+                    update: SessionUpdatePayload::ToolCall { title, .. },
+                }) => titles.push(title.clone()),
+                Event::SessionUpdate(SessionUpdate {
+                    update: SessionUpdatePayload::AgentMessageChunk { text },
+                }) => shown.push_str(text),
+                _ => {}
+            }
+        }
+        assert_eq!(titles, vec!["read nope.txt".to_owned()]);
+        assert!(
+            !shown.contains("{\"tool\""),
+            "raw tool-call JSON must not reach the user, got {shown:?}"
+        );
+        assert!(shown.contains("Done."));
+
+        // The assistant block for the call turn ends with the call, once —
+        // `call_in_text` kept the loop from rendering it on a second time.
+        let assistant: Vec<&str> = ctx
+            .blocks()
+            .iter()
+            .filter(|b| b.role == BlockRole::Assistant)
+            .map(|b| b.text.as_str())
+            .collect();
+        assert_eq!(assistant.len(), 2, "{assistant:?}");
+        assert_eq!(
+            assistant[0],
+            "{\"tool\":\"read\",\"arguments\":{\"path\":\"nope.txt\"}}"
+        );
+        assert_eq!(assistant[0].matches("\"tool\"").count(), 1);
+    }
+
     /// The native tool-spec projection sees the same exposure the prompt does —
     /// the cap bounding the non-exempt tools, and the cap-exempt `teton_docs`
     /// riding through it (REQ-577 BR-7). A projection that applied the cap its
@@ -980,8 +1602,18 @@ mod tests {
         assert!(specs[0].input_schema.is_object());
     }
 
+    /// **Seam 2 of three (REQ-585 BR-7, ADR-9).** The union is over every block
+    /// that carries file provenance — which now includes a **user** block, because
+    /// a `/skill` expansion is prompt text by role and file content by origin and
+    /// has to pin the turn exactly as a `read` of that file would.
+    ///
+    /// This test was named `context_provenance_unions_tool_result_paths_only`,
+    /// and that name *was* the claim BR-7 breaks: it is renamed and re-asserted
+    /// rather than deleted, so the seam keeps a witness across the change.
+    /// Typed prompt text still contributes nothing, and the empty set is what
+    /// says so — which is precisely why `unknown` could not be encoded inside it.
     #[test]
-    fn context_provenance_unions_tool_result_paths_only() {
+    fn context_provenance_unions_tool_result_and_skill_expansion_sources() {
         let mut ctx = ContextManager::new("system", 10_000);
         ctx.push_user("do the thing");
         ctx.push_model("{\"tool\":\"read\"}");
@@ -990,12 +1622,50 @@ mod tests {
         // A tool result with no touched files (e.g. a benign status) contributes
         // nothing and is not unknown.
         ctx.push_tool_result("shell", None, "ok");
+        // A skill expansion: a user block whose text came out of a repo file.
+        ctx.push_user_from(
+            "run the release checklist",
+            [fixture_id(".claude/skills/release/SKILL.md")]
+                .into_iter()
+                .collect(),
+            false,
+        );
 
         let prov = context_provenance(&ctx);
-        assert_eq!(prov.len(), 2);
+        assert_eq!(prov.len(), 3, "{prov:?}");
         assert!(prov.contains("src/lib.rs"));
         assert!(prov.contains("secrets/prod.env"));
+        assert!(
+            prov.contains(".claude/skills/release/SKILL.md"),
+            "a skill expansion must pin the turn as a read of its file would"
+        );
         assert!(!prov.is_unknown());
+    }
+
+    /// **ADR-9's id-minting gap.** A skill file with no mintable identity — a
+    /// user-scoped `~/.claude/skills/x/SKILL.md` in a repo-rooted session, which
+    /// `ProvenanceId::from_resolved` refuses by design (REQ-571 ADR-B) — sets
+    /// `unknown` on its user block, and the whole context fail-closes, exactly
+    /// as a `shell` result does. The alternative would be a file outside the
+    /// root silently counting as unpinnable.
+    ///
+    /// The empty set beside the bit is the point: this block names no file *and*
+    /// is not ordinary typed prose, and only two fields can say both.
+    #[test]
+    fn a_user_block_whose_sources_cannot_be_minted_makes_the_context_unknown() {
+        let mut ctx = ContextManager::new("system", 10_000);
+        ctx.push_tool_result("read", Some(fixture_id("src/lib.rs")), "code");
+        ctx.push_user_from("run my personal skill", BTreeSet::new(), true);
+
+        let prov = context_provenance(&ctx);
+        assert!(
+            prov.is_unknown(),
+            "an unpinnable skill expansion must fail the turn closed"
+        );
+        assert!(!prov.is_empty(), "unknown provenance is never empty");
+        // Known sources are still carried alongside the unknown bit — the pair,
+        // not one collapsed into the other.
+        assert!(prov.contains("src/lib.rs"));
     }
 
     #[test]
@@ -1020,12 +1690,19 @@ mod tests {
         assert!(prov.contains("src/lib.rs"));
     }
 
+    /// The half of ADR-9 that a one-field `Provenance::User` would have broken:
+    /// an ordinary typed prompt is the empty set with `unknown` clear, and it
+    /// pins nothing. Encoding "unpinnable" as the empty set would make this
+    /// context unknown and pin every typed prompt on every machine with a
+    /// boundary configured.
     #[test]
     fn a_context_of_only_prompt_text_has_empty_provenance() {
         let mut ctx = ContextManager::new("system", 10_000);
         ctx.push_user("just a question");
         ctx.push_model("just an answer");
-        assert!(context_provenance(&ctx).is_empty());
+        let prov = context_provenance(&ctx);
+        assert!(prov.is_empty());
+        assert!(!prov.is_unknown());
     }
 
     #[tokio::test]

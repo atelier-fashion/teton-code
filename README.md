@@ -118,13 +118,52 @@ session running it.
 
 Two limits. Arguments are split on whitespace and quotes are **not**
 interpreted, so a value containing a space has to be given to `teton` in a
-shell. And the four commands that write (`/provider add`, `/boundary add`,
-`/policy set-tier`, `/policy set-category`) are typed-input only: piped into a
-session they change nothing and name the shell command instead. Every
-daemon-side gate is the same one the shell twin meets.
+shell. That is how the built-in rows above read an argument; a skill row is
+handed its line as typed. And the four commands that write (`/provider add`,
+`/boundary add`, `/policy set-tier`, `/policy set-category`) are typed-input
+only: piped into a session they change nothing and name the shell command
+instead. Every daemon-side gate is the same one the shell twin meets.
 
 To send a prompt that genuinely starts with a slash — a pasted path, say —
 double it: `//usr/local/bin/x — why?` asks the model about `/usr/local/bin/x`.
+
+### Your own commands
+
+The Claude Code-style skills you already have are session commands here. At
+launch — and again whenever `/cd` moves the root — Teton reads
+`~/.claude/skills/*/SKILL.md`, `~/.claude/commands/*.md` and the same two under
+the session root's `.claude/`. Four globs, one level deep, nothing else: no
+recursion, and `CLAUDE.md`, agents and hooks are not loaded. Each file registers
+one `/name`, listed in `/help` with where it came from, and anything found but
+not registered is named there with its reason. A built-in row always wins the
+name; the skill is listed as shadowed.
+
+`/name <rest>` becomes exactly one prompt turn — the file's body with
+`$ARGUMENTS` replaced by the rest of your line **as typed** — and from there it
+takes the path any prompt takes: same routing, same permission level, same
+egress gate, same cost row.
+
+A `` !`cmd` `` in a body inlines that command's output at expansion time. It
+runs under that skill's own permission key, never the `shell` tool's, so no
+grant crosses between the two: at `guarded` and `edits` the session lists every
+command of the invocation and asks once, `plan` does not run them, `full` runs
+them, and piped into a session at a level that would ask they are refused
+without a line of stdin being read. Whatever did not run leaves a placeholder
+saying so, in the prompt, where the model can see it. One consequence worth
+knowing before you configure a boundary: dynamic-context output is unattributed,
+like all shell output, so an invocation that ran one pins that turn to this
+machine.
+
+What this is **not** is a Claude Code runtime. Frontmatter other than `name`,
+`description` and `argument-hint` is inert — nothing in a file changes your
+permission level, your routing or your boundaries — and the body is passed as
+written, with no translation of tool names and no rewriting of references to
+`Agent`, `Task`, `Skill` or subagents, because there is nothing behind them
+here. Prompt-template skills work. A skill that dispatches subagents or invokes
+other skills gets one model with five tools, and stalls where it would have
+invoked one. And a skill whose expansion does not fit the route's context budget
+is refused with the numbers and the bound — never quietly shortened into
+something you did not type.
 
 ### Permission levels
 
@@ -301,11 +340,15 @@ differentiators:
 # Register the provider. Every remote kind needs --kind, --endpoint and
 # --model; the API key is read from TETON_PROVIDER_KEY or prompted for, and
 # stored in the OS keychain — never written to a file. --endpoint is the full
-# request URL, posted exactly as given, not a vendor's base_url:
+# request URL, posted exactly as given, not a vendor's base_url. --max-context
+# declares the model's context window, so turns routed there are assembled to
+# fit it rather than the local default:
 teton provider add opus --kind anthropic \
-  --endpoint https://api.anthropic.com/v1/messages --model claude-opus-5
+  --endpoint https://api.anthropic.com/v1/messages --model claude-opus-5 \
+  --max-context 1000000
 teton provider add kimi --kind openai-compatible \
-  --endpoint https://api.moonshot.ai/v1/chat/completions --model kimi-k3
+  --endpoint https://api.moonshot.ai/v1/chat/completions --model kimi-k3 \
+  --max-context 1000000
 
 # Route work to it — a whole tier (reflex | scan | build | think), with an
 # optional fallback, or a single category ahead of its tier:
@@ -320,6 +363,16 @@ teton doctor
 
 Config lives in `config.toml` in Teton's state directory (override with
 `TETON_CONFIG`); API keys are never stored in it.
+
+**Context budget.** Every turn is assembled to fit the route it takes. A
+provider that declares a window gets a budget derived from it — in words *and*
+bytes, and on a remote route it is the byte guard that binds for prose and for
+code; one that declares none runs under the local default of 4,096 words, and
+`teton doctor` says so rather than leaving it a surprise. `/provider setup`
+records the window for the recipes it ships, `--max-context` sets one by hand,
+and `--context-budget-cap` holds a large window to a smaller budget — the
+budget bounds a model *call*, and a prompt may make up to 25 of them. The
+whole of it is one topic: ask a session for `teton_docs context`.
 
 Recipes for Anthropic, OpenAI, Moonshot (Kimi), DeepSeek, Ollama and
 Grok (xAI) ship inside the binary. Ask in a session and the agent hands back

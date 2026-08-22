@@ -40,7 +40,7 @@
 
 use std::collections::BTreeSet;
 
-use tetond::harness::tools::{ToolRegistry, WEB_TOOL_NAME};
+use tetond::harness::tools::{ToolRegistry, SKILL_TOOL_NAME, WEB_TOOL_NAME};
 use tetond::mcp::namespaced_tool_name;
 
 // ---------------------------------------------------------------------------
@@ -62,6 +62,7 @@ const TOOL_SOURCES: &[(&str, &str)] = &[
     ("mcp.rs", include_str!("../src/harness/tools/mcp.rs")),
     ("read.rs", include_str!("../src/harness/tools/read.rs")),
     ("shell.rs", include_str!("../src/harness/tools/shell.rs")),
+    ("skill.rs", include_str!("../src/harness/tools/skill.rs")),
     ("walk.rs", include_str!("../src/harness/tools/walk.rs")),
     ("web.rs", include_str!("../src/harness/tools/web.rs")),
 ];
@@ -75,6 +76,7 @@ const SUITES: &[(&str, &str)] = &[
     ("provenance_egress.rs", include_str!("provenance_egress.rs")),
     ("mcp_egress.rs", include_str!("mcp_egress.rs")),
     ("web_lookup_egress.rs", include_str!("web_lookup_egress.rs")),
+    ("skill_boundary.rs", include_str!("skill_boundary.rs")),
 ];
 
 /// The privacy-boundary matcher's own source — the BR-8 half of this file.
@@ -209,6 +211,33 @@ const COVERAGE: &[Covered] = &[
             "web_lookup_egress.rs",
             "no_raw_page_bytes_reach_any_remote_provider_payload",
         )],
+    },
+    Covered {
+        tool_type: "SkillTool",
+        registered: Some(SKILL_TOOL_NAME),
+        // Registered by `build_tools`, and only when the session's registry
+        // holds a model-invocable skill (REQ-587 BR-2) — the `web` posture, for
+        // the same kind of reason: presence is a fact `with_builtins` does not
+        // have and should not acquire.
+        builtin: false,
+        mention: "skill",
+        surfaces: "the body of a Markdown file the model is told to **follow** — from \
+                   under the root for a project skill, and from `~/.claude` for a user \
+                   skill, which is the one content class that reaches the model as \
+                   instructions rather than as data",
+        // Two rules, two tests, plus the control that keeps them meaning
+        // something (BR-10, ADR-8). The second is the one `ToolOutcome::ok`'s
+        // `Sources(∅)` default would have broken in silence.
+        tests: &[
+            (
+                "skill_boundary.rs",
+                "a_project_skill_mints_its_identity_and_pins_the_next_remote_turn",
+            ),
+            (
+                "skill_boundary.rs",
+                "a_user_skill_is_unknown_and_pins_under_a_boundary_it_never_touched",
+            ),
+        ],
     },
     Covered {
         tool_type: "McpToolHandle",
@@ -447,7 +476,7 @@ fn every_content_surfacing_tool_has_a_boundary_test() {
     // an empty claim (BUG-159).
     assert_eq!(
         TOOL_SOURCES.len(),
-        10,
+        11,
         "the embedded source list shrank; the scan below is narrower than the module"
     );
     for (file, text) in TOOL_SOURCES {

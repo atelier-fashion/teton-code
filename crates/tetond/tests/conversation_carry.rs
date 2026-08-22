@@ -21,6 +21,7 @@
 //! | AC-10 mutation check | executed by hand — see below | — |
 //! | AC-11 duty-input bound | `the_classifiers_input_stays_fixed_while_the_conversation_grows` | `runtime.rs` |
 //! | AC-12 cross-session isolation | `two_interleaved_sessions_never_see_each_others_conversations` | `runtime.rs` |
+//! | REQ-586 AC-11 route change between turns | [`a_conversation_assembled_on_a_128k_route_survives_a_local_turns_smaller_budget`] | here |
 //! | BR-4 tool-free budget | [`a_tool_free_session_is_measured_and_bounded_at_every_prompt`] | here |
 //! | BR-3 dropped provenance | `a_truncated_away_boundary_read_still_pins_the_session_and_the_next_prompt` | `runtime.rs` |
 //! | C-2 pin on abort | `a_cancelled_turn_that_read_boundary_content_leaves_the_session_pinned` | `runtime.rs` |
@@ -151,6 +152,33 @@
 //!   `a_commit_carries_the_truncation_note_and_the_dropped_provenance` red;
 //! - **`Drop` stops checking `std::thread::panicking()`** —
 //!   `a_panicking_turn_commits_nothing_while_an_aborted_one_commits` red.
+//!
+//! # REQ-586 verify (2026-08-19): the fixture commits the daemon's way
+//!
+//! [`Carry::prompt_under`] called `CarriedTurn::commit()` — the
+//! **report-discarding** twin of the commit-and-publish pair
+//! `DaemonRuntime::run_prompt_turn` runs. So the BR-10 commit seam this file's
+//! AC-11 leg is named for was never exercised here at all, and the one event
+//! that leg asserts came from the turn loop's own gate. It now runs
+//! [`commit_and_publish`] — the daemon's **own** function, not a two-line copy
+//! of it — which is the same LESSON-451 rule as mutation 1 above: a fixture
+//! standing in for the dispatch has to run the dispatch's protocol, or the seam
+//! it stands in for is untested. (The first version of this fix inlined the
+//! publish and so reproduced the defect one level down: deleting the daemon's
+//! call left this file green.)
+//!
+//! On an *ordinary* completed turn the commit's report really is quiet — the
+//! loop gates both of its `Ok` exits (BUG-157) and nothing appends between that
+//! gate and the commit — so AC-11's count stays 1, asserted below as "the
+//! loop's gate, not twice over by the commit's". That is a fact about turns
+//! whose context **fits**, and it is not the whole story:
+//! `PressureReport::over_budget` is recomputed on every gate call and counts
+//! toward `is_quiet()`, so a turn under a budget its own system prompt cannot
+//! fit completes, reaches the commit, and the commit has something to say.
+//! [`an_unfittable_turn_still_publishes_the_commits_own_report`] drives exactly
+//! that, and `runtime.rs`'s
+//! `the_commit_publishes_a_clamp_and_says_nothing_about_a_quiet_one` states the
+//! decision directly.
 
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
@@ -159,27 +187,36 @@ use teton_inference::{
     over_window, ChatFormat, Completion, Engine, EngineError, GenParams, MissReason,
     PrefixCacheState,
 };
-use teton_protocol::events::{Event, PrefixCacheOutcome};
+use teton_protocol::events::{
+    BudgetBound, ContextPressure, ContextPressureKind, Event, PrefixCacheOutcome,
+};
 use teton_protocol::{SessionId, SessionMode, TurnId};
 
 use tetond::broadcast::EventBus;
 use tetond::carry::CarriedTurn;
 use tetond::cost::{CostLedger, LocalUsageMeter, NoopCostSink, PriceTable};
+use tetond::harness::budget::derive;
 use tetond::harness::compact::COMPACT_OUTPUT_CONTRACT;
 use tetond::harness::context::{approx_tokens, APPROX_BYTES_PER_TOKEN};
 use tetond::harness::{
-    build_system_prompt, run_session_turn_with_source, DutyRoute, HarnessConfig, HarnessError,
-    LocalEngineSource, NoopProvenanceHook, PendingPermissions, PermissionConfig, PermissionGate,
-    SessionEvents, ToolContext, ToolDuties, ToolRegistry, TurnOutcome, COMPACT_DUTY, DIGEST_DUTY,
-    SHELL_DUTY, TRIAGE_DUTY,
+    build_system_prompt, run_session_turn_with_source, BudgetInputs, DutyRoute, HarnessConfig,
+    HarnessError, LocalEngineSource, NoopProvenanceHook, PendingPermissions, PermissionConfig,
+    PermissionGate, SessionEvents, ToolContext, ToolDuties, ToolRegistry, TurnOutcome,
+    COMPACT_DUTY, DIGEST_DUTY, SHELL_DUTY, TRIAGE_DUTY,
 };
-use tetond::runtime::SessionTaint;
+use tetond::runtime::{commit_and_publish, SessionTaint};
 use tetond::sessions::SessionRegistry;
 
 /// A window wide enough for the real system prompt plus several carried turns.
 /// The point of these tests is the reuse arithmetic, not the window guard —
 /// which `prefix_cache_session.rs` pins on both paths.
-const WIDE_N_CTX: u32 = 32_768;
+///
+/// Widened for REQ-586 AC-11, whose conversation is 30,000 words **by
+/// requirement** and is assembled whole on a 128k route before the local turn
+/// meets it. A ceiling raised can only turn a refusal into a served call, and no
+/// test in this file expects one; the guard itself is still the real
+/// [`over_window`], run on both arms.
+const WIDE_N_CTX: u32 = 65_536;
 
 /// The opening of the system head: what tells a **turn** prompt from a duty's.
 ///
@@ -475,12 +512,15 @@ impl Carry {
                 max_tokens: 128,
                 temperature: 0.0,
             },
-            // A tool result enters context whole: these fixtures fill the budget
-            // deliberately, and a digest duty condensing them first would be the
-            // thing under test rather than compaction.
-            summarize_threshold_tokens: usize::MAX,
             ..HarnessConfig::default()
-        };
+        }
+        // A tool result enters context whole: these fixtures fill the budget
+        // deliberately, and a digest duty condensing them first would be the
+        // thing under test rather than compaction. Both currencies, in one
+        // call — setting only the token threshold leaves the byte twin at its
+        // default and digests the very results this fixture needs kept
+        // (REQ-586 TASK-189 verification).
+        .without_digest();
         if let Some(tokens) = budget_tokens {
             let system = build_system_prompt(&tools, &config);
             config.context_budget_tokens = approx_tokens(&system) + tokens;
@@ -538,6 +578,31 @@ impl Carry {
         session_id: &SessionId,
         text: &str,
     ) -> Result<TurnOutcome, HarnessError> {
+        self.prompt_under(session_id, text, &self.config).await
+    }
+
+    /// The same turn, under a config that is not the fixture's own — how AC-11
+    /// assembles a conversation on one route's budget and takes the next prompt
+    /// on another's (REQ-586 BR-10).
+    ///
+    /// [`Carry::with_budget`] is per **fixture**; a budget that changes between
+    /// turns is per **prompt**, and it has to be, because the pair
+    /// [`CarriedTurn::begin`] seeds the manager from is the pair of the route
+    /// *this* turn takes. A fixture that could only state one budget could
+    /// express "a session that always had 4k" or "a session that always had
+    /// 128k" and not the thing BR-10 is about: the same conversation meeting a
+    /// smaller window on its next turn.
+    ///
+    /// The head is rebuilt from `config` for the same reason the daemon rebuilds
+    /// it per turn (BR-7): the head is a function of the turn's tools and route,
+    /// and seeding a replayed conversation under a head from a different one is
+    /// the fossilization REQ-567 closed.
+    async fn prompt_under(
+        &self,
+        session_id: &SessionId,
+        text: &str,
+        config: &HarnessConfig,
+    ) -> Result<TurnOutcome, HarnessError> {
         let gate = PermissionGate::new(
             session_id.clone(),
             PermissionConfig::permissive(),
@@ -556,14 +621,16 @@ impl Carry {
         let mut conversation = CarriedTurn::begin(
             &self.sessions,
             session_id,
-            build_system_prompt(&self.tools, &self.config),
-            &self.config,
+            build_system_prompt(&self.tools, config),
+            config,
             Arc::clone(&self.taint),
             // No boundaries in these fixtures: the taint pin's own behaviour is
             // pinned by the runtime tests and by the AC-2 e2e leg, which are the
             // ones that can watch egress.
             Vec::new(),
             text,
+            std::collections::BTreeSet::new(),
+            false,
         );
 
         // Metered exactly as dispatch meters it, so the ledger rows below are
@@ -587,7 +654,7 @@ impl Carry {
             &gate,
             &events,
             conversation.ctx_mut(),
-            &self.config,
+            config,
             &mut hook,
             &digest,
             &compact,
@@ -598,8 +665,28 @@ impl Carry {
         )
         .await;
 
+        // Committed exactly as `DaemonRuntime::run_prompt_turn` commits — the
+        // **reporting** variant, published through the daemon's own
+        // `publish_commit_pressure` (REQ-586 BR-10, verify M7-b).
+        //
+        // `commit()` — the report-discarding twin — is the right default for a
+        // caller with no event handle, and it is what this fixture used to
+        // call. That made AC-11 below silently unable to see the commit seam at
+        // all: `if false && !pressure.is_quiet()` at the daemon's own publish
+        // left the whole `tetond` package green, because the one event AC-11
+        // asserted came from the turn loop's gate and no fixture anywhere drove
+        // the commit's.
+        //
+        // Calling the daemon's own function rather than re-typing its two
+        // lines is the second half of that fix, and the same LESSON-451 rule
+        // one level down: the first attempt inlined `if !pressure.is_quiet() {
+        // events.context_pressure(..) }` here, which is a *copy* of the
+        // dispatch's publish — so neutering the real one still left this file
+        // green, and the fixture was testing itself. `commit_and_publish` is
+        // the whole success-arm protocol, so this fixture and
+        // `run_prompt_turn` cannot come to run different ones.
         if outcome.is_ok() {
-            conversation.commit();
+            commit_and_publish(conversation, &events, &config.budget);
         } else {
             conversation.abandon();
         }
@@ -633,6 +720,29 @@ impl Carry {
 
     fn retained_blocks(&self, session_id: &SessionId) -> usize {
         self.sessions.conversation_snapshot(session_id).len()
+    }
+
+    /// Everything the session has retained, as one string — so "the oldest
+    /// paste is gone and the newest is still here" is a claim about content
+    /// rather than about a block count that any rewrite would also satisfy.
+    fn retained_text(&self, session_id: &SessionId) -> String {
+        self.sessions
+            .conversation_snapshot(session_id)
+            .blocks()
+            .iter()
+            .map(|block| block.text.as_str())
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    /// The bytes the session has retained, in the gate's own currency.
+    fn retained_bytes(&self, session_id: &SessionId) -> usize {
+        self.sessions
+            .conversation_snapshot(session_id)
+            .blocks()
+            .iter()
+            .map(|block| block.text.len())
+            .sum()
     }
 }
 
@@ -1214,4 +1324,326 @@ async fn a_tool_free_session_is_measured_and_bounded_at_every_prompt() {
         "the last prompt does not say that history is missing — a conversation \
          cut without a word is the silent degradation BR-4 forbids"
     );
+}
+
+// ---------------------------------------------------------------------------
+// REQ-586 AC-11 — a route change between turns is a budget change, and the
+// carry survives it
+// ---------------------------------------------------------------------------
+
+/// **REQ-586 AC-11 / BR-10.** A session carries a 30,000-word conversation
+/// assembled on a 128k route; the next turn routes local. The retained blocks
+/// replay, the oldest are dropped to fit the smaller pair with a
+/// `context_pressure` event saying so, the turn completes, and the session's
+/// retained conversation afterwards is exactly what that local turn kept
+/// (REQ-567 BR-6's atomic commit).
+///
+/// ## Why this needs a per-prompt budget and could not be written before
+///
+/// [`Carry::with_budget`] states one budget for a whole fixture, which can
+/// express a session that always had 4k or one that always had 128k — never the
+/// thing BR-10 is about. [`Carry::prompt_under`] exists for this test: the
+/// twelve pasting turns run under a config carrying `derive`'s 128k pair, the
+/// thirteenth runs under the fixture's default (local) one, and
+/// [`CarriedTurn::begin`] seeds each turn's manager from the pair of the route
+/// *that* turn takes — which is exactly what the daemon does.
+///
+/// ## The shape, and its bytes per word
+///
+/// Twelve pasted documents of 2,500 whitespace words at **4 bytes per word**
+/// (`"abc "`), so the conversation is 30,000 words / ≈120 KB. On the 128k pair
+/// (84,650 words / 253,952 bytes) that is under *both* soft thresholds — asserted
+/// below, because a fixture that compacted on the way up would be pressing the
+/// same machinery twice and proving neither. On the local pair (4,096 / 32,768)
+/// one document plus the system head is what fits, which is why the paste is
+/// 2,500 words rather than 5,000: the point is that a carried block **survives**
+/// the drop, and a fixture that lost every one of them could not tell "the
+/// oldest were dropped to fit" from "the session was cleared".
+///
+/// ## What the last assertion is for
+///
+/// "The retained conversation is what the local turn kept" is BR-6's atomic
+/// commit read from the outside: the session ends up holding the manager's
+/// surviving blocks plus the new exchange, not the pre-turn vector and not the
+/// pre-drop one. Asserted as content — the twelfth paste's marker present, the
+/// first paste's marker gone — because a block count alone is satisfied by any
+/// rewrite that happens to arrive at the same length.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_conversation_assembled_on_a_128k_route_survives_a_local_turns_smaller_budget() {
+    /// Whitespace words per pasted document, at 4 B/word.
+    const PASTE_WORDS: usize = 2_500;
+    /// How many of them the session accumulates: 12 × 2,500 = 30,000 words.
+    const PASTES: usize = 12;
+
+    let replies: Vec<&str> = vec!["Noted; the paste is in context."; PASTES + 1];
+    let carry = Carry::new(&replies, true, "req586-ac11");
+    let local = carry.config.clone();
+    let remote_budget = derive(BudgetInputs {
+        window: 128_000,
+        cap: 0,
+        reservation: 1_024,
+        is_local: false,
+        redact_scan: false,
+        provider_id: Some("kimi"),
+    });
+    assert_eq!(remote_budget.bound, BudgetBound::Window);
+    // `without_digest` **after** `with_route_budget`: the latter sets both
+    // thresholds from the route, so a fixture that wanted its pastes whole and
+    // said so first would have them digested anyway (REQ-586 TASK-189).
+    let remote = local
+        .clone()
+        .with_route_budget(remote_budget.clone())
+        .without_digest();
+
+    // The premise the fixture's arithmetic rests on, stated rather than assumed:
+    // one pasted document has to fit the local pair beside the system head, or
+    // nothing carried survives and this is a test about a cleared session.
+    let head_tokens = approx_tokens(&carry.system());
+    assert!(
+        head_tokens + PASTE_WORDS + 64 < local.context_budget_tokens,
+        "a {head_tokens}-word head leaves no room for a {PASTE_WORDS}-word \
+         document under a {}-word budget — shrink the paste or this test proves \
+         only that everything was thrown away",
+        local.context_budget_tokens
+    );
+
+    let session = carry.session();
+    let mut events = carry.bus.subscribe(4_096);
+
+    // --- The conversation, assembled on the 128k pair. ---
+    for n in 0..PASTES {
+        let mut text = format!("document-{n}-marker ");
+        for _ in 0..PASTE_WORDS {
+            text.push_str("abc ");
+        }
+        carry
+            .prompt_under(&session, &text, &remote)
+            .await
+            .unwrap_or_else(|err| panic!("remote paste {n} must be served: {err}"));
+    }
+    let carried_blocks = carry.retained_blocks(&session);
+    let carried_tokens = carry.retained_tokens(&session);
+    assert_eq!(
+        carried_blocks,
+        PASTES * 2,
+        "one user block and one model block per paste, all retained"
+    );
+    assert!(
+        carried_tokens >= 30_000,
+        "AC-11 asks for a 30,000-word conversation; this one is {carried_tokens}"
+    );
+    // Nothing was clamped on the way up: the 128k pair had room for all of it,
+    // which is what makes the drop below attributable to the *route change*.
+    let climb = drain_pressure(&mut events);
+    assert!(
+        climb.is_empty(),
+        "the conversation fitted the 128k pair, so nothing should have been \
+         clamped assembling it: {climb:?}"
+    );
+    assert!(
+        carried_tokens < remote_budget.budget_tokens * 70 / 100
+            && carry.retained_bytes(&session) < remote_budget.budget_bytes * 70 / 100,
+        "the remote leg must stay under the soft threshold too, or the fixture \
+         compacts on the way up and the drop below is not the route change: \
+         {carried_tokens} words / {} bytes",
+        carry.retained_bytes(&session)
+    );
+
+    // --- The next turn routes local: the same conversation, a quarter of the
+    // words and an eighth of the bytes. ---
+    carry
+        .prompt_under(&session, "what did the first document say?", &local)
+        .await
+        .expect("a session that outgrew its new route compacts, it does not fail");
+
+    let pressure = drain_pressure(&mut events);
+    // Exactly one, and it is the **loop's** gate rather than the commit's.
+    //
+    // Both are live in this fixture: `prompt_under` commits the daemon's way
+    // (`commit_reporting`, published through the turn's `SessionEvents`), so a
+    // commit that clamped anything would show up here as a second event. It
+    // does not, and that is the shape rather than an accident — the loop gates
+    // both of its exits (BUG-157), so a turn that *completed* arrives at the
+    // commit already fitting. The commit gate is the backstop for the
+    // cancellation paths, which reach it through `Drop` and publish nothing;
+    // `runtime.rs::the_commit_publishes_a_clamp_and_says_nothing_about_a_quiet_one`
+    // is what states its rule, because no completed turn can.
+    assert_eq!(
+        pressure.len(),
+        1,
+        "one clamp on the way down, announced once — and by the loop's gate, \
+         not twice over by the commit's: {pressure:?}"
+    );
+    let event = &pressure[0];
+    assert_eq!(event.kind, ContextPressureKind::BlocksDropped);
+    assert_eq!(
+        event.budget_tokens, local.context_budget_tokens as u64,
+        "the event carries the budget the turn actually ran under, which is the \
+         local one — the route changed, and so did the number"
+    );
+    assert_eq!(event.bound, BudgetBound::LocalEngine);
+
+    // The seeded manager held the carried blocks plus the new message; what it
+    // kept is what the session now holds, plus this turn's reply.
+    let seeded = carried_blocks + 1;
+    let kept = seeded - event.dropped_blocks as usize;
+    assert!(
+        kept >= 3,
+        "a drop that kept only the new message would make 'the carry survived' \
+         vacuous: {kept} of {seeded}"
+    );
+    assert_eq!(
+        carry.retained_blocks(&session),
+        kept + 1,
+        "REQ-567 BR-6: the session holds what the turn kept plus what it added, \
+         not the pre-turn vector and not the pre-drop one"
+    );
+
+    // …and it holds the *newest* end of the conversation, not the oldest.
+    let retained = carry.retained_text(&session);
+    assert!(
+        retained.contains(&format!("document-{}-marker", PASTES - 1)),
+        "the newest carried document must have survived the drop"
+    );
+    assert!(
+        !retained.contains("document-0-marker"),
+        "the oldest document must be gone — `truncate_to_budget` drops \
+         oldest-first, and a retained conversation still holding it means the \
+         commit wrote the pre-drop vector"
+    );
+    // And what it holds fits the route that kept it, in both currencies.
+    assert!(
+        head_tokens + carry.retained_tokens(&session) <= local.context_budget_tokens,
+        "the retained conversation must fit the budget that produced it: {} + {} \
+         against {}",
+        head_tokens,
+        carry.retained_tokens(&session),
+        local.context_budget_tokens
+    );
+    assert!(
+        carry.retained_bytes(&session) <= local.context_budget_bytes,
+        "…in bytes too: {} against {}",
+        carry.retained_bytes(&session),
+        local.context_budget_bytes
+    );
+
+    // Non-vacuity for the machinery: the soft threshold was reached on the way
+    // down, so this session degraded to compaction-then-truncation rather than
+    // straight to the hard gate.
+    assert!(
+        carry.compact_duty_calls() > 0,
+        "the `compact` duty was never asked on the local turn"
+    );
+    // And the turn the engine actually served fits the local budget.
+    let last = carry.calls().last().expect("a local turn ran").clone();
+    assert!(
+        last.prompt.len() <= local.context_budget_bytes + 512,
+        "the local turn assembled {} bytes against a {}-byte budget",
+        last.prompt.len(),
+        local.context_budget_bytes
+    );
+    assert!(
+        last.prompt.contains("[earlier conversation truncated"),
+        "the model must be told that history is missing"
+    );
+}
+
+/// **REQ-586 BR-10, verify.** A turn that **completed** and could not fit its
+/// budget reaches the commit's own gate with something to say, and the commit
+/// says it.
+///
+/// This is the test `publish_commit_pressure` used to document as impossible.
+/// The reasoning was sound when it was written and stopped being true at
+/// TASK-194: the loop gates both of its `Ok` exits, so a completed turn never
+/// arrives at the commit having *dropped or elided* anything — but
+/// `PressureReport::over_budget` is recomputed on every gate call and counts
+/// toward `is_quiet()`, and a context the gate could not fit is not made
+/// fittable by gating it again. A budget below the harness's own system prompt
+/// is the shape that produces it, and it is not a contrivance: it is exactly
+/// what `budget::MIN_BUDGET_BYTES` exists to keep a *route* from ever deriving.
+///
+/// What the "impossible" claim cost is the point of writing this down. The
+/// branch was documented as unreachable on the success path and therefore
+/// guarded only by a unit test over the function itself, so deleting the
+/// daemon's **call** to it — and with it every between-turns clamp report on a
+/// live over-budget session — left the `tetond` package green.
+///
+/// Two lines go out for this turn, and the count is the assertion:
+/// the loop's own over-budget latch (`turn_loop::announce_pressure`) bounds its
+/// three gates to **one** `did_not_fit`, so the second can only be the
+/// commit's. Deleting the publish takes it back to one.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_unfittable_turn_still_publishes_the_commits_own_report() {
+    let carry = Carry::new(&["Answered."], true, "req586-commit-didnotfit");
+
+    // A pair no context can meet: the system head alone is several KB, so every
+    // gate — the loop's two and the commit's one — finishes over budget. Built
+    // by hand rather than through `derive`, because `derive`'s floor exists
+    // precisely to stop a *route* from being budgeted this way (M1).
+    let mut unfittable = derive(BudgetInputs::local());
+    unfittable.budget_tokens = 200;
+    unfittable.budget_bytes = 1_000;
+    let config = carry
+        .config
+        .clone()
+        .with_route_budget(unfittable.clone())
+        .without_digest();
+    assert!(
+        carry.system().len() > config.context_budget_bytes,
+        "non-vacuity: the system head ({} bytes) must not fit the {}-byte \
+         budget, or nothing here is over budget",
+        carry.system().len(),
+        config.context_budget_bytes
+    );
+
+    let session = carry.session();
+    let mut events = carry.bus.subscribe(256);
+    carry
+        .prompt_under(&session, "a question that will not fit", &config)
+        .await
+        .expect("a turn that cannot fit its budget is still served");
+
+    let published = drain_pressure(&mut events);
+    let did_not_fit: Vec<&ContextPressure> = published
+        .iter()
+        .filter(|p| p.kind == ContextPressureKind::DidNotFit)
+        .collect();
+    assert_eq!(
+        did_not_fit.len(),
+        2,
+        "the loop says it once and the commit says it once — one of these is \
+         the seam `publish_commit_pressure` is: {published:#?}"
+    );
+    for event in &did_not_fit {
+        assert_eq!(event.budget_tokens, unfittable.budget_tokens as u64);
+        assert_eq!(event.budget_bytes, unfittable.budget_bytes as u64);
+        assert_eq!(event.bound, unfittable.bound);
+    }
+    // The commit still *committed* — the report is a by-product of the write,
+    // never a replacement for it.
+    assert!(
+        !carry.retained_text(&session).is_empty(),
+        "the turn's work was stored"
+    );
+}
+
+/// Every `context_pressure` queued on `events` right now, oldest first.
+///
+/// `try_recv` rather than a timed `recv`: `EventBus::publish` is synchronous and
+/// the turns above have already returned, so everything they published is
+/// already queued — a wall-clock window is the assertion shape that goes flaky
+/// first under CI scheduler pressure (LESSON-450).
+fn drain_pressure(events: &mut tetond::broadcast::Subscription) -> Vec<ContextPressure> {
+    let mut out = Vec::new();
+    while let Some(envelope) = events.try_recv() {
+        if let Event::ContextPressure(pressure) = envelope.event {
+            out.push(pressure);
+        }
+    }
+    assert!(
+        !events.is_lagged(),
+        "the subscription was evicted for falling behind, so an absent event \
+         here would prove nothing"
+    );
+    out
 }

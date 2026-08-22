@@ -40,7 +40,7 @@ use teton_core::ToolCallTier;
 
 use teton_inference::{ChatFormat, Engine, MockEngine};
 
-use teton_protocol::events::Event;
+use teton_protocol::events::{BudgetBound, Event};
 use teton_protocol::{Phase as ProtoPhase, ProviderId, SessionId};
 
 use teton_providers::transport::{
@@ -52,6 +52,8 @@ use tetond::broadcast::{EventBus, Subscription};
 use tetond::classify::{self, ClassificationSignal};
 use tetond::cost::{CostLedger, NoopCostSink, PriceTable};
 use tetond::egress::{Egress, EgressError, NoopSink, Provenance};
+use tetond::harness::budget::{derive, BudgetInputs};
+use tetond::harness::turn_loop::HarnessConfig;
 use tetond::router::{to_protocol_phase, Route, Router};
 
 /// Mint the identity of a fixture file (REQ-571 ADR-A).
@@ -535,9 +537,11 @@ async fn a_malformed_tool_call_degrades_in_place_rather_than_failing() {
     // The other side of "falls back per failure class": a weak-tool-calling
     // failure keeps the provider but forces the reduced BR-6 profile, still
     // completing rather than aborting.
+    let bus = Arc::new(EventBus::new());
+    let mut sub = bus.subscribe(64);
     let router = structured_router();
-    let route = structured_route(&router, CorePhase::Implement);
-    let outcome = router.on_provider_failure(&route, "deepseek", FailureClass::MalformedToolCall);
+    let before = structured_route(&router, CorePhase::Implement);
+    let outcome = router.on_provider_failure(&before, "deepseek", FailureClass::MalformedToolCall);
     let degraded = outcome
         .degraded
         .expect("degrade surfaces provider_degraded");
@@ -549,6 +553,76 @@ async fn a_malformed_tool_call_degrades_in_place_rather_than_failing() {
     assert_eq!(route.provider_id.as_ref().unwrap().0, "deepseek");
     assert!(route.harness.require_verification, "reduced profile (BR-6)");
     assert_eq!(route.harness.max_tools, Some(5));
+
+    // REQ-586 ADR-2 / AC-15: the profile degraded, the window did not. The
+    // failure said this provider calls tools badly — not that it forgot how big
+    // its context window is — so the continuing turn runs on the same budget it
+    // was already running on, under the same bound, and nothing has to re-fit
+    // the context mid-turn.
+    assert_eq!(
+        route.budget, before.budget,
+        "the degrade keeps the failed provider's budget"
+    );
+    assert_eq!(route.budget.bound, BudgetBound::Window);
+    assert_eq!(
+        route.harness.budget, route.budget,
+        "and the config the loop runs under carries the same fact (AC-12)"
+    );
+    assert_eq!(
+        route.harness.context_budget_tokens,
+        route.budget.budget_tokens
+    );
+    assert_eq!(
+        route.route_decided().expect("provider kept").budget_tokens,
+        before
+            .route_decided()
+            .expect("the failed route reported one")
+            .budget_tokens,
+        "the event after the degrade announces the budget it announced before"
+    );
+
+    // AC-15c, the negative half: **no `refit_on_reroute`**. The daemon's two
+    // reroute arms re-budget and announce because they move the turn to a
+    // different window; an in-place degrade moves it to a different *profile*,
+    // and re-fitting a context that already fits — then telling the user their
+    // context was re-fitted — would be a clamp that never happened.
+    //
+    // The load-bearing assertion is the pair equality below, and it is the
+    // whole of it: byte-equal pairs are the condition `runtime::refit_for_reroute`
+    // returns on, so the refit is **unreachable** rather than merely
+    // unobserved. Watching this router's own degrade path for a
+    // `context_pressure` would prove nothing — `emit_provider_degraded`
+    // publishes one event and it is a `provider_degraded`; the router has no
+    // code path that can publish context pressure under any mutation. The
+    // silence of the *runtime* arm is a separate claim, pinned where that arm
+    // lives, by
+    // `runtime.rs::a_degrade_that_keeps_the_window_refits_nothing_and_says_nothing`.
+    assert_eq!(
+        (
+            route.budget.budget_tokens,
+            route.budget.budget_bytes,
+            route.harness.context_budget_tokens,
+            route.harness.context_budget_bytes,
+        ),
+        (
+            before.budget.budget_tokens,
+            before.budget.budget_bytes,
+            before.harness.context_budget_tokens,
+            before.harness.context_budget_bytes,
+        ),
+        "the pair moved, so the runtime would re-fit and announce a \
+         degrade that changed no window"
+    );
+    // Non-vacuity: the degrade this test is about really was a degrade the
+    // daemon would announce, rather than an outcome that fell through.
+    router.emit_provider_degraded(&bus, None, degraded);
+    let events = collect_events(&mut sub).await;
+    assert!(
+        events
+            .iter()
+            .any(|e| matches!(e.event, Event::ProviderDegraded(_))),
+        "the degrade really was announced"
+    );
 }
 
 // --------------------------------------------------------------------------
@@ -633,6 +707,36 @@ async fn weak_capability_provider_gets_degraded_harness_profile() {
     let turn = route.turn_route().expect("provider selected");
     assert!(turn.config.require_verification);
     assert_eq!(turn.model.as_deref(), Some("kimi-k2"));
+
+    // REQ-586 BR-1/BR-8: a weak tool-caller is not a small-windowed one. `kimi`
+    // declares a window, so the turn is budgeted from **that** window under
+    // `bound: window` — the same inputs restated here and put through the one
+    // derivation, so this asserts the router's classification rather than
+    // re-doing its arithmetic.
+    assert_eq!(route.budget.bound, BudgetBound::Window);
+    assert_eq!(
+        route.budget,
+        derive(BudgetInputs {
+            window: degraded().max_context,
+            cap: 0,
+            reservation: HarnessConfig::default().gen_params.max_tokens,
+            is_local: false,
+            redact_scan: false,
+            provider_id: Some("kimi"),
+        }),
+        "the route's budget is the declared window's, through `budget::derive`"
+    );
+    assert!(
+        route.budget.budget_tokens > HarnessConfig::default().context_budget_tokens,
+        "and the declared window actually moved the turn off the default pair"
+    );
+    // What the loop is held to, in both currencies, is that budget.
+    assert_eq!(
+        turn.config.context_budget_tokens,
+        route.budget.budget_tokens
+    );
+    assert_eq!(turn.config.context_budget_bytes, route.budget.budget_bytes);
+    assert_eq!(turn.config.budget, route.budget);
 }
 
 // --------------------------------------------------------------------------

@@ -53,7 +53,7 @@ use teton_providers::{
 };
 
 use tetond::egress::{Egress, NoopSink, Provenance};
-use tetond::harness::context::summarize_if_large;
+use tetond::harness::context::{summarize_if_large, APPROX_BYTES_PER_TOKEN};
 
 /// Mint the identity of a fixture file (REQ-571 ADR-A).
 ///
@@ -249,6 +249,7 @@ async fn a_digest_of_clean_content_sends_inside_a_boundary_bearing_turn() {
         "read",
         &oversized,
         64,
+        64 * APPROX_BYTES_PER_TOKEN,
         &ToolProvenance::path(source_id("src/lib.rs")),
     )
     .await;
@@ -440,7 +441,7 @@ async fn a_compaction_of_a_boundary_bearing_conversation_is_refused_whole() {
 
     // And BR-4's structural half: the budget is still met, by the gate rather
     // than by the duty.
-    guarded.truncate_to_budget();
+    let _ = guarded.truncate_to_budget();
     assert!(guarded.estimated_bytes() <= 4_000);
 }
 

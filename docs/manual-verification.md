@@ -2027,3 +2027,635 @@ Support/teton/models` were listed intact afterwards.
 **Still outstanding for a person:** step 2 at a real terminal, watching the
 screen for the *Media & Apple Music* / *Photos* / *"data from other apps"*
 dialogs across the turn (and noting a Desktop/Documents one if it appears).
+
+# Manual verification runbook — REQ-586 (a declared window, and what a turn is assembled to fit)
+
+**Status: OUTSTANDING.** CI pins the mechanism everywhere it can reach it: the
+derivation is a pure table-tested function (`harness::budget`), the router is
+its one caller, the corpus fixture pins both guards against a real tokenizer,
+the wire fields and the event are contract-tested, the `window:` column and the
+two doctor advisories run through the shipped binaries (`cli_e2e`), and the
+reroute refit, the carry drop, the redact bound and the pressure emissions are
+driven end to end in the daemon's integration suite.
+
+What no CI run settles is the claim a user actually cares about: that a real
+frontier provider, given a real window, really does take a prompt that used to
+be silently cut — and that the cost row agrees. The mock providers accept
+whatever they are sent, so "the whole prompt arrived" is only observable
+against a vendor that would have refused it (LESSON-481: pay for the harness or
+record the gap). The model's *reply* is an observation, never an assertion
+(LESSON-532); what is asserted is the surfaces.
+
+## Prerequisites
+
+A build with the local engine (`cargo build --release --features
+tetond/llama`) or the shipped binary, `TETON_TEST_SEAMS` unset, verified
+weights (`teton model status` → `verified`), and a real Moonshot key. Use the
+isolation recipe above (a short `XDG_RUNTIME_DIR` base, weights symlinked at
+`$BASE/teton/models`) to keep a launchd daemon out of it. A 6,000-word prompt
+is ~34 KB of prose — well past the old 4,096-word budget and past the 32,768-B
+one, so before this REQ it was guaranteed to be cut.
+
+## Procedure
+
+1. [ ] **Declare the window through the new surface, not by hand.** Either
+   `/provider setup kimi build` in a session (it records the recipe's window —
+   1,000,000 — when you take `kimi-k3`, the recipe's example model), or
+   `teton provider add kimi --kind openai-compatible --endpoint
+   https://api.moonshot.ai/v1/chat/completions --model kimi-k3 --max-context
+   128000`. AC-14 names 128,000; the recipe now ships 1,000,000, and either is
+   a valid record of this step — write down which you used. Confirm
+   `config.toml` gained `max_context` under `[providers.kimi.capabilities]`
+   without you opening the file.
+2. [ ] **`teton doctor` shows the window.** The `kimi` row ends `window: 128k`
+   (or `1m`), and there is **no** advisory line for it. A provider you have
+   *not* given a window still reads `window: unknown — context budget
+   defaulted (set capabilities.max_context)` and draws the advisory — check
+   one, so the column is not vacuously green. `teton provider list` shows the
+   same column.
+3. [ ] **A 6,000-word prompt reaches Kimi whole.** Route `build` to `kimi`
+   (`teton policy set-tier build kimi`), start a session with `/verbose`, and
+   paste ~6,000 words (any long document; prose is the class the byte guard
+   binds on). Expect on the route line
+   `· budget 84,650 words / 254 KB (bound: window)` for a 128k window, or
+   `· budget 665,984 words / 2 MB (bound: window)` for 1m — and **no**
+   `context:` pressure line at all. Record both the route line and `/cost`'s
+   input-token count for the turn; the input tokens should be in the same
+   ballpark as the prompt's own token count (≈7,500 for 6,000 words of prose),
+   not clipped near 4,096 words.
+4. [ ] **The same prompt under `redact = true` names the redact bound.** Set
+   `[privacy] redact = true`, restart the daemon, and paste the same prompt.
+   Expect `(bound: redact scan)` on the route line — the byte figure drops to
+   `89 KB` while the word figure stays window-derived — and expect the turn to
+   **complete**, never a block for an unscannable body.
+5. [ ] **Chunk-count note.** Record how long step 4's turn took before the
+   model's first token. A body near the bound is scanned in up to five chunks
+   (`REDACT_MAX_CHUNKS` — four chunk-widths plus the overlap), each one a local
+   model call, so this is where a redacted big-window turn spends its latency.
+   There is no per-chunk surface by design; the number to write down is the
+   wall time and whether anything was flagged.
+6. [ ] **Record the worst case per prompt at this budget.** The budget bounds
+   one model **call**. A prompt runs up to 25 tool iterations
+   (`NATIVE_MAX_ITERATIONS`) and each re-sends the context, so a 1,000,000-token
+   window — 665,984 words / 2 MB per call — is up to **≈25 million input
+   tokens for a single prompt**; a 128,000-token window is 84,650 words / 254 KB
+   per call and ≈3.2 million per prompt. Price both against your provider's
+   rate and write the two numbers down. `context_budget_cap` is the knob that
+   lowers the ceiling; there is no spend cap, and this runbook is where that is
+   said out loud (BR-9).
+7. [ ] **Once REQ-585 lands: `/proceed REQ-xxx` expands rather than being
+   refused for size.** The seven ADLC skills that fit on no tier before this
+   REQ — `/spec`, `/manifest`, `/analyze`, `/template-drift`, `/wrapup`,
+   `/sprint`, `/proceed` — should expand on a Kimi-routed `build` tier with no
+   pressure line. Until REQ-585 ships there is nothing to type here; leave the
+   box open rather than closing it on the smaller claim.
+
+## Recorded resident-prompt headroom after REQ-585
+
+**Superseded — see "Re-measured at REQ-587" below for the current figures.**
+This section is the record of what REQ-587 inherited and of how the
+measurement is taken; the table in it is REQ-585's tip, not today's.
+
+The number REQ-587 should read before it writes a resident sentence. Measured
+on this branch's tip with the two margin tests
+(`egress::redact::tests::the_total_cap_clears_the_harness_context_budget_with_margin`
+and `harness::tools::web::tests::the_web_tool_docs_clear_the_outbound_body_overhead`),
+against BUG-181's 10,240-byte body overhead and the unmoved 48-byte floor:
+
+| shape | worst prompt | spent | margin |
+|---|---|---|---|
+| opted-out (no web tool) — the tighter | 6,138 | 9,414 | **826** |
+| opted-in (web tool docs + schema) | 6,091 | 9,367 | **873** |
+
+REQ-585 spent **68** of what it inherited: 52 on BR-9's amended capability
+sentence, and 16 on the `skills` topic's name, which `teton_docs` renders
+twice — once in its description and once in the schema's `One of: …`. Verified
+two-sided on the tip rather than by arithmetic: 778 bytes of filler leaves the
+tighter shape at exactly the 48-byte floor and passes, 779 fails.
+
+**How to read these off the tests, because neither prints when green.** Both
+assertions report `worst`, the escaping term and the overhead only in their
+failure message, so the figures above were taken by appending a known number
+of filler bytes to `crates/tetond/src/harness/self_config.md` (the guide is
+embedded verbatim, so a byte added there is a byte added to every shape),
+running the two tests, reading the `N-byte system prompt` each one names, and
+subtracting the filler. A 1,000-byte pad trips both; the pad is then removed.
+This is the two-minute measurement LESSON-543 says to run *before* writing a
+resident sentence, not after.
+
+Before this task the same two were 6,070 / 9,346 / **894** and 6,023 / 9,299 /
+**941**. REQ-585 spent **52 bytes**, and that is the whole of its resident
+cost: BR-9's amendment to the guide's capability sentence, which grew from 186
+to 238 bytes when "loads nothing from `.claude/` or `~/.claude`" became "loads
+skills and commands from `.claude/` and `~/.claude` but nothing else there".
+The skill roster is deliberately **not** in the guide (OQ-2) — a resident line
+that grew with the user's `~/.claude` tree is the one shape these two tests
+cannot bound — and the registry, the `/help` section, the invocation preamble
+and the refusal messages are surfaces and turn-scoped text, which the resident
+prompt does not pay for. Neither the overhead nor the floor moved.
+
+**A 26-byte correction to REQ-586's recorded figures.** That REQ recorded
+6,096 / 9,372 / **868** and 6,049 / 9,325 / **915**; re-measured here, its own
+tip is 6,070 and 6,023. `self_config.md`, `turn_loop.rs` and `harness/tools/`
+are byte-identical between REQ-586's merge commit (`c9e9265`) and this
+branch's tip before this task (`57e733f`), and
+the gap between the two shapes (47 bytes) is unchanged, so both recorded
+numbers were 26 high rather than anything having shrunk since. The prose
+figures in `egress/redact.rs` and `harness/tools/web.rs` still carry the old
+pair; treat this table as the measured one. REQ-586's account of *what it
+spent* stands: 18 bytes, nine for `context` in the `teton_docs` topic index
+and nine for the same word in the tool's schema, with the 3.4 KB `context`
+topic, the `window:` column, the doctor advisories, the budget clause and the
+pressure lines all tool results and CLI surfaces the prompt does not pay for
+(ADR-11).
+
+**And the tool description is not at its ceiling** — a claim this section used
+to make. REQ-586's own verify pass bought the room where the review said to buy
+it: the sentence in front of the index lost `setup and troubleshooting`, leaving
+`DESCRIPTION` at **94** of `MAX_DESCRIPTION_CHARS` = 120. TASK-209 then spent
+**8** of those 26 on `skills`, exactly as that note said the next topic should,
+and moved no ceiling: the description is **102, with 18 left**. Its resident
+cost is 8 bytes twice — the description and the tool schema's `One of: …`, both
+rendered into the prompt verbatim (`ToolRegistry::docs`) — so **16 bytes** come
+off the table above, by arithmetic rather than a second measurement: 6,138 /
+9,414 / **826** and 6,091 / 9,367 / **873** as of TASK-209. The 4.0 KB `skills`
+topic itself, the `/help` section, the consent block, the echo line and the
+refusal message are tool results and CLI surfaces the prompt does not pay for.
+
+## Re-measured at REQ-587 — and the overhead moved
+
+REQ-587 spent **1,092** bytes against the 826 above, so the assumption moved
+rather than the margin absorbing it: `REDACT_BODY_OVERHEAD_BYTES` is **11 KiB**
+(10 → 11, the fourth such raise), the 48-byte floor is untouched, and both
+sweeps now register a `skill` tool at BR-2's worst-case roster.
+
+| shape | worst prompt | spent | margin |
+|---|---|---|---|
+| opted-out (no web tool) — the tighter | 7,230 | 10,506 | **758** |
+| opted-in (web tool docs + schema) | 7,183 | 10,459 | **805** |
+
+Where the 1,092 went, measured rather than reasoned:
+
+| line item | bytes |
+|---|---|
+| the `skill` tool's docs entry (description + schema) at a roster of `ROSTER_MAX_BYTES` = 512 | **1,010** |
+| BR-8's third amendment to the guide's capability sentence (238 → 320 on the file) | **82** |
+
+Verified two-sided on both shapes with the pad method below: **710** bytes of
+filler leaves the tighter shape at exactly the 48-byte floor and passes, 711
+fails; **757** and 758 are the same pair for the looser one. So **710 usable
+bytes** is the figure the next resident sentence reads.
+
+**Two things about this raise that the previous three did not carry.** The
+first is that a resident line now **grows with the user's tree** — the roster
+is the names of every model-invocable skill — which is why it is bounded by a
+byte cap and why both sweeps measure it *at* that cap rather than at whatever
+the developer's `~/.claude` holds. The second is that since REQ-586 the
+overhead has a production reader, so raising it narrowed every
+`[privacy] redact = true` route's byte budget:
+`REDACT_SCANNABLE_CONTEXT_BYTES` dropped **89,127 → 88,196**, a 931-byte cut to
+the budget BR-7's `bound: redact scan` refusal measures against. The chunk
+count is unchanged (2 × (32,768 + 11,264) = 88,064 ≤ 108,280; 88,064 / 27,070 =
+3.25 → 4). Both claims are asserted by
+`egress::redact::tests::the_overhead_raise_restates_the_chunk_count_and_the_scannable_bound`,
+because every other assertion about that bound is an inequality that holds
+either way — the cut is silent unless it is stated.
+
+REQ-584 contends for the same constant. It moves once; whichever REQ lands
+second re-measures against the moved value rather than moving it again.
+
+## Sign-off
+
+```
+Date / build     :
+Provider + model :
+Window declared  :            (how: /provider setup | provider add --max-context)
+Step 1 — config gained max_context without a hand edit : yes / no
+Step 2 — doctor row window, and an unknown row advised : yes / no
+Step 3 — route line budget + bound                     :
+Step 3 — /cost input tokens for the turn               :
+Step 3 — any `context:` pressure line                  : yes / no
+Step 4 — bound: redact scan, turn completed            : yes / no
+Step 5 — wall time to first token under redact         :
+Step 6 — worst case per prompt, priced                 :
+Step 7 — REQ-585 skills expand                         : yes / no / not yet shipped
+Notes / findings :
+```
+
+# Manual verification runbook — REQ-585 (the user's own `/` commands)
+
+**Status: OUTSTANDING — nothing below has been executed.** This is a runbook
+written for a person with the ADLC toolkit on their machine; it is not a record
+of a run, and no box in it may be ticked from CI.
+
+## What this proves that CI does not
+
+CI reaches the mechanism at every seam it can: discovery is a pure function over
+a recording lister (so what was opened is asserted, not assumed), the expander
+is pure, and `/help`'s section, the consent matrix, the pipe rule, the two-stage
+budget refusal and the boundary pin are each driven through the shipped
+surfaces by this REQ's verification suites (TASK-208) — all of it against
+**fixture** roots, which is the point of the recording lister. One figure was taken by hand against the **real** tree on the
+dogfood machine while this REQ was implemented, and it is the precondition for
+everything below rather than a CI assertion: discovery registers **17 skills
+(user 17, project 0); 0 skipped**, with the largest — `proceed` at 49.8 KiB —
+inside the 64 KiB body cap. Step 2 is where a person re-confirms it.
+
+What no CI run settles is what a person actually gets. The mock providers accept
+whatever they are sent, so "the whole of `/proceed` arrived" is only observable
+against a vendor that would have refused it; and a model's *reply* is an
+observation, never an assertion (LESSON-532). Legs (a)–(c) observe a real model
+against a real corpus — including **where it stops**, which is this REQ's most
+important negative result. Legs (d)–(f) assert surfaces.
+
+## Prerequisites
+
+- The shipped binary or a `--release` build, with `TETON_TEST_SEAMS` unset.
+- The ADLC toolkit installed, `~/.claude/skills` being the symlink into
+  `~/Documents/GitHub/adlc-toolkit`. A symlinked **root** is followed on
+  purpose; a symlinked *entry* under one is refused and named.
+- A Kimi provider with a declared window — **write down which**: the shipped
+  recipe's `max_context = 1000000` (what `/provider setup kimi` records when you
+  take `kimi-k3`), or a hand-lowered `teton provider add … --max-context
+  128000`. Both clear the ≈31.3k tokens a `/proceed` expansion needs; AC-20
+  names either.
+- The tier you will type on routed there: `teton policy set-tier build kimi`.
+- macOS: the first read of a root that resolves under `~/Documents` can raise a
+  consent dialog. Answer it. If you decline, the skills section will say
+  `unreadable (permission denied)` — which is the correct behaviour, and worth
+  noting rather than retrying blindly.
+
+## Procedure
+
+### (a) `/status` at `guarded`: one consent, every command shown, one report
+
+1. [ ] Start `teton` in the teton-code repo and turn on `/verbose`.
+2. [ ] `/help`. Expect a skills section — header
+   `skills — arguments are passed through as typed:`, one row per skill with
+   its source, and the diagnostic `17 skills (user 17, project 0); 0 skipped` —
+   sitting **above** the argument footer, with the escape footer still the last
+   line of all.
+3. [ ] Type `/status`. Expect, in this order: one echo line
+   `/status → skill status (user, <n.n> KiB, <N> dynamic commands)`; one consent
+   block, ``skill `status` (user) wants to run <N> dynamic-context commands:``
+   followed by one indented line per command, **verbatim**; your single answer;
+   then the model's status report, produced with `read`/`glob`/`shell`.
+4. [ ] Confirm the consent was asked **once** for the whole invocation, not once
+   per command, and that the commands listed are the ones that ran.
+5. [ ] Record the echo line verbatim. Where the two numbers differ it says so
+   (`<N> dynamic commands, none run`, `…, 1 run`) — a bare count beside
+   placeholders in the prompt would be the bug BR-12 exists to prevent.
+6. [ ] `/verbose` for the turn shows the path **relative, never absolute** —
+   for this *user* skill, `~/.claude/skills/status/SKILL.md` (never an absolute
+   path carrying your username) — plus the ignored frontmatter keys and each
+   command's typed outcome. A **project** skill is spelled from the session
+   root instead (`.claude/skills/<name>/SKILL.md`), which is what BUG-187
+   fixed; its sharp case — a checkout outside `$HOME` — is covered by
+   `skills_discovery.rs` and `skills_list_contracts.rs` and needs no step
+   here.
+
+### (b) `/validate REQ-585`: the argument reaches the body
+
+7. [ ] Type `/validate REQ-585`. Expect the expansion to carry `REQ-585` where
+   the body writes `$ARGUMENTS`, and the model to read and validate this REQ's
+   own `requirement.md`. Record what it produced — the point is that the
+   argument arrived as typed, not that the verdict is right.
+8. [ ] `/cost` shows one ordinary prompt turn for it, with input tokens in the
+   ballpark of the expansion's size. Not zero, and not two turns.
+
+### (c) The fidelity leg — and the evidence the Deferred follow-ups are written on
+
+9. [ ] `/analyze teton code repo` on the Kimi route. Expect it to expand with no
+   pressure line, and the model to perform a **read-based** audit: one model, no
+   subagents. The body asks for four parallel auditors; record what happened
+   instead. That degradation is BR-13's documented behaviour, not a failure.
+10. [ ] `/proceed REQ-585`. The `proceed` skill has no `$ARGUMENTS`, so the
+    argument arrives as the closing `ARGUMENTS: REQ-585` line — that fallback is
+    what makes this invocation work at all; confirm it in `/verbose`.
+11. [ ] **Record the exact step at which it stalls.** Quote (i) the line of the
+    skill body the model reached and (ii) the model's own words on reaching it.
+    The expected shape is the first *"invoke the actual `/validate` skill"* gate:
+    Teton has no model-invocable skill surface, and the model cannot even `read`
+    `~/.claude/skills/validate/SKILL.md` from a repo-rooted session, because it
+    is outside the tool jail. It will narrate the step, ask you to run it, or do
+    that phase's work itself without invoking anything. Any of the three is the
+    finding; paste the quote into the sign-off. This is the evidence the two
+    Deferred follow-ups — **model-invoked skills** and **subagent dispatch** —
+    are written against, and the reason they are separate REQs.
+
+### (d) On the local tier, a big skill is refused, and the bound is spoken
+
+12. [ ] `teton policy set-tier build local` (or `/policy set-tier build local`
+    at a terminal), then type `/analyze teton code repo` again.
+13. [ ] Expect a refusal naming the skill, the measured size, the budget and
+    `(bound: local engine)` — the **spoken** form. `local_engine` is the wire
+    spelling and must not appear on a surface.
+14. [ ] In the same breath, three negatives: **no consent was asked** (the body
+    alone is measured before consent — nobody approves four commands and is then
+    told the turn was refused); **no `context:` pressure line and no elision
+    notice** (a refused turn never joined the conversation); and `/cost` shows
+    no provider call for it.
+15. [ ] Put the tier back.
+
+### (e) Unattended: `full` runs it, `guarded` refuses without reading a line
+
+16. [ ] Two real recipes; use one and say which:
+    `printf '/permissions full\n/status\n' | teton`, or `[permissions]
+    default_level = "full"` in a throwaway config (`TETON_CONFIG=…`) with
+    `printf '/status\n' | teton`. (`--permissions` is **not** a flag — the
+    globals are `--yes` and `--verbose`; AC-20 said otherwise and was corrected
+    along with the refusal line it described.)
+    Expect the dynamic context to run with no prompt, and the report produced.
+17. [ ] The same at the default `guarded`: `printf '/status\n' | teton`. Expect
+    one refusal line — ``skill `status`'s dynamic context was refused without
+    asking: this session's input is not a terminal, so nobody could be asked``
+    — a placeholder in the prompt for every command, an echo line reading
+    `<N> dynamic commands, none run`, and **the turn still completing**. The
+    line's remedy names `/permissions full` and `[permissions] default_level`,
+    both of which exist — check that it does not say `--permissions`, which
+    does not, and which would send an unattended runner to a parse error at the
+    one moment nobody can be asked anything.
+18. [ ] Confirm no stdin line was eaten: `printf '/status\ny\n' | teton` must
+    treat the `y` as an ordinary prompt line, never as an answer to a question
+    that was never asked.
+
+### (f) With a privacy boundary configured: pinned, which for seven means refused
+
+19. [ ] On a machine that has a `local-only` boundary (`teton boundary list`
+    shows one), repeat (a) and (b) with the tier still routed to Kimi.
+20. [ ] Expect both to run on the **local** tier. The reason is BR-7 and it is
+    worth writing down as it actually is: dynamic-context output carries
+    `Unknown` provenance, exactly as `shell` output does, and the egress
+    inspector fails closed on unknown provenance whenever any boundary is
+    configured. A **user** skill file outside the session root pins under the
+    same unknown rule (it has no root-relative identity to match a glob
+    against); a **project** skill pins exactly as reading that file would.
+21. [ ] **Pinned is not run.** All seventeen ADLC skills run the ethos include,
+    so on such a machine all seventeen are pinned to the local tier — and seven
+    of them (`/spec`, `/manifest`, `/analyze`, `/template-drift`, `/wrapup`,
+    `/sprint`, `/proceed`) exceed the local budget and are therefore **refused
+    there**, not served. The pin is what forces the refusal. Verify with one of
+    the seven and record the refusal beside the pin. (BR-7's parenthetical
+    originally said those seventeen "run" on the local tier; TASK-196 amended
+    it. The amended sentence is the true one.)
+22. [ ] **OQ-8's residual, in v1:** the consent offers no "run without dynamic
+    context" option, so there is no way to keep an invocation remote once a
+    command has run. The two remedies are to let the model run the command
+    itself with `shell` (which pins identically) or to `/cd` out of the boundary
+    — record which, if either, you reached for.
+23. [ ] **OQ-7's residual, in v1:** a project skill gets no separate trust
+    acknowledgment. The permission gate is the whole trust boundary: at the
+    default `guarded` every dynamic command of every invocation is shown and
+    asked about **every time**, and the body is prompt text the model reads
+    under the same level a typed prompt would. If you answer "for this session"
+    on a project skill, note that the grant dies when `/cd` moves the root.
+
+## Sign-off
+
+```
+REQ-585 sign-off
+----------------
+Verified by      :
+Date             :
+Platform / OS    :
+Build            :               (`teton --version`)
+TETON_TEST_SEAMS confirmed unset : yes / no
+Provider + model :
+Window used      : 1,000,000 (shipped recipe) | 128,000 (hand-lowered)   <-- circle one
+/help — skills section, diagnostic line read : ______________________________
+(a) echo line, verbatim                      :
+(a) one consent for the whole invocation     : yes / no
+(a) report produced                          : yes / no
+(a) /verbose path was relative (user: ~/…)   : yes / no
+(b) $ARGUMENTS carried REQ-585               : yes / no
+(b) /cost showed one ordinary prompt turn    : yes / no
+(c) /analyze audited read-only, no subagents : yes / no  (what it did instead:)
+(c) /proceed expanded (ARGUMENTS: fallback)  : yes / no
+(c) STALL STEP — body line quoted            :
+(c) STALL STEP — model's words               :
+(d) refusal named skill/size/budget          : yes / no
+(d) bound printed                            : `bound: local engine` / other:
+(d) no consent asked, no pressure line, no provider call : yes / no
+(e) recipe used for `full`                   : /permissions line | config default_level
+(e) full: dynamic context ran unattended     : yes / no
+(e) guarded on a pipe: refused, placeholders, turn completed : yes / no
+(e) remedy names `/permissions full` + `[permissions] default_level`, not `--permissions` : yes / no
+(e) no stdin line was consumed               : yes / no
+(f) boundary configured on this machine      : yes / no
+(f) (a) and (b) ran on the local tier        : yes / no
+(f) one of the seven was refused there       : which, and the message:
+(f) OQ-8 remedy reached for, if any          : shell | /cd | none
+(f) OQ-7 noted (no project-skill trust step) : yes / no
+Notes / findings :
+```
+
+---
+
+# Manual verification runbook — REQ-587 (the model runs a skill)
+
+**Status: OUTSTANDING — nothing below has been executed.** This is a runbook
+written for a person with the ADLC toolkit on their machine; it is not a record
+of a run, and no box in it may be ticked from CI or by an agent.
+
+## What this proves that CI does not
+
+CI reaches every seam it can, and TASK-222 closed the ones that needed a real
+model-issued call: a scripted vendor now drives a thirteen-call chain, a
+committed expansion through a live reroute, the per-call cost rows, and the four
+egress legs. What no mock settles is the thing this REQ exists for — whether a
+**real** model, handed a real `/proceed`, actually calls `skill`, follows the
+body it gets back, and reaches the next gate. A mock provider replies with
+whatever it was scripted to reply with; a model's behaviour is an *observation*,
+never an assertion (LESSON-532).
+
+Two negative results are the point rather than a side effect. Leg (a) records
+**where the run stops** — the first "dispatch an agent" step — which is the
+evidence the subagent spec needs. Leg (e) records what the local tier does with
+a large orchestrator, which is what a machine with no remote provider gets.
+
+## Prerequisites — and one of them is not optional
+
+- The shipped binary or a `--release` build, with `TETON_TEST_SEAMS` unset.
+- The ADLC toolkit installed, `~/.claude/skills` being the symlink into
+  `~/Documents/GitHub/adlc-toolkit`.
+- A Kimi provider with a declared window — **write down which**: the shipped
+  recipe's `max_context = 1000000` (what `/provider setup kimi` records for
+  `kimi-k3`), or a hand-lowered `teton provider add … --max-context 128000`.
+  Both clear what a `/proceed` expansion needs; AC-15 names either, and the
+  sign-off block asks which was used because the two are not interchangeable
+  evidence for leg (a)'s cumulative case.
+- The tier you will type on routed there: `teton policy set-tier build kimi`.
+- **No privacy boundary configured.** This is a precondition, not a
+  convenience, and it is stated because the failure it prevents looks like a
+  feature that does not work. Every ADLC skill lives under `~/.claude`; BR-10
+  makes a user skill's block **unpinnable** (`ProvenanceId::from_resolved`
+  refuses a file outside the session root, by design); and an unpinnable block
+  pins the turn under *any* boundary, related to the file or not. So on a
+  machine with `[[privacy.boundaries]]` set, every leg below routes to the local
+  tier and the large ones are refused there — and you would be recording "the
+  model cannot run `/proceed`" when what you measured was the boundary rule
+  working exactly as `provenance_egress.rs`'s
+  `a_model_invoked_user_skill_pins_the_turn_wherever_any_boundary_exists`
+  says it does. **Check with `/boundary list` before starting** — not
+  `/doctor`, which issues one `config/get` and renders **providers only**; it
+  never prints a boundary, so a boundary-configured machine reads a clean
+  doctor report as "none configured" and then measures the boundary rule for
+  six legs. `/boundary list` on a clean machine prints exactly
+  ``no privacy boundaries configured. Add one with `teton boundary add`.``;
+  anything else is a listing headed `privacy boundaries:` with one
+  `<glob> [<mode>]` line per boundary. The shell twin is `teton boundary list`
+  and prints the same lines. **A machine that has one configured runs
+  leg (f) instead**, and records that it did.
+- macOS: the first read of a root under `~/Documents` can raise a consent
+  dialog. Answer it; a decline renders `unreadable (permission denied)`, which
+  is correct behaviour and worth noting rather than retrying blindly.
+
+> **A note on AC-15's letters.** The AC used to refer to a "leg (g)" for the
+> boundary-configured machine while defining only (a)–(e). It has been
+> renumbered: AC-15 now defines **(f)** and names it as the leg run *instead
+> of* (a)–(e), which is leg (f) below. The two documents agree; do not add a
+> second lettering.
+
+## Procedure
+
+### (a) `/proceed REQ-587` — how far one prompt gets, and where it stops
+
+1. [ ] Start `teton` in the teton-code repo, `/verbose` on, and confirm the
+       route: `/policy show` names `kimi` for `build`.
+2. [ ] `/help`. Record the skills diagnostic line verbatim (it was
+       `17 skills (user 17, project 0); 0 skipped` when REQ-585 shipped).
+3. [ ] Type `/proceed REQ-587`. Expect the echo line
+       `/proceed → skill proceed (user, <n.n> KiB, <N> dynamic commands)` —
+       **record `<N>`, do not predict it.** Every ADLC body carries 1–6
+       `` !`…` `` commands (Assumptions, the 2026-08-19 corpus), so `<N>` is
+       non-zero and `/proceed`'s own value is one of the things this leg
+       produces. At the default `guarded` that non-zero count also means the
+       **first thing you see is a dynamic-context consent** under the skill's
+       own key `skill:user:proceed`, listing each command as it will run
+       (substitution happens first). That prompt is the feature, not a defect:
+       answer it, and record which way. Declining is a valid run — it leaves
+       one ``[dynamic context not run: `cmd` — reason]`` placeholder per
+       command and the echo line then reads `<N> dynamic commands, none run`.
+       Then the body lands as one prompt turn.
+4. [ ] Watch for the **first model-issued call**: a status line
+       `- skill validate [running]` and then an echo line
+       `skill validate (user, <n.n> KiB, <N> dynamic commands) — invoked by the
+       model`. Record it verbatim. *This line is the whole REQ.*
+5. [ ] Record how many `continue` prompts the run needed. One prompt's 25
+       iterations do not span the pipeline (OQ-8); the count is the number this
+       runbook exists to produce.
+6. [ ] Record **the exact step at which it next stalls**, quoting the line of
+       the skill body it stopped on and the model's own words. It should be the
+       first "dispatch an agent" step (`/proceed` Phase 4). This is the
+       subagent spec's evidence — write the quote down, not a paraphrase.
+7. [ ] Record `/verbose`'s per-invocation lines for one of the calls: the
+       home-relative path, any declared flags, each dynamic outcome, and the
+       `invocation N of 12 this turn` count.
+
+### (b) A scratch skill hidden from the model
+
+1. [ ] Copy any small skill to `~/.claude/skills/scratch-hidden/SKILL.md` and
+       add `disable-model-invocation: true` to its frontmatter.
+2. [ ] In a fresh session, ask the model to list what it can run. Expect
+       `scratch-hidden` **absent** from the roster and from `skill {}`'s listing.
+3. [ ] Ask it to run `scratch-hidden` by name. Expect a typed refusal naming the
+       flag, no expansion, and no dynamic command run. Record the words.
+4. [ ] Type `/scratch-hidden` yourself. It must still dispatch: the flag hides
+       the row from the model and costs the user nothing.
+5. [ ] Delete the scratch copy.
+
+### (c) The two capability questions (BR-8)
+
+1. [ ] Ask *"can you run `/validate`?"*. Expect: yes, through the `skill` tool.
+2. [ ] Ask *"can you run `/help`?"*. Expect: no — the user runs the built-in
+       commands, and it names one for you to type.
+3. [ ] Record both answers verbatim. A model that denies the skills it *does*
+       have, or claims the built-ins it does not, is BUG-181's defect with its
+       sign flipped and is a finding either way.
+
+### (d) Unattended, on a pipe
+
+1. [ ] `printf '/permissions full\n/proceed REQ-587\n' | teton`. Expect the
+       ethos include to run and the first gate to be reached with **no prompt**.
+       There is no `--permissions` flag; the level is set with REQ-560's
+       `/permissions` session command. (REQ-585 AC-20(e) carries the same
+       nonexistent flag and needs the same correction when it is run.)
+2. [ ] The same piped run at the default `guarded`. Expect placeholders where
+       the dynamic context would have been, the refusal naming
+       `/permissions full` and `[permissions] default_level` as the remedies,
+       **no stdin line consumed**, and the run still completing.
+3. [ ] The teton-code repo has no project skills, so the acknowledgment path
+       needs a throwaway root: `mkdir -p /tmp/scratch-root/.claude/skills/scratch`
+       with a one-line `SKILL.md`, then run a piped session there at `guarded`
+       and ask the model to use it. Expect the client to refuse **without
+       reading stdin** and the model to be told the user must acknowledge or run
+       at `full`.
+4. [ ] Note the BUG-185 residual if you see it: at `full` a cloned repository's
+       dynamic context runs unattended, up to 12 invocations per turn, each
+       command with a 30-second deadline inside a non-cancellable
+       `spawn_blocking`. Nothing here reproduces it; record only what you
+       observe.
+
+### (e) On the local tier
+
+1. [ ] Route `build` to the local tier (`teton policy set-tier build local`).
+2. [ ] Ask the model for `skill { name: "proceed" }`. Expect a typed refusal
+       naming the skill, its size, the budget, and **`bound: local engine`** —
+       the spoken form, never `local_engine`.
+3. [ ] Ask it for `skill { name: "status" }`. Expect that one to expand.
+4. [ ] Record both messages verbatim; the pair is what shows the refusal is the
+       budget rather than the tier.
+
+### (f) The boundary-configured machine (AC-15's leg (f))
+
+Run **this leg instead of (a)–(e)** if `/boundary list` reports a configured
+privacy boundary and you are not willing to remove it. (`/doctor` cannot answer
+this question — see Prerequisites.)
+
+1. [ ] Confirm the boundary with `/boundary list` and record its glob and mode,
+       verbatim from the `<glob> [<mode>]` line.
+2. [ ] Ask the model to run any `~/.claude` skill. Expect the turn to route to
+       the **local tier** and nothing to reach the provider — a user skill's
+       block is unpinnable and pins under any boundary.
+3. [ ] Ask it for a large one (`proceed`). Expect the local-tier refusal from
+       leg (e), for the same reason.
+4. [ ] Record that this machine ran (f) rather than (a)–(e), so a reader does
+       not read a boundary rule as a broken feature.
+
+## Sign-off
+
+```
+REQ-587 AC-15 verified by : ______________________  date: ____________
+Machine          :               (chip / RAM / OS)
+Build            :               (`teton --version`)
+TETON_TEST_SEAMS confirmed unset : yes / no
+Window used      : 1,000,000 (shipped recipe) | 128,000 (hand-lowered)   <-- circle one
+Privacy boundary configured?     : no (ran a–e) | yes (ran f)   <-- circle one
+  ^ answered with `/boundary list` (NOT `/doctor`)  : yes / no
+  ^ line it printed, verbatim :
+/help — skills diagnostic line read          : ______________________________
+(a) `/proceed` echo line, verbatim           :
+(a) dynamic commands `/proceed` carried      : ____  (recorded, not predicted)
+(a) dynamic-context consent raised at guarded : yes / no   answered: accept | decline
+(a) first model-issued echo line, verbatim   :
+(a) `continue` prompts needed                : ____
+(a) STALL STEP — body line quoted            :
+(a) STALL STEP — model's words               :
+(a) /verbose showed path, flags, outcomes, count : yes / no
+(b) hidden skill absent from the roster      : yes / no
+(b) model's call refused, flag named         : yes / no  (words:)
+(b) no dynamic command ran                   : yes / no
+(b) `/scratch-hidden` still dispatched for the user : yes / no
+(c) "can you run /validate?" — answer        :
+(c) "can you run /help?" — answer            :
+(d) full on a pipe: reached the gate with no prompt : yes / no
+(d) guarded on a pipe: placeholders, run completed  : yes / no
+(d) no stdin line was consumed               : yes / no
+(d) remedy named `/permissions full` + `[permissions] default_level` : yes / no
+(d) scratch root at guarded: refused without reading stdin : yes / no
+(e) `proceed` refused, `bound: local engine` : yes / no  (message:)
+(e) `status` expanded on the local tier      : yes / no
+(f) boundary glob, if this leg was run       :
+(f) turn routed local, nothing reached the provider : yes / no
+Notes / findings :
+```

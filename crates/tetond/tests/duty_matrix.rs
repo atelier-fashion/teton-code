@@ -452,9 +452,15 @@ async fn exercise(duty: Duty, route: &DutyRoute, tainted: bool) -> Observed {
             } else {
                 ToolProvenance::path(source_id("src/lib.rs"))
             };
-            let out =
-                summarize_if_large(route, "read", &text, DIGEST_THRESHOLD_TOKENS, &provenance)
-                    .await;
+            let out = summarize_if_large(
+                route,
+                "read",
+                &text,
+                DIGEST_THRESHOLD_TOKENS,
+                DIGEST_THRESHOLD_TOKENS * APPROX_BYTES_PER_TOKEN,
+                &provenance,
+            )
+            .await;
             // The invariant: an oversized result is never folded raw. Both the
             // summary and the mechanical fallback are bounded by the threshold
             // the caller set (plus the frame each wraps it in).
@@ -552,7 +558,7 @@ async fn exercise(duty: Duty, route: &DutyRoute, tainted: bool) -> Observed {
             let out = ctx.compact_if_pressured(route).await;
             // ADR-4: unconditional, unmodified, and never made conditional on
             // anything the duty did. This line is what enforces the budget.
-            ctx.truncate_to_budget();
+            let _ = ctx.truncate_to_budget();
             // Only the *replacement* block a compaction inserts is reported as
             // delivered content, beside the shape of the surviving context — the
             // 5 KB of block padding would drown every failure message.

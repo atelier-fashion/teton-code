@@ -73,7 +73,7 @@
       "prUrl": "https://github.com/atelier-fashion/teton-code/pull/161",
       "prNumber": 161,
       "prCreatedAt": "2026-08-15T20:33:44Z",
-      "merged": false,
+      "merged": true,
       "snapshotBranch": null,
       "snapshotPR": null
     }

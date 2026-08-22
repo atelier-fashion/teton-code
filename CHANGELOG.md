@@ -18,6 +18,142 @@ unchanged. What belongs here is what an *upgrade* does to a machine that was
 already running — above all, anything that changes where data goes without the
 user having asked for it.
 
+## [Unreleased]
+
+### Added
+
+- **The `/` commands you already wrote, discovered and run (REQ-585).** A
+  session now reads `~/.claude/skills/*/SKILL.md`, `~/.claude/commands/*.md`
+  and the same two under the session root's `.claude/` — four globs, one level
+  deep, no recursion — and registers one `/name` per file. **On a machine with
+  a `~/.claude/skills` tree this is new commands appearing in a session that
+  did not have them**: against the seventeen-skill ADLC toolkit, all
+  seventeen register and none is skipped. A built-in row always wins a name it
+  shares; the skill is listed as shadowed rather than dispatched.
+
+  - **An invocation is one prompt turn.** `/name <rest>` expands to the file's
+    body with `$ARGUMENTS` replaced by the rest of the line **as typed** (not
+    split, quotes not interpreted) and `$1`…`$N` by its whitespace-split
+    tokens, preceded by one line naming the command and its file; a body with
+    no placeholder gets a closing `ARGUMENTS: <rest>`. From there it is an
+    ordinary prompt: same classifier, routing, permission level, egress choke
+    point and cost row. `/help` lists every skill with its source and closes
+    with what was found and skipped, and why.
+  - **Dynamic context asks, under the skill's own key.** A `` !`cmd` `` in a
+    body inlines that command's output at expansion time. It runs under
+    `skill:<source>:<name>` — **never** the `shell` tool's key, so an existing
+    "allow always" on `shell` does not silently authorize it and a grant on one
+    skill frees nothing else. At the default `guarded` (and at `edits`) the
+    session lists every command of the invocation and asks **once**; `plan`
+    does not run them; `full` runs them; piped into a session at a level that
+    would ask, they are refused without a line of stdin being read. Anything
+    not run leaves `` [dynamic context not run: `cmd` — reason] `` in the
+    prompt, so the model is told rather than misled. Project-skill grants are
+    dropped when `/cd` moves the root.
+  - **Nothing in a skill file changes the session.** Frontmatter other than
+    `name`, `description` and `argument-hint` — `allowed-tools`, `model`,
+    `effort`, `context`, `agent`, `hooks`, `disable-model-invocation` — is
+    inert and listed by `/verbose`. `CLAUDE.md`, agents and hooks are still not
+    loaded. The model cannot invoke a skill; only you can.
+  - **Carried whole or refused, never shortened.** A skill turn that does not
+    fit its route's budget (REQ-586) is refused before anything is sent, naming
+    the skill, its size, the budget and the bound — and the body alone is
+    checked *before* consent is asked, so nobody approves four commands and is
+    then told the turn was refused.
+  - **`teton_docs skills`** is a new bundled topic, carrying the above and the
+    fidelity note below.
+
+  **Fidelity, stated rather than faked.** Teton does not translate Claude Code
+  tool names and does not rewrite a body's references to `Agent`, `Task`,
+  `Skill`, `Workflow` or subagents — there is nothing behind them here.
+  Prompt-template skills work. A skill that dispatches subagents or invokes
+  other skills (`/proceed`, `/sprint`, `/analyze`) degrades to what one model
+  with `read`/`edit`/`glob`/`grep`/`shell` can do, and **stalls** at its first
+  "invoke the skill" step.
+
+- **A turn is assembled to fit the model it is routed to (REQ-586).** Every
+  turn — local or remote — used to run under one budget sized for the local
+  engine: 4,096 words and 32,768 bytes, whatever window the provider actually
+  had. A prompt that did not fit had its oldest blocks dropped and its newest
+  message middle-elided in place, and nothing told you. The budget is now a
+  property of the **route**, derived once where the route is decided:
+
+  - **Declare a window.** `teton provider add … --max-context <tokens>`, with
+    an optional `--context-budget-cap <tokens>` to hold a large window to a
+    smaller budget. `/provider setup` records the window from the shipped
+    recipe when you take that recipe's example model, and `config/set` carries
+    both keys. The recipes now ship verified windows: Anthropic
+    `claude-opus-5` 1,000,000, OpenAI `gpt-5.6` 1,050,000, Moonshot `kimi-k3`
+    1,000,000, DeepSeek `deepseek-v4-pro` 1,000,000, xAI `grok-4.6` 500,000,
+    and Ollama `llama3.2` 4,096 — Ollama's *served* default, not the model
+    card's 128k, and a declared window below the local default legitimately
+    yields a smaller budget.
+  - **Two currencies, and the bound is named.** A remote budget is
+    `(window − 1,024) × 2/3` words and `(window − 1,024) × 2` bytes; on a
+    remote route it is the byte guard that binds for prose and for code.
+    `/verbose` ends the route line with
+    `· budget 665,984 words / 2 MB (bound: window)` — one of `window`,
+    `unknown window`, `redact scan`, `user cap`, `local engine`.
+  - **Nothing is clamped in silence.** A new `context_pressure` event, and one
+    CLI line that is never gated by `/verbose`, whenever blocks are dropped, a
+    block is elided in place, or the context is re-fitted after a mid-turn
+    reroute. An elided *newest* message is additionally a notice in the turn's
+    own output. The in-prompt elision marker now names the route's window
+    instead of always saying "local context window".
+  - **`teton doctor` and `teton provider list` show the window.** A `window:`
+    column on every provider row — `1m`, `unknown — context budget defaulted
+    (set capabilities.max_context)`, or `(local engine)` — plus a doctor
+    advisory for a provider that declares none, and for a
+    `context_budget_cap` at or above its window (inert rather than invalid).
+  - **A provider's "context length exceeded" is a typed outcome** (RPC
+    `-32022`) naming the window and the assembled size. It does not retry, it
+    does not fail over, and it does not count against the provider's health.
+  - **`teton_docs context`** is a new bundled topic carrying all of the above,
+    including the number worth knowing: the budget bounds one model **call**,
+    and a single prompt may make up to 25 of them.
+
+  With `[privacy] redact = true` the byte budget is additionally held to what
+  the redact scan can cover (≈89 KB) and the bound reads `redact scan`; the
+  word figure stays window-derived.
+
+### Changed
+
+- **The `digest` threshold scales with the route (REQ-586).** A tool result is
+  condensed above the same ≈36.6% of the route's budget it has always been,
+  rather than a fixed 1,500 words / 12,000 bytes — capped on every route at
+  20,000 words / 160 KiB, so one enormous result is still digested. The local
+  tier's numbers are byte-identical to before. Compaction still fires at 70%
+  of either budget, and the `compact` duty's own prompt stays bounded to the
+  local engine's window as the conversation grows.
+
+### Upgrade notes
+
+- **REQ-585 adds commands, not settings.** No config is rewritten and nothing
+  is watched: discovery is four globs at launch and on `/cd`, a missing
+  directory costs nothing, and a machine with no `~/.claude` sees a `/help`
+  byte-identical to the one it has now. Nothing in a discovered file can change
+  a permission level, a route or a boundary.
+- **One privacy consequence to know before you invoke one.** A skill file rides
+  its turn as a source, and dynamic-context output is unattributed exactly as
+  `shell` output is — so on a machine with a privacy boundary configured, an
+  invocation that ran a dynamic command **pins that turn to this machine**.
+  Every one of the ADLC toolkit's seventeen skills runs one (the ethos
+  include), so on such a machine they are all pinned to the local tier; the
+  seven that exceed the local budget are then refused there rather than served
+  remotely. There is no "run without dynamic context" option in this version.
+- **REQ-586 moves no data and rewrites no config**: a provider with no declared
+  window behaves exactly as it did, under the default budget — the difference
+  is that Teton now says so instead of leaving you to guess.
+- The protocol fields are **additive** and `PROTOCOL_VERSION` has not moved,
+  so mixed builds degrade rather than break. An older **CLI** against this
+  daemon ignores `max_context`, `context_budget_cap`, `budget_tokens`,
+  `budget_bytes` and `bound`, and drops the `context_pressure` event; its
+  route line is byte-for-byte the pre-REQ-586 one. An older **daemon** behind
+  this CLI reports no window at all, and the row reads `window: not reported`
+  rather than claiming one is unset. And an older client re-registering a
+  provider cannot zero a window you declared: the registration merges these
+  fields, so an absent value preserves what is stored.
+
 ## [0.1.23] - 2026-08-19
 
 ### Added
@@ -67,6 +203,23 @@ user having asked for it.
   that cannot be automated — that no Media / Photos / "other apps" dialog
   appears during a `~`-rooted search — is a runbook step in
   `docs/manual-verification.md`.
+
+### Fixed
+
+- **A skill from a repository outside your home folder no longer puts that
+  repository's absolute path in the transcript (BUG-187).** REQ-585 promised a
+  skill's file is always shown *relative* — never as an absolute path carrying
+  a username or the location of your working tree — but the daemon could only
+  shorten paths under `$HOME`. For a checkout anywhere else (a CI workspace, an
+  external volume, `/tmp`) a **project** skill's file was rendered in full:
+  `/srv/build/app/.claude/skills/validate/SKILL.md`, on the invocation's
+  `/verbose` line, in `/help`'s skipped list, and — the one that leaves the
+  machine — in the preamble of the prompt the turn sends. A project skill is
+  now spelled from the session root (`.claude/skills/validate/SKILL.md`) and a
+  user skill from your home folder (`~/.claude/skills/…`), whichever directory
+  the session stands in. Both are still bounded to 80 characters, and the
+  invocation event still never carries the skill's body. REQ-585 has not been
+  in a release, so nothing that already shipped behaved this way.
 
 ## [0.1.22] - 2026-08-18
 

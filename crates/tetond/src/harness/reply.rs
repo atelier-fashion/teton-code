@@ -49,12 +49,26 @@ use teton_inference::ChatFormat;
 /// match, so listing only the latter left the MCP envelope forgeable on the
 /// output side while the input side already defused it — the gap BUG-149
 /// closes.
+/// `<skill-body` is the REQ-587 BR-4 instructions frame the `skill` tool writes
+/// around an expansion ([`super::tools::skill::SkillFrame`]). A model that emits
+/// one flush-left is claiming the harness handed it a skill body it never
+/// invoked — the fabrication axis, with the frame that says *follow this*
+/// instead of the one that says *this is data*, which makes it the more
+/// valuable one to forge, not the less.
+/// `<skill-arguments` ([`super::tools::skill::ARGS_OPEN_TAG`]) is the sub-frame
+/// that marks a region of an expansion as the **caller's** argument text rather
+/// than the file's instructions. It is listed for the same reason and with the
+/// opposite payoff: a model that emits one is not claiming to hold a skill body
+/// but re-drawing the line inside one the harness already wrote, which is how a
+/// forged region ends up outside the "this is data" sentence.
 pub(super) const FLAT_ANCHORED_MARKERS: &[&str] = &[
     "User:",
     "Assistant:",
     "Tool (",
     "<tool-result",
     "<mcp-tool-result",
+    "<skill-body",
+    "<skill-arguments",
 ];
 
 /// Line-anchored fabrication markers for the ChatML rendering (REQ-554 BR-4,
@@ -71,6 +85,8 @@ pub(super) const FLAT_ANCHORED_MARKERS: &[&str] = &[
 pub(super) const CHATML_ANCHORED_MARKERS: &[&str] = &[
     "<tool-result",
     "<mcp-tool-result",
+    "<skill-body",
+    "<skill-arguments",
     super::context::TOOL_RESULT_LABEL_PREFIX,
 ];
 
@@ -191,6 +207,11 @@ fn tool_call_name(value: &Value) -> Option<&str> {
 /// Parse a model reply into a tool call, an end-of-turn answer, or a malformed
 /// call. A reply is a tool call only if it contains a JSON object with a `tool`
 /// (or `name`) key; anything else is treated as the final answer.
+///
+/// The one reader of the reply grammar for **both** sources: the local tier's
+/// text is always read here, and a remote provider's prose is read here when
+/// the provider sent no native call (BUG-180) — the system prompt teaches
+/// every model this grammar, so a call written in it is a call whoever wrote it.
 pub(crate) fn parse_reply(text: &str, known_tools: &[&str]) -> ParsedReply {
     let spans = json_object_spans(text);
     let mut first_call: Option<(usize, usize, ParsedTurn)> = None;

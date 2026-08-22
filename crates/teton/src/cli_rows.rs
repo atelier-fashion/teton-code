@@ -789,6 +789,7 @@ mod tests {
             auto_accept_model: false,
             typed_input,
             session_id: None,
+            skills: crate::slash::SkillSnapshot::empty(),
         }
     }
 
@@ -916,6 +917,31 @@ mod tests {
                     "https://x/v1/chat/completions",
                     "--model",
                     "kimi-k3",
+                ],
+            ),
+            // REQ-586 BR-3: the window flags are part of the same grammar, so
+            // the session spelling has to reach the same parse as the shell's.
+            // A flag added to the clap tree but not to the mirrored row would
+            // be a command a user can run in one place and not the other.
+            (
+                "teton provider add",
+                "kimi --kind openai-compatible --endpoint https://x/v1/chat/completions \
+                 --model kimi-k3 --max-context 128000 --context-budget-cap 40000",
+                vec![
+                    "teton",
+                    "provider",
+                    "add",
+                    "kimi",
+                    "--kind",
+                    "openai-compatible",
+                    "--endpoint",
+                    "https://x/v1/chat/completions",
+                    "--model",
+                    "kimi-k3",
+                    "--max-context",
+                    "128000",
+                    "--context-budget-cap",
+                    "40000",
                 ],
             ),
         ] {
@@ -1563,6 +1589,9 @@ mod tests {
                     endpoint: Some("https://api.moonshot.ai/v1/chat/completions".to_owned()),
                     model: Some("kimi-k3".to_owned()),
                     auth_ref: Some("keychain://teton/kimi".to_owned()),
+                    max_context: None,
+                    context_budget_cap: None,
+                    floored_budget: None,
                 }],
                 ..Default::default()
             },

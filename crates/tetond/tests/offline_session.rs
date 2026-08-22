@@ -222,7 +222,7 @@ async fn offline_read_edit_verify_completes_with_zero_egress() {
     assert!(!hook.seen.is_empty());
     assert!(hook.seen.iter().all(|p| matches!(
         p,
-        Provenance::System | Provenance::User | Provenance::Model | Provenance::Tool { .. }
+        Provenance::System | Provenance::User { .. } | Provenance::Model | Provenance::Tool { .. }
     )));
 
     // The session broadcast streaming updates (agent messages + tool status).
@@ -507,7 +507,7 @@ async fn an_offline_session_serves_a_teton_docs_topic_with_zero_egress() {
     assert!(!hook.seen.is_empty());
     assert!(hook.seen.iter().all(|p| matches!(
         p,
-        Provenance::System | Provenance::User | Provenance::Model | Provenance::Tool { .. }
+        Provenance::System | Provenance::User { .. } | Provenance::Model | Provenance::Tool { .. }
     )));
 
     // The context the *next* turn would carry names no source at all: the body

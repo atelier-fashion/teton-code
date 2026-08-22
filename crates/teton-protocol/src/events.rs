@@ -29,7 +29,12 @@
 //! makes against a registered provider. REQ-583 adds `session_root_changed`
 //! (BR-7), which announces that a live session's root moved on the user's
 //! `/cd` — always beside a `context_cleared`, since the move clears the
-//! conversation.
+//! conversation. REQ-586 adds `context_pressure` (BR-7), which announces that
+//! the context gate dropped blocks, elided one in place, or re-fitted the
+//! conversation to a new route's budget — nothing is clamped in silence.
+//! REQ-585 adds `skill_invoked` (BR-12), which announces that a user-typed
+//! `/name` expanded into a prompt turn, and carries what the echo line and
+//! `/verbose` render — never the body, which stays in the file.
 //!
 //! This list is an index, not decoration: a new variant of [`Event`] that is not
 //! named here makes the paragraph above wrong.
@@ -37,7 +42,7 @@
 use serde::{Deserialize, Serialize};
 
 use crate::effort::ResolvedEffort;
-use crate::methods::{ProviderHealth, ProviderTestOutcome, SessionRoot, TierBinding};
+use crate::methods::{ProviderHealth, ProviderTestOutcome, SessionRoot, SkillSource, TierBinding};
 use crate::{
     Category, ClientKind, Phase, ProtocolVersion, ProviderId, ProviderKind, RequestId, SessionId,
     Tier, TurnId,
@@ -181,6 +186,11 @@ pub enum Event {
     ProviderTested(ProviderTested),
     /// The user moved a live session's root with `/cd` (REQ-583 BR-7).
     SessionRootChanged(SessionRootChanged),
+    /// The context gate dropped, elided, or re-fitted conversation to a
+    /// turn's budget (REQ-586 BR-7).
+    ContextPressure(ContextPressure),
+    /// A user-typed `/name` expanded into a prompt turn (REQ-585 BR-12).
+    SkillInvoked(SkillInvoked),
 }
 
 impl Event {
@@ -218,6 +228,8 @@ impl Event {
             Event::TurnQueued(_) => "turn_queued",
             Event::ProviderTested(_) => "provider_tested",
             Event::SessionRootChanged(_) => "session_root_changed",
+            Event::ContextPressure(_) => "context_pressure",
+            Event::SkillInvoked(_) => "skill_invoked",
         }
     }
 }
@@ -407,6 +419,45 @@ pub struct RouteDecided {
     /// (BR-6).
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub effort: Option<ResolvedEffort>,
+    /// The word budget this route attempt's context was fitted to (REQ-586
+    /// BR-8) — the `HarnessConfig` pair's token half, as the router derived it
+    /// for this attempt, never recomputed by a surface.
+    ///
+    /// `Option` is for **wire additivity only**, exactly as [`Self::effort`]:
+    /// a daemon that has this field always populates it, a frame from a daemon
+    /// predating it carries no key and reads `None`, and a client predating it
+    /// ignores a key serde does not require it to know — so this moves neither
+    /// [`crate::PROTOCOL_VERSION`] nor [`crate::PROTOCOL_VERSION_MIN`].
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub budget_tokens: Option<u64>,
+    /// The byte budget of the same attempt — the pair's other half. Both
+    /// currencies ride the event because on a remote route the byte guard is
+    /// what binds for prose and code, and the word figure alone would overstate
+    /// what fits (architecture "Derivation"). Same additivity as
+    /// [`Self::budget_tokens`].
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub budget_bytes: Option<u64>,
+    /// Which constraint bound the budget (REQ-586 BR-8) — computed once, where
+    /// the route is decided, and what `/verbose`, `/doctor`, `context_pressure`
+    /// and every refusal read. Same additivity as [`Self::budget_tokens`].
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub bound: Option<BudgetBound>,
+    /// Whether the derivation had to **raise** this attempt's pair to its floor
+    /// — so [`Self::bound`] names what the user declared, and the budget above
+    /// is larger than that declaration asked for (REQ-586 TASK-194 2b).
+    ///
+    /// The floor is the smallest budget that can still hold the harness's own
+    /// system prompt. A `context_budget_cap` of 500 on a 200k provider derives
+    /// *below* it, so the pair is raised and the turn gets more room than the
+    /// cap asked for — a bound reported as `user cap` with nothing beside it
+    /// would be a surface claiming a ceiling that is not in force. Rendered as
+    /// a clause on the `/verbose` route line and on every pressure line; the
+    /// remedy (`/doctor`'s advisory) reads the same fact off the snapshot.
+    ///
+    /// Same additivity as [`Self::budget_tokens`]: a daemon that has this field
+    /// always populates it, and `None` means a daemon that predates it.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub bound_floored: Option<bool>,
 }
 
 // ---------------------------------------------------------------------------
@@ -1106,6 +1157,171 @@ pub struct PermissionRequest {
     pub description: Option<String>,
     /// The choices offered to the user.
     pub options: Vec<PermissionOption>,
+    /// What is being consented to, as a **structure** rather than a sentence
+    /// (REQ-585 BR-11, architecture ADR-7).
+    ///
+    /// Absent on every request a pre-REQ-585 daemon raises and on every
+    /// ordinary tool prompt, so this is additive and moves no version. Present
+    /// when the client must be able to recognize the request **without parsing
+    /// the permission key**: BR-11 says so outright, because the key's
+    /// `skill:<source>:<name>` shape is an implementation detail and a client
+    /// sniffing an unstable string would mis-fire in the one direction that
+    /// costs a swallowed stdin line.
+    ///
+    /// It is a structure and not a [`Self::description`] string for a
+    /// mechanical reason as well: `Surface::line` destroys newlines, so "every
+    /// command of the invocation, listed verbatim" cannot ride a one-line
+    /// description — the client has to render one line per command, from a
+    /// list.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub subject: Option<PermissionSubject>,
+}
+
+/// What a [`PermissionRequest`] is about, in a form a client selects on by
+/// **kind** rather than by string (REQ-585 ADR-7).
+///
+/// [`OPTION_ID_ENABLE_PERMANENT`] is the shipped precedent for the one value a
+/// client may match by string; everything else is matched by a typed
+/// discriminant, and this is that discriminant for the *subject* of a request.
+///
+/// **Fail-closed by construction.** [`Self::Unrecognized`] exists so that a
+/// subject a client has never heard of maps to a variant it *can* see: the
+/// client refuses (with
+/// [`crate::methods::RefusalReason::UnrecognizedSubject`]) instead of falling
+/// through to `prompter.ask`, which on a pipe would read the user's next line
+/// and turn a pasted `y` into consent for shell commands. A `kind` this build
+/// does not know must therefore **deserialize**, not error — that is the whole
+/// property, and it is pinned by a test rather than left to serde's defaults.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum PermissionSubject {
+    /// A skill's dynamic-context commands, asked about **once per invocation**
+    /// with every command shown (REQ-585 BR-6).
+    SkillDynamicContext {
+        /// The skill's dispatchable name.
+        skill: String,
+        /// Which root it came from — half of the grant key, and the half that
+        /// decides whether the grant survives a `/cd` (ADR-6).
+        source: SkillSource,
+        /// Every command of this invocation, in document order, **already
+        /// substituted**: BR-4 puts `$ARGUMENTS`/`$N` substitution before
+        /// execution precisely so the consent shows what will actually run.
+        ///
+        /// Each entry is file-supplied text, bounded and rendered on one line
+        /// by the daemon and defused again by the client's `Surface`.
+        commands: Vec<String>,
+        /// Who invoked the skill whose commands these are (REQ-587 BR-5).
+        ///
+        /// BR-5 requires the consent to say **who asked**: "you asked for
+        /// `deploy`" and "the model decided to run `deploy`" are different
+        /// questions that carry the same command list, and the human at
+        /// `guarded` is entitled to know which one is on the screen.
+        ///
+        /// Additive, absent means [`InvokedBy::User`] — a request from a daemon
+        /// predating REQ-587 could only ever have been the user's, and a client
+        /// predating the field renders REQ-585's prompt unchanged. Note what
+        /// that costs and what it does not: the prompt still lists every
+        /// command verbatim under the skill's own key, so the *decision* the
+        /// user makes is the same one; only the attribution is missing.
+        #[serde(default, skip_serializing_if = "InvokedBy::is_user")]
+        invoked_by: InvokedBy,
+    },
+    /// May the model run **this repository's** skills as instructions at all
+    /// (REQ-587 BR-4, architecture ADR-7)?
+    ///
+    /// Asked once per session per root, before any expansion, under
+    /// [`crate::methods::project_skill_trust_key`] — never a skill's own key
+    /// and never a tool's name (LESSON-495: the key encodes the question).
+    /// Nothing here grants an *effect*: `shell`, `edit` and each skill's
+    /// dynamic-context key gate effects exactly as they did. What it guards is
+    /// the one channel by which repository text reaches the model labelled
+    /// *instructions* rather than *data* with no human typing its name.
+    ///
+    /// # A new variant is not additive the way a new field is
+    ///
+    /// A field a client has never heard of is ignored; a *variant* it has never
+    /// heard of lands on [`Self::Unrecognized`], and that arm is a **refusal**,
+    /// not an ignore — the client answers
+    /// [`crate::methods::RefusalReason::UnrecognizedSubject`] without asking
+    /// anyone, and the daemon tells the model `project_not_acknowledged`.
+    ///
+    /// So on a REQ-585-vintage client a project skill is **never**
+    /// model-invocable. That is a shipped consequence rather than a bug, and it
+    /// is worth stating plainly:
+    ///
+    /// - it is fail-closed, which is the entire purpose of `Unrecognized`;
+    /// - it is announced, not silent — the client prints a refusal line naming
+    ///   the request's key, and the model is given a typed refusal;
+    /// - the next step it names is one that client can actually perform:
+    ///   `/permissions full` ([`crate::permissions::PermissionLevel::Full`]),
+    ///   at which BR-4 allows a project skill with no acknowledgment at all.
+    ///   The exception is a project skill that *shadows* a user skill, which
+    ///   asks even at `full`; that one stays refused until the client
+    ///   understands this subject, and the only fix is upgrading the client.
+    ///
+    /// Pinned by `project_skill_trust_is_a_variant_an_older_client_refuses`,
+    /// because the field-additivity test does not cover a variant and would
+    /// pass while this held or failed.
+    ProjectSkillTrust {
+        /// The session root the acknowledgment is scoped to, **home-relative**
+        /// (`session_root::display_for`) and bounded — never an absolute path
+        /// carrying a username into a transcript (REQ-585 BR-1's entity table).
+        ///
+        /// It is the same spelling [`crate::methods::project_skill_trust_key`]
+        /// builds the grant key from, so what the user sees and what the answer
+        /// is remembered under cannot name two different repositories.
+        root: String,
+        /// The project's model-invocable skills, so the user is answering about
+        /// a named set rather than a category (BR-4).
+        ///
+        /// **Bounded by the daemon**, at most twenty entries: an unbounded
+        /// prompt is LESSON-517's shape, and the tail rides as `more`'s count
+        /// instead. Each `name` is file-supplied and already matched
+        /// REQ-585's `^[a-z0-9][a-z0-9_-]{0,63}$` to be registered at all; the
+        /// client defuses again at render, as it does every other file-derived
+        /// string.
+        skills: Vec<ProjectSkillTrustEntry>,
+        /// How many model-invocable project skills `skills` does not list —
+        /// the `+N more` tail, `0` when the list is complete.
+        ///
+        /// A count rather than a truncation flag: "and 5 more" and "and some
+        /// more" are different facts, and the user is being asked to trust the
+        /// whole set.
+        more: u32,
+    },
+    /// A subject this build does not know. Never constructed by a daemon —
+    /// serde produces it when the `kind` is one this build has never heard of,
+    /// which is exactly the case the client must refuse rather than guess at.
+    #[serde(other)]
+    Unrecognized,
+}
+
+/// One model-invocable project skill, as the acknowledgment prompt lists it
+/// (REQ-587 BR-4).
+///
+/// A structure and not a pre-marked sentence, on [`PermissionSubject`]'s own
+/// rule: the daemon states the facts and the client renders the line. The
+/// shadowing mark in particular (`validate (project — shadows your user
+/// skill)`) is rendered on both sides of the wire — the prompt here and the
+/// expansion's source line in the daemon's frame — and a pre-marked string
+/// would make the client's copy a re-parse of the daemon's prose (LESSON-529).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ProjectSkillTrustEntry {
+    /// The skill's dispatchable name.
+    pub name: String,
+    /// Whether a **user** skill of the same name exists, which this project
+    /// skill takes the name from (REQ-585 BR-2).
+    ///
+    /// The one case a `full` session can be surprised by, and therefore the one
+    /// case BR-4 asks about even at `full`: the model invokes `validate`
+    /// meaning the skill the user installed, and gets a body the repository
+    /// substituted. Marked in the prompt so the swap is acknowledged rather
+    /// than discovered.
+    ///
+    /// Omitted from the wire when `false` — the ordinary entry's shape, and the
+    /// `probe` rule in a second place.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub shadows_user_skill: bool,
 }
 
 /// One offered permission choice. ACP: `PermissionOption`.
@@ -2086,6 +2302,231 @@ pub struct SessionRootChanged {
 }
 
 // ---------------------------------------------------------------------------
+// context_pressure (REQ-586)
+// ---------------------------------------------------------------------------
+
+/// Which constraint bound a route attempt's context budget (REQ-586 BR-8).
+///
+/// One fact with one source: the router computes this where it decides the
+/// route, stamps it on [`RouteDecided`], and every surface — `/verbose`,
+/// `/doctor`, [`ContextPressure`], the refusal texts — reads that value rather
+/// than re-deriving it (LESSON-456: one classifier per fact). The precedence
+/// among the variants is the router's to state and test; this enum only names
+/// the outcomes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum BudgetBound {
+    /// The provider's declared context window, less the generation
+    /// reservation, is what bound the budget — the ordinary remote case.
+    Window,
+    /// The provider declared no window (`capabilities.max_context = 0`), so the
+    /// default pair applies — stated, never silent (BR-3).
+    DefaultUnknown,
+    /// `[privacy] redact = true`, and the bytes the redact scan can cover bound
+    /// the budget below what the window would have allowed (BR-4).
+    RedactScan,
+    /// The user's `capabilities.context_budget_cap` sat below the window and is
+    /// what bound the budget (BR-5).
+    UserCap,
+    /// The route is the local engine; its budget is the local pair regardless
+    /// of any declared window.
+    LocalEngine,
+}
+
+impl BudgetBound {
+    /// The wire spelling, identical to the serialized tag — [`Event::name`]'s
+    /// arrangement, one level down.
+    ///
+    /// Snake_case, because that is what the field carries; the words a person
+    /// is shown are [`BudgetBound::words`]. Kept as its own accessor so a
+    /// surface that needs the token — a log line, a machine-read `/doctor`
+    /// row — asks for it rather than reaching for `serde_json` to get a
+    /// string out of a five-way enum.
+    #[must_use]
+    pub const fn wire_name(&self) -> &'static str {
+        match self {
+            BudgetBound::Window => "window",
+            BudgetBound::DefaultUnknown => "default_unknown",
+            BudgetBound::RedactScan => "redact_scan",
+            BudgetBound::UserCap => "user_cap",
+            BudgetBound::LocalEngine => "local_engine",
+        }
+    }
+
+    /// The words the bound is **said** in: `unknown window`, not
+    /// `default_unknown`.
+    ///
+    /// One table, and it lives here rather than in the CLI because both sides
+    /// need it. The client words the `/verbose` route line and every
+    /// `context_pressure` line; the daemon words the refusals that name the
+    /// bound — REQ-585 BR-8's oversized-skill refusal is the first, and it
+    /// runs in `tetond`, which cannot reach a `teton` helper. A second table
+    /// over there would be the mirrored-predicate shape LESSON-528 is about:
+    /// identical today, and identical only until one of them is edited.
+    ///
+    /// Each spelling names the thing a user would go and change — a bound of
+    /// `unknown window` is a `capabilities.max_context` that was never set,
+    /// which is why the wire's `default_unknown` is not what is printed. The
+    /// phrases are lower-case fragments, so a caller may set them in a
+    /// sentence (`bound: user cap`) or after a colon without re-casing them.
+    #[must_use]
+    pub const fn words(&self) -> &'static str {
+        match self {
+            BudgetBound::Window => "window",
+            BudgetBound::DefaultUnknown => "unknown window",
+            BudgetBound::RedactScan => "redact scan",
+            BudgetBound::UserCap => "user cap",
+            BudgetBound::LocalEngine => "local engine",
+        }
+    }
+}
+
+/// A count with thousands separators: `4096` → `4,096` — **the one home** of
+/// how a budget's word figure is spelled (REQ-586 BR-8, LESSON-456).
+///
+/// Budgets are five- and six-digit numbers a reader compares at a glance ("did
+/// that turn really only get 4k?"), and an ungrouped `132650` is the one shape
+/// that cannot be read at a glance.
+///
+/// It lives beside [`BudgetBound::words`] and for the same reason: **both ends
+/// spell these figures**. The client words the `/verbose` route line and every
+/// `context_pressure` line; the daemon words the big-window notice its provider
+/// registration surfaces carry (`harness::budget::big_window_notice`), and it
+/// runs in `tetond`, which cannot reach a `teton` helper. Two private
+/// formatters for one figure is the mirrored-predicate shape LESSON-528 is
+/// about — identical today, and identical only until one of them is edited.
+#[must_use]
+pub fn thousands(n: u64) -> String {
+    let digits = n.to_string();
+    let mut out = String::with_capacity(digits.len() + digits.len() / 3);
+    let first = digits.len() % 3;
+    for (at, ch) in digits.chars().enumerate() {
+        if at > 0 && at % 3 == first {
+            out.push(',');
+        }
+        out.push(ch);
+    }
+    out
+}
+
+/// A byte figure for a budget line: `900 B`, `33 KB`, `4.2 MB` — **the one
+/// home** of how a budget's byte figure is spelled (REQ-586 BR-8).
+///
+/// Named for what it *is* rather than for its first caller: `budget_bytes` is
+/// the wire field's name (and one call site hands it `elided_bytes`, which is
+/// not a budget at all), so a formatter wearing that name read as an accessor.
+///
+/// **Decimal** units, and labelled as such. The CLI's `firstrun::format_bytes`
+/// is the other byte formatter in the workspace and stays where it is: it
+/// renders an *exact* download size in the binary units the daemon's own
+/// sentences use, where the tenth of a GiB is a fact about a file. A budget is
+/// an approximation with a safety ratio already baked into it, so it is rounded
+/// to whole KB and never claims a precision the number has not got — and
+/// rounding a 1024-based number under a `KB` label is the exact confusion that
+/// formatter's doc warns about, which is why this one divides by 1000.
+///
+/// Shared for [`thousands`]' reason: the daemon composes the same figures.
+#[must_use]
+pub fn bytes_figure(bytes: u64) -> String {
+    if bytes < 1_000 {
+        return format!("{bytes} B");
+    }
+    if bytes < 1_000_000 {
+        return format!("{} KB", (bytes + 500) / 1_000);
+    }
+    let tenths = (bytes + 50_000) / 100_000;
+    match tenths % 10 {
+        0 => format!("{} MB", tenths / 10),
+        frac => format!("{}.{frac} MB", tenths / 10),
+    }
+}
+
+/// What the context gate did to earn a [`ContextPressure`] event (REQ-586
+/// BR-7).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ContextPressureKind {
+    /// Older blocks were dropped from the assembled context to fit the budget.
+    BlocksDropped,
+    /// A single block was middle-elided in place because it alone exceeded the
+    /// budget.
+    BlockElided,
+    /// The conversation was re-fitted after a reroute or fallback moved the
+    /// turn to a route with a different budget (BR-1).
+    RefitOnReroute,
+    /// The gate ran and the context **still does not fit** either budget — the
+    /// turn is being sent over budget (REQ-586 verify m1, TASK-194 2a).
+    ///
+    /// Two arms of `truncate_to_budget` deliberately stop short: the in-place
+    /// clamp floors the last block's room at 1 KiB, and the drop loop stops at
+    /// one block whatever the word estimate says. Both are the right
+    /// degradation — a turn that cannot fit beats a turn with no content — and
+    /// neither may be silent.
+    ///
+    /// It has its own name because it used to ride as [`Self::BlockElided`]
+    /// with `elided_bytes: 0`, which is worse than silence: BR-7's whole claim
+    /// is that nothing is clamped without being said, and an event announced
+    /// under the wrong name says something that did not happen. A client
+    /// predating this variant drops the frame rather than mis-rendering it —
+    /// the same fail-closed choice the enum's snake_case tag makes everywhere
+    /// else — so no reader is ever told the wrong story about a context that
+    /// did not fit.
+    DidNotFit,
+}
+
+/// The context gate dropped, elided, or re-fitted conversation to a turn's
+/// budget (REQ-586 BR-7).
+///
+/// Emitted whenever `truncate_to_budget` dropped at least one block, elided a
+/// block in place, or re-fitted the context after a reroute — nothing is
+/// clamped in silence, on any tier. The CLI renders one line, never gated by
+/// `/verbose` (the [`ContextCleared`] precedent: the reset is the news), and an
+/// elision of the **newest user block** is additionally a turn notice, because
+/// that is the case where the model would answer a prompt the user did not
+/// send.
+///
+/// `budget_tokens`, `budget_bytes` and `bound` repeat the route's figures from
+/// [`RouteDecided`] so a client can render the line from this event alone,
+/// without correlating it back to the route frame.
+///
+/// The session is named by [`EventEnvelope::session_id`], not by a field here:
+/// [`Event`] is internally tagged and flattened, so a `session_id` on this
+/// struct would emit the key twice and fail to deserialize — the same shape
+/// [`ContextCleared`], [`SessionTitled`] and [`PrefixCache`] document.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ContextPressure {
+    /// What the gate did.
+    pub kind: ContextPressureKind,
+    /// How many blocks were dropped; `0` for an elision or a refit that dropped
+    /// none.
+    pub dropped_blocks: u64,
+    /// How many bytes an in-place elision removed; `0` when nothing was elided.
+    pub elided_bytes: u64,
+    /// Whether the block elided was the newest user block — the case the CLI
+    /// additionally reports as a turn notice (BR-7).
+    pub newest_user_elided: bool,
+    /// The word budget the context was fitted to.
+    pub budget_tokens: u64,
+    /// The byte budget the context was fitted to.
+    pub budget_bytes: u64,
+    /// Which constraint bound that budget — the route's, read off
+    /// [`RouteDecided::bound`], never re-derived here.
+    pub bound: BudgetBound,
+    /// Whether the derivation had to **raise** the pair to its floor, so the
+    /// bound above could not be honored as declared (REQ-586 TASK-194 2b).
+    ///
+    /// See [`RouteDecided::bound_floored`] for what the floor is and why a
+    /// bound that says `user cap` beside a budget larger than that cap is the
+    /// untruth this field exists to close.
+    ///
+    /// `#[serde(default)]` rather than `Option`: this event's other fields are
+    /// all required, and `false` is exactly what a frame from a daemon
+    /// predating the field means — that daemon floored nothing it could report.
+    #[serde(default)]
+    pub bound_floored: bool,
+}
+
+// ---------------------------------------------------------------------------
 // attach_consent_requested / attach_refused (REQ-569)
 // ---------------------------------------------------------------------------
 
@@ -2300,6 +2741,334 @@ pub struct SessionGrantMinted {
     pub attestation: String,
 }
 
+// ---------------------------------------------------------------------------
+// skill_invoked (REQ-585)
+// ---------------------------------------------------------------------------
+
+/// Who issued a skill invocation (REQ-587 BR-9).
+///
+/// Two doors, named: REQ-585 shipped the user typing `/name`, and REQ-587 adds
+/// the model calling the `skill` tool. It is what BR-9's echo line renders
+/// (`skill validate (user, 4.6 KB, 2 dynamic commands) — invoked by the
+/// model`), what BR-5's consent text says out loud, and the fact BR-4's
+/// acknowledgment turns on — a model-typed name has no human behind it at the
+/// moment of invocation, and that difference is the whole reason the
+/// acknowledgment exists.
+///
+/// **Closed**, like [`SkillSource`] and [`NotRunReason`] beside it. An
+/// externally tagged enum cannot carry serde's `other` arm, so a third invoker
+/// would be a deliberate wire change rather than a value silently read as one
+/// of these two.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum InvokedBy {
+    /// The user typed `/name` (REQ-585 BR-4).
+    ///
+    /// **The default**, because it is what every invocation a daemon predating
+    /// REQ-587 could report was.
+    #[default]
+    User,
+    /// The model called the `skill` tool (REQ-587 BR-1).
+    Model,
+}
+
+impl InvokedBy {
+    /// True for [`Self::User`].
+    ///
+    /// The `skip_serializing_if` predicate every `invoked_by` field uses: a
+    /// user invocation writes no key, so its wire stays byte-identical to the
+    /// one REQ-585 wrote and neither [`crate::PROTOCOL_VERSION`] nor
+    /// [`crate::PROTOCOL_VERSION_MIN`] moves.
+    #[must_use]
+    pub fn is_user(&self) -> bool {
+        matches!(self, Self::User)
+    }
+}
+
+/// A skill expanded into a turn — a user-typed `/name` (REQ-585 BR-12,
+/// architecture ADR-15) or, since REQ-587, a model-issued `skill` call
+/// ([`Self::invoked_by`] says which).
+///
+/// **Typed, not pre-rendered.** The CLI already knows the name and source from
+/// its `skills/list` snapshot but not the size, the ignored keys or the
+/// outcomes, so *some* event is required; making it a structure rather than a
+/// finished sentence is LESSON-544's rule — a test that builds the wire value
+/// by hand leaves the producer unguarded, and the assertion has to run against
+/// what the daemon actually emitted.
+///
+/// **Published before the second budget check, never after** (ADR-11's Stage
+/// B). A turn where the user approved four commands, watched them run, and was
+/// then refused is precisely the turn whose record matters most; emitting
+/// after a refusal would leave it with no echo line and no `/verbose`
+/// outcomes, while BR-12 says *every* invocation echoes one.
+///
+/// The **body is never here**. BR-12 says it is not printed — it is in the
+/// file — and this event is what the printing is driven from.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SkillInvoked {
+    /// The skill's dispatchable name.
+    pub name: String,
+    /// Which root it came from.
+    pub source: SkillSource,
+    /// The file it was read from, **relative and bounded** — never an absolute
+    /// path carrying a username, or the location of the user's working tree,
+    /// into a transcript (BR-1's entity table).
+    ///
+    /// Which base it is relative to follows the skill's [`SkillSource`]: a
+    /// `project` skill is spelled from the session root
+    /// (`.claude/skills/x/SKILL.md`), a `user` skill from the home folder
+    /// (`~/.claude/skills/x/SKILL.md`). The daemon derives it at discovery,
+    /// where the source, the root and `HOME` are all in hand, and bounds it
+    /// with `bounded_field` at the wire. Before BUG-187 only the home half
+    /// existed, so a project skill in a checkout outside `$HOME` — a CI
+    /// workspace, an external volume — reached this field absolute.
+    pub path_display: String,
+    /// The body's size in bytes, which is what BR-12's echo line renders
+    /// (`/status → skill status (user, 5.3 KB, 4 dynamic commands)`).
+    pub body_bytes: u64,
+    /// The frontmatter keys Teton does not honor, listed so `/verbose` can say
+    /// what was inert rather than leaving a user to infer it from behaviour
+    /// (BR-5: `allowed-tools`, `model`, `effort`, … are read and ignored).
+    pub ignored_keys: Vec<String>,
+    /// A frontmatter `name` that disagrees with the file's own name, said out
+    /// loud rather than silently ignored (BR-2).
+    ///
+    /// The spelling that dispatches is the directory or the file stem, always —
+    /// one spelling reaches one handler, REQ-555's rule. A file that declares a
+    /// different one is not wrong, it is *misleading*, and the author is the
+    /// person best placed to fix it. Additive: absent for every skill whose
+    /// declaration agrees, which is nearly all of them.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub name_note: Option<String>,
+    /// One entry per `` !`command` `` in the body, in document order.
+    ///
+    /// Empty for a skill with no dynamic context — which is a real state, not
+    /// a missing one, and is why BR-12's echo line can honestly say "0 dynamic
+    /// commands".
+    pub outcomes: Vec<DynamicOutcomeView>,
+    /// Who issued this invocation (REQ-587 BR-9).
+    ///
+    /// Additive, and **absent means [`InvokedBy::User`]**: a daemon predating
+    /// REQ-587 has no `skill` tool, so every invocation it could report was a
+    /// user typing `/name`, and the bytes it wrote are the bytes this build
+    /// writes for a user invocation — the key appears only for a model one.
+    ///
+    /// What a client built before the field loses is the `— invoked by the
+    /// model` suffix on one echo line. That is a missing adjective, not a
+    /// missing guard: the guard is BR-4's acknowledgment, which the daemon
+    /// settles before an expansion exists, and an old client cannot reach a
+    /// model-invoked *project* skill at all (see
+    /// [`PermissionSubject::ProjectSkillTrust`]).
+    #[serde(default, skip_serializing_if = "InvokedBy::is_user")]
+    pub invoked_by: InvokedBy,
+    /// Whether a **user** skill of this name lost its spelling to this one
+    /// (REQ-587 BR-9).
+    ///
+    /// BR-9's echo line names it — `skill validate (project — shadows your user
+    /// skill, …)` — and `/verbose` repeats it. Carried rather than derived,
+    /// because the only surface that could derive it is the client, and the
+    /// registry snapshot lives on its `UiContext` while `render_event` sees
+    /// only `SessionState`. A renderer that reached for the snapshot would be
+    /// answering a question about *this* invocation from a value that may have
+    /// moved under a `/cd` since.
+    ///
+    /// Additive, and **absent means `false`**: a daemon predating the field
+    /// wrote nothing, and "nothing is shadowed" is the state nearly every
+    /// invocation is in.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub shadows_user_skill: bool,
+    /// Whether the model may reach this skill through the `skill` tool — the
+    /// frontmatter flag as the file wrote it (REQ-587 BR-3, BR-9's `/verbose`).
+    ///
+    /// Additive in the one direction that keeps the wire byte-identical:
+    /// absent means `true`, which is what every skill a pre-REQ-587 daemon
+    /// could report was, because that daemon had no flag to read.
+    #[serde(default = "invocable_by_default", skip_serializing_if = "is_invocable")]
+    pub model_invocable: bool,
+    /// Whether the user may dispatch this skill by typing `/name` — the other
+    /// frontmatter flag, on the same additive terms as
+    /// [`Self::model_invocable`].
+    #[serde(default = "invocable_by_default", skip_serializing_if = "is_invocable")]
+    pub user_invocable: bool,
+    /// How many `skill` calls this turn has spent, and the ceiling
+    /// (REQ-587 BR-6a, BR-9's `/verbose`).
+    ///
+    /// `None` for a user-typed `/name`, and that is a *fact* rather than an
+    /// omission: the per-turn cap bounds the **model's** invocations inside one
+    /// prompt turn, and a human typing a slash command spends none of it. A
+    /// renderer showing "1 of 12" there would be inventing a budget the user
+    /// is not drawing on.
+    ///
+    /// The cap travels with the count because it is a daemon constant: a client
+    /// that hardcoded 12 would print a stale ceiling the day it moves.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub turn_invocations: Option<TurnInvocations>,
+    /// Why this invocation was **refused**, as the stable reason id the model
+    /// was given — or `None` when it ran (REQ-587 BR-9).
+    ///
+    /// # A refused call and a command-free skill are otherwise the same bytes
+    ///
+    /// Every other field on this event describes a skill that *expanded*: the
+    /// name, the file, the body's size, the commands' outcomes. A refusal
+    /// carries all of them and an empty `outcomes` — which is byte-identical to
+    /// a skill with no dynamic context that ran perfectly. Without this field a
+    /// client renders the two the same, so BR-9's "a refusal is never silent"
+    /// is met by a line that reports the opposite of what happened, which is
+    /// worse than silence.
+    ///
+    /// # The reason, not a bool
+    ///
+    /// BR-9 asks for one line per typed refusal **naming the reason**. A bare
+    /// flag would make every client re-derive one, and there is nothing on the
+    /// event to derive it from. The value is the same stable id the model
+    /// reads at the head of its refusal sentence — `over_budget`,
+    /// `per_turn_cap`, `repeated`, `not_model_invocable` — so the human and the
+    /// model are told the same word, and a suite asserts an id rather than a
+    /// phrase that reads differently next month.
+    ///
+    /// `unknown_skill` is deliberately **not** among those examples: it is one
+    /// of the two ids this field can never carry. A refusal record describes a
+    /// registry row — a source, a path, a size — and `unknown_skill` names no
+    /// row, so the daemon publishes nothing rather than a hollow record that
+    /// would have to invent one. `invalid_arguments` is the other, for the same
+    /// reason from the other end: the call whose parse failed named no skill.
+    ///
+    /// **Daemon-authored, never file-authored**, which is what makes a `String`
+    /// safe here on `name_note`'s precedent: the ids come from the daemon's own
+    /// typed refusal set, and the publish site bounds the value like every
+    /// other string on this event. It is a `String` rather than a closed enum
+    /// because the refusal set is still growing — the daemon raises its reasons
+    /// from several layers (the tool, the turn's bookkeeping, the loop's budget
+    /// stages), and a variant per reason would be a wire commitment made ahead
+    /// of a set that is not settled. Two of today's ids (`unknown_skill`,
+    /// `invalid_arguments`) are not published on this event at all, for the
+    /// reason above; the rest are, and the next one added will be too, without
+    /// a wire change.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub refused: Option<String>,
+}
+
+/// The serde default for an invocation flag: absent means permitted.
+///
+/// A free function rather than an inline literal because `serde(default = …)`
+/// takes a path, and the same one is named by both flags — one reading of "the
+/// pre-REQ-587 world allowed both".
+fn invocable_by_default() -> bool {
+    true
+}
+
+/// The `skip_serializing_if` predicate both invocation flags use: a permitted
+/// flag writes no key, so an ordinary skill's wire stays byte-identical to the
+/// one REQ-585 wrote.
+#[allow(clippy::trivially_copy_pass_by_ref)]
+fn is_invocable(value: &bool) -> bool {
+    *value
+}
+
+/// A turn's `skill` invocation count against the per-turn cap (REQ-587 BR-6a).
+///
+/// Two numbers rather than two optional fields, so a skew that carried the
+/// count without the ceiling — or the reverse — is not representable. `/verbose`
+/// renders them as one phrase, and they are only ever true together.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TurnInvocations {
+    /// How many `skill` calls this turn has made, **including this one**.
+    ///
+    /// Every call counts — expansion, listing or typed refusal — because a
+    /// refusal that cost nothing would make a loop of refusals unbounded.
+    pub count: u32,
+    /// The most this turn may make.
+    pub cap: u32,
+}
+
+/// What became of one `` !`command` `` (REQ-585 BR-6, BR-12).
+///
+/// A **typed** outcome, never prose a renderer parses (the spec's System Model
+/// says so in as many words): the daemon composes the placeholder that goes
+/// into the turn, and this is the parallel record the surface renders. The two
+/// are deliberately not the same string — a client that had to re-parse
+/// `[dynamic context not run: … — declined]` to count what ran would be a
+/// second parser of the daemon's own sentence (LESSON-529).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DynamicOutcomeView {
+    /// The command as it was considered, **after** `$ARGUMENTS`/`$N`
+    /// substitution (BR-4 precedes BR-6, so this is what the consent showed).
+    ///
+    /// File-supplied bytes: bounded and rendered on one line by the daemon,
+    /// defused again by the client's `Surface`. It is echoed into the not-run
+    /// placeholder too, which is why the expander neutralizes envelope tags in
+    /// it — at `plan`, where no command runs, the raw command text is the part
+    /// that reaches the model (ADR-10).
+    pub command: String,
+    /// How it ended.
+    pub outcome: DynamicOutcome,
+}
+
+/// The four ways a dynamic-context command can end (REQ-585 BR-6).
+///
+/// Only the first one puts anything in the turn; the other three leave an
+/// explicit placeholder, because BR-6's rule is that the model is **told** what
+/// it does not have rather than left to read a gap. None of them fails the
+/// invocation.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum DynamicOutcome {
+    /// Ran to completion and its stdout was inlined.
+    Ran {
+        /// How many bytes of stdout were inlined, after the cap.
+        output_bytes: u64,
+        /// Whether the `shell` tool's `MAX_OUTPUT_CHARS` cut it short — the
+        /// model is reading a prefix, and the surface says so.
+        truncated: bool,
+    },
+    /// Never started, and why.
+    NotRun {
+        /// Which door was closed.
+        reason: NotRunReason,
+    },
+    /// Ran and exited non-zero.
+    Failed {
+        /// The exit status, or `None` when the process was killed by a signal
+        /// and there is none to report.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        exit_status: Option<i32>,
+    },
+    /// Killed at the `shell` tool's timeout.
+    TimedOut,
+}
+
+/// Why a dynamic-context command was never started (REQ-585 BR-6, BR-11).
+///
+/// Four closed doors rather than one, because the placeholder the model reads
+/// says which: "the user declined" and "no human could be asked" are different
+/// facts about the same missing output, and AC-9 requires the pipe case to say
+/// so explicitly.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum NotRunReason {
+    /// The user was asked and said no.
+    Declined,
+    /// The session's permission level does not run them at all (`plan`).
+    Level,
+    /// There was no terminal to ask at — piped stdin at a level that would ask
+    /// (BR-11). The client refused **without reading stdin**, so the user's
+    /// next line stayed their next prompt.
+    NoTerminal,
+    /// The client did not recognize the request's [`PermissionSubject`] and
+    /// refused rather than guessing (ADR-7).
+    UnrecognizedSubject,
+    /// Consent was given and the command still never started — the shell was
+    /// missing, the jail root could not be resolved, the spawn failed.
+    ///
+    /// The one arm that is **not** a closed door. It exists because the other
+    /// four are all answers to "who said no", and reporting a command that
+    /// never ran as [`DynamicOutcome::Failed`] instead would tell a reader it
+    /// was attempted and exited — a false statement on `/verbose`, and one that
+    /// points at the wrong fix. What went wrong here is on this machine, not in
+    /// anybody's answer.
+    CouldNotStart,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2376,6 +3145,10 @@ mod tests {
             model: Some("opus".to_owned()),
             reason: "architecture phase routes to the frontier tier".to_owned(),
             effort: Some(ResolvedEffort::effort(crate::effort::EffortLevel::Xhigh)),
+            budget_tokens: Some(132_650),
+            budget_bytes: Some(397_952),
+            bound: Some(BudgetBound::Window),
+            bound_floored: None,
         }));
         // Flattened: envelope metadata and the payload share one object.
         assert_eq!(wire["event"], "route_decided");
@@ -2387,6 +3160,11 @@ mod tests {
         // REQ-559 AC-4: the event names the effective effort.
         assert_eq!(wire["effort"]["kind"], "effort");
         assert_eq!(wire["effort"]["level"], "xhigh");
+        // REQ-586 BR-8: the event names the budget and its bound, in the flat
+        // object, under the spec's snake_case spellings.
+        assert_eq!(wire["budget_tokens"], 132_650);
+        assert_eq!(wire["budget_bytes"], 397_952);
+        assert_eq!(wire["bound"], "window");
     }
 
     #[test]
@@ -2403,6 +3181,10 @@ mod tests {
                     model: None,
                     reason: "r".to_owned(),
                     effort: None,
+                    budget_tokens: None,
+                    budget_bytes: None,
+                    bound: None,
+                    bound_floored: None,
                 }),
                 "route_decided",
             ),
@@ -2476,6 +3258,7 @@ mod tests {
                     tool_name: "shell".to_owned(),
                     description: None,
                     options: vec![],
+                    subject: None,
                 }),
                 "permission_request",
             ),
@@ -2578,6 +3361,43 @@ mod tests {
                     },
                 }),
                 "session_root_changed",
+            ),
+            (
+                Event::ContextPressure(ContextPressure {
+                    kind: ContextPressureKind::BlocksDropped,
+                    dropped_blocks: 3,
+                    elided_bytes: 0,
+                    newest_user_elided: false,
+                    budget_tokens: 4_096,
+                    budget_bytes: 32_768,
+                    bound: BudgetBound::LocalEngine,
+                    bound_floored: false,
+                }),
+                "context_pressure",
+            ),
+            (
+                Event::SkillInvoked(SkillInvoked {
+                    name: "status".to_owned(),
+                    source: SkillSource::User,
+                    path_display: "~/.claude/skills/status/SKILL.md".to_owned(),
+                    body_bytes: 5_432,
+                    ignored_keys: vec!["allowed-tools".to_owned()],
+                    name_note: None,
+                    outcomes: vec![DynamicOutcomeView {
+                        command: "git branch --show-current".to_owned(),
+                        outcome: DynamicOutcome::Ran {
+                            output_bytes: 19,
+                            truncated: false,
+                        },
+                    }],
+                    invoked_by: InvokedBy::User,
+                    shadows_user_skill: false,
+                    model_invocable: true,
+                    user_invocable: true,
+                    turn_invocations: None,
+                    refused: None,
+                }),
+                "skill_invoked",
             ),
         ];
 
@@ -2713,6 +3533,216 @@ mod tests {
         assert!(wire["root"].get("vcs_branch").is_none(), "{wire}");
     }
 
+    /// **REQ-586 BR-7's wire half.** A clamp reaches a client as a flat
+    /// `context_pressure` object naming its session, what the gate did, how
+    /// much, and the budget it fitted to with its bound — and survives the
+    /// round trip unchanged.
+    ///
+    /// `session_id` is asserted on the wire object rather than on the payload
+    /// for [`ContextCleared`]'s reason: the envelope is what carries it, and
+    /// `envelope_wire` round-trips before returning, so re-adding `session_id`
+    /// to [`ContextPressure`] fails here on the duplicate key rather than
+    /// reaching a client. The payload's own keys are asserted absent of a
+    /// `session_id` for the same reason, from the other side.
+    ///
+    /// All three kinds ride along, spelled out, so a fourth has to be added
+    /// here by hand — and the zero counts survive as numbers rather than being
+    /// skipped as defaults, because "re-fitted and dropped nothing" is a real
+    /// report.
+    #[test]
+    fn context_pressure_round_trips_under_its_wire_name() {
+        let pressure = ContextPressure {
+            kind: ContextPressureKind::BlocksDropped,
+            dropped_blocks: 3,
+            elided_bytes: 0,
+            newest_user_elided: false,
+            budget_tokens: 4_096,
+            budget_bytes: 32_768,
+            bound: BudgetBound::LocalEngine,
+            bound_floored: false,
+        };
+        round_trip(&pressure);
+
+        let wire = envelope_wire(Event::ContextPressure(pressure));
+        assert_eq!(wire["event"], "context_pressure");
+        assert_eq!(wire["session_id"], "s1");
+        assert_eq!(wire["kind"], "blocks_dropped");
+        assert_eq!(wire["dropped_blocks"], 3);
+        assert_eq!(wire["elided_bytes"], 0);
+        assert_eq!(wire["newest_user_elided"], false);
+        assert_eq!(wire["budget_tokens"], 4_096);
+        assert_eq!(wire["budget_bytes"], 32_768);
+        assert_eq!(wire["bound"], "local_engine");
+        let payload = serde_json::to_value(pressure).unwrap();
+        assert!(
+            payload.get("session_id").is_none(),
+            "the envelope names the session, the payload must not: {payload}"
+        );
+
+        assert_eq!(Event::ContextPressure(pressure).name(), "context_pressure");
+
+        // The elision of the newest user block — the case that is additionally
+        // a turn notice — and the refit, which may have dropped nothing.
+        for (kind, spelling) in [
+            (ContextPressureKind::BlockElided, "block_elided"),
+            (ContextPressureKind::RefitOnReroute, "refit_on_reroute"),
+        ] {
+            let pressure = ContextPressure {
+                kind,
+                dropped_blocks: 0,
+                elided_bytes: 1_024,
+                newest_user_elided: true,
+                budget_tokens: 84_650,
+                budget_bytes: 253_952,
+                bound: BudgetBound::RedactScan,
+                bound_floored: false,
+            };
+            round_trip(&pressure);
+            let wire = envelope_wire(Event::ContextPressure(pressure));
+            assert_eq!(wire["kind"], spelling, "{wire}");
+            assert_eq!(
+                wire["dropped_blocks"], 0,
+                "a refit that dropped nothing must still say so on the wire"
+            );
+            assert_eq!(wire["elided_bytes"], 1_024);
+            assert_eq!(wire["newest_user_elided"], true);
+            assert_eq!(wire["bound"], "redact_scan");
+        }
+    }
+
+    /// **The one home's golden table** (REQ-586 BR-8): both figure formatters,
+    /// at every boundary that decides a unit.
+    ///
+    /// It lives here because [`thousands`] and [`bytes_figure`] live here. When
+    /// they were lifted out of the CLI so the daemon and the CLI could not word
+    /// the same figure two ways, the table pinning them stayed behind in
+    /// `session_ui.rs` — so `cargo test -p teton-protocol` was green with the KB
+    /// rounding removed, and the only thing standing between a wrong budget
+    /// figure and a release was a test in a different crate. A formatter and the
+    /// numbers that pin it belong in one place.
+    ///
+    /// The boundaries are the point, not the samples: 999/1,000 is where `B`
+    /// becomes `KB`, 999,999 is the one that must **not** round up into `MB`
+    /// (`1000 KB`, deliberately), 1,000,000 is where `MB` starts, and 32,768 is
+    /// the default byte budget — the figure a reader sees most often.
+    #[test]
+    fn budget_figures_are_grouped_and_scaled() {
+        assert_eq!(thousands(0), "0");
+        assert_eq!(thousands(999), "999");
+        assert_eq!(thousands(4_096), "4,096");
+        assert_eq!(thousands(132_650), "132,650");
+        assert_eq!(thousands(1_050_000), "1,050,000");
+
+        assert_eq!(bytes_figure(0), "0 B");
+        assert_eq!(bytes_figure(999), "999 B");
+        assert_eq!(bytes_figure(1_000), "1 KB");
+        assert_eq!(bytes_figure(32_768), "33 KB");
+        assert_eq!(bytes_figure(999_999), "1000 KB");
+        assert_eq!(bytes_figure(1_000_000), "1 MB");
+        assert_eq!(bytes_figure(4_200_000), "4.2 MB");
+    }
+
+    /// **TASK-194 2a/2b, both directions of the additive rule.**
+    ///
+    /// `did_not_fit` is a fourth kind with its own wire spelling — the case
+    /// that used to ride as `block_elided` with a zero for a tell — and
+    /// `bound_floored` is a fifth field with a `false` default. The two
+    /// directions are asserted rather than assumed, and they are **not
+    /// symmetric**, which the name says out loud:
+    ///
+    /// * **older daemon → this client**: additive and lossless. A frame with no
+    ///   `bound_floored` key reads `false`, so the line renders exactly as it
+    ///   did before.
+    /// * **newer daemon → older client**: the frame is *dropped*. An
+    ///   unrecognized `kind` is a refusal to deserialize, never a silent
+    ///   coercion into a neighbouring variant — the fail-closed half of BR-7,
+    ///   since a client that cannot name what happened must say nothing rather
+    ///   than say the wrong thing, and it is why `did_not_fit` needed a new
+    ///   spelling instead of reusing one. It is also a real cost, recorded as
+    ///   this REQ's forward-compat residual: a released client predating the
+    ///   variant shows a user *nothing* for an over-budget turn. Nothing is a
+    ///   worse answer than the old wrong one only if the wrong one was
+    ///   actionable, and "a block was elided by 0 bytes" was not.
+    #[test]
+    fn a_context_that_did_not_fit_has_its_own_kind_and_an_older_client_drops_the_frame() {
+        let pressure = ContextPressure {
+            kind: ContextPressureKind::DidNotFit,
+            dropped_blocks: 0,
+            elided_bytes: 0,
+            newest_user_elided: false,
+            budget_tokens: 2_048,
+            budget_bytes: 16_384,
+            bound: BudgetBound::UserCap,
+            bound_floored: true,
+        };
+        round_trip(&pressure);
+        let wire = envelope_wire(Event::ContextPressure(pressure));
+        assert_eq!(wire["kind"], "did_not_fit");
+        assert_eq!(wire["bound_floored"], true);
+        // No two kinds share a spelling — the whole point of the new one.
+        let spellings: Vec<String> = [
+            ContextPressureKind::BlocksDropped,
+            ContextPressureKind::BlockElided,
+            ContextPressureKind::RefitOnReroute,
+            ContextPressureKind::DidNotFit,
+        ]
+        .into_iter()
+        .map(|kind| serde_json::to_value(kind).unwrap().to_string())
+        .collect();
+        let unique: std::collections::HashSet<&String> = spellings.iter().collect();
+        assert_eq!(unique.len(), spellings.len(), "{spellings:?}");
+
+        // Older daemon: no `bound_floored` key at all.
+        let older: ContextPressure = serde_json::from_str(
+            r#"{"kind":"block_elided","dropped_blocks":0,"elided_bytes":9,
+                "newest_user_elided":false,"budget_tokens":4096,"budget_bytes":32768,
+                "bound":"window"}"#,
+        )
+        .expect("a frame predating the field still parses");
+        assert!(!older.bound_floored);
+
+        // Older client: a kind it does not know is refused, never folded into
+        // one it does.
+        assert!(serde_json::from_str::<ContextPressureKind>("\"did_not_fit\"").is_ok());
+        assert!(serde_json::from_str::<ContextPressureKind>("\"a_kind_from_the_future\"").is_err());
+    }
+
+    /// **TASK-194 2b, the route line's half.** `bound_floored` rides
+    /// `route_decided` beside the bound it qualifies, and a frame from a daemon
+    /// predating it carries no key and reads `None` — the `effort` rule, one
+    /// field over.
+    #[test]
+    fn route_decided_carries_whether_its_bound_was_floored() {
+        let decided = RouteDecided {
+            category: None,
+            tier: None,
+            phase: None,
+            provider_id: crate::ProviderId::from("kimi"),
+            model: None,
+            reason: "r".to_owned(),
+            effort: None,
+            budget_tokens: Some(2_048),
+            budget_bytes: Some(16_384),
+            bound: Some(BudgetBound::UserCap),
+            bound_floored: Some(true),
+        };
+        round_trip(&decided);
+        let wire = serde_json::to_value(&decided).unwrap();
+        assert_eq!(wire["bound_floored"], true);
+
+        let quiet = RouteDecided {
+            bound_floored: None,
+            ..decided.clone()
+        };
+        let wire = serde_json::to_value(&quiet).unwrap();
+        assert!(
+            wire.get("bound_floored").is_none(),
+            "an unstated fact writes no key: {wire}"
+        );
+        let back: RouteDecided = serde_json::from_value(wire).unwrap();
+        assert_eq!(back.bound_floored, None);
+    }
+
     #[test]
     fn session_update_variants_round_trip() {
         round_trip(&SessionUpdate {
@@ -2750,6 +3780,74 @@ mod tests {
         });
     }
 
+    /// **BR-8's one home, both halves.** Every bound has a wire spelling that
+    /// *is* the serde tag and a human spelling that is not it.
+    ///
+    /// The golden pair is written out again here rather than read off the
+    /// accessors, which is the whole point: a table compared against itself
+    /// asserts nothing. The `match` is exhaustive and has no wildcard, so a
+    /// sixth variant cannot be added without being given both spellings here
+    /// — and the assertions below then demand that the production ones agree.
+    ///
+    /// `words()` is checked to be free of `_` because the failure mode this
+    /// guards is a variant whose human spelling was filled in by pasting the
+    /// wire token: legal, compiling, and shown to a user as `default_unknown`.
+    #[test]
+    fn every_budget_bound_carries_its_wire_name_and_its_words() {
+        const fn golden(bound: BudgetBound) -> (&'static str, &'static str) {
+            match bound {
+                BudgetBound::Window => ("window", "window"),
+                BudgetBound::DefaultUnknown => ("default_unknown", "unknown window"),
+                BudgetBound::RedactScan => ("redact_scan", "redact scan"),
+                BudgetBound::UserCap => ("user_cap", "user cap"),
+                BudgetBound::LocalEngine => ("local_engine", "local engine"),
+            }
+        }
+
+        let all = [
+            BudgetBound::Window,
+            BudgetBound::DefaultUnknown,
+            BudgetBound::RedactScan,
+            BudgetBound::UserCap,
+            BudgetBound::LocalEngine,
+        ];
+        let mut wire_names = Vec::new();
+        let mut said = Vec::new();
+        for bound in all {
+            let (wire, words) = golden(bound);
+            assert_eq!(bound.wire_name(), wire, "{bound:?}");
+            assert_eq!(bound.words(), words, "{bound:?}");
+            assert!(
+                !words.contains('_'),
+                "`{words}` reads like a wire token, not like something to say to a \
+                 person: {bound:?}"
+            );
+
+            // The wire half is the tag, in both directions — an accessor that
+            // drifted from the `serde` rename would be a `/doctor` row or a
+            // log line naming a bound no client can parse.
+            let json = serde_json::to_string(&bound).unwrap();
+            assert_eq!(json, format!("\"{wire}\""));
+            let back: BudgetBound = serde_json::from_str(&json).unwrap();
+            assert_eq!(back, bound);
+            round_trip(&bound);
+
+            wire_names.push(wire);
+            said.push(words);
+        }
+
+        wire_names.sort_unstable();
+        wire_names.dedup();
+        said.sort_unstable();
+        said.dedup();
+        assert_eq!(wire_names.len(), all.len(), "two bounds share a wire name");
+        assert_eq!(
+            said.len(),
+            all.len(),
+            "two bounds are said the same way, so a user cannot tell which knob to reach for"
+        );
+    }
+
     #[test]
     fn route_decided_round_trips() {
         round_trip(&RouteDecided {
@@ -2760,7 +3858,931 @@ mod tests {
             model: Some("deepseek-coder".to_owned()),
             reason: "implement phase routes to the configured cheap tier".to_owned(),
             effort: Some(ResolvedEffort::effort(crate::effort::EffortLevel::High)),
+            budget_tokens: None,
+            budget_bytes: None,
+            bound: None,
+            bound_floored: None,
         });
+
+        // REQ-586: the budget pair and its bound ride the same frame, and every
+        // bound survives the wire under its own spelling — the list is spelled
+        // out so a sixth variant has to be added here by hand.
+        for (bound, spelling) in [
+            (BudgetBound::Window, "window"),
+            (BudgetBound::DefaultUnknown, "default_unknown"),
+            (BudgetBound::RedactScan, "redact_scan"),
+            (BudgetBound::UserCap, "user_cap"),
+            (BudgetBound::LocalEngine, "local_engine"),
+        ] {
+            let decided = RouteDecided {
+                category: Some(Category::Edit),
+                tier: Some(Tier::Build),
+                phase: None,
+                provider_id: ProviderId::from("deepseek"),
+                model: Some("deepseek-coder".to_owned()),
+                reason: "implement phase routes to the configured cheap tier".to_owned(),
+                effort: Some(ResolvedEffort::effort(crate::effort::EffortLevel::High)),
+                budget_tokens: Some(84_650),
+                budget_bytes: Some(253_952),
+                bound: Some(bound),
+                bound_floored: None,
+            };
+            round_trip(&decided);
+            let wire: serde_json::Value =
+                serde_json::from_str(&serde_json::to_string(&decided).unwrap()).unwrap();
+            assert_eq!(wire["budget_tokens"], 84_650);
+            assert_eq!(wire["budget_bytes"], 253_952);
+            assert_eq!(wire["bound"], spelling, "{wire}");
+        }
+    }
+
+    /// REQ-586's additivity, both directions, for the three new `route_decided`
+    /// keys — the `effort` rule re-applied rather than assumed inherited.
+    ///
+    /// A frame from a daemon predating the budget carries no key and reads
+    /// `None`; a build that has never heard of the keys still reads a frame
+    /// that carries them (modelled by the pre-REQ-586 shape of the reader).
+    /// Serde ignores unknown fields by default and no type here opts out, but
+    /// the posture is what keeps [`crate::PROTOCOL_VERSION`] still, so it is
+    /// asserted — the same claim `a_client_predating_the_cause_field_…` makes
+    /// for `PrivacyBlock`.
+    #[test]
+    fn route_decided_budget_fields_are_additive_in_both_directions() {
+        // A pre-REQ-586 frame: no budget, no bound — absent, not an error.
+        let decided: RouteDecided = serde_json::from_str(
+            r#"{"phase":"review","provider_id":"anthropic","reason":"because"}"#,
+        )
+        .unwrap();
+        assert_eq!(decided.budget_tokens, None);
+        assert_eq!(decided.budget_bytes, None);
+        assert_eq!(decided.bound, None);
+        // And a frame that never populated them emits no key at all, rather
+        // than `null` — the same wire an older daemon writes.
+        let wire = serde_json::to_value(&decided).unwrap();
+        assert!(wire.get("budget_tokens").is_none(), "{wire}");
+        assert!(wire.get("budget_bytes").is_none(), "{wire}");
+        assert!(wire.get("bound").is_none(), "{wire}");
+
+        // The other direction: a reader built before the fields.
+        #[derive(Deserialize)]
+        struct PreBudgetRouteDecided {
+            provider_id: ProviderId,
+            reason: String,
+            effort: Option<ResolvedEffort>,
+        }
+        let wire = serde_json::to_string(&RouteDecided {
+            category: Some(Category::Edit),
+            tier: Some(Tier::Build),
+            phase: None,
+            provider_id: ProviderId::from("kimi"),
+            model: Some("kimi-k3".to_owned()),
+            reason: "implement routes to the cheap tier".to_owned(),
+            effort: Some(ResolvedEffort::effort(crate::effort::EffortLevel::High)),
+            budget_tokens: Some(84_650),
+            budget_bytes: Some(253_952),
+            bound: Some(BudgetBound::UserCap),
+            bound_floored: None,
+        })
+        .unwrap();
+        assert!(
+            wire.contains(r#""budget_tokens":84650"#)
+                && wire.contains(r#""budget_bytes":253952"#)
+                && wire.contains(r#""bound":"user_cap""#),
+            "the fixture must actually carry the new keys: {wire}"
+        );
+        let old: PreBudgetRouteDecided = serde_json::from_str(&wire).unwrap();
+        assert_eq!(old.provider_id, ProviderId::from("kimi"));
+        assert_eq!(old.reason, "implement routes to the cheap tier");
+        assert_eq!(
+            old.effort,
+            Some(ResolvedEffort::effort(crate::effort::EffortLevel::High))
+        );
+    }
+
+    /// REQ-585's additivity, both directions, for `PermissionRequest.subject`
+    /// — the `route_decided` budget rule re-applied rather than assumed
+    /// inherited.
+    ///
+    /// A request from a daemon predating the field carries no key and reads
+    /// `None`; a client built before the field still reads a request that
+    /// carries it. Serde ignores unknown fields by default and no type here
+    /// opts out, but the posture is what keeps [`crate::PROTOCOL_VERSION`]
+    /// still, so it is asserted.
+    #[test]
+    fn permission_request_subject_is_additive_in_both_directions() {
+        // A pre-REQ-585 request: no subject — absent, not an error. This is
+        // also every ordinary tool prompt from *this* build, which is why the
+        // client cannot treat "has a subject" as the only recognizable state.
+        let request: PermissionRequest =
+            serde_json::from_str(r#"{"request_id":"r1","tool_name":"shell","options":[]}"#)
+                .expect("a request from a daemon predating the field must still parse");
+        assert_eq!(request.subject, None);
+        assert_eq!(request.tool_name, "shell");
+
+        // And a request that never populated it emits no key at all, rather
+        // than `null` — the same wire an older daemon writes.
+        let wire = serde_json::to_value(&request).unwrap();
+        assert!(wire.get("subject").is_none(), "{wire}");
+
+        // The other direction: a reader built before the field.
+        #[derive(Deserialize)]
+        struct PreSubjectPermissionRequest {
+            request_id: RequestId,
+            tool_name: String,
+            options: Vec<PermissionOption>,
+        }
+        let wire = serde_json::to_string(&PermissionRequest {
+            request_id: RequestId::from("r1"),
+            tool_name: "skill:user:status".to_owned(),
+            description: None,
+            options: vec![PermissionOption {
+                option_id: "allow_once".to_owned(),
+                label: "Allow once".to_owned(),
+                kind: PermissionOptionKind::AllowOnce,
+            }],
+            subject: Some(PermissionSubject::SkillDynamicContext {
+                skill: "status".to_owned(),
+                source: SkillSource::User,
+                commands: vec![
+                    "cat ~/.claude/adlc/ETHOS.md".to_owned(),
+                    "git branch --show-current".to_owned(),
+                ],
+                invoked_by: InvokedBy::User,
+            }),
+        })
+        .unwrap();
+        assert!(
+            wire.contains(r#""subject":{"kind":"skill_dynamic_context""#)
+                && wire.contains(r#""source":"user""#)
+                && wire.contains(r#""git branch --show-current""#),
+            "the fixture must actually carry the new key: {wire}"
+        );
+        let old: PreSubjectPermissionRequest =
+            serde_json::from_str(&wire).expect("a client predating the field still reads it");
+        assert_eq!(old.request_id, RequestId::from("r1"));
+        assert_eq!(old.tool_name, "skill:user:status");
+        assert_eq!(old.options.len(), 1, "the old reader still gets its fields");
+
+        // BR-6: the commands ride as a **list**, one entry per command, not as
+        // a joined sentence — `Surface::line` destroys newlines, so a client
+        // that had to split a string could not render one line per command.
+        let back: PermissionRequest = serde_json::from_str(&wire).unwrap();
+        match back.subject.expect("the subject survives the round trip") {
+            PermissionSubject::SkillDynamicContext {
+                skill,
+                source,
+                commands,
+                invoked_by,
+            } => {
+                assert_eq!(skill, "status");
+                assert_eq!(source, SkillSource::User);
+                assert_eq!(commands.len(), 2);
+                assert_eq!(commands[1], "git branch --show-current");
+                assert_eq!(invoked_by, InvokedBy::User);
+            }
+            // REQ-587's variant is matched here rather than swept up with
+            // `_`: this arm existing is what makes the `Unrecognized` arm
+            // below mean "unknown to this build" instead of "anything else".
+            PermissionSubject::ProjectSkillTrust { .. } => {
+                panic!("a dynamic-context subject must not read as the acknowledgment")
+            }
+            PermissionSubject::Unrecognized => panic!("a known kind must not read as unrecognized"),
+        }
+
+        assert_eq!(
+            crate::PROTOCOL_VERSION,
+            crate::ProtocolVersion(2),
+            "REQ-585 adds only optional fields and one method, so the negotiated version \
+             does not move — the capability is proven by a successful `skills/list`"
+        );
+    }
+
+    /// ADR-7's fail-closed rule, pinned at the layer that has to hold it: a
+    /// subject `kind` this build has never heard of **deserializes**, to a
+    /// variant the client can see, and does not error.
+    ///
+    /// This is not a serde nicety. The client's rule is "refuse anything you do
+    /// not recognize, without calling `prompter.ask`" — and a subject that
+    /// failed to parse would take the whole `PermissionRequest` with it, so the
+    /// client would see no request at all and fall back to whatever it does for
+    /// a malformed event. On a pipe that difference costs the user's next stdin
+    /// line, which becomes a `y` (LESSON-537). `Unrecognized` is what makes the
+    /// unknown case *visible* rather than absent.
+    #[test]
+    fn an_unknown_permission_subject_kind_reads_as_unrecognized_and_does_not_error() {
+        let wire = r#"{
+            "request_id":"r1",
+            "tool_name":"skill:project:deploy",
+            "options":[],
+            "subject":{"kind":"some_future_thing","fields":"a client cannot know"}
+        }"#;
+        let request: PermissionRequest =
+            serde_json::from_str(wire).expect("an unknown kind must not fail the whole request");
+        assert_eq!(
+            request.subject,
+            Some(PermissionSubject::Unrecognized),
+            "the unknown case has to be a value the client can branch on"
+        );
+
+        // Non-vacuity: the *known* kind still reaches its own variant, so the
+        // assertion above is reached by the tag being unknown rather than by a
+        // catch-all that swallows everything.
+        let known = serde_json::to_string(&PermissionSubject::SkillDynamicContext {
+            skill: "status".to_owned(),
+            source: SkillSource::Project,
+            commands: vec!["pwd".to_owned()],
+            invoked_by: InvokedBy::User,
+        })
+        .unwrap();
+        assert!(
+            known.contains(r#""kind":"skill_dynamic_context""#),
+            "{known}"
+        );
+        let back: PermissionSubject = serde_json::from_str(&known).unwrap();
+        assert!(
+            matches!(back, PermissionSubject::SkillDynamicContext { .. }),
+            "a known kind must not be swallowed by the catch-all"
+        );
+    }
+
+    /// REQ-587 BR-9: `SkillInvoked.invoked_by` is additive in both directions
+    /// — `permission_request_subject_is_additive_in_both_directions`'s four
+    /// legs re-applied rather than assumed inherited.
+    ///
+    /// An event from a daemon predating the field carries no key and reads
+    /// [`InvokedBy::User`]; a client built before the field still reads an
+    /// event that carries it. The non-vacuity leg is the one that earns its
+    /// place: a fixture that never wrote `invoked_by` would satisfy the
+    /// old-reader leg by writing nothing at all.
+    #[test]
+    fn skill_invoked_says_who_invoked_it_additively() {
+        // A pre-REQ-587 event: no `invoked_by` — absent, not an error, and the
+        // absence is a fact rather than a gap, because that daemon has no
+        // `skill` tool and every invocation it could report was typed.
+        let invoked: SkillInvoked = serde_json::from_str(
+            r#"{"name":"status","source":"user","path_display":"~/.claude/skills/status/SKILL.md",
+                "body_bytes":118,"ignored_keys":[],"outcomes":[]}"#,
+        )
+        .expect("an event from a daemon predating the field must still parse");
+        assert_eq!(invoked.invoked_by, InvokedBy::User);
+        assert_eq!(invoked.name, "status");
+
+        // And a user invocation emits no key at all, rather than `"user"` or
+        // `null` — the same wire an older daemon writes. Downgrading the
+        // `skip_serializing_if` to a bare `default` fails here.
+        let wire = serde_json::to_value(&invoked).unwrap();
+        assert!(wire.get("invoked_by").is_none(), "{wire}");
+
+        // The other direction: a reader built before the field.
+        #[derive(Deserialize)]
+        struct PreInvokerSkillInvoked {
+            name: String,
+            source: SkillSource,
+            body_bytes: u64,
+            outcomes: Vec<DynamicOutcomeView>,
+        }
+        let wire = serde_json::to_string(&SkillInvoked {
+            name: "validate".to_owned(),
+            source: SkillSource::Project,
+            path_display: ".claude/skills/validate/SKILL.md".to_owned(),
+            body_bytes: 4_712,
+            ignored_keys: vec![],
+            name_note: None,
+            shadows_user_skill: false,
+            model_invocable: true,
+            user_invocable: true,
+            turn_invocations: None,
+            refused: None,
+            outcomes: vec![DynamicOutcomeView {
+                command: "git status --short".to_owned(),
+                outcome: DynamicOutcome::Ran {
+                    output_bytes: 41,
+                    truncated: false,
+                },
+            }],
+            invoked_by: InvokedBy::Model,
+        })
+        .unwrap();
+        assert!(
+            wire.contains(r#""invoked_by":"model""#),
+            "the fixture must actually carry the new key: {wire}"
+        );
+        let old: PreInvokerSkillInvoked =
+            serde_json::from_str(&wire).expect("a client predating the field still reads it");
+        assert_eq!(old.name, "validate");
+        assert_eq!(old.source, SkillSource::Project);
+        assert_eq!(old.body_bytes, 4_712);
+        assert_eq!(
+            old.outcomes.len(),
+            1,
+            "the old reader still gets its fields"
+        );
+        // What it loses is one adjective on one echo line — BR-9's `— invoked
+        // by the model` suffix. Not a guard: BR-4's acknowledgment is settled
+        // daemon-side before an expansion exists.
+
+        // BR-12 still holds with a second invoker: the body is never here.
+        let back: SkillInvoked = serde_json::from_str(&wire).unwrap();
+        assert_eq!(back.invoked_by, InvokedBy::Model);
+        let wire = serde_json::to_value(&back).unwrap();
+        assert!(wire.get("body").is_none(), "{wire}");
+        // And the path stays home-relative for a model invocation exactly as
+        // for a typed one — who asked does not change what may be printed.
+        assert!(
+            !wire["path_display"]
+                .as_str()
+                .expect("a string")
+                .starts_with('/'),
+            "{wire}"
+        );
+
+        assert_eq!(
+            crate::PROTOCOL_VERSION,
+            crate::ProtocolVersion(2),
+            "REQ-587 adds optional fields and one subject variant, so the negotiated \
+             version does not move"
+        );
+    }
+
+    /// REQ-587 BR-9: the three facts BR-9 asks the client to render — the
+    /// shadowing fact, the two frontmatter flags, and the turn's invocation
+    /// count against the cap — ride the event additively, on
+    /// [`skill_invoked_says_who_invoked_it_additively`]'s four legs.
+    ///
+    /// They are on the event because no reader can derive them. `render_event`
+    /// sees only `SessionState`; the registry snapshot the shadowing fact and
+    /// the flags would come from lives on the client's `UiContext`, and the
+    /// per-turn count lives in the daemon's tool state and exists nowhere else
+    /// at all.
+    ///
+    /// The **non-vacuity leg** is the one that earns its place, exactly as it
+    /// does for `invoked_by`: a fixture that never set a flag to its
+    /// non-default value would satisfy the old-reader leg by writing no key at
+    /// all, and the test would pass against a build that had dropped the field.
+    #[test]
+    fn skill_invoked_carries_the_shadowing_fact_the_flags_and_the_turn_count_additively() {
+        // Leg one — a pre-REQ-587 event. None of the four keys is written, and
+        // each reads as the world that daemon was in: nothing shadowed, both
+        // invocations permitted (it had no flags to read), and no per-turn cap
+        // (it had no `skill` tool to cap).
+        let invoked: SkillInvoked = serde_json::from_str(
+            r#"{"name":"status","source":"user","path_display":"~/.claude/skills/status/SKILL.md",
+                "body_bytes":118,"ignored_keys":[],"outcomes":[]}"#,
+        )
+        .expect("an event from a daemon predating these fields must still parse");
+        assert!(!invoked.shadows_user_skill);
+        assert!(invoked.model_invocable, "absent must not read as denied");
+        assert!(invoked.user_invocable, "absent must not read as denied");
+        assert_eq!(invoked.turn_invocations, None);
+
+        // Leg two — and the ordinary invocation writes none of them either, so
+        // the wire REQ-585 wrote is the wire this build writes. Downgrading any
+        // of the four `skip_serializing_if`s to a bare `default` fails here.
+        let wire = serde_json::to_value(&invoked).unwrap();
+        for key in [
+            "shadows_user_skill",
+            "model_invocable",
+            "user_invocable",
+            "turn_invocations",
+        ] {
+            assert!(wire.get(key).is_none(), "{key} was written: {wire}");
+        }
+
+        // Leg three — non-vacuity. A model invocation of a shadowing,
+        // model-only project skill carries every one of them, so the legs above
+        // are reached by the values being defaults rather than by the fields
+        // being gone.
+        let loud = SkillInvoked {
+            name: "validate".to_owned(),
+            source: SkillSource::Project,
+            path_display: ".claude/skills/validate/SKILL.md".to_owned(),
+            body_bytes: 4_712,
+            ignored_keys: vec![],
+            name_note: None,
+            outcomes: vec![],
+            invoked_by: InvokedBy::Model,
+            shadows_user_skill: true,
+            model_invocable: true,
+            user_invocable: false,
+            turn_invocations: Some(TurnInvocations { count: 3, cap: 12 }),
+            refused: None,
+        };
+        let wire = serde_json::to_string(&loud).unwrap();
+        assert!(wire.contains(r#""shadows_user_skill":true"#), "{wire}");
+        assert!(wire.contains(r#""user_invocable":false"#), "{wire}");
+        assert!(
+            !wire.contains(r#""model_invocable""#),
+            "a permitted flag still writes no key: {wire}"
+        );
+        assert!(wire.contains(r#""count":3"#), "{wire}");
+        assert!(
+            wire.contains(r#""cap":12"#),
+            "the cap travels with the count, or a client prints a stale ceiling: {wire}"
+        );
+
+        // Leg four — a reader built before the fields still reads that event.
+        #[derive(Deserialize)]
+        struct PreBr9SkillInvoked {
+            name: String,
+            body_bytes: u64,
+            #[serde(default)]
+            invoked_by: InvokedBy,
+        }
+        let old: PreBr9SkillInvoked =
+            serde_json::from_str(&wire).expect("a client predating the fields still reads it");
+        assert_eq!(old.name, "validate");
+        assert_eq!(old.body_bytes, 4_712);
+        assert_eq!(old.invoked_by, InvokedBy::Model);
+
+        // And BR-12 still holds with three more fields on the event: the body
+        // is never here.
+        let back: SkillInvoked = serde_json::from_str(&wire).unwrap();
+        assert_eq!(back, loud);
+        assert!(
+            serde_json::to_value(&back).unwrap().get("body").is_none(),
+            "{wire}"
+        );
+    }
+
+    /// **BR-9's refusal, additively — and the four legs are why the field is a
+    /// field.**
+    ///
+    /// A refused invocation and a skill with no dynamic context that ran
+    /// perfectly carry the *same* bytes on this event: the name, the file, the
+    /// body's size, an empty `outcomes`. So "a refusal is never silent" was met
+    /// by a line that reported the opposite of what happened, which is worse
+    /// than silence — nothing was red, because a client cannot assert a
+    /// distinction the wire does not carry.
+    ///
+    /// The **non-vacuity leg** earns its place exactly as it does for
+    /// `invoked_by` and the BR-9 trio: a fixture that never set `refused` to
+    /// `Some` satisfies the old-reader and byte-identity legs by writing no key
+    /// at all, and would pass against a build that had dropped the field.
+    #[test]
+    fn skill_invoked_says_it_was_refused_and_why_additively() {
+        // Leg one — an event from a daemon predating the field. It ran, because
+        // that daemon published a record only for an invocation that expanded.
+        let invoked: SkillInvoked = serde_json::from_str(
+            r#"{"name":"status","source":"user","path_display":"~/.claude/skills/status/SKILL.md",
+                "body_bytes":118,"ignored_keys":[],"outcomes":[]}"#,
+        )
+        .expect("an event from a daemon predating this field must still parse");
+        assert_eq!(
+            invoked.refused, None,
+            "absent means it ran — the only thing a pre-REQ-587 record could be"
+        );
+
+        // Leg two — an invocation that ran writes no key, so REQ-585's wire is
+        // byte-for-byte the wire this build writes. Downgrading the
+        // `skip_serializing_if` to a bare `default` fails here.
+        let wire = serde_json::to_value(&invoked).unwrap();
+        assert!(
+            wire.get("refused").is_none(),
+            "an invocation that ran must write nothing: {wire}"
+        );
+
+        // Leg three — non-vacuity. A refused model invocation carries the
+        // reason, so the legs above are reached by the value being absent
+        // rather than by the field being gone.
+        let refused = SkillInvoked {
+            name: "architect".to_owned(),
+            source: SkillSource::User,
+            path_display: "~/.claude/skills/architect/SKILL.md".to_owned(),
+            body_bytes: 28_700,
+            ignored_keys: vec![],
+            name_note: None,
+            // Empty — and this is the whole point of the field. Without it
+            // these bytes are a command-free skill that ran.
+            outcomes: vec![],
+            invoked_by: InvokedBy::Model,
+            shadows_user_skill: false,
+            model_invocable: true,
+            user_invocable: true,
+            turn_invocations: Some(TurnInvocations { count: 1, cap: 12 }),
+            refused: Some("over_budget".to_owned()),
+        };
+        let wire = serde_json::to_string(&refused).unwrap();
+        assert!(wire.contains(r#""refused":"over_budget""#), "{wire}");
+        assert!(
+            !wire.contains(r#""refused":true"#),
+            "the reason travels, not a flag: BR-9's line names why, and there \
+             is nothing else on this event to derive it from: {wire}"
+        );
+
+        // Leg four — a reader built before the field still reads that event,
+        // and still gets everything it knew about.
+        #[derive(Deserialize)]
+        struct PreRefusalSkillInvoked {
+            name: String,
+            body_bytes: u64,
+            #[serde(default)]
+            invoked_by: InvokedBy,
+        }
+        let old: PreRefusalSkillInvoked =
+            serde_json::from_str(&wire).expect("a client predating the field still reads it");
+        assert_eq!(old.name, "architect");
+        assert_eq!(old.body_bytes, 28_700);
+        assert_eq!(old.invoked_by, InvokedBy::Model);
+
+        let back: SkillInvoked = serde_json::from_str(&wire).unwrap();
+        assert_eq!(back, refused);
+        // BR-12 still holds with one more field: the body is never here — least
+        // of all on a record whose whole claim is that nothing was folded.
+        assert!(
+            serde_json::to_value(&back).unwrap().get("body").is_none(),
+            "{wire}"
+        );
+    }
+
+    /// REQ-587 BR-5: the dynamic-context subject says **who asked**, and that
+    /// field is additive in both directions.
+    ///
+    /// The contrast with `project_skill_trust_is_a_variant_an_older_client_refuses`
+    /// is the point of keeping the two tests adjacent: a new *field* on a known
+    /// `kind` is ignored by an old client, which still reaches its own variant
+    /// and still draws REQ-585's prompt. A new *kind* is not.
+    #[test]
+    fn a_dynamic_context_subjects_invoker_is_additive_in_both_directions() {
+        // A pre-REQ-587 request: the known kind, no `invoked_by`.
+        let request: PermissionRequest = serde_json::from_str(
+            r#"{"request_id":"r1","tool_name":"skill:project:deploy","options":[],
+                "subject":{"kind":"skill_dynamic_context","skill":"deploy",
+                           "source":"project","commands":["git status"]}}"#,
+        )
+        .expect("a request from a daemon predating the field must still parse");
+        match request.subject.expect("the subject is present") {
+            PermissionSubject::SkillDynamicContext {
+                invoked_by,
+                commands,
+                ..
+            } => {
+                assert_eq!(invoked_by, InvokedBy::User);
+                assert_eq!(commands, vec!["git status".to_owned()]);
+            }
+            other => panic!("a known kind must reach its own variant: {other:?}"),
+        }
+
+        // And a user-invoked subject emits no key, rather than `"user"`.
+        let wire = serde_json::to_value(PermissionSubject::SkillDynamicContext {
+            skill: "deploy".to_owned(),
+            source: SkillSource::Project,
+            commands: vec!["git status".to_owned()],
+            invoked_by: InvokedBy::User,
+        })
+        .unwrap();
+        assert!(wire.get("invoked_by").is_none(), "{wire}");
+
+        // The other direction: the subject enum exactly as a REQ-585-vintage
+        // client compiled it, reading a model-invoked request.
+        #[derive(Debug, Deserialize)]
+        #[serde(tag = "kind", rename_all = "snake_case")]
+        enum PreInvokerSubject {
+            SkillDynamicContext {
+                skill: String,
+                source: SkillSource,
+                commands: Vec<String>,
+            },
+            #[serde(other)]
+            Unrecognized,
+        }
+        let wire = serde_json::to_string(&PermissionSubject::SkillDynamicContext {
+            skill: "deploy".to_owned(),
+            source: SkillSource::Project,
+            commands: vec!["gcloud run deploy teton".to_owned()],
+            invoked_by: InvokedBy::Model,
+        })
+        .unwrap();
+        assert!(
+            wire.contains(r#""invoked_by":"model""#),
+            "the fixture must actually carry the new key: {wire}"
+        );
+        let old: PreInvokerSubject =
+            serde_json::from_str(&wire).expect("a client predating the field still reads it");
+        match old {
+            PreInvokerSubject::SkillDynamicContext {
+                skill,
+                source,
+                commands,
+            } => {
+                assert_eq!(skill, "deploy");
+                assert_eq!(source, SkillSource::Project);
+                assert_eq!(commands, vec!["gcloud run deploy teton".to_owned()]);
+            }
+            PreInvokerSubject::Unrecognized => {
+                panic!("a new *field* on a known kind must not read as unrecognized")
+            }
+        }
+        // The consequence, stated: that client draws REQ-585's prompt, listing
+        // every command verbatim under the skill's own key. The decision the
+        // human makes is the same decision; only the attribution is missing.
+
+        assert_eq!(
+            crate::PROTOCOL_VERSION,
+            crate::ProtocolVersion(2),
+            "REQ-587 adds optional fields and one subject variant, so the negotiated \
+             version does not move"
+        );
+    }
+
+    /// REQ-587 BR-4 / ADR-7: `ProjectSkillTrust` is a new **variant**, and a
+    /// variant is not additive the way a field is — so this is its own skew
+    /// leg, and what it pins is a **consequence** rather than a compatibility.
+    ///
+    /// `permission_request_subject_is_additive_in_both_directions` covers the
+    /// `subject` *field*: serde ignores an unknown field, and that test would
+    /// stay green whether or not this variant existed. It cannot ignore an
+    /// unknown *tag* — [`PermissionSubject`] is closed with `#[serde(other)]
+    /// Unrecognized`, and that arm is a **refusal**, not an ignore.
+    ///
+    /// So the honest claim is not "the variant is additive". It is: an old
+    /// client refuses the acknowledgment unconditionally, therefore a project
+    /// skill is never model-invocable there, and the refusal that says so names
+    /// a next step that client can actually perform. That is shipped behaviour,
+    /// not a bug — the fail-closed direction, announced rather than silent.
+    #[test]
+    fn project_skill_trust_is_a_variant_an_older_client_refuses() {
+        use crate::methods::{PermissionOutcome, PermissionRespondParams, RefusalReason};
+        use crate::permissions::PermissionLevel;
+
+        let subject = PermissionSubject::ProjectSkillTrust {
+            root: "~/dev/teton".to_owned(),
+            skills: vec![
+                ProjectSkillTrustEntry {
+                    name: "deploy".to_owned(),
+                    shadows_user_skill: false,
+                },
+                ProjectSkillTrustEntry {
+                    name: "validate".to_owned(),
+                    shadows_user_skill: true,
+                },
+            ],
+            more: 5,
+        };
+        round_trip(&subject);
+
+        let value = serde_json::to_value(&subject).unwrap();
+        assert_eq!(value["kind"], "project_skill_trust", "{value}");
+        // BR-1's entity table: the root the prompt names is home-relative, and
+        // it is the same spelling the grant key is built from.
+        assert_eq!(value["root"], "~/dev/teton", "{value}");
+        assert!(!value.to_string().contains("/Users/"), "{value}");
+        // The shadowing fact rides as a bool the client renders, not as prose
+        // it would re-parse (LESSON-529) — and the ordinary entry emits no key.
+        assert_eq!(value["skills"][1]["shadows_user_skill"], true, "{value}");
+        assert!(
+            value["skills"][0].get("shadows_user_skill").is_none(),
+            "{value}"
+        );
+        // LESSON-517: the list is bounded and the tail is a **count**, so "and
+        // 5 more" is available rather than "and some more".
+        assert_eq!(value["more"], 5, "{value}");
+
+        // Leg one — the skew itself. The whole request, read by a
+        // REQ-585-vintage client: the subject enum exactly as that client
+        // compiled it, inside the request struct exactly as it had it.
+        #[derive(Debug, Deserialize)]
+        #[serde(tag = "kind", rename_all = "snake_case")]
+        enum PreTrustSubject {
+            SkillDynamicContext {
+                skill: String,
+                source: SkillSource,
+                commands: Vec<String>,
+            },
+            #[serde(other)]
+            Unrecognized,
+        }
+        #[derive(Debug, Deserialize)]
+        struct PreTrustRequest {
+            request_id: RequestId,
+            tool_name: String,
+            subject: Option<PreTrustSubject>,
+        }
+        let wire = serde_json::to_string(&PermissionRequest {
+            request_id: RequestId::from("r1"),
+            tool_name: crate::methods::project_skill_trust_key("~/dev/teton"),
+            description: None,
+            options: vec![],
+            subject: Some(subject),
+        })
+        .unwrap();
+        assert!(
+            wire.contains(r#""kind":"project_skill_trust""#),
+            "the fixture must actually carry the new kind: {wire}"
+        );
+        let old: PreTrustRequest = serde_json::from_str(&wire)
+            .expect("an unknown kind must not take the whole request down with it");
+        assert!(
+            matches!(old.subject, Some(PreTrustSubject::Unrecognized)),
+            "a new variant lands on the catch-all, which is a refusal: {old:?}"
+        );
+
+        // Non-vacuity, both halves. The vintage reader still resolves the kind
+        // it *does* know — so the leg above is reached by the tag being new,
+        // not by a catch-all that swallows every subject — and this build
+        // resolves the new kind to its own variant, so the fixture is not
+        // merely a shape nobody can read.
+        let known = serde_json::to_string(&PermissionSubject::SkillDynamicContext {
+            skill: "deploy".to_owned(),
+            source: SkillSource::Project,
+            commands: vec!["git status".to_owned()],
+            invoked_by: InvokedBy::Model,
+        })
+        .unwrap();
+        let old_known: PreTrustSubject = serde_json::from_str(&known).unwrap();
+        match old_known {
+            PreTrustSubject::SkillDynamicContext {
+                skill,
+                source,
+                commands,
+            } => {
+                assert_eq!(skill, "deploy");
+                assert_eq!(source, SkillSource::Project);
+                assert_eq!(commands, vec!["git status".to_owned()]);
+            }
+            PreTrustSubject::Unrecognized => {
+                panic!(
+                    "the vintage reader must still read the kind it knows, or leg one is vacuous"
+                )
+            }
+        }
+        let mine: PermissionRequest = serde_json::from_str(&wire).unwrap();
+        assert!(
+            matches!(
+                mine.subject,
+                Some(PermissionSubject::ProjectSkillTrust { .. })
+            ),
+            "this build must reach the variant, or leg one proves nothing"
+        );
+
+        // Leg two — what that client *does*. `Unrecognized` is a refusal, and
+        // this is the answer it sends, checked on the wire because the daemon
+        // reads it: `refused`, not `cancelled`, so the daemon knows nobody was
+        // asked and composes `project_not_acknowledged` for the model rather
+        // than "the user declined".
+        let refusal = serde_json::to_value(PermissionRespondParams {
+            request_id: RequestId::from("r1"),
+            outcome: PermissionOutcome::Refused {
+                reason: RefusalReason::UnrecognizedSubject,
+            },
+        })
+        .unwrap();
+        assert_eq!(refusal["outcome"]["outcome"], "refused", "{refusal}");
+        assert_eq!(
+            refusal["outcome"]["reason"], "unrecognized_subject",
+            "{refusal}"
+        );
+
+        // Leg three — the next step, and it is one that client can perform.
+        // `/permissions full` is REQ-560's, so it predates the vintage being
+        // modelled, and BR-4 admits a project skill at `full` with no
+        // acknowledgment at all.
+        assert_eq!(PermissionLevel::Full.name(), "full");
+        // Said with its exception, so the line above is not read as a complete
+        // remedy: a project skill that **shadows** a user skill asks even at
+        // `full`, so on this client that one stays refused until the client is
+        // upgraded. The fixture carries exactly such an entry — `validate`.
+        assert!(matches!(
+            mine.subject.expect("the subject survives"),
+            PermissionSubject::ProjectSkillTrust { ref skills, .. }
+                if skills.iter().any(|entry| entry.shadows_user_skill)
+        ));
+
+        // And the key the refusal line renders is the acknowledgment's own —
+        // the client prints it, and may not parse it (ADR-7). It names the
+        // question, is nobody's skill key, and carries no username.
+        assert_eq!(old.tool_name, "project_skill_trust:~/dev/teton");
+        assert!(!crate::methods::is_project_skill_key(&old.tool_name));
+        assert!(crate::methods::is_project_acknowledgment_key(
+            &old.tool_name
+        ));
+        assert_eq!(old.request_id, RequestId::from("r1"));
+
+        assert_eq!(
+            crate::PROTOCOL_VERSION,
+            crate::ProtocolVersion(2),
+            "a subject variant is not a new method and moves no version — what it \
+             costs an older client is a refusal, not a parse failure"
+        );
+    }
+
+    /// REQ-585 BR-12 / ADR-15: the echo line and `/verbose`'s detail are
+    /// rendered from one typed event, and the body is not in it.
+    ///
+    /// The four outcome shapes are round-tripped together because BR-6's rule
+    /// is that a command which did not run **says so** — "declined", "no human
+    /// could be asked", "timed out" and "exit 1" are four different sentences
+    /// the daemon composes, and folding them into one string here is what would
+    /// make the surface re-parse the daemon's own prose (LESSON-529).
+    #[test]
+    fn skill_invoked_carries_the_echo_line_without_carrying_the_body() {
+        let invoked = SkillInvoked {
+            name: "status".to_owned(),
+            source: SkillSource::User,
+            path_display: "~/.claude/skills/status/SKILL.md".to_owned(),
+            body_bytes: 5_432,
+            ignored_keys: vec!["allowed-tools".to_owned(), "model".to_owned()],
+            name_note: None,
+            shadows_user_skill: false,
+            model_invocable: true,
+            user_invocable: true,
+            turn_invocations: None,
+            refused: None,
+            outcomes: vec![
+                DynamicOutcomeView {
+                    command: "cat ~/.claude/adlc/ETHOS.md".to_owned(),
+                    outcome: DynamicOutcome::Ran {
+                        output_bytes: 3_812,
+                        truncated: false,
+                    },
+                },
+                DynamicOutcomeView {
+                    command: "grep -rn TODO .".to_owned(),
+                    outcome: DynamicOutcome::Ran {
+                        output_bytes: 8_000,
+                        truncated: true,
+                    },
+                },
+                DynamicOutcomeView {
+                    command: "gcloud run services list".to_owned(),
+                    outcome: DynamicOutcome::NotRun {
+                        reason: NotRunReason::NoTerminal,
+                    },
+                },
+                DynamicOutcomeView {
+                    command: "test -f .adlc/context/architecture.md".to_owned(),
+                    outcome: DynamicOutcome::Failed {
+                        exit_status: Some(1),
+                    },
+                },
+                DynamicOutcomeView {
+                    command: "sleep 600".to_owned(),
+                    outcome: DynamicOutcome::TimedOut,
+                },
+            ],
+            invoked_by: InvokedBy::User,
+        };
+        round_trip(&invoked);
+
+        let wire = envelope_wire(Event::SkillInvoked(invoked));
+        assert_eq!(wire["event"], "skill_invoked");
+        assert_eq!(wire["name"], "status");
+        assert_eq!(wire["source"], "user");
+        assert_eq!(wire["body_bytes"], 5_432);
+        // BR-1's entity table: relative, never an absolute path carrying a
+        // username into a transcript. `~/…` here because this row is a **user**
+        // skill; the `project` row below carries the other half of the rule,
+        // spelled from the session root (BUG-187).
+        assert_eq!(wire["path_display"], "~/.claude/skills/status/SKILL.md");
+        assert!(
+            !wire["path_display"]
+                .as_str()
+                .expect("a string")
+                .starts_with('/'),
+            "{wire}"
+        );
+        // BR-12: the body is never printed, so it is never sent either. The
+        // size is the only thing about it that crosses.
+        assert!(wire.get("body").is_none(), "{wire}");
+        assert_eq!(
+            wire["outcomes"][0]["command"],
+            "cat ~/.claude/adlc/ETHOS.md"
+        );
+        assert_eq!(wire["outcomes"][0]["outcome"]["kind"], "ran");
+        assert_eq!(wire["outcomes"][0]["outcome"]["output_bytes"], 3_812);
+        assert_eq!(wire["outcomes"][1]["outcome"]["truncated"], true);
+        assert_eq!(wire["outcomes"][2]["outcome"]["kind"], "not_run");
+        assert_eq!(wire["outcomes"][2]["outcome"]["reason"], "no_terminal");
+        assert_eq!(wire["outcomes"][3]["outcome"]["kind"], "failed");
+        assert_eq!(wire["outcomes"][3]["outcome"]["exit_status"], 1);
+        assert_eq!(wire["outcomes"][4]["outcome"]["kind"], "timed_out");
+
+        // A skill with no dynamic context is a real state, not a missing one:
+        // BR-12's echo line says "0 dynamic commands" from an empty list.
+        let plain = SkillInvoked {
+            name: "beta".to_owned(),
+            source: SkillSource::Project,
+            path_display: ".claude/commands/beta.md".to_owned(),
+            body_bytes: 118,
+            ignored_keys: vec![],
+            name_note: None,
+            outcomes: vec![],
+            invoked_by: InvokedBy::User,
+            shadows_user_skill: false,
+            model_invocable: true,
+            user_invocable: true,
+            turn_invocations: None,
+            refused: None,
+        };
+        round_trip(&plain);
+        let wire = serde_json::to_value(&plain).unwrap();
+        assert_eq!(wire["outcomes"], serde_json::json!([]), "{wire}");
+        assert_eq!(wire["ignored_keys"], serde_json::json!([]), "{wire}");
+
+        // A signal-killed command has no status to report, and the absent case
+        // emits no key rather than `null`.
+        let signalled = serde_json::to_value(DynamicOutcome::Failed { exit_status: None }).unwrap();
+        assert_eq!(signalled["kind"], "failed");
+        assert!(signalled.get("exit_status").is_none(), "{signalled}");
     }
 
     /// REQ-558 AC-8: the four things a decision must name travel together, and
@@ -2780,6 +4802,10 @@ mod tests {
             effort: Some(ResolvedEffort::omit(
                 crate::effort::EffortOmission::ShapeNone,
             )),
+            budget_tokens: None,
+            budget_bytes: None,
+            bound: None,
+            bound_floored: None,
         };
         round_trip(&decided);
         let wire: serde_json::Value =
@@ -3405,6 +5431,7 @@ mod tests {
                     kind: PermissionOptionKind::RejectAlways,
                 },
             ],
+            subject: None,
         });
     }
 

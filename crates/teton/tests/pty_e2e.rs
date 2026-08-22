@@ -1344,3 +1344,157 @@ fn a_move_to_a_non_project_root_re_fires_the_notice_at_a_terminal() {
         "the re-fired notice names the home root; transcript:\n{after}"
     );
 }
+
+// ---------------------------------------------------------------------------
+// REQ-585 AC-8 — the consent prompt's bytes, at a terminal
+// ---------------------------------------------------------------------------
+//
+// This is the other half of the LESSON-481 trade this file exists for. On a
+// pipe a skill's dynamic-context consent is **refused without being asked**
+// (BR-11) — `cli_e2e`'s
+// `on_a_pipe_at_guarded_a_skill_consent_is_refused_without_eating_the_next_line`
+// pins that, and it means the piped suite can never see the question itself.
+// The question is the thing BR-6 makes promises about: one prompt per
+// invocation, every command shown verbatim, asked under the skill's own key.
+// So it is asked here, where there is a terminal to ask at.
+//
+// Only the prompt's bytes. What each answer *does* — the placeholders, the
+// remembered grant, the neutralized output — is the daemon's, and lives in
+// `tetond/tests/skill_consent_matrix.rs` and `skill_turn.rs`.
+
+/// A skill whose body carries three dynamic-context commands, in an order the
+/// prompt must preserve.
+const THREE_COMMAND_SKILL: &str = "---\ndescription: three commands\n---\n\
+                                   !`echo one`\n!`echo two`\n!`echo three`\n";
+
+/// **AC-8's prompt, at a real terminal: one question for the whole invocation,
+/// every command listed verbatim in document order, under the skill's own
+/// permission key.**
+///
+/// Three claims, and each fails a different plausible implementation:
+///
+/// * **one** `permission requested` for three commands — a gate that asked per
+///   command would train a user to hold `y` down, which is the failure BR-6's
+///   "once per invocation" exists to prevent;
+/// * the three commands appear **verbatim, one per line, in document order** —
+///   `Surface::line` destroys newlines, so a joined list would arrive as one
+///   run-on line and the ordering assertion below would be about nothing;
+/// * the key is `skill:user:three`, **not** `shell` — a skill consent asked
+///   under the shell tool's name is a grant remembered against the wrong
+///   question, and a remembered `shell` allow would silently answer it.
+#[test]
+fn a_skill_consent_asks_once_at_a_terminal_and_lists_every_command_verbatim() {
+    let daemon_path = daemon_bin();
+    let home = PathBuf::from("/tmp").join(format!("tcptyskill{:x}", std::process::id() & 0xffff));
+    let _ = std::fs::remove_dir_all(&home);
+    std::fs::create_dir_all(home.join(".claude/skills/three")).unwrap();
+    std::fs::write(
+        home.join(".claude/skills/three/SKILL.md"),
+        THREE_COMMAND_SKILL,
+    )
+    .unwrap();
+
+    // Every tier bound to the scripted local tier, for the REQ-558 reason every
+    // typed-turn test here binds them: otherwise the turn resolves to an
+    // unreachable remote provider and fails before it can produce a reply — and
+    // this test's last assertion is that the invocation still finished.
+    let tiers: String = ["reflex", "scan", "build", "think"]
+        .iter()
+        .map(|t| format!("[[tiers]]\ntier = \"{t}\"\nprovider_id = \"local\"\n\n"))
+        .collect();
+    let config = format!("[[providers]]\nid = \"local\"\nkind = \"local\"\n\n{tiers}");
+    let daemon = TestDaemon::spawn_with_env(
+        &daemon_path,
+        &config,
+        &["scripted reply"],
+        &[("HOME", &home)],
+    );
+    let project = daemon.root.join("proj");
+    std::fs::create_dir_all(&project).unwrap();
+    std::fs::write(project.join("Cargo.toml"), "[package]\nname = \"proj\"\n").unwrap();
+
+    // Wide enough that the terminal cannot hard-wrap a command line under test:
+    // a wrapped line is still correct output, but it would split the marker and
+    // fail an assertion about wording rather than about behaviour.
+    let pty = native_pty_system()
+        .openpty(PtySize {
+            rows: 40,
+            cols: 200,
+            pixel_width: 0,
+            pixel_height: 0,
+        })
+        .expect("openpty");
+    let mut cmd = CommandBuilder::new(teton_bin());
+    cmd.args(["--cwd", project.to_str().unwrap()]);
+    cmd.env("XDG_RUNTIME_DIR", &daemon.runtime_dir);
+    cmd.env("TETON_CONFIG", daemon.root.join("config.toml"));
+    cmd.env("TETON_REPO_ROOT", &daemon.root);
+    cmd.env("HOME", &home);
+    let mut session = pty.slave.spawn_command(cmd).expect("spawn teton under pty");
+    drop(pty.slave);
+    let transcript = spawn_reader(pty.master.try_clone_reader().expect("pty reader"));
+    let mut writer = pty.master.take_writer().expect("pty writer");
+
+    assert!(
+        wait_for(&transcript, "ready (freeform)"),
+        "the session never reached the entry prompt; transcript:\n{}",
+        snapshot(&transcript)
+    );
+    writer.write_all(b"/three\r").expect("type /three");
+    writer.flush().ok();
+
+    // The question itself is the marker: a prompt that never came would time out
+    // here rather than be inferred from a partial transcript.
+    let asked = wait_for(&transcript, "allow skill:user:three?");
+    let asking = snapshot(&transcript);
+    assert!(
+        asked,
+        "a skill with dynamic context must ask at a terminal; transcript:\n{asking}"
+    );
+
+    // Answer, so the session finishes rather than being killed mid-question.
+    writer.write_all(b"n\r").expect("decline");
+    writer.flush().ok();
+    let done = wait_for(&transcript, "scripted reply");
+    let after = snapshot(&transcript);
+    let _ = session.kill();
+    let _ = session.wait();
+    let _ = std::fs::remove_dir_all(&home);
+
+    // One question for the whole invocation.
+    assert_eq!(
+        after
+            .matches("permission requested: skill:user:three")
+            .count(),
+        1,
+        "one consent per invocation, never one per command; transcript:\n{after}"
+    );
+    // Under the skill's own key, and not the shell tool's.
+    assert!(
+        !after.contains("permission requested: shell"),
+        "a skill's dynamic context must never ask under `shell`; transcript:\n{after}"
+    );
+    // The subject block: who is asking, and how many.
+    assert!(
+        asking.contains("skill `three` (user) wants to run 3 dynamic-context commands:"),
+        "the prompt must name the skill, its source and the count; transcript:\n{asking}"
+    );
+    // Every command, verbatim, one per line, in document order.
+    let at = |needle: &str| {
+        asking.find(needle).unwrap_or_else(|| {
+            panic!("`{needle}` was never shown at the prompt; transcript:\n{asking}")
+        })
+    };
+    let one = at("    !`echo one`");
+    let two = at("    !`echo two`");
+    let three = at("    !`echo three`");
+    assert!(
+        one < two && two < three,
+        "the commands must be listed in the order the body runs them; \
+         transcript:\n{asking}"
+    );
+    assert!(
+        done,
+        "the turn must still complete after the answer; transcript:\n{after}"
+    );
+}

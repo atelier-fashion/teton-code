@@ -75,6 +75,11 @@
 //!   checked off `metadata` before the open, the read `take`n — shared by the
 //!   probe's `.git`/`HEAD` reads and `grep`'s per-file reads, so a FIFO or a
 //!   giant file holds neither hostage and the two cannot drift in order.
+//! - [`skills`] — user-defined slash commands read from `SKILL.md` (REQ-585
+//!   BR-1): four fixed globs one level deep behind a listing seam, a total
+//!   frontmatter parser, and the name contest that decides which file a
+//!   spelling reaches. Pure over the seam; the turn that runs one is
+//!   [`runtime`]'s.
 //! - [`single_instance`] — the `flock`-based single-instance guard.
 //!
 //! Socket and lock path resolution lives in the shared
@@ -109,6 +114,7 @@ pub mod server;
 pub mod session_root;
 pub mod sessions;
 pub mod single_instance;
+pub mod skills;
 pub mod structured;
 pub mod web;
 pub mod web_setup_catalog;

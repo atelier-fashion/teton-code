@@ -144,6 +144,21 @@ pub struct ProviderRecipe {
     /// A model the vendor serves today, offered as an example to substitute —
     /// never as a recommendation and never as "the current best".
     pub example_model: String,
+    /// The context window of [`example_model`](Self::example_model), in tokens
+    /// — what `/provider setup` records as `capabilities.max_context`, so a
+    /// route's budget derives from a declared window instead of the default
+    /// from the first turn (REQ-586 BR-3).
+    ///
+    /// A fact about the **example model**, not the vendor: substitute a
+    /// different model and the flow records the window as unknown rather than
+    /// inheriting this one (`derive_provider_setup` is the guard). Never `0`
+    /// in the shipped catalog — `no_recipe_ships_an_unknown_window` pins that
+    /// — because a recipe with an "unknown" window would ship the
+    /// default-budget experience under a vendor's name, silently. Verified per
+    /// entry like every other third-party fact here; the one deliberate
+    /// under-statement is Ollama's, where the honest figure is what the server
+    /// *serves* by default, not what the model card claims.
+    pub max_context: u32,
     /// One bounded clause for a fact the command shape alone does not say, or
     /// `None` when it says everything.
     pub notes: Option<String>,
@@ -186,6 +201,15 @@ pub fn recipe_catalog() -> Vec<ProviderRecipe> {
             // rejected (BUG-170).
             endpoint: Some("https://api.anthropic.com/v1/messages".to_owned()),
             example_model: "claude-opus-5".to_owned(),
+            // Window verified 2026-08-19 against the same site's context-windows
+            // page (platform.claude.com/docs/en/build-with-claude/context-windows):
+            // "Claude Opus 5 … [has] a 1M-token context window on the Claude
+            // API", and "for every model with a 1M-token context window, 1M is
+            // the default: you don't need a beta header". The REQ was drafted
+            // with 200_000, which had already moved by implementation time —
+            // this catalog's third mid-draft correction, after DeepSeek's
+            // model pair and Moonshot's `kimi-k2`.
+            max_context: 1_000_000,
             // The one vendor here whose path is not `/chat/completions`: this
             // is the Messages API, a different protocol, which is exactly what
             // `--kind anthropic` selects. A reader pattern-matching the five
@@ -208,6 +232,12 @@ pub fn recipe_catalog() -> Vec<ProviderRecipe> {
             kind: ProviderKind::OpenaiCompatible,
             endpoint: Some("https://api.openai.com/v1/chat/completions".to_owned()),
             example_model: "gpt-5.6".to_owned(),
+            // Window verified 2026-08-19 against the model's own page
+            // (developers.openai.com/api/docs/models/gpt-5.6-sol — the model
+            // the `gpt-5.6` alias resolves to): "1,050,000 context window".
+            // The vendor prices input above 272k at a higher rate; a pricing
+            // threshold is not a window, so it is not the figure here.
+            max_context: 1_050_000,
             notes: None,
         },
         // Verified 2026-08-14 (round 2) against Kimi's chat API page
@@ -224,6 +254,10 @@ pub fn recipe_catalog() -> Vec<ProviderRecipe> {
             kind: ProviderKind::OpenaiCompatible,
             endpoint: Some("https://api.moonshot.ai/v1/chat/completions".to_owned()),
             example_model: "kimi-k3".to_owned(),
+            // Window verified 2026-08-19 against the vendor's own quickstart
+            // (platform.kimi.ai/docs/guide/kimi-k3-quickstart): `kimi-k3`
+            // ships "a 1M-token context window".
+            max_context: 1_000_000,
             notes: None,
         },
         // Verified 2026-08-14 (round 2) against DeepSeek's API docs
@@ -245,6 +279,11 @@ pub fn recipe_catalog() -> Vec<ProviderRecipe> {
             kind: ProviderKind::OpenaiCompatible,
             endpoint: Some("https://api.deepseek.com/chat/completions".to_owned()),
             example_model: "deepseek-v4-pro".to_owned(),
+            // Window verified 2026-08-19 against the vendor's V4 release note
+            // (api-docs.deepseek.com/news/news260424): "1M context is now the
+            // default across all official DeepSeek services", `deepseek-v4-pro`
+            // named on the same page.
+            max_context: 1_000_000,
             // The one OpenAI-compatible URL here with no `/v1` segment, which is
             // exactly the kind of small difference a user pattern-matches away
             // from its five neighbours and then spends an afternoon on. Stated
@@ -268,15 +307,29 @@ pub fn recipe_catalog() -> Vec<ProviderRecipe> {
             kind: ProviderKind::OpenaiCompatible,
             endpoint: Some("http://localhost:11434/v1/chat/completions".to_owned()),
             example_model: "llama3.2".to_owned(),
+            // Window verified 2026-08-19 against Ollama's context-length page
+            // (docs.ollama.com/context-length): the **served** default is
+            // VRAM-dependent — "4k context" below 24 GiB, 32k to 48 GiB, 256k
+            // above — so 4k is the allocation a request can count on
+            // everywhere. The model card's 128k describes the weights, not
+            // what `ollama serve` grants by default; recording it here would
+            // derive a budget the server then truncates silently, which is the
+            // failure REQ-586 exists to end. Deliberately the conservative
+            // served default, and the note says so, because this is the one
+            // entry whose honest figure is smaller than the vendor's headline.
+            max_context: 4_096,
             // Round 1 called this entry "keyless", which is true of the *server*
             // and false of the *command*: `teton provider add` reads a secret
             // for every kind but `local` (teton/src/main.rs), so a user told
             // there is "no key step at all" meets a prompt the recipe said would
             // not come. Both halves are stated, because only saying the second
-            // would make Ollama look like it needs an account.
+            // would make Ollama look like it needs an account. The window
+            // clause is the same courtesy for a different silent gap: the
+            // recorded 4k is Ollama's served default, not the model's card.
             notes: Some(
                 "Ollama ignores the key, but provider add still asks for one — any \
-                 placeholder does"
+                 placeholder does; the window here is Ollama's served default (4k), \
+                 not the model card's 128k — raise num_ctx and max_context together"
                     .to_owned(),
             ),
         },
@@ -292,6 +345,10 @@ pub fn recipe_catalog() -> Vec<ProviderRecipe> {
             kind: ProviderKind::OpenaiCompatible,
             endpoint: Some("https://api.x.ai/v1/chat/completions".to_owned()),
             example_model: "grok-4.6".to_owned(),
+            // Window verified 2026-08-19 against the model's own page
+            // (docs.x.ai/developers/grok-4-6): "Context window | 500,000
+            // tokens".
+            max_context: 500_000,
             notes: None,
         },
     ]
@@ -332,6 +389,11 @@ pub fn recipe_entries() -> Vec<ProviderRecipeEntry> {
             endpoint: recipe.endpoint,
             example_model: recipe.example_model,
             notes: recipe.notes,
+            // Carried as-is (REQ-586 BR-3): the wire entry's `0` spelling is
+            // reserved for a daemon predating the field, and the contract test
+            // above (`no_recipe_ships_an_unknown_window`) keeps this catalog
+            // from ever emitting it.
+            max_context: recipe.max_context,
         })
         .collect()
 }
@@ -414,6 +476,12 @@ mod tests {
             drift("Anthropic's example model")
         );
         assert_eq!(
+            anthropic.max_context,
+            1_000_000,
+            "{}",
+            drift("Anthropic's context window for claude-opus-5")
+        );
+        assert_eq!(
             anthropic.notes.as_deref(),
             Some("the Messages API path, not /chat/completions"),
             "{}",
@@ -445,6 +513,12 @@ mod tests {
             "gpt-5.6",
             "{}",
             drift("OpenAI's example model")
+        );
+        assert_eq!(
+            openai.max_context,
+            1_050_000,
+            "{}",
+            drift("OpenAI's context window for gpt-5.6 (the gpt-5.6-sol alias)")
         );
         assert_eq!(openai.notes, None, "{}", drift("OpenAI's absent note"));
 
@@ -479,6 +553,12 @@ mod tests {
             "{}",
             drift("Moonshot's example model")
         );
+        assert_eq!(
+            kimi.max_context,
+            1_000_000,
+            "{}",
+            drift("Moonshot's context window for kimi-k3")
+        );
         assert_eq!(kimi.notes, None, "{}", drift("Moonshot's absent note"));
 
         let deepseek = &catalog[3];
@@ -506,6 +586,12 @@ mod tests {
             "deepseek-v4-pro",
             "{}",
             drift("DeepSeek's example model")
+        );
+        assert_eq!(
+            deepseek.max_context,
+            1_000_000,
+            "{}",
+            drift("DeepSeek's context window for deepseek-v4-pro")
         );
         assert_eq!(
             deepseek.notes.as_deref(),
@@ -541,10 +627,26 @@ mod tests {
             drift("Ollama's example model")
         );
         assert_eq!(
-            ollama.notes.as_deref(),
-            Some("Ollama ignores the key, but provider add still asks for one — any placeholder does"),
+            ollama.max_context,
+            4_096,
             "{}",
-            drift("Ollama's note, which is the only place the key step is qualified")
+            drift(
+                "Ollama's window — deliberately the SERVED default context, not the model \
+                 card's 128k"
+            )
+        );
+        assert_eq!(
+            ollama.notes.as_deref(),
+            Some(
+                "Ollama ignores the key, but provider add still asks for one — any \
+                 placeholder does; the window here is Ollama's served default (4k), not \
+                 the model card's 128k — raise num_ctx and max_context together"
+            ),
+            "{}",
+            drift(
+                "Ollama's note, which is the only place the key step and the served-default \
+                 window are qualified"
+            )
         );
 
         let grok = &catalog[5];
@@ -573,7 +675,45 @@ mod tests {
             "{}",
             drift("Grok's example model")
         );
+        assert_eq!(
+            grok.max_context,
+            500_000,
+            "{}",
+            drift("Grok's context window for grok-4.6")
+        );
         assert_eq!(grok.notes, None, "{}", drift("Grok's absent note"));
+    }
+
+    /// **REQ-586 AC-5: no recipe ships an unknown window.**
+    ///
+    /// `0` is the config's spelling of "unknown / unset — the budget is
+    /// defaulted", and it is a legal value for a *user's* record. It is not a
+    /// legal value here: a recipe exists to hand `/provider setup` the facts a
+    /// registration needs, and an entry with no window would ship the
+    /// default-budget experience under a vendor's name — silently, which is
+    /// exactly what BR-3 forbids. A vendor whose page cannot be reached gets
+    /// the most conservative *documented* figure and a comment saying so,
+    /// never `0`.
+    #[test]
+    fn no_recipe_ships_an_unknown_window() {
+        let catalog = recipe_catalog();
+        assert!(
+            catalog.len() >= 6,
+            "the catalog ships {} recipes; this sweep is narrower than the roster",
+            catalog.len()
+        );
+        for recipe in catalog {
+            assert!(
+                recipe.max_context > 0,
+                "`{}` ships max_context = 0 — the \"unknown\" spelling. Verify the window \
+                 of `{}` against the vendor's model page and record it (REQ-586 BR-3); if \
+                 the page is unreachable, record the most conservative documented figure \
+                 and say so in the entry's `Verified <date>` comment. Never 0, and \
+                 deleting this assertion is never the fix.",
+                recipe.id_suggestion,
+                recipe.example_model
+            );
+        }
     }
 
     /// An endpoint is required exactly when
@@ -680,7 +820,13 @@ mod tests {
                 endpoint: recipe.endpoint.clone(),
                 model: Some(recipe.example_model.clone()),
                 auth_ref: Some(format!("keychain://teton/{}", recipe.id_suggestion)),
-                capabilities: ProviderCapabilities::default(),
+                // The window the recipe declares, registered the way the setup
+                // commit records it (REQ-586 BR-3) — so every recipe's figure
+                // is also a capabilities value `Config::validate` accepts.
+                capabilities: ProviderCapabilities {
+                    max_context: recipe.max_context,
+                    ..ProviderCapabilities::default()
+                },
             };
             let config = Config {
                 providers: vec![provider],
@@ -906,6 +1052,7 @@ mod tests {
                 kind,
                 endpoint,
                 example_model,
+                max_context,
                 notes,
             } = recipe;
             fields.push(id_suggestion);
@@ -914,9 +1061,11 @@ mod tests {
             fields.push(example_model);
             fields.extend(endpoint);
             fields.extend(notes);
-            // The one field swept by inspection rather than by content: a
-            // four-variant enum has no room for a secret.
+            // The two fields swept by inspection rather than by content: a
+            // four-variant enum has no room for a secret, and a token count is
+            // a number — the sweep is for the strings a secret could hide in.
             let _ = kind;
+            let _ = max_context;
         }
 
         // Non-vacuity, derived rather than a bare literal so it moves with the
@@ -1044,6 +1193,7 @@ mod tests {
                 kind,
                 endpoint,
                 example_model,
+                max_context,
                 notes,
             } = recipe;
 
@@ -1069,6 +1219,12 @@ mod tests {
             assert_eq!(
                 entry.example_model, example_model,
                 "`{id_suggestion}`'s example model"
+            );
+            assert_eq!(
+                entry.max_context, max_context,
+                "`{id_suggestion}`'s window — what the setup flow records as \
+                 `capabilities.max_context` (REQ-586 BR-3), and a figure the wire's `0` \
+                 spelling would silently un-declare"
             );
             assert_eq!(entry.notes, notes, "`{id_suggestion}`'s note");
         }

@@ -318,6 +318,380 @@ impl RpcMethod for SessionSetCwdParams {
 }
 
 // ---------------------------------------------------------------------------
+// skills (REQ-585)
+// ---------------------------------------------------------------------------
+
+/// Which of REQ-585's two discovery roots a skill was found under (BR-1).
+///
+/// `user` is `~/.claude/{skills,commands}`; `project` is the same pair under
+/// the session root. The distinction is not cosmetic: it decides the name
+/// contest (BR-2 — a project skill shadows a user skill of the same name), it
+/// is half of the permission key (`skill:<source>:<name>`, ADR-6), and it is
+/// why a `/cd` drops the project grants and keeps the user ones.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SkillSource {
+    /// Found under the user's `~/.claude`.
+    User,
+    /// Found under the session root's `.claude`.
+    Project,
+}
+
+/// Every name the built-in command table claims, so a skill can never take one.
+///
+/// **Why this lives above both crates.** BR-2 says a reserved name always wins,
+/// and the table that defines "reserved" is `teton`'s `COMMANDS` — which
+/// `tetond` cannot read, because the daemon does not depend on the CLI. So the
+/// client enforced it and the daemon did not, and the daemon's name resolver —
+/// then one function, since split into
+/// `SkillRegistry::{dispatchable_by_user, invocable_by_model}` (REQ-587 ADR-12)
+/// — happily answered for a skill named `cost`. That is invisible while the only
+/// client is `teton`, and it is a hole the moment a second one exists: a
+/// `session/prompt { skill: { name: "cost" } }` from a client carrying no table
+/// runs a repo-supplied `.claude/skills/cost/SKILL.md`, and the spec's own
+/// Assumptions say project skills may be authored by someone other than the
+/// user. ADR-1's rule is that every rule with teeth lives in the daemon; this
+/// one had none there (REQ-585 verify).
+///
+/// **It is a list here and a derivation there.** `teton::slash::table_claim`
+/// still derives the same set from `COMMANDS` — rows, aliases, the first word
+/// of every multi-word row, and `teton` — and a test asserts the two agree in
+/// both directions, so adding a row without adding it here fails in the crate
+/// that owns the row. A hand-written list nothing checks is LESSON-546's shape;
+/// a hand-written list a derivation is checked against is a wire contract.
+pub const RESERVED_SKILL_NAMES: &[&str] = &[
+    "boundary",
+    "cd",
+    "clear",
+    "cost",
+    "doctor",
+    "effort",
+    "exit",
+    "help",
+    "model",
+    "permissions",
+    "policy",
+    "provider",
+    "quit",
+    "teton",
+    "verbose",
+    "web",
+];
+
+/// True when the built-in command table claims `name`, so no skill may dispatch
+/// under it (BR-2).
+#[must_use]
+pub fn is_reserved_skill_name(name: &str) -> bool {
+    RESERVED_SKILL_NAMES.contains(&name)
+}
+
+/// The permission key a skill's dynamic context asks under: `skill:<source>:<name>`.
+///
+/// **One home, because two crates enforce one rule.** The daemon mints the key
+/// and drops the project-scoped ones when the session root moves (ADR-6); the
+/// client memoizes "allow for this session" answers under the *same* string and
+/// has to forget them at the same moment. Those are the two halves of one
+/// decision, and a decision with two stores needs one invalidation rule — so
+/// the spelling and the predicate live here, above both, rather than being
+/// written out twice and drifting.
+#[must_use]
+pub fn skill_permission_key(source: SkillSource, name: &str) -> String {
+    format!("{}{name}", skill_permission_key_prefix(source))
+}
+
+/// The `skill:<source>:` prefix every key of one source shares.
+#[must_use]
+pub fn skill_permission_key_prefix(source: SkillSource) -> String {
+    let word = match source {
+        SkillSource::User => "user",
+        SkillSource::Project => "project",
+    };
+    format!("skill:{word}:")
+}
+
+/// True when `key` is a **project** skill's dynamic-context key — the grants a
+/// root move invalidates, on either side of the wire.
+///
+/// A user skill's file is the same file whatever the session root is, so its
+/// grant survives; a project skill's name means a different file in a different
+/// repo, which is the whole of ADR-6's argument.
+#[must_use]
+pub fn is_project_skill_key(key: &str) -> bool {
+    key.starts_with(&skill_permission_key_prefix(SkillSource::Project))
+}
+
+/// The prefix every project-skill **acknowledgment** key starts with.
+///
+/// Deliberately not `skill:`. See [`project_skill_trust_key`].
+pub const PROJECT_SKILL_TRUST_KEY_PREFIX: &str = "project_skill_trust:";
+
+/// The permission key the project-skill acknowledgment is remembered under:
+/// `project_skill_trust:<root>` (REQ-587 BR-4, architecture ADR-7).
+///
+/// **A different question, so a different key.** `skill:<source>:<name>` asks
+/// "may these commands run?"; this one asks "may the model run *this
+/// repository's* skills as instructions at all?", once per session per root and
+/// before any expansion exists. LESSON-495's rule is that the key encodes the
+/// question and that a remembered answer frees every later request whose key
+/// matches — so folding the two into one string would let a `y` to one question
+/// answer the other.
+///
+/// It is **not a skill key**, and that is load-bearing rather than cosmetic:
+/// `authorize_skill` requires its key to be a skill key *and* to equal the key
+/// `(source, name)` mints, and an acknowledgment satisfies neither. ADR-7 opens
+/// a third gate door rather than widening two guards that are pinned in both
+/// directions. The family half of each guard is an ordinary refusal rather than
+/// a `debug_assert!`, so it is present in the shipped binary too (REQ-587
+/// verify).
+///
+/// It is also absent from the permission **level table**, on purpose: an
+/// unenumerated key falls to the level's default, which is exactly BR-4's
+/// posture for this question — `guarded`/`edits` ask, `plan` denies, `full`
+/// allows.
+///
+/// `root` is the session root's **home-relative display**
+/// (`session_root::display_for`), never an absolute path: a client that does
+/// not recognize the subject renders the request's key on its refusal line, and
+/// `/Users/jane/dev/teton` on that line carries a username into a transcript
+/// (REQ-585 BR-1's entity table).
+///
+/// The root is **not** truncated here. A key is matched, never read: two long
+/// roots sharing a prefix must not collapse onto one key, or a grant for one
+/// repository would answer for another — precisely the harm the per-root scope
+/// exists to prevent. Bounding belongs to what is *rendered*, not to what is
+/// *compared*.
+///
+/// # The display is lossy, and that is a known gap in this key
+///
+/// `display_for` ends in `Path::display`, which renders bytes that are not valid
+/// UTF-8 as `U+FFFD`. Two roots differing only in such bytes therefore render
+/// identically and mint **one** key here — the same collapse the paragraph above
+/// refuses to introduce by truncation, arriving through the input instead.
+///
+/// The fix is to key on the raw `OsStr` bytes (or a hash of them) and keep the
+/// display for the prompt, which is a change where the two are *minted* — the
+/// caller that computes `display_for(ctx.repo_root(), …)` and passes it here —
+/// not in this function, which never sees a path. Until that lands,
+/// `PermissionGate::authorize_project_skill_trust` refuses a root whose display
+/// carries `U+FFFD` rather than remembering an answer under an ambiguous name,
+/// and `expires_on_session_root_change` bounds the exposure further: the key
+/// does not outlive the root it was answered for.
+#[must_use]
+pub fn project_skill_trust_key(root: &str) -> String {
+    format!("{PROJECT_SKILL_TRUST_KEY_PREFIX}{root}")
+}
+
+/// True when `key` is a project-skill **acknowledgment** key (REQ-587 BR-4).
+///
+/// A bare prefix names no root, and a grant under it would be an answer to no
+/// question — the rule `is_skill_permission_key` already applies to a bare
+/// `skill:project:`.
+#[must_use]
+pub fn is_project_acknowledgment_key(key: &str) -> bool {
+    key.strip_prefix(PROJECT_SKILL_TRUST_KEY_PREFIX)
+        .is_some_and(|root| !root.is_empty())
+}
+
+/// True when a session root move invalidates `key` — **the** invalidation rule,
+/// spelled once above both crates (ASSUME-017).
+///
+/// Two families expire on `/cd`, and no others: a project skill's
+/// dynamic-context grant ([`is_project_skill_key`]) and the project-skill
+/// acknowledgment ([`is_project_acknowledgment_key`]). A user skill's grant
+/// survives, because its file is the same file whatever the session root is.
+///
+/// **Why this is a function and not a `starts_with` at each call site.** The
+/// daemon drops its grants when the root moves; the client drops its
+/// `SessionGrants` memo of the same answers, and it consults that memo *before*
+/// drawing any prompt. When the two disagree about which keys expire, the
+/// client auto-answers the new root's question with the old root's answer and
+/// no human is ever shown anything — ASSUME-017, reached in REQ-585 by writing
+/// the rule out twice. A security decision with two stores needs one
+/// invalidation rule, and the rule belongs above both.
+#[must_use]
+pub fn expires_on_session_root_change(key: &str) -> bool {
+    is_project_skill_key(key) || is_project_acknowledgment_key(key)
+}
+
+/// `serde`'s `default` for a flag whose **absence means yes**.
+fn absent_means_yes() -> bool {
+    true
+}
+
+/// The `skip_serializing_if` companion to [`absent_means_yes`]: the key rides
+/// only when the flag is `false`, so the ordinary row's bytes never change.
+fn is_yes(flag: &bool) -> bool {
+    *flag
+}
+
+/// One registered skill, as a client sees it (REQ-585 BR-3, ADR-1).
+///
+/// This is the whole of what the CLI holds: enough to classify a `/name` line
+/// and to print a `/help` row, and nothing more. The body never crosses the
+/// wire — the daemon expands it (ADR-3), so a client cannot compose a turn out
+/// of file bytes it was handed.
+///
+/// `description` and `argument_hint` **are file bytes** and are treated as
+/// such at both ends: the daemon bounds them with `session_root::bounded_field`
+/// before they go on the wire, and the client defuses again at render through
+/// `Surface::line`. Two layers, each where the frame is authored — ADR-009's
+/// shape, and LESSON-517's.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SkillView {
+    /// The dispatchable spelling: the directory name (`skills/<name>/SKILL.md`)
+    /// or the file stem (`commands/<name>.md`). A frontmatter `name` that
+    /// differs creates no second spelling (BR-2).
+    pub name: String,
+    /// Which root it came from.
+    pub source: SkillSource,
+    /// The frontmatter `description`, bounded and one-line; absent when the
+    /// file declares none.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+    /// The frontmatter `argument-hint`, bounded and one-line; absent when the
+    /// file declares none.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub argument_hint: Option<String>,
+    /// What owns this name instead, when something does — a built-in row, a
+    /// project skill, or a `skills/` entry beating a `commands/` one (BR-2,
+    /// ADR-6). `Some` means **listed but never dispatchable**: `/help` marks
+    /// the row and `classify` must not return it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub shadowed: Option<String>,
+    /// Whether the model may invoke this skill through the `skill` tool
+    /// (REQ-587 BR-3).
+    ///
+    /// `false` for a skill whose frontmatter says `disable-model-invocation:
+    /// true` — absent from the roster, absent from the listing, and a model
+    /// call naming it refused before the expander is asked.
+    ///
+    /// **Absent means `false`**, which is both the compat reading and the safe
+    /// one. A daemon predating REQ-587 has no `skill` tool at all, so nothing
+    /// it lists is model-invocable, and a client defaulting this to `true`
+    /// would print REQ-587's marks for a capability that build does not have.
+    /// It is equally the value BR-3 gives a *malformed* flag — hidden from the
+    /// model, invocable by the user — so a typo in a repository's frontmatter
+    /// can never widen what the model may run.
+    ///
+    /// Both flags `false` is a real state and a named diagnostic rather than a
+    /// silent drop: a skill invocable by nobody.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub model_invocable: bool,
+    /// Whether the user may dispatch this skill by typing `/name` (REQ-587
+    /// BR-3).
+    ///
+    /// `false` for a skill whose frontmatter says `user-invocable: false` —
+    /// model-only, which `/help` **marks** rather than hides (REQ-585 BR-3
+    /// holds: `/help` never shows a *dispatchable* entry the table does not
+    /// resolve, and a model-only entry is not dispatchable by the user), and
+    /// which `classify` refuses with a hint naming the flag.
+    ///
+    /// **Absent means `true`** — the opposite default to
+    /// [`Self::model_invocable`] and for the same two reasons: it is what a
+    /// daemon predating REQ-587 meant by listing a skill at all, and it is
+    /// BR-3's safe value. The wire therefore carries this key only for the
+    /// unusual skill, and every ordinary row is byte-identical to the bytes
+    /// REQ-585 wrote.
+    #[serde(default = "absent_means_yes", skip_serializing_if = "is_yes")]
+    pub user_invocable: bool,
+}
+
+/// One entry discovery found and did not register, with why (REQ-585 BR-1).
+///
+/// Named, never silent: BR-1's rule is that an unreadable, malformed,
+/// mis-named or oversized file is *counted and named*, because a skill that
+/// vanishes without a diagnostic is the LESSON-481 shape — a feature the user
+/// cannot see is one the suite cannot see either. A missing directory is the
+/// normal case and produces no entry, and a directory with no `SKILL.md` is
+/// not a skill.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SkillSkipped {
+    /// The name this entry **would have dispatched under**, empty when it names
+    /// no skill at all (a root-level refusal or truncation, or an entry whose
+    /// spelling was never a candidate).
+    ///
+    /// Named by the daemon rather than re-derived from [`Self::path`] by every
+    /// client that needs it. BR-2's rule — a `skills/` entry is named by its
+    /// directory, a `commands/` entry by its file stem — belongs to the side
+    /// that owns discovery; a client re-deriving it from a display path is a
+    /// second home for that rule in a crate that cannot see the four roots, and
+    /// two spellings of one decision are identical only until one of them is
+    /// edited (LESSON-528).
+    ///
+    /// **Untrusted, and bounded as such**: unlike [`SkillView::name`] — which is
+    /// dispatchable and therefore matched `^[a-z0-9][a-z0-9_-]{0,63}$` before it
+    /// was registered — this is whatever the filesystem spelled, *including* the
+    /// invalid spellings that are why the entry was skipped. The daemon
+    /// neutralizes and bounds it exactly as it does the description.
+    ///
+    /// Additive (REQ-585 ADR-2): a result from a daemon predating the field
+    /// carries no key and reads empty, and an entry that names nothing emits no
+    /// key rather than `""`.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub name: String,
+    /// The file, **relative** and bounded, exactly as [`SkillView`]'s
+    /// description is — from the session root for a `project` entry, from the
+    /// home folder for a `user` one, the rule
+    /// [`crate::events::SkillInvoked::path_display`] states.
+    ///
+    /// Not an absolute path: BR-1's entity table says a skill path is never
+    /// shown as one, because `/Users/jane/.claude/skills/broken/SKILL.md`
+    /// carries a username into a transcript and
+    /// `/tmp/ci-4f2a/repo/.claude/skills/broken/SKILL.md` carries the working
+    /// tree's location (BUG-187), and AC-6 puts these entries on a
+    /// user-visible surface.
+    pub path: String,
+    /// Why it was skipped, in the daemon's own words — `unreadable (permission
+    /// denied)`, `over 64 KiB (67,184 B)`, `not UTF-8`, `malformed
+    /// frontmatter`, `invalid name`, `symlink not followed`, `shadowed by
+    /// <what>` (ADR-4).
+    pub reason: String,
+}
+
+/// List the skills this session would dispatch (REQ-585 BR-3, ADR-1/ADR-2).
+///
+/// **This method is the version handshake.** A client calls it after
+/// `session/create` and again after every `session_root_changed`; a daemon
+/// that answers [`crate::jsonrpc::error_code::METHOD_NOT_FOUND`] yields an
+/// **empty** snapshot rather than an error, which makes `classify` incapable
+/// of returning a skill and leaves a new CLI against an old daemon behaving
+/// byte-for-byte as it does today. The capability is proven by a successful
+/// call, never asserted from a version number — which is why
+/// [`crate::PROTOCOL_VERSION`] does not move for any of REQ-585's additions.
+///
+/// It carries a `session_id` because half the answer is derived from the
+/// session root (BR-1's two project globs), and the root moves under `/cd`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SkillsListParams {
+    /// The session whose registry to report.
+    pub session_id: SessionId,
+}
+
+/// Result of [`SkillsListParams`].
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SkillsListResult {
+    /// Every registered skill, including the shadowed ones — `/help` lists
+    /// them and `classify` refuses them, and both need to see the same rows
+    /// (BR-3: a skill cannot be dispatchable without appearing in `/help`).
+    ///
+    /// Ordered by the daemon, by name: APFS lists in hash order and ext4 does
+    /// not, so an order the client re-derived would be a platform-flaky
+    /// `/help` (LESSON-540).
+    #[serde(default)]
+    pub skills: Vec<SkillView>,
+    /// Everything found and not registered. Rides the same result as `skills`
+    /// so `/help`'s diagnostic line and BR-10's unknown-command hint read one
+    /// list rather than two that can disagree.
+    #[serde(default)]
+    pub skipped: Vec<SkillSkipped>,
+}
+
+impl RpcMethod for SkillsListParams {
+    const METHOD: &'static str = "skills/list";
+    type Result = SkillsListResult;
+}
+
+// ---------------------------------------------------------------------------
 // prompt turn
 // ---------------------------------------------------------------------------
 
@@ -340,6 +714,36 @@ pub enum PromptBlock {
     },
 }
 
+/// A user-typed skill invocation, carried as a name and the rest of the line
+/// (REQ-585 BR-4, architecture ADR-3).
+///
+/// **The invocation crosses the wire as a name, never as an expansion.** The
+/// client never composes the body, which keeps the untrusted file bytes on the
+/// side of the seam that sanitizes them (LESSON-517), and it never puts the
+/// typed `/name …` line in `prompt` either — so a daemon that dropped this
+/// field yields a visible empty turn, not a leaked command line reaching a
+/// model.
+///
+/// Deliberately **not** a [`PromptBlock`] variant: that enum is
+/// `#[serde(tag = "type")]`, where an unknown tag is a deserialization failure
+/// rather than a degrade — and an invocation is not prompt content in the
+/// first place.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SkillInvocation {
+    /// The skill's dispatchable name, as [`SkillView::name`] spells it.
+    pub name: String,
+    /// The rest of the typed line, **verbatim** — interior whitespace
+    /// preserved, quotes uninterpreted, the line's edges trimmed as the
+    /// classifier trims today.
+    ///
+    /// This is the one place the session does not use REQ-582 ADR-2's
+    /// tokenization (BR-4), so it must never be re-joined from a token list
+    /// anywhere on the path: `/alpha teton  code "repo"` reaches `$ARGUMENTS`
+    /// with both interior spaces and both quotes intact, and a re-join would
+    /// silently normalize them.
+    pub raw_arguments: String,
+}
+
 /// Submit a prompt turn to a session. ACP equivalent: `session/prompt`.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct PromptTurnParams {
@@ -347,6 +751,19 @@ pub struct PromptTurnParams {
     pub session_id: SessionId,
     /// The prompt, as an ordered list of content blocks.
     pub prompt: Vec<PromptBlock>,
+    /// A skill invocation to expand into this turn instead of `prompt`
+    /// (REQ-585 BR-4, ADR-3).
+    ///
+    /// Additive, and absent on every turn a pre-REQ-585 client sends. Exactly
+    /// one of `prompt`/`skill` is populated: the daemon refuses
+    /// [`crate::jsonrpc::error_code::INVALID_PARAMS`] when **both** are, a
+    /// combination that was never valid so nothing is narrowed. A request with
+    /// *neither* is still accepted — `flatten_prompt(&[])` is `""` and such a
+    /// turn runs today, so rejecting it would narrow an existing method for
+    /// third-party clients while [`crate::PROTOCOL_VERSION`] is asserted
+    /// unchanged.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub skill: Option<SkillInvocation>,
 }
 
 /// Why a prompt turn ended. ACP: `stopReason`.
@@ -407,6 +824,47 @@ pub enum PermissionOutcome {
     },
     /// The user dismissed the prompt without choosing.
     Cancelled,
+    /// The client refused the request **without asking anyone** (REQ-585
+    /// BR-11, architecture ADR-7/ADR-8).
+    ///
+    /// **Why this is not [`PermissionOutcome::Cancelled`].** `Cancelled`
+    /// already means *the user dismissed the prompt* — it is what EOF on a
+    /// pipe returns — so folding these into it would say a human declined when
+    /// no human was ever reachable. AC-9 requires the not-run placeholders to
+    /// say *no human could be asked*, which the daemon cannot know from a
+    /// dismissal, and BR-11's whole point is that the refusal happens
+    /// **before** `prompter.ask` reads a line: a refusal computed after that
+    /// call has already eaten the user's next prompt line and turned a pasted
+    /// `y` into consent (LESSON-537).
+    ///
+    /// Additive on a tagged enum, so it travels in one direction only and is
+    /// only ever sent to a daemon that answered `skills/list` (ADR-2's
+    /// handshake). A pre-REQ-585 daemon has no `refused` arm and would refuse
+    /// the params outright — which is why the handshake, not serde tolerance,
+    /// is what gates it.
+    Refused {
+        /// Which of BR-11's two closed doors this was.
+        reason: RefusalReason,
+    },
+}
+
+/// Why a client refused a permission request without asking (REQ-585 BR-11).
+///
+/// Closed on purpose: it is read by the daemon, which composes AC-9's
+/// placeholder sentence from it, and a reason it cannot render is a refusal it
+/// cannot explain. A future client inventing a third door fails the params
+/// rather than having its answer silently rendered as one of these two.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RefusalReason {
+    /// There is no terminal to ask at — piped stdin, at a level that would ask
+    /// (BR-11). The commands are not run and the next stdin line stays the
+    /// next prompt line.
+    NoTerminal,
+    /// The request carried a subject this client does not recognize, so it
+    /// refused rather than falling through to `prompter.ask` (ADR-7's
+    /// fail-closed rule; see [`crate::events::PermissionSubject::Unrecognized`]).
+    UnrecognizedSubject,
 }
 
 /// Result of [`PermissionRespondParams`].
@@ -692,6 +1150,68 @@ pub struct ProviderConfig {
     /// wire and config only carry the reference, the daemon resolves it.
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub auth_ref: Option<String>,
+    /// The provider's declared context window in tokens —
+    /// `capabilities.max_context` (REQ-586 BR-3).
+    ///
+    /// On a snapshot, the daemon **always populates** this field: `Some(0)`
+    /// means "unknown / unset — the budget is defaulted", which `/doctor` and
+    /// `/provider list` state rather than hide. `None` means the snapshot came
+    /// from a daemon that predates the field — the `RouteDecided::effort` rule,
+    /// so `Option` is for **wire additivity only** and moves neither
+    /// [`crate::PROTOCOL_VERSION`] nor [`crate::PROTOCOL_VERSION_MIN`].
+    ///
+    /// On a `RegisterProvider` update, `Some(v)` writes the window and `None`
+    /// preserves whatever is stored (an older client's re-registration cannot
+    /// zero a declared window — architecture ADR-7, field-wise merge).
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub max_context: Option<u32>,
+    /// A user ceiling on the context budget, in tokens, below the window —
+    /// `capabilities.context_budget_cap` (REQ-586 BR-5). `Some(0)` is "no cap".
+    /// Same additivity and merge rule as [`Self::max_context`]; a cap above the
+    /// window is inert, not invalid (ADR-7).
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub context_budget_cap: Option<u32>,
+    /// The pair turns to this provider actually run under, present **only**
+    /// when the derivation had to **raise** it off this provider's own
+    /// declaration (REQ-586 TASK-194 2b) — a snapshot field the daemon owns,
+    /// and one a client never sends.
+    ///
+    /// The one fact `/doctor`'s advisory cannot compute: whether the floor bit
+    /// depends on the generation reservation and the two budget ratios, which
+    /// live in the daemon's derivation and have exactly one home there
+    /// (LESSON-456). So the daemon answers it and the client renders the
+    /// answer, the way the `window:` column renders [`Self::max_context`].
+    ///
+    /// `None` on a `RegisterProvider` update (there is nothing to declare here
+    /// — the daemon ignores whatever a client puts in it), `None` on a
+    /// snapshot from a daemon predating the field, and `None` on a provider
+    /// whose budget was not floored. All three render nothing, which is why one
+    /// spelling covers them.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub floored_budget: Option<FlooredBudget>,
+}
+
+/// The budget a provider whose declaration fell **below the floor** actually
+/// runs under (REQ-586 TASK-194 2b).
+///
+/// The floor is the smallest budget that can still hold the harness's own
+/// system prompt; a window or a `context_budget_cap` deriving under it is
+/// raised to it, so the turn gets *more* than the declaration asked for. That
+/// is a deliberate degradation with a documented cost — a budget that cannot
+/// hold the system prompt would fail every turn instead — and this is what
+/// carries it to a surface.
+///
+/// Carried as a pair rather than as a boolean because the advisory that renders
+/// it has to say *what the turn gets instead* — "2,048 words / 16 KB" — and
+/// those two numbers are the daemon's derivation to state, not the client's to
+/// compute. Only one currency may have been raised, so this is the derived pair
+/// rather than the floor constants.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FlooredBudget {
+    /// The word budget in force.
+    pub budget_tokens: u64,
+    /// The byte budget in force.
+    pub budget_bytes: u64,
 }
 
 // `RoutingRule` and `ConfigUpdate::SetRoutingRule` are **gone** (REQ-558 AC-9).
@@ -1177,6 +1697,23 @@ pub struct ConfigSetParams {
 pub struct ConfigSetResult {
     /// True when the mutation was accepted and persisted.
     pub applied: bool,
+    /// The one sentence a registration that records a **big context window**
+    /// earns (REQ-586 TASK-194, OQ-6 as amended): what one call to this
+    /// provider may now carry, what one prompt may spend at worst, and the key
+    /// that would bound it.
+    ///
+    /// Composed by the daemon, not by the client, because every figure in it
+    /// comes from `harness::budget::derive` — the same derivation the router
+    /// runs, and one no thin client may repeat (BR-8, AC-12). `/provider
+    /// setup`'s preview carries the identical sentence in its own warning list;
+    /// this field is how `teton provider add --max-context` gets it, so the two
+    /// surfaces cannot drift into two wordings of one fact.
+    ///
+    /// `None` for every update that records no window above the threshold, and
+    /// from a daemon that predates the field — both render nothing, which is
+    /// exactly today's output.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub budget_notice: Option<String>,
 }
 
 impl RpcMethod for ConfigSetParams {
@@ -1880,6 +2417,15 @@ pub struct ProviderRecipeEntry {
     /// when it says everything. Absent from the wire when `None`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub notes: Option<String>,
+    /// The context window, in tokens, of [`Self::example_model`] — what
+    /// `/provider setup` records as `capabilities.max_context` so the budget
+    /// follows the route from the first turn (REQ-586 BR-3). Never `0` in the
+    /// shipped catalog (the daemon's contract test pins that); `0` is what an
+    /// entry from a daemon predating the field reads as, which is the
+    /// "unknown" spelling the config already uses — so the field is not
+    /// optional on the wire, and a client never has to tell absent from unset.
+    #[serde(default)]
+    pub max_context: u32,
 }
 
 /// A provider the config already holds, for the flow to show before it offers
@@ -2057,6 +2603,13 @@ pub struct ProviderSetupCandidate {
     /// "route nothing" has one spelling.
     #[serde(default)]
     pub bindings: Vec<TierBinding>,
+    /// The context window to record as `capabilities.max_context`, in tokens —
+    /// the recipe's default, carried silently by the setup UI (REQ-586 BR-3,
+    /// architecture ADR-9). `None` leaves the window unknown, which is the
+    /// honest outcome for a candidate built from no recipe, and what a client
+    /// predating the field sends; absent from the wire when `None`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_context: Option<u32>,
 }
 
 /// Show exactly what registering the candidate would write, without writing it
@@ -2710,6 +3263,7 @@ mod tests {
                     name: None,
                 },
             ],
+            skill: None,
         });
         round_trip(&PromptTurnResult {
             turn_id: TurnId::from("t1"),
@@ -3025,6 +3579,11 @@ mod tests {
                     endpoint: Some("https://api.anthropic.com".to_owned()),
                     model: Some("claude-opus-5".to_owned()),
                     auth_ref: Some("keychain://teton/anthropic".to_owned()),
+                    // REQ-586: what a daemon that has the field always sends —
+                    // the declared window, and no cap.
+                    max_context: Some(200_000),
+                    context_budget_cap: None,
+                    floored_budget: None,
                 }],
                 tiers: vec![TierRouteView {
                     tier: Tier::Think,
@@ -3207,6 +3766,109 @@ mod tests {
         assert_eq!(old.judgment_default, Some(Category::Edit));
     }
 
+    /// REQ-586's additive rule on the wire `ProviderConfig`, in the direction a
+    /// **newer client** reads an **older daemon**: a provider record without
+    /// `max_context`/`context_budget_cap` deserializes, and both read `None` —
+    /// "the daemon predates the field", which is a different claim from
+    /// `Some(0)`, "the daemon says the window is unknown". Keeping the two
+    /// distinct is what lets `/doctor` say which one it is (BR-3).
+    ///
+    /// And the non-vacuity: a record that carries them round-trips with the
+    /// values it carried, and one built with `None` emits no key rather than
+    /// `null` — the same wire an older daemon writes.
+    #[test]
+    fn a_provider_record_without_the_window_fields_still_deserializes() {
+        let pre_586: ProviderConfig = serde_json::from_str(
+            r#"{"id":"kimi","kind":"openai-compatible",
+                "endpoint":"https://api.moonshot.ai/v1/chat/completions",
+                "model":"kimi-k3","auth_ref":"keychain://teton/kimi"}"#,
+        )
+        .unwrap();
+        assert_eq!(pre_586.id, ProviderId::from("kimi"));
+        assert_eq!(pre_586.max_context, None);
+        assert_eq!(pre_586.context_budget_cap, None);
+        let wire = serde_json::to_value(&pre_586).unwrap();
+        assert!(wire.get("max_context").is_none(), "{wire}");
+        assert!(wire.get("context_budget_cap").is_none(), "{wire}");
+
+        // The daemon's "unknown" spelling is a present zero, not an absence.
+        let unknown = ProviderConfig {
+            max_context: Some(0),
+            ..pre_586.clone()
+        };
+        round_trip(&unknown);
+        let wire = serde_json::to_value(&unknown).unwrap();
+        assert_eq!(wire["max_context"], 0, "{wire}");
+
+        let declared = ProviderConfig {
+            max_context: Some(131_072),
+            context_budget_cap: Some(65_536),
+            ..pre_586
+        };
+        round_trip(&declared);
+        let wire = serde_json::to_value(&declared).unwrap();
+        assert_eq!(wire["max_context"], 131_072, "{wire}");
+        assert_eq!(wire["context_budget_cap"], 65_536, "{wire}");
+    }
+
+    /// The other direction of the same claim: a client that predates the
+    /// window fields still reads a provider that carries them, and the
+    /// snapshot around it.
+    ///
+    /// Serde ignores unknown fields by default and no type here opts out, but
+    /// this posture is what keeps [`crate::PROTOCOL_VERSION`] still across the
+    /// addition, so it is asserted rather than assumed — modelled by the
+    /// pre-REQ-586 shape of the reader, exactly as
+    /// `a_client_predating_redact_enabled_still_reads_a_snapshot_that_carries_it`
+    /// does one REQ up.
+    #[test]
+    fn a_client_predating_the_window_fields_still_reads_a_provider_that_carries_them() {
+        #[derive(Deserialize)]
+        struct PreWindowProvider {
+            id: ProviderId,
+            kind: ProviderKind,
+            model: Option<String>,
+            auth_ref: Option<String>,
+        }
+        #[derive(Deserialize)]
+        struct PreWindowSnapshot {
+            providers: Vec<PreWindowProvider>,
+            redact_enabled: bool,
+        }
+
+        let wire = serde_json::to_string(&ConfigSnapshot {
+            providers: vec![ProviderConfig {
+                id: ProviderId::from("kimi"),
+                kind: ProviderKind::OpenaiCompatible,
+                endpoint: Some("https://api.moonshot.ai/v1/chat/completions".to_owned()),
+                model: Some("kimi-k3".to_owned()),
+                auth_ref: Some("keychain://teton/kimi".to_owned()),
+                max_context: Some(131_072),
+                context_budget_cap: Some(65_536),
+                floored_budget: None,
+            }],
+            redact_enabled: true,
+            ..ConfigSnapshot::default()
+        })
+        .unwrap();
+        assert!(
+            wire.contains(r#""max_context":131072"#)
+                && wire.contains(r#""context_budget_cap":65536"#),
+            "the fixture must actually carry the new keys: {wire}"
+        );
+
+        let old: PreWindowSnapshot = serde_json::from_str(&wire).unwrap();
+        assert_eq!(old.providers.len(), 1, "the old reader still gets its rows");
+        assert_eq!(old.providers[0].id, ProviderId::from("kimi"));
+        assert_eq!(old.providers[0].kind, ProviderKind::OpenaiCompatible);
+        assert_eq!(old.providers[0].model.as_deref(), Some("kimi-k3"));
+        assert_eq!(
+            old.providers[0].auth_ref.as_deref(),
+            Some("keychain://teton/kimi")
+        );
+        assert!(old.redact_enabled);
+    }
+
     /// The eleven categories, spelled out rather than iterated, so a twelfth
     /// has to be added here by hand — the same reason the `Category` tests in
     /// `lib.rs` spell them.
@@ -3371,6 +4033,13 @@ mod tests {
                 endpoint: Some("https://api.deepseek.com".to_owned()),
                 model: Some("deepseek-chat".to_owned()),
                 auth_ref: Some("keychain://teton/deepseek".to_owned()),
+                // REQ-586 BR-3/BR-5: a registration that declares both the
+                // window and a cap below it — both fields set, so a round trip
+                // that silently dropped either would fail rather than coincide
+                // with the absent default.
+                max_context: Some(128_000),
+                context_budget_cap: Some(64_000),
+                floored_budget: None,
             }),
             ConfigUpdate::SetTierBinding(TierBindingConfig {
                 tier: Tier::Build,
@@ -3389,7 +4058,10 @@ mod tests {
         ] {
             round_trip(&ConfigSetParams { update });
         }
-        round_trip(&ConfigSetResult { applied: true });
+        round_trip(&ConfigSetResult {
+            applied: true,
+            budget_notice: None,
+        });
     }
 
     /// REQ-562 AC-4, RPC leg: `config/set` cannot carry a binding for a pinned
@@ -3578,10 +4250,486 @@ mod tests {
         // this literal.
         assert_eq!(SessionClearParams::METHOD, "session/clear");
         assert_eq!(SessionSetCwdParams::METHOD, "session/set_cwd");
+        // REQ-585's one method, and the literal matters more here than for the
+        // rest: this string *is* the capability handshake (ADR-2). The daemon's
+        // dispatch match and the CLI's post-`session/create` call are written
+        // against it, and a rename that edited only one side would not be a
+        // visible failure — it would be `METHOD_NOT_FOUND`, which the client
+        // deliberately reads as "this daemon has no skills", so every `/name`
+        // would quietly become `unknown command` on a daemon that has them.
+        assert_eq!(SkillsListParams::METHOD, "skills/list");
         assert_eq!(
             request(Id::Number(2), ModelStatusParams::default()).method,
             "model/status"
         );
+    }
+
+    /// REQ-585's snapshot round-trips, including every state whose *absence* is
+    /// a distinct fact: no description, no argument hint, nothing shadowing it,
+    /// and an entirely empty registry.
+    ///
+    /// The empty result is the one worth naming. It is what a daemon with no
+    /// `~/.claude` answers **and** what the client synthesizes from
+    /// `METHOD_NOT_FOUND` on an old daemon (ADR-2), so it has to be a value the
+    /// wire can carry rather than a shape that only exists in the client's
+    /// head — and it must be reachable from `Default`, because that is how the
+    /// old-daemon path constructs it.
+    #[test]
+    fn skills_list_round_trips_including_the_empty_registry() {
+        round_trip(&SkillsListParams {
+            session_id: SessionId::from("s1"),
+        });
+        round_trip(&SkillsListResult::default());
+        assert!(SkillsListResult::default().skills.is_empty());
+        assert!(SkillsListResult::default().skipped.is_empty());
+
+        round_trip(&SkillsListResult {
+            skills: vec![
+                SkillView {
+                    name: "alpha".to_owned(),
+                    source: SkillSource::User,
+                    description: Some("audit the repo".to_owned()),
+                    argument_hint: Some("[path]".to_owned()),
+                    shadowed: None,
+                    model_invocable: true,
+                    user_invocable: true,
+                },
+                // A project skill with nothing declared but its name — the
+                // `.claude/commands/*.md` shape, which routinely has no
+                // frontmatter at all.
+                SkillView {
+                    name: "gamma".to_owned(),
+                    source: SkillSource::Project,
+                    description: None,
+                    argument_hint: None,
+                    shadowed: None,
+                    model_invocable: false,
+                    user_invocable: true,
+                },
+                // Listed, never dispatchable (BR-2).
+                SkillView {
+                    name: "cost".to_owned(),
+                    source: SkillSource::User,
+                    description: None,
+                    argument_hint: None,
+                    shadowed: Some("a built-in command".to_owned()),
+                    model_invocable: false,
+                    user_invocable: true,
+                },
+            ],
+            skipped: vec![SkillSkipped {
+                name: "broken".to_owned(),
+                path: "~/.claude/skills/broken/SKILL.md".to_owned(),
+                reason: "malformed frontmatter".to_owned(),
+            }],
+        });
+
+        // The two sources keep their spec spellings on the wire: the grant key
+        // (`skill:<source>:<name>`) is built from them, so a rename here would
+        // silently invalidate every remembered grant.
+        assert_eq!(
+            serde_json::to_string(&SkillSource::User).unwrap(),
+            "\"user\""
+        );
+        assert_eq!(
+            serde_json::to_string(&SkillSource::Project).unwrap(),
+            "\"project\""
+        );
+
+        // An undeclared description emits **no key**, not `null` — a client
+        // that renders `Some("null")` into a `/help` row would be printing the
+        // absence rather than omitting it.
+        let bare = serde_json::to_value(SkillView {
+            name: "gamma".to_owned(),
+            source: SkillSource::Project,
+            description: None,
+            argument_hint: None,
+            shadowed: None,
+            model_invocable: false,
+            user_invocable: true,
+        })
+        .expect("serializes");
+        assert!(bare.get("description").is_none(), "{bare}");
+        assert!(bare.get("argument_hint").is_none(), "{bare}");
+        assert!(bare.get("shadowed").is_none(), "{bare}");
+        // REQ-587's two flags in their ordinary posture — not model-invocable,
+        // invocable by the user — write **no keys at all**, so an ordinary
+        // row's bytes are exactly the bytes REQ-585 wrote.
+        assert!(bare.get("model_invocable").is_none(), "{bare}");
+        assert!(bare.get("user_invocable").is_none(), "{bare}");
+    }
+
+    /// REQ-585 TASK-203: `SkillSkipped.name` is additive in both directions —
+    /// the `route_decided` budget rule re-applied to the one field this task
+    /// adds, rather than assumed inherited.
+    ///
+    /// The field exists so BR-2's naming rule ("a `skills/` entry is named by
+    /// its directory, a `commands/` entry by its stem") has one home, on the
+    /// side that owns discovery. That makes the skew question real: a client
+    /// that already re-derives the name from the path will keep working against
+    /// a daemon that has never sent one, and a daemon that sends one must not
+    /// break a reader built before it.
+    ///
+    /// Four legs, as the rule asks: an absent key parses, an empty name emits
+    /// **no** key rather than `""`, the new wire parses through a
+    /// locally-declared pre-REQ struct, and the fixture that proves the third
+    /// leg is checked for actually carrying the key (LESSON-502 — the vacuity
+    /// is the failure mode).
+    #[test]
+    fn a_skipped_entrys_name_is_additive_in_both_directions() {
+        // A result from a daemon predating the field: no `name` key at all.
+        let older: SkillsListResult = serde_json::from_str(
+            r#"{"skills":[],"skipped":[
+                {"path":"~/.claude/skills/broken/SKILL.md","reason":"malformed frontmatter"}]}"#,
+        )
+        .expect("a result from a daemon predating the field must still parse");
+        assert_eq!(older.skipped[0].name, "");
+        assert_eq!(older.skipped[0].reason, "malformed frontmatter");
+
+        // And an entry that names nothing — a root-level refusal — writes no
+        // key, rather than an empty string a client would render as a name.
+        let unnamed = serde_json::to_value(&older).unwrap();
+        assert!(
+            unnamed["skipped"][0].get("name").is_none(),
+            "an entry that names no skill emits no key: {unnamed}"
+        );
+
+        // The other direction: a reader built before the field.
+        #[derive(Deserialize)]
+        struct PreNameSkillSkipped {
+            path: String,
+            reason: String,
+        }
+        #[derive(Deserialize)]
+        struct PreNameSkillsListResult {
+            skipped: Vec<PreNameSkillSkipped>,
+        }
+        let wire = serde_json::to_string(&SkillsListResult {
+            skills: Vec::new(),
+            skipped: vec![SkillSkipped {
+                name: "broken".to_owned(),
+                path: "~/.claude/skills/broken/SKILL.md".to_owned(),
+                reason: "malformed frontmatter".to_owned(),
+            }],
+        })
+        .unwrap();
+        assert!(
+            wire.contains(r#""name":"broken""#),
+            "the fixture must actually carry the new key: {wire}"
+        );
+        let old: PreNameSkillsListResult =
+            serde_json::from_str(&wire).expect("a client predating the field still reads the list");
+        assert_eq!(old.skipped[0].path, "~/.claude/skills/broken/SKILL.md");
+        assert_eq!(old.skipped[0].reason, "malformed frontmatter");
+
+        assert_eq!(
+            crate::PROTOCOL_VERSION,
+            crate::ProtocolVersion(2),
+            "a named skipped entry is one more optional field, so the negotiated \
+             version does not move"
+        );
+    }
+
+    /// REQ-587 BR-3's two invocability flags, additive in both directions —
+    /// the `SkillSkipped.name` rule re-applied rather than assumed inherited,
+    /// with the **opposite defaults** asserted, because that is the half a
+    /// copied test gets wrong.
+    ///
+    /// Four legs, as the rule asks: an absent key parses to the safe posture,
+    /// an ordinary row emits **no** key rather than `false`/`true`, the new
+    /// wire parses through a locally-declared pre-REQ-587 reader, and the
+    /// fixture that proves the third leg is checked for actually carrying the
+    /// keys (LESSON-502 — the vacuity is the failure mode).
+    #[test]
+    fn skill_view_invocability_flags_are_additive_in_both_directions() {
+        // A row from a daemon predating the flags: neither key present. The two
+        // defaults are not symmetric, and both are the safe reading — that
+        // daemon has no `skill` tool, so nothing it lists is model-invocable,
+        // and it listed the skill at all because the user may type it.
+        let older: SkillView =
+            serde_json::from_str(r#"{"name":"alpha","source":"user","description":"audit"}"#)
+                .expect("a row from a daemon predating the flags must still parse");
+        assert!(!older.model_invocable, "absent means not model-invocable");
+        assert!(older.user_invocable, "absent means the user may type it");
+
+        // And a row in that same posture writes neither key — not
+        // `"model_invocable":false`, not `"user_invocable":true`. Downgrading
+        // either `skip_serializing_if` to a bare `default` fails here.
+        let wire = serde_json::to_value(&older).unwrap();
+        assert!(wire.get("model_invocable").is_none(), "{wire}");
+        assert!(wire.get("user_invocable").is_none(), "{wire}");
+
+        // The other direction: a reader built before the flags.
+        #[derive(Deserialize)]
+        struct PreFlagsSkillView {
+            name: String,
+            source: SkillSource,
+            #[serde(default)]
+            shadowed: Option<String>,
+        }
+        let model_only = SkillView {
+            name: "release".to_owned(),
+            source: SkillSource::Project,
+            description: Some("cut a release".to_owned()),
+            argument_hint: None,
+            shadowed: None,
+            model_invocable: true,
+            user_invocable: false,
+        };
+        round_trip(&model_only);
+        let wire = serde_json::to_string(&model_only).unwrap();
+        assert!(
+            wire.contains(r#""model_invocable":true"#)
+                && wire.contains(r#""user_invocable":false"#),
+            "the fixture must actually carry the new keys: {wire}"
+        );
+        let old: PreFlagsSkillView =
+            serde_json::from_str(&wire).expect("a client predating the flags still reads the row");
+        assert_eq!(old.name, "release");
+        assert_eq!(old.source, SkillSource::Project);
+        // What that client makes of it, stated rather than left to inference:
+        // an unmarked, dispatchable `/help` row. The flag has teeth in the
+        // daemon (ADR-1), so the worst an old client does is offer a row whose
+        // dispatch the daemon refuses — one refusal line, never a wrong
+        // expansion.
+        assert_eq!(old.shadowed, None);
+
+        // BR-3's fourth state: both flags off — invocable by nobody, a named
+        // diagnostic rather than a silent drop — survives the wire, and the
+        // `false` half is the half that rides.
+        let nobody = SkillView {
+            name: "orphan".to_owned(),
+            source: SkillSource::User,
+            description: None,
+            argument_hint: None,
+            shadowed: None,
+            model_invocable: false,
+            user_invocable: false,
+        };
+        round_trip(&nobody);
+        let wire = serde_json::to_value(&nobody).unwrap();
+        assert!(wire.get("model_invocable").is_none(), "{wire}");
+        assert_eq!(wire["user_invocable"], false, "{wire}");
+
+        assert_eq!(
+            crate::PROTOCOL_VERSION,
+            crate::ProtocolVersion(2),
+            "REQ-587 adds optional fields, one subject variant and no method, so the \
+             negotiated version does not move"
+        );
+    }
+
+    /// REQ-587 BR-4 / ADR-7: the acknowledgment key is its **own** family, it
+    /// is nobody's skill key, and one predicate decides what a `/cd` expires.
+    ///
+    /// The three claims are here together because they are one claim about a
+    /// string that two crates and two stores compare. ASSUME-017 is what
+    /// happens when the rule is written out twice: the daemon expired its
+    /// grants, the client's memo did not, and the client answered the new
+    /// root's question with the old root's answer before a human saw anything.
+    #[test]
+    fn the_acknowledgment_key_is_its_own_family_and_expires_with_the_root() {
+        let key = project_skill_trust_key("~/dev/teton");
+        assert_eq!(key, "project_skill_trust:~/dev/teton");
+        assert!(is_project_acknowledgment_key(&key));
+
+        // Not a skill key, in either crate's spelling of that question. The
+        // daemon's `is_skill_permission_key` matches on the `skill:<source>:`
+        // prefixes, and `authorize_skill` `debug_assert!`s its key is one —
+        // which is why ADR-7 opens a third door instead of widening the guard.
+        assert!(!key.starts_with("skill:"), "{key}");
+        assert!(!is_project_skill_key(&key), "{key}");
+        assert!(
+            !is_project_acknowledgment_key(&skill_permission_key(SkillSource::Project, "deploy")),
+            "the two families do not overlap in the other direction either"
+        );
+        assert!(!is_project_acknowledgment_key(&skill_permission_key(
+            SkillSource::User,
+            "status"
+        )));
+        assert!(!is_project_acknowledgment_key("shell"));
+
+        // A bare prefix names no root; a grant under it would be an answer to
+        // no question.
+        assert!(!is_project_acknowledgment_key(
+            PROJECT_SKILL_TRUST_KEY_PREFIX
+        ));
+
+        // Two roots, two keys — never one. The root is not truncated on its way
+        // into a key, because a key is compared and not read: two long roots
+        // sharing a prefix collapsing onto one string would let a grant for one
+        // repository answer for another, which is the harm the per-root scope
+        // exists to prevent.
+        let long_a = format!("~/dev/{}/alpha", "nested/".repeat(40));
+        let long_b = format!("~/dev/{}/beta", "nested/".repeat(40));
+        assert_ne!(
+            project_skill_trust_key(&long_a),
+            project_skill_trust_key(&long_b)
+        );
+        assert!(project_skill_trust_key(&long_a).ends_with("/alpha"));
+
+        // The root rides exactly as the caller spelled it, so the key the
+        // answer is remembered under and the root the prompt showed name one
+        // repository — and a home-relative display stays home-relative, since
+        // an unrecognizing client renders this key on its refusal line.
+        assert!(!project_skill_trust_key("~/dev/teton").contains("/Users/"));
+
+        // One invalidation rule, both families, and only those two: a user
+        // skill's file is the same file whatever the root is, so its grant
+        // survives the move.
+        assert!(expires_on_session_root_change(&key));
+        assert!(expires_on_session_root_change(&skill_permission_key(
+            SkillSource::Project,
+            "deploy"
+        )));
+        assert!(!expires_on_session_root_change(&skill_permission_key(
+            SkillSource::User,
+            "status"
+        )));
+        assert!(!expires_on_session_root_change("shell"));
+        assert!(!expires_on_session_root_change("web_search"));
+    }
+
+    /// REQ-585's additivity for `PromptTurnParams.skill`, both directions —
+    /// the `route_decided` budget rule re-applied rather than assumed
+    /// inherited.
+    ///
+    /// A turn from a client predating the field carries no key and reads
+    /// `None`; a daemon that has never heard of the field still reads a turn
+    /// that carries it. Serde ignores unknown fields by default and no type
+    /// here opts out, but that posture is what keeps
+    /// [`crate::PROTOCOL_VERSION`] still, so it is asserted rather than
+    /// assumed.
+    #[test]
+    fn prompt_turn_skill_is_additive_in_both_directions() {
+        // A pre-REQ-585 turn: no `skill` key — absent, not an error.
+        let turn: PromptTurnParams =
+            serde_json::from_str(r#"{"session_id":"s1","prompt":[{"type":"text","text":"hi"}]}"#)
+                .expect("a turn from a client predating the field must still parse");
+        assert_eq!(turn.skill, None);
+        assert_eq!(turn.prompt.len(), 1);
+
+        // And a turn that never populated it emits no key at all, rather than
+        // `null` — the same wire an older client writes.
+        let wire = serde_json::to_value(&turn).unwrap();
+        assert!(wire.get("skill").is_none(), "{wire}");
+
+        // The other direction: a reader built before the field.
+        #[derive(Deserialize)]
+        struct PreSkillPromptTurn {
+            session_id: SessionId,
+            prompt: Vec<PromptBlock>,
+        }
+        let wire = serde_json::to_string(&PromptTurnParams {
+            session_id: SessionId::from("s1"),
+            // ADR-3: the client sends an **empty** prompt, so a dropped
+            // `skill` field yields a visible empty turn rather than a leaked
+            // `/name …` command line reaching a model.
+            prompt: vec![],
+            skill: Some(SkillInvocation {
+                name: "alpha".to_owned(),
+                raw_arguments: "teton  code \"repo\"".to_owned(),
+            }),
+        })
+        .unwrap();
+        assert!(
+            wire.contains(r#""skill":{"name":"alpha""#)
+                && wire.contains(r#""raw_arguments":"teton  code \"repo\"""#),
+            "the fixture must actually carry the new key: {wire}"
+        );
+        let old: PreSkillPromptTurn =
+            serde_json::from_str(&wire).expect("a daemon predating the field still reads the turn");
+        assert_eq!(old.session_id, SessionId::from("s1"));
+        assert!(
+            old.prompt.is_empty(),
+            "the old reader still gets its fields"
+        );
+
+        // BR-4: the rest of the line rides **verbatim**. Two interior spaces
+        // and both quotes survive the wire, because a re-join from a token
+        // list is the one transformation this field must never suffer.
+        let back: PromptTurnParams = serde_json::from_str(&wire).unwrap();
+        assert_eq!(
+            back.skill.expect("the skill survives").raw_arguments,
+            "teton  code \"repo\""
+        );
+
+        assert_eq!(
+            crate::PROTOCOL_VERSION,
+            crate::ProtocolVersion(2),
+            "REQ-585 adds only optional fields and one method, so the negotiated version \
+             does not move — the capability is proven by a successful `skills/list`"
+        );
+    }
+
+    /// `PermissionOutcome::Refused` is additive in the one direction it can be
+    /// — and the direction it cannot be is asserted too, because that is the
+    /// constraint the daemon's ordering rests on.
+    ///
+    /// This is a new **variant** on an internally tagged enum, not a new field,
+    /// so the four-leg field rule does not transfer: there is no "absent key
+    /// parses to the default" leg, and a reader that predates the variant
+    /// cannot ignore an unknown tag the way it ignores an unknown key. What
+    /// replaces it is the pin below — a pre-REQ-585 reader **fails**, which is
+    /// exactly why ADR-2's handshake (not serde's tolerance) is what gates
+    /// sending this: a client only ever sends `refused` to a daemon that
+    /// answered `skills/list`.
+    #[test]
+    fn permission_outcome_refused_travels_only_to_a_daemon_that_knows_it() {
+        for reason in [
+            RefusalReason::NoTerminal,
+            RefusalReason::UnrecognizedSubject,
+        ] {
+            round_trip(&PermissionRespondParams {
+                request_id: RequestId::from("r1"),
+                outcome: PermissionOutcome::Refused { reason },
+            });
+        }
+        let wire = serde_json::to_value(PermissionOutcome::Refused {
+            reason: RefusalReason::NoTerminal,
+        })
+        .unwrap();
+        assert_eq!(wire["outcome"], "refused", "{wire}");
+        assert_eq!(wire["reason"], "no_terminal", "{wire}");
+
+        // The two outcomes that were already there keep their tags. `refused`
+        // is emphatically **not** `cancelled`: that one means a human
+        // dismissed the prompt (it is what EOF on a pipe returns), and AC-9
+        // needs the daemon to tell "the user said no" from "no human could be
+        // asked".
+        assert_eq!(
+            serde_json::to_value(PermissionOutcome::Cancelled).unwrap()["outcome"],
+            "cancelled"
+        );
+        assert_eq!(
+            serde_json::to_value(PermissionOutcome::Selected {
+                option_id: "allow_once".to_owned(),
+            })
+            .unwrap()["outcome"],
+            "selected"
+        );
+
+        // The direction that does not work, pinned rather than assumed: a
+        // daemon built before the variant refuses the params outright.
+        #[derive(Deserialize)]
+        #[serde(tag = "outcome", rename_all = "snake_case")]
+        #[allow(dead_code)]
+        enum PreRefusalOutcome {
+            Selected { option_id: String },
+            Cancelled,
+        }
+        let refused = serde_json::to_string(&PermissionOutcome::Refused {
+            reason: RefusalReason::NoTerminal,
+        })
+        .unwrap();
+        assert!(
+            serde_json::from_str::<PreRefusalOutcome>(&refused).is_err(),
+            "an older daemon cannot read `refused`, which is why the handshake gates it: {refused}"
+        );
+        // And the old reader still reads what it always did, so nothing about
+        // the existing two arms moved.
+        let cancelled = serde_json::to_string(&PermissionOutcome::Cancelled).unwrap();
+        assert!(serde_json::from_str::<PreRefusalOutcome>(&cancelled).is_ok());
     }
 
     /// The two user-only web actions round-trip, and the override answers the
@@ -3922,6 +5070,9 @@ mod tests {
                 tier: Tier::Think,
                 provider_id: ProviderId::from("kimi"),
             }],
+            // REQ-586: the recipe's window, carried silently into the
+            // candidate so the registration records one (BR-3).
+            max_context: Some(131_072),
         }
     }
 
@@ -3951,6 +5102,7 @@ mod tests {
                     endpoint: Some("https://api.sentinel.example/v1/chat/completions".to_owned()),
                     example_model: "sentinel-1".to_owned(),
                     notes: Some("a sentinel note".to_owned()),
+                    max_context: 131_072,
                 },
                 // The kind that carries its own address (ADR-7) and has nothing
                 // to add: two of its keys are the ones that *aren't* there.
@@ -3962,6 +5114,7 @@ mod tests {
                     endpoint: None,
                     example_model: "sentinel-native-1".to_owned(),
                     notes: None,
+                    max_context: 200_000,
                 },
             ],
             existing: vec![],
@@ -3993,10 +5146,16 @@ mod tests {
                 "guide_spelling",
                 "id_suggestion",
                 "kind",
-                "label"
+                "label",
+                "max_context"
             ],
             "a recipe with no endpoint and no notes drops both keys: {wire}"
         );
+        // REQ-586: the window is never optional on a recipe — it is a fact
+        // about the example model, carried as a number even when it is the
+        // "unknown" zero, so a client does not have to tell absent from unset.
+        assert_eq!(wire["catalog"][0]["max_context"], 131_072);
+        assert_eq!(wire["catalog"][1]["max_context"], 200_000);
         assert!(
             wire["tiers"][0].get("provider_id").is_none(),
             "an unbound tier is an absent id, not an empty string: {wire}"
@@ -4062,6 +5221,9 @@ mod tests {
                 model: "claude-x".to_owned(),
                 key_ref: "keychain://teton/native".to_owned(),
                 bindings: vec![],
+                // A candidate built from no recipe: the window stays unknown,
+                // and the key stays off the wire (REQ-586).
+                max_context: None,
             },
         });
 
@@ -4171,6 +5333,7 @@ mod tests {
             endpoint: Some("https://api.sentinel.example/v1/chat/completions".to_owned()),
             example_model: "sentinel-1".to_owned(),
             notes: Some("a sentinel note".to_owned()),
+            max_context: 131_072,
         })
         .unwrap();
         assert_eq!(
@@ -4182,10 +5345,76 @@ mod tests {
                 "id_suggestion",
                 "kind",
                 "label",
+                "max_context",
                 "notes"
             ],
             "{wire}"
         );
+    }
+
+    /// REQ-586's additivity on the two setup types: a recipe entry from a daemon
+    /// predating the window reads as the "unknown" zero rather than failing,
+    /// and a candidate from a client predating it reads as `None`; a reader
+    /// built before either field still reads an entry and a candidate that
+    /// carry them.
+    #[test]
+    fn recipe_entry_and_setup_candidate_window_fields_are_additive_in_both_directions() {
+        // Older daemon → newer client: no key, the unknown spelling.
+        let entry: ProviderRecipeEntry = serde_json::from_str(
+            r#"{"id_suggestion":"kimi","label":"Moonshot (Kimi)",
+                "guide_spelling":"Moonshot/Kimi","kind":"openai-compatible",
+                "endpoint":"https://api.moonshot.ai/v1/chat/completions",
+                "example_model":"kimi-k3"}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            entry.max_context, 0,
+            "absent reads as unknown, not as an error"
+        );
+
+        // Older client → newer daemon: no key, no window to record.
+        let candidate: ProviderSetupCandidate = serde_json::from_str(
+            r#"{"id":"kimi","kind":"openai-compatible",
+                "endpoint":"https://api.moonshot.ai/v1/chat/completions",
+                "model":"kimi-k3","key_ref":"keychain://teton/kimi"}"#,
+        )
+        .unwrap();
+        assert_eq!(candidate.max_context, None);
+        assert_eq!(candidate.bindings, vec![]);
+        let wire = serde_json::to_value(&candidate).unwrap();
+        assert!(
+            wire.get("max_context").is_none(),
+            "a candidate with no window emits no key, not null: {wire}"
+        );
+
+        // The other direction: readers built before the fields.
+        #[derive(Deserialize)]
+        struct PreWindowEntry {
+            id_suggestion: String,
+            example_model: String,
+        }
+        #[derive(Deserialize)]
+        struct PreWindowCandidate {
+            id: ProviderId,
+            model: String,
+            key_ref: String,
+        }
+        let wire = serde_json::to_string(&ProviderRecipeEntry {
+            max_context: 131_072,
+            ..entry
+        })
+        .unwrap();
+        assert!(wire.contains(r#""max_context":131072"#), "{wire}");
+        let old: PreWindowEntry = serde_json::from_str(&wire).unwrap();
+        assert_eq!(old.id_suggestion, "kimi");
+        assert_eq!(old.example_model, "kimi-k3");
+
+        let wire = serde_json::to_string(&sentinel_candidate()).unwrap();
+        assert!(wire.contains(r#""max_context":131072"#), "{wire}");
+        let old: PreWindowCandidate = serde_json::from_str(&wire).unwrap();
+        assert_eq!(old.id, ProviderId::from("kimi"));
+        assert_eq!(old.model, "kimi-k2-turbo-preview");
+        assert_eq!(old.key_ref, "keychain://teton/kimi");
     }
 
     /// BR-2's wire half, re-applied at this second flow rather than assumed
@@ -4229,7 +5458,15 @@ mod tests {
             .collect();
         assert_eq!(
             candidate_keys,
-            ["bindings", "endpoint", "id", "key_ref", "kind", "model"]
+            [
+                "bindings",
+                "endpoint",
+                "id",
+                "key_ref",
+                "kind",
+                "max_context",
+                "model"
+            ]
         );
 
         // And the params wrapping it carry only the session, the candidate, and

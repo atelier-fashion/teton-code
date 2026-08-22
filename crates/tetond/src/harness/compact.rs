@@ -77,6 +77,7 @@
 //! |---|---|
 //! | **link 1** — `compact_if_pressured` returns declined before ever asking the duty | `harness::context::tests::a_routed_compaction_replaces_the_blocks_it_forgets`, `…::compaction_runs_ahead_of_the_hard_gate_not_at_it`, `runtime::tests::dispatch::compact::a_performed_compaction_announces_its_route_and_a_declined_one_does_not`, and every other compaction test in `harness::context` |
 //! | **link 2** (parse) — `read_compaction` keeps the numbers it managed to read instead of failing the whole answer | `harness::compact::tests::a_partly_readable_answer_is_no_answer_at_all`, `harness::context::tests::a_half_readable_compaction_is_not_half_applied` |
+//! | **link 3** (apply) — the accepted range is taken from the conversation (`blocks.len() − 1`) instead of from the offer (`CompactOffer::droppable`) | `harness::context::tests::an_answer_naming_a_block_that_was_never_offered_is_refused_not_applied` — **and nothing else**, which is how a bounded offer came to accept an answer about blocks it never rendered (verify C1) |
 //! | **link 3** (apply) — the over-budget candidate is committed instead of rejected | `harness::context::tests::an_over_budget_compaction_is_rejected_rather_than_rescued` |
 //! | **link 3** (apply) — the no-shrink refusal is removed | `harness::context::tests::a_compaction_that_does_not_shrink_the_context_is_rejected` |
 //! | **link 3** (apply) — the forget set is applied but no replacement block is inserted | `harness::context::tests::a_routed_compaction_replaces_the_blocks_it_forgets` + 4 others |
@@ -103,15 +104,18 @@
 
 use teton_protocol::Category;
 
+use super::budget::LOCAL_BUDGET_BYTES;
 use super::context::{truncate_middle, ContextBlock, Provenance};
-use super::duty::DutyKind;
+use super::duty::{DutyKind, DUTY_REQUEST_BYTES_PER_TOKEN};
+use super::render::CHATML_DUTY_ENVELOPE_BYTES;
+use crate::runtime::LOCAL_ENGINE_N_CTX;
 
 /// Byte ceiling on what a `compact` duty may return (BR-8).
 ///
 /// The **loosest of the five**, deliberately: a `title` is a handful of words and
 /// a `triage` is a list of numbers, but a compaction stands in for a
 /// conversation. Sized to the default context **byte** budget
-/// (`HarnessConfig::default().context_budget_bytes` — 4,096 whitespace tokens ×
+/// ([`LOCAL_BUDGET_BYTES`] — 4,096 whitespace tokens ×
 /// [`APPROX_BYTES_PER_TOKEN`](super::context::APPROX_BYTES_PER_TOKEN)), because a
 /// replacement paragraph larger than the window it is making room in cannot
 /// possibly be applied: the budget check in
@@ -119,9 +123,15 @@ use super::duty::DutyKind;
 /// would reject it anyway, so accumulating more than this is bytes spent to be
 /// thrown away.
 ///
+/// It **reads** that budget rather than restating its 32,768 (REQ-586 BR-8,
+/// TASK-192's one-home grep): the sentence above already said the ceiling *is*
+/// the default byte budget, so a literal here was a copy waiting to drift — and
+/// the duty that repairs an over-budget context must not be allowed to return
+/// more than the budget it is repairing to.
+///
 /// Enforced in the duty implementation rather than requested of the provider
 /// (LESSON-484): `max_tokens` is a request, and a request is not a bound.
-pub const COMPACT_OUTPUT_MAX_BYTES: usize = 32_768;
+pub const COMPACT_OUTPUT_MAX_BYTES: usize = LOCAL_BUDGET_BYTES;
 
 /// The `compact` duty on the shared seam: its category and its output ceiling.
 ///
@@ -129,6 +139,37 @@ pub const COMPACT_OUTPUT_MAX_BYTES: usize = 32_768;
 /// the resolver in [`crate::runtime`], the transport-free offline entry point in
 /// [`super::turn_loop`], and the tests.
 pub const COMPACT_DUTY: DutyKind = DutyKind::new(Category::Compact, COMPACT_OUTPUT_MAX_BYTES);
+
+/// Byte ceiling on the `compact` duty's own **prompt** (REQ-586 BR-6, ADR-5).
+///
+/// **Derived from the engine window, not picked beside it** (LESSON-446), in the
+/// same shape as
+/// [`REDACT_PROMPT_BUDGET_BYTES`](crate::egress::redact::REDACT_PROMPT_BUDGET_BYTES):
+///
+/// ```text
+///   engine window            16,384 tokens   (LOCAL_ENGINE_N_CTX)
+///   − the duty's generation   4,096 tokens   (COMPACT_DUTY.max_tokens())
+///   = 12,288 tokens × 2 B/token             (DUTY_REQUEST_BYTES_PER_TOKEN)
+///   − the ChatML envelope        55 bytes   (CHATML_DUTY_ENVELOPE_BYTES)
+/// ```
+///
+/// Why the *local* window and not the route's: `compact` sits on its default
+/// local binding for most sessions, and its prompt renders the whole
+/// conversation. Before REQ-586 there was no total bound at all, which was
+/// harmless while every conversation was budgeted at 32 KB — and became a
+/// per-fold failure the moment a 128k route let a conversation grow past the
+/// local engine's window, because `LlamaEngine::complete` refuses an
+/// over-window prompt, the refusal degrades the duty, and every fold then fell
+/// back to the deterministic drop the duty exists to improve on (BR-6's "keeps
+/// its proportion in practice and not only in the threshold").
+///
+/// A remote `compact` binding has a larger window than this and is simply
+/// offered less than it could take, which costs a partial offer — and a partial
+/// offer still compacts, because the answer is block numbers.
+pub const COMPACT_PROMPT_BUDGET_BYTES: usize = (LOCAL_ENGINE_N_CTX as usize
+    - COMPACT_DUTY.max_tokens() as usize)
+    * DUTY_REQUEST_BYTES_PER_TOKEN
+    - CHATML_DUTY_ENVELOPE_BYTES;
 
 /// The compact duty's output contract, verbatim: the last sentence of the
 /// instruction, before the numbered blocks it embeds.
@@ -224,6 +265,99 @@ const FORGET_MARKER: &str = "FORGET:";
 /// The marker introducing the paragraph that replaces them.
 const SUMMARY_MARKER: &str = "SUMMARY:";
 
+/// The note appended to the block the duty may not forget — the **aside**, on
+/// the numbered line itself.
+///
+/// The protected block is named twice in a prompt that offers it, and the two
+/// wordings are deliberately not one string (verify D2). This one is an aside
+/// hanging off a line the reader is already on ("this block"); [`offer_footer`]
+/// says the same thing as a *sentence about a numbered block* ("block 200 is
+/// the step in progress and cannot be forgotten"), because it has to be
+/// readable when block 200 was never rendered — which is the case the footer
+/// exists for. Composing both from one fragment would make one of them read as
+/// a fragment.
+///
+/// Neither is a fact anything is derived from: the protection is enforced by
+/// [`CompactOffer::droppable`] and [`read_compaction`], whatever the prompt
+/// said, so a drift between these two sentences costs a badly-phrased question
+/// and never a wrongly-applied answer. Both spellings are pinned verbatim —
+/// the aside by `the_duty_prompt_numbers_every_block_and_protects_the_last`,
+/// the sentence by `a_two_hundred_block_conversation_still_fits_the_duty_prompt`.
+const PROTECTED_BLOCK_NOTE: &str = "   (the step in progress — this block cannot be forgotten)\n";
+
+/// The line that tells the duty exactly which slice of the conversation it was
+/// shown, and which block is protected (REQ-586 BR-6).
+///
+/// A partial offer is still a usable question — the answer is block numbers, and
+/// numbers 1..`offered` mean the same blocks whether or not the rest of the
+/// conversation was rendered — but only if the duty is told where the list
+/// stops. Without it a model asked to compact "the conversation" while shown its
+/// first twenty blocks would reasonably answer about blocks it never saw, and
+/// [`read_compaction`]'s range check would reject the whole answer.
+fn offer_footer(offered: usize, total: usize) -> String {
+    format!(
+        "(offered blocks 1..{offered} of {total}; block {total} is the step in progress and \
+         cannot be forgotten)\n"
+    )
+}
+
+/// A rendered `compact` offer: the prompt, and **how much of the conversation
+/// it actually showed** (REQ-586 verify, C1).
+///
+/// The two travel together because the second is what bounds the first's
+/// answer. Once the offer became a bounded prefix (BR-6), "how many blocks may
+/// this answer name" stopped being a fact about the conversation and became a
+/// fact about the *prompt*: a duty shown blocks 1..24 of 200 that answers
+/// `FORGET: 1..150` has written about blocks nobody rendered, and applying it
+/// would delete 126 blocks the duty never saw and replace them with a summary
+/// written from the 24 it did. Both post-checks (over-budget, no-shrink) pass
+/// for that answer — the context genuinely got smaller — so nothing downstream
+/// would catch it.
+///
+/// [`Self::droppable`] is therefore the one number [`read_compaction`] should
+/// ever be given, and it is computed here, beside the loop that decided how
+/// much to render, rather than at the call site from `blocks.len()`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CompactOffer {
+    prompt: String,
+    offered: usize,
+    total: usize,
+}
+
+impl CompactOffer {
+    /// The rendered duty prompt.
+    #[must_use]
+    pub fn prompt(&self) -> &str {
+        &self.prompt
+    }
+
+    /// How many of the conversation's blocks the prompt rendered.
+    #[must_use]
+    pub const fn offered(&self) -> usize {
+        self.offered
+    }
+
+    /// How many blocks the duty's answer may name — the leading blocks of the
+    /// offer, minus the step in progress.
+    ///
+    /// `min(offered, total − 1)`, and both halves are load-bearing: the offer
+    /// bounds it because a block that was never rendered cannot have been
+    /// chosen, and `total − 1` bounds it because the newest block is the step
+    /// the turn is working on — the one block neither the duty nor
+    /// `truncate_to_budget` may take. When the whole conversation fits (every
+    /// pre-REQ-586 render, and every small one since) `offered == total` and
+    /// this is exactly the `blocks.len() − 1` the apply step used to pass.
+    #[must_use]
+    pub const fn droppable(&self) -> usize {
+        let protected = self.total.saturating_sub(1);
+        if self.offered < protected {
+            self.offered
+        } else {
+            protected
+        }
+    }
+}
+
 /// One compaction the duty asked for, already checked against the list it was
 /// offered.
 ///
@@ -280,8 +414,36 @@ pub const fn worth_compacting(blocks: usize) -> bool {
 /// also refuses to drop. Marking it in the prompt saves the duty from spending
 /// its answer on a block that would be rejected; [`read_compaction`] is what
 /// makes the refusal real.
+///
+/// ## The offer is bounded, and the offer is stated (REQ-586 BR-6, ADR-5)
+///
+/// The rendered prompt fits `prompt_budget_bytes`
+/// ([`COMPACT_PROMPT_BUDGET_BYTES`] at the one production call site): the
+/// **oldest** blocks are offered — they are the ones a compaction is for — and
+/// the list stops at the first block that would overflow. The footer then names
+/// the slice (`offered blocks 1..N of M`) and the protected block, so the
+/// answer's numbers still mean what they meant when the whole conversation was
+/// rendered.
+///
+/// The protected block is named whether or not it was itself offered: a duty
+/// shown blocks 1..20 of 200 must still know that 200 is off limits, and
+/// `read_compaction` refuses it either way.
+///
+/// A conversation whose *first* block already overflows the budget still offers
+/// that block — one over-budget prompt that the engine refuses is a degraded
+/// fold, whereas an empty list is an unanswerable question every time.
+///
+/// ## The offer is also what bounds the answer (verify C1)
+///
+/// The returned [`CompactOffer`] carries the offered count, and
+/// [`CompactOffer::droppable`] is the range [`read_compaction`] must be given.
+/// Rendering a prefix while accepting an answer about the whole conversation
+/// is the one way a bounded offer can *lose* a conversation rather than
+/// compact it: every block between the end of the offer and the largest number
+/// the answer named would be deleted unseen, and replaced by a summary written
+/// from the prefix alone.
 #[must_use]
-pub fn compact_prompt(blocks: &[ContextBlock]) -> String {
+pub fn compact_offer(blocks: &[ContextBlock], prompt_budget_bytes: usize) -> CompactOffer {
     let mut prompt = String::new();
     prompt.push_str(
         "Below is a numbered list of the blocks of one conversation between a person and an \
@@ -291,19 +453,59 @@ pub fn compact_prompt(blocks: &[ContextBlock]) -> String {
     );
     prompt.push_str(COMPACT_OUTPUT_CONTRACT);
     prompt.push_str(BLOCK_LIST_HEADER);
-    let last = blocks.len();
+    let total = blocks.len();
+    // Reserved with `total` in both positions: `offered <= total`, so this is an
+    // upper bound on the footer the loop will actually write, and the budget is
+    // met whatever the loop decides.
+    let footer_reserve = offer_footer(total, total).len();
+    let mut offered = 0usize;
     for (i, block) in blocks.iter().enumerate() {
-        prompt.push_str(&format!(
+        let line = format!(
             "{}. {}: {}\n",
             i + 1,
             speaker(block),
             truncate_middle(&block.text, COMPACT_BLOCK_MAX_BYTES)
-        ));
-        if i + 1 == last {
-            prompt.push_str("   (the step in progress — this block cannot be forgotten)\n");
+        );
+        let protected = i + 1 == total;
+        let extra = if protected {
+            PROTECTED_BLOCK_NOTE.len()
+        } else {
+            0
+        };
+        if offered > 0 && prompt.len() + line.len() + extra + footer_reserve > prompt_budget_bytes {
+            break;
         }
+        prompt.push_str(&line);
+        if protected {
+            prompt.push_str(PROTECTED_BLOCK_NOTE);
+        }
+        offered += 1;
     }
-    prompt
+    // An empty conversation has no slice and no protected block to name; the
+    // duty declines long before this in production ([`worth_compacting`]), and a
+    // footer about "block 0" would be the only nonsense in the prompt.
+    if total > 0 {
+        prompt.push_str(&offer_footer(offered, total));
+    }
+    CompactOffer {
+        prompt,
+        offered,
+        total,
+    }
+}
+
+/// The rendered prompt alone — [`compact_offer`] for a caller that will not
+/// apply an answer.
+///
+/// The stand-in engine's recognizer and the prompt-shape tests want the string
+/// and nothing else. A caller that *applies* what the duty answers must take
+/// the whole [`CompactOffer`] instead: the accepted range is a fact about this
+/// prompt (how much of the conversation it rendered), not about the
+/// conversation, and re-deriving it from `blocks.len()` is exactly the drop C1
+/// found.
+#[must_use]
+pub fn compact_prompt(blocks: &[ContextBlock], prompt_budget_bytes: usize) -> String {
+    compact_offer(blocks, prompt_budget_bytes).prompt
 }
 
 /// How many blocks a compact prompt offered.
@@ -488,6 +690,53 @@ mod tests {
         assert!(under_pressure(1, 0));
     }
 
+    /// **AC-9.** The soft threshold is a *fraction*, so a 100k route crosses it
+    /// at exactly the same point a 4k one does — the proportion is what REQ-586
+    /// keeps, not a byte count that happened to suit the local pair.
+    ///
+    /// The hard gate is unchanged in kind and in number too: it fires at 100% of
+    /// whichever budget the manager holds, which
+    /// `harness::context::tests::a_gate_that_drops_three_blocks_reports_three_blocks`
+    /// and `…::rebudget_from_a_remote_pair_to_the_local_one_drops_and_reports`
+    /// exercise on both pairs. And the REQ-561 fallback — a compaction that
+    /// cannot be served leaves the deterministic drop to enforce the budget — is
+    /// unchanged and still pinned by
+    /// `harness::context::tests::a_failed_compaction_does_not_keep_everything`
+    /// (with `…::an_unrouted_compact_duty_still_ends_under_budget` for the
+    /// never-routed arm) and, at the loop, by
+    /// `harness::turn_loop::tests::a_turn_whose_compact_duty_cannot_serve_still_ends_under_budget`.
+    #[test]
+    fn a_hundred_k_budget_is_pressured_at_the_same_percent_as_a_four_k_one() {
+        // The local pair's byte half, and a 100k route's — the two ends of the
+        // range REQ-586 opens up.
+        for budget in [
+            crate::harness::budget::LOCAL_BUDGET_BYTES,
+            crate::harness::budget::derive(crate::harness::budget::BudgetInputs {
+                window: 100_000,
+                cap: 0,
+                reservation: 1_024,
+                is_local: false,
+                redact_scan: false,
+                provider_id: Some("kimi"),
+            })
+            .budget_bytes,
+        ] {
+            let at = budget * COMPACT_PRESSURE_PERCENT / 100;
+            assert!(
+                !under_pressure(at, budget),
+                "budget {budget}: exactly at the threshold must not fire"
+            );
+            assert!(
+                under_pressure(at + 1, budget),
+                "budget {budget}: one byte past the threshold must fire"
+            );
+            assert!(
+                under_pressure(budget * 4 / 5, budget),
+                "budget {budget}: four-fifths must count as pressure"
+            );
+        }
+    }
+
     /// The other decline: a conversation too short to hold a decision.
     #[test]
     fn only_a_conversation_with_a_choice_in_it_is_worth_compacting() {
@@ -519,7 +768,8 @@ mod tests {
              blocks to drop, then `SUMMARY:` followed by the one paragraph that stands in for \
              them."
         );
-        assert!(compact_prompt(&conversation()).contains(COMPACT_OUTPUT_CONTRACT));
+        assert!(compact_prompt(&conversation(), COMPACT_PROMPT_BUDGET_BYTES)
+            .contains(COMPACT_OUTPUT_CONTRACT));
     }
 
     /// The prompt numbers every block from 1, names its speaker, and says which
@@ -527,12 +777,124 @@ mod tests {
     #[test]
     fn the_duty_prompt_numbers_every_block_and_protects_the_last() {
         let blocks = conversation();
-        let prompt = compact_prompt(&blocks);
+        let prompt = compact_prompt(&blocks, COMPACT_PROMPT_BUDGET_BYTES);
         assert_eq!(offered_block_count(&prompt), blocks.len());
         assert!(prompt.contains("1. User: port the download client"));
         assert!(prompt.contains("3. Tool (read): fn get() {}"));
         assert!(prompt.contains("4. Assistant: I will edit it now"));
         assert!(prompt.contains("cannot be forgotten"));
+        // And the offer is stated even when it is the whole conversation, so
+        // the duty never has to infer where the list stops (REQ-586 BR-6).
+        assert!(
+            prompt.contains(
+                "(offered blocks 1..4 of 4; block 4 is the step in progress and cannot be \
+                 forgotten)"
+            ),
+            "{prompt}"
+        );
+    }
+
+    /// **The prompt budget is derived from the engine window, not picked beside
+    /// it** (REQ-586 ADR-5, LESSON-446) — the `REDACT_PROMPT_BUDGET_BYTES`
+    /// shape.
+    #[test]
+    fn the_prompt_budget_is_derived_from_the_local_engine_window() {
+        // The arithmetic, written out once: 16,384 − 4,096 = 12,288 tokens, at
+        // 2 B/token = 24,576, less the 55-byte ChatML envelope.
+        assert_eq!(
+            COMPACT_PROMPT_BUDGET_BYTES, 24_521,
+            "the duty's prompt budget moved; if that was deliberate, say why here"
+        );
+        const {
+            // The generation reservation really was subtracted, and the
+            // envelope really was charged.
+            assert!(
+                COMPACT_PROMPT_BUDGET_BYTES
+                    < LOCAL_ENGINE_N_CTX as usize * DUTY_REQUEST_BYTES_PER_TOKEN
+            );
+            // And what is left still holds a decision: more than the minimum
+            // number of blocks worth asking about, at the per-block display
+            // bound. A budget under this would decline every conversation by
+            // rendering one block and calling it a choice.
+            assert!(COMPACT_PROMPT_BUDGET_BYTES > COMPACT_MIN_BLOCKS * COMPACT_BLOCK_MAX_BYTES);
+        }
+    }
+
+    /// **AC-9 / BR-6.** A 200-block conversation — what a 128k route makes
+    /// reachable — renders a duty prompt the *local* engine will accept, so the
+    /// fold is decided by a model rather than degrading to the deterministic
+    /// drop every time.
+    ///
+    /// The oldest blocks are the ones offered, because they are the ones a
+    /// compaction is for; the protected block is named in the footer even though
+    /// it was never rendered, because `read_compaction` will refuse it either
+    /// way and the duty should not spend its answer finding that out.
+    #[test]
+    fn a_two_hundred_block_conversation_still_fits_the_duty_prompt() {
+        let mut ctx = ContextManager::new("sys", 1_000_000);
+        for i in 0..200 {
+            ctx.push_user(format!("block {i}: {}", "padding ".repeat(200)));
+        }
+        let blocks = ctx.blocks().to_vec();
+        // Non-vacuity: rendered whole, this conversation is far past the window.
+        assert!(blocks.len() * COMPACT_BLOCK_MAX_BYTES > COMPACT_PROMPT_BUDGET_BYTES);
+
+        let offer = compact_offer(&blocks, COMPACT_PROMPT_BUDGET_BYTES);
+        let prompt = offer.prompt();
+
+        assert!(
+            prompt.len() <= COMPACT_PROMPT_BUDGET_BYTES,
+            "a 200-block conversation produced a {} byte prompt against a {} byte budget",
+            prompt.len(),
+            COMPACT_PROMPT_BUDGET_BYTES
+        );
+        let offered = offered_block_count(prompt);
+        // **Verify C1.** What the answer may name is bounded by what the prompt
+        // showed, not by what the conversation holds: on a partial offer the
+        // two are 175 blocks apart, and every one of those blocks would be
+        // deleted unseen by an answer resolved against the conversation.
+        assert_eq!(
+            offer.offered(),
+            offered,
+            "the rendered list and the reported count are one fact"
+        );
+        assert_eq!(offer.droppable(), offer.offered());
+        assert!(
+            offer.droppable() < blocks.len() - 1,
+            "a partial offer must accept less than the whole conversation: \
+             {} against {}",
+            offer.droppable(),
+            blocks.len() - 1
+        );
+        assert!(
+            (1..200).contains(&offered),
+            "a partial offer is still an offer, and an empty one is not: {offered}"
+        );
+        assert!(prompt.contains("1. User: block 0"), "the oldest go first");
+        assert!(
+            !prompt.contains("200. User: block 199"),
+            "the whole conversation was rendered after all"
+        );
+        assert!(
+            prompt.contains(&format!(
+                "(offered blocks 1..{offered} of 200; block 200 is the step in progress and \
+                 cannot be forgotten)"
+            )),
+            "the offer and the protected block must both be named: {}",
+            &prompt[prompt.len().saturating_sub(200)..]
+        );
+        assert!(prompt.contains(COMPACT_OUTPUT_CONTRACT));
+    }
+
+    /// A conversation whose very first block already overflows the budget is
+    /// still asked a question: one over-budget prompt the engine may refuse is a
+    /// degraded fold, but an empty list is an unanswerable one every time.
+    #[test]
+    fn a_budget_too_small_for_one_block_still_offers_that_block() {
+        let blocks = conversation();
+        let prompt = compact_prompt(&blocks, 1);
+        assert_eq!(offered_block_count(&prompt), 1);
+        assert!(prompt.contains("(offered blocks 1..1 of 4;"), "{prompt}");
     }
 
     /// A pasted core dump cannot make the prompt unbounded: every block is
@@ -543,7 +905,7 @@ mod tests {
         ctx.push_user("é".repeat(50_000));
         ctx.push_model("ok");
         ctx.push_user("and now?");
-        let prompt = compact_prompt(ctx.blocks());
+        let prompt = compact_prompt(ctx.blocks(), COMPACT_PROMPT_BUDGET_BYTES);
         assert!(
             prompt.len() < 3 * COMPACT_BLOCK_MAX_BYTES + 1_024,
             "a 100 KB block produced a {} byte prompt",
@@ -722,7 +1084,10 @@ mod tests {
     async fn a_local_route_answers_with_a_compaction() {
         let route = local_route("FORGET: 1 2\nSUMMARY: the agent read src/download.rs.");
         let answer = route
-            .perform(&compact_prompt(&conversation()), &EgressProvenance::empty())
+            .perform(
+                &compact_prompt(&conversation(), COMPACT_PROMPT_BUDGET_BYTES),
+                &EgressProvenance::empty(),
+            )
             .await
             .expect("the local duty served");
         let c = read_compaction(&answer, 3).expect("the answer parses");
@@ -791,7 +1156,10 @@ mod tests {
     async fn an_unbounded_machine_sends_the_compact_prompt_and_returns_its_answer() {
         let (route, sent) = remote_route(Vec::new(), "FORGET: 1\nSUMMARY: they read a file.", 1);
         let answer = route
-            .perform(&compact_prompt(&conversation()), &EgressProvenance::empty())
+            .perform(
+                &compact_prompt(&conversation(), COMPACT_PROMPT_BUDGET_BYTES),
+                &EgressProvenance::empty(),
+            )
             .await
             .expect("with no boundary configured the duty sends");
         let c = read_compaction(&answer, 3).expect("the answer parses");
@@ -829,7 +1197,10 @@ mod tests {
         let provenance = crate::harness::completion::context_provenance(&ctx);
 
         let err = route
-            .perform(&compact_prompt(ctx.blocks()), &provenance)
+            .perform(
+                &compact_prompt(ctx.blocks(), COMPACT_PROMPT_BUDGET_BYTES),
+                &provenance,
+            )
             .await
             .expect_err("boundary content must not be compacted remotely");
 

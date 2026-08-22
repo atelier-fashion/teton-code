@@ -1,0 +1,95 @@
+{
+  "req": "REQ-585",
+  "branch": "feat/REQ-585-user-defined-slash-commands",
+  "startedAt": "2026-08-20T07:12:20Z",
+  "completed": true,
+  "currentPhase": 8,
+  "completedPhases": [
+    0,
+    1,
+    2,
+    3,
+    4,
+    5,
+    6,
+    7,
+    8
+  ],
+  "phaseHistory": [
+    {
+      "phase": 0,
+      "name": "Create Worktree",
+      "completedAt": "2026-08-20T07:12:32Z"
+    },
+    {
+      "phase": 1,
+      "name": "Validate Spec",
+      "completedAt": "2026-08-20T12:10:07Z"
+    },
+    {
+      "phase": 2,
+      "name": "Architect",
+      "completedAt": "2026-08-20T13:05:00Z"
+    },
+    {
+      "phase": 3,
+      "name": "Validate Tasks",
+      "completedAt": "2026-08-20T14:20:00Z"
+    },
+    {
+      "phase": 4,
+      "name": "Implement Tasks",
+      "completedAt": "2026-08-20T22:40:00Z"
+    },
+    {
+      "phase": 5,
+      "name": "Verify",
+      "completedAt": "2026-08-20T23:30:00Z"
+    },
+    {
+      "phase": 8,
+      "name": "Wrapup - merged 76fa8f4 (PR #195); record reconciled from GitHub 2026-08-22",
+      "completedAt": "2026-08-20T21:39:36Z"
+    }
+  ],
+  "integrationBranch": "main",
+  "repos": {
+    "teton-code": {
+      "primary": true,
+      "path": "/Users/brettluelling/Documents/GitHub/teton-code",
+      "worktree": "/Users/brettluelling/Documents/GitHub/teton-code/.worktrees/REQ-585",
+      "branch": "feat/REQ-585-user-defined-slash-commands",
+      "touched": true,
+      "prUrl": "https://github.com/atelier-fashion/teton-code/pull/195",
+      "prNumber": 195,
+      "prCreatedAt": "2026-08-20T07:12:23Z",
+      "merged": true,
+      "snapshotBranch": null,
+      "snapshotPR": null
+    }
+  },
+  "mergeOrder": [
+    "teton-code"
+  ],
+  "phase4": {
+    "currentTask": null,
+    "completedTasks": [
+      "TASK-195",
+      "TASK-196",
+      "TASK-197",
+      "TASK-198",
+      "TASK-199",
+      "TASK-200",
+      "TASK-201",
+      "TASK-202",
+      "TASK-203",
+      "TASK-204",
+      "TASK-205",
+      "TASK-206",
+      "TASK-207",
+      "TASK-208",
+      "TASK-209"
+    ],
+    "failedTasks": []
+  }
+}

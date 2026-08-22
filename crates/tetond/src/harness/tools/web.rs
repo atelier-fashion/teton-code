@@ -2066,8 +2066,29 @@ mod tests {
         ))
     }
 
-    /// **`gates_itself` is the web tool's alone — across every kind of tool the
-    /// registry can hold.**
+    /// A skill registry with one model-invocable skill, written under `dir`.
+    ///
+    /// In-repo and deterministic; never a read of `~/.claude`, which would make
+    /// the sweep below a property of the developer's machine (LESSON-540).
+    fn skill_registry(dir: &std::path::Path) -> Arc<crate::skills::SkillRegistry> {
+        let home = dir.join("home");
+        let skill = home.join(".claude").join("skills").join("alpha");
+        std::fs::create_dir_all(&skill).unwrap();
+        std::fs::write(skill.join("SKILL.md"), "---\nname: alpha\n---\nbody\n").unwrap();
+        let root = dir.join("repo");
+        std::fs::create_dir_all(&root).unwrap();
+        let registry = Arc::new(crate::skills::discover(
+            Some(&home),
+            &root,
+            teton_protocol::methods::RootKind::Plain,
+            &crate::skills::RealFs,
+        ));
+        assert!(registry.invocable_by_model("alpha").is_some());
+        registry
+    }
+
+    /// **`gates_itself` is exactly the declared self-gating set — across every
+    /// kind of tool the registry can hold.**
     ///
     /// The surface it opens is fail-open: a tool that answers `true` is *not*
     /// authorized by the loop, so a second one that started answering `true`
@@ -2077,41 +2098,82 @@ mod tests {
     /// discovered MCP tool, from a *different* `Tool` impl, and a self-gating
     /// one would be an unprompted subprocess or an unprompted remote call.
     /// Registering one here means a future `gates_itself` on that impl fails this
-    /// test rather than shipping.
+    /// test rather than shipping. REQ-587's `skill` tool is registered for the
+    /// same reason — a third `Tool` impl, swept rather than assumed.
+    ///
+    /// **The predicate is a table, not a name comparison (ADR-10).** It used to
+    /// read `gates_itself() == (name == WEB_TOOL_NAME)`, and the way that pin
+    /// gets amended when a second tool wants the surface is by *relaxing* the
+    /// equality — which is AC-17's complaint. Against
+    /// [`SELF_GATING_TOOLS`](crate::harness::tools::SELF_GATING_TOOLS) it stays
+    /// an equality: a tool that starts answering `true` without a declared,
+    /// stated reason fails here exactly as a second `web` would have.
     #[tokio::test]
     async fn the_web_tool_is_the_only_tool_that_gates_itself() {
         // The fail-open surface `gates_itself` opens, bounded by an assertion:
         // every other tool is authorized by the loop, by name, before it runs.
         let dir = temp_dir("gates-itself");
         let seam = FakeSeam::new();
-        let (_bus, _pending, gate) = gate(PermissionPolicy::Ask);
+        let (_bus, _pending, web_gate) = gate(PermissionPolicy::Ask);
+        let (_bus2, _pending2, skill_gate) = gate(PermissionPolicy::Ask);
         let mut reg = ToolRegistry::with_builtins();
         assert!(register_web_tool(
             &mut reg,
             &web_config(WebTier::Search),
             WebCache::from_config(&dir, &web_config(WebTier::Search)),
             Arc::new(Mutex::new(UserUrls::new())),
-            gate,
+            web_gate,
             Arc::clone(&seam) as Arc<dyn WebLookupSeam>,
             Handle::current(),
         ));
         reg.register(mcp_tool_handle());
+        assert!(
+            crate::harness::tools::register_skill_tool(
+                &mut reg,
+                skill_registry(&dir),
+                skill_gate,
+                None,
+                Handle::current(),
+                1_000,
+            ),
+            "the fixture registry holds a model-invocable skill"
+        );
 
         let names = reg.names();
-        // Non-vacuity, both ends: the sweep really did see the web tool and
-        // really did see a second `Tool` impl.
+        // Non-vacuity, all three ends: the sweep really did see the web tool,
+        // an MCP-shaped tool, and the `skill` tool.
         assert!(names.contains(&WEB_TOOL_NAME));
         assert!(
             names.iter().any(|n| n.starts_with("mcp__")),
             "the sweep must include an MCP-shaped tool: {names:?}"
         );
+        assert!(
+            names.contains(&crate::harness::tools::SKILL_TOOL_NAME),
+            "the sweep must include the `skill` tool: {names:?}"
+        );
 
         for name in names {
             let tool = reg.get(name).unwrap();
+            let declared = crate::harness::tools::SELF_GATING_TOOLS
+                .iter()
+                .any(|(declared, _)| *declared == name);
             assert_eq!(
                 tool.gates_itself(),
-                name == WEB_TOOL_NAME,
-                "`{name}` disagrees with the loop about who raises its permission prompt"
+                declared,
+                "`{name}` disagrees with the loop about who raises its permission \
+                 prompt. The set is declared with a stated reason per member \
+                 (`SELF_GATING_TOOLS`); a tool that answers `true` is not authorized by \
+                 the loop at all, so joining it is a decision, not an edit."
+            );
+        }
+        for (name, reason) in crate::harness::tools::SELF_GATING_TOOLS {
+            assert!(
+                reg.get(name).is_some(),
+                "`{name}` is declared self-gating but the sweep never saw it"
+            );
+            assert!(
+                !reason.trim().is_empty(),
+                "`{name}` self-gates for no stated reason"
             );
         }
         std::fs::remove_dir_all(&dir).ok();
@@ -2260,13 +2322,41 @@ mod tests {
     /// byte bound moved into `environment_block` (`bounded_field_bytes`, the
     /// prompt's alone) and the row is byte-identical; this sweep now also
     /// checks that its widest prompt carries the block at all.
+    ///
+    /// **Recorded headroom at REQ-585:** 6,091 bytes, `spent` 9,367, margin
+    /// **873** — against BUG-181's 10,240-byte overhead, which every figure
+    /// above predates. REQ-585 spent the **68** both shapes pay: 52 on BR-9's
+    /// amended capability sentence, 16 on the `skills` topic's name where
+    /// `teton_docs` renders it twice. This shape stays the looser of the two by
+    /// the same 47 B it always has, and the account of what was bought — and
+    /// the note that REQ-586's recorded pair was 26 B high on both shapes — is
+    /// `egress::redact`'s twin of this paragraph.
+    ///
+    /// **Recorded headroom at REQ-587:** 7,183 bytes, `spent` 10,459, margin
+    /// **805** — against an overhead raised 10 → 11 KiB by that REQ, with the
+    /// floor unmoved at 48 and this shape still the looser of the two by 47 B.
+    /// Both shapes pay the same **1,092**: 1,010 for the `skill` tool's docs
+    /// and schema at BR-2's worst-case roster, 82 for BR-8's third amendment to
+    /// the guide's capability sentence. The account of the raise — and of the
+    /// 931-byte cut it makes to every scanned route's budget — is
+    /// `egress::redact`'s twin of this paragraph.
+    ///
+    /// **This sweep now registers a `skill` tool too**, at that worst-case
+    /// roster, for the reason ADR-9 gives: `SkillTool` is registered per turn
+    /// from the session's registry, so neither sweep sees it unless it is put
+    /// there, and a sweep that cannot see it passes while the resident prompt
+    /// grows. Both sides of the figure were checked with the pad method
+    /// `docs/manual-verification.md` records: 757 bytes of filler leaves this
+    /// shape at exactly the floor and passes, 758 fails.
     #[tokio::test]
     async fn the_web_tool_docs_clear_the_outbound_body_overhead() {
         use teton_core::capability::{SearchGap, WebCapabilityState};
 
-        use crate::egress::redact::{MIN_PROMPT_HEADROOM_BYTES, REDACT_BODY_OVERHEAD_BYTES};
+        use crate::egress::redact::{
+            MIN_PROMPT_HEADROOM_BYTES, REDACT_BODY_OVERHEAD_BYTES, REDACT_ESCAPING_DIVISOR,
+        };
         use crate::harness::turn_loop::{
-            build_system_prompt, worst_case_session_root, HarnessConfig,
+            build_system_prompt, worst_case_session_root, HarnessConfig, SkillToolDocs,
         };
 
         let dir = temp_dir("budget");
@@ -2288,6 +2378,16 @@ mod tests {
             FakeSeam::new() as Arc<dyn WebLookupSeam>,
             Handle::current(),
         ));
+        // And the `skill` tool, at BR-2's worst-case roster (REQ-587 ADR-9).
+        // Registered in **both** sweeps or in neither: this one could build the
+        // real `SkillTool` — it has a runtime and a gate — but its twin in
+        // `egress::redact` is a sync `#[test]` and cannot, and two sweeps
+        // measuring two different worst cases is how they come to disagree
+        // about the budget they share. `SkillToolDocs` renders the shipped
+        // tool's own description and schema, pinned byte-identical by
+        // `skill::tests::the_doc_only_tool_and_the_real_one_render_one_set_of_prompt_bytes`.
+        let skill_docs = Arc::new(SkillToolDocs::worst_case());
+        tools.register_cap_exempt(Arc::clone(&skill_docs) as Arc<dyn Tool>);
 
         let base = HarnessConfig::for_strong_model();
         // Non-vacuity: the tool's docs really are in what is being measured.
@@ -2297,6 +2397,20 @@ mod tests {
         assert!(
             system.contains("\"query\""),
             "the schema is missing:\n{system}"
+        );
+        // The same for the `skill` tool, and for the same reason its twin gives:
+        // dropping the registration above *shrinks* the prompt, so every
+        // arithmetic assertion below would still pass while the sweep measured a
+        // resident prompt the daemon never builds.
+        assert!(
+            system.contains("- skill: "),
+            "the measured prompt carries no `skill` tool docs (REQ-587 ADR-9):\n{system}"
+        );
+        assert!(
+            system.contains(skill_docs.description()),
+            "the `skill` tool's docs are present without its worst-case roster, so the \
+             bytes that grow with the user's installed skills are unmeasured (REQ-587 \
+             BR-2):\n{system}"
         );
 
         // The two states this registry can be in: ready (docs, no clause) and
@@ -2345,7 +2459,10 @@ mod tests {
         );
         let worst = widest.len();
 
-        let escaping = base.context_budget_bytes / 10;
+        // The same escaping allowance the opted-out shape charges and the
+        // scannable bound is solved with (`egress::redact`'s
+        // `REDACT_ESCAPING_DIVISOR`), read rather than restated.
+        let escaping = base.context_budget_bytes / REDACT_ESCAPING_DIVISOR;
         let spent = worst + escaping;
         // Strictly under, and checked before the subtraction: otherwise an
         // overflowing prompt panics on the arithmetic instead of on the sentence

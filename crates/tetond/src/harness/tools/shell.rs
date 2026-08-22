@@ -27,6 +27,26 @@
 //! The command runs synchronously via `sh -c`; a watcher thread enforces the
 //! deadline. Output (stdout + stderr) is captured and capped.
 //!
+//! ## Three functions, because the spawn body has two callers and one is not a tool
+//!
+//! [`run_bounded`] is the spawn body — jail, scrub, `PATH` floor, process
+//! group, deadline, group kill — and it hands back the **raw** streams as a
+//! typed [`BoundedRun`]. [`cap_output`] is the ceiling, applied over the
+//! *merged* stdout/stderr body. `render_output` is this tool's presentation: it
+//! merges, caps, prepends the status line, and hands [`cap_output`]'s
+//! **pre-cap** length to `measuring(…)`.
+//!
+//! The cap is its own function rather than the runner's last step because those
+//! are two different numbers and the duty's size trigger is decided on the
+//! first (REQ-561 ADR-5). A runner that capped would make `measured` the
+//! *capped* length, at which point the trigger compares a truncated body
+//! against the cap that truncated it and can never fire (LESSON-443). Splitting
+//! it out rather than leaving it inside `render_output` is the other half: a
+//! second caller — a skill's dynamic context (REQ-585 ADR-14), which wants the
+//! bytes without this tool's status line or its duty — must reach the ceiling
+//! without reaching the presentation, or it would inline uncapped command
+//! output into a prompt.
+//!
 //! ## The `shell` duty attaches here (REQ-561 TASK-061)
 //!
 //! [`Tool::run`] answers with the command's status line and its output, capped
@@ -54,7 +74,8 @@
 
 use std::io::Result as IoResult;
 use std::os::unix::process::CommandExt;
-use std::process::{Command, Output, Stdio};
+use std::path::Path;
+use std::process::{Command, ExitStatus, Output, Stdio};
 use std::sync::mpsc::{self, RecvTimeoutError};
 use std::time::Duration;
 
@@ -90,6 +111,16 @@ const TIMEOUT_CONSENT_HINT: &str = " On macOS a consent dialog for a protected f
 /// (REQ-561 ADR-5).
 pub(crate) const MAX_OUTPUT_CHARS: usize = 8_000;
 
+/// The timeout a `shell` call gets when it names none — and, since REQ-585, the
+/// deadline a skill's dynamic-context command runs under (BR-6: "the `shell`
+/// tool's jail, timeout and output cap").
+///
+/// A named constant rather than a literal inside [`ShellTool::default`] for
+/// [`MAX_OUTPUT_CHARS`]'s reason: the skill path is a second consumer of the
+/// same figure, and a second consumer that restated it would be two spellings of
+/// one deadline (LESSON-528).
+pub(crate) const DEFAULT_TIMEOUT_MS: u64 = 30_000;
+
 /// Runs shell commands under a timeout, cwd jail, and scrubbed environment.
 #[derive(Debug, Clone, Copy)]
 pub struct ShellTool {
@@ -102,7 +133,7 @@ pub struct ShellTool {
 impl Default for ShellTool {
     fn default() -> Self {
         Self {
-            default_timeout_ms: 30_000,
+            default_timeout_ms: DEFAULT_TIMEOUT_MS,
             max_timeout_ms: 120_000,
         }
     }
@@ -152,13 +183,19 @@ impl Tool for ShellTool {
         // missing `command`" with an empty command line is a model call bought
         // for a harness sentence (REQ-561 verify).
         //
-        // The third is the `cmd.spawn()` failure below — the only one of the
+        // The third is [`BoundedRun::SpawnFailed`] below — the only one of the
         // three where a launch was actually attempted, and still one where no
         // command output exists to interpret.
         let command = match str_arg(args, "command") {
             Ok(c) => c,
             Err(e) => return e.into(),
         };
+        // The tool's own precondition, and it stays the tool's: the refusal is
+        // the context's own sentence — the one `resolve`, `glob` and `grep`
+        // print too — not something a runner shared with the skill path should
+        // be phrasing. [`run_bounded`] canonicalizes again for its jail, which
+        // on the path through here is a no-op on an already-canonical root; the
+        // duplicate is what lets neither caller depend on the other's check.
         let root = match ctx.repo_root().canonicalize() {
             Ok(r) => r,
             Err(_) => return ctx.root_missing_error().into(),
@@ -168,43 +205,12 @@ impl Tool for ShellTool {
             .unwrap_or(self.default_timeout_ms)
             .min(self.max_timeout_ms);
 
-        let mut scrubbed = scrub(std::env::vars());
-        // BUG-174: the daemon's own `PATH` is only as good as whatever started
-        // it, and launchd starts it with a bare one. Floor it before the child
-        // inherits it, or every user-installed command is unreachable.
-        apply_path_floor(&mut scrubbed);
-
-        let mut cmd = Command::new("sh");
-        cmd.arg("-c")
-            .arg(&command)
-            .current_dir(&root)
-            .env_clear()
-            .envs(scrubbed)
-            // REQ-544 L-2: make the child its own process-group leader (pgid ==
-            // child pid) so that on timeout we can SIGKILL the whole group and no
-            // backgrounded grandchild survives the deadline.
-            .process_group(0)
-            .stdin(Stdio::null())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped());
-
-        let child = match cmd.spawn() {
-            Ok(c) => c,
-            Err(e) => return ToolOutcome::error(format!("failed to start command: {}", e.kind())),
-        };
-        let pid = child.id();
-
-        let (tx, rx) = mpsc::channel::<IoResult<Output>>();
-        let handle = std::thread::spawn(move || {
-            let _ = tx.send(child.wait_with_output());
-        });
-
         // BR-1 (REQ-544 C-1): a shell command runs arbitrary code, so the daemon
         // cannot know which files its output was derived from. Every result of a
         // command that actually started is therefore tagged UNKNOWN provenance,
         // which egress fail-closes whenever a boundary is configured. (The three
-        // arms above — two pre-spawn, one failed spawn — surface no command
-        // output and carry no provenance.)
+        // arms that carry none — the two pre-spawn ones above and the failed
+        // spawn below — surface no command output.)
         //
         // Every arm below also *measures* — `Some(n)`, even when `n` is zero —
         // because a spawned command's arms are exactly the arms where a command
@@ -217,78 +223,35 @@ impl Tool for ShellTool {
         // sentences below buy no model call either — the same argument the
         // `None` above makes, one step further along.
         const NO_OUTPUT_CAPTURED: usize = 0;
-        // **The group is killed on the timeout arm only** — and the alternative
-        // was tried and reverted (REQ-569 re-verify, R4).
-        //
-        // The verify pass moved the `kill(-pgid)` up here, ahead of the match,
-        // so it ran on *every* ending. The intent was to reach the escapee in
-        // `sh -c 'helper >/dev/null 2>&1 &'`: the command backgrounds a
-        // grandchild, closes the pipes, `wait_with_output` returns promptly and
-        // successfully, and on the old shape nothing killed the group. The
-        // escapee reparents to `launchd`/`init`, which breaks the ancestry
-        // chain REQ-569 BR-4 keys on — it reconnects classified
-        // `NotDescendant`, with full client rights.
-        //
-        // It is reverted because it cost more than it bought:
-        //
-        // - **It killed work a command legitimately backgrounded.** `npm run dev
-        //   &`, a fixture server, a language server — anything an agent starts
-        //   on purpose and expects to outlive one tool call died on the
-        //   *success* path. That is a functional regression in the common case,
-        //   paid for a security case the same change did not close.
-        // - **On a success arm the group leader has already been reaped** by
-        //   `wait_with_output`, so the pgid may already have been released.
-        //   Signalling it then is not the `ESRCH` no-op the timeout arm's
-        //   reasoning describes: it can reach a *recycled* group.
-        // - **It did not close the escape it was aimed at.** `setsid helper`
-        //   leaves the process group outright, so no group-directed signal on
-        //   any arm reaches it.
-        //
-        // So the escape stands, recorded rather than papered over, in
-        // `crate::peer`'s module docs and in the REQ-569 architecture ADR-A
-        // residuals. Closing it needs a mechanism that does not key on the
-        // process group at all.
-        match rx.recv_timeout(Duration::from_millis(timeout_ms)) {
-            Ok(Ok(output)) => {
-                let _ = handle.join();
-                render_output(&command, &output).with_unknown_provenance()
-            }
-            Ok(Err(e)) => {
-                let _ = handle.join();
-                ToolOutcome::error(format!("command failed to run: {}", e.kind()))
-                    .with_unknown_provenance()
-                    .measuring(NO_OUTPUT_CAPTURED)
-            }
-            Err(RecvTimeoutError::Timeout) => {
-                // Kill the whole process group, not just the direct child:
-                // `wait_with_output` moved the child into the watcher thread, so
-                // we cannot call `Child::kill` here, and a bare `kill(pid)` would
-                // leave backgrounded grandchildren running (REQ-544 L-2). The
-                // child is its own group leader (`process_group(0)`), so its pgid
-                // equals its pid; a negative target signals the entire group.
-                // libc is already a daemon dependency (peer-cred / flock).
-                // SAFETY: kill(2) with the negated pgid of a group we just created
-                // and a valid signal.
-                unsafe {
-                    libc::kill(-(pid as libc::pid_t), libc::SIGKILL);
-                }
-                let _ = handle.join();
+        match run_bounded(&root, &command, timeout_ms) {
+            BoundedRun::Completed {
+                status,
+                stdout,
+                stderr,
+            } => render_output(&command, status, &stdout, &stderr).with_unknown_provenance(),
+            // The third arm with no measurement and no provenance: nothing ran,
+            // so nothing this machine holds is in the answer. The runner has
+            // already phrased the reason.
+            BoundedRun::SpawnFailed(reason) => ToolOutcome::error(reason),
+            BoundedRun::Lost(reason) => ToolOutcome::error(reason)
+                .with_unknown_provenance()
+                .measuring(NO_OUTPUT_CAPTURED),
+            BoundedRun::TimedOut => {
                 let mut message = format!("command timed out after {timeout_ms}ms and was killed");
                 // BR-14: from a home-kind root on macOS, the likeliest reason a
                 // command hangs is a consent dialog for a protected folder that
                 // nobody at the terminal can see. Say so, once, only there.
+                //
+                // This sentence, and the decoration around it, are the *tool's*
+                // presentation of a timeout. `run_bounded` reports only that the
+                // deadline passed: the skill path answers the same fact with a
+                // placeholder, and neither spelling belongs to the runner.
                 if cfg!(target_os = "macos")
                     && matches!(ctx.root_kind(), RootKind::Home | RootKind::FilesystemRoot)
                 {
                     message.push_str(TIMEOUT_CONSENT_HINT);
                 }
                 ToolOutcome::error(message)
-                    .with_unknown_provenance()
-                    .measuring(NO_OUTPUT_CAPTURED)
-            }
-            Err(RecvTimeoutError::Disconnected) => {
-                let _ = handle.join();
-                ToolOutcome::error("command watcher disconnected")
                     .with_unknown_provenance()
                     .measuring(NO_OUTPUT_CAPTURED)
             }
@@ -365,7 +328,172 @@ impl Tool for ShellTool {
     }
 }
 
-/// The line [`Tool::run`] appends when the command's raw output ran past
+/// What one bounded run came to — the whole of [`run_bounded`]'s answer.
+///
+/// Typed rather than a rendered sentence, because the callers decorate the arms
+/// differently and must not have to recover the arm by reading text. The
+/// distinction that carries the most weight is **ran** versus **never ran**:
+/// [`Tool::run`] tags anything that reached a shell with unknown provenance and
+/// a measurement and tags the rest with neither, and a skill's dynamic context
+/// leaves a different placeholder for each (REQ-585 BR-6).
+#[derive(Debug)]
+pub(crate) enum BoundedRun {
+    /// The command ran to completion inside the deadline.
+    ///
+    /// The streams are **raw**: unmerged, unrendered, and *uncapped*. The
+    /// ceiling is [`cap_output`]'s, applied by whichever caller is presenting
+    /// them, because the pre-cap length is a number one of them needs
+    /// (REQ-561 ADR-5).
+    Completed {
+        status: ExitStatus,
+        stdout: Vec<u8>,
+        stderr: Vec<u8>,
+    },
+    /// The deadline passed and the whole process group was `SIGKILL`ed. What to
+    /// *say* about that is the caller's — the tool has a sentence and a
+    /// consent hint, the skill path has a placeholder.
+    TimedOut,
+    /// The command **never started**: the jail root could not be resolved, or
+    /// `sh` could not be launched. `reason` is a whole sentence.
+    SpawnFailed(String),
+    /// The command **started** and its output never arrived — the collector's
+    /// `wait_with_output` failed, or its channel hung up. Distinct from
+    /// [`BoundedRun::SpawnFailed`] on the axis that matters: something ran on
+    /// this machine, so a caller that tags provenance still has to tag it.
+    /// `reason` is a whole sentence.
+    Lost(String),
+}
+
+/// Run `command` under the shell tool's jail, scrubbed environment, `PATH`
+/// floor, process group and deadline — and hand back the **raw** result.
+///
+/// This is the whole of the spawn body and the single home of every guarantee
+/// this module's header claims. It is deliberately *not* the home of the output
+/// cap ([`cap_output`]) or of any sentence a user or a model reads: those
+/// differ between the two callers, and a runner that owned them would have to
+/// grow a mode flag.
+///
+/// `root` is canonicalized here rather than trusted, so the jail is this
+/// function's property and not an invariant a caller has to maintain.
+pub(crate) fn run_bounded(root: &Path, command: &str, timeout_ms: u64) -> BoundedRun {
+    // Phrased exactly as the spawn failure below, on purpose: a root that
+    // disappears between a caller's own check and this call is the same
+    // `NotFound` that `spawn` would have reported a microsecond later, and no
+    // caller should be able to tell which syscall happened to notice first.
+    let root = match root.canonicalize() {
+        Ok(root) => root,
+        Err(e) => return BoundedRun::SpawnFailed(spawn_failure(&e)),
+    };
+
+    let mut scrubbed = scrub(std::env::vars());
+    // BUG-174: the daemon's own `PATH` is only as good as whatever started
+    // it, and launchd starts it with a bare one. Floor it before the child
+    // inherits it, or every user-installed command is unreachable.
+    apply_path_floor(&mut scrubbed);
+
+    let mut cmd = Command::new("sh");
+    cmd.arg("-c")
+        .arg(command)
+        .current_dir(&root)
+        .env_clear()
+        .envs(scrubbed)
+        // REQ-544 L-2: make the child its own process-group leader (pgid ==
+        // child pid) so that on timeout we can SIGKILL the whole group and no
+        // backgrounded grandchild survives the deadline.
+        .process_group(0)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+
+    let child = match cmd.spawn() {
+        Ok(c) => c,
+        Err(e) => return BoundedRun::SpawnFailed(spawn_failure(&e)),
+    };
+    let pid = child.id();
+
+    let (tx, rx) = mpsc::channel::<IoResult<Output>>();
+    let handle = std::thread::spawn(move || {
+        let _ = tx.send(child.wait_with_output());
+    });
+
+    // **The group is killed on the timeout arm only** — and the alternative
+    // was tried and reverted (REQ-569 re-verify, R4).
+    //
+    // The verify pass moved the `kill(-pgid)` up here, ahead of the match,
+    // so it ran on *every* ending. The intent was to reach the escapee in
+    // `sh -c 'helper >/dev/null 2>&1 &'`: the command backgrounds a
+    // grandchild, closes the pipes, `wait_with_output` returns promptly and
+    // successfully, and on the old shape nothing killed the group. The
+    // escapee reparents to `launchd`/`init`, which breaks the ancestry
+    // chain REQ-569 BR-4 keys on — it reconnects classified
+    // `NotDescendant`, with full client rights.
+    //
+    // It is reverted because it cost more than it bought:
+    //
+    // - **It killed work a command legitimately backgrounded.** `npm run dev
+    //   &`, a fixture server, a language server — anything an agent starts
+    //   on purpose and expects to outlive one tool call died on the
+    //   *success* path. That is a functional regression in the common case,
+    //   paid for a security case the same change did not close.
+    // - **On a success arm the group leader has already been reaped** by
+    //   `wait_with_output`, so the pgid may already have been released.
+    //   Signalling it then is not the `ESRCH` no-op the timeout arm's
+    //   reasoning describes: it can reach a *recycled* group.
+    // - **It did not close the escape it was aimed at.** `setsid helper`
+    //   leaves the process group outright, so no group-directed signal on
+    //   any arm reaches it.
+    //
+    // So the escape stands, recorded rather than papered over, in
+    // `crate::peer`'s module docs and in the REQ-569 architecture ADR-A
+    // residuals. Closing it needs a mechanism that does not key on the
+    // process group at all.
+    match rx.recv_timeout(Duration::from_millis(timeout_ms)) {
+        Ok(Ok(Output {
+            status,
+            stdout,
+            stderr,
+        })) => {
+            let _ = handle.join();
+            BoundedRun::Completed {
+                status,
+                stdout,
+                stderr,
+            }
+        }
+        Ok(Err(e)) => {
+            let _ = handle.join();
+            BoundedRun::Lost(format!("command failed to run: {}", e.kind()))
+        }
+        Err(RecvTimeoutError::Timeout) => {
+            // Kill the whole process group, not just the direct child:
+            // `wait_with_output` moved the child into the watcher thread, so
+            // we cannot call `Child::kill` here, and a bare `kill(pid)` would
+            // leave backgrounded grandchildren running (REQ-544 L-2). The
+            // child is its own group leader (`process_group(0)`), so its pgid
+            // equals its pid; a negative target signals the entire group.
+            // libc is already a daemon dependency (peer-cred / flock).
+            // SAFETY: kill(2) with the negated pgid of a group we just created
+            // and a valid signal.
+            unsafe {
+                libc::kill(-(pid as libc::pid_t), libc::SIGKILL);
+            }
+            let _ = handle.join();
+            BoundedRun::TimedOut
+        }
+        Err(RecvTimeoutError::Disconnected) => {
+            let _ = handle.join();
+            BoundedRun::Lost("command watcher disconnected".to_owned())
+        }
+    }
+}
+
+/// The one spelling of "it never started", shared by the two ways that can
+/// happen so a caller cannot distinguish them (see [`run_bounded`]).
+fn spawn_failure(error: &std::io::Error) -> String {
+    format!("failed to start command: {}", error.kind())
+}
+
+/// The line [`cap_output`] appends when the command's raw output ran past
 /// [`MAX_OUTPUT_CHARS`], telling the model how much the cap threw away.
 ///
 /// **This sentence is for the model and for nothing else.** It used to be the
@@ -457,32 +585,72 @@ fn looks_like_credential_url(value: &str) -> bool {
     }
 }
 
+/// Apply the [`MAX_OUTPUT_CHARS`] ceiling to a merged stdout+stderr body, and
+/// report the length it had **before** the cap.
+///
+/// The one home of the ceiling, and the reason it is a function of its own
+/// rather than the last step of [`run_bounded`] or a few lines inside
+/// `render_output`:
+///
+/// - **The pre-cap length is a second answer, not an implementation detail.**
+///   It is what the `shell` duty's size trigger is decided on (REQ-561 ADR-5),
+///   and this is the last moment it exists — the caller is handed only the
+///   capped text. Capping inside the runner would make the measured length the
+///   *capped* one, so the trigger would compare a clamped body against the cap
+///   that clamped it and could never fire (LESSON-443).
+/// - **Both callers need the ceiling and only one needs the presentation.** A
+///   skill's dynamic context inlines these bytes into a prompt (REQ-585 BR-6)
+///   without the status line, the error flag or the duty; leaving the cap
+///   inside `render_output` would mean it inlined *uncapped* output.
+///
+/// The input is the merged body rather than the two streams because the cap is
+/// over what the model will read, `[stderr] ` label included — capping the
+/// streams separately would admit twice the ceiling.
+///
+/// # The third element
+///
+/// **Whether the ceiling fired** — a third answer, for the reason the second is
+/// one. REQ-585's `skill_invoked` reports it (`truncated`, so a surface can say
+/// the model is reading a prefix), and it is the branch this function has
+/// already taken: a caller that re-derived it would need the comparison, which
+/// means a second copy of the ceiling in a second file — the very thing
+/// [`the_output_cap_has_exactly_one_home`](tests::the_output_cap_has_exactly_one_home)
+/// forbids. It is not recoverable from the pair alone: a capped body's length
+/// and the length it reports are two independent numbers that can coincide.
+pub(crate) fn cap_output(merged: String) -> (String, usize, bool) {
+    let raw_output_chars = merged.chars().count();
+    if raw_output_chars <= MAX_OUTPUT_CHARS {
+        return (merged, raw_output_chars, false);
+    }
+    let truncated: String = merged.chars().take(MAX_OUTPUT_CHARS).collect();
+    (
+        format!("{truncated}\n{}", truncation_notice(raw_output_chars)),
+        raw_output_chars,
+        true,
+    )
+}
+
 /// Render a finished command's output for the model, capped.
-fn render_output(command: &str, output: &Output) -> ToolOutcome {
-    let mut body = String::new();
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    let stderr = String::from_utf8_lossy(&output.stderr);
+fn render_output(command: &str, status: ExitStatus, stdout: &[u8], stderr: &[u8]) -> ToolOutcome {
+    let mut merged = String::new();
+    let stdout = String::from_utf8_lossy(stdout);
+    let stderr = String::from_utf8_lossy(stderr);
     if !stdout.trim().is_empty() {
-        body.push_str(stdout.trim_end());
-        body.push('\n');
+        merged.push_str(stdout.trim_end());
+        merged.push('\n');
     }
     if !stderr.trim().is_empty() {
-        body.push_str("[stderr] ");
-        body.push_str(stderr.trim_end());
-        body.push('\n');
+        merged.push_str("[stderr] ");
+        merged.push_str(stderr.trim_end());
+        merged.push('\n');
     }
-    // REQ-561 ADR-5: the length of what the command **actually** produced, taken
-    // before the cap is applied. This is the last moment it exists — `run`
-    // returns only the capped text — and it is the number the `shell` duty's size
-    // trigger is decided on, so it is recorded in the notice rather than left to
-    // be re-derived from a string the cap has already clamped (LESSON-443).
-    let raw_output_chars = body.chars().count();
-    if raw_output_chars > MAX_OUTPUT_CHARS {
-        let truncated: String = body.chars().take(MAX_OUTPUT_CHARS).collect();
-        body = format!("{truncated}\n{}", truncation_notice(raw_output_chars));
-    }
+    // The cap, and the length the command **actually** produced — which
+    // [`cap_output`] takes before it truncates, because that number is the one
+    // the `shell` duty's size trigger is decided on and the capped text can no
+    // longer show it (REQ-561 ADR-5, LESSON-443).
+    let (body, raw_output_chars, _truncated) = cap_output(merged);
 
-    let code = output.status.code();
+    let code = status.code();
     let status_line = match code {
         Some(0) => format!("$ {command}\n(exit 0)\n"),
         Some(c) => format!("$ {command}\n(exit {c})\n"),
@@ -705,6 +873,53 @@ mod tests {
         assert!(
             !root.join("survivor.txt").exists(),
             "backgrounded grandchild outlived the deadline"
+        );
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// **The runner still floors the child's `PATH`** (BUG-174) — asserted
+    /// against the function that does the flooring rather than a hand-listed set
+    /// of directories, so the two cannot drift.
+    ///
+    /// This is the extraction's faithfulness check for the one guarantee in the
+    /// spawn body whose removal nothing else notices. The floor is a
+    /// *usability* control, so deleting it changes nothing at all on a machine
+    /// whose ambient `PATH` already names every floor directory that exists —
+    /// which is most developer machines and most of CI. The equality below
+    /// fails wherever the floor adds anything, which is exactly the machine
+    /// class BUG-174 is about (a launchd-started daemon inheriting
+    /// `/usr/bin:/bin:/usr/sbin:/sbin`), and passes rather than flaking where it
+    /// adds nothing.
+    ///
+    /// It also pins the "exactly one `PATH`" half: `apply_path_floor` rewrites
+    /// the variable rather than appending a second one, and `env_clear` plus
+    /// `envs` would happily carry two.
+    #[test]
+    fn the_bounded_runner_floors_the_childs_path() {
+        let root = temp_root("path-floor");
+
+        let mut expected_env = scrub(std::env::vars());
+        apply_path_floor(&mut expected_env);
+        let expected: Vec<&String> = expected_env
+            .iter()
+            .filter(|(k, _)| k == "PATH")
+            .map(|(_, v)| v)
+            .collect();
+        assert_eq!(
+            expected.len(),
+            1,
+            "the floor must leave exactly one PATH behind"
+        );
+
+        let stdout = match run_bounded(&root, "printf %s \"$PATH\"", 5_000) {
+            BoundedRun::Completed { stdout, .. } => stdout,
+            other => panic!("the fixture must run to completion: {other:?}"),
+        };
+        assert_eq!(
+            &String::from_utf8_lossy(&stdout),
+            expected[0],
+            "the child's PATH is not the one `apply_path_floor` produces from the daemon's \
+             own environment"
         );
         std::fs::remove_dir_all(&root).ok();
     }
@@ -1010,6 +1225,144 @@ mod tests {
             .content
             .contains(&truncation_notice(MAX_OUTPUT_CHARS + 1_000)));
         std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// **The cap reports the length it saw, not the one it left behind.**
+    ///
+    /// The pair [`cap_output`] returns is two different facts, and
+    /// `render_output` hands the second to `measuring(…)`. Counting *after* the
+    /// truncation instead would report `MAX_OUTPUT_CHARS` for every capped
+    /// command, at which point the `shell` duty's size trigger compares the cap
+    /// against itself and can never fire (LESSON-443).
+    ///
+    /// That mutation is caught twice on purpose — here on the function, and
+    /// through the whole tool by
+    /// [`the_raw_output_length_is_carried_beside_the_text_not_inside_it`] — because
+    /// the ceiling now has a second caller that never touches `render_output`.
+    #[test]
+    fn cap_output_reports_the_length_before_the_cap_not_after() {
+        // Under the cap: the body is handed back untouched, and the length is
+        // its own.
+        let short = "hello\n[stderr] boom\n".to_owned();
+        let (text, raw, truncated) = cap_output(short.clone());
+        assert_eq!(text, short, "an uncapped body must not be rewritten");
+        assert_eq!(raw, short.chars().count());
+        assert!(!truncated, "a body under the cap threw nothing away");
+
+        // Exactly at the cap is not past it — the boundary the duty's trigger
+        // sits on (`worth_interpreting` is `>`, not `>=`).
+        let at_the_cap = "x".repeat(MAX_OUTPUT_CHARS);
+        let (text, raw, truncated) = cap_output(at_the_cap.clone());
+        assert_eq!(text, at_the_cap, "at the cap is not past it");
+        assert_eq!(raw, MAX_OUTPUT_CHARS);
+        assert!(!truncated, "at the cap is not past it, so nothing was cut");
+
+        // Over it: the text is clamped and the *reported* length is the pre-cap
+        // one, which the clamped text can no longer show.
+        let over = MAX_OUTPUT_CHARS + 1_000;
+        let (text, raw, truncated) = cap_output("x".repeat(over));
+        assert!(truncated, "a body past the cap reports that it was cut");
+        assert_eq!(
+            raw, over,
+            "the reported length must be what the command produced, not what survived the cap"
+        );
+        let notice = truncation_notice(over);
+        assert!(text.ends_with(&notice), "the notice must close the body");
+        assert_eq!(
+            text.chars().count(),
+            MAX_OUTPUT_CHARS + 1 + notice.chars().count(),
+            "the kept body is exactly the cap, plus the separating newline and the notice"
+        );
+    }
+
+    /// **LESSON-546: a one-home rule is a test, not a grep in a task file.**
+    ///
+    /// [`MAX_OUTPUT_CHARS`] is the shell tool's output ceiling *and* the `shell`
+    /// duty's size trigger, which is why `shell_duty` derives its constant from
+    /// it rather than restating the number (REQ-561 ADR-5). Extracting
+    /// [`cap_output`] moved the place the cap is *applied*; this asserts it left
+    /// no second one behind, in both directions:
+    ///
+    /// - the number 8,000 is written down in exactly one production line, and
+    /// - `MAX_OUTPUT_CHARS` is named by exactly two production files — this one,
+    ///   where it is defined and applied, and `shell_duty`, which derives from
+    ///   it — with exactly one application site here.
+    ///
+    /// The second caller this REQ adds (a skill's dynamic context, REQ-585
+    /// ADR-14) reaches the ceiling through [`cap_output`] and so appears in
+    /// neither list. A file that *does* appear has re-implemented the cap, which
+    /// is the thing being refused.
+    #[test]
+    fn the_output_cap_has_exactly_one_home() {
+        use crate::call_sites::scan::{code_only, count, production_sources};
+
+        /// Occurrences of `needle` that are not part of a longer word.
+        ///
+        /// `8_000` is a substring of `128_000`, and `8000` of `128000`, both of
+        /// which the daemon writes for provider context windows. A plain
+        /// substring count would charge those to this constant.
+        fn standalone(haystack: &str, needle: &str) -> usize {
+            let free = |c: Option<char>| !c.is_some_and(|c| c.is_ascii_alphanumeric() || c == '_');
+            haystack
+                .match_indices(needle)
+                .filter(|(at, _)| {
+                    free(haystack[..*at].chars().next_back())
+                        && free(haystack[at + needle.len()..].chars().next())
+                })
+                .count()
+        }
+
+        let sources: Vec<(String, String)> = production_sources()
+            .into_iter()
+            .map(|(rel, src)| (rel, code_only(&src)))
+            .collect();
+        // Non-vacuity: the sweep really did see the module it is about.
+        assert!(
+            sources
+                .iter()
+                .any(|(rel, _)| rel == "harness/tools/shell.rs"),
+            "the scan missed the module it is about: {:?}",
+            sources.iter().map(|(rel, _)| rel).collect::<Vec<_>>()
+        );
+
+        let number_homes: Vec<(&str, usize)> = sources
+            .iter()
+            .filter_map(|(rel, code)| {
+                let n = standalone(code, "8_000") + standalone(code, "8000");
+                (n > 0).then_some((rel.as_str(), n))
+            })
+            .collect();
+        assert_eq!(
+            number_homes,
+            vec![("harness/tools/shell.rs", 1usize)],
+            "8,000 is the shell tool's output cap and must be written down exactly once, at \
+             `MAX_OUTPUT_CHARS`. Everything else that needs it reads the constant."
+        );
+
+        let identifier_homes: Vec<&str> = sources
+            .iter()
+            .filter(|(_, code)| code.contains("MAX_OUTPUT_CHARS"))
+            .map(|(rel, _)| rel.as_str())
+            .collect();
+        assert_eq!(
+            identifier_homes,
+            vec!["harness/shell_duty.rs", "harness/tools/shell.rs"],
+            "only the module that owns the cap and the duty that derives its trigger from it \
+             may name `MAX_OUTPUT_CHARS`. A third file is a second cap; call `cap_output`."
+        );
+
+        let here = sources
+            .iter()
+            .find(|(rel, _)| rel == "harness/tools/shell.rs")
+            .map(|(_, code)| code.as_str())
+            .expect("this module is a production source");
+        assert_eq!(
+            count(here, "MAX_OUTPUT_CHARS"),
+            3,
+            "the cap is applied in exactly one place: the constant's definition, plus the \
+             comparison and the `take` inside `cap_output`. A fourth mention is a second \
+             application site."
+        );
     }
 
     /// **A command cannot buy itself a model call by printing the harness's own

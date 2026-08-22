@@ -1498,6 +1498,68 @@ tier = "off"
         assert!(edited.contains("# The one I actually pay for."), "{edited}");
     }
 
+    /// REQ-586 BR-5: `context_budget_cap` is a conditionally-serialized key
+    /// (zero is "no cap" and writes no line), so the delta engine's rule for
+    /// such keys — "absent from both sides or present in both, never a spurious
+    /// edit" — is what a cap rides on. Both directions are asserted: setting a
+    /// cap on a record that had none adds exactly that key inside the record's
+    /// own `[providers.capabilities]`, and clearing it back to zero removes the
+    /// key rather than writing `context_budget_cap = 0` — each edit reloads to
+    /// the candidate, and the user's own lines survive both.
+    #[test]
+    fn a_context_budget_cap_set_and_cleared_on_an_element_round_trips_through_the_delta() {
+        let current = registered_provider();
+        let mut capped = current.clone();
+        capped.providers[0].capabilities.context_budget_cap = 65_536;
+
+        let edited = apply_config_delta(REGISTERED_PROVIDER_CONFIG, &current, &capped)
+            .expect("setting a cap applies");
+        let reloaded = Config::load(&edited).expect("the edited document must load");
+        assert_eq!(reloaded, capped);
+        assert_eq!(
+            reloaded.providers[0].capabilities.context_budget_cap, 65_536,
+            "the cap belongs to the element the delta named:\n{edited}",
+        );
+        assert!(
+            edited.contains("context_budget_cap = 65536"),
+            "a set cap is one line under the element's sub-table:\n{edited}",
+        );
+        assert_eq!(
+            edited.matches("[providers.capabilities]").count(),
+            1,
+            "the cap lands in the element's own sub-table, not a second one:\n{edited}",
+        );
+        // The window key was not in the document and the cap alone does not
+        // conjure it — zero is the default for both, and only the key that
+        // changed is written.
+        assert!(
+            !edited.contains("max_context"),
+            "an untouched sibling key is not written alongside the cap:\n{edited}",
+        );
+        assert!(edited.contains("# The one I actually pay for."), "{edited}");
+        assert!(edited.contains(r#"nickname = "the good one""#), "{edited}");
+
+        // And back: clearing the cap removes its line rather than pinning a
+        // zero the canonical rendering would never write.
+        let cleared = current.clone();
+        let edited_back =
+            apply_config_delta(&edited, &capped, &cleared).expect("clearing a cap applies");
+        let reloaded = Config::load(&edited_back).expect("the cleared document must load");
+        assert_eq!(reloaded, cleared);
+        assert!(
+            !edited_back.contains("context_budget_cap"),
+            "a cleared cap is an absent key, not `= 0`:\n{edited_back}",
+        );
+        assert!(
+            edited_back.contains("# The one I actually pay for."),
+            "{edited_back}"
+        );
+        assert!(
+            edited_back.contains(r#"nickname = "the good one""#),
+            "{edited_back}"
+        );
+    }
+
     #[test]
     fn a_reshaped_array_of_tables_is_replaced_wholesale_where_it_stood() {
         // ADR-1's exception, kept and pinned: an array that shrank has no index

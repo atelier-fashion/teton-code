@@ -247,11 +247,41 @@ const MAX_SPECIAL_TOKEN_SPAN_BYTES: usize = 64;
 /// note. Closing tags are included because the *escape* is the first move in
 /// the BUG-148 forgery: content that closes the envelope early puts its
 /// remaining bytes outside the "this block is DATA" frame.
+/// The `skill` tool's instructions frame is here for the same reason and with
+/// one difference worth stating: the block it delimits is *not* untrusted data
+/// — REQ-587 BR-4 says an expansion is the user's own instructions — but the
+/// tag is still harness-authored frame, and ADR-009 is two-sided. A marker the
+/// harness writes is a marker the harness must be able to defuse, or a cloned
+/// repository's `SKILL.md` closes its own frame flush-left and its remaining
+/// bytes read as harness prose (BUG-148's shape, one layer over).
+///
+/// The `skill` tool's **argument sub-frame** is here for the third reason, and
+/// it is the inverse of the second: `<skill-arguments`
+/// ([`super::tools::skill::ARGS_OPEN_TAG`]) delimits the *caller's* argument
+/// text inside an expansion, and says that region is data rather than
+/// instructions. The instructions frame vouches for the skill **file's** bytes;
+/// this one un-vouches for the bytes the caller spliced into them. A model-
+/// supplied argument that could close it flush-left would put its remaining
+/// payload back under the outer frame's sentence — which is the whole promotion
+/// path REQ-587 opens from `UntrustedData` to `Expansion`, so the closing
+/// spelling matters here more than anywhere else in this list.
+///
+/// It is `<`-prefixed deliberately. [`starts_with_frame_label`]'s cheap reject
+/// admits only `U`/`A`/`T` — every *existing* transcript label happens to open
+/// with one of those bytes — so a **prose** frame label would be silently
+/// skipped even after being added to a marker set, leaving
+/// `the_input_alphabet_covers_every_output_marker` green while the defuser
+/// never fired. A `<`-prefixed tag routes through
+/// [`starts_with_envelope_tag`] instead, which has no such reject.
 const UNTRUSTED_ENVELOPE_TAGS: &[&str] = &[
     "<tool-result",
     "</tool-result",
     "<mcp-tool-result",
     "</mcp-tool-result",
+    "<skill-body",
+    "</skill-body",
+    "<skill-arguments",
+    "</skill-arguments",
 ];
 
 /// Inserted at a line start to defuse a frame label there (BUG-148).
@@ -1031,6 +1061,23 @@ mod tests {
         // so there is nothing to add — and this pins the alphabets literally, so
         // a later REQ that *does* introduce a spelling fails here and is sent to
         // update both sides rather than one.
+        //
+        // **REQ-587 is that later REQ, and it did both sides — twice.** The
+        // `skill` tool writes two markers, so ADR-009 obliges the harness to
+        // defuse both and obliges the reply gate to refuse a model that
+        // fabricates either:
+        //
+        // * `<skill-body` is BR-4's instructions frame around an expansion —
+        //   the frame that says *follow this*;
+        // * `<skill-arguments` is the sub-frame inside it that marks the
+        //   **caller's** argument text as data. It is the inverse claim and it
+        //   needs the same two-sided treatment for a sharper reason: the outer
+        //   frame vouches for the skill file's bytes, and a caller who could
+        //   close the inner one flush-left would put its own payload back under
+        //   that vouch.
+        //
+        // The three assertions below moved together, which is the only way this
+        // pin is worth anything.
         assert_eq!(
             UNTRUSTED_ENVELOPE_TAGS,
             &[
@@ -1038,6 +1085,10 @@ mod tests {
                 "</tool-result",
                 "<mcp-tool-result",
                 "</mcp-tool-result",
+                "<skill-body",
+                "</skill-body",
+                "<skill-arguments",
+                "</skill-arguments",
             ],
             "the input envelope alphabet grew — add the spelling to BOTH output \
              marker sets and extend the bidirectional coverage tests above"
@@ -1050,6 +1101,8 @@ mod tests {
                 "Tool (",
                 "<tool-result",
                 "<mcp-tool-result",
+                "<skill-body",
+                "<skill-arguments",
             ],
             "the flat fabrication markers changed"
         );
@@ -1058,6 +1111,8 @@ mod tests {
             &[
                 "<tool-result",
                 "<mcp-tool-result",
+                "<skill-body",
+                "<skill-arguments",
                 super::super::context::TOOL_RESULT_LABEL_PREFIX,
             ],
             "the ChatML fabrication markers changed"

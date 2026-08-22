@@ -86,10 +86,10 @@
 //! *describing* the machine, changes no safety decision, and is how the offline
 //! session path is exercised at all.
 
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
 use teton_core::boundary::BoundaryMatcher;
@@ -107,7 +107,7 @@ use teton_core::phase::Phase as CorePhase;
 use teton_core::policy::ProviderHealth;
 use teton_core::{
     apply_config_delta, compose_endpoint, is_absolute_http_url, is_cleartext_to_a_remote_host,
-    table_section,
+    table_section, ProvenanceId,
 };
 
 use teton_inference::benchmark::{BenchmarkResult, DutySpec};
@@ -116,10 +116,10 @@ use teton_inference::probe::{decide, GpuClass, HardwareProfile, TierDecision, GI
 use teton_inference::{ChatFormat, Completion, Engine, EngineError, GenParams, MockEngine};
 
 use teton_protocol::events::{
-    BlockCause, CapabilityDeadEnd, ContextCleared, Event, ModelLifecycle, ModelLifecycleStage,
-    PrivacyAction, ProviderTested, SessionRootChanged, SessionTitled, TierWarming, TurnQueued,
-    WebCapabilityState as WireWebCapabilityState, WebLookup, WebSetupCompleted, WebTaintOverridden,
-    WebTier as WireWebTier,
+    BlockCause, CapabilityDeadEnd, ContextCleared, ContextPressureKind, Event, ModelLifecycle,
+    ModelLifecycleStage, PrivacyAction, ProviderTested, SessionRootChanged, SessionTitled,
+    SkillInvoked, TierWarming, TurnQueued, WebCapabilityState as WireWebCapabilityState, WebLookup,
+    WebSetupCompleted, WebTaintOverridden, WebTier as WireWebTier,
 };
 use teton_protocol::jsonrpc::{error_code, RpcError};
 use teton_protocol::methods::{
@@ -130,7 +130,7 @@ use teton_protocol::methods::{
     ProviderSetupCommitResult, ProviderSetupPlanResult, ProviderSetupPreviewResult,
     ProviderTestOutcome, ProviderTestResult, SessionClearParams, SessionClearResult,
     SessionPermissionsParams, SessionPermissionsResult, SessionSetCwdParams, SessionSetCwdResult,
-    TierBinding as WireTierBinding, TierBindingConfig, TierRouteView, TierSummary,
+    SkillInvocation, TierBinding as WireTierBinding, TierBindingConfig, TierRouteView, TierSummary,
     WebOverrideParams, WebOverrideResult, WebRefreshOutcome, WebRefreshParams, WebRefreshResult,
     WebSetupCommitParams, WebSetupCommitResult, WebSetupPlanResult, WebSetupPreviewParams,
     WebSetupPreviewResult, WebTableSummary, WebTotalsView,
@@ -162,10 +162,15 @@ use crate::egress::{
     EgressError, HttpTransport, LookupContext, LookupOutcome, LookupRecord, LookupRecorder,
     LookupRequest, Provenance, RedactionGate, RedactionVerdict, TaintView,
 };
+use crate::grants::ConnectionId;
+use crate::harness::budget::{skill_fit, RouteBudget, SkillCaller, SkillFit, SkillStage};
 use crate::harness::completion::{context_provenance, RemoteProviderSource};
-use crate::harness::context::NoopProvenanceHook;
+use crate::harness::context::{NoopProvenanceHook, PressureReport};
+use crate::harness::permissions::{AddressedPermissionDelivery, SkillConsent};
+use crate::harness::tools::shell;
+use crate::harness::tools::skill::register_skill_tool;
 use crate::harness::tools::web::{register_web_tool, tier_name, SeamError, WebLookupSeam};
-use crate::harness::turn_loop::{run_session_turn_with_source, HarnessError};
+use crate::harness::turn_loop::{pressure_kind, run_session_turn_with_source, HarnessError};
 use crate::harness::{
     build_system_prompt, ContextManager, DutyKind, DutyRoute, LocalEngineSource,
     PendingPermissions, PermissionGate, SessionEvents, ToolContext, ToolDuties, ToolRegistry,
@@ -185,6 +190,8 @@ use crate::router::{
 use crate::selection_store::SelectionStore;
 use crate::session_root::{home, ProbedRoot};
 use crate::sessions::{validate_session_cwd, SessionRegistry, TurnClaimError};
+use crate::skills::dynamic::{closed_door, door_outcome, outcome_view};
+use crate::skills::{DynamicOutcome, Expansion, Pending, SkillRegistry, SkillSource};
 use crate::web::{UserUrls, WebCache};
 // The module rather than the function: `suggestion_catalog()` on its own would
 // read, in a file this size, as something the runtime computes.
@@ -1421,6 +1428,89 @@ fn attempt_source<'a>(
     }
 }
 
+/// One accepted `/name` invocation, resolved against the session's registry and
+/// expanded **once** (REQ-585 BR-4, ADR-3, ADR-9, ADR-11).
+///
+/// Everything a skill turn needs that a typed turn does not, carried as one
+/// value from the moment the invocation is accepted to the moment the user block
+/// is seeded — which is what lets [`DaemonRuntime::run_prompt_turn`] read "this
+/// turn's prompt text" exactly once for the classifier, the naming attempt and
+/// both budget checks. Two derivations of that string would be BR-4's own
+/// failure mode one layer up: the turn the user consented to and the turn that
+/// ran would be two different strings.
+struct SkillTurn {
+    /// The dispatch name, as the registry validated it
+    /// (`^[a-z0-9][a-z0-9_-]{0,63}$`) — safe to put in a refusal sentence, and
+    /// the name [`skill_fit`] quotes.
+    name: String,
+    /// The expansion as it stands: [`crate::skills::PENDING_PLACEHOLDER`] in
+    /// each `` !`command` `` slot until the consent seam folds the outcomes in,
+    /// and the finished prompt text afterwards.
+    ///
+    /// Replaced at the seam in `run_prompt_turn`, after the commands have been
+    /// consented to and run, with [`Expansion::fold`]'s output — which is
+    /// precisely why Stage B measures this field rather than re-reading Stage
+    /// A's answer.
+    text: String,
+    /// The expansion value itself, taken at the seam and folded exactly once.
+    ///
+    /// `None` afterwards, and that is the type doing the work: [`Expansion::fold`]
+    /// consumes, so a second fold is not expressible, and BR-4's "built once
+    /// because two copies would disagree" holds one layer up as well — the
+    /// string the user consented to and the string the model receives come from
+    /// one value.
+    expansion: Option<Expansion<Pending>>,
+    /// The gate key this skill's dynamic context asks under
+    /// ([`Expansion::grant_key`], REQ-585 ADR-6 as REQ-587 BR-5 narrows it) —
+    /// minted at [`Self::accept_invocation`] with the registry row *and* the
+    /// expansion in hand, rather than re-derived at the seam, so the key the
+    /// grant is remembered under cannot come from a second reading of either.
+    ///
+    /// It carries the digest of the substituted commands whenever the body
+    /// interpolated its arguments, which is what keeps one "allow for this
+    /// session" answer from covering a *different* command list under the same
+    /// skill name.
+    permission_key: String,
+    /// Which of the two roots the file came from — half the permission key, and
+    /// what BR-12's echo line names.
+    source: SkillSource,
+    /// The file as a surface may spell it, bounded
+    /// (`skills::Skill::path_display` + `bounded_field`) — the one form
+    /// allowed, because an absolute path carries a username, or the location of
+    /// the user's working tree, into a transcript (BR-1's entity table).
+    path_display: String,
+    /// The body's size in bytes, which is what BR-12's echo line renders.
+    body_bytes: u64,
+    /// The frontmatter keys this daemon read and ignored (BR-5), listed by
+    /// `/verbose` and inert everywhere else.
+    ignored_keys: Vec<String>,
+    /// A frontmatter `name` that disagrees with the file's own (BR-2), carried
+    /// so `/verbose` can say it. The dispatching spelling is never in doubt —
+    /// this is a note to the author, not a second name.
+    name_note: Option<String>,
+    /// Whether a **user** skill of this name lost its spelling to this one —
+    /// BR-9's `shadows your user skill` clause on the echo line.
+    shadows_user_skill: bool,
+    /// The frontmatter invocation flags as the file wrote them (REQ-587 BR-3),
+    /// carried for `/verbose` (BR-9). Read off the registry row at
+    /// [`Self::accept_invocation`], for the reason `shadows_user_skill` is.
+    model_invocable: bool,
+    /// The other flag. `false` here would mean a model-only skill, which this
+    /// path cannot reach — `dispatchable_by_user` refused it above — so it is
+    /// carried rather than assumed, because that is a fact about *this* build's
+    /// resolution and not a property of the field.
+    user_invocable: bool,
+    /// The skill file's identity, for the seeded user block (BR-7, ADR-9). A
+    /// project skill is under the root and mints cleanly.
+    sources: BTreeSet<ProvenanceId>,
+    /// Set when the file has no root-relative identity to mint — a **user**
+    /// skill outside the session root, which `ProvenanceId::from_resolved`
+    /// refuses by design (REQ-571 ADR-B). The block then fails closed wherever a
+    /// boundary is configured, exactly as `shell` output does, which is stricter
+    /// than BR-7's letter and right in the charter's direction (ADR-9).
+    unknown: bool,
+}
+
 /// The assembled daemon runtime shared by every client task.
 pub struct DaemonRuntime {
     /// The live configuration (providers, routing, boundaries). Mutated by
@@ -1571,6 +1661,29 @@ pub struct DaemonRuntime {
     /// as an endpoint-bound authorization header at the egress choke point and
     /// never reaches a log, `CostRecord`, or telemetry.
     secret_resolver: SecretResolver,
+    /// Where an **addressed** permission request is delivered (REQ-585 ADR-7).
+    ///
+    /// Installed once, by [`crate::server::Daemon`]'s constructors, over the
+    /// live surface registry that daemon holds. It lives here because the gate
+    /// is built here ([`Self::permission_gate_for`]) and cached for the
+    /// session's life, while the route is a daemon-wide fact fixed before any
+    /// connection exists.
+    ///
+    /// A [`OnceLock`] rather than a constructor parameter because the ownership
+    /// runs the other way: the daemon holds the runtime, so the runtime cannot
+    /// be handed the daemon's registry until the runtime already exists. Empty
+    /// on a runtime nobody wired one into, which is **no prompt** rather than a
+    /// degraded one — see [`AddressedPermissionDelivery`].
+    addressed_delivery: OnceLock<Arc<dyn AddressedPermissionDelivery>>,
+    /// The per-command deadline a skill's dynamic context runs under (REQ-585
+    /// BR-6: "the `shell` tool's jail, timeout and output cap").
+    ///
+    /// Production is [`shell::DEFAULT_TIMEOUT_MS`] — the same figure a `shell`
+    /// call that names no timeout gets — and it is a field only so a test can
+    /// reach the timed-out arm without waiting out a window sized for a human
+    /// (the argument `Daemon::with_consent_timeout` makes, and
+    /// `ShellTool::with_timeouts` makes for the tool itself).
+    skill_command_timeout_ms: u64,
 }
 
 impl DaemonRuntime {
@@ -1627,7 +1740,43 @@ impl DaemonRuntime {
             data_dir: std::env::temp_dir(),
             provider_health: Mutex::new(BTreeMap::new()),
             secret_resolver: SecretResolver::with_default_backend(),
+            addressed_delivery: OnceLock::new(),
+            skill_command_timeout_ms: shell::DEFAULT_TIMEOUT_MS,
         }
+    }
+
+    /// Install the route an addressed permission request is delivered on
+    /// (REQ-585 ADR-7) — the daemon's one call, made before any connection
+    /// exists.
+    ///
+    /// Idempotent-by-first-writer: a second call is ignored, because two
+    /// daemons over one runtime is not a production shape and the first
+    /// daemon's live surface registry is as good an answer as the second's.
+    ///
+    /// Without it every skill consent answers
+    /// [`SkillConsent::Unanswerable`](crate::harness::permissions::SkillConsent::Unanswerable)
+    /// and no dynamic command runs — fail-closed, which is the only safe
+    /// absence: the fallback would be the event bus, and keeping a skill
+    /// consent *off* the bus is the whole of ADR-7.
+    pub fn install_addressed_delivery(&self, route: Arc<dyn AddressedPermissionDelivery>) {
+        let _ = self.addressed_delivery.set(route);
+    }
+
+    /// Replace the per-command deadline a skill's dynamic context runs under
+    /// (REQ-585 AC-10).
+    ///
+    /// **The observation seam AC-10's turn-level claim is written against.**
+    /// Production takes [`shell::DEFAULT_TIMEOUT_MS`], 30 s — sized for a real
+    /// command — and a test that asserted "a command past the deadline leaves a
+    /// timed-out placeholder and the invocation still produces its turn" by
+    /// waiting that out would spend half a minute proving a branch it can prove
+    /// in milliseconds. A fixture has to say this out loud, exactly as it does
+    /// [`crate::server::Daemon::with_consent_timeout`], so no shipped path can
+    /// be running a shortened deadline.
+    #[must_use]
+    pub fn with_skill_command_timeout(mut self, timeout_ms: u64) -> Self {
+        self.skill_command_timeout_ms = timeout_ms;
+        self
     }
 
     /// [`Self::minimal`] with a **real config file** behind it, loaded (REQ-579
@@ -1805,6 +1954,8 @@ impl DaemonRuntime {
             data_dir: base_dir.to_path_buf(),
             provider_health: Mutex::new(BTreeMap::new()),
             secret_resolver: SecretResolver::with_default_backend(),
+            addressed_delivery: OnceLock::new(),
+            skill_command_timeout_ms: shell::DEFAULT_TIMEOUT_MS,
         })
     }
 
@@ -2487,6 +2638,46 @@ impl DaemonRuntime {
             .collect()
     }
 
+    /// The big-window notice a provider's **recorded** window earns, or `None`
+    /// (REQ-586 OQ-6 as amended, TASK-194).
+    ///
+    /// Asked after `config/set` applied a `RegisterProvider`, so the figures
+    /// describe what was actually stored rather than what the client sent: the
+    /// merge is field-wise, and a registration that names no window inherits
+    /// the one the config already held (ADR-7). A provider that vanished
+    /// between the write and this read, or one below the threshold, answers
+    /// `None` — which renders nothing, exactly as today.
+    ///
+    /// **A local entry answers `None` however large its window.** Its turns run
+    /// on the engine on this machine, under the local pair, whatever
+    /// `max_context` says — which is why `provider list` renders such a row as
+    /// `(local engine)` and why `/doctor` does not advise it to set a window.
+    /// A notice naming a per-call figure and a worst-case spend for it would be
+    /// the exact class of untruth this task is closing, and it would name money
+    /// where none is spent.
+    ///
+    /// The sentence itself is `harness::budget`'s, shared byte for byte with
+    /// `/provider setup`'s preview warning: one composer, so the two surfaces
+    /// that record a window cannot come to word it differently (BR-8). (That
+    /// flow refuses a local candidate outright, so this is the only path where
+    /// the kind has to be asked about at all.)
+    #[must_use]
+    pub fn provider_budget_notice(&self, provider_id: &ProviderId) -> Option<String> {
+        let config = self.config.lock().expect("config mutex poisoned");
+        let provider = config
+            .providers
+            .iter()
+            .find(|provider| provider.id == provider_id.0)?;
+        if !provider.kind.is_remote() {
+            return None;
+        }
+        crate::harness::budget::big_window_notice(
+            provider.capabilities.max_context,
+            provider.capabilities.context_budget_cap,
+            config.privacy.redact,
+        )
+    }
+
     /// Apply a `config/set` mutation, validate, and persist it.
     ///
     /// ## Registration is stricter than loading, deliberately (BUG-155)
@@ -2645,6 +2836,324 @@ impl DaemonRuntime {
         }
     }
 
+    /// Resolve one `/name` invocation against **this daemon's** registry and
+    /// expand it (REQ-585 BR-4, ADR-3, ADR-9).
+    ///
+    /// # The client's snapshot is a convenience, not the authority
+    ///
+    /// `classify` runs client-side over a snapshot of this registry (ADR-13), so
+    /// in the ordinary case the name arriving here is one the client already
+    /// matched. That is not a reason to trust it: the snapshot is refreshed on
+    /// an event, a third-party client need not hold one at all, and the registry
+    /// moves under `/cd`. A check that lived only on the far side of the wire is
+    /// LESSON-520's shape — so the name is resolved again here, against the
+    /// registry that will actually be dispatched from, and an unknown or
+    /// **shadowed** name is refused. `SkillRegistry::dispatchable` is what
+    /// decides both: a shadowed row exists, is listed by `/help`, and never
+    /// dispatches (BR-2).
+    ///
+    /// # Nothing unvalidated reaches the sentence
+    ///
+    /// The name is checked against [`crate::skills::is_valid_skill_name`]
+    /// *before* it is echoed. A registered skill's name already satisfies it —
+    /// discovery would not have registered it otherwise — so this guard only
+    /// ever fires on a name that came off the wire and matched nothing, which is
+    /// exactly the string that must not be reflected verbatim into a message a
+    /// terminal renders (LESSON-517). `raw_arguments` is never echoed at all: it
+    /// reaches the model through [`crate::skills::expand`], which defuses it.
+    fn accept_invocation(
+        &self,
+        registry: &SkillRegistry,
+        probed: &ProbedRoot,
+        invocation: &SkillInvocation,
+    ) -> Result<SkillTurn, RpcError> {
+        if !crate::skills::is_valid_skill_name(&invocation.name) {
+            return Err(RpcError::new(
+                error_code::INVALID_PARAMS,
+                "`skill.name` is not a skill name: a skill dispatches under \
+                 `^[a-z0-9][a-z0-9_-]{0,63}$`, and nothing else is registered"
+                    .to_owned(),
+            ));
+        }
+        // `dispatchable_by_user`, which is this caller's question: `skill/invoke`
+        // is the *user* typing `/name`, so REQ-587 BR-3's `user-invocable:
+        // false` is refused here and not only by the client that usually
+        // refuses it first (ADR-1 — a rule enforced only in the client is a
+        // rule the next client does not have).
+        let Some(skill) = registry.dispatchable_by_user(&invocation.name) else {
+            return Err(RpcError::new(
+                error_code::INVALID_PARAMS,
+                format!(
+                    "no skill `/{}` you can dispatch in this session — `skills/list` is \
+                     what this session dispatches, and a name it does not list, lists as \
+                     shadowed, or lists as `user-invocable: false` (model-only) is not \
+                     one of them",
+                    invocation.name
+                ),
+            ));
+        };
+
+        // BR-4's preamble names the file, never absolutely: an absolute path
+        // carries a username — or the location of the user's working tree —
+        // into a transcript and into every remote payload this turn produces.
+        // Taken from the registry row rather than re-derived here, because the
+        // rule needs the skill's *source* and the session root as well as
+        // `HOME`, and discovery is the one place that holds all three
+        // (BUG-187); `expand` stays pure either way (BR-14).
+        let display = skill.path_display.clone();
+        let expansion = crate::skills::expand(skill, &invocation.raw_arguments, &display);
+        // REQ-587 ADR-6: the frame line is the caller's, and this caller is the
+        // user path — so BR-4's line is supplied here and composed *inside* the
+        // string below. Prepending it around `pending_text` would leave Stage A
+        // and Stage B measuring a string this turn does not send, short by the
+        // frame's length, and `truncate_to_budget` middle-elides what BR-8 says
+        // is carried whole or refused.
+        let frame = expansion.user_frame();
+        let text = expansion.pending_text(&frame);
+
+        // ADR-9's id-minting gap, decided rather than papered over: a project
+        // skill is under the root and mints; a user skill at
+        // `~/.claude/skills/x/SKILL.md` in a repo-rooted session has no
+        // repo-relative identity, and the minter refuses rather than inventing
+        // one. `unknown` is what carries that refusal forward.
+        //
+        // Through `skills::provenance_of`, not `ProvenanceId::from_resolved`
+        // directly (REQ-587 verify): `from_resolved` takes a **canonical** path
+        // and `skill.path` is the path discovery walked to the file, which a
+        // symlinked-but-in-repo project root leaves non-canonical. That helper
+        // is the one home for resolving both sides, and it fails closed.
+        let (sources, unknown) = match crate::skills::provenance_of(&probed.path, skill) {
+            Some(id) => (BTreeSet::from([id]), false),
+            None => (BTreeSet::new(), true),
+        };
+
+        Ok(SkillTurn {
+            name: skill.name.clone(),
+            text,
+            // REQ-587 BR-5: **the** mint, from the expansion, before the value
+            // is moved into the turn. `permission_key_for(skill.source, …)` is
+            // the tempting spelling and it is the silent one — the gate accepts
+            // either and pins whichever it is given, so a plain key here would
+            // keep REQ-585's behaviour (one answer covering every argument list
+            // this skill is ever invoked with) with nothing red. The two facts a
+            // caller cannot supply correctly on its own — the *substituted*
+            // command set, and whether the arguments had a hand in it — live on
+            // the expansion, which is why the mint does. The `Skill` method that
+            // used to offer the tempting spelling on the row itself is gone.
+            permission_key: expansion.grant_key(skill.source),
+            expansion: Some(expansion),
+            source: skill.source,
+            // BR-9's three rendered facts, read off the registry row here
+            // because this is the surface that has it: the client's snapshot
+            // lives on its `UiContext` and `render_event` cannot see it, and by
+            // the time it could the registry may have moved under a `/cd`.
+            shadows_user_skill: crate::harness::tools::skill::shadows_user_skill(
+                registry,
+                &skill.name,
+            ),
+            model_invocable: skill.model_invocable,
+            user_invocable: skill.user_invocable,
+            // Bounded here, at the surface, for the reason the preamble's copy
+            // is bounded in `expand`: BR-12's event goes to every attached
+            // client and into transcripts (ADR-15). The *rule* is discovery's
+            // (BUG-187); the ceiling is the renderer's.
+            path_display: teton_core::session_root::bounded_field(
+                &display,
+                teton_core::session_root::DISPLAY_MAX_CHARS,
+            ),
+            body_bytes: skill.body.len() as u64,
+            ignored_keys: skill.ignored_keys.clone(),
+            name_note: skill.name_note.clone(),
+            sources,
+            unknown,
+        })
+    }
+
+    /// Ask once, run in document order, fold the outcomes back into the
+    /// expansion, and publish the invocation's record (REQ-585 BR-6, BR-12;
+    /// ADR-7, ADR-14, ADR-15).
+    ///
+    /// # One consent, every command
+    ///
+    /// [`PermissionGate::authorize_skill`] is called **once per invocation**,
+    /// with the whole command list in document order and already substituted, so
+    /// the prompt shows what will run. A prompt per command is REQ-560 BR-2's
+    /// named anti-pattern — the shipped ADLC corpus has skills with four `` !`…` ``
+    /// slots, and four prompts for one typed `/name` is a session nobody uses
+    /// twice.
+    ///
+    /// The key is the skill's own (`skill:<source>:<name>`, ADR-6), minted with
+    /// the registry row in hand at [`Self::accept_invocation`] and carried here
+    /// — never `shell`, or one "allow for this session" answered at a skill
+    /// prompt would free every later model-issued shell call (LESSON-495).
+    ///
+    /// # Nothing is re-read across the await
+    ///
+    /// The permission `await` releases this turn to the event loop, and nothing
+    /// below it re-reads a fact the gate settled above it: `decide` snapshots the
+    /// level at the top of its own body for exactly that reason (REQ-560 BR-7),
+    /// and the root, the commands and the expansion were all fixed before the
+    /// question was asked. A `/permissions` landing mid-prompt moves the *next*
+    /// turn.
+    ///
+    /// # The event is published here, and not one line later
+    ///
+    /// BR-12 says *every* invocation echoes one line, so the publish is the last
+    /// thing this function does and the Stage B check is the first thing after
+    /// it. A turn where the user approved four commands, watched them run, and
+    /// was then refused for size is the turn whose record matters most; a publish
+    /// on the far side of that refusal would leave it with no echo line and no
+    /// `/verbose` outcomes (ADR-15).
+    ///
+    /// # No model call happens here (BR-4)
+    ///
+    /// [`crate::skills::run_all`] is `run_bounded`'s second caller, not
+    /// `ShellTool::run`'s — so `Tool::refine`, which fires the `shell` duty and
+    /// *is* a model call, is not on this path (ADR-14).
+    async fn settle_dynamic_context(
+        self: &Arc<Self>,
+        events: &Arc<EventBus>,
+        session_id: &SessionId,
+        gate: &PermissionGate,
+        root: &Path,
+        invoker: Option<ConnectionId>,
+        skill: &mut SkillTurn,
+    ) {
+        // Taken, not borrowed: `fold` consumes, so this value can be spent once
+        // and the type says so (see [`SkillTurn::expansion`]). It is `Some` on
+        // every path into this function, which runs once per turn.
+        let Some(expansion) = skill.expansion.take() else {
+            return;
+        };
+        let commands = expansion.commands().to_vec();
+
+        // A skill with no dynamic context asks nothing. There is no question to
+        // put — a prompt listing zero commands is a prompt about nothing — and
+        // BR-12's line still gets published below with an empty outcome list,
+        // which is a real state ("0 dynamic commands") rather than a missing one.
+        let door = if commands.is_empty() {
+            None
+        } else {
+            let consent = match invoker {
+                Some(connection) => {
+                    gate.authorize_skill(
+                        &skill.permission_key,
+                        &skill.name,
+                        skill.source,
+                        commands.iter().map(|c| c.as_str().to_owned()).collect(),
+                        // This path is REQ-585's user-typed `/name`, and only
+                        // that: `SkillTurn` is `Some` for a slash command and
+                        // nothing else. The model's invocations reach the gate
+                        // from inside the turn loop (TASK-217/TASK-218) and pass
+                        // `InvokedBy::Model` there.
+                        teton_protocol::events::InvokedBy::User,
+                        connection,
+                    )
+                    .await
+                }
+                // No addressable connection — an internal caller, or a fixture.
+                // The question cannot be *put* to anyone, which is precisely the
+                // gate's own fail-closed answer, so it is spelled with the gate's
+                // word rather than with a second one.
+                None => SkillConsent::Unanswerable,
+            };
+            closed_door(consent)
+        };
+
+        let outcomes = match door {
+            // Consent given. Sequential, in document order, with the session
+            // root as cwd and the `shell` tool's jail, scrub, PATH floor,
+            // process group and deadline (ADR-14).
+            None if !commands.is_empty() => {
+                let root = root.to_path_buf();
+                let to_run = commands.clone();
+                let timeout_ms = self.skill_command_timeout_ms;
+                // On the blocking pool: `run_bounded` waits on a child process
+                // for up to the deadline, per command, and a turn that parked an
+                // async worker for that long would stall every other session on
+                // it. A panic inside propagates exactly as an inline call's
+                // would — which is the only way this join can fail, since a
+                // `spawn_blocking` task is never cancelled.
+                tokio::task::spawn_blocking(move || {
+                    crate::skills::run_all(&root, &to_run, timeout_ms)
+                })
+                .await
+                .expect("the dynamic-context runner does not panic")
+            }
+            None => Vec::new(),
+            // A closed door is the same answer for every command of the
+            // invocation, because the question was asked once about all of them.
+            Some(reason) => vec![door_outcome(reason); commands.len()],
+        };
+
+        // The fold is where the output becomes prompt text: a ran slot enters
+        // inside `frame_untrusted_builtin("skill:<name>", …)` — the same
+        // envelope every built-in tool result gets, which neutralizes envelope
+        // tags in its payload — and every other slot becomes an explicit
+        // ``[dynamic context not run: `<cmd>` — <reason>]`` (BR-6).
+        //
+        // The frame is the same line Stage A measured, from the same composer
+        // (REQ-587 ADR-6): this fold changes the slots and nothing else, which
+        // is what entitles Stage B's sentence to say the body itself already
+        // fit.
+        let frame = expansion.user_frame();
+        skill.text = expansion.fold(&frame, &outcomes);
+
+        // BR-7: anything that came from a command carries what `shell` output
+        // carries — nothing that can be pinned. On a boundary-configured machine
+        // that fails closed, so an invocation that **spawned** any command pins
+        // its turn to the local tier, exactly as a `shell` result does. Recorded
+        // on the block the seed below builds, which is what egress inspects.
+        //
+        // `spawned`, not `did_run`: a command that ran and exited non-zero, or
+        // timed out, produces no output but still reports a *value the command
+        // chose*, and `fold` writes that value into the prompt (`exited 2`).
+        // Asking about output left a side channel that pinned nothing — one bit
+        // per command about a boundary-protected file, in a turn free to route
+        // remote. `ShellTool::run` tags every spawned arm the same way, and the
+        // claim above is parity with it.
+        skill.unknown |= outcomes.iter().any(DynamicOutcome::spawned);
+
+        events.publish(
+            Some(session_id.clone()),
+            Event::SkillInvoked(SkillInvoked {
+                name: skill.name.clone(),
+                source: skill.source,
+                path_display: skill.path_display.clone(),
+                body_bytes: skill.body_bytes,
+                ignored_keys: skill.ignored_keys.clone(),
+                name_note: skill.name_note.clone(),
+                outcomes: commands
+                    .iter()
+                    .zip(outcomes.iter())
+                    .map(|(command, outcome)| outcome_view(command, outcome, door))
+                    .collect(),
+                // A literal, and it stays one: the only path that reaches here
+                // is REQ-585's user-typed `/name` expansion. A model-issued
+                // call never comes through this function — it publishes its own
+                // record from inside the tool (REQ-587 TASK-217), which is the
+                // one surface that has the turn's invocation count.
+                invoked_by: teton_protocol::events::InvokedBy::User,
+                shadows_user_skill: skill.shadows_user_skill,
+                model_invocable: skill.model_invocable,
+                user_invocable: skill.user_invocable,
+                // **`None`, and that is a fact rather than an omission.** BR-6a's
+                // per-turn cap bounds the *model's* invocations inside one
+                // prompt turn; a human typing `/name` spends none of it, and a
+                // `/verbose` line reading "1 of 12" here would name a budget
+                // the user is not drawing on.
+                turn_invocations: None,
+                // **Never `Some` on this path.** A typed `/name` that reaches
+                // this publish has expanded; BR-8's two stages refuse a turn
+                // that cannot fit by *returning* — Stage A before this runs at
+                // all, Stage B after it — so there is no refused invocation for
+                // this site to describe. The model path is where a refusal has
+                // a record to be attached to, because its turn survives it.
+                refused: None,
+            }),
+        );
+    }
+
     /// Run one prompt turn for `session`, streaming events over `events` and
     /// returning the turn result.
     ///
@@ -2666,14 +3175,41 @@ impl DaemonRuntime {
     /// client that disconnects while its turn waits gets no ghost turn run on
     /// its behalf once the tier opens (see [`ClientPresence`]).
     ///
+    /// ## A `/name` invocation is expanded here, and expanded FIRST (REQ-585)
+    ///
+    /// `skill` is the invocation as it crossed the wire — a name and the rest of
+    /// the typed line, never an expansion (ADR-3) — and `prompt` is empty
+    /// whenever it is `Some`. The expansion is built before
+    /// [`Self::dispatch_route`] and before [`Self::spawn_title_session`],
+    /// because both of those read the prompt *text*: a skill turn expanded after
+    /// them would be classified from `""` and would spend the session's one
+    /// naming attempt on `""`. From there the order is BR-8's, and BR-8(c) is a
+    /// statement about a single line — [`CarriedTurn::begin`] both pushes the
+    /// user block and arms the drop-commit, so a check placed after it has
+    /// already committed the expansion:
+    ///
+    /// ```text
+    /// probe root → expand → route + route.budget → Stage A
+    ///            → (TASK-205: consent + commands) → Stage B → CarriedTurn::begin
+    /// ```
+    ///
     /// # Errors
-    /// Returns a [`RpcError`] when no provider can serve the turn or an
-    /// unrecoverable provider failure occurs.
+    /// Returns a [`RpcError`] when no provider can serve the turn, an
+    /// unrecoverable provider failure occurs, the named skill is not one this
+    /// session dispatches ([`error_code::INVALID_PARAMS`]), or its expansion does
+    /// not fit the route's budget ([`error_code::SKILL_EXPANSION_TOO_LARGE`]).
     // The parameters are the session's own facts, passed individually because
     // that is how the caller reads them off `session/prompt` — the same shape
     // `run_one_attempt` already carries below. `session_cwd` is the caller's
     // pre-claim snapshot of the root; the turn re-reads the registry once it
     // holds the claim and uses the snapshot only if the session is gone.
+    //
+    // `invoker` is the connection that sent this prompt, and it is carried for
+    // exactly one purpose: a skill's dynamic-context consent is **addressed** to
+    // it and answerable by nobody else (REQ-585 ADR-7). `None` is a caller with
+    // no connection at all — an internal driver or a fixture — and it asks
+    // nobody, which is the gate's own fail-closed answer rather than a fallback
+    // to the bus.
     #[allow(clippy::too_many_arguments)]
     pub async fn run_prompt_turn(
         self: &Arc<Self>,
@@ -2684,6 +3220,8 @@ impl DaemonRuntime {
         phase: Option<ProtoPhase>,
         session_cwd: Option<PathBuf>,
         prompt: String,
+        skill: Option<SkillInvocation>,
+        invoker: Option<ConnectionId>,
         mut presence: ClientPresence,
     ) -> Result<PromptTurnResult, RpcError> {
         let turn_id = teton_protocol::TurnId::from(format!(
@@ -2726,12 +3264,63 @@ impl DaemonRuntime {
             .map(|summary| summary.cwd)
             .unwrap_or(session_cwd);
 
+        // REQ-583 ADR-1: the root is probed once per turn, from the registry's
+        // path, and the ONE probe feeds every consumer — the jail
+        // (`ToolContext::for_root`), the prompt's environment block
+        // (`route.harness.session_root`) and, since REQ-585, the identity a
+        // skill turn's user block is pinned to. (The skill file's *display*
+        // spelling is discovery's, not this probe's — it needs the skill's
+        // source as well, which only the registry has; BUG-187.)
+        // It is read here rather than beside the jail below because the
+        // expansion needs it and the expansion runs before the route (see the
+        // comment at `accept_invocation`'s call site).
+        let probed = self.session_root_for(session_cwd.as_deref());
+
+        // REQ-585 BR-4/ADR-3: **expand before routing.** A skill turn's `prompt`
+        // is empty by ADR-3 — the invocation crosses the wire as a name — and
+        // both readers of the prompt text are below this line: `dispatch_route`
+        // runs the freeform classifier over it, and `spawn_title_session` spends
+        // the session's one naming attempt on it. Expanding after either would
+        // classify and name every invocation from `""`: on a machine with
+        // per-category bindings that is a route chosen from nothing, and it is a
+        // session left unnamed for its whole life.
+        //
+        // Refusing here is free in BR-8(c)'s sense: nothing has been seeded, no
+        // route has been decided, and no event has been published.
+        // **The turn's one registry snapshot**, taken here under the claim and
+        // read by both consumers: the `/name` resolution just below, and the
+        // `skill` tool `build_tools` registers further down (REQ-587 ADR-3,
+        // ADR-5). An `Arc` clone off the session registry, not a discovery —
+        // `discovery_is_paid_at_create_and_at_cd_and_never_per_turn` pins that
+        // no turn opens a directory, and this opens none.
+        //
+        // One turn, one snapshot, for the reason the config above is one
+        // snapshot: a `/cd` landing between two reads would leave the roster
+        // the model was shown and the registry its call resolves against
+        // describing two different roots. The claim is held, so no move can
+        // land — which makes the single read a *statement* rather than a race
+        // this happens to win.
+        let skills = sessions.skills(&session_id);
+        let mut skill_turn = match &skill {
+            Some(invocation) => Some(self.accept_invocation(&skills, &probed, invocation)?),
+            None => None,
+        };
+        // The one reading of "this turn's prompt text". For a skill turn it is
+        // the **body-only** expansion — the dynamic-context output is not folded
+        // in yet, and that is deliberate rather than incidental: the classifier
+        // reads the skill's instructions, and the alternative would make the
+        // route depend on output that the route's own permission level decides
+        // whether to produce.
+        let routed_text: &str = skill_turn
+            .as_ref()
+            .map_or(prompt.as_str(), |skill| skill.text.as_str());
+
         let config = self.config.lock().expect("config mutex poisoned").clone();
         let router = self.turn_router(&config, &session_id);
 
         let core_phase = phase.map(to_core_phase);
         let mut route = self
-            .dispatch_route(&router, &session_id, mode, core_phase, &prompt)
+            .dispatch_route(&router, &session_id, mode, core_phase, routed_text)
             .await;
 
         // REQ-580 BR-1/BR-3: a turn with nowhere to run *only* because the
@@ -2787,7 +3376,7 @@ impl DaemonRuntime {
                 // where the classifier now says something settled.
                 let router = self.turn_router(&config, &session_id);
                 route = self
-                    .dispatch_route(&router, &session_id, mode, core_phase, &prompt)
+                    .dispatch_route(&router, &session_id, mode, core_phase, routed_text)
                     .await;
                 router
             }
@@ -2814,7 +3403,35 @@ impl DaemonRuntime {
         // below reads a title, and a session that is not named yet is a session
         // with no title — BR-3's degraded state. It cannot fail the turn — see
         // `spawn_title_session`.
-        let _ = self.spawn_title_session(events, sessions, &router, &config, &session_id, &prompt);
+        //
+        // REQ-585: `routed_text`, not `prompt` — the naming attempt is spent
+        // once per session, and a skill turn's `prompt` is empty.
+        //
+        // **A skill turn names later**, below Stage A. The naming duty is a
+        // model call: on a machine with `reflex` bound remotely it puts a
+        // bounded copy of its input on the wire. Spending it here would make
+        // BR-8's refusal sentence — *"Nothing was sent and no provider saw this
+        // turn"* — true of the turn and false of the machine, and would spend
+        // the session's one naming attempt on an expansion that never ran. A
+        // typed prompt still names exactly here, so REQ-561's "label the
+        // session the moment the user hits enter" is unchanged for every turn
+        // that is not a skill invocation.
+        if skill_turn.is_none() {
+            let _ = self.spawn_title_session(
+                events,
+                sessions,
+                &router,
+                &config,
+                &session_id,
+                routed_text,
+                // A typed prompt is the user's own bytes, read from no file, so
+                // there is nothing for a boundary to be compared against. This
+                // is the one call site for which the empty value is a statement
+                // rather than an omission — the skill call site below is the
+                // other one, and it says something different.
+                Provenance::empty(),
+            );
+        }
 
         // Assemble the harness context, tools, and the permission gate once; a
         // fallback re-runs the loop against the same accumulated context.
@@ -2838,6 +3455,12 @@ impl DaemonRuntime {
         // about it in one breath classifies as `UserPasted` — the ordinary
         // shape of the request. This is the one ingestion point, and the text it
         // reads is the user's own (see `record_user_prompt_urls`).
+        //
+        // REQ-585: `prompt`, deliberately — **not** `routed_text`. A skill body
+        // is file-authored, and feeding it here would let a file on disk author
+        // its own authorization by writing a URL into the set the web tool then
+        // trusts. A skill turn's `prompt` is empty, so an invocation contributes
+        // nothing, which is the correct answer: nobody pasted anything.
         self.record_user_prompt_urls(&session_id, &prompt);
         // Fetched before the tools, because the web tool holds it: that tool
         // raises its own per-tier prompt inside its run rather than being
@@ -2851,7 +3474,18 @@ impl DaemonRuntime {
         // turn instead of leaving this one's prompt disagreeing with its own
         // tool set (REQ-572 verify).
         let tools = self
-            .build_tools(&router, events, &session_id, &gate, &config)
+            .build_tools(
+                &router,
+                events,
+                &session_id,
+                &gate,
+                &config,
+                Arc::clone(&skills),
+                // REQ-587 ADR-3: the connection that submitted this turn is the
+                // addressee of any consent the `skill` tool raises. `ConnectionId`
+                // is `Copy`, so the seam below still consumes its own.
+                invoker,
+            )
             .await;
         // BUG-147: jail this session's tools to the CLIENT's working directory.
         // The daemon-global `repo_root` is only a fallback for clients that did
@@ -2866,7 +3500,10 @@ impl DaemonRuntime {
         // path and the probed view cannot come from two readings. Probing per
         // turn is what keeps the branch honest after a checkout between turns
         // and moves every consumer the turn after a `/cd` rewrote the path.
-        let probed = self.session_root_for(session_cwd.as_deref());
+        //
+        // REQ-585 moved the probe itself to the top of the turn — the expansion
+        // needs it, and the expansion runs before the route — so `probed` here
+        // is that same single reading, not a second one.
         let tool_ctx = ToolContext::for_root(&probed);
         let stream_events = SessionEvents::new(events.clone(), session_id.clone());
 
@@ -2882,6 +3519,172 @@ impl DaemonRuntime {
         // the environment block and the jail's refusals print one spelling.
         route.harness.session_root = Some(probed.view);
         let system = build_system_prompt(&tools, &route.harness);
+
+        // ── REQ-585 BR-8 / ADR-11: Stage A — does the BODY fit? ──────────────
+        //
+        // Before the user is asked to approve anything (BR-8d), and before
+        // `CarriedTurn::begin` below, which both pushes the user block and arms
+        // the drop-commit — so a check placed after it would have committed the
+        // very expansion it is refusing (BR-8c). Nothing is derived here: the
+        // budget is the one `Router::budget_for` stamped on this route, and the
+        // measurement is `ContextManager::would_seed_fit`, the estimators the
+        // pressure path itself runs on.
+        //
+        // A refused turn returns from here: no `context_pressure` of any kind,
+        // no health change, no degradation, no retry — none of the machinery
+        // below has run.
+        if let Some(skill) = &skill_turn {
+            if let SkillFit::TooLarge { message } = skill_fit(
+                // BR-8's two stages are the typed turn's, and only the typed
+                // turn's: a model-issued call is measured by the loop's
+                // `skill_append_fit`, never here.
+                SkillCaller::User,
+                SkillStage::Body,
+                &skill.name,
+                &system,
+                &skill.text,
+                &route.harness.budget,
+                route.provider_id.as_ref().map(|id| id.0.as_str()),
+            ) {
+                return Err(RpcError::new(
+                    error_code::SKILL_EXPANSION_TOO_LARGE,
+                    message,
+                ));
+            }
+        }
+
+        // Stage A said the body fits, so this turn is going to happen and the
+        // session may be named after it. Deferred to here rather than run with
+        // the typed prompts above, because the naming duty is a model call and
+        // a refused turn must not have reached one (BR-8).
+        //
+        // **With the expansion's own provenance** (REQ-587 verify). `routed_text`
+        // here is `SkillTurn::text` — the skill file's bytes — and the duty sends
+        // a bounded copy of it to a route `title_route` resolves *remotely*
+        // unless the session is already tainted, which on the session's first
+        // substantive prompt it is not. `Provenance::empty()` short-circuits
+        // `Egress::send` before any boundary check, so passing it here would ship
+        // a `local-only` skill body (or a user skill's fail-closed `unknown`) off
+        // the machine through the one duty the turn does not wait for.
+        //
+        // The values are read off the turn rather than recomputed, and they are
+        // this text's provenance *at this point in the function*: the commands
+        // have not run yet, so `routed_text` still carries
+        // `PENDING_PLACEHOLDER` where their output will go and no command has
+        // contributed anything for `unknown` to account for. The seam below OR's
+        // in `spawned` before the user block is seeded, which is the same rule
+        // applied to a longer string — not a second reading of this one.
+        if let Some(skill) = skill_turn.as_ref() {
+            let _ = self.spawn_title_session(
+                events,
+                sessions,
+                &router,
+                &config,
+                &session_id,
+                routed_text,
+                expansion_provenance(&skill.sources, skill.unknown),
+            );
+        }
+
+        // ── REQ-585 BR-6 / BR-12: dynamic-context consent and execution ──────
+        //
+        // The TASK-205 seam. One `authorize_skill` for the whole invocation,
+        // `run_all` in document order with the session root as cwd, the outcomes
+        // folded back into `skill_turn.text`, and BR-12's `skill_invoked`
+        // published — in that order, and all of it **between** the two budget
+        // stages.
+        //
+        // Stage A is above this and must stay there: a body that cannot fit is
+        // refused *before* a user is walked through approving four commands,
+        // watching them run, and then being told the turn was refused (BR-8d).
+        // Stage B is below it and must stay there: until this seam runs, the
+        // slots hold `skills::PENDING_PLACEHOLDER` — exactly what Stage A
+        // measured — and it is the fold that makes the second measurement a
+        // different one.
+        // ─────────────────────────────────────────────────────────────────────
+        if let Some(skill) = &mut skill_turn {
+            self.settle_dynamic_context(events, &session_id, &gate, &probed.path, invoker, skill)
+                .await;
+        }
+
+        // ── REQ-585 BR-8 / ADR-11: Stage B — does it still fit with the
+        // dynamic-context output folded in? ──────────────────────────────────
+        //
+        // Reached only once Stage A has answered `Fits`, which is what entitles
+        // this stage's sentence to say the body itself fit. Still before
+        // `CarriedTurn::begin`, for Stage A's reason.
+        if let Some(skill) = &skill_turn {
+            if let SkillFit::TooLarge { message } = skill_fit(
+                SkillCaller::User,
+                SkillStage::WithDynamicContext,
+                &skill.name,
+                &system,
+                &skill.text,
+                &route.harness.budget,
+                route.provider_id.as_ref().map(|id| id.0.as_str()),
+            ) {
+                return Err(RpcError::new(
+                    error_code::SKILL_EXPANSION_TOO_LARGE,
+                    message,
+                ));
+            }
+        }
+
+        // The seed, and its provenance (BR-7, ADR-9): the expansion for a skill
+        // turn, the typed text otherwise. One block either way — `push_user_from`
+        // with an empty set and `unknown: false` is byte-identical to the
+        // `push_user` every typed turn has always taken.
+        // What a **reroute** has to re-ask, carried past the move below.
+        //
+        // Both stages measured against the budget of the route this turn
+        // started on. A mid-turn reroute — the privacy pin, or a provider
+        // fallback — swaps in a smaller one, and `refit_for_reroute` then
+        // *clamps* the conversation: `truncate_to_budget` drops history until
+        // one block is left and middle-elides that block, which by then is the
+        // skill expansion. BR-8 says a skill turn is never middle-elided into
+        // something the user did not invoke, and BR-4 says carried whole or
+        // refused.
+        //
+        // It is not a corner: BR-7 makes the privacy pin the *expected* path
+        // for any invocation that ran a dynamic command on a boundary-configured
+        // machine, which is every ADLC skill. The name and the text are cloned
+        // because the seed below consumes them, and a clone of one expansion is
+        // the price of not shortening it behind the user's back.
+        // The system prompt rides along for the same reason: it is consumed by
+        // `CarriedTurn::begin` below, and the refusal has to measure the same
+        // pair Stage A and Stage B did — system plus expansion.
+        //
+        // **REQ-587 BR-7: there is more than one of them, and REQ-585's guard
+        // could not see any of the others.** This list was a single `Option`
+        // built from `skill_turn`, which is `Some` only for a user-typed
+        // `/name` — so `skill_would_not_survive_refit` answered `None` for
+        // *every* model invocation and `refit_for_reroute` middle-elided the
+        // expansion, at the one seam REQ-585 built the guard for. On a
+        // boundary-configured machine that privacy pin is the expected path for
+        // any invocation that ran a dynamic command, so this was the common
+        // case, not a corner. The typed turn seeds the list; every expansion
+        // the model commits inside the loop joins it below, and the guard
+        // refuses on the first that would not survive.
+        let refit_system = system.clone();
+        let mut skill_refit: Vec<(String, String, String)> = skill_turn
+            .as_ref()
+            .map(|skill| (skill.name.clone(), skill.text.clone(), refit_system.clone()))
+            .into_iter()
+            .collect();
+        // Where the typed seed ends and the loop's own expansions begin, so a
+        // second attempt rebuilds the tail rather than appending a duplicate of
+        // it: the tool's per-turn state accumulates across attempts.
+        let typed_refit = skill_refit.len();
+
+        // The seed, and its provenance (BR-7, ADR-9): the expansion for a skill
+        // turn, the typed text otherwise. One block either way — `push_user_from`
+        // with an empty set and `unknown: false` is byte-identical to the
+        // `push_user` every typed turn has always taken.
+        let (prompt, prompt_sources, prompt_unknown) = match skill_turn {
+            Some(skill) => (skill.text, skill.sources, skill.unknown),
+            None => (prompt, BTreeSet::new(), false),
+        };
+
         // REQ-567 BR-1: this turn begins from what the session has already said.
         // The head was rebuilt from *this* turn's tools and route, and the
         // carried blocks are replayed under it — so a mid-session head change
@@ -2899,6 +3702,11 @@ impl DaemonRuntime {
             Arc::clone(&self.session_taint),
             config.boundaries.clone(),
             prompt,
+            // REQ-585 BR-7: a typed prompt is drawn from no file; a skill turn
+            // carries the skill file's id, or the unpinnable marker for a user
+            // skill outside the root. It is the same block either way.
+            prompt_sources,
+            prompt_unknown,
         );
 
         let mut attempts = 0u32;
@@ -2927,6 +3735,16 @@ impl DaemonRuntime {
                     conversation.ctx_mut(),
                 )
                 .await;
+
+            // REQ-587 BR-7: what the *loop* committed is only knowable now.
+            // Both reroute arms below sit under this `Err`, so the list is
+            // refreshed here — once, from the tool's own per-turn record of
+            // what it folded — rather than at each guard. The tail is rebuilt
+            // from `typed_refit` because that state accumulates across attempts.
+            if result.is_err() {
+                skill_refit.truncate(typed_refit);
+                skill_refit.extend(model_invoked_expansions(&tools, &refit_system));
+            }
 
             // REQ-544 M-1: a privacy block is NOT a transient failure. It must
             // never be retried against the blocked provider (which would emit
@@ -2958,7 +3776,22 @@ impl DaemonRuntime {
                             failed_reroute_block_sentence(detail),
                         ));
                     }
+                    // REQ-586 BR-1: the budget follows the route. The local
+                    // pin's window is a fraction of the remote one this turn
+                    // was assembled against, so the context is re-fitted here —
+                    // after the route is chosen, before the retry — rather than
+                    // arriving over-window at a tier that has no fallback left.
+                    let previous = route.budget.clone();
                     route = router.resolve_local_pin(reroute_after_block_reason(detail));
+                    if let Some(message) =
+                        skill_would_not_survive_refit(&skill_refit, typed_refit, &route)
+                    {
+                        break 'turn Err(RpcError::new(
+                            error_code::SKILL_EXPANSION_TOO_LARGE,
+                            message,
+                        ));
+                    }
+                    refit_for_reroute(&mut conversation, &stream_events, &previous, &route.budget);
                     rerouted_local = true;
                     continue;
                 }
@@ -2984,6 +3817,42 @@ impl DaemonRuntime {
                         turn_id,
                         stop_reason: outcome.stop_reason,
                     });
+                }
+                // REQ-586 BR-2 / ADR-8: the provider answered that the
+                // request does not fit its window. A **typed outcome**, and
+                // therefore ahead of every `Remote` arm below: this is not a
+                // provider failure and must not be run through the machinery
+                // that treats one.
+                //
+                // No `record_health` — a provider that correctly reported its
+                // own limit is not unhealthy, and downgrading it would move
+                // *later* turns off a provider that is working. No
+                // `on_provider_failure` — a fallback would send the same bytes
+                // to a window that may be smaller, and would emit a
+                // `provider_degraded` blaming the provider for the daemon's
+                // sizing. And no retry, because nothing about resending
+                // unchanged bytes can succeed.
+                //
+                // The sentence carries the three numbers a user can act on and
+                // no response body (BR-11): the provider, what was assembled,
+                // and the budget the route was running under. A wide gap
+                // between the last two says the declared window is wrong; a
+                // narrow one says this content tokenizes denser than the
+                // estimator assumed.
+                Err(HarnessError::ContextLengthExceeded {
+                    provider_id,
+                    assembled_tokens,
+                    budget_tokens,
+                }) => {
+                    break 'turn Err(RpcError::new(
+                        error_code::CONTEXT_LENGTH_EXCEEDED,
+                        format!(
+                            "`{provider_id}` refused this turn as larger than {}: about \
+                             {assembled_tokens} words were assembled against a \
+                             {budget_tokens}-word budget",
+                            route.budget.window_label,
+                        ),
+                    ));
                 }
                 Err(HarnessError::Remote(perr)) if attempts < 2 => {
                     attempts += 1;
@@ -3012,7 +3881,28 @@ impl DaemonRuntime {
                     }
                     match fo.route {
                         Some(next) => {
+                            // REQ-586 BR-1/ADR-2: a fallback provider may
+                            // declare a smaller window than the one that just
+                            // failed, so the same refit runs here. An in-place
+                            // degrade arrives through this arm too and is
+                            // silent by construction — it keeps the failed
+                            // provider's pair (see `refit_for_reroute`).
+                            let previous = route.budget.clone();
                             route = next;
+                            if let Some(message) =
+                                skill_would_not_survive_refit(&skill_refit, typed_refit, &route)
+                            {
+                                break 'turn Err(RpcError::new(
+                                    error_code::SKILL_EXPANSION_TOO_LARGE,
+                                    message,
+                                ));
+                            }
+                            refit_for_reroute(
+                                &mut conversation,
+                                &stream_events,
+                                &previous,
+                                &route.budget,
+                            );
                             continue;
                         }
                         None => {
@@ -3075,7 +3965,12 @@ impl DaemonRuntime {
         // construction: the pre-turn vector was never touched.
         match outcome {
             Ok(result) => {
-                conversation.commit();
+                // REQ-586 BR-10: the commit re-asserts the budget one last
+                // time, and what it took is news like any other clamp. Written
+                // as one call rather than two lines so that the fixture
+                // standing in for this dispatch runs the same protocol — see
+                // [`commit_and_publish`].
+                commit_and_publish(conversation, &stream_events, &route.budget);
                 Ok(result)
             }
             Err(err) => {
@@ -3224,6 +4119,25 @@ impl DaemonRuntime {
     /// clear: an empty session moves with `blocks_dropped: 0` and still
     /// announces, because the event is the user's action.
     ///
+    /// ## The skill registry is re-derived *here*, ahead of the announcement
+    ///
+    /// The project half of the registry hangs off the root, so the root moving
+    /// re-derives it (REQ-585 BR-1, AC-14). It runs inside this method, before
+    /// `session_root_changed` is published, rather than in the handler after
+    /// this method returns: same-connection ordering was already safe (the
+    /// reader loop is serial), but a **second** attached client reacting to that
+    /// event within microseconds would call `skills/list` and be answered from
+    /// the pre-move registry. `skills_fs` is the daemon's discovery seam, passed
+    /// in because it lives on `Daemon` — the runtime performs the rebuild, the
+    /// daemon still owns what discovery reads.
+    ///
+    /// And the same move drops every remembered `skill:project:*` grant
+    /// (ADR-6). A grant remembered under `skill:project:<name>` in one repo
+    /// authorizes a file that no longer exists at that name, and a rebuilt
+    /// registry beside a stale grant is LESSON-501 exactly — carried state that
+    /// sheds its invariants silently. The user half is untouched: those names
+    /// still mean the same files.
+    ///
     /// ## Two events, both session-scoped, in this order
     ///
     /// `context_cleared` first, then `session_root_changed` — a client learns
@@ -3249,6 +4163,7 @@ impl DaemonRuntime {
         params: &SessionSetCwdParams,
         sessions: &SessionRegistry,
         events: &Arc<EventBus>,
+        skills_fs: &dyn crate::skills::DirLister,
     ) -> Result<SessionSetCwdResult, RpcError> {
         // `cd-N` off the turn counter, for `clear_session`'s reason: a refused
         // peer is told "already running turn cd-4", which names what actually
@@ -3279,7 +4194,16 @@ impl DaemonRuntime {
                 format!("no session `{}`", params.session_id),
             ));
         }
-        let root = self.session_root_for(Some(&params.cwd)).view;
+        let moved_to = self.session_root_for(Some(&params.cwd));
+
+        // REQ-585 BR-1/AC-14 and ADR-6, both before the announcement below, and
+        // both through the one derivation `session/create` also takes — a second
+        // spelling of the four globs would be LESSON-528's shape at the seam
+        // where the two answers have to agree.
+        Self::store_session_skills(sessions, &params.session_id, &moved_to, skills_fs);
+        self.drop_grants_expiring_on_root_change(&params.session_id);
+
+        let root = moved_to.view;
         let blocks_dropped =
             u64::try_from(sessions.clear_conversation(&params.session_id)).unwrap_or(u64::MAX);
         events.publish(
@@ -3370,14 +4294,47 @@ impl DaemonRuntime {
     }
 
     /// Build the tool registry for a turn: the built-ins, any registered MCP
-    /// server tools (ADR-003, namespaced and egress-gated), and — **only** on a
-    /// machine that opted in — the web tool (REQ-563 D-1).
+    /// server tools (ADR-003, namespaced and egress-gated), — **only** on a
+    /// machine that opted in — the web tool (REQ-563 D-1), and — **only** where
+    /// the session's registry holds a model-invocable skill — the `skill` tool
+    /// (REQ-587 BR-2, ADR-3, ADR-4).
     ///
-    /// The web tool goes on **last**, after the MCP tools, and that ordering is
-    /// the BR-6 charter rule expressed as insertion order rather than as a
-    /// special case: [`ToolRegistry::exposed_names`] caps from the front, so a
-    /// degraded provider's `max_tools` cuts the opt-in capability before it cuts
-    /// a server the user configured.
+    /// The web tool goes on **last** among the capped tools, after the MCP
+    /// tools, and that ordering is the BR-6 charter rule expressed as insertion
+    /// order rather than as a special case: [`ToolRegistry::exposed_names`] caps
+    /// from the front, so a degraded provider's `max_tools` cuts the opt-in
+    /// capability before it cuts a server the user configured. The `skill` tool
+    /// is registered cap-**exempt** (ADR-4) and so sits outside that argument
+    /// entirely.
+    ///
+    /// ## `invoker` is the whole of REQ-587 ADR-3, and its absence is silent
+    ///
+    /// `invoker` is the connection that submitted **this turn**, and it is the
+    /// addressee of any consent the `skill` tool raises. It is threaded here
+    /// rather than stored on [`ToolContext`] — the jail type, which dozens of
+    /// fixtures construct and whose subject is the root — or on
+    /// [`PermissionGate`], which is per *session*, so a connection kept there
+    /// is whichever one created the session rather than the one that sent this
+    /// prompt.
+    ///
+    /// Dropping it does not break a build and does not redden a suite: the tool
+    /// takes `authorize_skill`'s `None => Unanswerable` arm and produces
+    /// placeholders byte-identical to REQ-585's tested piped-refusal path,
+    /// because that arm is already correct for an internal caller. What guards
+    /// it is a test that drives a model-issued call and reads the addressee off
+    /// the consent double (`skill_turn.rs`).
+    ///
+    /// ## One turn, one registry snapshot
+    ///
+    /// `skills` is the caller's snapshot — the same `Arc` [`Self::accept_
+    /// invocation`] resolved this turn's `/name` against, taken once in
+    /// [`Self::run_prompt_turn`] — and not a second read of the session
+    /// registry. That is what makes ADR-5's claim true: the roster the tool
+    /// renders into its description and the registry a call resolves against
+    /// are provably one value, so a `/cd` cannot leave the model reading one
+    /// root's names and reaching another root's files. Discovery is not paid
+    /// here and must not be (`discovery_is_paid_at_create_and_at_cd_and_never_
+    /// per_turn`): this is an `Arc` clone, not a walk.
     ///
     /// `config` is the **caller's** snapshot, not a second read of the mutex
     /// (REQ-572 verify): [`Self::run_prompt_turn`] already clones the config to
@@ -3386,6 +4343,7 @@ impl DaemonRuntime {
     /// that said the capability was off while the registry it was handed had the
     /// tool in it. One turn, one snapshot — which is also what makes ADR-1's
     /// "the config **is** the flow state" true per turn rather than per read.
+    #[allow(clippy::too_many_arguments)]
     async fn build_tools(
         self: &Arc<Self>,
         router: &Router,
@@ -3393,6 +4351,8 @@ impl DaemonRuntime {
         session_id: &SessionId,
         gate: &Arc<PermissionGate>,
         config: &Config,
+        skills: Arc<SkillRegistry>,
+        invoker: Option<ConnectionId>,
     ) -> ToolRegistry {
         let mut tools = ToolRegistry::with_builtins();
         if !self.mcp_servers.is_empty() {
@@ -3443,6 +4403,21 @@ impl DaemonRuntime {
             }),
             tokio::runtime::Handle::current(),
         );
+        // REQ-587 BR-2/ADR-4: `register_skill_tool` is the one place the "at
+        // least one model-invocable skill" condition is expressed, so a session
+        // whose roots hold none has no `skill` tool rather than a tool with an
+        // empty roster. After the built-ins and outside `with_builtins()`,
+        // which `docs_are_capped_by_max_tools_for_degraded_providers` asserts
+        // by equality.
+        register_skill_tool(
+            &mut tools,
+            skills,
+            Arc::clone(gate),
+            // ADR-3. See this function's doc: the parameter is the feature.
+            invoker,
+            tokio::runtime::Handle::current(),
+            self.skill_command_timeout_ms,
+        );
         tools
     }
 
@@ -3480,7 +4455,7 @@ impl DaemonRuntime {
             .lock()
             .expect("session gate mutex poisoned");
         Arc::clone(gates.entry(session_id.clone()).or_insert_with(|| {
-            Arc::new(
+            let mut gate =
                 // REQ-560: the gate is created at a *level*, not at a built
                 // table, because the level is what the user can change
                 // mid-session — a table snapshotted here would go stale the
@@ -3501,9 +4476,88 @@ impl DaemonRuntime {
                 // REQ-563 BR-4: the one consent answer that outlives the session
                 // writes through the daemon, never the client. The gate holds
                 // the seam and this is the only place it is filled in.
-                .with_web_persistence(Arc::clone(self) as Arc<dyn WebTierPersistence>),
-            )
+                .with_web_persistence(Arc::clone(self) as Arc<dyn WebTierPersistence>);
+            // REQ-585 ADR-7: and the route a skill's dynamic-context consent is
+            // *addressed* on. Filled in here for the same reason the web sink is
+            // — the gate is built in one place and is cached for the session's
+            // life — and left empty on a runtime nobody wired one into, which
+            // asks nobody rather than falling back to the bus.
+            if let Some(route) = self.addressed_delivery.get() {
+                gate = gate.with_addressed_delivery(Arc::clone(route));
+            }
+            Arc::new(gate)
         }))
+    }
+
+    /// Derive `session_id`'s skill registry from the root it stands on and store
+    /// it — **the one derivation** (REQ-585 BR-1, ADR-1).
+    ///
+    /// Two call sites, and they are the only two: `session/create`'s (through
+    /// `server::rebuild_session_skills`, which owns the cost argument for why
+    /// there is no third) and [`Self::set_session_cwd`]'s. They differ in *when*
+    /// they run, never in what they compute, so the four globs are spelled here
+    /// and nowhere else.
+    ///
+    /// `probed` arrives already probed rather than being re-derived from a path,
+    /// because discovery needs two things and the probe carries both: the path
+    /// the globs hang off, and the [`RootKind`](teton_protocol::methods::RootKind)
+    /// that decides whether there is a project pair at all. A session whose root
+    /// *is* `$HOME` must reach `~/.claude/skills` once, not twice — every skill
+    /// would otherwise register under both sources, shadowing itself, with two
+    /// permission keys for one file (AC-3). Taking the probe rather than probing
+    /// again also keeps the caller's reading and this one from being two
+    /// readings of a filesystem that can change between them.
+    pub(crate) fn store_session_skills(
+        sessions: &SessionRegistry,
+        session_id: &SessionId,
+        probed: &ProbedRoot,
+        fs: &dyn crate::skills::DirLister,
+    ) {
+        // `set_skills` answering `false` — a session that vanished between the
+        // caller's claim and this write — is nothing to act on: there is no
+        // record to hold a registry, and no id anyone can query it with.
+        sessions.set_skills(
+            session_id,
+            crate::skills::discover(home().as_deref(), &probed.path, probed.view.kind, fs),
+        );
+    }
+
+    /// Forget every remembered consent this session's **root** gave meaning to,
+    /// and say how many went (REQ-585 ADR-6, TASK-201; REQ-587 TASK-215).
+    ///
+    /// The `/cd` half of the per-skill permission key. `skill:<source>:<name>`
+    /// encodes the whole question only for as long as `<name>` means the same
+    /// file: after the root moves it names a different one, so a grant that
+    /// survived would authorize another repo's commands under a name the user
+    /// approved somewhere else.
+    ///
+    /// **Renamed from `drop_project_skill_grants` (REQ-587 TASK-217), because
+    /// the old name is now narrower than the effect.** TASK-215 widened the
+    /// gate's own drop from a `skill:project:` prefix to
+    /// `expires_on_session_root_change`, the shared predicate, which also
+    /// catches BR-4's project-skill *acknowledgment* — a key that is neither a
+    /// skill grant nor spelled with that prefix. A name that said "project
+    /// skill grants" would leave the next reader believing the acknowledgment
+    /// survives a `/cd`, which is precisely the belief ASSUME-017 was written
+    /// to prevent.
+    ///
+    /// The method it delegates to still carries the REQ-585 name:
+    /// `harness/permissions.rs` is TASK-215's file, and renaming a shipped
+    /// public method from here would be a change made outside the boundary that
+    /// owns its argument. The residue is one hop wide and is named here rather
+    /// than left for a reader to notice.
+    ///
+    /// **A missing gate is nothing to do, not a gate to mint.** Reaching for
+    /// [`Self::permission_gate_for`] here would create a session's gate at
+    /// `/cd` time — snapshotting `[web] permission_allow` earlier than the first
+    /// turn does — to then drop zero grants from it. A session that has never
+    /// run a turn has remembered no answers.
+    fn drop_grants_expiring_on_root_change(&self, session_id: &SessionId) -> usize {
+        self.session_gates
+            .lock()
+            .expect("session gate mutex poisoned")
+            .get(session_id)
+            .map_or(0, |gate| gate.drop_project_skill_grants())
     }
 
     /// This session's set of user-pasted URLs, created on first use (BR-3).
@@ -5352,6 +6406,51 @@ impl DaemonRuntime {
             }
         }
 
+        // The window, carried only with the model it describes (REQ-586 BR-3:
+        // no window is ever *guessed* from a model name outside the recipes).
+        // A candidate's `max_context` is the recipe's figure for the recipe's
+        // **example model**, carried silently by the setup UI — so it is
+        // written only when the chosen model is that example, matched as the
+        // (example_model, window) pair so a stale client's old catalog cannot
+        // smuggle a superseded figure under a current model name.
+        //
+        // Every other case contributes **no answer**, exactly like the cap
+        // below: `None` preserves whatever the config already holds (ADR-7's
+        // field-wise merge). That covers a candidate with no recipe behind it, a
+        // client predating the field, and — the case this spelling exists for —
+        // a hand-typed model. The setup UI always sends `Some(recipe_window)`,
+        // so writing `Some(0)` for a model that is not the recipe's example
+        // would let `/provider setup kimi` with a hand-typed model silently
+        // un-declare a window the user had already set with
+        // `provider add kimi --max-context 128000`, dropping that route's budget
+        // ~20× with nothing said. This flow asks no window question about a
+        // model it does not recognize, and a question this flow does not ask is
+        // not an answer of "unknown" (verify M4).
+        //
+        // For a **fresh** record the outcome is unchanged: capabilities default
+        // to 0, so the preview still renders `max_context = 0` and the window is
+        // still stated as unknown rather than defaulted silently.
+        //
+        // ## The pair is matched across the whole catalog, deliberately
+        //
+        // The lookup is by (example_model, window) over every recipe rather than
+        // over "the recipe whose `id_suggestion` is this candidate's id". A
+        // recipe id is a *suggestion* and ids are the user's namespace
+        // (`ProviderRecipe::id_suggestion`), so Kimi registered under the id
+        // `work-model` is an ordinary registration and must still get Kimi's
+        // window. What is being trusted is a fact about the **model**, and a
+        // model name is the same fact whatever row it is stored in. So the pin
+        // this guard provides is against a *superseded figure* — an old client
+        // sending a current model name with last year's window — and not against
+        // a cross-vendor pairing, which is a correct pairing carrying a correct
+        // window.
+        let max_context = candidate.max_context.and_then(|window| {
+            let is_a_recipes_own_example = crate::provider_recipes::recipe_catalog()
+                .iter()
+                .any(|recipe| recipe.example_model == model && recipe.max_context == window);
+            is_a_recipes_own_example.then_some(window)
+        });
+
         // The candidate, built by identity — see the section above.
         let mut config = current.clone();
         apply_update(
@@ -5362,6 +6461,15 @@ impl DaemonRuntime {
                 endpoint: endpoint.clone(),
                 model: Some(model.to_owned()),
                 auth_ref: Some(key_ref.to_owned()),
+                max_context,
+                // The flow asks no cap question, so it contributes no answer —
+                // the `SetTierBinding` fallback reasoning, one field over: a
+                // question this flow does not ask is not an answer of "none",
+                // and `None` leaves a hand-authored cap exactly where it was.
+                context_budget_cap: None,
+                // A snapshot field, never an update one: the daemon derives it
+                // and a client never declares it (TASK-194 2b).
+                floored_budget: None,
             }),
         );
         for binding in &candidate.bindings {
@@ -5484,8 +6592,30 @@ impl DaemonRuntime {
             .iter()
             .find(|provider| provider.id == id)
             .map(existing_provider);
-        let warnings =
-            self.provider_setup_warnings(replaces.as_ref(), model, &endpoint, &dial_host);
+        // The window this registration will have **recorded**, read back off the
+        // candidate config rather than off `candidate.max_context`: the merge
+        // above is field-wise, so a `None` answer preserves a window the config
+        // already held, and that preserved figure is the one the user is about
+        // to live with (ADR-7). Same for the cap, which this flow never asks
+        // about and can therefore only inherit.
+        let recorded = config
+            .providers
+            .iter()
+            .find(|provider| provider.id == id)
+            .map_or((0, 0), |provider| {
+                (
+                    provider.capabilities.max_context,
+                    provider.capabilities.context_budget_cap,
+                )
+            });
+        let warnings = self.provider_setup_warnings(
+            replaces.as_ref(),
+            model,
+            &endpoint,
+            &dial_host,
+            recorded,
+            config.privacy.redact,
+        );
 
         Ok(RenderedProviderSetup {
             toml,
@@ -5511,12 +6641,21 @@ impl DaemonRuntime {
     /// renders them owns how they look, and a daemon that shipped escape codes
     /// down this wire would put them through a sanitizer built to strip exactly
     /// that.
+    ///
+    /// `recorded_window` is the `(max_context, context_budget_cap)` pair this
+    /// registration will have **recorded** — read off the candidate config
+    /// after the merge, not off the candidate — and `redact_scan` is
+    /// `[privacy] redact`. Both feed the REQ-586 big-window notice, and both
+    /// are passed in rather than read here so this stays a pure composer over
+    /// facts its caller already holds under the config lock.
     fn provider_setup_warnings(
         &self,
         replaces: Option<&ExistingProvider>,
         model: &str,
         endpoint: &str,
         dial_host: &str,
+        recorded_window: (u32, u32),
+        redact_scan: bool,
     ) -> Vec<String> {
         let mut warnings = Vec::new();
         // BR-14 / BUG-155's class: a replace is stated, never silent — but it is
@@ -5567,6 +6706,18 @@ impl DaemonRuntime {
                  machine.)"
             ));
         }
+        // REQ-586 OQ-6 as amended: the window is still the consent, and this is
+        // where its size is said. Composed by `harness::budget` — the same
+        // derivation a turn runs under, never a second arithmetic here
+        // (LESSON-456) — and byte-identical to what `teton provider add
+        // --max-context` prints off `config/set`, because it is the same
+        // function.
+        let (window, cap) = recorded_window;
+        warnings.extend(crate::harness::budget::big_window_notice(
+            window,
+            cap,
+            redact_scan,
+        ));
         warnings
     }
 
@@ -5969,9 +7120,26 @@ impl DaemonRuntime {
     /// REQ. This function therefore returns nothing; there is no outcome a caller
     /// could act on that would be better than proceeding with the turn.
     ///
-    /// The provenance handed to the duty is [`Provenance::empty`]: the content
-    /// being sent is the user's own typed request, which was derived from no file
-    /// (LESSON-432 — the call site is what knows where its content came from).
+    /// ## The provenance is the **caller's**, and that is REQ-587's correction
+    ///
+    /// `provenance` is the egress provenance of `prompt` — the content this duty
+    /// is about to send — and it is a parameter for the reason LESSON-432 gives:
+    /// the call site is what knows where its content came from. This function
+    /// used to hard-code [`Provenance::empty`], which was right while there was
+    /// only one caller: a typed prompt is the user's own bytes and touched no
+    /// file. REQ-585 added a second caller whose `prompt` is a **skill
+    /// expansion** — a file's contents, plus whatever its dynamic commands
+    /// printed — and REQ-587's verify found the hard-coded value still here.
+    /// `Egress::send` short-circuits on an empty provenance before any boundary
+    /// check, so `title` — which `title_route` resolves **remotely** unless the
+    /// session is already tainted, and which fires on the session's first
+    /// substantive prompt, before any taint exists — was putting up to
+    /// `TITLE_REQUEST_MAX_BYTES` of that file on the wire.
+    ///
+    /// The typed-prompt call sites still pass [`Provenance::empty`], and that
+    /// stays correct for them; what changed is that it is now something a caller
+    /// states rather than something this function assumes on every caller's
+    /// behalf.
     ///
     /// ## The naming is **detached**; the turn never waits on it (REQ-561 verify)
     ///
@@ -5996,6 +7164,7 @@ impl DaemonRuntime {
     /// Returns the spawned task so a test can await it. **Production drops it**:
     /// a title that has not landed yet is a session with no title, which is BR-3's
     /// degraded state and costs the turn nothing.
+    #[allow(clippy::too_many_arguments)]
     fn spawn_title_session(
         &self,
         events: &Arc<EventBus>,
@@ -6004,6 +7173,7 @@ impl DaemonRuntime {
         config: &Config,
         session_id: &SessionId,
         prompt: &str,
+        provenance: Provenance,
     ) -> Option<tokio::task::JoinHandle<()>> {
         if !crate::harness::title::worth_titling(prompt) {
             return None;
@@ -6019,8 +7189,7 @@ impl DaemonRuntime {
         let session_id = session_id.clone();
         let prompt = prompt.to_owned();
         Some(tokio::spawn(async move {
-            let Ok(title) =
-                crate::harness::title::name_session(&route, &prompt, &Provenance::empty()).await
+            let Ok(title) = crate::harness::title::name_session(&route, &prompt, &provenance).await
             else {
                 return;
             };
@@ -8997,6 +10166,14 @@ fn probe_outcome(
                  this test does not send"
             ),
         },
+        // REQ-586 TASK-185: the probe's fixed payload cannot exceed a window; folded like EffortRefused
+        ProviderError::ContextLengthExceeded { .. } => ProviderTestOutcome::Refused {
+            status: 400,
+            reason: format!(
+                "HTTP 400 from `{host}` — the vendor refused the request as exceeding its \
+                 context window, which this test's fixed payload cannot do"
+            ),
+        },
         // Cannot occur: empty provenance and a constant payload, with no
         // redaction gate installed. Nothing left the machine if it does.
         ProviderError::PrivacyBlocked(_) => ProviderTestOutcome::Unreachable {
@@ -9178,6 +10355,256 @@ fn reroute_after_block_reason(detail: BlockDetail) -> String {
     )
 }
 
+/// Re-fit a turn's context to the route it is about to take, and publish the
+/// change (REQ-586 BR-1, ADR-2/ADR-3).
+///
+/// The mid-turn seam both reroute arms share — a privacy block pinning the turn
+/// local, and a provider failure falling over to a fallback. `previous` is the
+/// budget the last attempt ran under, `next` the one the next attempt will:
+/// called after the new route is chosen and **before** the retry, so the
+/// context that reaches the next model call already fits the window it is being
+/// sent to. Without it, a 60,000-word conversation assembled on a 128k route
+/// arrives at a 4k local pin over-window and the reroute that was supposed to
+/// rescue the turn kills it.
+///
+/// ## The refit itself is the news
+///
+/// The event fires whenever the **pair changed**, even when the report is
+/// quiet. "Your turn moved to a window a quarter the size and nothing had to be
+/// cut" is exactly as much a budget change as one that dropped ten blocks, and
+/// a client that only heard about the lossy case could not explain why the next
+/// `route_decided` carries different numbers. The order is deliberate — choose
+/// route, refit, announce, retry — so this event precedes the new route's
+/// `route_decided` rather than trailing it.
+///
+/// ## The in-place degrade is silent, by construction
+///
+/// A `MalformedToolCall` degrade continues on the *same* provider under the
+/// reduced harness profile, and ADR-2 has `degraded_harness_config` keep that
+/// provider's window — so `next` and `previous` carry the same pair, this
+/// returns before touching the manager, and no `context_pressure` is published.
+/// That is the right answer rather than a lucky one: nothing was re-budgeted, so
+/// there is nothing to say. The window *label* still follows the route, which
+/// costs nothing and keeps the in-prompt marker honest if a same-pair reroute
+/// ever crosses providers.
+///
+/// ## A refit that did not fit is not a refit
+///
+/// The kind is passed rather than derived (see `SessionEvents::context_pressure`)
+/// because only this arm knows the gate ran because of a *reroute* — but
+/// "re-fitted to the N-word budget" is a claim about the outcome, and a refit
+/// onto a much smaller route can finish still over budget just as a loop gate
+/// can. Saying it re-fitted anyway is the same untruth
+/// [`ContextPressureKind::DidNotFit`] exists to close, one call site along, so
+/// the over-budget answer wins here exactly as it does in
+/// Whether **any** skill expansion this turn carries would be middle-elided by
+/// the refit a reroute is about to perform — and if so, the refusal to raise
+/// instead.
+///
+/// `None` for a turn carrying none, which keeps REQ-586 BR-7's loud elision for
+/// ordinary text, and `None` when every one of them still fits: the refit then
+/// runs as it always has, dropping *history* to make room, which is ordinary
+/// pressure.
+///
+/// This exists because both budget stages ran against the route the turn started
+/// on. A reroute swaps in a smaller budget, and `truncate_to_budget` clamps the
+/// newest block once history is gone — which for a skill turn is the expansion
+/// itself. BR-8: never middle-elided into something the user did not invoke.
+/// BR-4: carried whole or refused.
+///
+/// # A list, because there is more than one kind of expansion (REQ-587 BR-7)
+///
+/// REQ-585 passed one `Option`, read off `skill_turn` — populated only for a
+/// user-typed `/name`. A model-invoked expansion therefore returned `None` here
+/// and was middle-elided silently, at the exact seam this guard was written for,
+/// and on a boundary-configured machine that pin is the *expected* path rather
+/// than a corner. The entries are `(name, text, system)` triples for every
+/// expansion committed this turn, and the **first** that would not survive
+/// refuses the turn: the answer does not improve by measuring the rest, and the
+/// sentence names the skill whose room is gone.
+///
+/// # …and the list says who asked (REQ-587 BR-7)
+///
+/// `typed` is where the typed seed ends and the loop's own expansions begin —
+/// `run_prompt_turn`'s `typed_refit`, the index it already keeps so a second
+/// attempt rebuilds the tail rather than duplicating it. The refusal composer is
+/// caller-aware (`SkillCaller`), so the entry below the index is named `/big`
+/// and everything above it is named ``The `big` skill``. Passing a constant here
+/// is not a cosmetic slip: a model told it typed a slash command is invited to
+/// tell the user to type one back, and `/big` is a surface the model cannot use
+/// (BR-8).
+///
+/// # The refusal ends the turn, and that is a stated exception
+///
+/// BR-6 and BR-9 say a refusal is a typed outcome the model can relay, and both
+/// of this function's call sites make it a `break 'turn Err(RpcError)` instead.
+/// That is deliberate and scoped rather than an oversight: both sit in
+/// `run_prompt_turn`'s `'turn` retry, *after* `run_session_turn_with_source` has
+/// returned. There is no `ToolCall` id in scope there and the expansion is
+/// already a committed block, so a tool result is not expressible without
+/// restructuring the retry — which REQ-587 does not propose. A model-invoked
+/// expansion caught at a reroute therefore ends the turn with the typed error,
+/// and "never a crash, always relayable" carries this seam as its one exception.
+fn skill_would_not_survive_refit(
+    skills: &[(String, String, String)],
+    typed: usize,
+    route: &crate::router::Route,
+) -> Option<String> {
+    skills
+        .iter()
+        .enumerate()
+        .find_map(|(index, (name, text, system))| {
+            // Who asked, read off the boundary the list is already built around
+            // rather than from a second table: entries below `typed` are the
+            // typed seed `skill_turn` supplied, everything above it is what
+            // `model_invoked_expansions` appended. Without this the sentence
+            // told the model it had typed `/name` — the one confusion
+            // `SkillCaller` exists to prevent, on the one surface whose whole
+            // job is to be a true account of what happened.
+            let caller = if index < typed {
+                SkillCaller::User
+            } else {
+                SkillCaller::Model
+            };
+            match skill_fit(
+                caller,
+                SkillStage::WithDynamicContext,
+                name,
+                system,
+                text,
+                &route.harness.budget,
+                route.provider_id.as_ref().map(|id| id.0.as_str()),
+            ) {
+                SkillFit::Fits => None,
+                SkillFit::TooLarge { message } => Some(message),
+            }
+        })
+}
+
+/// Every expansion the **model** committed this turn, as the refit guard's
+/// triples (REQ-587 BR-7).
+///
+/// Read off the `skill` tool's own per-turn record rather than accumulated in
+/// `run_prompt_turn`, because the loop is where a fold happens and the loop is
+/// several frames below this one; the tool is the value both frames hold. It is
+/// the *loop's* record of what it pushed, not the tool's of what it returned —
+/// see `TurnState::note_committed`.
+///
+/// `system` is this turn's prompt, cloned per entry: the refusal has to measure
+/// the same pair the loop's Stage B did, and `build_system_prompt` runs once
+/// per turn, above the loop.
+fn model_invoked_expansions(
+    tools: &crate::harness::tools::ToolRegistry,
+    system: &str,
+) -> Vec<(String, String, String)> {
+    tools
+        .get(crate::harness::tools::skill::SKILL_TOOL_NAME)
+        .and_then(|tool| tool.as_skill())
+        .map(|tool| {
+            tool.turn_state()
+                .committed()
+                .iter()
+                .map(|(name, text)| (name.clone(), text.clone(), system.to_owned()))
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// [`pressure_kind`](crate::harness::turn_loop::pressure_kind).
+fn refit_for_reroute(
+    conversation: &mut CarriedTurn,
+    events: &SessionEvents,
+    previous: &RouteBudget,
+    next: &RouteBudget,
+) {
+    conversation.set_window_label(&next.window_label);
+    if next.budget_tokens == previous.budget_tokens && next.budget_bytes == previous.budget_bytes {
+        return;
+    }
+    let report = conversation.rebudget(next);
+    let kind = if report.over_budget {
+        ContextPressureKind::DidNotFit
+    } else {
+        ContextPressureKind::RefitOnReroute
+    };
+    events.context_pressure(&report, kind, next);
+}
+
+/// The whole success-arm commit protocol: hand the session what the turn's
+/// manager holds, and announce what the commit's own budget gate took on the way
+/// (REQ-586 BR-10).
+///
+/// One function because it is one decision made in two places — the daemon's
+/// dispatch, and the `conversation_carry.rs` fixture that stands in for it. Two
+/// lines at each call site is how the fixture came to run a *different*
+/// protocol from the dispatch twice over: first by calling the
+/// report-discarding `commit()`, then by inlining its own copy of the publish.
+/// Both times the fixture stayed green while the real seam was neutered
+/// (LESSON-451). With one implementation, a dispatch that stopped publishing
+/// would have to stop committing too, and the commit is guarded everywhere.
+///
+/// Consumes the turn, because committing is the end of it.
+pub fn commit_and_publish(conversation: CarriedTurn, events: &SessionEvents, budget: &RouteBudget) {
+    let report = conversation.commit_reporting();
+    publish_commit_pressure(events, &report, budget);
+}
+
+/// Publish what the **commit's** own budget gate took, if it took anything
+/// (REQ-586 BR-10, ADR-3).
+///
+/// [`CarriedTurn::commit_now`] re-asserts the budget one last time so that "a
+/// stored conversation fits the budget" is an invariant of the store rather
+/// than a property the last writer happened to leave behind. It runs from
+/// `Drop` as well as from the success arm, so it can hold no `SessionEvents`
+/// and cannot emit: it reports, and this publishes (LESSON-501).
+///
+/// ## Why this is a named function and not two lines at the call site
+///
+/// So that the one caller in this file and the fixture that stands in for it
+/// run the *same* protocol. `conversation_carry.rs` used to inline
+/// `commit_reporting()` plus its own `if !is_quiet() { context_pressure(..) }`,
+/// which is LESSON-451 in miniature: a fixture re-implementing the dispatch
+/// tests its own copy, and the copy stayed green while the real one was
+/// neutered. It is `pub` for that reason and no other.
+///
+/// ## A completed turn *can* reach here with something to say
+///
+/// This used to say it could not, and the claim was true until TASK-194. The
+/// turn loop gates both of its `Ok` exits (BUG-157) and nothing appends between
+/// that gate and this commit, so a completed turn never arrives here having
+/// *dropped or elided* anything — that much still holds. But
+/// [`PressureReport::over_budget`] is recomputed on every
+/// `truncate_to_budget` call and counts toward `is_quiet()`, and a context the
+/// gate cannot fit does not become fittable by being gated again: a turn under
+/// a budget smaller than its own system prompt completes, reaches this line,
+/// and the report is **not** quiet. So this is a live branch on the success
+/// path, not only a backstop for a future `Ok` exit — and
+/// `an_unfittable_turn_still_publishes_the_commits_own_report`
+/// (`conversation_carry.rs`) drives it end to end, with
+/// `the_commit_publishes_a_clamp_and_says_nothing_about_a_quiet_one` below
+/// stating the decision directly.
+///
+/// The cancellation paths still reach the commit through `Drop`, where the
+/// report is discarded because there is no client left waiting on the news;
+/// that half of the old note was and remains correct.
+///
+/// It is deliberately not `turn_loop`'s `announce_pressure`: that one also
+/// writes a turn notice into the model's own output stream when the clamp
+/// landed on the user's newest message, which is the right thing mid-turn and
+/// the wrong thing here — this runs after the turn's last token, with nothing
+/// left to append it to. It also carries that loop's per-turn over-budget latch,
+/// which is scoped to one run of the loop; the commit is a separate seam whose
+/// single report is its own news.
+pub fn publish_commit_pressure(
+    events: &SessionEvents,
+    report: &PressureReport,
+    budget: &RouteBudget,
+) {
+    if !report.is_quiet() {
+        events.context_pressure(report, pressure_kind(report), budget);
+    }
+}
+
 /// The local tier's canonical provider id when the config declares no explicit
 /// `[[providers]]` entry for it (REQ-557 ADR-D).
 ///
@@ -9308,6 +10735,12 @@ fn build_router(
 
     let mut router = Router::new(table, default_provider)
         .with_judgment_default(config.judgment_default)
+        // REQ-586 BR-4 / ADR-1: the router derives each route's byte budget,
+        // and on this daemon that budget must fit what the redaction scan can
+        // read whole. It is the same `config.privacy.redact` `redaction_gate`
+        // consults before installing the gate — one field, so the bound and
+        // the gate cannot disagree about whether anything is scanning.
+        .with_redact_scan(config.privacy.redact)
         // REQ-559 BR-2/BR-8: one global level, read from the persisted config so
         // it is configuration-visible rather than a constant compiled in here.
         // The session override (ADR-I) is layered on by the caller that has a
@@ -9409,6 +10842,32 @@ fn health_record_after_failure(class: FailureClass, now: Instant) -> Option<Heal
         // Healthy downgrade is not a thing.
         ProviderHealth::Healthy => Some(HealthRecord::healthy()),
     }
+}
+
+/// The egress [`Provenance`] of a skill expansion, from the two values
+/// [`SkillTurn`] carries (REQ-587 BR-10, ADR-8).
+///
+/// The pair — a minted id set and a fail-closed bit — is the shape
+/// `ContextManager::push_user_from` takes, because that is how the *seed* block
+/// records where a turn's text came from. A **duty** does not push a block; it
+/// sends a string, and the choke point in front of it wants a `Provenance`. This
+/// is the one conversion between the two, so a duty and the seed cannot come to
+/// describe one string two ways.
+///
+/// A **project** skill mints one id and is compared against the boundary globs
+/// like any `read`. A **user** skill has no repo-relative identity, arrives with
+/// `unknown` set, and is refused wherever any boundary is configured — stricter
+/// than a `read` of the same bytes, which is BR-10's stated consequence and not
+/// an accident of this function.
+fn expansion_provenance(sources: &BTreeSet<ProvenanceId>, unknown: bool) -> Provenance {
+    let mut provenance = Provenance::empty();
+    for id in sources {
+        provenance.merge(&Provenance::tainted_by(id.clone()));
+    }
+    if unknown {
+        provenance.mark_unknown();
+    }
+    provenance
 }
 
 /// Whether the assembled context in `ctx` carries content that must pin the
@@ -9788,6 +11247,28 @@ fn snapshot_from_config(
                 endpoint: p.endpoint.clone(),
                 model: p.model.clone(),
                 auth_ref: p.auth_ref.clone(),
+                // REQ-586 ADR-7: always populated — `Some(0)` is "unknown" /
+                // "no cap", stated rather than hidden (BR-3), and `None` is
+                // reserved for a snapshot from a daemon predating the fields,
+                // so a live daemon never emits it.
+                max_context: Some(p.capabilities.max_context),
+                context_budget_cap: Some(p.capabilities.context_budget_cap),
+                // TASK-194 2b: whether this provider's declaration actually
+                // survives the derivation, answered by the **router's** budget
+                // for it — the same `budget_for` every route attempt runs
+                // through, so `/doctor` reports the floor a turn would really
+                // get rather than a client's guess at one (BR-8, AC-12).
+                // `Some` only when the floor bit, so a snapshot of ordinary
+                // providers is byte-identical to today's.
+                floored_budget: {
+                    let budget = router.budget_for(Some(p.id.as_str()));
+                    budget
+                        .floored
+                        .then_some(teton_protocol::methods::FlooredBudget {
+                            budget_tokens: budget.budget_tokens as u64,
+                            budget_bytes: budget.budget_bytes as u64,
+                        })
+                },
             })
             .collect(),
         tiers: Tier::ALL
@@ -9948,6 +11429,21 @@ fn apply_update(config: &mut Config, update: ConfigUpdate) {
                 .iter()
                 .find(|p| p.id == id)
                 .map_or_else(ProviderCapabilities::default, |p| p.capabilities);
+            // REQ-586 ADR-7: the two window fields are the one exception to
+            // "capabilities are not settable over this RPC", and they merge
+            // **field-wise** — `Some(v)` writes (`0` included: it is the
+            // config's own "unknown" / "no cap" spelling, and un-declaring a
+            // window is a write, not an absence), `None` preserves what is
+            // stored. An older client's re-registration therefore cannot zero
+            // a declared window, and the rest of the profile still rides the
+            // BUG-155 lookup above untouched.
+            let capabilities = ProviderCapabilities {
+                max_context: pc.max_context.unwrap_or(capabilities.max_context),
+                context_budget_cap: pc
+                    .context_budget_cap
+                    .unwrap_or(capabilities.context_budget_cap),
+                ..capabilities
+            };
             let provider = ModelProvider {
                 id,
                 kind: to_core_kind(pc.kind),
@@ -11442,6 +12938,7 @@ permission_allow = [\"fetch_user_url\"]
             "read",
             &"word ".repeat(500),
             50,
+            50 * crate::harness::context::APPROX_BYTES_PER_TOKEN,
             &crate::harness::ToolProvenance::none(),
         )
         .await;
@@ -11663,6 +13160,9 @@ permission_allow = [\"fetch_user_url\"]
                 endpoint: Some("https://api.deepseek.com/v1/chat/completions".to_owned()),
                 model: Some("deepseek-chat".to_owned()),
                 auth_ref: Some("keychain:deepseek".to_owned()),
+                max_context: None,
+                context_budget_cap: None,
+                floored_budget: None,
             }),
         );
         apply_update(
@@ -11692,6 +13192,31 @@ permission_allow = [\"fetch_user_url\"]
         assert_eq!(snap.providers.len(), 1);
         assert_eq!(snap.providers[0].kind, ProtoProviderKind::OpenaiCompatible);
         assert_eq!(snap.privacy[0].mode, PrivacyMode::LocalOnly);
+        // REQ-586 ADR-7: the snapshot ALWAYS populates the window fields — a
+        // provider with no capabilities table reads `Some(0)` ("unknown" /
+        // "no cap"), never `None`, which is reserved for a daemon predating
+        // the fields.
+        assert_eq!(snap.providers[0].max_context, Some(0));
+        assert_eq!(snap.providers[0].context_budget_cap, Some(0));
+
+        // And a declared window round-trips: registered over the wire,
+        // projected back out as the same figures.
+        apply_update(
+            &mut config,
+            ConfigUpdate::RegisterProvider(ProviderConfig {
+                id: ProviderId::from("deepseek"),
+                kind: ProtoProviderKind::OpenaiCompatible,
+                endpoint: Some("https://api.deepseek.com/v1/chat/completions".to_owned()),
+                model: Some("deepseek-chat".to_owned()),
+                auth_ref: Some("keychain:deepseek".to_owned()),
+                max_context: Some(131_072),
+                context_budget_cap: Some(65_536),
+                floored_budget: None,
+            }),
+        );
+        let snap = snapshot_from_config(&config, &router_for_config(&config), false);
+        assert_eq!(snap.providers[0].max_context, Some(131_072));
+        assert_eq!(snap.providers[0].context_budget_cap, Some(65_536));
     }
 
     /// **The snapshot reports whether the redaction scan is enabled** (REQ-562;
@@ -11750,6 +13275,9 @@ permission_allow = [\"fetch_user_url\"]
                 endpoint: Some("https://api.deepseek.com/v1/chat/completions".to_owned()),
                 model: Some("deepseek-chat".to_owned()),
                 auth_ref: None,
+                max_context: None,
+                context_budget_cap: None,
+                floored_budget: None,
             }),
         );
         config
@@ -11888,6 +13416,9 @@ permission_allow = [\"fetch_user_url\"]
                 endpoint: Some("https://api.anthropic.com".to_owned()),
                 model: None,
                 auth_ref: None,
+                max_context: None,
+                context_budget_cap: None,
+                floored_budget: None,
             }),
         );
         let before = config.clone();
@@ -11922,6 +13453,9 @@ permission_allow = [\"fetch_user_url\"]
                 endpoint: Some("https://api.anthropic.com".to_owned()),
                 model: Some("claude-opus-5".to_owned()),
                 auth_ref: None,
+                max_context: None,
+                context_budget_cap: None,
+                floored_budget: None,
             }),
         );
         *runtime.config.lock().expect("config") = usable;
@@ -12186,6 +13720,9 @@ permission_allow = [\"fetch_user_url\"]
                 endpoint: Some(endpoint.to_owned()),
                 model: Some("test-model".to_owned()),
                 auth_ref: None,
+                max_context: None,
+                context_budget_cap: None,
+                floored_budget: None,
             })
         };
         apply_update(
@@ -12201,6 +13738,54 @@ permission_allow = [\"fetch_user_url\"]
             config.providers[0].endpoint.as_deref(),
             Some("https://b.example/v1/chat/completions")
         );
+    }
+
+    /// **REQ-586 AC-5 (daemon half): the window fields merge field-wise on
+    /// re-registration** (ADR-7, tracer gotcha #6).
+    ///
+    /// `None` preserves — an older client's re-registration cannot zero a
+    /// declared window — and `Some` writes, `0` included, because `0` is the
+    /// config's own "unknown" / "no cap" spelling and un-declaring is a write,
+    /// not an absence. The rest of the capability profile rides the BUG-155
+    /// lookup, which this merge builds on rather than replaces.
+    #[test]
+    fn re_registration_merges_the_window_fields_field_wise() {
+        let register = |max_context: Option<u32>, cap: Option<u32>| {
+            ConfigUpdate::RegisterProvider(ProviderConfig {
+                id: ProviderId::from("kimi"),
+                kind: ProtoProviderKind::OpenaiCompatible,
+                endpoint: Some("https://api.moonshot.ai/v1/chat/completions".to_owned()),
+                model: Some("kimi-k3".to_owned()),
+                auth_ref: None,
+                max_context,
+                context_budget_cap: cap,
+                floored_budget: None,
+            })
+        };
+
+        let mut config = Config::default();
+        apply_update(&mut config, register(Some(200_000), Some(40_000)));
+        assert_eq!(config.providers[0].capabilities.max_context, 200_000);
+        assert_eq!(config.providers[0].capabilities.context_budget_cap, 40_000);
+
+        // AC-5's exact case: a request without the fields preserves the stored
+        // values instead of zeroing them.
+        apply_update(&mut config, register(None, None));
+        assert_eq!(config.providers.len(), 1);
+        assert_eq!(config.providers[0].capabilities.max_context, 200_000);
+        assert_eq!(config.providers[0].capabilities.context_budget_cap, 40_000);
+
+        // One field written, the other preserved: the merge is per FIELD, not
+        // per request.
+        apply_update(&mut config, register(Some(128_000), None));
+        assert_eq!(config.providers[0].capabilities.max_context, 128_000);
+        assert_eq!(config.providers[0].capabilities.context_budget_cap, 40_000);
+
+        // And `Some(0)` is a write — the "unknown" / "no cap" spelling —
+        // never a preserve.
+        apply_update(&mut config, register(Some(0), Some(0)));
+        assert_eq!(config.providers[0].capabilities.max_context, 0);
+        assert_eq!(config.providers[0].capabilities.context_budget_cap, 0);
     }
 
     /// E-5: the consent gate must not switch itself off the moment a real engine
@@ -12369,6 +13954,9 @@ permission_allow = [\"fetch_user_url\"]
             reason: resolution.reason.clone(),
             outcome: resolution.outcome,
             harness: Default::default(),
+            // REQ-586: the route carries its harness's budget — the default
+            // (local) pair here, since this fixture's harness is the default.
+            budget: crate::harness::turn_loop::HarnessConfig::default().budget,
             effort: None,
             resolution: Some(resolution),
         };
@@ -12392,6 +13980,7 @@ permission_allow = [\"fetch_user_url\"]
             reason: "No provider is bound to the 'build' tier.".to_owned(),
             outcome: RouteOutcome::NoPolicy,
             harness: Default::default(),
+            budget: crate::harness::turn_loop::HarnessConfig::default().budget,
             // No provider was selected, so there was nothing to resolve against.
             effort: None,
             resolution: None,
@@ -15170,9 +16759,17 @@ permission_allow = [\"fetch_user_url\"]
                 let config = runtime.config.lock().expect("config mutex").clone();
                 let router =
                     build_router(&config, runtime.local_tier_available(), &BTreeMap::new());
-                if let Some(handle) =
-                    runtime.spawn_title_session(bus, sessions, &router, &config, session, prompt)
-                {
+                if let Some(handle) = runtime.spawn_title_session(
+                    bus,
+                    sessions,
+                    &router,
+                    &config,
+                    session,
+                    prompt,
+                    // These fixtures name a session after a **typed** prompt,
+                    // which is the call site the empty value belongs to.
+                    Provenance::empty(),
+                ) {
                     handle.await.expect("the titling task must not panic");
                 }
             }
@@ -15625,13 +17222,14 @@ permission_allow = [\"fetch_user_url\"]
                     ("title", crate::harness::title::title_prompt(REQUEST)),
                     (
                         "compact",
-                        crate::harness::compact::compact_prompt(&[
-                            crate::harness::context::ContextBlock {
+                        crate::harness::compact::compact_prompt(
+                            &[crate::harness::context::ContextBlock {
                                 role: crate::harness::context::BlockRole::User,
                                 text: "do the thing".to_owned(),
-                                provenance: crate::harness::context::Provenance::User,
-                            },
-                        ]),
+                                provenance: crate::harness::context::Provenance::user(),
+                            }],
+                            crate::harness::compact::COMPACT_PROMPT_BUDGET_BYTES,
+                        ),
                     ),
                 ] {
                     let out = engine
@@ -15720,7 +17318,15 @@ permission_allow = [\"fetch_user_url\"]
                 });
 
                 let handle = runtime
-                    .spawn_title_session(&bus, &sessions, &router, &cfg, &session, REQUEST)
+                    .spawn_title_session(
+                        &bus,
+                        &sessions,
+                        &router,
+                        &cfg,
+                        &session,
+                        REQUEST,
+                        Provenance::empty(),
+                    )
                     .expect("the fixture must claim the title");
 
                 assert!(
@@ -15923,7 +17529,10 @@ permission_allow = [\"fetch_user_url\"]
 
                 let duty = engine
                     .complete(
-                        &crate::harness::compact::compact_prompt(&blocks),
+                        &crate::harness::compact::compact_prompt(
+                            &blocks,
+                            crate::harness::compact::COMPACT_PROMPT_BUDGET_BYTES,
+                        ),
                         &params,
                         &mut |_| true,
                     )
@@ -15946,10 +17555,11 @@ permission_allow = [\"fetch_user_url\"]
             /// away from the duty it is meant to answer.
             #[test]
             fn the_stand_in_recognizes_the_contract_the_prompt_carries() {
-                assert!(
-                    crate::harness::compact::compact_prompt(pressured().blocks())
-                        .contains(COMPACT_OUTPUT_CONTRACT)
-                );
+                assert!(crate::harness::compact::compact_prompt(
+                    pressured().blocks(),
+                    crate::harness::compact::COMPACT_PROMPT_BUDGET_BYTES,
+                )
+                .contains(COMPACT_OUTPUT_CONTRACT));
             }
         }
 
@@ -16874,6 +18484,8 @@ permission_allow = [\"fetch_user_url\"]
                         None,
                         None,
                         format!("please summarize {SENTINEL} for me"),
+                        None,
+                        None,
                         ClientPresence::unwatched(),
                     )
                     .await
@@ -16933,6 +18545,8 @@ permission_allow = [\"fetch_user_url\"]
                         None,
                         None,
                         "please summarize src/main.rs for me".to_owned(),
+                        None,
+                        None,
                         ClientPresence::unwatched(),
                     )
                     .await
@@ -16995,6 +18609,8 @@ permission_allow = [\"fetch_user_url\"]
                         None,
                         None,
                         format!("please summarize {SENTINEL} for me"),
+                        None,
+                        None,
                         ClientPresence::unwatched(),
                     )
                     .await;
@@ -17069,6 +18685,8 @@ permission_allow = [\"fetch_user_url\"]
                         None,
                         None,
                         "please summarize src/main.rs for me".to_owned(),
+                        None,
+                        None,
                         ClientPresence::unwatched(),
                     )
                     .await
@@ -17131,6 +18749,8 @@ permission_allow = [\"fetch_user_url\"]
                         None,
                         None,
                         "please summarize sk-ABCDEFGHIJKLMNOPQRSTUVWX for me".to_owned(),
+                        None,
+                        None,
                         ClientPresence::unwatched(),
                     )
                     .await;
@@ -18661,6 +20281,8 @@ permission_allow = [\"fetch_user_url\"]
                             None,
                             None,
                             "what does the tokio page say about task pinning?".to_owned(),
+                            None,
+                            None,
                             ClientPresence::unwatched(),
                         )
                         .await
@@ -18840,7 +20462,19 @@ permission_allow = [\"fetch_user_url\"]
                 ));
 
                 let tools = runtime
-                    .build_tools(&router, &events, &session, &gate, &config)
+                    .build_tools(
+                        &router,
+                        &events,
+                        &session,
+                        &gate,
+                        &config,
+                        // No skills and nobody to ask: these fixtures are about the
+                        // MCP and web halves of the registry, and an invented
+                        // `ConnectionId` here would prove nothing about the addressee
+                        // (TASK-217's own test drives a real one through the loop).
+                        Arc::new(crate::skills::SkillRegistry::default()),
+                        None,
+                    )
                     .await;
 
                 assert_eq!(
@@ -18914,7 +20548,19 @@ permission_allow = [\"fetch_user_url\"]
             };
             assert!(
                 runtime
-                    .build_tools(&router, &events, &session, &gate, &snapshot)
+                    .build_tools(
+                        &router,
+                        &events,
+                        &session,
+                        &gate,
+                        &snapshot,
+                        // No skills and nobody to ask: these fixtures are about the
+                        // MCP and web halves of the registry, and an invented
+                        // `ConnectionId` here would prove nothing about the addressee
+                        // (TASK-217's own test drives a real one through the loop).
+                        Arc::new(crate::skills::SkillRegistry::default()),
+                        None,
+                    )
                     .await
                     .get(WEB_TOOL_NAME)
                     .is_some(),
@@ -18925,7 +20571,19 @@ permission_allow = [\"fetch_user_url\"]
             // this, so the same call with the live snapshot has no web tool.
             assert!(
                 runtime
-                    .build_tools(&router, &events, &session, &gate, &live)
+                    .build_tools(
+                        &router,
+                        &events,
+                        &session,
+                        &gate,
+                        &live,
+                        // No skills and nobody to ask: these fixtures are about the
+                        // MCP and web halves of the registry, and an invented
+                        // `ConnectionId` here would prove nothing about the addressee
+                        // (TASK-217's own test drives a real one through the loop).
+                        Arc::new(crate::skills::SkillRegistry::default()),
+                        None,
+                    )
                     .await
                     .get(WEB_TOOL_NAME)
                     .is_none(),
@@ -19306,7 +20964,19 @@ max_page_bytes_from_the_future = 4096
                     Arc::clone(&runtime.pending),
                 ));
                 runtime
-                    .build_tools(&router, &events, &session, &gate, &config)
+                    .build_tools(
+                        &router,
+                        &events,
+                        &session,
+                        &gate,
+                        &config,
+                        // No skills and nobody to ask: these fixtures are about the
+                        // MCP and web halves of the registry, and an invented
+                        // `ConnectionId` here would prove nothing about the addressee
+                        // (TASK-217's own test drives a real one through the loop).
+                        Arc::new(crate::skills::SkillRegistry::default()),
+                        None,
+                    )
                     .await
                     .get(WEB_TOOL_NAME)
                     .is_some()
@@ -20912,6 +22582,7 @@ provider_id = \"deepseek\"
                     tier: WireTier::Think,
                     provider_id: ProviderId::from("kimi"),
                 }],
+                max_context: None,
             }
         }
 
@@ -21645,6 +23316,91 @@ fallback_id = \"local\"
                     rendered.full_text
                 );
             }
+        }
+
+        /// **The setup flow records the recipe's window — for the recipe's own
+        /// example model** (REQ-586 BR-3, AC-5, ADR-7).
+        ///
+        /// The candidate's `max_context` is read from the daemon's own catalog
+        /// rather than typed here, so a re-verified vendor figure re-verifies
+        /// this test instead of breaking it. The preview's `max_context = N`
+        /// line is the user's view of what a commit would record.
+        #[test]
+        fn a_candidate_on_the_recipes_example_model_records_the_recipes_window() {
+            let (runtime, _path) = runtime_seeded("provider-setup-window-recorded", SEEDED);
+            let window = crate::provider_recipes::recipe_catalog()
+                .iter()
+                .find(|r| r.id_suggestion == "kimi")
+                .map(|r| r.max_context)
+                .expect("the catalog ships a kimi recipe");
+            assert!(
+                window > 0,
+                "the recipe contract test pins a non-zero window"
+            );
+
+            let candidate = ProviderSetupCandidate {
+                max_context: Some(window),
+                ..kimi()
+            };
+            let rendered = derive(&runtime, &candidate).expect("previews");
+            assert_eq!(
+                rendered
+                    .candidate_config
+                    .providers
+                    .iter()
+                    .find(|p| p.id == "kimi")
+                    .map(|p| p.capabilities.max_context),
+                Some(window),
+                "the chosen model IS the recipe's example, so the recipe's window is \
+                 recorded"
+            );
+            assert!(
+                rendered
+                    .full_text
+                    .contains(&format!("max_context = {window}")),
+                "the preview must show the window a commit would record:\n{}",
+                rendered.full_text
+            );
+        }
+
+        /// **A substituted model does not inherit the recipe's window**
+        /// (REQ-586 BR-3: no window is ever guessed from a model name outside
+        /// the recipes).
+        ///
+        /// The carried figure describes the recipe's example model. A user who
+        /// named their own model gets `0` — "unknown", visible in the
+        /// preview's `max_context = 0` line — never a neighbouring model's
+        /// window recorded as fact.
+        #[test]
+        fn a_candidate_on_a_substituted_model_records_the_window_as_unknown() {
+            let (runtime, _path) = runtime_seeded("provider-setup-window-substituted", SEEDED);
+            let window = crate::provider_recipes::recipe_catalog()
+                .iter()
+                .find(|r| r.id_suggestion == "kimi")
+                .map(|r| r.max_context)
+                .expect("the catalog ships a kimi recipe");
+
+            let candidate = ProviderSetupCandidate {
+                model: "kimi-k2.5-turbo".to_owned(),
+                max_context: Some(window),
+                ..kimi()
+            };
+            let rendered = derive(&runtime, &candidate).expect("previews");
+            assert_eq!(
+                rendered
+                    .candidate_config
+                    .providers
+                    .iter()
+                    .find(|p| p.id == "kimi")
+                    .map(|p| p.capabilities.max_context),
+                Some(0),
+                "a substituted model must not inherit the example model's window"
+            );
+            assert!(
+                rendered.full_text.contains("max_context = 0"),
+                "the unknown window is stated in the preview, not hidden:\n{}",
+                rendered.full_text
+            );
         }
 
         // -- the preview: the warnings ----------------------------------------
@@ -24058,6 +25814,8 @@ provider_id = \"deepseek\"
                     None,
                     cwd,
                     text.to_owned(),
+                    None,
+                    None,
                     ClientPresence::unwatched(),
                 )
                 .await
@@ -24940,6 +26698,8 @@ provider_id = \"deepseek\"
                     Arc::clone(&taint),
                     Vec::new(),
                     prompt.to_owned(),
+                    std::collections::BTreeSet::new(),
+                    false,
                 )
             };
 
@@ -25592,6 +27352,10 @@ provider_id = \"deepseek\"
                 },
                 sessions,
                 events,
+                // REQ-585: the real filesystem, so a move that finds no
+                // `.claude/` under the new root stores an empty registry —
+                // which is what a `/cd` in these fixtures actually does.
+                &crate::skills::RealFs,
             )
         }
 
@@ -26206,6 +27970,680 @@ provider_id = \"deepseek\"
         }
     }
 
+    /// REQ-586: the budget follows the route attempt.
+    ///
+    /// Three claims: a reroute re-fits the turn's context to the window it is
+    /// about to be sent to and says so; a route change that moves no window
+    /// says nothing; and a provider's own "too big" answer ends the turn typed,
+    /// without touching the machinery that exists for providers that *failed*.
+    ///
+    /// The first two are pinned here at [`refit_for_reroute`], the shared
+    /// helper both of `run_prompt_turn`'s reroute arms call — so what these
+    /// tests own is the *helper's* rule, not the arms' wiring to it. That
+    /// wiring is a separate claim and it is covered separately: the two e2e
+    /// legs — `e2e/privacy_fixes.rs` for the privacy-block → local-pin arm and
+    /// `e2e/ac_matrix.rs` for the provider-failure → fallback arm — drive the
+    /// whole daemon and assert the `refit_on_reroute` line lands *before* the
+    /// retried attempt's `route_decided`, positionally, rather than merely
+    /// somewhere in the stream. The third test below is itself an e2e leg — it
+    /// drives
+    /// `run_prompt_turn` against a socket, because health, `provider_degraded`
+    /// and the client's error code only run when the refusal has travelled the
+    /// whole adapter → egress → source → loop path.
+    mod route_budget {
+        use super::*;
+        use crate::carry::CarriedTurn;
+        use crate::harness::budget::{derive, BudgetInputs, RouteBudget};
+        use crate::sessions::SessionRegistry;
+        use std::io::{Read, Write};
+        use std::net::TcpListener;
+        use teton_protocol::events::{ContextPressure, ContextPressureKind};
+
+        /// ADR-1's reservation — the `max_tokens` the adapters send.
+        const RESERVATION: u32 = 1_024;
+
+        fn remote_budget(window: u32) -> RouteBudget {
+            derive(BudgetInputs {
+                window,
+                cap: 0,
+                reservation: RESERVATION,
+                is_local: false,
+                redact_scan: false,
+                provider_id: Some("kimi"),
+            })
+        }
+
+        /// A turn holding `blocks` model turns of `words` words each, seeded
+        /// against `budget`.
+        fn turn_of(
+            sessions: &SessionRegistry,
+            session_id: &SessionId,
+            budget: &RouteBudget,
+            blocks: usize,
+            words: usize,
+        ) -> CarriedTurn {
+            let config = crate::harness::turn_loop::HarnessConfig::for_strong_model()
+                .with_route_budget(budget.clone());
+            let mut turn = CarriedTurn::begin(
+                sessions,
+                session_id,
+                "SYSTEM HEAD",
+                &config,
+                Arc::new(SessionTaint::new()),
+                Vec::new(),
+                "the opening prompt",
+                std::collections::BTreeSet::new(),
+                false,
+            );
+            let filler = vec!["lorem"; words].join(" ");
+            for _ in 0..blocks {
+                turn.ctx_mut().push_model(filler.clone());
+            }
+            turn
+        }
+
+        fn one_freeform_session() -> (SessionRegistry, SessionId) {
+            let sessions = SessionRegistry::new();
+            let session = sessions
+                .create(SessionMode::Freeform, None, None)
+                .expect("a freeform session needs no phase");
+            let id = session.session_id.clone();
+            (sessions, id)
+        }
+
+        /// Every `context_pressure` published on `bus` since `sub` was taken.
+        async fn pressure(sub: &mut crate::broadcast::Subscription) -> Vec<ContextPressure> {
+            let mut out = Vec::new();
+            while let Ok(Some(env)) =
+                tokio::time::timeout(Duration::from_millis(50), sub.recv()).await
+            {
+                if let Event::ContextPressure(cp) = env.event {
+                    out.push(cp);
+                }
+            }
+            out
+        }
+
+        /// **BR-1 / AC-15.** A reroute to a smaller window re-fits the turn's
+        /// context *before* the next attempt and publishes the refit.
+        ///
+        /// The failure this prevents is the one AC-15 describes: a turn
+        /// assembled against a 128k provider is privacy-blocked, pinned to the
+        /// local tier, and — without this — hands a 60,000-word context to a
+        /// 4,096-word window. The reroute meant to rescue the turn is what kills
+        /// it, and the user sees a second failure with no account of the first.
+        #[tokio::test]
+        async fn a_reroute_to_a_smaller_window_refits_the_context_and_publishes_it() {
+            let (sessions, session_id) = one_freeform_session();
+            let bus = Arc::new(EventBus::new());
+            let mut sub = bus.subscribe(64);
+            let events = SessionEvents::new(Arc::clone(&bus), session_id.clone());
+
+            let wide = remote_budget(128_000);
+            let local = derive(BudgetInputs::local());
+            // Enough conversation to overflow the local pair several times over
+            // while sitting comfortably inside the wide one.
+            let mut turn = turn_of(&sessions, &session_id, &wide, 12, 2_000);
+            let before = turn.ctx().estimated_tokens();
+            assert!(
+                before > local.budget_tokens && before < wide.budget_tokens,
+                "the fixture must fit the wide window and not the narrow one \
+                 ({before} words)"
+            );
+
+            refit_for_reroute(&mut turn, &events, &wide, &local);
+
+            assert!(
+                turn.ctx().estimated_tokens() <= local.budget_tokens
+                    && turn.ctx().estimated_bytes() <= local.budget_bytes,
+                "the context still does not fit the route it is about to be sent to"
+            );
+            let published = pressure(&mut sub).await;
+            assert_eq!(published.len(), 1, "{published:#?}");
+            let event = published[0];
+            assert_eq!(event.kind, ContextPressureKind::RefitOnReroute);
+            assert!(event.dropped_blocks > 0, "{event:?}");
+            // Both currencies, from the route the turn is moving TO — a client
+            // told the old numbers could not explain what just happened.
+            assert_eq!(event.budget_tokens, local.budget_tokens as u64);
+            assert_eq!(event.budget_bytes, local.budget_bytes as u64);
+            assert_eq!(event.bound, local.bound);
+
+            turn.abandon();
+        }
+
+        /// **BR-1, the quiet half.** A reroute whose new window happens to hold
+        /// everything already there is still announced: the *budget* changed,
+        /// and the next `route_decided` will carry different numbers with no
+        /// account of why.
+        #[tokio::test]
+        async fn a_refit_with_nothing_to_cut_is_still_the_news() {
+            let (sessions, session_id) = one_freeform_session();
+            let bus = Arc::new(EventBus::new());
+            let mut sub = bus.subscribe(64);
+            let events = SessionEvents::new(Arc::clone(&bus), session_id.clone());
+
+            let wide = remote_budget(128_000);
+            let narrower = remote_budget(32_000);
+            let mut turn = turn_of(&sessions, &session_id, &wide, 2, 50);
+
+            refit_for_reroute(&mut turn, &events, &wide, &narrower);
+
+            let published = pressure(&mut sub).await;
+            assert_eq!(published.len(), 1, "{published:#?}");
+            assert_eq!(published[0].kind, ContextPressureKind::RefitOnReroute);
+            assert_eq!(
+                (published[0].dropped_blocks, published[0].elided_bytes),
+                (0, 0),
+                "nothing was cut, which is exactly what the line should say"
+            );
+            assert_eq!(published[0].budget_tokens, narrower.budget_tokens as u64);
+
+            turn.abandon();
+        }
+
+        /// **AC-15c / ADR-2.** The in-place degrade keeps the failed provider's
+        /// window, so it re-fits nothing and announces nothing.
+        ///
+        /// The counterpart to the two tests above, and the reason
+        /// `refit_for_reroute` compares pairs rather than trusting its callers:
+        /// the degrade arrives through the *same* `route = next` arm as a
+        /// fallback, so "the degrade is quiet" has to be a property of the
+        /// budget it carries, not of which line of the runtime called.
+        #[tokio::test]
+        async fn a_degrade_that_keeps_the_window_refits_nothing_and_says_nothing() {
+            let (sessions, session_id) = one_freeform_session();
+            let bus = Arc::new(EventBus::new());
+            let mut sub = bus.subscribe(64);
+            let events = SessionEvents::new(Arc::clone(&bus), session_id.clone());
+
+            let wide = remote_budget(128_000);
+            let mut turn = turn_of(&sessions, &session_id, &wide, 12, 2_000);
+            let before = turn.ctx().estimated_tokens();
+
+            refit_for_reroute(&mut turn, &events, &wide, &wide.clone());
+
+            assert!(
+                pressure(&mut sub).await.is_empty(),
+                "an in-place degrade announced a re-fit that never happened"
+            );
+            assert_eq!(
+                turn.ctx().estimated_tokens(),
+                before,
+                "and it must not have touched the conversation either"
+            );
+
+            turn.abandon();
+        }
+
+        /// **BR-10.** The commit's own budget gate reports what it took, so the
+        /// between-turns drop can be published where the events handle lives.
+        ///
+        /// The seam's whole reason for existing: `commit_now` runs from `Drop`
+        /// as well as from the success arm, so it cannot hold a `SessionEvents`
+        /// and cannot emit. If it swallowed its report instead of returning it,
+        /// a session whose retained conversation no longer fits the next turn's
+        /// window would lose its oldest turns with nothing said — the exact
+        /// silence BR-7 forbids, at the one gate the loop's three do not cover.
+        #[test]
+        fn the_commit_reports_the_blocks_it_dropped_to_fit() {
+            let (sessions, session_id) = one_freeform_session();
+            // A conversation assembled on a wide route meeting the local pair,
+            // which is BR-10's scenario in miniature.
+            let turn = turn_of(
+                &sessions,
+                &session_id,
+                &derive(BudgetInputs::local()),
+                40,
+                500,
+            );
+            let report = turn.commit_reporting();
+            assert!(
+                report.dropped_blocks > 0,
+                "the commit re-asserted the budget but reported nothing: {report:?}"
+            );
+            assert!(!report.is_quiet());
+            // And the write still happened — the report is a by-product of the
+            // commit, not a replacement for it.
+            assert!(!sessions
+                .conversation_snapshot(&session_id)
+                .blocks()
+                .is_empty());
+        }
+
+        /// **BR-10, verify M7-b.** The commit's publish speaks for a clamp and
+        /// stays silent for a quiet report — and it carries the commit's own
+        /// numbers, not the loop's.
+        ///
+        /// [`publish_commit_pressure`]'s own doc says why this is a unit test
+        /// rather than a leg of an end-to-end fixture: a turn that *completed*
+        /// cannot reach it with anything to say, because the loop gates both of
+        /// its `Ok` exits and nothing appends between that gate and the commit.
+        /// That made the branch unguardable in practice — `if false &&
+        /// !pressure.is_quiet()` at the seam left the whole `tetond` package
+        /// green, and the fixture AC-11 drives it through
+        /// (`conversation_carry.rs`) was calling the report-discarding
+        /// `commit()` so it could not have caught it either way. Both halves are
+        /// fixed: the fixture now commits the daemon's way, and the decision
+        /// itself is stated here.
+        ///
+        /// The kind is asserted too, because the commit is the one caller that
+        /// must **not** pass a kind of its own: an identical report is
+        /// `RefitOnReroute` at a reroute arm and `BlocksDropped` here, and
+        /// getting that from [`pressure_kind`] is what keeps the commit from
+        /// inventing a fourth vocabulary.
+        #[tokio::test]
+        async fn the_commit_publishes_a_clamp_and_says_nothing_about_a_quiet_one() {
+            let (_sessions, session_id) = one_freeform_session();
+            let bus = Arc::new(EventBus::new());
+            let mut sub = bus.subscribe(64);
+            let events = SessionEvents::new(Arc::clone(&bus), session_id.clone());
+            let budget = remote_budget(128_000);
+
+            // A quiet report — the ordinary case, since `truncate_to_budget`
+            // runs on every commit — says nothing at all.
+            publish_commit_pressure(&events, &PressureReport::default(), &budget);
+            assert!(
+                pressure(&mut sub).await.is_empty(),
+                "a commit that clamped nothing announced a clamp"
+            );
+
+            // A report that dropped blocks is the BR-10 news, with the numbers
+            // of the route the turn ran under.
+            let dropped = PressureReport {
+                dropped_blocks: 3,
+                ..PressureReport::default()
+            };
+            publish_commit_pressure(&events, &dropped, &budget);
+            let published = pressure(&mut sub).await;
+            assert_eq!(published.len(), 1, "{published:#?}");
+            assert_eq!(published[0].kind, ContextPressureKind::BlocksDropped);
+            assert_eq!(published[0].dropped_blocks, 3);
+            assert_eq!(published[0].budget_tokens, budget.budget_tokens as u64);
+            assert_eq!(published[0].budget_bytes, budget.budget_bytes as u64);
+            assert_eq!(published[0].bound, budget.bound);
+
+            // …and a pure in-place clamp is the other kind, off the same
+            // classifier the loop's gates use.
+            let elided = PressureReport {
+                elided_bytes: 4_096,
+                newest_user_elided: true,
+                ..PressureReport::default()
+            };
+            publish_commit_pressure(&events, &elided, &budget);
+            let published = pressure(&mut sub).await;
+            assert_eq!(published.len(), 1, "{published:#?}");
+            assert_eq!(published[0].kind, ContextPressureKind::BlockElided);
+            assert_eq!(published[0].elided_bytes, 4_096);
+            assert!(published[0].newest_user_elided);
+
+            // …and the third: the gate ran and could do nothing, which is its
+            // own kind rather than an elision of zero bytes (TASK-194 2a). The
+            // zero used to *be* the report, which meant a reader was told a
+            // block had been shortened when none had.
+            let did_not_fit = PressureReport {
+                over_budget: true,
+                ..PressureReport::default()
+            };
+            publish_commit_pressure(&events, &did_not_fit, &budget);
+            let published = pressure(&mut sub).await;
+            assert_eq!(published.len(), 1, "{published:#?}");
+            assert_eq!(published[0].kind, ContextPressureKind::DidNotFit);
+            assert_eq!(published[0].dropped_blocks, 0);
+            assert_eq!(published[0].elided_bytes, 0);
+        }
+
+        /// **TASK-194 2b.** The event carries whether the bound it names is
+        /// actually in force.
+        ///
+        /// A cap of 500 on a 200k provider derives below the floor, so the pair
+        /// is raised and the turn gets *more* than the cap asked for. Reporting
+        /// `bound: user cap` with nothing beside it is a line claiming a ceiling
+        /// the turn is not running under — and it is read off the route's own
+        /// budget here, never recomputed by comparing the pair to a floor.
+        #[tokio::test]
+        async fn a_floored_bound_says_so_on_the_event() {
+            let (_sessions, session_id) = one_freeform_session();
+            let bus = Arc::new(EventBus::new());
+            let mut sub = bus.subscribe(64);
+            let events = SessionEvents::new(Arc::clone(&bus), session_id.clone());
+            let dropped = PressureReport {
+                dropped_blocks: 1,
+                ..PressureReport::default()
+            };
+
+            let honoured = remote_budget(128_000);
+            assert!(!honoured.floored);
+            publish_commit_pressure(&events, &dropped, &honoured);
+            let published = pressure(&mut sub).await;
+            assert!(!published[0].bound_floored, "{published:#?}");
+
+            let floored = derive(BudgetInputs {
+                window: 200_000,
+                cap: 500,
+                reservation: RESERVATION,
+                is_local: false,
+                redact_scan: false,
+                provider_id: Some("kimi"),
+            });
+            assert_eq!(floored.bound, teton_protocol::events::BudgetBound::UserCap);
+            publish_commit_pressure(&events, &dropped, &floored);
+            let published = pressure(&mut sub).await;
+            assert!(
+                published[0].bound_floored,
+                "a cap the floor overruled must be reported as overruled: {published:#?}"
+            );
+            assert!(published[0].budget_tokens > 500);
+        }
+
+        /// **Verify M7-a.** `build_router` passes `[privacy] redact` into the
+        /// derivation, so an opted-in machine's large-window route is bounded
+        /// by what the scan can read whole.
+        ///
+        /// AC-6's own test builds a `Router` and calls `.with_redact_scan(flag)`
+        /// on it explicitly, which proves `budget_for` honours the flag and
+        /// nothing about how the flag gets there. The single line
+        /// `.with_redact_scan(config.privacy.redact)` in [`build_router`] is
+        /// what makes `[privacy] redact = true` a *budget* on the daemon, and
+        /// replacing it with `false` left the entire `tetond` package green.
+        ///
+        /// What that mutation costs is not subtle: every opted-in machine on a
+        /// 128k provider would derive `BudgetBound::Window` — a 253,952-byte
+        /// budget, well over `REDACT_INPUT_MAX_BYTES` — assemble a body that
+        /// size, and have the gate refuse it fail-closed as `ScanUnavailable`.
+        /// That is the REQ-562/REQ-577 collision this REQ exists not to
+        /// reintroduce, arriving as a privacy error on a turn whose only fault
+        /// is its size.
+        ///
+        /// The third leg closes AC-6's untested clause: `[web] tier = search`
+        /// installs the *search* redaction gate, which deliberately does not
+        /// read `[privacy] redact` (BR-14) — and does not scan provider
+        /// payloads either. So the provider route's bound follows `redact`
+        /// alone, and a search-tier machine with the scan off is `window`.
+        #[test]
+        fn build_router_makes_the_privacy_flag_the_routes_bound() {
+            use teton_core::config::{PrivacyConfig, WebConfig, WebTier};
+            use teton_protocol::events::BudgetBound;
+
+            /// A remote provider big enough that its window-derived byte budget
+            /// is over the scannable bound — which is the only shape where the
+            /// two answers differ.
+            fn config_with(redact: bool, tier: WebTier) -> Config {
+                Config {
+                    providers: vec![ModelProvider {
+                        id: "wide".to_owned(),
+                        kind: ProviderKind::OpenaiCompatible,
+                        endpoint: Some("https://example.invalid/v1/chat/completions".to_owned()),
+                        model: Some("wide-model".to_owned()),
+                        auth_ref: None,
+                        capabilities: ProviderCapabilities {
+                            max_context: 128_000,
+                            ..ProviderCapabilities::default()
+                        },
+                    }],
+                    default_provider: Some("wide".to_owned()),
+                    privacy: PrivacyConfig { redact },
+                    web: WebConfig {
+                        tier,
+                        ..WebConfig::default()
+                    },
+                    ..Config::default()
+                }
+            }
+
+            let scanning = build_router(&config_with(true, WebTier::Off), true, &BTreeMap::new())
+                .budget_for(Some("wide"));
+            assert_eq!(
+                scanning.bound,
+                BudgetBound::RedactScan,
+                "`[privacy] redact = true` must reach the derivation through \
+                 `build_router`, or an opted-in machine assembles a body the \
+                 gate then refuses as unscannable: {scanning:?}"
+            );
+
+            let unscanned = build_router(&config_with(false, WebTier::Off), true, &BTreeMap::new())
+                .budget_for(Some("wide"));
+            assert_eq!(
+                unscanned.bound,
+                BudgetBound::Window,
+                "with the scan off the same route is window-bound: {unscanned:?}"
+            );
+            assert!(
+                unscanned.budget_bytes > scanning.budget_bytes,
+                "the two legs must differ, or neither says anything: {} vs {}",
+                unscanned.budget_bytes,
+                scanning.budget_bytes
+            );
+
+            // AC-6's search clause: the search gate is switched by `[web] tier`
+            // and not by `[privacy] redact`, and it does not scan the provider
+            // payload — so it moves no provider route's bound.
+            let searching =
+                build_router(&config_with(false, WebTier::Search), true, &BTreeMap::new())
+                    .budget_for(Some("wide"));
+            assert_eq!(
+                searching, unscanned,
+                "`[web] tier = search` with `redact = false` must leave the \
+                 provider route window-bound: {searching:?}"
+            );
+        }
+
+        /// **TASK-194 2b, `/doctor`'s half.** The snapshot's `floored_budget`
+        /// is filled in by the daemon for a declaration the floor overruled, and
+        /// left out for one it honoured.
+        ///
+        /// The CLI's rendering of the cell is guarded against a synthetic
+        /// [`teton_protocol::methods::ProviderConfig`] with the field already
+        /// populated, which says nothing about the line in
+        /// [`snapshot_from_config`] that populates it. **Both** mutations
+        /// therefore survived the workspace: never `Some` (the cell silently
+        /// disappears from `/doctor` for every floored provider) and always
+        /// `Some` (every ordinary provider grows a line claiming its window was
+        /// overruled when it was not).
+        ///
+        /// The pair is asserted, not just the presence: the whole point of the
+        /// cell is to name the budget actually in force beside a cap that is
+        /// not, so a `Some` carrying the *cap's* numbers would be the same
+        /// untruth one field along. And it is read through `router.budget_for`,
+        /// the seam every route attempt runs through — a snapshot deriving its
+        /// own answer could disagree with the turn.
+        #[test]
+        fn the_doctor_snapshot_names_a_floored_budget_and_only_a_floored_one() {
+            fn config_capped_at(cap: u32) -> Config {
+                Config {
+                    providers: vec![ModelProvider {
+                        id: "wide".to_owned(),
+                        kind: ProviderKind::OpenaiCompatible,
+                        endpoint: Some("https://example.invalid/v1/chat/completions".to_owned()),
+                        model: Some("wide-model".to_owned()),
+                        auth_ref: None,
+                        capabilities: ProviderCapabilities {
+                            max_context: 200_000,
+                            context_budget_cap: cap,
+                            ..ProviderCapabilities::default()
+                        },
+                    }],
+                    default_provider: Some("wide".to_owned()),
+                    ..Config::default()
+                }
+            }
+
+            // A 500-token cap on a 200k window derives nothing usable and lands
+            // on the floor, so the snapshot must say the declaration below is
+            // not what runs.
+            let config = config_capped_at(500);
+            let router = router_for_config(&config);
+            let snap = snapshot_from_config(&config, &router, false);
+            let row = snap
+                .providers
+                .iter()
+                .find(|p| p.id.0 == "wide")
+                .expect("the registered provider has a row");
+            assert_eq!(row.context_budget_cap, Some(500), "the cap is recorded");
+            let floored = row
+                .floored_budget
+                .expect("a cap the floor overruled must be named in the snapshot");
+            let in_force = router.budget_for(Some("wide"));
+            assert!(in_force.floored, "{in_force:?}");
+            assert_eq!(
+                (floored.budget_tokens, floored.budget_bytes),
+                (in_force.budget_tokens as u64, in_force.budget_bytes as u64),
+                "the cell must carry the pair actually in force, which is \
+                 *larger* than the cap asked for — repeating the cap would be \
+                 the same untruth the field exists to close"
+            );
+            assert!(floored.budget_tokens > 500);
+
+            // The twin, differing only in the cap: an honoured declaration adds
+            // no cell at all, so an ordinary `/doctor` is byte-identical.
+            let honoured = config_capped_at(0);
+            let snap = snapshot_from_config(&honoured, &router_for_config(&honoured), false);
+            let row = snap
+                .providers
+                .iter()
+                .find(|p| p.id.0 == "wide")
+                .expect("the registered provider has a row");
+            assert_eq!(
+                row.floored_budget, None,
+                "a window the floor never touched must not grow a line saying \
+                 it was overruled: {row:?}"
+            );
+        }
+
+        /// A provider bound to every tier at `endpoint`, declaring a 128k
+        /// window it will then refuse a request against.
+        fn refusing_provider_config(endpoint: &str) -> Config {
+            Config {
+                providers: vec![ModelProvider {
+                    id: "kimi".to_owned(),
+                    kind: ProviderKind::OpenaiCompatible,
+                    endpoint: Some(endpoint.to_owned()),
+                    model: Some("kimi-k2".to_owned()),
+                    auth_ref: None,
+                    capabilities: ProviderCapabilities {
+                        max_context: 128_000,
+                        ..ProviderCapabilities::default()
+                    },
+                }],
+                tiers: Tier::ALL
+                    .iter()
+                    .map(|tier| TierBinding {
+                        tier: *tier,
+                        provider_id: "kimi".to_owned(),
+                        // No fallback at all: if the arm below ever asked for
+                        // one, the absence would surface as a *different* error
+                        // code and this test would fail loudly rather than
+                        // silently passing on a fallback that could not be
+                        // built.
+                        fallback_id: None,
+                    })
+                    .collect(),
+                ..Config::default()
+            }
+        }
+
+        /// **AC-3, at the runtime.** A provider answering the vendor's
+        /// context-length 400 ends the turn with the typed
+        /// `CONTEXT_LENGTH_EXCEEDED`, and the provider's standing with the
+        /// router is exactly what it was before.
+        ///
+        /// Driven against a real socket rather than a mocked source, because the
+        /// claim is about `run_prompt_turn`'s arms — health, `provider_degraded`,
+        /// and the code the client receives — and those only run when the error
+        /// has travelled the whole adapter → egress → source → loop path. The
+        /// body is Moonshot's own spelling: Kimi is the dogfood provider and the
+        /// spelling it sends is the one that was not pinned before this REQ.
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn a_context_length_refusal_changes_no_health_and_degrades_nothing() {
+            const BODY: &str = r#"{"error":{"type":"invalid_request_error","message":"Input token length too long"}}"#;
+            let listener = TcpListener::bind("127.0.0.1:0").expect("bind a mock vendor");
+            let addr = listener.local_addr().expect("mock vendor address");
+            let hits = Arc::new(AtomicUsize::new(0));
+            let served = Arc::clone(&hits);
+            std::thread::spawn(move || {
+                for stream in listener.incoming() {
+                    let Ok(mut stream) = stream else { break };
+                    served.fetch_add(1, Ordering::SeqCst);
+                    // Enough of the request to know it arrived; the response is
+                    // fixed either way.
+                    let mut buf = [0u8; 4096];
+                    let _ = stream.read(&mut buf);
+                    let _ = stream.write_all(
+                        format!(
+                            "HTTP/1.1 400 Bad Request\r\nContent-Type: application/json\r\n\
+                             Content-Length: {}\r\nConnection: close\r\n\r\n{BODY}",
+                            BODY.len()
+                        )
+                        .as_bytes(),
+                    );
+                    let _ = stream.flush();
+                }
+            });
+
+            let runtime = Arc::new(DaemonRuntime::minimal());
+            *runtime.config.lock().expect("config mutex") =
+                refusing_provider_config(&format!("http://{addr}/v1/chat/completions"));
+            let events = Arc::new(EventBus::new());
+            let mut sub = events.subscribe(256);
+            let sessions = SessionRegistry::new();
+            let session_id = sessions
+                .create(SessionMode::Structured, Some(ProtoPhase::Implement), None)
+                .expect("a structured session takes a phase")
+                .session_id;
+
+            let before = runtime.health_snapshot();
+            let err = runtime
+                .run_prompt_turn(
+                    &events,
+                    &sessions,
+                    session_id.clone(),
+                    SessionMode::Structured,
+                    Some(ProtoPhase::Implement),
+                    None,
+                    "a prompt the provider will say is too large".to_owned(),
+                    None,
+                    None,
+                    ClientPresence::unwatched(),
+                )
+                .await
+                .expect_err("a refused turn must not report success");
+
+            // Typed, and naming what the user can act on.
+            assert_eq!(err.code, error_code::CONTEXT_LENGTH_EXCEEDED, "{err:?}");
+            assert!(err.message.contains("kimi"), "{}", err.message);
+            assert!(err.message.contains("word budget"), "{}", err.message);
+            assert!(
+                !err.message.contains("Input token length"),
+                "the provider's own body leaked into the turn error: {}",
+                err.message
+            );
+
+            // No health change: a provider that correctly reported its own limit
+            // is not unhealthy, and downgrading it here would move *later* turns
+            // off a provider that works.
+            assert_eq!(
+                runtime.health_snapshot(),
+                before,
+                "the refusal changed the provider's standing with the router"
+            );
+            // And no `provider_degraded`: nothing failed over, so nothing may
+            // tell the user their provider was demoted.
+            let mut degraded = Vec::new();
+            while let Ok(Some(env)) =
+                tokio::time::timeout(Duration::from_millis(100), sub.recv()).await
+            {
+                if let Event::ProviderDegraded(pd) = env.event {
+                    degraded.push(pd);
+                }
+            }
+            assert!(degraded.is_empty(), "{degraded:#?}");
+            assert!(
+                hits.load(Ordering::SeqCst) >= 1,
+                "non-vacuity: the daemon really did reach the mock vendor"
+            );
+        }
+    }
+
     /// REQ-580: a turn that meets a warming local tier is **held** for it, not
     /// refused — and every way the hold can end is pinned here.
     ///
@@ -26331,6 +28769,8 @@ provider_id = \"deepseek\"
                         None,
                         None,
                         "hi".to_owned(),
+                        None,
+                        None,
                         presence,
                     )
                     .await
@@ -26596,6 +29036,7 @@ provider_id = \"deepseek\"
                     reason: String::new(),
                     outcome: RouteOutcome::Primary,
                     harness: Default::default(),
+                    budget: crate::harness::turn_loop::HarnessConfig::default().budget,
                     effort: None,
                     resolution: None,
                 }
@@ -26835,6 +29276,380 @@ provider_id = \"deepseek\"
             tier_opens(&live, &engine);
             assert!(live.local_tier_available());
             assert!(live.local_tier_hold().is_none());
+        }
+    }
+
+    /// REQ-585 TASK-204 — the two readers of "this turn's prompt text", observed
+    /// at the engine they reach.
+    ///
+    /// The integration suite (`tests/skill_turn.rs`) proves the *naming* half
+    /// behaviourally, through `claim_title`, and the ordering structurally. It
+    /// cannot reach the **classifier**: `route` has no configurable counterpart,
+    /// so it resolves to the local tier or to nothing, and an integration test
+    /// cannot install a local engine. So the classifier's own prompt is read
+    /// here, from inside the crate, off an engine that records every string it
+    /// was handed.
+    /// The one `NotRun` arm that is **not** a closed door.
+    ///
+    /// A command the runner could not start — no shell, an unresolvable jail
+    /// root, a failed spawn — arrives with consent already **given**, so there
+    /// is no door to name. Reporting it as `Failed` would tell a reader on
+    /// `/verbose` that it was attempted and exited, which is untrue and points
+    /// at the wrong fix; reporting one of the consent's four doors would blame
+    /// a refusal nobody made.
+    mod a_command_that_could_not_start {
+        use super::*;
+        use teton_protocol::events::{DynamicOutcome as WireDynamicOutcome, NotRunReason};
+
+        #[test]
+        fn is_not_a_closed_door_and_is_not_a_failure() {
+            let command = crate::skills::Command::new("definitely-not-a-program");
+            let never_started = crate::skills::DynamicOutcome::could_not_start();
+
+            // No door: consent was given and the machine could not carry it out.
+            let view = outcome_view(&command, &never_started, None);
+            assert!(
+                matches!(
+                    view.outcome,
+                    WireDynamicOutcome::NotRun {
+                        reason: NotRunReason::CouldNotStart
+                    }
+                ),
+                "{:?}",
+                view.outcome
+            );
+
+            // The control: with a door, the door is what is reported — so the
+            // arm above is reached by the *absence* of one, not by the outcome
+            // kind alone.
+            let declined = crate::skills::DynamicOutcome::declined();
+            let view = outcome_view(&command, &declined, Some(NotRunReason::Declined));
+            assert!(
+                matches!(
+                    view.outcome,
+                    WireDynamicOutcome::NotRun {
+                        reason: NotRunReason::Declined
+                    }
+                ),
+                "{:?}",
+                view.outcome
+            );
+        }
+    }
+
+    mod skill_turn_readers {
+        use super::*;
+        use crate::sessions::SessionRegistry;
+        use crate::skills::{discover, RealFs};
+        use teton_protocol::methods::SkillInvocation;
+
+        /// A body marker no other fixture in this crate uses, so a prompt
+        /// containing it can only have come from this expansion.
+        const MARKER: &str = "SKILLBODYMARKER-204";
+
+        /// An engine that answers `edit` — parseable as a judgment category, as
+        /// a session title, and as a finished turn — and remembers every prompt.
+        #[derive(Clone)]
+        struct RecordingEngine(Arc<Mutex<Vec<String>>>);
+
+        impl RecordingEngine {
+            fn new() -> Self {
+                Self(Arc::new(Mutex::new(Vec::new())))
+            }
+
+            fn prompts(&self) -> Vec<String> {
+                self.0.lock().expect("recorder mutex").clone()
+            }
+        }
+
+        impl Engine for RecordingEngine {
+            fn model_id(&self) -> &str {
+                "recording"
+            }
+
+            fn complete(
+                &self,
+                prompt: &str,
+                _params: &GenParams,
+                _on_token: &mut dyn FnMut(&str) -> bool,
+            ) -> Result<Completion, EngineError> {
+                self.0
+                    .lock()
+                    .expect("recorder mutex")
+                    .push(prompt.to_owned());
+                Ok(Completion::cold("edit".to_owned(), 0, 1))
+            }
+        }
+
+        /// A runtime whose local tier is this recorder — capability backed by a
+        /// fact, exactly as `with_consent` does it, because a `Ready` outcome
+        /// re-derives `local_available` from the slot's own state.
+        fn runtime_with(engine: &RecordingEngine) -> Arc<DaemonRuntime> {
+            let slot = EngineSlot::empty();
+            slot.install(
+                "recording".to_owned(),
+                Arc::new(Mutex::new(engine.clone())) as Arc<Mutex<dyn Engine>>,
+            );
+            Arc::new(DaemonRuntime {
+                engine: slot,
+                local_available: AtomicBool::new(true),
+                ..DaemonRuntime::minimal()
+            })
+        }
+
+        /// **Both assertions ADR-3 asks for**: the classifier receives the
+        /// expansion, and the naming attempt receives it.
+        ///
+        /// A skill turn's `prompt` is empty by ADR-3, so an expansion built
+        /// after either of them hands both `""` — a route chosen from nothing
+        /// and a session named from nothing, for the whole of its life. Both
+        /// prompts are identified by their own instruction text, so neither
+        /// assertion can be satisfied by the turn's request happening to carry
+        /// the body.
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn the_classifier_and_the_naming_attempt_both_read_the_expansion() {
+            let dir = scratch_dir("skill-readers");
+            std::fs::create_dir_all(dir.join(".claude/skills/marked")).unwrap();
+            std::fs::write(dir.join("Cargo.toml"), "[package]\n").unwrap();
+            std::fs::write(
+                dir.join(".claude/skills/marked/SKILL.md"),
+                format!("---\ndescription: marked\n---\n\nPlease handle {MARKER} now.\n"),
+            )
+            .unwrap();
+
+            let engine = RecordingEngine::new();
+            let runtime = runtime_with(&engine);
+            let events = Arc::new(EventBus::new());
+            let sessions = SessionRegistry::new();
+            let session_id = sessions
+                .create(SessionMode::Freeform, None, Some(dir.clone()))
+                .expect("a freeform session")
+                .session_id;
+            let probed = runtime.session_root_for(Some(&dir));
+            // `home: None` — the four globs then cover the fixture root only, so
+            // this assertion is about this file rather than about whatever
+            // `~/.claude/skills` the runner happens to have.
+            sessions.set_skills(
+                &session_id,
+                discover(None, &probed.path, probed.view.kind, &RealFs),
+            );
+
+            runtime
+                .run_prompt_turn(
+                    &events,
+                    &sessions,
+                    session_id,
+                    SessionMode::Freeform,
+                    None,
+                    Some(dir.clone()),
+                    String::new(),
+                    Some(SkillInvocation {
+                        name: "marked".to_owned(),
+                        raw_arguments: String::new(),
+                    }),
+                    None,
+                    ClientPresence::unwatched(),
+                )
+                .await
+                .expect("the skill turn runs on the local tier");
+
+            let prompts = engine.prompts();
+            let classifier = prompts
+                .iter()
+                .find(|p| p.contains("Classify one software-engineering request"))
+                .unwrap_or_else(|| {
+                    panic!(
+                        "the freeform classifier never ran: {} prompts",
+                        prompts.len()
+                    )
+                });
+            assert!(
+                classifier.contains(MARKER),
+                "the classifier was handed the empty typed prompt rather than the \
+                 expansion — every invocation would be routed from `\"\"`: {classifier}"
+            );
+
+            let title = prompts
+                .iter()
+                .find(|p| p.contains("Below is the first thing someone asked"))
+                .unwrap_or_else(|| {
+                    panic!("the naming attempt never ran: {} prompts", prompts.len())
+                });
+            assert!(
+                title.contains(MARKER),
+                "the naming attempt was handed the empty typed prompt — the session \
+                 would carry a name derived from nothing for its whole life: {title}"
+            );
+
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+    }
+
+    /// REQ-585 TASK-204 — the two seams TASK-201 and TASK-203 could not reach
+    /// from where they lived: the `/cd` grant drop, and the rebuild's position.
+    ///
+    /// `skill_consent_matrix.rs` proves the gate's own drop **works**;
+    /// nothing proved anything *calls* it, which is the half that decides
+    /// whether a grant survives a move. The gate lives behind a private
+    /// `session_gates`, so the witness has to be in-crate.
+    mod cd_sheds_what_the_root_gave_meaning_to {
+        use super::*;
+        use crate::grants::{ConnectionId, GrantRegistry};
+        use crate::harness::permissions::{
+            AddressedPermissionDelivery, PermissionConfig, SkillConsent,
+        };
+        use crate::sessions::SessionRegistry;
+        use crate::skills::{permission_key_for, SkillSource};
+        use teton_protocol::events::PermissionRequest;
+        use teton_protocol::methods::PermissionOutcome;
+
+        /// A delivery route that answers "allow for this session" the instant a
+        /// prompt is put in front of it — the one thing these two assertions
+        /// need a client for, and nothing else.
+        struct AlwaysAllows(Arc<PendingPermissions>);
+
+        impl AddressedPermissionDelivery for AlwaysAllows {
+            fn deliver(
+                &self,
+                connection: ConnectionId,
+                _session_id: &SessionId,
+                request: PermissionRequest,
+            ) -> bool {
+                // `resolve_from`, not `resolve`: an addressed waiter treats an
+                // answer that cannot name a connection exactly as it treats the
+                // wrong one (ADR-7), so a fixture answering anonymously would
+                // be refused — which is the guard working, not a mock detail.
+                self.0.resolve_from(
+                    &request.request_id,
+                    PermissionOutcome::Selected {
+                        option_id: "allow_always".to_owned(),
+                    },
+                    connection,
+                )
+            }
+        }
+
+        /// **The inherited seam, both halves in one move.** A grant remembered
+        /// under `skill:project:<name>` names a file that the root moving
+        /// renames out from under it (LESSON-501), so `/cd` forgets it — while
+        /// `skill:user:<name>` names the same `~/.claude` file it always did and
+        /// is kept. The user half is the falsifier: a sweep that took everything
+        /// would satisfy the first assertion and re-ask a question the user has
+        /// already answered about the very same file.
+        ///
+        /// The rebuild's own position is asserted beside it: the registry a
+        /// reader sees straight after the move is the new root's, which is what
+        /// closes the cross-client window `session_root_changed` opens.
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn a_move_forgets_the_project_grants_and_re_derives_the_registry() {
+            let from = scratch_dir("cd-grants-from");
+            let to = scratch_dir("cd-grants-to");
+            std::fs::create_dir_all(to.join(".claude/skills/overthere")).unwrap();
+            std::fs::write(
+                to.join(".claude/skills/overthere/SKILL.md"),
+                "---\ndescription: only under the second root\n---\n\nBody.\n",
+            )
+            .unwrap();
+
+            let runtime = Arc::new(DaemonRuntime::minimal());
+            let events = Arc::new(EventBus::new());
+            let sessions = SessionRegistry::new();
+            let session_id = sessions
+                .create(SessionMode::Freeform, None, Some(from.clone()))
+                .expect("a freeform session")
+                .session_id;
+
+            // The session's own gate, wired with a route so a consent can be
+            // answered at all, and installed where `/cd` will look for it.
+            let pending = Arc::clone(runtime.pending());
+            let gate = Arc::new(
+                PermissionGate::new(
+                    session_id.clone(),
+                    PermissionConfig::default(),
+                    Arc::clone(&events),
+                    Arc::clone(&pending),
+                )
+                .with_addressed_delivery(Arc::new(AlwaysAllows(Arc::clone(&pending)))),
+            );
+            runtime
+                .session_gates
+                .lock()
+                .expect("session gate mutex poisoned")
+                .insert(session_id.clone(), Arc::clone(&gate));
+
+            let conn = GrantRegistry::new().next_connection_id();
+            let project = permission_key_for(SkillSource::Project, "audit");
+            let user = permission_key_for(SkillSource::User, "status");
+            assert_eq!(
+                gate.authorize_skill(
+                    &project,
+                    "audit",
+                    SkillSource::Project,
+                    vec!["./audit.sh".to_owned()],
+                    teton_protocol::events::InvokedBy::User,
+                    conn
+                )
+                .await,
+                SkillConsent::Allowed
+            );
+            assert_eq!(
+                gate.authorize_skill(
+                    &user,
+                    "status",
+                    SkillSource::User,
+                    vec!["git status".to_owned()],
+                    teton_protocol::events::InvokedBy::User,
+                    conn
+                )
+                .await,
+                SkillConsent::Allowed
+            );
+            assert!(
+                gate.remembered(&project).is_some(),
+                "the fixture remembered"
+            );
+            assert!(gate.remembered(&user).is_some(), "the fixture remembered");
+
+            runtime
+                .set_session_cwd(
+                    &SessionSetCwdParams {
+                        session_id: session_id.clone(),
+                        cwd: to.clone(),
+                    },
+                    &sessions,
+                    &events,
+                    &crate::skills::RealFs,
+                )
+                .expect("the move succeeds");
+
+            assert!(
+                gate.remembered(&project).is_none(),
+                "`skill:project:audit` named the first root's file; the move must \
+                 forget it rather than let it authorize the second root's"
+            );
+            assert!(
+                gate.remembered(&user).is_some(),
+                "`~/.claude` did not move when the session root did, so the user \
+                 grant answers the same file it always did"
+            );
+
+            // …and the registry a reader sees straight after the move is the one
+            // the new root defines. Derived inside `set_session_cwd`, ahead of
+            // the `session_root_changed` publish, so a second attached client
+            // reacting to that event cannot read the pre-move answer.
+            let registry = sessions.skills(&session_id);
+            assert!(
+                registry.dispatchable_by_user("overthere").is_some(),
+                "the move did not re-derive the project half of the registry: {:?}",
+                registry
+                    .skills()
+                    .iter()
+                    .map(|skill| skill.name.as_str())
+                    .collect::<Vec<_>>()
+            );
+
+            let _ = std::fs::remove_dir_all(&from);
+            let _ = std::fs::remove_dir_all(&to);
         }
     }
 }

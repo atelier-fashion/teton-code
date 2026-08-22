@@ -898,11 +898,32 @@ fn assert_no_turn_ran(output: &str, what: &str) {
 /// that had died.
 #[test]
 fn slash_help_lists_every_command_and_no_turn_is_attempted() {
-    let daemon = daemon_bin();
-    let daemon = TestDaemon::spawn_scripted(&daemon, TURN_REPLIES);
+    let daemon_bin = daemon_bin();
     let teton = teton_bin();
 
-    let session = daemon.run_cli_with_stdin(&teton, &[], "/frobnicate\n/help\n");
+    // An **empty** fixture HOME, handed to both processes. Without it this test
+    // reads whatever `~/.claude` the machine running it happens to have: on the
+    // dogfood machine that is seventeen ADLC skills, on CI it is none, and a
+    // developer with one malformed skill would see the diagnostic line change
+    // under a test that never mentions skills. The assertions below are about
+    // the *built-in* listing, so the registry they run against has to be a
+    // fact about the fixture rather than about the machine (LESSON-540).
+    let empty_home = SkillTree::new("nohome");
+    let daemon = TestDaemon::spawn_scripted_with_env(
+        &daemon_bin,
+        TURN_REPLIES,
+        &[("HOME", empty_home.path().to_str().unwrap())],
+    );
+
+    let session = daemon
+        .run_cli_from(
+            &teton,
+            &[],
+            "/frobnicate\n/help\n",
+            None,
+            &[("HOME", empty_home.path())],
+        )
+        .0;
 
     // AC-6: one actionable line naming `/help`, and no RPC behind it. The
     // command is quoted as it was typed rather than rebuilt from the parsed
@@ -1155,6 +1176,15 @@ fn slash_verbose_toggles_the_route_notice_around_real_turns() {
         !quiet.contains("route [") && !quiet.contains("turn ended"),
         "a default session must start quiet; segment:\n{quiet}"
     );
+    // REQ-586 BR-7/AC-10, the negative half: a short turn clamps nothing, so
+    // there is no pressure line to draw. The positive half — a turn that really
+    // does drop blocks draws exactly one — is the daemon's emission to prove
+    // and rides its own fixture; what this pins is that the never-gated line is
+    // not chatter on every turn.
+    assert!(
+        !quiet.contains("context: "),
+        "a turn that clamped nothing must say nothing about context; segment:\n{quiet}"
+    );
 
     // Turn two, after the toggle: the routing notice and the turn-end line. The
     // notice's key is the **category and tier** the turn resolved through
@@ -1168,12 +1198,32 @@ fn slash_verbose_toggles_the_route_notice_around_real_turns() {
         loud.contains("turn ended"),
         "`/verbose` did not surface the turn-end line; segment:\n{loud}"
     );
+    // REQ-586 BR-9/AC-4: the route notice carries the budget that turn ran
+    // under and what bound it. The local tier is the route here, so the bound
+    // is the local engine's — the one case where a declared window would not
+    // change the answer.
+    let route = loud
+        .lines()
+        .find(|line| line.contains("route ["))
+        .unwrap_or_else(|| panic!("the verbose segment has no route line:\n{loud}"));
+    assert!(
+        route.contains(" · budget ") && route.contains(" words / "),
+        "the budget rides the route line, in both currencies; line: {route:?}"
+    );
+    assert!(
+        route.ends_with("(bound: local engine)"),
+        "a turn on the local tier names the local engine as its bound; line: {route:?}"
+    );
 
     // Turn three, after the second toggle: quiet again — the toggle flips back,
     // it does not latch.
     assert!(
         !quiet_again.contains("route [") && !quiet_again.contains("turn ended"),
         "a second `/verbose` must hide the notices again; segment:\n{quiet_again}"
+    );
+    assert!(
+        !quiet_again.contains("context: "),
+        "still nothing to clamp, so still nothing to say; segment:\n{quiet_again}"
     );
 
     // And the counts, which is what makes the three segments an exclusive
@@ -1929,6 +1979,336 @@ fn provider_list_renders_the_declared_model() {
         listed.contains("deepseek-v4-pro"),
         "the listing must show the model the provider calls, not only its id; \
          output:\n{listed}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// REQ-586: the context window on the provider surfaces, and the budget on a turn
+// ---------------------------------------------------------------------------
+
+/// A remote provider that declares a 128k window, and one that declares a
+/// window with a cap sitting at it — the two shapes the listing and doctor say
+/// different things about. Written the way a user writes them, as a
+/// `[providers.capabilities]` sub-table.
+fn windowed_provider_config() -> String {
+    "[[providers]]\nid = \"windowed\"\nkind = \"openai-compatible\"\n\
+     endpoint = \"https://api.example.invalid/v1/chat/completions\"\n\
+     model = \"windowed-model\"\n[providers.capabilities]\nmax_context = 128000\n\n\
+     [[providers]]\nid = \"capped\"\nkind = \"anthropic\"\n\
+     endpoint = \"https://api.example.invalid/v1/messages\"\n\
+     model = \"capped-model\"\n[providers.capabilities]\n\
+     max_context = 200000\ncontext_budget_cap = 200000\n\n"
+        .to_owned()
+}
+
+/// **AC-4 through the shipped binary, on both surfaces.**
+///
+/// Every provider row names its context window, and the three answers are three
+/// different sentences: a declared window, an undeclared one that says the
+/// budget is defaulted and which key fixes it (BR-3 — stated, never silent),
+/// and the local tier, whose budget is the local engine's whatever any window
+/// says and which therefore has nothing to set.
+///
+/// Asserted on `/provider list` **and** `teton provider list` because the claim
+/// is about the shipped renderer both reach (REQ-582's one-renderer rule); the
+/// byte-for-byte half of that is
+/// `every_read_row_prints_exactly_what_its_shell_twin_prints`, which stays green
+/// for the same reason.
+///
+/// The fourth state — `window: not reported`, an absent field from a daemon
+/// older than it — has no fixture here: the shipped daemon always populates the
+/// field, so it is pinned as a `render_config` unit test instead.
+#[test]
+fn every_provider_row_names_its_window_on_both_surfaces() {
+    let daemon_path = daemon_bin();
+    // Scripted, because the session half is a **pipe**: a daemon with no engine
+    // leaves the first-run proposal outstanding, and the first piped line would
+    // be eaten answering it rather than reaching the entry loop.
+    let daemon = TestDaemon::spawn_scripted_with_config(
+        &daemon_path,
+        TURN_REPLIES,
+        &windowed_provider_config(),
+    );
+    let teton = teton_bin();
+
+    let shell = daemon.run_cli(&teton, &["provider", "list"]);
+    let session = daemon.run_cli_with_stdin(&teton, &[], "/provider list\n");
+
+    for (what, listing) in [
+        ("teton provider list", &shell),
+        ("/provider list", &session),
+    ] {
+        let row = |id: &str| -> &str {
+            listing
+                .lines()
+                .find(|line| line.contains(&format!("  {id} [")))
+                .unwrap_or_else(|| panic!("{what} printed no row for `{id}`:\n{listing}"))
+        };
+        assert!(
+            row("windowed").ends_with("window: 128k"),
+            "{what}: a declared window must be shown:\n{listing}"
+        );
+        assert!(
+            row("deepseek").ends_with(
+                "window: unknown — context budget defaulted (set capabilities.max_context)"
+            ),
+            "{what}: BR-3 — an unknown window is stated, with the key that fixes it:\n{listing}"
+        );
+        assert!(
+            row("local").ends_with("(local engine)") && !row("local").contains("unknown"),
+            "{what}: the local tier's budget is its own, so it has no unknown window to \
+             report:\n{listing}"
+        );
+    }
+}
+
+/// **AC-4's advisory half, end to end, and BR-5's inert cap beside it.**
+///
+/// Doctor is where a user goes with "why is this provider only being sent 4k?",
+/// so the two things the listing column can only imply are said outright: an
+/// undeclared window means the budget is defaulted and here is the key, and a
+/// cap that sits at or above its window never binds. Neither is a fault, and
+/// neither may change doctor's exit status — the REQ-578 advisory's posture,
+/// one class over.
+#[test]
+fn doctor_advises_on_an_undeclared_window_and_an_inert_cap_and_stays_green() {
+    let daemon_path = daemon_bin();
+    let daemon = TestDaemon::spawn_with_config(&daemon_path, &windowed_provider_config());
+    let teton = teton_bin();
+
+    let (output, status) = daemon.run_cli_capture(&teton, &["doctor"], "");
+
+    assert!(
+        status.success(),
+        "an advisory must not change doctor's exit status; output:\n{output}\n\
+         daemon log:\n{}",
+        daemon.log()
+    );
+    let advisories: Vec<&str> = output
+        .lines()
+        .filter(|line| line.contains("context budget") || line.contains("context_budget_cap"))
+        .collect();
+
+    assert!(
+        advisories
+            .iter()
+            .any(|line| line.contains("`deepseek`") && line.contains("capabilities.max_context")),
+        "a provider with no declared window must be named, with the remedy; \
+         advisories:\n{advisories:#?}\nfull output:\n{output}"
+    );
+    assert!(
+        advisories
+            .iter()
+            .any(|line| line.contains("`capped`") && line.contains("never binds")),
+        "a cap at the window is inert and doctor says so; advisories:\n{advisories:#?}\n\
+         full output:\n{output}"
+    );
+    assert!(
+        !advisories.iter().any(|line| line.contains("`windowed`")),
+        "a provider that declared its window has nothing to act on; \
+         advisories:\n{advisories:#?}"
+    );
+    assert!(
+        !advisories.iter().any(|line| line.contains("`local`")),
+        "the local tier has no `max_context` worth setting — advising it would send a user to \
+         edit a key that changes nothing; advisories:\n{advisories:#?}"
+    );
+}
+
+/// **AC-5, the CLI half: `--max-context` and `--context-budget-cap` are flags,
+/// not hand edits.**
+///
+/// Both flags in one registration, because the cap has been tested at every
+/// seam separately — parse to payload, payload to file, file to bound — and
+/// nowhere end to end. A cap that parsed and never reached the record would
+/// leave all three legs green.
+///
+/// Registering a **local** provider because that is the one kind this suite can
+/// register end to end: every remote kind reads a credential, and the CLI's
+/// keychain is the machine's own (the harness clears `TETON_PROVIDER_KEY` for
+/// exactly that reason), so a test that completed a remote registration would
+/// write a fake key into the developer's login keychain.
+///
+/// The evidence is the **daemon's config file**, not the CLI's echo: what BR-3
+/// claims is that a window typed on the command line is recorded, and a client
+/// sentence about it would be this process agreeing with itself. The listing
+/// then shows the local row as `(local engine)`, which is the same claim from
+/// the other side — a declared window does not make the local tier's budget
+/// anything other than the local engine's.
+#[test]
+fn provider_add_records_a_declared_window_in_the_daemons_config() {
+    let daemon_path = daemon_bin();
+    let daemon = TestDaemon::spawn(&daemon_path);
+    let teton = teton_bin();
+
+    let (output, status) = daemon.run_cli_capture(
+        &teton,
+        &[
+            "provider",
+            "add",
+            "on-device",
+            "--kind",
+            "local",
+            "--max-context",
+            "128000",
+            "--context-budget-cap",
+            "40000",
+        ],
+        "",
+    );
+    assert!(
+        status.success(),
+        "a local provider needs no credential, so the flag alone must register; output:\n{output}"
+    );
+
+    let written = std::fs::read_to_string(daemon.root.join("config.toml"))
+        .expect("the fixture's config is where the daemon writes");
+    assert!(
+        written.contains("max_context = 128000"),
+        "the window typed on the command line must reach the stored record; config:\n{written}"
+    );
+    assert!(
+        written.contains("context_budget_cap = 40000"),
+        "the cap typed on the command line must reach the stored record too — it is the \
+         cost knob, and a flag that parses without being written is a knob that does \
+         nothing; config:\n{written}"
+    );
+
+    let listed = daemon.run_cli(&teton, &["provider", "list"]);
+    let row = listed
+        .lines()
+        .find(|line| line.contains("  on-device ["))
+        .unwrap_or_else(|| panic!("the new provider is not listed:\n{listed}"));
+    assert!(
+        row.ends_with("(local engine)"),
+        "a local row's budget is the local engine's whatever it declares; row: {row:?}"
+    );
+}
+
+/// **AC-8 at the CLI: a cap below the window is what `/verbose` names as the
+/// bound.**
+///
+/// The turn is routed to a provider nothing is listening for, and that is fine:
+/// the route — and the budget stamped on it — is decided before the call, so
+/// the line under test is printed whether or not the provider answers. What
+/// matters is that the bound the user reads is `user cap` and not `window`,
+/// because those two are the difference between "this is as much as the model
+/// takes" and "this is as much as you asked me to send it".
+///
+/// `[privacy] redact` is off in this fixture, so the redact clamp cannot be
+/// what bound the budget — which is the other half of the precedence claim.
+#[test]
+fn a_cap_below_the_window_is_the_bound_a_verbose_turn_names() {
+    let daemon_path = daemon_bin();
+    let daemon = TestDaemon::spawn_scripted_with_config(
+        &daemon_path,
+        TURN_REPLIES,
+        &format!(
+            "[[providers]]\nid = \"capped\"\nkind = \"openai-compatible\"\n\
+             endpoint = \"http://127.0.0.1:{}/v1/chat/completions\"\n\
+             model = \"capped-model\"\n[providers.capabilities]\n\
+             max_context = 200000\ncontext_budget_cap = 40000\n\n",
+            closed_port()
+        ),
+    );
+    let teton = teton_bin();
+
+    let bound = daemon.run_cli(&teton, &["policy", "set-tier", "build", "capped"]);
+    assert!(
+        bound.contains("capped"),
+        "the fixture's tier binding did not move, so the turn below would route \
+         elsewhere; output:\n{bound}"
+    );
+
+    let session = daemon.run_cli_with_stdin(&teton, &[], "/verbose\nexplain the first thing\n");
+
+    let route = session
+        .lines()
+        .find(|line| line.contains("route [") && line.contains("capped"))
+        .unwrap_or_else(|| {
+            panic!(
+                "the turn never routed to the capped provider; session:\n{session}\n\
+                 daemon log:\n{}",
+                daemon.log()
+            )
+        });
+    assert!(
+        route.contains("(bound: user cap)"),
+        "AC-8: a cap below the window is what bound the budget, and the line must say so \
+         rather than naming the window; line: {route:?}"
+    );
+    assert!(
+        route.contains(" · budget ") && route.contains(" words / "),
+        "BR-9: the budget is printed in both currencies — the byte guard is what binds on a \
+         remote route, so the word figure alone would overstate what fits; line: {route:?}"
+    );
+}
+
+/// **TASK-194 (OQ-6 as amended) at the CLI: a *local* row's declared window is
+/// never stated as a cost, however large.**
+///
+/// The notice this REQ adds names a per-call budget and a 25-call worst case,
+/// and both are facts about a **remote** route. A `kind = "local"` entry runs
+/// the engine on this machine under the local pair whatever `max_context` says
+/// — which is why `provider list` renders it `(local engine)` and why doctor
+/// does not advise it to declare a window. Printing "every call may carry
+/// 665,984 words … at worst" for it would be the exact class of untruth this
+/// task is closing, and it would name a spend where nothing is spent.
+///
+/// This suite can only complete a **local** registration end to end — every
+/// remote kind reads a credential, and the CLI's keychain is the machine's own
+/// (the harness clears `TETON_PROVIDER_KEY` for exactly that reason), so a test
+/// that registered a remote provider would write a fake key into the
+/// developer's login keychain. So the negative is what is drivable here, and it
+/// is the leg worth having: the positive path is asserted against a real daemon
+/// over the real socket in `tetond`'s `provider_setup_flow`
+/// (`a_recorded_big_window_is_stated_once_and_in_the_same_words_on_both_surfaces`,
+/// which also pins the two surfaces byte-identical) and the rendering in
+/// `main.rs`'s `a_recorded_big_window_prints_the_daemons_notice_once`.
+#[test]
+fn provider_add_states_no_per_call_cost_for_a_local_rows_declared_window() {
+    let daemon_path = daemon_bin();
+    let daemon = TestDaemon::spawn(&daemon_path);
+    let teton = teton_bin();
+
+    let (output, status) = daemon.run_cli_capture(
+        &teton,
+        &[
+            "provider",
+            "add",
+            "wide",
+            "--kind",
+            "local",
+            "--max-context",
+            "1000000",
+        ],
+        "",
+    );
+    assert!(
+        status.success(),
+        "a local provider needs no credential; output:\n{output}"
+    );
+    assert!(
+        output.contains("provider `wide` registered"),
+        "the registration itself must still be reported:\n{output}"
+    );
+    assert!(
+        !output.contains("context window is recorded"),
+        "a local row spends nothing per call, so nothing may be said about what it \
+         spends:\n{output}"
+    );
+
+    // The window is still *recorded* — the notice's absence is about what is
+    // said, not about what is stored (BR-3 is unchanged).
+    let written = std::fs::read_to_string(daemon.root.join("config.toml"))
+        .expect("the fixture's config is where the daemon writes");
+    assert!(
+        written.contains("max_context = 1000000"),
+        "the window typed on the command line still reaches the record:\n{written}"
+    );
+    assert!(
+        !written.contains("context_budget_cap"),
+        "and nothing was capped: the declaration is still the consent:\n{written}"
     );
 }
 
@@ -4525,10 +4905,22 @@ fn on_a_pipe_every_write_row_names_its_shell_twin_and_changes_nothing() {
 #[test]
 fn slash_help_lists_every_mirrored_row_grouped_with_both_footers() {
     let daemon_path = daemon_bin();
-    let daemon = TestDaemon::spawn_scripted(&daemon_path, TURN_REPLIES);
     let teton = teton_bin();
 
-    let session = daemon.run_cli_with_stdin(&teton, &[], "/help\n");
+    // Empty fixture HOME, for the reason the unknown-command test above
+    // carries: the family grouping asserted here is a property of `COMMANDS`,
+    // and it must not be read through whatever skills the running machine
+    // happens to have under `~/.claude`.
+    let empty_home = SkillTree::new("nohome2");
+    let daemon = TestDaemon::spawn_scripted_with_env(
+        &daemon_path,
+        TURN_REPLIES,
+        &[("HOME", empty_home.path().to_str().unwrap())],
+    );
+
+    let session = daemon
+        .run_cli_from(&teton, &[], "/help\n", None, &[("HOME", empty_home.path())])
+        .0;
     // The listing on its own: the first row line shares its row with the entry
     // prompt the session drew before reading `/help`, and every check below is
     // about what the row line says rather than about that frame.
@@ -4605,9 +4997,16 @@ fn slash_help_lists_every_mirrored_row_grouped_with_both_footers() {
         "the listing has no blank line, so nothing is grouped; \
          listing:\n{listing:#?}"
     );
+    //
+    // **Bounded to the built-in half** (REQ-585 ADR-12). The skills section
+    // hangs below the rows and its rows open with `/` too, but a skill is not a
+    // family: `/alpha` groups with nothing, and a *shadowed* skill deliberately
+    // repeats a built-in row's name — which this walk would read as a family
+    // listed twice and fail on. BR-1's grouping is a claim about the **table**,
+    // so the walk stops where the table's rows do.
     let mut seen: Vec<String> = Vec::new();
     let mut current: Option<String> = None;
-    for line in &listing {
+    for line in listing.iter().take_while(|line| **line != SKILLS_HEADER) {
         let Some(name) = line.strip_prefix('/') else {
             current = None;
             continue;
@@ -5359,5 +5758,1418 @@ fn slash_cd_to_home_on_a_pipe_is_byte_identical_to_a_move_to_a_project() {
     assert_eq!(
         home_stderr, project_stderr,
         "stderr differs between the two moves"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// REQ-585 — user-defined slash commands discovered from SKILL.md
+// ---------------------------------------------------------------------------
+//
+// Everything below drives the **shipped pair** — the `teton` binary and the
+// `teton-code` daemon — over a fixture `HOME`, because that is the only place
+// the four globs of BR-1 can be observed at all. A test written against
+// `run_cli`/`run_cli_with_stdin` inherits the *runner's* environment: on a
+// developer's machine that is a real `~/.claude` with a real skill shelf, and on
+// CI it is a home with nothing in it. Neither is the fixture, and a suite that
+// leaned on either would be green for a reason unrelated to the code under test
+// (LESSON-481's corollary). So every test here hands the same made-up `HOME` to
+// **both** processes — `TestDaemon::spawn_scripted_with_env` for the daemon that
+// discovers, `run_cli_from`'s env for the client that renders — exactly as
+// `slash_cd_to_home_on_a_pipe_is_byte_identical_to_a_move_to_a_project` does.
+//
+// The fixtures are ordering-independent by construction: names are chosen so
+// the registry's own sort (`SkillRegistry::assemble`, by name) is the order
+// asserted, and nothing here reads a `read_dir` result. Two REQ-583 tests were
+// green on APFS and red on ext4 for exactly that (LESSON-540).
+
+/// The one line `/help`'s skills section opens with (`slash::SKILLS_HEADER`).
+///
+/// Stated here rather than imported because this suite runs the **shipped
+/// binary** and knows nothing of the crate's internals: that the section really
+/// carries these bytes is a claim under test, not an assumption (the same reason
+/// [`READ_ROWS`] spells its two vocabularies out).
+const SKILLS_HEADER: &str = "skills — arguments are passed through as typed:";
+
+/// The head of `/help`'s argument footer — where the built-in half ends on a
+/// session that discovered no skills at all.
+const ARGUMENT_FOOTER_HEAD: &str = "Command arguments are split on whitespace";
+
+/// The tail every rejected `/` line carries (`slash::HELP_HINT`).
+const HELP_HINT: &str = "type /help for the commands this session knows.";
+
+/// A throwaway directory tree under `/tmp`, removed on drop.
+///
+/// `/tmp` and a short name for the reason [`TestDaemon`]'s own root is there: a
+/// fixture path is joined onto by the daemon's socket-adjacent state, and the
+/// deep per-user temp dir would blow past `SUN_LEN`. The pid and a counter keep
+/// two trees in one run apart.
+struct SkillTree {
+    root: PathBuf,
+}
+
+impl SkillTree {
+    fn new(tag: &str) -> Self {
+        static SEQ: AtomicUsize = AtomicUsize::new(0);
+        let seq = SEQ.fetch_add(1, Ordering::SeqCst);
+        let root = PathBuf::from("/tmp").join(format!(
+            "tcsk{tag}{:x}-{:x}",
+            std::process::id() & 0xffff,
+            seq
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        Self { root }
+    }
+
+    fn path(&self) -> &Path {
+        &self.root
+    }
+
+    /// Write `contents` at `rel`, creating the parents. Returns the file.
+    fn write(&self, rel: &str, contents: &str) -> PathBuf {
+        let path = self.root.join(rel);
+        std::fs::create_dir_all(path.parent().expect("a file has a parent")).unwrap();
+        std::fs::write(&path, contents).unwrap();
+        path
+    }
+}
+
+impl Drop for SkillTree {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.root);
+    }
+}
+
+/// A well-formed skill file: the three keys the daemon reads, then `body`
+/// **verbatim**.
+///
+/// The closing delimiter is followed immediately by the body, so
+/// `skill.body.len()` is `body.len()` — which is what BR-12's echo line renders
+/// and what the size assertions below compute from.
+fn skill_file(description: &str, hint: Option<&str>, body: &str) -> String {
+    let mut out = format!("---\ndescription: {description}\n");
+    if let Some(hint) = hint {
+        out.push_str(&format!("argument-hint: {hint}\n"));
+    }
+    out.push_str("---\n");
+    out.push_str(body);
+    out
+}
+
+/// [`skill_file`] with extra frontmatter lines between the delimiters — the
+/// two REQ-587 BR-3 flags, and any future key a fixture needs to declare.
+///
+/// A builder rather than four literal files: the flags are `key: value` lines
+/// under REQ-585's flat parser, and a fixture that hand-wrote the header would
+/// drift from the one `skill_file` writes for every other test here.
+fn skill_file_with(description: &str, frontmatter: &[&str], body: &str) -> String {
+    let mut out = format!("---\ndescription: {description}\n");
+    for line in frontmatter {
+        out.push_str(line);
+        out.push('\n');
+    }
+    out.push_str("---\n");
+    out.push_str(body);
+    out
+}
+
+/// A project fixture under `root`: a `Cargo.toml` (so the root classifies as a
+/// project) and nothing else.
+fn project_at(root: &Path, name: &str) -> PathBuf {
+    let project = root.join(name);
+    std::fs::create_dir_all(&project).unwrap();
+    std::fs::write(
+        project.join("Cargo.toml"),
+        format!("[package]\nname = \"{name}\"\n"),
+    )
+    .unwrap();
+    project
+}
+
+/// The rendered lines of `/help`'s skills section — the rows between the header
+/// and the diagnostic line that closes it.
+fn skill_rows(listing: &[String], what: &str) -> Vec<String> {
+    let at = listing
+        .iter()
+        .position(|line| line == SKILLS_HEADER)
+        .unwrap_or_else(|| panic!("{what} printed no skills section; listing:\n{listing:#?}"));
+    listing[at + 1..]
+        .iter()
+        .take_while(|line| line.starts_with('/'))
+        .cloned()
+        .collect()
+}
+
+/// The line closing the skills section: what registered, from where, and what
+/// was found and dropped (BR-3).
+fn skills_diagnostic(listing: &[String], what: &str) -> String {
+    let rows = skill_rows(listing, what).len();
+    let at = listing
+        .iter()
+        .position(|line| line == SKILLS_HEADER)
+        .expect("`skill_rows` already found the header");
+    listing
+        .get(at + 1 + rows)
+        .unwrap_or_else(|| panic!("{what} printed no diagnostic line; listing:\n{listing:#?}"))
+        .clone()
+}
+
+/// `/help`'s **built-in** half: every line above the skills section (or above
+/// the footers, when there is no section), trailing blanks trimmed.
+///
+/// The comparison AC-1's "byte-identical to the pre-REQ golden" is made with:
+/// an empty registry renders no section at all, so a session with no skills
+/// prints the pre-REQ listing by construction — and the populated session's
+/// built-in half has to equal it line for line.
+fn builtin_half(listing: &[String]) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    for line in listing {
+        if line == SKILLS_HEADER || line.starts_with(ARGUMENT_FOOTER_HEAD) {
+            break;
+        }
+        out.push(line.clone());
+    }
+    while out.last().is_some_and(|line| line.trim().is_empty()) {
+        out.pop();
+    }
+    out
+}
+
+/// One piped session's `/help` listing, as owned lines.
+fn help_listing(session: &str, what: &str) -> Vec<String> {
+    typed_output(session_body(session, what), what)
+        .into_iter()
+        .map(str::to_owned)
+        .collect()
+}
+
+/// The transcript with its root-naming line replaced by a sentinel, so two runs
+/// under two daemons (two fixture roots) can be compared for everything else.
+fn mask_root_reported(transcript: &str) -> String {
+    transcript
+        .lines()
+        .map(|line| match line.find(ROOT_LINE) {
+            Some(at) => format!("{}{ROOT_LINE}<root>", &line[..at]),
+            None => line.to_owned(),
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+/// **AC-1: `/help` lists what the four globs found, with sources, hints and the
+/// diagnostic — and the built-in half does not move.**
+///
+/// Two sessions on two daemons, differing only in what their `HOME` and their
+/// project root hold. The populated one finds `alpha` (a `skills/` directory)
+/// and `beta` (a `commands/` file) under the fixture `HOME`, and `gamma` under
+/// the session root's `.claude/skills`; the bare one finds nothing anywhere.
+///
+/// Three claims, and the third is the one that needs the pair:
+///
+/// * the rows carry name, hint, description and source, **in name order** — the
+///   registry sorts, so `read_dir`'s order cannot reach the surface (LESSON-540);
+/// * the diagnostic reports `3 skills (user 2, project 1); 0 skipped`;
+/// * the **built-in** half of the listing is byte-identical between the two. An
+///   empty registry renders no section at all (ADR-12), so the bare session
+///   prints the pre-REQ golden by construction, and the comparison is against a
+///   listing produced by this same binary rather than against a copy of one.
+///
+/// The bare run doubles as the fixture's own isolation check: if `HOME` had
+/// leaked from the runner, a developer's real skill shelf would print a section
+/// here and this test would say so (LESSON-481's corollary).
+#[test]
+fn slash_help_lists_the_discovered_skills_with_their_sources_and_the_diagnostic() {
+    let daemon_bin = daemon_bin();
+    let teton = teton_bin();
+
+    let populated = SkillTree::new("a");
+    populated.write(
+        ".claude/skills/alpha/SKILL.md",
+        &skill_file("the alpha skill", Some("[target]"), "Alpha body.\n"),
+    );
+    populated.write(
+        ".claude/commands/beta.md",
+        &skill_file("the beta skill", None, "Beta body.\n"),
+    );
+    let bare = SkillTree::new("b");
+
+    let listing_from = |home: &SkillTree, with_project: bool| -> Vec<String> {
+        let daemon = TestDaemon::spawn_scripted_with_env(
+            &daemon_bin,
+            TURN_REPLIES,
+            &[("HOME", home.path().to_str().unwrap())],
+        );
+        let project = project_at(&daemon.root, "proj");
+        if with_project {
+            std::fs::create_dir_all(project.join(".claude/skills/gamma")).unwrap();
+            std::fs::write(
+                project.join(".claude/skills/gamma/SKILL.md"),
+                skill_file("the gamma skill", Some("<REQ-xxx>"), "Gamma body.\n"),
+            )
+            .unwrap();
+        }
+        let (stdout, stderr, status) = daemon.run_cli_from(
+            &teton,
+            &["--cwd", project.to_str().unwrap()],
+            "/help\n",
+            None,
+            &[("HOME", home.path())],
+        );
+        assert!(status.success(), "stdout:\n{stdout}\nstderr:\n{stderr}");
+        assert_no_turn_ran(&stdout, "`/help`");
+        help_listing(&stdout, "`/help`")
+    };
+
+    let full = listing_from(&populated, true);
+    let empty = listing_from(&bare, false);
+
+    // The isolation check, first: a fixture HOME with no `.claude` and a project
+    // with none either registers nothing, and an empty registry renders no
+    // section. A section here would mean the runner's own home leaked in.
+    assert!(
+        !empty.iter().any(|line| line == SKILLS_HEADER),
+        "a session with no skills must render no skills section — the fixture \
+         HOME did not take, so every assertion below would be about the \
+         developer's own `~/.claude`; listing:\n{empty:#?}"
+    );
+
+    // The rows: every field, in the registry's own order.
+    assert_eq!(
+        skill_rows(&full, "`/help`"),
+        vec![
+            "/alpha [target] — the alpha skill (user)".to_owned(),
+            "/beta — the beta skill (user)".to_owned(),
+            "/gamma <REQ-xxx> — the gamma skill (project)".to_owned(),
+        ],
+        "the skills section must list every discovered command with its hint, \
+         its description and its source, sorted by name; listing:\n{full:#?}"
+    );
+    assert_eq!(
+        skills_diagnostic(&full, "`/help`"),
+        "3 skills (user 2, project 1); 0 skipped",
+        "listing:\n{full:#?}"
+    );
+
+    // The built-in half did not move.
+    let builtin = builtin_half(&full);
+    assert!(
+        builtin.len() > 10,
+        "the built-in half is too short to be the command table; \
+         listing:\n{full:#?}"
+    );
+    assert_eq!(
+        builtin,
+        builtin_half(&empty),
+        "the skills section changed the built-in listing — REQ-585 adds one \
+         section below the rows and nothing else (ADR-12)"
+    );
+    // Both footers still close the page, below the new section.
+    for footer in [ARGUMENT_FOOTER_HEAD, "//text sends text as a prompt"] {
+        assert!(
+            full.iter().any(|line| line.starts_with(footer)),
+            "`{footer}` vanished from /help; listing:\n{full:#?}"
+        );
+    }
+}
+
+/// **REQ-587 AC-12: `/help` marks the rows the user may not type, and typing
+/// one names the flag that made it so.**
+///
+/// End to end, through a real daemon that reads the two frontmatter flags: the
+/// mark is only honest if the flags survive discovery, the wire and the render,
+/// and the unit tests upstream of this one can each be green while any of those
+/// three drops a key ([`both_invocation_flags_reach_the_client`] is the
+/// daemon-side half of the same claim).
+///
+/// Four rows, because BR-3's states are only distinguishable side by side:
+///
+/// * `alpha` declares neither flag — the ordinary row, unmarked;
+/// * `beta` declares `disable-model-invocation: true` — hidden from the model
+///   and **unmarked here**, because that flag says nothing about the user;
+/// * `delta` declares `user-invocable: false` — model-only, marked;
+/// * `mute` declares both — listed, invocable by nobody, and this is the only
+///   surface in the product that renders the combination.
+#[test]
+fn slash_help_marks_a_model_only_skill_and_typing_it_names_the_flag() {
+    let daemon_bin = daemon_bin();
+    let teton = teton_bin();
+
+    let home = SkillTree::new("m");
+    home.write(
+        ".claude/skills/alpha/SKILL.md",
+        &skill_file("the alpha skill", Some("[target]"), "Alpha body.\n"),
+    );
+    home.write(
+        ".claude/commands/beta.md",
+        &skill_file_with(
+            "the beta skill",
+            &["disable-model-invocation: true"],
+            "Beta body.\n",
+        ),
+    );
+    home.write(
+        ".claude/commands/delta.md",
+        &skill_file_with(
+            "the delta skill",
+            &["user-invocable: false"],
+            "Delta body.\n",
+        ),
+    );
+    home.write(
+        ".claude/commands/mute.md",
+        &skill_file_with(
+            "the mute skill",
+            &["user-invocable: false", "disable-model-invocation: true"],
+            "Mute body.\n",
+        ),
+    );
+
+    let daemon = TestDaemon::spawn_scripted_with_env(
+        &daemon_bin,
+        TURN_REPLIES,
+        &[("HOME", home.path().to_str().unwrap())],
+    );
+    let project = project_at(&daemon.root, "proj");
+    let (stdout, stderr, status) = daemon.run_cli_from(
+        &teton,
+        &["--cwd", project.to_str().unwrap()],
+        "/help\n/delta\n/mute\n/beta\n",
+        None,
+        &[("HOME", home.path())],
+    );
+    assert!(status.success(), "stdout:\n{stdout}\nstderr:\n{stderr}");
+
+    let listing = help_listing(&stdout, "`/help`");
+    assert_eq!(
+        skill_rows(&listing, "`/help`"),
+        vec![
+            "/alpha [target] — the alpha skill (user)".to_owned(),
+            "/beta — the beta skill (user)".to_owned(),
+            "/delta — the delta skill (user, model-only)".to_owned(),
+            "/mute — the mute skill (user, invocable by nobody)".to_owned(),
+        ],
+        "a row the user may not type must say which kind of row it is, and a \
+         row only the *model* may not reach must not be marked at all; \
+         listing:\n{listing:#?}"
+    );
+    // Registered and counted, never skipped: BR-3's flags are a named state of
+    // a file discovery accepted, not a reason to drop it.
+    assert_eq!(
+        skills_diagnostic(&listing, "`/help`"),
+        "4 skills (user 4, project 0); 0 skipped",
+        "listing:\n{listing:#?}"
+    );
+
+    // Typed: the refusal names the line of the user's own file, because the
+    // name is spelled correctly and listed in `/help` four lines above.
+    assert!(
+        stdout.contains(&format!(
+            "`/delta` is a skill whose frontmatter says `user-invocable: false`, so only the \
+             model may invoke it — {HELP_HINT}"
+        )),
+        "output:\n{stdout}"
+    );
+    assert!(
+        stdout.contains(&format!(
+            "`/mute` is a skill whose frontmatter says `user-invocable: false`, so nobody may \
+             invoke it — its frontmatter also says `disable-model-invocation: true` — {HELP_HINT}"
+        )),
+        "the two-flag row must not be told that the model may run it; output:\n{stdout}"
+    );
+    assert!(
+        !stdout.contains("unknown command: `/delta`"),
+        "a listed name answered as if the session had never heard of it; \
+         output:\n{stdout}"
+    );
+    // …and `disable-model-invocation` costs the user nothing: `/beta` still
+    // dispatches, which is what keeps the two flags from being read as one.
+    assert!(
+        stdout.contains("/beta → skill beta (user,"),
+        "a skill hidden from the model must still dispatch for the user; \
+         output:\n{stdout}"
+    );
+}
+
+/// **AC-2: a skill may not take a name the table has claimed.**
+///
+/// Four fixture skills named for four different *kinds* of claim — a row
+/// (`cost`), an alias (`exit`, which is `/quit`), a family word (`provider`,
+/// which no row spells but four rows begin with) and REQ-582's `teton` line —
+/// are each listed as shadowed and none of them dispatches.
+///
+/// The "behaves byte-identically to today" half is a **paired run** rather than
+/// a phrase search: the same four lines are typed into a session whose `HOME`
+/// holds those skills and into one whose `HOME` holds nothing, and the two
+/// transcripts are compared whole (session id and root line masked, since the
+/// two daemons have their own of each). A shadowed skill that leaked one byte
+/// into `/cost`, `/provider list`, `teton provider list` or `/exit` fails here.
+///
+/// `/exit` is last because it is `/quit`: the session ends on it, which is
+/// itself the assertion that the alias still reaches the row.
+#[test]
+fn a_skill_may_not_take_a_reserved_name_and_the_built_in_still_runs() {
+    let daemon_bin = daemon_bin();
+    let teton = teton_bin();
+
+    let claimed = SkillTree::new("c");
+    for name in ["cost", "exit", "provider", "teton"] {
+        claimed.write(
+            &format!(".claude/skills/{name}/SKILL.md"),
+            &skill_file(
+                &format!("the {name} skill"),
+                None,
+                &format!("Body of {name}.\n"),
+            ),
+        );
+    }
+    let bare = SkillTree::new("d");
+
+    // The four surfaces AC-2 names, typed into a session under each HOME.
+    const RESERVED_LINES: &str = "/cost\n/provider list\nteton provider list\n/exit\n";
+
+    let run = |home: &SkillTree, stdin: &str| -> String {
+        let daemon = TestDaemon::spawn_scripted_with_env(
+            &daemon_bin,
+            TURN_REPLIES,
+            &[("HOME", home.path().to_str().unwrap())],
+        );
+        let project = project_at(&daemon.root, "proj");
+        let (stdout, stderr, status) = daemon.run_cli_from(
+            &teton,
+            &["--cwd", project.to_str().unwrap()],
+            stdin,
+            None,
+            &[("HOME", home.path())],
+        );
+        assert!(status.success(), "stdout:\n{stdout}\nstderr:\n{stderr}");
+        stdout
+    };
+
+    // Leg 1 — `/help` marks each of the four, and says why.
+    let helped = run(&claimed, "/help\n");
+    let listing = help_listing(&helped, "`/help`");
+    assert_eq!(
+        skill_rows(&listing, "`/help`"),
+        vec![
+            "/cost — the cost skill (user, shadowed by the built-in `/cost`)".to_owned(),
+            "/exit — the exit skill (user, shadowed by the built-in `/quit`)".to_owned(),
+            "/provider — the provider skill (user, shadowed by the `/provider` commands)"
+                .to_owned(),
+            "/teton — the teton skill (user, shadowed by the `teton` command line)".to_owned(),
+        ],
+        "each reserved name must be listed and marked with what owns it; \
+         listing:\n{listing:#?}"
+    );
+    assert_eq!(
+        skills_diagnostic(&listing, "`/help`"),
+        "4 skills (user 4, project 0); 0 skipped",
+        "a shadowed skill is registered and listed, never skipped; \
+         listing:\n{listing:#?}"
+    );
+    assert_no_turn_ran(&helped, "`/help` over four shadowed skills");
+
+    // Leg 2 — the four lines, with and without the shadowing files present.
+    let with = run(&claimed, RESERVED_LINES);
+    let without = run(&bare, RESERVED_LINES);
+
+    // Non-vacuity: each surface really rendered, and the alias really quit.
+    assert!(
+        with.contains(COST_MARKER),
+        "`/cost` did not render the cost report; output:\n{with}"
+    );
+    assert!(
+        with.contains(PROVIDER_LIST_NOTE),
+        "`teton provider list` did not hand off to the row; output:\n{with}"
+    );
+    assert!(
+        with.contains("deepseek"),
+        "`/provider list` did not render the registered provider; output:\n{with}"
+    );
+    // Nothing expanded: a shadowed row never becomes an invocation.
+    assert!(
+        !with.contains("→ skill "),
+        "a shadowed skill dispatched; output:\n{with}"
+    );
+    assert_no_turn_ran(&with, "the four reserved lines");
+
+    assert_eq!(
+        mask_root_reported(&mask_session_id(&with, "the shadowed run")),
+        mask_root_reported(&mask_session_id(&without, "the control run")),
+        "four skills holding reserved names changed what `/cost`, `/provider \
+         list`, `teton provider list` and `/exit` print.\n\
+         with skills:\n{with}\nwithout:\n{without}"
+    );
+}
+
+/// The body AC-4 substitutes into: one `$ARGUMENTS`, no dynamic context.
+const ALPHA_BODY: &str = "Say hello about $ARGUMENTS.\n";
+
+/// **AC-4 / BR-12, the surface half: one typed `/name …` draws exactly one echo
+/// line, before anything else, naming the skill, its source and its size.**
+///
+/// The line is pinned byte for byte, and the size is computed with the product's
+/// own formatter ([`teton_protocol::format_bytes`], so `KiB` and not `KB`) over
+/// the body this test wrote — never a figure copied out of the spec's
+/// illustration.
+///
+/// "No model call precedes it" is asserted by *position*: the echo is the first
+/// line the session printed after the entry prompt, and the scripted engine's
+/// reply comes after it. What the model was actually handed — the substituted
+/// body, both interior spaces and both quotes intact — is asserted where it is
+/// produced (`tetond`'s `the_engine_is_handed_the_expansion_the_budget_measured`);
+/// this suite pins the bytes on the terminal.
+#[test]
+fn a_skill_invocation_echoes_one_line_naming_the_skill_before_any_model_call() {
+    let daemon_bin = daemon_bin();
+    let teton = teton_bin();
+
+    let home = SkillTree::new("e");
+    home.write(
+        ".claude/skills/alpha/SKILL.md",
+        &skill_file("the alpha skill", Some("[target]"), ALPHA_BODY),
+    );
+    let daemon = TestDaemon::spawn_scripted_with_env(
+        &daemon_bin,
+        TURN_REPLIES,
+        &[("HOME", home.path().to_str().unwrap())],
+    );
+    let project = project_at(&daemon.root, "proj");
+
+    let (stdout, stderr, status) = daemon.run_cli_from(
+        &teton,
+        &["--cwd", project.to_str().unwrap()],
+        "/alpha teton  code \"repo\"\n",
+        None,
+        &[("HOME", home.path())],
+    );
+    assert!(status.success(), "stdout:\n{stdout}\nstderr:\n{stderr}");
+
+    let expected = format!(
+        ">> /alpha → skill alpha (user, {}, 0 dynamic commands)",
+        teton_protocol::format_bytes(ALPHA_BODY.len() as u64)
+    );
+    let printed = typed_output(session_body(&stdout, "`/alpha`"), "`/alpha`");
+    assert_eq!(
+        printed.first().copied(),
+        Some(expected.as_str()),
+        "the invocation's echo line must be the first thing the session prints \
+         for it, in BR-12's spelling; output:\n{stdout}"
+    );
+
+    // It really became a turn, and the echo came first.
+    let reply = TURN_REPLIES[0];
+    assert!(
+        stdout.contains(reply),
+        "the invocation produced no prompt turn; output:\n{stdout}"
+    );
+    assert!(
+        stdout.find(&expected) < stdout.find(reply),
+        "the model answered before the invocation was echoed; output:\n{stdout}"
+    );
+    // The body is in the file, and BR-12 says it stays there.
+    assert!(
+        !stdout.contains("Say hello about"),
+        "the expansion was printed to the surface; output:\n{stdout}"
+    );
+}
+
+/// A skill whose body carries one dynamic-context command.
+fn one_command_skill() -> String {
+    skill_file("the dyn skill", None, "Context follows.\n\n!`echo one`\n")
+}
+
+/// **AC-9's `plan` leg, through the binary: the level settles it, nobody is
+/// asked, and `/verbose` says which door closed.**
+#[test]
+fn at_plan_a_skills_dynamic_context_is_not_run_and_verbose_names_the_level() {
+    let daemon_bin = daemon_bin();
+    let teton = teton_bin();
+
+    let home = SkillTree::new("f");
+    home.write(".claude/skills/dyn/SKILL.md", &one_command_skill());
+    let daemon = TestDaemon::spawn_scripted_with_env(
+        &daemon_bin,
+        TURN_REPLIES,
+        &[("HOME", home.path().to_str().unwrap())],
+    );
+    let project = project_at(&daemon.root, "proj");
+
+    let (stdout, stderr, status) = daemon.run_cli_from(
+        &teton,
+        &["--cwd", project.to_str().unwrap()],
+        "/verbose\n/permissions plan\n/dyn\n",
+        None,
+        &[("HOME", home.path())],
+    );
+    assert!(status.success(), "stdout:\n{stdout}\nstderr:\n{stderr}");
+
+    assert!(
+        stdout.contains("/dyn → skill dyn (user, ")
+            && stdout.contains(", 1 dynamic command, none run)"),
+        "the echo line must report both numbers when they differ (BR-12); \
+         output:\n{stdout}"
+    );
+    assert!(
+        stdout
+            .contains("  !`echo one` — not run: this session's permission level does not run them"),
+        "`/verbose` must name the level as the door that closed; output:\n{stdout}"
+    );
+    assert!(
+        !stdout.contains("permission requested"),
+        "at `plan` nothing may be asked; output:\n{stdout}"
+    );
+    assert!(
+        stdout.contains(TURN_REPLIES[0]),
+        "the invocation must still produce its turn; output:\n{stdout}"
+    );
+}
+
+/// **AC-9's `full` leg: an unattended session runs the commands with no prompt
+/// at all — the automation posture BR-11 names.**
+#[test]
+fn at_full_a_skills_dynamic_context_runs_on_a_pipe_with_no_prompt() {
+    let daemon_bin = daemon_bin();
+    let teton = teton_bin();
+
+    let home = SkillTree::new("g");
+    home.write(".claude/skills/dyn/SKILL.md", &one_command_skill());
+    let daemon = TestDaemon::spawn_scripted_with_env(
+        &daemon_bin,
+        TURN_REPLIES,
+        &[("HOME", home.path().to_str().unwrap())],
+    );
+    let project = project_at(&daemon.root, "proj");
+
+    let (stdout, stderr, status) = daemon.run_cli_from(
+        &teton,
+        &["--cwd", project.to_str().unwrap()],
+        "/verbose\n/permissions full\n/dyn\n",
+        None,
+        &[("HOME", home.path())],
+    );
+    assert!(status.success(), "stdout:\n{stdout}\nstderr:\n{stderr}");
+
+    assert!(
+        stdout.contains("/dyn → skill dyn (user, ") && stdout.contains(", 1 dynamic command)"),
+        "when every command ran the echo line carries one count, not two; \
+         output:\n{stdout}"
+    );
+    assert!(
+        stdout.contains("  !`echo one` — ran ("),
+        "`/verbose` must report the command as run; output:\n{stdout}"
+    );
+    assert!(
+        !stdout.contains("permission requested") && !stdout.contains("was refused without asking"),
+        "at `full` a piped session asks nothing and refuses nothing; \
+         output:\n{stdout}"
+    );
+    assert!(
+        stdout.contains(TURN_REPLIES[0]),
+        "the invocation must still produce its turn; output:\n{stdout}"
+    );
+}
+
+/// **AC-9's sharpest leg, and BR-11's whole point: on piped stdin at `guarded`
+/// the client refuses the consent *without reading a line*, so the `y` that
+/// follows is still the next prompt.**
+///
+/// The claim is a negative one — a line was **not** consumed — so it is asserted
+/// as one, the way
+/// [`yes_waives_the_in_session_above_floor_confirmation_without_eating_a_line`]
+/// asserts its own: the session is fed a second line after the invocation, and
+/// that line has to reach the *entry loop*. Two turns ran, so the `y` became a
+/// prompt; had it been eaten as a consent answer there would have been one.
+///
+/// The counts are equalities rather than `>=` for the same reason: a client that
+/// answered the consent from stdin *and* then ran the `y` as a prompt would
+/// satisfy a `contains`, and fails this.
+#[test]
+fn on_a_pipe_at_guarded_a_skill_consent_is_refused_without_eating_the_next_line() {
+    let daemon_bin = daemon_bin();
+    let teton = teton_bin();
+
+    let home = SkillTree::new("i");
+    home.write(".claude/skills/dyn/SKILL.md", &one_command_skill());
+    let daemon = TestDaemon::spawn_scripted_with_env(
+        &daemon_bin,
+        TURN_REPLIES,
+        &[("HOME", home.path().to_str().unwrap())],
+    );
+    let project = project_at(&daemon.root, "proj");
+
+    let (stdout, stderr, status) = daemon.run_cli_from(
+        &teton,
+        // `guarded` is the session default, so nothing is typed to reach it —
+        // and the `y` therefore sits immediately behind the invocation, which
+        // is the arrangement the negative assertion below needs.
+        &["--cwd", project.to_str().unwrap()],
+        "/verbose\n/dyn\ny\n",
+        None,
+        &[("HOME", home.path())],
+    );
+    assert!(status.success(), "stdout:\n{stdout}\nstderr:\n{stderr}");
+
+    // The question was drawn — with every command of the invocation on it — and
+    // then refused, unanswered.
+    assert!(
+        stdout.contains("skill `dyn` (user) wants to run 1 dynamic-context command:")
+            && stdout.contains("    !`echo one`"),
+        "the refusal must still show what it refused; output:\n{stdout}"
+    );
+    assert!(
+        stdout.contains(
+            "skill `dyn`'s dynamic context was refused without asking: this session's input \
+             is not a terminal"
+        ),
+        "BR-11's refusal line is missing; output:\n{stdout}"
+    );
+    assert!(
+        stdout.contains(
+            "send `/permissions full` ahead of it, or set `[permissions] default_level`, to \
+             allow it unattended."
+        ),
+        "a refusal must name its remedy — and the remedy has to be one a piped \
+         session can actually take (there is no `--permissions` flag); \
+         output:\n{stdout}"
+    );
+    assert!(
+        stdout.contains("  !`echo one` — not run: no human could be asked"),
+        "the placeholder must say nobody was asked — not that anyone declined; \
+         output:\n{stdout}"
+    );
+    assert!(
+        !stdout.contains("the user declined"),
+        "a fail-closed refusal is not a decline; output:\n{stdout}"
+    );
+
+    // THE NEGATIVE: the `y` was not consumed. It reached the entry loop and
+    // became the second prompt of the session, so the scripted engine served a
+    // second reply and the verbose session drew a second turn-end line.
+    assert!(
+        stdout.contains(TURN_REPLIES[1]),
+        "the `y` after the invocation was eaten as a consent answer instead of \
+         reaching the entry loop as the next prompt line (BR-11); output:\n{stdout}"
+    );
+    assert_eq!(
+        stdout.matches("turn ended").count(),
+        2,
+        "exactly two turns must have run — the invocation and the `y` that \
+         followed it; output:\n{stdout}"
+    );
+}
+
+/// **AC-19's `/verbose` half: the invocation line, the file it came from, the
+/// frontmatter that was ignored, and what became of each command.**
+///
+/// The four are one record, so they are asserted from one session. The two
+/// commands end differently on purpose — BR-6's endings are distinct facts, and
+/// a `/verbose` that collapsed them would be reporting a summary rather than a
+/// record.
+///
+/// The `/cost` half of AC-19 is **not** here: this suite's scripted tier is
+/// local, and a local turn is billed nothing (`cost_attribution`'s "none for
+/// local-tier inference"), so a `/cost` assertion in this file would pass
+/// against an empty ledger and say nothing. It runs in
+/// `tetond/tests/cost_attribution.rs`.
+#[test]
+fn verbose_shows_the_invocation_line_with_its_path_and_per_command_outcomes() {
+    let daemon_bin = daemon_bin();
+    let teton = teton_bin();
+
+    let home = SkillTree::new("j");
+    home.write(
+        ".claude/skills/rec/SKILL.md",
+        // `model:` is a key Teton does not honor: registered, listed, inert.
+        "---\ndescription: the rec skill\nmodel: opus\n---\n\
+         !`echo one`\n!`exit 3`\n",
+    );
+    let daemon = TestDaemon::spawn_scripted_with_env(
+        &daemon_bin,
+        TURN_REPLIES,
+        &[("HOME", home.path().to_str().unwrap())],
+    );
+    let project = project_at(&daemon.root, "proj");
+
+    let (stdout, stderr, status) = daemon.run_cli_from(
+        &teton,
+        &["--cwd", project.to_str().unwrap()],
+        "/verbose\n/permissions full\n/rec\n",
+        None,
+        &[("HOME", home.path())],
+    );
+    assert!(status.success(), "stdout:\n{stdout}\nstderr:\n{stderr}");
+
+    // A command that exited non-zero still *started*, so both count as run and
+    // the echo line carries a single number.
+    assert!(
+        stdout.contains("/rec → skill rec (user, ") && stdout.contains(", 2 dynamic commands)"),
+        "the echo line must name the skill, its source, its size and its command \
+         count; output:\n{stdout}"
+    );
+    // The path, home-relative: an absolute one would carry a username into the
+    // transcript.
+    assert!(
+        stdout.contains("  ~/.claude/skills/rec/SKILL.md"),
+        "`/verbose` must name the file the body came from, home-relative; \
+         output:\n{stdout}"
+    );
+    assert!(
+        stdout.contains("  ignored frontmatter: model"),
+        "`/verbose` must list the frontmatter keys this build ignored; \
+         output:\n{stdout}"
+    );
+    assert!(
+        stdout.contains("  !`echo one` — ran ("),
+        "the first command ran; output:\n{stdout}"
+    );
+    assert!(
+        stdout.contains("  !`exit 3` — failed (exit 3)"),
+        "the second command's non-zero exit must be reported as its own ending; \
+         output:\n{stdout}"
+    );
+}
+
+/// **REQ-587 BR-9: the echo line names the swap, and `/verbose` names the
+/// flags — end to end, on the path a person can actually type.**
+///
+/// Both facts are new keys on `skill_invoked`, and each has three places to be
+/// dropped between the registry row and the screen: the daemon's publish, the
+/// wire, and the renderer. A unit test on the renderer is green while any of
+/// the first two loses a key, which is why this leg exists at all.
+///
+/// It drives the **typed** path deliberately. The model path is instrumented in
+/// `tetond/tests/skill_turn.rs`, where a real tool call can be made; here the
+/// point is that neither fact is model-only news — `/validate` in a repository
+/// that defines its own reaches the repository's file at every permission level
+/// with no prompt, so this echo line is the only notice the user gets that the
+/// name they typed resolved somewhere else.
+///
+/// The **turn count** is asserted by its absence, which is the same claim from
+/// the other side: a typed invocation spends none of the per-turn cap, and a
+/// renderer that printed `0 of 12` here would name a budget the user is not
+/// drawing on.
+///
+/// The third skill (`/gamma`) is BR-3's **typo** case, and it needs the whole
+/// product to be honest: the daemon reads a value that is not a boolean, takes
+/// the safe reading, names the key as unhonored, and only the client can tell
+/// the reader which of the two things happened. A renderer that quoted the
+/// canonical literal here would show an author a line their file does not
+/// contain — and a unit test on either half alone cannot see that, because each
+/// half is doing exactly what it was asked to.
+#[test]
+fn a_typed_invocation_names_the_swap_and_its_flags_and_counts_no_turn_budget() {
+    let daemon_bin = daemon_bin();
+    let teton = teton_bin();
+
+    const VALIDATE_BODY: &str = "Validate the repository's way.\n";
+
+    let home = SkillTree::new("n");
+    // The user's own `validate`, which the repository's is about to take the
+    // name from — without this file there is no swap to name.
+    home.write(
+        ".claude/skills/validate/SKILL.md",
+        &skill_file("the user validate", None, "User body.\n"),
+    );
+    // Hidden from the model, still the user's to type: the flag `/help` marks
+    // not at all, and this line is the only place it is ever named.
+    home.write(
+        ".claude/commands/beta.md",
+        &skill_file_with(
+            "the beta skill",
+            &["disable-model-invocation: true"],
+            "Beta body.\n",
+        ),
+    );
+    // The same flag with a value no parser reads as a boolean. BR-3's safe
+    // reading hides this file from the model exactly as beta's `true` does — the
+    // *outcome* is identical — while the file itself said something else
+    // entirely, and `/verbose` is where the author of the typo finds out which
+    // of the two happened.
+    home.write(
+        ".claude/commands/gamma.md",
+        &skill_file_with(
+            "the gamma skill",
+            &["disable-model-invocation: yes"],
+            "Gamma body.\n",
+        ),
+    );
+
+    let daemon = TestDaemon::spawn_scripted_with_env(
+        &daemon_bin,
+        TURN_REPLIES,
+        &[("HOME", home.path().to_str().unwrap())],
+    );
+    let project = project_at(&daemon.root, "proj");
+    std::fs::create_dir_all(project.join(".claude/skills/validate")).unwrap();
+    std::fs::write(
+        project.join(".claude/skills/validate/SKILL.md"),
+        skill_file("the project validate", None, VALIDATE_BODY),
+    )
+    .unwrap();
+
+    let (stdout, stderr, status) = daemon.run_cli_from(
+        &teton,
+        &["--cwd", project.to_str().unwrap()],
+        "/verbose\n/validate\n/beta\n/gamma\n",
+        None,
+        &[("HOME", home.path())],
+    );
+    assert!(status.success(), "stdout:\n{stdout}\nstderr:\n{stderr}");
+
+    assert!(
+        stdout.contains(&format!(
+            "/validate → skill validate (project — shadows your user skill, {}, \
+             0 dynamic commands)",
+            teton_protocol::format_bytes(VALIDATE_BODY.len() as u64)
+        )),
+        "the echo line must name the swap in the source slot — the user typed a \
+         name their own shelf has and the repository answered; output:\n{stdout}"
+    );
+    assert!(
+        stdout.contains("  hidden from the model (`disable-model-invocation: true`)"),
+        "`/verbose` must name the flag this build honored, in the file's own \
+         spelling; output:\n{stdout}"
+    );
+    // BR-3's *other* reading of the same key, through the whole product: the
+    // daemon parses `yes`, takes the safe value, names the key as unhonored, and
+    // the client words the two cases apart. The old line quoted
+    // `disable-model-invocation: true` at an author who wrote `yes` — a line
+    // their file does not contain — one line above `ignored frontmatter:
+    // disable-model-invocation`, which alone reads as "this key did nothing".
+    assert!(
+        stdout.contains(
+            "  hidden from the model (`disable-model-invocation` was not `true` or \
+             `false`, so the safe reading hid it)"
+        ),
+        "a file whose flag value is not a boolean must be told so, and told \
+         which reading was taken; output:\n{stdout}"
+    );
+    assert!(
+        stdout.contains("  ignored frontmatter: disable-model-invocation"),
+        "the unhonored key is still named, now explained by the line above it \
+         rather than contradicted by it; output:\n{stdout}"
+    );
+    // The flags line reports what the file *wrote*: neither skill declared
+    // `user-invocable`, so neither is called model-only anywhere.
+    assert!(
+        !stdout.contains("model-only") && !stdout.contains("invocable by nobody"),
+        "a file that declared no `user-invocable` key was reported as if it \
+         had; output:\n{stdout}"
+    );
+    // Matched as a **line shape**, not as a phrase: `this turn` occurs in the
+    // route classifier's own sentence, and a substring search would pass on
+    // that instead of on the absence it is asserting.
+    assert!(
+        !stdout
+            .lines()
+            .any(|line| line.trim_start().starts_with("invocation ") && line.contains("this turn")),
+        "a typed invocation was given a per-turn budget it does not draw on; \
+         output:\n{stdout}"
+    );
+}
+
+/// **AC-14: `/cd` re-derives the project skills and leaves the user skills
+/// alone — and `/help` says so without a restart.**
+///
+/// One session, two roots, three `/help`s worth of evidence in two: the user
+/// skill is in both listings and the two project skills are in exactly one each.
+/// A registry that was merged rather than replaced would leave `/one`
+/// dispatchable under the second root, which is a row naming a file the session
+/// no longer stands on.
+#[test]
+fn a_cd_re_derives_the_project_skills_and_help_reflects_it_without_a_restart() {
+    let daemon_bin = daemon_bin();
+    let teton = teton_bin();
+
+    let home = SkillTree::new("k");
+    home.write(
+        ".claude/skills/usr/SKILL.md",
+        &skill_file("the user skill", None, "User body.\n"),
+    );
+    let daemon = TestDaemon::spawn_scripted_with_env(
+        &daemon_bin,
+        TURN_REPLIES,
+        &[("HOME", home.path().to_str().unwrap())],
+    );
+    let first = project_at(&daemon.root, "one");
+    let second = project_at(&daemon.root, "two");
+    for (project, name) in [(&first, "one"), (&second, "two")] {
+        std::fs::create_dir_all(project.join(format!(".claude/skills/{name}"))).unwrap();
+        std::fs::write(
+            project.join(format!(".claude/skills/{name}/SKILL.md")),
+            skill_file(&format!("the {name} skill"), None, "Project body.\n"),
+        )
+        .unwrap();
+    }
+
+    let (stdout, stderr, status) = daemon.run_cli_from(
+        &teton,
+        &["--cwd", first.to_str().unwrap()],
+        &format!("/help\n/cd {}\n/help\n", second.display()),
+        None,
+        &[("HOME", home.path())],
+    );
+    assert!(status.success(), "stdout:\n{stdout}\nstderr:\n{stderr}");
+
+    let body = session_body(&stdout, "the /cd session");
+    let (before, after) = body
+        .split_once(ROOT_MOVED)
+        .unwrap_or_else(|| panic!("the session never moved; output:\n{stdout}"));
+
+    for (segment, present, absent, what) in [
+        (before, "/one — the one skill (project)", "/two", "before"),
+        (after, "/two — the two skill (project)", "/one", "after"),
+    ] {
+        assert!(
+            segment.contains(present),
+            "the {what} listing is missing `{present}`; segment:\n{segment}"
+        );
+        assert!(
+            !segment.contains(absent),
+            "the {what} listing still carries `{absent}` — the registry was \
+             merged rather than replaced; segment:\n{segment}"
+        );
+        assert!(
+            segment.contains("/usr — the user skill (user)"),
+            "the user half must survive a move; segment:\n{segment}"
+        );
+        assert!(
+            segment.contains("2 skills (user 1, project 1); 0 skipped"),
+            "the {what} diagnostic is wrong; segment:\n{segment}"
+        );
+    }
+    assert_no_turn_ran(&stdout, "the /cd session");
+}
+
+/// **AC-17 / BR-10: a name discovery *found and dropped* says why; a name it
+/// never saw keeps the pre-REQ bytes.**
+///
+/// The pair is the point. `unknown command` is the honest answer for a name that
+/// exists nowhere, and it is exactly the wrong answer for `/analyze` on a
+/// machine whose `~/.claude/skills/analyze/SKILL.md` is sitting right there with
+/// a broken header — which is the dogfood incident this REQ was opened on.
+///
+/// The second leg's bytes are asserted against the same literal the pre-REQ
+/// unknown-command test uses, on a session whose registry is genuinely
+/// non-empty: a control with *no* skills at all would pass whether or not the
+/// skipped branch exists.
+#[test]
+fn a_skipped_skill_says_why_and_a_name_nobody_has_stays_unknown() {
+    let daemon_bin = daemon_bin();
+    let teton = teton_bin();
+
+    let home = SkillTree::new("l");
+    // Found and not registered: an opening delimiter with no closing one.
+    home.write(".claude/skills/analyze/SKILL.md", "---\nname: analyze\n");
+    // A healthy neighbour, so the registry is not empty and the second leg is
+    // about the *absence of an entry* rather than the absence of a registry.
+    home.write(
+        ".claude/skills/healthy/SKILL.md",
+        &skill_file("the healthy skill", None, "Healthy body.\n"),
+    );
+    let daemon = TestDaemon::spawn_scripted_with_env(
+        &daemon_bin,
+        TURN_REPLIES,
+        &[("HOME", home.path().to_str().unwrap())],
+    );
+    let project = project_at(&daemon.root, "proj");
+
+    let (stdout, stderr, status) = daemon.run_cli_from(
+        &teton,
+        &["--cwd", project.to_str().unwrap()],
+        "/analyze teton code repo\n/nobodyhasthis\n",
+        None,
+        &[("HOME", home.path())],
+    );
+    assert!(status.success(), "stdout:\n{stdout}\nstderr:\n{stderr}");
+
+    assert!(
+        stdout.contains(&format!(
+            "`/analyze` is a skill that was skipped: malformed frontmatter — {HELP_HINT}"
+        )),
+        "a name discovery dropped must be answered with the reason, not with \
+         `unknown command`; output:\n{stdout}"
+    );
+    assert!(
+        stdout.contains(&format!("unknown command: `/nobodyhasthis` — {HELP_HINT}")),
+        "a name with no entry at all must keep the pre-REQ bytes; \
+         output:\n{stdout}"
+    );
+    assert_no_turn_ran(&stdout, "a skipped and an unknown name");
+}
+
+// ---------------------------------------------------------------------------
+// REQ-587 TASK-222 — the two legs only a model-issued call can drive
+// ---------------------------------------------------------------------------
+//
+// The scripted local engine reads the text tool-call form
+// (`{"tool": …, "arguments": …}`), which is the only way a *whole-CLI* test can
+// make the model issue a `skill` call. Both legs below need one: an
+// acknowledgment nobody types, and a refusal nobody can earn by typing.
+//
+// The tier is deliberately the **local** one, and both legs turn on that: it is
+// what makes the second refusal reachable at all (`LOCAL_BUDGET_BYTES` is 32 KiB
+// and the fixture body is larger), and it is why AC-10's *cost* half is not
+// here — a local turn produces no billed row, so a `/cost` assertion at this
+// layer is vacuous. That half runs against a remote `Vendor` in
+// `tetond/tests/skill_turn.rs`, and BUG-183 is what happens when it does not.
+
+/// The scripted engine's replies for a session that invokes a skill twice: once
+/// successfully, once past the local route's budget.
+const SKILL_CALL_REPLIES: &[&str] = &[
+    r#"{"tool": "skill", "arguments": {"name": "small", "args": "REQ-587"}}"#,
+    "the small skill landed.",
+    r#"{"tool": "skill", "arguments": {"name": "huge", "args": ""}}"#,
+    "the huge skill did not.",
+];
+
+/// **REQ-587 BR-9 end to end: a model invocation echoes one line, and a model
+/// invocation the loop refuses echoes a *different* one.**
+///
+/// TASK-219 could reach neither. Both lines are raised only by a call the model
+/// makes, so no typed line drives them, and the negative half lived at unit
+/// level. Once the tool is wired, both are on the path a person actually sees —
+/// and the second is where the trap is: a first draft that exercised only
+/// `skill_echo_line` stayed **green** under "drop the line entirely", because
+/// *a refusal is never silent* is a claim about what reaches the surface, not
+/// about what a formatter returns. This drives `render_event`.
+///
+/// The refusal's shape is the assertion, not merely its presence. A refused
+/// record and a command-free skill that ran are the same bytes apart from one
+/// field, so a refusal rendered as "the invocation line, plus something" reads
+/// at a glance as a skill that worked. It therefore opens with the verdict and
+/// carries **no** size and **no** dynamic-command count — both true of the file
+/// and false of this turn.
+#[test]
+fn a_model_invocation_echoes_its_line_and_a_refused_one_says_so_instead() {
+    let daemon_bin = daemon_bin();
+    let teton = teton_bin();
+
+    const SMALL_BODY: &str = "Do the small thing for $ARGUMENTS.\n";
+    let home = SkillTree::new("mi");
+    home.write(".claude/skills/small/SKILL.md", &{
+        let mut out = String::from("---\ndescription: the small skill\n---\n");
+        out.push_str(SMALL_BODY);
+        out
+    });
+    // Larger than the local route's byte budget (32 KiB) with the system prompt
+    // beside it, so Stage A in the loop refuses it — the one refusal a local
+    // tier can actually produce, and the reason this leg is scripted local.
+    let filler = "abcdefgh ".repeat(5_000);
+    home.write(
+        ".claude/skills/huge/SKILL.md",
+        &format!("---\ndescription: the huge skill\n---\nHUGE-BODY-MARKER {filler}\n"),
+    );
+
+    let daemon = TestDaemon::spawn_scripted_with_env(
+        &daemon_bin,
+        SKILL_CALL_REPLIES,
+        &[("HOME", home.path().to_str().unwrap())],
+    );
+    let project = project_at(&daemon.root, "proj");
+    let (stdout, stderr, status) = daemon.run_cli_from(
+        &teton,
+        &["--cwd", project.to_str().unwrap()],
+        "/verbose\nrun the small skill\nrun the huge skill\n",
+        None,
+        &[("HOME", home.path())],
+    );
+    assert!(status.success(), "stdout:\n{stdout}\nstderr:\n{stderr}");
+
+    // The successful line: no `/name →` prefix, because nobody typed one.
+    assert!(
+        stdout.contains(&format!(
+            "skill small (user, {}, 0 dynamic commands) — invoked by the model",
+            teton_protocol::format_bytes(SMALL_BODY.len() as u64)
+        )),
+        "a model invocation must echo one line saying the model asked; \
+         output:\n{stdout}"
+    );
+    assert!(
+        !stdout.contains("/small →"),
+        "nobody typed `/small`; a model invocation must not render as the \
+         user's own line; output:\n{stdout}"
+    );
+    // The `12` is `tetond::harness::tools::skill::PER_TURN_INVOCATION_CAP`,
+    // spelled rather than read: the `teton` crate cannot depend on `tetond`, and
+    // a whole-CLI test reads the daemon's ceiling off the wire like any client.
+    // The literal is therefore correct and brittle in the same breath, so the
+    // message names the constant that moved rather than leaving a reader to
+    // wonder where `12` came from.
+    assert!(
+        stdout.contains("  invocation 1 of 12 this turn"),
+        "`/verbose` shows the turn's count against the cap for a model \
+         invocation — the `12` here is `PER_TURN_INVOCATION_CAP` \
+         (`tetond::harness::tools::skill`), spelled because this crate cannot \
+         depend on that one; if that constant moved, this literal follows it. \
+         output:\n{stdout}"
+    );
+    // AC-10's `tool_call` title: `skill <name>`, so the status line says which
+    // skill the model reached for rather than only that *something* did.
+    assert!(
+        stdout.contains("- skill small [") && stdout.contains("- skill huge ["),
+        "each `skill` call's status line must be titled with the skill it \
+         named; output:\n{stdout}"
+    );
+
+    // The refusal line: the verdict first, the reason named, and none of the
+    // figures that would claim an expansion happened.
+    assert!(
+        stdout.contains(
+            "refused: skill huge (user) — the expansion did not fit this turn's context budget"
+        ),
+        "a refused model invocation must print one line naming the reason; \
+         output:\n{stdout}"
+    );
+    assert!(
+        !stdout.contains("skill huge (user,"),
+        "the refusal must not be rendered as the invocation line with something \
+         added — at a glance that reads as a skill that ran; output:\n{stdout}"
+    );
+    // Nothing of the refused body entered the session.
+    assert!(
+        !stdout.contains("HUGE-BODY-MARKER"),
+        "a refused expansion reached the surface; output:\n{stdout}"
+    );
+    // …and the turn went on rather than ending: the refusal is a tool result.
+    assert!(
+        stdout.contains("the huge skill did not."),
+        "a refusal is a tool result the model relays, not a turn-ender; \
+         output:\n{stdout}"
+    );
+}
+
+/// **REQ-587 AC-6's pipe leg, which TASK-219 could not reach.**
+///
+/// BR-4's acknowledgment is raised only by a *model-issued* call for a
+/// **project** skill, so no typed line drives it and the negative pin lived at
+/// unit level (`prompter.asked == 0` with the pasted `y` still queued). With the
+/// tool wired, the whole rule is observable end to end: on piped stdin at
+/// `guarded` the client refuses **without reading a line**, the model is told
+/// what the user must do, and the `y` that follows is still the next prompt.
+///
+/// The negative is asserted as one, the way
+/// [`on_a_pipe_at_guarded_a_skill_consent_is_refused_without_eating_the_next_line`]
+/// asserts its own: a second line is fed after the request, and it has to reach
+/// the *entry loop*. Two turns ran, so the `y` became a prompt; had it been
+/// eaten as an answer there would have been one.
+#[test]
+fn on_a_pipe_at_guarded_a_model_issued_project_skill_is_refused_without_eating_the_next_line() {
+    let daemon_bin = daemon_bin();
+    let teton = teton_bin();
+
+    const REPLIES: &[&str] = &[
+        r#"{"tool": "skill", "arguments": {"name": "scratch", "args": ""}}"#,
+        "I could not run the repository's skill.",
+        "and this is the second prompt.",
+    ];
+
+    // A user skill so the roster is never empty for reasons unrelated to the
+    // project one, and the project skill the acknowledgment is about.
+    let home = SkillTree::new("pk");
+    home.write(
+        ".claude/skills/mine/SKILL.md",
+        &skill_file("a user skill", None, "User body.\n"),
+    );
+    let daemon = TestDaemon::spawn_scripted_with_env(
+        &daemon_bin,
+        REPLIES,
+        &[("HOME", home.path().to_str().unwrap())],
+    );
+    let project = project_at(&daemon.root, "proj");
+    std::fs::create_dir_all(project.join(".claude/skills/scratch")).unwrap();
+    std::fs::write(
+        project.join(".claude/skills/scratch/SKILL.md"),
+        skill_file("the repository's own skill", None, "PROJECT-BODY-MARKER\n"),
+    )
+    .unwrap();
+
+    let (stdout, stderr, status) = daemon.run_cli_from(
+        &teton,
+        // `guarded` is the session default, so nothing is typed to reach it and
+        // the `y` sits immediately behind the prompt that triggers the request.
+        &["--cwd", project.to_str().unwrap()],
+        "/verbose\nuse the repository's scratch skill\ny\n",
+        None,
+        &[("HOME", home.path())],
+    );
+    assert!(status.success(), "stdout:\n{stdout}\nstderr:\n{stderr}");
+
+    // The question was drawn — naming the root and its skills — and then
+    // refused, unanswered.
+    assert!(
+        stdout.contains("running `") && stdout.contains("`'s skills as instructions"),
+        "the refusal must still show what it refused; output:\n{stdout}"
+    );
+    assert!(
+        stdout.contains("was refused without asking: this session's input is not a terminal"),
+        "BR-11's refusal line is missing; output:\n{stdout}"
+    );
+    assert!(
+        stdout.contains(
+            "send `/permissions full` ahead of it, or set `[permissions] default_level`, to \
+             allow it unattended."
+        ),
+        "a refusal names a remedy a piped session can actually take; \
+         output:\n{stdout}"
+    );
+    // What the session *does* show for the call itself: the tool-call status
+    // line, titled with the skill the model reached for, ending `failed`.
+    assert!(
+        stdout.contains("- skill scratch [failed]"),
+        "the tool-call line must name the skill and say the call did not \
+         succeed; output:\n{stdout}"
+    );
+
+    // **And the refusal names itself, in the tool's own words** (BR-9, the
+    // Events table). TASK-222 recorded the opposite as a gap: the daemon
+    // published a `SkillInvoked` only for the two refusals the **loop** raises
+    // (`SkillTool::note_loop_refusal` / `publish_refusal`, both `over_budget`),
+    // while every refusal the **tool** raises returned through
+    // `Refusal::into_outcome` and published nothing — so this client had a
+    // rendered sentence for all seven reasons (`session_ui::
+    // refusal_reason_words`) and the daemon reached none of them. It now
+    // publishes from `SkillTool::refuse`, the one door out of `invoke`'s refusal
+    // arms, and this is that record arriving through a real socket at a real
+    // client.
+    //
+    // Mutation: drop the publish from `refuse` and this line disappears.
+    assert!(
+        stdout.contains(
+            "refused: skill scratch (project) — this repository's skills have not been \
+             acknowledged for this session"
+        ),
+        "a typed refusal must say which skill call it was and why, not leave \
+         the user with a failed tool line; output:\n{stdout}"
+    );
+    // A refusal record is **not** an invocation record: the file's size and its
+    // dynamic-command count are true of the file and false of this turn —
+    // nothing of it entered the context — so the line drops both.
+    assert!(
+        !stdout.contains("skill scratch (project, "),
+        "the refusal rendered as the invocation line with a flag on it, which \
+         at a glance reads as a skill that ran; output:\n{stdout}"
+    );
+    assert!(
+        !stdout.contains("PROJECT-BODY-MARKER"),
+        "an unacknowledged repository's body reached the session; output:\n{stdout}"
+    );
+    assert!(
+        !stdout.contains("the user declined"),
+        "a fail-closed refusal is not a decline; output:\n{stdout}"
+    );
+
+    // THE NEGATIVE: the `y` was not consumed. It reached the entry loop and
+    // became the second prompt of the session.
+    assert!(
+        stdout.contains("and this is the second prompt."),
+        "the `y` after the request was eaten as an answer instead of reaching \
+         the entry loop as the next prompt line (BR-11); output:\n{stdout}"
+    );
+    assert_eq!(
+        stdout.matches("turn ended").count(),
+        2,
+        "exactly two turns must have run — the one that raised the request and \
+         the `y` that followed it; output:\n{stdout}"
     );
 }
