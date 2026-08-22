@@ -2659,3 +2659,86 @@ Privacy boundary configured?     : no (ran a–e) | yes (ran f)   <-- circle one
 (f) turn routed local, nothing reached the provider : yes / no
 Notes / findings :
 ```
+
+---
+
+# Manual verification runbook — REQ-584 (the project locator)
+
+## What this proves that CI does not
+
+CI proves the parts: the registry records and prunes, the scan stays inside its
+budget and its skip sets, the tool is exposed at every level, the environment
+line stays inside REQ-583's ceiling, `/cd <name>` reads a directory first and a
+project second. What no mock settles is the question the 2026-08-18 incident
+actually asked — whether a **real** model, sitting in `~` and asked "look in my
+development folder for the Teton repo", now *answers* instead of walking the
+disk and apologising.
+
+That is an **observation, not an assertion** (LESSON-532). The model's prose is
+recorded, never required. What *is* required is at the surface: the environment
+line carried the names, and the hand-off line appeared if the tool was called.
+Both are the harness's, not the model's — which is the whole of BR-7 and BR-11.
+
+## Prerequisites
+
+- The shipped binary or a `--release` build, with `TETON_TEST_SEAMS` unset.
+- A local tier that actually loads (this is the tier the REQ is *for* — a weak
+  model is the one that reaches for a disk walk).
+- `~/Documents/GitHub/teton-code` present. On this machine it is, and it is why
+  `Documents/GitHub` leads the dev-folder table.
+- **macOS note, expected and not a defect:** the first scan may raise
+  *"Terminal would like to access files in your Documents folder"*. That dialog
+  is raised by a question the user asked (`/projects`, or a `projects` call),
+  never by a launch — BR-3 forbids a scan at launch, and AC-4 pins it. Answer it
+  once. If you decline, the scan reports what it could reach and the registry
+  still fills from use (BR-1).
+
+## Procedure
+
+### Leg (a) — the warm registry, which is the ordinary case
+
+1. `cd ~/Documents/GitHub/teton-code && teton`, then `/quit`. That one launch is
+   BR-1: the root is recorded, `source: launched`.
+2. `cd ~ && teton`.
+3. **Before typing anything**, read the launch notice. It should now name up to
+   five known projects with `/cd <name>` (BR-10).
+4. Ask, verbatim: `look in my development folder for the Teton repo`
+5. Record what happens, then `/quit`.
+
+### Leg (b) — the cold registry, which is the first-run case
+
+1. Stop the daemon, delete `projects.json` from the state dir
+   (`$XDG_RUNTIME_DIR/teton` or `~/Library/Application Support/teton`), restart.
+2. `cd ~ && teton`, ask the same question.
+3. This is the leg the dev-folder scan exists for: with nothing remembered, the
+   scan should still find `~/Documents/GitHub/teton-code`.
+
+### Leg (c) — `/cd` by name
+
+1. From `~`, type `/cd teton-code`. The session should move, with REQ-583's
+   `context cleared` and `session root is now …` lines.
+2. From a directory that has a `src/` subdirectory, type `/cd src`. It must move
+   to `./src` **even if** a known project is also named `src` — REQ-583's
+   reading wins, and this is the leg that proves the ordering by hand.
+
+## Sign-off
+
+```
+Date / build                                  :
+(a) launch notice named known projects        : yes / no   (names:)
+(a) environment line carried `Known projects:` : yes / no
+     — check with /verbose, or read the turn's prompt
+(a) `→ /cd teton-code` hand-off line appeared : yes / no
+(a) the turn ran a glob/grep over ~           : yes / no
+     — if yes, did it END BY BUDGET as REQ-583 guarantees? yes / no
+(a) model's prose (recorded, not required)    :
+     — did it name ~/Documents/GitHub/teton-code?  yes / no
+     — did it name `/cd teton-code`?               yes / no
+(b) cold registry: scan found the repo        : yes / no
+(b) macOS Documents dialog raised             : yes / no   answered: allow | deny
+(b) if denied — the answer said where it looked : yes / no
+(c) `/cd teton-code` moved the session        : yes / no
+(c) `/cd src` chose ./src over the known project : yes / no
+(c) an ambiguous name listed candidates and moved nowhere : yes / no  (n/a if none)
+Notes / findings :
+```

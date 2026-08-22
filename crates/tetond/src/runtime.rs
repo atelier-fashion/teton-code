@@ -1710,6 +1710,14 @@ pub struct DaemonRuntime {
     /// (the argument `Daemon::with_consent_timeout` makes, and
     /// `ShellTool::with_timeouts` makes for the tool itself).
     skill_command_timeout_ms: u64,
+    /// The machine's known-project registry (REQ-584 BR-1, ADR-2).
+    ///
+    /// In-memory on a `minimal()` runtime, file-backed on a real one. Held here
+    /// rather than beside the session registry because it is a fact about the
+    /// **machine**, not about any session: every session writes the same one,
+    /// and a `/cd` in one session is exactly what should let another session's
+    /// `/projects` find that project.
+    projects: Arc<crate::projects::ProjectStore>,
 }
 
 impl DaemonRuntime {
@@ -1768,6 +1776,9 @@ impl DaemonRuntime {
             secret_resolver: SecretResolver::with_default_backend(),
             addressed_delivery: OnceLock::new(),
             skill_command_timeout_ms: shell::DEFAULT_TIMEOUT_MS,
+            // In memory: a `minimal()` runtime has no state dir, and a test
+            // must never be able to write the real machine's project list.
+            projects: Arc::new(crate::projects::ProjectStore::in_memory()),
         }
     }
 
@@ -1982,6 +1993,9 @@ impl DaemonRuntime {
             secret_resolver: SecretResolver::with_default_backend(),
             addressed_delivery: OnceLock::new(),
             skill_command_timeout_ms: shell::DEFAULT_TIMEOUT_MS,
+            projects: Arc::new(crate::projects::ProjectStore::open(
+                &teton_protocol::socket_path::projects_path(base_dir),
+            )),
         })
     }
 
@@ -3543,7 +3557,31 @@ impl DaemonRuntime {
         ));
         // REQ-583 BR-1: the same probed root the jail above was built from — so
         // the environment block and the jail's refusals print one spelling.
-        route.harness.session_root = Some(probed.view);
+        route.harness.session_root = Some(probed.view.clone());
+        // REQ-584 BR-7: known project names for a NON-project root, ranked by
+        // `last_seen` and bounded here, where the registry is. The composer
+        // places them and decides how many fit; deriving them there would put a
+        // filesystem-backed read inside a pure renderer.
+        //
+        // **Reads the stored snapshot only — it never scans** (BR-3): this runs
+        // on every turn, and a turn that did not ask for projects must not pay
+        // for a directory walk, let alone raise the macOS Documents dialog.
+        route.harness.known_projects =
+            if probed.view.kind == teton_protocol::methods::RootKind::Project {
+                Vec::new()
+            } else {
+                self.projects
+                    .snapshot()
+                    .rank(None)
+                    .iter()
+                    .map(|p| {
+                        teton_core::session_root::bounded_field(
+                            &p.name,
+                            teton_core::session_root::NAME_MAX_CHARS,
+                        )
+                    })
+                    .collect()
+            };
         let system = build_system_prompt(&tools, &route.harness);
 
         // ── REQ-585 BR-8 / ADR-11: Stage A — does the BODY fit? ──────────────
@@ -4220,27 +4258,92 @@ impl DaemonRuntime {
 
         // Validate before touching anything: a refusal leaves the root and the
         // conversation exactly as they were.
-        validate_session_cwd(&params.cwd)
-            .map_err(|refusal| RpcError::new(error_code::INVALID_PARAMS, refusal.to_string()))?;
+        //
+        // REQ-584 BR-8: **the path reading is tried first, always.** Only when
+        // it fails, and only when the client said the argument was a bare name,
+        // is the registry consulted — which is what keeps `/cd src` meaning
+        // `./src` wherever `./src` exists, and keeps REQ-583's grammar table
+        // passing unchanged.
+        let cwd = match validate_session_cwd(&params.cwd) {
+            Ok(()) => params.cwd.clone(),
+            Err(refusal) => {
+                let Some(name) = params.name_hint.as_deref() else {
+                    return Err(RpcError::new(
+                        error_code::INVALID_PARAMS,
+                        refusal.to_string(),
+                    ));
+                };
+                match self.projects.snapshot().resolve_name(name) {
+                    teton_core::projects::NameResolution::Unique(project) => {
+                        // Validated like any other root — a registry entry is a
+                        // remembered path, not a licence to skip the check.
+                        validate_session_cwd(&project.path).map_err(|refusal| {
+                            RpcError::new(error_code::INVALID_PARAMS, refusal.to_string())
+                        })?;
+                        project.path.clone()
+                    }
+                    teton_core::projects::NameResolution::Ambiguous(candidates) => {
+                        // Names the candidates and moves nowhere: picking one
+                        // would move the session somewhere the user did not
+                        // choose, which is worse than asking again.
+                        let listed = candidates
+                            .iter()
+                            .map(|p| {
+                                teton_core::session_root::bounded_field(
+                                    &teton_core::session_root::display_for(
+                                        &p.path,
+                                        home().as_deref(),
+                                    ),
+                                    teton_core::session_root::DISPLAY_MAX_CHARS,
+                                )
+                            })
+                            .collect::<Vec<_>>()
+                            .join(", ");
+                        return Err(RpcError::new(
+                            error_code::INVALID_PARAMS,
+                            format!(
+                                "`{name}` names more than one known project: {listed} —                                  `/cd <path>` picks one"
+                            ),
+                        ));
+                    }
+                    teton_core::projects::NameResolution::None => {
+                        return Err(RpcError::new(
+                            error_code::INVALID_PARAMS,
+                            teton_core::session_root::cd_two_reading_refusal(name),
+                        ));
+                    }
+                }
+            }
+        };
 
         // The claim above proved the session exists, so `get` cannot miss —
         // but the fallback reads as what it is rather than as an unwrap.
         let previous_cwd = sessions.get(&params.session_id).and_then(|s| s.cwd);
         let previous_display = self.session_root_for(previous_cwd.as_deref()).view.display;
 
-        if !sessions.set_cwd(&params.session_id, params.cwd.clone()) {
+        if !sessions.set_cwd(&params.session_id, cwd.clone()) {
             return Err(RpcError::new(
                 error_code::UNKNOWN_SESSION,
                 format!("no session `{}`", params.session_id),
             ));
         }
-        let moved_to = self.session_root_for(Some(&params.cwd));
+        // `cwd`, not `params.cwd`: after a BR-8 registry resolution those are
+        // different paths, and probing the requested one would derive the root,
+        // the skills and the recorded project from a directory that does not
+        // exist.
+        let moved_to = self.session_root_for(Some(&cwd));
 
         // REQ-585 BR-1/AC-14 and ADR-6, both before the announcement below, and
         // both through the one derivation `session/create` also takes — a second
         // spelling of the four globs would be LESSON-528's shape at the seam
         // where the two answers have to agree.
-        Self::store_session_skills(sessions, &params.session_id, &moved_to, skills_fs);
+        Self::store_session_skills(
+            sessions,
+            &params.session_id,
+            &moved_to,
+            skills_fs,
+            &self.projects,
+        );
         self.drop_grants_expiring_on_root_change(&params.session_id);
 
         let root = moved_to.view;
@@ -4422,6 +4525,23 @@ impl DaemonRuntime {
                 .await;
             }
         }
+        // REQ-584 BR-6. **Unconditional**, unlike the skill tool's "at least one
+        // model-invocable skill": an empty registry is a meaningful answer here
+        // and the one a new machine gives ("no known projects; looked in: …"),
+        // so withholding the tool would send the model back to the disk walk
+        // this exists to replace.
+        //
+        // Registered here — beside the built-ins, before the two conditional
+        // tools — because it is a static knowledge tool in `teton_docs`' class,
+        // and because REQ-563 requires `web` to be registered **last** so it
+        // reads after the built-ins and MCP in the exposed tool docs.
+        crate::harness::tools::register_projects_tool(
+            &mut tools,
+            Arc::clone(self.projects()),
+            home(),
+            // BR-11's hand-off record goes to the session that asked.
+            Some(SessionEvents::new(Arc::clone(events), session_id.clone())),
+        );
         // REQ-563 BR-1: `register_web_tool` is the one place the "tier is above
         // off" condition is expressed, so a machine that never opted in has no
         // web tool rather than a web tool behind a flag.
@@ -4547,11 +4667,18 @@ impl DaemonRuntime {
     /// permission keys for one file (AC-3). Taking the probe rather than probing
     /// again also keeps the caller's reading and this one from being two
     /// readings of a filesystem that can change between them.
+    /// The machine's known-project registry (REQ-584).
+    #[must_use]
+    pub(crate) fn projects(&self) -> &Arc<crate::projects::ProjectStore> {
+        &self.projects
+    }
+
     pub(crate) fn store_session_skills(
         sessions: &SessionRegistry,
         session_id: &SessionId,
         probed: &ProbedRoot,
         fs: &dyn crate::skills::DirLister,
+        projects: &crate::projects::ProjectStore,
     ) {
         // `set_skills` answering `false` — a session that vanished between the
         // caller's claim and this write — is nothing to act on: there is no
@@ -4566,6 +4693,22 @@ impl DaemonRuntime {
         // here rather than at the two call sites so a third cannot forget it —
         // the same reason the globs are spelled here and nowhere else.
         let discovered = block_in_place_if_multithread(|| {
+            // REQ-584 BR-1, and ADR-4's reason for putting it *here*: this
+            // function is the one derivation both `session/create` and
+            // `session/set_cwd` funnel through, so a third caller cannot
+            // forget to record. Inside the same `block_in_place` as discovery
+            // because it is a file write, and taking that on the connection's
+            // reader loop is the defect BUG-184 fixed one line above.
+            //
+            // Only a `project`-kind root is recorded. `home`, `filesystem_root`
+            // and `plain` are three different ways of not being a project, and
+            // BR-1 excludes all three.
+            if probed.view.kind == teton_protocol::methods::RootKind::Project {
+                projects.record(
+                    probed.path.clone(),
+                    teton_core::projects::ProjectSource::Launched,
+                );
+            }
             crate::skills::discover(home().as_deref(), &probed.path, probed.view.kind, fs)
         });
         sessions.set_skills(session_id, discovered);
@@ -27498,6 +27641,7 @@ provider_id = \"deepseek\"
                 &SessionSetCwdParams {
                     session_id: session_id.clone(),
                     cwd: cwd.to_path_buf(),
+                    name_hint: None,
                 },
                 sessions,
                 events,
@@ -29764,6 +29908,7 @@ provider_id = \"deepseek\"
                     &SessionSetCwdParams {
                         session_id: session_id.clone(),
                         cwd: to.clone(),
+                        name_hint: None,
                     },
                     &sessions,
                     &events,

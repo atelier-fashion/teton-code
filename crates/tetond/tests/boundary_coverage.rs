@@ -60,6 +60,10 @@ const TOOL_SOURCES: &[(&str, &str)] = &[
     ("glob.rs", include_str!("../src/harness/tools/glob.rs")),
     ("grep.rs", include_str!("../src/harness/tools/grep.rs")),
     ("mcp.rs", include_str!("../src/harness/tools/mcp.rs")),
+    (
+        "projects.rs",
+        include_str!("../src/harness/tools/projects.rs"),
+    ),
     ("read.rs", include_str!("../src/harness/tools/read.rs")),
     ("shell.rs", include_str!("../src/harness/tools/shell.rs")),
     ("skill.rs", include_str!("../src/harness/tools/skill.rs")),
@@ -180,6 +184,28 @@ const COVERAGE: &[Covered] = &[
         tests: &[(
             "provenance_egress.rs",
             "shell_cat_of_a_boundary_file_blocks_the_next_remote_turn",
+        )],
+    },
+    Covered {
+        tool_type: "ProjectsTool",
+        registered: Some("projects"),
+        // Not a `with_builtins` tool: the daemon registers it per session,
+        // because it needs the machine's registry — the same reason `skill`
+        // and `web` are registered there.
+        builtin: false,
+        // The second entry whose `surfaces` is an argument rather than a
+        // warning (REQ-584 BR-5). This tool *does* touch the filesystem — it
+        // reads directory names — and the distinction the boundary cares about
+        // is that it never opens a file, so `Sources(∅)` is a fact rather than
+        // an omission. Checked, not asserted in prose: the cited test drives a
+        // real turn against a repo that HAS a boundary file, and the next
+        // remote turn goes out, which is only true if no content was read.
+        mention: "projects",
+        surfaces: "directory names from the machine's own project registry and dev \
+                   folders — no file is opened, and therefore no provenance to carry",
+        tests: &[(
+            "provenance_egress.rs",
+            "projects_touches_no_repo_file_and_leaves_the_next_remote_turn_free",
         )],
     },
     Covered {
@@ -476,7 +502,7 @@ fn every_content_surfacing_tool_has_a_boundary_test() {
     // an empty claim (BUG-159).
     assert_eq!(
         TOOL_SOURCES.len(),
-        11,
+        12,
         "the embedded source list shrank; the scan below is narrower than the module"
     );
     for (file, text) in TOOL_SOURCES {

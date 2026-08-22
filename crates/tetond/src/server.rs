@@ -122,12 +122,12 @@ use teton_protocol::methods::{
     AttachConsentOutcome, AttachConsentParams, AttachConsentResult, ConfigGetParams,
     ConfigGetResult, ConfigSetParams, ConfigSetResult, CostQueryParams, ModelConfirmParams,
     ModelListParams, ModelSetParams, ModelStatusParams, PermissionRespondParams,
-    PermissionRespondResult, PromptBlock, PromptTurnParams, ProviderSetupCommitParams,
-    ProviderSetupPlanParams, ProviderSetupPreviewParams, ProviderTestParams, RpcMethod,
-    SessionAttachParams, SessionAttachResult, SessionClearParams, SessionCreateParams,
-    SessionCreateResult, SessionListParams, SessionListResult, SessionPermissionsParams,
-    SessionSetCwdParams, SessionSummary, SkillSkipped, SkillView, SkillsListParams,
-    SkillsListResult, WebOverrideParams, WebRefreshParams, WebSetupCommitParams,
+    PermissionRespondResult, ProjectsListParams, ProjectsListResult, PromptBlock, PromptTurnParams,
+    ProviderSetupCommitParams, ProviderSetupPlanParams, ProviderSetupPreviewParams,
+    ProviderTestParams, RpcMethod, SessionAttachParams, SessionAttachResult, SessionClearParams,
+    SessionCreateParams, SessionCreateResult, SessionListParams, SessionListResult,
+    SessionPermissionsParams, SessionSetCwdParams, SessionSummary, SkillSkipped, SkillView,
+    SkillsListParams, SkillsListResult, WebOverrideParams, WebRefreshParams, WebSetupCommitParams,
     WebSetupPlanParams, WebSetupPreviewParams,
 };
 use teton_protocol::{RequestId, SessionId};
@@ -2470,6 +2470,12 @@ fn dispatch(
         // human, no network, no filesystem — so it stays on the synchronous
         // path beside the other session-scoped reads.
         SkillsListParams::METHOD => Some(handle_skills_list(daemon, conn, id, params)),
+        // REQ-584 BR-9. **Not on the synchronous path**: unlike `skills/list`,
+        // which reads a stored snapshot, this may run BR-3's dev-folder scan —
+        // up to eleven directory reads two levels deep, and on macOS the one
+        // that can raise the Documents dialog. Parking the connection's reader
+        // loop on that is the defect BUG-184 fixed for discovery.
+        ProjectsListParams::METHOD => Some(handle_projects_list(daemon, id, params)),
         SessionPermissionsParams::METHOD => {
             Some(handle_session_permissions(daemon, conn, id, params))
         }
@@ -4330,6 +4336,7 @@ fn rebuild_session_skills(daemon: &Daemon, session_id: &SessionId, cwd: Option<&
         session_id,
         &daemon.runtime.session_root_for(cwd),
         daemon.skills_fs.as_ref(),
+        daemon.runtime.projects(),
     );
 }
 
@@ -4352,6 +4359,41 @@ fn rebuild_session_skills(daemon: &Daemon, session_id: &SessionId, cwd: Option<&
 ///
 /// It answers from the stored snapshot and opens nothing: the discovery this
 /// reports was paid at [`rebuild_session_skills`]'s two call sites.
+/// `projects/list` — the machine's known projects, rendered (REQ-584 BR-9).
+///
+/// **Ungated on the session**, unlike `skills/list`: there is no session in the
+/// params and nothing session-scoped in the answer. A project list is a fact
+/// about the *machine*, the same class as REQ-583's root display, and gating it
+/// on an attachment would make `/projects` unusable from exactly the state it
+/// exists for — a client that has not settled anywhere yet.
+///
+/// Returns the text the `projects` tool returns, from the one composition both
+/// read (BR-9's one-renderer rule). The client styles; it does not restate.
+fn handle_projects_list(daemon: &Daemon, id: Id, params: Value) -> String {
+    let params: ProjectsListParams = match serde_json::from_value(params) {
+        Ok(params) => params,
+        Err(_) => return error_string(id, error_code::INVALID_PARAMS, "invalid params"),
+    };
+    // The scan is filesystem work, so it leaves the async worker for the same
+    // reason discovery does (BUG-184).
+    let view = crate::runtime::block_in_place_if_multithread(|| {
+        crate::projects::locator_view(
+            daemon.runtime.projects(),
+            crate::session_root::home().as_deref(),
+            crate::projects::scan::ScanBudget::default(),
+            &crate::projects::scan::ScanObserver::default(),
+            params.query.as_deref().filter(|q| !q.is_empty()),
+            params.allow_scan,
+        )
+    });
+    ok_string(
+        id,
+        &ProjectsListResult {
+            rendered: teton_core::projects::render_locator(&view),
+        },
+    )
+}
+
 fn handle_skills_list(daemon: &Daemon, conn: &ConnState, id: Id, params: Value) -> String {
     let params: SkillsListParams = match serde_json::from_value(params) {
         Ok(params) => params,

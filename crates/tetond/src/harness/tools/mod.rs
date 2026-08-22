@@ -52,6 +52,7 @@ pub mod edit;
 pub mod glob;
 pub mod grep;
 pub mod mcp;
+pub mod projects;
 pub mod read;
 pub mod shell;
 pub mod skill;
@@ -63,6 +64,9 @@ pub use edit::EditTool;
 pub use glob::GlobTool;
 pub use grep::GrepTool;
 pub use mcp::{register_mcp_tools, McpToolHandle};
+pub use projects::{
+    register_projects_tool, ProjectsTool, PROJECTS_CAP_EXEMPT_REASON, PROJECTS_TOOL_NAME,
+};
 pub use read::ReadTool;
 pub use shell::ShellTool;
 pub use skill::{register_skill_tool, SkillTool, SKILL_TOOL_NAME};
@@ -93,6 +97,7 @@ pub const CAP_EXEMPT_TOOLS: &[(&str, &str)] = &[
          profiles the cap applies to are the ones whose model does not know Teton's own \
          setup surface (REQ-577 BR-7)",
     ),
+    (PROJECTS_TOOL_NAME, PROJECTS_CAP_EXEMPT_REASON),
     (
         WEB_TOOL_NAME,
         "the user's opt-in must survive the cap: the capability exists only because \
@@ -1708,6 +1713,16 @@ mod tests {
     fn daemon_shaped_registry(tag: &str) -> ToolRegistry {
         let mut reg = ToolRegistry::with_builtins();
         reg.register(Arc::new(StubTool("mcp")));
+        // REQ-584 BR-6, in the position the daemon registers it — this
+        // fixture stands in for "the registry the daemon builds", so a tool
+        // missing here would make the cross-check below assert against a
+        // shape production never has.
+        projects::register_projects_tool(
+            &mut reg,
+            Arc::new(crate::projects::ProjectStore::in_memory()),
+            None,
+            None,
+        );
         reg.register_cap_exempt(Arc::new(StubTool(WEB_TOOL_NAME)));
         assert!(
             register_skill_tool(
@@ -1795,6 +1810,9 @@ mod tests {
                 "glob",
                 "shell",
                 DOCS_TOOL_NAME,
+                // REQ-584 BR-6 / AC-7: cap-exempt, so the cap does not displace
+                // it — registered before `web` because web must stay last.
+                PROJECTS_TOOL_NAME,
                 WEB_TOOL_NAME,
                 SKILL_TOOL_NAME
             ],
@@ -1811,7 +1829,12 @@ mod tests {
 
         assert_eq!(
             reg.exposed_names(Some(0)),
-            vec![DOCS_TOOL_NAME, WEB_TOOL_NAME, SKILL_TOOL_NAME],
+            vec![
+                DOCS_TOOL_NAME,
+                PROJECTS_TOOL_NAME,
+                WEB_TOOL_NAME,
+                SKILL_TOOL_NAME
+            ],
             "a cap of zero bounds the non-exempt registrations only; the exempt tools \
              are present exactly as `teton_docs` is today"
         );

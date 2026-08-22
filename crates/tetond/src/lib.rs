@@ -106,6 +106,7 @@ pub mod lifetime;
 pub mod mcp;
 pub mod model_consent;
 pub mod peer;
+pub mod projects;
 pub mod provider_recipes;
 pub mod router;
 pub mod runtime;

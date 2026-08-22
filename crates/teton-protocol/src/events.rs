@@ -193,6 +193,8 @@ pub enum Event {
     SkillInvoked(SkillInvoked),
     /// A skill call was refused before any file was resolved (BUG-189).
     SkillRefused(SkillRefused),
+    /// The `projects` tool found a project this turn (REQ-584 BR-11).
+    ProjectMatch(ProjectMatch),
 }
 
 impl Event {
@@ -233,6 +235,7 @@ impl Event {
             Event::ContextPressure(_) => "context_pressure",
             Event::SkillInvoked(_) => "skill_invoked",
             Event::SkillRefused(_) => "skill_refused",
+            Event::ProjectMatch(_) => "project_match",
         }
     }
 }
@@ -2745,6 +2748,36 @@ pub struct SessionGrantMinted {
 }
 
 // ---------------------------------------------------------------------------
+/// The best project a turn's `projects` call matched (REQ-584 BR-11).
+///
+/// **The hand-off is a surface line, not prose the model is asked to say**
+/// (REQ-579 ADR-9, LESSON-532). A small model told "tell the user to run
+/// `/cd teton-code`" often does not, or garbles the command; the session prints
+/// it from this record instead, so the recipe reaches the user whatever the
+/// model said. Published only when there was a match — a turn that called the
+/// tool and found nothing publishes none, and a turn that never called it
+/// publishes none either.
+///
+/// **What an older client loses, stated rather than assumed.** [`Event`] is a
+/// closed enum with no `#[serde(other)]`, so a client built before this variant
+/// drops the whole frame at `serde_json::from_value` — it does not render a
+/// degraded line, it renders nothing. The cost is one convenience line on a
+/// turn whose *answer* arrived normally in the tool result, which is why this
+/// ships as an ordinary additive event the way `skill_invoked` and
+/// `skill_refused` did before it.
+///
+/// The general gap — that `Event` itself is not tolerant, where BUG-186 made
+/// its inner enums so — is real and outlives this REQ. It is recorded as a
+/// follow-up rather than widened here: adding `#[serde(other)] Unknown` to
+/// `Event` touches every match on it and deserves its own change.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ProjectMatch {
+    /// The best match's name, bounded and neutralised by the daemon.
+    pub name: String,
+    /// Its display path, bounded the same way.
+    pub display: String,
+}
+
 /// A skill call the daemon refused **before resolving it to a file** (BUG-189).
 ///
 /// BR-9 says a refusal is never silent: one line per invocation, one line per

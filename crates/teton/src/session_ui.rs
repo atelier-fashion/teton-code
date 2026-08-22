@@ -545,6 +545,13 @@ pub fn render_event(
             surface.line(LineKind::Notice, &skill_name_refusal_line(refused));
             EventOutcome::Rendered
         }
+        // REQ-584 BR-11: the hand-off, drawn from the daemon's record rather
+        // than hoped for in the model's prose (REQ-579 ADR-9, LESSON-532). Not
+        // behind `/verbose`: it is the answer to the question the user asked.
+        Event::ProjectMatch(matched) => {
+            surface.line(LineKind::Notice, &project_handoff_line(matched));
+            EventOutcome::Rendered
+        }
         Event::RouteDecided(rd) => {
             if state.verbose {
                 surface.line(LineKind::Notice, &format_route(rd));
@@ -1285,6 +1292,16 @@ fn skill_refusal_line(invoked: &SkillInvoked, reason: &str) -> String {
         source = slash::source_words(invoked.source, invoked.shadows_user_skill),
         words = refusal_reason_words(reason),
     )
+}
+
+/// REQ-584 BR-11's hand-off: the one line that answers "where is my X repo".
+///
+/// Deliberately an **imperative recipe**, not a report. The user asked where
+/// something is; the useful reply is the command that takes them there, and the
+/// arrow is what makes it read as an offer rather than as another fact among
+/// the model's prose.
+fn project_handoff_line(matched: &events::ProjectMatch) -> String {
+    format!("→ /cd {}  ({})", matched.name, matched.display)
 }
 
 /// BR-9's refusal line for a call that never reached a file (BUG-189).
@@ -4995,6 +5012,62 @@ mod tests {
     }
 
     /// Only a lookup that ran proves a tier was held. A refusal proves the
+    /// **REQ-584 BR-11 / AC-12.** A matched `projects` call ends the turn with
+    /// the recipe — from the daemon's record, not the model's prose.
+    ///
+    /// Driven through `render_event` rather than through the formatter, for the
+    /// reason BUG-189's sibling test records: "the line reaches the surface" is
+    /// a claim about the dispatch, and a test that called
+    /// `project_handoff_line` directly would stay green with the arm deleted.
+    #[test]
+    fn a_matched_project_ends_the_turn_with_the_cd_recipe() {
+        let mut surface = RecordingSurface::new();
+        let mut state = SessionState::new();
+        render_event(
+            &envelope(Event::ProjectMatch(events::ProjectMatch {
+                name: "teton-code".to_owned(),
+                display: "~/Documents/GitHub/teton-code".to_owned(),
+            })),
+            &mut surface,
+            &mut state,
+        );
+
+        assert!(
+            surface.any_line_contains(LineKind::Notice, "→ /cd teton-code"),
+            "the hand-off must name the command that moves the session: {:?}",
+            surface.lines_of(LineKind::Notice)
+        );
+        assert!(
+            surface.any_line_contains(LineKind::Notice, "~/Documents/GitHub/teton-code"),
+            "and where it goes: {:?}",
+            surface.lines_of(LineKind::Notice)
+        );
+    }
+
+    /// **AC-12's negative half.** No event, no line.
+    ///
+    /// The daemon publishes only on a match, so "a turn that did not call the
+    /// tool, or called it and found nothing, prints nothing" is the absence of
+    /// this event — which is what this asserts, over an unrelated event so the
+    /// surface is not merely empty for want of anything happening.
+    #[test]
+    fn a_turn_without_a_project_match_prints_no_hand_off() {
+        let mut surface = RecordingSurface::new();
+        let mut state = SessionState::new();
+        render_event(
+            &envelope(Event::ContextCleared(events::ContextCleared {
+                blocks_dropped: 1,
+            })),
+            &mut surface,
+            &mut state,
+        );
+        assert!(
+            !surface.fragments().contains("→ /cd "),
+            "a turn with no project match must print no hand-off: {}",
+            surface.fragments()
+        );
+    }
+
     /// opposite, and must never raise the status row's reading.
     #[test]
     fn only_a_lookup_that_ran_raises_the_status_field() {

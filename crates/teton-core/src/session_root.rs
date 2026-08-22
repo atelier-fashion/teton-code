@@ -384,6 +384,47 @@ pub enum CwdArgError {
     NotAbsolute(String),
 }
 
+/// Whether `raw` is a **bare name** rather than a path spelling (REQ-584 BR-8).
+///
+/// The gate on the registry reading. A bare name contains no path separator and
+/// does not open with `~`, `.` or `-`:
+///
+/// - `teton-code` → a name, and a candidate for the registry;
+/// - `src`, likewise — but `./src` under the root still **wins**, because the
+///   path reading is tried first and only its failure reaches the registry;
+/// - `~/x`, `./x`, `../x`, `/abs`, `a/b` → path spellings, never names;
+/// - `-x` → not a name either: a leading `-` is a flag's shape, and reading it
+///   as a project would make a typo'd flag move the session.
+///
+/// Deliberately **narrower** than "not a valid path": the question is what the
+/// user meant, and anything that looks like a path is read as one. That is what
+/// keeps REQ-583's grammar unchanged wherever it applied — the new reading is
+/// reachable only from spellings the old one could never resolve to anything
+/// but a sibling directory.
+#[must_use]
+pub fn is_bare_project_name(raw: &str) -> bool {
+    let arg = raw.trim();
+    !arg.is_empty()
+        && !arg.contains('/')
+        && !arg.contains('\\')
+        && !arg.starts_with('~')
+        && !arg.starts_with('.')
+        && !arg.starts_with('-')
+}
+
+/// The refusal a `/cd <name>` earns when **neither** reading resolved (BR-8).
+///
+/// One composer, because the sentence has to name both readings and a caller
+/// assembling it from two halves is the drift LESSON-529 names. The daemon
+/// raises it; the client renders what it is given.
+#[must_use]
+pub fn cd_two_reading_refusal(name: &str) -> String {
+    format!(
+        "no directory `{name}` under the session root, and no known project named \
+         `{name}` — `/projects` lists what is known"
+    )
+}
+
 /// Turn a `--cwd`/`/cd` argument into the absolute path the daemon is asked to
 /// validate (BR-6, BR-7 — one grammar, two spellings; AC-12).
 ///
@@ -1230,5 +1271,46 @@ mod tests {
         assert_eq!(lexical_normalize(Path::new("/a/b/")), Path::new("/a/b"));
         assert_eq!(lexical_normalize(Path::new("../a")), Path::new("../a"));
         assert_eq!(lexical_normalize(Path::new("a/../../b")), Path::new("../b"));
+    }
+    /// **REQ-584 BR-8 / AC-9.** The bare-name gate is narrower than "not a path".
+    ///
+    /// The question is what the user *meant*, and anything shaped like a path is
+    /// read as one — which is what keeps REQ-583's grammar unchanged wherever it
+    /// applied. The new reading is reachable only from spellings the old one
+    /// could resolve to nothing but a sibling directory.
+    #[test]
+    fn a_bare_name_is_narrower_than_not_a_path() {
+        for name in ["teton-code", "src", "api", "a", "under_score", "CAPS"] {
+            assert!(is_bare_project_name(name), "`{name}` is a bare name");
+        }
+        for path in [
+            "~", "~/x", "./x", "../x", "/abs", "a/b", "x/", "-x", "--cwd", "", "   ",
+        ] {
+            assert!(
+                !is_bare_project_name(path),
+                "`{path}` is a path spelling or a flag, never a project name"
+            );
+        }
+        // Whitespace is trimmed, as `resolve_cwd_argument` trims it — the two
+        // readings must agree about what the argument even is.
+        assert!(is_bare_project_name("  teton  "));
+    }
+
+    /// **AC-9.** The refusal names **both** readings, from one composer.
+    #[test]
+    fn the_two_reading_refusal_names_both_readings() {
+        let line = cd_two_reading_refusal("nothing-known");
+        assert!(
+            line.contains("no directory `nothing-known` under the session root"),
+            "{line}"
+        );
+        assert!(
+            line.contains("no known project named `nothing-known`"),
+            "{line}"
+        );
+        assert!(
+            line.contains("/projects"),
+            "and it points at the surface that would have listed them: {line}"
+        );
     }
 }

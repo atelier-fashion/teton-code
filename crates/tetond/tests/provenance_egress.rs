@@ -244,7 +244,16 @@ async fn drive_scripted_turn(
     );
 
     let config = scripted_config();
-    let tools = ToolRegistry::with_builtins();
+    let mut tools = ToolRegistry::with_builtins();
+    // REQ-584 BR-6: the daemon registers `projects` per session, so a harness
+    // that stands in for a real turn has to as well — otherwise the tool's own
+    // boundary test would be exercising an "unknown tool" refusal.
+    tetond::harness::tools::register_projects_tool(
+        &mut tools,
+        std::sync::Arc::new(tetond::projects::ProjectStore::in_memory()),
+        None,
+        None,
+    );
     let tool_ctx = ToolContext::new(repo);
 
     let pending = Arc::new(PendingPermissions::new());
@@ -488,6 +497,83 @@ async fn glob_listing_the_boundary_directory_by_name_tags_it_but_does_not_block(
 // ---------------------------------------------------------------------------
 // teton_docs — no repo file, and therefore no taint (REQ-577 BR-6)
 // ---------------------------------------------------------------------------
+
+/// **REQ-584 BR-5: the locator surfaces no repository content, so the session
+/// it runs in is not pinned.**
+///
+/// The same negative claim `teton_docs` makes, over a different mechanism: this
+/// tool *does* touch the filesystem — it reads directory names — and the
+/// distinction the boundary cares about is that it never opens a file. The repo
+/// here holds the boundary file every other test in this suite leaks through,
+/// and the second remote turn still goes out.
+///
+/// Paired with its positive half in the same run (LESSON-520), so "no
+/// provenance" is a statement about a served result rather than an empty one.
+#[tokio::test]
+async fn projects_touches_no_repo_file_and_leaves_the_next_remote_turn_free() {
+    let repo = temp_repo();
+    let (result, captured, blocks, ctx) =
+        run_touching_tool(&repo, ("c1", "projects", r#"{}"#)).await;
+
+    // The positive half: the tool answered and its answer was folded in.
+    let framed = ctx
+        .blocks()
+        .iter()
+        .rev()
+        .find(|b| {
+            matches!(
+                b.provenance,
+                tetond::harness::context::Provenance::Tool { .. }
+            )
+        })
+        .map(|b| b.text.clone())
+        .expect("the projects result was folded into context");
+    assert!(
+        framed.contains("no known projects") || framed.contains("/cd "),
+        "the locator did not answer: {framed}"
+    );
+    assert_last_tool_result_is_framed(&ctx);
+
+    // The negative half, which is the boundary claim (REQ-584 BR-5). The
+    // locator reads **directory names**, never file bodies — so like
+    // `teton_docs` it has knowable, empty provenance rather than `Unknown`.
+    // `Unknown` here would fail-close egress over a list of folder names.
+    let provenance = context_provenance(&ctx);
+    assert!(
+        !provenance.is_unknown(),
+        "a directory listing has knowable provenance — `Unknown` would \
+         fail-close egress over the machine's own project names"
+    );
+    assert_eq!(
+        provenance.len(),
+        0,
+        "`projects` opened no path, so there is no identity to carry: {:?}",
+        provenance.sources().collect::<Vec<_>>()
+    );
+
+    // And therefore the turn carrying the result is not refused — the leg that
+    // makes the assertions above mean something (LESSON-479).
+    assert!(
+        result.is_ok(),
+        "listing projects must not block the next remote turn: {result:?}"
+    );
+    assert!(
+        blocks.is_empty(),
+        "no privacy block was warranted: {blocks:?}"
+    );
+    assert_eq!(
+        captured.len(),
+        2,
+        "the fixture must really have put a second request on the wire, or \
+         'not blocked' is an observation about a turn that never happened"
+    );
+    for body in &captured {
+        assert!(
+            !contains_bytes(body, SECRET),
+            "boundary content reached egress through a tool that reads no files"
+        );
+    }
+}
 
 /// **REQ-577 BR-6: the bundled-docs tool surfaces nothing from the repository,
 /// so the session it runs in is not pinned.**

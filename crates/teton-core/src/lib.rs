@@ -61,6 +61,7 @@ pub mod lifetime;
 pub mod mcp;
 pub mod phase;
 pub mod policy;
+pub mod projects;
 pub mod provenance_id;
 pub mod session_root;
 
