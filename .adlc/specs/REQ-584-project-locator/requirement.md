@@ -1,10 +1,10 @@
 ---
 id: REQ-584
 title: "A project locator — the session can name this machine's projects without walking the disk, and a bare name moves the root"
-status: draft
+status: approved
 deployable: true
 created: 2026-08-19
-updated: 2026-08-19
+updated: 2026-08-22
 component: "daemon/harness"
 domain: "harness"
 stack: ["rust", "daemon", "cli", "json-rpc"]
