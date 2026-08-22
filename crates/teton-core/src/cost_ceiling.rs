@@ -121,6 +121,22 @@ pub fn usd(micro_cents: u64) -> String {
     format!("${}.{:02}", cents / 100, cents % 100)
 }
 
+/// The `/verbose` clause naming the ceiling in force (BR-2, AC-2).
+///
+/// The **same** `bound.words()` the refusal uses, so the surface that tells a
+/// user a ceiling exists and the surface that tells them they hit it cannot
+/// come to name different things. That is the whole of BR-2: one decision, one
+/// home, and every surface reading it rather than re-deriving it — the
+/// `BudgetBound` pattern REQ-586 set, applied to money.
+///
+/// Returns `None` when no ceiling is configured, which is what keeps an
+/// un-opted-in turn byte-identical to today: there is no clause to append, not
+/// an empty one.
+#[must_use]
+pub fn spend_ceiling_clause(ceiling_micro_cents: Option<u64>, bound: SpendBound) -> Option<String> {
+    ceiling_micro_cents.map(|c| format!("{} {}", bound.words(), usd(c)))
+}
+
 /// **The one refusal sentence** (ADR-5, BR-2).
 ///
 /// Composed here because the daemon raises it and the CLI renders it, and two
@@ -334,5 +350,52 @@ mod tests {
                  decides a refusal must be integral, and the daemon owns the I/O"
             );
         }
+    }
+
+    /// BR-2, the half AC-2 is really about: **one home for the bound's name**.
+    ///
+    /// Three surfaces say which ceiling is in force — the `/verbose` route
+    /// clause, the overspend refusal, and the unpriced refusal — and all three
+    /// must say it in the same words. The failure this pins is not a typo but a
+    /// drift: someone rewords one sentence, its own test is updated alongside
+    /// it, and a user now meets two names for one setting with nothing to tell
+    /// them it is the same setting. Asserting that each rendering *contains*
+    /// `bound.words()` means the wording can only change in one place.
+    #[test]
+    fn every_surface_names_the_bound_in_the_same_words() {
+        let bound = SpendBound::PromptCeiling;
+        let words = bound.words();
+
+        let clause = spend_ceiling_clause(Some(500_000), bound).expect("configured");
+        let overspent = ceiling_refusal(500_000, 500_000, bound);
+        let unpriced = unpriced_refusal("kimi", "kimi-k3", bound);
+
+        for (surface, rendered) in [
+            ("the /verbose clause", &clause),
+            ("the overspend refusal", &overspent),
+            ("the unpriced refusal", &unpriced),
+        ] {
+            assert!(
+                rendered.to_lowercase().contains(&words.to_lowercase()),
+                "{surface} must name the bound in the composer's words: {rendered}"
+            );
+        }
+
+        // And the two refusals stay two sentences. They are different problems
+        // with different remedies — nothing was overspent when a price is
+        // missing — so telling them apart is the point of having both.
+        assert_ne!(overspent, unpriced);
+        assert!(!unpriced.contains("has spent"));
+    }
+
+    /// No ceiling is no clause — not an empty one.
+    ///
+    /// The distinction is what keeps an un-opted-in turn's route line
+    /// byte-identical to before this REQ: the caller appends `unwrap_or_default`
+    /// on an `Option`, so a `Some("")` would add a stray separator to every
+    /// line on every machine that never asked for this feature.
+    #[test]
+    fn no_ceiling_composes_no_clause() {
+        assert_eq!(spend_ceiling_clause(None, SpendBound::PromptCeiling), None);
     }
 }

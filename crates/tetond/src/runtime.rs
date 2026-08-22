@@ -3942,6 +3942,42 @@ impl DaemonRuntime {
                         ),
                     ));
                 }
+                // REQ-588 BR-3 / ADR-4: the spend ceiling, answered here and
+                // **before** the generic remote arm below. That arm asks for a
+                // `failure_class`, and this error deliberately has none, so
+                // without this branch a budget stop would fall through to
+                // "provider failed unrecoverably" — a sentence that is wrong
+                // about the cause, silent about the money, and names no remedy.
+                //
+                // The sentence is composed here rather than carried up from the
+                // choke point because `TransportError` is `Copy` and cannot hold
+                // one — and because every fact it needs is already in scope at
+                // this point: the accumulator this prompt has been adding to,
+                // the ceiling the same config supplied to the choke point, and
+                // the route's provider and model. Composed through the one
+                // composer the `/verbose` clause uses, so the two surfaces
+                // cannot come to name different ceilings (BR-2).
+                Err(HarnessError::Remote(perr)) if perr.is_spend_ceiling_reached() => {
+                    use teton_core::cost_ceiling::{ceiling_refusal, unpriced_refusal, SpendBound};
+                    let bound = SpendBound::PromptCeiling;
+                    let ceiling = config.cost.ceiling_micro_cents().unwrap_or(0);
+                    let spent = prompt_spend.as_ref().map_or(0, |s| s.spent());
+                    // Two different problems with two different remedies, told
+                    // apart by what the prompt recorded: an unpriceable call is
+                    // not an overspend, and telling a user to raise a ceiling
+                    // when the real fix is a missing price would send them to
+                    // the wrong file.
+                    let message = if prompt_spend.as_ref().is_some_and(|s| s.saw_unpriced()) {
+                        unpriced_refusal(
+                            provider_id.as_ref().map_or("", |p| p.0.as_str()),
+                            route.model.as_deref().unwrap_or("(unknown model)"),
+                            bound,
+                        )
+                    } else {
+                        ceiling_refusal(spent, ceiling, bound)
+                    };
+                    break 'turn Err(RpcError::new(error_code::SPEND_CEILING_REACHED, message));
+                }
                 Err(HarnessError::Remote(perr)) if attempts < 2 => {
                     attempts += 1;
                     let Some(pid) = provider_id.as_ref() else {
@@ -11149,6 +11185,9 @@ fn build_router(
         // The session override (ADR-I) is layered on by the caller that has a
         // session; `build_router` sees only the persisted floor.
         .with_effort(config.effort)
+        // REQ-588 BR-2: the ceiling the surfaces will name, read from the same
+        // config the choke point reads its own from.
+        .with_spend_ceiling(config.cost.ceiling_micro_cents())
         .with_local_available(local_available);
     for p in &config.providers {
         // REQ-544 M-5: seed each provider's health from the persisted map (default

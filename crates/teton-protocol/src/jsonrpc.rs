@@ -558,6 +558,32 @@ pub mod error_code {
         /// before consent, when the body alone does not fit, and after the
         /// dynamic outcomes are folded in, when their output pushed it over.
         SKILL_EXPANSION_TOO_LARGE = -32023;
+        /// Teton stopped this prompt because it reached the spend ceiling the
+        /// user configured (REQ-588 BR-3, architecture ADR-4).
+        ///
+        /// A **budget** outcome, not a failure. Like the two codes above it,
+        /// nothing is wrong with the provider and nothing about resending
+        /// helps — but the distinction that matters here is a different one:
+        /// this is the only one of the three where the remedy is a decision
+        /// about money rather than about size. The message names what the
+        /// prompt spent, the ceiling it reached, and which ceiling that was,
+        /// through `SpendBound::words()` and never a wire spelling.
+        ///
+        /// Deliberately **not** a fallback trigger. Rerouting to another
+        /// provider because the budget ran out spends more money rather than
+        /// less, and does it without saying so — the silent downgrade the
+        /// requirement's OQ-4 rejected in favour of refusing out loud. And
+        /// deliberately not a health signal, for the reason `failure_class`
+        /// states: degrading a provider here would make a budget decision look
+        /// like an outage and route later turns away from a healthy provider
+        /// for the rest of the session, with nothing in the behaviour
+        /// mentioning money.
+        ///
+        /// The ceiling is checked *between* calls, so a call already in flight
+        /// can carry the total past the line by its own cost. The message says
+        /// this rather than leaving a user to discover that the figure they
+        /// see exceeds the number they set.
+        SPEND_CEILING_REACHED = -32024;
     }
 }
 

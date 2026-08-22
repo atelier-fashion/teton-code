@@ -1,7 +1,7 @@
 ---
 id: TASK-236
 title: "the check at the choke point"
-status: pending
+status: complete
 parent: REQ-588
 created: 2026-08-22
 updated: 2026-08-22

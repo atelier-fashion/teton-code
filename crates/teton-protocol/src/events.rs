@@ -448,6 +448,16 @@ pub struct RouteDecided {
     /// and every refusal read. Same additivity as [`Self::budget_tokens`].
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub bound: Option<BudgetBound>,
+    /// The per-prompt **spend** ceiling in force, in micro-cents (REQ-588 BR-2).
+    ///
+    /// The money twin of [`Self::bound`], and additive in the same way: absent
+    /// on every turn where the user has set no ceiling, which is what makes an
+    /// un-opted-in turn serialize byte-identically to before this REQ. The
+    /// figure rides rather than the rendered dollars so the surface can format
+    /// it once, through the same composer the refusal uses — two surfaces
+    /// describing one ceiling must not be able to disagree (BR-2).
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub spend_ceiling_micro_cents: Option<u64>,
     /// Whether the derivation had to **raise** this attempt's pair to its floor
     /// — so [`Self::bound`] names what the user declared, and the budget above
     /// is larger than that declaration asked for (REQ-586 TASK-194 2b).
@@ -3273,6 +3283,7 @@ mod tests {
             budget_bytes: Some(397_952),
             bound: Some(BudgetBound::Window),
             bound_floored: None,
+            spend_ceiling_micro_cents: None,
         }));
         // Flattened: envelope metadata and the payload share one object.
         assert_eq!(wire["event"], "route_decided");
@@ -3309,6 +3320,7 @@ mod tests {
                     budget_bytes: None,
                     bound: None,
                     bound_floored: None,
+                    spend_ceiling_micro_cents: None,
                 }),
                 "route_decided",
             ),
@@ -3860,6 +3872,7 @@ mod tests {
             budget_bytes: Some(16_384),
             bound: Some(BudgetBound::UserCap),
             bound_floored: Some(true),
+            spend_ceiling_micro_cents: None,
         };
         round_trip(&decided);
         let wire = serde_json::to_value(&decided).unwrap();
@@ -4003,6 +4016,7 @@ mod tests {
             budget_bytes: None,
             bound: None,
             bound_floored: None,
+            spend_ceiling_micro_cents: None,
         });
 
         // REQ-586: the budget pair and its bound ride the same frame, and every
@@ -4027,6 +4041,7 @@ mod tests {
                 budget_bytes: Some(253_952),
                 bound: Some(bound),
                 bound_floored: None,
+                spend_ceiling_micro_cents: None,
             };
             round_trip(&decided);
             let wire: serde_json::Value =
@@ -4083,6 +4098,7 @@ mod tests {
             budget_bytes: Some(253_952),
             bound: Some(BudgetBound::UserCap),
             bound_floored: None,
+            spend_ceiling_micro_cents: None,
         })
         .unwrap();
         assert!(
@@ -5100,6 +5116,7 @@ mod tests {
             budget_bytes: None,
             bound: None,
             bound_floored: None,
+            spend_ceiling_micro_cents: None,
         };
         round_trip(&decided);
         let wire: serde_json::Value =

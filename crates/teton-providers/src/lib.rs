@@ -680,6 +680,19 @@ impl ProviderError {
         matches!(self, ProviderError::EffortRefused { .. })
     }
 
+    /// Whether this is the REQ-588 BR-3 spend-ceiling stop, which the daemon
+    /// answers with a typed outcome naming the spend and the ceiling — no
+    /// retry, no failover, no change to the provider's health.
+    ///
+    /// A predicate rather than a `failure_class` arm because the machinery must
+    /// not act on it at all: `failure_class` returning `None` is what keeps the
+    /// retry/degrade path away from it, and this is how the *turn* path
+    /// recognises it in order to say something useful instead.
+    #[must_use]
+    pub const fn is_spend_ceiling_reached(&self) -> bool {
+        matches!(self, ProviderError::SpendCeilingReached)
+    }
+
     /// Whether this is the REQ-586 BR-2 context-length refusal, which the
     /// daemon answers with a typed outcome naming the window and the assembled
     /// size — no retry, no failover, no change to the provider's health.

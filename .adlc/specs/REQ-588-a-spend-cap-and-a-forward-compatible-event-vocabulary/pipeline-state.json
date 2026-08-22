@@ -52,8 +52,13 @@
     "teton-code"
   ],
   "phase4": {
-    "currentTask": null,
-    "completedTasks": [],
+    "currentTask": "TASK-237",
+    "completedTasks": [
+      "TASK-233",
+      "TASK-234",
+      "TASK-235",
+      "TASK-236"
+    ],
     "failedTasks": []
   },
   "notes": [

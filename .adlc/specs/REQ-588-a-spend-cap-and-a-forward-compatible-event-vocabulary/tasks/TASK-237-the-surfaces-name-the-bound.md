@@ -1,7 +1,7 @@
 ---
 id: TASK-237
 title: "the surfaces name the binding ceiling"
-status: pending
+status: complete
 parent: REQ-588
 created: 2026-08-22
 updated: 2026-08-22
