@@ -118,6 +118,52 @@ fn summarize_frame(frame: &serde_json::Value) -> String {
     }
 }
 
+/// **BUG-163, the defect the instrument found.** A response read out of order
+/// is kept, not discarded.
+///
+/// This client is single-threaded with more than one request in flight: the
+/// resume leg sends `session/attach`, then answers the consent it raises with
+/// `permission/respond` **before** reading the attach's reply. The daemon may
+/// answer those two in either order. `read_response` used to drop any response
+/// whose id did not match, so whenever the attach's reply arrived first it was
+/// thrown away inside the respond's read, and the later `read_response` for the
+/// attach waited out its full deadline for a frame that had already come and
+/// gone. macOS usually won that race; the slower Linux runner lost it.
+///
+/// Reproduced here deterministically rather than by timing: two requests are
+/// sent, and the **second** is read first. The daemon answers in order, so the
+/// first response necessarily arrives while the client is waiting for the
+/// second — the exact interleaving, with none of the flakiness.
+#[test]
+fn a_response_that_arrives_while_another_is_awaited_is_kept() {
+    let ws = Workspace::new("bug163-out-of-order");
+    let script = ws.write_script("Unused by this fixture.");
+    let daemon = Daemon::spawn(&ws, probe_with_local(script));
+    let mut client = RawClient::connect(daemon.socket());
+    assert!(client.handshake("out-of-order").get("result").is_some());
+
+    let first = client.send("session/list", json!({}));
+    let second = client.send("session/list", json!({}));
+
+    // Read them backwards. `second`'s read must pass over `first`'s response.
+    let b = client.read_response(second);
+    assert_eq!(b["id"].as_i64(), Some(second), "{b}");
+
+    // The one that would have been dropped. Before the fix this blocked until
+    // the 20s deadline and panicked.
+    let a = client.read_response(first);
+    assert_eq!(
+        a["id"].as_i64(),
+        Some(first),
+        "a response passed over while another was awaited must be kept, not \
+         discarded: {a}"
+    );
+    assert!(
+        a.get("result").is_some(),
+        "and it must be the real response, not a placeholder: {a}"
+    );
+}
+
 /// The instrument has to be correct at exactly the moment everything else has
 /// failed, so it is pinned rather than trusted.
 ///
@@ -188,6 +234,17 @@ struct RawClient {
     /// The response id `read_response` is currently blocked on, so the deadline
     /// panic can say what it was waiting for rather than only that it waited.
     awaiting: Option<i64>,
+    /// Responses that arrived while this client was waiting for a **different**
+    /// id, kept until someone asks for them (BUG-163).
+    ///
+    /// This client is single-threaded and has more than one request in flight
+    /// at a time: the resume leg sends `session/attach`, then answers a consent
+    /// with `permission/respond` *before* reading the attach's reply. The
+    /// daemon may answer those two in either order, so the reader can meet the
+    /// attach response while it is inside `read_response` for the respond. It
+    /// used to discard it, and the later `read_response` for the attach then
+    /// waited out its deadline for a frame that had already come and gone.
+    out_of_order: Vec<Value>,
 }
 
 impl RawClient {
@@ -204,6 +261,7 @@ impl RawClient {
             auto_approve_tools: true,
             seen: Vec::new(),
             awaiting: None,
+            out_of_order: Vec::new(),
         }
     }
 
@@ -271,12 +329,28 @@ impl RawClient {
 
     /// Read frames until the response to `id` arrives.
     fn read_response(&mut self, id: i64) -> Value {
+        // It may already have arrived, out of order, while this client was
+        // waiting on another id (BUG-163).
+        if let Some(at) = self
+            .out_of_order
+            .iter()
+            .position(|frame| frame.get("id").and_then(Value::as_i64) == Some(id))
+        {
+            return self.out_of_order.remove(at);
+        }
         let previous = self.awaiting.replace(id);
         loop {
             let frame = self.read_frame();
-            if frame.get("id").and_then(Value::as_i64) == Some(id) {
-                self.awaiting = previous;
-                return frame;
+            match frame.get("id").and_then(Value::as_i64) {
+                Some(seen) if seen == id => {
+                    self.awaiting = previous;
+                    return frame;
+                }
+                // A response to something else. **Kept**, not dropped: this is
+                // the frame whose loss made the Linux leg flake.
+                Some(_) => self.out_of_order.push(frame),
+                // A notification. `read_frame` has already recorded it.
+                None => {}
             }
         }
     }
@@ -294,6 +368,12 @@ impl RawClient {
         match self.awaiting {
             Some(id) => out.push_str(&format!("  awaiting response id {id}\n")),
             None => out.push_str("  awaiting: nothing (not inside read_response)\n"),
+        }
+        if !self.out_of_order.is_empty() {
+            out.push_str(&format!(
+                "  {} response(s) held out of order\n",
+                self.out_of_order.len()
+            ));
         }
         if self.seen.is_empty() {
             out.push_str("  received: nothing at all\n");
