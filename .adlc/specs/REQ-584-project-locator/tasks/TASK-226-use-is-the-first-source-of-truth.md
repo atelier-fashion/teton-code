@@ -1,7 +1,7 @@
 ---
 id: TASK-226
 title: "use is the first source of truth"
-status: pending
+status: complete
 parent: REQ-584
 created: 2026-08-22
 updated: 2026-08-22

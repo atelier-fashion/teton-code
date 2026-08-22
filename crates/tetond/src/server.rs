@@ -4330,6 +4330,7 @@ fn rebuild_session_skills(daemon: &Daemon, session_id: &SessionId, cwd: Option<&
         session_id,
         &daemon.runtime.session_root_for(cwd),
         daemon.skills_fs.as_ref(),
+        daemon.runtime.projects(),
     );
 }
 

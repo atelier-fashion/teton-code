@@ -412,6 +412,102 @@ mod tests {
         std::fs::remove_dir_all(&dir).ok();
     }
 
+    /// **BR-1 / AC-1.** Only a `project`-kind root is recorded, and a second
+    /// landing bumps rather than duplicates.
+    ///
+    /// Driven through `store_session_skills` — the one derivation ADR-4 put the
+    /// hook inside — rather than through `ProjectStore::record` directly, so
+    /// this fails if the hook is removed from that function. Calling `record`
+    /// here would be a test of the store, which the tests above already are.
+    #[test]
+    fn only_a_project_root_is_recorded_and_a_second_landing_bumps_it() {
+        use crate::runtime::DaemonRuntime;
+        use crate::session_root::probe;
+        use crate::sessions::SessionRegistry;
+        use crate::skills::RealFs;
+        use teton_protocol::methods::RootKind;
+
+        let dir = temp_dir("ac1");
+        let repo = project_at(&dir, "repo");
+        let other = project_at(&dir, "other");
+        let plain = dir.join("plain");
+        std::fs::create_dir_all(&plain).unwrap();
+
+        let sessions = SessionRegistry::new();
+        let store = ProjectStore::in_memory();
+        let fs = RealFs;
+
+        let mut record_root = |path: &Path| {
+            let id = sessions
+                .create(
+                    teton_protocol::SessionMode::Freeform,
+                    None,
+                    Some(path.to_path_buf()),
+                )
+                .expect("a freeform session")
+                .session_id;
+            let probed = crate::session_root::ProbedRoot {
+                path: path.to_path_buf(),
+                view: probe(path, None),
+            };
+            DaemonRuntime::store_session_skills(&sessions, &id, &probed, &fs, &store);
+            probed.view.kind
+        };
+
+        assert_eq!(record_root(&repo), RootKind::Project);
+        let snap = store.snapshot();
+        assert_eq!(snap.len(), 1, "the project root is recorded: {snap:?}");
+        let entry = snap.iter().next().unwrap();
+        assert_eq!(entry.name, "repo");
+        assert_eq!(entry.source, ProjectSource::Launched);
+        assert_eq!(entry.uses, 1);
+        let first_seen = entry.first_seen;
+
+        // A second landing bumps `uses`, and does not duplicate.
+        record_root(&repo);
+        let snap = store.snapshot();
+        assert_eq!(snap.len(), 1, "still one entry");
+        let entry = snap.iter().next().unwrap();
+        assert_eq!(entry.uses, 2);
+        assert_eq!(entry.first_seen, first_seen, "first_seen does not move");
+
+        // A different project is recorded too — this is the `set_cwd` shape,
+        // which reaches the same function.
+        record_root(&other);
+        assert_eq!(store.snapshot().len(), 2);
+
+        // And the three ways of not being a project record nothing. All three,
+        // because BR-1 excludes three distinct RootKinds and a hook that tested
+        // only `!= Home` would pass a two-legged version of this.
+        let before = store.snapshot().len();
+        assert_eq!(record_root(&plain), RootKind::Plain);
+        assert_eq!(record_root(Path::new("/")), RootKind::FilesystemRoot);
+        if let Some(home) = std::env::var_os("HOME").map(PathBuf::from) {
+            // Probing with `home` supplied is what makes this the Home kind.
+            let id = sessions
+                .create(
+                    teton_protocol::SessionMode::Freeform,
+                    None,
+                    Some(home.clone()),
+                )
+                .expect("session")
+                .session_id;
+            let probed = crate::session_root::ProbedRoot {
+                path: home.clone(),
+                view: probe(&home, Some(&home)),
+            };
+            assert_eq!(probed.view.kind, RootKind::Home);
+            DaemonRuntime::store_session_skills(&sessions, &id, &probed, &fs, &store);
+        }
+        assert_eq!(
+            store.snapshot().len(),
+            before,
+            "home, / and a marker-less directory record nothing"
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
     /// The pruning predicate is the thing BR-2 actually means.
     #[test]
     fn is_live_project_wants_a_directory_that_still_holds_a_marker() {

@@ -1710,6 +1710,14 @@ pub struct DaemonRuntime {
     /// (the argument `Daemon::with_consent_timeout` makes, and
     /// `ShellTool::with_timeouts` makes for the tool itself).
     skill_command_timeout_ms: u64,
+    /// The machine's known-project registry (REQ-584 BR-1, ADR-2).
+    ///
+    /// In-memory on a `minimal()` runtime, file-backed on a real one. Held here
+    /// rather than beside the session registry because it is a fact about the
+    /// **machine**, not about any session: every session writes the same one,
+    /// and a `/cd` in one session is exactly what should let another session's
+    /// `/projects` find that project.
+    projects: Arc<crate::projects::ProjectStore>,
 }
 
 impl DaemonRuntime {
@@ -1768,6 +1776,9 @@ impl DaemonRuntime {
             secret_resolver: SecretResolver::with_default_backend(),
             addressed_delivery: OnceLock::new(),
             skill_command_timeout_ms: shell::DEFAULT_TIMEOUT_MS,
+            // In memory: a `minimal()` runtime has no state dir, and a test
+            // must never be able to write the real machine's project list.
+            projects: Arc::new(crate::projects::ProjectStore::in_memory()),
         }
     }
 
@@ -1982,6 +1993,9 @@ impl DaemonRuntime {
             secret_resolver: SecretResolver::with_default_backend(),
             addressed_delivery: OnceLock::new(),
             skill_command_timeout_ms: shell::DEFAULT_TIMEOUT_MS,
+            projects: Arc::new(crate::projects::ProjectStore::open(
+                &teton_protocol::socket_path::projects_path(base_dir),
+            )),
         })
     }
 
@@ -4240,7 +4254,13 @@ impl DaemonRuntime {
         // both through the one derivation `session/create` also takes — a second
         // spelling of the four globs would be LESSON-528's shape at the seam
         // where the two answers have to agree.
-        Self::store_session_skills(sessions, &params.session_id, &moved_to, skills_fs);
+        Self::store_session_skills(
+            sessions,
+            &params.session_id,
+            &moved_to,
+            skills_fs,
+            &self.projects,
+        );
         self.drop_grants_expiring_on_root_change(&params.session_id);
 
         let root = moved_to.view;
@@ -4547,11 +4567,18 @@ impl DaemonRuntime {
     /// permission keys for one file (AC-3). Taking the probe rather than probing
     /// again also keeps the caller's reading and this one from being two
     /// readings of a filesystem that can change between them.
+    /// The machine's known-project registry (REQ-584).
+    #[must_use]
+    pub(crate) fn projects(&self) -> &Arc<crate::projects::ProjectStore> {
+        &self.projects
+    }
+
     pub(crate) fn store_session_skills(
         sessions: &SessionRegistry,
         session_id: &SessionId,
         probed: &ProbedRoot,
         fs: &dyn crate::skills::DirLister,
+        projects: &crate::projects::ProjectStore,
     ) {
         // `set_skills` answering `false` — a session that vanished between the
         // caller's claim and this write — is nothing to act on: there is no
@@ -4566,6 +4593,22 @@ impl DaemonRuntime {
         // here rather than at the two call sites so a third cannot forget it —
         // the same reason the globs are spelled here and nowhere else.
         let discovered = block_in_place_if_multithread(|| {
+            // REQ-584 BR-1, and ADR-4's reason for putting it *here*: this
+            // function is the one derivation both `session/create` and
+            // `session/set_cwd` funnel through, so a third caller cannot
+            // forget to record. Inside the same `block_in_place` as discovery
+            // because it is a file write, and taking that on the connection's
+            // reader loop is the defect BUG-184 fixed one line above.
+            //
+            // Only a `project`-kind root is recorded. `home`, `filesystem_root`
+            // and `plain` are three different ways of not being a project, and
+            // BR-1 excludes all three.
+            if probed.view.kind == teton_protocol::methods::RootKind::Project {
+                projects.record(
+                    probed.path.clone(),
+                    teton_core::projects::ProjectSource::Launched,
+                );
+            }
             crate::skills::discover(home().as_deref(), &probed.path, probed.view.kind, fs)
         });
         sessions.set_skills(session_id, discovered);

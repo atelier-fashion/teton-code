@@ -47,6 +47,18 @@ pub struct DaemonPaths {
     pub projects: PathBuf,
 }
 
+/// The known-project registry inside `base` (REQ-584 ADR-2).
+///
+/// **One spelling, two callers.** `daemon_paths()` uses it, and so does the
+/// runtime — which is handed the base directory rather than a `DaemonPaths` and
+/// would otherwise have to join the filename itself. Two joins is two answers
+/// to a question ADR-2 says has one, and the one that drifts is the one no test
+/// covers.
+#[must_use]
+pub fn projects_path(base: &std::path::Path) -> PathBuf {
+    base.join("projects.json")
+}
+
 /// Resolves the socket, lock, and log paths from the current environment.
 #[must_use]
 pub fn daemon_paths() -> DaemonPaths {
@@ -58,7 +70,7 @@ pub fn daemon_paths() -> DaemonPaths {
         socket: base.join("tetond.sock"),
         lock: base.join("tetond.lock"),
         log: base.join("tetond.log"),
-        projects: base.join("projects.json"),
+        projects: projects_path(&base),
     }
 }
 
