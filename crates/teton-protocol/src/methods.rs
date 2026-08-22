@@ -629,12 +629,16 @@ pub struct SkillSkipped {
     /// key rather than `""`.
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub name: String,
-    /// The file, **home-relative** (`session_root::display_for`) and bounded,
-    /// exactly as [`SkillView`]'s description is.
+    /// The file, **relative** and bounded, exactly as [`SkillView`]'s
+    /// description is — from the session root for a `project` entry, from the
+    /// home folder for a `user` one, the rule
+    /// [`crate::events::SkillInvoked::path_display`] states.
     ///
     /// Not an absolute path: BR-1's entity table says a skill path is never
     /// shown as one, because `/Users/jane/.claude/skills/broken/SKILL.md`
-    /// carries a username into a transcript, and AC-6 puts these entries on a
+    /// carries a username into a transcript and
+    /// `/tmp/ci-4f2a/repo/.claude/skills/broken/SKILL.md` carries the working
+    /// tree's location (BUG-187), and AC-6 puts these entries on a
     /// user-visible surface.
     pub path: String,
     /// Why it was skipped, in the daemon's own words — `unreadable (permission

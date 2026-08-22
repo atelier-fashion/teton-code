@@ -115,9 +115,9 @@ pub const MAX_NAME_LEN: usize = 64;
 ///
 /// `path` is the file actually read, absolute and **local-only**: it is the
 /// jail-relative fact the expander needs and the identity provenance is minted
-/// from, and it is reduced to a home-relative display (`session_root::
-/// display_for`) at every surface that shows it. An absolute path carries a
-/// username into a transcript or a remote payload; this struct is the last
+/// from. [`Skill::path_display`] beside it is the only spelling allowed on a
+/// surface. An absolute path carries a username, or the location of the user's
+/// working tree, into a transcript or a remote payload; this struct is the last
 /// place it is allowed to be one.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Skill {
@@ -129,6 +129,24 @@ pub struct Skill {
     pub source: SkillSource,
     /// The file that was read.
     pub path: PathBuf,
+    /// [`Skill::path`] as a surface may spell it (BR-1's entity table): a
+    /// **project** skill relative to the session root
+    /// (`.claude/skills/x/SKILL.md`), a **user** skill relative to the home
+    /// folder (`~/.claude/skills/x/SKILL.md`), and — only when neither base
+    /// applies — whatever `session_root::display_under` could not shorten.
+    ///
+    /// **Derived here, by the one function that knows all three inputs.**
+    /// Discovery holds the source, the session root and `HOME` together;
+    /// nothing downstream does. `skills/list` answers from a stored snapshot
+    /// and has no root to hand, and the turn path had only `HOME` — which is
+    /// why a project skill under a root outside `$HOME` reached the wire
+    /// absolute until BUG-187. Built once, at the root that decided it, so two
+    /// surfaces cannot spell one file two ways (REQ-583 ADR-2).
+    ///
+    /// Unbounded here and bounded at each surface, exactly as the description
+    /// is: this is a *path*, not a rendering, and the character ceiling belongs
+    /// where the rendering happens (`DISPLAY_MAX_CHARS`).
+    pub path_display: String,
     /// The frontmatter `description`, verbatim; bounded and neutralized by the
     /// surface that renders it, not here.
     pub description: Option<String>,
@@ -327,12 +345,20 @@ impl fmt::Display for ShadowedBy {
 /// One entry discovery found and did not register, with why.
 ///
 /// `path` is the file (or, for a root-level refusal, the directory) as
-/// discovery opened it. Like [`Skill::path`] it is absolute here and reduced to
-/// a home-relative display at the wire.
+/// discovery opened it. Like [`Skill::path`] it is absolute here, and
+/// [`Skipped::path_display`] beside it is what a surface may show.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Skipped {
     /// What was skipped.
     pub path: PathBuf,
+    /// [`Skipped::path`] as a surface may spell it, under the rule
+    /// [`Skill::path_display`] states — and for the same reason: `/help`'s
+    /// skipped list is a user-visible surface and a screenshot of it must not
+    /// carry a username or a working-tree location (BR-1's entity table).
+    ///
+    /// A root-level refusal (an unreadable directory, a truncated root) spells
+    /// the directory, so the diagnostic still names which of the four it was.
+    pub path_display: String,
     /// The spelling this entry would have been typed as, when discovery got far
     /// enough to know one — `None` for a whole root (refused, or truncated),
     /// which names no single skill.
@@ -613,38 +639,104 @@ fn assemble(candidates: Vec<Skill>, skipped: Vec<Skipped>) -> SkillRegistry {
 fn roots(home: Option<&Path>, session_root: &Path, root_kind: RootKind) -> Vec<RootSpec> {
     let mut specs = Vec::with_capacity(4);
     if root_kind != RootKind::Home {
+        // A **project** skill is spelled relative to the session root — the
+        // directory the banner, the environment block and every jail refusal
+        // already name — so `.claude/skills/x/SKILL.md` is the whole of what a
+        // surface needs to say, and it says it identically whether the checkout
+        // is under `$HOME`, on an external volume or in a CI workspace
+        // (BUG-187: only the first of those had a spelling before).
         specs.push(RootSpec::new(
             SkillSource::Project,
             Shape::Skills,
             session_root,
+            Some(session_root),
+            home,
         ));
         specs.push(RootSpec::new(
             SkillSource::Project,
             Shape::Commands,
             session_root,
+            Some(session_root),
+            home,
         ));
     }
     if let Some(home) = home {
-        specs.push(RootSpec::new(SkillSource::User, Shape::Skills, home));
-        specs.push(RootSpec::new(SkillSource::User, Shape::Commands, home));
+        // A **user** skill is spelled `~/…`, and is given no base on purpose:
+        // it is not part of the project the session stands in, and a session
+        // root that happens to be an ancestor of `$HOME` (`/Users`, `/`) would
+        // otherwise turn `~/.claude/skills/x/SKILL.md` into
+        // `someone/.claude/skills/x/SKILL.md` — the username this rule exists
+        // to keep off a surface.
+        specs.push(RootSpec::new(
+            SkillSource::User,
+            Shape::Skills,
+            home,
+            None,
+            Some(home),
+        ));
+        specs.push(RootSpec::new(
+            SkillSource::User,
+            Shape::Commands,
+            home,
+            None,
+            Some(home),
+        ));
     }
     specs
 }
 
-/// One of the four directories discovery opens.
+/// One of the four directories discovery opens, and the spelling every row
+/// found under it is displayed with.
+///
+/// The display rule travels with the root rather than being re-decided per row:
+/// which base a path is shown relative to is a property of *which of the four
+/// this is* (BUG-187), and [`roots`] is where that is known.
 struct RootSpec {
     source: SkillSource,
     shape: Shape,
     dir: PathBuf,
+    /// What paths from this root are spelled relative to, or `None` for the
+    /// home-relative rule. See [`roots`] for why the two sources differ.
+    display_base: Option<PathBuf>,
+    /// The home folder, for [`teton_core::session_root::display_under`]'s
+    /// fall-through — carried so [`RootSpec::display`] is total and no caller
+    /// downstream has to hold `HOME` to spell a path.
+    home: Option<PathBuf>,
 }
 
 impl RootSpec {
-    fn new(source: SkillSource, shape: Shape, base: &Path) -> Self {
+    fn new(
+        source: SkillSource,
+        shape: Shape,
+        base: &Path,
+        display_base: Option<&Path>,
+        home: Option<&Path>,
+    ) -> Self {
         let dir = base.join(".claude").join(match shape {
             Shape::Skills => "skills",
             Shape::Commands => "commands",
         });
-        Self { source, shape, dir }
+        Self {
+            source,
+            shape,
+            dir,
+            display_base: display_base.map(Path::to_path_buf),
+            home: home.map(Path::to_path_buf),
+        }
+    }
+
+    /// How a surface may spell `path`, which came from this root.
+    ///
+    /// The one derivation ([`Skill::path_display`]): every `Skill` and every
+    /// `Skipped` row gets its display from here, so a registered skill and a
+    /// skipped one under the same root cannot disagree about how their
+    /// directory is written.
+    fn display(&self, path: &Path) -> String {
+        teton_core::session_root::display_under(
+            path,
+            self.display_base.as_deref(),
+            self.home.as_deref(),
+        )
     }
 }
 
@@ -685,6 +777,8 @@ mod tests {
             path: PathBuf::from("/h/.claude/skills")
                 .join(name)
                 .join("SKILL.md"),
+            // BUG-187: the spelling a surface shows, carried on the row.
+            path_display: format!("~/.claude/skills/{name}/SKILL.md"),
             description: None,
             argument_hint: None,
             body: String::new(),

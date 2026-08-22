@@ -1474,9 +1474,10 @@ struct SkillTurn {
     /// Which of the two roots the file came from — half the permission key, and
     /// what BR-12's echo line names.
     source: SkillSource,
-    /// The file, home-relative and bounded (`session_root::display_for` +
-    /// `bounded_field`) — the one form allowed on a surface, because an absolute
-    /// path carries a username into a transcript (BR-1's entity table).
+    /// The file as a surface may spell it, bounded
+    /// (`skills::Skill::path_display` + `bounded_field`) — the one form
+    /// allowed, because an absolute path carries a username, or the location of
+    /// the user's working tree, into a transcript (BR-1's entity table).
     path_display: String,
     /// The body's size in bytes, which is what BR-12's echo line renders.
     body_bytes: u64,
@@ -2892,11 +2893,14 @@ impl DaemonRuntime {
             ));
         };
 
-        // BR-4's preamble names the file, home-relative: an absolute path
-        // carries a username into a transcript and into every remote payload
-        // this turn produces. Reduced here, at the one surface that has both the
-        // path and `home`, so `expand` stays pure (BR-14).
-        let display = teton_core::session_root::display_for(&skill.path, home().as_deref());
+        // BR-4's preamble names the file, never absolutely: an absolute path
+        // carries a username — or the location of the user's working tree —
+        // into a transcript and into every remote payload this turn produces.
+        // Taken from the registry row rather than re-derived here, because the
+        // rule needs the skill's *source* and the session root as well as
+        // `HOME`, and discovery is the one place that holds all three
+        // (BUG-187); `expand` stays pure either way (BR-14).
+        let display = skill.path_display.clone();
         let expansion = crate::skills::expand(skill, &invocation.raw_arguments, &display);
         // REQ-587 ADR-6: the frame line is the caller's, and this caller is the
         // user path — so BR-4's line is supplied here and composed *inside* the
@@ -2949,9 +2953,10 @@ impl DaemonRuntime {
             ),
             model_invocable: skill.model_invocable,
             user_invocable: skill.user_invocable,
-            // Bounded here, at the one surface that has the path and `home`,
-            // for the reason the preamble's copy is bounded here: BR-12's event
-            // goes to every attached client and into transcripts (ADR-15).
+            // Bounded here, at the surface, for the reason the preamble's copy
+            // is bounded in `expand`: BR-12's event goes to every attached
+            // client and into transcripts (ADR-15). The *rule* is discovery's
+            // (BUG-187); the ceiling is the renderer's.
             path_display: teton_core::session_root::bounded_field(
                 &display,
                 teton_core::session_root::DISPLAY_MAX_CHARS,
@@ -3262,8 +3267,10 @@ impl DaemonRuntime {
         // REQ-583 ADR-1: the root is probed once per turn, from the registry's
         // path, and the ONE probe feeds every consumer — the jail
         // (`ToolContext::for_root`), the prompt's environment block
-        // (`route.harness.session_root`) and, since REQ-585, the skill file's
-        // home-relative display and the identity its user block is pinned to.
+        // (`route.harness.session_root`) and, since REQ-585, the identity a
+        // skill turn's user block is pinned to. (The skill file's *display*
+        // spelling is discovery's, not this probe's — it needs the skill's
+        // source as well, which only the registry has; BUG-187.)
         // It is read here rather than beside the jail below because the
         // expansion needs it and the expansion runs before the route (see the
         // comment at `accept_invocation`'s call site).

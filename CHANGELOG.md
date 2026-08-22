@@ -204,6 +204,23 @@ user having asked for it.
   appears during a `~`-rooted search — is a runbook step in
   `docs/manual-verification.md`.
 
+### Fixed
+
+- **A skill from a repository outside your home folder no longer puts that
+  repository's absolute path in the transcript (BUG-187).** REQ-585 promised a
+  skill's file is always shown *relative* — never as an absolute path carrying
+  a username or the location of your working tree — but the daemon could only
+  shorten paths under `$HOME`. For a checkout anywhere else (a CI workspace, an
+  external volume, `/tmp`) a **project** skill's file was rendered in full:
+  `/srv/build/app/.claude/skills/validate/SKILL.md`, on the invocation's
+  `/verbose` line, in `/help`'s skipped list, and — the one that leaves the
+  machine — in the preamble of the prompt the turn sends. A project skill is
+  now spelled from the session root (`.claude/skills/validate/SKILL.md`) and a
+  user skill from your home folder (`~/.claude/skills/…`), whichever directory
+  the session stands in. Both are still bounded to 80 characters, and the
+  invocation event still never carries the skill's body. REQ-585 has not been
+  in a release, so nothing that already shipped behaved this way.
+
 ## [0.1.22] - 2026-08-18
 
 ### Fixed

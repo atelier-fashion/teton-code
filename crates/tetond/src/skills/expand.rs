@@ -66,7 +66,7 @@
 //!
 //! [`expand`] and [`Expansion::fold`] have no clock, no filesystem and no
 //! terminal in them (BR-14): the display path arrives as a string the caller
-//! already reduced with `session_root::display_for`, and the outcomes arrive
+//! already reduced with `session_root::display_under`, and the outcomes arrive
 //! from [`dynamic::run_all`](super::dynamic::run_all), which is the one I/O
 //! edge.
 
@@ -158,9 +158,10 @@ enum Segment {
 /// "repo"` keeps both interior spaces and both quote characters; this is the
 /// one place in the session where a typed line is not tokenized (AC-4).
 ///
-/// `path_display` is the skill file's home-relative display
-/// (`session_root::display_for`), passed in rather than derived so this
-/// function stays pure; it is bounded here, once, and is what
+/// `path_display` is the skill file's display spelling
+/// ([`crate::skills::Skill::path_display`] — session-root-relative for a
+/// project skill, `~/…` for a user skill, BUG-187), passed in rather than
+/// derived so this function stays pure; it is bounded here, once, and is what
 /// [`Expansion::user_frame`] names the file with.
 #[must_use]
 pub fn expand(skill: &Skill, raw_arguments: &str, path_display: &str) -> Expansion<Pending> {
@@ -571,6 +572,7 @@ mod tests {
             name: "alpha".to_owned(),
             source: SkillSource::User,
             path: PathBuf::from("/home/dev/.claude/skills/alpha/SKILL.md"),
+            path_display: "~/.claude/skills/alpha/SKILL.md".to_owned(),
             description: None,
             argument_hint: None,
             body: body.to_owned(),
@@ -834,14 +836,16 @@ mod tests {
     }
 
     /// **BR-4.** The user path's frame is exactly one line, names the command
-    /// and its home-relative path, and the path is bounded.
+    /// and the display spelling it was handed — `~/…` here, a user skill — and
+    /// bounds it. Which spelling arrives is the registry's decision (BUG-187);
+    /// that it is *only ever* the spelling, and bounded, is this function's.
     ///
-    /// The frame is a parameter now (ADR-6) and this is where its **bytes** are
-    /// pinned: `/name` renders what it has always rendered, and it renders it
-    /// as the first line of what the caller receives — not as something a
-    /// caller adds afterwards.
+    /// The frame is a parameter now (REQ-587 ADR-6) and this is where its
+    /// **bytes** are pinned: `/name` renders what it has always rendered, and
+    /// it renders it as the first line of what the caller receives — not as
+    /// something a caller adds afterwards.
     #[test]
-    fn the_preamble_is_one_line_naming_the_command_and_its_home_relative_path() {
+    fn the_preamble_is_one_line_naming_the_command_and_its_display_path() {
         let out = text("body\n", "");
         assert_eq!(
             out.lines().next(),

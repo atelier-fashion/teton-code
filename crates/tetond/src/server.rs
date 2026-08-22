@@ -133,7 +133,7 @@ use teton_protocol::methods::{
 use teton_protocol::{RequestId, SessionId};
 
 use teton_core::lifetime::{BlockingActivity, PolicySource, ShutdownPolicy};
-use teton_core::session_root::{bounded_field, display_for};
+use teton_core::session_root::bounded_field;
 
 use crate::attest::{
     AttestationRefusal, AttestationRegistry, MechanismAvailability, PresenceVerifier,
@@ -4390,10 +4390,7 @@ fn handle_skills_list(daemon: &Daemon, conn: &ConnState, id: Id, params: Value) 
         return error_string(id, error_code::NOT_ATTACHED, NOT_ATTACHED_MESSAGE);
     }
     let registry = daemon.sessions.skills(&params.session_id);
-    ok_string(
-        id,
-        &skills_list_result(&registry, crate::session_root::home().as_deref()),
-    )
+    ok_string(id, &skills_list_result(&registry))
 }
 
 /// The ceiling, in characters, on a skill's `description` — 200.
@@ -4424,6 +4421,11 @@ const SKILL_SKIPPED_NAME_MAX_CHARS: usize = crate::skills::MAX_NAME_LEN;
 /// The wire view of a registry: every row, bounded and neutralized **here**,
 /// before it leaves the process (REQ-585 BR-3, LESSON-517).
 ///
+/// It takes no `HOME` and no session root, and that is the shape BUG-187 left
+/// behind: the display rule needs a skill's source *and* the root it was
+/// discovered under, so it is applied once at discovery and this function only
+/// bounds what it is handed.
+///
 /// Descriptions, hints, skipped paths and skipped names are all *file bytes* —
 /// written by whoever owns the repo the session stands in, which is not always
 /// the person reading the screen. They are bounded at the wire rather than at
@@ -4439,7 +4441,7 @@ const SKILL_SKIPPED_NAME_MAX_CHARS: usize = crate::skills::MAX_NAME_LEN;
 /// is ASCII, one line and at most 64 characters by construction. Bounding it
 /// again would say the invariant is not trusted, in the one place it is
 /// actually enforced.
-fn skills_list_result(registry: &SkillRegistry, home: Option<&Path>) -> SkillsListResult {
+fn skills_list_result(registry: &SkillRegistry) -> SkillsListResult {
     SkillsListResult {
         skills: registry
             .skills()
@@ -4489,9 +4491,13 @@ fn skills_list_result(registry: &SkillRegistry, home: Option<&Path>) -> SkillsLi
                 // BR-1's entity table: never an absolute path. A refusal that
                 // said `/Users/jane/.claude/skills/broken/SKILL.md` would carry
                 // a username into a transcript and, through `/help`, into a
-                // screenshot.
+                // screenshot — and one that said `/tmp/ci-4f2a/repo/.claude/…`
+                // would carry the working tree's location (BUG-187). The
+                // spelling is discovery's, which is the only place that had the
+                // session root; this method answers from a stored snapshot and
+                // has none.
                 path: bounded_field(
-                    &display_for(&entry.path, home),
+                    &entry.path_display,
                     teton_core::session_root::DISPLAY_MAX_CHARS,
                 ),
                 // The daemon's own words, from the daemon's own enum: no file

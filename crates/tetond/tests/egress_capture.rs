@@ -949,8 +949,9 @@ fn expansion_of(
     let skill = registry
         .dispatchable_by_user(name)
         .unwrap_or_else(|| panic!("the fixture must register `{name}`"));
-    let display = teton_core::session_root::display_for(&skill.path, home);
-    let expansion = tetond::skills::expand(skill, "", &display);
+    // BUG-187: the registry carries the display spelling; this no longer
+    // re-derives it with the home rule.
+    let expansion = tetond::skills::expand(skill, "", &skill.path_display);
     // The user path's frame, which is the one `accept_invocation` supplies
     // (REQ-587 ADR-6).
     let frame = expansion.user_frame();

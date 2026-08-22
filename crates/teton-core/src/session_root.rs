@@ -188,6 +188,45 @@ pub fn display_for(path: &Path, home: Option<&Path>) -> String {
     path.display().to_string()
 }
 
+/// The spelling of `path` a person reads when it sits under a directory the
+/// session already names — the part **below `base`**, with no leading `./`, and
+/// `.` for `base` itself.
+///
+/// The second half of the display rule (REQ-585 BR-1, BUG-187). [`display_for`]
+/// can only shorten what is under the home folder, so a file under a session
+/// root *outside* `$HOME` — `/tmp/build/repo/.claude/skills/x/SKILL.md`, a
+/// checkout on an external volume, a CI workspace — came back absolute, and an
+/// absolute path is the one form the entity table forbids on a surface. Where
+/// the caller has a base the reader already knows (the session root, printed in
+/// the banner and resident in the environment block), the honest spelling is
+/// relative to it: it says everything the reader needs and repeats nothing the
+/// surface has already told them.
+///
+/// `base` of `None` (or an empty path), or a `path` that is not under `base`,
+/// falls through to [`display_for`] — so a caller with no base, and a caller
+/// whose value simply lives elsewhere, get the home-relative rule and its
+/// absolute last resort, unchanged. Which base a caller passes is the caller's
+/// decision, not this function's: `tetond::skills` picks it from the skill's
+/// **source**, because "a project skill is under the session root" is
+/// discovery's fact and re-deriving it here from a path comparison would be a
+/// second copy of it (LESSON-546).
+///
+/// Component-wise, like [`display_for`]: a sibling that merely shares a prefix
+/// string (`/tmp/repo-old` against a base of `/tmp/repo`) is not under it.
+#[must_use]
+pub fn display_under(path: &Path, base: Option<&Path>, home: Option<&Path>) -> String {
+    if let Some(base) = base.filter(|base| !base.as_os_str().is_empty()) {
+        if let Ok(rest) = path.strip_prefix(base) {
+            return if rest.as_os_str().is_empty() {
+                ".".to_owned()
+            } else {
+                rest.display().to_string()
+            };
+        }
+    }
+    display_for(path, home)
+}
+
 /// `s`, made safe to print mid-line in a refusal, a banner line or a notice
 /// (ADR-2 bounding) — bounded in **characters**, the unit a person reads.
 ///
@@ -637,6 +676,111 @@ mod tests {
         assert_eq!(
             display_for(Path::new("/opt/x"), Some(Path::new(""))),
             "/opt/x"
+        );
+    }
+
+    // ---- display_under (the base-relative rule, BUG-187) ----
+
+    #[test]
+    fn display_under_is_the_part_below_the_base() {
+        let base = Path::new("/tmp/tc-4f2a/proj");
+        assert_eq!(
+            display_under(
+                Path::new("/tmp/tc-4f2a/proj/.claude/skills/validate/SKILL.md"),
+                Some(base),
+                Some(Path::new("/Users/someone"))
+            ),
+            ".claude/skills/validate/SKILL.md",
+            "a root outside `$HOME` is exactly the case `display_for` cannot \
+             shorten, and the one this rule exists for"
+        );
+    }
+
+    /// The base being *inside* the home folder changes nothing: the base wins
+    /// where it applies, so one skill file has one spelling wherever the
+    /// checkout happens to live.
+    #[test]
+    fn display_under_prefers_the_base_over_home() {
+        assert_eq!(
+            display_under(
+                Path::new("/Users/someone/code/repo/.claude/commands/ship.md"),
+                Some(Path::new("/Users/someone/code/repo")),
+                Some(Path::new("/Users/someone"))
+            ),
+            ".claude/commands/ship.md"
+        );
+    }
+
+    #[test]
+    fn display_under_is_a_dot_for_the_base_itself() {
+        let base = Path::new("/opt/proj");
+        assert_eq!(display_under(base, Some(base), None), ".");
+        assert_eq!(
+            display_under(Path::new("/opt/proj/"), Some(base), None),
+            "."
+        );
+    }
+
+    /// Outside the base — or with no base at all — this *is* [`display_for`],
+    /// down to the absolute last resort. A user skill is passed `None` on
+    /// purpose: `~/…` is its spelling, and a session root of `/Users` must not
+    /// turn it into `someone/.claude/…`, which would carry the username the
+    /// whole rule exists to keep off a surface.
+    #[test]
+    fn display_under_falls_through_to_the_home_rule() {
+        let home = Path::new("/Users/someone");
+        assert_eq!(
+            display_under(
+                Path::new("/Users/someone/.claude/skills/x/SKILL.md"),
+                None,
+                Some(home)
+            ),
+            "~/.claude/skills/x/SKILL.md"
+        );
+        assert_eq!(
+            display_under(
+                Path::new("/Users/someone/.claude/skills/x/SKILL.md"),
+                Some(Path::new("/tmp/proj")),
+                Some(home)
+            ),
+            "~/.claude/skills/x/SKILL.md"
+        );
+        assert_eq!(
+            display_under(
+                Path::new("/opt/x/SKILL.md"),
+                Some(Path::new("/tmp/proj")),
+                Some(home)
+            ),
+            "/opt/x/SKILL.md",
+            "neither base nor home applies: absolute, and the caller bounds it"
+        );
+    }
+
+    /// A sibling that merely shares a prefix string is not under the base —
+    /// the same claim `display_does_not_confuse_a_string_prefix_with_an_ancestor`
+    /// makes about home, on the other half of the rule.
+    #[test]
+    fn display_under_does_not_confuse_a_string_prefix_with_an_ancestor() {
+        assert_eq!(
+            display_under(
+                Path::new("/tmp/repo-old/f.md"),
+                Some(Path::new("/tmp/repo")),
+                None
+            ),
+            "/tmp/repo-old/f.md"
+        );
+    }
+
+    #[test]
+    fn an_empty_base_is_no_base() {
+        let home = Path::new("/Users/someone");
+        assert_eq!(
+            display_under(
+                Path::new("/Users/someone/x"),
+                Some(Path::new("")),
+                Some(home)
+            ),
+            "~/x"
         );
     }
 

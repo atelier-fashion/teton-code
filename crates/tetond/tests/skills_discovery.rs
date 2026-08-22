@@ -141,6 +141,16 @@ fn names(registry: &SkillRegistry) -> Vec<&str> {
     registry.skills().iter().map(|s| s.name.as_str()).collect()
 }
 
+/// The `(name, display spelling)` pairs a surface would be handed, in registry
+/// order — BR-1's "shown relative, never absolute" (BUG-187).
+fn displays(registry: &SkillRegistry) -> Vec<(&str, &str)> {
+    registry
+        .skills()
+        .iter()
+        .map(|s| (s.name.as_str(), s.path_display.as_str()))
+        .collect()
+}
+
 /// The `(path, rendered reason)` pairs discovery reported, for equality
 /// assertions against the words BR-1 promises.
 fn diagnostics(registry: &SkillRegistry) -> Vec<(PathBuf, String)> {
@@ -1114,5 +1124,150 @@ fn a_skill_named_after_a_built_in_is_shadowed_by_the_daemon_not_only_by_the_clie
             .iter()
             .any(|s| s.name == "deploy" && s.is_dispatchable()),
         "the control name stopped dispatching, so this test says nothing",
+    );
+}
+
+// ---------------------------------------------------------------------------
+// BUG-187 — the display spelling, for a root that is not under `$HOME`
+// ---------------------------------------------------------------------------
+
+/// **A path this registry hands to a surface is never an absolute one.**
+///
+/// BR-1's entity table says a skill path is *shown* relative, never absolute,
+/// because an absolute path carries a username or the location of the user's
+/// working tree into a transcript and onto a remote payload. `display_for`
+/// alone could only deliver that for a file under `$HOME`, so a project skill
+/// in a checkout anywhere else — `/tmp`, an external volume, a CI workspace,
+/// this fixture — reached the wire as
+/// `/tmp/tsk4e9f0/repo/.claude/skills/gamma/SKILL.md` (BUG-187). The rule now
+/// has two halves, chosen by **source**: the session root for a project skill,
+/// the home folder for a user skill.
+///
+/// The fixture is the sharp one on purpose: `home` and `repo` are siblings, so
+/// the project root is outside `$HOME` exactly as a real checkout on another
+/// volume is.
+#[test]
+fn a_project_skill_outside_home_is_spelled_relative_to_the_session_root() {
+    let fixture = Fixture::new();
+    fixture.write(
+        "repo/.claude/skills/gamma/SKILL.md",
+        &skill_file("gamma", "the project skill"),
+    );
+    fixture.write("repo/.claude/commands/delta.md", "delta body\n");
+    fixture.write(
+        "home/.claude/skills/alpha/SKILL.md",
+        &skill_file("alpha", "the user skill"),
+    );
+    fixture.write("home/.claude/commands/beta.md", "beta body\n");
+
+    let registry = discover(
+        Some(&fixture.home()),
+        &fixture.repo(),
+        RootKind::Project,
+        &RecordingFs::default(),
+    );
+
+    assert_eq!(
+        displays(&registry),
+        vec![
+            ("alpha", "~/.claude/skills/alpha/SKILL.md"),
+            ("beta", "~/.claude/commands/beta.md"),
+            ("delta", ".claude/commands/delta.md"),
+            ("gamma", ".claude/skills/gamma/SKILL.md"),
+        ],
+        "a project skill is spelled relative to the session root, a user skill \
+         relative to `$HOME` — and the project root here is under neither the \
+         home folder nor any ancestor of it"
+    );
+    assert!(
+        registry
+            .skills()
+            .iter()
+            .all(|skill| !skill.path_display.starts_with('/')),
+        "no row's display spelling is an absolute path"
+    );
+    assert!(
+        registry
+            .skills()
+            .iter()
+            .all(|skill| skill.path.is_absolute()),
+        "…while `path` itself stays absolute: it is the local-only fact the \
+         expander and the provenance mint need (BR-7)"
+    );
+}
+
+/// **A skipped row is spelled by the same rule.** `/help`'s diagnostic list is
+/// a user-visible surface — the one a screenshot reaches — and a refusal that
+/// named `/tmp/ci-4f2a/repo/.claude/skills/broken/SKILL.md` would put the
+/// working tree's location there. The wire contract in
+/// `skills_list_contracts.rs` covers a *user* skip; this covers the project
+/// half.
+#[test]
+fn a_skipped_project_entry_is_spelled_relative_to_the_session_root() {
+    let fixture = Fixture::new();
+    fixture.write(
+        "repo/.claude/skills/broken/SKILL.md",
+        "---\nname: broken\ndescription: unterminated frontmatter\n",
+    );
+    fixture.write(
+        "repo/.claude/skills/ok/SKILL.md",
+        &skill_file("ok", "the positive control"),
+    );
+
+    let registry = discover(
+        Some(&fixture.home()),
+        &fixture.repo(),
+        RootKind::Project,
+        &RecordingFs::default(),
+    );
+
+    assert_eq!(
+        names(&registry),
+        vec!["ok"],
+        "the positive control registered, so the skip below is the rule's \
+         doing and not an empty root"
+    );
+    assert_eq!(
+        registry
+            .skipped()
+            .iter()
+            .map(|entry| (entry.path_display.as_str(), entry.reason.to_string()))
+            .collect::<Vec<_>>(),
+        vec![(
+            ".claude/skills/broken/SKILL.md",
+            "malformed frontmatter".to_owned()
+        )],
+        "the diagnostic names the file relative to the session root"
+    );
+}
+
+/// **A user skill keeps `~/…` even when the session root is an ancestor of the
+/// home folder.** A session rooted at `/` or `/Users` reaches
+/// `~/.claude/skills` through the *user* pair, and spelling it against the root
+/// would produce `Users/someone/.claude/skills/x/SKILL.md` — the username the
+/// whole rule exists to keep off a surface. Which base applies is decided by
+/// the skill's **source**, not by whichever prefix happens to match.
+#[test]
+fn a_user_skill_under_a_session_root_that_contains_home_is_still_spelled_from_home() {
+    let fixture = Fixture::new();
+    fixture.write(
+        "home/.claude/skills/alpha/SKILL.md",
+        &skill_file("alpha", "the user skill"),
+    );
+    // The fixture root is an ancestor of `home` — the `/Users`-as-session-root
+    // shape, without having to be `/Users`.
+    fixture.write("Cargo.toml", "[package]\n");
+
+    let registry = discover(
+        Some(&fixture.home()),
+        &fixture.path(""),
+        RootKind::Project,
+        &RecordingFs::default(),
+    );
+
+    assert_eq!(
+        displays(&registry),
+        vec![("alpha", "~/.claude/skills/alpha/SKILL.md")],
+        "the user pair's rule is `$HOME`, whatever the session root contains"
     );
 }

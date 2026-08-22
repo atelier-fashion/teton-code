@@ -2305,9 +2305,14 @@ important negative result. Legs (d)–(f) assert surfaces.
 5. [ ] Record the echo line verbatim. Where the two numbers differ it says so
    (`<N> dynamic commands, none run`, `…, 1 run`) — a bare count beside
    placeholders in the prompt would be the bug BR-12 exists to prevent.
-6. [ ] `/verbose` for the turn shows the **home-relative** path
-   (`~/.claude/skills/status/SKILL.md` — never an absolute path carrying your
-   username), the ignored frontmatter keys, and each command's typed outcome.
+6. [ ] `/verbose` for the turn shows the path **relative, never absolute** —
+   for this *user* skill, `~/.claude/skills/status/SKILL.md` (never an absolute
+   path carrying your username) — plus the ignored frontmatter keys and each
+   command's typed outcome. A **project** skill is spelled from the session
+   root instead (`.claude/skills/<name>/SKILL.md`), which is what BUG-187
+   fixed; its sharp case — a checkout outside `$HOME` — is covered by
+   `skills_discovery.rs` and `skills_list_contracts.rs` and needs no step
+   here.
 
 ### (b) `/validate REQ-585`: the argument reaches the body
 
@@ -2421,7 +2426,7 @@ Window used      : 1,000,000 (shipped recipe) | 128,000 (hand-lowered)   <-- cir
 (a) echo line, verbatim                      :
 (a) one consent for the whole invocation     : yes / no
 (a) report produced                          : yes / no
-(a) /verbose path was home-relative          : yes / no
+(a) /verbose path was relative (user: ~/…)   : yes / no
 (b) $ARGUMENTS carried REQ-585               : yes / no
 (b) /cost showed one ordinary prompt turn    : yes / no
 (c) /analyze audited read-only, no subagents : yes / no  (what it did instead:)

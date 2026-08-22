@@ -38,6 +38,8 @@
 //! | AC-12: ran output is framed and its forged close defused | [`ran_output_enters_inside_the_untrusted_envelope_with_its_markers_neutralized`] |
 //! | BR-7/AC-11b: a command that ran pins the turn local | [`an_invocation_that_ran_a_command_seeds_a_block_that_cannot_be_pinned`] |
 //! | BR-12/ADR-15: the event, from the value the daemon emitted | [`the_invocation_event_carries_what_the_daemon_read_off_the_file`], [`a_skill_with_no_dynamic_context_asks_nothing_and_still_echoes_its_invocation`] |
+//! | BR-1/BUG-187: neither source reaches the wire absolute | [`the_invocation_event_carries_what_the_daemon_read_off_the_file`] |
+//! | BR-1/ADR-2: the relative spelling is bounded too | [`a_relative_path_past_the_display_ceiling_is_still_elided_on_the_wire`] |
 //! | ADR-15: the event precedes the Stage B refusal | [`the_invocation_event_is_published_before_the_stage_b_refusal_not_after`] |
 //! | BR-8d: Stage A refuses before consent is spent | [`a_body_that_cannot_fit_is_refused_before_anyone_is_asked_to_approve_anything`] |
 //! | ADR-7: the delivery seam is wired, end to end | [`a_skill_consent_reaches_the_client_that_typed_it_and_is_answerable_by_it`] |
@@ -72,6 +74,8 @@
 //! | running the commands out of document order | [`the_commands_run_sequentially_in_document_order_with_the_session_root_as_cwd`] |
 //! | running them anywhere but the session root | [`the_commands_run_sequentially_in_document_order_with_the_session_root_as_cwd`] |
 //! | dropping the `Unknown` provenance dynamic output earns | [`an_invocation_that_ran_a_command_seeds_a_block_that_cannot_be_pinned`] |
+//! | spelling a project skill's path with the home rule alone (BUG-187) | [`the_invocation_event_carries_what_the_daemon_read_off_the_file`] |
+//! | dropping `bounded_field` from the emitted `path_display` | [`a_relative_path_past_the_display_ceiling_is_still_elided_on_the_wire`] |
 //! | publishing `skill_invoked` **after** Stage B | [`the_invocation_event_is_published_before_the_stage_b_refusal_not_after`] |
 //! | not publishing `skill_invoked` at all for a command-free skill | [`a_skill_with_no_dynamic_context_asks_nothing_and_still_echoes_its_invocation`] |
 //! | collapsing a fail-closed refusal into "declined" | [`a_client_that_refused_without_asking_never_gets_the_decline_text`] |
@@ -2122,12 +2126,15 @@ async fn the_invocation_event_carries_what_the_daemon_read_off_the_file() {
     let invoked = &invoked[0];
     assert_eq!(invoked.name, "reported");
     assert_eq!(invoked.source, SkillSource::Project);
-    assert!(
-        invoked
-            .path_display
-            .ends_with(".claude/skills/reported/SKILL.md"),
-        "{}",
-        invoked.path_display
+    // The repo fixture lives under `/tmp`, not under this binary's `HOME`, so
+    // this is exactly BUG-187's case: `display_for` alone left the wire
+    // carrying `/tmp/tstinvoked…/.claude/skills/reported/SKILL.md`, the
+    // absolute path of the user's working tree, in an event that reaches every
+    // attached client and every transcript. A project skill is spelled from the
+    // session root, which the surface already names.
+    assert_eq!(
+        invoked.path_display, ".claude/skills/reported/SKILL.md",
+        "a project skill's path reaches the wire root-relative"
     );
 
     assert_eq!(
@@ -2169,10 +2176,10 @@ async fn the_invocation_event_carries_what_the_daemon_read_off_the_file() {
         "the body is never in the event — it is in the file (BR-12)"
     );
 
-    // The path is reduced through `session_root::display_for`, which is only
-    // observable on a file that *is* under the fixture home — this binary's user
-    // skill. An absolute `/Users/<name>/…` on the wire carries a username into
-    // every transcript this event reaches (BR-1's entity table).
+    // The other half of the rule, on the other source: a **user** skill is
+    // spelled from `$HOME`, whatever the session root is. An absolute
+    // `/Users/<name>/…` on the wire carries a username into every transcript
+    // this event reaches (BR-1's entity table).
     let mut sub = h.events.subscribe(256);
     h.turn(&session, "", Harness::invoke("homeonly", ""))
         .await
@@ -2215,6 +2222,45 @@ async fn a_skill_with_no_dynamic_context_asks_nothing_and_still_echoes_its_invoc
         "*every* invocation echoes one line (BR-12)"
     );
     assert!(invoked[0].outcomes.is_empty(), "{:?}", invoked[0].outcomes);
+}
+
+/// **The relative spelling is still a bounded one (BR-1, ADR-2).**
+///
+/// Making a project path root-relative made it shorter, not short: BR-2 admits
+/// a 64-character skill name, and `.claude/skills/<64>/SKILL.md` is 88
+/// characters — past `DISPLAY_MAX_CHARS`. The event goes to every attached
+/// client and onto a terminal line, so the ceiling has to survive the change of
+/// rule, and it is applied at the surface rather than in the registry.
+///
+/// **Mutation**: drop `bounded_field` from `accept_invocation` and the wire
+/// carries all 88 characters with no elision mark.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_relative_path_past_the_display_ceiling_is_still_elided_on_the_wire() {
+    let long = "l".repeat(64);
+    let repo = Tree::new("longname");
+    repo.write(
+        &format!(".claude/skills/{long}/SKILL.md"),
+        &skill_file("a legal name at BR-2's ceiling", "Just prose."),
+    );
+    let h = Harness::with_window(128_000);
+    let session = h.session_at(repo.path());
+    let mut sub = h.events.subscribe(256);
+
+    h.turn(&session, "", Harness::invoke(&long, ""))
+        .await
+        .expect("the skill runs");
+
+    let invoked = invocations(&drain(&mut sub).await);
+    let display = &invoked[0].path_display;
+    assert_eq!(
+        display.chars().count(),
+        teton_core::session_root::DISPLAY_MAX_CHARS,
+        "the 88-character relative path is cut to the ceiling: {display}"
+    );
+    assert!(
+        display.contains('…') && display.starts_with(".claude/skills/"),
+        "…in the middle, so both ends still read: {display}"
+    );
 }
 
 // ---------------------------------------------------------------------------

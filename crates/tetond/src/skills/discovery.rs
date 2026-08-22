@@ -323,6 +323,7 @@ pub fn discover(
             && !resolves_under(fs, &root.dir, boundary.as_deref())
         {
             skipped.push(Skipped {
+                path_display: root.display(&root.dir),
                 path: root.dir.clone(),
                 name: None,
                 reason: SkipReason::EscapingRoot,
@@ -337,6 +338,7 @@ pub fn discover(
             Err(ListError::NotFound) => continue,
             Err(ListError::Denied) => {
                 skipped.push(Skipped {
+                    path_display: root.display(&root.dir),
                     path: root.dir.clone(),
                     name: None,
                     reason: SkipReason::Unreadable,
@@ -353,6 +355,7 @@ pub fn discover(
         if entries.len() > MAX_ENTRIES_PER_ROOT {
             entries.truncate(MAX_ENTRIES_PER_ROOT);
             skipped.push(Skipped {
+                path_display: root.display(&root.dir),
                 path: root.dir.clone(),
                 name: None,
                 reason: SkipReason::RootTruncated,
@@ -469,6 +472,7 @@ fn consider(
             .and_then(|entry_name| root.shape.name_of(entry_name))
             .map(str::to_owned);
         skipped.push(Skipped {
+            path_display: root.display(&path),
             path,
             name,
             reason: SkipReason::SymlinkEntry,
@@ -497,26 +501,27 @@ fn consider(
             // dominate: a `.git` or a `node_modules` under a `skills/` root
             // must not be reported as an invalid name.
             let file = path.join("SKILL.md");
-            let Some(text) = read_or_name(&file, name, fs, skipped) else {
+            let Some(text) = read_or_name(&file, name, root, fs, skipped) else {
                 return;
             };
-            register(name, root.source, file, &text, candidates, skipped);
+            register(name, root, file, &text, candidates, skipped);
         }
         Shape::Commands => {
             // Here the `.md` entry *is* the candidate, so a bad name is a bad
             // name and is named before anything is opened.
             if !is_valid_skill_name(name) {
                 skipped.push(Skipped {
+                    path_display: root.display(&path),
                     path,
                     name: Some(name.to_owned()),
                     reason: SkipReason::InvalidName,
                 });
                 return;
             }
-            let Some(text) = read_or_name(&path, name, fs, skipped) else {
+            let Some(text) = read_or_name(&path, name, root, fs, skipped) else {
                 return;
             };
-            register(name, root.source, path, &text, candidates, skipped);
+            register(name, root, path, &text, candidates, skipped);
         }
     }
 }
@@ -529,6 +534,7 @@ fn consider(
 fn read_or_name(
     file: &Path,
     name: &str,
+    root: &RootSpec,
     fs: &dyn DirLister,
     skipped: &mut Vec<Skipped>,
 ) -> Option<String> {
@@ -544,6 +550,7 @@ fn read_or_name(
         Err(ReadError::NotUtf8) => SkipReason::NotUtf8,
     };
     skipped.push(Skipped {
+        path_display: root.display(file),
         path: file.to_path_buf(),
         name: Some(name.to_owned()),
         reason,
@@ -555,7 +562,7 @@ fn read_or_name(
 /// reason there is none.
 fn register(
     name: &str,
-    source: SkillSource,
+    root: &RootSpec,
     path: PathBuf,
     text: &str,
     candidates: &mut Vec<Skill>,
@@ -563,6 +570,7 @@ fn register(
 ) {
     if !is_valid_skill_name(name) {
         skipped.push(Skipped {
+            path_display: root.display(&path),
             path,
             name: Some(name.to_owned()),
             reason: SkipReason::InvalidName,
@@ -573,6 +581,7 @@ fn register(
         // Skipped **whole**: there is no partial value to register, because
         // the parser returns none (ADR-5).
         skipped.push(Skipped {
+            path_display: root.display(&path),
             path,
             name: Some(name.to_owned()),
             reason: SkipReason::MalformedFrontmatter,
@@ -588,7 +597,8 @@ fn register(
     });
     candidates.push(Skill {
         name: name.to_owned(),
-        source,
+        source: root.source,
+        path_display: root.display(&path),
         path,
         description: parsed.description,
         argument_hint: parsed.argument_hint,
@@ -676,9 +686,18 @@ mod tests {
     fn registered(text: &str) -> Skill {
         let mut candidates = Vec::new();
         let mut skipped = Vec::new();
+        // BUG-187: `register` takes the root it came from, because the root
+        // owns the display spelling. A user root, so the home rule applies.
+        let root = RootSpec::new(
+            SkillSource::User,
+            Shape::Commands,
+            Path::new("/h"),
+            None,
+            Some(Path::new("/h")),
+        );
         register(
             "alpha",
-            SkillSource::User,
+            &root,
             PathBuf::from("/h/.claude/commands/alpha.md"),
             text,
             &mut candidates,
