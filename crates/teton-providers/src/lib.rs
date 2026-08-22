@@ -817,6 +817,41 @@ mod tests {
         assert!(!ProviderError::Timeout.is_context_length_exceeded());
     }
 
+    /// REQ-588 BR-3, the load-bearing leg: a spend-ceiling stop must leave
+    /// provider health **unchanged**.
+    ///
+    /// This is asserted rather than assumed because the failure mode is quiet
+    /// and long-lived. Degrading the provider here would make a budget decision
+    /// look like an outage: the health tracker would mark a provider that is
+    /// working perfectly, and later turns — turns the user has not even typed
+    /// yet, possibly under a raised ceiling — would be routed away from it for
+    /// the rest of the session. Nothing in the resulting behaviour would
+    /// mention money, so nobody would connect the two.
+    ///
+    /// The `decision()` half is the second guarantee, and the one OQ-4 turned
+    /// on: no `FailureAction::Fallback`. Falling back would reroute to another
+    /// provider *because the budget ran out*, which spends more money rather
+    /// than less — and does it silently, which is exactly the downgrade OQ-4
+    /// rejected in favour of refusing and saying so.
+    #[test]
+    fn a_spend_ceiling_stop_is_not_a_provider_failure() {
+        let stopped = ProviderError::SpendCeilingReached;
+        assert_eq!(
+            stopped.failure_class(),
+            None,
+            "the budget ran out; the provider is healthy and must not be marked"
+        );
+        assert_eq!(
+            stopped.decision(),
+            None,
+            "no retry, no fallback, no degrade — a reroute would spend more, not less"
+        );
+        // It is its own outcome, not a borrowed one: the surfaces that special-
+        // case a context-length refusal must not mistake this for one.
+        assert!(!stopped.is_context_length_exceeded());
+        assert!(!stopped.is_effort_refused());
+    }
+
     // -----------------------------------------------------------------------
     // REQ-586 BR-2 / ADR-8: the context-length sniff
     // -----------------------------------------------------------------------
