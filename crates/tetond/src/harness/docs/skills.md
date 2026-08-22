@@ -37,9 +37,11 @@ included.
 
 Frontmatter reads `name`, `description`, `argument-hint`, and two flags for who
 may invoke: `disable-model-invocation: true` hides the skill from the model,
-`user-invocable: false` makes it model-only (`/help` marks it `(model-only)`). A
-non-boolean value reads as the safe one — user only. Every other key
-(`allowed-tools`, `model`, `agent`, `hooks`, …) is inert, listed by `/verbose`.
+`user-invocable: false` makes it model-only. A non-boolean value is safe **per
+key**: unreadable `disable-model-invocation` hides it, unreadable
+`user-invocable` changes nothing, so it stays invocable by **both**. Every other
+key (`allowed-tools`, `model`, `agent`, `hooks`, …) is inert, listed by
+`/verbose`.
 A body saying "run this at `full`" is a sentence, not a setting.
 
 ## Dynamic context — `` !`cmd` ``
@@ -52,7 +54,7 @@ command shown; `plan` does not run them, `full` does. On piped stdin at a level
 that would ask, the client refuses without reading it: the next line is a
 prompt, never a `y`.
 
-Commands run in document order, session root as cwd, under `shell`'s jail,
+Commands run in order, session root as cwd, under `shell`'s jail,
 timeout and output cap. One that did not run leaves ``[dynamic context not run:
 `cmd` — reason]`` in its place.
 
@@ -61,8 +63,7 @@ timeout and output cap. One that did not run leaves ``[dynamic context not run:
 A skill turn is never elided: if the expansion plus the system prompt exceeds
 the route's budget (`teton_docs context`) it is refused before anything is sent
 — the body alone before consent, the whole expansion after; the message names
-both sizes and the bound. The remedy is a route with a big enough window; a
-small declaration is floored.
+both sizes and the bound. The remedy is a route with a big enough window.
 
 ## Provenance
 
@@ -71,7 +72,7 @@ reading it would. A **user** skill (`~/.claude/…`) has no such identity: its
 block is `Unknown` and pins the turn wherever **any** boundary is configured —
 stricter than a `read` of those bytes. Dynamic output is `Unknown`, like all
 shell output. So under a boundary a model invocation of a `~/.claude` skill runs
-local, and one over the local budget is refused there, not sent remotely.
+local, and one over the local budget is refused there.
 
 ## Fidelity
 

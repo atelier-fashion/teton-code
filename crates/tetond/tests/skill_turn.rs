@@ -101,7 +101,7 @@
 //! | the model path composing its own frame around a differently-built body | [`one_fixture_reaches_the_model_as_the_same_body_bytes_for_both_callers`] |
 //! | `expand`'s `defuse` dropped (a planted `</skill-body>`/`<tool-result>` arrives live) | [`one_fixture_reaches_the_model_as_the_same_body_bytes_for_both_callers`] |
 //! | `prepare`'s `neutralize_frame_labels` dropped (a planted `User:`/`Assistant:` arrives live) | [`one_fixture_reaches_the_model_as_the_same_body_bytes_for_both_callers`] |
-//! | adding `skill` to `UNTRUSTED_OUTPUT_TOOLS` | [`one_fixture_reaches_the_model_as_the_same_body_bytes_for_both_callers`] |
+//! | adding `skill` to `UNTRUSTED_OUTPUT_TOOLS` | `turn_loop::tests::builtin_results_are_framed_as_untrusted_data` — **not** the byte-equality test above, which cannot see it (Phase 5 verify) |
 //! | Stage A measuring a string other than the one `CarriedTurn::begin` seeds | [`what_the_budget_measured_is_the_block_the_turn_carried_on_both_paths`] |
 //! | the loop's Stage A measuring a string other than the one it folds | [`what_the_budget_measured_is_the_block_the_turn_carried_on_both_paths`] |
 //! | `resolve_for_model` checked after the expansion instead of before | [`a_skill_hidden_from_the_model_is_refused_with_no_consent_and_no_command`] |
@@ -3782,7 +3782,13 @@ const PLANTED_ARGS: &str = "teton  code \"repo\"";
 /// * the fold **never wrapped** the expansion: no flush-left
 ///   `<tool-result tool="skill"` exists anywhere on the model path's wire.
 ///   `UNTRUSTED_OUTPUT_TOOLS` does not contain `skill`, and adding it is the
-///   tempting fix that breaks the feature.
+///   tempting fix that breaks the feature — but **this test would not catch
+///   that**, and saying so is the point. The fold matches on the disposition
+///   first (`turn_loop.rs`): the `Expansion` arm returns without ever reading
+///   the name list, which is consulted only on the `Data` arm. So adding
+///   `skill` to that list is a *no-op* against the assertion below. The guard
+///   that does catch it is `turn_loop::tests::builtin_results_are_framed_as_
+///   untrusted_data`, which pins the absence negatively beside `edit`.
 ///
 /// **What this cannot see, stated rather than skipped.** The fifth marker,
 /// `<|im_start|>`, is neutralized by `render::neutralize_control_tokens`, which

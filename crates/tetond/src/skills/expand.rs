@@ -377,6 +377,16 @@ impl Expansion<Pending> {
     }
 }
 
+/// The ceiling substitution stops at, well above any route's budget.
+///
+/// Not a product limit — a route's budget is the product limit, and Stage A is
+/// what enforces it. This exists only so an expansion that is *going* to be
+/// refused cannot exhaust the daemon's memory on its way to being measured. Two
+/// megabytes is ~64× the local byte budget and ~30× the largest shipped skill,
+/// so nothing a user could plausibly want reaches it, and everything that does
+/// reach it fails Stage A on the next statement.
+const EXPANSION_CEILING_BYTES: usize = 2 * 1024 * 1024;
+
 /// Replace `$ARGUMENTS` and `$1`…`$N` in `body`, and report whether either
 /// appeared.
 ///
@@ -389,17 +399,31 @@ impl Expansion<Pending> {
 ///
 /// The flag is what BR-4's `ARGUMENTS:` fallback keys on, and it is set by an
 /// out-of-range `$9` as much as by a `$1` that hit — the body *asked* for its
-/// The ceiling substitution stops at, well above any route's budget.
-///
-/// Not a product limit — a route's budget is the product limit, and Stage A is
-/// what enforces it. This exists only so an expansion that is *going* to be
-/// refused cannot exhaust the daemon's memory on its way to being measured. Two
-/// megabytes is ~64× the local byte budget and ~30× the largest shipped skill,
-/// so nothing a user could plausibly want reaches it, and everything that does
-/// reach it fails Stage A on the next statement.
-const EXPANSION_CEILING_BYTES: usize = 2 * 1024 * 1024;
-
 /// arguments positionally, so appending them again would be a second copy.
+///
+/// # What this function does **not** draw, and why (REQ-587 BR-4, Deferred)
+///
+/// The caller's bytes go in **verbatim, unmarked**, at whatever offset the
+/// body's placeholder sits at. `SkillFrame`'s closing sentence scopes its
+/// vouching to "the file's own text" and sub-frames the `ARGUMENTS:` trailer,
+/// but a splice cannot be sub-framed from here and the reasons are mechanical,
+/// not stylistic:
+///
+/// * the marker would be destroyed by the next stage — both
+///   `<skill-arguments` spellings are in `render`'s `UNTRUSTED_ENVELOPE_TAGS`,
+///   so [`defuse`] `_`-prefixes any flush-left occurrence it finds in the
+///   string this function returns, the expander's own marker included; and
+///   exempting the pair from that pass hands the caller a forgeable
+///   `</skill-arguments>` — the one close whose forgery puts the rest of a
+///   payload back under the outer frame's sentence;
+/// * a flush-left marker at a mid-line splice means injecting newlines into
+///   the file's prose, and every shipped skill that names `$ARGUMENTS` names
+///   it mid-line (`Scope: $ARGUMENTS`), several inside a code span;
+/// * substitution runs **before** [`dynamic::scan`] by design (BR-4 precedes
+///   BR-6), so injected newlines would land inside a `` !`cmd` `` that
+///   interpolates — and *which* `$` sites are command-interior is not
+///   decidable here, because an argument can introduce the `` !` `` opener
+///   itself.
 fn substitute(body: &str, raw_arguments: &str) -> (String, bool) {
     let tokens: Vec<&str> = raw_arguments.split_whitespace().collect();
     let mut out = String::with_capacity(body.len());

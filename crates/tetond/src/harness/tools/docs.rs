@@ -460,9 +460,10 @@ mod tests {
         );
         assert_states(
             &topic,
-            "A non-boolean value reads as the safe one",
+            "A non-boolean value is safe per key",
             "a value that is not `true`/`false` takes the safe reading, so a typo can \
-             never widen what the model may run (BR-3)",
+             never widen what the model may run (BR-3). Which reading is safe depends on \
+             the flag, and the eighth passage below pins that half",
         );
 
         // The inert list itself, read out of the sentence that makes the claim:
@@ -640,6 +641,53 @@ mod tests {
             "with none it is absent",
             "the consequence is stated as absence rather than as an empty list — a \
              model that reads about a tool missing from its own schema guesses (BR-2)",
+        );
+    }
+
+    /// **AC-16, eighth passage: the safe reading is per flag, not "user only".**
+    ///
+    /// The flag paragraph used to end *"A non-boolean value reads as the safe
+    /// one — user only"*, which is true of exactly one of the two flags.
+    /// `disable-model-invocation: bogus` does read user-only: `boolean` returns
+    /// `None`, the key is named in `ignored_keys`, and `model_invocable` takes
+    /// `false` while the user keeps `/name`. `user-invocable: bogus` does not:
+    /// the safe reading in that direction is the *unchanged* one, so
+    /// `user_invocable` stays `true` and `model_invocable` is never touched —
+    /// that row is invocable by **both**.
+    ///
+    /// The asymmetry is deliberate and is spelled out on `skills::frontmatter`'s
+    /// module docs: an unreadable value lands on the narrower capability for the
+    /// model and the unchanged one for the user, so a typo can hide a skill from
+    /// the model and can never hand it one the user meant to keep to themselves.
+    /// A topic that flattens that into one answer tells the model it cannot
+    /// invoke a row it can in fact invoke — BUG-181's defect in the shape AC-16
+    /// exists to keep out, on the surface the model reads to find out what it
+    /// is allowed to do.
+    ///
+    /// Paid for by cutting elsewhere in the same file; the ceiling did not move
+    /// and `every_bundled_topic_is_under_the_ceiling` still guards it.
+    #[test]
+    fn the_skills_topic_states_the_safe_reading_is_per_flag() {
+        let topic = skills_topic();
+        assert_no_stale_claim(
+            &topic,
+            "reads as the safe one — user only",
+            "the safe reading is per flag — user-only for `disable-model-invocation`, and \
+             for `user-invocable` the unchanged reading, which leaves that row invocable \
+             by both",
+        );
+        assert_states(
+            &topic,
+            "unreadable `disable-model-invocation` hides it",
+            "an unreadable value on the negative flag takes the narrower reading for the \
+             model, and only for the model (BR-3)",
+        );
+        assert_states(
+            &topic,
+            "unreadable `user-invocable` changes nothing, so it stays invocable by both",
+            "an unreadable value on the positive flag moves neither capability, so that \
+             row is invocable by the user *and* the model — the arm the old wording got \
+             backwards (BR-3)",
         );
     }
 

@@ -594,11 +594,13 @@ pub fn shadows_user_skill(registry: &SkillRegistry, name: &str) -> bool {
 /// identically and mint **one** key — a grant for one repository answering for
 /// another, which is precisely the harm the per-root scope exists to prevent
 /// and the harm `project_skill_trust_key`'s own doc refuses to introduce by
-/// truncation. `PermissionGate::authorize_project_skill_trust` currently
-/// fail-closes on a `U+FFFD` in this string rather than remembering an
-/// ambiguous answer; that refusal costs a repository at a non-UTF-8 path its
-/// model-invocable project skills, and it is this function's faithfulness that
-/// makes it unreachable.
+/// truncation. `PermissionGate::authorize_project_skill_trust` used to
+/// fail-close on a `U+FFFD` in this string rather than remember an ambiguous
+/// answer; this function's faithfulness is what made that refusal unreachable
+/// from the production call site, and it has been removed — its own comment
+/// there says so, and
+/// `permissions::tests::two_roots_the_display_cannot_tell_apart_are_two_acknowledgments_and_both_can_be_given`
+/// pins the door half of what replaced it.
 ///
 /// # The rule
 ///
@@ -609,7 +611,12 @@ pub fn shadows_user_skill(registry: &SkillRegistry, name: &str) -> bool {
 /// today's. A root containing a literal `%` reads `%25`, which is the price of
 /// the escape being **injective**: an encoding that left `%` alone would let a
 /// valid path spell an escaped byte and collide with the root that has it.
-fn trust_root_name(root: &Path, home: Option<&Path>) -> String {
+///
+/// `pub(crate)` for the gate's own suite, which asserts that the two names this
+/// mints are two acknowledgments the door will give. It has to ask **this**
+/// function for them: a test that spelled `~/dev/repo%FF` by hand would be a
+/// second copy of the escape, green on the day the first one changed.
+pub(crate) fn trust_root_name(root: &Path, home: Option<&Path>) -> String {
     if let Some(home) = home.filter(|home| !home.as_os_str().is_empty()) {
         if let Ok(rest) = root.strip_prefix(home) {
             return if rest.as_os_str().is_empty() {
@@ -3486,8 +3493,8 @@ mod tests {
         assert_eq!(name_two, "~/dev/repo%FE", "{name_two}");
         assert!(
             !name_one.contains(char::REPLACEMENT_CHARACTER),
-            "a name carrying U+FFFD is one the gate fail-closes on, which costs \
-             this repository its project skills: {name_one}"
+            "the escape names the byte, so nothing here is spelled with the \
+             character that stood for every unnameable byte: {name_one}"
         );
         assert_ne!(
             project_skill_trust_key(&name_one),

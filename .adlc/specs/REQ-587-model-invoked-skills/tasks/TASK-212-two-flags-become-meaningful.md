@@ -1,7 +1,7 @@
 ---
 id: TASK-212
 title: "Two frontmatter keys stop being inert, and a skill gains a third state"
-status: draft
+status: complete
 parent: REQ-587
 created: 2026-08-20
 updated: 2026-08-20
@@ -24,12 +24,12 @@ dispatchable, model-only, and listed-but-neither.
 
 ## Acceptance Criteria
 
-- [ ] Both keys parse as boolean **literals**; anything else takes the **safe** value and is named in the diagnostics rather than silently ignored. There is no boolean coercion anywhere in this module today, so this is new code and the safe value must be stated per flag: an unparseable `disable-model-invocation` means *not* model-invocable; an unparseable `user-invocable` means *still* user-invocable.
-- [ ] They leave `ignored_keys`. Exactly one surface renders that list (`session_ui.rs`'s `/verbose` line) and four tests assert it — update them, do not widen the list.
-- [ ] **Two named resolvers, per ADR-12** — `dispatchable_by_user(name)` and `invocable_by_model(name)`. `is_dispatchable()` keeps its meaning (`shadowed.is_none()`) and **neither flag is folded into it**. Folding `user_invocable` in there is the arm that silently kills BR-3's model-only state: `/delta` refuses (AC-12 green), the roster still lists it (AC-1 green), and the model's call returns `unknown_skill` with no AC red.
-- [ ] Assert both directions on one fixture: a `user-invocable: false` skill refuses from `/name` **and** resolves for the model.
-- [ ] Both flags reach `SkillView` (TASK-210's fields) so `/help` can mark `(model-only)`.
-- [ ] Mutation: dropping either flag from `assemble`, and leaving `dispatchable` unchanged, each fail a named test.
+- [x] Both keys parse as boolean **literals**; anything else takes the **safe** value and is named in the diagnostics rather than silently ignored. There is no boolean coercion anywhere in this module today, so this is new code and the safe value must be stated per flag: an unparseable `disable-model-invocation` means *not* model-invocable; an unparseable `user-invocable` means *still* user-invocable.
+- [x] They leave `ignored_keys`. Exactly one surface renders that list (`session_ui.rs`'s `/verbose` line) and four tests assert it — update them, do not widen the list.
+- [x] **Two named resolvers, per ADR-12** — `dispatchable_by_user(name)` and `invocable_by_model(name)`. `is_dispatchable()` keeps its meaning (`shadowed.is_none()`) and **neither flag is folded into it**. Folding `user_invocable` in there is the arm that silently kills BR-3's model-only state: `/delta` refuses (AC-12 green), the roster still lists it (AC-1 green), and the model's call returns `unknown_skill` with no AC red.
+- [x] Assert both directions on one fixture: a `user-invocable: false` skill refuses from `/name` **and** resolves for the model.
+- [x] Both flags reach `SkillView` (TASK-210's fields) so `/help` can mark `(model-only)`.
+- [x] Mutation: dropping either flag from `assemble`, and leaving `dispatchable` unchanged, each fail a named test.
 
 ## Technical Notes
 

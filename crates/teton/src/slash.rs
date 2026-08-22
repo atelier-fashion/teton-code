@@ -2037,9 +2037,10 @@ pub(crate) fn source_word(source: SkillSource) -> &'static str {
 /// acknowledgment prompt, BR-9's echo line, and `/verbose` under it — so a user
 /// who acknowledged `validate (project — shadows your user skill)` reads the
 /// same words back when the expansion lands. The daemon has its own copy
-/// (`tools::skill::source_clause`) for the *frame the model reads*, which is a
-/// different audience and deliberately a separate rendering of the same typed
-/// fact (LESSON-529); what must not exist is two copies on **this** side.
+/// (`tools::skill::SkillFrame::source_clause`) for the *frame the model reads*,
+/// which is a different audience and deliberately a separate rendering of the
+/// same typed fact (LESSON-529); what must not exist is two copies on **this**
+/// side.
 ///
 /// A **user** skill never carries the clause, matching that counterpart arm for
 /// arm: the swap BR-4 is about is a repository taking a name from the shelf the

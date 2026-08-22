@@ -1,7 +1,7 @@
 ---
 id: TASK-221
 title: "One sentence about who runs what, measured with the roster in place"
-status: draft
+status: complete
 parent: REQ-587
 created: 2026-08-20
 updated: 2026-08-20
@@ -22,14 +22,14 @@ while the prompt grows.
 
 ## Acceptance Criteria
 
-- [ ] The sentence keeps **five** needles, not three: `/help` (exactly one line), both `.claude/` paths, "only the user runs" — which BR-8 re-words, so the anchor moves *with* the sentence — plus REQ-585's `loads skills and commands from` and `no CLAUDE.md, agents or hooks`. BR-8's illustrative wording in the spec fails the second of those; the shipped sentence must not.
-- [ ] The `asking`-line count is still 1; no `teton …` form; position before step 1; resident in **both** harness shapes.
-- [ ] **The seam is a pure renderer plus a doc-only tool, because `redact.rs`'s test cannot build the real one.** That test is a sync `#[test]` and its own comment explains why the *web* tool is excluded — building one "needs a permission gate and a choke-point seam that do not belong in this module" — and `SkillTool` holds a gate and a `Handle`, whose `current()` panics outside a runtime. So: a pure `render_roster(&SkillRegistry, cap) -> String`, and a doc-only `SkillTool` constructor with no gate and no `Handle`. **A hand-typed stub description is the trap**: its bytes and the real renderer's would drift independently while the margin test stayed green — LESSON-481, in the test that exists to prevent it. Pin that the doc-only tool and the real one render byte-identical descriptions.
-- [ ] **Both margin tests register that doc-only `skill` tool carrying the at-cap roster.** `the_total_cap_clears_the_harness_context_budget_with_margin` builds `with_builtins()` only, so a conditionally-registered tool is invisible to it and it would keep passing while the real prompt grew — LESSON-481, in the one test guarding a budget three REQs contend for.
-- [ ] The margin is counted with BR-8's sentence **and** BR-2's roster **together**, never one at a time. Today: 826 margin, 48 floor, **778 usable**. Measure, do not estimate — the tests print only on failure, so pad the guide by a known amount, read the figure the failure names, and subtract.
-- [ ] If `REDACT_BODY_OVERHEAD_BYTES` moves 10 → 11 KiB, **both** arithmetic claims are re-stated: the chunk count stays 4, *and* `REDACT_SCANNABLE_CONTEXT_BYTES` drops 89,127 → 88,196 — a 931-byte cut to every `redact = true` route's byte budget, which is the budget BR-7's `bound: redact scan` refusal measures against. The existing test passes either way, so the cut is silent unless asserted.
-- [ ] AC-3's "byte-identical" is **two registries compared in one test**, not a checked-in golden — nothing in the tree pins rendered tool docs byte-for-byte.
-- [ ] Mutation: reverting the sentence, and omitting the skill tool from either margin test, each fail a named test.
+- [x] The sentence keeps **five** needles, not three: `/help` (exactly one line), both `.claude/` paths, "only the user runs" — which BR-8 re-words, so the anchor moves *with* the sentence — plus REQ-585's `loads skills and commands from` and `no CLAUDE.md, agents or hooks`. BR-8's illustrative wording in the spec fails the second of those; the shipped sentence must not.
+- [x] The `asking`-line count is still 1; no `teton …` form; position before step 1; resident in **both** harness shapes.
+- [x] **The seam is a pure renderer plus a doc-only tool, because `redact.rs`'s test cannot build the real one.** That test is a sync `#[test]` and its own comment explains why the *web* tool is excluded — building one "needs a permission gate and a choke-point seam that do not belong in this module" — and `SkillTool` holds a gate and a `Handle`, whose `current()` panics outside a runtime. So: a pure `render_roster(&SkillRegistry, cap) -> String`, and a doc-only `SkillTool` constructor with no gate and no `Handle`. **A hand-typed stub description is the trap**: its bytes and the real renderer's would drift independently while the margin test stayed green — LESSON-481, in the test that exists to prevent it. Pin that the doc-only tool and the real one render byte-identical descriptions.
+- [x] **Both margin tests register that doc-only `skill` tool carrying the at-cap roster.** `the_total_cap_clears_the_harness_context_budget_with_margin` builds `with_builtins()` only, so a conditionally-registered tool is invisible to it and it would keep passing while the real prompt grew — LESSON-481, in the one test guarding a budget three REQs contend for.
+- [x] The margin is counted with BR-8's sentence **and** BR-2's roster **together**, never one at a time. Today: 826 margin, 48 floor, **778 usable**. Measure, do not estimate — the tests print only on failure, so pad the guide by a known amount, read the figure the failure names, and subtract.
+- [x] If `REDACT_BODY_OVERHEAD_BYTES` moves 10 → 11 KiB, **both** arithmetic claims are re-stated: the chunk count stays 4, *and* `REDACT_SCANNABLE_CONTEXT_BYTES` drops 89,127 → 88,196 — a 931-byte cut to every `redact = true` route's byte budget, which is the budget BR-7's `bound: redact scan` refusal measures against. The existing test passes either way, so the cut is silent unless asserted.
+- [x] AC-3's "byte-identical" is **two registries compared in one test**, not a checked-in golden — nothing in the tree pins rendered tool docs byte-for-byte.
+- [x] Mutation: reverting the sentence, and omitting the skill tool from either margin test, each fail a named test.
 
 ## Technical Notes
 

@@ -2491,15 +2491,25 @@ a large orchestrator, which is what a machine with no remote provider gets.
   model cannot run `/proceed`" when what you measured was the boundary rule
   working exactly as `provenance_egress.rs`'s
   `a_model_invoked_user_skill_pins_the_turn_wherever_any_boundary_exists`
-  says it does. Check with `/doctor` before starting. **A machine that has one
-  configured runs leg (f) instead**, and records that it did.
+  says it does. **Check with `/boundary list` before starting** — not
+  `/doctor`, which issues one `config/get` and renders **providers only**; it
+  never prints a boundary, so a boundary-configured machine reads a clean
+  doctor report as "none configured" and then measures the boundary rule for
+  six legs. `/boundary list` on a clean machine prints exactly
+  ``no privacy boundaries configured. Add one with `teton boundary add`.``;
+  anything else is a listing headed `privacy boundaries:` with one
+  `<glob> [<mode>]` line per boundary. The shell twin is `teton boundary list`
+  and prints the same lines. **A machine that has one configured runs
+  leg (f) instead**, and records that it did.
 - macOS: the first read of a root under `~/Documents` can raise a consent
   dialog. Answer it; a decline renders `unreadable (permission denied)`, which
   is correct behaviour and worth noting rather than retrying blindly.
 
-> **A note on AC-15's letters.** The AC's text refers to "leg (g)" for the
-> boundary-configured machine but never defines an (f) or a (g). Leg (f) below
-> is that leg. Renumber the AC or keep this note; do not add a second one.
+> **A note on AC-15's letters.** The AC used to refer to a "leg (g)" for the
+> boundary-configured machine while defining only (a)–(e). It has been
+> renumbered: AC-15 now defines **(f)** and names it as the leg run *instead
+> of* (a)–(e), which is leg (f) below. The two documents agree; do not add a
+> second lettering.
 
 ## Procedure
 
@@ -2510,8 +2520,18 @@ a large orchestrator, which is what a machine with no remote provider gets.
 2. [ ] `/help`. Record the skills diagnostic line verbatim (it was
        `17 skills (user 17, project 0); 0 skipped` when REQ-585 shipped).
 3. [ ] Type `/proceed REQ-587`. Expect the echo line
-       `/proceed → skill proceed (user, <n.n> KiB, 0 dynamic commands)` and the
-       body to land as one prompt turn.
+       `/proceed → skill proceed (user, <n.n> KiB, <N> dynamic commands)` —
+       **record `<N>`, do not predict it.** Every ADLC body carries 1–6
+       `` !`…` `` commands (Assumptions, the 2026-08-19 corpus), so `<N>` is
+       non-zero and `/proceed`'s own value is one of the things this leg
+       produces. At the default `guarded` that non-zero count also means the
+       **first thing you see is a dynamic-context consent** under the skill's
+       own key `skill:user:proceed`, listing each command as it will run
+       (substitution happens first). That prompt is the feature, not a defect:
+       answer it, and record which way. Declining is a valid run — it leaves
+       one ``[dynamic context not run: `cmd` — reason]`` placeholder per
+       command and the echo line then reads `<N> dynamic commands, none run`.
+       Then the body lands as one prompt turn.
 4. [ ] Watch for the **first model-issued call**: a status line
        `- skill validate [running]` and then an echo line
        `skill validate (user, <n.n> KiB, <N> dynamic commands) — invoked by the
@@ -2581,12 +2601,14 @@ a large orchestrator, which is what a machine with no remote provider gets.
 4. [ ] Record both messages verbatim; the pair is what shows the refusal is the
        budget rather than the tier.
 
-### (f) The boundary-configured machine (AC-15's undefined "leg (g)")
+### (f) The boundary-configured machine (AC-15's leg (f))
 
-Run **this leg instead of (a)–(e)** if `/doctor` reports a configured privacy
-boundary and you are not willing to remove it.
+Run **this leg instead of (a)–(e)** if `/boundary list` reports a configured
+privacy boundary and you are not willing to remove it. (`/doctor` cannot answer
+this question — see Prerequisites.)
 
-1. [ ] Confirm the boundary with `/doctor` and record its glob.
+1. [ ] Confirm the boundary with `/boundary list` and record its glob and mode,
+       verbatim from the `<glob> [<mode>]` line.
 2. [ ] Ask the model to run any `~/.claude` skill. Expect the turn to route to
        the **local tier** and nothing to reach the provider — a user skill's
        block is unpinnable and pins under any boundary.
@@ -2604,7 +2626,12 @@ Build            :               (`teton --version`)
 TETON_TEST_SEAMS confirmed unset : yes / no
 Window used      : 1,000,000 (shipped recipe) | 128,000 (hand-lowered)   <-- circle one
 Privacy boundary configured?     : no (ran a–e) | yes (ran f)   <-- circle one
+  ^ answered with `/boundary list` (NOT `/doctor`)  : yes / no
+  ^ line it printed, verbatim :
 /help — skills diagnostic line read          : ______________________________
+(a) `/proceed` echo line, verbatim           :
+(a) dynamic commands `/proceed` carried      : ____  (recorded, not predicted)
+(a) dynamic-context consent raised at guarded : yes / no   answered: accept | decline
 (a) first model-issued echo line, verbatim   :
 (a) `continue` prompts needed                : ____
 (a) STALL STEP — body line quoted            :

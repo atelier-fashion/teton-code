@@ -19,7 +19,7 @@
 //! Integration test binaries share no modules in this workspace
 //! (`provenance_egress.rs`, `egress_capture.rs` and `cost_attribution.rs` each
 //! carry their own scripted transport for the same reason), so the vendor is a
-//! copy — a smaller one, with only the two scripting verbs these claims need.
+//! copy — a smaller one, with only the scripting verbs these claims need.
 //!
 //! ## Why this binary owns `HOME`
 //!
@@ -39,11 +39,15 @@
 //! | AC-7: refusals and listings count against the cap | [`a_run_of_listings_exhausts_the_per_turn_cap`] |
 //! | AC-7: a refused call never seeds the repeat rule | [`a_refused_call_never_seeds_the_repeat_rule`] |
 //! | AC-7: a body that names itself stops at `repeated`, not at the cap | [`a_body_that_names_itself_stops_at_the_repeat_refusal_not_at_the_cap`] |
+//! | AC-7/BR-6c: one call, one iteration — `max_turns` ends the turn before the cap can | [`every_skill_call_spends_one_iteration_and_the_ceiling_ends_the_turn_before_the_cap`] |
+//! | AC-11/BR-10: `read` stays jailed in the session the tool expands a body in | [`the_skill_tool_opens_one_body_and_leaves_read_jailed_in_the_same_session`] |
 //! | AC-8: a 7,222-word expansion enters a 128k route whole | [`a_seven_thousand_word_expansion_enters_a_128k_route_whole_and_unelided`] |
 //! | AC-8: the same fixture on an undeclared window is refused, in the spoken bound | [`the_same_fixture_on_an_undeclared_window_is_refused_in_the_bounds_spoken_form`] |
 //! | BR-9: a typed refusal over a registered row publishes its own record | [`every_tool_raised_refusal_over_a_registered_skill_publishes_a_record`] |
 //! | BR-9: the cap's refusal publishes one too, with the count that refused it | [`the_thirteenth_call_of_a_turn_is_refused_by_the_cap_and_the_next_prompt_starts_over`] |
 //! | BR-9: a refusal with no skill file to describe publishes none | [`every_tool_raised_refusal_over_a_registered_skill_publishes_a_record`] (`unknown_skill`), [`a_run_of_listings_exhausts_the_per_turn_cap`] (no name at all) |
+//! | AC-13: a model-issued call expands at `plan`, while the two unenumerated keys stay shut | [`at_plan_a_model_issued_call_expands_a_user_skill_and_shuts_the_project_row_and_the_commands`] |
+//! | AC-13: the same three calls at `full`, and everything opens | [`at_full_the_same_three_calls_expand_and_the_dynamic_command_runs`] |
 //!
 //! ## Mutation table
 //!
@@ -62,6 +66,14 @@
 //! | a refusal published with the *file's* dynamic outcomes on it | [`every_tool_raised_refusal_over_a_registered_skill_publishes_a_record`] |
 //! | the cap arm returning before `refuse`, as it did before BR-9's record | [`the_thirteenth_call_of_a_turn_is_refused_by_the_cap_and_the_next_prompt_starts_over`] |
 //! | a record invented for a call that named no skill | [`a_run_of_listings_exhausts_the_per_turn_cap`] |
+//! | a `skill` dispatch that does not spend a loop iteration | [`every_skill_call_spends_one_iteration_and_the_ceiling_ends_the_turn_before_the_cap`] |
+//! | `HarnessConfig::from_harness_profile` ignoring `max_tool_iterations` | [`every_skill_call_spends_one_iteration_and_the_ceiling_ends_the_turn_before_the_cap`] |
+//! | a `read` allowlist for `~/.claude/**` beside the tool (BR-10's refused precedent) | [`the_skill_tool_opens_one_body_and_leaves_read_jailed_in_the_same_session`] |
+//! | a jail exception for the companion file a body names | [`the_skill_tool_opens_one_body_and_leaves_read_jailed_in_the_same_session`] |
+//! | the `skill` row dropped from `READ_ONLY_TOOLS`, or enumerated `deny` at `plan` | [`at_plan_a_model_issued_call_expands_a_user_skill_and_shuts_the_project_row_and_the_commands`] |
+//! | `acknowledge_project` skipped, or its consent read as allow-on-deny | [`at_plan_a_model_issued_call_expands_a_user_skill_and_shuts_the_project_row_and_the_commands`] |
+//! | the dynamic-context door consulted with a key some level enumerates `allow` | [`at_plan_a_model_issued_call_expands_a_user_skill_and_shuts_the_project_row_and_the_commands`] |
+//! | the level never reaching the gate a turn reads (a second table beside it) | both AC-13 legs, in opposite directions |
 //!
 //! ## What is *not* here, and why
 //!
@@ -80,12 +92,20 @@ use std::time::Duration;
 use serde_json::{json, Value};
 use tokio::time::timeout;
 
-use teton_protocol::events::{Event, SkillInvoked};
-use teton_protocol::methods::{ConfigUpdate, ProviderConfig, SkillInvocation, TierBindingConfig};
+use teton_core::ToolCallTier;
+use teton_protocol::events::{
+    DynamicOutcome as WireDynamicOutcome, Event, NotRunReason, SkillInvoked,
+};
+use teton_protocol::methods::{
+    ConfigUpdate, ProviderConfig, SessionPermissionsParams, SkillInvocation, SkillSource,
+    StopReason, TierBindingConfig,
+};
+use teton_protocol::permissions::PermissionLevel;
 use teton_protocol::{
     Phase as ProtoPhase, ProviderId, ProviderKind as ProtoProviderKind, SessionId, SessionMode,
     Tier as ProtoTier,
 };
+use teton_providers::CapabilityProfile;
 
 use tetond::broadcast::EventBus;
 use tetond::grants::{ConnectionId, GrantRegistry};
@@ -99,6 +119,22 @@ use tetond::skills::RealFs;
 
 /// The pinned cap, read from the module that owns it rather than spelled again.
 const CAP: usize = tetond::harness::tools::skill::PER_TURN_INVOCATION_CAP;
+
+/// BR-6's *other* bound, derived from the module that owns it.
+///
+/// `DEGRADED_MAX_ITERATIONS` is private to `teton_providers::capability`, so the
+/// figure is taken the way production takes it — through the public
+/// [`CapabilityProfile::harness_profile`] — rather than spelled again here. A
+/// build that lengthened the degraded loop moves this figure with it, which is
+/// the point: the claim below is "the ceiling ends the turn", not "five".
+fn degraded_iteration_ceiling() -> usize {
+    CapabilityProfile {
+        tool_call_tier: ToolCallTier::Degraded,
+        ..CapabilityProfile::default()
+    }
+    .harness_profile()
+    .max_tool_iterations as usize
+}
 
 /// The word count AC-8's synthetic fixture is built to, and where it comes
 /// from: `/proceed`'s measured length. The real file is third-party content and
@@ -161,6 +197,15 @@ fn words(count: usize) -> String {
 /// binary run without a consent double at all: nothing below is ever asked a
 /// question, so "no prompt was raised" is not a claim any of these tests has to
 /// make or could accidentally rely on.
+///
+/// AC-13's two level legs keep that property rather than spending it, and they
+/// keep it for a stated reason rather than by luck: `plan` and `full` are the
+/// two levels whose table **settles** every question a model invocation can
+/// raise — `plan` denies the unenumerated `skill:<source>:<name>` and
+/// `project_skill_trust:<root>` keys outright, `full` allows them — so neither
+/// leg reaches the delivery route this binary does not install. `guarded` and
+/// `edits` do ask, which is exactly why their legs live in
+/// `skill_consent_matrix.rs`, beside the double that can answer.
 fn fixture_home() -> &'static Path {
     static HOME: OnceLock<Tree> = OnceLock::new();
     HOME.get_or_init(|| {
@@ -206,6 +251,38 @@ fn fixture_home() -> &'static Path {
         home.write(
             ".claude/skills/cost/SKILL.md",
             "---\ndescription: a name a built-in owns\n---\n\nCost body.\n",
+        );
+        // BR-10's jail contrast: a user skill whose body **names a companion
+        // file sitting beside it**, and that companion on disk. The pair is what
+        // makes "the tool is a door, not an exemption" a claim with two halves —
+        // the body arrives, and the file it points at stays unreadable.
+        //
+        // `checklist.md` is not a `SKILL.md`, so discovery (one level deep,
+        // `<name>/SKILL.md` only) never registers it and no roster figure moves.
+        home.write(
+            ".claude/skills/companion/SKILL.md",
+            "---\ndescription: a body that points at the file beside it\n---\n\n\
+             COMPANION-BODY-MARKER\nFollow `checklist.md`, next to this file.\n",
+        );
+        home.write(
+            ".claude/skills/companion/checklist.md",
+            "COMPANION-CHECKLIST-SECRET\n",
+        );
+        // AC-13's dynamic half: a **user** skill carrying one `` !`command` ``
+        // slot, so the level's answer at the skill's own door is visible in the
+        // body the model receives.
+        //
+        // The two forms the slot can take are disjoint strings, which is what
+        // makes each leg's assertion falsifiable by the other's behaviour: a
+        // command that ran is its output inside
+        // `<tool-result tool="skill:dynamic" …>`, and a command that did not is
+        // ``[dynamic context not run: `echo dyn-command-ran` — <reason>]``. So
+        // `plan` asserts the envelope is **absent** and `full` asserts it is
+        // present, over one file.
+        home.write(
+            ".claude/skills/dynamic/SKILL.md",
+            "---\ndescription: a body with one dynamic command\n---\n\n\
+             DYNAMIC-BODY-MARKER\nContext: !`echo dyn-command-ran`\n",
         );
         // AC-8's synthetic `/proceed`: the measured word count, with a marker
         // at each end and one in the middle, so "whole" is a claim about the
@@ -341,6 +418,19 @@ impl Vendor {
         )));
     }
 
+    /// Answer the next request with one call to some **other** tool.
+    ///
+    /// BR-10's contrast needs a `read` and a `skill` call in **one** session:
+    /// the position is that the tool is a door and not an exemption, and only a
+    /// fixture that asks both questions of the same jail can say so.
+    fn will_call_tool(&self, tool: &str, arguments: &Value) {
+        let id = format!("call-{}", self.next_call.fetch_add(1, Ordering::SeqCst));
+        self.script.lock().unwrap().push_back(Reply(sse_turn(
+            None,
+            Some((&id, tool, &arguments.to_string())),
+        )));
+    }
+
     /// Everything this vendor was asked to send, as one searchable string.
     fn on_the_wire(&self) -> String {
         self.bodies.lock().unwrap().join("\n")
@@ -355,6 +445,10 @@ struct Harness {
     sessions: SessionRegistry,
     vendor: Vendor,
     connection: ConnectionId,
+    /// The scratch `base_dir` a [`Harness::degraded`] runtime was started over,
+    /// held so its `config.toml` and cost ledger outlive the runtime that reads
+    /// them. `None` for the `minimal()` harnesses, which have no file at all.
+    _base: Option<Tree>,
 }
 
 impl Harness {
@@ -396,7 +490,83 @@ impl Harness {
             sessions: SessionRegistry::new(),
             vendor,
             connection: GrantRegistry::new().next_connection_id(),
+            _base: None,
         }
+    }
+
+    /// A runtime whose one provider declares the **degraded** tool-call tier, so
+    /// its turns run BR-6's short loop: `max_tool_iterations = 5`.
+    ///
+    /// Built the way `main` builds one — [`DaemonRuntime::from_env`] over a
+    /// scratch `base_dir` holding a real `config.toml` — because a capability
+    /// profile is the one provider fact `config/set` cannot carry:
+    /// `ConfigUpdate::RegisterProvider` deliberately **preserves** the stored
+    /// `[providers.capabilities]` rather than replacing it (BUG-155), so a
+    /// `minimal()` runtime's provider is Native whatever the RPC says. The tier
+    /// is therefore declared where a user declares it, and the figure under test
+    /// is the one `Router::harness_config_for` derives from it.
+    ///
+    /// `reflex` is left unbound for [`Self::with_window`]'s reason: `route`,
+    /// `redact` and `title` hang off it, and this machine has no local tier, so
+    /// binding it would put duty calls into the scripted queue these chains
+    /// depend on.
+    fn degraded() -> Self {
+        assert!(
+            std::env::var_os("TETON_CONFIG").is_none(),
+            "this harness relies on `from_env` resolving `base_dir/config.toml`; \
+             a TETON_CONFIG in the environment would point it at one shared file"
+        );
+        fixture_home();
+        let vendor = Vendor::start();
+        let base = Tree::new("degr");
+        let tiers: String = ["scan", "build", "think"]
+            .iter()
+            .map(|t| format!("[[tiers]]\ntier = \"{t}\"\nprovider_id = \"mock\"\n\n"))
+            .collect();
+        base.write(
+            "config.toml",
+            &format!(
+                "[[providers]]\nid = \"mock\"\nkind = \"openai-compatible\"\n\
+                 endpoint = \"{}\"\nmodel = \"mock-1\"\n\n\
+                 [providers.capabilities]\ntool_call_tier = \"degraded\"\n\
+                 max_context = 128000\n\n{tiers}",
+                vendor.endpoint
+            ),
+        );
+        let events = Arc::new(EventBus::new());
+        let runtime =
+            Arc::new(DaemonRuntime::from_env(base.path(), &events).expect("the daemon starts"));
+        Self {
+            runtime,
+            events,
+            sessions: SessionRegistry::new(),
+            vendor,
+            connection: GrantRegistry::new().next_connection_id(),
+            _base: Some(base),
+        }
+    }
+
+    /// Put this session at `level`, through the daemon's own
+    /// `session/permissions` path — the gate the turn below will read, never a
+    /// second table built beside it.
+    ///
+    /// The result is asserted rather than dropped because the whole of AC-13's
+    /// claim rests on the level being *in force*: a `session_permissions` that
+    /// silently addressed a different gate would leave both legs below running
+    /// at the `guarded` default, where `plan`'s denials are prompts nobody
+    /// answers and `full`'s allowances are indistinguishable from them.
+    fn at_level(&self, id: &SessionId, level: PermissionLevel) {
+        let result = self.runtime.session_permissions(
+            &SessionPermissionsParams {
+                session_id: id.clone(),
+                level: Some(level),
+            },
+            &self.events,
+        );
+        assert!(
+            result.changed && result.level == level,
+            "the session did not move to {level}: {result:?}"
+        );
     }
 
     /// A structured session rooted at `cwd`, with its skill registry derived
@@ -681,6 +851,102 @@ async fn a_run_of_listings_exhausts_the_per_turn_cap() {
         published.is_empty(),
         "a turn of nameless calls describes no skill file, so it publishes no \
          `skill_invoked` at all: {published:?}"
+    );
+}
+
+/// **AC-7's last clause: every skill call spends one loop iteration, and
+/// `max_turns` still ends the turn.**
+///
+/// The AC ends *"every skill call counts one loop iteration and `max_turns`
+/// still ends the turn"*, and BR-6(c) calls `max_turns` "the real bound on how
+/// far one prompt gets" — but on the Native profile every other test in this
+/// file runs, the two bounds never meet: 25 iterations against a cap of 12 means
+/// the cap always fires first and the iteration counter is never the thing that
+/// stopped anything. A build that dispatched `skill` **outside** the loop's own
+/// accounting — a side channel that expanded without spending a turn —
+/// satisfies every one of them.
+///
+/// So this leg inverts the two figures rather than restating one. On BR-6's
+/// **degraded** profile the loop is five iterations long; twelve calls are
+/// scripted (the cap's own number, so a build that let the cap fire would have
+/// had the calls to reach it); and what must be true is that the turn ends at
+/// the **iteration ceiling**, with `per_turn_cap` nowhere on the wire.
+///
+/// Three claims, none of which the others imply:
+///
+/// * the `stop_reason` is [`StopReason::MaxTurnRequests`] — the turn ended
+///   because it ran out of iterations, not because the model stopped;
+/// * exactly `ceiling` expansions happened, which is "one call, one iteration"
+///   stated as a number;
+/// * `per_turn_cap` appears nowhere, which is what separates this bound from the
+///   one every other test here exercises.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn every_skill_call_spends_one_iteration_and_the_ceiling_ends_the_turn_before_the_cap() {
+    let repo = Tree::new("iterc");
+    let ceiling = degraded_iteration_ceiling();
+    assert!(
+        ceiling < CAP,
+        "this fixture only separates the two bounds while the degraded loop is \
+         shorter than the per-turn cap ({ceiling} vs {CAP})"
+    );
+
+    let h = Harness::degraded();
+    let session = h.session_at(repo.path());
+    let mut sub = h.events.subscribe(512);
+
+    // Twelve calls: exactly the cap, so a build whose `skill` dispatch escaped
+    // the iteration accounting would have had the script to reach `per_turn_cap`
+    // and the assertion below would see it.
+    for n in 0..CAP {
+        h.vendor.will_call_skill(Some("step"), &format!("pass {n}"));
+    }
+    let outcome = h
+        .turn(&session, "walk a chain longer than the loop", None)
+        .await
+        .expect("a turn that runs out of iterations still returns a result");
+
+    assert_eq!(
+        outcome.stop_reason,
+        StopReason::MaxTurnRequests,
+        "the turn must end at the iteration ceiling — a turn that ended any \
+         other way did not spend one iteration per `skill` call"
+    );
+
+    let published = invocations(&drain(&mut sub).await);
+    assert_eq!(
+        published.len(),
+        ceiling,
+        "each `skill` call spends exactly one loop iteration, so a {ceiling}-\
+         iteration route dispatches {ceiling} of the {CAP} scripted calls and no \
+         more: {published:?}"
+    );
+    assert!(
+        published.iter().all(|invoked| invoked.refused.is_none()),
+        "nothing here is refused — the loop simply stops asking: {published:?}"
+    );
+
+    let wire = tool_results(&h.vendor);
+    assert!(
+        !wire.iter().any(|content| content.contains("per_turn_cap")),
+        "the cap is not what ended this turn and must not be quoted as though it \
+         were — `max_turns` bit {} calls earlier: {wire:#?}",
+        CAP - ceiling
+    );
+    // Non-vacuity, and the ceiling's own signature. The expansions really
+    // happened — this is a turn the tool worked in rather than one it was never
+    // reached in — but the **last** one never reaches the provider: its result is
+    // folded into context, and the loop then finds `turns >= max_turns` at the
+    // top of the next iteration and returns without a further request. That
+    // asymmetry is what `MaxTurnRequests` *means*, and it is the opposite of the
+    // cap's shape, where the refusal is a tool result the next request carries.
+    assert_eq!(
+        wire.iter()
+            .filter(|content| content.contains("Step body."))
+            .count(),
+        ceiling - 1,
+        "every admitted call but the last folded a body the next request \
+         carried; the {ceiling}th was committed and the ceiling ended the turn \
+         before anything could be sent: {wire:#?}"
     );
 }
 
@@ -1041,5 +1307,349 @@ async fn the_same_fixture_on_an_undeclared_window_is_refused_in_the_bounds_spoke
         !h.vendor.on_the_wire().contains("PROCEED-MIDDLE"),
         "a refused expansion enters nothing — never a shortened version of \
          itself"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// BR-10 — the tool is a door, not an exemption
+// ---------------------------------------------------------------------------
+
+/// **AC-11's opening contrast, in one session: `read` of a `~/.claude` skill
+/// file is refused with REQ-583's jail message while `skill { name }` returns
+/// that same file's body — and the companion file beside it stays unreadable.**
+///
+/// The four egress legs in `skill_boundary.rs` drive BR-10's *provenance* half
+/// well. What had no test at all is the sentence the rule opens with, and it is
+/// the sentence that says what the `skill` tool **is**: a door onto one named
+/// file, not a widening of the jail. That position rests entirely on the
+/// **absence** of a `read` allowlist for `~/.claude/**`, and an absence is only
+/// defended by a test that asks for it. A future allowlist — the precedent
+/// BR-10 exists to refuse, and the obvious "fix" for a model that reads a body
+/// and then cannot open the checklist it names — would break nothing else in
+/// this REQ.
+///
+/// Three calls, one prompt turn, one jail:
+///
+/// 1. `read` of the skill file's own absolute path — refused;
+/// 2. `read` of `checklist.md`, the companion sitting **in the same directory**,
+///    which the body names in so many words — refused *identically*, which is
+///    the clause AC-11 ends on and the one a reader is most likely to assume the
+///    tool relaxed;
+/// 3. `skill { name: "companion" }` — the body lands.
+///
+/// The two refusals are compared to **each other** rather than to a literal:
+/// what AC-11 pins is that the message is REQ-583's, *byte-identical to today*,
+/// for both files. So the caller's own path is asserted where REQ-583 puts it,
+/// and everything after it — the words and the root's display — is asserted to
+/// be the same string in both, which a special case for either file could not
+/// be.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_skill_tool_opens_one_body_and_leaves_read_jailed_in_the_same_session() {
+    let repo = Tree::new("jaildr");
+    let h = Harness::with_window(Some(128_000));
+    let session = h.session_at(repo.path());
+
+    let skill_file = fixture_home().join(".claude/skills/companion/SKILL.md");
+    let companion = fixture_home().join(".claude/skills/companion/checklist.md");
+    // Non-vacuity for the refusals: both files exist and are readable by this
+    // process, so "refused" is the jail's answer and not the filesystem's.
+    assert!(skill_file.is_file() && companion.is_file());
+
+    h.vendor
+        .will_call_tool("read", &json!({ "path": skill_file.display().to_string() }));
+    h.vendor
+        .will_call_tool("read", &json!({ "path": companion.display().to_string() }));
+    h.vendor.will_call_skill(Some("companion"), "");
+    h.turn(&session, "read the skill file, then run the skill", None)
+        .await
+        .expect("a jailed read is a tool result, and the turn goes on");
+
+    let wire = tool_results(&h.vendor);
+    let refusal_tail_for = |path: &Path| -> String {
+        let needle = format!("path `{}` is outside the session root ", path.display());
+        wire.iter()
+            .find_map(|content| content.split_once(&needle).map(|(_, tail)| tail.to_owned()))
+            .unwrap_or_else(|| {
+                panic!(
+                    "`read` of `{}` was not refused in REQ-583's words. The `skill` \
+                     tool is a door onto one body, never a widening of the jail — a \
+                     `read` allowlist for `~/.claude/**` is the precedent BR-10 \
+                     exists to refuse: {wire:#?}",
+                    path.display()
+                )
+            })
+    };
+    let skill_tail = refusal_tail_for(&skill_file);
+    let companion_tail = refusal_tail_for(&companion);
+    assert_eq!(
+        skill_tail, companion_tail,
+        "the companion file's refusal must be the same refusal, word for word — \
+         AC-11 ends on exactly this clause, and a jail that made an exception for \
+         the file a body *names* would still be an exception: {wire:#?}"
+    );
+
+    // And the door, in the same turn: the body the `read` could not have.
+    assert!(
+        wire.iter()
+            .any(|content| content.contains("COMPANION-BODY-MARKER")),
+        "the tool must return the body of the very file `read` was refused, or \
+         this session shows a jail rather than a door: {wire:#?}"
+    );
+    // The body names `checklist.md`; its *contents* are still nowhere, on any
+    // path — the expansion carries the file it was asked for and nothing beside
+    // it.
+    assert!(
+        !h.vendor
+            .on_the_wire()
+            .contains("COMPANION-CHECKLIST-SECRET"),
+        "the companion file's contents reached the model, so something read a \
+         file outside the root"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// AC-13 — the expansion is callable at a *level*, through the composed path
+// ---------------------------------------------------------------------------
+
+/// **AC-13 at `plan`: a model-issued `skill { name }` expands, and the two keys
+/// no level enumerates stay shut.**
+///
+/// AC-13's headline is that the expansion is callable at all four levels, and
+/// callable is a claim about the composed path — the cap, then the level table,
+/// then consent — not about any one of them. It had two independent lookups
+/// standing in for it (`harness::permissions::tests::the_skill_tool_never_asks_and_is_never_denied_at_any_level`
+/// reads a `table_for(level).policy_for("skill")` row, and
+/// `harness::tools::tests::the_skill_tool_is_exposed_at_every_cap_ac4_names`
+/// reads an `exposed_names` set) and no test at all that drove a model-issued
+/// call through [`DaemonRuntime::run_prompt_turn`] at anything but the session
+/// default. Two lookups agreeing is the substitution LESSON-524 is *about*:
+/// `teton_docs` was in the exposure list and denied at `plan`, and the exposure
+/// test stayed green through the whole of it.
+///
+/// So this leg asserts the **expansion**, from the wire, and never reads the
+/// level back out of a table.
+///
+/// ## Why `plan` is the interesting level, and the reason is specific
+///
+/// [`READ_ONLY_TOOLS`](tetond::harness::permissions) allows the `skill` tool's
+/// own row at every level — which is the whole of what the two lookups say.
+/// What a model invocation *also* passes through is finer than the tool's name
+/// and is asked under keys the level table deliberately leaves unenumerated
+/// (REQ-560 ADR-A): `skill:<source>:<name>` for BR-5's dynamic context, and
+/// `project_skill_trust:<root>` for BR-4's acknowledgment. Both fall to the
+/// level's `default`, and at `plan` that default is `Deny`. So the row being
+/// `allow` is necessary and nowhere near sufficient, and the claim this pins is
+/// the three-way one:
+///
+/// * a **user** skill with no dynamic context expands — the tool is genuinely
+///   callable at the level a user picks *because* they want reading and
+///   nothing else;
+/// * a **project** skill is refused `project_not_acknowledged`, and the
+///   sentence says the *level* shut it rather than that a user declined;
+/// * a body **with** a dynamic command still expands, with the command refused
+///   at its own door — the placeholder, and the typed `NotRun` record beside
+///   it.
+///
+/// The absences carry as much as the presences. `PROJECT-BODY-MARKER` must be
+/// nowhere, or the acknowledgment is decorative; the `skill:dynamic` envelope
+/// must be nowhere, or a command ran at `plan`. And nothing is asked — not
+/// asserted here as "no prompt was raised", which this binary installs no
+/// double to observe, but *structurally*: `plan`'s table settles both keys, so
+/// a build that started asking would hang this test rather than pass it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn at_plan_a_model_issued_call_expands_a_user_skill_and_shuts_the_project_row_and_the_commands(
+) {
+    let repo = Tree::new("planlvl");
+    repo.write(
+        ".claude/skills/repospecific/SKILL.md",
+        "---\ndescription: a skill this repository defines\n---\n\nPROJECT-BODY-MARKER\n",
+    );
+    let h = Harness::with_window(Some(128_000));
+    let session = h.session_at(repo.path());
+    h.at_level(&session, PermissionLevel::Plan);
+    let mut sub = h.events.subscribe(512);
+
+    h.vendor.will_call_skill(Some("step"), "");
+    h.vendor.will_call_skill(Some("repospecific"), "");
+    h.vendor.will_call_skill(Some("dynamic"), "");
+    h.turn(&session, "run all three", None)
+        .await
+        .expect("`plan` is a level a turn runs at, not an error");
+
+    let wire = tool_results(&h.vendor);
+    let published = invocations(&drain(&mut sub).await);
+
+    // 1. The headline, and the only form of it that is not a second lookup: the
+    //    body of a user skill, on the wire, at `plan`.
+    assert!(
+        wire.iter().any(|content| content.contains("Step body.")),
+        "a model-issued `skill` call must expand at `plan` — a knowledge tool \
+         denied at the level a user picks *for* reading is indistinguishable \
+         from not shipping it (LESSON-524): {wire:#?}"
+    );
+    assert_eq!(
+        published
+            .iter()
+            .filter(|invoked| invoked.name == "step" && invoked.refused.is_none())
+            .count(),
+        1,
+        "the expansion must publish its record unrefused: {published:?}"
+    );
+    // Non-vacuity for all three calls: a discovery that registered nothing
+    // would refuse every one of them `unknown_skill`, and two of the three
+    // assertions below would still read as "it was refused".
+    assert!(
+        !wire.iter().any(|content| content.contains("unknown_skill")),
+        "every name below is registered in this session; an `unknown_skill` \
+         means discovery, not the level, decided this turn: {wire:#?}"
+    );
+
+    // 2. BR-4's key is unenumerated, so `plan` denies it — and the sentence
+    //    names the level rather than a user who was never asked.
+    let refused = wire
+        .iter()
+        // The refusal is the reason id at the head of its own sentence, inside
+        // the untrusted envelope every refusal is framed in — anchored on
+        // `ERROR: <reason>:` rather than on a bare substring, so a *mention* of
+        // the reason somewhere in a roster could not satisfy this.
+        .find(|content| content.contains("ERROR: project_not_acknowledged:"))
+        .unwrap_or_else(|| {
+            panic!(
+                "a project skill must be refused at `plan`: \
+                 `project_skill_trust:<root>` has no row at any level, so it \
+                 falls to `plan`'s `Deny` default: {wire:#?}"
+            )
+        });
+    assert!(
+        refused.contains("`repospecific`")
+            && refused.contains("this session's permission level does not allow it"),
+        "the refusal must name the skill and say the *level* shut the door — \
+         `the user declined` would be a decision nobody made: {refused}"
+    );
+    assert!(
+        !h.vendor.on_the_wire().contains("PROJECT-BODY-MARKER"),
+        "the repository's body reached the model anyway, so the acknowledgment \
+         is decorative: {wire:#?}"
+    );
+    assert_eq!(
+        published
+            .iter()
+            .find(|invoked| invoked.name == "repospecific")
+            .map(|invoked| (invoked.refused.as_deref(), invoked.source)),
+        Some((Some("project_not_acknowledged"), SkillSource::Project)),
+        "the refusal publishes its own record, describing the project file it \
+         refused (BR-9): {published:?}"
+    );
+
+    // 3. BR-5's key is unenumerated too, so the body arrives and the command
+    //    does not run. Both halves, because either alone is a different claim:
+    //    an expansion with no placeholder is a command that ran, and a
+    //    placeholder with no body is a refusal.
+    let expanded = wire
+        .iter()
+        .find(|content| content.contains("DYNAMIC-BODY-MARKER"))
+        .unwrap_or_else(|| {
+            panic!(
+                "a body carrying a dynamic command must still expand at `plan` \
+                 — the command's door is not the tool's: {wire:#?}"
+            )
+        });
+    assert!(
+        expanded
+            .contains("[dynamic context not run: `echo dyn-command-ran` — plan permission level]"),
+        "the slot must carry the level's placeholder: {expanded}"
+    );
+    assert!(
+        !expanded.contains("<tool-result tool=\"skill:dynamic\""),
+        "a command ran at `plan`: its output is in the untrusted envelope where \
+         the placeholder belongs: {expanded}"
+    );
+    let outcomes = published
+        .iter()
+        .find(|invoked| invoked.name == "dynamic")
+        .map(|invoked| invoked.outcomes.clone())
+        .expect("the expansion publishes a record");
+    assert_eq!(
+        outcomes.len(),
+        1,
+        "the fixture declares one slot: {outcomes:?}"
+    );
+    assert!(
+        outcomes.iter().all(|view| view.outcome
+            == WireDynamicOutcome::NotRun {
+                reason: NotRunReason::Level
+            }),
+        "the typed record must say the level closed the door, not a user: {outcomes:?}"
+    );
+}
+
+/// **AC-13 at `full`: the same three calls, and everything opens.**
+///
+/// The contrast is the evidence. One fixture set, one script, one difference —
+/// the level — and every assertion above inverts: the project body arrives
+/// where it was refused, the command's output sits in the envelope where the
+/// placeholder sat, and `project_not_acknowledged` is nowhere. A build in which
+/// the level had stopped reaching the composed path could not satisfy both
+/// legs, which is what the two standing lookups cannot say: `table_for` returns
+/// `allow` for the `skill` row at `plan` and at `full` alike, so neither lookup
+/// changes at all between these two turns.
+///
+/// `full` asks nothing either, and for a stated reason rather than a hopeful
+/// one: `authorize_skill` settles on an `allow` row
+/// ([`LevelAllow::Settles`](tetond::harness::permissions)), and
+/// `authorize_project_skill_trust` settles on one too **unless** the project
+/// skill shadows a user skill of the same name — BR-4's one case that surprises
+/// `full`. `repospecific` is named so it shadows nothing, so this leg stays
+/// inside the no-double property this binary is built on. The shadowing case is
+/// a prompt, and it is pinned in `skill_consent_matrix.rs` beside the double
+/// that can answer it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn at_full_the_same_three_calls_expand_and_the_dynamic_command_runs() {
+    let repo = Tree::new("fulllvl");
+    repo.write(
+        ".claude/skills/repospecific/SKILL.md",
+        "---\ndescription: a skill this repository defines\n---\n\nPROJECT-BODY-MARKER\n",
+    );
+    let h = Harness::with_window(Some(128_000));
+    let session = h.session_at(repo.path());
+    h.at_level(&session, PermissionLevel::Full);
+
+    h.vendor.will_call_skill(Some("step"), "");
+    h.vendor.will_call_skill(Some("repospecific"), "");
+    h.vendor.will_call_skill(Some("dynamic"), "");
+    h.turn(&session, "run all three", None)
+        .await
+        .expect("`full` is a level a turn runs at");
+
+    let wire = tool_results(&h.vendor);
+    assert!(
+        wire.iter().any(|content| content.contains("Step body.")),
+        "the user skill must expand at `full` too: {wire:#?}"
+    );
+    assert!(
+        wire.iter()
+            .any(|content| content.contains("PROJECT-BODY-MARKER")),
+        "`full` allows the unenumerated acknowledgment key and settles it, so a \
+         non-shadowing project skill expands with nobody asked: {wire:#?}"
+    );
+    assert!(
+        !wire
+            .iter()
+            .any(|content| content.contains("project_not_acknowledged")),
+        "nothing was refused at `full`: {wire:#?}"
+    );
+    let expanded = wire
+        .iter()
+        .find(|content| content.contains("DYNAMIC-BODY-MARKER"))
+        .unwrap_or_else(|| panic!("the body with a command must expand: {wire:#?}"));
+    assert!(
+        expanded
+            .contains("<tool-result tool=\"skill:dynamic\" trust=\"untrusted\">\ndyn-command-ran"),
+        "at `full` the command runs and its stdout enters inside the untrusted \
+         envelope, in the slot the placeholder held at `plan`: {expanded}"
+    );
+    assert!(
+        !expanded.contains("dynamic context not run"),
+        "a command was refused at `full`: {expanded}"
     );
 }

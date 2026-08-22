@@ -1514,32 +1514,18 @@ impl PermissionGate {
             );
             return SkillConsent::Unanswerable;
         }
-        // The root reaches this door as a **display** string
-        // (`session_root::display_for`), and a display is lossy: a path whose
-        // bytes are not valid UTF-8 renders with U+FFFD, so two distinct roots
-        // can render identically and mint **one** key. The key's own doc
-        // (`project_skill_trust_key`) says that must not happen — a grant for
-        // one repository answering for another is the whole harm the per-root
-        // scope exists to prevent.
-        //
-        // The real fix is to key on the raw `OsStr` bytes and keep the display
-        // for the prompt, which is a change at the *caller* that mints both
-        // (`harness/tools/skill.rs`). Until it lands, this door refuses a root
-        // it cannot key faithfully rather than remembering an answer under an
-        // ambiguous name: fail-closed costs a repository with an
-        // invalid-UTF-8 path its model-invocable project skills — the user's own
-        // `/name` is unaffected, since it does not come through this door — and
-        // the alternative costs correctness of the grant.
-        if root.contains(char::REPLACEMENT_CHARACTER) {
-            eprintln!(
-                "tetond: refusing the project-skill acknowledgment for `{root}` — \
-                 the session root's display carries U+FFFD, so it cannot \
-                 distinguish this repository from another whose path differs \
-                 only in bytes the display cannot show, and the grant would be \
-                 remembered under a name shared by both (BR-4)"
-            );
-            return SkillConsent::Unanswerable;
-        }
+        // No guard here on the *faithfulness* of `root`, and that is now a
+        // property rather than an omission. This door once refused a root whose
+        // string carried `U+FFFD`, because the name was minted by
+        // `session_root::display_for` — which ends in `Path::display` and
+        // renders every byte that is not valid UTF-8 as that character, so two
+        // distinct roots rendered identically and minted **one** key. The mint
+        // is `tools::skill::trust_root_name` now: it percent-escapes each
+        // non-UTF-8 byte and each literal `%`, which is injective, so the
+        // collapse the interim watched for cannot be produced by the production
+        // call site at all. Keeping it would only have cost a repository whose
+        // path holds a *genuine* `U+FFFD` — valid UTF-8, faithfully named — its
+        // model-invocable project skills.
         debug_assert_eq!(
             key,
             project_skill_trust_key(root),
@@ -2504,48 +2490,77 @@ mod tests {
         }
     }
 
-    /// **REQ-587 verify: a root the key cannot faithfully name is refused.**
+    /// **REQ-587 verify, the property that replaced an interim refusal: two
+    /// roots the *display* cannot tell apart are two acknowledgments, and both
+    /// of them can be given.**
     ///
-    /// The acknowledgment's key is built from the session root's *display*, and
-    /// `Path::display` renders bytes that are not valid UTF-8 as U+FFFD — so two
-    /// distinct roots can render identically and mint one key, which is the
+    /// This door used to refuse any root whose string carried `U+FFFD`. The
+    /// reason was real while it lasted: the name was minted by
+    /// `session_root::display_for`, which ends in `Path::display` and renders
+    /// every byte that is not valid UTF-8 as that character, so two distinct
+    /// roots rendered identically, minted **one** key, and a `y` about one
+    /// repository was remembered under a name the other also mints — the
     /// grant-for-another-repository harm the per-root scope exists to prevent.
     ///
-    /// Until the caller keys on the raw `OsStr` bytes, the door refuses rather
-    /// than remembering an answer under an ambiguous name. The control leg is
-    /// what makes this about the ambiguity and not about the root being unusual:
-    /// the same root without the replacement character is allowed by the same
-    /// gate at the same level.
+    /// The mint is [`trust_root_name`] now, which percent-escapes each
+    /// non-UTF-8 byte and each literal `%`. That is injective, so the collapse
+    /// cannot be produced from the production call site and the interim had
+    /// nothing left to catch. What replaces it is the property that makes it
+    /// unnecessary — asserted **through the door**, since
+    /// `tools::skill::tests::two_roots_the_display_cannot_tell_apart_mint_two_acknowledgment_keys`
+    /// owns the mint half: the two roots arrive under two keys, and each is
+    /// acknowledgeable.
+    ///
+    /// The third leg is the behaviour the removal changed, stated rather than
+    /// left to be discovered. A root whose path holds a **genuine** `U+FFFD`
+    /// character — valid UTF-8, nothing lossy about it, a name that names
+    /// exactly one repository — was refused by the interim's overreach and is
+    /// admitted again.
+    ///
+    /// **Mutation:** restore `if root.contains(char::REPLACEMENT_CHARACTER) {
+    /// return SkillConsent::Unanswerable; }` and the third leg fails; put
+    /// `display_for` back in the mint and the first fails.
     #[tokio::test]
-    async fn a_root_whose_display_cannot_name_it_is_not_acknowledged() {
+    async fn two_roots_the_display_cannot_tell_apart_are_two_acknowledgments_and_both_can_be_given()
+    {
+        use std::ffi::OsString;
+        use std::os::unix::ffi::OsStringExt;
+        use std::path::PathBuf;
+
+        use crate::harness::tools::skill::trust_root_name;
+
+        let home = PathBuf::from("/home/jane");
+        let root_of = |tail: &[u8]| {
+            let mut bytes = b"/home/jane/dev/repo".to_vec();
+            bytes.extend_from_slice(tail);
+            trust_root_name(&PathBuf::from(OsString::from_vec(bytes)), Some(&home))
+        };
+        let one = root_of(b"\xff");
+        let two = root_of(b"\xfe");
+        assert_ne!(
+            project_skill_trust_key(&one),
+            project_skill_trust_key(&two),
+            "the two repositories must not share the name this door remembers an \
+             answer under, or a `y` about `{one}` frees `{two}`"
+        );
+
         let (_bus, _pending, gate) = gate(PermissionConfig::with_default(PermissionPolicy::Allow));
-        let lossy = "~/dev/te\u{FFFD}ton";
-        assert_eq!(
-            gate.authorize_project_skill_trust(
-                &project_skill_trust_key(lossy),
-                lossy,
-                &[],
-                false,
-                GrantRegistry::new().next_connection_id(),
-            )
-            .await,
-            SkillConsent::Unanswerable,
-            "a display that cannot distinguish this repository from another must \
-             not become the name a session grant is remembered under"
-        );
-        assert!(
-            gate.authorize_project_skill_trust(
-                &project_skill_trust_key("~/dev/teton"),
-                "~/dev/teton",
-                &[],
-                false,
-                GrantRegistry::new().next_connection_id(),
-            )
-            .await
-            .is_allowed(),
-            "the control: a root the display can name is acknowledged normally, \
-             so the refusal above is about the ambiguity"
-        );
+        for root in [one.as_str(), two.as_str(), "~/dev/te\u{FFFD}ton"] {
+            assert!(
+                gate.authorize_project_skill_trust(
+                    &project_skill_trust_key(root),
+                    root,
+                    &[],
+                    false,
+                    GrantRegistry::new().next_connection_id(),
+                )
+                .await
+                .is_allowed(),
+                "`{root}` names exactly one repository, so this door has nothing \
+                 to fail closed on — and refusing it costs that repository its \
+                 model-invocable project skills"
+            );
+        }
     }
 
     /// The acknowledgment's second guard, pinned in the same direction

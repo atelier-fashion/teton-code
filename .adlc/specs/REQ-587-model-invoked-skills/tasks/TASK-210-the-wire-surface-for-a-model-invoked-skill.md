@@ -1,7 +1,7 @@
 ---
 id: TASK-210
 title: "Protocol: the two flags, who invoked, and an acknowledgment subject an old client refuses"
-status: draft
+status: complete
 parent: REQ-587
 created: 2026-08-20
 updated: 2026-08-20
@@ -21,12 +21,12 @@ which is the point of doing it first.
 
 ## Acceptance Criteria
 
-- [ ] Every new **field** is `#[serde(default, skip_serializing_if = …)]` and gets the four-leg skew test at `events.rs:~3616` copied whole — including the non-vacuity leg, which is the one that catches a fixture that never carried the key.
-- [ ] **`PermissionSubject::ProjectSkillTrust` gets its own variant-skew leg, because the field test does not cover it.** The enum is closed with `#[serde(other)] Unrecognized`, and that arm is a **refusal**, not an ignore. Assert: a REQ-585-vintage reader parsing the new variant lands on `Unrecognized`; the client turns that into `RefusalReason::UnrecognizedSubject`; and the daemon-side consequence is `project_not_acknowledged` with a next step that client can actually perform. A project skill is simply never model-invocable there, and that is a shipped consequence, not a bug — say so in the doc.
-- [ ] The acknowledgment key's spelling and `is_project_acknowledgment_key` live **here**, above both crates, for ASSUME-017's reason: a decision with two stores needs one invalidation rule. `/cd` expires it on the daemon *and* in the client's `SessionGrants`.
-- [ ] `PROTOCOL_VERSION` unchanged — asserted, not assumed.
-- [ ] `SkillInvoked` still never carries the body (pinned at `skill_turn.rs:~1868`); `path_display` stays home-relative and bounded.
-- [ ] Mutation: downgrading any `skip_serializing_if` to bare `default` fails the "no key, not null" leg; deleting `#[serde(other)]` fails the `Unrecognized` pin.
+- [x] Every new **field** is `#[serde(default, skip_serializing_if = …)]` and gets the four-leg skew test at `events.rs:~3616` copied whole — including the non-vacuity leg, which is the one that catches a fixture that never carried the key.
+- [x] **`PermissionSubject::ProjectSkillTrust` gets its own variant-skew leg, because the field test does not cover it.** The enum is closed with `#[serde(other)] Unrecognized`, and that arm is a **refusal**, not an ignore. Assert: a REQ-585-vintage reader parsing the new variant lands on `Unrecognized`; the client turns that into `RefusalReason::UnrecognizedSubject`; and the daemon-side consequence is `project_not_acknowledged` with a next step that client can actually perform. A project skill is simply never model-invocable there, and that is a shipped consequence, not a bug — say so in the doc.
+- [x] The acknowledgment key's spelling and `is_project_acknowledgment_key` live **here**, above both crates, for ASSUME-017's reason: a decision with two stores needs one invalidation rule. `/cd` expires it on the daemon *and* in the client's `SessionGrants`.
+- [x] `PROTOCOL_VERSION` unchanged — asserted, not assumed.
+- [x] `SkillInvoked` still never carries the body (pinned at `skill_turn.rs:~1868`); `path_display` stays home-relative and bounded.
+- [x] Mutation: downgrading any `skip_serializing_if` to bare `default` fails the "no key, not null" leg; deleting `#[serde(other)]` fails the `Unrecognized` pin.
 
 ## Technical Notes
 
