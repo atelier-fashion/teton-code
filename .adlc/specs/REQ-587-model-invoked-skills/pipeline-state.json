@@ -3,14 +3,15 @@
   "branch": "feat/REQ-587-model-invoked-skills",
   "startedAt": "2026-08-20T22:30:00Z",
   "completed": false,
-  "currentPhase": 6,
+  "currentPhase": 7,
   "completedPhases": [
     0,
     1,
     2,
     3,
     4,
-    5
+    5,
+    6
   ],
   "phaseHistory": [
     {
@@ -41,6 +42,11 @@
     {
       "phase": 5,
       "name": "Verify",
+      "completedAt": "2026-08-22T00:00:00Z"
+    },
+    {
+      "phase": 6,
+      "name": "PR ready for review",
       "completedAt": "2026-08-22T00:00:00Z"
     }
   ],

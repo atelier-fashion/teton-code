@@ -736,17 +736,39 @@ impl Vendor {
             for stream in listener.incoming() {
                 let Ok(mut stream) = stream else { break };
                 served.fetch_add(1, Ordering::SeqCst);
-                // Read until the request body has been seen. The daemon sends
-                // one request and waits, so a single large read is enough for a
-                // fixture; the body is only ever inspected for substrings.
+                // Read the request by its **framing**, never by a heuristic.
+                //
+                // This loop used to stop once it had seen `\r\n\r\n` and one
+                // read came back short of the buffer — which is not a rule
+                // about HTTP, it is a guess about socket chunking. A short read
+                // is legal at any point in a stream, so on Linux a body larger
+                // than the buffer breaks the loop mid-payload while on macOS
+                // the same body arrives in full-buffer chunks and does not.
+                // AC-8's 7,222-word expansion is well over 64 KiB, so the
+                // capture lost its tail on one platform only and the test read
+                // as "the expansion was elided" when the daemon had sent all of
+                // it (LESSON-540: a difference between platforms is a property
+                // of the instrument until proven otherwise).
                 let mut raw = Vec::new();
                 let mut buf = [0u8; 65_536];
+                let mut want: Option<usize> = None;
                 while let Ok(read) = stream.read(&mut buf) {
                     if read == 0 {
                         break;
                     }
                     raw.extend_from_slice(&buf[..read]);
-                    if raw.windows(4).any(|w| w == b"\r\n\r\n") && read < buf.len() {
+                    if want.is_none() {
+                        if let Some(end) = raw.windows(4).position(|w| w == b"\r\n\r\n") {
+                            let head = String::from_utf8_lossy(&raw[..end]).to_ascii_lowercase();
+                            let len = head
+                                .lines()
+                                .find_map(|line| line.strip_prefix("content-length:"))
+                                .and_then(|value| value.trim().parse::<usize>().ok())
+                                .unwrap_or(0);
+                            want = Some(end + 4 + len);
+                        }
+                    }
+                    if want.is_some_and(|total| raw.len() >= total) {
                         break;
                     }
                 }
