@@ -4,7 +4,7 @@ title: "The self-approval attach test flakes on the Linux CI leg — the withhol
 status: open
 severity: medium
 created: 2026-08-12
-updated: 2026-08-12
+updated: 2026-08-22
 component: "daemon/session"
 domain: "session-authorization"
 stack: ["rust", "daemon", "json-rpc", "linux"]
@@ -312,6 +312,38 @@ clears it for good.
 That is a small, additive change to a security-critical path: it records a
 decision already being made and changes no predicate. It is the cheapest thing
 that can end this.
+
+## SECOND INSTRUMENT ADDED — 2026-08-22 (still open, deliberately)
+
+Asked to fix every open bug, this one was **not** fixed, because its own
+evidence says a fix would be a guess. The report already published two
+confident wrong causes, and the first instrumented capture *positively
+excluded* the ancestry mechanism rather than merely failing to confirm it.
+Patching `linux::parent_of` — the obvious-looking change, and the one the
+"withholding chain" section still describes — would have been the third wrong
+cause. The prescribed next step was a measurement, so a measurement is what was
+added.
+
+**What landed** (`crates/tetond/tests/attach_authorization.rs`): the client half
+of the dump the last capture asked for. `RawClient` now records a one-line
+structural summary of **every** frame it reads — responses with their ids, not
+only event notifications — plus the response id `read_response` is currently
+blocked on. The deadline panic prints both.
+
+This is precisely the distinction the last capture left open. The flake was
+localised to `read_response`'s loop *after* consent was granted, leaving two
+shapes: the response never arrived, or it arrived in a form the `id` match did
+not recognise. `events` could not tell them apart; this can.
+
+The summary is **structural only** — method, id, event name, error code, never
+the payload. A consent frame carries file-authored text and a panic message is
+not a place to reproduce it. It is unit-pinned
+(`the_frame_summary_distinguishes_the_shapes_bug_163_has_to_tell_apart`),
+because an instrument that renders garbage at the moment everything else failed
+is worse than none.
+
+No predicate changed. Status stays `open`: the next red CI run should now
+identify or clear the delivery/ordering seam in one read.
 
 ## Related
 
