@@ -178,6 +178,22 @@ pub enum TransportError {
     /// user looking for the wrong thing.
     #[error("egress refused: {0}")]
     PrivacyBlocked(BlockDetail),
+    /// The egress choke point refused the request because this **prompt**
+    /// reached its spend ceiling (REQ-588 BR-1/BR-3).
+    ///
+    /// Like [`Self::PrivacyBlocked`] and for the same reason: not a network
+    /// fault, never retried, and — critically — **never a reason to mark the
+    /// provider unhealthy**. The provider did nothing wrong; degrading it would
+    /// make a budget decision look like an outage and route later turns away
+    /// from a healthy provider for the rest of the session.
+    ///
+    /// A **unit** variant, unlike `PrivacyBlocked`'s detail, because this enum
+    /// is `Copy` and the sentence a user reads is composed from the prompt's
+    /// accumulator and the configured ceiling — both of which the daemon holds
+    /// at the point it words the failure. Baking a string in here would put a
+    /// second composer one layer below the one that has the facts.
+    #[error("egress refused: this prompt reached its spend ceiling")]
+    SpendCeiling,
 }
 
 /// The one seam through which adapters reach the network (D-2). Implemented by

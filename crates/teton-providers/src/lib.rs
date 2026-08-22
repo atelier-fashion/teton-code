@@ -622,6 +622,14 @@ pub enum ProviderError {
     /// the daemon can say which inspection refused the turn (REQ-562 BR-3).
     #[error("egress refused: {0}")]
     PrivacyBlocked(BlockDetail),
+    /// The prompt reached its spend ceiling at the choke point (REQ-588 BR-3).
+    ///
+    /// Carries nothing: the sentence a user reads is composed where the facts
+    /// are — the daemon holds the prompt's accumulator and the configured
+    /// ceiling — so a payload here would be a second composer one layer below
+    /// the one that can actually fill it in.
+    #[error("this prompt reached its spend ceiling")]
+    SpendCeilingReached,
 }
 
 impl ProviderError {
@@ -649,9 +657,16 @@ impl ProviderError {
             // retry and no health change (REQ-586 BR-2 / ADR-8) — the same
             // bytes would overflow a fallback too. Handing any of them to
             // `classify` would degrade a provider that is working fine.
+            // …and a spend-ceiling stop, for the same reason as the
+            // context-length refusal beside it (REQ-588 BR-3 / ADR-4): the
+            // provider is working fine, the *budget* ran out, and a fallback
+            // would spend more money rather than less. Degrading it here would
+            // make a budget decision look like an outage and route later turns
+            // away from a healthy provider for the rest of the session.
             ProviderError::Build(_)
             | ProviderError::PrivacyBlocked(_)
             | ProviderError::EffortRefused { .. }
+            | ProviderError::SpendCeilingReached
             | ProviderError::ContextLengthExceeded { .. } => return None,
         })
     }
@@ -711,6 +726,10 @@ impl ProviderError {
             // Preserve the privacy-block signal end to end: it must NOT collapse
             // into the retryable transport class (REQ-544 M-1).
             TransportError::PrivacyBlocked(detail) => ProviderError::PrivacyBlocked(detail),
+            // Preserved end to end for the same reason (REQ-588 BR-3): folding
+            // it into `Transport` would make it retryable and degrade a healthy
+            // provider over a budget stop.
+            TransportError::SpendCeiling => ProviderError::SpendCeilingReached,
         }
     }
 }

@@ -3780,6 +3780,22 @@ impl DaemonRuntime {
         // commit/abandon below instead of each exit remembering to disarm —
         // BR-6's atomicity is a property of the shape, not of ten call sites
         // agreeing.
+        // REQ-588 ADR-1: the prompt's spend accumulator, created **here** —
+        // before the attempt loop — because "per prompt" is its lifetime, not a
+        // key looked up somewhere. Every attempt, every fallback reroute and
+        // every duty of this prompt is handed this same `Arc`, so they add into
+        // one total; the next prompt gets a new one and therefore starts at
+        // zero, without anything having to remember to reset it.
+        //
+        // `None` when no ceiling is configured, which is what makes the whole
+        // feature cost nothing when it is off (ADR-6): the check at the choke
+        // point needs both this and a ceiling, so neither the accumulator nor
+        // the pricing lookup exists on an un-opted-in machine.
+        let prompt_spend = config
+            .cost
+            .ceiling_micro_cents()
+            .map(|_| Arc::new(teton_core::cost_ceiling::PromptSpend::default()));
+
         let outcome: Result<PromptTurnResult, RpcError> = 'turn: loop {
             router.emit_route_decided(events, Some(session_id.clone()), &route);
             let provider_id = route.provider_id.clone();
@@ -3797,6 +3813,7 @@ impl DaemonRuntime {
                     &gate,
                     &stream_events,
                     conversation.ctx_mut(),
+                    prompt_spend.as_ref(),
                 )
                 .await;
 
@@ -4835,6 +4852,11 @@ impl DaemonRuntime {
             Arc::clone(events),
             Arc::clone(&self.session_taint),
         ));
+        // REQ-588: **no spend ceiling here, deliberately.** An MCP call carries no
+        // `CostAttribution` — there is no model and no priced token — so it can
+        // neither add to the prompt's spend nor be measured against it. Wiring a
+        // ceiling in would advertise a check that could never fire. MCP tool
+        // traffic is outside the dollar ceiling; the spec says so explicitly.
         let mut egress = Egress::new(transport, config.boundaries.clone(), sink)
             .with_cost_meter(Arc::new(self.ledger.clone()));
         if let Some(gate) = self.redaction_gate(router, config, events, session_id) {
@@ -4858,6 +4880,7 @@ impl DaemonRuntime {
         gate: &PermissionGate,
         stream_events: &SessionEvents,
         ctx: &mut ContextManager,
+        prompt_spend: Option<&Arc<teton_core::cost_ceiling::PromptSpend>>,
     ) -> Result<crate::harness::TurnOutcome, HarnessError> {
         let mut hook = NoopProvenanceHook;
 
@@ -4874,22 +4897,50 @@ impl DaemonRuntime {
         // provider still summarizes through whatever `scan` is bound to, and a
         // turn on the local tier can digest remotely — the two decisions are not
         // the same decision, which is the whole premise of dispatching on purpose.
-        let digest = self.digest_route(router, config, events, session_id, local_engine.as_ref());
+        let digest = self.digest_route(
+            router,
+            config,
+            events,
+            session_id,
+            local_engine.as_ref(),
+            prompt_spend,
+        );
         // REQ-561 TASK-060: and so does `triage`, the duty the `grep` tool owns.
         // Resolved here beside `digest` because both need the engine slot read
         // once for the attempt, and independently of it because two categories
         // are two decisions.
-        let triage = self.triage_route(router, config, events, session_id, local_engine.as_ref());
+        let triage = self.triage_route(
+            router,
+            config,
+            events,
+            session_id,
+            local_engine.as_ref(),
+            prompt_spend,
+        );
         // REQ-561 TASK-061: and so does `shell`, the duty the `shell` tool owns.
         // It is a `build` duty where `triage` is a `scan` one, which is the point
         // of resolving them separately: interpreting a failed build is worth a
         // stronger model than ordering a list of grep hits.
-        let shell = self.shell_route(router, config, events, session_id, local_engine.as_ref());
+        let shell = self.shell_route(
+            router,
+            config,
+            events,
+            session_id,
+            local_engine.as_ref(),
+            prompt_spend,
+        );
         // REQ-561 TASK-063: and `compact`, which belongs to no tool at all — the
         // thing that knows a conversation no longer fits is the context manager.
         // Resolved here with the others and passed separately, because
         // `ToolDuties` is the tools' own struct.
-        let compact = self.compact_route(router, config, events, session_id, local_engine.as_ref());
+        let compact = self.compact_route(
+            router,
+            config,
+            events,
+            session_id,
+            local_engine.as_ref(),
+            prompt_spend,
+        );
         let duties = ToolDuties {
             triage: &triage,
             shell: &shell,
@@ -4946,7 +4997,12 @@ impl DaemonRuntime {
         let transport = build_remote_transport(provider_cfg, &self.secret_resolver)?;
         let boundaries = config.boundaries.clone();
         let mut egress = Egress::new(transport, boundaries, events.clone())
-            .with_cost_meter(Arc::new(self.ledger.clone()));
+            .with_cost_meter(Arc::new(self.ledger.clone()))
+            // REQ-588 BR-1/ADR-6: the user's ceiling, when they set one. Absent
+            // leaves the choke point exactly as it was — no check, no pricing
+            // lookup, no branch.
+            .with_optional_spend_ceiling(config.cost.ceiling_micro_cents())
+            .with_prompt_spend(prompt_spend.cloned());
         // REQ-562 ADR-1/ADR-2: the turn's own outbound payload is scanned here,
         // and only when the user opted in.
         if let Some(gate) = self.redaction_gate(router, config, events, session_id) {
@@ -5044,6 +5100,7 @@ impl DaemonRuntime {
     /// `digest` is unreached while it is fully wired, and the test would fail
     /// pointing at the marker rather than at the receiver. So the shared helper
     /// sits **behind** the literal, not in front of it.
+    #[allow(clippy::too_many_arguments)]
     fn digest_route(
         &self,
         router: &Router,
@@ -5051,6 +5108,7 @@ impl DaemonRuntime {
         events: &Arc<EventBus>,
         session_id: &SessionId,
         local_engine: Option<&(Arc<Mutex<dyn Engine>>, ChatFormat)>,
+        prompt_spend: Option<&Arc<teton_core::cost_ceiling::PromptSpend>>,
     ) -> DutyRoute {
         let route = if self.session_taint.is_tainted(session_id) {
             router.resolve_local_pin(taint_pin_reason("the `digest` duty"))
@@ -5065,6 +5123,7 @@ impl DaemonRuntime {
             events,
             session_id,
             local_engine,
+            prompt_spend,
         )
     }
 
@@ -5082,6 +5141,7 @@ impl DaemonRuntime {
     /// working as configured; what holds the line is BR-7's scoping at the
     /// egress choke point, by the provenance of the matched files rather than of
     /// the turn.
+    #[allow(clippy::too_many_arguments)]
     fn triage_route(
         &self,
         router: &Router,
@@ -5089,6 +5149,7 @@ impl DaemonRuntime {
         events: &Arc<EventBus>,
         session_id: &SessionId,
         local_engine: Option<&(Arc<Mutex<dyn Engine>>, ChatFormat)>,
+        prompt_spend: Option<&Arc<teton_core::cost_ceiling::PromptSpend>>,
     ) -> DutyRoute {
         let route = if self.session_taint.is_tainted(session_id) {
             router.resolve_local_pin(taint_pin_reason("the `triage` duty"))
@@ -5103,6 +5164,7 @@ impl DaemonRuntime {
             events,
             session_id,
             local_engine,
+            prompt_spend,
         )
     }
 
@@ -5120,6 +5182,7 @@ impl DaemonRuntime {
     /// so the choke point fail-closes on it wherever a boundary is configured,
     /// and a remotely bound `shell` duty simply degrades. That is BR-3 working;
     /// see [`crate::harness::shell_duty`].
+    #[allow(clippy::too_many_arguments)]
     fn shell_route(
         &self,
         router: &Router,
@@ -5127,6 +5190,7 @@ impl DaemonRuntime {
         events: &Arc<EventBus>,
         session_id: &SessionId,
         local_engine: Option<&(Arc<Mutex<dyn Engine>>, ChatFormat)>,
+        prompt_spend: Option<&Arc<teton_core::cost_ceiling::PromptSpend>>,
     ) -> DutyRoute {
         let route = if self.session_taint.is_tainted(session_id) {
             router.resolve_local_pin(taint_pin_reason("the `shell` duty"))
@@ -5141,6 +5205,7 @@ impl DaemonRuntime {
             events,
             session_id,
             local_engine,
+            prompt_spend,
         )
     }
 
@@ -5161,6 +5226,7 @@ impl DaemonRuntime {
     /// through the same table every other category reads (LESSON-484). A user who
     /// binds `reflex` remotely on purpose gets what they asked for, scoped and
     /// metered by the shared seam like any other duty.
+    #[allow(clippy::too_many_arguments)]
     fn title_route(
         &self,
         router: &Router,
@@ -5168,6 +5234,7 @@ impl DaemonRuntime {
         events: &Arc<EventBus>,
         session_id: &SessionId,
         local_engine: Option<&(Arc<Mutex<dyn Engine>>, ChatFormat)>,
+        prompt_spend: Option<&Arc<teton_core::cost_ceiling::PromptSpend>>,
     ) -> DutyRoute {
         let route = if self.session_taint.is_tainted(session_id) {
             router.resolve_local_pin(taint_pin_reason("the `title` duty"))
@@ -5182,6 +5249,7 @@ impl DaemonRuntime {
             events,
             session_id,
             local_engine,
+            prompt_spend,
         )
     }
 
@@ -5200,6 +5268,7 @@ impl DaemonRuntime {
     /// BR-7's scoping at the egress choke point: the conversation's own merged
     /// provenance, so a session that read a `local-only` file compacts locally or
     /// not at all, while the turn proceeds either way.
+    #[allow(clippy::too_many_arguments)]
     fn compact_route(
         &self,
         router: &Router,
@@ -5207,6 +5276,7 @@ impl DaemonRuntime {
         events: &Arc<EventBus>,
         session_id: &SessionId,
         local_engine: Option<&(Arc<Mutex<dyn Engine>>, ChatFormat)>,
+        prompt_spend: Option<&Arc<teton_core::cost_ceiling::PromptSpend>>,
     ) -> DutyRoute {
         let route = if self.session_taint.is_tainted(session_id) {
             router.resolve_local_pin(taint_pin_reason("the `compact` duty"))
@@ -5221,6 +5291,7 @@ impl DaemonRuntime {
             events,
             session_id,
             local_engine,
+            prompt_spend,
         )
     }
 
@@ -7107,6 +7178,11 @@ impl DaemonRuntime {
         // scanner to find, and running one would spend a local model call on a
         // string that is compiled in. The boundary inspection still runs, over
         // `Provenance::empty()`, which is the same guard a system prompt gets.
+        // REQ-588: **no spend ceiling here, deliberately.** A connection test is
+        // not a prompt — it carries no accumulator, so the check could never
+        // bind anyway, and attaching a ceiling would only invite a future reader
+        // to wire one. `/provider test` must not be refusable because some
+        // prompt elsewhere spent its budget.
         let egress = Egress::new(transport, boundaries, events.clone())
             .with_cost_meter(Arc::new(self.ledger.clone()));
 
@@ -7374,7 +7450,21 @@ impl DaemonRuntime {
             return None;
         }
         let local_engine = self.engine.get_with_format();
-        let route = self.title_route(router, config, events, session_id, local_engine.as_ref());
+        // REQ-588: no accumulator — and so no ceiling — on the titling duty.
+        // `spawn_title_session` outlives the prompt that triggered it: it is
+        // detached onto its own task and may still be running after the turn
+        // has ended. Binding it to that prompt's accumulator would let a
+        // background job spend against a total nobody is watching any more, and
+        // would race the next prompt's. Titling is cheap and outside the
+        // ceiling, stated here rather than left to be inferred.
+        let route = self.title_route(
+            router,
+            config,
+            events,
+            session_id,
+            local_engine.as_ref(),
+            None,
+        );
 
         let events = Arc::clone(events);
         let sessions = sessions.clone();
@@ -7433,6 +7523,7 @@ impl DaemonRuntime {
     /// must fix), but only the **duty** here — a duty is never fatal, and the
     /// failure is reported on the duty's own outcome instead.
     #[allow(clippy::too_many_arguments)]
+    #[allow(clippy::too_many_arguments)]
     fn resolve_duty(
         &self,
         duty: DutyKind,
@@ -7442,6 +7533,7 @@ impl DaemonRuntime {
         events: &Arc<EventBus>,
         session_id: &SessionId,
         local_engine: Option<&(Arc<Mutex<dyn Engine>>, ChatFormat)>,
+        prompt_spend: Option<&Arc<teton_core::cost_ceiling::PromptSpend>>,
     ) -> DutyRoute {
         self.build_duty_route(
             duty,
@@ -7451,6 +7543,7 @@ impl DaemonRuntime {
             events,
             session_id,
             local_engine,
+            prompt_spend,
         )
         .announcing(events, Some(session_id.clone()), route.route_decided())
     }
@@ -7469,6 +7562,7 @@ impl DaemonRuntime {
     /// first remote provider, no `[[tiers]]` rows) an unbound tier inherits that
     /// provider, so this is the *ordinary* upgraded config and not an exotic one.
     #[allow(clippy::too_many_arguments)]
+    #[allow(clippy::too_many_arguments)]
     fn build_duty_route(
         &self,
         duty: DutyKind,
@@ -7478,6 +7572,7 @@ impl DaemonRuntime {
         events: &Arc<EventBus>,
         session_id: &SessionId,
         local_engine: Option<&(Arc<Mutex<dyn Engine>>, ChatFormat)>,
+        prompt_spend: Option<&Arc<teton_core::cost_ceiling::PromptSpend>>,
     ) -> DutyRoute {
         // The category's own name, read off the duty rather than spelled again:
         // two surfaces describing one routing state must not be able to drift.
@@ -7549,7 +7644,12 @@ impl DaemonRuntime {
             Arc::clone(&self.session_taint),
         ));
         let mut egress = Egress::new(transport, config.boundaries.clone(), sink)
-            .with_cost_meter(Arc::new(self.ledger.clone()));
+            .with_cost_meter(Arc::new(self.ledger.clone()))
+            // REQ-588 BR-1/ADR-6: the user's ceiling, when they set one. Absent
+            // leaves the choke point exactly as it was — no check, no pricing
+            // lookup, no branch.
+            .with_optional_spend_ceiling(config.cost.ceiling_micro_cents())
+            .with_prompt_spend(prompt_spend.cloned());
         // REQ-562 ADR-1: a remotely-bound duty's prompt is an outbound payload
         // like any other, so it crosses the same gate the turn path's does. It
         // is the same construction for the same reason the boundaries and the
@@ -10369,6 +10469,17 @@ fn probe_outcome(
         // Cannot occur: empty provenance and a constant payload, with no
         // redaction gate installed. Nothing left the machine if it does.
         ProviderError::PrivacyBlocked(_) => ProviderTestOutcome::Unreachable {
+            reason: format!(
+                "nothing was sent to `{host}`: the egress choke point refused the call"
+            ),
+        },
+        // REQ-588: `/provider test` builds its own `EgressContext` and attaches
+        // no prompt accumulator, so the ceiling never binds here — a connection
+        // test is not a prompt and must not be refused because some prompt
+        // elsewhere spent its budget. Spelled out rather than left to a
+        // catch-all, for the reason the arm above gives about its own
+        // impossible case.
+        ProviderError::SpendCeilingReached => ProviderTestOutcome::Unreachable {
             reason: format!(
                 "nothing was sent to `{host}`: the egress choke point refused the call"
             ),
@@ -15753,7 +15864,7 @@ permission_allow = [\"fetch_user_url\"]
             let blocked = SessionId::from("blocked");
             let bystander = SessionId::from("bystander");
             let slot = runtime.engine.get_with_format();
-            let route = runtime.title_route(&router, &config, &bus, &blocked, slot.as_ref());
+            let route = runtime.title_route(&router, &config, &bus, &blocked, slot.as_ref(), None);
 
             // Non-vacuity, both halves: the route really is remote — so there
             // really was a transport a byte could have left through — and the
@@ -16377,6 +16488,7 @@ permission_allow = [\"fetch_user_url\"]
                     &Arc::new(EventBus::new()),
                     session,
                     slot.as_ref(),
+                    None,
                 )
             }
 
@@ -16521,7 +16633,7 @@ permission_allow = [\"fetch_user_url\"]
                 let router =
                     build_router(&config, runtime.local_tier_available(), &BTreeMap::new());
                 let slot = runtime.engine.get_with_format();
-                runtime.digest_route(&router, &config, bus, session, slot.as_ref())
+                runtime.digest_route(&router, &config, bus, session, slot.as_ref(), None)
             }
 
             /// **REQ-561 BR-2, the positive half.** A `digest` that actually runs
@@ -16643,6 +16755,7 @@ permission_allow = [\"fetch_user_url\"]
                     &Arc::new(EventBus::new()),
                     session,
                     slot.as_ref(),
+                    None,
                 )
             }
 
@@ -16762,6 +16875,7 @@ permission_allow = [\"fetch_user_url\"]
                     &Arc::new(EventBus::new()),
                     session,
                     slot.as_ref(),
+                    None,
                 )
             }
 
@@ -16885,7 +16999,7 @@ permission_allow = [\"fetch_user_url\"]
                 let router =
                     build_router(&config, runtime.local_tier_available(), &BTreeMap::new());
                 let slot = runtime.engine.get_with_format();
-                runtime.shell_route(&router, &config, bus, session, slot.as_ref())
+                runtime.shell_route(&router, &config, bus, session, slot.as_ref(), None)
             }
 
             /// `ShellTool::run` then `ShellTool::refine` over `route`, in `root`.
@@ -17025,6 +17139,7 @@ permission_allow = [\"fetch_user_url\"]
                     &Arc::new(EventBus::new()),
                     session,
                     slot.as_ref(),
+                    None,
                 )
             }
 
@@ -17118,6 +17233,7 @@ permission_allow = [\"fetch_user_url\"]
                             &Arc::new(EventBus::new()),
                             &SessionId::from("sess"),
                             runtime.engine.get_with_format().as_ref(),
+                            None,
                         )
                         .provider(),
                     Some("cheap"),
@@ -17686,7 +17802,7 @@ permission_allow = [\"fetch_user_url\"]
                 let router =
                     build_router(&config, runtime.local_tier_available(), &BTreeMap::new());
                 let slot = runtime.engine.get_with_format();
-                runtime.compact_route(&router, &config, bus, session, slot.as_ref())
+                runtime.compact_route(&router, &config, bus, session, slot.as_ref(), None)
             }
 
             /// A conversation over its byte budget, with a decision in it.
@@ -18004,7 +18120,8 @@ permission_allow = [\"fetch_user_url\"]
                             &config,
                             &Arc::new(EventBus::new()),
                             &session,
-                            slot.as_ref()
+                            slot.as_ref(),
+                            None,
                         )
                         .provider(),
                     Some("frontier"),
@@ -18040,13 +18157,13 @@ permission_allow = [\"fetch_user_url\"]
                 // The sibling: taint moves it from the frontier to the tier.
                 assert_eq!(
                     runtime
-                        .title_route(&router, &config, &bus, &clean, slot.as_ref())
+                        .title_route(&router, &config, &bus, &clean, slot.as_ref(), None)
                         .provider(),
                     Some("frontier")
                 );
                 assert_eq!(
                     runtime
-                        .title_route(&router, &config, &bus, &tainted, slot.as_ref())
+                        .title_route(&router, &config, &bus, &tainted, slot.as_ref(), None)
                         .provider(),
                     Some(LOCAL_PROVIDER_ID)
                 );
