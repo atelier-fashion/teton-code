@@ -1367,6 +1367,10 @@ fn dynamic_outcome_words(outcome: &DynamicOutcome) -> String {
         } => format!("failed (exit {code})"),
         DynamicOutcome::Failed { exit_status: None } => "failed (killed by a signal)".to_owned(),
         DynamicOutcome::TimedOut => "timed out".to_owned(),
+        // A `kind` this build does not know (BUG-186). Naming it as unknown
+        // keeps the invocation's echo line — the alternative was the whole
+        // `skill_invoked` frame failing to parse and no line at all.
+        DynamicOutcome::Unknown => "outcome unknown to this build".to_owned(),
     }
 }
 
@@ -1383,6 +1387,10 @@ fn not_run_words(reason: NotRunReason) -> &'static str {
         NotRunReason::NoTerminal => "no human could be asked",
         NotRunReason::UnrecognizedSubject => "this client did not recognize the request",
         NotRunReason::CouldNotStart => "it could not be started",
+        // A fifth door this build has no sentence for (BUG-186). The fact that
+        // it did not run is still true and still worth saying; only the reason
+        // is lost.
+        NotRunReason::Unknown => "it did not run",
     }
 }
 

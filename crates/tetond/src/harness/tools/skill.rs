@@ -1161,6 +1161,11 @@ fn door_words(door: NotRunReason) -> &'static str {
         // same variant: a future caller should meet a sentence here, not a
         // panic.
         NotRunReason::CouldNotStart => "the acknowledgment could not be raised",
+        // Unreachable on this side of the wire, and structurally so: `Unknown`
+        // is a *deserialize* arm (BUG-186) and the daemon only ever constructs
+        // these. Given a sentence rather than an `unreachable!` for the same
+        // reason as `CouldNotStart` above.
+        NotRunReason::Unknown => "the acknowledgment did not happen",
     }
 }
 

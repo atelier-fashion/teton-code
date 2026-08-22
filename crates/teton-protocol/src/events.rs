@@ -3035,6 +3035,20 @@ pub enum DynamicOutcome {
     },
     /// Killed at the `shell` tool's timeout.
     TimedOut,
+    /// A `kind` this build does not know (BUG-186).
+    ///
+    /// This travels **daemon → client only** and both surfaces it feeds are
+    /// cosmetic, so failing closed buys nothing: without this arm a future
+    /// fifth `kind` fails the whole `skill_invoked` frame at
+    /// `serde_json::from_value`, and BR-12's "every invocation echoes one"
+    /// quietly becomes false with nothing said. Degrading one outcome line is
+    /// strictly better than dropping the event that carries it.
+    ///
+    /// Contrast [`crate::methods::PermissionSubject`], which is deliberately
+    /// **not** tolerant: its unrecognized arm is load-bearing and must stay a
+    /// refusal, because guessing there would run a command nobody approved.
+    #[serde(other)]
+    Unknown,
 }
 
 /// Why a dynamic-context command was never started (REQ-585 BR-6, BR-11).
@@ -3067,6 +3081,13 @@ pub enum NotRunReason {
     /// points at the wrong fix. What went wrong here is on this machine, not in
     /// anybody's answer.
     CouldNotStart,
+    /// A reason this build does not know (BUG-186).
+    ///
+    /// Rendered as a bare "not run" — the fact survives even when the reason
+    /// does not. See [`DynamicOutcome::Unknown`] for why this direction is
+    /// tolerant where `PermissionSubject` stays closed.
+    #[serde(other)]
+    Unknown,
 }
 
 #[cfg(test)]
@@ -4481,6 +4502,87 @@ mod tests {
             crate::ProtocolVersion(2),
             "REQ-587 adds optional fields and one subject variant, so the negotiated \
              version does not move"
+        );
+    }
+
+    /// BUG-186: a future outcome `kind` or `NotRunReason` must cost one *line*,
+    /// never the whole `skill_invoked` event.
+    ///
+    /// The failure this pins is not cosmetic drift — it is total for the event.
+    /// The client's reader is `serde_json::from_value(params).ok()?`, so before
+    /// `#[serde(other)]` a fifth variant took the entire frame down: no echo
+    /// line, no `/verbose` outcomes, and BR-12's "every invocation echoes one"
+    /// quietly false with nothing said.
+    ///
+    /// The tolerant direction is chosen deliberately and only here. Both
+    /// surfaces this feeds are cosmetic and it travels daemon → client only, so
+    /// failing closed buys nothing. Leg four states the contrast: the sibling
+    /// [`PermissionSubject`] stays closed, because *its* unrecognized arm is a
+    /// refusal that keeps an unapproved command from running.
+    #[test]
+    fn a_future_outcome_or_reason_degrades_one_line_and_keeps_the_event() {
+        // A frame from a *newer* daemon: a fifth outcome kind, and a NotRun
+        // carrying a fifth reason. Built as raw JSON on purpose — the point is
+        // a value this build's enums cannot construct.
+        let wire = serde_json::json!({
+            "name": "status",
+            "source": "user",
+            "path_display": "~/.claude/skills/status/SKILL.md",
+            "body_bytes": 5_432,
+            "ignored_keys": [],
+            "outcomes": [
+                { "command": "a", "outcome": { "kind": "deferred_to_next_turn" } },
+                { "command": "b", "outcome": { "kind": "not_run", "reason": "quota_exhausted" } },
+                { "command": "c", "outcome": { "kind": "timed_out" } },
+            ],
+            "invoked_by": "model",
+            "shadows_user_skill": false,
+            "model_invocable": true,
+            "user_invocable": true,
+        });
+
+        // Leg one — the unknown *kind* lands on `Unknown` rather than failing.
+        let ev: SkillInvoked = serde_json::from_value(wire.clone())
+            .expect("an unknown outcome kind must not take the whole event down");
+        assert_eq!(
+            ev.outcomes[0].outcome,
+            DynamicOutcome::Unknown,
+            "a fifth kind degrades to Unknown: {:?}",
+            ev.outcomes[0]
+        );
+
+        // Leg two — the unknown *reason* degrades inside a kind we do know, so
+        // "it did not run" survives even though "why" does not.
+        assert_eq!(
+            ev.outcomes[1].outcome,
+            DynamicOutcome::NotRun {
+                reason: NotRunReason::Unknown
+            },
+            "a fifth reason keeps its NotRun kind: {:?}",
+            ev.outcomes[1]
+        );
+
+        // Leg three — non-vacuity. The rest of the event is intact, and a known
+        // kind in the same payload still parses as itself, so legs one and two
+        // are not passing because everything collapsed to Unknown.
+        assert_eq!(ev.name, "status");
+        assert_eq!(ev.invoked_by, InvokedBy::Model);
+        assert_eq!(ev.outcomes.len(), 3);
+        assert_eq!(
+            ev.outcomes[2].outcome,
+            DynamicOutcome::TimedOut,
+            "a known kind alongside unknown ones still parses as itself"
+        );
+
+        // Leg four — the contrast that makes this a decision and not an
+        // oversight. `PermissionSubject` meets an unknown kind and refuses;
+        // that arm is load-bearing and must NOT become tolerant.
+        let subject: PermissionSubject =
+            serde_json::from_value(serde_json::json!({ "kind": "some_future_consent" }))
+                .expect("PermissionSubject also parses, but to its refusal arm");
+        assert!(
+            matches!(subject, PermissionSubject::Unrecognized),
+            "the fail-closed sibling stays fail-closed: {subject:?}"
         );
     }
 

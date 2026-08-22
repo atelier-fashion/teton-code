@@ -380,6 +380,13 @@ pub fn door_outcome(door: NotRunReason) -> DynamicOutcome {
         // `CouldNotStart`, which arrives as an *outcome* and not as a door —
         // and a future caller should meet a sentence here, not a panic.
         NotRunReason::CouldNotStart => DynamicOutcome::could_not_start(),
+        // Unreachable here for a structural reason, not a contingent one:
+        // `Unknown` exists so an *older client* can parse a newer daemon's
+        // frame (BUG-186), and the daemon is the producer. `not_run` keeps the
+        // arm total without inventing a door that was never closed.
+        NotRunReason::Unknown => DynamicOutcome::NotRun {
+            reason: "it did not run".to_owned(),
+        },
     }
 }
 

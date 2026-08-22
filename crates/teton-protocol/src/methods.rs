@@ -854,6 +854,25 @@ pub enum PermissionOutcome {
 /// placeholder sentence from it, and a reason it cannot render is a refusal it
 /// cannot explain. A future client inventing a third door fails the params
 /// rather than having its answer silently rendered as one of these two.
+///
+/// **What "fails the params" actually costs** (BUG-186). The whole
+/// `permission/respond` fails to deserialize, so the daemon answers
+/// `INVALID_PARAMS` and the waiter is neither resolved nor withdrawn: the
+/// prompt stays open and `rx.await` keeps waiting, with no timeout of its own.
+///
+/// That is the intended outcome, not an oversight, and it is the *same* rule
+/// `handle_permission_respond` documents for a refusal it rejects: an answer
+/// the daemon cannot act on must not consume the question. Withdrawing the
+/// waiter here would be strictly worse in two ways. The parse is what failed,
+/// so the `request_id` is not reliably in hand — there is no dependable
+/// identity to withdraw. And if it were, a malformed message would become a
+/// way to cancel any session's standing prompt, which is the denial of service
+/// dressed as a safety check that the refusal path exists to prevent.
+///
+/// So the turn parks exactly as long as it would have if the client had simply
+/// not answered yet, which is the ordinary waiting state. The client holds the
+/// remedy: it gets a typed error and can re-send a well-formed answer against
+/// the still-standing request.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum RefusalReason {
