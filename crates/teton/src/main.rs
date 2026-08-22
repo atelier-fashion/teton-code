@@ -5562,6 +5562,7 @@ mod tests {
             socket: std::path::PathBuf::from("/tmp/teton-test/teton.sock"),
             lock: std::path::PathBuf::from("/tmp/teton-test/teton.lock"),
             log: std::path::PathBuf::from("/tmp/teton-test/teton.log"),
+            projects: std::path::PathBuf::from("/tmp/teton-test/projects.json"),
         }
     }
 

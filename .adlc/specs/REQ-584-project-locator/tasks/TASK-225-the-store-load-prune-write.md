@@ -1,7 +1,7 @@
 ---
 id: TASK-225
 title: "the store: load, prune, write, and a corrupt file is empty"
-status: pending
+status: complete
 parent: REQ-584
 created: 2026-08-22
 updated: 2026-08-22

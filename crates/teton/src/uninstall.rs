@@ -403,6 +403,7 @@ mod tests {
             socket: base.join("tetond.sock"),
             lock: base.join("tetond.lock"),
             log: base.join("tetond.log"),
+            projects: base.join("projects.json"),
         }
     }
 

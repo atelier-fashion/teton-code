@@ -29,6 +29,22 @@ pub struct DaemonPaths {
     /// the user would see only "could not reach the daemon". Capturing it to a
     /// file beside the socket is what lets `teton` quote the actual cause back.
     pub log: PathBuf,
+    /// The known-project registry (REQ-584 BR-5, ADR-2).
+    ///
+    /// **Here rather than computed where it is used**, for the reason the three
+    /// paths above are here: `resolve_base_dir` is the one home for "where this
+    /// daemon keeps its things", and a second derivation could disagree with it.
+    /// It also means every test is isolated for free — the harness already sets
+    /// `XDG_RUNTIME_DIR`, so a suite can never read or clobber the real
+    /// machine's project list.
+    ///
+    /// Unlike the socket and lock, this one is **persistent state** rather than
+    /// runtime state. On a Linux box whose `XDG_RUNTIME_DIR` is a tmpfs the
+    /// registry is therefore forgotten on reboot. That is acceptable and not
+    /// worth a second base directory: BR-1 rebuilds it from use, and BR-3's
+    /// scan rebuilds it on demand — the registry is a cache, and losing a cache
+    /// costs one scan.
+    pub projects: PathBuf,
 }
 
 /// Resolves the socket, lock, and log paths from the current environment.
@@ -42,6 +58,7 @@ pub fn daemon_paths() -> DaemonPaths {
         socket: base.join("tetond.sock"),
         lock: base.join("tetond.lock"),
         log: base.join("tetond.log"),
+        projects: base.join("projects.json"),
     }
 }
 
@@ -73,6 +90,25 @@ mod tests {
             Some(PathBuf::from("/home/x")),
         );
         assert_eq!(base, PathBuf::from("/run/user/1000/teton"));
+    }
+
+    /// REQ-584 ADR-2: the registry shares the daemon's one base directory.
+    ///
+    /// Asserted as a *relationship* to the socket rather than against a literal
+    /// path — a test that re-derived the expected path would be the second
+    /// derivation this field exists to prevent.
+    #[test]
+    fn the_project_registry_sits_in_the_same_base_as_the_socket() {
+        let paths = daemon_paths();
+        assert_eq!(
+            paths.projects.parent(),
+            paths.socket.parent(),
+            "the registry must live beside the socket, lock and log"
+        );
+        assert_eq!(
+            paths.projects.file_name().and_then(|n| n.to_str()),
+            Some("projects.json")
+        );
     }
 
     #[test]

@@ -1,7 +1,7 @@
 ---
 id: TASK-223
 title: "the registry's value types and its ranking"
-status: pending
+status: complete
 parent: REQ-584
 created: 2026-08-22
 updated: 2026-08-22
