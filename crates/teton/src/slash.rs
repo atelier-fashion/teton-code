@@ -1970,27 +1970,21 @@ pub(crate) fn model_only_words(model_invocable: bool) -> &'static str {
 /// file. One composition, consulted by [`SkillSnapshot::dispatchable`],
 /// [`dispatch_mark`] and [`model_only_hint`] alike — three surfaces, one answer,
 /// which is the whole of BR-3's both-directions pin.
-#[derive(Debug, Clone, PartialEq, Eq)]
-enum UserDispatch {
-    /// `/name` reaches this file.
-    Allowed,
-    /// Something else owns the spelling (BR-2), in the words that surface says
-    /// it.
-    Shadowed(String),
-    /// `user-invocable: false`. Listed and marked, refused from `/name`, and
-    /// still the model's — unless [`SkillView::model_invocable`] is false too,
-    /// which [`dispatch_mark`] words differently and `classify` refuses the
-    /// same way.
-    ModelOnly,
-}
+///
+/// The client's spelling of the shared three-state answer, carrying the
+/// rendered sentence this crate can be more specific about than the wire can.
+/// The **rule** — shadowing wins over model-only — is
+/// `teton_protocol::methods::user_dispatch`, one home for both sides (BUG-192).
+type UserDispatch = teton_protocol::methods::UserDispatch<String>;
 
 /// [`UserDispatch`] for one row.
+///
+/// [`shadow_reason`] runs **first and separately**: the built-in table claim is
+/// this client's precondition, composed on top of the shared rule rather than
+/// folded into it (BUG-192). Folding it in is what made the mirror diverge from
+/// the daemon's copy in the first place.
 fn user_dispatch(view: &SkillView) -> UserDispatch {
-    match shadow_reason(view) {
-        Some(by) => UserDispatch::Shadowed(by),
-        None if !view.user_invocable => UserDispatch::ModelOnly,
-        None => UserDispatch::Allowed,
-    }
+    teton_protocol::methods::user_dispatch(shadow_reason(view), view.user_invocable)
 }
 
 /// What owns a skill's name instead of the skill, or `None` when the skill owns

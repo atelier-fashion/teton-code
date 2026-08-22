@@ -249,11 +249,10 @@ impl Skill {
     /// its own.
     #[must_use]
     pub fn user_dispatch(&self) -> UserDispatch {
-        match self.shadowed {
-            Some(by) => UserDispatch::Shadowed(by),
-            None if !self.user_invocable => UserDispatch::ModelOnly,
-            None => UserDispatch::Allowed,
-        }
+        // The precedence lives in `teton_protocol` (BUG-192), because the
+        // client composes the same three states from the same two wire facts
+        // and the two copies could drift with both suites green.
+        teton_protocol::methods::user_dispatch(self.shadowed, self.user_invocable)
     }
 
     /// The diagnostic this row carries when something else owns its name, in
@@ -280,19 +279,11 @@ impl Skill {
 /// the shape a caller reaches for when it must tell "another file owns this
 /// name" from "this file is the model's, not yours". See
 /// [`Skill::user_dispatch`] for the precedence between them.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum UserDispatch {
-    /// `/name` reaches this file.
-    Allowed,
-    /// Something else owns the spelling (BR-2). Listed, marked, never
-    /// dispatched.
-    Shadowed(ShadowedBy),
-    /// `user-invocable: false`. Listed and marked, refused from `/name`, and
-    /// still the model's — unless [`Skill::model_invocable`] is false too, in
-    /// which case the row is invocable by nobody, which is a named state and
-    /// not a silent drop.
-    ModelOnly,
-}
+///
+/// The daemon's spelling of the shared three-state answer, carrying its typed
+/// [`ShadowedBy`]. The **rule** — shadowing wins over model-only — is
+/// `teton_protocol::methods::user_dispatch`, one home for both sides (BUG-192).
+pub type UserDispatch = teton_protocol::methods::UserDispatch<ShadowedBy>;
 
 /// What beat a skill to its name (BR-2, ADR-6).
 ///

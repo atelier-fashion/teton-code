@@ -385,6 +385,61 @@ pub fn is_reserved_skill_name(name: &str) -> bool {
     RESERVED_SKILL_NAMES.contains(&name)
 }
 
+/// Whether the **user** may reach a listed skill by typing `/name`, and why not
+/// when they may not (REQ-587 BR-3).
+///
+/// Three states, because BR-3 has three and `Option<…>` has two: a caller must
+/// be able to tell "another file owns this name" from "this file is the
+/// model's, not yours".
+///
+/// Generic in the shadow payload because the two sides name the shadower
+/// differently and legitimately so — the daemon carries a typed `ShadowedBy`,
+/// the client a rendered sentence that can be more specific about a built-in it
+/// alone has the table for. Only the **precedence** was ever the shared fact,
+/// and that is what lives here.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum UserDispatch<S> {
+    /// `/name` reaches this file.
+    Allowed,
+    /// Something else owns the spelling (BR-2). Listed, marked, never
+    /// dispatched.
+    Shadowed(S),
+    /// `user-invocable: false`. Listed and marked, refused from `/name`, and
+    /// still the model's — unless the row is model-invocable too, which is a
+    /// named state ("invocable by nobody") and not a silent drop.
+    ModelOnly,
+}
+
+/// [`UserDispatch`] for one row: **shadowing wins over model-only** (BUG-192).
+///
+/// **One home, because two crates enforced one rule.** This ordering existed
+/// twice — `tetond`'s `Skill::user_dispatch` and `teton`'s `user_dispatch(&
+/// SkillView)` — with both sides unit-tested and nothing cross-checking them,
+/// so the precedence could drift on one side with every suite green
+/// (LESSON-528's shape). No in-process bridge could close it: `Skill` is a
+/// `tetond` type carrying a `PathBuf`, and a `tetond` dependency in `teton`
+/// would invert the daemon/client boundary. Deleting the mirror was the way
+/// out, and it works because both inputs are already wire facts on
+/// [`SkillView`].
+///
+/// The order is the decision, not a detail. Only once nothing owns the spelling
+/// is `user-invocable: false` the reason, so no surface can read "model-only"
+/// off a row whose name resolves to a different file.
+///
+/// Callers compose their own preconditions **on top**, never folded in — the
+/// client resolves its built-in table claim first and passes the result as
+/// `shadowed`. That distinction is why the mirror grew a precondition on one
+/// side in the first place, and keeping it outside is what lets one rule serve
+/// both.
+#[must_use]
+pub fn user_dispatch<S>(shadowed: Option<S>, user_invocable: bool) -> UserDispatch<S> {
+    match shadowed {
+        Some(by) => UserDispatch::Shadowed(by),
+        None if !user_invocable => UserDispatch::ModelOnly,
+        None => UserDispatch::Allowed,
+    }
+}
+
 /// The permission key a skill's dynamic context asks under: `skill:<source>:<name>`.
 ///
 /// **One home, because two crates enforce one rule.** The daemon mints the key
