@@ -1673,6 +1673,32 @@ impl ContextManager {
     /// the manager holds no `SessionEvents` and the carry commit runs from
     /// `Drop` — so each of the four call sites decides what to publish
     /// (LESSON-501).
+    /// Bytes the in-place clamp leaves for the reply this turn is about to
+    /// append (BUG-182).
+    ///
+    /// Without it the clamp fills the byte budget **exactly**, so appending the
+    /// model's answer puts the context back over and the same turn's exit gate
+    /// drops the now-oldest block — which is the user's own clamped message.
+    /// The conversation kept the answer and lost the question, and the next
+    /// turn carried an assistant turn with nothing before it.
+    ///
+    /// REQ-586 BR-2 subtracts the generation reservation from the **window**
+    /// when the budget is derived, which is a different subtraction: it sizes
+    /// the budget against the provider's limit and says nothing about how much
+    /// of that budget one block may take. This is the second one.
+    ///
+    /// Capped at a quarter of the budget so the reservation can never starve
+    /// the clamp. At today's figures the cap does not bind — the reservation is
+    /// 1,024 tokens (8 KiB) against a 32 KiB local budget, exactly a quarter —
+    /// but a future `max_tokens` larger than the whole budget would otherwise
+    /// drive `room` to its 1 KiB floor and truncate every long message to
+    /// nothing.
+    fn reply_reserve_bytes(&self) -> usize {
+        let reservation = (super::budget::generation_reservation() as usize)
+            .saturating_mul(APPROX_BYTES_PER_TOKEN);
+        reservation.min(self.budget_bytes / 4)
+    }
+
     pub fn truncate_to_budget(&mut self) -> PressureReport {
         let mut report = PressureReport::default();
         while (self.estimated_tokens() > self.budget_tokens
@@ -1693,7 +1719,11 @@ impl ContextManager {
             // from clamping the block to nothing.
             let last_text_len = self.blocks.last().map_or(0, |b| b.text.len());
             let non_last = self.estimated_bytes().saturating_sub(last_text_len);
-            let room = self.budget_bytes.saturating_sub(non_last).max(1_024);
+            let room = self
+                .budget_bytes
+                .saturating_sub(non_last)
+                .saturating_sub(self.reply_reserve_bytes())
+                .max(1_024);
             // Disjoint field borrows: the label is read while the block list is
             // borrowed mutably, which is what keeps the marker route-aware
             // without cloning the label on every gate call.
@@ -2887,6 +2917,55 @@ mod tests {
             report.elided_bytes,
             50_000 - ctx.blocks()[0].text.len(),
             "the report's byte count is the block's own before/after"
+        );
+    }
+
+    /// **BUG-182.** A clamped user message survives its own turn.
+    ///
+    /// The defect this pins is a *sequence*, not a single call, which is why it
+    /// survived a suite that already asserted the clamp: the clamp filled the
+    /// byte budget exactly, appending the model's reply put the context back
+    /// over, and the same turn's exit gate then dropped the now-oldest block —
+    /// the user's own message. The conversation retained the answer with no
+    /// question before it, and the next turn carried that.
+    ///
+    /// Asserted on the retained conversation rather than on the report, because
+    /// the report was always honest: it published a second `context_pressure`
+    /// and said what it dropped. Being told the question was thrown away is not
+    /// the same as keeping it.
+    #[test]
+    fn a_clamped_user_message_survives_the_reply_appended_after_it() {
+        let mut ctx = ContextManager::new("sys", 10_000).with_budget_bytes(20_000);
+        ctx.push_user("z".repeat(200_000));
+
+        // The turn's entry gate: clamped in place, nothing to drop yet.
+        let entry = ctx.truncate_to_budget();
+        assert!(
+            entry.newest_user_elided,
+            "the fixture must clamp: {entry:?}"
+        );
+        assert_eq!(entry.dropped_blocks, 0, "{entry:?}");
+
+        // The model answers, and the turn's exit gate runs.
+        ctx.push_model("the answer");
+        let exit = ctx.truncate_to_budget();
+
+        assert_eq!(
+            exit.dropped_blocks, 0,
+            "the reply must fit in the room the clamp reserved for it, so the \
+             exit gate has nothing to drop: {exit:?}"
+        );
+        assert!(
+            ctx.blocks()
+                .iter()
+                .any(|b| matches!(b.role, BlockRole::User)),
+            "the user's own message must outlive the turn that answered it"
+        );
+        assert_eq!(
+            ctx.blocks().len(),
+            2,
+            "question and answer, in that order: {:?}",
+            ctx.blocks().iter().map(|b| b.role).collect::<Vec<_>>()
         );
     }
 
