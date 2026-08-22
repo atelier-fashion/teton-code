@@ -887,6 +887,19 @@ async fn teton_docs_serves_its_topic_without_reaching_the_transport() {
 // (`a_project_skills_expansion_is_pinned_to_the_file_it_came_from`,
 // `a_user_skill_outside_the_root_seeds_a_block_that_says_it_cannot_be_pinned`);
 // what egress does with them is here.
+//
+// **REQ-587's four legs are not here, and that is deliberate.** A *model*
+// invocation reaches context by a different route entirely: the `skill` tool
+// decides the provenance in `expand_and_fold`, the loop folds the result with
+// it, and only the next remote call meets the choke point. Nothing can be said
+// about that decision from a hand-seeded block, so the four model-path legs are
+// driven through the real tool, the real loop and the real `Egress` in
+// `tetond/tests/provenance_egress.rs`
+// (`a_model_invoked_project_skill_under_a_boundary_pins_the_turn_and_nothing_leaves`,
+// `a_model_invoked_user_skill_pins_the_turn_wherever_any_boundary_exists`,
+// `a_model_invocation_whose_command_failed_still_pins_the_turn`,
+// `with_no_boundary_a_model_invoked_expansion_reaches_the_provider`). The two
+// tests below stay as the *user* path's half of the same two facts.
 
 /// A repo and a home beside it, holding the skills AC-11(a) needs.
 ///
@@ -934,12 +947,15 @@ fn expansion_of(
         &tetond::skills::RealFs,
     );
     let skill = registry
-        .dispatchable(name)
+        .dispatchable_by_user(name)
         .unwrap_or_else(|| panic!("the fixture must register `{name}`"));
-    (
-        tetond::skills::expand(skill, "", &skill.path_display).pending_text(),
-        skill.path.clone(),
-    )
+    // BUG-187: the registry carries the display spelling; this no longer
+    // re-derives it with the home rule.
+    let expansion = tetond::skills::expand(skill, "", &skill.path_display);
+    // The user path's frame, which is the one `accept_invocation` supplies
+    // (REQ-587 ADR-6).
+    let frame = expansion.user_frame();
+    (expansion.pending_text(&frame), skill.path.clone())
 }
 
 /// One skill turn, scoped exactly as the daemon scopes it: the expansion is a

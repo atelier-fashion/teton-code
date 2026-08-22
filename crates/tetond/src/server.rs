@@ -4344,8 +4344,11 @@ fn handle_session_set_cwd(daemon: &Daemon, conn: &ConnState, id: Id, params: Val
 /// rebuilt registry beside a stale grant is exactly LESSON-501's shape —
 /// carried state that sheds its invariants silently. That drop reaches
 /// `PermissionGate::drop_project_skill_grants` (REQ-585 TASK-201) through
-/// `DaemonRuntime::drop_project_skill_grants`, which needs the private
-/// `session_gates` map. A *fresh* session has no grants and no gate, which is
+/// `DaemonRuntime::drop_grants_expiring_on_root_change`, which needs the
+/// private `session_gates` map — and which sheds more than the gate method's
+/// name says: since REQ-587 TASK-215 the predicate is
+/// `expires_on_session_root_change`, so BR-4's project-skill *acknowledgment*
+/// goes with the grants. A *fresh* session has no grants and no gate, which is
 /// why this function has nothing to drop.
 fn rebuild_session_skills(daemon: &Daemon, session_id: &SessionId, cwd: Option<&Path>) {
     DaemonRuntime::store_session_skills(
@@ -4458,6 +4461,23 @@ fn skills_list_result(registry: &SkillRegistry) -> SkillsListResult {
                 // reserved built-in name — is the client's, so this says what
                 // *this* side found and never `None` where it found something.
                 shadowed: skill.shadowed.map(|by| by.to_string()),
+                // REQ-587 BR-3's two flags, **as the file wrote them** and not
+                // composed with `shadowed` above. The composition is the
+                // client's and its order is not open: a row is read as
+                // *shadowed* first and *model-only* only when nothing shadows
+                // it (`Skill::user_dispatch` holds that decision, so `/help`'s
+                // mark cannot pick a different one).
+                //
+                // Composing here instead would put "the user may not type
+                // this" on every shadowed row — the wire spelling of the
+                // model-only state — and a client rendering the mark straight
+                // off the flag would call another file's name a model-only
+                // skill. The flags stay the file's; the *authority* on who may
+                // actually invoke a name is the registry's pair of resolvers
+                // (`dispatchable_by_user` / `invocable_by_model`), daemon-side,
+                // where ADR-1 keeps every rule with teeth.
+                model_invocable: skill.model_invocable,
+                user_invocable: skill.user_invocable,
             })
             .collect(),
         skipped: registry

@@ -320,6 +320,194 @@ fn a_symlinked_root_is_followed_and_a_symlinked_entry_is_never_reached() {
     );
 }
 
+/// **REQ-587 BR-10.** The follow-the-root exemption belongs to the **home**
+/// directory, and a repository does not inherit it.
+///
+/// The sibling above pins "a symlinked root is followed" — and it exercises only
+/// a **user** root, which is the whole of the reason that rule exists: the
+/// dogfood machine's `~/.claude/skills` is a symlink into a checked-out toolkit.
+/// But `roots()` builds two of the four from `session_root`, so under a blanket
+/// exemption `<repo>/.claude/commands` was a **repository-controlled** symlink
+/// that discovery followed. Git stores a symlink verbatim, so a cloned repo
+/// shipping `.claude/commands -> ../../..` had every lowercase-stemmed `*.md`
+/// under the target registered as a *project* skill — in the roster, in the
+/// resident prompt, and callable as `skill { name }` with no prompt at `full` —
+/// while `read` of the same bytes is refused by REQ-583's jail. That is the
+/// second classifier of "what may be read" BR-10 says must not exist.
+///
+/// Both directions in one fixture, deliberately: a rule stated as an exemption
+/// is only meaningful beside the case it does *not* cover, and a fix that simply
+/// stopped following every root would pass a one-legged version of this test
+/// while breaking the feature's own author.
+///
+/// **Mutation:** delete the `resolves_under` guard in `discover` and this fails
+/// twice over — `pwned` registers, and `outside/` shows up in what was opened.
+#[test]
+fn a_symlinked_project_root_is_refused_while_a_symlinked_user_root_is_still_followed() {
+    let fixture = Fixture::new();
+
+    // The user's own toolkit, reached through a symlinked **user** root. This
+    // is the shape the exemption exists for and it must keep working.
+    fixture.write(
+        "toolkit/mine/SKILL.md",
+        &skill_file("mine", "the user's own, through a symlinked home root"),
+    );
+    fixture.mkdir("home/.claude");
+    symlink(fixture.path("toolkit"), fixture.path("home/.claude/skills")).unwrap();
+
+    // The cloned repository's, pointing out of the repo at a tree of ordinary
+    // Markdown that would otherwise register under `commands/`'s file-stem rule.
+    fixture.write(
+        "outside/pwned.md",
+        &skill_file("pwned", "not the repository's to offer"),
+    );
+    fixture.mkdir("repo/.claude");
+    symlink(
+        fixture.path("outside"),
+        fixture.path("repo/.claude/commands"),
+    )
+    .unwrap();
+
+    // Positive controls (LESSON-479). Both links resolve — otherwise the
+    // refusal below would be a dangling link's doing and the follow above would
+    // be about an empty directory — and the file behind the project link really
+    // is one discovery would register if it followed.
+    assert!(
+        fixture
+            .path("home/.claude/skills/mine/SKILL.md")
+            .canonicalize()
+            .is_ok(),
+        "fixture: the user root link must actually resolve"
+    );
+    assert_eq!(
+        fixture
+            .path("repo/.claude/commands")
+            .canonicalize()
+            .unwrap(),
+        fixture.path("outside").canonicalize().unwrap(),
+        "fixture: the project root link must actually resolve out of the repo"
+    );
+    {
+        // …and the file behind the link is one discovery genuinely registers
+        // when the same bytes sit in a **real** `commands/` directory. Without
+        // this leg, "pwned did not register" could be a fact about the fixture's
+        // frontmatter or its file stem rather than about the refusal
+        // (LESSON-479).
+        let control = Fixture::new();
+        control.write(
+            "repo/.claude/commands/pwned.md",
+            &skill_file("pwned", "not the repository's to offer"),
+        );
+        assert_eq!(
+            names(&discover(
+                None,
+                &control.repo(),
+                RootKind::Project,
+                &RecordingFs::default(),
+            )),
+            vec!["pwned"],
+            "fixture: the file behind the link is registrable — so its absence \
+             below is the root refusal's doing"
+        );
+    }
+
+    let fs = RecordingFs::default();
+    let registry = discover(
+        Some(&fixture.home()),
+        &fixture.repo(),
+        RootKind::Project,
+        &fs,
+    );
+
+    assert_eq!(
+        names(&registry),
+        vec!["mine"],
+        "the user's symlinked root is still followed, and the repository's is not"
+    );
+    assert_eq!(
+        diagnostics(&registry),
+        vec![(
+            fixture.path("repo/.claude/commands"),
+            "resolves outside the session root".to_owned()
+        )],
+        "the refusal is named against the root, so a user whose `/help` is short \
+         is told why rather than left guessing (BR-1)"
+    );
+
+    // The reach claim, and it is the sharp one: the guard runs **before** the
+    // listing, because `read_dir` follows and there is no undoing it.
+    assert_eq!(
+        fs.listed(),
+        sorted(&[
+            fixture.path("home/.claude/commands"),
+            fixture.path("home/.claude/skills"),
+            fixture.path("repo/.claude/skills"),
+        ]),
+        "the escaping root was never listed at all"
+    );
+    let outside = fixture.path("outside");
+    assert!(
+        !fs.opened().iter().any(|p| p.starts_with(&outside)),
+        "nothing behind the escaping root was opened"
+    );
+}
+
+/// **REQ-587 BR-10, the id half.** A project root that is a symlink *within* the
+/// repository is permitted — it resolves under the session root — so the
+/// provenance id must be minted from where the file actually **is**.
+///
+/// `ProvenanceId::from_resolved` is a bare `strip_prefix` and is documented as
+/// taking a canonical path; `Skill::path` is the path discovery walked to the
+/// file, which this shape leaves non-canonical. Minting off the spelling gives
+/// one file two identities: the id reads `.claude/skills/x/SKILL.md` for a file
+/// at `vendor/skills/x/SKILL.md`, so a `vendor/**` boundary matches nothing and
+/// REQ-585 BR-7's *"pins exactly as a `read` would"* is false for exactly the
+/// shape that most needs it.
+///
+/// **Mutation:** drop the `canonicalize` calls in `skills::provenance_of` and
+/// this fails — the id comes back as the link's spelling.
+#[test]
+fn a_skill_reached_through_an_in_repo_symlinked_root_mints_the_id_of_the_real_file() {
+    let fixture = Fixture::new();
+    fixture.write(
+        "repo/vendor/skills/alpha/SKILL.md",
+        &skill_file("alpha", "lives under vendor/, reached through .claude/"),
+    );
+    fixture.mkdir("repo/.claude");
+    symlink(
+        fixture.path("repo/vendor/skills"),
+        fixture.path("repo/.claude/skills"),
+    )
+    .unwrap();
+
+    let registry = discover(None, &fixture.repo(), RootKind::Project, &RealFs);
+    let skill = registry
+        .dispatchable_by_user("alpha")
+        .expect("an in-repo symlinked project root is permitted and still registers");
+    assert_eq!(
+        skill.path,
+        fixture.path("repo/.claude/skills/alpha/SKILL.md"),
+        "the row keeps the spelling the user recognizes"
+    );
+
+    let id = tetond::skills::provenance_of(&fixture.repo(), skill)
+        .expect("a file under the root has a repo-relative identity");
+    assert_eq!(
+        id.as_str(),
+        "vendor/skills/alpha/SKILL.md",
+        "the id names the file, not the link that reached it"
+    );
+
+    // Fail-closed, not fall-back: a row whose file is gone mints nothing rather
+    // than an id for a path nothing is at.
+    let mut moved = skill.clone();
+    moved.path = fixture.path("repo/.claude/skills/absent/SKILL.md");
+    assert!(
+        tetond::skills::provenance_of(&fixture.repo(), &moved).is_none(),
+        "a path that does not resolve has no identity"
+    );
+}
+
 // ---------------------------------------------------------------------------
 // AC-3 — the home-root de-dup
 // ---------------------------------------------------------------------------
@@ -401,7 +589,7 @@ fn a_project_skill_beats_a_user_skill_and_the_loser_is_listed_as_shadowed() {
         "both rows are listed"
     );
     let winner = registry
-        .dispatchable("analyze")
+        .dispatchable_by_user("analyze")
         .expect("one row dispatches the name");
     assert_eq!(winner.source, SkillSource::Project);
     assert_eq!(winner.description.as_deref(), Some("the project copy"));
@@ -447,7 +635,7 @@ fn within_one_source_the_skills_directory_beats_the_commands_file() {
 
     assert_eq!(names(&registry), vec!["status", "status"]);
     let winner = registry
-        .dispatchable("status")
+        .dispatchable_by_user("status")
         .expect("exactly one row dispatches");
     assert_eq!(
         winner.path,
@@ -465,12 +653,21 @@ fn within_one_source_the_skills_directory_beats_the_commands_file() {
         loser.shadow_reason().map(|r| r.to_string()),
         Some("shadowed by the skills/ entry of the same name".to_owned())
     );
+    // `permission_key_for`, not a `Skill::permission_key()` — REQ-587 BR-5
+    // removed that method, because the key a *grant* is remembered under is
+    // `Expansion::grant_key` and a row cannot answer it. What is asserted here
+    // is the base key both files would collide on, which is a property of
+    // `(source, name)` and of nothing else — which is exactly why the free
+    // function is the right spelling for it.
+    let key_of = |skill: &tetond::skills::Skill| {
+        tetond::skills::permission_key_for(skill.source, &skill.name)
+    };
     assert_eq!(
-        winner.permission_key(),
-        loser.permission_key(),
+        key_of(winner),
+        key_of(loser),
         "the same key for both files is exactly why one of them has to lose"
     );
-    assert_eq!(winner.permission_key(), "skill:user:status");
+    assert_eq!(key_of(winner), "skill:user:status");
 }
 
 /// The name is where the file lives. A frontmatter `name` that disagrees is a
@@ -493,10 +690,10 @@ fn a_frontmatter_name_that_differs_is_a_note_and_never_a_second_spelling() {
 
     assert_eq!(names(&registry), vec!["deploy"]);
     assert!(
-        registry.dispatchable("shipit").is_none(),
+        registry.dispatchable_by_user("shipit").is_none(),
         "the declared name is not a spelling anything dispatches"
     );
-    let skill = registry.dispatchable("deploy").unwrap();
+    let skill = registry.dispatchable_by_user("deploy").unwrap();
     assert_eq!(
         skill.name_note.as_deref(),
         Some("frontmatter name `shipit` differs; this command dispatches as `/deploy`")
@@ -710,7 +907,9 @@ fn a_command_file_with_no_frontmatter_is_all_body() {
         &RecordingFs::default(),
     );
 
-    let skill = registry.dispatchable("deploy").expect("it registered");
+    let skill = registry
+        .dispatchable_by_user("deploy")
+        .expect("it registered");
     assert_eq!(skill.body, body);
     assert_eq!(skill.description, None);
     assert!(skill.ignored_keys.is_empty());

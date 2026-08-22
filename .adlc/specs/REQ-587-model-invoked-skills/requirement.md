@@ -1,7 +1,7 @@
 ---
 id: REQ-587
 title: "Model-invoked skills — a `skill` tool lets the model expand a registered skill into its own turn as a tool result, under REQ-585's registry, keys and provenance, so `/proceed` reaches its gates"
-status: draft
+status: approved
 deployable: true
 created: 2026-08-19
 updated: 2026-08-20
@@ -694,8 +694,9 @@ the CLI renders each as one line (BR-9).
   — the prompt and the BR-4 frame's source line both reading `validate
   (project — shadows your user skill)`; on piped
   stdin at `guarded` the client refuses without reading stdin and the model
-  is told to have the user acknowledge or run at `full`. (daemon unit + pty
-  for the prompt bytes + `cli_e2e` for the pipe; BR-4)
+  is told to have the user acknowledge or run at `full`. (daemon unit for the
+  prompt bytes + `cli_e2e` for the pipe; BR-4. **No pty leg** — the terminal
+  rendering of this prompt is unasserted; see Deferred.)
 - [ ] AC-7: In one prompt turn the call past the pinned cap (the thirteenth
   at 12) is refused `per_turn_cap`
   naming the cap and the next prompt starts at zero; `skill { validate,
@@ -792,9 +793,13 @@ the CLI renders each as one line (BR-9).
   (daemon unit; BR-11)
 - [ ] AC-14: The roster renderer, flag parser, frame renderer, cap/repeat
   decision and over-budget decision are exercised by unit tests with no pty
-  and no daemon; the pty suite covers only the acknowledgment prompt bytes;
-  `cli_e2e` pins the echo lines, `/help` marks and hints. `cargo test
-  --workspace --no-fail-fast` green. (BR-12)
+  and no daemon; `cli_e2e` pins the echo lines, `/help` marks and hints.
+  **The pty suite covers none of this REQ** — `pty_e2e.rs` is byte-unchanged
+  from `main`, and its one skill test is REQ-585's, over the dynamic-context
+  consent rather than BR-4's acknowledgment. The acknowledgment's bytes are
+  asserted at unit level and its pipe refusal in `cli_e2e`; its terminal
+  rendering is the gap, recorded in Deferred. `cargo test --workspace
+  --no-fail-fast` green. (BR-12)
 - [ ] AC-15: **Dogfood, by hand, recorded in `docs/manual-verification.md`:**
   in the teton-code repo with the ADLC toolkit installed (its
   `~/.claude/skills` a symlink), the Kimi provider at the window the shipped
@@ -804,8 +809,10 @@ the CLI renders each as one line (BR-9).
   every ADLC skill lives under `~/.claude`, BR-10 makes a user skill's block
   unpinnable, and an unpinnable block pins the turn under *any* boundary — so
   on a boundary-configured machine every leg below routes to the local tier
-  and the large ones are refused there. A machine that has one runs leg (g)
-  instead. (a) the user types `/proceed
+  and the large ones are refused there. **Check it with `/boundary list`** —
+  `/doctor` renders providers only and never prints a boundary, so it cannot
+  answer this question. A machine that has one configured runs leg (f)
+  instead of (a)–(e). (a) the user types `/proceed
   REQ-587`: the expansion lands, the model reaches Phase 1 and calls `skill {
   name: "validate", arguments: "REQ-587" }` — the echo line shows `skill
   validate … invoked by the model` — the `/validate` body lands and the model
@@ -829,8 +836,15 @@ the CLI renders each as one line (BR-9).
   `.claude/skills/scratch/SKILL.md` in a throwaway root: at `guarded` on the
   pipe the model's call is refused without reading stdin); (e)
   on the local tier the model's `skill { name: "proceed" }` is refused with
-  `bound: local_engine` and `skill { name: "status" }` expands. (manual; BR-2,
-  BR-4, BR-5, BR-7, BR-8)
+  `bound: local engine` — the spoken form `BudgetBound::words()` produces,
+  never `wire_name()`'s `local_engine`, exactly as AC-8 says — and `skill {
+  name: "status" }` expands; **(f)** the leg a boundary-configured machine runs
+  *instead of* (a)–(e): the boundary is recorded from `/boundary list`, a model
+  invocation of any `~/.claude` skill routes to the local tier with nothing
+  reaching the provider, a large one (`proceed`) earns (e)'s local-tier
+  refusal, and the runbook records that this machine ran (f) — so a reader
+  cannot mistake the boundary rule for a broken feature. (manual; BR-2,
+  BR-4, BR-5, BR-7, BR-8, BR-10)
 - [ ] AC-16: **The bundled `skills` docs topic no longer contradicts this
   REQ.** `crates/tetond/src/harness/docs/skills.md` is what the model reads
   when it asks what skills are, and it currently says — compiled into the same
@@ -1123,7 +1137,101 @@ the CLI renders each as one line (BR-9).
   trust file (Claude Code's shape) or a config-writing gate option like
   web's `OPTION_ID_ENABLE_PERMANENT` (OQ-3, resolved to session-only in v1).
 - `docs/manual-verification.md` REQ-587 runbook — AC-15 needs a release and
-  the ADLC toolkit on the user's machine.
+  the ADLC toolkit on the user's machine. **Written and marked OUTSTANDING**
+  (TASK-222); six legs, and the "no privacy boundary configured" precondition
+  is stated there with its reason, because a boundary-configured machine
+  measures the boundary rule and reads the result as a broken feature.
+- **BUG-185's residual, unclosed (ADR-11, BR-5).** The spec offered two ways
+  out — land the slot cap and the per-invocation deadline in this REQ, or name
+  the residual here. No task does the first, so this is the second. The
+  multiplier, stated rather than left to be discovered: at `full` — which is
+  AC-15(d)'s prescribed *unattended* posture — a cloned repository's 400-slot
+  body invoked up to `PER_TURN_INVOCATION_CAP` (12) times in one turn is
+  **4,800 sequential 30-second commands** inside a non-cancellable
+  `spawn_blocking` that holds the session claim for the duration. Nothing
+  bounds the *number* of `` !`…` `` slots in one body (only the 64 KiB body cap
+  bounds it indirectly), nothing bounds the total time one invocation may
+  spend, and the runner is `tokio::task::spawn_blocking`, which the turn's
+  cancellation cannot reach. The mitigations that exist are the per-command
+  deadline, the acknowledgment at every level that asks, and the fact that
+  `full` is a choice; none of them bounds the product. Closing it means a slot
+  cap per body and a deadline per invocation, both refusals the model can
+  relay.
+- **The reroute residual — a stated exception to BR-6/BR-9.** A model-invoked
+  expansion caught at a mid-turn reroute **ends the prompt turn** with
+  `error_code::SKILL_EXPANSION_TOO_LARGE` rather than reaching the model as a
+  relayable tool result. Both call sites sit in `run_prompt_turn`'s `'turn`
+  retry loop *after* `run_session_turn_with_source` returned — no `ToolCall` id
+  is in scope there and the expansion is already a committed block — so a tool
+  result is not expressible without restructuring the retry, which this REQ
+  does not propose. It is neither silent nor a crash; it is a turn that ends
+  where the spec would prefer one that continues. Closing it means giving the
+  retry a way to fold a result back into the loop it just left. Driven, not
+  assumed, since TASK-222:
+  `skill_turn.rs::a_reroute_after_a_committed_model_expansion_refuses_rather_than_eliding_it`.
+- **A refusal that names no registered skill carries no record — a decision,
+  not the gap TASK-222 recorded.** Both of that task's defects are fixed: the
+  reroute guard now names the caller who actually asked (`SkillCaller` threaded
+  through `skill_fit`, read off the `typed_refit` index), and every typed
+  refusal the tool raises publishes its `skill_invoked` record through the one
+  door out of `SkillTool::invoke` — `repeated`, `not_model_invocable`,
+  `reserved_name`, `project_not_acknowledged` and `per_turn_cap` all reach the
+  session surface, and the client's `refusal_reason_words` arms are reached
+  rather than dead. Two cases still publish none, because the record describes a
+  skill **file** — a `source` (a closed two-variant enum), a path and a body
+  size — and there is no file behind them: a call that named **nothing** (a
+  listing refused by the cap; `invalid_arguments`, which *is* the parse failing)
+  and `unknown_skill`, whose name no registry row carries, so every identifying
+  field but the model's own spelling would have to be invented. Both are still
+  relayed to the model as typed reasons and both still show as a `skill …
+  [failed]` tool-call line; what is missing is the `refused: …` sentence naming
+  why. Closing it means a record whose subject is a *name* rather than a file —
+  a second event, or an optional `source` — a protocol change this REQ does not
+  propose. Driven, not assumed:
+  `skill_tool_loop.rs::every_tool_raised_refusal_over_a_registered_skill_publishes_a_record`,
+  `…::the_thirteenth_call_of_a_turn_is_refused_by_the_cap_and_the_next_prompt_starts_over`
+  and `…::a_run_of_listings_exhausts_the_per_turn_cap`.
+- **The `$ARGUMENTS`/`$N` splice is not sub-framed** (BR-4). The `ARGUMENTS:`
+  trailer is wrapped in `<skill-arguments>` and `SkillFrame`'s closing sentence
+  vouches only for *the file's own text*, but a body that names `$ARGUMENTS`
+  puts the caller's bytes verbatim and unmarked inside the region the frame
+  certifies. That is 1 of the 17 shipped ADLC skills; the other 16 take the
+  trailer path. Three mechanisms defeat drawing the marker at the splice, and
+  all three are properties of the pipeline rather than of the renderer: (a)
+  both `<skill-arguments` spellings are in `render`'s
+  `UNTRUSTED_ENVELOPE_TAGS`, so `defuse` `_`-prefixes any flush-left occurrence
+  in the string the expander returns — the expander's own marker included — and
+  exempting the pair from that pass hands the caller a forgeable
+  `</skill-arguments>`, the one close whose forgery puts the rest of a payload
+  back under the outer frame's sentence; (b) a flush-left marker at a mid-line
+  splice means injecting newlines into the file's prose, and every shipped
+  skill that names `$ARGUMENTS` names it mid-line (`Scope: $ARGUMENTS`),
+  several inside a code span; (c) substitution runs **before** `dynamic::scan`
+  by design (BR-4 precedes BR-6), so injected newlines would land inside a
+  `` !`cmd` `` that interpolates — and which `$` sites are command-interior is
+  not decidable at substitution time, because an argument can introduce the
+  `` !` `` opener itself. Closing it means moving the sub-framing to a stage
+  that knows both the line structure and the command spans, which this REQ does
+  not propose. **All three mechanisms are recorded, in these terms, on
+  `substitute`'s doc comment in `crates/tetond/src/skills/expand.rs`** (the
+  section headed *"What this function does not draw, and why"*) — cite it
+  rather than re-deriving it, and note that a residual naming only (a) invites
+  the next reader to "just exempt the marker", which (a) is precisely the
+  reason not to.
+- **The project-skill acknowledgment prompt has no terminal rendering test.**
+  AC-6's evidence clause reads "pty for the prompt bytes" and AC-14 reads "the
+  pty suite covers only the acknowledgment prompt bytes"; neither is true.
+  `crates/teton/tests/pty_e2e.rs` is **byte-unchanged from `main`** across this
+  REQ, and its one skill test
+  (`a_skill_consent_asks_once_at_a_terminal_and_lists_every_command_verbatim`)
+  is REQ-585's, covering the **dynamic-context consent** prompt rather than
+  BR-4's acknowledgment. What *is* asserted: the acknowledgment's text and its
+  twenty-name/`+N more` bound at unit level, and its pipe refusal end to end in
+  `cli_e2e`. What is not: how the prompt draws on a real terminal — the
+  wrapping, the option list and the default, which is the class of defect a pty
+  leg exists to catch and which no other suite can see. Closing it is one pty
+  leg modelled on the REQ-585 test named above; TASK-222 planned the file and
+  did not touch it.
 
 ## Validation
 

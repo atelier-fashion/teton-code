@@ -40,7 +40,7 @@ use teton_protocol::events::{
 };
 use teton_protocol::methods::{
     AttachConsentOutcome, AttachConsentParams, PermissionOutcome, PermissionRespondParams,
-    RefusalReason, SessionRoot,
+    RefusalReason, SessionRoot, SkillSource,
 };
 use teton_protocol::{Phase, RequestId, SessionId};
 
@@ -76,27 +76,38 @@ impl SessionGrants {
         self.allow_always.insert(tool.to_owned());
     }
 
-    /// Forget every **project** skill grant, because the session root moved.
+    /// Forget every grant a **session root move** invalidates (ADR-6,
+    /// REQ-587 ASSUME-017).
     ///
     /// The other half of ADR-6, and the half a daemon-side test cannot see.
-    /// `PermissionGate::drop_project_skill_grants` forgets the daemon's copy on
-    /// `/cd`; this store holds the same key, is consulted *before* any prompt is
+    /// `PermissionGate::drop_project_skill_grants` (a REQ-585 name its own doc
+    /// records as narrower than what it now sweeps) forgets the daemon's copy on
+    /// `/cd`; this store holds the same keys, is consulted *before* any prompt is
     /// drawn, and answers `allow_always` on its own. Without this, the daemon
     /// re-asks after a root move and the client auto-answers from a grant the
     /// user gave in a different repo — one `auto-allow` line, no commands
     /// shown, and the daemon then re-remembers it under the new root. That is
     /// exactly the harm ADR-6 exists to prevent, one hop across the seam.
     ///
-    /// User skills are kept: `~/.claude/skills/<name>` is the same file
-    /// whatever the root is. The predicate is
-    /// [`teton_protocol::methods::is_project_skill_key`] rather than a literal
-    /// prefix, so the two stores cannot drift about which keys expire.
-    pub fn forget_project_skills(&mut self) -> usize {
+    /// **Two families expire, and the predicate is shared rather than spelled.**
+    /// [`teton_protocol::methods::expires_on_session_root_change`] is the one
+    /// invalidation rule, above both crates: a project skill's dynamic-context
+    /// grant *and* REQ-587 BR-4's project-skill acknowledgment. A copy here that
+    /// knew only the first would keep the acknowledgment across a `/cd` while
+    /// the daemon dropped it — and the acknowledgment is the one grant whose
+    /// auto-answer costs a whole repository's skills reaching the model as
+    /// instructions with nobody shown anything. That is REQ-585's finding 2 on
+    /// the key ASSUME-017 was written for, which is why the rule lives in
+    /// `teton_protocol` and not in either store.
+    ///
+    /// User skills are kept: `~/.claude/skills/<name>` is the same file whatever
+    /// the root is.
+    pub fn forget_root_scoped_grants(&mut self) -> usize {
         let before = self.allow_always.len() + self.reject_always.len();
         self.allow_always
-            .retain(|key| !teton_protocol::methods::is_project_skill_key(key));
+            .retain(|key| !teton_protocol::methods::expires_on_session_root_change(key));
         self.reject_always
-            .retain(|key| !teton_protocol::methods::is_project_skill_key(key));
+            .retain(|key| !teton_protocol::methods::expires_on_session_root_change(key));
         before - (self.allow_always.len() + self.reject_always.len())
     }
 
@@ -924,14 +935,15 @@ pub fn render_event(
                         // refresh, and re-fetching on another session's move
                         // would ask for a root this client never had.
                         state.skills_stale = true;
-                        // …and the answers the user gave about *this* root's
-                        // skills. The daemon drops its copy inside
-                        // `set_session_cwd`; this is the same moment on this
-                        // side of the wire, under the same own-session
-                        // condition, because a grant consulted before the
-                        // prompt is drawn would otherwise auto-answer for a
-                        // repo the user never approved.
-                        state.grants.forget_project_skills();
+                        // …and the answers the user gave about *this* root:
+                        // its skills' commands, and REQ-587 BR-4's
+                        // acknowledgment that the model may run them at all.
+                        // The daemon drops its copy inside `set_session_cwd`;
+                        // this is the same moment on this side of the wire,
+                        // under the same own-session condition, because a grant
+                        // consulted before the prompt is drawn would otherwise
+                        // auto-answer for a repo the user never approved.
+                        state.grants.forget_root_scoped_grants();
                     }
                     surface.line(
                         LineKind::Notice,
@@ -978,8 +990,27 @@ fn format_session_root_changed(root: &SessionRoot) -> String {
 ///
 /// **The body is never printed** — it is in the file, and BR-12 says so. What
 /// reaches the surface is a summary of the file and, under `/verbose`, where it
-/// lives, what of its frontmatter was inert, and what became of each dynamic
-/// command.
+/// lives, what its frontmatter flags did, what of its frontmatter was inert,
+/// what became of each dynamic command, and what this turn has spent of the
+/// per-turn cap (REQ-587 BR-9).
+///
+/// **The shadowing fact is not repeated here.** BR-9 lists it among what
+/// `/verbose` adds, and the echo line above already carries it in the source
+/// slot — `skill validate (project — shadows your user skill, …)` — on **every**
+/// invocation, verbose or not. A second line under it would be one fact in two
+/// spellings on one screen (LESSON-528), and the event carries nothing further
+/// to say: which user file lost the name is not on it.
+///
+/// **A refused record is one of these events too, and it is not a duplicate.**
+/// BR-9 asks for one line per invocation *and* one line per typed refusal, and
+/// the daemon publishes accordingly: a call the loop refuses before dispatch
+/// (Stage A) publishes only a refusal record, while one refused after its
+/// expansion came back (Stage B) publishes an invocation record — whose commands
+/// really did run, which is why it exists — and then a refusal record for the
+/// same call. This renderer is stateless per event and deliberately stays that
+/// way: it prints the pair as the two lines it is. Folding them would require
+/// remembering the previous event to guess at a relationship the wire does not
+/// state, and would drop the very line BR-9 asks for.
 ///
 /// Everything rendered here is either the daemon's own typed value or
 /// file-supplied text the daemon already bounded; `Surface::line` defuses it
@@ -994,11 +1025,39 @@ fn render_skill_invoked(invoked: &SkillInvoked, surface: &mut dyn Surface, verbo
     if !verbose {
         return;
     }
+    // **A refusal gets none of the file detail below.** Every line of it reports
+    // what the invocation *did* — where the body it expanded came from, what its
+    // frontmatter did on the way, what became of each command — and a refused
+    // call did none of that. Printing the block anyway would put a paragraph of
+    // true-sounding provenance under a line saying nothing happened, and in the
+    // Stage B shape (an invocation record, then a refusal record for the same
+    // call) it would print that paragraph twice.
+    //
+    // The turn's count is the exception and is rendered below for both, because
+    // it is the one line here about the **turn** rather than about the file —
+    // and on a `per_turn_cap` refusal it is the evidence for the refusal.
+    if invoked.refused.is_none() {
+        render_invocation_detail(invoked, surface);
+    }
+    if let Some(turn) = invoked.turn_invocations {
+        surface.line(LineKind::Info, &turn_invocations_line(turn));
+    }
+}
+
+/// The `/verbose` block under a *successful* invocation: where the body came
+/// from, what its frontmatter did, and what became of each dynamic command.
+fn render_invocation_detail(invoked: &SkillInvoked, surface: &mut dyn Surface) {
     surface.line(LineKind::Info, &format!("  {}", invoked.path_display));
     // Only when there were any: BR-5's ignored keys are news about *this* file,
     // and "ignored frontmatter: " with nothing after it is a line about nothing.
     if let Some(note) = &invoked.name_note {
         surface.line(LineKind::Notice, &format!("  {note}"));
+    }
+    // The keys this build **honored**, above the ones it did not: BR-3 took two
+    // out of BR-5's inert list, and a reader comparing the two lines is reading
+    // the same file's frontmatter sorted by what happened to it.
+    if let Some(line) = declared_flags_line(invoked) {
+        surface.line(LineKind::Info, &line);
     }
     if !invoked.ignored_keys.is_empty() {
         surface.line(
@@ -1011,7 +1070,120 @@ fn render_skill_invoked(invoked: &SkillInvoked, surface: &mut dyn Surface, verbo
     }
 }
 
-/// BR-12's echo line: `/status → skill status (user, 5.3 KiB, 4 dynamic commands)`.
+/// What BR-3's two frontmatter flags did to this file, for `/verbose` (BR-9),
+/// or `None` when the file declared neither.
+///
+/// **The words are [`slash::model_only_words`]'s**, which is `/help`'s mark for
+/// the same file. Composing them again here would put "model-only" one line
+/// under an echo line for a skill no roster contains, on exactly the file where
+/// `/help` says `invocable by nobody` — one product, two answers, and the
+/// disagreement only in the case that matters (LESSON-528).
+///
+/// Nothing renders for the ordinary file, on the `ignored frontmatter` line's
+/// own rule: this block reports what *this file wrote*, and a line reading
+/// "invocable by the user and the model" over a file that declared no flag at
+/// all would report an absence as a declaration.
+///
+/// The key is named because the actionable half of "model-only" is which line
+/// of which file said so — and a **value** this build could not read is worded
+/// apart from one it could ([`model_flag_clause`]).
+fn declared_flags_line(invoked: &SkillInvoked) -> Option<String> {
+    match (invoked.user_invocable, invoked.model_invocable) {
+        (true, true) => None,
+        // The user's door is open and the model's is shut. `/help` marks this
+        // row not at all — it answers "may you type this?", and the answer is
+        // yes — so this line is the only place the flag is ever named, and the
+        // two surfaces are not in disagreement about anything.
+        (true, false) => Some(format!(
+            "  hidden from the model ({})",
+            model_flag_clause(invoked)
+        )),
+        // `user-invocable` needs no such split: its safe reading is the
+        // *unchanged* one (the user keeps `/name`), so a `false` here can only
+        // have come from the literal the clause quotes.
+        (false, model_invocable) => Some(format!(
+            "  {} (`{USER_INVOCATION_KEY}: false`{})",
+            slash::model_only_words(model_invocable),
+            if model_invocable {
+                String::new()
+            } else {
+                format!(", {}", model_flag_clause(invoked))
+            },
+        )),
+    }
+}
+
+/// BR-3's negative flag, as this build read it: the literal the file wrote, or
+/// — when the value was not a boolean — what it was read as instead.
+///
+/// **A typo must not be quoted back as a declaration.** BR-3's safe reading
+/// hides a file whose `disable-model-invocation` value is neither `true` nor
+/// `false`, so an author who wrote `yes` is hidden from the model *and* was
+/// shown, until this split existed, a line quoting `disable-model-invocation:
+/// true` — a line their file does not contain — one line above
+/// `ignored frontmatter: disable-model-invocation`, which on its own reads as
+/// "this key did nothing". Two lines, contradicting each other, and the one
+/// that was true was the one that sounded harmless.
+///
+/// The malformed case is recognized from [`SkillInvoked::ignored_keys`] rather
+/// than from a new wire field, because that list is already exactly the daemon's
+/// answer to "which keys did this file write that I did not honor": its parser
+/// names the flag there precisely when the value was unreadable, and an honored
+/// `true` never appears in it. The file's raw value is not on the wire, so the
+/// clause names the key and the reading rather than quoting bytes it does not
+/// have.
+fn model_flag_clause(invoked: &SkillInvoked) -> String {
+    if invoked
+        .ignored_keys
+        .iter()
+        .any(|key| key == MODEL_INVOCATION_KEY)
+    {
+        format!("`{MODEL_INVOCATION_KEY}` was not `true` or `false`, so the safe reading hid it")
+    } else {
+        format!("`{MODEL_INVOCATION_KEY}: true`")
+    }
+}
+
+/// The frontmatter key that hides a skill from the model (BR-3).
+const MODEL_INVOCATION_KEY: &str = "disable-model-invocation";
+
+/// The frontmatter key that keeps a skill out of the user's `/name` (BR-3).
+const USER_INVOCATION_KEY: &str = "user-invocable";
+
+/// BR-9's `/verbose` count: what this turn has spent of the per-turn cap.
+///
+/// **A count against the ceiling, never a bare number.** "3" is unreadable
+/// without the cap and unfalsifiable with it — a reader cannot tell a turn
+/// halfway through its budget from one at the last call it will be allowed, and
+/// the next refusal (`per_turn_cap`) would arrive as a surprise. The cap travels
+/// with the count for the same reason it travels on the wire: a client that
+/// hardcoded 12 would print a stale ceiling the day the daemon moves it.
+///
+/// Never rendered for a `None`, which is the typed path — see
+/// [`render_skill_invoked`].
+fn turn_invocations_line(turn: events::TurnInvocations) -> String {
+    format!("  invocation {} of {} this turn", turn.count, turn.cap)
+}
+
+/// BR-12's echo line: `/status → skill status (user, 5.3 KiB, 4 dynamic commands)`,
+/// or REQ-587 BR-9's `skill status (user, 5.3 KiB, 4 dynamic commands) — invoked
+/// by the model`.
+///
+/// The **source** slot names BR-9's swap where there is one — `skill validate
+/// (project — shadows your user skill, …)` — read off the event's own
+/// `shadows_user_skill` and never re-derived from the session's snapshot: the
+/// registry lives on `UiContext`, `render_event` sees only `SessionState`, and a
+/// snapshot may have moved under a `/cd` since the invocation it would be
+/// answering about. It applies to a typed invocation as readily as to a model
+/// one — `/validate` in a repository that defines its own reaches the
+/// repository's file, and that is the same surprise BR-4 asks about.
+///
+/// **The `/name →` prefix is the user's typed line, so a model invocation does
+/// not carry one.** Nobody typed `/status`; printing it would put a line in the
+/// transcript that reads exactly like the user's own, which is the one
+/// distinction BR-9's suffix exists to draw. The parenthetical is identical in
+/// both, deliberately: same facts, same order, same units, so the two lines are
+/// comparable at a glance and only the attribution differs.
 ///
 /// The count is how many dynamic commands the invocation **had**, not how many
 /// succeeded: `outcomes` carries one entry per `` !`…` `` in the body whatever
@@ -1025,6 +1197,11 @@ fn render_skill_invoked(invoked: &SkillInvoked, surface: &mut dyn Surface, verbo
 /// `5.3 KB`; two spellings of a file size in one feature would be worse than
 /// one that differs from an illustration by a unit suffix.
 fn skill_echo_line(invoked: &SkillInvoked) -> String {
+    // BR-9's *other* sentence, and it is a different line rather than this one
+    // with a flag on it — see [`skill_refusal_line`].
+    if let Some(reason) = &invoked.refused {
+        return skill_refusal_line(invoked, reason);
+    }
     let count = invoked.outcomes.len();
     // How many of them actually started. A command that was declined, refused
     // for want of a terminal, denied by the level, or never spawned leaves a
@@ -1054,12 +1231,100 @@ fn skill_echo_line(invoked: &SkillInvoked) -> String {
     } else {
         format!("{count} dynamic commands, {ran} run")
     };
-    format!(
-        "/{name} → skill {name} ({source}, {size}, {dynamic})",
-        name = invoked.name,
-        source = slash::source_word(invoked.source),
+    let name = &invoked.name;
+    let body = format!(
+        "skill {name} ({source}, {size}, {dynamic})",
+        source = slash::source_words(invoked.source, invoked.shadows_user_skill),
         size = teton_protocol::format_bytes(invoked.body_bytes),
+    );
+    match invoked.invoked_by {
+        events::InvokedBy::User => format!("/{name} → {body}"),
+        events::InvokedBy::Model => format!("{body} — invoked by the model"),
+    }
+}
+
+/// BR-9's second sentence: **one line per typed refusal**, naming the reason.
+///
+/// # It is not the invocation line with a flag on it
+///
+/// A refused record and a skill with no dynamic context are the same bytes
+/// apart from one field — same name, same source, same size, the same empty
+/// `outcomes` — so a refusal rendered as "the invocation line, plus something"
+/// fails in the one direction that matters: at a glance it reads as a skill that
+/// ran. This line therefore opens with the **verdict**, where the successful
+/// line opens with the skill, and it drops every figure that would claim an
+/// expansion happened. The body's size and the dynamic-command count are true of
+/// the *file* and false of this turn — nothing of that file entered the context —
+/// and printing them under the word "refused" is the same lie told quietly.
+///
+/// What is kept is what identifies the call: the name, the source, and BR-9's
+/// shadowing clause, because "which `validate`?" is a question a refusal raises
+/// more sharply than a success does.
+///
+/// # No invoker suffix
+///
+/// The successful line carries `— invoked by the model` because its two invokers
+/// produce two shapes and the typed one opens with a `/name →` prefix this one
+/// never has. Every record carrying `refused` on this build comes from the model
+/// path — a typed refusal is composed client-side by `slash::dispatch` and
+/// publishes no event at all — so the suffix would be a constant on every
+/// refusal line, which BR-9 calls noise rather than observability. If a daemon
+/// ever publishes a user-side refusal the line is still true, and
+/// [`invoker_clause`] is where those words already live.
+fn skill_refusal_line(invoked: &SkillInvoked, reason: &str) -> String {
+    format!(
+        "refused: skill {name} ({source}) — {words}",
+        name = invoked.name,
+        source = slash::source_words(invoked.source, invoked.shadows_user_skill),
+        words = refusal_reason_words(reason),
     )
+}
+
+/// The daemon's stable refusal id, in words a person reads (REQ-587 BR-9).
+///
+/// **The id keys the record; it is not the sentence.** It is the same token the
+/// model is given at the head of its refusal, so the two audiences are told the
+/// same fact — but `per_turn_cap` spliced into a line for a human is a token,
+/// not a reason, and this client already maps every other typed outcome it
+/// renders ([`not_run_words`], [`dynamic_outcome_words`], `BudgetBound::words`)
+/// rather than printing the wire spelling.
+///
+/// # The set is open, and the unknown arm is the load-bearing one
+///
+/// Two of the daemon's ids cannot reach this arm at all — `unknown_skill` and
+/// `invalid_arguments` — because neither names a registry row and the daemon
+/// publishes no record for a call it cannot attribute to a file (its
+/// `registered_row` returns `None`). They are worded here anyway, because
+/// "which reasons publish" is the daemon's to change and this map costs nothing
+/// for being complete. Every other id it raises does publish, and more will
+/// exist than this build knows, exactly as `PermissionSubject::Unrecognized`
+/// anticipates for subjects. An id this build cannot word must still produce a
+/// **readable line** — BUG-186 is open against dropping an event a client does
+/// not fully understand, and a refusal that renders blank is the worst of the three
+/// outcomes here (worse than an awkward line, and much worse than a wrong one,
+/// because nothing on the surface says the call happened at all).
+///
+/// So the unknown arm frames the id rather than either hiding it or emitting it
+/// bare: the daemon's own word for what it did is the only information there
+/// is, and quoting it inside a sentence is how a user finds the refusal in a
+/// log — `refusal_line`'s rule for a request whose subject this build cannot
+/// name. It is rendered rather than re-bounded: the value is daemon-authored
+/// and bounded at the publish site, and `Surface::line` defuses it here, which
+/// is the same two-layer treatment the skipped-skill reason already gets.
+fn refusal_reason_words(reason: &str) -> String {
+    match reason {
+        "over_budget" => "the expansion did not fit this turn's context budget".to_owned(),
+        "per_turn_cap" => "this turn has already made as many skill calls as it may".to_owned(),
+        "repeated" => "the same skill and arguments were invoked twice in a row".to_owned(),
+        "unknown_skill" => "this session has no skill of that name".to_owned(),
+        "not_model_invocable" => "its frontmatter says `disable-model-invocation: true`".to_owned(),
+        "reserved_name" => "a built-in command owns that name".to_owned(),
+        "invalid_arguments" => "the call's arguments were not usable".to_owned(),
+        "project_not_acknowledged" => {
+            "this repository's skills have not been acknowledged for this session".to_owned()
+        }
+        other => format!("the daemon reported `{other}`"),
+    }
 }
 
 /// One `/verbose` line for one dynamic command and what became of it.
@@ -2482,10 +2747,13 @@ pub(crate) enum ConsentGate {
 ///   answering from the next stdin line is behaviour a shipped script depends
 ///   on. BR-11's narrowing is about the *skill* consent and nothing else; a gate
 ///   that generalized it would be a silent change to every tool prompt.
-/// - **A skill's dynamic context needs a terminal.** This is the narrowing, and
-///   it is the whole of it. At `full` the daemon asks nothing, so a piped
-///   session still runs dynamic context exactly as a TTY does — that is the
-///   automation posture, and it is why this gate never sees those turns.
+/// - **Every skill subject needs a terminal.** This is the narrowing, and it is
+///   the whole of it: a skill's dynamic context (REQ-585 BR-6) and REQ-587
+///   BR-4's project-skill acknowledgment, which is the same rule applied to the
+///   question one step earlier. At `full` the daemon asks neither, so a piped
+///   session still runs dynamic context and still expands a non-shadowing
+///   project skill exactly as a TTY does — that is the automation posture, and
+///   it is why this gate never sees those turns.
 /// - **An unrecognized subject is refused, terminal or not.** A client that does
 ///   not know what it is being asked cannot render the question, so there is
 ///   nothing to put to the user even at a terminal; falling through to `ask`
@@ -2493,7 +2761,7 @@ pub(crate) enum ConsentGate {
 ///   in the direction that can only cost a skill invocation, never a swallowed
 ///   prompt line.
 ///
-/// Pure, so all six rows are unit-tested without a terminal, a pipe or a
+/// Pure, so all eight rows are unit-tested without a terminal, a pipe or a
 /// daemon: the rows that matter are the ones a test process cannot otherwise
 /// reach.
 #[must_use]
@@ -2502,6 +2770,22 @@ pub(crate) fn consent_gate(subject: Option<&PermissionSubject>, typed_input: boo
         None => ConsentGate::Answerable,
         Some(PermissionSubject::Unrecognized) => ConsentGate::RefuseUnrecognized,
         Some(PermissionSubject::SkillDynamicContext { .. }) => {
+            if typed_input {
+                ConsentGate::Answerable
+            } else {
+                ConsentGate::RefuseNoTerminal
+            }
+        }
+        // REQ-587 BR-4, and the same row as the one above it: this client can
+        // draw the question (`render_consent_subject` names the root and lists
+        // the set), so at a terminal it is asked — and on a pipe it is refused
+        // **without reading a line**, for the reason BR-11 gave the first skill
+        // subject. Nothing about this question is more answerable from a pipe
+        // than a command list is: it grants no effect, but what it grants is
+        // repository text reaching the model labelled *instructions*, and a
+        // pasted `y` becoming that consent is LESSON-537's shape on the one
+        // question that has no human in the loop by construction.
+        Some(PermissionSubject::ProjectSkillTrust { .. }) => {
             if typed_input {
                 ConsentGate::Answerable
             } else {
@@ -2679,6 +2963,12 @@ pub fn resolve_permission(
 /// matched rather than wildcarded so that adding a subject variant is a
 /// compile error here, where the question is drawn, and not a silently blank
 /// prompt.
+///
+/// Both skill subjects are drawn on the **refusing** path too, above the
+/// refusal line: a piped session is told what was refused, not merely that
+/// something was. That is the one place the wildcard would have been invisible —
+/// a blank arm renders nothing and asserts nothing, and the request would still
+/// be refused with the right reason.
 fn render_consent_subject(subject: Option<&PermissionSubject>, surface: &mut dyn Surface) {
     match subject {
         None | Some(PermissionSubject::Unrecognized) => {}
@@ -2686,12 +2976,14 @@ fn render_consent_subject(subject: Option<&PermissionSubject>, surface: &mut dyn
             skill,
             source,
             commands,
+            invoked_by,
         }) => {
             surface.line(
                 LineKind::Prompt,
                 &format!(
-                    "  skill `{skill}` ({}) wants to run {} dynamic-context command{}:",
+                    "  skill `{skill}` ({}){} wants to run {} dynamic-context command{}:",
                     slash::source_word(*source),
+                    invoker_clause(*invoked_by),
                     commands.len(),
                     if commands.len() == 1 { "" } else { "s" },
                 ),
@@ -2703,6 +2995,73 @@ fn render_consent_subject(subject: Option<&PermissionSubject>, surface: &mut dyn
                 );
             }
         }
+        // REQ-587 BR-4's acknowledgment: the root, then the named set, one
+        // `Surface::line` per entry for the reason the command list is one per
+        // line — `line` defuses, and defusing destroys newlines.
+        Some(PermissionSubject::ProjectSkillTrust { root, skills, more }) => {
+            surface.line(
+                LineKind::Prompt,
+                &format!(
+                    "  the model wants to run this repository's skills as instructions: {root}",
+                ),
+            );
+            for entry in skills {
+                surface.line(
+                    LineKind::Prompt,
+                    &format!("    {}", project_skill_entry(entry)),
+                );
+            }
+            // Only when the daemon left some out. The tail is the *count* it
+            // sent, never a re-count of a list this side bounded: the bound is
+            // the daemon's, at the door that mints the subject, and "and some
+            // more" is a different fact from "+5 more" to someone being asked
+            // to trust the whole set.
+            if *more > 0 {
+                surface.line(LineKind::Prompt, &format!("    +{more} more"));
+            }
+        }
+    }
+}
+
+/// How the acknowledgment prompt names one project skill (REQ-587 BR-4, AC-6).
+///
+/// A shadowing entry reads `validate (project — shadows your user skill)`, which
+/// is the spelling the daemon's expansion frame uses for the same fact on the
+/// other side of the wire. Both are *rendered* from
+/// [`events::ProjectSkillTrustEntry::shadows_user_skill`]; neither is a re-parse
+/// of the other's prose (LESSON-529), which is why the wire carries a flag and
+/// not a pre-marked name.
+///
+/// An ordinary entry is its bare name. Every entry in this list is a project
+/// skill — the line above says so — so `(project)` on each of them would be the
+/// same word twenty times over, and the source is only worth saying where it
+/// contrasts with the user skill this one is taking the name from.
+fn project_skill_entry(entry: &events::ProjectSkillTrustEntry) -> String {
+    if entry.shadows_user_skill {
+        format!(
+            "{} ({})",
+            entry.name,
+            slash::source_words(SkillSource::Project, true)
+        )
+    } else {
+        entry.name.clone()
+    }
+}
+
+/// The clause BR-5 adds to a skill consent: **who asked**.
+///
+/// "You asked for `deploy`" and "the model decided to run `deploy`" are
+/// different questions carrying the same command list, and the human at
+/// `guarded` is entitled to know which one is on the screen.
+///
+/// A user invocation adds nothing, so REQ-585's prompt keeps its bytes exactly —
+/// the words it renders are the words `pty_e2e` already pins. The model's clause
+/// is the vocabulary [`skill_echo_line`] uses for the same fact, so a user who
+/// answered a prompt reads the same phrase back in the echo line that follows.
+fn invoker_clause(invoked_by: events::InvokedBy) -> &'static str {
+    match invoked_by {
+        events::InvokedBy::User => "",
+        events::InvokedBy::Model => ", invoked by the model,",
     }
 }
 
@@ -2725,6 +3084,15 @@ fn refusal_line(req: &PermissionRequest, reason: RefusalReason) -> String {
     let subject = match &req.subject {
         Some(PermissionSubject::SkillDynamicContext { skill, .. }) => {
             format!("skill `{skill}`'s dynamic context")
+        }
+        // REQ-587 BR-4. Named from the subject like the row above it: the key
+        // would say `project_skill_trust:~/dev/teton`, which names the same root
+        // in the vocabulary of a log rather than of a question. The fallback
+        // below still renders the key for a subject this build cannot read, and
+        // that remains the right answer there — it is the only thing such a
+        // request is known by.
+        Some(PermissionSubject::ProjectSkillTrust { root, .. }) => {
+            format!("running `{root}`'s skills as instructions")
         }
         _ => format!("`{}`", req.tool_name),
     };
@@ -7170,8 +7538,13 @@ mod skill_tests {
     }
 
     /// The subject a skill consent carries: three commands, already substituted,
-    /// in document order (ADR-7).
+    /// in document order (ADR-7), for a skill the **user** typed.
     fn skill_subject(skill: &str) -> PermissionSubject {
+        skill_subject_from(skill, events::InvokedBy::User)
+    }
+
+    /// [`skill_subject`], with who asked (REQ-587 BR-5).
+    fn skill_subject_from(skill: &str, invoked_by: events::InvokedBy) -> PermissionSubject {
         PermissionSubject::SkillDynamicContext {
             skill: skill.to_owned(),
             source: SkillSource::User,
@@ -7180,6 +7553,38 @@ mod skill_tests {
                 "git status --short".to_owned(),
                 "grep -c '' README.md".to_owned(),
             ],
+            invoked_by,
+        }
+    }
+
+    /// BR-4's acknowledgment subject, as the daemon mints one: the root
+    /// home-relative, the named set in registry order with the shadowing entry
+    /// marked, and the tail as a count.
+    fn trust_subject(more: u32) -> PermissionSubject {
+        PermissionSubject::ProjectSkillTrust {
+            root: "~/dev/teton".to_owned(),
+            skills: vec![
+                events::ProjectSkillTrustEntry {
+                    name: "validate".to_owned(),
+                    shadows_user_skill: true,
+                },
+                events::ProjectSkillTrustEntry {
+                    name: "canary".to_owned(),
+                    shadows_user_skill: false,
+                },
+            ],
+            more,
+        }
+    }
+
+    /// The acknowledgment as the daemon raises it: under
+    /// `project_skill_trust:<root>`, never a skill's key and never a tool's
+    /// name, and with no `description` — the subject carries the facts.
+    fn trust_permission_request(subject: Option<PermissionSubject>) -> PermissionRequest {
+        PermissionRequest {
+            request_id: RequestId::from("r-trust"),
+            tool_name: teton_protocol::methods::project_skill_trust_key("~/dev/teton"),
+            ..skill_permission_request(subject)
         }
     }
 
@@ -7225,13 +7630,14 @@ mod skill_tests {
 
     // ----------------------------------------------------------------- gate
 
-    /// **ADR-8's truth table.** All six rows of a two-input predicate, pinned
+    /// **ADR-8's truth table.** All eight rows of a two-input predicate, pinned
     /// the way `cli_rows::write_gate`'s are — because the two rows that matter
     /// (a pipe, and a subject from the future) are the ones a test process
     /// cannot reach through a real terminal.
     #[test]
     fn the_consent_gate_is_a_truth_table_over_the_subject_and_the_terminal() {
         let skill = skill_subject("status");
+        let trust = trust_subject(0);
         let unknown = unrecognized_subject();
         for (case, subject, typed_input, expected) in [
             (
@@ -7256,6 +7662,21 @@ mod skill_tests {
             (
                 "a skill's dynamic context, on a pipe: refuse (BR-11)",
                 Some(&skill),
+                false,
+                ConsentGate::RefuseNoTerminal,
+            ),
+            (
+                "the project-skill acknowledgment, at a terminal: ask (BR-4)",
+                Some(&trust),
+                true,
+                ConsentGate::Answerable,
+            ),
+            (
+                "the project-skill acknowledgment, on a pipe: refuse — and \
+                 `RefuseNoTerminal`, not `RefuseUnrecognized`: this build knows \
+                 exactly what it is being asked and there is simply nobody to \
+                 ask (the placeholder arm TASK-210 left fails here)",
+                Some(&trust),
                 false,
                 ConsentGate::RefuseNoTerminal,
             ),
@@ -7314,6 +7735,137 @@ mod skill_tests {
             !grants.is_allow_always("skill:user:status")
                 && !grants.is_reject_always("skill:user:status"),
             "a refusal nobody answered records no session grant"
+        );
+    }
+
+    /// **REQ-587 BR-4's pipe rule, and the negative pin is the one that
+    /// matters.** A piped session at a level that would ask refuses the
+    /// acknowledgment **without reading a line** — the `y` a paste would have
+    /// left queued is still queued afterwards, and arrives as the user's next
+    /// *prompt* line rather than as consent for a repository's skills to reach
+    /// the model as instructions.
+    ///
+    /// **Mutation.** Treat the new subject as answerable on a pipe — the
+    /// `Answerable` row, or `prompter.ask` moved above the gate — and
+    /// `prompter.asked` is 1 here. Answer it `RefuseUnrecognized` instead, as
+    /// TASK-210's placeholder did, and the outcome assertion fails: the reason
+    /// is what tells the daemon whether anybody could have been asked, and
+    /// "this build does not know what it is asking" is false of a build that
+    /// draws the question two tests below.
+    #[test]
+    fn a_piped_project_skill_acknowledgment_is_refused_without_reading_a_line() {
+        let req = trust_permission_request(Some(trust_subject(0)));
+        let mut surface = RecordingSurface::new();
+        let mut prompter = ScriptedPrompter::new(&["y"]);
+        let mut grants = SessionGrants::default();
+
+        let resp = resolve_permission(&req, &mut surface, &mut prompter, &mut grants, false);
+
+        assert_eq!(
+            prompter.asked, 0,
+            "the gate ran before `ask`: {:?}",
+            prompter.questions
+        );
+        assert_eq!(
+            resp.outcome,
+            PermissionOutcome::Refused {
+                reason: RefusalReason::NoTerminal
+            },
+            "a refusal is never the cancellation a dismissed prompt produces, \
+             and never `UnrecognizedSubject` for a question this build can draw"
+        );
+        assert!(
+            !grants.is_allow_always(&req.tool_name) && !grants.is_reject_always(&req.tool_name),
+            "a refusal nobody answered records no session grant"
+        );
+        // Refused, and *said* — with the root named from the subject rather
+        // than from the key, and the unattended remedy BR-4 gives.
+        let notices = surface.lines_of(LineKind::Notice);
+        assert_eq!(notices.len(), 1, "one line, not a paragraph: {notices:?}");
+        assert!(
+            notices[0].contains("`~/dev/teton`") && notices[0].contains("not a terminal"),
+            "{}",
+            notices[0]
+        );
+        assert!(
+            notices[0].contains("/permissions full"),
+            "the model is to be told the user must acknowledge or run at full: {}",
+            notices[0]
+        );
+        // What was refused is still shown: a piped session is told which
+        // repository and which skills, not merely that something was refused.
+        let shown = surface.lines_of(LineKind::Prompt);
+        assert!(
+            shown.iter().any(|line| line.contains("~/dev/teton"))
+                && shown.iter().any(|line| line.contains("validate")),
+            "the subject block did not render on the refusing path: {shown:?}"
+        );
+    }
+
+    /// **BR-4's prompt bytes.** The root, the named set in registry order, the
+    /// shadowing entry marked in the spelling the daemon's expansion frame uses
+    /// for the same fact, and the bounded tail as `+N more`.
+    ///
+    /// One `Surface::line` per entry, for the command list's mechanical reason:
+    /// `line` defuses, and defusing destroys newlines, so a joined list would
+    /// arrive as one run-on line.
+    #[test]
+    fn the_acknowledgment_names_the_root_marks_shadowing_and_counts_the_tail() {
+        let req = trust_permission_request(Some(trust_subject(5)));
+        let mut surface = RecordingSurface::new();
+        let mut prompter = ScriptedPrompter::new(&["y"]);
+        let mut grants = SessionGrants::default();
+
+        let resp = resolve_permission(&req, &mut surface, &mut prompter, &mut grants, true);
+
+        assert_eq!(prompter.asked, 1, "at a terminal it is asked");
+        assert_eq!(
+            resp.outcome,
+            PermissionOutcome::Selected {
+                option_id: "allow_once".to_owned()
+            }
+        );
+        let lines = surface.lines_of(LineKind::Prompt);
+        let at = lines
+            .iter()
+            .position(|line| line.contains("this repository's skills"))
+            .unwrap_or_else(|| panic!("no acknowledgment block: {lines:?}"));
+        assert_eq!(
+            &lines[at..at + 4],
+            [
+                "  the model wants to run this repository's skills as instructions: ~/dev/teton",
+                "    validate (project — shadows your user skill)",
+                "    canary",
+                "    +5 more",
+            ],
+            "{lines:?}"
+        );
+        // The root is home-relative wherever it is rendered: BR-1's entity
+        // table, and the reason the daemon sends a display and not a path.
+        assert!(
+            !lines.iter().any(|line| line.contains("/Users/")),
+            "a username reached the prompt: {lines:?}"
+        );
+    }
+
+    /// A complete list has no tail line: `+0 more` is a line about nothing, and
+    /// the count is the daemon's fact rather than a re-count of what this side
+    /// was handed.
+    #[test]
+    fn a_complete_acknowledgment_list_prints_no_tail() {
+        let req = trust_permission_request(Some(trust_subject(0)));
+        let mut surface = RecordingSurface::new();
+        let mut prompter = ScriptedPrompter::new(&["y"]);
+        let mut grants = SessionGrants::default();
+        resolve_permission(&req, &mut surface, &mut prompter, &mut grants, true);
+
+        assert!(
+            !surface
+                .lines_of(LineKind::Prompt)
+                .iter()
+                .any(|line| line.contains("more")),
+            "{:?}",
+            surface.lines_of(LineKind::Prompt)
         );
     }
 
@@ -7436,6 +7988,42 @@ mod skill_tests {
         );
     }
 
+    /// **REQ-587 BR-5: the consent says who asked.** "You asked for `status`"
+    /// and "the model decided to run `status`" are different questions carrying
+    /// the same command list, and the human at `guarded` is entitled to know
+    /// which one is on the screen.
+    ///
+    /// The user's line is asserted **verbatim and unchanged**, because
+    /// `pty_e2e` pins those bytes against a real terminal: BR-9's attribution is
+    /// an inserted clause on the model's line, never a rewording of REQ-585's.
+    #[test]
+    fn a_skill_consent_says_when_the_model_was_the_one_that_asked() {
+        let ask = |invoked_by| {
+            let req = skill_permission_request(Some(skill_subject_from("status", invoked_by)));
+            let mut surface = RecordingSurface::new();
+            let mut prompter = ScriptedPrompter::new(&["y"]);
+            let mut grants = SessionGrants::default();
+            resolve_permission(&req, &mut surface, &mut prompter, &mut grants, true);
+            surface
+                .lines_of(LineKind::Prompt)
+                .iter()
+                .find(|line| line.contains("dynamic-context command"))
+                .expect("the block names the skill and the count")
+                .to_string()
+        };
+
+        assert_eq!(
+            ask(events::InvokedBy::User),
+            "  skill `status` (user) wants to run 3 dynamic-context commands:",
+            "REQ-585's prompt keeps its bytes; `pty_e2e` pins them",
+        );
+        assert_eq!(
+            ask(events::InvokedBy::Model),
+            "  skill `status` (user), invoked by the model, wants to run 3 \
+             dynamic-context commands:",
+        );
+    }
+
     /// The refusal says what was checked and names the remedy, because a
     /// refusal without one is a dead end — and the remedy is BR-11's stated
     /// automation posture, not an invitation to type at a terminal.
@@ -7480,8 +8068,17 @@ mod skill_tests {
 
     // --------------------------------------------------------- echo line
 
-    /// One invocation, as the daemon publishes it.
+    /// One invocation, as the daemon publishes it — the **user**-typed one,
+    /// which is REQ-585's whole world and every byte of it is still pinned.
     fn invoked(outcomes: Vec<DynamicOutcomeView>) -> SkillInvoked {
+        invoked_by(outcomes, events::InvokedBy::User)
+    }
+
+    /// [`invoked`], with who issued it (REQ-587 BR-9).
+    fn invoked_by(
+        outcomes: Vec<DynamicOutcomeView>,
+        invoked_by: events::InvokedBy,
+    ) -> SkillInvoked {
         SkillInvoked {
             name: "status".to_owned(),
             source: SkillSource::User,
@@ -7490,6 +8087,79 @@ mod skill_tests {
             ignored_keys: vec!["allowed-tools".to_owned(), "model".to_owned()],
             name_note: None,
             outcomes,
+            invoked_by,
+            // The ordinary user-typed row: nobody's name was taken, both doors
+            // are open, and no per-turn budget was spent. Every REQ-585
+            // assertion below runs against exactly this, which is what makes
+            // "those bytes did not move" a claim about the shipped line rather
+            // than about a fixture that happens to avoid the new branches. The
+            // varied ones are built from it by the three helpers under this.
+            shadows_user_skill: false,
+            model_invocable: true,
+            user_invocable: true,
+            turn_invocations: None,
+            // Not refused: this is the record of a skill that ran. The refused
+            // shape is `refusal` below, and it is deliberately built from this
+            // one — a refused record differs from a command-free successful
+            // record in exactly this field, which is the whole reason the field
+            // exists.
+            refused: None,
+        }
+    }
+
+    /// A record of a call the loop **refused**, as either loop stage publishes
+    /// one: no commands, no outcomes, the turn's count, and the reason id.
+    fn refusal(reason: &str, count: u32) -> SkillInvoked {
+        SkillInvoked {
+            outcomes: Vec::new(),
+            turn_invocations: Some(events::TurnInvocations { count, cap: 12 }),
+            refused: Some(reason.to_owned()),
+            ..invoked_by(Vec::new(), events::InvokedBy::Model)
+        }
+    }
+
+    /// [`invoked`] of a **project** skill that took a user skill's name — the
+    /// swap BR-9's echo line names and BR-4's acknowledgment asks about.
+    fn shadowing(outcomes: Vec<DynamicOutcomeView>, by: events::InvokedBy) -> SkillInvoked {
+        SkillInvoked {
+            name: "validate".to_owned(),
+            source: SkillSource::Project,
+            path_display: "~/dev/teton/.claude/skills/validate/SKILL.md".to_owned(),
+            shadows_user_skill: true,
+            ..invoked_by(outcomes, by)
+        }
+    }
+
+    /// A model invocation carrying BR-6a's count, as the tool publishes one.
+    fn counted(count: u32, cap: u32) -> SkillInvoked {
+        SkillInvoked {
+            turn_invocations: Some(events::TurnInvocations { count, cap }),
+            ..invoked_by(vec![ran("date", 8)], events::InvokedBy::Model)
+        }
+    }
+
+    /// [`invoked`] with BR-3's two frontmatter flags set as a file wrote them.
+    fn flagged(user_invocable: bool, model_invocable: bool) -> SkillInvoked {
+        SkillInvoked {
+            user_invocable,
+            model_invocable,
+            ..invoked(vec![ran("date", 8)])
+        }
+    }
+
+    /// [`flagged`] for a file whose `disable-model-invocation` value this build
+    /// could **not** read — `disable-model-invocation: yes`, say.
+    ///
+    /// The wire shape is BR-3's safe reading exactly as the daemon publishes it:
+    /// the model is shut out (`model_invocable: false`), the user's door is
+    /// whatever the other flag said, and the key is named on `ignored_keys`
+    /// because the value was not honored. That list is the *only* signal the
+    /// event carries that a typo rather than a declaration produced this row —
+    /// the raw value is not on the wire.
+    fn flagged_unreadable(user_invocable: bool) -> SkillInvoked {
+        SkillInvoked {
+            ignored_keys: vec!["disable-model-invocation".to_owned()],
+            ..flagged(user_invocable, false)
         }
     }
 
@@ -7532,6 +8202,525 @@ mod skill_tests {
         assert_eq!(
             surface.lines_of(LineKind::Notice),
             vec!["/status → skill status (user, 5.3 KiB, 4 dynamic commands)"]
+        );
+    }
+
+    /// **REQ-587 BR-9 / AC-10, in the shipped spellings.** A model invocation
+    /// echoes one line saying so — `teton_protocol::format_bytes`, so `KiB` and
+    /// not the spec's illustrative `KB`, and **both** counts whenever they
+    /// differ, which AC-5's declined path produces routinely.
+    ///
+    /// It carries **no `/status →` prefix**: nobody typed that line, and a
+    /// transcript that showed one would read exactly like the user's own — the
+    /// single distinction the suffix exists to draw. The parenthetical is
+    /// byte-identical to the user line's, which is the other half of the claim.
+    #[test]
+    fn a_model_invocation_says_so_and_carries_no_typed_prefix() {
+        let outcomes = vec![
+            ran("ls -1", 120),
+            DynamicOutcomeView {
+                command: "date".to_owned(),
+                outcome: DynamicOutcome::NotRun {
+                    reason: NotRunReason::Declined,
+                },
+            },
+            DynamicOutcomeView {
+                command: "git status".to_owned(),
+                outcome: DynamicOutcome::NotRun {
+                    reason: NotRunReason::Declined,
+                },
+            },
+        ];
+        let mut surface = RecordingSurface::new();
+        let mut state = SessionState::new();
+        render_event(
+            &envelope(Event::SkillInvoked(invoked_by(
+                outcomes.clone(),
+                events::InvokedBy::Model,
+            ))),
+            &mut surface,
+            &mut state,
+        );
+
+        assert_eq!(
+            surface.lines_of(LineKind::Notice),
+            vec!["skill status (user, 5.3 KiB, 3 dynamic commands, 1 run) — invoked by the model"],
+        );
+        assert_eq!(surface.calls.len(), 1, "still one line, and never the body");
+
+        // The same invocation typed by the user: the prefix returns, the suffix
+        // goes, and everything between them is the same bytes.
+        let user = skill_echo_line(&invoked(outcomes));
+        assert_eq!(
+            user,
+            "/status → skill status (user, 5.3 KiB, 3 dynamic commands, 1 run)",
+        );
+    }
+
+    /// **BR-9's shadowing clause, in the source slot.** A project skill that
+    /// took a user skill's name says so on the one line every invocation
+    /// prints: the user asked for `validate` and a file the repository
+    /// substituted answered, which is the same swap BR-4's acknowledgment asks
+    /// about and the daemon's expansion frame names to the model.
+    ///
+    /// It is on the **typed** line too, and that is the case worth having:
+    /// `/validate` in a repository that defines its own reaches the
+    /// repository's file with no prompt at any level, so the echo line is the
+    /// only notice the user gets.
+    ///
+    /// **Mutation.** Drop the clause — `source_word` in place of
+    /// `source_words`, or a `source_words` that ignores its second argument —
+    /// and both assertions here fail.
+    #[test]
+    fn a_shadowing_invocation_names_the_swap_in_the_source_slot() {
+        assert_eq!(
+            skill_echo_line(&shadowing(vec![ran("date", 8)], events::InvokedBy::User)),
+            "/validate → skill validate (project — shadows your user skill, 5.3 KiB, \
+             1 dynamic command)",
+        );
+        assert_eq!(
+            skill_echo_line(&shadowing(vec![ran("date", 8)], events::InvokedBy::Model)),
+            "skill validate (project — shadows your user skill, 5.3 KiB, 1 dynamic command) \
+             — invoked by the model",
+        );
+        // An ordinary project skill takes nobody's name and says nothing about
+        // it: the clause is news, not decoration.
+        let plain = SkillInvoked {
+            shadows_user_skill: false,
+            ..shadowing(Vec::new(), events::InvokedBy::Model)
+        };
+        assert_eq!(
+            skill_echo_line(&plain),
+            "skill validate (project, 5.3 KiB, 0 dynamic commands) — invoked by the model",
+        );
+    }
+
+    /// **The `/verbose` flags line speaks `/help`'s words.** BR-3's two states
+    /// have one home (`slash::model_only_words`), so a file both flags deny
+    /// cannot be `invocable by nobody` in `/help` and `model-only` here — the
+    /// only case where two spellings of that precedence would differ, and the
+    /// case where the difference is a claim that the model is running a skill
+    /// no roster contains.
+    ///
+    /// The literals are pinned in **both** files deliberately: the code has one
+    /// home, and re-spelling it reddens `/help`'s row goldens and this test
+    /// together rather than leaving one surface to drift.
+    ///
+    /// The ordinary file gets **no line**, on the `ignored frontmatter` rule:
+    /// this block reports what the file wrote, and a file that declared no flag
+    /// declared nothing to report.
+    #[test]
+    fn verbose_names_the_flags_in_the_same_words_help_marks_them_with() {
+        let flags_line = |user_invocable, model_invocable| -> Option<String> {
+            let mut surface = RecordingSurface::new();
+            let mut state = SessionState::new();
+            state.verbose = true;
+            render_event(
+                &envelope(Event::SkillInvoked(flagged(
+                    user_invocable,
+                    model_invocable,
+                ))),
+                &mut surface,
+                &mut state,
+            );
+            surface
+                .lines_of(LineKind::Info)
+                .iter()
+                .find(|line| line.contains("invocable") || line.contains("hidden"))
+                .map(|line| (*line).to_owned())
+        };
+
+        assert_eq!(
+            flags_line(false, true).as_deref(),
+            Some("  model-only (`user-invocable: false`)"),
+        );
+        assert_eq!(
+            flags_line(false, false).as_deref(),
+            Some(
+                "  invocable by nobody (`user-invocable: false`, \
+                 `disable-model-invocation: true`)"
+            ),
+        );
+        // The user's door open, the model's shut: `/help` marks this row not at
+        // all, because the user may type it — so this line is the only place
+        // the flag is named, and the two surfaces contradict nothing.
+        assert_eq!(
+            flags_line(true, false).as_deref(),
+            Some("  hidden from the model (`disable-model-invocation: true`)"),
+        );
+        assert_eq!(
+            flags_line(true, true),
+            None,
+            "a default is not a declaration"
+        );
+    }
+
+    /// **BR-3's named diagnostic must not name the opposite of what happened.**
+    ///
+    /// A file writing `disable-model-invocation: yes` is hidden from the model —
+    /// that is BR-3's safe reading of a value the parser cannot read — *and* has
+    /// its key on the `ignored frontmatter` line, because the daemon did not
+    /// honor the value it was given. Quoting `disable-model-invocation: true`
+    /// back at that author shows them a line their file does not contain, one
+    /// line above a line that on its own reads "this key had no effect"; of the
+    /// two, the harmless-sounding one is the false one, and the author of the
+    /// typo is exactly the reader this block exists for.
+    ///
+    /// Both `/verbose` lines are asserted **together**, because the failure was
+    /// never in either line alone — it was in what they say side by side.
+    ///
+    /// **Mutation.** Return the literal unconditionally from
+    /// `model_flag_clause` (the shape before this split) and the first two
+    /// assertions fail; drop the malformed branch's reference to the reading it
+    /// took and the third does.
+    #[test]
+    fn verbose_tells_an_unreadable_flag_value_apart_from_the_literal_that_hid_the_file() {
+        let block = |invoked: SkillInvoked| -> Vec<String> {
+            let mut surface = RecordingSurface::new();
+            let mut state = SessionState::new();
+            state.verbose = true;
+            render_event(
+                &envelope(Event::SkillInvoked(invoked)),
+                &mut surface,
+                &mut state,
+            );
+            surface
+                .lines_of(LineKind::Info)
+                .iter()
+                .map(|line| (*line).to_owned())
+                .collect()
+        };
+
+        let typo = block(flagged_unreadable(true));
+        assert!(
+            typo.iter().any(|line| line
+                == "  hidden from the model (`disable-model-invocation` was not `true` or \
+                    `false`, so the safe reading hid it)"),
+            "the file wrote `yes`; the line must say the value was not a boolean \
+             and name the reading it took: {typo:?}"
+        );
+        assert!(
+            !typo
+                .iter()
+                .any(|line| line.contains("`disable-model-invocation: true`")),
+            "a value the file never wrote was quoted back at its author: {typo:?}"
+        );
+        // And the key is still on the ignored line — the daemon's own
+        // diagnostic, which is now explained rather than contradicted.
+        assert!(
+            typo.iter()
+                .any(|line| line == "  ignored frontmatter: disable-model-invocation"),
+            "the unhonored key must still be named: {typo:?}"
+        );
+
+        // The two-flag file, whose model flag is the unreadable one: the
+        // `user-invocable` half is a literal (its safe reading is the unchanged
+        // one, so `false` can only have been written) and the other is not.
+        let both = block(flagged_unreadable(false));
+        assert!(
+            both.iter().any(|line| line
+                == "  invocable by nobody (`user-invocable: false`, \
+                    `disable-model-invocation` was not `true` or `false`, so the safe \
+                    reading hid it)"),
+            "the two flags must be quoted as each was written: {both:?}"
+        );
+
+        // The honored value still reads as the declaration it is — the reverse
+        // mutation, which would tell every author their `true` was a typo.
+        let honored = block(flagged(true, false));
+        assert!(
+            honored
+                .iter()
+                .any(|line| line == "  hidden from the model (`disable-model-invocation: true`)"),
+            "a file that wrote the literal must be quoted verbatim: {honored:?}"
+        );
+    }
+
+    /// **BR-9's `/verbose` count, against the cap.** A bare "3" cannot tell a
+    /// turn halfway through its budget from one at its last permitted call, and
+    /// the `per_turn_cap` refusal would then arrive as a surprise. The ceiling
+    /// rides with the count rather than being hardcoded here, so a daemon that
+    /// moves it does not leave this client printing a stale one.
+    ///
+    /// **Mutation.** Drop the line, or render the count without the cap, and
+    /// this fails.
+    #[test]
+    fn verbose_counts_the_turns_invocations_against_the_cap() {
+        let mut surface = RecordingSurface::new();
+        let mut state = SessionState::new();
+        state.verbose = true;
+        render_event(
+            &envelope(Event::SkillInvoked(counted(3, 12))),
+            &mut surface,
+            &mut state,
+        );
+
+        let detail = surface.lines_of(LineKind::Info);
+        assert_eq!(
+            detail.last().copied(),
+            Some("  invocation 3 of 12 this turn"),
+            "the turn's count closes the block, and names the ceiling: {detail:?}"
+        );
+        // The ceiling is the daemon's, not this crate's: a different cap reads
+        // back as a different line.
+        let mut other = RecordingSurface::new();
+        let mut state = SessionState::new();
+        state.verbose = true;
+        render_event(
+            &envelope(Event::SkillInvoked(counted(1, 25))),
+            &mut other,
+            &mut state,
+        );
+        assert_eq!(
+            other.lines_of(LineKind::Info).last().copied(),
+            Some("  invocation 1 of 25 this turn"),
+        );
+    }
+
+    /// **`None` is a fact, and it renders as nothing at all.** The per-turn cap
+    /// bounds the *model's* calls inside one prompt turn; a human typing
+    /// `/name` spends none of it, and the daemon publishes `None` there.
+    ///
+    /// **Mutation.** Render the count for a `None` — `unwrap_or_default()`, a
+    /// `0 of 12`, or an em-dash placeholder — and this fails. Any of them would
+    /// invent a budget the user is not drawing on, and "0 of 12" would read as
+    /// a turn that has spent nothing rather than as a turn with no cap.
+    #[test]
+    fn a_typed_invocation_prints_no_turn_count_because_it_spends_none_of_the_cap() {
+        let mut surface = RecordingSurface::new();
+        let mut state = SessionState::new();
+        state.verbose = true;
+        render_event(
+            &envelope(Event::SkillInvoked(invoked(vec![ran("date", 8)]))),
+            &mut surface,
+            &mut state,
+        );
+
+        let lines = surface.lines_of(LineKind::Info);
+        assert!(
+            !lines.iter().any(|line| line.contains("this turn")
+                || line.contains(" of ")
+                || line.contains("invocation")),
+            "a typed invocation was given a per-turn budget it does not draw \
+             on: {lines:?}"
+        );
+        // Non-vacuity: the same session *does* print the rest of the block, so
+        // this is the absence of one line rather than of the whole thing.
+        assert!(
+            lines.iter().any(|line| line.contains("SKILL.md")),
+            "{lines:?}"
+        );
+    }
+
+    /// **BR-9's second sentence: a refusal is its own line, and it is not the
+    /// invocation line wearing a flag.**
+    ///
+    /// The fixture is the point. `refusal(…)` differs from a *successful*
+    /// command-free invocation in exactly one field, which is the shape the
+    /// wire has and the reason `refused` exists — so a renderer that ignored it
+    /// would print "skill status (user, 5.3 KiB, 0 dynamic commands)" for a
+    /// call that put nothing in the turn, and the surface would be reporting
+    /// the opposite of what happened.
+    ///
+    /// Three claims: the line **opens with the verdict**, so a glance at the
+    /// left edge tells the two apart; it carries **neither figure** that would
+    /// imply an expansion; and it names the reason in **words**, never the id.
+    ///
+    /// **Mutation.** Drop the refusal branch from `skill_echo_line` and the
+    /// first three assertions fail; render the refusal as the invocation line
+    /// plus a suffix and the size and count assertions fail.
+    #[test]
+    fn a_refused_call_is_not_rendered_as_an_invocation() {
+        let line = skill_echo_line(&refusal("over_budget", 4));
+
+        assert_eq!(
+            line,
+            "refused: skill status (user) — the expansion did not fit this turn's context budget",
+        );
+        assert!(
+            line.starts_with("refused:"),
+            "the verdict has to be the first thing read, not a suffix: {line}"
+        );
+        // Neither figure: both are true of the file and false of this turn.
+        assert!(
+            !line.contains("KiB") && !line.contains("dynamic command"),
+            "a refusal reported a body size or a command count, which would \
+             describe an expansion that never happened: {line}"
+        );
+        // The id keys the record; the sentence is what a person reads.
+        assert!(!line.contains("over_budget"), "{line}");
+
+        // And the same record, but successful, is the line it has always been —
+        // which is what makes the comparison above a claim about the field
+        // rather than about two unrelated fixtures.
+        let ran_instead = SkillInvoked {
+            refused: None,
+            ..refusal("over_budget", 4)
+        };
+        assert_eq!(
+            skill_echo_line(&ran_instead),
+            "skill status (user, 5.3 KiB, 0 dynamic commands) — invoked by the model",
+        );
+
+        // Through `render_event`, because "a refusal is never silent" is a claim
+        // about what reaches the surface and not about what a formatter returns:
+        // a renderer that swallowed the record would leave the pure function
+        // above green and the session with nothing to show.
+        let mut surface = RecordingSurface::new();
+        let mut state = SessionState::new();
+        let outcome = render_event(
+            &envelope(Event::SkillInvoked(refusal("over_budget", 4))),
+            &mut surface,
+            &mut state,
+        );
+        assert!(matches!(outcome, EventOutcome::Rendered));
+        assert_eq!(surface.lines_of(LineKind::Notice), vec![line.as_str()]);
+    }
+
+    /// **The Stage B pair is two records on purpose, and the session prints two
+    /// lines.**
+    ///
+    /// The tool publishes its invocation record at the end of the expansion —
+    /// correct, because those dynamic commands really did run and `/verbose`
+    /// renders their outcomes — and the loop then refuses to fold the result and
+    /// publishes a second record carrying the reason. That is BR-9's two
+    /// sentences about one call, not a duplicate.
+    ///
+    /// **Mutation.** Read the pair as two invocations (ignore `refused`) and the
+    /// second line's assertion fails; dedupe them to one line — by name, or by
+    /// remembering the previous event — and the count fails. The renderer is
+    /// stateless per event precisely so that neither is expressible without
+    /// adding state that the wire does not justify.
+    #[test]
+    fn the_stage_b_pair_prints_an_invocation_line_and_then_a_refusal_line() {
+        let mut surface = RecordingSurface::new();
+        let mut state = SessionState::new();
+
+        // What the tool published when the expansion came back: its commands ran.
+        let expanded = SkillInvoked {
+            turn_invocations: Some(events::TurnInvocations { count: 4, cap: 12 }),
+            ..invoked_by(vec![ran("git status", 96)], events::InvokedBy::Model)
+        };
+        render_event(
+            &envelope(Event::SkillInvoked(expanded)),
+            &mut surface,
+            &mut state,
+        );
+        // …and what the loop published when it declined to fold it.
+        render_event(
+            &envelope(Event::SkillInvoked(refusal("over_budget", 4))),
+            &mut surface,
+            &mut state,
+        );
+
+        assert_eq!(
+            surface.lines_of(LineKind::Notice),
+            vec![
+                "skill status (user, 5.3 KiB, 1 dynamic command) — invoked by the model",
+                "refused: skill status (user) — the expansion did not fit this turn's context \
+                 budget",
+            ],
+            "one call, two records, two lines — in the order the daemon published \
+             them, and neither folded into the other"
+        );
+    }
+
+    /// **A reason id this build has never heard of still reads.** Six of the
+    /// daemon's ids are unpublished today and the set is open; a client that
+    /// rendered a blank line, or dropped the event, would leave nothing on the
+    /// surface saying the call happened at all — BUG-186's shape, and the
+    /// failure `PermissionSubject::Unrecognized` exists to prevent for subjects.
+    ///
+    /// The id is quoted **inside a sentence**, which is the same answer
+    /// [`refusal_line`] gives for a request whose subject it cannot name: the
+    /// daemon's own word for what it did is the only information there is, and
+    /// it is how a user finds the refusal in a log.
+    #[test]
+    fn an_unrecognized_refusal_id_still_reads_as_a_sentence() {
+        let line = skill_echo_line(&refusal("some_reason_invented_later", 2));
+
+        assert_eq!(
+            line,
+            "refused: skill status (user) — the daemon reported \
+             `some_reason_invented_later`",
+        );
+        assert!(
+            line.starts_with("refused:") && line.len() > "refused: skill status (user) — ".len(),
+            "an unknown id must not render a blank tail: {line:?}"
+        );
+    }
+
+    /// Every published id this build knows reads as a distinct sentence, and
+    /// none of them is its own wire spelling.
+    ///
+    /// Listed exhaustively rather than sampled, on
+    /// [`the_not_run_reasons_read_as_different_sentences`]'s rule: an id added
+    /// to the daemon and forgotten here reaches a user wearing the fallback
+    /// sentence, which is readable but says less than it could.
+    #[test]
+    fn the_refusal_reasons_read_as_different_sentences() {
+        let ids = [
+            "over_budget",
+            "per_turn_cap",
+            "repeated",
+            "unknown_skill",
+            "not_model_invocable",
+            "reserved_name",
+            "invalid_arguments",
+            "project_not_acknowledged",
+        ];
+        let mut seen: Vec<String> = ids.iter().map(|id| refusal_reason_words(id)).collect();
+        for (id, words) in ids.iter().zip(seen.iter()) {
+            assert!(
+                !words.contains(id),
+                "`{id}` reached a user as its own wire spelling: {words}"
+            );
+            assert!(
+                !words.contains("the daemon reported"),
+                "`{id}` fell through to the unknown arm: {words}"
+            );
+        }
+        let total = seen.len();
+        seen.sort();
+        seen.dedup();
+        assert_eq!(seen.len(), total, "two reasons share a sentence: {seen:?}");
+    }
+
+    /// **`/verbose` under a refusal: the turn's count, and none of the file
+    /// detail.**
+    ///
+    /// The detail block reports what the invocation did — the file its body came
+    /// from, what its frontmatter did on the way, what each command did — and a
+    /// refused call did none of it. The count is the exception because it is
+    /// about the *turn*, and on a `per_turn_cap` refusal it is the evidence for
+    /// the refusal itself.
+    #[test]
+    fn verbose_under_a_refusal_adds_the_turn_count_and_no_file_detail() {
+        let mut surface = RecordingSurface::new();
+        let mut state = SessionState::new();
+        state.verbose = true;
+        render_event(
+            &envelope(Event::SkillInvoked(refusal("per_turn_cap", 12))),
+            &mut surface,
+            &mut state,
+        );
+
+        assert_eq!(
+            surface.lines_of(LineKind::Info),
+            vec!["  invocation 12 of 12 this turn"],
+            "the count is the evidence for this refusal, and the file detail \
+             describes an expansion that did not happen"
+        );
+        assert!(
+            !surface.any_line_contains(LineKind::Info, "SKILL.md"),
+            "a refusal claimed a body came from a file"
+        );
+        assert_eq!(
+            surface.lines_of(LineKind::Notice),
+            vec![
+                "refused: skill status (user) — this turn has already made as many skill \
+                  calls as it may"
+            ],
         );
     }
 
@@ -7585,6 +8774,10 @@ mod skill_tests {
     /// **BR-12's `/verbose` clause.** The path, the ignored frontmatter keys and
     /// one line per command's typed outcome — added under the echo line, and
     /// only under `/verbose`.
+    ///
+    /// `allowed-tools` and `model` are still inert under REQ-587: BR-3 shrank
+    /// REQ-585 BR-5's list by exactly two keys, and neither of them is one of
+    /// these.
     #[test]
     fn verbose_adds_the_path_the_ignored_keys_and_one_line_per_outcome() {
         let event = Event::SkillInvoked(invoked(vec![
@@ -7665,6 +8858,46 @@ mod skill_tests {
         assert!(
             !surface.any_line_contains(LineKind::Info, "ignored frontmatter"),
             "{:?}",
+            surface.lines_of(LineKind::Info)
+        );
+    }
+
+    /// **Which keys a build honors is the daemon's answer, and this line is a
+    /// renderer.**
+    ///
+    /// REQ-587 BR-3 takes `disable-model-invocation` and `user-invocable` out
+    /// of the inert list — *when the daemon could read their values*. A value
+    /// it could not read leaves the key named here, which is how a user who
+    /// wrote `user-invocable: yes` learns the line did nothing; the same bytes
+    /// arrive from a REQ-585-vintage daemon, for which they are simply true.
+    ///
+    /// So the client filters nothing. A filter here would be a second home for
+    /// a rule the daemon owns, and the stale one against a daemon of any other
+    /// vintage (LESSON-528) — it would swallow exactly the diagnostic BR-3
+    /// promises instead of a silent ignore.
+    #[test]
+    fn verbose_names_the_keys_the_daemon_called_ignored_and_filters_none_of_them() {
+        let mut event = invoked(vec![ran("date", 8)]);
+        event.ignored_keys = vec![
+            "user-invocable".to_owned(),
+            "disable-model-invocation".to_owned(),
+        ];
+        let mut surface = RecordingSurface::new();
+        let mut state = SessionState::new();
+        state.verbose = true;
+        render_event(
+            &envelope(Event::SkillInvoked(event)),
+            &mut surface,
+            &mut state,
+        );
+
+        assert!(
+            surface.any_line_contains(
+                LineKind::Info,
+                "  ignored frontmatter: user-invocable, disable-model-invocation"
+            ),
+            "the daemon named two keys it did not honor and both must reach the \
+             user, in the daemon's order: {:?}",
             surface.lines_of(LineKind::Info)
         );
     }
@@ -7765,7 +8998,10 @@ mod skill_tests {
     /// see any of that, because by then the request never reaches a human.
     #[test]
     fn a_root_move_forgets_the_project_skill_grants_and_keeps_the_others() {
-        use teton_protocol::methods::{skill_permission_key, SkillSource};
+        use teton_protocol::methods::{
+            expires_on_session_root_change, project_skill_trust_key, skill_permission_key,
+            SkillSource,
+        };
 
         let mut surface = RecordingSurface::new();
         let mut state = SessionState::new();
@@ -7773,15 +9009,41 @@ mod skill_tests {
 
         let project = skill_permission_key(SkillSource::Project, "deploy");
         let user = skill_permission_key(SkillSource::User, "status");
+        // REQ-587 BR-4 / ASSUME-017: the acknowledgment is the second family a
+        // root move invalidates, and the one whose survival costs most.
+        let acknowledgment = project_skill_trust_key("~/dev/before");
         state.grants.allow_always(&project);
         state.grants.allow_always(&user);
         state.grants.allow_always("shell");
+        state.grants.allow_always(&acknowledgment);
         state
             .grants
             .reject_always(&skill_permission_key(SkillSource::Project, "canary"));
 
         render_event(&root_moved("s1"), &mut surface, &mut state);
 
+        // **The two stores expire the same keys at the same moment.** This
+        // client's memo is consulted *before* any prompt is drawn, so a key it
+        // keeps and the daemon drops is not a stale entry — it is an
+        // `auto-allow` line answering the new root's question with the old
+        // root's answer, with no human shown anything. Asserted against the
+        // shared predicate rather than against a list of keys, so a family
+        // added to one side cannot be forgotten on this one.
+        for key in [&project, &acknowledgment] {
+            assert!(
+                expires_on_session_root_change(key),
+                "`{key}` is one of the keys a `/cd` invalidates",
+            );
+            assert!(
+                !state.grants.is_allow_always(key),
+                "`{key}` outlived the root that gave it meaning, and this store \
+                 answers before a prompt is drawn",
+            );
+        }
+        assert!(
+            !expires_on_session_root_change(&user) && !expires_on_session_root_change("shell"),
+            "the kept half is kept because the rule says so, not by coincidence",
+        );
         assert!(
             !state.grants.is_allow_always(&project),
             "a project skill's grant outlived the root that gave its name meaning",
@@ -7829,15 +9091,16 @@ mod skill_tests {
 /// A source-level scan of the whole `teton` crate, in the style of
 /// `tetond/tests/boundary_coverage.rs`'s.
 ///
-/// The claim ADR-7 makes is a **negative** one — `req.tool_name`'s
-/// `skill:<source>:<name>` shape is not parsed anywhere in this crate — and a
-/// negative claim about code that does not exist cannot be asserted by running
-/// anything. So it is asserted about the source itself, embedded with
+/// The claim ADR-7 makes is a **negative** one — neither shape `req.tool_name`
+/// can take for this feature (`skill:<source>:<name>` and REQ-587's
+/// `project_skill_trust:<root>`) is parsed or composed anywhere in this crate —
+/// and a negative claim about code that does not exist cannot be asserted by
+/// running anything. So it is asserted about the source itself, embedded with
 /// `include_str!` at compile time rather than read from disk, which is BUG-159's
 /// trap: a scan that opens files at runtime passes vacuously from a directory
 /// that is not the crate.
 ///
-/// The rule this guards is not "the key is unimportant" — it is the grant key,
+/// The rule this guards is not "the key is unimportant" — each is a grant key,
 /// and [`SessionGrants`] uses it as an **opaque** one, whole, hashed, never
 /// split. What a client may not do is *select behaviour* by its shape: BR-11
 /// says the key is an implementation detail, and a client sniffing an unstable
@@ -7848,6 +9111,9 @@ mod skill_tests {
 #[cfg(test)]
 mod key_scan {
     use std::collections::BTreeSet;
+    use teton_protocol::methods::{
+        skill_permission_key_prefix, SkillSource, PROJECT_SKILL_TRUST_KEY_PREFIX,
+    };
 
     /// Every production source file of this crate. A fixed list, because
     /// `include_str!` takes a literal path — and
@@ -7876,10 +9142,37 @@ mod key_scan {
         ("web_setup_ui.rs", include_str!("web_setup_ui.rs")),
     ];
 
-    /// A string literal that opens with the grant key's prefix — `"skill:` —
-    /// which is what `starts_with`, `strip_prefix`, `split` and `format!` all
-    /// need in order to take the key apart or to build one.
-    const KEY_LITERAL: &str = "\"skill:";
+    /// The string literals a client would have to write in order to take one of
+    /// this feature's grant keys apart **or to build one**: an opening quote
+    /// followed by a key family's prefix, which is what `starts_with`,
+    /// `strip_prefix`, `split` and `format!` all need.
+    ///
+    /// **Both families, and neither of them spelled here.** REQ-587 minted a
+    /// second key beside REQ-585's `skill:<source>:<name>` — the project-skill
+    /// acknowledgment's `project_skill_trust:<root>` (ADR-7) — and a scan that
+    /// knew only the first would pass a client that matched the second by
+    /// string. The [`DECOMPOSITIONS`] half catches a `starts_with` on either,
+    /// but not a `format!` that *builds* one, so the literal needle is the only
+    /// guard on that half of the mutation and it has to cover both keys.
+    ///
+    /// The prefixes are read off the protocol's own definitions rather than
+    /// re-typed, so a rename of either key reaches this scan through the
+    /// compiler instead of through somebody's grep (LESSON-546).
+    fn key_literals() -> Vec<String> {
+        // `skill:` — the root both source prefixes share, taken off one of them
+        // rather than written out: a client matching the bare family root is
+        // the mutation this catches, and a needle of `"skill:user:` would miss
+        // it.
+        let source_prefix = skill_permission_key_prefix(SkillSource::User);
+        let family = source_prefix
+            .split_once(':')
+            .expect("the skill permission key is `skill:<source>:<name>`")
+            .0;
+        vec![
+            format!("\"{family}:"),
+            format!("\"{PROJECT_SKILL_TRUST_KEY_PREFIX}"),
+        ]
+    }
 
     /// Ways to decompose the key once it is in hand. `as_str`, `clone` and a
     /// bare `{}` are absent on purpose: passing the key along whole, hashing it
@@ -7920,15 +9213,17 @@ mod key_scan {
     }
 
     /// **ADR-7 / BR-11.** No production line of this crate builds or takes apart
-    /// the `skill:<source>:<name>` permission key. A client that sniffed it
-    /// would mis-fire the one way that costs a stdin line, and the typed
-    /// `PermissionSubject` exists precisely so that it never has to.
+    /// either permission key this feature mints — `skill:<source>:<name>` or
+    /// `project_skill_trust:<root>`. A client that sniffed one would mis-fire
+    /// the one way that costs a stdin line, and the typed `PermissionSubject`
+    /// exists precisely so that it never has to.
     #[test]
     fn no_production_source_parses_the_skill_permission_key() {
+        let literals = key_literals();
         let mut offences: Vec<String> = Vec::new();
         for (file, text) in CRATE_SOURCES {
             for (index, line) in code_lines(production_half(text)) {
-                if line.contains(KEY_LITERAL) {
+                if literals.iter().any(|needle| line.contains(needle)) {
                     offences.push(format!("{file}:{}: {}", index + 1, line.trim()));
                 }
                 for needle in DECOMPOSITIONS {
@@ -7985,22 +9280,48 @@ mod key_scan {
         );
     }
 
-    /// The scan is not vacuous: it really would fire.
+    /// The scan is not vacuous: it really would fire, **on both key families
+    /// and on both shapes of the mutation**.
     ///
-    /// Both needles are exercised against text shaped like the mutation they
-    /// exist to catch — a client that recognized a skill consent by reading its
-    /// key — so a later edit that broke `production_half`, `code_lines` or the
-    /// needle list is a failure here rather than a green scan of nothing.
+    /// Every needle is exercised against text shaped like the mutation it
+    /// exists to catch — a client that recognized a consent by reading its key,
+    /// and a client that composed one — so a later edit that broke
+    /// `production_half`, `code_lines` or [`key_literals`] is a failure here
+    /// rather than a green scan of nothing.
+    ///
+    /// The `format!` rows are the ones [`DECOMPOSITIONS`] cannot see: nothing is
+    /// taken apart there, so the literal needle is the whole guard, and before
+    /// REQ-587 extended it a client building a `project_skill_trust:` key passed
+    /// this module untouched.
     #[test]
     fn the_scan_would_catch_a_client_that_sniffed_the_key() {
-        let sniffing = "    if req.tool_name.starts_with(\"skill:\") {\n        ask();\n    }\n";
-        let hits: Vec<&str> = code_lines(production_half(sniffing))
-            .filter(|(_, line)| {
-                line.contains(KEY_LITERAL) || DECOMPOSITIONS.iter().any(|n| line.contains(n))
-            })
-            .map(|(_, line)| line)
-            .collect();
-        assert_eq!(hits.len(), 1, "the mutation is caught: {hits:?}");
+        let literals = key_literals();
+        let offending_lines = |source: &str| -> Vec<String> {
+            code_lines(production_half(source))
+                .filter(|(_, line)| {
+                    literals.iter().any(|needle| line.contains(needle))
+                        || DECOMPOSITIONS.iter().any(|n| line.contains(n))
+                })
+                .map(|(_, line)| line.to_owned())
+                .collect()
+        };
+
+        for mutation in [
+            // Reading a skill key's shape …
+            "    if req.tool_name.starts_with(\"skill:\") {\n        ask();\n    }\n",
+            // … and the acknowledgment key's, which is the family REQ-587 added.
+            "    if req.tool_name.starts_with(\"project_skill_trust:\") {\n        ask();\n    }\n",
+            // Building either, which no decomposition needle can catch.
+            "    let key = format!(\"skill:{source}:{name}\");\n",
+            "    let key = format!(\"project_skill_trust:{root}\");\n",
+        ] {
+            let hits = offending_lines(mutation);
+            assert_eq!(
+                hits.len(),
+                1,
+                "the mutation is caught: {mutation:?} → {hits:?}"
+            );
+        }
 
         // And a comment saying the same words is not an offence.
         let prose = "    /// The key's `skill:<source>:<name>` shape (`\"skill:`) is not parsed.\n";

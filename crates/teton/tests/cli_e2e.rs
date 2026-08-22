@@ -5856,6 +5856,23 @@ fn skill_file(description: &str, hint: Option<&str>, body: &str) -> String {
     out
 }
 
+/// [`skill_file`] with extra frontmatter lines between the delimiters — the
+/// two REQ-587 BR-3 flags, and any future key a fixture needs to declare.
+///
+/// A builder rather than four literal files: the flags are `key: value` lines
+/// under REQ-585's flat parser, and a fixture that hand-wrote the header would
+/// drift from the one `skill_file` writes for every other test here.
+fn skill_file_with(description: &str, frontmatter: &[&str], body: &str) -> String {
+    let mut out = format!("---\ndescription: {description}\n");
+    for line in frontmatter {
+        out.push_str(line);
+        out.push('\n');
+    }
+    out.push_str("---\n");
+    out.push_str(body);
+    out
+}
+
 /// A project fixture under `root`: a `Cargo.toml` (so the root classifies as a
 /// project) and nothing else.
 fn project_at(root: &Path, name: &str) -> PathBuf {
@@ -6053,6 +6070,124 @@ fn slash_help_lists_the_discovered_skills_with_their_sources_and_the_diagnostic(
             "`{footer}` vanished from /help; listing:\n{full:#?}"
         );
     }
+}
+
+/// **REQ-587 AC-12: `/help` marks the rows the user may not type, and typing
+/// one names the flag that made it so.**
+///
+/// End to end, through a real daemon that reads the two frontmatter flags: the
+/// mark is only honest if the flags survive discovery, the wire and the render,
+/// and the unit tests upstream of this one can each be green while any of those
+/// three drops a key ([`both_invocation_flags_reach_the_client`] is the
+/// daemon-side half of the same claim).
+///
+/// Four rows, because BR-3's states are only distinguishable side by side:
+///
+/// * `alpha` declares neither flag — the ordinary row, unmarked;
+/// * `beta` declares `disable-model-invocation: true` — hidden from the model
+///   and **unmarked here**, because that flag says nothing about the user;
+/// * `delta` declares `user-invocable: false` — model-only, marked;
+/// * `mute` declares both — listed, invocable by nobody, and this is the only
+///   surface in the product that renders the combination.
+#[test]
+fn slash_help_marks_a_model_only_skill_and_typing_it_names_the_flag() {
+    let daemon_bin = daemon_bin();
+    let teton = teton_bin();
+
+    let home = SkillTree::new("m");
+    home.write(
+        ".claude/skills/alpha/SKILL.md",
+        &skill_file("the alpha skill", Some("[target]"), "Alpha body.\n"),
+    );
+    home.write(
+        ".claude/commands/beta.md",
+        &skill_file_with(
+            "the beta skill",
+            &["disable-model-invocation: true"],
+            "Beta body.\n",
+        ),
+    );
+    home.write(
+        ".claude/commands/delta.md",
+        &skill_file_with(
+            "the delta skill",
+            &["user-invocable: false"],
+            "Delta body.\n",
+        ),
+    );
+    home.write(
+        ".claude/commands/mute.md",
+        &skill_file_with(
+            "the mute skill",
+            &["user-invocable: false", "disable-model-invocation: true"],
+            "Mute body.\n",
+        ),
+    );
+
+    let daemon = TestDaemon::spawn_scripted_with_env(
+        &daemon_bin,
+        TURN_REPLIES,
+        &[("HOME", home.path().to_str().unwrap())],
+    );
+    let project = project_at(&daemon.root, "proj");
+    let (stdout, stderr, status) = daemon.run_cli_from(
+        &teton,
+        &["--cwd", project.to_str().unwrap()],
+        "/help\n/delta\n/mute\n/beta\n",
+        None,
+        &[("HOME", home.path())],
+    );
+    assert!(status.success(), "stdout:\n{stdout}\nstderr:\n{stderr}");
+
+    let listing = help_listing(&stdout, "`/help`");
+    assert_eq!(
+        skill_rows(&listing, "`/help`"),
+        vec![
+            "/alpha [target] — the alpha skill (user)".to_owned(),
+            "/beta — the beta skill (user)".to_owned(),
+            "/delta — the delta skill (user, model-only)".to_owned(),
+            "/mute — the mute skill (user, invocable by nobody)".to_owned(),
+        ],
+        "a row the user may not type must say which kind of row it is, and a \
+         row only the *model* may not reach must not be marked at all; \
+         listing:\n{listing:#?}"
+    );
+    // Registered and counted, never skipped: BR-3's flags are a named state of
+    // a file discovery accepted, not a reason to drop it.
+    assert_eq!(
+        skills_diagnostic(&listing, "`/help`"),
+        "4 skills (user 4, project 0); 0 skipped",
+        "listing:\n{listing:#?}"
+    );
+
+    // Typed: the refusal names the line of the user's own file, because the
+    // name is spelled correctly and listed in `/help` four lines above.
+    assert!(
+        stdout.contains(&format!(
+            "`/delta` is a skill whose frontmatter says `user-invocable: false`, so only the \
+             model may invoke it — {HELP_HINT}"
+        )),
+        "output:\n{stdout}"
+    );
+    assert!(
+        stdout.contains(&format!(
+            "`/mute` is a skill whose frontmatter says `user-invocable: false`, so nobody may \
+             invoke it — its frontmatter also says `disable-model-invocation: true` — {HELP_HINT}"
+        )),
+        "the two-flag row must not be told that the model may run it; output:\n{stdout}"
+    );
+    assert!(
+        !stdout.contains("unknown command: `/delta`"),
+        "a listed name answered as if the session had never heard of it; \
+         output:\n{stdout}"
+    );
+    // …and `disable-model-invocation` costs the user nothing: `/beta` still
+    // dispatches, which is what keeps the two flags from being read as one.
+    assert!(
+        stdout.contains("/beta → skill beta (user,"),
+        "a skill hidden from the model must still dispatch for the user; \
+         output:\n{stdout}"
+    );
 }
 
 /// **AC-2: a skill may not take a name the table has claimed.**
@@ -6494,6 +6629,145 @@ fn verbose_shows_the_invocation_line_with_its_path_and_per_command_outcomes() {
     );
 }
 
+/// **REQ-587 BR-9: the echo line names the swap, and `/verbose` names the
+/// flags — end to end, on the path a person can actually type.**
+///
+/// Both facts are new keys on `skill_invoked`, and each has three places to be
+/// dropped between the registry row and the screen: the daemon's publish, the
+/// wire, and the renderer. A unit test on the renderer is green while any of
+/// the first two loses a key, which is why this leg exists at all.
+///
+/// It drives the **typed** path deliberately. The model path is instrumented in
+/// `tetond/tests/skill_turn.rs`, where a real tool call can be made; here the
+/// point is that neither fact is model-only news — `/validate` in a repository
+/// that defines its own reaches the repository's file at every permission level
+/// with no prompt, so this echo line is the only notice the user gets that the
+/// name they typed resolved somewhere else.
+///
+/// The **turn count** is asserted by its absence, which is the same claim from
+/// the other side: a typed invocation spends none of the per-turn cap, and a
+/// renderer that printed `0 of 12` here would name a budget the user is not
+/// drawing on.
+///
+/// The third skill (`/gamma`) is BR-3's **typo** case, and it needs the whole
+/// product to be honest: the daemon reads a value that is not a boolean, takes
+/// the safe reading, names the key as unhonored, and only the client can tell
+/// the reader which of the two things happened. A renderer that quoted the
+/// canonical literal here would show an author a line their file does not
+/// contain — and a unit test on either half alone cannot see that, because each
+/// half is doing exactly what it was asked to.
+#[test]
+fn a_typed_invocation_names_the_swap_and_its_flags_and_counts_no_turn_budget() {
+    let daemon_bin = daemon_bin();
+    let teton = teton_bin();
+
+    const VALIDATE_BODY: &str = "Validate the repository's way.\n";
+
+    let home = SkillTree::new("n");
+    // The user's own `validate`, which the repository's is about to take the
+    // name from — without this file there is no swap to name.
+    home.write(
+        ".claude/skills/validate/SKILL.md",
+        &skill_file("the user validate", None, "User body.\n"),
+    );
+    // Hidden from the model, still the user's to type: the flag `/help` marks
+    // not at all, and this line is the only place it is ever named.
+    home.write(
+        ".claude/commands/beta.md",
+        &skill_file_with(
+            "the beta skill",
+            &["disable-model-invocation: true"],
+            "Beta body.\n",
+        ),
+    );
+    // The same flag with a value no parser reads as a boolean. BR-3's safe
+    // reading hides this file from the model exactly as beta's `true` does — the
+    // *outcome* is identical — while the file itself said something else
+    // entirely, and `/verbose` is where the author of the typo finds out which
+    // of the two happened.
+    home.write(
+        ".claude/commands/gamma.md",
+        &skill_file_with(
+            "the gamma skill",
+            &["disable-model-invocation: yes"],
+            "Gamma body.\n",
+        ),
+    );
+
+    let daemon = TestDaemon::spawn_scripted_with_env(
+        &daemon_bin,
+        TURN_REPLIES,
+        &[("HOME", home.path().to_str().unwrap())],
+    );
+    let project = project_at(&daemon.root, "proj");
+    std::fs::create_dir_all(project.join(".claude/skills/validate")).unwrap();
+    std::fs::write(
+        project.join(".claude/skills/validate/SKILL.md"),
+        skill_file("the project validate", None, VALIDATE_BODY),
+    )
+    .unwrap();
+
+    let (stdout, stderr, status) = daemon.run_cli_from(
+        &teton,
+        &["--cwd", project.to_str().unwrap()],
+        "/verbose\n/validate\n/beta\n/gamma\n",
+        None,
+        &[("HOME", home.path())],
+    );
+    assert!(status.success(), "stdout:\n{stdout}\nstderr:\n{stderr}");
+
+    assert!(
+        stdout.contains(&format!(
+            "/validate → skill validate (project — shadows your user skill, {}, \
+             0 dynamic commands)",
+            teton_protocol::format_bytes(VALIDATE_BODY.len() as u64)
+        )),
+        "the echo line must name the swap in the source slot — the user typed a \
+         name their own shelf has and the repository answered; output:\n{stdout}"
+    );
+    assert!(
+        stdout.contains("  hidden from the model (`disable-model-invocation: true`)"),
+        "`/verbose` must name the flag this build honored, in the file's own \
+         spelling; output:\n{stdout}"
+    );
+    // BR-3's *other* reading of the same key, through the whole product: the
+    // daemon parses `yes`, takes the safe value, names the key as unhonored, and
+    // the client words the two cases apart. The old line quoted
+    // `disable-model-invocation: true` at an author who wrote `yes` — a line
+    // their file does not contain — one line above `ignored frontmatter:
+    // disable-model-invocation`, which alone reads as "this key did nothing".
+    assert!(
+        stdout.contains(
+            "  hidden from the model (`disable-model-invocation` was not `true` or \
+             `false`, so the safe reading hid it)"
+        ),
+        "a file whose flag value is not a boolean must be told so, and told \
+         which reading was taken; output:\n{stdout}"
+    );
+    assert!(
+        stdout.contains("  ignored frontmatter: disable-model-invocation"),
+        "the unhonored key is still named, now explained by the line above it \
+         rather than contradicted by it; output:\n{stdout}"
+    );
+    // The flags line reports what the file *wrote*: neither skill declared
+    // `user-invocable`, so neither is called model-only anywhere.
+    assert!(
+        !stdout.contains("model-only") && !stdout.contains("invocable by nobody"),
+        "a file that declared no `user-invocable` key was reported as if it \
+         had; output:\n{stdout}"
+    );
+    // Matched as a **line shape**, not as a phrase: `this turn` occurs in the
+    // route classifier's own sentence, and a substring search would pass on
+    // that instead of on the absence it is asserting.
+    assert!(
+        !stdout
+            .lines()
+            .any(|line| line.trim_start().starts_with("invocation ") && line.contains("this turn")),
+        "a typed invocation was given a per-turn budget it does not draw on; \
+         output:\n{stdout}"
+    );
+}
+
 /// **AC-14: `/cd` re-derives the project skills and leaves the user skills
 /// alone — and `/help` says so without a restart.**
 ///
@@ -6622,4 +6896,280 @@ fn a_skipped_skill_says_why_and_a_name_nobody_has_stays_unknown() {
          output:\n{stdout}"
     );
     assert_no_turn_ran(&stdout, "a skipped and an unknown name");
+}
+
+// ---------------------------------------------------------------------------
+// REQ-587 TASK-222 — the two legs only a model-issued call can drive
+// ---------------------------------------------------------------------------
+//
+// The scripted local engine reads the text tool-call form
+// (`{"tool": …, "arguments": …}`), which is the only way a *whole-CLI* test can
+// make the model issue a `skill` call. Both legs below need one: an
+// acknowledgment nobody types, and a refusal nobody can earn by typing.
+//
+// The tier is deliberately the **local** one, and both legs turn on that: it is
+// what makes the second refusal reachable at all (`LOCAL_BUDGET_BYTES` is 32 KiB
+// and the fixture body is larger), and it is why AC-10's *cost* half is not
+// here — a local turn produces no billed row, so a `/cost` assertion at this
+// layer is vacuous. That half runs against a remote `Vendor` in
+// `tetond/tests/skill_turn.rs`, and BUG-183 is what happens when it does not.
+
+/// The scripted engine's replies for a session that invokes a skill twice: once
+/// successfully, once past the local route's budget.
+const SKILL_CALL_REPLIES: &[&str] = &[
+    r#"{"tool": "skill", "arguments": {"name": "small", "args": "REQ-587"}}"#,
+    "the small skill landed.",
+    r#"{"tool": "skill", "arguments": {"name": "huge", "args": ""}}"#,
+    "the huge skill did not.",
+];
+
+/// **REQ-587 BR-9 end to end: a model invocation echoes one line, and a model
+/// invocation the loop refuses echoes a *different* one.**
+///
+/// TASK-219 could reach neither. Both lines are raised only by a call the model
+/// makes, so no typed line drives them, and the negative half lived at unit
+/// level. Once the tool is wired, both are on the path a person actually sees —
+/// and the second is where the trap is: a first draft that exercised only
+/// `skill_echo_line` stayed **green** under "drop the line entirely", because
+/// *a refusal is never silent* is a claim about what reaches the surface, not
+/// about what a formatter returns. This drives `render_event`.
+///
+/// The refusal's shape is the assertion, not merely its presence. A refused
+/// record and a command-free skill that ran are the same bytes apart from one
+/// field, so a refusal rendered as "the invocation line, plus something" reads
+/// at a glance as a skill that worked. It therefore opens with the verdict and
+/// carries **no** size and **no** dynamic-command count — both true of the file
+/// and false of this turn.
+#[test]
+fn a_model_invocation_echoes_its_line_and_a_refused_one_says_so_instead() {
+    let daemon_bin = daemon_bin();
+    let teton = teton_bin();
+
+    const SMALL_BODY: &str = "Do the small thing for $ARGUMENTS.\n";
+    let home = SkillTree::new("mi");
+    home.write(".claude/skills/small/SKILL.md", &{
+        let mut out = String::from("---\ndescription: the small skill\n---\n");
+        out.push_str(SMALL_BODY);
+        out
+    });
+    // Larger than the local route's byte budget (32 KiB) with the system prompt
+    // beside it, so Stage A in the loop refuses it — the one refusal a local
+    // tier can actually produce, and the reason this leg is scripted local.
+    let filler = "abcdefgh ".repeat(5_000);
+    home.write(
+        ".claude/skills/huge/SKILL.md",
+        &format!("---\ndescription: the huge skill\n---\nHUGE-BODY-MARKER {filler}\n"),
+    );
+
+    let daemon = TestDaemon::spawn_scripted_with_env(
+        &daemon_bin,
+        SKILL_CALL_REPLIES,
+        &[("HOME", home.path().to_str().unwrap())],
+    );
+    let project = project_at(&daemon.root, "proj");
+    let (stdout, stderr, status) = daemon.run_cli_from(
+        &teton,
+        &["--cwd", project.to_str().unwrap()],
+        "/verbose\nrun the small skill\nrun the huge skill\n",
+        None,
+        &[("HOME", home.path())],
+    );
+    assert!(status.success(), "stdout:\n{stdout}\nstderr:\n{stderr}");
+
+    // The successful line: no `/name →` prefix, because nobody typed one.
+    assert!(
+        stdout.contains(&format!(
+            "skill small (user, {}, 0 dynamic commands) — invoked by the model",
+            teton_protocol::format_bytes(SMALL_BODY.len() as u64)
+        )),
+        "a model invocation must echo one line saying the model asked; \
+         output:\n{stdout}"
+    );
+    assert!(
+        !stdout.contains("/small →"),
+        "nobody typed `/small`; a model invocation must not render as the \
+         user's own line; output:\n{stdout}"
+    );
+    // The `12` is `tetond::harness::tools::skill::PER_TURN_INVOCATION_CAP`,
+    // spelled rather than read: the `teton` crate cannot depend on `tetond`, and
+    // a whole-CLI test reads the daemon's ceiling off the wire like any client.
+    // The literal is therefore correct and brittle in the same breath, so the
+    // message names the constant that moved rather than leaving a reader to
+    // wonder where `12` came from.
+    assert!(
+        stdout.contains("  invocation 1 of 12 this turn"),
+        "`/verbose` shows the turn's count against the cap for a model \
+         invocation — the `12` here is `PER_TURN_INVOCATION_CAP` \
+         (`tetond::harness::tools::skill`), spelled because this crate cannot \
+         depend on that one; if that constant moved, this literal follows it. \
+         output:\n{stdout}"
+    );
+    // AC-10's `tool_call` title: `skill <name>`, so the status line says which
+    // skill the model reached for rather than only that *something* did.
+    assert!(
+        stdout.contains("- skill small [") && stdout.contains("- skill huge ["),
+        "each `skill` call's status line must be titled with the skill it \
+         named; output:\n{stdout}"
+    );
+
+    // The refusal line: the verdict first, the reason named, and none of the
+    // figures that would claim an expansion happened.
+    assert!(
+        stdout.contains(
+            "refused: skill huge (user) — the expansion did not fit this turn's context budget"
+        ),
+        "a refused model invocation must print one line naming the reason; \
+         output:\n{stdout}"
+    );
+    assert!(
+        !stdout.contains("skill huge (user,"),
+        "the refusal must not be rendered as the invocation line with something \
+         added — at a glance that reads as a skill that ran; output:\n{stdout}"
+    );
+    // Nothing of the refused body entered the session.
+    assert!(
+        !stdout.contains("HUGE-BODY-MARKER"),
+        "a refused expansion reached the surface; output:\n{stdout}"
+    );
+    // …and the turn went on rather than ending: the refusal is a tool result.
+    assert!(
+        stdout.contains("the huge skill did not."),
+        "a refusal is a tool result the model relays, not a turn-ender; \
+         output:\n{stdout}"
+    );
+}
+
+/// **REQ-587 AC-6's pipe leg, which TASK-219 could not reach.**
+///
+/// BR-4's acknowledgment is raised only by a *model-issued* call for a
+/// **project** skill, so no typed line drives it and the negative pin lived at
+/// unit level (`prompter.asked == 0` with the pasted `y` still queued). With the
+/// tool wired, the whole rule is observable end to end: on piped stdin at
+/// `guarded` the client refuses **without reading a line**, the model is told
+/// what the user must do, and the `y` that follows is still the next prompt.
+///
+/// The negative is asserted as one, the way
+/// [`on_a_pipe_at_guarded_a_skill_consent_is_refused_without_eating_the_next_line`]
+/// asserts its own: a second line is fed after the request, and it has to reach
+/// the *entry loop*. Two turns ran, so the `y` became a prompt; had it been
+/// eaten as an answer there would have been one.
+#[test]
+fn on_a_pipe_at_guarded_a_model_issued_project_skill_is_refused_without_eating_the_next_line() {
+    let daemon_bin = daemon_bin();
+    let teton = teton_bin();
+
+    const REPLIES: &[&str] = &[
+        r#"{"tool": "skill", "arguments": {"name": "scratch", "args": ""}}"#,
+        "I could not run the repository's skill.",
+        "and this is the second prompt.",
+    ];
+
+    // A user skill so the roster is never empty for reasons unrelated to the
+    // project one, and the project skill the acknowledgment is about.
+    let home = SkillTree::new("pk");
+    home.write(
+        ".claude/skills/mine/SKILL.md",
+        &skill_file("a user skill", None, "User body.\n"),
+    );
+    let daemon = TestDaemon::spawn_scripted_with_env(
+        &daemon_bin,
+        REPLIES,
+        &[("HOME", home.path().to_str().unwrap())],
+    );
+    let project = project_at(&daemon.root, "proj");
+    std::fs::create_dir_all(project.join(".claude/skills/scratch")).unwrap();
+    std::fs::write(
+        project.join(".claude/skills/scratch/SKILL.md"),
+        skill_file("the repository's own skill", None, "PROJECT-BODY-MARKER\n"),
+    )
+    .unwrap();
+
+    let (stdout, stderr, status) = daemon.run_cli_from(
+        &teton,
+        // `guarded` is the session default, so nothing is typed to reach it and
+        // the `y` sits immediately behind the prompt that triggers the request.
+        &["--cwd", project.to_str().unwrap()],
+        "/verbose\nuse the repository's scratch skill\ny\n",
+        None,
+        &[("HOME", home.path())],
+    );
+    assert!(status.success(), "stdout:\n{stdout}\nstderr:\n{stderr}");
+
+    // The question was drawn — naming the root and its skills — and then
+    // refused, unanswered.
+    assert!(
+        stdout.contains("running `") && stdout.contains("`'s skills as instructions"),
+        "the refusal must still show what it refused; output:\n{stdout}"
+    );
+    assert!(
+        stdout.contains("was refused without asking: this session's input is not a terminal"),
+        "BR-11's refusal line is missing; output:\n{stdout}"
+    );
+    assert!(
+        stdout.contains(
+            "send `/permissions full` ahead of it, or set `[permissions] default_level`, to \
+             allow it unattended."
+        ),
+        "a refusal names a remedy a piped session can actually take; \
+         output:\n{stdout}"
+    );
+    // What the session *does* show for the call itself: the tool-call status
+    // line, titled with the skill the model reached for, ending `failed`.
+    assert!(
+        stdout.contains("- skill scratch [failed]"),
+        "the tool-call line must name the skill and say the call did not \
+         succeed; output:\n{stdout}"
+    );
+
+    // **And the refusal names itself, in the tool's own words** (BR-9, the
+    // Events table). TASK-222 recorded the opposite as a gap: the daemon
+    // published a `SkillInvoked` only for the two refusals the **loop** raises
+    // (`SkillTool::note_loop_refusal` / `publish_refusal`, both `over_budget`),
+    // while every refusal the **tool** raises returned through
+    // `Refusal::into_outcome` and published nothing — so this client had a
+    // rendered sentence for all seven reasons (`session_ui::
+    // refusal_reason_words`) and the daemon reached none of them. It now
+    // publishes from `SkillTool::refuse`, the one door out of `invoke`'s refusal
+    // arms, and this is that record arriving through a real socket at a real
+    // client.
+    //
+    // Mutation: drop the publish from `refuse` and this line disappears.
+    assert!(
+        stdout.contains(
+            "refused: skill scratch (project) — this repository's skills have not been \
+             acknowledged for this session"
+        ),
+        "a typed refusal must say which skill call it was and why, not leave \
+         the user with a failed tool line; output:\n{stdout}"
+    );
+    // A refusal record is **not** an invocation record: the file's size and its
+    // dynamic-command count are true of the file and false of this turn —
+    // nothing of it entered the context — so the line drops both.
+    assert!(
+        !stdout.contains("skill scratch (project, "),
+        "the refusal rendered as the invocation line with a flag on it, which \
+         at a glance reads as a skill that ran; output:\n{stdout}"
+    );
+    assert!(
+        !stdout.contains("PROJECT-BODY-MARKER"),
+        "an unacknowledged repository's body reached the session; output:\n{stdout}"
+    );
+    assert!(
+        !stdout.contains("the user declined"),
+        "a fail-closed refusal is not a decline; output:\n{stdout}"
+    );
+
+    // THE NEGATIVE: the `y` was not consumed. It reached the entry loop and
+    // became the second prompt of the session.
+    assert!(
+        stdout.contains("and this is the second prompt."),
+        "the `y` after the request was eaten as an answer instead of reaching \
+         the entry loop as the next prompt line (BR-11); output:\n{stdout}"
+    );
+    assert_eq!(
+        stdout.matches("turn ended").count(),
+        2,
+        "exactly two turns must have run — the one that raised the request and \
+         the `y` that followed it; output:\n{stdout}"
+    );
 }

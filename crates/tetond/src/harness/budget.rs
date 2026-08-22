@@ -316,15 +316,33 @@ fn sanitized_provider_id(id: &str) -> String {
         .collect()
 }
 
-/// What the elision marker calls a remote route's window.
+/// What the elision marker calls a remote route's window, **and the id that
+/// name is made of** — one function, returning both (REQ-587 BR-7).
+///
+/// The two are minted together because they are one fact spelled two ways: a
+/// label reading `` `kimi`'s context window `` and a
+/// [`RouteBudget::provider_id`] of `kimi` cannot come to disagree if neither is
+/// written without the other. The alternative a reader reaches for — recovering
+/// the id by stripping `"'s context window"` off the label — reads a machine
+/// fact out of a human-facing sentence, and that sentence gets reworded.
+///
+/// The redact clamp is where the two spellings genuinely part company: it
+/// renames the window without changing whose window it is, so a parsed id goes
+/// `None` on a route that has a provider. **No refusal reachable today is
+/// different for it** — see [`RouteBudget::provider_id`] for why, and for why
+/// the pair is minted together anyway.
 ///
 /// Defensive `None` arm: a remote route always has an id in practice (the
 /// window came from `capability_of(id)`); an id-less caller gets the default
-/// pair's historical name rather than a nameless marker.
-fn provider_label(provider_id: Option<&str>) -> String {
+/// pair's historical name rather than a nameless marker, and no id, because
+/// there is none to name.
+fn labelled_provider(provider_id: Option<&str>) -> (String, Option<String>) {
     match provider_id {
-        Some(id) => format!("{}'s context window", sanitized_provider_id(id)),
-        None => LOCAL_WINDOW_LABEL.to_owned(),
+        Some(id) => {
+            let id = sanitized_provider_id(id);
+            (format!("{id}'s context window"), Some(id))
+        }
+        None => (LOCAL_WINDOW_LABEL.to_owned(), None),
     }
 }
 
@@ -411,6 +429,61 @@ pub struct RouteBudget {
     /// [`BudgetBound::DefaultUnknown`] arms: those return the default pair by
     /// decision rather than by a clamp, and nothing was raised.
     pub floored: bool,
+    /// The provider whose declaration this pair was derived from, sanitized
+    /// exactly as [`Self::window_label`] sanitizes it — `None` on the local
+    /// tier and for an id-less caller (REQ-587 BR-7).
+    ///
+    /// # Why the budget carries it
+    ///
+    /// BR-7's refusal names the remedy a new user meets verbatim:
+    /// `` bound: default_unknown — set `capabilities.max_context` for <id> ``.
+    /// The user path has the id in hand (`run_prompt_turn` holds the `Route`),
+    /// but the **turn loop** does not: `HarnessConfig` carries the budget and
+    /// not who declared it, so a model-invoked refusal could only say "for this
+    /// provider" — the defensive arm, on the one bound the sentence was written
+    /// for. Carrying the id here puts it wherever the pair goes, which is
+    /// exactly the set of places that can quote it.
+    ///
+    /// A `HarnessConfig` field would have gone **stale**: the config is stamped
+    /// once per turn and a mid-turn reroute replaces the route, so the id would
+    /// name the provider that was dropped. This travels with the pair, and the
+    /// pair is re-stamped by [`with_route_budget`](crate::harness::turn_loop::HarnessConfig::with_route_budget)
+    /// on every route decision.
+    ///
+    /// # It is not `window_label` parsed back
+    ///
+    /// Both come out of [`labelled_provider`], and
+    /// `the_window_label_names_the_provider_the_field_carries_and_neither_is_parsed_from_the_other`
+    /// pins that.
+    ///
+    /// **The honest form of that claim, corrected in verify.** An earlier
+    /// version of this doc said a `strip_suffix("'s context window")`
+    /// implementation would drop the remedy from a clamped remote route's
+    /// refusal. It would not, and the control flow is one screen away: the
+    /// remedy is appended by [`bound_clause`] only when the bound is
+    /// [`BudgetBound::DefaultUnknown`], and [`derive`]'s `DefaultUnknown` arm
+    /// **returns early**, above the redact clamp. So the one bound that renders
+    /// the remedy can never wear [`REDACT_WINDOW_LABEL`], and on every row
+    /// reachable today a parse and this field compose byte-identical refusals.
+    /// A guard argued from a consequence that cannot happen is a guard nobody
+    /// can check, which is worse than no argument.
+    ///
+    /// **Why the pair is still minted together.** Two reasons, both about
+    /// tomorrow rather than today:
+    ///
+    /// * The redact clamp really does rename the window without changing whose
+    ///   window it is, so the label and the id genuinely disagree on that row —
+    ///   `Some("kimi")` beside `"the redact-scannable window"`. Nothing renders
+    ///   the remedy there *yet*. The moment a second bound does — a
+    ///   `RedactScan` route is exactly one whose user might want to raise
+    ///   `capabilities.max_context` — a parse-based id would go silently `None`
+    ///   on it, and the test row that discriminates the two is already written.
+    /// * Recovering a machine fact by parsing a human-facing string couples the
+    ///   fact to the sentence's wording. `window_label` is prose: it is written
+    ///   into an elided block's own text and into refusals, and it is reworded
+    ///   by whoever is improving that prose, who has no reason to know an id
+    ///   was being read out of it. That break is silent in both directions.
+    pub provider_id: Option<String>,
 }
 
 /// Turn a route's window facts into its budget — the one classifier (BR-8,
@@ -418,12 +491,16 @@ pub struct RouteBudget {
 #[must_use]
 pub fn derive(inputs: BudgetInputs<'_>) -> RouteBudget {
     if inputs.is_local {
-        return default_pair(BudgetBound::LocalEngine, LOCAL_WINDOW_LABEL.to_owned());
+        // `None`, deliberately, even when the routing table gave the local tier
+        // a provider id: the local window is not a provider's declaration, so
+        // there is no `capabilities.max_context` for anyone to go and set. The
+        // label says the same thing, which is the invariant.
+        return default_pair(BudgetBound::LocalEngine, labelled_provider(None));
     }
     if inputs.window == 0 {
         return default_pair(
             BudgetBound::DefaultUnknown,
-            provider_label(inputs.provider_id),
+            labelled_provider(inputs.provider_id),
         );
     }
 
@@ -460,10 +537,15 @@ pub fn derive(inputs: BudgetInputs<'_>) -> RouteBudget {
     // The redact clamp applies LAST and names the bound only when it bites
     // (BR-4): the scan is byte-denominated, so only bytes clamp — the word
     // component stays window-derived and the byte guard binds.
-    let mut window_label = provider_label(inputs.provider_id);
+    let (mut window_label, provider_id) = labelled_provider(inputs.provider_id);
     if inputs.redact_scan && budget_bytes > REDACT_SCANNABLE_CONTEXT_BYTES {
         budget_bytes = REDACT_SCANNABLE_CONTEXT_BYTES;
         bound = BudgetBound::RedactScan;
+        // The clamp renames the **window**, not the provider: this route is
+        // still `kimi`'s, and `capabilities.max_context` for `kimi` is still
+        // the line a user would go and write. `provider_id` above is therefore
+        // untouched here — which is also why it cannot be recovered from the
+        // label.
         window_label = REDACT_WINDOW_LABEL.to_owned();
     }
 
@@ -477,12 +559,17 @@ pub fn derive(inputs: BudgetInputs<'_>) -> RouteBudget {
         digest_threshold_tokens,
         digest_threshold_bytes,
         floored,
+        provider_id,
     }
 }
 
 /// The default (local) pair with the given bound and label — the
 /// `LocalEngine`/`DefaultUnknown` arms of [`derive`].
-fn default_pair(bound: BudgetBound, window_label: String) -> RouteBudget {
+/// The label and its id arrive as one value from [`labelled_provider`], so this
+/// constructor cannot be handed a label naming one provider and an id naming
+/// another (REQ-587 BR-7).
+fn default_pair(bound: BudgetBound, labelled: (String, Option<String>)) -> RouteBudget {
+    let (window_label, provider_id) = labelled;
     let (digest_threshold_tokens, digest_threshold_bytes) =
         digest_thresholds(LOCAL_BUDGET_TOKENS, LOCAL_BUDGET_BYTES);
     RouteBudget {
@@ -490,6 +577,7 @@ fn default_pair(bound: BudgetBound, window_label: String) -> RouteBudget {
         budget_bytes: LOCAL_BUDGET_BYTES,
         bound,
         window_label,
+        provider_id,
         digest_threshold_tokens,
         digest_threshold_bytes,
         // The default pair is the answer, not a clamp of a smaller one.
@@ -628,14 +716,109 @@ impl SkillStage {
 pub enum SkillFit {
     /// Both currencies land inside the route's budget; the turn proceeds.
     Fits,
-    /// The expansion does not fit. The caller raises this under
+    /// The expansion does not fit. A user-typed `/name` raises this under
     /// `error_code::SKILL_EXPANSION_TOO_LARGE` and sends nothing — `-32023`
-    /// and not `-32022`, because no provider has seen this turn.
+    /// and not `-32022`, because no provider has seen that turn; a
+    /// model-invoked call renders it as a tool result instead
+    /// ([`SkillFit::into_tool_refusal`]).
     TooLarge {
         /// BR-8's sentence: the skill, its size, the budget, the spoken bound,
-        /// and which stage refused.
+        /// which stage refused, and — through [`SkillCaller`] — who asked.
         message: String,
     },
+}
+
+impl SkillFit {
+    /// The refusal's **text**, for a caller that is going to push it as a tool
+    /// result (REQ-587 BR-6/BR-9, ADR-2).
+    ///
+    /// Every raise site REQ-585 shipped turns [`SkillFit::TooLarge`] into an
+    /// `RpcError` and ends the prompt turn, which is the right answer for a
+    /// user-typed `/name`: the turn *is* the expansion, so once it is refused
+    /// there is nothing left to run. A model-invoked call is one tool call
+    /// inside a turn that is still going, and ending the turn there would take
+    /// the conversation down with the call — so the refusal is a typed outcome
+    /// the model reads and relays, exactly as a rejected edit or a jailed read
+    /// already is. [`Fits`] renders as nothing, because a fitting expansion has
+    /// no refusal to print.
+    ///
+    /// # Why a `String` and not a `ToolOutcome`
+    ///
+    /// This returned `ToolOutcome::error(message)` and both call sites read only
+    /// its `.content`. That is not merely dead weight — the value it carried was
+    /// **wrong**: `ToolOutcome::error` defaults to
+    /// [`ResultDisposition::Data`](super::tools::ResultDisposition::Data), and a
+    /// caller that ever folded it would have got the one classification ADR-1
+    /// forbids for a `skill` result, name-keyed off `UNTRUSTED_OUTPUT_TOOLS`.
+    /// Neither of the loop's two budget refusals goes through the fold at all —
+    /// they are raised before the dispatch and after it but before the push —
+    /// so there is no disposition for this to carry honestly, and the type says
+    /// so rather than carrying a plausible default nobody reads.
+    ///
+    /// [`Fits`]: SkillFit::Fits
+    pub fn into_tool_refusal(self) -> Option<String> {
+        match self {
+            SkillFit::Fits => None,
+            SkillFit::TooLarge { message } => Some(message),
+        }
+    }
+}
+
+/// Who asked for the expansion — the half of BR-8's sentence that changes with
+/// the asker (REQ-587 BR-7, ADR-2).
+///
+/// It is a parameter of the composer rather than a second composer because the
+/// figures, the stage clause and the bound are the same facts either way:
+/// [`BudgetBound::words`] stays the one adjective vocabulary and
+/// [`thousands`]/[`bytes_figure`] the one number vocabulary (LESSON-456). What
+/// differs is only what is *true* about the two callers — see
+/// [`SkillCaller::consequence`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SkillCaller {
+    /// The user typed `/name`, and the expansion would have been the turn.
+    User,
+    /// The model called the `skill` tool mid-loop, in a turn already running.
+    Model,
+}
+
+impl SkillCaller {
+    /// How the refused skill is named at the head of the sentence.
+    ///
+    /// A user typed `/proceed` and reads it back in the form they typed. A
+    /// model passed a *name* to a tool and never saw a slash: printing
+    /// `` `/proceed` `` at it would name a surface it cannot use — the built-in
+    /// commands and `/name` are the user's alone (BR-8) — and would invite it to
+    /// tell the user to type something instead of relaying what happened.
+    fn subject(self, skill: &str) -> String {
+        match self {
+            SkillCaller::User => format!("`/{skill}`"),
+            SkillCaller::Model => format!("The `{skill}` skill"),
+        }
+    }
+
+    /// What did **not** happen, and what the reader does about it.
+    ///
+    /// The user arm's *"no provider saw this turn"* is the clause that makes
+    /// `-32023` different from `-32022`, and it is pinned by
+    /// `a_skill_refusal_carries_no_provider_response_body` and by
+    /// `context_pressure.rs`. The model arm cannot borrow it: a provider has
+    /// already seen this turn — it is what produced the call — so repeating the
+    /// clause there would be a false claim in a sentence whose whole job is to
+    /// be the one true account of what happened. What is true instead is that
+    /// nothing was folded, and the model is the one who has to say so.
+    const fn consequence(self) -> &'static str {
+        match self {
+            SkillCaller::User => {
+                "Nothing was sent and no provider saw this turn — a skill expansion is carried \
+                 whole or refused, never shortened into something you did not invoke."
+            }
+            SkillCaller::Model => {
+                "Nothing was folded into this conversation — a skill expansion is carried whole \
+                 or refused, never shortened into a partial procedure. Say what you tried to run \
+                 and that it did not fit."
+            }
+        }
+    }
 }
 
 /// Measure one skill expansion against the route's **stamped** budget and, if it
@@ -673,7 +856,20 @@ pub enum SkillFit {
 /// than re-checked, because a second copy of that predicate here would be
 /// LESSON-528's shape: the precondition belongs at the seam that establishes
 /// it, and mirroring the body without it is what drifts.
+///
+/// # Why `caller` is a parameter here too
+///
+/// BR-8's two stages are the user's alone — a typed `/name` is the only thing
+/// that can be measured as a *seed* before a turn exists — so this took
+/// [`SkillCaller::User`] as a constant. The reroute guard then reached for it
+/// (`runtime.rs`'s `skill_would_not_survive_refit`), and every model-invoked
+/// expansion caught there was described to the model as `/name`: a slash command
+/// nobody typed, on the one surface whose job is to say truthfully what
+/// happened. The constant is therefore a parameter, exactly as
+/// [`skill_append_fit`]'s is, and for the same reason — the *composer* is what
+/// is caller-aware, not the entry point.
 pub fn skill_fit(
+    caller: SkillCaller,
     stage: SkillStage,
     skill: &str,
     system: &str,
@@ -691,15 +887,89 @@ pub fn skill_fit(
         return SkillFit::Fits;
     }
     SkillFit::TooLarge {
-        message: skill_refusal(stage, skill, fit, budget, provider_id),
+        message: skill_refusal(caller, stage, skill, fit, budget, provider_id),
+    }
+}
+
+/// BR-7's name for this refusal, and the id [`SkillInvoked::refused`] carries
+/// (REQ-587 BR-9).
+///
+/// It lives beside the composer so the refusal and the word a session prints
+/// for it have one home. It is *not* spliced into the sentence: BR-8's
+/// composer opens with the subject (`` The `architect` skill does not fit… ``)
+/// rather than with a reason token, and that shape is pinned by
+/// `the_refusal_names_the_skill_its_size_the_budget_and_the_bound`. What the id
+/// keys is the **record** — the session line and any suite asserting on it —
+/// in the same vocabulary the tool's own typed refusals use (`per_turn_cap`,
+/// `repeated`, `unknown_skill`).
+///
+/// [`SkillInvoked::refused`]: teton_protocol::events::SkillInvoked::refused
+pub const OVER_BUDGET_REASON: &str = "over_budget";
+
+/// Measure one expansion **appended mid-loop** against the route's stamped
+/// budget and, if it does not fit, compose the refusal (REQ-587 BR-7, ADR-2).
+///
+/// [`skill_fit`]'s sibling, and the difference is the question, not the
+/// arithmetic: that one asks whether an expansion could be a legal *seed*, this
+/// one whether it survives as an *append* to a turn that is already running.
+/// The measurement is [`ContextManager::would_append_fit`] — system, the turn's
+/// request block (`latest_request`, threaded in by the loop), the candidate,
+/// charged at `truncated = true`. It is **not** a measurement of the live
+/// conversation, and that function's doc is where the reason lives: history is
+/// droppable, so a body that fits this worst case is folded and any pressure it
+/// creates is answered by the top-of-loop gate, loudly (AC-8).
+///
+/// Everything [`skill_fit`] says about deriving and estimating holds here
+/// unchanged: `budget` is the pair the router stamped, the estimators are the
+/// pressure path's own, and nothing but integers this daemon measured, two
+/// literal key names, the skill's name and (on the `unknown window` arm) the
+/// provider id can reach the sentence.
+///
+/// `caller` is [`SkillCaller::Model`] for the `skill` tool. It is a parameter
+/// rather than a constant here because the *composer* is what is caller-aware
+/// (one sentence, two true endings), not this entry point.
+// Eight, because every one of them is a distinct fact the sentence names and
+// none can be derived from another; the alternative is a struct whose only
+// purpose is to be destructured at the one call site. `run_session_turn_with_source`
+// carries the same allow for the same reason.
+#[allow(clippy::too_many_arguments)]
+pub fn skill_append_fit(
+    caller: SkillCaller,
+    stage: SkillStage,
+    skill: &str,
+    system: &str,
+    request: &str,
+    expansion: &str,
+    budget: &RouteBudget,
+    provider_id: Option<&str>,
+) -> SkillFit {
+    let fit = ContextManager::would_append_fit(
+        system,
+        request,
+        expansion,
+        budget.budget_tokens,
+        budget.budget_bytes,
+    );
+    if fit.fits {
+        return SkillFit::Fits;
+    }
+    SkillFit::TooLarge {
+        message: skill_refusal(caller, stage, skill, fit, budget, provider_id),
     }
 }
 
 /// BR-8's sentence — **the composer, and the only one** (LESSON-456).
 ///
-/// Private, and reachable only through [`skill_fit`], so the message cannot be
-/// written without the measurement whose figures it quotes.
+/// Private, and reachable only through [`skill_fit`] and [`skill_append_fit`],
+/// so the message cannot be written without the measurement whose figures it
+/// quotes.
+///
+/// `caller` supplies the two clauses that are not the same fact for both
+/// askers — how the skill is named, and what did not happen — and nothing else
+/// forks: one stage table, one bound table, one pair of number formatters
+/// (REQ-587 ADR-2).
 fn skill_refusal(
+    caller: SkillCaller,
     stage: SkillStage,
     skill: &str,
     fit: Fit,
@@ -707,16 +977,16 @@ fn skill_refusal(
     provider_id: Option<&str>,
 ) -> String {
     format!(
-        "`/{skill}` does not fit this route's context budget: {} about {} words / {}, and the \
-         budget is {} words / {} ({}). Nothing was sent and no provider saw this turn — a skill \
-         expansion is carried whole or refused, never shortened into something you did not \
-         invoke.",
+        "{} does not fit this route's context budget: {} about {} words / {}, and the budget is \
+         {} words / {} ({}). {}",
+        caller.subject(skill),
         stage.measured_clause(),
         thousands(fit.tokens as u64),
         bytes_figure(fit.bytes as u64),
         thousands(budget.budget_tokens as u64),
         bytes_figure(budget.budget_bytes as u64),
         bound_clause(budget, provider_id),
+        caller.consequence(),
     )
 }
 
@@ -920,6 +1190,226 @@ mod tests {
             assert_eq!(got.budget_tokens, *tokens, "{name}: budget_tokens");
             assert_eq!(got.budget_bytes, *bytes, "{name}: budget_bytes");
             assert_eq!(got.bound, *bound, "{name}: bound");
+        }
+    }
+
+    /// **REQ-587 BR-7: the label names the provider the field carries, and
+    /// neither is derived from the other.**
+    ///
+    /// `RouteBudget` now carries the provider id because BR-7's refusal quotes
+    /// it — `` set `capabilities.max_context` for <id> ``, "the one a new user
+    /// meets" — and the turn loop, which raises that refusal for a model
+    /// invocation, holds no `Route` to ask. The id was already *spelled into*
+    /// `window_label`, which is exactly why the tempting implementation is to
+    /// strip `"'s context window"` back off it.
+    ///
+    /// **The redact row is where the two spellings part company**, and it is the
+    /// row this test exists for. The clamp renames the window without changing
+    /// whose window it is: the label becomes `"the redact-scannable window"`
+    /// while the route is still `kimi`'s and `capabilities.max_context` for
+    /// `kimi` is still the line a user would go and write. A parsed id answers
+    /// `None` there while this field answers `Some("kimi")`.
+    ///
+    /// **What that row does *not* prove, stated so nobody has to re-derive it.**
+    /// No refusal reachable today differs between the two implementations.
+    /// `bound_clause` appends the remedy only on [`BudgetBound::DefaultUnknown`],
+    /// and [`derive`]'s `DefaultUnknown` arm returns *above* the clamp — so the
+    /// one bound that quotes an id can never wear [`REDACT_WINDOW_LABEL`], and a
+    /// `strip_suffix` implementation would compose byte-identical sentences on
+    /// every row below. This test pins a **fact**, not a user-visible
+    /// consequence: the label and the id disagree here, so the day a second
+    /// bound renders the remedy — a `RedactScan` route's user has every reason
+    /// to want `capabilities.max_context` raised — the parse is already known to
+    /// answer `None` on it. That, and the ordinary reason not to read a machine
+    /// fact out of prose someone else is free to reword.
+    ///
+    /// The general invariant is checked over every row besides: the label is in
+    /// the provider form **iff** it is that provider's id spelled out, and a
+    /// route with no id never wears one.
+    #[test]
+    fn the_window_label_names_the_provider_the_field_carries_and_neither_is_parsed_from_the_other()
+    {
+        fn id_less<'a>(window: u32) -> BudgetInputs<'a> {
+            BudgetInputs {
+                provider_id: None,
+                ..remote(window, 0, false)
+            }
+        }
+
+        let rows: &[(&str, BudgetInputs<'_>, Option<&str>, &str)] = &[
+            (
+                "the local tier declares nothing, so there is no id to set",
+                BudgetInputs::local(),
+                None,
+                LOCAL_WINDOW_LABEL,
+            ),
+            (
+                "an undeclared window is the bound BR-7 writes the remedy for",
+                remote(0, 0, false),
+                Some("kimi"),
+                "kimi's context window",
+            ),
+            (
+                "a declared window names its provider",
+                remote(128_000, 0, false),
+                Some("kimi"),
+                "kimi's context window",
+            ),
+            (
+                "a user cap does not change whose window it is",
+                remote(200_000, 40_000, false),
+                Some("kimi"),
+                "kimi's context window",
+            ),
+            (
+                // The row where the label and the field disagree: a
+                // stripped-suffix id is `None` here and this field is not.
+                // No refusal renders differently for it today — see the doc.
+                "the redact clamp renames the window, not the provider",
+                remote(128_000, 0, true),
+                Some("kimi"),
+                REDACT_WINDOW_LABEL,
+            ),
+            (
+                "an id-less caller gets no id and the historical label",
+                id_less(128_000),
+                None,
+                LOCAL_WINDOW_LABEL,
+            ),
+        ];
+
+        for (name, inputs, expected_id, expected_label) in rows {
+            let got = derive(*inputs);
+            assert_eq!(
+                got.provider_id.as_deref(),
+                *expected_id,
+                "{name}: this is the id BR-7's refusal quotes, and it is minted \
+                 beside the label rather than read back out of it — on the \
+                 redact row the two genuinely differ, and every row here is one \
+                 a reworded label would silently break"
+            );
+            assert_eq!(got.window_label, *expected_label, "{name}");
+
+            // The invariant, over whichever row this is: the provider form of
+            // the label is spelled from the field, and only from it.
+            match got.window_label.strip_suffix("'s context window") {
+                Some(named) => assert_eq!(
+                    Some(named),
+                    got.provider_id.as_deref(),
+                    "{name}: the label names a provider the field does not"
+                ),
+                None => assert!(
+                    got.window_label == LOCAL_WINDOW_LABEL
+                        || got.window_label == REDACT_WINDOW_LABEL,
+                    "{name}: a label in neither form is a third spelling nobody \
+                     decided on: {}",
+                    got.window_label
+                ),
+            }
+            if got.provider_id.is_none() {
+                assert!(
+                    !got.window_label.ends_with("'s context window"),
+                    "{name}: a route with no id must never wear one"
+                );
+            }
+        }
+
+        // One sanitization, not two: the field is the same bytes the label is
+        // built from, so a refusal and an elision marker name one provider.
+        let hostile = BudgetInputs {
+            provider_id: Some("ki mi/1\n"),
+            ..remote(128_000, 0, false)
+        };
+        let got = derive(hostile);
+        assert_eq!(got.provider_id.as_deref(), Some("ki_mi_1_"));
+        assert_eq!(got.window_label, "ki_mi_1_'s context window");
+    }
+
+    /// **The corrected half of the argument above, made checkable.**
+    ///
+    /// The field's doc used to claim that reading the id back off
+    /// `window_label` would drop BR-7's remedy from a clamped remote route's
+    /// refusal. It cannot: [`bound_clause`] appends the remedy only on
+    /// [`BudgetBound::DefaultUnknown`], and [`derive`]'s `DefaultUnknown` arm
+    /// returns **above** the redact clamp, so the bound that quotes an id can
+    /// never wear [`REDACT_WINDOW_LABEL`].
+    ///
+    /// Two legs, because the correction has two halves and only one of them is
+    /// about today.
+    ///
+    /// * The control-flow fact, asserted directly: an *undeclared* window on a
+    ///   `redact = true` route is still `DefaultUnknown` and still wears its
+    ///   provider's name. Moving that early return below the clamp — the one
+    ///   edit that would make the retracted claim true — fails here, which is
+    ///   why the retraction is safe to write down.
+    /// * The consequence, asserted by composing both refusals: over every row
+    ///   the table above reaches, a `strip_suffix` id and this field produce
+    ///   **byte-identical** sentences. So the pair is minted together on drift
+    ///   grounds (see [`RouteBudget::provider_id`]) and not because a user can
+    ///   see the difference today. A guard sold on a consequence that cannot
+    ///   happen is one nobody can check.
+    #[test]
+    fn no_reachable_bound_both_quotes_a_provider_id_and_wears_the_redact_label() {
+        let undeclared_and_clamped = derive(remote(0, 0, true));
+        assert_eq!(
+            undeclared_and_clamped.bound,
+            BudgetBound::DefaultUnknown,
+            "the undeclared-window arm returns before the redact clamp; if it \
+             stops doing so, the bound that quotes an id can wear the redact \
+             label and reading the id off the label really would drop the remedy"
+        );
+        assert_ne!(
+            undeclared_and_clamped.window_label, REDACT_WINDOW_LABEL,
+            "the one bound whose clause names a provider must never wear the \
+             label that hides which provider it is"
+        );
+
+        // Same rows as the table above, plus the clamped-and-undeclared one.
+        let rows: &[(&str, BudgetInputs<'_>)] = &[
+            ("local", BudgetInputs::local()),
+            ("undeclared window", remote(0, 0, false)),
+            ("undeclared window, redact", remote(0, 0, true)),
+            ("declared window", remote(128_000, 0, false)),
+            ("user cap", remote(200_000, 40_000, false)),
+            ("redact clamp", remote(128_000, 0, true)),
+            (
+                "id-less remote",
+                BudgetInputs {
+                    provider_id: None,
+                    ..remote(128_000, 0, false)
+                },
+            ),
+        ];
+        for (name, inputs) in rows {
+            let budget = derive(*inputs);
+            let parsed = budget.window_label.strip_suffix("'s context window");
+            let fit = Fit {
+                tokens: 9_999,
+                bytes: 99_999,
+                fits: false,
+            };
+            let from_field = skill_refusal(
+                SkillCaller::Model,
+                SkillStage::Body,
+                "architect",
+                fit,
+                &budget,
+                budget.provider_id.as_deref(),
+            );
+            let from_parse = skill_refusal(
+                SkillCaller::Model,
+                SkillStage::Body,
+                "architect",
+                fit,
+                &budget,
+                parsed,
+            );
+            assert_eq!(
+                from_field, from_parse,
+                "{name}: the retracted claim was that these differ; if they ever \
+                 do, the field's doc has a user-visible consequence to name and \
+                 should say so"
+            );
         }
     }
 
@@ -1501,7 +1991,15 @@ mod tests {
         budget: &RouteBudget,
         provider_id: Option<&str>,
     ) -> String {
-        match skill_fit(stage, skill, system, text, budget, provider_id) {
+        match skill_fit(
+            SkillCaller::User,
+            stage,
+            skill,
+            system,
+            text,
+            budget,
+            provider_id,
+        ) {
             SkillFit::TooLarge { message } => message,
             SkillFit::Fits => {
                 panic!("`/{skill}` was admitted on a route this test needs it refused on")
@@ -1580,7 +2078,15 @@ mod tests {
         ];
 
         for (route, budget, skill, body, expect_fits) in rows {
-            let fit = skill_fit(SkillStage::Body, skill, &system, body, budget, Some("kimi"));
+            let fit = skill_fit(
+                SkillCaller::User,
+                SkillStage::Body,
+                skill,
+                &system,
+                body,
+                budget,
+                Some("kimi"),
+            );
             assert_eq!(
                 fit == SkillFit::Fits,
                 *expect_fits,
@@ -1824,6 +2330,7 @@ mod tests {
         // the user is asked for consent and the commands run.
         assert_eq!(
             skill_fit(
+                SkillCaller::User,
                 SkillStage::Body,
                 "status",
                 &system,
@@ -1925,6 +2432,7 @@ mod tests {
             digest_threshold_tokens: 1,
             digest_threshold_bytes: 1,
             floored: false,
+            provider_id: None,
         };
         let message = refusal(
             SkillStage::Body,
@@ -1941,6 +2449,213 @@ mod tests {
         );
     }
 
+    // -- REQ-587: the append, and a refusal the model can relay (ADR-2) ------
+
+    /// The message a [`SkillFit`] carries, with the verdict asserted on the way
+    /// through so no test below can be green against a route that admitted the
+    /// turn. [`refusal`]'s sibling, for the entry points that take a request.
+    fn message_of(fit: SkillFit) -> String {
+        match fit {
+            SkillFit::TooLarge { message } => message,
+            SkillFit::Fits => {
+                panic!("this route admitted an expansion the test needs it to refuse")
+            }
+        }
+    }
+
+    /// **The sentence is caller-aware, and only where the truth differs.**
+    ///
+    /// A model never typed a slash command, so `` `/proceed` `` would name a
+    /// surface it cannot use; and a provider *has* seen this turn — it is what
+    /// produced the call — so `-32023`'s "no provider saw this turn" would be a
+    /// false claim in the one sentence whose job is to account for what
+    /// happened. Everything else is the same fact for both askers, and is
+    /// asserted here to still be present.
+    #[test]
+    fn a_model_invoked_refusal_names_the_skill_without_a_slash_and_says_what_did_not_happen() {
+        let system = real_system_prompt();
+        let proceed = corpus_body(PROCEED_BODY_BYTES);
+        let message = message_of(skill_append_fit(
+            SkillCaller::Model,
+            SkillStage::Body,
+            "proceed",
+            &system,
+            "summarize this repository",
+            &proceed,
+            &derive(BudgetInputs::local()),
+            None,
+        ));
+
+        assert!(
+            message.starts_with("The `proceed` skill does not fit this route's context budget"),
+            "{message}"
+        );
+        assert!(
+            !message.contains("`/proceed`"),
+            "a model never typed a slash command: {message}"
+        );
+        assert!(
+            !message.contains("you did not invoke"),
+            "the user's clause reached a model-invoked refusal: {message}"
+        );
+        assert!(
+            !message.contains("no provider saw this turn"),
+            "a provider has already seen this turn — it produced the call: {message}"
+        );
+        assert!(
+            message.contains("Nothing was folded into this conversation"),
+            "{message}"
+        );
+
+        // The facts that do not fork with the caller: the stage clause and the
+        // spoken bound, from the same two tables the typed refusal reads.
+        assert!(
+            message.contains("the body alone, with the system prompt, comes to"),
+            "one stage table: {message}"
+        );
+        assert!(message.contains("bound: local engine"), "{message}");
+    }
+
+    /// **One bound table, one number vocabulary** (LESSON-456, ADR-2).
+    ///
+    /// The caller-aware composer forks two clauses; a second copy of the
+    /// composer would fork all of them, and the first thing to drift would be
+    /// the bound — which is the fact REQ-586 spent a whole BR making singular.
+    /// Same route, both callers, byte-identical bound clause and budget pair.
+    #[test]
+    fn the_user_and_model_refusals_share_one_bound_table_and_one_number_vocabulary() {
+        let system = real_system_prompt();
+        let proceed = corpus_body(PROCEED_BODY_BYTES);
+        let budget = derive(remote(0, 0, false));
+
+        let typed = refusal(
+            SkillStage::Body,
+            "proceed",
+            &system,
+            &proceed,
+            &budget,
+            Some("kimi"),
+        );
+        let called = message_of(skill_append_fit(
+            SkillCaller::Model,
+            SkillStage::Body,
+            "proceed",
+            &system,
+            "run it",
+            &proceed,
+            &budget,
+            Some("kimi"),
+        ));
+
+        let bound = "bound: unknown window — set `capabilities.max_context` for `kimi`";
+        assert!(typed.contains(bound), "{typed}");
+        assert!(called.contains(bound), "{called}");
+        assert!(
+            !called.contains("default_unknown"),
+            "the wire spelling reached the model: {called}"
+        );
+
+        let pair = format!(
+            "the budget is {} words / {}",
+            thousands(budget.budget_tokens as u64),
+            bytes_figure(budget.budget_bytes as u64)
+        );
+        assert!(typed.contains(&pair), "{typed}");
+        assert!(called.contains(&pair), "{called}");
+    }
+
+    /// **A model-facing refusal is a typed outcome, not only an `RpcError`**
+    /// (BR-6, BR-9, ADR-2).
+    ///
+    /// Ending the prompt turn is right for a user-typed `/name`, whose turn
+    /// *is* the expansion, and wrong for one tool call inside a turn that is
+    /// still going: it would take the conversation down with the call. The
+    /// refusal the model relays is the refusal that was composed — not a second
+    /// sentence written at the raise site.
+    #[test]
+    fn a_model_invoked_refusal_is_a_tool_result_not_only_an_rpc_error() {
+        let system = real_system_prompt();
+        let fit = skill_append_fit(
+            SkillCaller::Model,
+            SkillStage::WithDynamicContext,
+            "proceed",
+            &system,
+            "run it",
+            &corpus_body(PROCEED_BODY_BYTES),
+            &derive(BudgetInputs::local()),
+            None,
+        );
+        let message = message_of(fit.clone());
+
+        let refusal = fit
+            .into_tool_refusal()
+            .expect("a refusal must render as a tool result");
+        assert_eq!(
+            refusal, message,
+            "the tool result is the composed refusal, not a second sentence"
+        );
+        assert_eq!(
+            SkillFit::Fits.into_tool_refusal(),
+            None,
+            "a fitting expansion has no refusal to print"
+        );
+    }
+
+    /// **An append charges the turn's request block; a seed does not** —
+    /// the difference between the two entry points, in one route.
+    ///
+    /// The stamped budget is sized to hold this body *exactly* as a seed, so
+    /// `skill_fit` admits it and `skill_append_fit` cannot: what refuses it is
+    /// the request the turn is serving, which is the block the expansion has to
+    /// survive beside once the loop's gate has dropped everything droppable.
+    #[test]
+    fn an_append_charges_the_turns_request_block_where_a_seed_does_not() {
+        const SYSTEM: &str = "HEAD";
+        let body = corpus_body(4_000);
+        let request = corpus_body(2_000);
+
+        let measured = ContextManager::would_seed_fit(SYSTEM, &body, usize::MAX, usize::MAX);
+        let stamped = RouteBudget {
+            budget_tokens: measured.tokens,
+            budget_bytes: measured.bytes,
+            bound: BudgetBound::LocalEngine,
+            window_label: LOCAL_WINDOW_LABEL.to_owned(),
+            digest_threshold_tokens: 1,
+            digest_threshold_bytes: 1,
+            floored: false,
+            provider_id: None,
+        };
+
+        assert_eq!(
+            skill_fit(
+                SkillCaller::User,
+                SkillStage::Body,
+                "status",
+                SYSTEM,
+                &body,
+                &stamped,
+                None
+            ),
+            SkillFit::Fits,
+            "non-vacuity: this body fits this route as a seed"
+        );
+
+        let refused = message_of(skill_append_fit(
+            SkillCaller::Model,
+            SkillStage::Body,
+            "status",
+            SYSTEM,
+            &request,
+            &body,
+            &stamped,
+            None,
+        ));
+        assert!(
+            refused.starts_with("The `status` skill does not fit"),
+            "{refused}"
+        );
+    }
+
     /// A turn that fits composes nothing: `SkillFit::Fits` carries no message,
     /// so there is no path by which a fitting skill acquires a refusal to print.
     #[test]
@@ -1948,6 +2663,7 @@ mod tests {
         let system = real_system_prompt();
         assert_eq!(
             skill_fit(
+                SkillCaller::User,
                 SkillStage::Body,
                 "status",
                 &system,
