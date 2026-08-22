@@ -387,6 +387,7 @@ pub const RESERVED_SKILL_NAMES: &[&str] = &[
     "model",
     "permissions",
     "policy",
+    "projects",
     "provider",
     "quit",
     "teton",
@@ -755,6 +756,54 @@ pub struct SkillsListResult {
     /// list rather than two that can disagree.
     #[serde(default)]
     pub skipped: Vec<SkillSkipped>,
+}
+
+/// Ask the daemon for this machine's known projects (REQ-584 BR-9).
+///
+/// **The CLI never reads the registry file** (the REQ's Permissions table): the
+/// daemon owns it, and `/projects` is a request rather than a read. That is
+/// also what makes the scan happen in the one place BR-3 bounds it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ProjectsListParams {
+    /// Optional filter, matched exactly as the `projects` tool matches it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub query: Option<String>,
+    /// Whether the caller will accept BR-3's dev-folder scan when the registry
+    /// cannot answer (REQ-584 BR-10).
+    ///
+    /// `/projects` sets it (the user asked); the **launch notice** does not,
+    /// because BR-10 says the notice must not trigger a scan and BR-3 says a
+    /// scan happens only when something asks for projects. A launch that walked
+    /// eleven directories to decorate a warning would be the opposite of what
+    /// REQ-583 set out to fix.
+    ///
+    /// Defaults to **true** so the ordinary request keeps its behaviour and an
+    /// older client's params mean what they meant.
+    #[serde(default = "crate::methods::default_true")]
+    pub allow_scan: bool,
+}
+
+/// Serde default for [`ProjectsListParams::allow_scan`].
+#[must_use]
+pub fn default_true() -> bool {
+    true
+}
+
+/// Result of [`ProjectsListParams`] — the rendered locator answer.
+///
+/// **Rendered text, not rows.** BR-9 requires one renderer for the tool's
+/// output and the CLI's, and shipping rows here would invite the client to
+/// build a second one. The CLI may style what it is given; it does not restate
+/// it (REQ-582's rule).
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ProjectsListResult {
+    /// The locator answer, already composed.
+    pub rendered: String,
+}
+
+impl RpcMethod for ProjectsListParams {
+    const METHOD: &'static str = "projects/list";
+    type Result = ProjectsListResult;
 }
 
 impl RpcMethod for SkillsListParams {

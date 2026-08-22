@@ -527,6 +527,12 @@ impl SessionEvents {
             .publish(Some(self.session_id.clone()), Event::PrefixCache(cache));
     }
 
+    /// Publish BR-11's project hand-off record (REQ-584).
+    pub fn project_match(&self, matched: teton_protocol::events::ProjectMatch) {
+        self.bus
+            .publish(Some(self.session_id.clone()), Event::ProjectMatch(matched));
+    }
+
     /// Announce that this turn ran out of `capability` (REQ-572 ADR-4).
     ///
     /// `capability` is a catalog id (`web_search`, `web_fetch_any_url`, …), not
@@ -4440,15 +4446,6 @@ mod tests {
         lines[0]
     }
 
-    /// **REQ-583 BR-1 / AC-1: a project root is stated as display, kind, name,
-    /// branch and platform — as facts, on both profiles.**
-    ///
-    /// The block is the one thing in the prompt no tool can supply — the tools
-    /// are jailed to the answer — so it is asserted by content on the line the
-    /// display sits on. Both profiles, like every prompt pin here: a strong
-    /// model with no idea where it is searches from the wrong ground just as
-    /// surely as the local tier.
-    #[test]
     /// **REQ-584 BR-7 / AC-8.** Known names ride a non-project root's line,
     /// inside the byte cost REQ-583 already pays.
     #[test]
@@ -4634,6 +4631,14 @@ mod tests {
         assert!(!line.contains('\u{202e}'), "{line:?}");
     }
 
+    /// **REQ-583 BR-1 / AC-1: a project root is stated as display, kind, name,
+    /// branch and platform — as facts, on both profiles.**
+    ///
+    /// The block is the one thing in the prompt no tool can supply — the tools
+    /// are jailed to the answer — so it is asserted by content on the line the
+    /// display sits on. Both profiles, like every prompt pin here: a strong
+    /// model with no idea where it is searches from the wrong ground just as
+    /// surely as the local tier.
     #[test]
     fn the_environment_block_states_a_project_root_by_display_kind_name_branch_and_platform() {
         let root = project_root(Some("main"));

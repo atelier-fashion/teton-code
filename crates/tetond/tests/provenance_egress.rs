@@ -252,6 +252,7 @@ async fn drive_scripted_turn(
         &mut tools,
         std::sync::Arc::new(tetond::projects::ProjectStore::in_memory()),
         None,
+        None,
     );
     let tool_ctx = ToolContext::new(repo);
 

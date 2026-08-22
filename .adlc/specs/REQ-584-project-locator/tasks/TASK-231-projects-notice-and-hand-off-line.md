@@ -1,7 +1,7 @@
 ---
 id: TASK-231
 title: "/projects, the launch notice, and the hand-off line"
-status: pending
+status: complete
 parent: REQ-584
 created: 2026-08-22
 updated: 2026-08-22

@@ -46,6 +46,12 @@ pub struct ProjectsTool {
     home: Option<PathBuf>,
     budget: scan::ScanBudget,
     observer: Arc<scan::ScanObserver>,
+    /// Where BR-11's hand-off record is published, when there is one.
+    ///
+    /// Optional because a tool built for a unit test has no bus, and a missing
+    /// bus must mean "no line" rather than a panic — the line is a convenience,
+    /// and nothing about the answer depends on it.
+    events: Option<crate::harness::turn_loop::SessionEvents>,
 }
 
 impl ProjectsTool {
@@ -57,7 +63,15 @@ impl ProjectsTool {
             home,
             budget: scan::ScanBudget::default(),
             observer: Arc::new(scan::ScanObserver::default()),
+            events: None,
         }
+    }
+
+    /// Publish BR-11's hand-off record on `events`.
+    #[must_use]
+    pub fn with_events(mut self, events: crate::harness::turn_loop::SessionEvents) -> Self {
+        self.events = Some(events);
+        self
     }
 
     /// The test seam that shrinks the scan budget, so AC-3's budget-stop leg
@@ -110,7 +124,18 @@ impl Tool for ProjectsTool {
             self.budget,
             &self.observer,
             query.as_deref().filter(|q| !q.is_empty()),
+            // The model asking is exactly the "something asked" BR-3 gates on.
+            true,
         );
+        // BR-11: the best match, handed to the session as a record rather than
+        // asked of the model as prose. Only on a match — a call that found
+        // nothing publishes nothing, which is what keeps the line meaningful.
+        if let (Some(events), Some(best)) = (self.events.as_ref(), view.matches.first()) {
+            events.project_match(teton_protocol::events::ProjectMatch {
+                name: best.name.clone(),
+                display: best.display.clone(),
+            });
+        }
         // `ToolOutcome::ok` carries `ToolProvenance::none()` — the reading a
         // tool that opened no file gets. Nothing here reads a file's contents,
         // only directory names, so there is no identity to mint (BR-5).
@@ -128,8 +153,13 @@ pub fn register_projects_tool(
     reg: &mut super::ToolRegistry,
     store: Arc<ProjectStore>,
     home: Option<PathBuf>,
+    events: Option<crate::harness::turn_loop::SessionEvents>,
 ) {
-    reg.register_cap_exempt(Arc::new(ProjectsTool::new(store, home)));
+    let mut tool = ProjectsTool::new(store, home);
+    if let Some(events) = events {
+        tool = tool.with_events(events);
+    }
+    reg.register_cap_exempt(Arc::new(tool));
 }
 
 #[cfg(test)]

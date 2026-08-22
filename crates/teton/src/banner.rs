@@ -135,16 +135,58 @@ pub fn root_line(root: &SessionRoot) -> String {
 /// not a project (BR-8), so launch and move announce with one voice.
 #[must_use]
 pub fn root_notice(root: &SessionRoot) -> Option<String> {
+    root_notice_with_projects(root, &[])
+}
+
+/// How many known projects the notice names (REQ-584 BR-10, ADR-8/OQ-2).
+///
+/// Five. The notice is already a long sentence and this clause is an offer, not
+/// an inventory — `/projects` is one word away for the rest. Unlike the
+/// environment line's clause this has no byte ceiling to respect (it is TTY
+/// output, never prompt bytes), so the bound is about *readability* rather than
+/// cost, which is why it is a count and not a measurement.
+pub const NOTICE_PROJECT_NAMES: usize = 5;
+
+/// [`root_notice`], with BR-10's clause naming up to [`NOTICE_PROJECT_NAMES`]
+/// known projects (REQ-584).
+///
+/// `known` is ranked and already bounded by the caller. An empty list renders
+/// REQ-583's notice byte for byte — which is what makes a machine with no
+/// registry behave exactly as it did before this REQ.
+///
+/// **The notice never triggers the scan** (BR-3): the caller passes what the
+/// registry already holds. A launch that walked eleven directories to decorate
+/// a warning would be the opposite of what REQ-583 set out to fix.
+#[must_use]
+pub fn root_notice_with_projects(root: &SessionRoot, known: &[String]) -> Option<String> {
     let walks = match root.kind {
         RootKind::Project => return None,
         RootKind::FilesystemRoot => "the whole filesystem",
         RootKind::Home | RootKind::Plain => "all of it",
     };
-    Some(format!(
+    let base = format!(
         "Not inside a project — the session root is {}; tools are scoped to it: every search \
          walks {walks}, and privacy boundaries declared for a project do not apply here. Run \
          teton from the project, `teton --cwd <path>`, or `/cd <path>` here.",
         root_line(root)
+    );
+    if known.is_empty() {
+        return Some(base);
+    }
+    let named: Vec<&str> = known
+        .iter()
+        .take(NOTICE_PROJECT_NAMES)
+        .map(String::as_str)
+        .collect();
+    let more = known.len().saturating_sub(named.len());
+    let tail = if more > 0 {
+        format!(" (+{more} more: `/projects`)")
+    } else {
+        String::new()
+    };
+    Some(format!(
+        "{base} Known projects: {}{tail} — `/cd <name>` moves there.",
+        named.join(", ")
     ))
 }
 
@@ -152,6 +194,70 @@ pub fn root_notice(root: &SessionRoot) -> Option<String> {
 mod tests {
     use super::*;
     use crate::render::RecordingSurface;
+
+    /// **REQ-584 BR-10 / AC-11.** The notice names a few known projects.
+    #[test]
+    fn the_notice_names_up_to_five_projects_and_counts_the_rest() {
+        let home = SessionRoot {
+            display: "~".to_owned(),
+            kind: RootKind::Home,
+            project_name: None,
+            vcs_branch: None,
+        };
+        let many: Vec<String> = (0..8).map(|i| format!("p{i}")).collect();
+        let notice = root_notice_with_projects(&home, &many).expect("a home root earns a notice");
+
+        assert!(
+            notice.contains("Known projects: p0, p1, p2, p3, p4"),
+            "{notice}"
+        );
+        assert!(
+            !notice.contains("p5"),
+            "only {NOTICE_PROJECT_NAMES} are named: {notice}"
+        );
+        assert!(
+            notice.contains("(+3 more: `/projects`)"),
+            "the rest are a count with a pointer, not an inventory: {notice}"
+        );
+        assert!(notice.contains("/cd <name>"), "{notice}");
+
+        // Exactly at the bound: no tail, because there is no remainder.
+        let five: Vec<String> = (0..5).map(|i| format!("p{i}")).collect();
+        let notice = root_notice_with_projects(&home, &five).unwrap();
+        assert!(!notice.contains("more:"), "{notice}");
+    }
+
+    /// **AC-11.** An empty registry renders REQ-583's notice byte for byte, and
+    /// a project root still earns none.
+    ///
+    /// The byte-identity is the claim worth pinning: a machine that has never
+    /// launched from a project must behave exactly as it did before this REQ.
+    #[test]
+    fn an_empty_registry_leaves_the_notice_unchanged() {
+        for kind in [RootKind::Home, RootKind::Plain, RootKind::FilesystemRoot] {
+            let root = SessionRoot {
+                display: "~".to_owned(),
+                kind,
+                project_name: None,
+                vcs_branch: None,
+            };
+            assert_eq!(
+                root_notice_with_projects(&root, &[]),
+                root_notice(&root),
+                "an empty registry must not change one byte of REQ-583's notice"
+            );
+        }
+        let project = SessionRoot {
+            display: "~/dev/repo".to_owned(),
+            kind: RootKind::Project,
+            project_name: Some("repo".to_owned()),
+            vcs_branch: None,
+        };
+        assert!(
+            root_notice_with_projects(&project, &["other".to_owned()]).is_none(),
+            "a project root earns no notice, and therefore no clause"
+        );
+    }
 
     #[test]
     fn banner_names_the_product_version_and_cwd() {

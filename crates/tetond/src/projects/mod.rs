@@ -192,6 +192,7 @@ pub fn locator_view(
     budget: scan::ScanBudget,
     observer: &scan::ScanObserver,
     query: Option<&str>,
+    allow_scan: bool,
 ) -> teton_core::projects::LocatorView {
     use teton_core::projects::{LocatorRow, LocatorView, LookedIn};
     use teton_core::session_root::{bounded_field, display_for, DISPLAY_MAX_CHARS, NAME_MAX_CHARS};
@@ -200,7 +201,7 @@ pub fn locator_view(
     let mut stopped_early = false;
     let mut scanned_folders: Vec<(PathBuf, usize)> = Vec::new();
 
-    if registry.rank(query).is_empty() {
+    if allow_scan && registry.rank(query).is_empty() {
         let known: Vec<_> = registry.iter().collect();
         let folders = scan::dev_folders(home, &known);
         let result = scan::scan(&folders, home, budget, observer);

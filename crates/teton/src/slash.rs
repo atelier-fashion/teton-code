@@ -101,6 +101,7 @@ use clap::Parser;
 use teton_core::session_root::{resolve_cwd_argument, CwdArgError};
 use teton_protocol::effort::EffortLevel;
 use teton_protocol::jsonrpc::{error_code, RpcError};
+use teton_protocol::methods::ProjectsListParams;
 use teton_protocol::methods::{
     ConfigGetParams, ConfigSetParams, ConfigUpdate, ModelStatusParams, PromptBlock,
     PromptTurnParams, SessionClearParams, SessionPermissionsParams, SessionPermissionsResult,
@@ -629,6 +630,17 @@ const COMMANDS: &[CommandSpec] = &[
         args: Args::Optional,
         mirror: None,
         handler: handle_cd,
+    },
+    // REQ-584 BR-9. `Args::Optional` for `/cd`'s reason: the bare form is the
+    // whole list, the argument filters it.
+    CommandSpec {
+        name: "projects",
+        aliases: &[],
+        summary: "List the projects this machine knows about, newest first, each with the \
+                  `/cd` that moves there. Optional argument filters by name.",
+        args: Args::Optional,
+        mirror: None,
+        handler: handle_projects,
     },
     CommandSpec {
         name: "verbose",
@@ -2877,6 +2889,41 @@ fn report_clear_refusal(err: &RpcError, surface: &mut dyn Surface) {
 /// No typed-input gate, for `/clear`'s reason: session-scoped, no consent, no
 /// money, and the daemon validates the path (BR-6's one validator). Available at
 /// every permission level — it moves the jail, it does not mutate files.
+/// `/projects [query]` — the machine's known projects (REQ-584 BR-9).
+///
+/// **Asks the daemon; never reads the registry file.** The file is the daemon's
+/// (the REQ's Permissions table), and routing through it is also what keeps the
+/// dev-folder scan in the one place BR-3 bounds it.
+///
+/// The daemon returns the answer already rendered, from the same composition the
+/// `projects` tool reads — so a row the model sees and a row the user sees
+/// cannot come to disagree (BR-9's one-renderer rule). This function styles the
+/// lines; it does not restate the facts.
+fn handle_projects(
+    conn: &mut Connection,
+    ctx: &mut UiContext<'_>,
+    args: &str,
+) -> anyhow::Result<CommandOutcome> {
+    let query = args.trim();
+    let params = ProjectsListParams {
+        query: (!query.is_empty()).then(|| query.to_owned()),
+        // The user asked, which is BR-3's gate on the scan.
+        allow_scan: true,
+    };
+    match conn.call(params, ctx)? {
+        Ok(result) => {
+            for line in result.rendered.lines() {
+                // `Surface::line` defuses; the daemon bounded and neutralised
+                // the values, and this is the second pass every user-controlled
+                // string on a surface gets.
+                ctx.surface.line(LineKind::Info, line);
+            }
+        }
+        Err(err) => ctx.surface.line(LineKind::Error, &err.message),
+    }
+    Ok(CommandOutcome::Continue)
+}
+
 fn handle_cd(
     conn: &mut Connection,
     ctx: &mut UiContext<'_>,
@@ -3421,6 +3468,9 @@ mod tests {
             "policy set-tier",
             "policy set-category",
             "doctor",
+            // REQ-584 BR-9: the locator's user surface, declared here first for
+            // the reason this list exists — a new row is a spec decision.
+            "projects",
         ];
         for expected in promised {
             assert!(

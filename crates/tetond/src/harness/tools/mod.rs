@@ -1721,6 +1721,7 @@ mod tests {
             &mut reg,
             Arc::new(crate::projects::ProjectStore::in_memory()),
             None,
+            None,
         );
         reg.register_cap_exempt(Arc::new(StubTool(WEB_TOOL_NAME)));
         assert!(

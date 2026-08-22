@@ -4539,6 +4539,8 @@ impl DaemonRuntime {
             &mut tools,
             Arc::clone(self.projects()),
             home(),
+            // BR-11's hand-off record goes to the session that asked.
+            Some(SessionEvents::new(Arc::clone(events), session_id.clone())),
         );
         // REQ-563 BR-1: `register_web_tool` is the one place the "tier is above
         // off" condition is expressed, so a machine that never opted in has no
