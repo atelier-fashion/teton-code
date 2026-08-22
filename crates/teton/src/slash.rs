@@ -2907,7 +2907,19 @@ fn handle_cd(
             return Ok(CommandOutcome::Continue);
         }
     };
-    if let Err(err) = conn.call(SessionSetCwdParams { session_id, cwd }, ctx)? {
+    // REQ-584 BR-8: send the bare name alongside the path reading. The daemon
+    // tries the path first and reaches for the registry only if it is not a
+    // directory, so `/cd src` with a `./src` present is unchanged.
+    let name_hint =
+        teton_core::session_root::is_bare_project_name(args).then(|| args.trim().to_owned());
+    if let Err(err) = conn.call(
+        SessionSetCwdParams {
+            session_id,
+            cwd,
+            name_hint,
+        },
+        ctx,
+    )? {
         report_cd_refusal(&err, ctx.surface);
     }
     Ok(CommandOutcome::Continue)

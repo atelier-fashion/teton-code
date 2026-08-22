@@ -4258,21 +4258,80 @@ impl DaemonRuntime {
 
         // Validate before touching anything: a refusal leaves the root and the
         // conversation exactly as they were.
-        validate_session_cwd(&params.cwd)
-            .map_err(|refusal| RpcError::new(error_code::INVALID_PARAMS, refusal.to_string()))?;
+        //
+        // REQ-584 BR-8: **the path reading is tried first, always.** Only when
+        // it fails, and only when the client said the argument was a bare name,
+        // is the registry consulted — which is what keeps `/cd src` meaning
+        // `./src` wherever `./src` exists, and keeps REQ-583's grammar table
+        // passing unchanged.
+        let cwd = match validate_session_cwd(&params.cwd) {
+            Ok(()) => params.cwd.clone(),
+            Err(refusal) => {
+                let Some(name) = params.name_hint.as_deref() else {
+                    return Err(RpcError::new(
+                        error_code::INVALID_PARAMS,
+                        refusal.to_string(),
+                    ));
+                };
+                match self.projects.snapshot().resolve_name(name) {
+                    teton_core::projects::NameResolution::Unique(project) => {
+                        // Validated like any other root — a registry entry is a
+                        // remembered path, not a licence to skip the check.
+                        validate_session_cwd(&project.path).map_err(|refusal| {
+                            RpcError::new(error_code::INVALID_PARAMS, refusal.to_string())
+                        })?;
+                        project.path.clone()
+                    }
+                    teton_core::projects::NameResolution::Ambiguous(candidates) => {
+                        // Names the candidates and moves nowhere: picking one
+                        // would move the session somewhere the user did not
+                        // choose, which is worse than asking again.
+                        let listed = candidates
+                            .iter()
+                            .map(|p| {
+                                teton_core::session_root::bounded_field(
+                                    &teton_core::session_root::display_for(
+                                        &p.path,
+                                        home().as_deref(),
+                                    ),
+                                    teton_core::session_root::DISPLAY_MAX_CHARS,
+                                )
+                            })
+                            .collect::<Vec<_>>()
+                            .join(", ");
+                        return Err(RpcError::new(
+                            error_code::INVALID_PARAMS,
+                            format!(
+                                "`{name}` names more than one known project: {listed} —                                  `/cd <path>` picks one"
+                            ),
+                        ));
+                    }
+                    teton_core::projects::NameResolution::None => {
+                        return Err(RpcError::new(
+                            error_code::INVALID_PARAMS,
+                            teton_core::session_root::cd_two_reading_refusal(name),
+                        ));
+                    }
+                }
+            }
+        };
 
         // The claim above proved the session exists, so `get` cannot miss —
         // but the fallback reads as what it is rather than as an unwrap.
         let previous_cwd = sessions.get(&params.session_id).and_then(|s| s.cwd);
         let previous_display = self.session_root_for(previous_cwd.as_deref()).view.display;
 
-        if !sessions.set_cwd(&params.session_id, params.cwd.clone()) {
+        if !sessions.set_cwd(&params.session_id, cwd.clone()) {
             return Err(RpcError::new(
                 error_code::UNKNOWN_SESSION,
                 format!("no session `{}`", params.session_id),
             ));
         }
-        let moved_to = self.session_root_for(Some(&params.cwd));
+        // `cwd`, not `params.cwd`: after a BR-8 registry resolution those are
+        // different paths, and probing the requested one would derive the root,
+        // the skills and the recorded project from a directory that does not
+        // exist.
+        let moved_to = self.session_root_for(Some(&cwd));
 
         // REQ-585 BR-1/AC-14 and ADR-6, both before the announcement below, and
         // both through the one derivation `session/create` also takes — a second
@@ -27580,6 +27639,7 @@ provider_id = \"deepseek\"
                 &SessionSetCwdParams {
                     session_id: session_id.clone(),
                     cwd: cwd.to_path_buf(),
+                    name_hint: None,
                 },
                 sessions,
                 events,
@@ -29846,6 +29906,7 @@ provider_id = \"deepseek\"
                     &SessionSetCwdParams {
                         session_id: session_id.clone(),
                         cwd: to.clone(),
+                        name_hint: None,
                     },
                     &sessions,
                     &events,

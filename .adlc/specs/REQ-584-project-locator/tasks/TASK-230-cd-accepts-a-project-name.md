@@ -1,7 +1,7 @@
 ---
 id: TASK-230
 title: "/cd accepts a project name, after the shell's own reading"
-status: pending
+status: complete
 parent: REQ-584
 created: 2026-08-22
 updated: 2026-08-22

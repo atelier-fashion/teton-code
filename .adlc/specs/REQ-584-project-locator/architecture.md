@@ -151,22 +151,43 @@ drift out of agreement with the sweep — the sweep measures the same function.
 - **OQ-6** — one platform-agnostic `$HOME`-relative table. Linux adds nothing
   the common names miss; Windows is out of scope.
 
-## ADR-10 — `/cd` resolution is a two-reading function in `teton-core`
+## ADR-10 — `/cd`'s two readings resolve in the daemon, on a `name_hint`
 
-BR-8's rule — path reading first, registry second — lives in
-`teton_core::session_root`, beside `resolve_cwd_argument`, as a widening of
-that function rather than a wrapper around it.
+**Amended during TASK-230, and the amendment is the interesting part.** The
+original decision was to widen `teton_core::resolve_cwd_argument` to take a
+borrowed slice of registry candidates. Implementation showed that cannot work,
+for two reasons that only appear once you look at the wire:
 
-**Why not a wrapper in the CLI.** The refusal has to name *both* readings ("no
-directory `x` under the session root, and no known project named `x`"), and a
-wrapper would compose that sentence from two places — the drift LESSON-529
-names. Widening the existing function keeps one composer, and keeps REQ-583's
-grammar table (`CwdGrammarRow`) as the single fixture both readings are proved
-against: AC-9 re-runs it unchanged, which is only meaningful if it still runs
-through the same entry point.
+1. **The ordering needs an existence check, and that function is pure.** BR-8
+   says a directory of that name under the root *wins*. `resolve_cwd_argument`
+   deliberately touches no filesystem — the daemon owns validation, one
+   validator (REQ-583 ADR-4) — so it cannot know which reading applies.
+2. **By the time the daemon sees the request, the bare name is gone.** The
+   client resolves `teton-code` to `<shell cwd>/teton-code` before sending, and
+   that is byte-identical to what `./teton-code` produces. The daemon cannot
+   recover which was typed.
 
-The registry reaches it as a **borrowed slice of candidates**, not as a store —
-the function stays pure and the daemon stays the only thing that reads a file.
+So the resolution lives in `DaemonRuntime::set_session_cwd`, where the existence
+answer already is, and `SessionSetCwdParams` gains an additive
+`name_hint: Option<String>` carrying the bare spelling. The client sets it only
+when `teton_core::session_root::is_bare_project_name` says the argument is a
+name — a predicate narrower than "not a path", because anything path-shaped is
+read as a path and REQ-583's grammar is therefore untouched.
+
+The ordering is the rule: `validate_session_cwd` runs first, unconditionally,
+and the registry is reached only from its failure. That is what keeps `/cd src`
+meaning `./src` wherever `./src` exists, and it is mutation-checked — trying the
+registry first reddens the `./src` leg.
+
+**What survives from the original ADR** is the concern that motivated it: the
+two-reading refusal must have one composer, or the two halves drift
+(LESSON-529). `teton_core::session_root::cd_two_reading_refusal` is that
+composer; the daemon raises it and the client renders what it is given.
+
+A registry hit is validated like any other root — a remembered path is not a
+licence to skip the check, and the probe that derives the new root, its skills
+and its registry entry runs against the **resolved** path, never the requested
+one.
 
 ---
 

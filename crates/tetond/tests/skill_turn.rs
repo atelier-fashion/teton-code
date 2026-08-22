@@ -1082,6 +1082,7 @@ async fn a_name_the_registry_lost_at_cd_is_refused_though_a_stale_snapshot_still
             &SessionSetCwdParams {
                 session_id: session.clone(),
                 cwd: after.path().to_path_buf(),
+                name_hint: None,
             },
             &h.sessions,
             &h.events,

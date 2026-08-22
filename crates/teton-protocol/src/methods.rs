@@ -300,6 +300,22 @@ pub struct SessionSetCwdParams {
     /// relative-to-shell-cwd joining); the daemon validates, the client does
     /// not canonicalize.
     pub cwd: std::path::PathBuf,
+    /// The **bare name** the user typed, when the argument was one (REQ-584 BR-8).
+    ///
+    /// `/cd teton-code` sends both: `cwd` is `<shell cwd>/teton-code`, the
+    /// reading REQ-583 has always given, and this is the spelling to try
+    /// against the known-project registry **if and only if** that path is not a
+    /// directory. Absent for every path spelling (`~/x`, `./x`, `/abs`, and
+    /// anything containing a separator), so REQ-583's behaviour is unchanged
+    /// wherever it applied.
+    ///
+    /// It rides the params rather than being re-derived daemon-side because by
+    /// the time `cwd` arrives the bare name is gone — `teton-code` and
+    /// `./teton-code` resolve to the same absolute path, and only the client
+    /// knows which was typed. Additive: a client that never sends it gets
+    /// exactly REQ-583's `/cd`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub name_hint: Option<String>,
 }
 
 /// Result of [`SessionSetCwdParams`].
@@ -3295,6 +3311,7 @@ mod tests {
         round_trip(&SessionSetCwdParams {
             session_id: SessionId::from("s1"),
             cwd: std::path::PathBuf::from("/Users/dev/repo"),
+            name_hint: None,
         });
         round_trip(&SessionSetCwdResult {
             root: SessionRoot {

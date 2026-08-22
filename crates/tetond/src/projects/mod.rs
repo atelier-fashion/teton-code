@@ -620,6 +620,123 @@ mod tests {
         std::fs::remove_dir_all(&dir).ok();
     }
 
+    /// **BR-8 / AC-9.** `/cd <name>` moves; `./src` still wins; two matches
+    /// refuse; neither reading names the two-reading refusal.
+    ///
+    /// Driven through `set_session_cwd`, because the ordering *is* the rule and
+    /// it lives there — a test of `resolve_name` alone would prove the registry
+    /// works and say nothing about which reading is tried first.
+    #[test]
+    fn cd_reads_a_bare_name_as_a_directory_first_and_a_project_second() {
+        use crate::runtime::DaemonRuntime;
+        use crate::sessions::SessionRegistry;
+        use crate::skills::RealFs;
+        use teton_protocol::methods::SessionSetCwdParams;
+
+        let dir = temp_dir("br8");
+        let shell = dir.join("shell");
+        std::fs::create_dir_all(&shell).unwrap();
+        // A project reachable only by name…
+        let named = project_at(&dir, "teton-code");
+        // …a sibling directory under the shell cwd that shares a project's name…
+        let sibling = shell.join("src");
+        std::fs::create_dir_all(&sibling).unwrap();
+        let decoy = project_at(&dir, "src");
+        // …and two projects that share a name.
+        let api_one = project_at(&dir, "one/api");
+        let api_two = project_at(&dir, "two/api");
+
+        let runtime = DaemonRuntime::minimal();
+        let sessions = SessionRegistry::new();
+        let events = std::sync::Arc::new(crate::broadcast::EventBus::new());
+        let fs = RealFs;
+        for p in [&named, &decoy, &api_one, &api_two] {
+            runtime
+                .projects()
+                .record(p.clone(), ProjectSource::Launched);
+        }
+
+        let session = sessions
+            .create(
+                teton_protocol::SessionMode::Freeform,
+                None,
+                Some(shell.clone()),
+            )
+            .expect("session")
+            .session_id;
+
+        let mut cd = |raw: &str, path: PathBuf| {
+            runtime.set_session_cwd(
+                &SessionSetCwdParams {
+                    session_id: session.clone(),
+                    cwd: path,
+                    name_hint: teton_core::session_root::is_bare_project_name(raw)
+                        .then(|| raw.to_owned()),
+                },
+                &sessions,
+                &events,
+                &fs,
+            )
+        };
+
+        // 1. A unique name with no such subdirectory: the session moves.
+        let moved = cd("teton-code", shell.join("teton-code")).expect("a unique name moves");
+        assert!(
+            moved.root.display.ends_with("teton-code"),
+            "{:?}",
+            moved.root
+        );
+
+        // 2. `./src` exists under the shell cwd, and a known project is ALSO
+        //    named `src`. REQ-583's reading wins — this is the leg that proves
+        //    the ordering rather than the lookup.
+        let moved = cd("src", sibling.clone()).expect("the sibling directory wins");
+        assert!(
+            moved.root.display.ends_with("shell/src"),
+            "a directory under the root must beat a known project of the same \
+             name, or REQ-583's behaviour changed: {:?}",
+            moved.root
+        );
+
+        // 3. Two projects named `api`: named, and nothing moves.
+        let before = sessions.get(&session).and_then(|s| s.cwd);
+        let err = cd("api", shell.join("api")).expect_err("ambiguous must refuse");
+        assert!(
+            err.message.contains("more than one known project"),
+            "{err:?}"
+        );
+        assert!(
+            err.message.contains("one/api") && err.message.contains("two/api"),
+            "{err:?}"
+        );
+        assert_eq!(
+            sessions.get(&session).and_then(|s| s.cwd),
+            before,
+            "an ambiguous name must move nowhere"
+        );
+
+        // 4. Neither reading resolves: the refusal names both.
+        let err =
+            cd("nothing-known", shell.join("nothing-known")).expect_err("neither reading resolves");
+        assert!(
+            err.message.contains("no directory `nothing-known`"),
+            "{err:?}"
+        );
+        assert!(err.message.contains("no known project named"), "{err:?}");
+
+        // 5. A PATH spelling never reaches the registry, even when a project of
+        //    that name exists — `name_hint` is absent, so the refusal is
+        //    REQ-583's, byte for byte.
+        let err = cd("./teton-code", shell.join("teton-code"))
+            .expect_err("a path spelling that does not exist is refused as a path");
+        assert!(
+            !err.message.contains("known project"),
+            "a path spelling must not be re-read as a name: {err:?}"
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
     /// The pruning predicate is the thing BR-2 actually means.
     #[test]
     fn is_live_project_wants_a_directory_that_still_holds_a_marker() {
