@@ -1,10 +1,10 @@
 ---
 id: REQ-588
 title: "A spend cap, and an event vocabulary a future kind cannot break"
-status: draft
+status: approved
 deployable: true
 created: 2026-08-20
-updated: 2026-08-20
+updated: 2026-08-22
 component: "daemon/cost-ledger"
 domain: "cost"
 stack: ["rust", "daemon", "json-rpc"]
@@ -60,6 +60,11 @@ for enums carried inside a payload that promise is currently unbacked.
 - [ ] BR-4: An unknown enum variant inside an event payload degrades to a
       rendered-but-unrecognised line, never a dropped frame; pinned in both
       directions for `ContextPressureKind`, `BudgetBound`, and any sibling.
+      **Scoped to enums *inside* a payload.** The top-level `Event` enum is a
+      larger, separate hole — an unknown event *kind* drops the whole frame,
+      which is why `ProjectMatch`, `SkillRefused` and `SkillInvoked` are all
+      invisible to older clients — and it is tracked on its own rather than
+      absorbed here, because widening `Event` touches every match on it.
 - [ ] BR-5: Whatever default is chosen, a fresh install's behaviour is stated
       in `teton_docs` and in the release notes — a ceiling that appears
       silently is the mirror of the window that was recorded silently.
@@ -75,25 +80,81 @@ for enums carried inside a payload that promise is currently unbacked.
       sane line rather than dropping the frame; a payload carrying a known one
       is byte-identical to today. (protocol contract, both directions)
 - [ ] AC-4: `cargo test --workspace --no-fail-fast` green; the REQ-586 budget
-      and bound behaviour is unchanged where no ceiling binds.
+      and bound behaviour is unchanged where no ceiling binds. (BR-1..BR-4
+      regression)
+- [ ] AC-5: **BR-5's half that is not code.** A fresh install's ceiling
+      behaviour — that there is none until it is configured (OQ-3) — is stated
+      in `teton_docs` and in the release notes, and a test asserts the
+      `teton_docs` sentence exists rather than trusting it was written. The
+      release-notes half is a wrapup checklist item, not a test.
+- [ ] AC-6: **The unpriced case (OQ-2).** A provider the price table cannot
+      price, with a ceiling configured, is refused at the choke point with a
+      typed outcome naming the missing price — not waved through uncapped, and
+      not charged a guessed rate. (egress-capture)
 
 ## External Dependencies
 
 - Builds on REQ-586 (merged, `c9e9265`) — the budget, the `bound` fact, and
   the `context_pressure` vocabulary.
-- REQ-587 (spec PR #193) will likely add a `ContextPressureKind`; if it lands
-  first, BR-4 is the thing that makes that safe.
+- REQ-587 **shipped** (2026-08-22, `f2066b0`) and added no
+  `ContextPressureKind` after all — only REQ-586 has ever touched that enum.
+  The speculation this line used to carry is retired; BR-4 stands on its own
+  merits rather than on a coming variant.
+- BUG-186 (2026-08-22) already applied BR-4's pattern to two sibling enums
+  (`DynamicOutcome`, `NotRunReason`), so the shape and its four-leg skew test
+  exist to copy. Verified at validation: `ContextPressureKind` (4 variants) and
+  `BudgetBound` (5) are **still closed**, so BR-4 has real work left.
+
+## Assumptions
+
+- A-1: **The cost ledger's prices are the ceiling's arithmetic.** A currency
+  cap (OQ-2) is only as correct as `prices.toml`, and a stale price enforces
+  the wrong number *silently* — the exact failure class this REQ exists to
+  close. This is why OQ-2 resolved to "refuse when unpriced" rather than
+  best-effort: an absent price is detectable and refusable, whereas a *wrong*
+  price is neither. The residual stands: a price that is present but stale
+  still yields a wrong ceiling, and nothing here detects that. The post-switch
+  price-page re-verify is the mitigation and is tracked separately.
+- A-2: A refusal mid-prompt is acceptable to a user who set a ceiling. Setting
+  one is an explicit act (OQ-3 keeps it opt-in), so the wall is a consequence
+  they chose. This is the assumption that would be wrong if the cap were ever
+  defaulted on — see OQ-3.
+- A-3: Per-prompt is the unit a user reasons in (OQ-1). A prompt is what they
+  initiate; a turn is an implementation detail of the loop, and a session is
+  long enough that a ceiling on it would bind at an arbitrary moment days
+  later.
+- A-4: The egress choke point sees every spend. BR-1 depends on it: a route
+  that reached a provider without passing it would be uncapped, and the same
+  property REQ-562 relies on for redaction is what makes the ceiling total.
+- A-5: The ledger is written before the refusal, so AC-1's "the cost ledger
+  showing what was spent" is available at the moment of refusal. If the write
+  happens after the forward point, the refusal cannot name the figure and BR-3
+  needs a different source.
 
 ## Open Questions
 
-- [ ] OQ-1: Per turn, per prompt, or per session? *Lean:* per prompt — it is
+_All four resolved at validation, 2026-08-22. OQ-1 and OQ-3 adopt their leans
+(consistent with precedent, and closable by ADR). **OQ-2 and OQ-4 were product
+decisions and were taken by the user**, not inferred — they determine what
+happens to someone's money and what they see when it happens._
+
+- [x] OQ-1: Per turn, per prompt, or per session? **Adopted: per prompt** — it is
       the unit the user initiates and the one the ≈25M figure is stated in.
-- [ ] OQ-2: Tokens or currency? *Lean:* currency, since the ledger prices
-      every call and a token ceiling means different money per provider.
-- [ ] OQ-3: Default on or opt-in? *Lean:* opt-in, matching `[privacy] redact`,
+- [x] OQ-2: Tokens or currency? **DECIDED: currency, and refuse when
+      unpriced.** The ledger prices every call and a token ceiling means
+      different money per provider. The addition over the original lean is the
+      unpriced case: if the table cannot price a provider the cap is
+      unenforceable, so the call is refused rather than waved through — a
+      missing price must not become a missing ceiling (AC-6, A-1).
+- [x] OQ-3: Default on or opt-in? **Adopted: opt-in**, matching `[privacy] redact`,
       with the REQ-586 notice pointing at it.
-- [ ] OQ-4: At the ceiling — refuse, or degrade to a cheaper tier? *Lean:*
-      refuse; a silent tier downgrade is the shape this project keeps rejecting.
+- [x] OQ-4: At the ceiling — refuse, or degrade to a cheaper tier?
+      **DECIDED: refuse, naming the spend and the ceiling.** A silent tier
+      downgrade answers with a model the user did not choose and was not told
+      about — the shape BUG-156's failover pin and REQ-586's "nothing is
+      clamped in silence" both reject. Offering the cheaper tier as an
+      *accepted* recipe was considered and left out of scope: it needs a new
+      consent surface, and refusing plainly is the smaller correct thing.
 
 ## Out of Scope
 
