@@ -4,7 +4,7 @@ title: "Architecture — model-invoked skills"
 status: approved
 parent: REQ-587
 created: 2026-08-20
-updated: 2026-08-20
+updated: 2026-08-22
 ---
 
 ## Approach

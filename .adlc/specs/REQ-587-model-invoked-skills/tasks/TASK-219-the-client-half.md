@@ -4,7 +4,7 @@ title: "The client: a `(model-only)` mark, an acknowledgment prompt, and who inv
 status: complete
 parent: REQ-587
 created: 2026-08-20
-updated: 2026-08-20
+updated: 2026-08-22
 dependencies: [TASK-210, TASK-212]
 ---
 

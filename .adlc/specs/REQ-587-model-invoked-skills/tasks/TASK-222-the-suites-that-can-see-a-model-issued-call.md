@@ -4,7 +4,7 @@ title: "The suites that can see a model-issued call — and a Vendor that can sc
 status: complete
 parent: REQ-587
 created: 2026-08-20
-updated: 2026-08-21
+updated: 2026-08-22
 dependencies: [TASK-218, TASK-219, TASK-220]
 ---
 

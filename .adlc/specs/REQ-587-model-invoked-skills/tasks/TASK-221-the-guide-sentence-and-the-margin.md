@@ -4,7 +4,7 @@ title: "One sentence about who runs what, measured with the roster in place"
 status: complete
 parent: REQ-587
 created: 2026-08-20
-updated: 2026-08-20
+updated: 2026-08-22
 dependencies: [TASK-211, TASK-216]
 ---
 

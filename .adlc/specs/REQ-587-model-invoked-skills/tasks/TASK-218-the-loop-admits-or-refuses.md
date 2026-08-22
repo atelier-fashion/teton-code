@@ -4,7 +4,7 @@ title: "The loop admits or refuses the expansion, and the reroute guard learns t
 status: complete
 parent: REQ-587
 created: 2026-08-20
-updated: 2026-08-20
+updated: 2026-08-22
 dependencies: [TASK-213, TASK-217]
 ---
 

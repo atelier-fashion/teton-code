@@ -4,7 +4,7 @@ title: "Protocol: the two flags, who invoked, and an acknowledgment subject an o
 status: complete
 parent: REQ-587
 created: 2026-08-20
-updated: 2026-08-20
+updated: 2026-08-22
 dependencies: []
 ---
 

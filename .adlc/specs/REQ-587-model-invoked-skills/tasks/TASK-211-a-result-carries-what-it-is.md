@@ -4,7 +4,7 @@ title: "A tool result carries what it *is*, so the fold stops guessing from the 
 status: complete
 parent: REQ-587
 created: 2026-08-20
-updated: 2026-08-20
+updated: 2026-08-22
 dependencies: []
 ---
 

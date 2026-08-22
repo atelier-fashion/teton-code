@@ -4,7 +4,7 @@ title: "The frame line leaves `expand`, so two callers can share a body and diff
 status: complete
 parent: REQ-587
 created: 2026-08-20
-updated: 2026-08-20
+updated: 2026-08-22
 dependencies: []
 ---
 
