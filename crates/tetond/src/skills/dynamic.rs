@@ -104,6 +104,14 @@ pub(crate) enum Piece {
         text: String,
         /// Whether the chunk starts at a line start in the body.
         at_line_start: bool,
+        /// The chunk's byte offset in the scanned body.
+        ///
+        /// Carried so the expander can tell **which bytes in this chunk came
+        /// from the caller** (BUG-190). `substitute` records those spans in
+        /// body coordinates; without an origin here they cannot be mapped onto
+        /// a chunk, and file prose and argument text stay indistinguishable in
+        /// the region the frame vouches for.
+        from: usize,
     },
     /// The slot of the command at this index in the scan's command list.
     Slot(usize),
@@ -156,6 +164,7 @@ fn push_text(pieces: &mut Vec<Piece>, body: &str, from: usize, to: usize) {
     pieces.push(Piece::Text {
         text: body[from..to].to_owned(),
         at_line_start: from == 0 || body.as_bytes()[from - 1] == b'\n',
+        from,
     });
 }
 

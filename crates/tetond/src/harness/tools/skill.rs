@@ -463,10 +463,12 @@ impl SkillFrame {
     ///
     /// Returns `body` untouched when no trailer was appended — the caller
     /// passed nothing, or the body named `$ARGUMENTS`/`$N` and the arguments
-    /// were spliced **into** it instead. That second case is the remaining half
-    /// of this guard and it cannot be closed from here: the splice happens
-    /// inside `skills::expand::substitute`, which composes the block this
-    /// function only wraps.
+    /// were spliced **into** it instead. That second case is not this
+    /// function's to close and no longer needs to be: since BUG-190 the splice
+    /// carries its own sub-frame, drawn by `skills::expand::sub_frame_splices`
+    /// after `dynamic::scan` — the stage that knows both the line structure and
+    /// the command spans. Both halves now draw the same `<skill-arguments>`
+    /// region, which is the one the closing sentence names.
     fn sub_frame_arguments(&self, body: &str) -> String {
         let Some(trailer) = self.argument_trailer() else {
             return body.to_owned();

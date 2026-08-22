@@ -1328,8 +1328,10 @@ async fn the_engine_is_handed_the_expansion_the_budget_measured() {
     // The rest of the line verbatim: interior whitespace preserved, quotes not
     // interpreted (AC-4). JSON-escaped on the wire, hence the escaped quotes.
     assert!(
-        sent.contains(r#"Handle REQ-585  \"quoted\" carefully."#),
-        "`$ARGUMENTS` is substituted verbatim: {}",
+        sent.contains(
+            r#"Handle <skill-arguments>REQ-585  \"quoted\"</skill-arguments> carefully."#
+        ),
+        "`$ARGUMENTS` is substituted verbatim inside BUG-190's sub-frame: {}",
         &sent[..sent.len().min(800)]
     );
     assert!(
@@ -4002,9 +4004,11 @@ async fn one_fixture_reaches_the_model_as_the_same_body_bytes_for_both_callers()
     // Non-vacuity: the arguments really were substituted, so this is a
     // comparison of an expansion rather than of two empty strings.
     assert!(
-        modelled_body.contains("Follow these steps for teton  code \"repo\"."),
-        "the arguments reach `$ARGUMENTS` verbatim, interior spaces and quotes \
-         intact: {modelled_body}"
+        modelled_body.contains(
+            "Follow these steps for <skill-arguments>teton  code \"repo\"</skill-arguments>."
+        ),
+        "the arguments reach `$ARGUMENTS` verbatim inside BUG-190's sub-frame, \
+         interior spaces and quotes intact: {modelled_body}"
     );
 
     // The planted markers, on both paths, defused where each layer defuses it.
