@@ -1915,6 +1915,16 @@ fn format_context_pressure(pressure: &ContextPressure) -> String {
                 ),
             }
         ),
+        // REQ-588 BR-4: a kind this build does not know. It says the true
+        // part — the context was changed to fit the budget — and does not
+        // invent the part it cannot know. Every other arm names WHAT happened;
+        // this one deliberately does not, because a guess here would be the
+        // mis-rendering `DidNotFit`'s doc calls worse than silence.
+        ContextPressureKind::Unknown => {
+            format!(
+                "context: adjusted to fit the {budget} {bound} (this build does not recognise how)"
+            )
+        }
     }
 }
 

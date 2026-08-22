@@ -1,7 +1,7 @@
 ---
 id: TASK-233
 title: "serde tolerance for the two closed payload enums"
-status: pending
+status: complete
 parent: REQ-588
 created: 2026-08-22
 updated: 2026-08-22

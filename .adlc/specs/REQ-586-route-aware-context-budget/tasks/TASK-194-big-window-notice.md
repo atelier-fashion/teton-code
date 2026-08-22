@@ -155,7 +155,10 @@ catch-all, so serde refuses a tag it does not know. That is the fail-closed
 choice — it can never be mis-rendered as a neighbouring kind — but it is a
 lost line, not a degraded one, and only for binaries built before this change.
 Both directions are pinned by
-`a_context_that_did_not_fit_has_its_own_kind_and_an_older_client_drops_the_frame`
+`a_context_that_did_not_fit_has_its_own_kind_and_an_unknown_one_degrades`
+(renamed by REQ-588 BR-4, which opened the enum: an unknown kind now degrades
+to `Unknown` rather than dropping the frame — the concern the original name
+carried, "never folded into a kind it does know", is still what the test pins)
 (renamed in the fix pass below — the old name claimed graceful degradation in
 both directions, and the new→old direction is a drop).
 
