@@ -538,6 +538,13 @@ pub fn render_event(
             render_skill_invoked(invoked, surface, state.verbose);
             EventOutcome::Rendered
         }
+        // BUG-189: a call refused before any file resolved. One line, always —
+        // not behind `/verbose`, because BR-9's rule is one line per typed
+        // refusal and the whole defect was that these two produced none.
+        Event::SkillRefused(refused) => {
+            surface.line(LineKind::Notice, &skill_name_refusal_line(refused));
+            EventOutcome::Rendered
+        }
         Event::RouteDecided(rd) => {
             if state.verbose {
                 surface.line(LineKind::Notice, &format_route(rd));
@@ -1280,6 +1287,29 @@ fn skill_refusal_line(invoked: &SkillInvoked, reason: &str) -> String {
     )
 }
 
+/// BR-9's refusal line for a call that never reached a file (BUG-189).
+///
+/// Deliberately **shaped like** [`skill_refusal_line`] and deliberately not
+/// identical: it opens with the same `refused: skill` verdict, so the two read
+/// as one vocabulary, but it carries no `(source)` clause because there is no
+/// file and therefore no source. Inventing one would be the hollow record this
+/// event exists to avoid.
+///
+/// A nameless call — `invalid_arguments`, where the parse is what failed — says
+/// so rather than rendering an empty gap where a name goes.
+fn skill_name_refusal_line(refused: &events::SkillRefused) -> String {
+    match &refused.name {
+        Some(name) => format!(
+            "refused: skill {name} — {}",
+            refusal_reason_words(&refused.reason)
+        ),
+        None => format!(
+            "refused: skill call — {}",
+            refusal_reason_words(&refused.reason)
+        ),
+    }
+}
+
 /// The daemon's stable refusal id, in words a person reads (REQ-587 BR-9).
 ///
 /// **The id keys the record; it is not the sentence.** It is the same token the
@@ -1291,12 +1321,15 @@ fn skill_refusal_line(invoked: &SkillInvoked, reason: &str) -> String {
 ///
 /// # The set is open, and the unknown arm is the load-bearing one
 ///
-/// Two of the daemon's ids cannot reach this arm at all — `unknown_skill` and
-/// `invalid_arguments` — because neither names a registry row and the daemon
-/// publishes no record for a call it cannot attribute to a file (its
-/// `registered_row` returns `None`). They are worded here anyway, because
-/// "which reasons publish" is the daemon's to change and this map costs nothing
-/// for being complete. Every other id it raises does publish, and more will
+/// `unknown_skill` and `invalid_arguments` reach this map through
+/// [`skill_name_refusal_line`] rather than through [`skill_refusal_line`]:
+/// neither names a registry row, so the daemon publishes them as
+/// [`events::SkillRefused`] — a record whose subject is a *name* — instead of
+/// forcing them onto `SkillInvoked`, whose subject is a file (BUG-189). They
+/// were worded here before anything published them, on the reasoning that
+/// "which reasons publish" is the daemon's to change and a complete map costs
+/// nothing; that turned out to be exactly right, and closing BUG-189 needed no
+/// change here at all. Every other id it raises does publish, and more will
 /// exist than this build knows, exactly as `PermissionSubject::Unrecognized`
 /// anticipates for subjects. An id this build cannot word must still produce a
 /// **readable line** — BUG-186 is open against dropping an event a client does

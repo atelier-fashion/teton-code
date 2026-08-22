@@ -191,6 +191,8 @@ pub enum Event {
     ContextPressure(ContextPressure),
     /// A user-typed `/name` expanded into a prompt turn (REQ-585 BR-12).
     SkillInvoked(SkillInvoked),
+    /// A skill call was refused before any file was resolved (BUG-189).
+    SkillRefused(SkillRefused),
 }
 
 impl Event {
@@ -230,6 +232,7 @@ impl Event {
             Event::SessionRootChanged(_) => "session_root_changed",
             Event::ContextPressure(_) => "context_pressure",
             Event::SkillInvoked(_) => "skill_invoked",
+            Event::SkillRefused(_) => "skill_refused",
         }
     }
 }
@@ -2742,6 +2745,44 @@ pub struct SessionGrantMinted {
 }
 
 // ---------------------------------------------------------------------------
+/// A skill call the daemon refused **before resolving it to a file** (BUG-189).
+///
+/// BR-9 says a refusal is never silent: one line per invocation, one line per
+/// typed refusal. Five of the daemon's seven refusal reasons ride
+/// [`SkillInvoked`] with `refused` set, because a registry row was in hand to
+/// describe. Two never resolve one:
+///
+/// - `unknown_skill` — no row carries that name;
+/// - `invalid_arguments` — the parse is what failed, so there is not even a
+///   name to trust (a capped *listing* call is the same shape: it named
+///   nothing).
+///
+/// Those two used to reach the model as a typed result and the human not at
+/// all. They could not be forced onto `SkillInvoked`, whose subject is a
+/// **file**: it carries a `source`, a `path_display` and a `body_bytes`, and
+/// publishing one here would have meant choosing a root the file was never
+/// found under and inventing every identifying field but the model's own
+/// spelling — a hollow record that reads like a real one, which on a session
+/// surface is worse than saying nothing.
+///
+/// So this is a record whose subject is a **name**, and it carries only what is
+/// actually known. `name` is optional because in the `invalid_arguments` case
+/// nothing reliable was parsed.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SkillRefused {
+    /// The name the call asked for, when one could be read.
+    ///
+    /// **Untrusted and model-supplied** — it matched no registry row, which is
+    /// the whole point of this record. Bounded by the daemon before it is sent
+    /// and defused again by the client's `Surface`. Absent when the arguments
+    /// did not parse into a usable name at all.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
+    /// The daemon's stable refusal id — the same token the model is given, so
+    /// both audiences are told the same fact. The client words it.
+    pub reason: String,
+}
+
 // skill_invoked (REQ-585)
 // ---------------------------------------------------------------------------
 

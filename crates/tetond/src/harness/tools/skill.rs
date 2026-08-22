@@ -67,7 +67,8 @@ use async_trait::async_trait;
 use serde_json::{json, Value};
 use teton_core::session_root::{bounded_field, display_for, DISPLAY_MAX_CHARS};
 use teton_protocol::events::{
-    Event, InvokedBy, NotRunReason, ProjectSkillTrustEntry, SkillInvoked, TurnInvocations,
+    Event, InvokedBy, NotRunReason, ProjectSkillTrustEntry, SkillInvoked, SkillRefused,
+    TurnInvocations,
 };
 use teton_protocol::methods::project_skill_trust_key;
 use tokio::runtime::Handle;
@@ -1443,11 +1444,12 @@ impl SkillTool {
     /// refusal sentence carries the roster, and the roster's identities are
     /// root-relative (BR-10).
     fn refuse(&self, ctx: &ToolContext, args: &Value, refusal: Refusal) -> ToolOutcome {
-        if let Some(skill) = call_name(args)
+        let name = call_name(args);
+        if let Some(skill) = name
             .as_deref()
             // Not `resolve_for_model`: two of these reasons are *about* a row
             // that resolver refuses by design.
-            .and_then(|name| registered_row(&self.registry, name))
+            .and_then(|n| registered_row(&self.registry, n))
         {
             let display = display_for(&skill.path, home().as_deref());
             let shadows = shadows_user_skill(&self.registry, &skill.name);
@@ -1459,6 +1461,23 @@ impl SkillTool {
                 &[],
                 None,
                 Some(refusal.reason()),
+            );
+        } else {
+            // BUG-189: no row resolved, so there is no *file* to describe — and
+            // `SkillInvoked`'s subject is a file. Publishing one here would mean
+            // inventing a source and a path the call never had. This record's
+            // subject is the **name**, so BR-9's "never silent" holds for the
+            // two reasons that never reach a row (`unknown_skill`, and
+            // `invalid_arguments`, which may not even have a name).
+            self.gate.events().publish(
+                Some(self.gate.session_id().clone()),
+                Event::SkillRefused(SkillRefused {
+                    // Untrusted and model-supplied: it matched nothing, which is
+                    // why we are here. Bounded at the same ceiling `path_display`
+                    // uses, before it reaches any client or transcript.
+                    name: name.map(|n| bounded_field(&n, DISPLAY_MAX_CHARS)),
+                    reason: refusal.reason().to_owned(),
+                }),
             );
         }
         refusal.into_outcome(&self.registry, ctx.repo_root())
