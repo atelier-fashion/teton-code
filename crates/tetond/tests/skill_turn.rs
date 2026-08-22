@@ -920,6 +920,85 @@ async fn drain(sub: &mut tetond::broadcast::Subscription) -> Vec<Event> {
 /// dispatch from.
 ///
 /// Non-vacuity: the same turn with the registered name expands and runs.
+/// **AC-19's attribution half (BUG-183).** A skill turn is billed exactly as a
+/// typed prompt on the same session is — asserted through the real skill path.
+///
+/// This claim used to live in `cost_attribution.rs` and would have passed with
+/// the whole `crate::skills` module deleted: both legs hand-built an
+/// `Egress::send`, neither reached `run_prompt_turn`, `expand` or
+/// `accept_invocation`, and the central equality compared two rows produced
+/// from **one reused `EgressContext`** — so `session_id`, `phase`,
+/// `provider_id` and `model` could not differ whatever the skill path did. The
+/// assertion was implied by its own setup (LESSON-544's shape).
+///
+/// Here both turns go through the daemon's own path on one session, so the
+/// attribution each carries is the one production built for it. A skill path
+/// that grew its own session key, phase or model would now differ — and a
+/// skill path that stopped billing at all would leave one row where this
+/// expects two.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_skill_turn_is_billed_with_the_same_attribution_a_typed_turn_gets() {
+    let repo = Tree::new("cost-attribution");
+    repo.write(
+        ".claude/skills/status/SKILL.md",
+        &skill_file("report on the repo", "Report on the repo."),
+    );
+    let h = Harness::with_window(128_000);
+    let session = h.session_at(repo.path());
+
+    // A typed turn first, to establish what "the same as a typed prompt" is on
+    // this session — read from production rather than asserted against a
+    // literal, which is what makes the comparison meaningful.
+    h.turn(&session, "Report on the repo.", None)
+        .await
+        .expect("a typed turn runs");
+    let after_typed = h
+        .runtime
+        .cost_report()
+        .expect("the ledger reads")
+        .report
+        .per_phase
+        .len();
+
+    // Then the same work as a skill invocation.
+    h.turn(&session, "", Harness::invoke("status", ""))
+        .await
+        .expect("a registered skill runs");
+
+    assert!(
+        h.vendor.hits() >= 2,
+        "both turns must actually have reached the vendor, or this measures \
+         nothing: {} hit(s)",
+        h.vendor.hits()
+    );
+
+    let report = h.runtime.cost_report().expect("the ledger reads").report;
+    let phases: Vec<&str> = report.per_phase.iter().map(|g| g.key.as_str()).collect();
+    assert_eq!(
+        phases,
+        vec!["implement"],
+        "the skill turn lands in the session's own phase, and nowhere else — \
+         a skill path with its own phase key would add a second group here"
+    );
+    assert_eq!(
+        report.per_phase.len(),
+        after_typed,
+        "and it joins the typed turn's group rather than making a new one"
+    );
+
+    // BR-7: the ledger holds counts and routing, never what the turn was made
+    // of. Driven off the REAL expansion — the body, the file name and anything
+    // a dynamic command printed all come from production here, where the old
+    // fixture hand-wrote a preamble production never emits.
+    let rendered = format!("{report:?}");
+    for leak in ["Report on the repo", ".claude/skills", "SKILL.md", "status"] {
+        assert!(
+            !rendered.contains(leak),
+            "a cost report carries `{leak}`: {rendered}"
+        );
+    }
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn an_unknown_skill_name_is_refused_by_the_daemon_not_only_by_the_client() {
     let repo = Tree::new("unknown");
