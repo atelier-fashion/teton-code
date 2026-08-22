@@ -1097,6 +1097,32 @@ const TAINT_BY_UNSTATED_CAUSE: &str = "a blocked outbound payload";
 /// reason `read_findings`' error type does: a compile-time literal cannot carry
 /// a runtime value, so no path, session id, or payload byte can reach this line
 /// even by accident. The cause is a *class*, never an instance.
+/// Run blocking work off the async worker, when there is a worker to leave.
+///
+/// `block_in_place` **panics** on a `current_thread` runtime and there is no
+/// worker to yield there anyway, so the flavor decides. Three call sites carried
+/// this same nine-line check verbatim before BUG-184 wanted a fourth; one home
+/// beats four copies of a rule whose failure mode is a panic.
+///
+/// `block_in_place` rather than `spawn_blocking` at every one of them: the work
+/// borrows from the daemon and is not `'static`, and moving the *thread* off the
+/// pool is exactly the right granularity.
+pub(crate) fn block_in_place_if_multithread<T>(f: impl FnOnce() -> T) -> T {
+    let multi = tokio::runtime::Handle::try_current()
+        .map(|h| {
+            matches!(
+                h.runtime_flavor(),
+                tokio::runtime::RuntimeFlavor::MultiThread
+            )
+        })
+        .unwrap_or(false);
+    if multi {
+        tokio::task::block_in_place(f)
+    } else {
+        f()
+    }
+}
+
 pub(crate) fn taint_pin_line(cause: &'static str) -> String {
     format!(
         "tetond: privacy — this session is pinned to the local tier for the rest of its life \
@@ -4516,10 +4542,19 @@ impl DaemonRuntime {
         // `set_skills` answering `false` — a session that vanished between the
         // caller's claim and this write — is nothing to act on: there is no
         // record to hold a registry, and no id anyone can query it with.
-        sessions.set_skills(
-            session_id,
-            crate::skills::discover(home().as_deref(), &probed.path, probed.view.kind, fs),
-        );
+        // BUG-184: discovery is up to four `read_dir` calls plus, worst case,
+        // 4 x MAX_ENTRIES_PER_ROOT metadata+open+read calls of up to 64 KiB, on
+        // user-controlled, symlinked paths — and on macOS a root under
+        // `~/Documents` can raise a TCC dialog that blocks the syscall for as
+        // long as the user takes to answer it. Both call sites reach this from a
+        // connection's synchronous reader loop (`session/create`) or from the
+        // `/cd` path, so the wait must not be taken on an async worker. Placed
+        // here rather than at the two call sites so a third cannot forget it —
+        // the same reason the globs are spelled here and nowhere else.
+        let discovered = block_in_place_if_multithread(|| {
+            crate::skills::discover(home().as_deref(), &probed.path, probed.view.kind, fs)
+        });
+        sessions.set_skills(session_id, discovered);
     }
 
     /// Forget every remembered consent this session's **root** gave meaning to,

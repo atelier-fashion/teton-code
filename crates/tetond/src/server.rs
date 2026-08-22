@@ -1075,19 +1075,8 @@ async fn refuse_unattested_commitment(
     let request = RequestId::from(format!("commit-{:?}", conn.id));
     let verifier = &daemon.verifier;
     let subject = conn.id;
-    let verified = if tokio::runtime::Handle::try_current()
-        .map(|h| {
-            matches!(
-                h.runtime_flavor(),
-                tokio::runtime::RuntimeFlavor::MultiThread
-            )
-        })
-        .unwrap_or(false)
-    {
-        tokio::task::block_in_place(|| verifier.verify(subject, &request))
-    } else {
-        verifier.verify(subject, &request)
-    };
+    let verified =
+        crate::runtime::block_in_place_if_multithread(|| verifier.verify(subject, &request));
     match verified {
         Ok(_) => None,
         Err(refusal) => {
@@ -4155,26 +4144,11 @@ async fn attest_presence(
         let verifier = &daemon.verifier;
         let subject = conn.id;
         let request = request_id.clone();
-        // `block_in_place` rather than `spawn_blocking`: the verifier is
-        // borrowed from the daemon and is not `'static`, and this call is
-        // already on its own per-request task (see `handle_client`), so moving
-        // the *thread* off the worker pool is exactly the right granularity.
-        // Falls back to a direct call on a single-threaded runtime, where
-        // `block_in_place` panics and where no other task shares this worker
-        // anyway.
-        if tokio::runtime::Handle::try_current()
-            .map(|h| {
-                matches!(
-                    h.runtime_flavor(),
-                    tokio::runtime::RuntimeFlavor::MultiThread
-                )
-            })
-            .unwrap_or(false)
-        {
-            tokio::task::block_in_place(|| verifier.verify(subject, &request))
-        } else {
-            verifier.verify(subject, &request)
-        }
+        // The verifier is borrowed from the daemon and is not `'static`, and
+        // this call is already on its own per-request task (see
+        // `handle_client`), so moving the *thread* off the worker pool is the
+        // right granularity. The flavor check lives in the helper.
+        crate::runtime::block_in_place_if_multithread(|| verifier.verify(subject, &request))
     }?;
 
     let method = attestation.method();
