@@ -2757,6 +2757,19 @@ pub struct SessionGrantMinted {
 /// model said. Published only when there was a match — a turn that called the
 /// tool and found nothing publishes none, and a turn that never called it
 /// publishes none either.
+///
+/// **What an older client loses, stated rather than assumed.** [`Event`] is a
+/// closed enum with no `#[serde(other)]`, so a client built before this variant
+/// drops the whole frame at `serde_json::from_value` — it does not render a
+/// degraded line, it renders nothing. The cost is one convenience line on a
+/// turn whose *answer* arrived normally in the tool result, which is why this
+/// ships as an ordinary additive event the way `skill_invoked` and
+/// `skill_refused` did before it.
+///
+/// The general gap — that `Event` itself is not tolerant, where BUG-186 made
+/// its inner enums so — is real and outlives this REQ. It is recorded as a
+/// follow-up rather than widened here: adding `#[serde(other)] Unknown` to
+/// `Event` touches every match on it and deserves its own change.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ProjectMatch {
     /// The best match's name, bounded and neutralised by the daemon.

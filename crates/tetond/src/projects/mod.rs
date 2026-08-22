@@ -738,6 +738,47 @@ mod tests {
         std::fs::remove_dir_all(&dir).ok();
     }
 
+    /// **BR-9 / AC-10.** The tool's text and `/projects`' text are the same
+    /// text, because they are the same call.
+    ///
+    /// Asserted as an equality rather than by matching both against a fixture:
+    /// a fixture would go on passing after one side grew a field, which is
+    /// exactly the drift the one-renderer rule exists to stop (LESSON-546).
+    #[test]
+    fn the_tool_and_the_cli_render_the_same_facts() {
+        use crate::harness::tools::{ProjectsTool, Tool, ToolContext};
+
+        let home = temp_dir("one-renderer");
+        let repo = project_at(&home, "dev/repo");
+        let store = std::sync::Arc::new(ProjectStore::in_memory());
+        store.record(repo, ProjectSource::Launched);
+
+        // The CLI's path: `projects/list`'s composition, rendered.
+        let cli = teton_core::projects::render_locator(&locator_view(
+            &store,
+            Some(&home),
+            scan::ScanBudget::default(),
+            &scan::ScanObserver::default(),
+            None,
+            true,
+        ));
+
+        // The model's path: the tool.
+        let tool = ProjectsTool::new(std::sync::Arc::clone(&store), Some(home.clone()));
+        let ctx = ToolContext::new(std::env::temp_dir());
+        let model = tool.run(&ctx, &serde_json::json!({})).content;
+
+        assert_eq!(
+            cli, model,
+            "the user and the model must be reading the same facts in the same \
+             words — one renderer, or the two drift the moment either grows a \
+             field (BR-9)"
+        );
+        assert!(cli.contains("/cd repo"), "non-vacuity: {cli}");
+
+        std::fs::remove_dir_all(&home).ok();
+    }
+
     /// The pruning predicate is the thing BR-2 actually means.
     #[test]
     fn is_live_project_wants_a_directory_that_still_holds_a_marker() {

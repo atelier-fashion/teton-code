@@ -1,7 +1,7 @@
 ---
 id: REQ-584
 title: "A project locator — the session can name this machine's projects without walking the disk, and a bare name moves the root"
-status: approved
+status: complete
 deployable: true
 created: 2026-08-19
 updated: 2026-08-22
@@ -106,17 +106,17 @@ machine already knows, in one turn, with no walk and no dialog:**
 
 _Leg A — the registry_
 
-- [ ] BR-1: **Use is the first source of truth.** Every `session/create` and
+- [x] BR-1: **Use is the first source of truth.** Every `session/create` and
   every `session/set_cwd` whose root kind is `project` records that root in
   the registry (path, basename, `last_seen = now`, `uses += 1`,
   `source = launched`). Roots of kind `home`, `filesystem_root`, `plain` are
   never recorded. The CLI's `--cwd` counts as a create.
-- [ ] BR-2: **The registry forgets what is gone.** An entry whose path no
+- [x] BR-2: **The registry forgets what is gone.** An entry whose path no
   longer exists, or no longer holds a REQ-583 project marker, is dropped at
   read and at write; no stale entry is ever shown. The registry is capped
   (LRU by `last_seen`); the cap is an architecture constant and its
   exhaustion is silent — the oldest entry goes.
-- [ ] BR-3: **The scan is on demand, bounded, and never a walk of home.** The
+- [x] BR-3: **The scan is on demand, bounded, and never a walk of home.** The
   dev-folder scan runs only when something asks for projects (the `projects`
   tool, `/projects`, a bare-name `/cd` that the registry cannot resolve) —
   never at launch, never on a timer, never during a turn that did not ask. It
@@ -129,11 +129,11 @@ _Leg A — the registry_
   DevFolder) — that is the ordinary "Terminal would like to access files in
   your Documents folder" dialog, raised by a question the user asked, not by
   a launch; it is named in the runbook, never suppressed.
-- [ ] BR-4: **Dev folders are one table plus evidence.** The conventional list
+- [x] BR-4: **Dev folders are one table plus evidence.** The conventional list
   is a single table (the System Model's DevFolder row), exercised by name in
   tests; the parent directory of every `launched` project is a DevFolder too.
   A DevFolder that does not exist is skipped silently.
-- [ ] BR-5: **Nothing leaves the machine on its own.** The registry lives in the
+- [x] BR-5: **Nothing leaves the machine on its own.** The registry lives in the
   daemon's state dir with its permissions; its content reaches a remote
   provider only as the text of a `projects` tool result inside a turn the user
   sent, and as the bounded project *names* the environment line carries for a
@@ -142,7 +142,7 @@ _Leg A — the registry_
 
 _Leg B — the surfaces_
 
-- [ ] BR-6: **One read-only tool, `projects`, on every profile that has
+- [x] BR-6: **One read-only tool, `projects`, on every profile that has
   `glob`.** Arguments: an optional `query`. Result (bounded text): the known
   projects matching the query — or all of them when there is none — each as
   *name, display path, source, when last used*, ranked as the ProjectQuery
@@ -154,7 +154,7 @@ _Leg B — the surfaces_
   displaced by the degraded-profile tool cap (REQ-563 LESSON-496 rule: an
   explicit exemption with a stated rationale, or membership in the mandatory
   set — architecture decides, the test asserts the headroom).
-- [ ] BR-7: **Known project names ride the environment line for a non-project
+- [x] BR-7: **Known project names ride the environment line for a non-project
   root — inside the byte budget REQ-583 already pays.** When the session root's
   kind is `home`, `filesystem_root` or `plain`, the REQ-583 environment line
   carries a clause of the form `Known projects: a, b, c (more: the projects
@@ -167,7 +167,7 @@ _Leg B — the surfaces_
   clause (it is already somewhere). This is data, not a directive (LESSON-532,
   ASSUME-008): the model learns *that these projects exist* with no tool
   call; the tool is for paths and queries.
-- [ ] BR-8: **`/cd` accepts a project name — after the shell's own reading.**
+- [x] BR-8: **`/cd` accepts a project name — after the shell's own reading.**
   An argument that is not a path spelling (contains no `/`, does not start
   with `~`, `.` or `-`) is tried first exactly as REQ-583 reads it — a
   directory of that name under the current root wins, so `/cd src` still
@@ -178,17 +178,17 @@ _Leg B — the surfaces_
   match at all → the refusal names both readings ("no directory `x` under
   the session root, and no known project named `x`"). `--cwd` keeps path
   semantics only (OQ-3).
-- [ ] BR-9: **`/projects` lists them.** Bare `/projects` renders the LocatorView
+- [x] BR-9: **`/projects` lists them.** Bare `/projects` renders the LocatorView
   (registry first, then the scan on demand, with the budget-stop line when
   it hit one); `/projects <query>` filters like the tool. Each row ends with
   its `/cd` recipe. One renderer for the tool text and the CLI rows' content
   (the same facts, REQ-582's one-renderer rule) — the CLI may style, not
   restate.
-- [ ] BR-10: **The launch notice names a few.** REQ-583's non-project notice
+- [x] BR-10: **The launch notice names a few.** REQ-583's non-project notice
   gains a clause listing up to N known project names with `/cd <name>` (TTY
   only, like the notice; no ceiling cost). Empty registry → no clause; the
   notice does not trigger the scan (BR-3).
-- [ ] BR-11: **A found project is handed off at the surface, not in prose.**
+- [x] BR-11: **A found project is handed off at the surface, not in prose.**
   When a turn's `projects` call returned at least one match, the session
   prints one line at turn end — `→ /cd <best name>  (<display path>)` — from
   the tool outcome, independent of what the model said (REQ-579 ADR-9's
@@ -199,48 +199,48 @@ _Leg B — the surfaces_
 
 _Leg A_
 
-- [ ] AC-1: A session created at `<tmp>/repo` (a `.git` project) writes a
+- [x] AC-1: A session created at `<tmp>/repo` (a `.git` project) writes a
   registry entry `{path, name: repo, source: launched, uses: 1}`; a second
   create there bumps `uses` and `last_seen`; `session/set_cwd` to another
   project records it too; creates at `$HOME`, `/`, and a marker-less directory
   record nothing.
-- [ ] AC-2: An entry whose directory is removed, or whose marker is removed, is
+- [x] AC-2: An entry whose directory is removed, or whose marker is removed, is
   absent from the next `projects` result and from the next registry write; a
   registry over the cap drops the oldest `last_seen` entry.
-- [ ] AC-3: The conventional DevFolder table is enumerated by name in a test
+- [x] AC-3: The conventional DevFolder table is enumerated by name in a test
   (BR-4). The scan, with a test-injected DevFolder table pointing at a
   fixture, finds projects at depth 1 and 2 and not at depth 3; does not enter
   `Library/`, `node_modules/`, a `.photoslibrary`, or a symlinked directory
   planted in the fixture; records finds as `scanned`; stops at an injected
   budget and says so; and a `launched` project's parent is scanned as a
   DevFolder even when it is not in the table.
-- [ ] AC-4: No scan runs at `session/create`, at daemon start, or during a turn
+- [x] AC-4: No scan runs at `session/create`, at daemon start, or during a turn
   that makes no `projects` call — asserted through a seam that records whether
   the scanner ran, across a full session create and one unrelated turn.
-- [ ] AC-5: The registry file lives in the state dir with the state dir's
+- [x] AC-5: The registry file lives in the state dir with the state dir's
   permissions; a `projects` result for a project whose name is a frame label
   (`User:`) or a bidi string renders neutralised and bounded (REQ-583's
   bounding); no tool result carries file content.
 
 _Leg B_
 
-- [ ] AC-6: `projects` with no query lists every known project ranked by
+- [x] AC-6: `projects` with no query lists every known project ranked by
   `last_seen` then `uses`, then the existing DevFolders with counts, and ends
   with the `/cd <name>` recipe; `projects {query: "teton"}` ranks `teton-code`
   (prefix) above `my-teton-notes` (substring) above a path-segment match; an
   ambiguous name yields `/cd <path>` recipes; an empty machine yields "no
   known projects; looked in: …".
-- [ ] AC-7: `projects` is allowed at every `PermissionLevel` (the full
+- [x] AC-7: `projects` is allowed at every `PermissionLevel` (the full
   enumerated set, `plan` included) with zero pending events (the LESSON-524
   template); it is exposed on every profile that exposes `glob`, and the
   degraded-cap headroom assertion still holds.
-- [ ] AC-8: The environment line for a `home` root carries `Known projects:`
+- [x] AC-8: The environment line for a `home` root carries `Known projects:`
   with names ordered by `last_seen`, truncated so that the rendered line's
   byte length ≤ REQ-583's worst-case project row; both resident-ceiling
   sweeps pass with constants unchanged and their worst prompt is still the
   project row; a `project` root carries no clause; an empty registry carries
   no clause; a name with a newline/bidi char renders neutralised.
-- [ ] AC-9: `/cd teton-code` with no such subdirectory and one registry
+- [x] AC-9: `/cd teton-code` with no such subdirectory and one registry
   match moves the session (the REQ-583 `context cleared; …` + `session root
   is now …` lines follow); `/cd src` when `./src` exists under the root moves
   to `./src` even if a known project is also named `src` (REQ-583's reading
@@ -249,14 +249,14 @@ _Leg B_
   with neither yields the two-reading refusal; `/cd ~/x`, `/cd ./x`,
   `/cd /abs` keep REQ-583's behaviour byte-for-byte (its grammar table is
   re-run).
-- [ ] AC-10: `/projects` renders the same facts the tool returns (a test diffs
+- [x] AC-10: `/projects` renders the same facts the tool returns (a test diffs
   the content through one renderer); `/projects teton` filters; the scan's
   budget-stop line appears when the injected budget is hit; nothing is
   scanned when `/projects` is not typed.
-- [ ] AC-11: The non-project launch notice lists up to N known names with the
+- [x] AC-11: The non-project launch notice lists up to N known names with the
   `/cd <name>` recipe; with an empty registry it is REQ-583's notice
   unchanged; piped output stays byte-identical (TTY gate).
-- [ ] AC-12: A turn in which `projects` returned a match ends with the surface
+- [x] AC-12: A turn in which `projects` returned a match ends with the surface
   line `→ /cd <best name>  (<display>)`; a turn without the call, or with no
   match, prints no such line; deleting the harness-side append makes the test
   fail (mutation check).
@@ -270,7 +270,7 @@ _Leg B_
   and `/cd teton-code`) is recorded as an observation, not asserted
   (LESSON-532). Repeat with an empty registry: the scan finds
   `~/Documents/GitHub/teton-code` on this machine.
-- [ ] AC-14: `docs/manual-verification.md` gains the AC-13 runbook, including
+- [x] AC-14: `docs/manual-verification.md` gains the AC-13 runbook, including
   the macOS note that the first scan may raise the Documents dialog.
 
 ## External Dependencies
@@ -306,24 +306,29 @@ _Leg B_
 
 ## Open Questions
 
-- [ ] OQ-1: **Ranking of `launched` vs `scanned`.** Should a `scanned` entry
+_All six closed at architecture time; see `architecture.md` ADR-7 (OQ-1),
+ADR-8 (OQ-2) and ADR-9 (OQ-3, OQ-4, OQ-5, OQ-6). Each was adopted as
+recommended. OQ-5's residual — that a `local-only` boundary does not cover
+project **names** — stays visible as A-1 rather than being resolved away._
+
+- [x] OQ-1: **Ranking of `launched` vs `scanned`.** Should a `scanned` entry
   that matches a query by name outrank a `launched` one that matches only by
   substring? Recommendation: match class first (exact > prefix > substring),
   then `launched` before `scanned`, then recency.
-- [ ] OQ-2: **How many names on the environment line and in the notice?** The
+- [x] OQ-2: **How many names on the environment line and in the notice?** The
   environment line is bounded by bytes (BR-7); the notice by a count N
   (BR-10). Recommendation: N = 5 for the notice; the line takes what fits.
-- [ ] OQ-3: **Should `teton --cwd <name>` accept a registry name?** Recommendation:
+- [x] OQ-3: **Should `teton --cwd <name>` accept a registry name?** Recommendation:
   no — `--cwd` is a path flag and a shell has completion; `/cd` is where the
   name is worth it. Revisit if dogfood shows people typing names there.
-- [ ] OQ-4: **`/projects forget <name>` / an edit path?** Recommendation: not
+- [x] OQ-4: **`/projects forget <name>` / an edit path?** Recommendation: not
   in this REQ — BR-2 already drops dead entries, and the cap bounds growth;
   file it when someone wants a project hidden.
-- [ ] OQ-5: **Should a `local-only` boundary be able to hide a project's name
+- [x] OQ-5: **Should a `local-only` boundary be able to hide a project's name
   from the environment line and tool?** Today boundaries are file globs
   relative to the session root (REQ-583 OQ-1 territory). Recommendation: out
   of scope here; note it beside OQ-1's boundary-anchoring follow-up.
-- [ ] OQ-6: **Dev-folder table per platform.** Linux adds nothing beyond the
+- [x] OQ-6: **Dev-folder table per platform.** Linux adds nothing beyond the
   common names; Windows is out of MVP scope. Recommendation: one table,
   `$HOME`-relative, platform-agnostic.
 
