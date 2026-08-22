@@ -1,7 +1,7 @@
 ---
 id: TASK-234
 title: "the ceiling's configuration, opt-in and absent by default"
-status: pending
+status: complete
 parent: REQ-588
 created: 2026-08-22
 updated: 2026-08-22

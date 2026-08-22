@@ -120,6 +120,68 @@ pub struct PrivacyConfig {
     pub redact: bool,
 }
 
+/// Opt-in spend behaviour (`[cost]`) — today, REQ-588's per-prompt ceiling.
+///
+/// **Absent means no ceiling**, and "off" means the check does not exist rather
+/// than that it runs and permits: with no ceiling configured the choke point
+/// builds no accumulator and performs no pricing lookup, so an un-opted-in
+/// machine pays nothing — the same posture `[privacy] redact` takes, and for
+/// the same reason (REQ-588 ADR-6, OQ-3).
+// `PartialEq` without `Eq`, matching `Config` itself: the ceiling is a
+// dollar figure and `f64` is not `Eq`. Nothing compares two ceilings for
+// exact equality outside `is_unset`, and the *arithmetic* that decides a
+// refusal runs on integral micro-cents, never on this field (ADR-3).
+#[derive(Debug, Clone, Copy, PartialEq, Default, Serialize, Deserialize)]
+pub struct CostConfig {
+    /// The most one **prompt** may spend, in US dollars (REQ-588 OQ-1/OQ-2).
+    ///
+    /// Per *prompt* — the unit the user initiates. A turn is an implementation
+    /// detail of the loop, and a session is long enough that a ceiling on it
+    /// would bind at an arbitrary moment days later.
+    ///
+    /// Dollars at this edge because that is what a person types; converted to
+    /// integral micro-cents immediately (see [`Self::ceiling_micro_cents`]) so
+    /// no float reaches the arithmetic that decides a refusal.
+    ///
+    /// **What it actually promises**, which the docs also say: the ceiling is a
+    /// floor crossing, not a prediction. A call's cost depends on its *output*
+    /// tokens, which nobody can price in advance, so the rule is "refuse the
+    /// next call once this prompt's recorded spend has reached the ceiling" —
+    /// and a prompt can therefore overshoot by at most one call (ADR-2).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub prompt_ceiling_usd: Option<f64>,
+}
+
+impl CostConfig {
+    /// Whether every field still holds its default, so an un-opted-in config
+    /// carries no `[cost]` table at all.
+    #[must_use]
+    pub fn is_unset(&self) -> bool {
+        *self == Self::default()
+    }
+
+    /// The ceiling in integral micro-cents, or `None` when none is configured.
+    ///
+    /// **The one conversion**, at the edge. Dollars are what a person types and
+    /// the worst thing to do arithmetic in: a ceiling compared in floating
+    /// point would refuse or permit differently depending on how the spend was
+    /// accumulated. Micro-cents make the comparison exact and the accumulator
+    /// an integer.
+    ///
+    /// A non-finite or negative value yields `None` rather than a nonsense
+    /// ceiling; [`Config::validate`] refuses it outright first, so this is the
+    /// belt to that braces.
+    #[must_use]
+    pub fn ceiling_micro_cents(&self) -> Option<u64> {
+        let usd = self.prompt_ceiling_usd?;
+        if !usd.is_finite() || usd < 0.0 {
+            return None;
+        }
+        // 1 USD = 100 cents = 100_000 micro-cents.
+        Some((usd * 100_000.0).round() as u64)
+    }
+}
+
 impl PrivacyConfig {
     /// Whether every field still holds its default, used to keep the
     /// `[privacy]` table out of a config that never opted in — the same
@@ -683,6 +745,10 @@ pub struct Config {
     /// switch is here rather than in [`Config::categories`].
     #[serde(default, skip_serializing_if = "PrivacyConfig::is_unset")]
     pub privacy: PrivacyConfig,
+    /// Opt-in spend behaviour (`[cost]`): today, REQ-588's per-prompt ceiling.
+    /// Absent means no ceiling — see [`CostConfig`].
+    #[serde(default, skip_serializing_if = "CostConfig::is_unset")]
+    pub cost: CostConfig,
     /// Opt-in web lookup (`[web]`): the capability ceiling, the search backend,
     /// and the cache window (REQ-563). Absent means `tier = "off"` and no code
     /// path performs a lookup (BR-1) — see [`WebConfig`] for why the ceiling is
@@ -925,6 +991,22 @@ pub enum ConfigError {
     /// Two providers share an id.
     #[error("provider '{0}' is defined more than once; provider ids must be unique")]
     DuplicateProvider(String),
+
+    /// `[cost] prompt_ceiling_usd` is not a usable amount (REQ-588 BR-5).
+    ///
+    /// **Structural, so it is fatal at load**, per conventions.md's split: a
+    /// ceiling that cannot be compared is not an incomplete record the daemon
+    /// can refuse at the point of use — it is a spend limit the user believes
+    /// they set. Starting with it silently ignored is the worst of the three
+    /// outcomes.
+    #[error(
+        "[cost] prompt_ceiling_usd = {0} is not a usable amount; it must be a finite number \
+         greater than zero (remove the key for no ceiling)"
+    )]
+    /// Carries the **rendered** figure rather than the `f64`: `ConfigError`
+    /// derives `Eq` (every other variant is comparable), and the message only
+    /// ever echoes what the user wrote back at them.
+    UnusableSpendCeiling(String),
 
     /// `[lifetime] shutdown = "linger"` with no `linger_seconds`.
     #[error(
@@ -1339,10 +1421,26 @@ impl Config {
     ///
     /// # Errors
     /// Returns the first [`ConfigError`] found.
+    /// `[cost]`'s structural check (REQ-588 BR-5).
+    ///
+    /// Only structure: a ceiling that is absent is the ordinary case and a
+    /// ceiling that is present must be a number this can compare. Whether the
+    /// figure is *sensible* is the user's business — a $0.01 ceiling is a
+    /// choice, not an error.
+    fn validate_cost(&self) -> Result<(), ConfigError> {
+        if let Some(usd) = self.cost.prompt_ceiling_usd {
+            if !usd.is_finite() || usd <= 0.0 {
+                return Err(ConfigError::UnusableSpendCeiling(usd.to_string()));
+            }
+        }
+        Ok(())
+    }
+
     pub fn validate(&self) -> Result<(), ConfigError> {
         self.validate_local_model()?;
         self.validate_web()?;
         self.validate_lifetime()?;
+        self.validate_cost()?;
 
         let mut ids: HashSet<&str> = HashSet::with_capacity(self.providers.len());
         for p in &self.providers {
@@ -2709,6 +2807,9 @@ effort_ladder = []
             // the opt-in has its own tests, and every caller here is asserting
             // something else.
             privacy: PrivacyConfig::default(),
+            // REQ-588: default (no ceiling), so the round trip proves the table
+            // stays out of a config that never opted in.
+            cost: CostConfig::default(),
             // REQ-563: likewise off, for the same reason.
             web: WebConfig::default(),
             // REQ-565: the shipped default (exit with the last client); the
@@ -5866,5 +5967,59 @@ cache_ttl_secs = 60
              each is an unguarded startup gate — give each one a test asserting \
              `cfg.validate().unwrap_err()` equals it (BR-10)."
         );
+    }
+    /// **REQ-588 ADR-6 / TASK-234.** `[cost]` is absent by default and a config
+    /// with no such table is unchanged.
+    #[test]
+    fn a_config_without_a_cost_table_has_no_ceiling_and_serializes_none() {
+        let cfg: Config = toml::from_str("").expect("an empty config loads");
+        assert!(cfg.cost.is_unset());
+        assert_eq!(cfg.cost.prompt_ceiling_usd, None);
+        assert_eq!(cfg.cost.ceiling_micro_cents(), None);
+        assert!(
+            !toml::to_string(&cfg).unwrap().contains("[cost]"),
+            "a config that never opted in must not grow the table"
+        );
+        cfg.validate().expect("no ceiling is not an error");
+    }
+
+    /// The dollar figure converts to **integral** micro-cents at the edge, so
+    /// no float reaches the comparison that decides a refusal (ADR-3).
+    #[test]
+    fn the_ceiling_converts_to_integral_micro_cents() {
+        let parse = |t: &str| toml::from_str::<Config>(t).expect("loads").cost;
+        assert_eq!(
+            parse("[cost]\nprompt_ceiling_usd = 5.0\n").ceiling_micro_cents(),
+            Some(500_000)
+        );
+        // A figure with cents, and one with sub-cent precision that must round
+        // rather than truncate toward a *smaller* ceiling than the user set.
+        assert_eq!(
+            parse("[cost]\nprompt_ceiling_usd = 0.01\n").ceiling_micro_cents(),
+            Some(1_000)
+        );
+        assert_eq!(
+            parse("[cost]\nprompt_ceiling_usd = 1.234567\n").ceiling_micro_cents(),
+            Some(123_457)
+        );
+    }
+
+    /// **Structural refusal, fatal at load.** A ceiling the daemon cannot
+    /// compare is a limit the user believes they set — starting with it
+    /// silently ignored is the worst of the three outcomes.
+    #[test]
+    fn an_unusable_ceiling_is_refused_at_load() {
+        for bad in ["0.0", "-1.0", "nan", "inf"] {
+            let cfg: Config = toml::from_str(&format!("[cost]\nprompt_ceiling_usd = {bad}\n"))
+                .expect("it parses as TOML; the refusal is validate's");
+            assert!(
+                matches!(cfg.validate(), Err(ConfigError::UnusableSpendCeiling(_))),
+                "`{bad}` must be refused rather than silently ignored"
+            );
+        }
+        // Non-vacuity: a usable one passes.
+        let ok: Config = toml::from_str("[cost]\nprompt_ceiling_usd = 2.50\n").unwrap();
+        ok.validate().expect("a usable ceiling loads");
+        assert_eq!(ok.cost.ceiling_micro_cents(), Some(250_000));
     }
 }
