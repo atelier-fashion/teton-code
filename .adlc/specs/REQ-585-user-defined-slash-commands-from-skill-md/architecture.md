@@ -230,6 +230,22 @@ riding the walker's.
 Because entries are refused, `skills/link → /` is never enumerated: `/` is not
 reached by the entry rule, not by a budget.
 
+**Where the I/O runs (BUG-184, added after REQ-585 shipped).** The bounds above
+argue about *how much* discovery reads and never about *which thread reads it* —
+a gap that let both call sites take the wait on an async worker. Even fully
+bounded, discovery is up to four `read_dir` calls plus, worst case,
+`4 x MAX_ENTRIES_PER_ROOT` metadata+open+read calls of up to 64 KiB, on
+user-controlled, symlinked paths; and on macOS a root under `~/Documents` can
+raise a TCC dialog that blocks the syscall for as long as the user takes to
+answer it. A bound on entry count says nothing about a human-latency syscall.
+
+`DaemonRuntime::store_session_skills` therefore runs `discover` inside
+`runtime::block_in_place_if_multithread`. It sits at the shared derivation
+rather than at the two call sites, for the same reason the four globs do: a
+third caller cannot forget it. This is the bar `skills/list` explicitly clears
+by *not* touching the filesystem, and the one `provider/test` was moved off the
+synchronous path to meet.
+
 **Bounds and determinism.** `MAX_ENTRIES_PER_ROOT = 512`, and entries are
 **sorted by file name before the cap applies**. Sorting is not cosmetic: APFS
 lists in hash order and ext4 does not, so an unsorted cap (and an unsorted

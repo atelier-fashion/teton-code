@@ -1,10 +1,10 @@
 ---
 id: BUG-182
 title: "A clamped newest message is dropped by the same turn's exit gate — the answer is retained without the question"
-status: open
+status: resolved
 severity: medium
 created: 2026-08-20
-updated: 2026-08-20
+updated: 2026-08-22
 component: "daemon/harness"
 domain: "harness"
 stack: ["rust", "daemon"]
@@ -74,3 +74,7 @@ Candidate shapes, cheapest first: reserve the turn's `gen_params.max_tokens`
 whose newest block cannot fit with that reservation, reusing REQ-585 BR-8's
 typed refusal; or retain the pre-clamp user text out-of-band so the carry
 keeps the question even when the block is dropped.
+
+## Closed — 2026-08-22
+
+Closed by subtracting a reply reservation before computing `room`, capped at a quarter of the budget so it can never starve the clamp. Distinct from REQ-586 BR-2's subtraction, which sizes the budget against the provider's window and says nothing about how much of it one block may take. The test asserts the retained **conversation**, not the report — the report was always honest. Mutation-checked.

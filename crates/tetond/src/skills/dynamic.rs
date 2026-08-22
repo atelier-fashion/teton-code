@@ -31,6 +31,7 @@
 
 use std::path::Path;
 use std::process::ExitStatus;
+use std::time::{Duration, Instant};
 
 use teton_protocol::events::{DynamicOutcomeView, NotRunReason};
 
@@ -38,6 +39,20 @@ use teton_protocol::methods::RefusalReason;
 
 use crate::harness::permissions::SkillConsent;
 use crate::harness::tools::shell::{cap_output, run_bounded, BoundedRun};
+
+/// The wall-clock budget for **one invocation's whole** dynamic-context run
+/// (BUG-185).
+///
+/// The per-command timeout bounds a single command; nothing bounded their sum.
+/// `run_all` runs every slot sequentially inside one `spawn_blocking`, and that
+/// work is **not cancellable** — connection teardown aborts the `await` and
+/// leaves the closure running, so the session stays claimed and the daemon
+/// stays awake. A ceiling on the total is the only thing that ends it.
+///
+/// Two minutes: far above any real skill (the shipped bodies run `git` and
+/// `ls`) and far below the 16 minutes [`crate::skills::MAX_DYNAMIC_COMMANDS`]
+/// slots could otherwise reach at the default per-command timeout.
+pub const INVOCATION_BUDGET_MS: u64 = 120_000;
 
 /// The opener: a `!` immediately followed by a backtick.
 const OPEN: &str = "!`";
@@ -89,6 +104,14 @@ pub(crate) enum Piece {
         text: String,
         /// Whether the chunk starts at a line start in the body.
         at_line_start: bool,
+        /// The chunk's byte offset in the scanned body.
+        ///
+        /// Carried so the expander can tell **which bytes in this chunk came
+        /// from the caller** (BUG-190). `substitute` records those spans in
+        /// body coordinates; without an origin here they cannot be mapped onto
+        /// a chunk, and file prose and argument text stay indistinguishable in
+        /// the region the frame vouches for.
+        from: usize,
     },
     /// The slot of the command at this index in the scan's command list.
     Slot(usize),
@@ -141,6 +164,7 @@ fn push_text(pieces: &mut Vec<Piece>, body: &str, from: usize, to: usize) {
     pieces.push(Piece::Text {
         text: body[from..to].to_owned(),
         at_line_start: from == 0 || body.as_bytes()[from - 1] == b'\n',
+        from,
     });
 }
 
@@ -265,6 +289,22 @@ impl DynamicOutcome {
         }
     }
 
+    /// The invocation's whole-run budget was already spent (BUG-185).
+    ///
+    /// A **not-run**, not a [`Self::TimedOut`]: this command was never started,
+    /// and reporting it as timed out would tell the reader it ran and was
+    /// killed, which points at the wrong command to fix. The one that overran
+    /// is the one before it.
+    #[must_use]
+    pub fn budget_exhausted() -> Self {
+        Self::NotRun {
+            reason: format!(
+                "this skill's dynamic context passed its {}s total budget before this command started",
+                INVOCATION_BUDGET_MS / 1000
+            ),
+        }
+    }
+
     /// True when this outcome carries output to inline.
     ///
     /// **Not the same question as [`Self::spawned`]**, and the difference is
@@ -380,6 +420,13 @@ pub fn door_outcome(door: NotRunReason) -> DynamicOutcome {
         // `CouldNotStart`, which arrives as an *outcome* and not as a door —
         // and a future caller should meet a sentence here, not a panic.
         NotRunReason::CouldNotStart => DynamicOutcome::could_not_start(),
+        // Unreachable here for a structural reason, not a contingent one:
+        // `Unknown` exists so an *older client* can parse a newer daemon's
+        // frame (BUG-186), and the daemon is the producer. `not_run` keeps the
+        // arm total without inventing a door that was never closed.
+        NotRunReason::Unknown => DynamicOutcome::NotRun {
+            reason: "it did not run".to_owned(),
+        },
     }
 }
 
@@ -442,9 +489,40 @@ pub fn outcome_view(
 /// itself rather than calling this.
 #[must_use]
 pub fn run_all(root: &Path, commands: &[Command], timeout_ms: u64) -> Vec<DynamicOutcome> {
+    run_all_within(root, commands, timeout_ms, INVOCATION_BUDGET_MS)
+}
+
+/// [`run_all`] against an explicit whole-invocation budget.
+///
+/// Split out so the budget is reachable from a test without one waiting
+/// [`INVOCATION_BUDGET_MS`]. Production has exactly one budget and
+/// [`run_all`] is the only caller that supplies it, so no call site can pick a
+/// different ceiling by accident.
+pub(crate) fn run_all_within(
+    root: &Path,
+    commands: &[Command],
+    timeout_ms: u64,
+    budget_ms: u64,
+) -> Vec<DynamicOutcome> {
+    let started = Instant::now();
+    let budget = Duration::from_millis(budget_ms);
     commands
         .iter()
-        .map(|command| run_one(root, command, timeout_ms))
+        .map(|command| {
+            // BUG-185's second half. The slot cap bounds the *count*; this
+            // bounds the *total*, and both are needed: 32 slots each taking the
+            // full per-command timeout is still 16 minutes on a blocking-pool
+            // thread that `spawn_blocking` cannot cancel.
+            let Some(left) = budget.checked_sub(started.elapsed()) else {
+                return DynamicOutcome::budget_exhausted();
+            };
+            // The per-command timeout still applies; the invocation's remaining
+            // budget only ever shortens it. A command started with 2 s left is
+            // killed at 2 s rather than being allowed its own 30 s and taking
+            // the whole invocation past the deadline it was checked against.
+            let allowed = timeout_ms.min(u64::try_from(left.as_millis()).unwrap_or(u64::MAX));
+            run_one(root, command, allowed)
+        })
         .collect()
 }
 
@@ -630,6 +708,79 @@ mod tests {
             },
             "the commands did not run in document order: {outcomes:?}"
         );
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// BUG-185: the whole invocation has a ceiling, not just each command.
+    ///
+    /// Three legs, because the interesting claim is the middle one. A slot cap
+    /// alone leaves 32 commands x the per-command timeout — 16 minutes on a
+    /// `spawn_blocking` thread that connection teardown cannot cancel.
+    #[test]
+    fn the_invocation_budget_stops_commands_that_have_not_started() {
+        let root = temp_root("budget");
+
+        // Leg one — an exhausted budget starts nothing at all, proven by the
+        // side effect rather than by the outcome list: a runner that ran the
+        // command and then relabelled the outcome would pass on the list alone.
+        let outcomes = run_all_within(
+            &root,
+            &[Command::new("echo leaked > budget-leg-one")],
+            10_000,
+            0,
+        );
+        assert!(
+            matches!(&outcomes[0], DynamicOutcome::NotRun { reason } if reason.contains("budget")),
+            "an exhausted budget is a not-run naming the budget: {outcomes:?}"
+        );
+        assert!(
+            !root.join("budget-leg-one").exists(),
+            "the command must never have started"
+        );
+
+        // Leg two — the real shape. The first command overruns the budget, so
+        // the second never starts, and it is reported as NOT-RUN rather than
+        // timed out: it was never launched, and calling it a timeout would
+        // point the reader at the wrong command to fix.
+        let outcomes = run_all_within(
+            &root,
+            &[
+                Command::new("sleep 1"),
+                Command::new("echo leaked > budget-leg-two"),
+            ],
+            10_000,
+            300,
+        );
+        assert_eq!(
+            outcomes[0],
+            DynamicOutcome::TimedOut,
+            "the running command is killed AT the budget, not allowed its own \
+             full timeout past it — the remaining budget only ever shortens the \
+             per-command deadline, which is what makes the total a real bound \
+             rather than budget-plus-one-command: {outcomes:?}"
+        );
+        assert!(
+            matches!(&outcomes[1], DynamicOutcome::NotRun { reason } if reason.contains("budget")),
+            "and the one after it never starts — a not-run, not a timeout, \
+             because it was never launched: {outcomes:?}"
+        );
+        assert!(
+            !root.join("budget-leg-two").exists(),
+            "and really never starts"
+        );
+
+        // Leg three — non-vacuity. With room, nothing is withheld; otherwise
+        // legs one and two would pass on a runner that refused everything.
+        let outcomes = run_all_within(&root, &[Command::new("echo fine")], 10_000, 60_000);
+        assert_eq!(
+            outcomes[0],
+            DynamicOutcome::Ran {
+                output: "fine".to_owned(),
+                truncated: false
+            },
+            "a budget with room runs the command: {outcomes:?}"
+        );
+
         std::fs::remove_dir_all(&root).ok();
     }
 

@@ -84,8 +84,9 @@ use std::path::{Path, PathBuf};
 use teton_protocol::methods::RootKind;
 
 use super::{
-    assemble, frontmatter, is_valid_skill_name, roots, RootSpec, Shape, Skill, SkillRegistry,
-    SkillSource, SkipReason, Skipped, MAX_ENTRIES_PER_ROOT, SKILL_MAX_BYTES,
+    assemble, dynamic, frontmatter, is_valid_skill_name, roots, RootSpec, Shape, Skill,
+    SkillRegistry, SkillSource, SkipReason, Skipped, MAX_DYNAMIC_COMMANDS, MAX_ENTRIES_PER_ROOT,
+    SKILL_MAX_BYTES,
 };
 use crate::harness::tools::skip_symlink_entry;
 
@@ -588,6 +589,24 @@ fn register(
         });
         return;
     };
+    // BUG-185: a body's dynamic-command count is bounded here, before the row
+    // exists. Scanned against the **raw** body, which is the right conservative
+    // reading: `$ARGUMENTS` substitution happens later and can only *add*
+    // openers (an argument may carry a `` !` `` of its own), never remove one,
+    // so a body that passes here can still be capped at expansion but a body
+    // that fails here could never have got smaller.
+    let declared_commands = dynamic::scan(&parsed.body).1.len();
+    if declared_commands > MAX_DYNAMIC_COMMANDS {
+        skipped.push(Skipped {
+            path_display: root.display(&path),
+            path,
+            name: Some(name.to_owned()),
+            reason: SkipReason::TooManyCommands {
+                count: declared_commands,
+            },
+        });
+        return;
+    }
     // A frontmatter `name` that differs is a note, never a second spelling:
     // one spelling reaches one handler (BR-2, REQ-555's rule).
     let name_note = parsed.name.as_deref().and_then(|declared| {
@@ -705,6 +724,82 @@ mod tests {
         );
         assert!(skipped.is_empty(), "the file must register: {skipped:?}");
         candidates.pop().expect("exactly one candidate")
+    }
+
+    /// The `register` outcome for `text`, whether it landed or was skipped.
+    fn outcome(text: &str) -> (Vec<Skill>, Vec<Skipped>) {
+        let mut candidates = Vec::new();
+        let mut skipped = Vec::new();
+        let root = RootSpec::new(
+            SkillSource::User,
+            Shape::Commands,
+            Path::new("/h"),
+            None,
+            Some(Path::new("/h")),
+        );
+        register(
+            "alpha",
+            &root,
+            PathBuf::from("/h/.claude/commands/alpha.md"),
+            text,
+            &mut candidates,
+            &mut skipped,
+        );
+        (candidates, skipped)
+    }
+
+    /// BUG-185: a body over the slot cap never becomes a row.
+    ///
+    /// Refused at discovery rather than at expansion, and that placement is the
+    /// security claim: an unregistered file is not invocable, so its commands
+    /// never reach a consent prompt at all. That is what closes the
+    /// consent-flooding surface — 400 innocuous commands with a dangerous one
+    /// buried cannot be rendered to a user who has no row to invoke.
+    #[test]
+    fn a_body_over_the_dynamic_command_cap_is_skipped_with_its_real_count() {
+        let over = MAX_DYNAMIC_COMMANDS + 1;
+        let body = "!`echo hi`\n".repeat(over);
+        let (candidates, skipped) = outcome(&body);
+
+        assert!(
+            candidates.is_empty(),
+            "an over-cap body must not register: {candidates:?}"
+        );
+        assert_eq!(
+            skipped.len(),
+            1,
+            "and it is reported, never silently dropped: {skipped:?}"
+        );
+        assert_eq!(
+            skipped[0].reason,
+            SkipReason::TooManyCommands { count: over },
+            "the real count rides the reason, so the author knows what to cut"
+        );
+        assert!(
+            skipped[0].reason.to_string().contains(&over.to_string())
+                && skipped[0]
+                    .reason
+                    .to_string()
+                    .contains(&MAX_DYNAMIC_COMMANDS.to_string()),
+            "both figures are in the sentence: {}",
+            skipped[0].reason
+        );
+    }
+
+    /// Non-vacuity for the cap: exactly at the limit still registers.
+    ///
+    /// Without this leg the test above would pass on a cap of zero, which would
+    /// break every shipped skill — `template-drift` declares six.
+    #[test]
+    fn a_body_exactly_at_the_dynamic_command_cap_still_registers() {
+        let body = "!`echo hi`\n".repeat(MAX_DYNAMIC_COMMANDS);
+        let (candidates, skipped) = outcome(&body);
+        assert_eq!(
+            candidates.len(),
+            1,
+            "at the cap is not over it: {skipped:?}"
+        );
+        assert!(skipped.is_empty(), "{skipped:?}");
     }
 
     /// **REQ-587 BR-3, carried.** `disable-model-invocation` reaches the row.

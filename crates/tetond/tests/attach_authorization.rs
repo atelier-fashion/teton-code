@@ -93,6 +93,111 @@ fn probe_with_local(script: PathBuf) -> DaemonOptions {
         .script(script)
 }
 
+/// One frame, in one line, for BUG-163's dump.
+///
+/// Structural only: method, id, event name, and whether an error is present.
+/// Deliberately not the frame body — a consent frame carries file-authored
+/// text, and a panic message is a place it should not be reproduced. The
+/// question this has to answer is *which frames arrived with which ids*, and
+/// that needs no payload.
+fn summarize_frame(frame: &serde_json::Value) -> String {
+    let id = frame
+        .get("id")
+        .and_then(serde_json::Value::as_i64)
+        .map_or_else(|| "-".to_owned(), |n| n.to_string());
+    match frame.get("method").and_then(serde_json::Value::as_str) {
+        Some("event") => format!(
+            "event {} (id={id})",
+            frame["params"]["event"].as_str().unwrap_or("?")
+        ),
+        Some(other) => format!("request {other} (id={id})"),
+        None if frame.get("error").is_some() => {
+            format!("response id={id} ERROR code={}", frame["error"]["code"])
+        }
+        None => format!("response id={id} ok"),
+    }
+}
+
+/// **BUG-163, the defect the instrument found.** A response read out of order
+/// is kept, not discarded.
+///
+/// This client is single-threaded with more than one request in flight: the
+/// resume leg sends `session/attach`, then answers the consent it raises with
+/// `permission/respond` **before** reading the attach's reply. The daemon may
+/// answer those two in either order. `read_response` used to drop any response
+/// whose id did not match, so whenever the attach's reply arrived first it was
+/// thrown away inside the respond's read, and the later `read_response` for the
+/// attach waited out its full deadline for a frame that had already come and
+/// gone. macOS usually won that race; the slower Linux runner lost it.
+///
+/// Reproduced here deterministically rather than by timing: two requests are
+/// sent, and the **second** is read first. The daemon answers in order, so the
+/// first response necessarily arrives while the client is waiting for the
+/// second — the exact interleaving, with none of the flakiness.
+#[test]
+fn a_response_that_arrives_while_another_is_awaited_is_kept() {
+    let ws = Workspace::new("bug163-out-of-order");
+    let script = ws.write_script("Unused by this fixture.");
+    let daemon = Daemon::spawn(&ws, probe_with_local(script));
+    let mut client = RawClient::connect(daemon.socket());
+    assert!(client.handshake("out-of-order").get("result").is_some());
+
+    let first = client.send("session/list", json!({}));
+    let second = client.send("session/list", json!({}));
+
+    // Read them backwards. `second`'s read must pass over `first`'s response.
+    let b = client.read_response(second);
+    assert_eq!(b["id"].as_i64(), Some(second), "{b}");
+
+    // The one that would have been dropped. Before the fix this blocked until
+    // the 20s deadline and panicked.
+    let a = client.read_response(first);
+    assert_eq!(
+        a["id"].as_i64(),
+        Some(first),
+        "a response passed over while another was awaited must be kept, not \
+         discarded: {a}"
+    );
+    assert!(
+        a.get("result").is_some(),
+        "and it must be the real response, not a placeholder: {a}"
+    );
+}
+
+/// The instrument has to be correct at exactly the moment everything else has
+/// failed, so it is pinned rather than trusted.
+///
+/// In particular the response/`id` legs: telling "no frame arrived" from "a
+/// frame arrived whose id did not match" is the one distinction BUG-163's first
+/// capture left open, and it is carried entirely by these strings.
+#[test]
+fn the_frame_summary_distinguishes_the_shapes_bug_163_has_to_tell_apart() {
+    use serde_json::json;
+
+    assert_eq!(
+        summarize_frame(&json!({"jsonrpc":"2.0","id":7,"result":{}})),
+        "response id=7 ok"
+    );
+    assert_eq!(
+        summarize_frame(&json!({"jsonrpc":"2.0","id":9,"error":{"code":-32011}})),
+        "response id=9 ERROR code=-32011"
+    );
+    assert_eq!(
+        summarize_frame(&json!({"method":"event","params":{"event":"grant_minted"}})),
+        "event grant_minted (id=-)"
+    );
+    // No payload reaches the dump: a consent frame carries file-authored text,
+    // and a panic message is not a place to reproduce it.
+    let consent = json!({
+        "method": "event",
+        "params": {"event": "permission_request", "description": "rm -rf /secret"},
+    });
+    assert!(
+        !summarize_frame(&consent).contains("secret"),
+        "the summary must stay structural"
+    );
+}
+
 // ---------------------------------------------------------------------------
 // A raw NDJSON client
 // ---------------------------------------------------------------------------
@@ -116,6 +221,30 @@ struct RawClient {
     /// off for the descendant probe — which must answer nothing it was not
     /// asked, so that anything it *does* receive is the daemon's doing.
     auto_approve_tools: bool,
+    /// A one-line summary of **every** frame this client has read, in arrival
+    /// order — BUG-163's instrument.
+    ///
+    /// `events` records only notifications; this records responses too, with
+    /// their ids. That difference is the whole point. The first instrumented
+    /// capture localised the flake to `read_response`'s loop *after* consent
+    /// was granted, leaving two shapes to tell apart: no frame arrived at all,
+    /// or one arrived whose `id` the match did not recognise. `events` cannot
+    /// distinguish them; this can.
+    seen: Vec<String>,
+    /// The response id `read_response` is currently blocked on, so the deadline
+    /// panic can say what it was waiting for rather than only that it waited.
+    awaiting: Option<i64>,
+    /// Responses that arrived while this client was waiting for a **different**
+    /// id, kept until someone asks for them (BUG-163).
+    ///
+    /// This client is single-threaded and has more than one request in flight
+    /// at a time: the resume leg sends `session/attach`, then answers a consent
+    /// with `permission/respond` *before* reading the attach's reply. The
+    /// daemon may answer those two in either order, so the reader can meet the
+    /// attach response while it is inside `read_response` for the respond. It
+    /// used to discard it, and the later `read_response` for the attach then
+    /// waited out its deadline for a frame that had already come and gone.
+    out_of_order: Vec<Value>,
 }
 
 impl RawClient {
@@ -130,6 +259,9 @@ impl RawClient {
             next_id: 1,
             events: Vec::new(),
             auto_approve_tools: true,
+            seen: Vec::new(),
+            awaiting: None,
+            out_of_order: Vec::new(),
         }
     }
 
@@ -169,11 +301,14 @@ impl RawClient {
             // succeeding as a timeout thirty seconds later.
             Err(e) => panic!(
                 "no frame from the daemon within {READ_DEADLINE:?} ({e}): it is wedged, or \
-                 something is awaiting a consent decision nobody is going to make"
+                 something is awaiting a consent decision nobody is going to make\n\
+                 {}",
+                self.frame_log()
             ),
         };
         assert!(n > 0, "the daemon closed the connection");
         let frame: Value = serde_json::from_str(&line).unwrap_or_else(|e| panic!("{e}: {line}"));
+        self.seen.push(summarize_frame(&frame));
         if frame.get("method").and_then(Value::as_str) == Some("event") {
             let event = frame["params"].clone();
             if self.auto_approve_tools && event["event"].as_str() == Some("permission_request") {
@@ -194,12 +329,61 @@ impl RawClient {
 
     /// Read frames until the response to `id` arrives.
     fn read_response(&mut self, id: i64) -> Value {
+        // It may already have arrived, out of order, while this client was
+        // waiting on another id (BUG-163).
+        if let Some(at) = self
+            .out_of_order
+            .iter()
+            .position(|frame| frame.get("id").and_then(Value::as_i64) == Some(id))
+        {
+            return self.out_of_order.remove(at);
+        }
+        let previous = self.awaiting.replace(id);
         loop {
             let frame = self.read_frame();
-            if frame.get("id").and_then(Value::as_i64) == Some(id) {
-                return frame;
+            match frame.get("id").and_then(Value::as_i64) {
+                Some(seen) if seen == id => {
+                    self.awaiting = previous;
+                    return frame;
+                }
+                // A response to something else. **Kept**, not dropped: this is
+                // the frame whose loss made the Linux leg flake.
+                Some(_) => self.out_of_order.push(frame),
+                // A notification. `read_frame` has already recorded it.
+                None => {}
             }
         }
+    }
+
+    /// BUG-163's dump: what this client was waiting for, and every frame it
+    /// actually received.
+    ///
+    /// The daemon's side of this run is already visible (its log is surfaced on
+    /// panic); this is the client's, which was the missing half. Read the two
+    /// together: a daemon that logged the attach completing against a client
+    /// log with no matching id says the response never arrived, and one with a
+    /// *different* id present says the match is what failed.
+    fn frame_log(&self) -> String {
+        let mut out = String::from("BUG-163 instrument — client frame stream\n");
+        match self.awaiting {
+            Some(id) => out.push_str(&format!("  awaiting response id {id}\n")),
+            None => out.push_str("  awaiting: nothing (not inside read_response)\n"),
+        }
+        if !self.out_of_order.is_empty() {
+            out.push_str(&format!(
+                "  {} response(s) held out of order\n",
+                self.out_of_order.len()
+            ));
+        }
+        if self.seen.is_empty() {
+            out.push_str("  received: nothing at all\n");
+        } else {
+            out.push_str(&format!("  received {} frame(s):\n", self.seen.len()));
+            for (n, line) in self.seen.iter().enumerate() {
+                out.push_str(&format!("    {n:>3}. {line}\n"));
+            }
+        }
+        out
     }
 
     fn call(&mut self, method: &str, params: Value) -> Value {

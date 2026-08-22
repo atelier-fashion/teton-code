@@ -1,10 +1,10 @@
 ---
 id: BUG-163
 title: "The self-approval attach test flakes on the Linux CI leg — the withholding mechanism is understood, the trigger is not"
-status: open
+status: resolved
 severity: medium
 created: 2026-08-12
-updated: 2026-08-12
+updated: 2026-08-22
 component: "daemon/session"
 domain: "session-authorization"
 stack: ["rust", "daemon", "json-rpc", "linux"]
@@ -313,6 +313,38 @@ That is a small, additive change to a security-critical path: it records a
 decision already being made and changes no predicate. It is the cheapest thing
 that can end this.
 
+## SECOND INSTRUMENT ADDED — 2026-08-22 (still open, deliberately)
+
+Asked to fix every open bug, this one was **not** fixed, because its own
+evidence says a fix would be a guess. The report already published two
+confident wrong causes, and the first instrumented capture *positively
+excluded* the ancestry mechanism rather than merely failing to confirm it.
+Patching `linux::parent_of` — the obvious-looking change, and the one the
+"withholding chain" section still describes — would have been the third wrong
+cause. The prescribed next step was a measurement, so a measurement is what was
+added.
+
+**What landed** (`crates/tetond/tests/attach_authorization.rs`): the client half
+of the dump the last capture asked for. `RawClient` now records a one-line
+structural summary of **every** frame it reads — responses with their ids, not
+only event notifications — plus the response id `read_response` is currently
+blocked on. The deadline panic prints both.
+
+This is precisely the distinction the last capture left open. The flake was
+localised to `read_response`'s loop *after* consent was granted, leaving two
+shapes: the response never arrived, or it arrived in a form the `id` match did
+not recognise. `events` could not tell them apart; this can.
+
+The summary is **structural only** — method, id, event name, error code, never
+the payload. A consent frame carries file-authored text and a panic message is
+not a place to reproduce it. It is unit-pinned
+(`the_frame_summary_distinguishes_the_shapes_bug_163_has_to_tell_apart`),
+because an instrument that renders garbage at the moment everything else failed
+is worse than none.
+
+No predicate changed. Status stays `open`: the next red CI run should now
+identify or clear the delivery/ordering seam in one read.
+
 ## Related
 
 - REQ-569 ADR-A/ADR-B — the ancestry gate and its per-platform peer-PID split;
@@ -328,3 +360,68 @@ that can end this.
   confidence. `peer.rs` cites it and splits the *parser* out to be testable
   everywhere; the **read** is the part that stayed platform-only, and the read is
   where the defect is
+
+## SOLVED — 2026-08-22, by the instrument, on its first CI opportunity
+
+The second instrument fired on the ubuntu leg of PR #201 and the capture is
+decisive. It is a **test-harness bug**. No daemon behaviour is involved, which
+is why three hypotheses about the daemon all failed.
+
+```
+BUG-163 instrument — client frame stream
+  awaiting response id 2
+  received 7 frame(s):
+      0. response id=1 ok
+      1. event model_lifecycle (id=-)
+      2. event model_lifecycle (id=-)
+      3. event attach_consent_requested (id=-)
+      4. event session_grant_minted (id=-)
+      5. response id=2 ok        <-- the frame it timed out waiting for
+      6. response id=3 ok
+```
+
+It timed out awaiting id 2 **while id 2 sat in the list of frames it had already
+received**. That is the whole diagnosis, and it is only visible because the dump
+records responses *with their ids* rather than only notifications.
+
+### The mechanism
+
+`RawClient` is single-threaded and the resume leg keeps **two requests in
+flight**:
+
+1. `resumer.send("session/attach", …)` → id 2, deliberately not awaited (the
+   attach cannot answer until somebody decides the consent it raises);
+2. `resumer.answer_consent(…)` → id 3, which internally calls
+   `read_response(3)`.
+
+`read_response` looped until it saw its own id and **discarded every other
+frame**. So when the daemon answered the attach *before* the respond, id 2 was
+read inside `read_response(3)`, did not match, and was thrown on the floor. The
+subsequent `resumer.read_response(resume_attach)` then waited its full 20s
+deadline for a frame that had already come and gone.
+
+Whether id 2 or id 3 lands first is a race. macOS usually won it; the slower
+ubuntu runner lost it. That is exactly the platform-skewed intermittency
+observed, and it explains why a docs-only change could turn CI red.
+
+### Why the earlier hypotheses could not have found it
+
+Both were about the daemon — the barrier's ordering, then the ancestry seam's
+`Indeterminate` withholding. The first capture cleared the ancestry seam
+outright and localised the failure to `read_response`'s loop *after* consent was
+granted. It could not go further because the client's own frame stream was
+invisible. The report's conclusion — "make the next occurrence diagnosable, then
+wait for it" — was right, and it took one occurrence.
+
+### The fix
+
+`read_response` now **keeps** a response whose id it is not waiting for, in
+`RawClient::out_of_order`, and checks that buffer before reading. Notifications
+are unaffected (`read_frame` already records them).
+
+Reproduced deterministically rather than by timing, in
+`a_response_that_arrives_while_another_is_awaited_is_kept`: two requests are
+sent and the *second* is read first, so the first's response necessarily arrives
+while the client is waiting for the second. Mutation-checked — restoring the
+discard makes that test fail in 20.8s with the same `awaiting id 2` signature
+the CI capture shows.

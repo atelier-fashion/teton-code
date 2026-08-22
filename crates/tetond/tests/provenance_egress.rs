@@ -1162,8 +1162,10 @@ async fn with_no_boundary_a_skills_expansion_reaches_the_provider_as_the_payload
         // The preamble the expander writes, naming the file the body came from.
         ".claude/…/ctx",
         // BR-4: the arguments reach `$ARGUMENTS` with both interior spaces and
-        // both quotes intact. (JSON-escaped on the wire, hence the escapes.)
-        "About teton  code \\\"repo\\\":",
+        // both quotes intact — now inside BR-4's argument sub-frame, which
+        // BUG-190 draws around a splice as well as around the trailer.
+        // (JSON-escaped on the wire, hence the escapes.)
+        "About <skill-arguments>teton  code \\\"repo\\\"</skill-arguments>:",
         // The command's stdout, folded into the body.
         "DYNAMIC-OUTPUT-MARKER",
         // …inside the envelope every built-in result gets.

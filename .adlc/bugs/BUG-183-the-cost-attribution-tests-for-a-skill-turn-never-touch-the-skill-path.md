@@ -1,10 +1,10 @@
 ---
 id: BUG-183
 title: "AC-19's cost-attribution tests never touch the skill path, and their central assertion is implied by their own setup"
-status: open
+status: resolved
 severity: medium
 created: 2026-08-20
-updated: 2026-08-20
+updated: 2026-08-22
 component: "daemon/cost-ledger"
 domain: "cost"
 stack: ["rust", "daemon"]
@@ -66,3 +66,7 @@ provenance both come from production.
 ## Found
 
 REQ-585 Phase 5 verify (architecture review), 2026-08-20.
+
+## Resolution — 2026-08-22
+
+Closed by moving AC-19's attribution half into `skill_turn.rs`, which drives real invocations against a remote `Vendor` mock. It runs a typed turn and a skill turn on one session, reads `/cost` via `DaemonRuntime::cost_report`, and asserts the skill turn joins the typed turn's phase group. Non-vacuous by construction: an unregistered name fails the turn outright.

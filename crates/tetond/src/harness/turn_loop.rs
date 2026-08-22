@@ -2122,7 +2122,7 @@ pub fn build_system_prompt(tools: &ToolRegistry, config: &HarnessConfig) -> Stri
 /// after it but before the push). A second `format!` at either site would be a
 /// second spelling of the same fact, identical today and identical only until
 /// one of them is edited (LESSON-456).
-fn error_result(content: &str) -> String {
+pub(crate) fn error_result(content: &str) -> String {
     format!("ERROR: {content}")
 }
 

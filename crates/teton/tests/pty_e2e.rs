@@ -1498,3 +1498,139 @@ fn a_skill_consent_asks_once_at_a_terminal_and_lists_every_command_verbatim() {
         "the turn must still complete after the answer; transcript:\n{after}"
     );
 }
+
+/// **BUG-191 / REQ-587 AC-6, AC-14: BR-4's acknowledgment prompt, at a real
+/// terminal.**
+///
+/// AC-6's evidence clause reads "(daemon unit + **pty for the prompt bytes** +
+/// `cli_e2e` for the pipe)" and AC-14 says the pty suite covers "only the
+/// acknowledgment prompt bytes". It did not: TASK-222 named this file and never
+/// touched it, so the prompt bytes were pinned at renderer-unit level in
+/// `session_ui.rs` and the only e2e leg asserted the refusal **without** a
+/// terminal — the opposite claim.
+///
+/// The acknowledgment is raised from `SkillTool::invoke`, which is the *model's*
+/// path, so no typed line can drive it. The scripted local engine's text
+/// tool-call form is the only way a whole-CLI test can make the model issue one.
+///
+/// 22 project skills against `MAX_LISTED_PROJECT_SKILLS` (20), one of them
+/// shadowing a user skill of the same name — so this draws the bounded list,
+/// the shadowing mark, and the `+2 more` tail in one prompt. Shadowing entries
+/// sort first, which is why the marked one is listed at all.
+#[test]
+fn the_acknowledgment_prompt_names_the_root_its_skills_and_what_it_left_out() {
+    let daemon_path = daemon_bin();
+    let home = PathBuf::from("/tmp").join(format!("tcptyack{:x}", std::process::id() & 0xffff));
+    let _ = std::fs::remove_dir_all(&home);
+    // A *user* skill named `validate`, for the project one of the same name to
+    // shadow. Without it the entry renders bare and the mark is untested.
+    std::fs::create_dir_all(home.join(".claude/skills/validate")).unwrap();
+    std::fs::write(
+        home.join(".claude/skills/validate/SKILL.md"),
+        "---\ndescription: the user's validate\n---\nUser body.\n",
+    )
+    .unwrap();
+
+    let tiers: String = ["reflex", "scan", "build", "think"]
+        .iter()
+        .map(|t| format!("[[tiers]]\ntier = \"{t}\"\nprovider_id = \"local\"\n\n"))
+        .collect();
+    let config = format!("[[providers]]\nid = \"local\"\nkind = \"local\"\n\n{tiers}");
+    let daemon = TestDaemon::spawn_with_env(
+        &daemon_path,
+        &config,
+        &[
+            r#"{"tool": "skill", "arguments": {"name": "validate", "args": ""}}"#,
+            "the project skill landed.",
+        ],
+        &[("HOME", &home)],
+    );
+
+    let project = daemon.root.join("proj");
+    std::fs::create_dir_all(&project).unwrap();
+    std::fs::write(project.join("Cargo.toml"), "[package]\nname = \"proj\"\n").unwrap();
+    // The shadowing one, plus 21 others: 22 against a bound of 20 leaves 2.
+    for name in std::iter::once("validate".to_owned()).chain((1..=21).map(|n| format!("s{n:02}"))) {
+        let dir = project.join(".claude/skills").join(&name);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("SKILL.md"),
+            format!("---\ndescription: project {name}\n---\nProject body for {name}.\n"),
+        )
+        .unwrap();
+    }
+
+    // Tall enough to hold a 20-entry prompt without scrolling it off, wide
+    // enough that no line under test can hard-wrap.
+    let pty = native_pty_system()
+        .openpty(PtySize {
+            rows: 60,
+            cols: 200,
+            pixel_width: 0,
+            pixel_height: 0,
+        })
+        .expect("openpty");
+    let mut cmd = CommandBuilder::new(teton_bin());
+    cmd.args(["--cwd", project.to_str().unwrap()]);
+    cmd.env("XDG_RUNTIME_DIR", &daemon.runtime_dir);
+    cmd.env("TETON_CONFIG", daemon.root.join("config.toml"));
+    cmd.env("TETON_REPO_ROOT", &daemon.root);
+    cmd.env("HOME", &home);
+    let mut session = pty.slave.spawn_command(cmd).expect("spawn teton under pty");
+    drop(pty.slave);
+    let transcript = spawn_reader(pty.master.try_clone_reader().expect("pty reader"));
+    let mut writer = pty.master.take_writer().expect("pty writer");
+
+    assert!(
+        wait_for(&transcript, "ready (freeform)"),
+        "the session never reached the entry prompt; transcript:\n{}",
+        snapshot(&transcript)
+    );
+    // A typed prompt the model answers with a `skill` call — the acknowledgment
+    // is raised by the call, never by anything a person can type.
+    writer.write_all(b"go\r").expect("type a prompt");
+    writer.flush().ok();
+
+    let asked = wait_for(
+        &transcript,
+        "the model wants to run this repository's skills as instructions",
+    );
+    let asking = snapshot(&transcript);
+    assert!(
+        asked,
+        "BR-4's acknowledgment must be drawn at a terminal; transcript:\n{asking}"
+    );
+
+    // Answer, so the session finishes rather than being killed mid-question.
+    writer.write_all(b"n\r").expect("decline");
+    writer.flush().ok();
+    let done = wait_for(&transcript, "the project skill landed.");
+    let after = snapshot(&transcript);
+    let _ = session.kill();
+    let _ = session.wait();
+    let _ = std::fs::remove_dir_all(&home);
+
+    // The shadowing entry, with its mark — the one entry whose source is worth
+    // saying, because it is taking a name from the user's own skill.
+    assert!(
+        asking.contains("    validate (project — shadows your user skill)"),
+        "the shadowing entry must carry its mark; transcript:\n{asking}"
+    );
+    // An ordinary entry is its bare name: every entry here is a project skill,
+    // so `(project)` on each would be the same word twenty times over.
+    assert!(
+        asking.contains("\n    s01\n") || asking.contains("    s01\r"),
+        "an ordinary entry is listed by bare name, one per line; \
+         transcript:\n{asking}"
+    );
+    // The tail is the daemon's *count* of what it left out, never a re-count of
+    // a list this side bounded — 22 skills against a bound of 20.
+    assert!(
+        asking.contains("    +2 more"),
+        "the prompt must say how many it left out; transcript:\n{asking}"
+    );
+    assert!(
+        done,
+        "the turn must still complete after the answer; transcript:\n{after}"
+    );
+}

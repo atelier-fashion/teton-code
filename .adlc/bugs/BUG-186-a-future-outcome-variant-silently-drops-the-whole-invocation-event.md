@@ -1,10 +1,10 @@
 ---
 id: BUG-186
 title: "`NotRunReason` and the wire `DynamicOutcome` are closed, so a future variant drops the whole `skill_invoked` event"
-status: open
+status: resolved
 severity: low
 created: 2026-08-20
-updated: 2026-08-20
+updated: 2026-08-22
 component: "protocol"
 domain: "clients"
 stack: ["rust", "json-rpc"]
@@ -52,3 +52,7 @@ request fails to parse.
 ## Found
 
 REQ-585 Phase 5 verify (architecture review), 2026-08-20.
+
+## Resolution — 2026-08-22
+
+Closed by adding `#[serde(other)] Unknown` to both enums, rendered as "outcome unknown to this build" and "it did not run". `PermissionSubject` deliberately stays closed. Four-leg skew test, mutation-checked. The related `RefusalReason` note was resolved by amending the doc rather than withdrawing the waiter: the parse is what failed, so the `request_id` is not reliably in hand, and if it were, a malformed message would become a way to cancel any session's standing prompt.

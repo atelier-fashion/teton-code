@@ -45,7 +45,7 @@
 //! | AC-8: the same fixture on an undeclared window is refused, in the spoken bound | [`the_same_fixture_on_an_undeclared_window_is_refused_in_the_bounds_spoken_form`] |
 //! | BR-9: a typed refusal over a registered row publishes its own record | [`every_tool_raised_refusal_over_a_registered_skill_publishes_a_record`] |
 //! | BR-9: the cap's refusal publishes one too, with the count that refused it | [`the_thirteenth_call_of_a_turn_is_refused_by_the_cap_and_the_next_prompt_starts_over`] |
-//! | BR-9: a refusal with no skill file to describe publishes none | [`every_tool_raised_refusal_over_a_registered_skill_publishes_a_record`] (`unknown_skill`), [`a_run_of_listings_exhausts_the_per_turn_cap`] (no name at all) |
+//! | BR-9: a refusal with no skill file to describe publishes no `skill_invoked`, and a `skill_refused` instead (BUG-189) | [`every_tool_raised_refusal_over_a_registered_skill_publishes_a_record`] (`unknown_skill`, named), [`a_run_of_listings_exhausts_the_per_turn_cap`] (no name at all) |
 //! | AC-13: a model-issued call expands at `plan`, while the two unenumerated keys stay shut | [`at_plan_a_model_issued_call_expands_a_user_skill_and_shuts_the_project_row_and_the_commands`] |
 //! | AC-13: the same three calls at `full`, and everything opens | [`at_full_the_same_three_calls_expand_and_the_dynamic_command_runs`] |
 //!
@@ -65,7 +65,8 @@
 //! | the record's lookup reaching for `resolve_for_model` instead of `registered_row` | [`every_tool_raised_refusal_over_a_registered_skill_publishes_a_record`] |
 //! | a refusal published with the *file's* dynamic outcomes on it | [`every_tool_raised_refusal_over_a_registered_skill_publishes_a_record`] |
 //! | the cap arm returning before `refuse`, as it did before BR-9's record | [`the_thirteenth_call_of_a_turn_is_refused_by_the_cap_and_the_next_prompt_starts_over`] |
-//! | a record invented for a call that named no skill | [`a_run_of_listings_exhausts_the_per_turn_cap`] |
+//! | a *file*-subject record invented for a call that named no skill | [`a_run_of_listings_exhausts_the_per_turn_cap`] |
+//! | `refuse` dropping the name-subject record on its no-row arm (BUG-189) | [`every_tool_raised_refusal_over_a_registered_skill_publishes_a_record`], [`a_run_of_listings_exhausts_the_per_turn_cap`] |
 //! | a `skill` dispatch that does not spend a loop iteration | [`every_skill_call_spends_one_iteration_and_the_ceiling_ends_the_turn_before_the_cap`] |
 //! | `HarnessConfig::from_harness_profile` ignoring `max_tool_iterations` | [`every_skill_call_spends_one_iteration_and_the_ceiling_ends_the_turn_before_the_cap`] |
 //! | a `read` allowlist for `~/.claude/**` beside the tool (BR-10's refused precedent) | [`the_skill_tool_opens_one_body_and_leaves_read_jailed_in_the_same_session`] |
@@ -656,6 +657,17 @@ async fn drain(sub: &mut tetond::broadcast::Subscription) -> Vec<Event> {
     out
 }
 
+/// Every `skill_refused` in `published`, in order (BUG-189).
+fn name_refusals(published: &[Event]) -> Vec<teton_protocol::events::SkillRefused> {
+    published
+        .iter()
+        .filter_map(|event| match event {
+            Event::SkillRefused(refused) => Some(refused.clone()),
+            _ => None,
+        })
+        .collect()
+}
+
 /// Every `skill_invoked` in `published`, in order.
 fn invocations(published: &[Event]) -> Vec<SkillInvoked> {
     published
@@ -871,11 +883,38 @@ async fn a_run_of_listings_exhausts_the_per_turn_cap() {
     // size would read on the session surface like a refusal of something real.
     // The refusal is still not silent: the model reads it and relays it, and the
     // session shows the tool call.
-    let published = invocations(&drain(&mut sub).await);
+    let raw_events = drain(&mut sub).await;
+    let published = invocations(&raw_events);
     assert!(
         published.is_empty(),
         "a turn of nameless calls describes no skill file, so it publishes no \
          `skill_invoked` at all: {published:?}"
+    );
+    // BUG-189: it does publish name-subject records, and they carry **no**
+    // name — the parse is what failed, so there is nothing reliable to name.
+    // That is the whole reason `SkillRefused::name` is optional: a record that
+    // invented a spelling here would be the hollow record this avoids.
+    let by_name = name_refusals(&raw_events);
+    assert!(
+        !by_name.is_empty(),
+        "a nameless refusal is still a refusal, and BR-9 says none are silent"
+    );
+    assert!(
+        by_name.iter().all(|r| r.name.is_none()),
+        "a call that named nothing publishes a record that names nothing — \
+         `SkillRefused::name` is optional precisely so this case invents no \
+         spelling: {by_name:?}"
+    );
+    // The reason here is the cap, not a bad parse: a *listing* call is
+    // well-formed, it just named nothing, and it is the cap that refuses it
+    // once the turn has spent its allowance. Pinned because it is the
+    // distinction the record has to preserve — "you asked too often" and "I
+    // could not read your arguments" are different news to a reader, and
+    // before BUG-189 neither reached one.
+    assert!(
+        by_name.iter().all(|r| r.reason == "per_turn_cap"),
+        "a nameless *listing* is refused by the cap, not as a bad parse: \
+         {by_name:?}"
     );
 }
 
@@ -1135,7 +1174,8 @@ async fn every_tool_raised_refusal_over_a_registered_skill_publishes_a_record() 
         .await
         .expect("a refused call is a tool result, and the turn goes on");
 
-    let published = invocations(&drain(&mut sub).await);
+    let raw_events = drain(&mut sub).await;
+    let published = invocations(&raw_events);
     let refusals: Vec<&SkillInvoked> = published
         .iter()
         .filter(|invoked| invoked.refused.is_some())
@@ -1160,12 +1200,25 @@ async fn every_tool_raised_refusal_over_a_registered_skill_publishes_a_record() 
          order the calls were made: {published:?}"
     );
 
-    // The one with nothing to name publishes nothing — not a hollow record with
-    // an invented source.
+    // The one with nothing to name publishes no *invocation* record — a
+    // `SkillInvoked` here would have to invent a source and a path (BUG-189).
     assert!(
         published.iter().all(|invoked| invoked.name != "zzz"),
-        "`unknown_skill` names a skill this session does not have, so there is \
-         no file to describe and no record to publish: {published:?}"
+        "`unknown_skill` has no file to describe, so it must not publish a \
+         record whose subject is a file: {published:?}"
+    );
+    // It publishes a record whose subject is the **name** instead, so BR-9's
+    // "a refusal is never silent" holds for this reason too. Before BUG-189 the
+    // model was told why and the human was not.
+    let by_name = name_refusals(&raw_events);
+    assert_eq!(
+        by_name
+            .iter()
+            .map(|r| (r.name.as_deref(), r.reason.as_str()))
+            .collect::<Vec<_>>(),
+        vec![(Some("zzz"), "unknown_skill")],
+        "the name-subject record names what was asked for and why it was \
+         refused: {by_name:?}"
     );
 
     // A refusal record is not an invocation record.

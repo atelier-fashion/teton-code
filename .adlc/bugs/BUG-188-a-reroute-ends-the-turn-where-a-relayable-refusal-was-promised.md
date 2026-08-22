@@ -1,7 +1,7 @@
 ---
 id: BUG-188
 title: "A model-invoked expansion caught at a mid-turn reroute ends the turn instead of relaying"
-status: open
+status: resolved
 severity: medium
 created: 2026-08-22
 updated: 2026-08-22
@@ -61,3 +61,7 @@ just left.
 - Pinned, not assumed:
   `crates/tetond/tests/skill_turn.rs::a_reroute_after_a_committed_model_expansion_refuses_rather_than_eliding_it`
 - Recorded in `.adlc/specs/REQ-587-model-invoked-skills/requirement.md` Deferred
+
+## Closed — 2026-08-22
+
+Closed by folding the result back into the loop it just left, which is what the report said closing it would take. `ContextManager::withdraw_block` edits the committed block in place — the expansion is replaced by the refusal the model reads, and the withdrawn block's provenance is **absorbed** into `DroppedProvenance` rather than shed, exactly as the budget gate's own drop path does (a skill block that shed its sources would let a `local-only` body egress next turn). The caller decides what is possible: a **model** call is withdrawn and relayed and the turn continues; a **typed** `/name` still ends the turn, because there is no call to answer; an unfindable block still ends the turn rather than continuing over a conversation it does not recognise. The caller fork is pinned by mutation.

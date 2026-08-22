@@ -1,7 +1,7 @@
 ---
 id: BUG-189
 title: "Two refusal reasons publish no record, so the session surface never says why"
-status: open
+status: resolved
 severity: low
 created: 2026-08-22
 updated: 2026-08-22
@@ -63,3 +63,7 @@ REQ-587 did not propose.
   `crates/tetond/tests/skill_tool_loop.rs::every_tool_raised_refusal_over_a_registered_skill_publishes_a_record`
   and `…::a_run_of_listings_exhausts_the_per_turn_cap`
 - Recorded in `.adlc/specs/REQ-587-model-invoked-skills/requirement.md` Deferred
+
+## Closed — 2026-08-22
+
+Closed with the second event the resolution named: `SkillRefused`, whose subject is a **name** rather than a file. It carries only what is known, and `name` is optional because `invalid_arguments` may have parsed nothing reliable. Chosen over making `SkillInvoked`'s file fields optional — that would weaken the "this record describes a file" invariant and touch 28 sites. The client needed no new vocabulary: `refusal_reason_words` already worded both reasons. A nameless *listing* turned out to be refused by the per-turn cap rather than as a bad parse, and that record now reaches the surface too.

@@ -1,7 +1,7 @@
 ---
 id: BUG-192
 title: "`user_dispatch` is implemented twice — no test can ask both copies the same question"
-status: open
+status: resolved
 severity: low
 created: 2026-08-22
 updated: 2026-08-22
@@ -62,3 +62,7 @@ naming the daemon function it mirrors.
 
 - `crates/teton-protocol/src/methods.rs` — the proposed home
 - `crates/tetond/src/skills/mod.rs`, `crates/teton/src/slash.rs` — the two copies
+
+## Closed — 2026-08-22
+
+Closed by deleting the mirror, as the resolution directed. `teton_protocol::methods::user_dispatch` is the single home, generic in the shadow payload because the two sides name the shadower differently and legitimately so — the daemon a typed `ShadowedBy`, the client a rendered sentence. Only the precedence was ever shared. The client's `table_claim` stays a precondition composed on top. Verified by the report's own reproduction: swapping the arm order now reddens **both** suites.

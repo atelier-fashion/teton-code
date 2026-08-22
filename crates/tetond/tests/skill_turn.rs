@@ -111,8 +111,8 @@
 //! | `resolve_for_model` checked after the expansion instead of before | [`a_skill_hidden_from_the_model_is_refused_with_no_consent_and_no_command`] |
 //! | `skill/invoke` resolving through `invocable_by_model` (widened, not narrowed) | [`the_rpc_refuses_a_model_only_skill_by_name_and_the_model_still_invokes_it`] |
 //! | the tool's publish composing its own outcome view beside `dynamic::outcome_view` | [`both_callers_project_their_dynamic_outcomes_through_the_one_view`] |
-//! | `skill_would_not_survive_refit` reading only the typed seed | [`a_reroute_after_a_committed_model_expansion_refuses_rather_than_eliding_it`] |
-//! | the reroute arm refitting instead of refusing | [`a_reroute_after_a_committed_model_expansion_refuses_rather_than_eliding_it`] |
+//! | `skill_would_not_survive_refit` reading only the typed seed | [`a_reroute_after_a_committed_model_expansion_relays_the_refusal_and_continues`] |
+//! | the reroute arm refitting instead of withdrawing (BUG-188) | [`a_reroute_after_a_committed_model_expansion_relays_the_refusal_and_continues`] |
 //! | one billed row per turn instead of one per remote call | [`the_expansion_is_priced_on_the_next_model_call_and_every_call_bills_its_own_row`] |
 //! | the expansion left out of the next call's payload | [`the_expansion_is_priced_on_the_next_model_call_and_every_call_bills_its_own_row`] |
 //!
@@ -920,6 +920,85 @@ async fn drain(sub: &mut tetond::broadcast::Subscription) -> Vec<Event> {
 /// dispatch from.
 ///
 /// Non-vacuity: the same turn with the registered name expands and runs.
+/// **AC-19's attribution half (BUG-183).** A skill turn is billed exactly as a
+/// typed prompt on the same session is — asserted through the real skill path.
+///
+/// This claim used to live in `cost_attribution.rs` and would have passed with
+/// the whole `crate::skills` module deleted: both legs hand-built an
+/// `Egress::send`, neither reached `run_prompt_turn`, `expand` or
+/// `accept_invocation`, and the central equality compared two rows produced
+/// from **one reused `EgressContext`** — so `session_id`, `phase`,
+/// `provider_id` and `model` could not differ whatever the skill path did. The
+/// assertion was implied by its own setup (LESSON-544's shape).
+///
+/// Here both turns go through the daemon's own path on one session, so the
+/// attribution each carries is the one production built for it. A skill path
+/// that grew its own session key, phase or model would now differ — and a
+/// skill path that stopped billing at all would leave one row where this
+/// expects two.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_skill_turn_is_billed_with_the_same_attribution_a_typed_turn_gets() {
+    let repo = Tree::new("cost-attribution");
+    repo.write(
+        ".claude/skills/status/SKILL.md",
+        &skill_file("report on the repo", "Report on the repo."),
+    );
+    let h = Harness::with_window(128_000);
+    let session = h.session_at(repo.path());
+
+    // A typed turn first, to establish what "the same as a typed prompt" is on
+    // this session — read from production rather than asserted against a
+    // literal, which is what makes the comparison meaningful.
+    h.turn(&session, "Report on the repo.", None)
+        .await
+        .expect("a typed turn runs");
+    let after_typed = h
+        .runtime
+        .cost_report()
+        .expect("the ledger reads")
+        .report
+        .per_phase
+        .len();
+
+    // Then the same work as a skill invocation.
+    h.turn(&session, "", Harness::invoke("status", ""))
+        .await
+        .expect("a registered skill runs");
+
+    assert!(
+        h.vendor.hits() >= 2,
+        "both turns must actually have reached the vendor, or this measures \
+         nothing: {} hit(s)",
+        h.vendor.hits()
+    );
+
+    let report = h.runtime.cost_report().expect("the ledger reads").report;
+    let phases: Vec<&str> = report.per_phase.iter().map(|g| g.key.as_str()).collect();
+    assert_eq!(
+        phases,
+        vec!["implement"],
+        "the skill turn lands in the session's own phase, and nowhere else — \
+         a skill path with its own phase key would add a second group here"
+    );
+    assert_eq!(
+        report.per_phase.len(),
+        after_typed,
+        "and it joins the typed turn's group rather than making a new one"
+    );
+
+    // BR-7: the ledger holds counts and routing, never what the turn was made
+    // of. Driven off the REAL expansion — the body, the file name and anything
+    // a dynamic command printed all come from production here, where the old
+    // fixture hand-wrote a preamble production never emits.
+    let rendered = format!("{report:?}");
+    for leak in ["Report on the repo", ".claude/skills", "SKILL.md", "status"] {
+        assert!(
+            !rendered.contains(leak),
+            "a cost report carries `{leak}`: {rendered}"
+        );
+    }
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn an_unknown_skill_name_is_refused_by_the_daemon_not_only_by_the_client() {
     let repo = Tree::new("unknown");
@@ -1249,8 +1328,10 @@ async fn the_engine_is_handed_the_expansion_the_budget_measured() {
     // The rest of the line verbatim: interior whitespace preserved, quotes not
     // interpreted (AC-4). JSON-escaped on the wire, hence the escaped quotes.
     assert!(
-        sent.contains(r#"Handle REQ-585  \"quoted\" carefully."#),
-        "`$ARGUMENTS` is substituted verbatim: {}",
+        sent.contains(
+            r#"Handle <skill-arguments>REQ-585  \"quoted\"</skill-arguments> carefully."#
+        ),
+        "`$ARGUMENTS` is substituted verbatim inside BUG-190's sub-frame: {}",
         &sent[..sent.len().min(800)]
     );
     assert!(
@@ -3334,9 +3415,17 @@ fn the_two_refusals_bracket_the_consent_seam_and_precede_the_seed() {
     let after: Vec<usize> = raises.iter().copied().filter(|at| *at > seed).collect();
     assert_eq!(after.len(), 2, "both reroute arms guard the expansion");
     for raise in &after {
-        let window = &body[raise.saturating_sub(400)..*raise];
+        // Widened from 400 by BUG-188, which put `relay_refit_refusal` between
+        // the guard call and the raise: a *model*-invoked expansion is now
+        // withdrawn and relayed as a tool result, and only a **typed** one —
+        // which has no call to answer — still ends the turn here. Both names
+        // are accepted because both are the refit path; what the assertion
+        // still forbids is a raise that reached this position from some other
+        // stage.
+        let window = &body[raise.saturating_sub(900)..*raise];
         assert!(
-            window.contains("skill_would_not_survive_refit"),
+            window.contains("skill_would_not_survive_refit")
+                || window.contains("relay_refit_refusal"),
             "a refusal below the seed must come from the refit guard, not from a \
              stage that lost its position"
         );
@@ -3714,7 +3803,7 @@ impl TestClient {
 // | AC-1: a hidden skill asks nobody and runs nothing | [`a_skill_hidden_from_the_model_is_refused_with_no_consent_and_no_command`] |
 // | BR-3 over the wire: `skill/invoke` refuses a model-only skill | [`the_rpc_refuses_a_model_only_skill_by_name_and_the_model_still_invokes_it`] |
 // | AC-13: one projection, both paths, non-empty outcomes | [`both_callers_project_their_dynamic_outcomes_through_the_one_view`] |
-// | BR-7: the reroute guard **fires** on a model-invoked expansion | [`a_reroute_after_a_committed_model_expansion_refuses_rather_than_eliding_it`] |
+// | BR-7: the reroute guard **fires** on a model-invoked expansion, and BUG-188 relays it | [`a_reroute_after_a_committed_model_expansion_relays_the_refusal_and_continues`] |
 // | AC-10: the expansion is priced on the next call, per call | [`the_expansion_is_priced_on_the_next_model_call_and_every_call_bills_its_own_row`] |
 
 /// Every request the vendor was handed, parsed out of the raw HTTP it captured.
@@ -3915,9 +4004,11 @@ async fn one_fixture_reaches_the_model_as_the_same_body_bytes_for_both_callers()
     // Non-vacuity: the arguments really were substituted, so this is a
     // comparison of an expansion rather than of two empty strings.
     assert!(
-        modelled_body.contains("Follow these steps for teton  code \"repo\"."),
-        "the arguments reach `$ARGUMENTS` verbatim, interior spaces and quotes \
-         intact: {modelled_body}"
+        modelled_body.contains(
+            "Follow these steps for <skill-arguments>teton  code \"repo\"</skill-arguments>."
+        ),
+        "the arguments reach `$ARGUMENTS` verbatim inside BUG-190's sub-frame, \
+         interior spaces and quotes intact: {modelled_body}"
     );
 
     // The planted markers, on both paths, defused where each layer defuses it.
@@ -4285,7 +4376,7 @@ async fn both_callers_project_their_dynamic_outcomes_through_the_one_view() {
 /// "the guard fired" from "the harness could not send", which is the failure
 /// mode a structural pin cannot rule out.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn a_reroute_after_a_committed_model_expansion_refuses_rather_than_eliding_it() {
+async fn a_reroute_after_a_committed_model_expansion_relays_the_refusal_and_continues() {
     let repo = Tree::new("reroute");
     model_invocable_skill(&repo, "big", &format!("Head.\n{}\nTail.\n", filler(20_000)));
     // A roomy primary and a fallback at the floor: the reroute is a *smaller*
@@ -4297,75 +4388,66 @@ async fn a_reroute_after_a_committed_model_expansion_refuses_rather_than_eliding
     // The request that follows the fold: a 404, which `classify` sends to
     // `FailureAction::Fallback` — the one action that hands the turn a route.
     h.vendor.will_fail();
-    // …and what a build with no guard would be served on the fallback.
+    // What the model says once it has read the refusal on the fallback.
     h.vendor.will_say("rerouted and finished", 5, 2);
 
-    let err = h
+    let result = h
         .turn(&session, "run big", None)
         .await
-        .expect_err("the committed expansion cannot survive the fallback's budget");
+        .expect("BUG-188: a model-invoked expansion refused at a reroute is relayed, not fatal");
 
-    assert_eq!(
-        err.code,
-        error_code::SKILL_EXPANSION_TOO_LARGE,
-        "the reroute guard must refuse by name, not fall through to a generic \
-         provider failure: {}",
-        err.message
-    );
-    assert!(
-        err.message.contains("`big`")
-            && err
-                .message
-                .contains("does not fit this route's context budget"),
-        "the refusal names the skill whose room is gone: {}",
-        err.message
-    );
-    // **And it names the caller who actually asked.** TASK-222 recorded the
-    // opposite as a defect: `skill_would_not_survive_refit` called `skill_fit`,
-    // which hard-coded `SkillCaller::User`, so a *model*-invoked expansion
-    // caught here was described as `/big` — a slash command nobody typed, and a
-    // surface the model cannot use (BR-8). The guard now reads the caller off
-    // `typed_refit`, the index `run_prompt_turn` already keeps.
-    //
-    // Mutation: put `SkillCaller::User` back at the reroute and this fails.
-    assert!(
-        err.message.starts_with("The `big` skill"),
-        "a model-invoked expansion refused at a reroute must be named as the \
-         model's, not as a `/name` the user typed: {}",
-        err.message
-    );
-    assert!(
-        !err.message.contains("`/big`"),
-        "the user caller's slash spelling reached a model-issued call: {}",
-        err.message
-    );
-    // The consequence clause forks with the subject and is the other half of
-    // the same fact: a provider *has* seen this turn — it is what produced the
-    // call — so the user arm's "no provider saw this turn" would be false here.
-    assert!(
-        err.message
-            .contains("Nothing was folded into this conversation"),
-        "the model arm's consequence must travel with the model's subject: {}",
-        err.message
-    );
-    // The expansion really was committed before the reroute — otherwise the
-    // guard would have had nothing to measure and this would be a test about an
-    // empty list.
-    assert!(
-        on_the_wire(&h).contains(FRAME_OPEN),
-        "the expansion never reached the model, so nothing was committed:\n{}",
-        on_the_wire(&h)
-    );
-    // Two requests and no more: the call that expanded, and the one that
-    // failed. A build whose guard did not fire would refit, retry on the
-    // fallback, be served the completion queued behind the failure, and make a
-    // third — which is the reading that distinguishes "the guard fired" from
-    // "the harness could not send".
+    // Three requests: the call that expanded, the one that failed, and the
+    // retry on the fallback carrying the refusal. Before BUG-188 there were
+    // two, because the turn ended here.
     assert_eq!(
         h.vendor.hits(),
-        2,
-        "the turn continued onto the fallback, so the guard did not fire and \
-         the committed expansion was refitted behind the model's back"
+        3,
+        "the turn must continue onto the fallback with the refusal in hand"
+    );
+
+    // The **retry** is what this is about. The first request legitimately
+    // carried the expansion — that is what "committed" means, and it is why the
+    // guard has something to measure. What matters is what the fallback sees.
+    let sent = h.vendor.sent();
+    let retry = sent.last().expect("the fallback request");
+
+    // The refusal reached the model, as a failed tool result it can relay —
+    // BR-6/BR-9's promise, which this seam used to be the one exception to.
+    assert!(
+        retry.contains("ERROR: ") && retry.contains("`big`"),
+        "the model must be handed the refusal naming the skill:\n{retry}"
+    );
+    assert!(
+        retry.contains("does not fit this route's context budget"),
+        "and the reason it could not be kept:\n{retry}"
+    );
+    // It is still named as the **model's** call, not as a `/name` nobody typed
+    // — the caller fix TASK-222 made, carried through the new path.
+    assert!(
+        !retry.contains("`/big`"),
+        "the user caller's slash spelling reached a model-issued call:\n{retry}"
+    );
+    // And the expansion itself is gone from the retry: the whole point is that
+    // the model is not handed a middle-elided instruction set.
+    assert!(
+        !retry.contains("Tail."),
+        "the withdrawn expansion must not survive the reroute:\n{retry}"
+    );
+    // Non-vacuity for the line above: it *was* there on the attempt that
+    // committed it, so the absence above is a withdrawal and not a fixture that
+    // never folded anything.
+    assert!(
+        sent[..sent.len() - 1]
+            .iter()
+            .any(|request| request.contains("Tail.")),
+        "the expansion never reached the model before the reroute, so nothing \
+         was committed and this test measures nothing:\n{}",
+        sent.join("\n---\n")
+    );
+    assert_eq!(
+        result.stop_reason,
+        teton_protocol::methods::StopReason::EndTurn,
+        "the turn completes on the fallback rather than stopping at the reroute"
     );
 }
 

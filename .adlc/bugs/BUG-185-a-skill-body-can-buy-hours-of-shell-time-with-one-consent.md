@@ -1,10 +1,10 @@
 ---
 id: BUG-185
 title: "One consent buys an unbounded number of dynamic commands, and the invocation has no deadline of its own"
-status: open
+status: resolved
 severity: medium
 created: 2026-08-20
-updated: 2026-08-20
+updated: 2026-08-22
 component: "daemon/harness"
 domain: "harness"
 stack: ["rust", "daemon"]
@@ -54,3 +54,7 @@ rendering a screen the user cannot read.
 ## Found
 
 REQ-585 Phase 5 verify (security audit), 2026-08-20.
+
+## Resolution — 2026-08-22
+
+Closed with two bounds, because neither suffices alone. `MAX_DYNAMIC_COMMANDS = 32`, refused at **discovery** with a named `SkipReason` carrying the real count — placement is the security claim, since an unregistered file is not invocable and its commands never reach a consent prompt, which also closes the consent-flooding surface. `INVOCATION_BUDGET_MS = 120_000` around the whole run, because 32 slots at the per-command timeout is still 16 minutes; the remaining budget also shortens each per-command deadline, so the total is a real bound.
