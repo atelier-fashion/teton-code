@@ -2,7 +2,7 @@
   "req": "REQ-565",
   "branch": "feat/REQ-565-daemon-exit-on-last-client",
   "startedAt": "2026-08-10T00:00:00Z",
-  "completed": false,
+  "completed": true,
   "currentPhase": 8,
   "completedPhases": [
     0,
@@ -12,7 +12,8 @@
     4,
     5,
     6,
-    7
+    7,
+    8
   ],
   "phaseHistory": [
     {
@@ -54,6 +55,11 @@
       "phase": 7,
       "name": "PR Cleanup & CI",
       "completedAt": "2026-08-10T12:49:25.495782Z"
+    },
+    {
+      "phase": 8,
+      "name": "Wrapup - merged 6a9bfdd (PR #80); record reconciled from GitHub 2026-08-22",
+      "completedAt": "2026-08-10T12:49:44Z"
     }
   ],
   "integrationBranch": "main",
@@ -67,7 +73,7 @@
       "prUrl": "https://github.com/atelier-fashion/teton-code/pull/80",
       "prNumber": 80,
       "prCreatedAt": "2026-08-10T11:25:54.088176Z",
-      "merged": false,
+      "merged": true,
       "snapshotBranch": null,
       "snapshotPR": null
     }

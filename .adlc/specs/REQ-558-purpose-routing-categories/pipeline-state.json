@@ -2,15 +2,18 @@
   "req": "REQ-558",
   "branch": "feat/REQ-558-purpose-routing-categories",
   "startedAt": "2026-08-05T22:10:55Z",
-  "completed": false,
-  "currentPhase": 6,
+  "completed": true,
+  "currentPhase": 8,
   "completedPhases": [
     0,
     1,
     2,
     3,
     4,
-    5
+    5,
+    6,
+    7,
+    8
   ],
   "integrationBranch": "main",
   "phaseHistory": [
@@ -43,6 +46,11 @@
       "phase": 5,
       "name": "Verify (reflect + review)",
       "completedAt": "2026-08-06T16:30:45Z"
+    },
+    {
+      "phase": 8,
+      "name": "Wrapup - merged 2a2f47b (PR #58); record reconciled from GitHub 2026-08-22",
+      "completedAt": "2026-08-07T11:39:14Z"
     }
   ],
   "repos": {
@@ -54,7 +62,7 @@
       "touched": true,
       "prUrl": "https://github.com/atelier-fashion/teton-code/pull/58",
       "prNumber": 58,
-      "merged": false
+      "merged": true
     }
   },
   "mergeOrder": [
