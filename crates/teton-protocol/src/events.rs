@@ -448,6 +448,16 @@ pub struct RouteDecided {
     /// and every refusal read. Same additivity as [`Self::budget_tokens`].
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub bound: Option<BudgetBound>,
+    /// The per-prompt **spend** ceiling in force, in micro-cents (REQ-588 BR-2).
+    ///
+    /// The money twin of [`Self::bound`], and additive in the same way: absent
+    /// on every turn where the user has set no ceiling, which is what makes an
+    /// un-opted-in turn serialize byte-identically to before this REQ. The
+    /// figure rides rather than the rendered dollars so the surface can format
+    /// it once, through the same composer the refusal uses — two surfaces
+    /// describing one ceiling must not be able to disagree (BR-2).
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub spend_ceiling_micro_cents: Option<u64>,
     /// Whether the derivation had to **raise** this attempt's pair to its floor
     /// — so [`Self::bound`] names what the user declared, and the budget above
     /// is larger than that declaration asked for (REQ-586 TASK-194 2b).
@@ -2337,6 +2347,13 @@ pub enum BudgetBound {
     /// The route is the local engine; its budget is the local pair regardless
     /// of any declared window.
     LocalEngine,
+    /// A bound this build does not know (REQ-588 BR-4).
+    ///
+    /// Same direction and same reasoning as [`ContextPressureKind::Unknown`]:
+    /// a future constraint must cost the *name* of the bound, never the event
+    /// that carries it.
+    #[serde(other)]
+    Unknown,
 }
 
 impl BudgetBound {
@@ -2356,6 +2373,9 @@ impl BudgetBound {
             BudgetBound::RedactScan => "redact_scan",
             BudgetBound::UserCap => "user_cap",
             BudgetBound::LocalEngine => "local_engine",
+            // Round-trips as itself: a client that re-emits what it read must
+            // not silently relabel an unknown bound as a known one.
+            BudgetBound::Unknown => "unknown",
         }
     }
 
@@ -2383,6 +2403,11 @@ impl BudgetBound {
             BudgetBound::RedactScan => "redact scan",
             BudgetBound::UserCap => "user cap",
             BudgetBound::LocalEngine => "local engine",
+            // Deliberately vague, because it is: this build cannot say WHICH
+            // constraint bound the pair, and inventing a plausible-sounding
+            // one would name a setting the user could go and change for no
+            // reason. Every other phrase here names a real knob.
+            BudgetBound::Unknown => "a bound this build does not know",
         }
     }
 }
@@ -2478,6 +2503,20 @@ pub enum ContextPressureKind {
     /// else — so no reader is ever told the wrong story about a context that
     /// did not fit.
     DidNotFit,
+    /// A kind this build does not know (REQ-588 BR-4).
+    ///
+    /// Tolerant for BUG-186's reason, applied one enum over: this travels
+    /// **daemon → client only** and the surface it feeds is a notice, so
+    /// failing closed buys nothing — without this arm a future kind takes the
+    /// whole `context_pressure` frame down at `serde_json::from_value` and
+    /// BR-7's "nothing is clamped in silence" quietly becomes false.
+    ///
+    /// The doc on [`Self::DidNotFit`] above notes that a client predating that
+    /// variant drops the frame. That is precisely the defect this closes, and
+    /// it is why the arm is worth adding before the next kind rather than
+    /// after.
+    #[serde(other)]
+    Unknown,
 }
 
 /// The context gate dropped, elided, or re-fitted conversation to a turn's
@@ -3244,6 +3283,7 @@ mod tests {
             budget_bytes: Some(397_952),
             bound: Some(BudgetBound::Window),
             bound_floored: None,
+            spend_ceiling_micro_cents: None,
         }));
         // Flattened: envelope metadata and the payload share one object.
         assert_eq!(wire["event"], "route_decided");
@@ -3280,6 +3320,7 @@ mod tests {
                     budget_bytes: None,
                     bound: None,
                     bound_floored: None,
+                    spend_ceiling_micro_cents: None,
                 }),
                 "route_decided",
             ),
@@ -3759,7 +3800,7 @@ mod tests {
     ///   worse answer than the old wrong one only if the wrong one was
     ///   actionable, and "a block was elided by 0 bytes" was not.
     #[test]
-    fn a_context_that_did_not_fit_has_its_own_kind_and_an_older_client_drops_the_frame() {
+    fn a_context_that_did_not_fit_has_its_own_kind_and_an_unknown_one_degrades() {
         let pressure = ContextPressure {
             kind: ContextPressureKind::DidNotFit,
             dropped_blocks: 0,
@@ -3796,10 +3837,21 @@ mod tests {
         .expect("a frame predating the field still parses");
         assert!(!older.bound_floored);
 
-        // Older client: a kind it does not know is refused, never folded into
-        // one it does.
+        // A kind this build does not know is **never folded into one it does**.
+        //
+        // REQ-586 wrote this as `is_err()` — the enum was closed, so an unknown
+        // kind was refused outright. REQ-588 BR-4 opened it, because refusing
+        // the *value* meant dropping the whole *frame*, and BR-7's "nothing is
+        // clamped in silence" then quietly became false at the moment something
+        // was. The concern behind the original assertion is unchanged and is
+        // what is pinned here: the unknown kind lands on its own arm, not on
+        // `DidNotFit` or any other real one.
         assert!(serde_json::from_str::<ContextPressureKind>("\"did_not_fit\"").is_ok());
-        assert!(serde_json::from_str::<ContextPressureKind>("\"a_kind_from_the_future\"").is_err());
+        assert_eq!(
+            serde_json::from_str::<ContextPressureKind>("\"a_kind_from_the_future\"").unwrap(),
+            ContextPressureKind::Unknown,
+            "an unknown kind must degrade to Unknown, never be folded into a known kind"
+        );
     }
 
     /// **TASK-194 2b, the route line's half.** `bound_floored` rides
@@ -3820,6 +3872,7 @@ mod tests {
             budget_bytes: Some(16_384),
             bound: Some(BudgetBound::UserCap),
             bound_floored: Some(true),
+            spend_ceiling_micro_cents: None,
         };
         round_trip(&decided);
         let wire = serde_json::to_value(&decided).unwrap();
@@ -3896,6 +3949,11 @@ mod tests {
                 BudgetBound::RedactScan => ("redact_scan", "redact scan"),
                 BudgetBound::UserCap => ("user_cap", "user cap"),
                 BudgetBound::LocalEngine => ("local_engine", "local engine"),
+                // REQ-588 BR-4. Its words are deliberately a phrase rather
+                // than a knob name: this build cannot say which constraint
+                // bound the pair, and every other spelling here names
+                // something the user could go and change.
+                BudgetBound::Unknown => ("unknown", "a bound this build does not know"),
             }
         }
 
@@ -3905,6 +3963,7 @@ mod tests {
             BudgetBound::RedactScan,
             BudgetBound::UserCap,
             BudgetBound::LocalEngine,
+            BudgetBound::Unknown,
         ];
         let mut wire_names = Vec::new();
         let mut said = Vec::new();
@@ -3957,6 +4016,7 @@ mod tests {
             budget_bytes: None,
             bound: None,
             bound_floored: None,
+            spend_ceiling_micro_cents: None,
         });
 
         // REQ-586: the budget pair and its bound ride the same frame, and every
@@ -3981,6 +4041,7 @@ mod tests {
                 budget_bytes: Some(253_952),
                 bound: Some(bound),
                 bound_floored: None,
+                spend_ceiling_micro_cents: None,
             };
             round_trip(&decided);
             let wire: serde_json::Value =
@@ -4037,6 +4098,7 @@ mod tests {
             budget_bytes: Some(253_952),
             bound: Some(BudgetBound::UserCap),
             bound_floored: None,
+            spend_ceiling_micro_cents: None,
         })
         .unwrap();
         assert!(
@@ -4579,6 +4641,78 @@ mod tests {
         );
     }
 
+    /// **REQ-588 BR-4 / AC-3.** A future `ContextPressureKind` or `BudgetBound`
+    /// costs the *name* of the thing, never the frame that carries it.
+    ///
+    /// The same four legs BUG-186 established one enum over, and for the same
+    /// reason: the client reads events with `serde_json::from_value(..).ok()?`,
+    /// so before `#[serde(other)]` a future variant took the whole
+    /// `context_pressure` frame down — and BR-7's "nothing is clamped in
+    /// silence" quietly became false at exactly the moment something was.
+    #[test]
+    fn a_future_pressure_kind_or_bound_degrades_and_keeps_the_frame() {
+        // A frame from a newer daemon: a fifth kind and a sixth bound, neither
+        // constructible by this build — which is the point of the fixture.
+        let wire = serde_json::json!({
+            "kind": "compacted_by_summary",
+            "bound": "monthly_spend",
+            "bound_floored": false,
+            "budget_tokens": 4_096,
+            "budget_bytes": 32_768,
+            "dropped_blocks": 0,
+            "elided_bytes": 0,
+            "newest_user_elided": false,
+        });
+
+        // Leg one and two — each unknown value lands on its own `Unknown`.
+        let ev: ContextPressure = serde_json::from_value(wire)
+            .expect("an unknown kind or bound must not take the whole frame down");
+        assert_eq!(ev.kind, ContextPressureKind::Unknown);
+        assert_eq!(ev.bound, BudgetBound::Unknown);
+
+        // Leg three — non-vacuity. A known frame is unaffected, so the two
+        // above are not passing because everything collapsed to Unknown.
+        let known: ContextPressure = serde_json::from_value(serde_json::json!({
+            "kind": "did_not_fit",
+            "bound": "redact_scan",
+            "bound_floored": true,
+            "budget_tokens": 1,
+            "budget_bytes": 1,
+            "dropped_blocks": 0,
+            "elided_bytes": 0,
+            "newest_user_elided": false,
+        }))
+        .expect("a known frame still parses");
+        assert_eq!(known.kind, ContextPressureKind::DidNotFit);
+        assert_eq!(known.bound, BudgetBound::RedactScan);
+
+        // …and a known bound's words are untouched, so the new arm did not
+        // disturb the table every surface reads.
+        assert_eq!(BudgetBound::RedactScan.words(), "redact scan");
+        assert_eq!(BudgetBound::RedactScan.wire_name(), "redact_scan");
+
+        // The unknown bound is deliberately vague rather than plausible: every
+        // other phrase names a knob the user could change, and inventing one
+        // here would send them to a setting that has nothing to do with it.
+        assert!(
+            BudgetBound::Unknown.words().contains("does not know"),
+            "{}",
+            BudgetBound::Unknown.words()
+        );
+
+        // Leg four — the contrast. `PermissionSubject` stays CLOSED: its
+        // unrecognized arm is a refusal that keeps an unapproved command from
+        // running, and tolerance there would be a security change, not a
+        // rendering one.
+        let subject: PermissionSubject =
+            serde_json::from_value(serde_json::json!({ "kind": "some_future_consent" }))
+                .expect("PermissionSubject parses, to its refusal arm");
+        assert!(
+            matches!(subject, PermissionSubject::Unrecognized),
+            "the fail-closed sibling stays fail-closed: {subject:?}"
+        );
+    }
+
     /// BUG-186: a future outcome `kind` or `NotRunReason` must cost one *line*,
     /// never the whole `skill_invoked` event.
     ///
@@ -4982,6 +5116,7 @@ mod tests {
             budget_bytes: None,
             bound: None,
             bound_floored: None,
+            spend_ceiling_micro_cents: None,
         };
         round_trip(&decided);
         let wire: serde_json::Value =

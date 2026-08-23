@@ -309,6 +309,7 @@ impl Route {
             // A surface printing the bound without it reports a ceiling the
             // route is not running under.
             bound_floored: Some(self.budget.floored),
+            spend_ceiling_micro_cents: None,
         })
     }
 
@@ -386,6 +387,15 @@ pub struct Router {
     /// `session_override.or(config.effort)` and defaulted to `high` — never
     /// absent (BR-1).
     effort: EffortLevel,
+    /// The per-prompt spend ceiling in force, in micro-cents (REQ-588 BR-2).
+    ///
+    /// Config-derived per-turn state like [`Router::effort`] beside it, and
+    /// held here rather than projected through [`Route`] on purpose: a spend
+    /// ceiling is **not a routing decision**. It does not choose a provider,
+    /// and threading it through the routing type would invite a later reader to
+    /// treat it as one. The router carries it only so the one place that emits
+    /// `route_decided` can stamp it.
+    spend_ceiling_micro_cents: Option<u64>,
     /// Providers that answered 400 on the effort field earlier in this session
     /// (REQ-559 BR-12 / ADR-F).
     ///
@@ -423,6 +433,7 @@ impl Router {
             judgment_default: JudgmentCategory::default(),
             local_available: true,
             effort: EffortLevel::default(),
+            spend_ceiling_micro_cents: None,
             effort_refused: BTreeSet::new(),
             // Off unless the daemon says otherwise: `[privacy] redact` is
             // opt-in, and a router that assumed the scan were on would hold
@@ -438,6 +449,16 @@ impl Router {
     #[must_use]
     pub fn with_effort(mut self, effort: EffortLevel) -> Self {
         self.effort = effort;
+        self
+    }
+
+    /// Set the per-prompt spend ceiling this router reports (REQ-588 BR-2).
+    ///
+    /// Read from `Config::cost`, and `None` on an un-opted-in machine — which
+    /// is what keeps the emitted event byte-identical to before this REQ.
+    #[must_use]
+    pub fn with_spend_ceiling(mut self, micro_cents: Option<u64>) -> Self {
+        self.spend_ceiling_micro_cents = micro_cents;
         self
     }
 
@@ -902,7 +923,10 @@ impl Router {
     /// Broadcast the `route_decided` event for `route` (BR-5), when a provider was
     /// selected. Scoped to `session_id`.
     pub fn emit_route_decided(&self, bus: &EventBus, session_id: Option<SessionId>, route: &Route) {
-        if let Some(decided) = route.route_decided() {
+        if let Some(mut decided) = route.route_decided() {
+            // BR-2: stamped here, at the one place the event is published, so
+            // the ceiling the surface names is the ceiling this turn ran under.
+            decided.spend_ceiling_micro_cents = self.spend_ceiling_micro_cents;
             bus.publish(session_id, Event::RouteDecided(decided));
         }
     }

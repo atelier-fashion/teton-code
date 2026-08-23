@@ -697,6 +697,7 @@ impl CostMeter for CostLedger {
         session_id: Option<SessionId>,
         provider_id: ProviderId,
         attribution: CostAttribution,
+        spend: Option<Arc<super::PromptSpend>>,
     ) -> TransportResponse {
         // A call with no session scope cannot be attributed to a CostRecord;
         // forward it untouched rather than record an orphan row.
@@ -717,6 +718,10 @@ impl CostMeter for CostLedger {
             status: response.status,
             polled: false,
             recorded: false,
+            // REQ-588 ADR-1/ADR-2: the prompt's accumulator, fed at `finalize`
+            // where the call's ACTUAL cost is known. Feeding it anywhere
+            // earlier would be the pre-flight estimate ADR-2 rejected.
+            spend,
         };
         TransportResponse {
             status: response.status,
@@ -726,6 +731,13 @@ impl CostMeter for CostLedger {
             location: response.location,
             body: Box::pin(metered),
         }
+    }
+
+    fn can_price(&self, model: &str) -> bool {
+        // The same table `finalize` prices with, asked the same question one
+        // step earlier — so "we will be able to count this" and "we counted
+        // it" cannot come to disagree.
+        self.prices.entry(model).is_some()
     }
 }
 
@@ -794,6 +806,7 @@ struct MeteredBody {
     /// that was served and abandoned.
     polled: bool,
     recorded: bool,
+    spend: Option<Arc<super::PromptSpend>>,
 }
 
 impl MeteredBody {
@@ -830,6 +843,18 @@ impl MeteredBody {
         let usd_micros = self
             .prices
             .price(&self.attribution.model, usage.input, usage.output);
+        // REQ-588 ADR-2: the ceiling counts what was ACTUALLY spent, which is
+        // only knowable here. An unpriced call feeds the sticky flag instead of
+        // the total, because a total that silently absorbed unknowns would
+        // claim a precision it does not have.
+        if let Some(spend) = &self.spend {
+            match usd_micros {
+                Some(micros) if micros >= 0 => spend.add(micros.unsigned_abs()),
+                // A negative price is nonsense rather than a credit; treat it
+                // as unpriced rather than reducing the total.
+                Some(_) | None => spend.note_unpriced(),
+            }
+        }
         let row = LedgerRow {
             session_id: self.session_id.0.clone(),
             phase: self.attribution.phase,
@@ -2038,6 +2063,7 @@ CREATE TRIGGER cost_records_no_delete
             Some(SessionId::from("sess-under-test")),
             ProviderId::from("anthropic"),
             CostAttribution::new("claude-fable-5").with_phase(Phase::Implement),
+            None,
         );
         let bytes = drain(metered.body).await;
         // Body passed through unchanged.
@@ -2073,6 +2099,7 @@ CREATE TRIGGER cost_records_no_delete
             Some(SessionId::from("s")),
             ProviderId::from("deepseek"),
             CostAttribution::new("deepseek-chat"),
+            None,
         );
         drain(metered.body).await;
         let rows = ledger.all_records().expect("read");
@@ -2099,6 +2126,7 @@ CREATE TRIGGER cost_records_no_delete
             None,
             ProviderId::from("anthropic"),
             CostAttribution::new("claude-fable-5"),
+            None,
         );
         drain(metered.body).await;
         assert!(
@@ -2146,6 +2174,7 @@ CREATE TRIGGER cost_records_no_delete
             Some(SessionId::from("sess-stalled")),
             ProviderId::from("anthropic"),
             CostAttribution::new("claude-fable-5").with_category(Category::Title),
+            None,
         );
 
         // Read what the provider did send, then give up on it — the shape a
@@ -2204,6 +2233,7 @@ CREATE TRIGGER cost_records_no_delete
             Some(SessionId::from("s")),
             ProviderId::from("mystery"),
             CostAttribution::new("mystery-1"),
+            None,
         );
         // Exactly what REQ-559's `classify_client_error` does: read the body.
         drain(metered.body).await;
@@ -2237,6 +2267,7 @@ CREATE TRIGGER cost_records_no_delete
             Some(SessionId::from("sess-under-test")),
             ProviderId::from("anthropic"),
             CostAttribution::new("claude-fable-5"),
+            None,
         );
         // What `stream_turn` does with a >= 400: return an error and drop the
         // response, body unread.
@@ -2270,6 +2301,7 @@ CREATE TRIGGER cost_records_no_delete
             Some(SessionId::from("sess-once")),
             ProviderId::from("deepseek"),
             CostAttribution::new("deepseek-chat"),
+            None,
         );
         drain(metered.body).await; // drains to the terminal `None`, then drops
         assert_eq!(
@@ -2389,6 +2421,7 @@ CREATE TRIGGER cost_records_no_delete
             Some(SessionId::from("s")),
             ProviderId::from("deepseek"),
             CostAttribution::new("deepseek-chat"),
+            None,
         );
         drain(metered.body).await;
         let rows = ledger.all_records().expect("read");
@@ -2417,6 +2450,7 @@ CREATE TRIGGER cost_records_no_delete
             Some(SessionId::from("s")),
             ProviderId::from("anthropic"),
             CostAttribution::new("claude-opus-5"),
+            None,
         );
         drain(metered.body).await;
         let rows = ledger.all_records().expect("read");

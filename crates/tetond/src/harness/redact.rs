@@ -2886,6 +2886,7 @@ mod tests {
                 model: None,
                 reason: "Routing the 'redact' category to the local tier.".to_owned(),
                 bound_floored: None,
+                spend_ceiling_micro_cents: None,
             })
         };
         let drain = |sub: &mut crate::broadcast::Subscription| -> usize {

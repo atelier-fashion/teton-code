@@ -622,6 +622,14 @@ pub enum ProviderError {
     /// the daemon can say which inspection refused the turn (REQ-562 BR-3).
     #[error("egress refused: {0}")]
     PrivacyBlocked(BlockDetail),
+    /// The prompt reached its spend ceiling at the choke point (REQ-588 BR-3).
+    ///
+    /// Carries nothing: the sentence a user reads is composed where the facts
+    /// are — the daemon holds the prompt's accumulator and the configured
+    /// ceiling — so a payload here would be a second composer one layer below
+    /// the one that can actually fill it in.
+    #[error("this prompt reached its spend ceiling")]
+    SpendCeilingReached,
 }
 
 impl ProviderError {
@@ -649,9 +657,16 @@ impl ProviderError {
             // retry and no health change (REQ-586 BR-2 / ADR-8) — the same
             // bytes would overflow a fallback too. Handing any of them to
             // `classify` would degrade a provider that is working fine.
+            // …and a spend-ceiling stop, for the same reason as the
+            // context-length refusal beside it (REQ-588 BR-3 / ADR-4): the
+            // provider is working fine, the *budget* ran out, and a fallback
+            // would spend more money rather than less. Degrading it here would
+            // make a budget decision look like an outage and route later turns
+            // away from a healthy provider for the rest of the session.
             ProviderError::Build(_)
             | ProviderError::PrivacyBlocked(_)
             | ProviderError::EffortRefused { .. }
+            | ProviderError::SpendCeilingReached
             | ProviderError::ContextLengthExceeded { .. } => return None,
         })
     }
@@ -663,6 +678,19 @@ impl ProviderError {
     #[must_use]
     pub const fn is_effort_refused(&self) -> bool {
         matches!(self, ProviderError::EffortRefused { .. })
+    }
+
+    /// Whether this is the REQ-588 BR-3 spend-ceiling stop, which the daemon
+    /// answers with a typed outcome naming the spend and the ceiling — no
+    /// retry, no failover, no change to the provider's health.
+    ///
+    /// A predicate rather than a `failure_class` arm because the machinery must
+    /// not act on it at all: `failure_class` returning `None` is what keeps the
+    /// retry/degrade path away from it, and this is how the *turn* path
+    /// recognises it in order to say something useful instead.
+    #[must_use]
+    pub const fn is_spend_ceiling_reached(&self) -> bool {
+        matches!(self, ProviderError::SpendCeilingReached)
     }
 
     /// Whether this is the REQ-586 BR-2 context-length refusal, which the
@@ -711,6 +739,10 @@ impl ProviderError {
             // Preserve the privacy-block signal end to end: it must NOT collapse
             // into the retryable transport class (REQ-544 M-1).
             TransportError::PrivacyBlocked(detail) => ProviderError::PrivacyBlocked(detail),
+            // Preserved end to end for the same reason (REQ-588 BR-3): folding
+            // it into `Transport` would make it retryable and degrade a healthy
+            // provider over a budget stop.
+            TransportError::SpendCeiling => ProviderError::SpendCeilingReached,
         }
     }
 }
@@ -796,6 +828,41 @@ mod tests {
         assert!(too_long.is_context_length_exceeded());
         assert!(!too_long.is_effort_refused());
         assert!(!ProviderError::Timeout.is_context_length_exceeded());
+    }
+
+    /// REQ-588 BR-3, the load-bearing leg: a spend-ceiling stop must leave
+    /// provider health **unchanged**.
+    ///
+    /// This is asserted rather than assumed because the failure mode is quiet
+    /// and long-lived. Degrading the provider here would make a budget decision
+    /// look like an outage: the health tracker would mark a provider that is
+    /// working perfectly, and later turns — turns the user has not even typed
+    /// yet, possibly under a raised ceiling — would be routed away from it for
+    /// the rest of the session. Nothing in the resulting behaviour would
+    /// mention money, so nobody would connect the two.
+    ///
+    /// The `decision()` half is the second guarantee, and the one OQ-4 turned
+    /// on: no `FailureAction::Fallback`. Falling back would reroute to another
+    /// provider *because the budget ran out*, which spends more money rather
+    /// than less — and does it silently, which is exactly the downgrade OQ-4
+    /// rejected in favour of refusing and saying so.
+    #[test]
+    fn a_spend_ceiling_stop_is_not_a_provider_failure() {
+        let stopped = ProviderError::SpendCeilingReached;
+        assert_eq!(
+            stopped.failure_class(),
+            None,
+            "the budget ran out; the provider is healthy and must not be marked"
+        );
+        assert_eq!(
+            stopped.decision(),
+            None,
+            "no retry, no fallback, no degrade — a reroute would spend more, not less"
+        );
+        // It is its own outcome, not a borrowed one: the surfaces that special-
+        // case a context-length refusal must not mistake this for one.
+        assert!(!stopped.is_context_length_exceeded());
+        assert!(!stopped.is_effort_refused());
     }
 
     // -----------------------------------------------------------------------

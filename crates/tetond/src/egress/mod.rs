@@ -145,6 +145,27 @@ pub enum EgressError {
         cause: BlockCause,
     },
     /// The underlying transport failed (before any HTTP status was known).
+    /// The prompt reached its spend ceiling (REQ-588 BR-3, ADR-4).
+    ///
+    /// **Not a provider failure, and the distinction is load-bearing.** The
+    /// provider did nothing wrong; degrading its health here would make a
+    /// *budget* decision look like an *outage* and reroute later turns away
+    /// from a healthy provider for the rest of the session. It rides the same
+    /// arm `PrivacyBlocked` does — "the choke point refused this, and it is not
+    /// the provider's fault" — which the router already excludes from health.
+    ///
+    /// It is also deliberately not a `FailureAction::Fallback`: falling back to
+    /// a cheaper provider is precisely the silent downgrade OQ-4 rejected.
+    ///
+    /// The message is composed by `teton_core::cost_ceiling`, once, so the
+    /// model-facing error and the CLI line cannot drift (LESSON-529).
+    #[error("{message}")]
+    SpendCeilingReached {
+        /// The composed sentence — spend, bound, ceiling, and the overshoot
+        /// caveat.
+        message: String,
+    },
+
     #[error("transport error: {0}")]
     Transport(#[from] TransportError),
     /// The configured privacy boundaries did not compile. Egress refuses
@@ -192,6 +213,11 @@ impl EgressError {
                     BlockCause::ScanUnavailable => BlockDetail::ScanUnavailable,
                 })
             }
+            // REQ-588 BR-3: its own variant, never folded into `Connect` or
+            // `Io`. Both of those are network faults the router may degrade a
+            // provider over, and a budget stop is not one — the whole point of
+            // the distinction this function's doc makes.
+            EgressError::SpendCeilingReached { .. } => TransportError::SpendCeiling,
             EgressError::ClientInit => TransportError::Connect,
             EgressError::BoundaryCompile => TransportError::Io,
         }
@@ -453,6 +479,22 @@ pub struct Egress<T: Transport> {
     boundaries: Vec<PrivacyBoundary>,
     sink: Arc<dyn PrivacyEventSink>,
     cost: Option<Arc<dyn CostMeter>>,
+    /// REQ-588 BR-1: the per-prompt spend ceiling in micro-cents, when the user
+    /// set one. `None` is the default and means the check does not exist.
+    spend_ceiling: Option<u64>,
+    /// The accumulator the ceiling is checked against (REQ-588 ADR-1).
+    ///
+    /// Its **lifetime is the prompt**, which is what makes "per prompt" a
+    /// structural fact rather than a key this code has to get right:
+    /// `run_prompt_turn` creates exactly one and every `Egress` that prompt
+    /// builds is handed the same `Arc`, so each attempt, fallback and duty of
+    /// that prompt adds into one total and the next prompt starts from zero
+    /// because it gets a new one.
+    ///
+    /// It lives here rather than on [`EgressContext`] because this is where the
+    /// ceiling lives, and a ceiling with no accumulator (or the reverse) is not
+    /// a state any caller should be able to construct halfway.
+    prompt_spend: Option<Arc<teton_core::cost_ceiling::PromptSpend>>,
     /// The REQ-562 redaction scanner, present **iff** `[privacy] redact` is on
     /// (ADR-2). `None` is the off state in full: no branch inside the hot path,
     /// no scanner call, nothing that could claim a scan ran.
@@ -499,12 +541,52 @@ impl<T: Transport> Egress<T> {
             inner,
             boundaries,
             sink,
+            spend_ceiling: None,
+            prompt_spend: None,
             cost: None,
             redaction: None,
             search_redaction: None,
             fetch_redaction: None,
             lookup_recorder: None,
         }
+    }
+
+    /// The per-prompt spend ceiling in micro-cents (REQ-588 BR-1, ADR-6).
+    ///
+    /// Additive and absent by default, like every other opt-in on this type: a
+    /// choke point built without one performs no ceiling check and no pricing
+    /// lookup, so an un-opted-in machine is byte-identical to before this REQ.
+    #[must_use]
+    pub fn with_spend_ceiling(mut self, micro_cents: u64) -> Self {
+        self.spend_ceiling = Some(micro_cents);
+        self
+    }
+
+    /// [`Self::with_spend_ceiling`] for a caller holding an `Option`.
+    ///
+    /// The four builders in `runtime` all read the same
+    /// `config.cost.ceiling_micro_cents()`, which is `None` on an un-opted-in
+    /// machine — a helper here keeps that from being four `if let` blocks that
+    /// could come to disagree.
+    #[must_use]
+    pub fn with_optional_spend_ceiling(mut self, micro_cents: Option<u64>) -> Self {
+        self.spend_ceiling = micro_cents;
+        self
+    }
+
+    /// Attach this prompt's spend accumulator (REQ-588 ADR-1).
+    ///
+    /// Takes an `Option` because the caller's is `None` whenever no ceiling is
+    /// configured, and the two must travel together: the check runs only when
+    /// *both* are present, so a ceiling can never be enforced against a total
+    /// that nothing is adding to.
+    #[must_use]
+    pub fn with_prompt_spend(
+        mut self,
+        spend: Option<Arc<teton_core::cost_ceiling::PromptSpend>>,
+    ) -> Self {
+        self.prompt_spend = spend;
+        self
     }
 
     /// Install the cost meter (TASK-008): every allowed forward carrying a
@@ -803,6 +885,40 @@ impl<T: Transport> Egress<T> {
             }
         }
 
+        // REQ-588 BR-1: the spend ceiling, checked here because this is the one
+        // place every remote call passes — the same property BR-1 of REQ-562
+        // relies on for redaction is what makes this total. Before the forward,
+        // so a refused call costs nothing.
+        //
+        // **Nothing runs when no ceiling is configured** (ADR-6): both `Option`s
+        // are `None` on an un-opted-in machine, so there is no pricing lookup
+        // and no branch taken.
+        if let (Some(ceiling), Some(spend)) = (self.spend_ceiling, self.prompt_spend.as_ref()) {
+            use teton_core::cost_ceiling::{ceiling_refusal, unpriced_refusal, SpendBound};
+            let bound = SpendBound::PromptCeiling;
+
+            // ADR-2: a floor crossing, not a prediction. What this prompt has
+            // *recorded* decides; what the next call will cost cannot be known
+            // until the model has written it.
+            if spend.reached(ceiling) {
+                return Err(EgressError::SpendCeilingReached {
+                    message: ceiling_refusal(spend.spent(), ceiling, bound),
+                });
+            }
+
+            // ADR-3 / OQ-2: an unpriced call cannot be counted, so with a
+            // ceiling in force it is refused rather than sent uncounted. A
+            // missing price must not become a missing ceiling.
+            if let (Some(meter), Some(attribution)) = (&self.cost, &ctx.cost) {
+                if !meter.can_price(&attribution.model) {
+                    spend.note_unpriced();
+                    return Err(EgressError::SpendCeilingReached {
+                        message: unpriced_refusal(&ctx.provider_id.0, &attribution.model, bound),
+                    });
+                }
+            }
+        }
+
         // Cleared. TASK-008 wraps this forward to record a CostRecord (BR-2) from
         // the streamed usage — the single point where every remote call is billed.
         let response = self
@@ -819,6 +935,7 @@ impl<T: Transport> Egress<T> {
                 ctx.session_id.clone(),
                 ctx.provider_id.clone(),
                 attribution.clone(),
+                self.prompt_spend.clone(),
             )),
             _ => Ok(response),
         }
@@ -1755,6 +1872,7 @@ mod tests {
                 _session_id: Option<SessionId>,
                 _provider_id: ProviderId,
                 _attribution: CostAttribution,
+                _spend: Option<Arc<teton_core::cost_ceiling::PromptSpend>>,
             ) -> TransportResponse {
                 self.metered
                     .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
@@ -2206,6 +2324,233 @@ mod tests {
             !searching.fetch_redaction_installed(),
             "and the search tier's own gate does not stand in for parity"
         );
+    }
+
+    // ---- REQ-588: the spend ceiling at the choke point (TASK-236) ----
+
+    /// A meter that answers pricing questions on instruction and counts how many
+    /// times it was asked.
+    ///
+    /// The count is the seam ADR-6's claim is asserted through: "off costs
+    /// nothing" is a statement about work *not done*, and the only way to test
+    /// an absence is to make the absent work observable.
+    #[derive(Default)]
+    struct PricingMeter {
+        unpriceable: bool,
+        price_queries: std::sync::atomic::AtomicUsize,
+        metered: std::sync::atomic::AtomicUsize,
+    }
+
+    impl PricingMeter {
+        fn unpriceable() -> Self {
+            Self {
+                unpriceable: true,
+                ..Self::default()
+            }
+        }
+
+        fn queries(&self) -> usize {
+            self.price_queries.load(std::sync::atomic::Ordering::SeqCst)
+        }
+    }
+
+    impl CostMeter for PricingMeter {
+        fn meter_response(
+            &self,
+            response: TransportResponse,
+            _session_id: Option<SessionId>,
+            _provider_id: ProviderId,
+            _attribution: CostAttribution,
+            _spend: Option<Arc<teton_core::cost_ceiling::PromptSpend>>,
+        ) -> TransportResponse {
+            self.metered
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            response
+        }
+
+        fn can_price(&self, _model: &str) -> bool {
+            self.price_queries
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            !self.unpriceable
+        }
+    }
+
+    fn priced_ctx() -> EgressContext {
+        EgressContext::new("anthropic")
+            .with_session("sess-under-test")
+            .with_cost(CostAttribution::new("claude-opus-4"))
+    }
+
+    /// AC-1: a prompt that has reached its ceiling is refused **before** the
+    /// forward, and the refusal names what was spent against what was allowed.
+    #[tokio::test]
+    async fn a_prompt_that_reached_its_ceiling_is_refused_at_the_choke_point() {
+        let inner = CaptureTransport::default();
+        let sent = inner.sent.clone();
+        let spend = Arc::new(teton_core::cost_ceiling::PromptSpend::default());
+        // 5.00 spent against a 5.00 ceiling: `reached` is `>=`, so the line is
+        // the line — arriving exactly at it is not "still under".
+        spend.add(500_000);
+
+        let egress = Egress::new(inner, boundaries(), Arc::new(CapturingSink::default()))
+            .with_cost_meter(Arc::new(PricingMeter::default()))
+            .with_spend_ceiling(500_000)
+            .with_prompt_spend(Some(spend.clone()));
+
+        let err = egress
+            .send(
+                a_request("another call"),
+                &Provenance::empty(),
+                &priced_ctx(),
+            )
+            .await
+            .expect_err("a prompt at its ceiling must not forward");
+
+        let EgressError::SpendCeilingReached { message } = err else {
+            panic!("the ceiling must refuse with its own typed outcome, got {err:?}");
+        };
+        // The two numbers a user needs to act are both in the sentence: what
+        // this prompt spent, and what they set.
+        assert!(
+            message.contains("$5.00"),
+            "refusal must name the amounts: {message}"
+        );
+        // A refused call costs nothing — the whole point of checking before the
+        // forward rather than after it.
+        assert!(
+            sent.lock().unwrap().is_empty(),
+            "the refused call must never reach the transport"
+        );
+        assert_eq!(spend.spent(), 500_000, "a refusal spends nothing further");
+    }
+
+    /// The other side of AC-1: under the ceiling, nothing changes.
+    #[tokio::test]
+    async fn a_prompt_under_its_ceiling_forwards_normally() {
+        let inner = CaptureTransport::default();
+        let sent = inner.sent.clone();
+        let spend = Arc::new(teton_core::cost_ceiling::PromptSpend::default());
+        spend.add(499_999);
+
+        let egress = Egress::new(inner, boundaries(), Arc::new(CapturingSink::default()))
+            .with_cost_meter(Arc::new(PricingMeter::default()))
+            .with_spend_ceiling(500_000)
+            .with_prompt_spend(Some(spend));
+
+        egress
+            .send(
+                a_request("still affordable"),
+                &Provenance::empty(),
+                &priced_ctx(),
+            )
+            .await
+            .expect("one micro-cent under the ceiling is under the ceiling");
+        assert_eq!(sent.lock().unwrap().len(), 1);
+    }
+
+    /// AC-6: a call the price table cannot price is refused **naming the missing
+    /// price** — not waved through uncapped, and not charged a guessed rate.
+    #[tokio::test]
+    async fn an_unpriceable_call_under_a_ceiling_is_refused_naming_the_missing_price() {
+        let inner = CaptureTransport::default();
+        let sent = inner.sent.clone();
+        let spend = Arc::new(teton_core::cost_ceiling::PromptSpend::default());
+
+        let egress = Egress::new(inner, boundaries(), Arc::new(CapturingSink::default()))
+            .with_cost_meter(Arc::new(PricingMeter::unpriceable()))
+            .with_spend_ceiling(500_000)
+            .with_prompt_spend(Some(spend.clone()));
+
+        let err = egress
+            .send(
+                a_request("unpriceable"),
+                &Provenance::empty(),
+                &priced_ctx(),
+            )
+            .await
+            .expect_err("an uncountable call under a ceiling must not be sent");
+
+        let EgressError::SpendCeilingReached { message } = err else {
+            panic!("expected the ceiling's typed outcome, got {err:?}");
+        };
+        // The remedy is to fix the price table, so the sentence has to say which
+        // provider and which model are missing one.
+        assert!(
+            message.contains("anthropic"),
+            "must name the provider: {message}"
+        );
+        assert!(
+            message.contains("claude-opus-4"),
+            "must name the model: {message}"
+        );
+        assert!(
+            sent.lock().unwrap().is_empty(),
+            "an uncountable call must not reach the wire"
+        );
+        assert!(
+            spend.saw_unpriced(),
+            "the prompt must record that it met something it could not count"
+        );
+    }
+
+    /// ADR-6, asserted through the seam: with no ceiling configured there is no
+    /// check, **no pricing lookup**, and no accumulator. "Off costs nothing" is
+    /// a claim about work not done, so the test counts the work.
+    #[tokio::test]
+    async fn no_ceiling_means_no_check_and_no_pricing_lookup() {
+        let inner = CaptureTransport::default();
+        let sent = inner.sent.clone();
+        // Deliberately a meter that would *refuse* everything if it were asked.
+        // If a pricing lookup happened anyway, this call would be blocked and
+        // the assertions below would fail loudly rather than pass by accident.
+        let meter = Arc::new(PricingMeter::unpriceable());
+
+        let egress = Egress::new(inner, boundaries(), Arc::new(CapturingSink::default()))
+            .with_cost_meter(meter.clone());
+
+        egress
+            .send(
+                a_request("un-opted-in"),
+                &Provenance::empty(),
+                &priced_ctx(),
+            )
+            .await
+            .expect("an un-opted-in machine forwards exactly as before");
+
+        assert_eq!(sent.lock().unwrap().len(), 1, "the call must forward");
+        assert_eq!(
+            meter.queries(),
+            0,
+            "no ceiling must mean the price table is never consulted — the cost \
+             of the feature when it is off is zero work, not cheap work"
+        );
+    }
+
+    /// Half a pair is not a ceiling. Neither an accumulator without a ceiling nor
+    /// a ceiling without an accumulator may enforce anything: the check reads
+    /// both, and a half-built state must fail open rather than guess.
+    #[tokio::test]
+    async fn a_ceiling_without_an_accumulator_enforces_nothing() {
+        let inner = CaptureTransport::default();
+        let sent = inner.sent.clone();
+        let meter = Arc::new(PricingMeter::unpriceable());
+
+        // A ceiling of zero — which every call has already "reached" — but no
+        // accumulator to measure against.
+        let egress = Egress::new(inner, boundaries(), Arc::new(CapturingSink::default()))
+            .with_cost_meter(meter.clone())
+            .with_spend_ceiling(0);
+
+        egress
+            .send(
+                a_request("no accumulator"),
+                &Provenance::empty(),
+                &priced_ctx(),
+            )
+            .await
+            .expect("a ceiling with nothing counting against it cannot refuse");
+        assert_eq!(sent.lock().unwrap().len(), 1);
+        assert_eq!(meter.queries(), 0, "and it must not price, either");
     }
 }
 

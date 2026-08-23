@@ -1714,6 +1714,12 @@ impl<R: ResolveHost + 'static> reqwest::dns::Resolve for GlobalOnlyResolver<R> {
 fn outcome_for(error: TransportError) -> WebLookupOutcome {
     match error {
         TransportError::PrivacyBlocked(_) => WebLookupOutcome::BlockedPrivacy,
+        // REQ-588: a web lookup refused by the spend ceiling is **not**
+        // `Offline` — the machine is fine and the network is fine, the budget
+        // ran out. Reported as blocked, beside the privacy block, because both
+        // are the choke point declining rather than the world being unreachable
+        // (a user told "offline" would go and check their wifi).
+        TransportError::SpendCeiling => WebLookupOutcome::BlockedPrivacy,
         TransportError::Timeout | TransportError::Connect | TransportError::Io => {
             WebLookupOutcome::Offline
         }

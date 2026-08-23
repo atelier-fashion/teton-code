@@ -45,6 +45,15 @@ pub mod ledger;
 pub mod prices;
 pub mod report;
 
+// REQ-588: re-exported here so `ledger.rs` can name the accumulator without
+// naming `teton_core`. The duty-path guard in `harness::duty` asserts that the
+// file holding the only text→category map cannot reach `teton_core` *at all* —
+// a blunt check on purpose, so `teton_core::Category` can never arrive there
+// under an alias. Importing through this module keeps that guard intact
+// instead of narrowing it to buy one import.
+pub(crate) use teton_core::cost_ceiling::PromptSpend;
+
+use std::sync::Arc;
 use teton_protocol::events::{CostRecord, CostRecorded, Event};
 use teton_protocol::{Category, Phase, ProviderId, SessionId};
 use teton_providers::transport::TransportResponse;
@@ -152,7 +161,31 @@ pub trait CostMeter: Send + Sync {
         session_id: Option<SessionId>,
         provider_id: ProviderId,
         attribution: CostAttribution,
+        // REQ-588 ADR-1: the prompt's accumulator, when a ceiling is in force.
+        // Threaded here rather than read from a registry because this is the
+        // one place a call's *actual* cost is known, and the accumulator's
+        // whole point is that its lifetime is the prompt.
+        //
+        // `None` on every un-opted-in call and every test double that does not
+        // care, so the metering path is unchanged where no ceiling exists.
+        spend: Option<Arc<PromptSpend>>,
     ) -> TransportResponse;
+
+    /// Whether `model` can be priced at all (REQ-588 ADR-3, OQ-2).
+    ///
+    /// The pre-flight half of the ceiling: an unpriced call cannot be counted,
+    /// so with a ceiling configured it is refused rather than sent uncounted —
+    /// a missing price must not become a missing ceiling.
+    ///
+    /// Defaults to `true` so a meter that does not price (a counting double, a
+    /// future meter that only observes) never *causes* a refusal by omission.
+    /// The fail-open direction is deliberate here and is the opposite of the
+    /// ceiling's own posture: refusing because the meter did not answer would
+    /// block calls over this trait's bookkeeping rather than over the user's
+    /// budget.
+    fn can_price(&self, _model: &str) -> bool {
+        true
+    }
 }
 
 /// A sink for **local-tier** usage rows (REQ-564 BR-9).

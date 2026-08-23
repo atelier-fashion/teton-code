@@ -1915,6 +1915,16 @@ fn format_context_pressure(pressure: &ContextPressure) -> String {
                 ),
             }
         ),
+        // REQ-588 BR-4: a kind this build does not know. It says the true
+        // part — the context was changed to fit the budget — and does not
+        // invent the part it cannot know. Every other arm names WHAT happened;
+        // this one deliberately does not, because a guess here would be the
+        // mis-rendering `DidNotFit`'s doc calls worse than silence.
+        ContextPressureKind::Unknown => {
+            format!(
+                "context: adjusted to fit the {budget} {bound} (this build does not recognise how)"
+            )
+        }
     }
 }
 
@@ -3289,11 +3299,33 @@ fn format_route(rd: &RouteDecided) -> String {
     };
     let model = rd.model.as_deref().unwrap_or("(model tbd)");
     format!(
-        "route [{key}] → {} {model} — {}{}",
+        "route [{key}] → {} {model} — {}{}{}",
         rd.provider_id,
         rd.reason,
-        budget_clause(rd).unwrap_or_default()
+        budget_clause(rd).unwrap_or_default(),
+        spend_clause(rd).unwrap_or_default()
     )
+}
+
+/// The spend-ceiling clause a route line carries (REQ-588 BR-2, AC-2), or
+/// `None` when no ceiling is in force.
+///
+/// Composed by `teton_core::cost_ceiling::spend_ceiling_clause` — the **same**
+/// function that words the refusal — so the line that tells a user a ceiling
+/// exists and the line that tells them they hit it cannot drift into naming
+/// different things. That is BR-2's whole content, and the reason the event
+/// carries micro-cents rather than a pre-rendered string: one formatter, at one
+/// surface, reading one number.
+///
+/// `None` is not an empty clause. An un-opted-in turn, and a turn from a daemon
+/// that predates the field, both render the pre-REQ-588 line byte for byte —
+/// the `budget_clause` rule beside it.
+fn spend_clause(rd: &RouteDecided) -> Option<String> {
+    teton_core::cost_ceiling::spend_ceiling_clause(
+        rd.spend_ceiling_micro_cents,
+        teton_core::cost_ceiling::SpendBound::PromptCeiling,
+    )
+    .map(|clause| format!(" · {clause}"))
 }
 
 /// The budget clause a route line carries, or `None` from a daemon that states
@@ -3604,6 +3636,7 @@ mod tests {
                 budget_bytes: None,
                 bound: None,
                 bound_floored: None,
+                spend_ceiling_micro_cents: None,
             })),
             &mut surface,
             &mut state,
@@ -3653,6 +3686,7 @@ mod tests {
                     budget_bytes: None,
                     bound: None,
                     bound_floored: None,
+                    spend_ceiling_micro_cents: None,
                 })),
                 &mut surface,
                 &mut state,
@@ -3689,6 +3723,7 @@ mod tests {
                 budget_bytes: None,
                 bound: None,
                 bound_floored: None,
+                spend_ceiling_micro_cents: None,
             }),
             Event::PrivacyBlock(PrivacyBlock {
                 path: "secrets/prod.env".to_owned(),
@@ -3894,6 +3929,7 @@ mod tests {
                 budget_bytes: None,
                 bound: None,
                 bound_floored: None,
+                spend_ceiling_micro_cents: None,
             }),
             Event::PrivacyBlock(PrivacyBlock {
                 path: "secrets/prod.env".to_owned(),
@@ -4313,6 +4349,7 @@ mod tests {
                 budget_bytes: Some(16_384),
                 bound: Some(BudgetBound::UserCap),
                 bound_floored,
+                spend_ceiling_micro_cents: None,
             })
         };
         assert!(
@@ -4383,6 +4420,7 @@ mod tests {
                 budget_bytes,
                 bound,
                 bound_floored: None,
+                spend_ceiling_micro_cents: None,
             })
         };
 
@@ -4412,9 +4450,56 @@ mod tests {
                 budget_bytes: None,
                 bound: Some(BudgetBound::LocalEngine),
                 bound_floored: None,
+                spend_ceiling_micro_cents: None,
             }),
             "route [pinned] → kimi (model tbd) — a reason."
         );
+    }
+
+    /// AC-2: the route line names the binding spend ceiling, and it names it in
+    /// the composer's words rather than a literal spelled here.
+    ///
+    /// The expectation is **built from `spend_ceiling_clause`**, not typed out,
+    /// which is the point of the test rather than a convenience: a literal
+    /// would let the CLI and the refusal drift apart and still pass — one
+    /// surface reworded, this assertion updated to match it, and the two
+    /// sentences quietly naming the same ceiling differently. Diffing against
+    /// the composer means the only way to change the wording is to change it
+    /// once, where both surfaces read it.
+    #[test]
+    fn a_route_line_names_the_binding_spend_ceiling_in_the_composers_words() {
+        use teton_core::cost_ceiling::{spend_ceiling_clause, SpendBound};
+
+        let route = |ceiling: Option<u64>| {
+            format_route(&RouteDecided {
+                category: Some(teton_protocol::Category::Edit),
+                tier: Some(teton_protocol::Tier::Build),
+                phase: None,
+                provider_id: ProviderId::from("kimi"),
+                model: Some("kimi-k3".to_owned()),
+                reason: "a reason.".to_owned(),
+                effort: None,
+                budget_tokens: None,
+                budget_bytes: None,
+                bound: None,
+                bound_floored: None,
+                spend_ceiling_micro_cents: ceiling,
+            })
+        };
+
+        // No ceiling configured, and a daemon that predates the field, are the
+        // same rendering: today's line, byte for byte. Not an empty clause, not
+        // a trailing separator.
+        let bare = route(None);
+        assert_eq!(bare, "route [edit/build] → kimi kimi-k3 — a reason.");
+
+        let clause = spend_ceiling_clause(Some(500_000), SpendBound::PromptCeiling)
+            .expect("a configured ceiling composes a clause");
+        assert_eq!(route(Some(500_000)), format!("{bare} · {clause}"));
+
+        // And the words really are the bound's — the same fragment the refusal
+        // sets in its own sentence, so a user meets one name for one thing.
+        assert!(route(Some(500_000)).contains(SpendBound::PromptCeiling.words()));
     }
 
     /// The two figure formatters, at the boundaries that decide a unit — and
