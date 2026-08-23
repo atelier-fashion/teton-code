@@ -10515,6 +10515,12 @@ fn probe_outcome(
         // elsewhere spent its budget. Spelled out rather than left to a
         // catch-all, for the reason the arm above gives about its own
         // impossible case.
+        // Cannot occur: the probe's egress is built without a spend ceiling on
+        // purpose — a connection test is not the user's prompt and must not be
+        // refused by that prompt's budget. If one is ever wired in, this is the
+        // honest label: `Unreachable` here means the host was not reached, the
+        // same sense `Build` below it carries, not that anything is wrong with
+        // the vendor.
         ProviderError::SpendCeilingReached => ProviderTestOutcome::Unreachable {
             reason: format!(
                 "nothing was sent to `{host}`: the egress choke point refused the call"
