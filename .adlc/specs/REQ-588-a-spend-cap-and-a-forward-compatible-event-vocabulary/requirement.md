@@ -1,10 +1,10 @@
 ---
 id: REQ-588
 title: "A spend cap, and an event vocabulary a future kind cannot break"
-status: approved
+status: complete
 deployable: true
 created: 2026-08-20
-updated: 2026-08-22
+updated: 2026-08-23
 component: "daemon/cost-ledger"
 domain: "cost"
 stack: ["rust", "daemon", "json-rpc"]
