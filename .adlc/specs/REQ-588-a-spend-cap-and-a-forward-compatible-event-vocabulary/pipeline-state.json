@@ -58,7 +58,10 @@
     {
       "phase": 8,
       "name": "Wrapup",
-      "completedAt": "2026-08-23T00:35:00Z"
+      "completedAt": "2026-08-23T00:35:00Z",
+      "mergeCommit": "0e0091904efe62d89861dc49a792ac003a91ba49",
+      "prUrl": "https://github.com/atelier-fashion/teton-code/pull/206",
+      "wrapupPr": "https://github.com/atelier-fashion/teton-code/pull/207"
     }
   ],
   "repos": {

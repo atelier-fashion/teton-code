@@ -61,6 +61,20 @@ teton-code/
   daemon still starts and every other record still works. Enforcing
   incompleteness at load makes one bad entry fatal for all of them, and vetoes
   any migration meant to fix it (REQ-557 ADR-E, LESSON-506).
+- **A typed outcome needs both halves.** An error the retry / fallback / degrade
+  machinery must not act on gets `failure_class() -> None` **and** its own arm on
+  the turn path. The first half only keeps the machinery away from it; without
+  the second, it falls through to the generic remote arm and the user is told
+  "provider failed unrecoverably" — wrong about the cause and naming no remedy.
+  Three outcomes are shaped this way: `PrivacyBlocked` (rerouted to local),
+  `ContextLengthExceeded` (REQ-586 BR-2), and `SpendCeilingReached` (REQ-588
+  BR-3). Adding a fourth means writing both halves (LESSON-557).
+- **Compose the sentence where the facts are.** A refusal message cannot ride a
+  `Copy` enum, and `TransportError` is `Copy`. Carry the *fact* across such a
+  boundary — an enum, a couple of integers — and word it at the surface that
+  renders it, which is also what makes a single composer enforceable. Composing
+  at the point of detection loses the message silently: it compiles, the tests
+  pass, and only the user sees the difference (REQ-588, LESSON-557).
 
 ## Git Conventions
 
