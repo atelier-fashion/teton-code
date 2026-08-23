@@ -2,15 +2,18 @@
   "req": "REQ-584",
   "branch": "feat/REQ-584-project-locator",
   "startedAt": "2026-08-22T19:00:00Z",
-  "completed": false,
-  "currentPhase": 6,
+  "completed": true,
+  "currentPhase": 8,
   "completedPhases": [
     0,
     1,
     2,
     3,
     4,
-    5
+    5,
+    6,
+    7,
+    8
   ],
   "integrationBranch": "main",
   "phaseHistory": [
@@ -48,6 +51,21 @@
       "name": "Verify (reviewer checklists in-context)",
       "completedAt": "2026-08-22T21:20:00Z",
       "result": "3650 tests; 1 finding filed as a follow-up (Event enum not forward-compatible)"
+    },
+    {
+      "phase": 6,
+      "name": "Create PR",
+      "completedAt": "2026-08-22T00:00:00Z"
+    },
+    {
+      "phase": 7,
+      "name": "PR Cleanup",
+      "completedAt": "2026-08-22T00:00:00Z"
+    },
+    {
+      "phase": 8,
+      "name": "Wrapup",
+      "completedAt": "2026-08-22T00:00:00Z"
     }
   ],
   "repos": {
@@ -57,9 +75,9 @@
       "worktree": "/Users/brettluelling/Documents/GitHub/teton-code/.worktrees/REQ-584",
       "branch": "feat/REQ-584-project-locator",
       "touched": true,
-      "prUrl": null,
+      "prUrl": "https://github.com/atelier-fashion/teton-code/pull/203",
       "prNumber": null,
-      "merged": false,
+      "merged": true,
       "snapshotBranch": null,
       "snapshotPR": null
     }
