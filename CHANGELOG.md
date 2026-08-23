@@ -18,7 +18,7 @@ unchanged. What belongs here is what an *upgrade* does to a machine that was
 already running — above all, anything that changes where data goes without the
 user having asked for it.
 
-## [Unreleased]
+## [0.1.24] - 2026-08-23
 
 ### Added
 
@@ -116,6 +116,52 @@ user having asked for it.
   the redact scan can cover (≈89 KB) and the bound reads `redact scan`; the
   word figure stays window-derived.
 
+- **A per-prompt spend ceiling, if you ask for one (REQ-588).** Opt-in, and
+  **a fresh install has no cap** — nothing limits what a prompt can spend until
+  you set one, and no ceiling appears on its own:
+
+  ```toml
+  [cost]
+  prompt_ceiling_usd = 5.00
+  ```
+
+  The scope is one **prompt**, not a session or a day: each new prompt starts
+  from zero, and the total is everything that prompt causes — its retries, its
+  fallbacks to another provider, and the duties it runs. Enforcement is at the
+  egress choke point, the one place every remote call passes, so no route
+  bypasses it.
+
+  **Read this part before you trust the number.** What a call will cost cannot
+  be known until the model has written its reply, so Teton cannot decline a
+  call for being too expensive — it can only refuse to start the *next* one
+  once the ceiling is reached. A prompt can therefore finish slightly **over**
+  the figure you set, by at most the cost of the one call already in flight. A
+  ceiling of `$5.00` is a promise to stop at $5.00, not a promise never to
+  exceed it. The refusal says so, and so does `teton_docs` topic `cost`.
+
+  Two things it deliberately does not do. It does not fall back to a cheaper
+  provider — rerouting because the budget ran out spends more money, not less,
+  and would do it without telling you. And it does not mark the provider
+  unhealthy: the provider is working, the budget ran out, and treating that as
+  an outage would route *later* turns away from a provider with nothing wrong
+  with it. With a ceiling in force, a model the price table cannot price is
+  **refused naming the missing price** rather than sent uncounted; with no
+  ceiling configured, pricing is never consulted at all.
+
+- **The session can name this machine's projects (REQ-584).** `/projects`
+  lists the repositories Teton knows about and `/cd <name>` switches the
+  session root to one by name, without a filesystem walk. The registry is
+  learned from use and rebuilt by an on-demand scan; the environment line now
+  names the root the session is actually rooted at, so "find my repo" stops
+  being answered by crawling `$HOME`.
+
+- **The model can invoke a registered skill itself (REQ-587).** A `skill` tool
+  lets the model expand a skill into its own turn as a tool result, framed as
+  instructions rather than as the user's words, and **gated per root** — a
+  skill under a root the session has not been granted is refused, by name, on
+  the surface. This is what lets a multi-phase command like `/proceed` reach
+  its own gates instead of stopping at the first one.
+
 ### Changed
 
 - **The `digest` threshold scales with the route (REQ-586).** A tool result is
@@ -125,6 +171,36 @@ user having asked for it.
   tier's numbers are byte-identical to before. Compaction still fires at 70%
   of either budget, and the `compact` duty's own prompt stays bounded to the
   local engine's window as the conversation grows.
+
+### Fixed
+
+- **A remote text-form tool call is a call, not a silent end of turn
+  (BUG-180).** An edit-routed turn whose model wrote a `{"tool": ...}` call as
+  text was read as an ordinary end-of-turn and the gate hid it, so the turn
+  ended having done nothing and said nothing about why.
+
+- **The model no longer affirms capabilities Teton does not have (BUG-181).**
+  What the session can actually run is now a fact in the bundled guide rather
+  than something the model infers.
+
+- **Eleven open bugs closed in one sweep.** Most are invisible until they are
+  not; the ones worth knowing about on upgrade:
+
+  - A skill body could buy **hours** of shell time on one consent — dynamic
+    commands are now bounded by count and by a total time budget (BUG-185).
+  - Skill discovery ran on the connection's reader loop, so a slow filesystem
+    stalled the session (BUG-184).
+  - A future enum value inside an invocation event dropped the **whole event**;
+    unknown values now degrade to a rendered line (BUG-186, BUG-189).
+  - A reroute could end a turn where a relayable refusal had been promised
+    (BUG-188), and the arguments splice was not sub-framed (BUG-190).
+  - A clamped newest message was dropped by the same turn's exit gate
+    (BUG-182).
+
+  The long-running Linux CI flake (BUG-163) also turned out to be a
+  **test-harness** bug rather than a product one: the client discarded any
+  response whose id it was not waiting for, and only the ordering Linux
+  happened to produce exposed it.
 
 ### Upgrade notes
 
@@ -153,6 +229,24 @@ user having asked for it.
   rather than claiming one is unset. And an older client re-registering a
   provider cannot zero a window you declared: the registration merges these
   fields, so an absent value preserves what is stored.
+- **REQ-588 is off until you turn it on, and costs nothing while it is off.**
+  No `[cost]` table means no ceiling, no accumulator, and no price-table
+  lookup — an un-opted-in machine behaves as it did, and the serialized config
+  gains no key. If you *do* set one, re-read the overshoot paragraph above: the
+  ceiling is checked between calls, so the figure you set is where Teton stops,
+  not a number it guarantees never to pass.
+- **REQ-584 keeps a small registry of project paths** under the daemon's base
+  directory. It is a cache — losing it costs one scan — and it holds paths, not
+  contents. Nothing is scanned until you ask.
+- **REQ-587 does not widen what a skill may do.** A model-invoked skill runs
+  under the same per-root grant, permission level and egress choke point as one
+  you type yourself; a skill under an ungranted root is refused rather than
+  quietly skipped.
+- **New event kinds, and one asymmetry to know.** This release adds
+  `project_match`, the skill events and `context_pressure`. An older CLI does
+  not merely ignore an unknown event — it drops the frame whole, so it simply
+  will not show the new lines. Mixed builds still work; upgrading both halves
+  is the fix.
 
 ## [0.1.23] - 2026-08-19
 
