@@ -77,6 +77,7 @@ const TOPICS: &[(&str, &str)] = &[
     ("web", include_str!("../docs/web.md")),
     ("skills", include_str!("../docs/skills.md")),
     ("doctor", include_str!("../docs/doctor.md")),
+    ("cost", include_str!("../docs/cost.md")),
 ];
 
 /// The topic index as the model reads it, in [`DESCRIPTION`] and in the
@@ -86,7 +87,7 @@ const TOPICS: &[(&str, &str)] = &[
 /// are `const` — and because a hand-written second spelling is what
 /// `the_description_indexes_every_bundled_topic` can compare against, the same
 /// golden posture the recipe catalog takes.
-const TOPIC_INDEX: &str = "providers, policy, context, web, skills, doctor";
+const TOPIC_INDEX: &str = "providers, policy, context, web, skills, doctor, cost";
 
 /// The longest echo of a caller-supplied topic any message here will carry.
 ///
@@ -128,7 +129,7 @@ pub(crate) fn bounded_topic_echo(topic: &str) -> String {
 ///
 /// It ends with the topic index because the index *is* the affordance: a model
 /// deciding whether this tool answers the question in front of it is matching
-/// the subject it was asked about against these six words. BUG-168's lesson
+/// the subject it was asked about against these seven words. BUG-168's lesson
 /// applies — a capability the prompt does not name outright is one the local
 /// tier does not reach for. The fifth word, `context`, cost nine characters
 /// here for a 3.4 KB topic (REQ-586 ADR-11); the sixth, `skills`, cost eight for
@@ -140,10 +141,12 @@ pub(crate) fn bounded_topic_echo(topic: &str) -> String {
 /// ceiling to 26 characters under it. **Spend that on names**: the index is
 /// the affordance, the sentence is the frame around it, and `skills` came out
 /// of that margin rather than out of `MAX_DESCRIPTION_CHARS`, which has not
-/// moved. **Spent: 102. Left: 18** — room for one more short name.
+/// moved. The seventh, `cost`, took six of what was left for a 2.6 KB topic
+/// (REQ-588 BR-5) — a page a user consults about their own money, which is not
+/// a page to make them find by guessing. **Spent: 108. Left: 12.**
 const DESCRIPTION: &str = concat!(
     "Read Teton's own docs, bundled in this binary. ",
-    "topics: providers, policy, context, web, skills, doctor"
+    "topics: providers, policy, context, web, skills, doctor, cost"
 );
 
 /// The body of `topic`, or `None` when nothing by that name is bundled.
@@ -294,11 +297,67 @@ mod tests {
     /// the claim is about what a model *receives*: a lookup that quietly
     /// truncated, or an outcome flagged `is_error` while carrying a body, would
     /// satisfy an equality against the constant and fail the user.
+    /// **AC-5 (REQ-588 BR-5).** The `cost` topic states what a fresh install
+    /// actually does, rather than being trusted to have said it.
+    ///
+    /// Three claims, each pinned separately because each is a different way the
+    /// page could mislead someone about their own money:
+    ///
+    /// - **No ceiling until one is configured.** The mirror of the silently
+    ///   recorded window: a limit nobody was told about is a limit nobody can
+    ///   plan around, and the absence of one has to be stated rather than
+    ///   inferred from the page not mentioning it.
+    /// - **The key is named.** A page that says a ceiling can be set without
+    ///   saying where leaves the reader to guess at a config file.
+    /// - **The one-call overshoot.** The load-bearing one. A user reading
+    ///   `$5.00` will believe they are promised $5.00, and they are not —
+    ///   output tokens cannot be priced before the model has written them, so
+    ///   the check is between calls and a prompt can finish over by the cost of
+    ///   the call already in flight. Leaving that out would make the page
+    ///   technically true and practically a lie.
+    ///
+    /// Asserted on the served body, not the file, so a topic that stopped being
+    /// bundled or served would fail here too.
+    #[test]
+    fn the_cost_topic_states_what_a_fresh_install_does() {
+        let outcome = call("cost");
+        assert!(!outcome.is_error, "the cost topic must serve");
+        let body = outcome.content.to_lowercase();
+
+        assert!(
+            body.contains("no cap") || body.contains("no spend ceiling until"),
+            "the page must say a fresh install has no ceiling"
+        );
+        assert!(
+            body.contains("prompt_ceiling_usd"),
+            "the page must name the key that sets one"
+        );
+        assert!(
+            body.contains("[cost]"),
+            "the page must name the table the key lives in"
+        );
+        // ADR-2's overshoot, in substance rather than by a single word: the
+        // check is between calls, and the excess is bounded by one of them.
+        assert!(
+            body.contains("between calls"),
+            "the page must say when the ceiling is checked"
+        );
+        assert!(
+            body.contains("one call"),
+            "the page must bound the overshoot at one call"
+        );
+        // And it must not promise what it cannot deliver.
+        assert!(
+            body.contains("not a promise never to exceed it"),
+            "the page must say plainly that the ceiling can be exceeded"
+        );
+    }
+
     #[test]
     fn every_topic_serves_its_whole_bundled_body() {
         assert_eq!(
             TOPICS.len(),
-            6,
+            7,
             "the topic roster changed: {:?}",
             TOPICS.iter().map(|(name, _)| *name).collect::<Vec<_>>()
         );

@@ -1,7 +1,7 @@
 ---
 id: TASK-238
 title: "what a fresh install does, said out loud"
-status: pending
+status: complete
 parent: REQ-588
 created: 2026-08-22
 updated: 2026-08-22

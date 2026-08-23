@@ -3,12 +3,13 @@
   "branch": "feat/REQ-588-spend-cap",
   "startedAt": "2026-08-22T22:30:00Z",
   "completed": false,
-  "currentPhase": 4,
+  "currentPhase": 5,
   "completedPhases": [
     0,
     1,
     2,
-    3
+    3,
+    4
   ],
   "integrationBranch": "main",
   "phaseHistory": [
@@ -34,6 +35,11 @@
       "name": "Validate Architecture & Tasks",
       "completedAt": "2026-08-22T22:55:00Z",
       "result": "APPROVED \u2014 acyclic, 6/6 ACs and 5/5 BRs covered after citing AC-4"
+    },
+    {
+      "phase": 4,
+      "name": "Implement",
+      "completedAt": "2026-08-22T00:00:00Z"
     }
   ],
   "repos": {
@@ -52,12 +58,14 @@
     "teton-code"
   ],
   "phase4": {
-    "currentTask": "TASK-237",
+    "currentTask": null,
     "completedTasks": [
       "TASK-233",
       "TASK-234",
       "TASK-235",
-      "TASK-236"
+      "TASK-236",
+      "TASK-237",
+      "TASK-238"
     ],
     "failedTasks": []
   },

@@ -161,6 +161,19 @@ happens to someone's money and what they see when it happens._
 - Changing REQ-586's budget derivation or its bounds.
 - Per-user or hosted billing of any kind (out of MVP scope entirely).
 
+## Wrapup Checklist (BR-5, the half that is not a test)
+
+TASK-238 pins the `teton_docs` sentence with a test, because a bundled page is
+something the build can check. The release-notes half cannot be, and is
+recorded here as an obligation rather than dressed up as one:
+
+- [ ] The release note for the version carrying REQ-588 states that a fresh
+      install has **no spend ceiling**, names `[cost] prompt_ceiling_usd`, and
+      states the one-call overshoot. A user who reads "spend ceiling" in a
+      changelog and infers a default cap has been told the opposite of the
+      truth by omission — which is the same failure BR-5 exists to prevent, one
+      surface over.
+
 ## Retrieved Context
 
 Filed at REQ-586 wrapup from its own review findings; not produced by a
