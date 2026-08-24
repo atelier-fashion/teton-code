@@ -53,6 +53,21 @@
 //! | AC-8 (read-back through the production loader) | every test above |
 //! | AC-10 (parseable-but-invalid drift) | [`a_hand_edit_that_fails_validation_refuses_both_writers_and_survives_them`] |
 //!
+//! ## REQ-589: the same seam, carrying a going-forward remedy
+//!
+//! REQ-589's over-budget offer writes its durable fix through `config/set`
+//! (ADR-4), so it becomes a **sixth** caller of the writer this file exists to
+//! witness — and BR-9's fix is two writes whose *order* is the whole safety
+//! argument (ADR-5). The last section adds that caller's three legs: the
+//! ordered pair applied, a refused second write, and a refused write outright.
+//!
+//! | AC | Test |
+//! |----|------|
+//! | AC-13 (the remedy applied, bytes + re-parse) | [`the_ordered_rebind_declares_the_window_then_binds_the_tier_and_both_reach_disk`] |
+//! | AC-8 / ADR-5 (the circle is unreachable from a partial failure) | [`a_refused_second_write_leaves_a_declared_window_on_an_unbound_tier_never_the_circle`] |
+//! | AC-13 / LESSON-520 (the paired refusal) | [`a_refused_remedy_write_leaves_the_document_byte_identical`] |
+//! | ADR-7 / BR-7c (the figure on disk is the figure the offer named, with its date) | [`the_window_written_to_disk_is_the_one_the_offer_named_with_its_date`] |
+//!
 //! ### Covered elsewhere, deliberately not repeated here
 //!
 //! * **AC-5 through `persist_web_tier`**, and the seam's own missing-file and
@@ -80,14 +95,18 @@
 use std::path::PathBuf;
 use std::sync::Arc;
 
+use teton_core::category::Tier;
 use teton_core::config::{Config, WebTier};
-use teton_protocol::events::WebTier as WireWebTier;
+use teton_protocol::events::{BudgetBound, WebTier as WireWebTier};
 use teton_protocol::jsonrpc::error_code;
 use teton_protocol::methods::{
-    ConfigUpdate, ProviderConfig, WebSetupCommitParams, WebSetupPreviewParams,
+    ConfigUpdate, ProviderConfig, TierBindingConfig, WebSetupCommitParams, WebSetupPreviewParams,
 };
-use teton_protocol::{ProviderId, ProviderKind, SessionId};
+use teton_protocol::{ProviderId, ProviderKind, SessionId, Tier as WireTier};
 use tetond::broadcast::EventBus;
+use tetond::harness::budget::{self, BudgetInputs, OverBudgetOffer, ProposedWindow, SkillStage};
+use tetond::harness::context::Fit;
+use tetond::harness::turn_loop::HarnessConfig;
 use tetond::runtime::DaemonRuntime;
 
 // ---------------------------------------------------------------------------
@@ -1447,6 +1466,523 @@ fn a_config_file_that_does_not_exist_yet_is_created_owner_only() {
             & 0o7777,
         0o600,
         "a config this daemon created gets owner-only, not the umask default"
+    );
+    daemon.cleanup();
+}
+
+// ---------------------------------------------------------------------------
+// REQ-589 — the going-forward remedy, read back off the file the daemon wrote
+// ---------------------------------------------------------------------------
+//
+// AC-13 and ADR-5, from the disk side. The *ordering* of BR-9's pair is pinned
+// at its own seam by `runtime::tests::…::the_rebind_declares_the_window_first_
+// so_the_circle_is_unreachable`, which is where `RemedyWrites::apply` can be
+// driven with a failing applier; `RemedyWrites` and `plan_over_budget_remedy`
+// are private to `runtime`, so nothing here can reach them. What this suite
+// owns is the other half: **what the file is left holding**, in each case,
+// inspected as bytes and re-parsed through the production loader — the double
+// check `a_field_less_registration_preserves_the_stored_window_and_a_declared_
+// one_writes_it` above sets the pattern for (LESSON-519), on the writer path a
+// user's config actually goes through.
+//
+// The three legs are one matched set on one fixture, and none of them means
+// anything alone (LESSON-520):
+//
+// * the pair applied in ADR-5's order writes both halves and moves nothing else;
+// * a refused **second** write leaves the harmless half — a declared window on a
+//   tier bound where it was — and the same fixture demonstrates that the
+//   **reverse** order's first write really does reach the forbidden state, so
+//   the "no circle" assertion discriminates between the two orders rather than
+//   passing for some unrelated reason;
+// * a refused write leaves the document byte-identical, which is only evidence
+//   because the accepted leg proves the same shape does write.
+
+/// The machine the reported `/analyze` failure ran on, as a config: one remote
+/// provider registered with a model and **no declared window**, and no
+/// `[[tiers]]` row at all — so every tier still falls through to the local
+/// engine, which is what makes the route's bound `LocalEngine` and its BR-7
+/// remedy the two-part rebind.
+///
+/// Every provider declares a model (or is local), which keeps the REQ-557
+/// startup migration out of these tests for the reason [`CONFIG_PREAMBLE`]
+/// records: a migration that fired at `from_env` would rewrite the document
+/// before the writer under test ever ran, and a byte-identical assertion would
+/// be measuring the migration.
+const REBIND_FIXTURE: &str = r#"# The machine that hit this. Hand-written, and staying that way.
+effort = "high"
+
+[[providers]]
+# Registered months ago. Nothing has ever been routed to it.
+id = "kimi"
+kind = "openai-compatible"
+endpoint = "https://api.moonshot.ai/v1/chat/completions"
+model = "kimi-k3"
+auth_ref = "keychain:kimi"
+
+[[providers]]
+id = "local"
+kind = "local"
+
+# Nothing in this build reads this table.
+[experimental]
+knob = 3
+"#;
+
+/// A measurement over the local pair in both currencies — the shape
+/// `would_seed_fit` hands the offer when a skill expansion does not fit.
+fn twice_the_local_pair() -> Fit {
+    Fit {
+        tokens: budget::LOCAL_BUDGET_TOKENS * 2,
+        bytes: budget::LOCAL_BUDGET_BYTES * 2,
+        fits: false,
+    }
+}
+
+/// The window BR-9's first write declares, **from the one home** (BR-7c,
+/// LESSON-546): [`budget::proposed_window`] reads the shipped vendor catalog by
+/// **model**, and carries back the date that figure was last read off the
+/// vendor's own documentation (ADR-7).
+///
+/// Nothing here invents, rounds or scales a number, and the test asserts the
+/// value that reaches disk *equals this one* rather than a literal of its own —
+/// a pinned figure here would be a second home for it.
+fn catalogued_window_for_kimi(measured: Fit) -> ProposedWindow {
+    budget::proposed_window(
+        Some("kimi-k3"),
+        BudgetInputs {
+            // Undeclared — the fixture's whole premise, and why the remedy has
+            // a window to write at all.
+            window: 0,
+            cap: 0,
+            // ADR-1's reservation: the `max_tokens` the adapters send.
+            reservation: HarnessConfig::default().gen_params.max_tokens,
+            is_local: false,
+            redact_scan: false,
+            provider_id: Some("kimi"),
+        },
+        measured,
+    )
+    .expect(
+        "`kimi-k3` is in the shipped catalog and its window clears the measurement — if this \
+         stops holding, the catalog moved and the remedy stopped being offerable, which is a \
+         change to make deliberately",
+    )
+}
+
+/// BR-9's **first** write: `kimi` re-registered field-wise with its window
+/// declared (REQ-586 ADR-7's merge — `None` on the fields it is not about).
+///
+/// The identity is re-stated rather than omitted because `RegisterProvider`
+/// replaces those fields wholesale and `apply_config_update` refuses a remote
+/// provider with no model; that is `field_wise_registration`'s own reasoning,
+/// mirrored here because the type it builds is private to `runtime`.
+fn declare_kimis_window(max_context: u32) -> ConfigUpdate {
+    ConfigUpdate::RegisterProvider(ProviderConfig {
+        id: ProviderId::from("kimi"),
+        kind: ProviderKind::OpenaiCompatible,
+        endpoint: Some("https://api.moonshot.ai/v1/chat/completions".to_owned()),
+        model: Some("kimi-k3".to_owned()),
+        auth_ref: Some("keychain:kimi".to_owned()),
+        max_context: Some(max_context),
+        context_budget_cap: None,
+        floored_budget: None,
+    })
+}
+
+/// BR-9's **second** write: the `build` tier bound to `kimi`.
+///
+/// `fallback` is `None` in the remedy — a fallback is a second routing decision
+/// and nobody was asked for one. It is a parameter here only so the refusal leg
+/// can be refused at one of the daemon's real gates; see that test.
+fn bind_build_to_kimi(fallback: Option<&str>) -> ConfigUpdate {
+    ConfigUpdate::SetTierBinding(TierBindingConfig {
+        tier: WireTier::Build,
+        provider_id: ProviderId::from("kimi"),
+        fallback_id: fallback.map(ProviderId::from),
+    })
+}
+
+/// `kimi`'s declared window, as the production loader reads it back.
+fn window_on_disk(config: &Config) -> u32 {
+    config
+        .providers
+        .iter()
+        .find(|p| p.id == "kimi")
+        .expect("a field-wise registration must not lose the provider")
+        .capabilities
+        .max_context
+}
+
+/// The provider the `build` tier is bound to, or `None` when no row binds it.
+fn build_tier_binding(config: &Config) -> Option<String> {
+    config
+        .tiers
+        .iter()
+        .find(|binding| binding.tier == Tier::Build)
+        .map(|binding| binding.provider_id.clone())
+}
+
+/// **AC-13, ADR-5 — the ordered pair, both halves, on disk.**
+///
+/// The accepted counterpart of the two refusal legs below: it is what makes
+/// their "nothing was written" / "only the harmless half was written"
+/// assertions mean something, because it proves these exact payloads do write
+/// on this exact fixture (LESSON-520).
+///
+/// Verified **both** ways, per `a_field_less_registration_preserves_the_stored_
+/// window_and_a_declared_one_writes_it`: the bytes the file holds, and what the
+/// production loader makes of them. A return code is not consulted for either
+/// claim (LESSON-519).
+#[test]
+fn the_ordered_rebind_declares_the_window_then_binds_the_tier_and_both_reach_disk() {
+    let daemon = Daemon::start("ob-rebind-applied", Some(REBIND_FIXTURE));
+    let before = daemon.document();
+    let measured = twice_the_local_pair();
+    let proposal = catalogued_window_for_kimi(measured);
+
+    // FIRST (ADR-5): the window.
+    daemon
+        .runtime
+        .apply_config_update(declare_kimis_window(proposal.tokens))
+        .expect("the window declaration lands");
+    // SECOND: the binding.
+    daemon
+        .runtime
+        .apply_config_update(bind_build_to_kimi(None))
+        .expect("the tier binding lands");
+
+    // --- the file's bytes -------------------------------------------------
+    //
+    // Both writes, and **nothing else** — the mechanical form of BR-1, which is
+    // this suite's own duty and which a remedy applied from inside a consent
+    // answer is not excused from. The empty removal list is the load-bearing
+    // half: no comment, no key and no unknown table was rewritten on the way,
+    // so the two hand-authored comments and `[experimental]` are still there by
+    // the same evidence that says the window landed.
+    let window_line = format!("max_context = {}", proposal.tokens);
+    let after = daemon.document();
+    assert_only_these_lines_changed(
+        &before,
+        &after,
+        &[],
+        &[
+            // FIRST — the window, into a capabilities table this hand-written
+            // config never had.
+            "[providers.capabilities]",
+            &window_line,
+            "",
+            "",
+            // SECOND — the binding.
+            "[[tiers]]",
+            r#"tier = "build""#,
+            r#"provider_id = "kimi""#,
+        ],
+    );
+
+    // --- and the same file, re-parsed ------------------------------------
+    let reloaded = daemon.reload();
+    assert_eq!(
+        window_on_disk(&reloaded),
+        proposal.tokens,
+        "the loaded config must agree with the document:\n{after}"
+    );
+    assert_eq!(
+        build_tier_binding(&reloaded).as_deref(),
+        Some("kimi"),
+        "the loaded config must agree with the document:\n{after}"
+    );
+
+    // ADR-7's date is **not** asserted here, and the reason is a finding rather
+    // than an omission: `Remedy::BindTierRemote`'s clause names neither the
+    // figure nor its provenance — it says "declare that provider's
+    // `capabilities.max_context`" and stops, which is the same gap ADR-18 item 2
+    // records for the provider's name. The window/date tie is therefore pinned
+    // on the bound whose label does carry both, in
+    // [`the_window_written_to_disk_is_the_one_the_offer_named_with_its_date`].
+
+    daemon.cleanup();
+}
+
+/// **AC-13, ADR-5 — a refused SECOND write leaves the harmless half, and the
+/// circle stays unreachable.**
+///
+/// The forbidden state AC-8 names is a newly-bound remote tier whose provider
+/// declares `max_context = 0`: the user pays a remote provider and derives the
+/// *same* default pair under `bound: unknown window`, which is the circle the
+/// reported `/analyze` failure was already sitting in. In ADR-5's order that
+/// state is unreachable from a partial failure; the last block of this test
+/// demonstrates — on the same fixture, from the same file — that the reverse
+/// order's first write really does reach it, which is what makes the assertion
+/// above it discriminating rather than decorative.
+///
+/// **What refuses the second write is not the point, and is stated rather than
+/// implied.** The remedy's own binding carries `fallback_id: None` and has no
+/// failure mode of its own, so the refusal is induced at one of the daemon's
+/// real gates — `Config::validate`'s unregistered-fallback rule — rather than
+/// mocked. ADR-5's claim is about the state a failure *leaves*, not about its
+/// cause, and this is that state.
+#[test]
+fn a_refused_second_write_leaves_a_declared_window_on_an_unbound_tier_never_the_circle() {
+    let daemon = Daemon::start("ob-rebind-partial", Some(REBIND_FIXTURE));
+    let measured = twice_the_local_pair();
+    let proposal = catalogued_window_for_kimi(measured);
+
+    daemon
+        .runtime
+        .apply_config_update(declare_kimis_window(proposal.tokens))
+        .expect("the window declaration lands");
+    let after_first = daemon.document();
+
+    let refused = daemon
+        .runtime
+        .apply_config_update(bind_build_to_kimi(Some("a-provider-nobody-registered")))
+        .expect_err("the second write was made to fail at a real gate");
+    assert_eq!(refused.code, error_code::CONFIG_REJECTED, "{refused:?}");
+
+    // A refused write leaves the file exactly as the *first* write left it —
+    // the gate runs above `persist_config`, and this is what proves it did.
+    let after = daemon.document();
+    assert_eq!(
+        after, after_first,
+        "a refused second write must not touch the document at all"
+    );
+
+    // --- bytes ---
+    assert!(
+        after.contains(&format!("max_context = {}", proposal.tokens)),
+        "the harmless half landed and stays landed:\n{after}"
+    );
+    assert!(
+        !after.contains("[[tiers]]"),
+        "**the forbidden state**: a partial failure bound the tier. In ADR-5's order it \
+         cannot — the binding is the write that did not happen:\n{after}"
+    );
+    // --- and the re-parse ---
+    let reloaded = daemon.reload();
+    assert_eq!(window_on_disk(&reloaded), proposal.tokens);
+    assert_eq!(
+        build_tier_binding(&reloaded),
+        None,
+        "no `[[tiers]]` row may bind `build` after a failed second write:\n{after}"
+    );
+    // The state is not merely "no circle" — it is a route that never moved, so
+    // there is nothing for the user to undo and no spend they did not choose.
+    assert_eq!(
+        budget::derive(BudgetInputs::local()).bound,
+        BudgetBound::LocalEngine,
+        "the tier is still the local one it was, which is what makes the half-applied \
+         pair harmless"
+    );
+
+    // --- why the order is that way round, on disk ------------------------
+    //
+    // The same fixture, the reverse order, its first write applied alone —
+    // which is exactly the state a failure between the reversed pair leaves.
+    let circled = Daemon::start("ob-rebind-reversed", Some(REBIND_FIXTURE));
+    circled
+        .runtime
+        .apply_config_update(bind_build_to_kimi(None))
+        .expect("the reverse order's first write is a perfectly valid binding");
+    let document = circled.document();
+    let reloaded = circled.reload();
+    assert_eq!(
+        build_tier_binding(&reloaded).as_deref(),
+        Some("kimi"),
+        "the reverse order binds the tier first:\n{document}"
+    );
+    assert_eq!(
+        window_on_disk(&reloaded),
+        0,
+        "…to a provider that still declares no window — **the forbidden state**, on \
+         disk:\n{document}"
+    );
+    let circle = budget::derive(BudgetInputs {
+        window: window_on_disk(&reloaded),
+        cap: 0,
+        reservation: HarnessConfig::default().gen_params.max_tokens,
+        is_local: false,
+        redact_scan: false,
+        provider_id: Some("kimi"),
+    });
+    assert_eq!(
+        circle.bound,
+        BudgetBound::DefaultUnknown,
+        "a tier bound to a provider with no declared window derives the default pair under \
+         `bound: unknown window` — which is why that state must be unreachable, not merely \
+         unlikely"
+    );
+    assert!(
+        measured.tokens > circle.budget_tokens,
+        "and the same measurement overflows it again: {} vs {} — the user would have paid a \
+         remote provider to meet the identical refusal (BR-9)",
+        measured.tokens,
+        circle.budget_tokens
+    );
+    circled.cleanup();
+
+    daemon.cleanup();
+}
+
+/// **AC-13 / LESSON-520 — a refused remedy write leaves the document
+/// byte-identical, and that is evidence only because the accepted leg exists.**
+///
+/// The payload is the remedy's own second write with one field changed to
+/// something the daemon refuses, so it is a payload that **would** persist:
+/// `the_ordered_rebind_declares_the_window_then_binds_the_tier_and_both_reach_
+/// disk` above writes the identical binding on the identical fixture. That is
+/// the pairing LESSON-520 requires — without it, "the file did not change"
+/// passes for a payload that could never have changed it, and cannot tell a
+/// gate from a parser.
+///
+/// The refusal here lands *above* `persist_config`: `Config::validate` refuses
+/// the candidate, so the write never reaches the document at all. The bytes are
+/// what says so, not the error code (LESSON-519).
+#[test]
+fn a_refused_remedy_write_leaves_the_document_byte_identical() {
+    let daemon = Daemon::start("ob-rebind-refused", Some(REBIND_FIXTURE));
+    let before = daemon.document();
+
+    let refused = daemon
+        .runtime
+        .apply_config_update(bind_build_to_kimi(Some("a-provider-nobody-registered")))
+        .expect_err("an unregistered fallback is refused");
+    assert_eq!(refused.code, error_code::CONFIG_REJECTED, "{refused:?}");
+
+    assert_eq!(
+        daemon.document(),
+        before,
+        "a refused remedy write must leave config.toml byte-identical"
+    );
+    let reloaded = daemon.reload();
+    assert_eq!(
+        build_tier_binding(&reloaded),
+        None,
+        "and the loaded config must agree — nothing was bound"
+    );
+    assert_eq!(window_on_disk(&reloaded), 0, "and nothing was declared");
+    daemon.cleanup();
+}
+
+/// The circle itself, as a config: the `build` tier already bound to a remote
+/// provider that declares **no** window, so the route derives the default pair
+/// under `bound: unknown window`. This is the state ADR-5's ordering exists to
+/// keep unreachable — and, once a user is in it, the bound whose BR-7 remedy is
+/// `DeclareWindow`: one write, addressed to a named provider, with a figure.
+const DECLARE_WINDOW_FIXTURE: &str = r#"# Bound last month. The window was never declared.
+effort = "high"
+
+[[providers]]
+id = "kimi"
+kind = "openai-compatible"
+endpoint = "https://api.moonshot.ai/v1/chat/completions"
+model = "kimi-k3"
+auth_ref = "keychain:kimi"
+
+[[tiers]]
+tier = "build"
+provider_id = "kimi"
+"#;
+
+/// **ADR-7 / BR-7c — the number written to disk is the number the offer named,
+/// and the date it was read was named with it.**
+///
+/// `verified_on` is deliberately not a config key: a provenance claim written
+/// into a file the user hand-edits would go stale silently and could not be
+/// corrected by re-reading the catalog. ADR-7 records it where a human can act
+/// on it instead — in the option label that offers the write. So "recorded
+/// alongside the written window" is a tie between two artifacts, and this test
+/// is that tie: the label the user was shown carries the figure **and** the
+/// date, and the figure it carries is the one the loader reads back off disk.
+///
+/// Both come from [`budget::proposed_window`], the one home (LESSON-546). The
+/// test pins no literal window and no literal date — a second copy of either
+/// here would be the drift the one-home rule exists to prevent — so a catalog
+/// re-verification moves both sides together and this stays green, while a
+/// change that let the label and the write disagree cannot.
+#[test]
+fn the_window_written_to_disk_is_the_one_the_offer_named_with_its_date() {
+    let measured = twice_the_local_pair();
+    // The route as the router stamps it: a remote provider with an undeclared
+    // window derives the default pair and says so.
+    let inputs = BudgetInputs {
+        window: 0,
+        cap: 0,
+        reservation: HarnessConfig::default().gen_params.max_tokens,
+        is_local: false,
+        redact_scan: false,
+        provider_id: Some("kimi"),
+    };
+    let budget = budget::derive(inputs);
+    assert_eq!(
+        budget.bound,
+        BudgetBound::DefaultUnknown,
+        "the fixture must be the bound whose remedy is a single, addressed window write"
+    );
+    let proposal = catalogued_window_for_kimi(measured);
+
+    // What the user is shown, composed by the one composer (ADR-16).
+    let offer = OverBudgetOffer::new(
+        "analyze",
+        SkillStage::Body,
+        measured,
+        &budget,
+        inputs.window,
+        Some(proposal.clone()),
+        None,
+    );
+    let labels = offer.option_labels();
+    let remedy = labels
+        .remedy
+        .as_ref()
+        .expect("`DefaultUnknown` with a catalogued figure carries BR-7's remedy");
+    for label in [&remedy.proceed_and_remedy, &remedy.remedy_only] {
+        assert!(
+            label.contains(&format!("capabilities.max_context = {}", proposal.tokens)),
+            "ADR-1: the label must name the concrete write, figure included:\n{label}"
+        );
+        assert!(
+            label.contains(&proposal.verified_on) && label.contains(&proposal.vendor),
+            "ADR-7: the date that figure was read off the vendor's docs must ride beside \
+             it, or a later `/doctor` cannot tell an inherited window from a measured \
+             one:\n{label}"
+        );
+    }
+
+    // And what actually lands, read back off the file (LESSON-519).
+    let daemon = Daemon::start("ob-declare-window", Some(DECLARE_WINDOW_FIXTURE));
+    let before = daemon.document();
+    daemon
+        .runtime
+        .apply_config_update(declare_kimis_window(proposal.tokens))
+        .expect("the window declaration lands");
+
+    let after = daemon.document();
+    let window_line = format!("max_context = {}", proposal.tokens);
+    assert_only_these_lines_changed(
+        &before,
+        &after,
+        &[],
+        &["[providers.capabilities]", &window_line, ""],
+    );
+    assert_eq!(
+        window_on_disk(&daemon.reload()),
+        proposal.tokens,
+        "the figure the label promised is the figure the loader reads back:\n{after}"
+    );
+
+    // The remedy did what it was for: the same measurement now fits.
+    let repaired = budget::derive(BudgetInputs {
+        window: window_on_disk(&daemon.reload()),
+        ..inputs
+    });
+    assert_eq!(repaired.bound, BudgetBound::Window);
+    assert!(
+        measured.tokens <= repaired.budget_tokens && measured.bytes <= repaired.budget_bytes,
+        "BR-7c's second rule, seen from the file: a proposed window that would not clear \
+         the measurement is never offered, so the one that was offered must clear it — \
+         {measured:?} against {}/{}",
+        repaired.budget_tokens,
+        repaired.budget_bytes
     );
     daemon.cleanup();
 }
