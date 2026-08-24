@@ -1574,6 +1574,12 @@ impl SkillTool {
                 &root,
                 &entries,
                 shadows,
+                // TASK-261: the model reached for this one. The typed path
+                // passes `InvokedBy::User` at its own call site, and the prompt
+                // reads as it always has here — REQ-587's wording is this
+                // caller's wording, byte for byte, because on this caller it
+                // was always true.
+                InvokedBy::Model,
                 connection,
             )
             .await;
@@ -3656,11 +3662,26 @@ mod tests {
             "the acknowledgment is remembered under the faithful name of its root"
         );
         match request.subject {
-            Some(PermissionSubject::ProjectSkillTrust { root, .. }) => assert_eq!(
-                root, expected,
-                "the prompt names the same string the key is minted from — \
-                 `authorize_project_skill_trust` asserts they are one value"
-            ),
+            Some(PermissionSubject::ProjectSkillTrust {
+                root, invoked_by, ..
+            }) => {
+                assert_eq!(
+                    root, expected,
+                    "the prompt names the same string the key is minted from — \
+                     `authorize_project_skill_trust` asserts they are one value"
+                );
+                // REQ-589 TASK-261. The typed path now knocks on this same door
+                // and passes `InvokedBy::User`, so "the model wants to run this
+                // repository's skills as instructions" is a claim this caller
+                // has to keep making rather than one the prompt can assume.
+                // Swap this argument and the client's model-path byte pin in
+                // `session_ui` reddens with it.
+                assert_eq!(
+                    invoked_by,
+                    InvokedBy::Model,
+                    "the model's tool asked, and the prompt says so"
+                );
+            }
             other => panic!("BR-4's own subject, never another: {other:?}"),
         }
     }

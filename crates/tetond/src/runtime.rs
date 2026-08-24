@@ -3045,6 +3045,16 @@ impl DaemonRuntime {
                         // list it renders.
                         &crate::harness::tools::skill::project_trust_entries(registry),
                         shadows,
+                        // TASK-261: **the user typed this**. The door's other
+                        // caller is the model's tool, and until this argument
+                        // existed the prompt said so unconditionally — so a
+                        // human who typed `/analyze` was told "the model wants
+                        // to run this repository's skills as instructions" by
+                        // the one prompt whose job is letting them decide
+                        // whether to trust the repository. The answer is still
+                        // remembered under the root's key alone, shared with
+                        // the model's caller (ADR-7); only the sentence differs.
+                        teton_protocol::events::InvokedBy::User,
                         connection,
                     )
                     .await
@@ -30448,6 +30458,77 @@ provider_id = \"deepseek\"
                  prompts",
                 engine.prompts().len()
             );
+
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+
+        /// **The question this path puts says the user asked (TASK-261).**
+        ///
+        /// D-10 gave the typed path REQ-587's door, and REQ-587 had written that
+        /// prompt's sentence when the model's tool was the only thing that could
+        /// knock on it: *the model wants to run this repository's skills as
+        /// instructions*. Shown to someone who has just typed `/marked`, that is
+        /// a false statement about who is acting — on the one prompt whose whole
+        /// job is letting a human decide whether to trust a repository.
+        ///
+        /// The claim is about the **producer**, which is why it reads the
+        /// subject the daemon actually delivered rather than a sentence: the
+        /// client's two byte pins live in `session_ui`, and a test that built
+        /// this subject by hand would leave the call site unguarded
+        /// (LESSON-544). `RejectOnce` because the subject is captured at
+        /// delivery, before any answer — what is being asked is the question,
+        /// not the outcome.
+        ///
+        /// **Mutation:** pass `InvokedBy::Model` at `accept_invocation`'s call
+        /// to the door and this reddens.
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn the_typed_door_says_the_user_asked_not_the_model() {
+            let dir = project_root("trust-invoker", "marked");
+            let engine = Recorder::new();
+            let runtime = runtime_with(&engine);
+            let events = Arc::new(EventBus::new());
+            let sessions = SessionRegistry::new();
+            let session_id = sessions
+                .create(SessionMode::Freeform, None, Some(dir.clone()))
+                .expect("a freeform session")
+                .session_id;
+            let probed = runtime.session_root_for(Some(&dir));
+            sessions.set_skills(
+                &session_id,
+                discover(None, &probed.path, probed.view.kind, &RealFs),
+            );
+            let client = Client::answering(runtime.pending(), PermissionOptionKind::RejectOnce);
+            install_gate(&runtime, &events, &session_id, Arc::clone(&client));
+            let conn = GrantRegistry::new().next_connection_id();
+
+            let _ = runtime
+                .run_prompt_turn(
+                    &events,
+                    &sessions,
+                    session_id,
+                    SessionMode::Freeform,
+                    None,
+                    Some(dir.clone()),
+                    String::new(),
+                    Some(SkillInvocation {
+                        name: "marked".to_owned(),
+                        raw_arguments: String::new(),
+                    }),
+                    Some(conn),
+                    ClientPresence::unwatched(),
+                )
+                .await;
+
+            let subjects = client.subjects();
+            match subjects.as_slice() {
+                [Some(PermissionSubject::ProjectSkillTrust { invoked_by, .. })] => assert_eq!(
+                    *invoked_by,
+                    teton_protocol::events::InvokedBy::User,
+                    "the user typed `/marked`; the prompt must not tell them a \
+                     model wanted this"
+                ),
+                other => panic!("BR-6's acknowledgment, and only it: {other:?}"),
+            }
 
             let _ = std::fs::remove_dir_all(&dir);
         }

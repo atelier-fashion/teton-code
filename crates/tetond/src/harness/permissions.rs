@@ -1506,12 +1506,22 @@ impl PermissionGate {
     /// count. Bounding at the door that mints the subject is what makes "at most
     /// twenty names, then `+N more`" true of every prompt rather than of every
     /// caller that remembered — an unbounded prompt is LESSON-517's shape.
+    /// ## The invoker rides on the subject, and never on the key
+    ///
+    /// `invoked_by` is carried through to the prompt (REQ-589 TASK-261) because
+    /// REQ-587 wrote this sentence when the model's tool was the only caller,
+    /// and ADR-10's typed path made "the model wants to run this repository's
+    /// skills as instructions" false for the human reading it. It changes what
+    /// the question **says**. It does not touch what the answer is remembered
+    /// under: the key is still the root's alone, so the paragraph above holds
+    /// unchanged — one answer per root per session, shared by both callers.
     pub async fn authorize_project_skill_trust(
         &self,
         key: &str,
         root: &str,
         skills: &[ProjectSkillTrustEntry],
         shadows_user_skill: bool,
+        invoked_by: InvokedBy,
         addressee: ConnectionId,
     ) -> SkillConsent {
         // The misroute this door drops. A skill's own key here would remember
@@ -1560,6 +1570,7 @@ impl PermissionGate {
                 root: root.to_owned(),
                 skills: listed,
                 more,
+                invoked_by,
             },
         };
 
@@ -2497,6 +2508,7 @@ mod tests {
                     "~/dev/teton",
                     &[],
                     false,
+                    InvokedBy::Model,
                     GrantRegistry::new().next_connection_id(),
                 )
                 .await;
@@ -2571,6 +2583,7 @@ mod tests {
                     root,
                     &[],
                     false,
+                    InvokedBy::Model,
                     GrantRegistry::new().next_connection_id(),
                 )
                 .await
@@ -2597,6 +2610,7 @@ mod tests {
                 "~/dev/teton",
                 &[],
                 false,
+                InvokedBy::Model,
                 GrantRegistry::new().next_connection_id(),
             )
             .await;

@@ -413,6 +413,11 @@ async fn acknowledge(
             root,
             skills,
             shadows_user_skill,
+            // REQ-589 TASK-261. This helper stands in for REQ-587's caller, the
+            // model's `skill` tool, which is the one every leg below is about;
+            // the typed path's own invoker is pinned at its call site in
+            // `runtime`, and the two prompts' bytes in `session_ui`.
+            InvokedBy::Model,
             from,
         ),
     )
@@ -1319,7 +1324,12 @@ async fn the_acknowledgment_asks_under_its_own_key_and_names_the_root_and_its_sk
          question"
     );
     match prompt.request.subject {
-        Some(PermissionSubject::ProjectSkillTrust { root, skills, more }) => {
+        Some(PermissionSubject::ProjectSkillTrust {
+            root,
+            skills,
+            more,
+            invoked_by,
+        }) => {
             assert_eq!(root, "~/dev/teton", "home-relative, never an absolute path");
             assert!(
                 !root.contains("/Users/"),
@@ -1331,6 +1341,14 @@ async fn the_acknowledgment_asks_under_its_own_key_and_names_the_root_and_its_sk
                 "the user answers about a named set, in registry order"
             );
             assert_eq!(more, 0, "nothing was left out of a two-name list");
+            // TASK-261: `acknowledge` raises this as the model's tool does, and
+            // the subject says so — the prompt's opening words are the client's
+            // to compose, but which words it may compose are decided here.
+            assert_eq!(
+                invoked_by,
+                InvokedBy::Model,
+                "the caller this leg models is the model's tool"
+            );
         }
         other => panic!(
             "a client must be able to recognize this request without parsing \
@@ -2158,6 +2176,7 @@ async fn each_skill_door_refuses_the_others_key_in_every_build_profile() {
                 "~/dev/teton",
                 &[entry("validate", true)],
                 false,
+                InvokedBy::Model,
                 conns[0],
             ),
         )
