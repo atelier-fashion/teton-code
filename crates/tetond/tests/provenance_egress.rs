@@ -40,11 +40,11 @@ use teton_core::effort::{EffortLevel, ResolvedEffort};
 use async_trait::async_trait;
 
 use teton_core::entities::{BoundaryMode, PrivacyBoundary};
-use teton_protocol::events::{Event, WebLookupOutcome};
+use teton_protocol::events::{Event, PermissionRequest, WebLookupOutcome};
 use teton_protocol::jsonrpc::RpcError;
 use teton_protocol::methods::{
-    ConfigUpdate, PrivacyBoundaryConfig, PromptTurnResult, ProviderConfig, SkillInvocation,
-    TierBindingConfig,
+    ConfigUpdate, PermissionOutcome, PrivacyBoundaryConfig, PromptTurnResult, ProviderConfig,
+    SkillInvocation, TierBindingConfig,
 };
 use teton_protocol::{
     Phase as ProtoPhase, PrivacyMode, ProviderId, ProviderKind as ProtoProviderKind, SessionId,
@@ -56,6 +56,8 @@ use teton_providers::{OpenAiCompatAdapter, OpenAiCompatConfig};
 use tetond::broadcast::EventBus;
 use tetond::carry::CarriedTurn;
 use tetond::egress::{Authorship, Egress, LookupContext, LookupRequest, NoopSink, TaintView};
+use tetond::grants::{ConnectionId, GrantRegistry};
+use tetond::harness::permissions::AddressedPermissionDelivery;
 use tetond::harness::{
     build_system_prompt, context_provenance, run_session_turn_with_source, ContextManager,
     DutyRoute, HarnessConfig, HarnessError, NoopProvenanceHook, PendingPermissions,
@@ -1842,6 +1844,31 @@ fn claude_tree_is_local_only() -> Vec<PrivacyBoundaryConfig> {
 /// resolves from the phase), and `redact` — the third `reflex` category — is off
 /// unless `[privacy] redact` is set, which `DaemonRuntime::minimal` leaves at its
 /// default. So a hit on the second vendor is the naming duty and nothing else.
+/// A client that acknowledges this repository's skills and answers nothing else.
+///
+/// REQ-589 ADR-10: a typed **project** skill is asked for once, before it
+/// expands, and a turn with no addressable connection cannot be asked at all —
+/// so without this the fixture below refuses before the naming duty it is about
+/// ever starts.
+struct Acknowledges(Arc<PendingPermissions>);
+
+impl AddressedPermissionDelivery for Acknowledges {
+    fn deliver(
+        &self,
+        connection: ConnectionId,
+        _session_id: &SessionId,
+        request: PermissionRequest,
+    ) -> bool {
+        self.0.resolve_from(
+            &request.request_id,
+            PermissionOutcome::Selected {
+                option_id: "allow_always".to_owned(),
+            },
+            connection,
+        )
+    }
+}
+
 async fn drive_named_skill_turn(
     boundary_set: Vec<PrivacyBoundaryConfig>,
 ) -> (TitleVendor, Result<PromptTurnResult, RpcError>) {
@@ -1886,6 +1913,10 @@ async fn drive_named_skill_turn(
             .expect("setting a boundary");
     }
 
+    let acknowledges: Arc<dyn AddressedPermissionDelivery> =
+        Arc::new(Acknowledges(Arc::clone(runtime.pending())));
+    runtime.install_addressed_delivery(acknowledges);
+
     let sessions = SessionRegistry::new();
     let session_id = sessions
         .create(
@@ -1918,7 +1949,10 @@ async fn drive_named_skill_turn(
                 name: "notes".to_owned(),
                 raw_arguments: String::new(),
             }),
-            None,
+            // The connection the acknowledgment is addressed to (REQ-585 ADR-7,
+            // REQ-589 ADR-10). `None` here is a caller nobody can be asked, and
+            // a project skill is not expanded for one.
+            Some(GrantRegistry::new().next_connection_id()),
             ClientPresence::unwatched(),
         )
         .await;

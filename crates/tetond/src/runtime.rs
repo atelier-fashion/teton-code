@@ -117,9 +117,10 @@ use teton_inference::{ChatFormat, Completion, Engine, EngineError, GenParams, Mo
 
 use teton_protocol::events::{
     BlockCause, CapabilityDeadEnd, ContextCleared, ContextPressureKind, Event, ModelLifecycle,
-    ModelLifecycleStage, PrivacyAction, ProviderTested, SessionRootChanged, SessionTitled,
-    SkillInvoked, TierWarming, TurnQueued, WebCapabilityState as WireWebCapabilityState, WebLookup,
-    WebSetupCompleted, WebTaintOverridden, WebTier as WireWebTier,
+    ModelLifecycleStage, NotRunReason, PrivacyAction, ProviderTested, SessionRootChanged,
+    SessionTitled, SkillInvoked, TierWarming, TurnQueued,
+    WebCapabilityState as WireWebCapabilityState, WebLookup, WebSetupCompleted, WebTaintOverridden,
+    WebTier as WireWebTier,
 };
 use teton_protocol::jsonrpc::{error_code, RpcError};
 use teton_protocol::methods::{
@@ -1243,6 +1244,57 @@ fn refused_claim_error(err: &TurnClaimError) -> RpcError {
         TurnClaimError::NoSuchSession { .. } => error_code::UNKNOWN_SESSION,
     };
     RpcError::new(code, err.to_string())
+}
+
+/// The sentence a typed `/name` earns when this repository's skills were not
+/// acknowledged (REQ-589 BR-6, ADR-10).
+///
+/// # Why it is not the model's sentence
+///
+/// `tools::skill`'s `ProjectNotAcknowledged` says the same *fact* to a different
+/// reader: it ends "Ask the user to acknowledge this repository's skills", which
+/// is an instruction to a model and is nonsense printed to the human who just
+/// declined. One fact, two audiences — the split REQ-585 already makes between
+/// the frame the model reads and the echo line the human reads.
+///
+/// # Why one code and not five
+///
+/// Every door takes [`error_code::CONSENT_DENIED`] and names itself in the
+/// sentence, which is [`DaemonRuntime::unserved_turn_error`]'s construction: five
+/// reasons a local tier will not serve a turn share one code and are told apart
+/// by what they say. A client reads none of these doors programmatically today
+/// (nothing in `crates/teton` matches on this code), so five numbers would be
+/// five facts nobody consumes; if one ever needs to be acted on differently, the
+/// change is a code of its own in the numbering module, not a widened match here.
+///
+/// The name is safe to interpolate — it resolved against the registry, so it
+/// satisfies `is_valid_skill_name` — and the root is `trust_root_name`'s
+/// home-relative spelling, so no username reaches the line.
+fn project_trust_refusal(name: &str, root: &str, door: NotRunReason) -> RpcError {
+    let because = match door {
+        NotRunReason::Declined => "you declined it",
+        NotRunReason::Level => {
+            "this session's permission level does not allow this repository's skills"
+        }
+        NotRunReason::NoTerminal => "there was no client to ask",
+        NotRunReason::UnrecognizedSubject => "this client did not recognize the request",
+        // Neither reaches here: `closed_door` answers only with the consent's
+        // own doors, and these two are a *runner* outcome and a deserialize arm
+        // (BUG-186). Spelled out rather than left to an `unreachable!` for the
+        // reason `door_outcome` gives about the same variants — a future caller
+        // should meet a sentence here, not a panic.
+        NotRunReason::CouldNotStart => "the acknowledgment could not be raised",
+        NotRunReason::Unknown => "the acknowledgment did not happen",
+    };
+    RpcError::new(
+        error_code::CONSENT_DENIED,
+        format!(
+            "`/{name}` is defined by this repository (`{root}`), whose skills this \
+             session has not acknowledged: {because}. Nothing was expanded, nothing \
+             was sent, and no provider saw this turn. Type `/{name}` again to be \
+             asked once more; a user-level skill of your own needs no acknowledgment."
+        ),
+    )
 }
 
 /// Why the local tier is not serving a turn — the typed reading behind
@@ -2901,11 +2953,38 @@ impl DaemonRuntime {
     /// exactly the string that must not be reflected verbatim into a message a
     /// terminal renders (LESSON-517). `raw_arguments` is never echoed at all: it
     /// reaches the model through [`crate::skills::expand`], which defuses it.
-    fn accept_invocation(
+    ///
+    /// # A project skill is acknowledged here, and nowhere else on this path
+    ///
+    /// REQ-589 BR-6 / ADR-10 / D-10. REQ-585 BR-4's acknowledgment had exactly
+    /// one production caller — `harness::tools::skill`'s **model**-invoked tool
+    /// — so until this function grew an `await`, a user who typed `/name` ran a
+    /// project-authored body with nothing asked. The gate is
+    /// [`PermissionGate::authorize_project_skill_trust`] verbatim, under the key
+    /// [`teton_protocol::methods::project_skill_trust_key`] mints, so one answer
+    /// covers both callers for the session and neither can drift onto a key
+    /// family of its own (ADR-7).
+    ///
+    /// It is asked **before the expansion**, which puts it before everything
+    /// `run_prompt_turn` does with the expansion: the route, the naming attempt,
+    /// Stage A's budget question and BR-8's refusal. That ordering is BR-6's
+    /// whole point — a user asked "may this oversized body be sent?" before "do
+    /// you trust this repository?" would be authorizing an over-budget send of
+    /// bytes from a repository they have not said they trust, and a file on disk
+    /// would be choosing when it gets a consent prompt. A declined trust returns
+    /// from here, so no budget offer is composed and no budget sentence is
+    /// rendered.
+    ///
+    /// **`async` is the forcing function.** The signature change is what makes
+    /// a caller that skips the gate a compile error rather than a silent
+    /// regression — the LESSON-508 shape this REQ found in the first place.
+    async fn accept_invocation(
         &self,
         registry: &SkillRegistry,
         probed: &ProbedRoot,
         invocation: &SkillInvocation,
+        gate: &PermissionGate,
+        invoker: Option<ConnectionId>,
     ) -> Result<SkillTurn, RpcError> {
         if !crate::skills::is_valid_skill_name(&invocation.name) {
             return Err(RpcError::new(
@@ -2932,6 +3011,58 @@ impl DaemonRuntime {
                 ),
             ));
         };
+
+        // One reading of "does a project skill take this name from a user
+        // skill?", two consumers: the trust gate's `shadows_user_skill`
+        // override, which is what makes BR-4 ask about the swap even at `full`,
+        // and BR-9's rendered fact on the `SkillInvoked` line below. Two
+        // readings of one registry would agree only by accident — and the
+        // registry is fixed for this turn (the claim is held), so asking once is
+        // a statement rather than a race this happens to win.
+        let shadows = crate::harness::tools::skill::shadows_user_skill(registry, &skill.name);
+
+        // REQ-589 BR-6 / ADR-10: the acknowledgment, before the expansion and
+        // therefore before the route, the naming attempt and both budget stages.
+        // A user-authored skill raises nothing — BR-4's question is about
+        // *repository* text reaching the model labelled instructions, and the
+        // current order stands for a file the user installed themselves.
+        if skill.source == SkillSource::Project {
+            // The **untruncated, faithful** home-relative root name, from the
+            // one minter both callers use (`tools::skill::trust_root_name`):
+            // untruncated because a key is matched and never read, home-relative
+            // because the subject reaches a client that may render it, and
+            // faithful because `display_for` alone collapses two distinct roots
+            // onto one name — and one name is one grant.
+            let root =
+                crate::harness::tools::skill::trust_root_name(&probed.path, home().as_deref());
+            let consent = match invoker {
+                Some(connection) => {
+                    gate.authorize_project_skill_trust(
+                        &teton_protocol::methods::project_skill_trust_key(&root),
+                        &root,
+                        // The project's whole model-invocable set, which is what
+                        // the user is being asked about; the door bounds the
+                        // list it renders.
+                        &crate::harness::tools::skill::project_trust_entries(registry),
+                        shadows,
+                        connection,
+                    )
+                    .await
+                }
+                // No addressable connection — an internal driver, or a fixture.
+                // The question cannot be *put* to anyone, which is the gate's
+                // own fail-closed answer, so it is spelled with the gate's word
+                // rather than with a second one (`settle_dynamic_context` says
+                // the same thing at its own door).
+                None => SkillConsent::Unanswerable,
+            };
+            // `closed_door` because it is the reader **both** callers share:
+            // the model's tool and this path must not come to disagree about
+            // which settlement is a decline and which is a refusal (LESSON-528).
+            if let Some(door) = closed_door(consent) {
+                return Err(project_trust_refusal(&skill.name, &root, door));
+            }
+        }
 
         // BR-4's preamble names the file, never absolutely: an absolute path
         // carries a username — or the location of the user's working tree —
@@ -2987,10 +3118,9 @@ impl DaemonRuntime {
             // because this is the surface that has it: the client's snapshot
             // lives on its `UiContext` and `render_event` cannot see it, and by
             // the time it could the registry may have moved under a `/cd`.
-            shadows_user_skill: crate::harness::tools::skill::shadows_user_skill(
-                registry,
-                &skill.name,
-            ),
+            // `shadows` is the one reading taken above, which the trust gate
+            // also asked its question with.
+            shadows_user_skill: shadows,
             model_invocable: skill.model_invocable,
             user_invocable: skill.user_invocable,
             // Bounded here, at the surface, for the reason the preamble's copy
@@ -3327,6 +3457,27 @@ impl DaemonRuntime {
         //
         // Refusing here is free in BR-8(c)'s sense: nothing has been seeded, no
         // route has been decided, and no event has been published.
+
+        // This turn's ONE config snapshot, taken before the expansion rather
+        // than after it because the gate below reads it and the expansion below
+        // needs the gate (REQ-589 ADR-10). Handed on rather than re-read: the
+        // route, the gate, the registry and the capability clause further down
+        // are then four readings of one config, so a commit that lands mid-turn
+        // moves the next turn instead of leaving this one's prompt disagreeing
+        // with its own tool set (REQ-572 verify).
+        let config = self.config.lock().expect("config mutex poisoned").clone();
+        // Fetched before the tools, because the web tool holds it: that tool
+        // raises its own per-tier prompt inside its run rather than being
+        // authorized by name at dispatch (REQ-563 BR-3/BR-12). Fetched rather
+        // than built, because a gate rebuilt per turn forgets every
+        // "allow for this session" answer at the end of the turn that earned it.
+        //
+        // **And now before the expansion too** (REQ-589 BR-6 / ADR-10): a typed
+        // project skill's trust question is asked inside `accept_invocation`,
+        // which is the first thing this turn does with the invocation. The fetch
+        // is a per-session cache lookup, so asking for it earlier reads the same
+        // gate with the same remembered answers — only sooner.
+        let gate = self.permission_gate_for(&session_id, events, &config);
         // **The turn's one registry snapshot**, taken here under the claim and
         // read by both consumers: the `/name` resolution just below, and the
         // `skill` tool `build_tools` registers further down (REQ-587 ADR-3,
@@ -3342,7 +3493,14 @@ impl DaemonRuntime {
         // this happens to win.
         let skills = sessions.skills(&session_id);
         let mut skill_turn = match &skill {
-            Some(invocation) => Some(self.accept_invocation(&skills, &probed, invocation)?),
+            // `invoker` is carried in for REQ-589 ADR-10's acknowledgment: the
+            // question is **addressed** to the connection that typed the `/name`
+            // and answerable by nobody else, exactly as the dynamic-context
+            // question below it is (REQ-585 ADR-7).
+            Some(invocation) => Some(
+                self.accept_invocation(&skills, &probed, invocation, &gate, invoker)
+                    .await?,
+            ),
             None => None,
         };
         // The one reading of "this turn's prompt text". For a skill turn it is
@@ -3355,7 +3513,6 @@ impl DaemonRuntime {
             .as_ref()
             .map_or(prompt.as_str(), |skill| skill.text.as_str());
 
-        let config = self.config.lock().expect("config mutex poisoned").clone();
         let router = self.turn_router(&config, &session_id);
 
         let core_phase = phase.map(to_core_phase);
@@ -3502,17 +3659,16 @@ impl DaemonRuntime {
         // trusts. A skill turn's `prompt` is empty, so an invocation contributes
         // nothing, which is the correct answer: nobody pasted anything.
         self.record_user_prompt_urls(&session_id, &prompt);
-        // Fetched before the tools, because the web tool holds it: that tool
-        // raises its own per-tier prompt inside its run rather than being
-        // authorized by name at dispatch (REQ-563 BR-3/BR-12). Fetched rather
-        // than built, because a gate rebuilt per turn forgets every
-        // "allow for this session" answer at the end of the turn that earned it.
-        let gate = self.permission_gate_for(&session_id, events, &config);
-        // This turn's config snapshot, handed on rather than re-read: the route,
-        // the gate, the registry and the capability clause below are then four
-        // readings of ONE config, so a commit that lands mid-turn moves the next
-        // turn instead of leaving this one's prompt disagreeing with its own
-        // tool set (REQ-572 verify).
+        // The gate is the one fetched above the expansion (REQ-589 ADR-10). It
+        // is still fetched before the tools, which is what the web tool needs:
+        // that tool raises its own per-tier prompt inside its run rather than
+        // being authorized by name at dispatch (REQ-563 BR-3/BR-12).
+        //
+        // This turn's config snapshot is handed on rather than re-read: the
+        // route, the gate, the registry and the capability clause below are then
+        // four readings of ONE config, so a commit that lands mid-turn moves the
+        // next turn instead of leaving this one's prompt disagreeing with its
+        // own tool set (REQ-572 verify).
         let tools = self
             .build_tools(
                 &router,
@@ -29796,13 +29952,40 @@ provider_id = \"deepseek\"
 
     mod skill_turn_readers {
         use super::*;
+        use crate::grants::GrantRegistry;
+        use crate::harness::permissions::{AddressedPermissionDelivery, PermissionConfig};
         use crate::sessions::SessionRegistry;
         use crate::skills::{discover, RealFs};
-        use teton_protocol::methods::SkillInvocation;
+        use teton_protocol::events::PermissionRequest;
+        use teton_protocol::methods::{PermissionOutcome, SkillInvocation};
 
         /// A body marker no other fixture in this crate uses, so a prompt
         /// containing it can only have come from this expansion.
         const MARKER: &str = "SKILLBODYMARKER-204";
+
+        /// A client that says yes to whatever it is shown. The fixture below
+        /// invokes a **project** skill, which since REQ-589 ADR-10 is asked for
+        /// once before it expands; this test is about what the classifier and
+        /// the naming attempt are handed, so the acknowledgment is answered and
+        /// nothing else about it is asserted here.
+        struct AllowsEverything(Arc<PendingPermissions>);
+
+        impl AddressedPermissionDelivery for AllowsEverything {
+            fn deliver(
+                &self,
+                connection: ConnectionId,
+                _session_id: &SessionId,
+                request: PermissionRequest,
+            ) -> bool {
+                self.0.resolve_from(
+                    &request.request_id,
+                    PermissionOutcome::Selected {
+                        option_id: "allow_always".to_owned(),
+                    },
+                    connection,
+                )
+            }
+        }
 
         /// An engine that answers `edit` — parseable as a judgment category, as
         /// a session title, and as a finished turn — and remembers every prompt.
@@ -29890,6 +30073,27 @@ provider_id = \"deepseek\"
                 &session_id,
                 discover(None, &probed.path, probed.view.kind, &RealFs),
             );
+            // The session's own gate, wired to a client that answers — REQ-589
+            // ADR-10's acknowledgment is put to the connection that typed the
+            // name, and a turn nobody can be asked about does not expand.
+            let pending = Arc::clone(runtime.pending());
+            runtime
+                .session_gates
+                .lock()
+                .expect("session gate mutex poisoned")
+                .insert(
+                    session_id.clone(),
+                    Arc::new(
+                        PermissionGate::new(
+                            session_id.clone(),
+                            PermissionConfig::default(),
+                            Arc::clone(&events),
+                            Arc::clone(&pending),
+                        )
+                        .with_addressed_delivery(Arc::new(AllowsEverything(Arc::clone(&pending)))),
+                    ),
+                );
+            let conn = GrantRegistry::new().next_connection_id();
 
             runtime
                 .run_prompt_turn(
@@ -29904,7 +30108,7 @@ provider_id = \"deepseek\"
                         name: "marked".to_owned(),
                         raw_arguments: String::new(),
                     }),
-                    None,
+                    Some(conn),
                     ClientPresence::unwatched(),
                 )
                 .await
@@ -29936,6 +30140,546 @@ provider_id = \"deepseek\"
                 title.contains(MARKER),
                 "the naming attempt was handed the empty typed prompt — the session \
                  would carry a name derived from nothing for its whole life: {title}"
+            );
+
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+    }
+
+    /// REQ-589 BR-6 / ADR-10 / D-10 — the acknowledgment the user-typed `/name`
+    /// path did not have.
+    ///
+    /// REQ-585 BR-4's question had exactly one production caller, the model's
+    /// `skill` tool. `accept_invocation` was a synchronous `fn` whose only check
+    /// was name validity, so a user who typed the name of a **project**-authored
+    /// skill ran its body with nothing asked — and nothing was red, because no
+    /// test can assert the absence of a gate nobody had written yet
+    /// (LESSON-508's shape). These are that gate's witnesses.
+    ///
+    /// The gate lives behind a private `session_gates`, so they have to be
+    /// in-crate, exactly as `cd_sheds_what_the_root_gave_meaning_to` below does.
+    mod a_typed_project_skill_is_acknowledged_first {
+        use super::*;
+        use crate::grants::GrantRegistry;
+        use crate::harness::permissions::{AddressedPermissionDelivery, PermissionConfig};
+        use crate::harness::tools::skill::SkillTool;
+        use crate::sessions::SessionRegistry;
+        use crate::skills::{discover, RealFs};
+        use teton_protocol::events::{PermissionOptionKind, PermissionRequest, PermissionSubject};
+        use teton_protocol::methods::{PermissionOutcome, SkillInvocation};
+
+        /// A body marker no other fixture in this crate uses, so a prompt
+        /// carrying it can only have come from this expansion.
+        const MARKER: &str = "SKILLBODYMARKER-248";
+
+        /// A client that records every prompt it is shown, in order, and answers
+        /// each with the option of one kind.
+        ///
+        /// The recording is half the point: "which questions were asked, and in
+        /// what order" is what BR-6 is a rule about, and a fixture that only
+        /// answered could not say whether a second question was ever put.
+        struct Client {
+            pending: Arc<PendingPermissions>,
+            answer: PermissionOptionKind,
+            asked: Mutex<Vec<PermissionRequest>>,
+        }
+
+        impl Client {
+            fn answering(
+                pending: &Arc<PendingPermissions>,
+                answer: PermissionOptionKind,
+            ) -> Arc<Self> {
+                Arc::new(Self {
+                    pending: Arc::clone(pending),
+                    answer,
+                    asked: Mutex::new(Vec::new()),
+                })
+            }
+
+            /// Every subject put in front of this client, in the order the
+            /// daemon asked.
+            fn subjects(&self) -> Vec<Option<PermissionSubject>> {
+                self.asked
+                    .lock()
+                    .expect("asked mutex poisoned")
+                    .iter()
+                    .map(|request| request.subject.clone())
+                    .collect()
+            }
+
+            fn trust_questions(&self) -> usize {
+                self.subjects()
+                    .iter()
+                    .filter(|subject| {
+                        matches!(subject, Some(PermissionSubject::ProjectSkillTrust { .. }))
+                    })
+                    .count()
+            }
+        }
+
+        impl AddressedPermissionDelivery for Client {
+            fn deliver(
+                &self,
+                connection: ConnectionId,
+                _session_id: &SessionId,
+                request: PermissionRequest,
+            ) -> bool {
+                self.asked
+                    .lock()
+                    .expect("asked mutex poisoned")
+                    .push(request.clone());
+                let option = request
+                    .options
+                    .iter()
+                    .find(|option| option.kind == self.answer)
+                    .unwrap_or_else(|| {
+                        panic!(
+                            "the prompt offered no {:?}: {:?}",
+                            self.answer, request.options
+                        )
+                    });
+                // `resolve_from`, exactly as `permission/respond` does: an
+                // addressed waiter is answerable only by the connection it was
+                // addressed to (REQ-585 ADR-7), so a fixture answering
+                // anonymously would be refused — the guard working, not a mock
+                // detail.
+                self.pending.resolve_from(
+                    &request.request_id,
+                    PermissionOutcome::Selected {
+                        option_id: option.option_id.clone(),
+                    },
+                    connection,
+                )
+            }
+        }
+
+        /// An engine that answers `edit` — parseable as a judgment category, as
+        /// a session title and as a finished turn — and remembers every prompt.
+        ///
+        /// What it remembers is the load-bearing part: a turn refused at the
+        /// acknowledgment must have handed it **nothing**, which is what makes
+        /// "before the route, and therefore before Stage A" an assertion rather
+        /// than a reading of the source.
+        #[derive(Clone)]
+        struct Recorder(Arc<Mutex<Vec<String>>>);
+
+        impl Recorder {
+            fn new() -> Self {
+                Self(Arc::new(Mutex::new(Vec::new())))
+            }
+
+            fn prompts(&self) -> Vec<String> {
+                self.0.lock().expect("recorder mutex poisoned").clone()
+            }
+        }
+
+        impl Engine for Recorder {
+            fn model_id(&self) -> &str {
+                "recording"
+            }
+
+            fn complete(
+                &self,
+                prompt: &str,
+                _params: &GenParams,
+                _on_token: &mut dyn FnMut(&str) -> bool,
+            ) -> Result<Completion, EngineError> {
+                self.0
+                    .lock()
+                    .expect("recorder mutex poisoned")
+                    .push(prompt.to_owned());
+                Ok(Completion::cold("edit".to_owned(), 0, 1))
+            }
+        }
+
+        /// A runtime whose local tier is this recorder — capability backed by a
+        /// fact, because a `Ready` outcome re-derives `local_available` from the
+        /// slot's own state.
+        fn runtime_with(engine: &Recorder) -> Arc<DaemonRuntime> {
+            let slot = EngineSlot::empty();
+            slot.install(
+                "recording".to_owned(),
+                Arc::new(Mutex::new(engine.clone())) as Arc<Mutex<dyn Engine>>,
+            );
+            Arc::new(DaemonRuntime {
+                engine: slot,
+                local_available: AtomicBool::new(true),
+                ..DaemonRuntime::minimal()
+            })
+        }
+
+        /// The session's own gate, wired to `client` and installed where
+        /// `permission_gate_for` looks — so the turn asks *this* client.
+        fn install_gate(
+            runtime: &Arc<DaemonRuntime>,
+            events: &Arc<EventBus>,
+            session_id: &SessionId,
+            client: Arc<Client>,
+        ) -> Arc<PermissionGate> {
+            let gate = Arc::new(
+                PermissionGate::new(
+                    session_id.clone(),
+                    PermissionConfig::default(),
+                    Arc::clone(events),
+                    Arc::clone(runtime.pending()),
+                )
+                .with_addressed_delivery(client),
+            );
+            runtime
+                .session_gates
+                .lock()
+                .expect("session gate mutex poisoned")
+                .insert(session_id.clone(), Arc::clone(&gate));
+            gate
+        }
+
+        /// A repository root carrying one project skill, `.claude/skills/<name>`.
+        fn project_root(tag: &str, name: &str) -> PathBuf {
+            let dir = scratch_dir(tag);
+            std::fs::create_dir_all(dir.join(format!(".claude/skills/{name}"))).unwrap();
+            std::fs::write(dir.join("Cargo.toml"), "[package]\n").unwrap();
+            std::fs::write(
+                dir.join(format!(".claude/skills/{name}/SKILL.md")),
+                format!("---\ndescription: {name}\n---\n\nPlease handle {MARKER} now.\n"),
+            )
+            .unwrap();
+            dir
+        }
+
+        /// A home carrying one user skill, `~/.claude/skills/<name>`.
+        fn user_home(tag: &str, name: &str) -> PathBuf {
+            let home = scratch_dir(tag);
+            std::fs::create_dir_all(home.join(format!(".claude/skills/{name}"))).unwrap();
+            std::fs::write(
+                home.join(format!(".claude/skills/{name}/SKILL.md")),
+                format!("---\ndescription: {name}\n---\n\nPlease handle {MARKER} now.\n"),
+            )
+            .unwrap();
+            home
+        }
+
+        /// **AC-9's two halves in one turn.** A typed project skill raises the
+        /// trust question, and a declined answer ends the turn *there*: the
+        /// refusal is the trust refusal, no budget question is ever put, and the
+        /// engine — the classifier, the naming attempt and the turn itself —
+        /// was handed nothing.
+        ///
+        /// The empty prompt list is what makes this an ordering assertion rather
+        /// than a sentence check. The classifier runs **before** Stage A, so an
+        /// engine that saw no classifier call cannot have reached a route, let
+        /// alone the budget measured against one. Reversing the two questions
+        /// would show up here as a prompt list that is not empty.
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn declining_the_repository_refuses_the_turn_and_asks_no_budget_question() {
+            let dir = project_root("trust-declined", "marked");
+            let engine = Recorder::new();
+            let runtime = runtime_with(&engine);
+            let events = Arc::new(EventBus::new());
+            let sessions = SessionRegistry::new();
+            let session_id = sessions
+                .create(SessionMode::Freeform, None, Some(dir.clone()))
+                .expect("a freeform session")
+                .session_id;
+            let probed = runtime.session_root_for(Some(&dir));
+            sessions.set_skills(
+                &session_id,
+                discover(None, &probed.path, probed.view.kind, &RealFs),
+            );
+            let client = Client::answering(runtime.pending(), PermissionOptionKind::RejectOnce);
+            install_gate(&runtime, &events, &session_id, Arc::clone(&client));
+            let conn = GrantRegistry::new().next_connection_id();
+
+            let err = runtime
+                .run_prompt_turn(
+                    &events,
+                    &sessions,
+                    session_id,
+                    SessionMode::Freeform,
+                    None,
+                    Some(dir.clone()),
+                    String::new(),
+                    Some(SkillInvocation {
+                        name: "marked".to_owned(),
+                        raw_arguments: String::new(),
+                    }),
+                    Some(conn),
+                    ClientPresence::unwatched(),
+                )
+                .await
+                .expect_err("a declined repository does not run its skill");
+
+            assert_eq!(
+                err.code,
+                error_code::CONSENT_DENIED,
+                "a declined acknowledgment must not surface as a generic turn \
+                 failure (LESSON-456): {err:?}"
+            );
+            assert!(
+                err.message.contains("this repository") && err.message.contains("you declined it"),
+                "the refusal must name what was refused and why: {}",
+                err.message
+            );
+            assert!(
+                !err.message
+                    .contains("does not fit this route's context budget"),
+                "BR-6: a declined trust yields the trust refusal, never a budget \
+                 sentence — the budget question was not the one that was answered: {}",
+                err.message
+            );
+
+            assert_eq!(
+                client.trust_questions(),
+                1,
+                "exactly one acknowledgment, and it is the only question this turn \
+                 put: {:?}",
+                client.subjects()
+            );
+            assert_eq!(
+                client.subjects().len(),
+                1,
+                "no second question — an over-budget offer put *after* a declined \
+                 trust is the ordering BR-6 forbids: {:?}",
+                client.subjects()
+            );
+            assert!(
+                engine.prompts().is_empty(),
+                "the turn reached the engine: the classifier runs before Stage A, so \
+                 a prompt here means the acknowledgment was asked too late — {} \
+                 prompts",
+                engine.prompts().len()
+            );
+
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+
+        /// **A user-authored skill raises no trust question — the current order
+        /// stands.** BR-4's question is about *repository* text reaching the
+        /// model labelled instructions; a file the user installed themselves in
+        /// `~/.claude/skills` is not that, and asking about it would be a prompt
+        /// on every `/name` a user ever typed.
+        ///
+        /// The falsifier is the client's answer: it says **yes** to whatever it
+        /// is shown, so a trust question raised here would be answered and the
+        /// turn would still succeed. Only the subject list can tell.
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn a_user_authored_skill_raises_no_trust_question() {
+            let home = user_home("trust-user-home", "mine");
+            let dir = scratch_dir("trust-user-root");
+            std::fs::create_dir_all(&dir).unwrap();
+            let engine = Recorder::new();
+            let runtime = runtime_with(&engine);
+            let events = Arc::new(EventBus::new());
+            let sessions = SessionRegistry::new();
+            let session_id = sessions
+                .create(SessionMode::Freeform, None, Some(dir.clone()))
+                .expect("a freeform session")
+                .session_id;
+            let probed = runtime.session_root_for(Some(&dir));
+            // `home` is the fixture's, so the one registered row is the user
+            // skill written above and not whatever `~/.claude/skills` the runner
+            // happens to have.
+            sessions.set_skills(
+                &session_id,
+                discover(Some(&home), &probed.path, probed.view.kind, &RealFs),
+            );
+            let client = Client::answering(runtime.pending(), PermissionOptionKind::AllowAlways);
+            install_gate(&runtime, &events, &session_id, Arc::clone(&client));
+            let conn = GrantRegistry::new().next_connection_id();
+
+            runtime
+                .run_prompt_turn(
+                    &events,
+                    &sessions,
+                    session_id,
+                    SessionMode::Freeform,
+                    None,
+                    Some(dir.clone()),
+                    String::new(),
+                    Some(SkillInvocation {
+                        name: "mine".to_owned(),
+                        raw_arguments: String::new(),
+                    }),
+                    Some(conn),
+                    ClientPresence::unwatched(),
+                )
+                .await
+                .expect("a user skill runs on the local tier");
+
+            assert_eq!(
+                client.trust_questions(),
+                0,
+                "a user-authored skill asked its own installer whether they trust \
+                 themselves: {:?}",
+                client.subjects()
+            );
+            assert!(
+                engine
+                    .prompts()
+                    .iter()
+                    .any(|prompt| prompt.contains(MARKER)),
+                "the user skill did not expand at all, so the assertion above is \
+                 about a turn that never happened"
+            );
+
+            let _ = std::fs::remove_dir_all(&home);
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+
+        /// **AC-5's paired assertion: the model path's acknowledgment is
+        /// unchanged, and it is the same one.**
+        ///
+        /// The typed path answers "allow for this session"; the model's `skill`
+        /// tool then invokes the same skill under the same root and is **not**
+        /// asked again. That holds only if both doors mint one key from one root
+        /// — which is the property `authorize_project_skill_trust`'s own
+        /// `debug_assert` states and the reason ADR-10 said to reuse the gate
+        /// verbatim rather than mint a key family for the typed path.
+        ///
+        /// A second prompt here would mean a user answering the same question
+        /// twice for one repository in one session; a *missing* first prompt
+        /// would mean the typed path had gone back to running project bodies
+        /// unasked.
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn one_answer_settles_the_typed_door_and_the_model_door() {
+            let dir = project_root("trust-paired", "marked");
+            let engine = Recorder::new();
+            let runtime = runtime_with(&engine);
+            let events = Arc::new(EventBus::new());
+            let sessions = SessionRegistry::new();
+            let session_id = sessions
+                .create(SessionMode::Freeform, None, Some(dir.clone()))
+                .expect("a freeform session")
+                .session_id;
+            let probed = runtime.session_root_for(Some(&dir));
+            sessions.set_skills(
+                &session_id,
+                discover(None, &probed.path, probed.view.kind, &RealFs),
+            );
+            let client = Client::answering(runtime.pending(), PermissionOptionKind::AllowAlways);
+            let gate = install_gate(&runtime, &events, &session_id, Arc::clone(&client));
+            let conn = GrantRegistry::new().next_connection_id();
+
+            runtime
+                .run_prompt_turn(
+                    &events,
+                    &sessions,
+                    session_id.clone(),
+                    SessionMode::Freeform,
+                    None,
+                    Some(dir.clone()),
+                    String::new(),
+                    Some(SkillInvocation {
+                        name: "marked".to_owned(),
+                        raw_arguments: String::new(),
+                    }),
+                    Some(conn),
+                    ClientPresence::unwatched(),
+                )
+                .await
+                .expect("an acknowledged repository runs its skill");
+            assert_eq!(
+                client.trust_questions(),
+                1,
+                "the typed path asked nothing: {:?}",
+                client.subjects()
+            );
+
+            // The model's door, over the same registry snapshot, the same gate
+            // and the same root.
+            let tool = SkillTool::new(
+                sessions.skills(&session_id),
+                gate,
+                Some(conn),
+                tokio::runtime::Handle::current(),
+                5_000,
+            );
+            let outcome = tool
+                .invoke(
+                    &ToolContext::for_root(&probed),
+                    &serde_json::json!({ "name": "marked" }),
+                )
+                .await;
+
+            assert!(
+                !outcome.is_error,
+                "the model path was refused after the user had already acknowledged \
+                 this repository — the two doors are minting different keys: {}",
+                outcome.content
+            );
+            assert_eq!(
+                client.trust_questions(),
+                1,
+                "the model path asked a second time for one root in one session: {:?}",
+                client.subjects()
+            );
+
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+
+        /// **A caller with no connection is refused, not admitted.** `None` is
+        /// an internal driver or a fixture, and the question cannot be *put* to
+        /// anyone — which is the gate's own fail-closed answer
+        /// (`SkillConsent::Unanswerable`), spelled with the gate's word rather
+        /// than a second one.
+        ///
+        /// The trap this pins is the tempting one: an `Option` that falls
+        /// through to "no question, so proceed" would leave every non-client
+        /// caller running project bodies unasked, and would look exactly like a
+        /// passing suite.
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn a_turn_nobody_can_be_asked_about_does_not_expand() {
+            let dir = project_root("trust-no-terminal", "marked");
+            let engine = Recorder::new();
+            let runtime = runtime_with(&engine);
+            let events = Arc::new(EventBus::new());
+            let sessions = SessionRegistry::new();
+            let session_id = sessions
+                .create(SessionMode::Freeform, None, Some(dir.clone()))
+                .expect("a freeform session")
+                .session_id;
+            let probed = runtime.session_root_for(Some(&dir));
+            sessions.set_skills(
+                &session_id,
+                discover(None, &probed.path, probed.view.kind, &RealFs),
+            );
+            let client = Client::answering(runtime.pending(), PermissionOptionKind::AllowAlways);
+            install_gate(&runtime, &events, &session_id, Arc::clone(&client));
+
+            let err = runtime
+                .run_prompt_turn(
+                    &events,
+                    &sessions,
+                    session_id,
+                    SessionMode::Freeform,
+                    None,
+                    Some(dir.clone()),
+                    String::new(),
+                    Some(SkillInvocation {
+                        name: "marked".to_owned(),
+                        raw_arguments: String::new(),
+                    }),
+                    None,
+                    ClientPresence::unwatched(),
+                )
+                .await
+                .expect_err("an unaddressable caller cannot acknowledge anything");
+
+            assert_eq!(err.code, error_code::CONSENT_DENIED, "{err:?}");
+            assert!(
+                err.message.contains("no client to ask"),
+                "the refusal must say nobody could be asked, which is not the same \
+                 fact as a decline (REQ-585 AC-9): {}",
+                err.message
+            );
+            assert!(
+                client.subjects().is_empty(),
+                "a question was put to a client this turn never had: {:?}",
+                client.subjects()
+            );
+            assert!(
+                engine.prompts().is_empty(),
+                "the turn ran anyway: {} prompts",
+                engine.prompts().len()
             );
 
             let _ = std::fs::remove_dir_all(&dir);
