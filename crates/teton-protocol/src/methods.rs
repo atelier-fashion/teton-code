@@ -811,6 +811,63 @@ impl RpcMethod for SkillsListParams {
     type Result = SkillsListResult;
 }
 
+/// Ask which of a session's skills will not fit on the route it is on
+/// (REQ-589 BR-13, ADR-11).
+///
+/// `skills/list`'s sibling, and the split is the question rather than the data:
+/// that one reports the registry, this one reports a **measurement** of the
+/// registry against the session's stamped route budget. They are two methods
+/// because a `/help` listing must not pay for a measurement, and because a
+/// daemon may have the first and not the second — the capability is proven by a
+/// successful call here exactly as it is there, so neither
+/// [`crate::PROTOCOL_VERSION`] nor [`crate::PROTOCOL_VERSION_MIN`] moves for
+/// this addition and a client whose daemon answers
+/// [`crate::jsonrpc::error_code::METHOD_NOT_FOUND`] reports a pending
+/// capability rather than an error.
+///
+/// It carries a `session_id` for `skills/list`'s reason — half the answer comes
+/// from the session root, which moves under `/cd` — and the route half comes
+/// from the same session's stamped budget.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SkillsPreflightParams {
+    /// The session whose registry and stamped route to report on.
+    pub session_id: SessionId,
+    /// Whether the asking surface is in `/verbose` (REQ-589 AC-19).
+    ///
+    /// The count of skills that will not fit is reported either way; this is
+    /// what adds the route's budget and bound beside it. It rides in the
+    /// **params** rather than being applied client-side because the side that
+    /// holds the budget is the side that words it — a client formatting the
+    /// pair itself would be a second spelling of a figure the daemon already
+    /// composes (LESSON-456).
+    ///
+    /// `#[serde(default)]` so a caller that omits it means "not verbose",
+    /// which is what every pre-REQ-589 surface meant.
+    #[serde(default)]
+    pub verbose: bool,
+}
+
+/// Result of [`SkillsPreflightParams`] — the pre-flight answer, already
+/// composed.
+///
+/// **Rendered text, not rows**, on [`ProjectsListResult`]'s precedent and for
+/// its reason, with one addition specific to this REQ: every figure in the
+/// report comes out of the daemon's one skill-budget composer, measured against
+/// the budget the router stamped. Shipping rows would invite a client to build
+/// a second sentence from them, and a surface naming a budget the turn was not
+/// running under is precisely the defect REQ-586's verify pass found. The CLI
+/// may style what it is given; it does not restate it.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SkillsPreflightResult {
+    /// The report, one fact per line.
+    pub rendered: String,
+}
+
+impl RpcMethod for SkillsPreflightParams {
+    const METHOD: &'static str = "skills/preflight";
+    type Result = SkillsPreflightResult;
+}
+
 // ---------------------------------------------------------------------------
 // prompt turn
 // ---------------------------------------------------------------------------
