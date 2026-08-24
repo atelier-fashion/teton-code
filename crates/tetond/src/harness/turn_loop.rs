@@ -4672,7 +4672,9 @@ mod tests {
             "the guide has {} lines that mention asking, and exactly one may: the \
              prohibition. If a new sentence legitimately needs the word, it is a decision \
              — make it here, deliberately, rather than letting a second instruction about \
-             asking for a credential arrive unnoticed.\nlines: {asking:?}",
+             asking for a credential arrive unnoticed. REQ-589's permission-memory fact \
+             is the sentence that came closest and did not spend it: it says \"the next \
+             turn prompts again\" precisely so this stays at one.\nlines: {asking:?}",
             asking.len()
         );
         assert_eq!(
@@ -4831,6 +4833,169 @@ mod tests {
                 system.contains(line),
                 "the capability fact is in self_config.md but not in the built system \
                  prompt for {config:?}"
+            );
+        }
+    }
+
+    /// **REQ-589 BR-14.2 / BR-10: an approval is never remembered; an
+    /// observation is.**
+    ///
+    /// TASK-246 gave the session a memo of the window rejections the daemon has
+    /// actually seen, so the next offer for the same skill on the same route
+    /// leads with what happened last time. It is deliberately **not** a stored
+    /// consent — BR-10 holds, and every over-budget send is authorized for the
+    /// one invocation that asked. Those two facts sit one word apart, and a
+    /// model with neither of them resident answers "do you remember that I said
+    /// yes?" from whatever it can see, which is LESSON-543's failure with a new
+    /// subject: the memo exists, the model can tell the memo exists, and the
+    /// wrong inference from that is that the *approval* was kept.
+    ///
+    /// What is pinned, and why in parts rather than by whole-line equality: the
+    /// sentence carries three claims across five needles, and a later REQ that
+    /// re-words it must fail on the claim it dropped rather than on a diff a
+    /// reader has to spot the difference in (LESSON-543's amendment rule, the
+    /// posture `the_system_prompt_states_what_the_session_can_run_and_from_where`
+    /// arrived at). This one *will* be re-worded — BR-7's durable remedy means
+    /// a route that was refused stops being refused — so the needles are the
+    /// short semantic cores, not the prose around them.
+    ///
+    /// 1. **`never remembers`** — the BR-10 half. Without it the guide says
+    ///    only that Teton has a memory, and the memory it names is a refusal.
+    /// 2. **`one turn only`** — the scope that makes an approval not a consent.
+    ///    A grant with no stated end is a grant a model will describe as
+    ///    standing.
+    /// 3. **`observed`** — the BR-14.2 half, and the word the distinction turns
+    ///    on: what is recorded is a measurement the daemon watched happen, not
+    ///    an authorization a user gave.
+    /// 4. **`same route`** — the observation is route-scoped (ADR-9: raising the
+    ///    window makes it a different route). Dropped, the model generalizes one
+    ///    provider's refusal into a property of the skill.
+    /// 5. **`Never say you remember an approval`** — the negative half, asserted
+    ///    on its own exactly as BUG-181's "loads nothing from" was. LESSON-543's
+    ///    rule is that a self-fact names the negative space and not only the
+    ///    roster; the roster half here ("it does remember observations") is the
+    ///    half that invites the false claim, so the prohibition travels with it
+    ///    or the sentence is worse than silence.
+    ///
+    /// Order is asserted too, for the reason REQ-579's live A/B established
+    /// about this file: what the model reads first is what frames the rest. The
+    /// line leads with the rule and names the memory second, so a model reading
+    /// left to right cannot reach "it does remember" before "never remembers".
+    ///
+    /// **The word `ask` is deliberately absent from this sentence.** The guide
+    /// is allowed exactly one line that mentions asking — the credential
+    /// prohibition, guarded in
+    /// `the_system_prompt_forbids_asking_for_a_credential_in_the_conversation`
+    /// — so "the next turn prompts again" says what "asks again" would. A later
+    /// re-wording that reaches for the natural word will redden that test with a
+    /// message about credentials; the fix is either a different word here or a
+    /// deliberate amendment there, never a deleted guard.
+    #[test]
+    fn the_system_prompt_states_that_an_approval_is_never_remembered() {
+        let memory: Vec<&str> = SELF_CONFIG_GUIDE
+            .lines()
+            .filter(|line| line.to_ascii_lowercase().contains("remember"))
+            .collect();
+        assert_eq!(
+            memory.len(),
+            1,
+            "the guide has {} lines about what Teton remembers, and exactly one may. A \
+             second sentence on the subject is how the file comes to say both that an \
+             approval is kept and that it is not — and whole-line pins cannot catch a \
+             contradiction added elsewhere (the hole the credential prohibition's own \
+             test documents). Fold it into the one line, or amend this test on \
+             purpose.\nlines: {memory:?}",
+            memory.len()
+        );
+        let line = memory[0];
+
+        for (needle, claim) in [
+            (
+                "never remembers",
+                "that a permission answer is not carried forward at all (BR-10). Without \
+                 it the guide names a memory and never says what is kept out of it",
+            ),
+            (
+                "one turn only",
+                "the scope of an approval. A grant with no stated end is one a model \
+                 will describe as standing, which is the false self-account this fact \
+                 exists to prevent",
+            ),
+            (
+                "observed",
+                "that what IS remembered is a measurement the daemon watched happen, not \
+                 an authorization a user gave (BR-14.2). That one word is the whole \
+                 distinction between the memo and a stored consent",
+            ),
+            (
+                "same route",
+                "that the observation is scoped to the route it was made on (ADR-9 — \
+                 raising the window makes it a different route). Dropped, the model \
+                 turns one provider's refusal into a property of the skill",
+            ),
+        ] {
+            assert!(
+                line.contains(needle),
+                "the permission-memory fact no longer says `{needle}`, so it no longer \
+                 states {claim}. If the wording changed deliberately, re-word this needle \
+                 with the sentence — deleting it is never the fix (LESSON-543).\n\
+                 line: {line}"
+            );
+        }
+
+        // The negative half, on its own. The roster half above ("it does
+        // remember what it observed") is precisely what invites a model to
+        // claim it remembers the approval too, so the prohibition is not a
+        // flourish on the end of the sentence — it is the clause that makes the
+        // rest safe to state.
+        assert!(
+            line.contains("Never say you remember an approval"),
+            "the permission-memory fact no longer forbids claiming a remembered \
+             approval. LESSON-543's rule is that a self-fact names the negative space \
+             and not only the roster: a sentence that says Teton keeps observations, \
+             with no sentence saying it keeps no approvals, is the half that gets \
+             generalized.\nline: {line}"
+        );
+
+        // Order inside the line, the assertion this file already makes about
+        // the prohibition and about step 1 (REQ-579 A1–A3: the model follows
+        // what it reads first). The rule leads; the memory is named second.
+        let rule = line
+            .find("never remembers")
+            .expect("the rule clause is present");
+        let memo = line
+            .find("observed")
+            .expect("the observation clause is present");
+        assert!(
+            rule < memo,
+            "the fact names what Teton remembers before it says an approval is not part \
+             of it, so a model reading top-down meets the memory first (BR-10 second). \
+             Order is the assertion here, as it is for step 1.\nline: {line}"
+        );
+
+        // Before the first numbered step, for the same reason the capability
+        // fact is: what precedes the recipes frames them.
+        let step_one = SELF_CONFIG_GUIDE
+            .find("\n1. ")
+            .expect("the guide has a numbered step 1");
+        let fact_at = SELF_CONFIG_GUIDE
+            .find(line)
+            .expect("the permission-memory line is in the guide");
+        assert!(
+            fact_at < step_one,
+            "the permission-memory fact moved below step 1; it has to frame the steps, \
+             not trail them.\nfact at {fact_at}, step 1 at {step_one}"
+        );
+
+        // Resident, in both harness shapes: a fact in the file the builder
+        // dropped passes every assertion above and still leaves the model with
+        // nothing to answer from.
+        for config in [HarnessConfig::default(), HarnessConfig::for_strong_model()] {
+            let system = build_system_prompt(&ToolRegistry::with_builtins(), &config);
+            assert!(
+                system.contains(line),
+                "the permission-memory fact is in self_config.md but not in the built \
+                 system prompt for {config:?}"
             );
         }
     }
