@@ -185,6 +185,28 @@ struct ProviderRuntime {
     health: ProviderHealth,
 }
 
+/// One configured **remote** provider, as an offer that must name a provider
+/// sees it (REQ-589 ADR-12).
+///
+/// Both fields are owned rather than borrowed from the router, because the
+/// surface that reads this list holds it across a consent prompt — an `await`
+/// on a human — and a borrow of the router would not survive that.
+///
+/// The two facts are the two an offer needs and no more: the **id** is what a
+/// tier binding names and what the user typed into `[[providers]]`, and the
+/// **model** is what a window proposal is looked up by
+/// ([`recipe_for_model`](crate::provider_recipes::recipe_for_model), ADR-6
+/// rule 1 — ids are the user's namespace, so Kimi registered as `work-model`
+/// must still get Kimi's window and a provider merely *called* `anthropic`
+/// must not get Anthropic's).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RemoteProvider {
+    /// The id the provider is configured and bound under.
+    pub id: String,
+    /// The concrete model it bills — the key a vendor recipe is found by.
+    pub model: String,
+}
+
 /// One resolved routing decision: the selected provider, a legible reason, and
 /// the harness profile the turn runs under (BR-6 degradation applied).
 ///
@@ -615,6 +637,59 @@ impl Router {
     #[must_use]
     pub fn default_provider(&self) -> Option<&str> {
         self.default_provider.as_deref()
+    }
+
+    /// Every configured remote provider, in id order (REQ-589 ADR-12).
+    ///
+    /// # What it is for
+    ///
+    /// BR-9's `BindTierRemote` remedy has to name a provider to bind a tier to,
+    /// and D-9 authorized *performing* that remedy — not choosing where a whole
+    /// category's spend goes. ADR-12 splits the difference on the count this
+    /// returns: **exactly one** configured remote may be proposed by name, and
+    /// **two or more** are presented as a choice rather than picked silently.
+    /// Zero is a real answer too, and the honest one — there is no remote to
+    /// bind to, and the offer says so instead of inventing a candidate.
+    ///
+    /// The count is `.len()` on the result. There is deliberately no separate
+    /// counting accessor beside this: two ways to say one fact is LESSON-545's
+    /// shape, and a count that could disagree with the list it summarizes is
+    /// exactly the disagreement the single representation rules out.
+    ///
+    /// # What "remote" means here, and what it does not
+    ///
+    /// * **Not local.** Local-ness is classified from
+    ///   [`CategoryTable::local_provider_id`], never from "its capabilities look
+    ///   like the default" and never from [`ProviderKind`] (BR-8, gotcha #9):
+    ///   the local tier's engine belongs to the daemon rather than to a
+    ///   `[[providers]]` entry, so it is normally absent from the map — but it
+    ///   is not *guaranteed* absent, which is why the filter is explicit rather
+    ///   than implied by iteration.
+    /// * **Configured, which already means routable.** `build_router` skips a
+    ///   remote provider that declares no `model` (REQ-557 ADR-E), so map
+    ///   membership *is* the usability check `Router::is_routable` reads, and
+    ///   every entry here has a model for a recipe lookup to key on.
+    /// * **Not screened on health.** A provider that is unavailable right now is
+    ///   still configured, and this list feeds a **config write**, not a routing
+    ///   decision. Filtering on health would make the same offer name different
+    ///   providers on two consecutive prompts, and would hide the user's own
+    ///   provider from them because it happened to be down while they were
+    ///   being asked about it.
+    ///
+    /// Order is the `BTreeMap`'s — lexicographic by id, and stable across
+    /// prompts for that reason. An offer that renumbered its choices between
+    /// two renders of the same question would be a consent surface whose
+    /// options moved under the answer.
+    #[must_use]
+    pub fn remote_providers(&self) -> Vec<RemoteProvider> {
+        self.providers
+            .iter()
+            .filter(|(id, _)| !self.is_local_tier(id))
+            .map(|(id, runtime)| RemoteProvider {
+                id: id.clone(),
+                model: runtime.model.clone(),
+            })
+            .collect()
     }
 
     /// Set whether the local tier can meet its BR-8 latency duty (false when it is
@@ -2983,6 +3058,104 @@ mod tests {
         assert_eq!(
             to_protocol_failure_class(FailureClass::Timeout),
             ProtoFailureClass::Timeout
+        );
+    }
+
+    /// **The provider enumeration BR-9's remedy is chosen from** (REQ-589
+    /// ADR-12).
+    ///
+    /// Three claims, and each is a way the remedy goes wrong without it:
+    ///
+    /// * **The local tier is never a candidate.** Binding a tier to the engine
+    ///   the route is already on is the circle the reported `/analyze` failure
+    ///   was sitting in. The filter reads
+    ///   [`CategoryTable::local_provider_id`] rather than the map's shape or a
+    ///   [`ProviderKind`] (gotcha #9), so the local provider is registered here
+    ///   *with* a `[[providers]]`-style entry — the case a membership test would
+    ///   let through — and it must still not appear.
+    /// * **The count is what ADR-12 keys on.** One configured remote may be
+    ///   proposed by name; two or more are a choice; zero is a real answer that
+    ///   the offer states rather than papers over.
+    /// * **The model travels with the id.** The window a `BindTierRemote`
+    ///   remedy declares is looked up by *model* (ADR-6 rule 1), so a list of
+    ///   bare ids would send the caller back to the router — or, worse, to the
+    ///   id — for the key.
+    ///
+    /// Health is deliberately not screened: a provider that is down right now is
+    /// still configured, this list feeds a config write rather than a routing
+    /// decision, and an offer whose options moved between two renders of the
+    /// same question would be a consent surface that changed under the answer.
+    #[test]
+    fn remote_providers_lists_every_configured_remote_and_never_the_local_tier() {
+        let empty = Router::new(CategoryTable::new().with_local_provider("on-device"), None);
+        assert!(
+            empty.remote_providers().is_empty(),
+            "no remote is configured, so BR-9's remedy has nothing to bind to and the offer has \
+             to say so"
+        );
+
+        let one = empty.clone().with_provider(
+            "kimi",
+            ProviderKind::OpenaiCompatible,
+            "kimi-k3",
+            native(),
+            ProviderHealth::Healthy,
+        );
+        assert_eq!(
+            one.remote_providers(),
+            vec![RemoteProvider {
+                id: "kimi".to_owned(),
+                model: "kimi-k3".to_owned(),
+            }],
+            "exactly one configured remote — ADR-12's proposed-by-name case"
+        );
+
+        let many = one
+            .with_provider(
+                "anthropic",
+                ProviderKind::Anthropic,
+                "claude-opus-5",
+                native(),
+                // Down right now, and still a provider the user configured and
+                // may want their `think` tier bound to.
+                ProviderHealth::Unavailable,
+            )
+            .with_provider(
+                // The local tier, registered in the map as well, under an
+                // openai-compatible kind and a declared window — which is how
+                // a served local endpoint is actually configured. Every
+                // *other* way of asking "is this local?" answers wrong here:
+                // map membership says remote, `ProviderKind` says remote, and
+                // "its capabilities look defaulted" says remote. Only
+                // `local_provider_id` says local, which is the point (gotcha
+                // #9).
+                "on-device",
+                ProviderKind::OpenaiCompatible,
+                "qwen3-8b",
+                native(),
+                ProviderHealth::Healthy,
+            );
+        assert_eq!(
+            many.remote_providers(),
+            vec![
+                RemoteProvider {
+                    id: "anthropic".to_owned(),
+                    model: "claude-opus-5".to_owned(),
+                },
+                RemoteProvider {
+                    id: "kimi".to_owned(),
+                    model: "kimi-k3".to_owned(),
+                },
+            ],
+            "two or more configured remotes are a choice, in stable id order, and the local tier \
+             is not among them however it got into the map"
+        );
+        assert!(
+            !many
+                .remote_providers()
+                .iter()
+                .any(|provider| provider.id == "on-device"),
+            "the tier a local-engine route would be leaving is never the tier's new home"
         );
     }
 }

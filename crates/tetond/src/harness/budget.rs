@@ -82,7 +82,8 @@
 //! path is not dead code. What this module does not have is a proof over a
 //! mixture, and it does not claim one.
 
-use teton_protocol::events::{bytes_figure, thousands, BudgetBound};
+use teton_core::Tier;
+use teton_protocol::events::{bytes_figure, thousands, BudgetBound, RemedyKind, WindowVerdict};
 use teton_providers::capability::NATIVE_MAX_ITERATIONS;
 
 use super::context::{ContextManager, Fit, APPROX_BYTES_PER_TOKEN};
@@ -1170,6 +1171,424 @@ pub fn proposed_window(
         vendor: recipe.label,
         verified_on: recipe.verified_on,
     })
+}
+
+// -- The over-budget offer (REQ-589 BR-3, BR-7) ------------------------------
+
+/// The provider tokens a measured pair may claim — **this module's own bound,
+/// read backwards** (REQ-589 BR-3).
+///
+/// # It is not a second estimator
+///
+/// `measured` is the [`Fit`] `ContextManager::would_seed_fit` /
+/// `would_append_fit` already produced. No text is re-read here and nothing is
+/// re-counted; what happens is a *projection* of that pair into the provider's
+/// own currency, using the same two ratios [`derive`] converts in the other
+/// direction — the module doc's `max(words × 3/2, bytes / 2) ≥ tokens`, which
+/// is the inequality the pair was sized to satisfy in the first place. A
+/// route's budget is that inequality solved for the pair; this is the same
+/// inequality solved for the tokens. Re-measuring the text to answer this
+/// would be the second estimator ADR-11 exists to prevent, and REQ-586's own
+/// verify pass caught exactly that once already.
+///
+/// # Which direction the guarantee runs
+///
+/// The projection is an **upper** bound on what the request will claim, and
+/// that asymmetry is why BR-3's two sentences are worded the way they are.
+/// A pair inside the window under this bound really is inside it, so
+/// [`WindowVerdict::FitsWindow`] may say the send "is expected to serve".
+/// Exceeding an upper bound is not the provider having refused, so
+/// [`WindowVerdict::ExceedsWindow`] says "very likely be rejected" and asks
+/// anyway (BR-3: a prediction of failure is a thing to say, not a reason to
+/// refuse to ask).
+///
+/// Integer division truncates, exactly as the module doc's inequality is
+/// written and exactly as [`derive`] truncates converting the other way; the
+/// slack is under one provider token against windows of thousands.
+fn claimed_provider_tokens(measured: Fit) -> u64 {
+    let from_words = measured.tokens as u64 * REMOTE_TOKENS_PER_WORD_NUM as u64
+        / REMOTE_TOKENS_PER_WORD_DEN as u64;
+    let from_bytes = measured.bytes as u64 / DUTY_REQUEST_BYTES_PER_TOKEN as u64;
+    from_words.max(from_bytes)
+}
+
+/// What the route's **declared window** says about a measured expansion — the
+/// one place that verdict is decided (REQ-589 BR-3).
+///
+/// Over-budget and over-window are not the same event: over-budget is this
+/// daemon's own policy refusing, over-window is the provider refusing. The
+/// daemon knows which one it is looking at and BR-3 requires it to say so —
+/// and then to ask anyway. This function is what selects which true sentence
+/// gets said; it never decides whether to ask.
+///
+/// # Three facts in, each from its own single home
+///
+/// * `bound` is read off the [`RouteBudget`] the router stamped, never
+///   re-derived here ([`Router::budget_for`](crate::router::Router::budget_for)
+///   stays the crate's single [`derive`] caller for routes).
+/// * `window` is the provider's declared `capabilities.max_context`, verbatim.
+/// * `measured` is the [`Fit`] the estimator produced, verbatim.
+///
+/// # Why the reservation is not subtracted
+///
+/// The declared window is the **provider's** bound; the generation reservation
+/// [`derive`] subtracts is **this daemon's** policy, room held back so the
+/// completion has somewhere to go. An expansion that overflows the budget but
+/// lands inside the reservation band will be accepted by the provider — the
+/// prompt fits — and BR-3's `FitsWindow` sentence ("the send is expected to
+/// serve") is true of it. Comparing against `window − reservation` instead
+/// would fold a policy margin into a claim about the provider, and it would
+/// make `Window` + `FitsWindow` unreachable, which the reachability table
+/// (architecture.md, normative) says is a cell that occurs.
+///
+/// # The verdict and the bound are not independent axes
+///
+/// [`BudgetBound::LocalEngine`] and [`BudgetBound::DefaultUnknown`] reach
+/// [`WindowVerdict::WindowUnknown`] alone — there is no window fact to have a
+/// verdict about — while `Window`, `UserCap` and `RedactScan` reach
+/// [`WindowVerdict::FitsWindow`] and [`WindowVerdict::ExceedsWindow`]. Nine of
+/// the fifteen cells cannot occur, and a test written for one of them passes
+/// vacuously (LESSON-520).
+///
+/// A declared window of `0` is *the absence of a window fact* rather than a
+/// window of size zero — that is what [`BudgetBound::DefaultUnknown`] means —
+/// so it answers `WindowUnknown` on any bound. On the three window-bearing
+/// bounds that combination cannot come out of [`derive`]; the arm is the
+/// definition applied consistently, not a special case.
+#[must_use]
+pub fn window_verdict(bound: BudgetBound, window: u32, measured: Fit) -> WindowVerdict {
+    match bound {
+        BudgetBound::LocalEngine | BudgetBound::DefaultUnknown => WindowVerdict::WindowUnknown,
+        BudgetBound::Window | BudgetBound::UserCap | BudgetBound::RedactScan => match window {
+            0 => WindowVerdict::WindowUnknown,
+            declared if claimed_provider_tokens(measured) > u64::from(declared) => {
+                WindowVerdict::ExceedsWindow
+            }
+            _ => WindowVerdict::FitsWindow,
+        },
+        // Defensive, and honest rather than confident: [`derive`] mints only
+        // the five bounds above, so this arm is unreachable from a stamped
+        // budget. `BudgetBound` is the *wire's* enum and tolerant by design, so
+        // the variant exists and must be answered — and the only true answer
+        // about a bound this build cannot name is that it cannot name the
+        // verdict either. Per ADR-13 that must render as a hedge and must never
+        // be relabelled `WindowUnknown`, which is a different, specific claim
+        // about the route.
+        BudgetBound::Unknown => WindowVerdict::Unknown,
+    }
+}
+
+/// What a **durable** fix for this route would be (REQ-589 BR-7) — the going
+/// forward half of the offer, beside the one-time override.
+///
+/// # One representation, and absence is a variant
+///
+/// [`Remedy::NotOffered`] is how "there is no durable fix here" is said. There
+/// is no parallel `Option<Remedy>` anywhere on this path: two ways to say one
+/// fact is LESSON-545's shape, and the two could then disagree — an offer
+/// claiming a fix exists while the options it presents contain none.
+/// `NotOffered` is reachable and is not an oversight: [`BudgetBound::RedactScan`]
+/// has no durable fix (BR-7b), because that byte ceiling is what bounds the
+/// egress scanner's reach and raising it to fit a skill would trade a privacy
+/// guarantee for a convenience.
+///
+/// # Why the payload rides the variants
+///
+/// The spec's entity table gives `Remedy` a `kind` plus a `provider_id`
+/// "present only for `DeclareWindow` / `RaiseCap` / `RaiseWindow`" and a `tier`
+/// "present only for `BindTierRemote`". Those two "present only for" rules are
+/// exactly what a Rust enum expresses without leaving the invalid combination
+/// constructible — a `RaiseCap` carrying a tier, or a `BindTierRemote` carrying
+/// a provider's `max_context`, cannot be built. [`Remedy::kind`] projects back
+/// to the wire's flat [`RemedyKind`] for the record the events carry.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Remedy {
+    /// The provider declares no window, so the default pair bound the budget:
+    /// write `capabilities.max_context` for it (BR-7, `DefaultUnknown`).
+    DeclareWindow {
+        /// The provider the write is addressed to, sanitized.
+        ///
+        /// `None` is defensive and unreachable in practice, on
+        /// [`bound_clause`]'s own reasoning: a remote route always has an id,
+        /// because its window came from `capability_of(id)`.
+        provider_id: Option<String>,
+        /// The value BR-7c looked up, or `None` when the offer must **ask**.
+        ///
+        /// Never invented here: it arrives from [`proposed_window`], which
+        /// reads the shipped vendor catalog and answers `None` for a provider
+        /// matching no recipe and for a recipe whose window would not clear the
+        /// measurement (ADR-6). A silently invented window would be worse than
+        /// the silently defaulted one REQ-586 BR-3 exists to name, because this
+        /// one gets written to a user's config.
+        proposal: Option<ProposedWindow>,
+    },
+    /// A user cap sat below the window and is what bound the budget: raise or
+    /// clear `capabilities.context_budget_cap` (BR-7, `UserCap`).
+    ///
+    /// It carries no proposal: the cap is the user's own number, and BR-7c's
+    /// catalog lookup answers a question about a *vendor's* window, which is
+    /// not what a cap is.
+    RaiseCap {
+        /// The provider whose cap is in question, sanitized. `None` is
+        /// defensive, as on [`Remedy::DeclareWindow`].
+        provider_id: Option<String>,
+    },
+    /// The declared window is what bound the budget, and the user's declaration
+    /// is the user's to correct: raise `capabilities.max_context` (BR-7,
+    /// `Window`).
+    ///
+    /// The daemon cannot distinguish an accurate declaration from a
+    /// conservative one, so BR-7a requires the offer to state what it risks —
+    /// raising this above the provider's *real* window does not enlarge that
+    /// window, it converts a local refusal into a remote error — in the same
+    /// breath as it is made.
+    RaiseWindow {
+        /// The provider whose window is in question, sanitized. `None` is
+        /// defensive, as on [`Remedy::DeclareWindow`].
+        provider_id: Option<String>,
+        /// The value BR-7c looked up, or `None` when the offer must ask — the
+        /// same `proposal` [`Remedy::DeclareWindow`] carries, and from the same
+        /// place ([`proposed_window`]).
+        proposal: Option<ProposedWindow>,
+    },
+    /// The route is the local engine, which has no config lever of its own:
+    /// bind the tier to a remote provider **and** declare that provider's
+    /// window (BR-9, `LocalEngine`).
+    ///
+    /// Both halves or neither. A provider with `max_context = 0` derives the
+    /// *same* default pair under `bound: unknown window`, so a remedy that
+    /// bound the tier and stopped would send the user round the circle the
+    /// reported `/analyze` failure was already sitting in.
+    ///
+    /// **Which** provider is not decided here. ADR-12 leaves that to the
+    /// applying surface, reading
+    /// [`Router::remote_providers`](crate::router::Router::remote_providers):
+    /// exactly one configured remote may be proposed by name, and two or more
+    /// are presented as a choice rather than picked silently. Choosing here
+    /// would put a routing decision inside a classifier, and this remedy moves
+    /// a whole category's work — and spend — to a paid provider.
+    BindTierRemote {
+        /// The tier that would be rebound, as a closed
+        /// [`Tier`] rather than a string: it is harness vocabulary, not user
+        /// text, so there is nothing here to sanitize and nothing a caller can
+        /// spell wrong. `None` is defensive, for a caller that has no tier in
+        /// hand.
+        tier: Option<Tier>,
+    },
+    /// This bound has no durable fix (BR-7b).
+    ///
+    /// The offer is still made — BR-3 never withholds the choice — but it
+    /// presents the one-time override alone and must not imply a fix exists.
+    NotOffered,
+}
+
+impl Remedy {
+    /// **BR-7's table**, keyed off the stamped [`BudgetBound`] and nothing else.
+    ///
+    /// | Bound | Remedy | Why |
+    /// |---|---|---|
+    /// | `DefaultUnknown` | [`Remedy::DeclareWindow`] | the window is undeclared; declaring it is the real fix |
+    /// | `UserCap` | [`Remedy::RaiseCap`] | the user set this ceiling and may raise it |
+    /// | `Window` | [`Remedy::RaiseWindow`] | the user's declaration is the user's to correct |
+    /// | `LocalEngine` | [`Remedy::BindTierRemote`] | the local *pair* has no lever, but the route does |
+    /// | `RedactScan` | [`Remedy::NotOffered`] | the byte clamp is an egress-privacy guarantee (BR-7b) |
+    ///
+    /// The bound is the **whole** key: it is the one fact that says what
+    /// actually held this route back, it was decided once in [`derive`], and a
+    /// second opinion about it here would be the two-sources drift LESSON-456
+    /// is about. `provider_id`, `proposal` and `tier` are the *payloads* the
+    /// chosen arm needs, not additional keys — an argument the table has no use
+    /// for on a given row is dropped, which is why `RaiseCap` cannot end up
+    /// quoting a vendor's window and `BindTierRemote` cannot end up addressed
+    /// to the provider the route is leaving.
+    ///
+    /// `provider_id` is sanitized on the way in even though the caller's usual
+    /// source — [`RouteBudget::provider_id`] — is sanitized already: the
+    /// operation is idempotent, and a remedy is quoted at a user and written to
+    /// disk, so the guarantee belongs at the boundary rather than in an
+    /// assumption about who called.
+    #[must_use]
+    pub fn for_bound(
+        bound: BudgetBound,
+        provider_id: Option<&str>,
+        proposal: Option<ProposedWindow>,
+        tier: Option<Tier>,
+    ) -> Self {
+        let provider_id = provider_id.map(sanitized_provider_id);
+        match bound {
+            BudgetBound::DefaultUnknown => Remedy::DeclareWindow {
+                provider_id,
+                proposal,
+            },
+            BudgetBound::Window => Remedy::RaiseWindow {
+                provider_id,
+                proposal,
+            },
+            BudgetBound::UserCap => Remedy::RaiseCap { provider_id },
+            BudgetBound::LocalEngine => Remedy::BindTierRemote { tier },
+            // BR-7b, and the one bound left remedy-less on purpose: raising the
+            // redact clamp to fit a skill would trade a privacy guarantee for a
+            // convenience, and a user asking to send a skill is not the same as
+            // a user asking to weaken redaction.
+            BudgetBound::RedactScan => Remedy::NotOffered,
+            // Unreachable from a stamped budget — `derive` mints only the five
+            // bounds above — and answered anyway, because `BudgetBound` is the
+            // wire's enum and tolerant by design. `NotOffered` is the
+            // fail-*safe* answer rather than the merely plausible one: it is
+            // what `is_offered` reads, so a bound this build cannot name
+            // appends no remedy option and proposes no durable write, and the
+            // one-time override is left to stand alone. `RemedyKind::Unknown`
+            // is deliberately not minted here: that arm belongs to a *reader*
+            // meeting a remedy some later build named, and a daemon is never in
+            // that position about its own route.
+            BudgetBound::Unknown => Remedy::NotOffered,
+        }
+    }
+
+    /// The flat [`RemedyKind`] the events carry — the *record* half of ADR-1.
+    ///
+    /// The offer itself expresses the remedy as named option ids whose labels
+    /// state the concrete write; this is what lets a reader of
+    /// `skill_over_budget_offered` tell which fix was proposed without
+    /// re-parsing an option label (LESSON-529).
+    ///
+    /// Never [`RemedyKind::Unknown`]: that arm is for a reader meeting a remedy
+    /// a *later* build minted, and a daemon always knows its own.
+    #[must_use]
+    pub const fn kind(&self) -> RemedyKind {
+        match self {
+            Remedy::DeclareWindow { .. } => RemedyKind::DeclareWindow,
+            Remedy::RaiseCap { .. } => RemedyKind::RaiseCap,
+            Remedy::RaiseWindow { .. } => RemedyKind::RaiseWindow,
+            Remedy::BindTierRemote { .. } => RemedyKind::BindTierRemote,
+            Remedy::NotOffered => RemedyKind::NotOffered,
+        }
+    }
+
+    /// Whether BR-7 grants this bound a durable fix at all.
+    ///
+    /// ADR-1's condition for widening the option list: the remedy-bearing
+    /// option ids are appended **only** where this is true, exactly as
+    /// `options_for` appends `enable_permanent` only when a web tier is in
+    /// hand. Reading it here rather than re-matching downstream is what keeps
+    /// the single representation single.
+    #[must_use]
+    pub const fn is_offered(&self) -> bool {
+        !matches!(self, Remedy::NotOffered)
+    }
+}
+
+/// The question BR-3 asks instead of refusing: what was measured, what the
+/// route allows, what the window says about it, and what a durable fix would be
+/// (REQ-589 BR-3, BR-7).
+///
+/// # Nothing here is derived, measured, or estimated
+///
+/// Every figure arrives from the one place that owns it and is carried
+/// verbatim: `measured` is the [`Fit`] the estimator produced, `budget` is the
+/// [`RouteBudget`] the router stamped, and `bound` is read off that budget
+/// rather than recomputed. This type exists precisely so the offer, the
+/// sentences composed from it and the events published from it all read one
+/// value — a second estimator beside the one that refused is LESSON-456's
+/// shape, and REQ-586's own verify pass caught exactly that on `/verbose`.
+///
+/// # The overrun is a method, not a field
+///
+/// `measured − budget` is a `saturating_sub` of two figures already here, so it
+/// is computed where it is read rather than stored beside them (ADR-13): a
+/// stored copy is a second way to say one fact, and the two can disagree.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OverBudgetOffer {
+    /// The registered skill's dispatchable name — already validated against
+    /// `^[a-z0-9][a-z0-9_-]{0,63}$` by the registry, stated rather than
+    /// re-checked (LESSON-528: the precondition belongs at the seam that
+    /// establishes it).
+    pub skill: String,
+    /// Which of BR-8's two budget checks measured this expansion.
+    ///
+    /// The daemon's own [`SkillStage`], which carries the clause it words;
+    /// the wire's same-named type is a separate, sentence-free enum and the
+    /// mapping between them is explicit at the surface that publishes
+    /// (ADR-13).
+    pub stage: SkillStage,
+    /// The pair the estimator produced, verbatim.
+    pub measured: Fit,
+    /// The pair the router stamped for this route, verbatim — and with it the
+    /// bound, the floor fact, the window's label and the provider id, each of
+    /// which the offer's sentences quote.
+    pub budget: RouteBudget,
+    /// What the route's declared window says about the measurement (BR-3),
+    /// from [`window_verdict`].
+    pub window_verdict: WindowVerdict,
+    /// What a durable fix would be on this route (BR-7), from
+    /// [`Remedy::for_bound`] — [`Remedy::NotOffered`] where the bound has none,
+    /// never an `Option`.
+    pub remedy: Remedy,
+}
+
+impl OverBudgetOffer {
+    /// Classify one over-budget measurement into the question BR-3 puts to a
+    /// human.
+    ///
+    /// **There is no refusing arm.** Every reachable (bound, verdict) pair
+    /// produces an offer, including the ones the daemon expects to fail and the
+    /// one bound that has no remedy to go with it: the daemon says what it
+    /// expects and lets the human decide (BR-3, and D-1's governing stance —
+    /// a prediction of failure is a thing to say, not a reason to refuse to
+    /// ask). What varies is the verdict, the remedy, and therefore the
+    /// sentence — never whether the question is asked.
+    ///
+    /// `window` is the provider's declared `capabilities.max_context`; `budget`
+    /// is what the router stamped from it. Both are needed and neither
+    /// substitutes for the other — that gap *is* BR-3's distinction between
+    /// this daemon's policy and the provider's limit.
+    ///
+    /// `proposal` and `tier` are the payloads BR-7's table may need
+    /// ([`Remedy::for_bound`] drops whichever the chosen arm has no use for);
+    /// pass [`proposed_window`]'s answer for the first, which is `None`
+    /// whenever the offer must ask for a value instead of naming one.
+    // Seven, and each is a distinct fact the offer names or classifies from:
+    // the same reasoning `skill_append_fit` records above, and the alternative
+    // is a struct whose only purpose is to be destructured at the one call
+    // site.
+    #[must_use]
+    pub fn new(
+        skill: &str,
+        stage: SkillStage,
+        measured: Fit,
+        budget: &RouteBudget,
+        window: u32,
+        proposal: Option<ProposedWindow>,
+        tier: Option<Tier>,
+    ) -> Self {
+        Self {
+            skill: skill.to_owned(),
+            stage,
+            measured,
+            window_verdict: window_verdict(budget.bound, window, measured),
+            remedy: Remedy::for_bound(budget.bound, budget.provider_id.as_deref(), proposal, tier),
+            budget: budget.clone(),
+        }
+    }
+
+    /// How far past the word budget the measurement ran, or `0`.
+    ///
+    /// Derived on read (ADR-13); `saturating_sub` because a Stage B
+    /// measurement can be under the word budget while over the byte one, and
+    /// "over by nothing in this currency" is the honest answer there.
+    #[must_use]
+    pub const fn overrun_tokens(&self) -> usize {
+        self.measured
+            .tokens
+            .saturating_sub(self.budget.budget_tokens)
+    }
+
+    /// How far past the byte budget the measurement ran, or `0`. See
+    /// [`OverBudgetOffer::overrun_tokens`].
+    #[must_use]
+    pub const fn overrun_bytes(&self) -> usize {
+        self.measured.bytes.saturating_sub(self.budget.budget_bytes)
+    }
 }
 
 #[cfg(test)]
@@ -3179,5 +3598,397 @@ mod tests {
             .tokens,
             shipped_window("kimi-k3")
         );
+    }
+
+    // -- The over-budget offer (REQ-589 BR-3, BR-7) --------------------------
+
+    /// **The reachability table, and only the reachability table** (BR-3,
+    /// architecture.md's normative table, LESSON-520).
+    ///
+    /// Verdict and bound are not independent axes: a window verdict exists only
+    /// where a window was declared, so nine of the fifteen cells cannot occur
+    /// and a test written for one of them would pass vacuously. The six that do
+    /// occur are here, each reached by *deriving* the bound from real inputs
+    /// rather than by asserting a hand-built `RouteBudget` — so a row that stops
+    /// producing the bound it is named for fails here instead of quietly
+    /// testing a different cell.
+    ///
+    /// Two guards ride along on every row, because either would make the row
+    /// vacuous on its own:
+    ///
+    /// * the measurement really is over the stamped budget in at least one
+    ///   currency (otherwise there is nothing to offer about), and
+    /// * an offer is produced. **All three verdicts offer; none refuses**
+    ///   (BR-3, AC-6) — including `ExceedsWindow`, which the daemon expects to
+    ///   fail, and `RedactScan`, which has no remedy to offer with it.
+    ///
+    /// The `Window` + `FitsWindow` row is the subtle one and is pinned again
+    /// below in `a_window_bound_route_can_still_fit_the_window_it_declared`.
+    #[test]
+    fn every_reachable_bound_and_verdict_pair_produces_an_offer() {
+        let rows: &[(
+            &str,
+            BudgetInputs<'_>,
+            BudgetBound,
+            Fit,
+            WindowVerdict,
+            RemedyKind,
+        )] = &[
+            (
+                "the local engine declares no window, and its remedy is the route's, not the \
+                 pair's",
+                BudgetInputs::local(),
+                BudgetBound::LocalEngine,
+                measured(5_000, 40_000, false),
+                WindowVerdict::WindowUnknown,
+                RemedyKind::BindTierRemote,
+            ),
+            (
+                "a provider with max_context = 0 has no window fact either — and declaring one \
+                 is the fix",
+                remote(0, 0, false),
+                BudgetBound::DefaultUnknown,
+                measured(5_000, 40_000, false),
+                WindowVerdict::WindowUnknown,
+                RemedyKind::DeclareWindow,
+            ),
+            (
+                // budget (84,650 w / 253,952 B); claimed = max(84,700 × 3/2,
+                // 100,000 / 2) = 127,050 ≤ 128,000. Over this daemon's budget,
+                // inside the provider's window: the generation reservation is
+                // the whole of the gap.
+                "over the budget and inside the window the same route declares",
+                remote(128_000, 0, false),
+                BudgetBound::Window,
+                measured(84_700, 100_000, false),
+                WindowVerdict::FitsWindow,
+                RemedyKind::RaiseWindow,
+            ),
+            (
+                // claimed = max(200,000 × 3/2, 100,000 / 2) = 300,000 > 128,000.
+                "far enough over that the declared window goes too",
+                remote(128_000, 0, false),
+                BudgetBound::Window,
+                measured(200_000, 100_000, false),
+                WindowVerdict::ExceedsWindow,
+                RemedyKind::RaiseWindow,
+            ),
+            (
+                // budget (25,984 w / 77,952 B) from the 40k cap; claimed =
+                // max(45,000, 30,000) = 45,000 ≤ 200,000. The user's own
+                // ceiling is what refused, and the provider would have served
+                // it — which is exactly why `RaiseCap` is the fix and not
+                // `RaiseWindow`.
+                "the user's cap refused something the window would have taken",
+                remote(200_000, 40_000, false),
+                BudgetBound::UserCap,
+                measured(30_000, 60_000, false),
+                WindowVerdict::FitsWindow,
+                RemedyKind::RaiseCap,
+            ),
+            (
+                // claimed = max(300,000, 30,000) = 300,000 > 200,000.
+                "past the cap and past the window behind it",
+                remote(200_000, 40_000, false),
+                BudgetBound::UserCap,
+                measured(200_000, 60_000, false),
+                WindowVerdict::ExceedsWindow,
+                RemedyKind::RaiseCap,
+            ),
+            (
+                // The clamp binds the bytes; the words stay window-derived.
+                // claimed comes off the bytes here — and still clears 128,000.
+                "the redact clamp refused it, and the window would not have — and BR-7b still \
+                 offers no fix",
+                remote(128_000, 0, true),
+                BudgetBound::RedactScan,
+                measured(1_000, REDACT_SCANNABLE_CONTEXT_BYTES + 20_000, false),
+                WindowVerdict::FitsWindow,
+                RemedyKind::NotOffered,
+            ),
+            (
+                // claimed = 400,000 / 2 = 200,000 > 128,000.
+                "past the clamp and past the window: the window consequence is still stated, \
+                 with the one-time override alone",
+                remote(128_000, 0, true),
+                BudgetBound::RedactScan,
+                measured(1_000, 400_000, false),
+                WindowVerdict::ExceedsWindow,
+                RemedyKind::NotOffered,
+            ),
+        ];
+
+        for (name, inputs, bound, fit, verdict, remedy) in rows {
+            let budget = derive(*inputs);
+            assert_eq!(
+                budget.bound, *bound,
+                "{name}: this row no longer reaches the bound it was written for, so whatever \
+                 it now asserts is about a different cell"
+            );
+            assert!(
+                fit.tokens > budget.budget_tokens || fit.bytes > budget.budget_bytes,
+                "{name}: a measurement that fits is never offered about, so this row would \
+                 assert nothing"
+            );
+
+            let offer = OverBudgetOffer::new(
+                "analyze",
+                SkillStage::Body,
+                *fit,
+                &budget,
+                inputs.window,
+                None,
+                Some(Tier::Think),
+            );
+            assert_eq!(offer.window_verdict, *verdict, "{name}: verdict");
+            assert_eq!(offer.remedy.kind(), *remedy, "{name}: remedy");
+            // The classifier is the one home of the verdict: the offer carries
+            // what `window_verdict` says and does not decide again.
+            assert_eq!(
+                offer.window_verdict,
+                window_verdict(budget.bound, inputs.window, *fit),
+                "{name}: the offer and the classifier disagree"
+            );
+            // BR-3: every one of them is a question. There is no arm that
+            // refuses instead — not the verdict the daemon expects to fail, and
+            // not the bound with no remedy behind it.
+            assert!(
+                !offer.skill.is_empty() && offer.stage == SkillStage::Body,
+                "{name}: an offer was produced"
+            );
+        }
+    }
+
+    /// **BR-7's table is exhaustive over `BudgetBound`, and `RedactScan` alone
+    /// has no remedy** (BR-7b, AC-7).
+    ///
+    /// Swept over every variant the enum has rather than over the five
+    /// [`derive`] mints, so a sixth bound added tomorrow cannot slip through
+    /// with whatever the last arm happened to return. The payload rules are
+    /// asserted structurally on the way past: a remedy carries the provider it
+    /// is addressed to **only** where the write is a provider's field, and the
+    /// tier **only** where the remedy is a binding.
+    #[test]
+    fn the_br7_remedy_table_covers_every_bound_and_only_redact_scan_has_none() {
+        let proposal = ProposedWindow {
+            tokens: 1_000_000,
+            vendor: "Moonshot".to_owned(),
+            verified_on: "2026-08-19".to_owned(),
+        };
+        let rows: &[(BudgetBound, RemedyKind)] = &[
+            (BudgetBound::DefaultUnknown, RemedyKind::DeclareWindow),
+            (BudgetBound::Window, RemedyKind::RaiseWindow),
+            (BudgetBound::UserCap, RemedyKind::RaiseCap),
+            (BudgetBound::LocalEngine, RemedyKind::BindTierRemote),
+            (BudgetBound::RedactScan, RemedyKind::NotOffered),
+            // Not a reachability cell and not vacuous either: `derive` never
+            // mints this, but `BudgetBound` is the wire's enum and tolerant by
+            // design, so the variant exists and the table has to answer it. The
+            // honest answer is that a build which cannot name the bound cannot
+            // name the fix — never a confident remedy inherited from whichever
+            // arm sat next to it.
+            (BudgetBound::Unknown, RemedyKind::NotOffered),
+        ];
+
+        for (bound, kind) in rows {
+            let remedy = Remedy::for_bound(
+                *bound,
+                Some("kimi"),
+                Some(proposal.clone()),
+                Some(Tier::Think),
+            );
+            assert_eq!(remedy.kind(), *kind, "{}", bound.wire_name());
+            // The single representation, read the one way there is to read it:
+            // absence is `NotOffered`, and this field is a `Remedy` — an
+            // `Option<Remedy>` beside it would not compile here (LESSON-545).
+            assert_eq!(
+                remedy.is_offered(),
+                *kind != RemedyKind::NotOffered,
+                "{}: `is_offered` is ADR-1's condition for widening the option list, so it must \
+                 agree with the kind rather than be a second opinion about it",
+                bound.wire_name()
+            );
+
+            match &remedy {
+                Remedy::DeclareWindow {
+                    provider_id,
+                    proposal: p,
+                }
+                | Remedy::RaiseWindow {
+                    provider_id,
+                    proposal: p,
+                } => {
+                    assert_eq!(provider_id.as_deref(), Some("kimi"));
+                    assert_eq!(p.as_ref(), Some(&proposal));
+                }
+                Remedy::RaiseCap { provider_id } => {
+                    // A cap is the user's own number; BR-7c's catalog lookup
+                    // answers a question about a *vendor's* window, and
+                    // `RaiseCap` has nowhere to put one — structurally.
+                    assert_eq!(provider_id.as_deref(), Some("kimi"));
+                }
+                Remedy::BindTierRemote { tier } => {
+                    // BR-9's remedy is addressed to the tier being rebound, not
+                    // to the provider the route is leaving — and there is no
+                    // `provider_id` on this arm to address it wrongly with.
+                    assert_eq!(*tier, Some(Tier::Think));
+                }
+                Remedy::NotOffered => {}
+            }
+        }
+
+        // BR-7b, stated as the exclusion it is: of the five bounds `derive`
+        // mints, exactly one is left remedy-less, and it is the byte clamp.
+        let unremedied: Vec<&str> = [
+            BudgetBound::DefaultUnknown,
+            BudgetBound::Window,
+            BudgetBound::UserCap,
+            BudgetBound::LocalEngine,
+            BudgetBound::RedactScan,
+        ]
+        .into_iter()
+        .filter(|bound| {
+            !Remedy::for_bound(*bound, Some("kimi"), None, Some(Tier::Think)).is_offered()
+        })
+        .map(|bound| bound.wire_name())
+        .collect();
+        assert_eq!(
+            unremedied,
+            vec!["redact_scan"],
+            "the redact clamp is the one bound left without a fix, and on privacy grounds rather \
+             than by omission (BR-7b, D-6)"
+        );
+    }
+
+    /// **A `Window`-bound route really can fit the window it declared** (BR-3).
+    ///
+    /// The cell worth its own test, because the tempting implementation loses
+    /// it: compare the measurement against `window − reservation` — the figure
+    /// [`derive`] actually budgets from — and `Window` + `FitsWindow` becomes
+    /// unreachable, every `Window` route reads `ExceedsWindow`, and the daemon
+    /// tells users a provider will very likely reject a turn it would have
+    /// served. The reservation is **this daemon's** policy, held back so the
+    /// completion has somewhere to go; the declared window is the
+    /// **provider's** bound, and BR-3's two sentences are about the two
+    /// different parties.
+    ///
+    /// The band is walked from inside to outside on one route, so the test
+    /// cannot pass by answering the same thing twice.
+    #[test]
+    fn a_window_bound_route_can_still_fit_the_window_it_declared() {
+        let inputs = remote(128_000, 0, false);
+        let budget = derive(inputs);
+        assert_eq!(budget.bound, BudgetBound::Window);
+
+        // One word past the budget: refused by this daemon, and the provider
+        // has not been consulted about it at all.
+        let just_over = measured(budget.budget_tokens + 1, 0, false);
+        assert_eq!(
+            window_verdict(budget.bound, inputs.window, just_over),
+            WindowVerdict::FitsWindow,
+            "the reservation is a policy margin, not the provider's limit"
+        );
+
+        // The window itself, walked past. 85,334 × 3/2 = 128,001.
+        let at_the_window = measured(85_333, 0, false);
+        let past_the_window = measured(85_334, 0, false);
+        assert_eq!(
+            window_verdict(budget.bound, inputs.window, at_the_window),
+            WindowVerdict::FitsWindow
+        );
+        assert_eq!(
+            window_verdict(budget.bound, inputs.window, past_the_window),
+            WindowVerdict::ExceedsWindow
+        );
+
+        // Both currencies are consulted, and the larger claim is the one that
+        // decides: a byte-heavy expansion with almost no words exceeds the same
+        // window (256,002 / 2 = 128,001).
+        assert_eq!(
+            window_verdict(budget.bound, inputs.window, measured(1, 256_002, false)),
+            WindowVerdict::ExceedsWindow,
+            "the pair bounds provider tokens in both currencies, so either can be the one that \
+             blows the window"
+        );
+    }
+
+    /// **The offer carries the stamped budget and the measurement it was
+    /// handed — it re-derives neither** (AC-12, LESSON-456).
+    ///
+    /// Asserted the only way that cannot pass by coincidence: the stamped pair
+    /// is doctored to figures [`derive`] would never produce for these inputs,
+    /// and the offer is checked to report *those*. An implementation that
+    /// re-derived from the window — the second-estimator failure REQ-586's own
+    /// verify pass found on `/verbose` — would answer (84,650 / 253,952) here
+    /// and fail.
+    ///
+    /// The verdict is checked to be unmoved by the doctoring, which is the same
+    /// fact from the other side: it is a question about the declared **window**
+    /// and the measurement, and the stamped pair is not an input to it.
+    #[test]
+    fn the_offer_reports_the_stamped_budget_and_the_measurement_not_a_second_derivation() {
+        let inputs = remote(128_000, 0, false);
+        let mut stamped = derive(inputs);
+        assert_eq!(
+            (stamped.budget_tokens, stamped.budget_bytes),
+            (84_650, 253_952),
+            "the derivation this test is about to walk away from"
+        );
+        stamped.budget_tokens = 7;
+        stamped.budget_bytes = 9;
+
+        let fit = measured(84_700, 100_000, false);
+        let offer = OverBudgetOffer::new(
+            "analyze",
+            SkillStage::Body,
+            fit,
+            &stamped,
+            inputs.window,
+            None,
+            None,
+        );
+
+        assert_eq!(offer.budget, stamped, "the stamped budget, verbatim");
+        assert_eq!(offer.budget.budget_tokens, 7);
+        assert_eq!(offer.budget.budget_bytes, 9);
+        assert_eq!(offer.measured, fit, "the measurement, verbatim");
+        assert_eq!(offer.skill, "analyze");
+        assert_eq!(offer.stage, SkillStage::Body);
+
+        // ADR-13: the overrun is a `saturating_sub` of the two figures already
+        // here, computed on read. It follows the doctored pair, which is what
+        // proves it is not a third stored figure.
+        assert_eq!(offer.overrun_tokens(), 84_700 - 7);
+        assert_eq!(offer.overrun_bytes(), 100_000 - 9);
+
+        assert_eq!(
+            offer.window_verdict,
+            WindowVerdict::FitsWindow,
+            "the verdict is about the declared window and the measurement; the stamped pair is \
+             not one of its inputs"
+        );
+    }
+
+    /// **A measurement under one budget and over the other still reads as
+    /// zero-over in the currency it fits** (ADR-13).
+    ///
+    /// Stage B's shape: the body fits the words and the dynamic-context output
+    /// spends the bytes. `saturating_sub` is what keeps the sentence from
+    /// claiming an overrun that did not happen, and an unsaturated subtraction
+    /// here would panic in debug rather than merely lie.
+    #[test]
+    fn an_overrun_in_one_currency_is_not_an_overrun_in_the_other() {
+        let budget = derive(remote(128_000, 0, false));
+        let offer = OverBudgetOffer::new(
+            "status",
+            SkillStage::WithDynamicContext,
+            measured(1_000, budget.budget_bytes + 512, false),
+            &budget,
+            128_000,
+            None,
+            None,
+        );
+        assert_eq!(offer.overrun_tokens(), 0);
+        assert_eq!(offer.overrun_bytes(), 512);
     }
 }
