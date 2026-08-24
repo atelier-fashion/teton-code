@@ -1,0 +1,53 @@
+{
+  "req": "REQ-589",
+  "branch": "feat/REQ-589-over-budget-skill-expansion-offer",
+  "startedAt": "2026-08-24T19:38:00Z",
+  "completed": false,
+  "currentPhase": 3,
+  "completedPhases": [
+    0,
+    1,
+    2
+  ],
+  "integrationBranch": "main",
+  "phaseHistory": [
+    {
+      "phase": 0,
+      "name": "Create Worktree",
+      "completedAt": "2026-08-24T19:38:00Z"
+    },
+    {
+      "phase": 1,
+      "name": "Validate Requirement Spec",
+      "completedAt": "2026-08-24T19:39:00Z",
+      "result": "approved"
+    },
+    {
+      "phase": 2,
+      "name": "Architect & Break Into Tasks",
+      "completedAt": "2026-08-24T20:05:00Z",
+      "adrs": 12,
+      "tasks": 18
+    }
+  ],
+  "repos": {
+    "teton-code": {
+      "primary": true,
+      "path": "/Users/brettluelling/Documents/GitHub/teton-code",
+      "worktree": "/Users/brettluelling/Documents/GitHub/teton-code/.worktrees/REQ-589",
+      "branch": "feat/REQ-589-over-budget-skill-expansion-offer",
+      "touched": true,
+      "prUrl": null,
+      "prNumber": null,
+      "merged": false
+    }
+  },
+  "mergeOrder": [
+    "teton-code"
+  ],
+  "phase4": {
+    "currentTask": null,
+    "completedTasks": [],
+    "failedTasks": []
+  }
+}
