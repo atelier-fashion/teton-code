@@ -4580,8 +4580,15 @@ impl DaemonRuntime {
         //
         // The one place this turn's pressure policy can be decided, because it
         // is the one place an over-budget send is consented to (BR-12).
-        let mut over_budget_accepted = false;
-        let mut accepted_expansion: Option<String> = None;
+        //
+        // **One variable, not a flag beside a payload** (REQ-589 BR-14.1). This
+        // was a `bool` and an `Option<String>` set on the same two arms; the
+        // withdrawal below needs the skill's *name* as well, and a third local
+        // that three arms have to remember to keep in step is how one of them
+        // comes to say a turn was accepted while another cannot say what was
+        // accepted. `Some` **is** "this turn's over-budget send was consented
+        // to", and everything downstream reads it from here.
+        let mut accepted: Option<AcceptedExpansion> = None;
         if let Some(skill) = &skill_turn {
             match self
                 .offer_or_refuse_over_budget(
@@ -4603,10 +4610,14 @@ impl DaemonRuntime {
             {
                 SkillStageVerdict::Fits => {}
                 SkillStageVerdict::Accepted => {
-                    over_budget_accepted = true;
                     // The exact bytes the answer was about, carried to Stage B
-                    // so an unchanged expansion is not put to the user twice.
-                    accepted_expansion = Some(skill.text.clone());
+                    // so an unchanged expansion is not put to the user twice —
+                    // and to the failure path below, which has to find this
+                    // block in the conversation to withdraw it (BR-14.1).
+                    accepted = Some(AcceptedExpansion {
+                        skill: skill.name.clone(),
+                        text: skill.text.clone(),
+                    });
                 }
                 SkillStageVerdict::NotSent(message) => {
                     return Err(RpcError::new(
@@ -4710,12 +4721,25 @@ impl DaemonRuntime {
                     // expansion the fold left untouched is the same question,
                     // already answered a few lines up — asking again would let
                     // a second refusal kill a turn the user had just approved.
-                    accepted_expansion.as_deref(),
+                    accepted.as_ref().map(|a| a.text.as_str()),
                 )
                 .await
             {
                 SkillStageVerdict::Fits => {}
-                SkillStageVerdict::Accepted => over_budget_accepted = true,
+                // Recorded with **this** stage's bytes, which is the point of
+                // re-assigning rather than only raising a flag: the fold may
+                // have grown the expansion since Stage A, and it is the folded
+                // text that becomes the block a failure has to withdraw
+                // (BR-14.1). A Stage-B-only acceptance — Stage A said `Fits`,
+                // the dynamic-context output is what spent the room — leaves
+                // this `None` if it does not write here, and the withdrawal
+                // would then have nothing to look for.
+                SkillStageVerdict::Accepted => {
+                    accepted = Some(AcceptedExpansion {
+                        skill: skill.name.clone(),
+                        text: skill.text.clone(),
+                    });
+                }
                 SkillStageVerdict::NotSent(message) => {
                     return Err(RpcError::new(
                         error_code::SKILL_EXPANSION_TOO_LARGE,
@@ -4806,6 +4830,14 @@ impl DaemonRuntime {
 
         let mut attempts = 0u32;
         let mut rerouted_local = false;
+        // Whether an accepted expansion was withdrawn from this conversation
+        // because the tier refused it at the window (REQ-589 BR-14.1).
+        //
+        // It travels out of the loop rather than being acted on inside it
+        // because it decides which of the two outcomes below this turn takes,
+        // and the loop's whole shape is that every ending funnels through that
+        // one seam. See the commit/abandon match for what it changes and why.
+        let mut withdrew_accepted_expansion = false;
         // The loop is labelled and its endings `break` a value rather than
         // returning one, so every one of them funnels through the single
         // commit/abandon below instead of each exit remembering to disarm —
@@ -4853,7 +4885,7 @@ impl DaemonRuntime {
                     // iteration" rule rather than a flag someone has to reset —
                     // and because a fallback attempt re-assembles the *same*
                     // consented prompt, so it is owed the same suspension.
-                    if over_budget_accepted {
+                    if accepted.is_some() {
                         PressurePolicy::SuspendedForAcceptedTurn
                     } else {
                         PressurePolicy::Enforced
@@ -4927,6 +4959,55 @@ impl DaemonRuntime {
                     rerouted_local = true;
                     continue;
                 }
+            }
+
+            // ── REQ-589 BR-14.1 / D-8: an approval must not leave the session
+            // hitting the same wall ──────────────────────────────────────────
+            //
+            // The tier refused the very bytes a human just approved. The turn
+            // is over either way — nothing about resending them can succeed —
+            // but the *session* must not be left holding the expansion that
+            // earned the refusal, because the budget the next turn is measured
+            // against is the one that already said these bytes fit. A window
+            // that disagrees with the stamped budget disagrees with it again on
+            // the next turn, and the next, which is the circle the reported
+            // `/analyze` failure walked.
+            //
+            // **Read through `context_refusal`, never by matching the two
+            // variants** (ADR-3). The local engine's refusal is its own variant
+            // and it is the tier the reported failure ran on; a predicate that
+            // matched `ContextLengthExceeded` here would handle the remote half
+            // and quietly miss the one that matters, exactly as the arm below
+            // used to.
+            //
+            // Sited here rather than in that arm for the same reason the
+            // privacy block above is: this is where `result` is still a
+            // `HarnessError` and `conversation` is still writable. The arm
+            // below composes the user's sentence from the same projection, so
+            // the words the model reads in the withdrawn block and the words
+            // the user reads in the error are one composer's (BR-5).
+            if let (Some(accepted), Some(refusal)) = (
+                accepted.as_ref(),
+                result
+                    .as_ref()
+                    .err()
+                    .and_then(HarnessError::context_refusal),
+            ) {
+                let sentence = refusal.sentence(&route.budget.window_label);
+                // BR-14.2, and it is marked whether or not the withdrawal below
+                // finds its block: the rejection is a thing this daemon
+                // *watched happen*, and the next offer for this pair is owed it
+                // regardless of what the conversation turned out to look like.
+                // Keyed off the route that actually refused — a fallback may
+                // have moved the turn since the offer was made, and it is the
+                // refusing window the next offer's lead is a claim about.
+                self.window_rejections.mark(
+                    &session_id,
+                    &accepted.skill,
+                    &RouteWindow::of(&route.harness.budget),
+                );
+                withdrew_accepted_expansion =
+                    withdraw_accepted_expansion(&mut conversation, &accepted.text, &sentence);
             }
 
             match result {
@@ -5147,6 +5228,30 @@ impl DaemonRuntime {
         // turn that failed writes nothing at all, which is what makes BR-6's
         // "byte-identical to the failed turn never having run" true by
         // construction: the pre-turn vector was never touched.
+        //
+        // # The one failure that writes, and why (REQ-589 BR-14.1 / D-8)
+        //
+        // BR-14.1 asks for an accepted expansion to be *withdrawn* from the
+        // session when the tier refuses it at the window, so the next turn
+        // assembles without it. Under abandon alone that withdrawal is
+        // unobservable: the manager it edited is dropped, the pre-turn vector
+        // is what the session keeps, and nothing any test can drive would tell
+        // the withdrawal apart from its deletion (LESSON-544's exact shape —
+        // a producer with no consumer, invisible to a green suite). So the
+        // withdrawal is what this turn commits, and BR-6's "no trace" is
+        // narrowed by exactly one path: an over-budget send a human approved,
+        // that the tier then refused at the window, whose block was found.
+        //
+        // What it writes is **smaller than what it was handed** — the same
+        // conversation with the expansion replaced by the refusal that killed
+        // it, and the block's provenance absorbed rather than shed (BUG-188).
+        // A user who approved once is left with a session that can take
+        // another turn, which is D-8's whole ask; the alternative is a
+        // withdrawal that is a comment.
+        //
+        // **This is a deviation from REQ-567 BR-6 and is flagged as one.** The
+        // narrowness is the mitigation: every other failure — every retry
+        // class, every reroute, every panic — still abandons.
         match outcome {
             Ok(result) => {
                 // REQ-586 BR-10: the commit re-asserts the budget one last
@@ -5156,6 +5261,15 @@ impl DaemonRuntime {
                 // [`commit_and_publish`].
                 commit_and_publish(conversation, &stream_events, &route.budget);
                 Ok(result)
+            }
+            Err(err) if withdrew_accepted_expansion => {
+                // The withdrawal, and the turn's error, both. The commit runs
+                // the same protocol the success arm does — it re-asserts the
+                // budget and evaluates the taint pin — because what is being
+                // handed over is a conversation the session will assemble from
+                // next, not a special case of one.
+                commit_and_publish(conversation, &stream_events, &route.budget);
+                Err(err)
             }
             Err(err) => {
                 conversation.abandon();
@@ -11942,6 +12056,71 @@ fn withdraw_model_expansion(
     conversation
         .ctx_mut()
         .withdraw_block(committed, crate::harness::turn_loop::error_result(refusal))
+}
+
+/// What an over-budget answer was about, carried from the stage that asked to
+/// the failure that has to undo it (REQ-589 BR-14.1).
+///
+/// The name rides with the text because BR-14.1 and BR-14.2 need different
+/// halves of the same fact — the bytes to find in the conversation, and the
+/// skill to record the observed rejection under — and two locals set on the
+/// same arms is how one of them comes to be `Some` while the other is not.
+struct AcceptedExpansion {
+    /// The skill as the user named it, the key
+    /// [`ObservedWindowRejections`] is scoped by.
+    skill: String,
+    /// The exact bytes the offer was about, and therefore the exact block the
+    /// seed pushed.
+    text: String,
+}
+
+/// Withdraw an expansion **the user approved over budget** after the tier
+/// refused it at the window, and leave the refusal in its place (REQ-589
+/// BR-14.1 / D-8).
+///
+/// # Why this is not [`withdraw_model_expansion`]
+///
+/// The two bodies are the same call and deliberately stay two functions. That
+/// one answers a *reroute guard*: the turn continues, the model reads the
+/// refusal as a tool result, and its caller has a `SkillCaller` to consult and
+/// a tool's bookkeeping to keep in step. This one answers a **terminal window
+/// refusal** on a turn a human consented to; there is no next iteration, no
+/// model waiting on a result, and no caller distinction — a model-invoked
+/// expansion is never offered a choice (BR-2), so everything reaching here was
+/// typed. Folding them into one would put a parameter in front of that
+/// difference and invite a later edit to make the reroute's decisions on this
+/// path.
+///
+/// # What it leaves behind
+///
+/// The refusal the user is also being told, through the same composer
+/// ([`crate::harness::turn_loop::ContextRefusal::sentence`]), so the block the
+/// next turn assembles and the error the client renders cannot come to say
+/// different things (BR-5).
+///
+/// **Provenance is absorbed, never shed** — [`ContextManager::withdraw_block`]
+/// does it, which is why BR-14.1 names that function rather than inventing a
+/// path. A skill block that shed its sources on the way out would let a
+/// `local-only` body egress on the next turn through a block nobody can see
+/// (BUG-188), and the pin has to outlive the text it is a pin for.
+///
+/// Returns `false` when no block matched, which leaves the turn to abandon
+/// exactly as it always did. That is the honest fallback rather than a
+/// best-effort search: the seed pushes the accepted bytes verbatim, so a miss
+/// means something re-fitted or elided the block mid-turn — a second
+/// iteration's enforced pressure gate, or a reroute's clamp — and a
+/// conversation this does not recognise is one to leave alone.
+fn withdraw_accepted_expansion(
+    conversation: &mut CarriedTurn,
+    accepted: &str,
+    refusal: &str,
+) -> bool {
+    // Matched on exact text: the seed block is `SkillTurn::text` as the offer
+    // measured it and as the answer approved it, pushed by `CarriedTurn::begin`
+    // without an edit in between.
+    conversation
+        .ctx_mut()
+        .withdraw_block(accepted, crate::harness::turn_loop::error_result(refusal))
 }
 
 fn skill_would_not_survive_refit(
@@ -31703,16 +31882,41 @@ provider_id = \"deepseek\"
         /// the engine *is* the provider, so "nothing was sent and no provider
         /// saw this turn" is the statement that no prompt beyond the
         /// classifier's ever reached it.
+        ///
+        /// **It can also be told to refuse the expansion** (TASK-249). Once
+        /// [`RecordingEngine::refuse_the_expansion`] is called it answers any
+        /// prompt carrying the whole body with the same
+        /// `EngineError::ContextWindowExceeded` variant
+        /// `teton_inference::over_window` produces in production — the local
+        /// tier's real window refusal, which is what BR-14.1's withdrawal
+        /// triggers on. The classifier is excluded from that rule for
+        /// [`RecordingEngine::beyond_the_classifier`]'s reason (it runs above
+        /// Stage A and is not the turn), and the naming duty excludes itself:
+        /// it sends a bounded *prefix*, which is precisely why [`TAIL_MARKER`]
+        /// exists.
         #[derive(Clone)]
-        struct RecordingEngine(Arc<Mutex<Vec<String>>>);
+        struct RecordingEngine {
+            prompts: Arc<Mutex<Vec<String>>>,
+            refusing: Arc<AtomicBool>,
+        }
 
         impl RecordingEngine {
             fn new() -> Self {
-                Self(Arc::new(Mutex::new(Vec::new())))
+                Self {
+                    prompts: Arc::new(Mutex::new(Vec::new())),
+                    refusing: Arc::new(AtomicBool::new(false)),
+                }
+            }
+
+            /// From here on, a prompt carrying the whole expansion is refused
+            /// at the window. Shared through the fixture's clone, so flipping
+            /// it here flips the engine the daemon holds.
+            fn refuse_the_expansion(&self) {
+                self.refusing.store(true, Ordering::SeqCst);
             }
 
             fn prompts(&self) -> Vec<String> {
-                self.0.lock().expect("recorder mutex").clone()
+                self.prompts.lock().expect("recorder mutex").clone()
             }
 
             /// Every prompt that is **not** the freeform classifier's — which,
@@ -31741,10 +31945,25 @@ provider_id = \"deepseek\"
                 _params: &GenParams,
                 _on_token: &mut dyn FnMut(&str) -> bool,
             ) -> Result<Completion, EngineError> {
-                self.0
+                self.prompts
                     .lock()
                     .expect("recorder mutex")
                     .push(prompt.to_owned());
+                // Recorded first, refused second: a refusal the recorder never
+                // saw would leave the "the accepted turn really did carry the
+                // whole body" non-vacuity check below unable to see it either.
+                if self.refusing.load(Ordering::SeqCst)
+                    && prompt.contains(TAIL_MARKER)
+                    && !prompt.contains("Classify one software-engineering request")
+                {
+                    let measured = u32::try_from(prompt.len()).unwrap_or(u32::MAX);
+                    return Err(EngineError::ContextWindowExceeded {
+                        prompt_tokens: measured,
+                        budget_tokens: 1,
+                        n_ctx: 1,
+                        max_tokens: 0,
+                    });
+                }
                 Ok(Completion::cold("edit".to_owned(), 0, 1))
             }
         }
@@ -31981,6 +32200,27 @@ provider_id = \"deepseek\"
                             name: "heavy".to_owned(),
                             raw_arguments: String::new(),
                         }),
+                        self.connection,
+                        ClientPresence::unwatched(),
+                    )
+                    .await
+            }
+
+            /// An ordinary typed turn in the **same session** — no skill, no
+            /// offer. What BR-14.1's "the next turn assembles without it" is a
+            /// claim about, and the only way to observe what this session now
+            /// carries without inspecting the block list (AC-22).
+            async fn prompt(&self, text: &str) -> Result<PromptTurnResult, RpcError> {
+                self.runtime
+                    .run_prompt_turn(
+                        &self.events,
+                        &self.sessions,
+                        self.session_id.clone(),
+                        SessionMode::Freeform,
+                        None,
+                        Some(self.dir.clone()),
+                        text.to_owned(),
+                        None,
                         self.connection,
                         ClientPresence::unwatched(),
                     )
@@ -33036,6 +33276,237 @@ provider_id = \"deepseek\"
                 2,
                 "the offer has exactly two call sites, and both are `run_prompt_turn`’s \
                  own budget stages"
+            );
+        }
+
+        /// **REQ-589 BR-14.1, AC-22 (D-8) — an approval must not leave the
+        /// session hitting the same wall.**
+        ///
+        /// Two real turns. The first is the reported failure's own shape: a
+        /// typed `/heavy` on the local engine, over budget, offered, accepted,
+        /// and then refused **by the tier** at the window. The second is an
+        /// ordinary prompt in the same session, and what *it* assembles is the
+        /// whole claim — read off the bytes that reached the engine rather than
+        /// off the block list, because a block list can be right while the
+        /// prompt built from it is not (AC-22 says so in as many words).
+        ///
+        /// The fixture's engine refuses **any** prompt carrying the whole
+        /// expansion, not just the first, which is what makes this a test of
+        /// the dead end rather than of one turn: leave the expansion in the
+        /// session and the second turn does not merely carry it, it *fails the
+        /// same way*, forever. Three mutations redden this (LESSON-544):
+        ///
+        /// | Mutation | How it fails |
+        /// |---|---|
+        /// | drop the `withdraw_accepted_expansion` call | the second turn carries the expansion, the engine refuses it again, and `expect` on that turn panics — D-8's circle, reproduced |
+        /// | abandon instead of committing the withdrawal | nothing of the refusal survives, and the "the withdrawal is *there*" assertion fails |
+        /// | trigger on `ContextLengthExceeded` alone (ADR-3) | the local tier refuses with the *other* variant, so nothing is withdrawn — the first row again |
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn a_window_refusal_withdraws_the_expansion_so_the_next_turn_assembles_without_it() {
+            /// Distinctive enough that a prompt carrying it is the second turn's
+            /// and not the first's, not the classifier's, and not the naming
+            /// duty's.
+            const SECOND_TURN: &str = "SECONDTURNMARKER-249, what happened?";
+
+            let fx = Fixture::new("ob-withdraw", OPTION_ID_OVER_BUDGET_PROCEED_ONCE, None);
+            fx.engine.refuse_the_expansion();
+
+            let err = fx
+                .invoke()
+                .await
+                .expect_err("the tier refused the accepted turn");
+            assert_eq!(err.code, error_code::CONTEXT_LENGTH_EXCEEDED, "{err:?}");
+            assert!(
+                err.message.contains("the local engine refused this turn"),
+                "the refusal must be the local tier's own (ADR-3): {}",
+                err.message
+            );
+
+            // Non-vacuity, both halves: the offer really was put to a human,
+            // and the accepted turn really did carry the whole body to the tier
+            // that refused it. Without them everything below is a claim about a
+            // turn that never happened.
+            assert_eq!(
+                fx.client.offers().len(),
+                1,
+                "Stage A asks exactly once: {:?}",
+                fx.client.offers()
+            );
+            assert!(
+                fx.engine
+                    .beyond_the_classifier()
+                    .iter()
+                    .any(|prompt| prompt.contains(TAIL_MARKER)),
+                "the accepted turn must have reached the engine with the whole expansion"
+            );
+
+            // A **real** second turn, and it has to succeed: an engine that
+            // still sees the expansion refuses this one too.
+            fx.prompt(SECOND_TURN)
+                .await
+                .expect("the next turn in this session must assemble and run");
+
+            let assembled: Vec<String> = fx
+                .engine
+                .prompts()
+                .into_iter()
+                .filter(|prompt| {
+                    prompt.contains("SECONDTURNMARKER-249")
+                        && !prompt.contains("Classify one software-engineering request")
+                })
+                .collect();
+            assert!(
+                !assembled.is_empty(),
+                "non-vacuity: the second turn never reached the engine, so nothing \
+                 below is about an assembled prompt"
+            );
+            for prompt in &assembled {
+                assert!(
+                    !prompt.contains(TAIL_MARKER),
+                    "the withdrawn expansion survived into the next turn's prompt"
+                );
+                assert!(
+                    !prompt.contains(MARKER),
+                    "the withdrawn expansion survived into the next turn's prompt"
+                );
+            }
+            // And the withdrawal is *present*, not merely the expansion absent.
+            // This is what tells a committed withdrawal apart from a turn that
+            // wrote nothing at all — the two are indistinguishable by absence.
+            assert!(
+                assembled
+                    .iter()
+                    .any(|prompt| prompt.contains("refused this turn as larger than")),
+                "the next turn must carry the refusal that replaced the expansion: \
+                 {assembled:#?}"
+            );
+        }
+
+        /// **REQ-589 BR-14.1 / AC-22, BUG-188's own regression shape — the
+        /// withdrawn block's `local-only` source is absorbed, never shed.**
+        ///
+        /// The skill file is behind a `local-only` boundary, so the expansion's
+        /// provenance is exactly the thing that must not be laundered by the
+        /// withdrawal. Both halves, because either alone is satisfiable by
+        /// accident:
+        ///
+        /// * **the source does not survive on a visible block** — the block the
+        ///   next turn assembles from carries no skill file's identity, because
+        ///   nothing of that file is in it any more;
+        /// * **the pin survives anyway** — the identity went into
+        ///   `DroppedProvenance`, so the session is still pinned local and a
+        ///   later model paraphrase of what this turn read cannot egress
+        ///   through a block nobody can see. That is the hole BUG-188 closed,
+        ///   and dropping the absorb would open it silently: the conversation
+        ///   would look *cleaner*, right up until the next turn routes remote.
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn the_withdrawn_expansions_local_only_source_is_absorbed_not_shed() {
+            use crate::harness::context::{Provenance as CtxProvenance, ToolProvenance};
+
+            let fx = Fixture::new("ob-withdraw-pin", OPTION_ID_OVER_BUDGET_PROCEED_ONCE, None);
+            fx.runtime
+                .config
+                .lock()
+                .expect("config mutex poisoned")
+                .boundaries
+                .push(PrivacyBoundary {
+                    path_glob: ".claude/**".to_owned(),
+                    mode: teton_core::entities::BoundaryMode::LocalOnly,
+                });
+            fx.engine.refuse_the_expansion();
+
+            fx.invoke()
+                .await
+                .expect_err("the tier refused the accepted turn");
+
+            let conversation = fx.sessions.conversation_snapshot(&fx.session_id);
+            assert!(
+                !conversation.blocks().is_empty(),
+                "non-vacuity: a session holding nothing would satisfy the \
+                 does-not-survive half for the wrong reason"
+            );
+
+            let sources_of = |provenance: &CtxProvenance| -> Vec<String> {
+                match provenance {
+                    CtxProvenance::User { sources, .. } => {
+                        sources.iter().map(|id| id.as_str().to_owned()).collect()
+                    }
+                    CtxProvenance::Tool {
+                        provenance: ToolProvenance::Sources(sources),
+                        ..
+                    } => sources.iter().map(|id| id.as_str().to_owned()).collect(),
+                    _ => Vec::new(),
+                }
+            };
+            for block in conversation.blocks() {
+                let named = sources_of(&block.provenance);
+                assert!(
+                    !named.iter().any(|id| id.contains("SKILL.md")),
+                    "a retained block still names the withdrawn skill file: {named:?}"
+                );
+            }
+
+            let dropped: Vec<&str> = conversation
+                .retained()
+                .dropped_provenance()
+                .sources()
+                .iter()
+                .map(|id| id.as_str())
+                .collect();
+            assert!(
+                dropped.iter().any(|id| id.contains("heavy")),
+                "the withdrawn block's provenance was shed rather than absorbed — a \
+                 `local-only` body could egress on the next turn through a block \
+                 nobody can see (BUG-188): {dropped:?}"
+            );
+            assert!(
+                fx.runtime.session_taint.is_tainted(&fx.session_id),
+                "the pin has to outlive the text it is a pin for: this session read a \
+                 `local-only` file and must stay on the local tier"
+            );
+        }
+
+        /// **REQ-589 BR-14.2 — the rejection this daemon watched leads the next
+        /// offer for the same pair.**
+        ///
+        /// The withdrawal's other half, and the one that makes the memo more
+        /// than a store: `ObservedWindowRejections::mark` is called from
+        /// exactly one production line, and this drives two real invocations to
+        /// reach it. The first offer cannot carry the lead — nothing had been
+        /// observed yet — and the second must, on the same skill and the same
+        /// route. Deleting the `mark` leaves the second offer worded like the
+        /// first, which no other test in this crate would notice.
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn a_watched_rejection_leads_the_next_offer_for_the_same_pair() {
+            let fx = Fixture::new("ob-withdraw-memo", OPTION_ID_OVER_BUDGET_PROCEED_ONCE, None);
+            fx.engine.refuse_the_expansion();
+
+            fx.invoke()
+                .await
+                .expect_err("the tier refused the accepted turn");
+            fx.invoke()
+                .await
+                .expect_err("and refuses the same bytes again");
+
+            let lead = "This skill was already rejected at the provider's window on this route";
+            let offers = fx.client.offers();
+            assert_eq!(offers.len(), 2, "one offer per invocation: {offers:#?}");
+            let worded = |request: &PermissionRequest| -> String {
+                match &request.subject {
+                    Some(PermissionSubject::SkillOverBudget { sentence, .. }) => sentence.clone(),
+                    other => panic!("not an over-budget offer: {other:?}"),
+                }
+            };
+            assert!(
+                !worded(&offers[0]).contains(lead),
+                "the first offer had nothing to lead with: {}",
+                worded(&offers[0])
+            );
+            assert!(
+                worded(&offers[1]).contains(lead),
+                "the second offer for this pair must open with the rejection this \
+                 daemon watched happen: {}",
+                worded(&offers[1])
             );
         }
     }
