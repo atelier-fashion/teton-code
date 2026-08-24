@@ -116,10 +116,11 @@ use teton_inference::probe::{decide, GpuClass, HardwareProfile, TierDecision, GI
 use teton_inference::{ChatFormat, Completion, Engine, EngineError, GenParams, MockEngine};
 
 use teton_protocol::events::{
-    BlockCause, CapabilityDeadEnd, ContextCleared, ContextPressureKind, Event, ModelLifecycle,
-    ModelLifecycleStage, PrivacyAction, ProviderTested, SessionRootChanged, SessionTitled,
-    SkillInvoked, TierWarming, TurnQueued, WebCapabilityState as WireWebCapabilityState, WebLookup,
-    WebSetupCompleted, WebTaintOverridden, WebTier as WireWebTier,
+    BlockCause, BudgetBound, CapabilityDeadEnd, ContextCleared, ContextPressureKind, Event,
+    ModelLifecycle, ModelLifecycleStage, PrivacyAction, ProviderTested, SessionRootChanged,
+    SessionTitled, SkillInvoked, TierWarming, TurnQueued,
+    WebCapabilityState as WireWebCapabilityState, WebLookup, WebSetupCompleted, WebTaintOverridden,
+    WebTier as WireWebTier,
 };
 use teton_protocol::jsonrpc::{error_code, RpcError};
 use teton_protocol::methods::{
@@ -608,6 +609,144 @@ impl EffortRefusals {
             .filter(|(s, _)| s == session)
             .map(|(_, p)| p.clone())
             .collect()
+    }
+}
+
+/// The window a route ran under, as the identity half of an observed rejection
+/// (REQ-589 BR-14.2 / ADR-9).
+///
+/// Every field is read off the [`RouteBudget`] the router stamped — nothing is
+/// derived here, and nothing is parsed out of [`RouteBudget::window_label`],
+/// which is prose (see that field's docs).
+///
+/// # Why the *figures* are part of the route's identity
+///
+/// "The same route" has to mean the same window, not the same provider. The
+/// whole point of the offer's remedy is that a user can **raise** the window;
+/// after they do, the route resolves to a larger budget and the rejection this
+/// memo observed no longer describes what would happen. Keying on the provider
+/// alone would carry that stale observation across the remedy and open the next
+/// offer with "the provider rejected this last time" about a window that no
+/// longer exists — a stale record replaying, which is the harm ASSUME-017
+/// records in its other half. With the pair in the key, a remedied route is
+/// simply a different route and the memo says nothing about it.
+///
+/// [`BudgetBound`] and the provider id ride along for the reverse reason: the
+/// redact clamp renames the window without changing whose it is, so two routes
+/// can share a pair and still be different windows.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct RouteWindow {
+    /// Which constraint bound the pair (REQ-586 BR-8).
+    bound: BudgetBound,
+    /// The provider whose declaration the pair came from — `None` on the local
+    /// tier, exactly as [`RouteBudget::provider_id`] means it.
+    provider_id: Option<String>,
+    /// The budget in words, as stamped.
+    budget_tokens: usize,
+    /// The budget in bytes, as stamped.
+    budget_bytes: usize,
+}
+
+impl RouteWindow {
+    /// The window identity of a stamped route budget.
+    #[must_use]
+    pub fn of(budget: &RouteBudget) -> Self {
+        Self {
+            bound: budget.bound,
+            provider_id: budget.provider_id.clone(),
+            budget_tokens: budget.budget_tokens,
+            budget_bytes: budget.budget_bytes,
+        }
+    }
+}
+
+/// Skill expansions a tier **actually refused at the window**, per session
+/// (REQ-589 BR-14.2 / ADR-9, D-8).
+///
+/// **Session-scoped and never persisted.** BR-14.2 asks for one thing: that a
+/// user who approved an over-budget send once, and watched it come back
+/// `context_length_exceeded`, is not made to choose blind the next time. So the
+/// next offer for the same skill on the same route opens with the rejection
+/// this daemon watched happen. Remembering is not consenting.
+///
+/// # An observation, not a consent — and the difference is the whole point
+///
+/// What is recorded here is a **measurement the daemon observed**: the tier
+/// refused these bytes at this window. It is not an authorization anybody
+/// granted. BR-10 forbids remembering the consent — a stored "yes" would be
+/// applied to a question that was never asked, and could send something nobody
+/// approved — while a stored *observation* can only ever make the next question
+/// better informed. That asymmetry is why this store may exist at all where
+/// [`crate::harness::permissions::PermissionGate`]'s one-time override may not
+/// be persisted.
+///
+/// Two consequences, and both are negative:
+///
+/// * **It does not suppress the next offer.** D-1 is always-ask. Whether an
+///   offer happens is [`skill_fit`]'s verdict against the stamped budget, and
+///   this store is not an input to it; a marked pair reaches the same question
+///   an unmarked one does
+///   (`an_observed_rejection_does_not_suppress_the_next_offer`).
+/// * **It does not pre-answer the next offer.** Nothing here is written to a
+///   [`PermissionGate`](crate::harness::permissions::PermissionGate), so the
+///   next offer is still asked and still has to be answered by a person; the
+///   record only changes the sentence it opens with
+///   (`an_observed_rejection_does_not_pre_answer_the_next_offer`).
+///
+/// # One store, daemon-side
+///
+/// Per **ASSUME-017** the CLI must not memoize this fact. That assumption
+/// records what the second store cost the last time: a client-side memo of a
+/// daemon decision answered a question the daemon had already forgotten, and
+/// the user never saw the prompt. There is no client half here by construction
+/// — the record never crosses the wire, and the only thing that does is the
+/// sentence the offer is composed with.
+///
+/// Keyed by `(session, skill, window)` — the skill by the name the user typed,
+/// the window by [`RouteWindow`] — on the same "a remembered fact is scoped by
+/// its key" principle [`EffortRefusals`] states beside it.
+#[derive(Debug, Default)]
+pub struct ObservedWindowRejections {
+    rejected: Mutex<HashSet<(SessionId, String, RouteWindow)>>,
+}
+
+impl ObservedWindowRejections {
+    /// An empty memo.
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Remember that `skill` was refused at `window` in `session`.
+    ///
+    /// Returns whether this was the **first** rejection observed for that
+    /// triple, so the caller can announce it once rather than on every
+    /// subsequent turn — the same announce-once discipline
+    /// [`EffortRefusals::mark`] and [`SessionTaint::mark`] use, and for the same
+    /// reason: a consequence nothing says out loud is one the user discovers as
+    /// "why does this keep failing".
+    ///
+    /// Not `#[must_use]`: a caller that only wants the fact recorded — the
+    /// withdrawal path already composing its own sentence — should not have to
+    /// say so, exactly as [`SessionTaint::mark`] reasons.
+    pub fn mark(&self, session: &SessionId, skill: &str, window: &RouteWindow) -> bool {
+        self.rejected
+            .lock()
+            .expect("observed rejection mutex poisoned")
+            .insert((session.clone(), skill.to_owned(), window.clone()))
+    }
+
+    /// Whether this skill on this route has already been refused at the window
+    /// in `session` — what the next offer opens its sentence from.
+    ///
+    /// A read and nothing else: it decides no offer, answers no question, and a
+    /// caller that ignores it loses only the opening clause.
+    #[must_use]
+    pub fn was_observed(&self, session: &SessionId, skill: &str, window: &RouteWindow) -> bool {
+        self.rejected
+            .lock()
+            .expect("observed rejection mutex poisoned")
+            .contains(&(session.clone(), skill.to_owned(), window.clone()))
     }
 }
 
@@ -1639,6 +1778,13 @@ pub struct DaemonRuntime {
     /// (REQ-559 BR-12 / ADR-F). Beside `session_taint` because both are
     /// session-scoped runtime degradation records rather than configuration.
     effort_refusals: Arc<EffortRefusals>,
+    /// Skill expansions a tier refused at the window, per session (REQ-589
+    /// BR-14.2 / ADR-9). Beside the two above because it is the same kind of
+    /// fact — something this daemon *observed* about one conversation, in
+    /// memory only — and deliberately **not** beside [`Self::session_gates`],
+    /// which is where answers a person gave live. An `Arc` for their reason
+    /// too: the turn path marks it from wherever the failed turn unwound.
+    window_rejections: Arc<ObservedWindowRejections>,
     /// Per-session lifts of the BR-13 web restriction (REQ-563). Behind an `Arc`
     /// because the lookup seam reads it through a [`TaintView`] on whatever task
     /// the turn is running on, while the `web/override` RPC writes it from the
@@ -1764,6 +1910,7 @@ impl DaemonRuntime {
             turn_counter: AtomicU64::new(0),
             session_taint: Arc::new(SessionTaint::new()),
             effort_refusals: Arc::new(EffortRefusals::new()),
+            window_rejections: Arc::new(ObservedWindowRejections::new()),
             web_override: Arc::new(WebTaintOverride::new()),
             session_user_urls: Mutex::new(HashMap::new()),
             session_gates: Mutex::new(HashMap::new()),
@@ -1985,6 +2132,7 @@ impl DaemonRuntime {
             turn_counter: AtomicU64::new(0),
             session_taint: Arc::new(SessionTaint::new()),
             effort_refusals: Arc::new(EffortRefusals::new()),
+            window_rejections: Arc::new(ObservedWindowRejections::new()),
             web_override: Arc::new(WebTaintOverride::new()),
             session_user_urls: Mutex::new(HashMap::new()),
             session_gates: Mutex::new(HashMap::new()),
@@ -5416,6 +5564,24 @@ impl DaemonRuntime {
     #[must_use]
     pub fn session_taint(&self) -> Arc<SessionTaint> {
         Arc::clone(&self.session_taint)
+    }
+
+    /// The observed-window-rejection memo (REQ-589 BR-14.2 / ADR-9).
+    ///
+    /// The **one** store of this fact, and it is on this side of the wire
+    /// (ASSUME-017). Handed out rather than kept private because the turn path
+    /// marks it from wherever an accepted over-budget turn unwound, and because
+    /// a suite proving "one store, daemon-side" has to be able to look at the
+    /// store it is claiming is the only one.
+    ///
+    /// Handing it out grants nothing dangerous, on [`Self::session_taint`]'s
+    /// reasoning one step further: the worst a holder can do is record that a
+    /// rejection happened, and a recorded rejection can only change the words
+    /// the next offer opens with. It cannot answer that offer — there is no
+    /// answer in here to read.
+    #[must_use]
+    pub fn window_rejections(&self) -> Arc<ObservedWindowRejections> {
+        Arc::clone(&self.window_rejections)
     }
 
     /// The two session flags the lookup taint gate reads (REQ-563 BR-13).
@@ -30288,6 +30454,265 @@ provider_id = \"deepseek\"
 
             let _ = std::fs::remove_dir_all(&from);
             let _ = std::fs::remove_dir_all(&to);
+        }
+    }
+    /// REQ-589 BR-14.2 / ADR-9 (D-8) — the observed-rejection memo.
+    ///
+    /// The store is the easy half. What these tests are actually holding is the
+    /// **boundary** between BR-14.2 and BR-10: a rejection this daemon watched
+    /// happen may be remembered, and an answer a person gave may not. The two
+    /// negative assertions below are what keeps a later edit from turning the
+    /// first into the second — the failure would otherwise be silent, because a
+    /// memo that quietly suppressed or pre-answered the next offer looks exactly
+    /// like a memo that works, right up until something is sent that nobody
+    /// approved.
+    mod observed_window_rejections {
+        use super::*;
+        use crate::harness::budget::{derive, BudgetInputs};
+        use crate::harness::permissions::PermissionConfig;
+        use crate::skills::permission_key_for;
+
+        /// The route the reported `/analyze` failure ran on — the local pair.
+        fn local_window() -> RouteWindow {
+            RouteWindow::of(&derive(BudgetInputs::local()))
+        }
+
+        /// A remote route whose provider declares `window` tokens.
+        fn remote_window(window: u32) -> RouteWindow {
+            RouteWindow::of(&derive(BudgetInputs {
+                window,
+                cap: 0,
+                reservation: 1_024,
+                is_local: false,
+                redact_scan: false,
+                provider_id: Some("kimi"),
+            }))
+        }
+
+        /// Every regular file under `dir`, recursively.
+        fn files_under(dir: &Path) -> Vec<PathBuf> {
+            let mut found = Vec::new();
+            let mut stack = vec![dir.to_path_buf()];
+            while let Some(next) = stack.pop() {
+                let Ok(entries) = std::fs::read_dir(&next) else {
+                    continue;
+                };
+                for entry in entries.flatten() {
+                    let path = entry.path();
+                    if path.is_dir() {
+                        stack.push(path);
+                    } else {
+                        found.push(path);
+                    }
+                }
+            }
+            found
+        }
+
+        /// `mark` reports the clean→observed transition, so the caller announces
+        /// once (`EffortRefusals::mark`'s discipline, and for its reason).
+        #[test]
+        fn mark_reports_the_first_time_transition_so_the_caller_announces_once() {
+            let memo = ObservedWindowRejections::new();
+            let session = SessionId::from("s");
+
+            assert!(
+                memo.mark(&session, "analyze", &local_window()),
+                "the first rejection observed for a pair is the transition"
+            );
+            assert!(
+                !memo.mark(&session, "analyze", &local_window()),
+                "a re-mark owes the user nothing — the sentence was already said"
+            );
+            assert!(memo.was_observed(&session, "analyze", &local_window()));
+        }
+
+        /// The record is scoped by its key, and the **window is part of it**.
+        ///
+        /// The last assertion is the one with teeth: raising the declared window
+        /// is the remedy the offer proposes, and a route that came back with a
+        /// bigger budget is a different route. A memo keyed on the provider
+        /// alone would open the next offer with "the provider rejected this last
+        /// time" about a window that no longer exists — a stale record
+        /// replaying, which is ASSUME-017's harm wearing a different hat.
+        #[test]
+        fn the_record_is_scoped_by_session_skill_and_window() {
+            let memo = ObservedWindowRejections::new();
+            let mine = SessionId::from("mine");
+            let theirs = SessionId::from("theirs");
+
+            assert!(memo.mark(&mine, "analyze", &local_window()));
+
+            assert!(
+                !memo.was_observed(&theirs, "analyze", &local_window()),
+                "another session's conversation is not evidence about this one"
+            );
+            assert!(
+                !memo.was_observed(&mine, "review", &local_window()),
+                "another skill's expansion is a different set of bytes"
+            );
+            assert!(
+                !memo.was_observed(&mine, "analyze", &remote_window(8_192)),
+                "another route's window refused nothing here"
+            );
+
+            assert!(memo.mark(&mine, "analyze", &remote_window(8_192)));
+            assert!(
+                !memo.was_observed(&mine, "analyze", &remote_window(200_000)),
+                "a raised window is a different route: the rejection observed \
+                 under the old one says nothing about what this one will do"
+            );
+        }
+
+        /// **Negative assertion 1 (BR-10, AC-23): the record does not suppress
+        /// the next offer.**
+        ///
+        /// D-1 is always-ask, and what decides whether the user is asked is
+        /// [`skill_fit`]'s verdict against the stamped budget — a function of
+        /// the system prompt, the expansion and the pair, and of nothing else.
+        /// This drives that function either side of a `mark` for the very pair
+        /// it is measuring and asserts the verdict is unchanged **byte for
+        /// byte**, message included: the memo is not an input to it, so a marked
+        /// pair reaches the same question an unmarked one does.
+        ///
+        /// It looks redundant and is not (LESSON-508). Nothing else would fail
+        /// if a later edit consulted this store before offering: the turn would
+        /// simply stop asking, which reads as the feature working — the user
+        /// hits the wall silently instead of being offered the remedy, which is
+        /// D-8's failure restored.
+        #[test]
+        fn an_observed_rejection_does_not_suppress_the_next_offer() {
+            let budget = derive(BudgetInputs::local());
+            let system = "You are Teton Code.";
+            let expansion = "word ".repeat(budget.budget_tokens + 1);
+            let verdict = || {
+                skill_fit(
+                    SkillCaller::User,
+                    SkillStage::Body,
+                    "analyze",
+                    system,
+                    &expansion,
+                    &budget,
+                    None,
+                )
+            };
+
+            let before = verdict();
+            assert!(
+                matches!(before, SkillFit::TooLarge { .. }),
+                "non-vacuity: this fixture must be the over-budget case, or the \
+                 comparison below is between two `Fits`"
+            );
+
+            let memo = ObservedWindowRejections::new();
+            let session = SessionId::from("s");
+            assert!(memo.mark(&session, "analyze", &RouteWindow::of(&budget)));
+
+            assert_eq!(
+                verdict(),
+                before,
+                "the offer is still reached, and its sentence is unchanged: the \
+                 memo may inform the question, never skip it"
+            );
+        }
+
+        /// **Negative assertion 2 (BR-10, AC-23): the record does not pre-answer
+        /// the next offer.**
+        ///
+        /// Answers a person gave live on the session's [`PermissionGate`], and
+        /// that is the only place a later turn can read one from. Marking an
+        /// observation writes nothing there — under either skill key — so the
+        /// next offer is still asked and still has to be answered by a human.
+        ///
+        /// This is the assertion that keeps an *observation* from becoming a
+        /// *consent*: a stored consent could send something nobody approved
+        /// (BR-10, BUG-161's shape), while a stored observation can only make
+        /// the next question better informed.
+        #[test]
+        fn an_observed_rejection_does_not_pre_answer_the_next_offer() {
+            let session = SessionId::from("s");
+            let gate = PermissionGate::new(
+                session.clone(),
+                PermissionConfig::default(),
+                Arc::new(EventBus::new()),
+                Arc::new(PendingPermissions::new()),
+            );
+
+            let memo = ObservedWindowRejections::new();
+            assert!(memo.mark(&session, "analyze", &local_window()));
+
+            for key in [
+                permission_key_for(SkillSource::User, "analyze"),
+                permission_key_for(SkillSource::Project, "analyze"),
+            ] {
+                assert!(
+                    gate.remembered(&key).is_none(),
+                    "an observation answered `{key}` — the next offer would be \
+                     resolved from a question nobody was asked"
+                );
+            }
+        }
+
+        /// **The memo is session-scoped and never persisted** (ADR-9), and the
+        /// guard is redundant-looking for LESSON-508's exact reason: nothing
+        /// else in the suite would redden if someone gave this store a serde
+        /// derive and a write, and a rejection observed in one session that
+        /// replayed into the next would open an offer with a claim about a route
+        /// this daemon has never run.
+        ///
+        /// Both halves, because either alone is satisfiable by accident: the
+        /// state directory gains no file naming the skill, **and** a daemon
+        /// restarted over that same directory has forgotten it.
+        #[test]
+        fn an_observed_rejection_never_reaches_disk_and_is_gone_on_restart() {
+            let dir = scratch_dir("observed-rejection");
+            let events = Arc::new(EventBus::new());
+            let runtime = DaemonRuntime::from_env(&dir, &events).expect("the daemon starts");
+
+            let session = SessionId::from("s");
+            // Distinctive enough that a substring hit anywhere under the state
+            // dir is this record and not a coincidence.
+            let skill = "zzz-observed-rejection-witness";
+            assert!(runtime
+                .window_rejections()
+                .mark(&session, skill, &local_window()));
+            assert!(
+                runtime
+                    .window_rejections()
+                    .was_observed(&session, skill, &local_window()),
+                "non-vacuity: the record is really in the store this is about to \
+                 claim wrote nothing"
+            );
+
+            let on_disk = files_under(&dir);
+            assert!(
+                !on_disk.is_empty(),
+                "non-vacuity: a state directory this daemon wrote nothing into \
+                 would satisfy the scan below for the wrong reason"
+            );
+            let named: Vec<_> = on_disk
+                .into_iter()
+                .filter(|path| {
+                    std::fs::read(path)
+                        .map(|bytes| String::from_utf8_lossy(&bytes).contains(skill))
+                        .unwrap_or(false)
+                })
+                .collect();
+            assert!(
+                named.is_empty(),
+                "the observation reached disk: {named:?} — it is evidence about \
+                 one conversation and must not outlive it"
+            );
+
+            let restarted = DaemonRuntime::from_env(&dir, &events).expect("the daemon restarts");
+            assert!(
+                !restarted
+                    .window_rejections()
+                    .was_observed(&session, skill, &local_window()),
+                "a restarted daemon remembered a rejection it never observed"
+            );
+
+            let _ = std::fs::remove_dir_all(&dir);
         }
     }
 }
