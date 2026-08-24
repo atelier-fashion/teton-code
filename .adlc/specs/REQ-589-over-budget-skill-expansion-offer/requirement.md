@@ -1,7 +1,7 @@
 ---
 id: REQ-589
 title: "Offer to proceed when a skill expansion exceeds the route's context budget"
-status: draft
+status: approved
 deployable: true
 created: 2026-08-24
 updated: 2026-08-24
@@ -131,6 +131,12 @@ AC-9's "nobody was asked and nobody decided" distinction, kept where it already 
   - `WindowUnknown` — no window fact exists (the local tier, or a remote provider with
     `max_context = 0`): offer, stating that the daemon **cannot promise** the send will
     fit, with the typed `context_length_exceeded` outcome as the backstop.
+    **Correction (architecture phase):** that outcome is produced today only on the
+    *remote* path (`completion.rs:535`/`:1259`); the local engine's failure becomes
+    `HarnessError::Engine` → `INTERNAL_ERROR`. The backstop this rule relies on must
+    therefore be **built** for the local tier, not assumed — see architecture ADR-3. It
+    is the head of the task DAG, because BR-14.1's trigger depends on it and the
+    alternative (string-matching the engine's sentence) is LESSON-528's shape.
 
   There is no overrun ceiling. A prediction of failure is a thing to say, not a reason
   to refuse to ask.
@@ -164,10 +170,23 @@ AC-9's "nobody was asked and nobody decided" distinction, kept where it already 
   names, the skill's name, and a sanitized provider id may reach any of them; no
   provider response body is an input, because none is in scope. (informed by REQ-586)
 
-- [ ] **BR-6: A project skill's trust question comes first.** Stage A currently runs
-  before **REQ-585's** BR-4 project-skill acknowledgment on purpose. *(Cross-REQ rule
-  references in this document are always qualified with their REQ — this document has
-  its own BR-4 and BR-10 meaning different things.)* For a **project-sourced**
+- [ ] **BR-6: A project skill's trust question comes first — and must first exist.**
+  *(Cross-REQ rule references in this document are always qualified with their REQ —
+  this document has its own BR-4 and BR-10 meaning different things.)*
+
+  **Correction (architecture phase).** This rule was drafted believing Stage A ran
+  before **REQ-585's** BR-4 acknowledgment on the typed path. It does not: the only
+  production caller of `authorize_project_skill_trust` is `harness/tools/skill.rs:1572`,
+  the **model-invoked** tool. The user-typed path's `accept_invocation`
+  (`runtime.rs:2904`) is a synchronous `fn` whose only check is name validity — **there
+  is no trust gate on the typed path at all.** A user who types `/name` today runs a
+  project-authored skill body with no acknowledgment.
+
+  **D-10 resolves this by building the gate** rather than dropping the rule: the
+  acknowledgment is introduced on the typed path as part of this REQ, `accept_invocation`
+  becomes `async`, and the gate call is inserted before Stage A. This is new
+  functionality, not the reordering the original text described, and it is a deliberate
+  scope increase the product owner accepted with that stated. See ADR-10. For a **project-sourced**
   skill that ordering must invert: the user is asked whether they trust the repository
   *before* they are asked whether to send an oversized body from it. Asking the budget
   question first would have a user authorize an over-budget send of bytes from a
@@ -348,6 +367,13 @@ AC-9's "nobody was asked and nobody decided" distinction, kept where it already 
   local tier itself*; the two writes are applied together or not at all (a half-applied
   remedy that leaves `max_context = 0` reproduces the original circle and must be
   impossible); and the cost sentence cannot be omitted.
+  **Correction (architecture phase):** "applied together or not at all" is not
+  achievable through `config/set`, which persists one update per call and which
+  `architecture.md:169-172` explicitly forbids generalizing. ADR-5 satisfies this
+  criterion's *intent* instead by **ordering the writes so the forbidden state is
+  unreachable** — `max_context` first, tier binding second. A partial failure then
+  leaves a declared window on an unbound tier, which is harmless; only the reverse
+  order can produce the circle.
 - [ ] AC-9: A project-sourced over-budget skill asks the trust question before the
   budget question; a user-authored one does not (BR-6). Declining trust yields the trust
   refusal, not a budget sentence.
@@ -471,19 +497,34 @@ was validated. **D-8 reversed the draft's lean; the other four confirmed it.**
 - **D-9 — the daemon performs the `BindTierRemote` remedy.** Reciting a two-command fix
   is what produced the reported circle. Applied, gated behind the cost sentence. → BR-9.
 
+**Third round — decisions taken during the architecture phase, 2026-08-24.**
+
+- **D-10 — build the project-skill trust gate on the typed path.** Exploration proved
+  BR-6's premise false: no trust gate exists on the user-typed `/name` path, so the rule
+  as drafted was a no-op. The product owner chose to **build** the gate rather than drop
+  the rule and file the gap. This is an accepted scope increase: `accept_invocation`
+  becomes `async` and its signature change reaches every caller. → BR-6, ADR-10.
+- **D-11 — the local tier's typed context outcome is built, not assumed.** → BR-3
+  correction, ADR-3.
+- **D-12 — ordering replaces atomicity for the two-write remedy.** → AC-8 correction,
+  ADR-5.
+
 ## Open Questions
 
 Every question from the first two rounds is now decided (D-1 … D-9). Answering them
 opened two new ones, both narrow and both created by D-9's decision to *perform* the
 tier rebind rather than recite it.
 
-- [ ] OQ-1: **Which provider does `BindTierRemote` bind to when more than one is
-  configured?** The reported machine has exactly one remote provider, which hides the
+- [x] OQ-1 *(decided in architecture — ADR-12: ask when two or more, propose by name
+  when exactly one; a provider-enumeration helper is new code)*: **Which provider does
+  `BindTierRemote` bind to when more than one is configured?** The reported machine has exactly one remote provider, which hides the
   question. With two or more healthy providers the daemon would be choosing where a
   whole category's spend goes. *Lean:* **ask, and never pick silently** — D-9 authorized
   performing the remedy, not choosing the vendor. A single configured provider may be
   proposed by name; two or more must be presented as a choice.
-- [ ] OQ-2: **What happens when a vendor recipe's window goes stale?** BR-7c writes a
+- [x] OQ-2 *(decided in architecture — ADR-7: `ProviderRecipe` gains a `verified_on`
+  field, promoting the comment-only date to data; the write records it)*: **What happens
+  when a vendor recipe's window goes stale?** BR-7c writes a
   recipe value to disk, and recipes carry a verification date precisely because vendors
   move (REQ-577 already documents this decay). A stale recipe means a wrong
   `max_context` persisted into the user's config, where it outlives the recipe that
