@@ -1,7 +1,7 @@
 ---
 id: TASK-241
 title: "Protocol: SkillOverBudget subject, option ids, and the three events"
-status: draft
+status: complete
 parent: REQ-589
 created: 2026-08-24
 updated: 2026-08-24
@@ -19,11 +19,11 @@ ADR-1 + ADR-2. Add the consent subject and the four option ids that express BR-7
 
 ## Acceptance Criteria
 
-- [ ] Four option ids: `over_budget_proceed_once`, `over_budget_proceed_and_remedy`, `over_budget_remedy_only`, `over_budget_decline`
-- [ ] `PermissionOutcome` is UNCHANGED — a test asserts the wire shape did not widen (ASSUME-B)
-- [ ] The subject carries measured integers, bound, verdict, skill name, sanitized provider id — and no provider response body
-- [ ] Adding the variant fails compilation anywhere `PermissionSubject` is matched non-exhaustively (this is the intended forcing function)
-- [ ] Round-trip serde test for the new subject and each event
+- [x] Four option ids: `over_budget_proceed_once`, `over_budget_proceed_and_remedy`, `over_budget_remedy_only`, `over_budget_decline`
+- [x] `PermissionOutcome` is UNCHANGED — a test asserts the wire shape did not widen (ASSUME-B)
+- [x] The subject carries measured integers, bound, verdict, skill name, sanitized provider id — and no provider response body
+- [x] Adding the variant fails compilation anywhere `PermissionSubject` is matched non-exhaustively (this is the intended forcing function)
+- [x] Round-trip serde test for the new subject and each event
 
 ## Technical Notes
 
