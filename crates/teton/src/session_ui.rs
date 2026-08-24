@@ -33,10 +33,12 @@ use teton_protocol::events::{
     ModelSelectionProposed, NotRunReason, PermissionOption, PermissionOptionKind,
     PermissionRequest, PermissionSubject, PhaseTransition, PrefixCache, PrefixCacheMiss,
     PrefixCacheOutcome, PrivacyAction, PrivacyBlock, ProvenanceRejected, ProvenanceRejection,
-    ProviderDegraded, ProviderSetupCompleted, ProviderSetupRejected, ProviderTested, RouteDecided,
-    SessionGrantMinted, SessionUpdatePayload, SkillInvoked, TierWarming, ToolCallStatus,
+    ProviderDegraded, ProviderSetupCompleted, ProviderSetupRejected, ProviderTested, RemedyKind,
+    RouteDecided, SessionGrantMinted, SessionUpdatePayload, SkillInvoked, SkillOverBudgetAccepted,
+    SkillOverBudgetOffered, SkillOverBudgetRemedyApplied, SkillStage, TierWarming, ToolCallStatus,
     TurnQueued, WebCapabilityState, WebConsentDecided, WebConsentScope, WebLookup, WebLookupKind,
-    WebLookupOutcome, WebSetupCompleted, WebSetupRejected, WebTier, OPTION_ID_ENABLE_PERMANENT,
+    WebLookupOutcome, WebSetupCompleted, WebSetupRejected, WebTier, WindowVerdict,
+    OPTION_ID_ENABLE_PERMANENT,
 };
 use teton_protocol::methods::{
     AttachConsentOutcome, AttachConsentParams, PermissionOutcome, PermissionRespondParams,
@@ -986,7 +988,176 @@ pub fn render_event(
             surface.line(LineKind::Notice, &format_context_pressure(pressure));
             EventOutcome::Rendered
         }
+        // REQ-589 BR-3. **Verbose-gated, and it is the only one of the three
+        // that is.** The offer is *raised*, not answered, and the connection
+        // this event reaches is the same one the addressed `permission_request`
+        // reaches (REQ-587 ADR-3) — which draws every figure this event carries
+        // and the four option labels besides, two lines later. An unconditional
+        // notice here would say the same numbers twice in the same breath,
+        // which is the `route_decided` situation exactly: the record is worth
+        // keeping and is not worth repeating, so `/verbose` keeps it.
+        //
+        // The two arms below are *not* gated, and the asymmetry is the point:
+        // an offer changes nothing yet, while an accept sent an oversized turn
+        // and a remedy wrote a config file.
+        Event::SkillOverBudgetOffered(offered) => {
+            if state.verbose {
+                surface.line(LineKind::Notice, &format_over_budget_offered(offered));
+            }
+            EventOutcome::Rendered
+        }
+        // REQ-589 BR-1, and never verbose-gated, on `skill_refused`'s rule: a
+        // declined offer prints a refusal line unconditionally, so the accepted
+        // one must print its counterpart or the two outcomes of one question
+        // are asymmetric — one visible, one silent. It is also the only record
+        // that BR-1's promise was kept, which is a claim about what left this
+        // machine rather than diagnostic chrome about how it left.
+        Event::SkillOverBudgetAccepted(accepted) => {
+            surface.line(LineKind::Notice, &format_over_budget_accepted(accepted));
+            EventOutcome::Rendered
+        }
+        // REQ-589 BR-7/BR-8, and the least gateable line in this function: a
+        // file on disk changed. `OPTION_ID_ENABLE_PERMANENT`'s comment records
+        // an earlier version that promised a durable write and silently made
+        // none, and a durable write nobody is told about is the same defect
+        // wearing the other face.
+        Event::SkillOverBudgetRemedyApplied(applied) => {
+            surface.line(
+                LineKind::Notice,
+                &format_over_budget_remedy_applied(applied),
+            );
+            EventOutcome::Rendered
+        }
     }
+}
+
+/// The words a [`SkillStage`] is said in, wherever this client names one.
+///
+/// The wire carries which stage spoke and nothing else — the protocol's own
+/// note on [`SkillStage`] says the sentence is composed at the surface that
+/// renders it, which is here. What the distinction buys a reader is what they
+/// can *do*: a body that will not fit was measured before any command ran, so
+/// nothing has happened yet; a Stage B measurement is over budget *because* the
+/// dynamic-context output it just paid for is what spent the room.
+///
+/// [`SkillStage::Unknown`] hedges rather than guessing. It is `#[serde(other)]`
+/// output from a daemon newer than this build, and "a stage this build does not
+/// know" is the only true thing to say about it — the alternative is a
+/// confident sentence about the wrong stage.
+fn stage_words(stage: SkillStage) -> &'static str {
+    match stage {
+        SkillStage::Body => "measured from its body, before any dynamic-context command ran",
+        SkillStage::WithDynamicContext => "measured with its dynamic-context output folded in",
+        SkillStage::Unknown => "measured at a stage this build does not know",
+    }
+}
+
+/// The words a [`WindowVerdict`] is said in on a **record** line — the three
+/// over-budget events (REQ-589 BR-3).
+///
+/// One table for the records, so the offered line and the accepted line cannot
+/// come to describe one route's window differently. The *question* does not
+/// read it: per ADR-16 the offer's verdict clause is the daemon's own sentence,
+/// riding on the subject, and a second wording of it here would be the second
+/// composer BR-5 forbids.
+///
+/// **[`WindowVerdict::Unknown`] is a hedge and is never spelled as
+/// [`WindowVerdict::WindowUnknown`]** (ADR-13). "This route declares no window"
+/// is a specific claim about the route; "this build cannot read the verdict" is
+/// a claim about this binary, and only the second is true of an
+/// `#[serde(other)]` value. Collapsing them would have an old client state a
+/// routing fact it has no evidence for.
+fn verdict_words(verdict: WindowVerdict) -> &'static str {
+    match verdict {
+        WindowVerdict::FitsWindow => "inside the window this route declares",
+        WindowVerdict::ExceedsWindow => "past the window this route declares",
+        WindowVerdict::WindowUnknown => "on a route that declares no window",
+        WindowVerdict::Unknown => "against a window verdict this build cannot read",
+    }
+}
+
+/// The words a [`RemedyKind`] is said in: the concrete write, never "raise the
+/// limit" (REQ-589 architecture ADR-1).
+///
+/// A noun phrase rather than a tensed clause, because both readers of this
+/// table need a different tense around it — the offered line names a fix that
+/// *was proposed*, the applied line names one that *was written*.
+///
+/// [`RemedyKind::NotOffered`] and [`RemedyKind::Unknown`] are deliberately
+/// different sentences. The first is the daemon stating that this bound has no
+/// durable fix (BR-7b, the `RedactScan` cell); the second is this build failing
+/// to read one. A record a person reads later must not collapse "there is no
+/// remedy" into "I could not name the remedy".
+fn remedy_words(remedy: RemedyKind) -> &'static str {
+    match remedy {
+        RemedyKind::DeclareWindow => "declare `capabilities.max_context`",
+        RemedyKind::RaiseCap => "raise `capabilities.context_budget_cap`",
+        RemedyKind::RaiseWindow => "raise `capabilities.max_context`",
+        RemedyKind::BindTierRemote => {
+            "register a remote provider with a declared window and bind this tier to it"
+        }
+        RemedyKind::NotOffered => "none — this bound has no durable fix",
+        RemedyKind::Unknown => "a fix this build cannot name",
+    }
+}
+
+/// The `skill_over_budget_offered` notice (REQ-589 BR-3).
+fn format_over_budget_offered(offered: &SkillOverBudgetOffered) -> String {
+    format!(
+        "over budget: skill `{}` ({}) was put to you as a question — measured {} · {}, {}; \
+         going-forward fix offered: {}",
+        offered.skill,
+        slash::source_word(offered.source),
+        figure_pair(offered.measured_tokens, offered.measured_bytes),
+        budget_figures(
+            offered.budget_tokens,
+            offered.budget_bytes,
+            offered.bound,
+            false,
+        ),
+        verdict_words(offered.window_verdict),
+        remedy_words(offered.remedy_kind),
+    )
+}
+
+/// The `skill_over_budget_accepted` notice (REQ-589 BR-1).
+///
+/// **No bound**, because the event carries none: it is on the `offered` event
+/// that precedes it and the two correlate by session and sequence. This line
+/// states what BR-1 promises instead — the figures that were *sent*, and that
+/// nothing was shortened to make them fit.
+fn format_over_budget_accepted(accepted: &SkillOverBudgetAccepted) -> String {
+    format!(
+        "over budget: skill `{}` ({}) was sent whole at your request — {} against a budget of {}, \
+         {}; {}. Nothing was shortened.",
+        accepted.skill,
+        slash::source_word(accepted.source),
+        figure_pair(accepted.measured_tokens, accepted.measured_bytes),
+        figure_pair(accepted.budget_tokens, accepted.budget_bytes),
+        verdict_words(accepted.window_verdict),
+        stage_words(accepted.stage),
+    )
+}
+
+/// The `skill_over_budget_remedy_applied` notice (REQ-589 BR-7, BR-8).
+///
+/// Both values, always, for the reason the event carries both: a line that
+/// named only the new one leaves a reader unable to tell a raise from a first
+/// declaration. They are the daemon's own spellings — a window and a cap are
+/// integers and a tier binding is a name, and a client that re-typed them per
+/// [`RemedyKind`] would be a second classifier of the daemon's decision.
+fn format_over_budget_remedy_applied(applied: &SkillOverBudgetRemedyApplied) -> String {
+    let addressed = applied
+        .provider_id
+        .as_ref()
+        .map_or_else(String::new, |id| format!(" for `{id}`"));
+    format!(
+        "over budget: wrote the going-forward fix ({}){} — was {}, now {}",
+        remedy_words(applied.remedy_kind),
+        addressed,
+        applied.previous_value,
+        applied.new_value,
+    )
 }
 
 /// The line a `session_root_changed` event draws for the session it is about
@@ -2816,12 +2987,22 @@ pub(crate) enum ConsentGate {
 ///   on. BR-11's narrowing is about the *skill* consent and nothing else; a gate
 ///   that generalized it would be a silent change to every tool prompt.
 /// - **Every skill subject needs a terminal.** This is the narrowing, and it is
-///   the whole of it: a skill's dynamic context (REQ-585 BR-6) and REQ-587
-///   BR-4's project-skill acknowledgment, which is the same rule applied to the
-///   question one step earlier. At `full` the daemon asks neither, so a piped
-///   session still runs dynamic context and still expands a non-shadowing
-///   project skill exactly as a TTY does — that is the automation posture, and
-///   it is why this gate never sees those turns.
+///   the whole of it: a skill's dynamic context (REQ-585 BR-6), REQ-587 BR-4's
+///   project-skill acknowledgment, which is the same rule applied to the
+///   question one step earlier, and REQ-589 BR-3's over-budget offer. At `full`
+///   the daemon asks neither of the first two, so a piped session still runs
+///   dynamic context and still expands a non-shadowing project skill exactly as
+///   a TTY does — that is the automation posture, and it is why this gate never
+///   sees those turns.
+///
+///   **The over-budget offer is the exception, and it is why this row earns its
+///   own line.** `authorize_skill_over_budget` settles under
+///   `LevelAllow::DoesNotSettle`, so a `full` session raises the question too
+///   (architecture ADR-14: `full` means "do not ask me about tool calls", and an
+///   oversized send is not a tool call). This gate therefore *does* see
+///   unattended sessions on that subject, and the refusal it returns there is
+///   not a narrowing of anything — it is BR-4 exactly, today's refusal, reached
+///   without reading a line.
 /// - **An unrecognized subject is refused, terminal or not.** A client that does
 ///   not know what it is being asked cannot render the question, so there is
 ///   nothing to put to the user even at a terminal; falling through to `ask`
@@ -2860,6 +3041,24 @@ pub(crate) fn consent_gate(subject: Option<&PermissionSubject>, typed_input: boo
                 ConsentGate::RefuseNoTerminal
             }
         }
+        // REQ-589 BR-3/BR-4, the third skill subject and the one with the most
+        // to lose. The other two cost a skill's dynamic context or a
+        // repository's text reaching the model; a swallowed line here sends an
+        // oversized expansion the daemon has already *measured* and expects the
+        // provider to reject — spend, on a turn nobody approved, in the posture
+        // where nobody is watching.
+        //
+        // `RefuseNoTerminal` and not `RefuseUnrecognized`: this build draws the
+        // question two functions below. Nobody could be asked, which is a
+        // different fact from "this build cannot show the question", and the
+        // daemon reads the two differently (REQ-585 AC-9).
+        Some(PermissionSubject::SkillOverBudget { .. }) => {
+            if typed_input {
+                ConsentGate::Answerable
+            } else {
+                ConsentGate::RefuseNoTerminal
+            }
+        }
     }
 }
 
@@ -2888,6 +3087,12 @@ pub(crate) fn consent_gate(subject: Option<&PermissionSubject>, typed_input: boo
 /// dismissed the prompt*, it is what EOF on a pipe returns two dozen lines
 /// below, and AC-9 needs the daemon's placeholders to be able to say that no
 /// human could be asked — which a dismissal cannot tell it.
+///
+/// **The over-budget offer leaves this function early**, below the gate and
+/// *above* the grants, into [`resolve_over_budget_offer`] (REQ-589 BR-10). It
+/// is the one question here whose answer must not be reachable from a
+/// remembered one, and the branch's own comment says why the ordering is the
+/// guarantee rather than a preference.
 pub fn resolve_permission(
     req: &PermissionRequest,
     surface: &mut dyn Surface,
@@ -2928,6 +3133,31 @@ pub fn resolve_permission(
                 },
             );
         }
+    }
+
+    // REQ-589 BR-10, architecture ADR-14 — **and the compiler gave no help
+    // here** (ADR-2's Correction). This branch sits above the grant lookups
+    // because those lookups are the client's half of the hole ADR-14 closes on
+    // the daemon's: the offer is asked under the *same* `skill:<source>:<name>`
+    // key REQ-585's dynamic-context consent is remembered under, so a user who
+    // once answered `a` to "run these four commands?" for `/analyze` has an
+    // `allow_always` row sitting right here. Fall through to it and
+    // `allow_outcome` picks by `PermissionOptionKind` — which cannot tell the
+    // four over-budget ids apart, because both proceed answers are allow-shaped
+    // — and auto-answers "send it whole", or worse `over_budget_proceed_and_
+    // remedy`, which also writes config. `deny_outcome` is no safer: with no
+    // `RejectAlways` on the offer it falls back to the first `RejectOnce`,
+    // which is `over_budget_remedy_only` — a config write from a grant that
+    // said *deny*. A grant answering a question nobody asked, in both
+    // directions.
+    //
+    // So BR-10 is two guards on this side as well as the daemon's: nothing is
+    // written, and nothing already written is read. The helper below takes no
+    // `&mut SessionGrants` at all, which is `interpret_over_budget`'s trick —
+    // the store is not in scope, so recording or consulting one is a compile
+    // error rather than a discipline.
+    if let Some(subject @ PermissionSubject::SkillOverBudget { .. }) = req.subject.as_ref() {
+        return resolve_over_budget_offer(req, subject, surface, prompter);
     }
 
     // Session-scoped auto-decisions first — these consume no prompt.
@@ -3015,6 +3245,122 @@ pub fn resolve_permission(
     }
 }
 
+/// Put REQ-589's over-budget offer to the user and read back the **one option
+/// id** they chose (BR-3, architecture ADR-1).
+///
+/// ## Why this is not the prompt above
+///
+/// The standard prompt is a two-way question with two remembering shortcuts,
+/// answered by letter and resolved to an outcome by
+/// [`PermissionOptionKind`]. Every one of those three properties is wrong here:
+///
+/// - **It is a four-way question** (two, on a bound BR-7 grants no remedy), and
+///   the four differ in whether this turn is sent *and* whether a config file is
+///   written. There is no `[y]es` that means one of them.
+/// - **The kinds cannot tell them apart.** Both proceed answers are
+///   allow-shaped and both refusals are reject-shaped, which is exactly why
+///   ADR-1 gives each its own id. Selecting by kind would pick "send it and
+///   write the fix" for a user who meant "send it once".
+/// - **Nothing may be remembered** (BR-10). `a` and `d` have no meaning on a
+///   question whose answer is discarded the moment it is read, and offering
+///   them would be a promise the daemon does not keep.
+///
+/// ## Numbers only, and that is a safety property
+///
+/// The answer is the row's number and nothing else. No letter is a choice here
+/// — a stray `y` re-asks. That is deliberate: the letter that means "yes" on
+/// every other prompt in this client is the single most likely thing to be
+/// sitting in a paste buffer or a here-doc, and the cost of it meaning
+/// *something* on this prompt is an oversized send nobody chose. Re-asking is
+/// free; the wrong send is not.
+///
+/// Empty and EOF both answer [`PermissionOutcome::Cancelled`], which the daemon
+/// reads as a human declining: this turn does not run and nothing is written.
+/// That is the pre-REQ-589 outcome, so the accidental `Enter` lands on the
+/// status quo rather than on a send.
+///
+/// ## The option rows are the daemon's, in the daemon's order
+///
+/// Labels are rendered verbatim — ADR-1 binds them to name the concrete write
+/// (`capabilities.max_context = 1000000` for `kimi`), and re-wording them here
+/// would be a second composer for BR-5 to drift against. The **order** is the
+/// daemon's too, because BR-3's "leads with the remedy" *is* the order and
+/// nothing else (ADR-14); a client that sorted the rows would silently undo it.
+///
+/// `grants` is not a parameter. See the branch that calls this.
+fn resolve_over_budget_offer(
+    req: &PermissionRequest,
+    subject: &PermissionSubject,
+    surface: &mut dyn Surface,
+    prompter: &mut dyn Prompter,
+) -> PermissionRespondParams {
+    let description = req
+        .description
+        .as_deref()
+        .map_or_else(String::new, |d| format!(" — {d}"));
+    surface.line(
+        LineKind::Prompt,
+        &format!("permission requested: {}{description}", req.tool_name),
+    );
+    render_consent_subject(Some(subject), surface);
+
+    // An offer with nothing to choose from. Unreachable from this daemon —
+    // `over_budget_options` always yields at least the override and the decline
+    // — which is why it refuses rather than inventing a fallback: a question
+    // with no answers is one this client cannot show, and that is precisely
+    // what `UnrecognizedSubject` means. **Not `Cancelled`**, which would claim a
+    // human dismissed a prompt nobody was shown, and not a read of stdin, which
+    // would eat a line to answer a question that was never put.
+    if req.options.is_empty() {
+        surface.line(
+            LineKind::Notice,
+            &refusal_line(req, RefusalReason::UnrecognizedSubject),
+        );
+        return respond(
+            req,
+            PermissionOutcome::Refused {
+                reason: RefusalReason::UnrecognizedSubject,
+            },
+        );
+    }
+
+    for (row, option) in req.options.iter().enumerate() {
+        surface.line(
+            LineKind::Prompt,
+            &format!("  {}) {}", row + 1, option.label),
+        );
+    }
+    let last = req.options.len();
+    let question = format!("  choose 1-{last} (empty refuses the turn): ");
+    let retry = format!(
+        "  please answer with one of the numbers above, 1-{last} — this prompt reads no letters, \
+         so a stray `y` is not an answer to it"
+    );
+
+    loop {
+        let Some(answer) = prompter.ask(&question) else {
+            // EOF: the user pressed Ctrl-D at a terminal this session was
+            // confirmed to have. A dismissal, which is what `Cancelled` means.
+            return respond(req, PermissionOutcome::Cancelled);
+        };
+        let choice = answer.trim();
+        if choice.is_empty() {
+            return respond(req, PermissionOutcome::Cancelled);
+        }
+        match choice.parse::<usize>() {
+            Ok(row) if (1..=last).contains(&row) => {
+                return respond(
+                    req,
+                    PermissionOutcome::Selected {
+                        option_id: req.options[row - 1].option_id.clone(),
+                    },
+                );
+            }
+            _ => surface.line(LineKind::Prompt, &retry),
+        }
+    }
+}
+
 /// Render what a request is about, from its typed subject (REQ-585 ADR-7).
 ///
 /// **One [`Surface::line`] per command.** `Surface::line` defuses its text, and
@@ -3032,11 +3378,30 @@ pub fn resolve_permission(
 /// compile error here, where the question is drawn, and not a silently blank
 /// prompt.
 ///
-/// Both skill subjects are drawn on the **refusing** path too, above the
+/// All three skill subjects are drawn on the **refusing** path too, above the
 /// refusal line: a piped session is told what was refused, not merely that
 /// something was. That is the one place the wildcard would have been invisible —
 /// a blank arm renders nothing and asserts nothing, and the request would still
 /// be refused with the right reason.
+///
+/// # The over-budget arm destructures every field, with no `..`
+///
+/// Deliberate, and it is the same forcing function one level up. ADR-2 made a
+/// new *variant* a compile error here; binding every *field* makes a new field
+/// one too. REQ-589's ADR-16 decided that the offer's composed sentence — the
+/// verdict clause, BR-7b's no-durable-fix line, BR-14.2's observed-rejection
+/// lead — rides on the subject as a field and is rendered here **verbatim**,
+/// because the daemon words the offer and this client only presents it. A `..`
+/// would let that field arrive and be silently dropped, which is a producer
+/// with no consumer, invisible to a green suite: LESSON-544's shape, and the
+/// exact failure ADR-16 exists to prevent.
+///
+/// The field landed mid-task, and this arm is where its arrival was noticed:
+/// the missing binding was an `E0027` before any test ran. What renders now is
+/// the source marking, that sentence verbatim, and — for an unreadable verdict
+/// — the hedge, which is the one verdict rendering ADR-16 assigns to the client
+/// outright, because it is a statement about *this build's* vocabulary rather
+/// than about the route.
 fn render_consent_subject(subject: Option<&PermissionSubject>, surface: &mut dyn Surface) {
     match subject {
         None | Some(PermissionSubject::Unrecognized) => {}
@@ -3088,8 +3453,73 @@ fn render_consent_subject(subject: Option<&PermissionSubject>, surface: &mut dyn
                 surface.line(LineKind::Prompt, &format!("    +{more} more"));
             }
         }
+        // REQ-589 BR-3's question. **Two lines, and only one of them is this
+        // client's** (ADR-16).
+        //
+        // The lead is the marking, in the one vocabulary this client already
+        // names a source in (ASSUME-018) — the same opening
+        // `SkillDynamicContext` gets one arm up, so a project skill looks like
+        // a project skill wherever it is asked about.
+        //
+        // The second line is the daemon's finished sentence, rendered verbatim
+        // and re-worded in no particular. Its head is byte-for-byte the head of
+        // the `-32023` refusal this question replaces, which is what makes the
+        // offer and its own decline quote one measurement (AC-2) — and it is
+        // why this arm quotes **none** of the figures beside it. `stage`, both
+        // pairs, `bound` and `provider_id` are all *in* that sentence, and a
+        // second rendering of them here would be BR-5's forbidden second
+        // composer in its most innocuous-looking form: two spellings of one
+        // number, one of which says "about" (LESSON-456). They are bound and
+        // discarded rather than wildcarded so that a **new** field still fails
+        // to compile at the surface that has to decide what to do with it —
+        // which is exactly how this arm learned about `sentence`.
+        Some(PermissionSubject::SkillOverBudget {
+            skill,
+            source,
+            sentence,
+            window_verdict,
+            stage: _,
+            measured_tokens: _,
+            measured_bytes: _,
+            budget_tokens: _,
+            budget_bytes: _,
+            bound: _,
+            provider_id: _,
+        }) => {
+            surface.line(
+                LineKind::Prompt,
+                &format!(
+                    "  skill `{skill}` ({}) is over this route's budget:",
+                    slash::source_word(*source),
+                ),
+            );
+            surface.line(LineKind::Prompt, &format!("  {sentence}"));
+            // ADR-13, and the whole content of the rule is that this is a
+            // *different* line from the one `WindowUnknown` would earn. It is
+            // also the one verdict rendering that cannot come from the sentence
+            // above: the daemon wrote that sentence knowing its own verdict,
+            // and "this build cannot read it" is a fact about the binary doing
+            // the reading.
+            if matches!(window_verdict, WindowVerdict::Unknown) {
+                surface.line(LineKind::Prompt, WINDOW_VERDICT_HEDGE);
+            }
+        }
     }
 }
+
+/// The line an unreadable [`WindowVerdict`] draws on the offer (REQ-589
+/// ADR-13).
+///
+/// It says what is true — *this build* cannot read the verdict — and then says
+/// what that is not, because the near-miss is the whole hazard: "no window fact
+/// exists" is [`WindowVerdict::WindowUnknown`], a specific claim about the
+/// route, and an older client that quietly relabelled the one as the other
+/// would tell a user their provider declares no window on the strength of
+/// having failed to parse a word.
+const WINDOW_VERDICT_HEDGE: &str =
+    "  this build cannot read the window verdict this daemon sent, so nothing above says what the \
+     provider will do with a send this size — which is not the same as this route declaring no \
+     window";
 
 /// How the acknowledgment prompt names one project skill (REQ-587 BR-4, AC-6).
 ///
@@ -3148,10 +3578,37 @@ fn invoker_clause(invoked_by: events::InvokedBy) -> &'static str {
 /// request's key instead — *rendered*, never parsed: what a client may not do
 /// is **select** on that string (ADR-7), and printing the thing the daemon
 /// called this request is how a user finds it in a log.
+///
+/// # The over-budget offer gets a different remedy, because the usual one is
+/// false for it
+///
+/// `/permissions full` settles the other two skill questions and is the right
+/// thing to tell an unattended runner about them. It settles **nothing** here:
+/// `authorize_skill_over_budget` asks under `LevelAllow::DoesNotSettle`, so a
+/// `full` session raises this question and lands on this very refusal
+/// (architecture ADR-14). Printing the standard remedy on this subject would
+/// send a user to set a level, watch it change nothing, and conclude the
+/// refusal is a bug — a dead end wearing the costume of a fix, which is worse
+/// than the bare refusal `typed_only_line`'s rule is about.
+///
+/// What it names instead is the only thing that is true of every bound: answer
+/// it at a terminal. It deliberately does **not** point at a durable fix, since
+/// one bound has none (BR-7b) and this line cannot see which bound it is
+/// looking at.
 fn refusal_line(req: &PermissionRequest, reason: RefusalReason) -> String {
+    let over_budget = matches!(
+        &req.subject,
+        Some(PermissionSubject::SkillOverBudget { .. })
+    );
     let subject = match &req.subject {
         Some(PermissionSubject::SkillDynamicContext { skill, .. }) => {
             format!("skill `{skill}`'s dynamic context")
+        }
+        // REQ-589 BR-4. Named from the subject for the reason the two rows
+        // around it are: the key spells `skill:project:analyze`, which is the
+        // vocabulary of a log rather than of the question that was refused.
+        Some(PermissionSubject::SkillOverBudget { skill, .. }) => {
+            format!("skill `{skill}`'s over-budget expansion")
         }
         // REQ-587 BR-4. Named from the subject like the row above it: the key
         // would say `project_skill_trust:~/dev/teton`, which names the same root
@@ -3165,6 +3622,12 @@ fn refusal_line(req: &PermissionRequest, reason: RefusalReason) -> String {
         _ => format!("`{}`", req.tool_name),
     };
     match reason {
+        RefusalReason::NoTerminal if over_budget => format!(
+            "{subject} was refused without asking: this session's input is not a terminal, so \
+             nobody could be asked. This question has no unattended answer — `/permissions full` \
+             does not settle it, because an over-budget send is not a tool call — so invoke it \
+             from a terminal to be asked, or the turn refuses exactly as it does today."
+        ),
         RefusalReason::NoTerminal => format!(
             "{subject} was refused without asking: this session's input is not a terminal, so \
              nobody could be asked — send `/permissions full` ahead of it, or set \
@@ -3346,13 +3809,53 @@ fn budget_clause(rd: &RouteDecided) -> Option<String> {
     let bytes = rd.budget_bytes?;
     let bound = rd.bound?;
     Some(format!(
-        " · budget {} words / {} {}",
-        thousands(tokens),
-        bytes_figure(bytes),
-        // `false` from a daemon that predates the field: it floored nothing it
-        // could report, and the clause is today's byte for byte.
-        bound_clause(bound, rd.bound_floored.unwrap_or(false))
+        " · {}",
+        budget_figures(
+            tokens,
+            bytes,
+            bound,
+            // `false` from a daemon that predates the field: it floored nothing
+            // it could report, and the clause is today's byte for byte.
+            rd.bound_floored.unwrap_or(false)
+        )
     ))
+}
+
+/// One measurement, in both currencies: `4,097 words / 31 KB`.
+///
+/// The **one** spelling of a context figure pair on this side of the wire
+/// (LESSON-456). Four surfaces read it — the route line's budget clause, the
+/// over-budget offer's figure line, and the `offered` and `accepted` records —
+/// and the whole point of the offer is that the question, the prompt and the
+/// record quote the same numbers the measurement produced (REQ-589 AC-2). Two
+/// `format!`s spelling this pair is one edit away from a prompt that says
+/// `31 KB` above a record that says `31744 bytes` for the same send.
+fn figure_pair(tokens: u64, bytes: u64) -> String {
+    format!("{} words / {}", thousands(tokens), bytes_figure(bytes))
+}
+
+/// A budget pair with the constraint that set it named: `budget 4,096 words /
+/// 33 KB (bound: local engine)`.
+///
+/// [`budget_clause`]'s body, lifted so the over-budget offer quotes the route's
+/// budget in the words the route line already uses. The bound closes it through
+/// [`bound_clause`], which reads [`bound_words`]'s one table — so a user who
+/// was told `(bound: local engine)` at the prompt reads `(bound: local engine)`
+/// on the `/verbose` route line for the same route.
+///
+/// `floored` is a fact the caller supplies because only some callers have it.
+/// The over-budget subject carries no floor flag — the bound is read off the
+/// stamped budget and the floor is not on the wire there — so it passes
+/// `false`, which makes [`bound_clause`] render the plain `(bound: …)` form.
+/// That form *omits* the floor rather than denying it, which is the honest
+/// rendering of a fact this surface was not sent; the daemon's own sentence,
+/// which holds the whole `RouteBudget`, is where a floored budget gets said.
+fn budget_figures(tokens: u64, bytes: u64, bound: BudgetBound, floored: bool) -> String {
+    format!(
+        "budget {} {}",
+        figure_pair(tokens, bytes),
+        bound_clause(bound, floored)
+    )
 }
 
 /// Renders a block as the sentence its cause earns.
@@ -7837,6 +8340,7 @@ mod skill_tests {
     fn the_consent_gate_is_a_truth_table_over_the_subject_and_the_terminal() {
         let skill = skill_subject("status");
         let trust = trust_subject(0);
+        let over_budget = over_budget_tests::over_budget_subject();
         let unknown = unrecognized_subject();
         for (case, subject, typed_input, expected) in [
             (
@@ -7876,6 +8380,22 @@ mod skill_tests {
                  exactly what it is being asked and there is simply nobody to \
                  ask (the placeholder arm TASK-210 left fails here)",
                 Some(&trust),
+                false,
+                ConsentGate::RefuseNoTerminal,
+            ),
+            (
+                "REQ-589's over-budget offer, at a terminal: ask (BR-3)",
+                Some(&over_budget),
+                true,
+                ConsentGate::Answerable,
+            ),
+            (
+                "REQ-589's over-budget offer, on a pipe: refuse — and this row \
+                 is not the narrowing the two above it are. `full` does not \
+                 settle this question (ADR-14), so unattended sessions really \
+                 do arrive here, and what they get is BR-4's refusal reached \
+                 without reading a line",
+                Some(&over_budget),
                 false,
                 ConsentGate::RefuseNoTerminal,
             ),
@@ -9280,6 +9800,996 @@ mod skill_tests {
 
         assert!(!state.take_skills_stale());
         assert_eq!(state.root, None, "and the root cache is untouched too");
+    }
+}
+
+// ---------------------------------------------------------------------------
+// REQ-589: the over-budget offer — the question, the answer, and the records
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod over_budget_tests {
+    use super::*;
+    use crate::prompt::ScriptedPrompter;
+    use crate::render::RecordingSurface;
+    use teton_protocol::events::{
+        OPTION_ID_OVER_BUDGET_DECLINE, OPTION_ID_OVER_BUDGET_PROCEED_AND_REMEDY,
+        OPTION_ID_OVER_BUDGET_PROCEED_ONCE, OPTION_ID_OVER_BUDGET_REMEDY_ONLY,
+    };
+    use teton_protocol::{RequestId, SessionId};
+
+    /// The reported `/analyze` failure's own figures (REQ-589's Description):
+    /// one word over a 4,096-word budget, with room to spare in bytes.
+    const MEASURED: (u64, u64) = (4_097, 31_744);
+    const BUDGET: (u64, u64) = (4_096, 33_000);
+
+    /// A stand-in for what `skill_refusal`'s `Offered` arm composes.
+    ///
+    /// Its **content** is the daemon's business and is pinned on that side; what
+    /// this module asserts about it is that it arrives on the wire and reaches
+    /// the screen unchanged. The one property that matters here is that it is
+    /// distinctive enough that a client which re-worded any part of it would
+    /// stop matching.
+    const SENTENCE: &str = "`/analyze` does not fit this route's context budget: the body alone, \
+                            with the system prompt, comes to about 4,097 words / 31 KB, and the \
+                            budget is 4,096 words / 33 KB (bound: local engine). This route \
+                            declares no window, so nothing here can promise the send will fit. \
+                            Send it anyway?";
+
+    /// The offer's subject **in the daemon's own key spellings**, built as JSON
+    /// and deserialized rather than as a struct literal.
+    ///
+    /// This is as close to a producer guard as this crate can stand on its own:
+    /// `teton` does not depend on `tetond` and cannot call the code that mints
+    /// this value, so what is pinned here is the *contract* — every key the
+    /// daemon writes, spelled the way it writes it, arriving through the real
+    /// `serde` path a live frame takes. Rename `measured_tokens` on the
+    /// producer, or re-spell a `BudgetBound` wire value, and these tests stop
+    /// deserializing.
+    ///
+    /// The end-to-end half — that the daemon actually emits this subject from a
+    /// real turn — is TASK-253's suite and TASK-255's pty leg, which are the
+    /// only surfaces that can run both binaries (LESSON-544).
+    pub(super) fn offer_subject_wire(bound: &str, verdict: &str) -> serde_json::Value {
+        serde_json::json!({
+            "kind": "skill_over_budget",
+            "skill": "analyze",
+            "source": "project",
+            "stage": "body",
+            "measured_tokens": MEASURED.0,
+            "measured_bytes": MEASURED.1,
+            "budget_tokens": BUDGET.0,
+            "budget_bytes": BUDGET.1,
+            "bound": bound,
+            "window_verdict": verdict,
+            "provider_id": "kimi",
+            "sentence": SENTENCE,
+        })
+    }
+
+    /// The subject as a typed value, for the gate's truth table.
+    pub(super) fn over_budget_subject() -> PermissionSubject {
+        serde_json::from_value(offer_subject_wire("local_engine", "window_unknown"))
+            .expect("the daemon's own wire spelling deserializes")
+    }
+
+    /// ADR-1's four option ids with labels in the shape `option_labels`
+    /// produces them — each write named concretely, never "raise the limit".
+    fn four_options() -> serde_json::Value {
+        serde_json::json!([
+            {
+                "option_id": OPTION_ID_OVER_BUDGET_PROCEED_ONCE,
+                "label": "Send it whole this once, over budget — writes nothing, and nothing is \
+                          remembered, so the next invocation asks again",
+                "kind": "allow_once",
+            },
+            {
+                "option_id": OPTION_ID_OVER_BUDGET_PROCEED_AND_REMEDY,
+                "label": "Send it whole this once, and write `capabilities.max_context = 1000000` \
+                          for `kimi`",
+                "kind": "allow_always",
+            },
+            {
+                "option_id": OPTION_ID_OVER_BUDGET_REMEDY_ONLY,
+                "label": "Do not send it, but write `capabilities.max_context = 1000000` for \
+                          `kimi`",
+                "kind": "reject_once",
+            },
+            {
+                "option_id": OPTION_ID_OVER_BUDGET_DECLINE,
+                "label": "Do not send it — refuse the turn exactly as this route does today, and \
+                          write nothing",
+                "kind": "reject_once",
+            },
+        ])
+    }
+
+    /// BR-7b's cell: a bound with no durable fix offers the override alone.
+    fn two_options() -> serde_json::Value {
+        let four = four_options();
+        let rows = four.as_array().expect("an array");
+        serde_json::json!([rows[0], rows[3]])
+    }
+
+    /// The whole `permission_request` frame, deserialized as one — the request
+    /// and its subject travel together and a test that built the outer struct by
+    /// hand would leave the frame's own keys unguarded.
+    fn offer_request(subject: serde_json::Value, options: serde_json::Value) -> PermissionRequest {
+        serde_json::from_value(serde_json::json!({
+            "request_id": "r-offer",
+            "tool_name": "skill:project:analyze",
+            "options": options,
+            "subject": subject,
+        }))
+        .expect("the daemon's own wire spelling deserializes")
+    }
+
+    /// The offer as the reported failure raised it: a local-engine route, no
+    /// window fact, and BR-7's `BindTierRemote` remedy on the prompt.
+    fn local_offer() -> PermissionRequest {
+        offer_request(
+            offer_subject_wire("local_engine", "window_unknown"),
+            four_options(),
+        )
+    }
+
+    fn envelope(event: Event) -> EventEnvelope {
+        EventEnvelope::new(1, Some(SessionId::from("s1")), event)
+    }
+
+    fn prompt_lines(surface: &RecordingSurface) -> String {
+        surface.lines_of(LineKind::Prompt).join("\n")
+    }
+
+    // ------------------------------------------------------- BR-4: the gate
+
+    /// **BR-4's negative pin, and the reason this task exists.**
+    ///
+    /// A piped session refuses the offer **without reading a line**: the
+    /// prompter is scripted with the `y` a paste would have left queued, and the
+    /// assertion is that it is still queued afterwards. `StdinPrompter::ask`
+    /// reads unconditionally, so a refusal computed after the call has already
+    /// eaten the user's next *prompt* line — and on this subject that stray line
+    /// would be an answer to a four-way question about sending an oversized turn
+    /// and writing a config file.
+    ///
+    /// **`Refused { NoTerminal }` and never `Cancelled`.** The daemon reads the
+    /// two differently: `Cancelled` means a human dismissed the prompt, and
+    /// nobody was asked here. REQ-585 AC-9's distinction, on the question where
+    /// "nobody was asked" and "somebody said no" have to be told apart in the
+    /// record (`skill_over_budget_offered` with no accept beside it).
+    ///
+    /// **Mutation.** Move the `resolve_over_budget_offer` branch above the gate,
+    /// or answer this subject `Answerable` on a pipe, and `prompter.asked` is 1.
+    /// Return `Cancelled` from the no-terminal path and the outcome assertion
+    /// fails.
+    #[test]
+    fn a_piped_over_budget_offer_is_refused_without_reading_a_line() {
+        let req = local_offer();
+        let mut surface = RecordingSurface::new();
+        let mut prompter = ScriptedPrompter::new(&["y"]);
+        let mut grants = SessionGrants::default();
+
+        let resp = resolve_permission(&req, &mut surface, &mut prompter, &mut grants, false);
+
+        assert_eq!(
+            prompter.asked, 0,
+            "the gate ran before `ask`: {:?}",
+            prompter.questions
+        );
+        assert_eq!(
+            resp.outcome,
+            PermissionOutcome::Refused {
+                reason: RefusalReason::NoTerminal
+            },
+            "nobody was asked, which is not the same as somebody dismissing"
+        );
+        assert_ne!(
+            resp.outcome,
+            PermissionOutcome::Cancelled,
+            "`Cancelled` claims a human decided; on a pipe there was no human"
+        );
+        assert!(
+            !grants.is_allow_always("skill:project:analyze")
+                && !grants.is_reject_always("skill:project:analyze"),
+            "a refusal nobody answered records no session grant"
+        );
+        assert!(
+            prompt_lines(&surface).contains(SENTENCE),
+            "the refusing path draws the subject too: a piped session is told \
+             what was refused, not merely that something was"
+        );
+    }
+
+    /// **The remedy the standard refusal names is false for this subject.**
+    ///
+    /// `/permissions full` settles the other two skill questions.
+    /// `authorize_skill_over_budget` asks under `LevelAllow::DoesNotSettle`, so
+    /// a `full` session raises this one and lands right back on this line
+    /// (architecture ADR-14). Printing the standard remedy would send a user to
+    /// set a level, watch nothing change, and conclude the refusal is broken.
+    ///
+    /// It names the offer rather than the key, for the reason the two rows
+    /// beside it do: `skill:project:analyze` is a log's vocabulary.
+    #[test]
+    fn the_no_terminal_refusal_names_the_offer_and_promises_no_unattended_answer() {
+        let req = local_offer();
+        let line = refusal_line(&req, RefusalReason::NoTerminal);
+
+        assert!(
+            line.contains("skill `analyze`'s over-budget expansion"),
+            "named from the subject, not from the key: {line}"
+        );
+        assert!(
+            !line.contains("send `/permissions full` ahead of it"),
+            "the standard remedy does not settle this question and must not be \
+             offered as though it did: {line}"
+        );
+        assert!(
+            line.contains("`/permissions full` does not settle it"),
+            "and the line says so outright, rather than leaving a user to \
+             discover it: {line}"
+        );
+        assert!(
+            line.contains("from a terminal"),
+            "a refusal without a remedy is a dead end; the remedy that is true \
+             of every bound is the terminal: {line}"
+        );
+    }
+
+    // -------------------------------------------- BR-10: no grant answers it
+
+    /// **BR-10's client half, and the compiler pointed at none of it.**
+    ///
+    /// The offer is asked under the *same* `skill:<source>:<name>` key REQ-585's
+    /// dynamic-context consent is remembered under. A user who once answered `a`
+    /// to "run these four commands?" for `/analyze` has an `allow_always` row
+    /// sitting in `SessionGrants` — and the standard path would read it, hand
+    /// `allow_outcome` the four over-budget options, and pick by
+    /// `PermissionOptionKind`. Both proceed answers are allow-shaped, so the
+    /// pick is "send it whole", or `over_budget_proceed_and_remedy`, which also
+    /// writes config.
+    ///
+    /// The deny direction is no safer: the offer carries no `RejectAlways`, so
+    /// `deny_outcome` falls back to the first `RejectOnce` — which is
+    /// `over_budget_remedy_only`, a **config write** from a grant that said
+    /// *deny*.
+    ///
+    /// **Mutation.** Move the over-budget branch below the two grant lookups and
+    /// both rows here fail: `prompter.asked` drops to 0 and the outcome becomes
+    /// an option nobody selected.
+    #[test]
+    fn a_remembered_grant_never_answers_an_over_budget_offer() {
+        for (case, seed) in [
+            ("an allow-always from a dynamic-context consent", true),
+            ("a deny-always from the same key", false),
+        ] {
+            let req = local_offer();
+            let mut surface = RecordingSurface::new();
+            let mut prompter = ScriptedPrompter::new(&["4"]);
+            let mut grants = SessionGrants::default();
+            if seed {
+                grants.allow_always("skill:project:analyze");
+            } else {
+                grants.reject_always("skill:project:analyze");
+            }
+
+            let resp = resolve_permission(&req, &mut surface, &mut prompter, &mut grants, true);
+
+            assert_eq!(prompter.asked, 1, "{case}: the question is still asked");
+            assert_eq!(
+                resp.outcome,
+                PermissionOutcome::Selected {
+                    option_id: OPTION_ID_OVER_BUDGET_DECLINE.to_owned()
+                },
+                "{case}: the answer is the user's, not the grant's"
+            );
+            assert!(
+                !surface.any_line_contains(LineKind::Prompt, "auto-allow"),
+                "{case}: no auto-decision line is drawn"
+            );
+            assert!(
+                !surface.any_line_contains(LineKind::Prompt, "auto-deny"),
+                "{case}: no auto-decision line is drawn"
+            );
+        }
+    }
+
+    /// **BR-10's other half: answering writes nothing down.** Accepting twice in
+    /// one session asks twice, because there is no `[a]llow-always` on this
+    /// prompt for the answer to be remembered under — and nothing in the four
+    /// rows offers one.
+    #[test]
+    fn answering_an_over_budget_offer_records_no_grant() {
+        let req = local_offer();
+        let mut surface = RecordingSurface::new();
+        let mut prompter = ScriptedPrompter::new(&["1", "1"]);
+        let mut grants = SessionGrants::default();
+
+        let first = resolve_permission(&req, &mut surface, &mut prompter, &mut grants, true);
+        let second = resolve_permission(&req, &mut surface, &mut prompter, &mut grants, true);
+
+        assert_eq!(
+            first.outcome,
+            PermissionOutcome::Selected {
+                option_id: OPTION_ID_OVER_BUDGET_PROCEED_ONCE.to_owned()
+            }
+        );
+        assert_eq!(
+            second.outcome, first.outcome,
+            "the second invocation asked again and got its own answer"
+        );
+        assert_eq!(prompter.asked, 2, "two invocations, two questions");
+        assert!(
+            !grants.is_allow_always("skill:project:analyze")
+                && !grants.is_reject_always("skill:project:analyze"),
+            "nothing about this answer survives it"
+        );
+    }
+
+    // ------------------------------------------------ ADR-1: the single-select
+
+    /// **The four ids are told apart by id, never by kind.** Row 2 and row 1 are
+    /// both allow-shaped; row 3 and row 4 are both reject-shaped. Picking by
+    /// `PermissionOptionKind` — which is what every other prompt in this
+    /// function does — cannot distinguish "send it once" from "send it and
+    /// write the fix", so this prompt selects by position in the daemon's own
+    /// list and returns that row's id verbatim.
+    #[test]
+    fn each_row_answers_with_its_own_option_id() {
+        for (typed, expected) in [
+            ("1", OPTION_ID_OVER_BUDGET_PROCEED_ONCE),
+            ("2", OPTION_ID_OVER_BUDGET_PROCEED_AND_REMEDY),
+            ("3", OPTION_ID_OVER_BUDGET_REMEDY_ONLY),
+            ("4", OPTION_ID_OVER_BUDGET_DECLINE),
+        ] {
+            let req = local_offer();
+            let mut surface = RecordingSurface::new();
+            let mut prompter = ScriptedPrompter::new(&[typed]);
+            let mut grants = SessionGrants::default();
+
+            let resp = resolve_permission(&req, &mut surface, &mut prompter, &mut grants, true);
+
+            assert_eq!(
+                resp.outcome,
+                PermissionOutcome::Selected {
+                    option_id: expected.to_owned()
+                },
+                "row {typed}"
+            );
+        }
+    }
+
+    /// **The rows are the daemon's words, in the daemon's order.** ADR-1 binds
+    /// every remedy label to name the concrete write; BR-3's "leads with the
+    /// remedy" *is* the order and nothing else. A client that re-worded or
+    /// re-sorted would undo both silently.
+    #[test]
+    fn the_option_rows_render_the_daemons_labels_in_the_daemons_order() {
+        let req = local_offer();
+        let mut surface = RecordingSurface::new();
+        let mut prompter = ScriptedPrompter::new(&["4"]);
+        let mut grants = SessionGrants::default();
+
+        resolve_permission(&req, &mut surface, &mut prompter, &mut grants, true);
+
+        let drawn = prompt_lines(&surface);
+        for (row, option) in req.options.iter().enumerate() {
+            let expected = format!("  {}) {}", row + 1, option.label);
+            assert!(
+                drawn.contains(&expected),
+                "row {} is missing or re-worded:\n{drawn}",
+                row + 1
+            );
+        }
+        assert!(
+            drawn.contains("`capabilities.max_context = 1000000` for `kimi`"),
+            "the concrete write survives to the screen:\n{drawn}"
+        );
+    }
+
+    /// **BR-7b: a bound with no durable fix presents the override alone**, and
+    /// nothing on the prompt implies a fix exists. The daemon narrows the option
+    /// list; this side must not draw rows it was not sent, and the question has
+    /// to count the rows it actually drew.
+    #[test]
+    fn a_bound_with_no_remedy_draws_two_rows_and_asks_for_two() {
+        let req = offer_request(
+            offer_subject_wire("redact_scan", "exceeds_window"),
+            two_options(),
+        );
+        let mut surface = RecordingSurface::new();
+        let mut prompter = ScriptedPrompter::new(&["2"]);
+        let mut grants = SessionGrants::default();
+
+        let resp = resolve_permission(&req, &mut surface, &mut prompter, &mut grants, true);
+
+        let drawn = prompt_lines(&surface);
+        assert!(!drawn.contains("  3)"), "no third row was sent:\n{drawn}");
+        assert!(
+            !drawn.contains("capabilities.max_context"),
+            "and nothing implies a durable fix exists:\n{drawn}"
+        );
+        assert!(
+            prompter.any_question_contains("choose 1-2"),
+            "the question counts the rows drawn, not a fixed four: {:?}",
+            prompter.questions
+        );
+        assert_eq!(
+            resp.outcome,
+            PermissionOutcome::Selected {
+                option_id: OPTION_ID_OVER_BUDGET_DECLINE.to_owned()
+            },
+            "row 2 of a two-row offer is the decline"
+        );
+    }
+
+    /// **No letter is an answer here, and that is a safety property.**
+    ///
+    /// `y` is the single most likely thing to be sitting in a paste buffer or a
+    /// here-doc, and on every other prompt in this client it means yes. On this
+    /// one it re-asks. The cost of a re-ask is a line; the cost of `y` meaning
+    /// something would be an oversized send nobody chose.
+    #[test]
+    fn the_offer_reads_no_letters_so_a_stray_yes_cannot_send_it() {
+        let req = local_offer();
+        let mut surface = RecordingSurface::new();
+        let mut prompter = ScriptedPrompter::new(&["y", "yes", "a", "0", "5", "4"]);
+        let mut grants = SessionGrants::default();
+
+        let resp = resolve_permission(&req, &mut surface, &mut prompter, &mut grants, true);
+
+        assert_eq!(
+            resp.outcome,
+            PermissionOutcome::Selected {
+                option_id: OPTION_ID_OVER_BUDGET_DECLINE.to_owned()
+            },
+            "only the number was read as a choice"
+        );
+        assert_eq!(prompter.asked, 6, "five re-asks, then the answer");
+        assert!(
+            surface.any_line_contains(LineKind::Prompt, "this prompt reads no letters"),
+            "and the retry line says why, rather than repeating the question"
+        );
+    }
+
+    /// **Empty and EOF both refuse, and neither proceeds.** BR-4's "silence is
+    /// never consent" on the two ways a terminal goes quiet. `Cancelled` is
+    /// correct for both — a human *was* asked and dismissed the question — and
+    /// the daemon reads it as a decline that writes nothing, which is the
+    /// pre-REQ-589 outcome.
+    #[test]
+    fn an_empty_answer_and_an_eof_both_refuse_the_turn() {
+        for (case, script) in [("empty line", vec![""]), ("EOF", vec![])] {
+            let req = local_offer();
+            let mut surface = RecordingSurface::new();
+            let mut prompter = ScriptedPrompter::new(&script);
+            let mut grants = SessionGrants::default();
+
+            let resp = resolve_permission(&req, &mut surface, &mut prompter, &mut grants, true);
+
+            assert_eq!(resp.outcome, PermissionOutcome::Cancelled, "{case}");
+        }
+    }
+
+    /// **An offer with nothing to choose from is refused, not guessed at.**
+    ///
+    /// Unreachable from this daemon — `over_budget_options` always yields at
+    /// least the override and the decline. It refuses rather than falling
+    /// through to the letter prompt because a question with no answers is one
+    /// this client cannot show, and above all it must not read a line to answer
+    /// a question that was never put.
+    #[test]
+    fn an_offer_with_no_options_refuses_without_reading_a_line() {
+        let req = offer_request(
+            offer_subject_wire("local_engine", "window_unknown"),
+            serde_json::json!([]),
+        );
+        let mut surface = RecordingSurface::new();
+        let mut prompter = ScriptedPrompter::new(&["1"]);
+        let mut grants = SessionGrants::default();
+
+        let resp = resolve_permission(&req, &mut surface, &mut prompter, &mut grants, true);
+
+        assert_eq!(prompter.asked, 0, "{:?}", prompter.questions);
+        assert_eq!(
+            resp.outcome,
+            PermissionOutcome::Refused {
+                reason: RefusalReason::UnrecognizedSubject
+            },
+            "not `Cancelled`, which would claim a human dismissed a prompt \
+             nobody was shown"
+        );
+    }
+
+    // ------------------------------------------------- ADR-16: whose words
+
+    /// **ADR-16: the daemon words the offer; this client only presents it.**
+    ///
+    /// The composed sentence rides on the subject and reaches the screen
+    /// verbatim. What this asserts alongside it is the *negative*: the arm
+    /// re-states none of the figures the sentence already quotes. Two spellings
+    /// of one measurement is LESSON-456's shape at its most innocuous — the
+    /// daemon says "about 4,097 words", a helpful client says "4,097 words", and
+    /// the two read as different claims about the same send.
+    ///
+    /// **Mutation.** Compose the verdict clause from `window_verdict` here and
+    /// the second assertion fails; drop the sentence line and the first does.
+    #[test]
+    fn the_offer_renders_the_daemons_sentence_verbatim_and_re_states_nothing() {
+        let req = local_offer();
+        let mut surface = RecordingSurface::new();
+        let mut prompter = ScriptedPrompter::new(&["4"]);
+        let mut grants = SessionGrants::default();
+
+        resolve_permission(&req, &mut surface, &mut prompter, &mut grants, true);
+
+        let drawn = prompt_lines(&surface);
+        assert!(
+            drawn.contains(SENTENCE),
+            "the sentence is rendered whole and unedited:\n{drawn}"
+        );
+        // The figures the sentence carries appear exactly once — inside it.
+        let subject_block: Vec<&str> = drawn
+            .lines()
+            .filter(|line| !line.contains(SENTENCE))
+            .collect();
+        for restated in [
+            "4,097 words",
+            "4,096 words",
+            "(bound: local engine)",
+            "measured",
+        ] {
+            assert!(
+                !subject_block.iter().any(|line| line.contains(restated)),
+                "`{restated}` is re-stated outside the daemon's sentence, which \
+                 is a second composer for BR-5 to drift against:\n{}",
+                subject_block.join("\n")
+            );
+        }
+    }
+
+    /// **ASSUME-018: a project-sourced name carries the project marking.**
+    ///
+    /// It is repository-authored text, and it renders under the same word this
+    /// client uses everywhere else it names a source — the `(project)` a user
+    /// already reads on `/help`, on the dynamic-context consent, and on the
+    /// invocation echo — rather than as bare harness vocabulary.
+    #[test]
+    fn a_project_sourced_skill_name_carries_the_project_marking() {
+        for (source, word) in [("project", "project"), ("user", "user")] {
+            let mut wire = offer_subject_wire("local_engine", "window_unknown");
+            wire["source"] = serde_json::json!(source);
+            let subject: PermissionSubject =
+                serde_json::from_value(wire).expect("a known source deserializes");
+            let mut surface = RecordingSurface::new();
+
+            render_consent_subject(Some(&subject), &mut surface);
+
+            assert!(
+                surface.any_line_contains(LineKind::Prompt, &format!("skill `analyze` ({word})")),
+                "the {source} marking is missing: {:?}",
+                surface.lines_of(LineKind::Prompt)
+            );
+        }
+    }
+
+    /// **ADR-13: an unreadable verdict is a hedge, never `WindowUnknown`.**
+    ///
+    /// "No window fact exists" is a specific claim about the *route*; "this
+    /// build cannot read the verdict" is a claim about this *binary*. Only the
+    /// second is true of an `#[serde(other)]` value, and an older client that
+    /// quietly relabelled the one as the other would tell a user their provider
+    /// declares no window on the strength of having failed to parse a word.
+    ///
+    /// The value is produced by serde from a verdict this build has never heard
+    /// of — never constructed by hand, because `Unknown` only exists as
+    /// `#[serde(other)]`'s output and a hand-built one would prove nothing about
+    /// the wire.
+    #[test]
+    fn an_unreadable_window_verdict_renders_as_a_hedge() {
+        let subject: PermissionSubject = serde_json::from_value(offer_subject_wire(
+            "local_engine",
+            "some_verdict_invented_later",
+        ))
+        .expect("an unknown verdict degrades, never errors");
+        assert!(
+            matches!(
+                &subject,
+                PermissionSubject::SkillOverBudget {
+                    window_verdict: WindowVerdict::Unknown,
+                    ..
+                }
+            ),
+            "the fixture really did land on the tolerant arm"
+        );
+
+        let mut surface = RecordingSurface::new();
+        render_consent_subject(Some(&subject), &mut surface);
+        let drawn = prompt_lines(&surface);
+
+        assert!(
+            drawn.contains("this build cannot read the window verdict"),
+            "the hedge names this build as the thing that failed:\n{drawn}"
+        );
+        assert!(
+            drawn.contains("not the same as this route declaring no window"),
+            "…and says outright which claim it is not making:\n{drawn}"
+        );
+        assert!(
+            !drawn.contains(verdict_words(WindowVerdict::WindowUnknown)),
+            "…and never borrows `WindowUnknown`'s words:\n{drawn}"
+        );
+
+        // The three known verdicts draw no hedge: the daemon's sentence said
+        // which one it is, and a hedge beside it would contradict it.
+        for verdict in ["fits_window", "exceeds_window", "window_unknown"] {
+            let known: PermissionSubject =
+                serde_json::from_value(offer_subject_wire("local_engine", verdict))
+                    .expect("a known verdict deserializes");
+            let mut quiet = RecordingSurface::new();
+            render_consent_subject(Some(&known), &mut quiet);
+            assert!(
+                !quiet.any_line_contains(LineKind::Prompt, "this build cannot read"),
+                "{verdict} is readable and earns no hedge"
+            );
+        }
+    }
+
+    /// The two are different sentences and neither contains the other, so no
+    /// `.contains` assertion anywhere can pass for the wrong one (ADR-13).
+    #[test]
+    fn the_unreadable_verdict_and_the_undeclared_window_are_different_sentences() {
+        let hedge = verdict_words(WindowVerdict::Unknown);
+        let undeclared = verdict_words(WindowVerdict::WindowUnknown);
+        assert_ne!(hedge, undeclared);
+        assert!(!hedge.contains(undeclared) && !undeclared.contains(hedge));
+        assert!(
+            hedge.contains("this build"),
+            "the hedge is about the reader, not the route: {hedge}"
+        );
+    }
+
+    /// The same rule one enum over: "there is no remedy" (BR-7b) and "this build
+    /// cannot name the remedy" must not collapse into one line on a record
+    /// somebody reads later.
+    #[test]
+    fn an_unnameable_remedy_is_never_rendered_as_no_remedy() {
+        let unknown: RemedyKind = serde_json::from_value(serde_json::json!("invented_later"))
+            .expect("an unknown remedy degrades, never errors");
+        assert_eq!(unknown, RemedyKind::Unknown);
+        assert_ne!(
+            remedy_words(RemedyKind::Unknown),
+            remedy_words(RemedyKind::NotOffered)
+        );
+        assert!(
+            remedy_words(RemedyKind::NotOffered).contains("no durable fix"),
+            "the daemon stating that no fix exists"
+        );
+        assert!(
+            remedy_words(RemedyKind::Unknown).contains("cannot name"),
+            "this build failing to read one"
+        );
+    }
+
+    // --------------------------------------------------- the three records
+
+    /// **LESSON-456, across two surfaces.** The offer's record and the
+    /// `/verbose` route line quote one budget in one spelling, because both go
+    /// through [`budget_figures`] and its [`bound_clause`] — and a user who was
+    /// told `(bound: local engine)` at the prompt reads the same three words on
+    /// the route line for the same route.
+    #[test]
+    fn the_offered_record_and_the_route_line_spell_one_budget() {
+        let offered = SkillOverBudgetOffered {
+            skill: "analyze".to_owned(),
+            source: SkillSource::Project,
+            stage: SkillStage::Body,
+            measured_tokens: MEASURED.0,
+            measured_bytes: MEASURED.1,
+            budget_tokens: BUDGET.0,
+            budget_bytes: BUDGET.1,
+            bound: BudgetBound::LocalEngine,
+            window_verdict: WindowVerdict::WindowUnknown,
+            remedy_kind: RemedyKind::BindTierRemote,
+        };
+        let clause = budget_figures(BUDGET.0, BUDGET.1, BudgetBound::LocalEngine, false);
+
+        assert!(
+            format_over_budget_offered(&offered).contains(&clause),
+            "the record reads the one budget spelling"
+        );
+        assert!(
+            budget_clause(&route_with_budget())
+                .expect("a stamped budget")
+                .contains(&clause),
+            "…and so does the route line"
+        );
+    }
+
+    /// A `route_decided` carrying the same stamped budget the offer quotes.
+    fn route_with_budget() -> RouteDecided {
+        let mut rd: RouteDecided = serde_json::from_value(serde_json::json!({
+            "provider_id": "local",
+            "reason": "tier binding",
+            "budget_tokens": BUDGET.0,
+            "budget_bytes": BUDGET.1,
+            "bound": "local_engine",
+        }))
+        .expect("a stamped route deserializes");
+        rd.bound_floored = Some(false);
+        rd
+    }
+
+    /// **Every bound is named in the words the route line uses, and never in
+    /// its wire spelling** — one table, `BudgetBound::words`, read through
+    /// [`bound_words`] (LESSON-456). `default_unknown` is the row that would
+    /// catch a second table: a reader is told `unknown window`, which names the
+    /// thing they would go and set.
+    ///
+    /// Only the reachable bounds, plus the tolerant arm. Which verdict rides
+    /// each bound is the reachability table's business (LESSON-520) and is not
+    /// re-asserted here; what is asserted is that the record's vocabulary does
+    /// not depend on it.
+    #[test]
+    fn the_offered_record_names_every_bound_in_the_route_lines_words() {
+        for (bound, wire) in [
+            (BudgetBound::LocalEngine, "local_engine"),
+            (BudgetBound::DefaultUnknown, "default_unknown"),
+            (BudgetBound::Window, "window"),
+            (BudgetBound::UserCap, "user_cap"),
+            (BudgetBound::RedactScan, "redact_scan"),
+            (BudgetBound::Unknown, "unknown"),
+        ] {
+            let offered = SkillOverBudgetOffered {
+                skill: "analyze".to_owned(),
+                source: SkillSource::Project,
+                stage: SkillStage::Body,
+                measured_tokens: MEASURED.0,
+                measured_bytes: MEASURED.1,
+                budget_tokens: BUDGET.0,
+                budget_bytes: BUDGET.1,
+                bound,
+                window_verdict: WindowVerdict::WindowUnknown,
+                remedy_kind: RemedyKind::NotOffered,
+            };
+            let line = format_over_budget_offered(&offered);
+
+            assert!(
+                line.contains(bound_words(bound)),
+                "{wire}: the record says `{}`: {line}",
+                bound_words(bound)
+            );
+            // `window` and `unknown` are their own words, so only the spellings
+            // that actually differ can be checked for absence.
+            if wire != bound_words(bound) {
+                assert!(
+                    !line.contains(wire),
+                    "{wire}: the wire spelling reached a person: {line}"
+                );
+            }
+        }
+    }
+
+    /// **The offer is verbose-gated; the accept and the write are not.**
+    ///
+    /// The asymmetry is the point. An offer changes nothing yet and is drawn in
+    /// full by the prompt two lines later, so an unconditional notice would say
+    /// the same numbers twice. An accept sent an oversized turn — the
+    /// counterpart of a decline's unconditional refusal line — and a remedy
+    /// changed a file on disk, which is the least gateable thing this function
+    /// renders.
+    #[test]
+    fn only_the_offer_is_verbose_gated() {
+        let events = [
+            Event::SkillOverBudgetOffered(SkillOverBudgetOffered {
+                skill: "analyze".to_owned(),
+                source: SkillSource::Project,
+                stage: SkillStage::Body,
+                measured_tokens: MEASURED.0,
+                measured_bytes: MEASURED.1,
+                budget_tokens: BUDGET.0,
+                budget_bytes: BUDGET.1,
+                bound: BudgetBound::LocalEngine,
+                window_verdict: WindowVerdict::WindowUnknown,
+                remedy_kind: RemedyKind::BindTierRemote,
+            }),
+            Event::SkillOverBudgetAccepted(SkillOverBudgetAccepted {
+                skill: "analyze".to_owned(),
+                source: SkillSource::Project,
+                stage: SkillStage::Body,
+                measured_tokens: MEASURED.0,
+                measured_bytes: MEASURED.1,
+                budget_tokens: BUDGET.0,
+                budget_bytes: BUDGET.1,
+                window_verdict: WindowVerdict::WindowUnknown,
+            }),
+            Event::SkillOverBudgetRemedyApplied(SkillOverBudgetRemedyApplied {
+                remedy_kind: RemedyKind::RaiseWindow,
+                provider_id: Some("kimi".into()),
+                previous_value: "128000".to_owned(),
+                new_value: "1000000".to_owned(),
+            }),
+        ];
+        let expected_quiet = [false, true, true];
+
+        for (event, wanted) in events.into_iter().zip(expected_quiet) {
+            let name = event.name();
+            let mut quiet = RecordingSurface::new();
+            let mut state = SessionState::new();
+            render_event(&envelope(event.clone()), &mut quiet, &mut state);
+            assert_eq!(
+                !quiet.lines_of(LineKind::Notice).is_empty(),
+                wanted,
+                "{name} without `/verbose`"
+            );
+
+            let mut loud = RecordingSurface::new();
+            let mut verbose = SessionState::new();
+            verbose.verbose = true;
+            render_event(&envelope(event), &mut loud, &mut verbose);
+            assert!(
+                !loud.lines_of(LineKind::Notice).is_empty(),
+                "{name} renders under `/verbose` either way"
+            );
+        }
+    }
+
+    /// **BR-1's record says what was sent and that nothing was shortened.**
+    ///
+    /// It quotes the figures that went out, not a re-measurement, and it names
+    /// no bound — the event carries none, because the `offered` event beside it
+    /// does and the two correlate by session and sequence.
+    #[test]
+    fn the_accepted_record_says_what_was_sent_and_that_it_was_whole() {
+        let line = format_over_budget_accepted(&SkillOverBudgetAccepted {
+            skill: "analyze".to_owned(),
+            source: SkillSource::Project,
+            stage: SkillStage::Body,
+            measured_tokens: MEASURED.0,
+            measured_bytes: MEASURED.1,
+            budget_tokens: BUDGET.0,
+            budget_bytes: BUDGET.1,
+            window_verdict: WindowVerdict::ExceedsWindow,
+        });
+
+        assert!(
+            line.contains(&figure_pair(MEASURED.0, MEASURED.1)),
+            "{line}"
+        );
+        assert!(line.contains(&figure_pair(BUDGET.0, BUDGET.1)), "{line}");
+        assert!(line.contains("(project)"), "ASSUME-018 here too: {line}");
+        assert!(line.contains("Nothing was shortened"), "{line}");
+        assert!(
+            line.contains(verdict_words(WindowVerdict::ExceedsWindow)),
+            "what the user was told before they answered: {line}"
+        );
+        assert!(
+            !line.contains("bound:"),
+            "the event carries no bound and the line invents none: {line}"
+        );
+    }
+
+    /// **A durable write names the key, the provider, and both values.**
+    ///
+    /// Both, always: a record that named only the new one leaves a reader unable
+    /// to tell a raise from a first declaration — the difference between
+    /// `RaiseWindow` and `DeclareWindow`, and between a fix and a surprise.
+    #[test]
+    fn the_remedy_record_names_the_write_the_provider_and_both_values() {
+        let line = format_over_budget_remedy_applied(&SkillOverBudgetRemedyApplied {
+            remedy_kind: RemedyKind::RaiseWindow,
+            provider_id: Some("kimi".into()),
+            previous_value: "128000".to_owned(),
+            new_value: "1000000".to_owned(),
+        });
+
+        assert!(line.contains("`capabilities.max_context`"), "{line}");
+        assert!(line.contains("for `kimi`"), "{line}");
+        assert!(line.contains("was 128000"), "{line}");
+        assert!(line.contains("now 1000000"), "{line}");
+
+        // A remedy that addresses no single provider says nothing about one,
+        // rather than rendering an empty parenthetical.
+        let unaddressed = format_over_budget_remedy_applied(&SkillOverBudgetRemedyApplied {
+            remedy_kind: RemedyKind::BindTierRemote,
+            provider_id: None,
+            previous_value: "local".to_owned(),
+            new_value: "kimi".to_owned(),
+        });
+        assert!(!unaddressed.contains(" for `"), "{unaddressed}");
+    }
+
+    // ----------------------------------------------------- the wire contract
+
+    /// **Every key the daemon writes lands where the renderer reads it.**
+    ///
+    /// The frame is the daemon's own spelling, deserialized through the real
+    /// `serde` path rather than assembled as a struct literal — so a producer
+    /// that renamed a field, or re-spelled a `BudgetBound`, stops matching here
+    /// rather than rendering a silently wrong prompt.
+    ///
+    /// This is the contract half of LESSON-544 and it is deliberately labelled
+    /// as such: `teton` does not depend on `tetond` and cannot drive the code
+    /// that mints this value. The producer half — that a real turn emits this
+    /// subject — is TASK-253's suite and TASK-255's pty leg.
+    #[test]
+    fn the_offer_subject_arrives_from_the_wire_with_every_field_where_it_is_read() {
+        let req = local_offer();
+        let PermissionSubject::SkillOverBudget {
+            skill,
+            source,
+            stage,
+            measured_tokens,
+            measured_bytes,
+            budget_tokens,
+            budget_bytes,
+            bound,
+            window_verdict,
+            provider_id,
+            sentence,
+        } = req.subject.as_ref().expect("the frame carries a subject")
+        else {
+            panic!("the daemon's `kind` is the over-budget one");
+        };
+
+        assert_eq!(skill, "analyze");
+        assert_eq!(*source, SkillSource::Project);
+        assert_eq!(*stage, SkillStage::Body);
+        assert_eq!((*measured_tokens, *measured_bytes), MEASURED);
+        assert_eq!((*budget_tokens, *budget_bytes), BUDGET);
+        assert_eq!(*bound, BudgetBound::LocalEngine);
+        assert_eq!(*window_verdict, WindowVerdict::WindowUnknown);
+        assert_eq!(provider_id.as_ref().map(|id| id.0.as_str()), Some("kimi"));
+        assert_eq!(sentence, SENTENCE);
+    }
+
+    /// ADR-13's absence, pinned: `measured − budget` is a `saturating_sub` at
+    /// the surface that renders it, and carrying it on the wire as well would be
+    /// two ways to say one fact for the two to disagree over.
+    #[test]
+    fn the_subject_carries_no_overrun_pair() {
+        let wire = offer_subject_wire("local_engine", "window_unknown");
+        let keys: Vec<&str> = wire
+            .as_object()
+            .expect("an object")
+            .keys()
+            .map(String::as_str)
+            .collect();
+        assert!(
+            !keys.iter().any(|k| k.contains("overrun")),
+            "the fixture spells the daemon's own key set: {keys:?}"
+        );
+        // …and a subject that did carry one would not round-trip into a value
+        // this build could read it from.
+        let subject: PermissionSubject =
+            serde_json::from_value(wire).expect("the daemon's spelling deserializes");
+        let back = serde_json::to_value(&subject).expect("and serializes");
+        assert!(
+            !back
+                .as_object()
+                .expect("an object")
+                .keys()
+                .any(|k| k.contains("overrun")),
+            "nor does the round trip mint one: {back}"
+        );
+    }
+
+    /// A `permission_request` whose `request_id` is echoed back unchanged — the
+    /// correlation the daemon's parked waiter is keyed on. Every arm of this
+    /// prompt goes through `respond`, so one assertion covers them all.
+    #[test]
+    fn every_answer_echoes_the_request_id() {
+        for script in [vec!["1"], vec![""], vec![]] {
+            let req = local_offer();
+            let mut surface = RecordingSurface::new();
+            let mut prompter = ScriptedPrompter::new(&script);
+            let mut grants = SessionGrants::default();
+
+            let resp = resolve_permission(&req, &mut surface, &mut prompter, &mut grants, true);
+
+            assert_eq!(resp.request_id, RequestId::from("r-offer"));
+        }
     }
 }
 
