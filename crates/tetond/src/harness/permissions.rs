@@ -2440,6 +2440,32 @@ impl PermissionGate {
             .expect("permission grants mutex poisoned")
             .insert(tool_name.to_owned(), grant);
     }
+
+    /// Every key the session grant map currently holds, sorted.
+    ///
+    /// Test-only, and deliberately the **whole map** rather than one more
+    /// lookup. BR-10's claim is that nothing survives an over-budget offer, and
+    /// [`Self::remembered`] can only ask about a key someone already thought
+    /// of — which is not the same question. A skill's grant has two legal
+    /// spellings ([`skill_grant_key`]: the plain `skill:<source>:<name>` and
+    /// that plus a digest of its substituted commands), the offer is asked
+    /// under the plain one, and `authorize_skill` asks under whichever the
+    /// expansion minted. So a grant left behind under the digest is invisible
+    /// to a lookup at the plain key and fully visible to the door that consults
+    /// it. See
+    /// [`no_over_budget_answer_reaches_the_grant_map_under_any_spelling_of_the_key`](tests::no_over_budget_answer_reaches_the_grant_map_under_any_spelling_of_the_key).
+    #[cfg(test)]
+    fn grant_keys(&self) -> Vec<String> {
+        let mut keys: Vec<String> = self
+            .grants
+            .lock()
+            .expect("permission grants mutex poisoned")
+            .keys()
+            .cloned()
+            .collect();
+        keys.sort();
+        keys
+    }
 }
 
 const OPTION_ALLOW_ONCE: &str = "allow_once";
@@ -4967,6 +4993,11 @@ mod tests {
             budget_bytes: 32_768,
             bound,
             window_verdict,
+            // ADR-16: the daemon's own words travel finished. A stand-in here —
+            // the gate never reads this field (it reads `skill`, `source`,
+            // `bound` and `window_verdict`), and `skill_refusal`'s real output
+            // is driven from a turn by the composer's own tests.
+            sentence: "`/deploy` does not fit this route's context budget.".to_owned(),
             provider_id: None,
         }
     }
@@ -5310,6 +5341,85 @@ mod tests {
                         || option_id == OPTION_ID_OVER_BUDGET_PROCEED_AND_REMEDY
                 );
             }
+        }
+    }
+
+    /// **BR-10 / AC-10 stated about the map instead of about one key
+    /// (LESSON-508).**
+    ///
+    /// # Why this test exists, given the one above it
+    ///
+    /// [`no_over_budget_answer_is_remembered_and_accepting_twice_asks_twice`]
+    /// asks `remembered(&key)` — a lookup at the one spelling this test file
+    /// happened to mint. That is a weaker claim than BR-10's, and the gap
+    /// between them is reachable rather than theoretical: a skill's grant has
+    /// **two** legal spellings ([`skill_grant_key`]), the plain
+    /// `skill:<source>:<name>` and that plus a digest of its substituted
+    /// commands. The offer is always asked under the plain one. `/deploy`'s
+    /// ordinary dynamic-context question is asked under whichever spelling its
+    /// expansion minted — the digest one whenever the body interpolated its
+    /// arguments (`skills/expand.rs`, `SkillTurn`'s `permission_key`).
+    ///
+    /// So an accepted offer recorded under the digest spelling would be
+    /// **invisible** to every assertion above — the offer itself never consults
+    /// grants, so accepting twice still asks twice — and fully visible to
+    /// `authorize_skill`, which would then run that skill's commands for the
+    /// rest of the session with no prompt on any screen. That is precisely the
+    /// consent nobody gave that BR-10 exists to forbid, and it is the silent
+    /// class LESSON-508 is about: nothing fails, the daemon simply stops
+    /// asking.
+    ///
+    /// **Mutation:** remember the accept arm under `format!("{key}#…")` instead
+    /// of `key`. The whole crate stays green (verified: 2,343 passed) and this
+    /// test alone goes red.
+    #[tokio::test]
+    async fn no_over_budget_answer_reaches_the_grant_map_under_any_spelling_of_the_key() {
+        // Non-vacuity, first: the accessor can see a grant at all. An accessor
+        // that always answered "empty" would make every assertion below pass
+        // forever — the inert-sweep failure mode, which is the likeliest thing
+        // to be wrong about a test shaped like this one.
+        let (planted, _route, _bus, _pending, _conn) = over_budget_gate(
+            PermissionConfig::with_default(PermissionPolicy::Ask),
+            RouteBehaviour::Answers(OPTION_ID_OVER_BUDGET_DECLINE),
+        );
+        let digest_spelling = format!("{}#{}", over_budget_key(), "0".repeat(64));
+        planted.remember(&digest_spelling, RememberedGrant::AllowAlways);
+        assert_eq!(
+            planted.grant_keys(),
+            vec![digest_spelling],
+            "non-vacuity: the map accessor cannot see a grant it is asked about"
+        );
+
+        for option_id in [
+            OPTION_ID_OVER_BUDGET_PROCEED_ONCE,
+            OPTION_ID_OVER_BUDGET_PROCEED_AND_REMEDY,
+            OPTION_ID_OVER_BUDGET_REMEDY_ONLY,
+            OPTION_ID_OVER_BUDGET_DECLINE,
+        ] {
+            let (gate, route, _bus, _pending, conn) = over_budget_gate(
+                PermissionConfig::with_default(PermissionPolicy::Ask),
+                RouteBehaviour::Answers(option_id),
+            );
+            gate.authorize_skill_over_budget(
+                &over_budget_key(),
+                over_budget_subject(BudgetBound::Window, WindowVerdict::FitsWindow),
+                labels_with_remedy(),
+                conn,
+            )
+            .await;
+            assert_eq!(
+                route.delivered().len(),
+                1,
+                "non-vacuity: `{option_id}` was never actually asked"
+            );
+            assert!(
+                gate.grant_keys().is_empty(),
+                "`{option_id}` left {:?} in the session grant map. BR-10: consent to send \
+                 one oversized expansion is not a standing answer about this skill under \
+                 any key — and a grant under the digest spelling would be read by \
+                 `authorize_skill` while `remembered` at the plain key saw nothing",
+                gate.grant_keys()
+            );
         }
     }
 
