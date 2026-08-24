@@ -2488,18 +2488,46 @@ async fn a_body_that_cannot_fit_is_refused_before_anyone_is_asked_to_approve_any
         "Stage A's sentence names the body: {}",
         err.message
     );
+    // **REQ-589 BR-2/BR-3 updates this assertion rather than weakening it.**
+    // Stage A no longer refuses on its own — it asks, and this fixture's client
+    // declines by default, which BR-4 makes byte-identical to the refusal
+    // asserted above. So one consent *is* raised here now. BR-8(d)'s claim is
+    // untouched and is stated more precisely than "nothing was asked": what
+    // must never be raised for a body that cannot fit is the **dynamic-context**
+    // consent, because that is the one that walks a user through approving four
+    // commands and watching them run before telling them the turn was refused.
+    let asked = h.consent.asked();
+    assert_eq!(
+        asked.len(),
+        1,
+        "Stage A puts its measurement to the user exactly once: {asked:?}"
+    );
     assert!(
-        h.consent.asked().is_empty(),
-        "the user was walked through a consent for a turn that was already refused"
+        matches!(
+            asked[0].subject,
+            Some(PermissionSubject::SkillOverBudget { .. })
+        ),
+        "the only question a body-too-large turn may raise is the offer itself — \
+         a command consent here would be BR-8(d)'s failure: {asked:?}"
     );
 
     h.turn(&session, "", Harness::invoke("small", ""))
         .await
         .expect("control: a skill that fits is asked about");
+    let asked = h.consent.asked();
     assert_eq!(
-        h.consent.asked().len(),
-        1,
-        "control: this route does raise consents, so the silence above is Stage A's"
+        asked.len(),
+        2,
+        "control: this route does raise command consents: {asked:?}"
+    );
+    assert!(
+        matches!(
+            asked[1].subject,
+            Some(PermissionSubject::SkillDynamicContext { .. })
+        ),
+        "control: a fitting skill reaches the command consent, so the absence of \
+         one above is Stage A's doing rather than a gate that stopped asking: \
+         {asked:?}"
     );
 }
 
