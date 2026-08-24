@@ -3,11 +3,12 @@
   "branch": "feat/REQ-589-over-budget-skill-expansion-offer",
   "startedAt": "2026-08-24T19:38:00Z",
   "completed": false,
-  "currentPhase": 3,
+  "currentPhase": 4,
   "completedPhases": [
     0,
     1,
-    2
+    2,
+    3
   ],
   "integrationBranch": "main",
   "phaseHistory": [
@@ -28,6 +29,16 @@
       "completedAt": "2026-08-24T20:05:00Z",
       "adrs": 12,
       "tasks": 18
+    },
+    {
+      "phase": 3,
+      "name": "Validate Architecture & Tasks",
+      "completedAt": "2026-08-24T20:12:00Z",
+      "result": "approved",
+      "fixed": [
+        "TASK-253 dep count 4->3 (split to TASK-257)",
+        "TASK-249/251 missing test requirements"
+      ]
     }
   ],
   "repos": {

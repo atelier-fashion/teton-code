@@ -22,6 +22,9 @@ BR-14.1 / D-8. An approval must not leave the session hitting the same wall. On 
 - [ ] The withdrawn block's provenance is absorbed into `DroppedProvenance` — a `local-only` source must not survive the withdrawal (BUG-188)
 - [ ] The NEXT turn in that session assembles without the expansion — driven by a real second turn, not by inspecting the block list (AC-22)
 - [ ] Withdrawal fires only on the context failure; other failure classes leave the turn to the ordinary retry machinery
+- [ ] A test drives a real accepted turn to a window failure and then a real SECOND turn, asserting the expansion is absent from the second turn's assembled prompt — not by inspecting the block list
+- [ ] A provenance test asserts a `local-only` source in the withdrawn block does not survive into the next turn (BUG-188's own regression shape)
+- [ ] Mutating the withdrawal call site reddens the suite (LESSON-544)
 
 ## Technical Notes
 

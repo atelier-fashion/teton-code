@@ -5,7 +5,7 @@ status: draft
 parent: REQ-589
 created: 2026-08-24
 updated: 2026-08-24
-dependencies: [TASK-247, TASK-248, TASK-249, TASK-250]
+dependencies: [TASK-247, TASK-248, TASK-250]
 ---
 
 ## Description

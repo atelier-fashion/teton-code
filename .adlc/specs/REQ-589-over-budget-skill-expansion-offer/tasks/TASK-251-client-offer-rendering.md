@@ -23,6 +23,9 @@ BR-4 + ADR-2. `PermissionSubject` is matched exhaustively client-side, so the ne
 - [ ] The four options render as a single-select; the remedy options are absent when the bound has no remedy
 - [ ] A project-sourced skill's name renders under the distinguishing treatment project skills already get, never as bare harness vocabulary (ASSUME-018)
 - [ ] Reuse `bound_clause`/`bound_words` (1944, 1975) and `budget_clause` (3282) — no second vocabulary for the same fact (LESSON-456)
+- [ ] A client-side test asserts the no-terminal path returns `Refused { reason: NoTerminal }` and never `Cancelled`, and that it fires before any read of stdin (BR-4)
+- [ ] A rendering test pins the offer's rendered text for each of the five bounds, driven from a constructed `PermissionRequest` — and a producer-side test proves the daemon actually emits that subject (LESSON-544: a struct-literal test alone leaves the producer unguarded)
+- [ ] Removing the `SkillOverBudget` arm fails compilation, demonstrating the exhaustive-match forcing function (ADR-2)
 
 ## Technical Notes
 
