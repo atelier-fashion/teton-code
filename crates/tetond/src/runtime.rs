@@ -118,10 +118,11 @@ use teton_inference::{ChatFormat, Completion, Engine, EngineError, GenParams, Mo
 use teton_protocol::events::{
     BlockCause, BudgetBound, CapabilityDeadEnd, ContextCleared, ContextPressureKind, Event,
     ModelLifecycle, ModelLifecycleStage, NotRunReason, PermissionSubject, PrivacyAction,
-    ProviderTested, SessionRootChanged, SessionTitled, SkillInvoked, SkillOverBudgetAccepted,
-    SkillOverBudgetOffered, SkillOverBudgetRemedyApplied, SkillStage as WireSkillStage,
-    TierWarming, TurnQueued, WebCapabilityState as WireWebCapabilityState, WebLookup,
-    WebSetupCompleted, WebTaintOverridden, WebTier as WireWebTier,
+    ProviderTested, RemedyKind, SessionRootChanged, SessionTitled, SkillInvoked,
+    SkillOverBudgetAccepted, SkillOverBudgetOffered, SkillOverBudgetRemedyApplied,
+    SkillStage as WireSkillStage, TierWarming, TurnQueued,
+    WebCapabilityState as WireWebCapabilityState, WebLookup, WebSetupCompleted, WebTaintOverridden,
+    WebTier as WireWebTier,
 };
 use teton_protocol::jsonrpc::{error_code, RpcError};
 use teton_protocol::methods::{
@@ -170,8 +171,10 @@ use crate::harness::budget::{
     SkillCaller, SkillFit, SkillStage,
 };
 use crate::harness::completion::{context_provenance, RemoteProviderSource};
-use crate::harness::context::{NoopProvenanceHook, PressureReport};
-use crate::harness::permissions::{AddressedPermissionDelivery, SkillConsent};
+use crate::harness::context::{Fit, NoopProvenanceHook, PressureReport};
+use crate::harness::permissions::{
+    AddressedPermissionDelivery, OverBudgetOptionLabels, SkillConsent,
+};
 use crate::harness::tools::shell;
 use crate::harness::tools::skill::register_skill_tool;
 use crate::harness::tools::web::{register_web_tool, tier_name, SeamError, WebLookupSeam};
@@ -192,7 +195,8 @@ use crate::model_consent::{
     ModelConsentGate, NoInstaller, PendingModelDecisions, WeightsInstaller,
 };
 use crate::router::{
-    to_protocol_category, to_protocol_phase, to_protocol_tier, Router, TierOrigin, TierReport,
+    to_protocol_category, to_protocol_phase, to_protocol_tier, RemoteProvider, Router, TierOrigin,
+    TierReport,
 };
 use crate::selection_store::SelectionStore;
 use crate::session_root::{home, ProbedRoot};
@@ -1818,6 +1822,380 @@ fn declared_value(tokens: u32, absent: &str) -> String {
     } else {
         tokens.to_string()
     }
+}
+
+/// The durable write an accepted over-budget remedy **is**, decided before the
+/// question is asked (REQ-589 BR-7, BR-8, BR-9; ADR-1, ADR-4, ADR-5).
+///
+/// # Why the plan is made before the offer, and not after the answer
+///
+/// ADR-1's binding precedent is `enable_permanent`, whose own comment records
+/// that an earlier version promised a write which was silently a no-op. The
+/// same defect is reachable here in a subtler form, because two of BR-7's own
+/// rules legitimately answer "not this time": BR-7c ships **no figure** for a
+/// provider matching no vendor recipe, and ADR-12 refuses to **choose** when
+/// more than one remote provider is configured. A remedy can therefore be
+/// classified — `RemedyKind::DeclareWindow`, say — and still have nothing this
+/// build may write. An option list widened on the classification alone puts a
+/// label promising a write in front of a human whose selection then applies
+/// nothing, which is exactly the failure ADR-1 cites.
+///
+/// So the write is planned **first**, and the plan is the single fact that
+/// decides both halves of the question: `Some` puts the two remedy-bearing
+/// options on the prompt and is applied verbatim when one is chosen, `None`
+/// withholds them and leaves the one-time override and the decline standing
+/// alone. One representation, read twice, so the option and the write cannot
+/// disagree about whether a fix exists (LESSON-545).
+///
+/// The composed **sentence** is unchanged either way. It still names the
+/// durable fix and, where the daemon has no figure, still says it ships none
+/// and will not invent one — which is BR-7c's *ask, never invent*. The offer
+/// asks for the value; it just does not pretend to have a button for it.
+struct RemedyPlan {
+    /// Which fix this is, for the record [`SkillOverBudgetRemedyApplied`]
+    /// carries. Never [`RemedyKind::NotOffered`]: a plan exists only where a
+    /// write does.
+    kind: RemedyKind,
+    /// The provider the write is addressed to. For a rebind that is the
+    /// provider the tier is being bound **to**, never the one the route is
+    /// leaving.
+    provider_id: ProviderId,
+    /// What the setting read before the write, spelled by [`declared_value`].
+    previous_value: String,
+    /// What it reads after, spelled the same way.
+    new_value: String,
+    /// The updates themselves, in the order they must be applied.
+    writes: RemedyWrites,
+}
+
+/// The `config/set` updates one [`RemedyPlan`] performs, **in order**
+/// (REQ-589 ADR-4, ADR-5).
+///
+/// Not a `Vec<ConfigUpdate>`: for BR-9's pair the order is the whole mechanism,
+/// so it is a variant whose field names say which write is which and whose only
+/// consumer walks them in one direction. A collection would let a later caller
+/// build the pair backwards without saying anything false.
+enum RemedyWrites {
+    /// One field-wise `RegisterProvider` — [`Remedy::RaiseWindow`],
+    /// [`Remedy::DeclareWindow`], [`Remedy::RaiseCap`].
+    Provider(ProviderConfig),
+    /// **BR-9's pair, ordered so the forbidden state is unreachable (ADR-5).**
+    ///
+    /// `config/set` persists one update per call and `architecture.md:169-172`
+    /// forbids generalizing it, so atomicity is not available and ordering is
+    /// what buys the invariant instead. In *this* order a partial failure
+    /// leaves a declared window on a tier still bound where it was: harmless,
+    /// no routing change, nothing the user must undo. In the **reverse** order
+    /// it leaves a newly-bound remote tier with `max_context = 0`, which
+    /// derives the same default pair under `bound: unknown window` — the exact
+    /// circle the reported `/analyze` failure was already sitting in.
+    TierRebind {
+        /// FIRST: the target provider re-registered with its window declared.
+        window: ProviderConfig,
+        /// SECOND: the tier binding that moves the category's work to it.
+        binding: TierBindingConfig,
+    },
+}
+
+impl RemedyWrites {
+    /// Apply every update in order, stopping at the first failure — and say
+    /// what *did* land, because "nothing changed" and "half of BR-9's pair
+    /// changed" are different things to tell a user.
+    ///
+    /// `write` is the applier rather than `&DaemonRuntime` so the ordering is
+    /// assertable at this seam: a caller that fails the second write can prove
+    /// the config never reaches the forbidden state. Per LESSON-508 that guard
+    /// needs a test of its own — without one, a reversed pair is silent until
+    /// a user hits the circle.
+    fn apply(
+        self,
+        mut write: impl FnMut(ConfigUpdate) -> Result<(), RpcError>,
+    ) -> Result<(), (RpcError, &'static str)> {
+        match self {
+            Self::Provider(provider) => write(ConfigUpdate::RegisterProvider(provider))
+                .map_err(|err| (err, "nothing was applied")),
+            Self::TierRebind { window, binding } => {
+                // FIRST — and the `?` is the mechanism (ADR-5). A window this
+                // write failed to declare stops the rebind here, so the tier
+                // is never bound to a provider with no window.
+                write(ConfigUpdate::RegisterProvider(window))
+                    .map_err(|err| (err, "nothing was applied"))?;
+                // SECOND.
+                write(ConfigUpdate::SetTierBinding(binding)).map_err(|err| {
+                    (
+                        err,
+                        "the provider's window was declared and the tier was left bound exactly \
+                         as it was — the harmless half of the pair, which is why it is written \
+                         first",
+                    )
+                })
+            }
+        }
+    }
+}
+
+/// A **field-wise** provider registration: the identity re-stated, at most one
+/// capability field written, everything else `None` (REQ-586 ADR-7's merge).
+///
+/// The three carried fields are carried rather than omitted because
+/// `RegisterProvider` replaces them wholesale and
+/// [`DaemonRuntime::apply_config_update`] refuses a remote provider with no
+/// model — so a write that only means to touch a capability still has to
+/// re-state the identity it is not changing. `None` on the two capability
+/// fields preserves what is stored, so a cap the user set survives a window
+/// write and a window the user declared survives a cap write.
+fn field_wise_registration(
+    existing: &ModelProvider,
+    max_context: Option<u32>,
+    context_budget_cap: Option<u32>,
+) -> ProviderConfig {
+    ProviderConfig {
+        id: ProviderId::from(existing.id.as_str()),
+        kind: to_proto_kind(existing.kind),
+        endpoint: existing.endpoint.clone(),
+        model: existing.model.clone(),
+        auth_ref: existing.auth_ref.clone(),
+        max_context,
+        context_budget_cap,
+        floored_budget: None,
+    }
+}
+
+/// **BR-7's remedies as writes** — what an accepted offer would durably change,
+/// or `None` where this build has nothing it may write (REQ-589 BR-7, BR-9;
+/// ADR-1, ADR-12).
+///
+/// | Remedy | Write |
+/// |---|---|
+/// | [`Remedy::RaiseWindow`] | `capabilities.max_context` = the recipe's figure |
+/// | [`Remedy::DeclareWindow`] | the same field, first declared |
+/// | [`Remedy::RaiseCap`] | `capabilities.context_budget_cap` = `0` ("no cap") |
+/// | [`Remedy::BindTierRemote`] | the window **then** the tier binding (ADR-5) |
+///
+/// `None` — the offer keeps its one-time override and its decline, and gains no
+/// option that would write nothing:
+///
+/// * a **window remedy with no proposal**: BR-7c's catalog matched nothing, and
+///   inventing a number that gets persisted into a user's config is worse than
+///   the silently defaulted window REQ-586 BR-3 exists to name (AC-21);
+/// * a **rebind this daemon may not decide**: no configured remote to bind to,
+///   or more than one and therefore a choice about where a whole category's
+///   spend goes (ADR-12) — each said on the record channel below;
+/// * [`Remedy::NotOffered`], `RedactScan`'s answer (BR-7b), which the gate
+///   already drops the remedy options for — answered here rather than assumed
+///   away;
+/// * a remedy addressed to a provider that is no longer in this turn's config.
+///
+/// The provider is looked up in **this turn's** config snapshot, the same one
+/// the route was decided from, so the "previous" value the record names is the
+/// value the refusal was actually measured under.
+fn plan_over_budget_remedy(
+    config: &Config,
+    router: &Router,
+    remedy: &Remedy,
+    measured: Fit,
+) -> Option<RemedyPlan> {
+    let registered = |id: &String| config.providers.iter().find(|p| &p.id == id);
+    match remedy {
+        Remedy::RaiseWindow {
+            provider_id: Some(id),
+            proposal: Some(proposal),
+        }
+        | Remedy::DeclareWindow {
+            provider_id: Some(id),
+            proposal: Some(proposal),
+        } => {
+            let existing = registered(id)?;
+            Some(RemedyPlan {
+                kind: remedy.kind(),
+                provider_id: ProviderId::from(existing.id.as_str()),
+                previous_value: declared_value(existing.capabilities.max_context, "undeclared"),
+                new_value: declared_value(proposal.tokens, "undeclared"),
+                writes: RemedyWrites::Provider(field_wise_registration(
+                    existing,
+                    Some(proposal.tokens),
+                    None,
+                )),
+            })
+        }
+        Remedy::RaiseCap {
+            provider_id: Some(id),
+        } => {
+            let existing = registered(id)?;
+            Some(RemedyPlan {
+                kind: remedy.kind(),
+                provider_id: ProviderId::from(existing.id.as_str()),
+                previous_value: declared_value(existing.capabilities.context_budget_cap, "no cap"),
+                // **Cleared, not guessed at.** The label offers to "raise or
+                // clear" this ceiling and the cap is the user's own number —
+                // the daemon has no second opinion about what it should be, and
+                // `0` is the config's own spelling of "no cap", the one value
+                // this daemon can write without inventing the user's policy.
+                // The window underneath still bounds the route.
+                new_value: declared_value(0, "no cap"),
+                writes: RemedyWrites::Provider(field_wise_registration(existing, None, Some(0))),
+            })
+        }
+        Remedy::BindTierRemote { tier: Some(tier) } => {
+            plan_tier_rebind(config, router, *tier, measured)
+        }
+        // Exhaustive rather than a `_`: a sixth remedy must be answered here
+        // deliberately, and the answer "no write" is a decision rather than a
+        // fall-through. The reachable members are listed above.
+        Remedy::RaiseWindow { .. }
+        | Remedy::DeclareWindow { .. }
+        | Remedy::RaiseCap { .. }
+        | Remedy::BindTierRemote { .. }
+        | Remedy::NotOffered => None,
+    }
+}
+
+/// **BR-9's rebind, planned**: which provider, what window, and the ordered
+/// pair that writes them (REQ-589 BR-9; ADR-5, ADR-12).
+///
+/// # ADR-12: exactly one may be proposed, two or more are not this daemon's to
+/// choose
+///
+/// D-9 authorized *performing* the remedy, not deciding where a whole
+/// category's work — and spend — goes. So the count
+/// [`Router::remote_providers`] returns is the whole gate: one is proposed by
+/// name, none and many both withhold the option and say why on the daemon's
+/// record channel. Picking the first in id order would be a routing decision
+/// taken on a user's behalf inside a consent answer, which is the one thing
+/// this remedy must not do.
+fn plan_tier_rebind(
+    config: &Config,
+    router: &Router,
+    tier: Tier,
+    measured: Fit,
+) -> Option<RemedyPlan> {
+    let configured = router.remote_providers();
+    let candidate = match configured.as_slice() {
+        [] => {
+            eprintln!(
+                "tetond: an over-budget offer on the local tier carries no rebind option — \
+                 BR-9's durable fix is to bind the `{}` tier to a remote provider and declare \
+                 that provider's window in the same change, and no remote provider is \
+                 configured to bind it to. Register one with `teton provider add` first.",
+                tier.as_str()
+            );
+            return None;
+        }
+        [only] => only,
+        many => {
+            eprintln!(
+                "tetond: an over-budget offer on the local tier carries no rebind option — \
+                 {} remote providers are configured ({}), and rebinding the `{}` tier moves \
+                 every turn that tier serves to whichever one is chosen, at that provider's \
+                 prices. Choosing that for you is not what answering this question authorizes \
+                 (ADR-12), so the binding is left to `teton policy set-tier {} <provider>`.",
+                many.len(),
+                many.iter()
+                    .map(|provider| provider.id.as_str())
+                    .collect::<Vec<_>>()
+                    .join(", "),
+                tier.as_str(),
+                tier.as_str(),
+            );
+            return None;
+        }
+    };
+    // Registered in the router but absent from this config snapshot is not a
+    // state either can produce — the router is built from this config — and it
+    // is answered rather than unwrapped, because the alternative is a panic in
+    // a consent path.
+    let existing = config.providers.iter().find(|p| p.id == candidate.id)?;
+    let Some(window) = rebind_window(router, candidate, measured) else {
+        eprintln!(
+            "tetond: an over-budget offer on the local tier carries no rebind option — \
+             binding the `{}` tier to `{}` has to declare that provider's window in the same \
+             change (BR-9), and this daemon ships no figure for `{}` and will not invent one. \
+             Declare it with `teton provider add {} --max-context <tokens>` and the binding \
+             follows.",
+            tier.as_str(),
+            candidate.id,
+            candidate.model,
+            candidate.id
+        );
+        return None;
+    };
+    // The `[[tiers]]` row as it stands, which is exactly what the second write
+    // replaces. `unbound` is the honest word for its absence: the tier still
+    // routed somewhere (here, the local engine — that is what made this bound
+    // `LocalEngine`), but no row said so.
+    let previously_bound = config
+        .tiers
+        .iter()
+        .find(|binding| binding.tier == tier)
+        .map_or("unbound", |binding| binding.provider_id.as_str());
+    Some(RemedyPlan {
+        // The one remedy that reaches here, so it is named rather than
+        // projected from a `Remedy` this function does not hold.
+        kind: RemedyKind::BindTierRemote,
+        provider_id: ProviderId::from(existing.id.as_str()),
+        // **Both halves on both sides.** BR-9's remedy is a pair, so a record
+        // naming only the binding would leave a reader unable to tell the fix
+        // from the circle — a tier bound to a provider with no declared window
+        // is the failure this remedy exists to close, and it has to be legible
+        // in the record that it did not happen.
+        previous_value: format!(
+            "{previously_bound}, capabilities.max_context {}",
+            declared_value(existing.capabilities.max_context, "undeclared")
+        ),
+        new_value: format!(
+            "{}, capabilities.max_context {}",
+            existing.id,
+            declared_value(window, "undeclared")
+        ),
+        writes: RemedyWrites::TierRebind {
+            window: field_wise_registration(existing, Some(window), None),
+            binding: TierBindingConfig {
+                tier: to_protocol_tier(tier),
+                provider_id: ProviderId::from(existing.id.as_str()),
+                // Not invented: a fallback is a second routing decision, and
+                // nobody was asked for one.
+                fallback_id: None,
+            },
+        },
+    })
+}
+
+/// The window BR-9's second half declares for `candidate`, or `None` when this
+/// build cannot name one (REQ-589 BR-7c, BR-9; ADR-6).
+///
+/// Two sources, in this order and no others:
+///
+/// 1. **The provider's own declaration**, where it has one that actually holds
+///    the measurement. A user who declared this provider's window months ago
+///    should not be told the daemon ships no figure for it, and re-stating the
+///    value they wrote invents nothing.
+/// 2. **The shipped vendor catalog**, through [`proposed_window`] — keyed off
+///    the candidate's **model**, never its id (ADR-6 rule 1: ids are the user's
+///    namespace), and only where the recipe's window would actually clear what
+///    was measured (rule 2, the rule Ollama's honest 4,096 exists to trip).
+///
+/// `None` is the honest third answer, and it withholds the **whole** remedy
+/// rather than half of it. Binding a tier to a provider with no declared window
+/// derives the same default pair under `bound: unknown window`: the user pays a
+/// remote provider and meets the identical refusal, which is the circle the
+/// reported `/analyze` failure was already sitting in.
+///
+/// **Nothing is derived here.** Both figures come from `Router::budget_for`,
+/// the routing layer's single caller of `budget::derive` (REQ-586 AC-12) — a
+/// second derivation would be a second figure, correct when computed and wrong
+/// the moment the route is re-decided.
+fn rebind_window(router: &Router, candidate: &RemoteProvider, measured: Fit) -> Option<u32> {
+    let inputs = router.budget_inputs_for(Some(&candidate.id));
+    if inputs.window > 0 {
+        let declared = router.budget_for(Some(&candidate.id));
+        if !declared.floored
+            && measured.tokens <= declared.budget_tokens
+            && measured.bytes <= declared.budget_bytes
+        {
+            return Some(inputs.window);
+        }
+    }
+    proposed_window(Some(&candidate.model), inputs, measured).map(|proposal| proposal.tokens)
 }
 
 /// The assembled daemon runtime shared by every client task.
@@ -3730,6 +4108,26 @@ impl DaemonRuntime {
             }),
         );
 
+        // **The write is planned before the question is asked**, and the plan
+        // is what decides whether the two remedy-bearing options appear at all
+        // (ADR-1). A `None` here is not a failure: BR-7c ships no figure for a
+        // provider matching no recipe, and ADR-12 will not choose between two
+        // configured remotes — in both cases the honest offer is the one-time
+        // override and the decline, with the sentence still naming the durable
+        // fix and asking for what the daemon does not have. What is *not*
+        // acceptable is an option a human can select that writes nothing, and
+        // [`RemedyPlan`]'s doc records why that is the same defect
+        // `enable_permanent` shipped once already.
+        let plan = plan_over_budget_remedy(config, router, &offer.remedy, measured);
+        let labels = if plan.is_some() {
+            offer.option_labels()
+        } else {
+            OverBudgetOptionLabels {
+                remedy: None,
+                ..offer.option_labels()
+            }
+        };
+
         let answer = gate
             .authorize_skill_over_budget(
                 // The **plain** key `skill:<source>:<name>`, never the digest
@@ -3759,7 +4157,7 @@ impl DaemonRuntime {
                 },
                 // The gate words nothing (BR-5): finished text arrives, and what
                 // it decides is which options reach the prompt.
-                offer.option_labels(),
+                labels,
                 connection,
             )
             .await;
@@ -3769,7 +4167,20 @@ impl DaemonRuntime {
         // other (AC-7b). Applied before the accept is announced because the
         // remedy is the going-forward half and holds whichever way the send went.
         if answer.apply_remedy() {
-            self.apply_over_budget_remedy(events, session_id, config, &offer.remedy);
+            match plan {
+                Some(plan) => self.apply_over_budget_remedy(events, session_id, plan),
+                // Unreachable, and stated rather than assumed away: the two
+                // remedy ids are denied by `interpret_over_budget` unless the
+                // option list carried them, and it carried them only where a
+                // plan existed. A client that answered one anyway gets the
+                // decline it was given, and the daemon says so — the one thing
+                // that must not happen quietly here is nothing.
+                None => eprintln!(
+                    "tetond: an over-budget answer authorized a durable write this build \
+                     planned none for — nothing was written, the limit still stands, and \
+                     the next invocation will meet the same measurement"
+                ),
+            }
         }
 
         if answer.consent().is_allowed() {
@@ -3803,8 +4214,9 @@ impl DaemonRuntime {
         }
     }
 
-    /// Write the offer's **going-forward** remedy, through the one durable-write
-    /// path this daemon has (REQ-589 BR-7, BR-8; ADR-4).
+    /// Perform the offer's **going-forward** remedy, through the one
+    /// durable-write path this daemon has (REQ-589 BR-7, BR-8, BR-9; ADR-4,
+    /// ADR-5).
     ///
     /// [`Self::apply_config_update`] is `config/set`'s own body, so this
     /// inherits that method's posture verbatim — its validation, its atomic
@@ -3813,139 +4225,50 @@ impl DaemonRuntime {
     /// `config/set` would refuse is refused identically, and the event below is
     /// the announcement rather than the permission.
     ///
-    /// # What it writes, and what it deliberately does not
+    /// # What it writes is not decided here
     ///
-    /// The three single-write remedies are applied here, each naming exactly the
-    /// key its own option label promised (ADR-1: a label that promises a write
-    /// must make it — the `enable_permanent` comment records what a silently
-    /// no-op promise cost the last time):
+    /// [`plan_over_budget_remedy`] decided it, *before* the question was asked,
+    /// and the same plan is what put the remedy options on the prompt at all.
+    /// That is the whole guard against ADR-1's cautionary precedent: there is
+    /// no arm in this function that can accept an answer it has no write for,
+    /// because a remedy with no write never became an option. A remedy this
+    /// build cannot apply is not offered — never offered and then quietly
+    /// dropped.
     ///
-    /// | Remedy | Write |
-    /// |---|---|
-    /// | [`Remedy::RaiseWindow`] | `capabilities.max_context` = the recipe's figure |
-    /// | [`Remedy::DeclareWindow`] | the same field, first declared |
-    /// | [`Remedy::RaiseCap`] | `capabilities.context_budget_cap` = `0` ("no cap") |
+    /// # Ordering, for the one remedy that is two writes
     ///
-    /// Everything else returns without writing and without publishing:
+    /// [`RemedyWrites::apply`] walks BR-9's pair in the one order that makes
+    /// the forbidden state unreachable (ADR-5): the window is declared first,
+    /// the tier is bound second. A failure between them leaves a declared
+    /// window on a tier bound exactly where it was, which is harmless; the
+    /// reverse order leaves a newly-bound remote tier with `max_context = 0`,
+    /// which is the circle the reported `/analyze` failure was sitting in.
     ///
-    /// * [`Remedy::BindTierRemote`] is **two ordered writes** plus ADR-12's
-    ///   "which provider?" question, and belongs to the task that owns that
-    ///   ordering — a half-applied version here would leave a newly-bound remote
-    ///   tier with no declared window, which derives the same default pair and
-    ///   sends the user round the exact circle BR-9 exists to close.
-    /// * A window remedy with **no proposal** has no figure to write: BR-7c's
-    ///   catalog matched nothing, and inventing a number that gets persisted to
-    ///   a user's config is worse than the silently defaulted window REQ-586
-    ///   BR-3 exists to name (AC-21).
-    /// * [`Remedy::NotOffered`] is `RedactScan`'s answer (BR-7b) and cannot
-    ///   reach here at all — the gate drops the remedy options on that bound,
-    ///   so `apply_remedy()` is `false` — but it is answered rather than assumed
-    ///   away.
-    ///
-    /// A failure is stated rather than swallowed: the turn's own answer already
-    /// stands, and a user told their limit was raised when the write failed
-    /// would meet the same refusal next turn with no explanation.
-    // TODO(REQ-589 TASK-250): `BindTierRemote`'s ordered pair and ADR-12's
-    // provider choice land here, on this match, beside the three rows above.
+    /// A failure is stated rather than swallowed, and says which half landed:
+    /// the turn's own answer already stands, and a user told their limit was
+    /// raised when the write failed would meet the same refusal next turn with
+    /// no explanation.
     fn apply_over_budget_remedy(
         &self,
         events: &Arc<EventBus>,
         session_id: &SessionId,
-        config: &Config,
-        remedy: &Remedy,
+        plan: RemedyPlan,
     ) {
-        // The rows are keyed on the remedy the classifier chose, and the
-        // provider is looked up in **this turn's** config snapshot — the same
-        // one the route was decided from, so the "previous" value the record
-        // names is the value the refusal was actually measured under.
-        let write = match remedy {
-            Remedy::RaiseWindow {
-                provider_id: Some(id),
-                proposal: Some(proposal),
-            }
-            | Remedy::DeclareWindow {
-                provider_id: Some(id),
-                proposal: Some(proposal),
-            } => config
-                .providers
-                .iter()
-                .find(|p| &p.id == id)
-                .map(|existing| {
-                    (
-                        ProviderConfig {
-                            id: ProviderId::from(existing.id.as_str()),
-                            kind: to_proto_kind(existing.kind),
-                            endpoint: existing.endpoint.clone(),
-                            // Carried, not omitted: `RegisterProvider` replaces
-                            // these three wholesale, and `apply_config_update`
-                            // refuses a remote provider with no model. A field-wise
-                            // window write therefore has to re-state the identity it
-                            // is not changing.
-                            model: existing.model.clone(),
-                            auth_ref: existing.auth_ref.clone(),
-                            max_context: Some(proposal.tokens),
-                            // `None` preserves what is stored (ADR-7's field-wise
-                            // merge). A cap the user set stays set — this remedy is
-                            // about the window.
-                            context_budget_cap: None,
-                            floored_budget: None,
-                        },
-                        declared_value(existing.capabilities.max_context, "undeclared"),
-                        declared_value(proposal.tokens, "undeclared"),
-                    )
-                }),
-            Remedy::RaiseCap {
-                provider_id: Some(id),
-            } => config
-                .providers
-                .iter()
-                .find(|p| &p.id == id)
-                .map(|existing| {
-                    (
-                        ProviderConfig {
-                            id: ProviderId::from(existing.id.as_str()),
-                            kind: to_proto_kind(existing.kind),
-                            endpoint: existing.endpoint.clone(),
-                            model: existing.model.clone(),
-                            auth_ref: existing.auth_ref.clone(),
-                            max_context: None,
-                            // **Cleared, not guessed at.** The label offers to
-                            // "raise or clear" this ceiling and the cap is the
-                            // user's own number — the daemon has no second opinion
-                            // about what it should be, and `0` is the config's own
-                            // spelling of "no cap", which is the one value this
-                            // daemon can write without inventing the user's policy.
-                            // The window underneath still bounds the route.
-                            context_budget_cap: Some(0),
-                            floored_budget: None,
-                        },
-                        declared_value(existing.capabilities.context_budget_cap, "no cap"),
-                        declared_value(0, "no cap"),
-                    )
-                }),
-            _ => None,
-        };
-
-        let Some((update, previous_value, new_value)) = write else {
-            eprintln!(
-                "tetond: an over-budget offer's remedy was accepted but nothing \
-                 was written — this bound's durable fix is not one this build \
-                 applies in-line ({:?}), so the limit still stands and the next \
-                 invocation will meet the same measurement",
-                remedy.kind()
-            );
-            return;
-        };
-
-        let provider_id = update.id.clone();
-        match self.apply_config_update(ConfigUpdate::RegisterProvider(update)) {
+        let RemedyPlan {
+            kind,
+            provider_id,
+            previous_value,
+            new_value,
+            writes,
+        } = plan;
+        match writes.apply(|update| self.apply_config_update(update)) {
             Ok(()) => events.publish(
                 Some(session_id.clone()),
                 Event::SkillOverBudgetRemedyApplied(SkillOverBudgetRemedyApplied {
                     // Never `NotOffered` on a published event: that value means
                     // no fix existed to take, and nothing reaches this line
                     // without one having been written.
-                    remedy_kind: remedy.kind(),
+                    remedy_kind: kind,
                     provider_id: Some(provider_id),
                     // **Both values, always.** A record naming only the new one
                     // leaves a reader unable to tell a raise from a first
@@ -3956,10 +4279,10 @@ impl DaemonRuntime {
                     new_value,
                 }),
             ),
-            Err(err) => eprintln!(
-                "tetond: the over-budget remedy for `{}` could not be written \
-                 ({}); nothing was applied and the limit still stands",
-                provider_id.0, err.message
+            Err((err, applied)) => eprintln!(
+                "tetond: the over-budget remedy for `{}` could not be written ({}); {} and \
+                 the limit still stands",
+                provider_id.0, err.message, applied
             ),
         }
     }
@@ -32062,13 +32385,14 @@ provider_id = \"deepseek\"
     mod the_over_budget_offer {
         use super::*;
         use crate::grants::GrantRegistry;
-        use crate::harness::budget::LOCAL_BUDGET_TOKENS;
+        use crate::harness::budget::{LOCAL_BUDGET_BYTES, LOCAL_BUDGET_TOKENS};
         use crate::harness::permissions::{AddressedPermissionDelivery, PermissionConfig};
         use crate::sessions::SessionRegistry;
         use crate::skills::{discover, RealFs};
         use teton_protocol::events::{
             PermissionRequest, RemedyKind, WindowVerdict, OPTION_ID_OVER_BUDGET_DECLINE,
-            OPTION_ID_OVER_BUDGET_PROCEED_ONCE, OPTION_ID_OVER_BUDGET_REMEDY_ONLY,
+            OPTION_ID_OVER_BUDGET_PROCEED_AND_REMEDY, OPTION_ID_OVER_BUDGET_PROCEED_ONCE,
+            OPTION_ID_OVER_BUDGET_REMEDY_ONLY,
         };
         use teton_protocol::methods::PermissionOutcome;
 
@@ -32696,8 +33020,12 @@ provider_id = \"deepseek\"
             assert_eq!(bound, BudgetBound::LocalEngine);
             assert!(measured_tokens > budget_tokens);
 
-            // The four ids ADR-1 spells the two booleans as, and — on a bound
-            // BR-7 does grant a remedy — all four are present.
+            // The two ids every offer carries, whatever BR-7's table said.
+            // Whether the other two join them is a question about the *write*
+            // rather than about the bound — this fixture configures no remote
+            // provider, so BR-9's rebind has nothing to bind to and the option
+            // that would promise it is withheld
+            // ([`a_rebind_is_offered_to_nobody_when_the_daemon_would_have_to_choose`]).
             let ids: Vec<&str> = offers[0]
                 .options
                 .iter()
@@ -32868,6 +33196,539 @@ provider_id = \"deepseek\"
             assert!(
                 fx.client.offers().is_empty(),
                 "the question must not have been delivered to anybody"
+            );
+        }
+
+        /// One configured remote and nothing bound to it — the shape the
+        /// reported machine had, and ADR-12's *propose by name* case.
+        ///
+        /// No `[[tiers]]` row, so every tier still falls through to the local
+        /// engine (REQ-557 BR-4 removed the "pick the first remote" fallback),
+        /// which is what makes this route's bound `LocalEngine` and its remedy
+        /// BR-9's rebind. The model is `kimi-k3` because BR-7c looks a window up
+        /// by **model**, never by id.
+        const ONE_REMOTE: &str = "[[providers]]\n\
+             id = \"kimi\"\n\
+             kind = \"openai-compatible\"\n\
+             endpoint = \"http://127.0.0.1:1/v1\"\n\
+             model = \"kimi-k3\"\n";
+
+        /// Two configured remotes, neither bound — ADR-12's *ask, never pick*
+        /// case. `anthropic` is second in id order and `kimi` first, so a
+        /// daemon that silently took "the first one" would take `anthropic`
+        /// here and `kimi` above.
+        const TWO_REMOTES: &str = "[[providers]]\n\
+             id = \"kimi\"\n\
+             kind = \"openai-compatible\"\n\
+             endpoint = \"http://127.0.0.1:1/v1\"\n\
+             model = \"kimi-k3\"\n\
+             \n\
+             [[providers]]\n\
+             id = \"anthropic\"\n\
+             kind = \"anthropic\"\n\
+             endpoint = \"http://127.0.0.1:1\"\n\
+             model = \"claude-opus-5\"\n";
+
+        /// A remote route whose provider declares no window and whose model
+        /// matches **no vendor recipe** — BR-7c's "ask, never invent" case, and
+        /// the one the DEFECT this task closes lived in.
+        const UNKNOWN_VENDOR_ROUTE: &str = "[[providers]]\n\
+             id = \"mystery\"\n\
+             kind = \"openai-compatible\"\n\
+             endpoint = \"http://127.0.0.1:1/v1\"\n\
+             model = \"mystery-model-9\"\n\
+             \n\
+             [[tiers]]\n\
+             tier = \"build\"\n\
+             provider_id = \"mystery\"\n";
+
+        /// The option ids an offer actually carried, in the order the prompt
+        /// listed them.
+        fn option_ids(request: &PermissionRequest) -> Vec<&str> {
+            request
+                .options
+                .iter()
+                .map(|option| option.option_id.as_str())
+                .collect()
+        }
+
+        /// **AC-8, ADR-5 — the window is declared FIRST, and the circle is
+        /// unreachable from a partial failure.**
+        ///
+        /// `config/set` persists one update per call and `architecture.md:169-172`
+        /// forbids generalizing it, so BR-9's pair is bought with *ordering*
+        /// rather than atomicity. That makes the order the invariant, and an
+        /// invariant a comment states is a convention — so this fails the
+        /// **second** write and reads what the config was left holding.
+        ///
+        /// The first write goes through the real production path
+        /// (`apply_config_update`: real validation, real atomic persist), so
+        /// what is asserted afterwards is a real file on disk. Reversing the two
+        /// lines in [`RemedyWrites::apply`] reddens this test twice over: the
+        /// declared window would be missing, and the tier would be bound.
+        ///
+        /// The last block is the *why*, demonstrated rather than described —
+        /// the state the reverse order would leave really is the circle the
+        /// reported `/analyze` failure was sitting in.
+        #[test]
+        fn the_rebind_declares_the_window_first_so_the_circle_is_unreachable() {
+            let dir = scratch_dir("ob-order");
+            let path = dir.join("config.toml");
+            std::fs::write(&path, ONE_REMOTE).expect("seed the config");
+            let config = Config::load(ONE_REMOTE).expect("the fixture config loads");
+            let router = build_router(&config, true, &BTreeMap::new());
+
+            // Over the local pair in both currencies, and the same shape
+            // `would_seed_fit` produces.
+            let measured = Fit {
+                tokens: LOCAL_BUDGET_TOKENS * 2,
+                bytes: LOCAL_BUDGET_BYTES * 2,
+                fits: false,
+            };
+            let plan = plan_over_budget_remedy(
+                &config,
+                &router,
+                &Remedy::BindTierRemote {
+                    tier: Some(Tier::Build),
+                },
+                measured,
+            )
+            .expect("one configured remote with a catalogued model is ADR-12's proposed case");
+            assert_eq!(plan.kind, RemedyKind::BindTierRemote);
+            assert_eq!(plan.provider_id.0, "kimi");
+
+            let runtime = Arc::new(DaemonRuntime {
+                config: Mutex::new(config.clone()),
+                config_path: Some(path.clone()),
+                ..DaemonRuntime::minimal()
+            });
+
+            // The applier: the first write is the real one, the second fails.
+            let mut order: Vec<&'static str> = Vec::new();
+            let outcome = plan.writes.apply(|update| match &update {
+                ConfigUpdate::SetTierBinding(_) => {
+                    order.push("set-tier-binding");
+                    Err(RpcError::new(
+                        error_code::CONFIG_REJECTED,
+                        "the second write fails here, and only here",
+                    ))
+                }
+                _ => {
+                    order.push("register-provider");
+                    runtime.apply_config_update(update)
+                }
+            });
+
+            let (err, applied) = outcome.expect_err("the second write was made to fail");
+            assert_eq!(err.code, error_code::CONFIG_REJECTED, "{err:?}");
+            assert_eq!(
+                order,
+                vec!["register-provider", "set-tier-binding"],
+                "ADR-5: `max_context` is declared first and the tier is bound second — \
+                 the order is the whole mechanism, so it is asserted directly"
+            );
+            assert!(
+                applied.contains("window was declared"),
+                "a half-applied pair says which half landed, or the user is told \
+                 nothing changed when something did: {applied}"
+            );
+
+            // What the config was left holding — read off disk and re-parsed,
+            // not off a return code (LESSON-519).
+            let document = std::fs::read_to_string(&path).expect("the document survives");
+            let reloaded = Config::load(&document).expect("and still parses");
+            assert_eq!(
+                reloaded
+                    .providers
+                    .iter()
+                    .find(|p| p.id == "kimi")
+                    .expect("the provider survives a field-wise write")
+                    .capabilities
+                    .max_context,
+                1_000_000,
+                "the harmless half landed: a declared window on a tier nobody rebound: \
+                 {document}"
+            );
+            assert!(
+                reloaded
+                    .tiers
+                    .iter()
+                    .all(|binding| binding.tier != Tier::Build),
+                "**the forbidden state**: a partial failure bound the tier. In this order \
+                 it cannot — the binding is the write that did not happen: {document}"
+            );
+
+            // And the reason the order is that way round, demonstrated: the
+            // reverse order's first write, applied alone, is the circle.
+            let mut reversed = config.clone();
+            apply_update(
+                &mut reversed,
+                ConfigUpdate::SetTierBinding(TierBindingConfig {
+                    tier: ProtoTier::Build,
+                    provider_id: ProviderId::from("kimi"),
+                    fallback_id: None,
+                }),
+            );
+            let circled = build_router(&reversed, true, &BTreeMap::new()).budget_for(Some("kimi"));
+            assert_eq!(
+                circled.bound,
+                BudgetBound::DefaultUnknown,
+                "a tier bound to a provider with no declared window derives the default \
+                 pair under `bound: unknown window` — which is why that state must be \
+                 unreachable, not merely unlikely"
+            );
+            assert!(
+                measured.tokens > circled.budget_tokens,
+                "and the same measurement overflows it again: {} vs {} — the user would \
+                 have paid a remote provider to meet the identical refusal (BR-9)",
+                measured.tokens,
+                circled.budget_tokens
+            );
+
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+
+        /// **The DEFECT TASK-247 found, closed — an option that writes nothing
+        /// is never offered (ADR-1, BR-7c, AC-21).**
+        ///
+        /// `mystery-model-9` matches no vendor recipe, so BR-7c proposes no
+        /// figure and there is no `capabilities.max_context` this daemon may
+        /// write. The remedy is still *classified* — `DeclareWindow` rides the
+        /// `skill_over_budget_offered` record — and the sentence still names the
+        /// durable fix and asks for the value. What must not appear is an option
+        /// whose label promises the write: selecting it would apply nothing,
+        /// which is precisely the `enable_permanent` failure ADR-1 cites.
+        ///
+        /// Deleting the plan's `None` arm — widening the options on the
+        /// classification alone — reddens the id assertion below.
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn a_window_remedy_with_no_figure_offers_no_option_that_would_write_nothing() {
+            let fx = Fixture::new(
+                "ob-nofigure",
+                OPTION_ID_OVER_BUDGET_DECLINE,
+                Some(UNKNOWN_VENDOR_ROUTE),
+            );
+            let before =
+                std::fs::read_to_string(fx.dir.join("config.toml")).expect("the seeded document");
+            let mut sub = fx.events.subscribe(256);
+
+            let err = fx.invoke().await.expect_err("declined");
+            assert_eq!(err.code, error_code::SKILL_EXPANSION_TOO_LARGE, "{err:?}");
+
+            let published = drain(&mut sub);
+            let Some(Event::SkillOverBudgetOffered(record)) = published
+                .iter()
+                .find(|event| matches!(event, Event::SkillOverBudgetOffered(_)))
+            else {
+                panic!("no offer was raised on the unrecognized route: {published:?}");
+            };
+            assert_eq!(
+                record.bound,
+                BudgetBound::DefaultUnknown,
+                "non-vacuity: this fixture must be the undeclared-window row"
+            );
+            assert_eq!(
+                record.remedy_kind,
+                RemedyKind::DeclareWindow,
+                "the remedy is still classified — what is withheld is the *option*, not \
+                 the diagnosis"
+            );
+
+            let offers = fx.client.offers();
+            assert_eq!(offers.len(), 1, "{offers:?}");
+            assert_eq!(
+                option_ids(&offers[0]),
+                vec![
+                    OPTION_ID_OVER_BUDGET_PROCEED_ONCE,
+                    OPTION_ID_OVER_BUDGET_DECLINE
+                ],
+                "BR-7c found no figure, so there is no write to promise — and an option \
+                 a human can select that applies nothing is the defect this closes"
+            );
+
+            let Some(PermissionSubject::SkillOverBudget { sentence, .. }) =
+                offers[0].subject.clone()
+            else {
+                panic!("the offer's subject never reached the client: {offers:?}");
+            };
+            assert!(
+                sentence.contains("ships no figure for it and will not invent one"),
+                "the ask survives in the sentence — withholding the option is not \
+                 withholding the fix: {sentence}"
+            );
+
+            assert!(
+                !published
+                    .iter()
+                    .any(|event| matches!(event, Event::SkillOverBudgetRemedyApplied(_))),
+                "nothing was written: {published:?}"
+            );
+            assert_eq!(
+                std::fs::read_to_string(fx.dir.join("config.toml")).expect("the document"),
+                before,
+                "the config is byte-identical afterwards"
+            );
+        }
+
+        /// **AC-24, BR-9, ADR-12 (the one-provider case) — the rebind is
+        /// applied, and the circle is closed.**
+        ///
+        /// One configured remote, nothing bound to it, and a `/heavy` that will
+        /// not fit the local pair: BR-7's table says `BindTierRemote`, and
+        /// `Router::remote_providers` returns exactly one, so it may be proposed
+        /// by name. The answer is `remedy_only` — fix the route, do not run this
+        /// turn — so the write is observed with no send beside it.
+        ///
+        /// The second invocation is the proof the reported `/analyze` circle is
+        /// closed: the same skill, the same session, and **no offer at all**,
+        /// because the route now holds it. Its turn outcome is deliberately not
+        /// asserted — the fixture's endpoint is a closed port — since what AC-24
+        /// claims is about the budget question, not about a transport.
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn one_configured_remote_is_bound_by_name_and_the_next_invocation_finds_no_offer() {
+            let fx = Fixture::new(
+                "ob-rebind",
+                OPTION_ID_OVER_BUDGET_REMEDY_ONLY,
+                Some(ONE_REMOTE),
+            );
+            let mut sub = fx.events.subscribe(256);
+
+            let err = fx.invoke().await.expect_err("remedy-only does not send");
+            assert_eq!(err.code, error_code::SKILL_EXPANSION_TOO_LARGE, "{err:?}");
+            assert!(
+                fx.engine.beyond_the_classifier().is_empty(),
+                "`remedy_only` writes and does not send: {:?}",
+                fx.engine.beyond_the_classifier()
+            );
+
+            let published = drain(&mut sub);
+            let applied: Vec<&Event> = published
+                .iter()
+                .filter(|event| matches!(event, Event::SkillOverBudgetRemedyApplied(_)))
+                .collect();
+            assert_eq!(applied.len(), 1, "the rebind is announced: {published:?}");
+            let Event::SkillOverBudgetRemedyApplied(remedy) = applied[0] else {
+                unreachable!("filtered above")
+            };
+            assert_eq!(remedy.remedy_kind, RemedyKind::BindTierRemote);
+            assert_eq!(
+                remedy.provider_id.as_ref().map(|id| id.0.as_str()),
+                Some("kimi"),
+                "the record names the provider bound **to**, never the route being left"
+            );
+            assert_eq!(
+                (remedy.previous_value.as_str(), remedy.new_value.as_str()),
+                (
+                    "unbound, capabilities.max_context 0 (undeclared)",
+                    "kimi, capabilities.max_context 1000000"
+                ),
+                "both halves on both sides: a record naming only the binding could not \
+                 tell this fix from the circle it exists to close"
+            );
+
+            // The write, read back off disk and re-parsed.
+            let document = std::fs::read_to_string(fx.dir.join("config.toml"))
+                .expect("the config document survives the write");
+            let reloaded = Config::load(&document).expect("and still parses");
+            assert_eq!(
+                reloaded
+                    .providers
+                    .iter()
+                    .find(|p| p.id == "kimi")
+                    .expect("the provider survives a field-wise write")
+                    .capabilities
+                    .max_context,
+                1_000_000,
+                "BR-7c's catalogued figure for `kimi-k3`, looked up by model: {document}"
+            );
+            let bound = reloaded
+                .tiers
+                .iter()
+                .find(|binding| binding.tier == Tier::Build)
+                .expect("the tier the offer named is bound on disk");
+            assert_eq!(bound.provider_id, "kimi", "{document}");
+            assert!(
+                bound.fallback_id.is_none(),
+                "a fallback is a second routing decision nobody asked for: {document}"
+            );
+
+            // AC-24: the same invocation again, and no question this time.
+            let mut second = fx.events.subscribe(256);
+            let _ = fx.invoke().await;
+            assert_eq!(
+                fx.client.offers().len(),
+                1,
+                "the route now holds this expansion, so the second invocation reaches no \
+                 offer — the end-to-end proof the circle is closed: {:?}",
+                fx.client.offers()
+            );
+            assert!(
+                !drain(&mut second)
+                    .iter()
+                    .any(|event| matches!(event, Event::SkillOverBudgetOffered(_))),
+                "and none was announced either"
+            );
+        }
+
+        /// **ADR-12 — where the daemon would have to choose, it does not.**
+        ///
+        /// Zero configured remotes and two configured remotes are the same
+        /// answer for different reasons: there is nothing to bind to, and there
+        /// is no single thing to bind to. Rebinding a tier moves every turn that
+        /// tier serves to a paid provider, and D-9 authorized *performing* the
+        /// remedy, not deciding where a whole category's spend goes.
+        ///
+        /// Both legs assert the option list rather than the write, because
+        /// picking silently would be indistinguishable from picking correctly
+        /// until a bill arrived. A daemon that took "the first in id order"
+        /// would take `anthropic` in the second leg.
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn a_rebind_is_offered_to_nobody_when_the_daemon_would_have_to_choose() {
+            for (tag, config, why) in [
+                (
+                    "ob-noremote",
+                    None,
+                    "no remote provider is configured, so BR-9's fix has nothing to bind to",
+                ),
+                (
+                    "ob-tworemotes",
+                    Some(TWO_REMOTES),
+                    "two remotes are configured, and choosing between them is a routing \
+                     decision this answer does not authorize (ADR-12)",
+                ),
+            ] {
+                let fx = Fixture::new(tag, OPTION_ID_OVER_BUDGET_DECLINE, config);
+                let mut sub = fx.events.subscribe(256);
+
+                let err = fx.invoke().await.expect_err("declined");
+                assert_eq!(err.code, error_code::SKILL_EXPANSION_TOO_LARGE, "{err:?}");
+
+                let published = drain(&mut sub);
+                let Some(Event::SkillOverBudgetOffered(record)) = published
+                    .iter()
+                    .find(|event| matches!(event, Event::SkillOverBudgetOffered(_)))
+                else {
+                    panic!("no offer was raised: {published:?}");
+                };
+                assert_eq!(
+                    (record.bound, record.remedy_kind),
+                    (BudgetBound::LocalEngine, RemedyKind::BindTierRemote),
+                    "non-vacuity: {why}, and this must be the row that would earn a rebind"
+                );
+
+                let offers = fx.client.offers();
+                assert_eq!(
+                    option_ids(&offers[0]),
+                    vec![
+                        OPTION_ID_OVER_BUDGET_PROCEED_ONCE,
+                        OPTION_ID_OVER_BUDGET_DECLINE
+                    ],
+                    "{why}"
+                );
+                assert!(
+                    !published
+                        .iter()
+                        .any(|event| matches!(event, Event::SkillOverBudgetRemedyApplied(_))),
+                    "and nothing was written: {published:?}"
+                );
+            }
+        }
+
+        /// **AC-7b — the send and the write are two answers, not one.**
+        ///
+        /// `remedy_only` has a leg of its own twice over (the capped route and
+        /// the rebind); these are the other two, and they are the pair that
+        /// would be indistinguishable if the two booleans were ever collapsed
+        /// into a single "yes":
+        ///
+        /// * **proceed-and-remedy** — the turn is authorized *and* the ceiling
+        ///   is cleared on disk. The turn's own transport outcome is not
+        ///   asserted (the fixture's endpoint is a closed port); what proves the
+        ///   send was authorized is `skill_over_budget_accepted`, which is
+        ///   published from the allow arm and from nowhere else.
+        /// * **proceed-only** — the turn runs and the config document is
+        ///   **byte-identical** afterwards. Read off disk rather than inferred
+        ///   from the absence of an event: an event nobody publishes and a write
+        ///   nobody makes look the same from the bus.
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn the_send_and_the_write_are_answered_independently() {
+            // Both, on the one bound whose remedy is a single write.
+            let both = Fixture::new(
+                "ob-both",
+                OPTION_ID_OVER_BUDGET_PROCEED_AND_REMEDY,
+                Some(CAPPED_ROUTE),
+            );
+            let mut sub = both.events.subscribe(256);
+            let _ = both.invoke().await;
+
+            let published = drain(&mut sub);
+            assert!(
+                published
+                    .iter()
+                    .any(|event| matches!(event, Event::SkillOverBudgetAccepted(_))),
+                "`proceed_and_remedy` authorizes the send: {published:?}"
+            );
+            assert!(
+                published
+                    .iter()
+                    .any(|event| matches!(event, Event::SkillOverBudgetRemedyApplied(_))),
+                "and the write beside it: {published:?}"
+            );
+            let document = std::fs::read_to_string(both.dir.join("config.toml"))
+                .expect("the config document survives");
+            assert_eq!(
+                Config::load(&document)
+                    .expect("and still parses")
+                    .providers
+                    .iter()
+                    .find(|p| p.id == "capped")
+                    .expect("the provider survives")
+                    .capabilities
+                    .context_budget_cap,
+                0,
+                "the ceiling is cleared on disk, on the same answer that sent the turn: \
+                 {document}"
+            );
+
+            // Proceed only — on a route whose remedy this build *can* apply, so
+            // the absence of a write is a choice rather than an inability.
+            let once = Fixture::new(
+                "ob-onceonly",
+                OPTION_ID_OVER_BUDGET_PROCEED_ONCE,
+                Some(ONE_REMOTE),
+            );
+            let before =
+                std::fs::read_to_string(once.dir.join("config.toml")).expect("the seeded document");
+            let mut sub = once.events.subscribe(256);
+            once.invoke()
+                .await
+                .expect("an accepted offer runs the turn");
+
+            let published = drain(&mut sub);
+            assert!(
+                published
+                    .iter()
+                    .any(|event| matches!(event, Event::SkillOverBudgetAccepted(_))),
+                "the turn ran: {published:?}"
+            );
+            assert!(
+                !published
+                    .iter()
+                    .any(|event| matches!(event, Event::SkillOverBudgetRemedyApplied(_))),
+                "`proceed_once` writes nothing (BR-10): {published:?}"
+            );
+            assert_eq!(
+                std::fs::read_to_string(once.dir.join("config.toml")).expect("the document"),
+                before,
+                "byte-identical afterwards — and the offer this answered *did* carry the \
+                 remedy options, so this is the user declining the durable half rather \
+                 than the daemon having none to write"
+            );
+            assert_eq!(
+                option_ids(&once.client.offers()[0]).len(),
+                4,
+                "non-vacuity: all four ids were on this prompt, so `proceed_once` is a \
+                 choice between them"
             );
         }
 
