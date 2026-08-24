@@ -67,8 +67,11 @@
 //! ## A third door, and a grant key that follows its arguments (REQ-587)
 //!
 //! [`PermissionGate::authorize_project_skill_trust`] asks a different question
-//! from either of the two above: not "may these commands run?" but "may the
-//! model run **this repository's** skills as instructions at all?" (BR-4). It is
+//! from either of the two above: not "may these commands run?" but "may
+//! **this repository's** skills run as instructions at all?" (BR-4). Both
+//! invocation paths ask it since REQ-589 ADR-10 — the model's `skill` tool and
+//! the user-typed `/name` — under one key per root, so one answer settles the
+//! session for whichever asks next. It is
 //! a third entry point rather than a widened [`PermissionGate::authorize_skill`]
 //! because that function guards its key twice — the key must be a skill key
 //! *and* equal the key `(source, name)` mints — and an acknowledgment key —
@@ -1870,9 +1873,25 @@ impl PermissionGate {
         }
     }
 
-    /// Decide whether the model may run **this repository's** skills as
-    /// instructions at all — the project-skill acknowledgment (REQ-587 BR-4,
-    /// architecture ADR-7).
+    /// Decide whether **this repository's** skills may run as instructions at
+    /// all — the project-skill acknowledgment (REQ-587 BR-4, architecture
+    /// ADR-7).
+    ///
+    /// ## Two callers, one question, one key (REQ-589 ADR-10)
+    ///
+    /// This door was written for the model's `skill` tool and, until REQ-589,
+    /// that tool was its only production caller: the user-typed `/name` path
+    /// (`runtime::accept_invocation`) gated nothing, so a typed project skill
+    /// ran its body unacknowledged. It now asks here too, **before** it expands
+    /// and therefore before the route, the naming duty and both budget stages
+    /// (BR-6: nobody authorizes an over-budget send from a repository they have
+    /// not said they trust).
+    ///
+    /// Nothing in this function distinguishes them, and that is the point: one
+    /// key per root means one answer per root per session, so a user who
+    /// acknowledged a repository at the prompt they typed is not asked again
+    /// when the model reaches for the same skill. The `debug_assert` below is
+    /// what holds both callers to that one key.
     ///
     /// ## Why this is a third door and not a widened [`Self::authorize_skill`]
     ///
