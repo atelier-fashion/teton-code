@@ -3906,11 +3906,10 @@ impl DaemonRuntime {
                         stop_reason: outcome.stop_reason,
                     });
                 }
-                // REQ-586 BR-2 / ADR-8: the provider answered that the
-                // request does not fit its window. A **typed outcome**, and
-                // therefore ahead of every `Remote` arm below: this is not a
-                // provider failure and must not be run through the machinery
-                // that treats one.
+                // REQ-586 BR-2 / ADR-8: the tier answered that the request does
+                // not fit its window. A **typed outcome**, and therefore ahead
+                // of every `Remote` arm below: this is not a provider failure
+                // and must not be run through the machinery that treats one.
                 //
                 // No `record_health` — a provider that correctly reported its
                 // own limit is not unhealthy, and downgrading it would move
@@ -3922,24 +3921,34 @@ impl DaemonRuntime {
                 // unchanged bytes can succeed.
                 //
                 // The sentence carries the three numbers a user can act on and
-                // no response body (BR-11): the provider, what was assembled,
+                // no response body (BR-11): who refused, what was assembled,
                 // and the budget the route was running under. A wide gap
                 // between the last two says the declared window is wrong; a
                 // narrow one says this content tokenizes denser than the
                 // estimator assumed.
-                Err(HarnessError::ContextLengthExceeded {
-                    provider_id,
-                    assembled_tokens,
-                    budget_tokens,
-                }) => {
+                //
+                // REQ-589 ADR-3: **both** window refusals arrive here, on one
+                // arm. The local engine has no provider to name, so it is its
+                // own variant; giving it its own arm as well would be a second
+                // place for the same sentence to be edited, and the local tier
+                // is precisely the one whose report was found wrong. Before
+                // this, a local over-window turn fell through to the
+                // `HarnessError::Engine` arm below and reached the user as
+                // `INTERNAL_ERROR "the local engine could not serve the turn"`.
+                Err(
+                    err @ (HarnessError::ContextLengthExceeded { .. }
+                    | HarnessError::LocalContextLengthExceeded { .. }),
+                ) => {
                     break 'turn Err(RpcError::new(
                         error_code::CONTEXT_LENGTH_EXCEEDED,
-                        format!(
-                            "`{provider_id}` refused this turn as larger than {}: about \
-                             {assembled_tokens} words were assembled against a \
-                             {budget_tokens}-word budget",
-                            route.budget.window_label,
-                        ),
+                        // `Display` is the total fallback rather than an
+                        // `expect`: the pattern above admits only the two
+                        // variants `window_refusal_sentence` answers for, so
+                        // the fallback is unreachable, and a future third
+                        // window refusal degrades to a true sentence instead of
+                        // panicking the daemon.
+                        err.window_refusal_sentence(&route.budget.window_label)
+                            .unwrap_or_else(|| err.to_string()),
                     ));
                 }
                 // REQ-588 BR-3 / ADR-4: the spend ceiling, answered here and
@@ -28450,7 +28459,7 @@ provider_id = \"deepseek\"
     mod route_budget {
         use super::*;
         use crate::carry::CarriedTurn;
-        use crate::harness::budget::{derive, BudgetInputs, RouteBudget};
+        use crate::harness::budget::{derive, BudgetInputs, RouteBudget, LOCAL_WINDOW_LABEL};
         use crate::sessions::SessionRegistry;
         use std::io::{Read, Write};
         use std::net::TcpListener;
@@ -29097,6 +29106,177 @@ provider_id = \"deepseek\"
             assert!(
                 hits.load(Ordering::SeqCst) >= 1,
                 "non-vacuity: the daemon really did reach the mock vendor"
+            );
+        }
+
+        /// An engine that refuses anything over `window_bytes` with the same
+        /// [`EngineError::ContextWindowExceeded`] variant
+        /// `teton_inference::over_window` produces in production — the local
+        /// tier's `RefuseOversized`.
+        ///
+        /// Byte currency rather than tokens because this double has no
+        /// tokenizer; the harness discards the engine's figures either way
+        /// (REQ-589 ADR-3), so only the variant travels.
+        struct RefusesOverWindow {
+            window_bytes: usize,
+        }
+
+        impl Engine for RefusesOverWindow {
+            fn model_id(&self) -> &str {
+                "refuses-over-window"
+            }
+            fn complete(
+                &self,
+                prompt: &str,
+                _params: &GenParams,
+                _on_token: &mut dyn FnMut(&str) -> bool,
+            ) -> Result<Completion, EngineError> {
+                let measured = u32::try_from(prompt.len()).unwrap_or(u32::MAX);
+                let window = u32::try_from(self.window_bytes).unwrap_or(u32::MAX);
+                if measured > window {
+                    return Err(EngineError::ContextWindowExceeded {
+                        prompt_tokens: measured,
+                        budget_tokens: window,
+                        n_ctx: window,
+                        max_tokens: 0,
+                    });
+                }
+                Ok(Completion::cold("Done.".to_owned(), 1, 1))
+            }
+        }
+
+        /// Every tier bound to a declared local provider, so the turn is served
+        /// on this machine rather than resolving to an endpoint nothing is
+        /// listening on.
+        fn local_only_config() -> Config {
+            Config {
+                providers: vec![ModelProvider {
+                    id: "local".to_owned(),
+                    kind: ProviderKind::Local,
+                    endpoint: None,
+                    model: None,
+                    auth_ref: None,
+                    capabilities: ProviderCapabilities::default(),
+                }],
+                tiers: Tier::ALL
+                    .iter()
+                    .map(|tier| TierBinding {
+                        tier: *tier,
+                        provider_id: "local".to_owned(),
+                        fallback_id: None,
+                    })
+                    .collect(),
+                ..Config::default()
+            }
+        }
+
+        /// A daemon whose local tier is live and refuses anything past
+        /// `window_bytes`.
+        fn refusing_local_runtime(engine: impl Engine + 'static) -> Arc<DaemonRuntime> {
+            let runtime = DaemonRuntime::minimal();
+            *runtime.config.lock().expect("config mutex") = local_only_config();
+            runtime.engine.install(
+                "refuses-over-window".to_owned(),
+                Arc::new(Mutex::new(engine)),
+            );
+            runtime.local_available.store(true, Ordering::SeqCst);
+            Arc::new(runtime)
+        }
+
+        async fn local_turn(runtime: &Arc<DaemonRuntime>) -> Result<PromptTurnResult, RpcError> {
+            let events = Arc::new(EventBus::new());
+            let sessions = SessionRegistry::new();
+            let session_id = sessions
+                .create(SessionMode::Freeform, None, None)
+                .expect("a freeform session needs no phase")
+                .session_id;
+            runtime
+                .run_prompt_turn(
+                    &events,
+                    &sessions,
+                    session_id,
+                    SessionMode::Freeform,
+                    None,
+                    None,
+                    "a prompt the local engine will say is too large".to_owned(),
+                    None,
+                    None,
+                    ClientPresence::unwatched(),
+                )
+                .await
+        }
+
+        /// **REQ-589 AC-1, at the runtime.** A local-engine turn whose rendered
+        /// prompt crosses the engine's window ends with
+        /// `CONTEXT_LENGTH_EXCEEDED` — the same code the remote tier has
+        /// produced since REQ-586 — rather than the `INTERNAL_ERROR` this path
+        /// produced for the whole life of the typed outcome.
+        ///
+        /// Driven end to end through `run_prompt_turn` rather than off the
+        /// error type, because the claim is about the arm the daemon takes: the
+        /// variant existing proves nothing if the runtime still lets it fall
+        /// through to the `HarnessError::Engine` arm below it (LESSON-544).
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn a_local_over_window_turn_is_the_typed_outcome_not_an_internal_error() {
+            // A system prompt alone is thousands of bytes, so any real turn
+            // crosses a 16-byte window.
+            let runtime = refusing_local_runtime(RefusesOverWindow { window_bytes: 16 });
+            let err = local_turn(&runtime)
+                .await
+                .expect_err("a refused turn must not report success");
+
+            assert_eq!(err.code, error_code::CONTEXT_LENGTH_EXCEEDED, "{err:?}");
+            assert!(
+                err.message.contains("the local engine refused this turn"),
+                "the report must name the tier that refused: {}",
+                err.message
+            );
+            assert!(
+                err.message.contains(LOCAL_WINDOW_LABEL),
+                "the report must name the window it was measured against: {}",
+                err.message
+            );
+            assert!(
+                err.message.contains("word budget"),
+                "the report must carry the gap a user acts on: {}",
+                err.message
+            );
+            assert!(
+                !err.message.contains("could not serve the turn"),
+                "the old opaque sentence must be gone: {}",
+                err.message
+            );
+        }
+
+        /// The paired half. An engine that simply falls over is still an
+        /// `INTERNAL_ERROR` naming the engine's own sentence — the arm this REQ
+        /// must not have widened.
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn a_local_inference_failure_is_still_an_internal_error() {
+            struct FallsOver;
+            impl Engine for FallsOver {
+                fn model_id(&self) -> &str {
+                    "falls-over"
+                }
+                fn complete(
+                    &self,
+                    _prompt: &str,
+                    _params: &GenParams,
+                    _on_token: &mut dyn FnMut(&str) -> bool,
+                ) -> Result<Completion, EngineError> {
+                    Err(EngineError::Backend("the backend went away".to_owned()))
+                }
+            }
+
+            let err = local_turn(&refusing_local_runtime(FallsOver))
+                .await
+                .expect_err("a failed turn must not report success");
+            assert_eq!(err.code, error_code::INTERNAL_ERROR, "{err:?}");
+            assert!(
+                err.message
+                    .contains("the local engine could not serve the turn"),
+                "{}",
+                err.message
             );
         }
     }

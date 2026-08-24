@@ -187,6 +187,103 @@ pub enum HarnessError {
         /// under — never re-derived here (BR-8).
         budget_tokens: usize,
     },
+    /// The **local engine** refused the rendered prompt as larger than its
+    /// context window (REQ-589 ADR-3).
+    ///
+    /// The same class of outcome as
+    /// [`ContextLengthExceeded`](Self::ContextLengthExceeded) and for the same
+    /// reasons — no health record, no fallback, no retry — but arriving from a
+    /// tier that has no provider to name. Before this variant the local
+    /// refusal was an [`Engine`](Self::Engine) error and the daemon reported it
+    /// as `INTERNAL_ERROR "the local engine could not serve the turn"`: wrong
+    /// about the cause and naming no remedy, on the route the reported
+    /// `/analyze` failure actually ran.
+    ///
+    /// # Why a sibling variant and not `provider_id: Option<String>`
+    ///
+    /// Both admit a local origin. This one admits it *by shape* rather than by
+    /// convention: `None` would mean "local" only because there happen to be
+    /// exactly two [`CompletionSource`](super::completion::CompletionSource)
+    /// implementations and only one names a provider — a fact a third source
+    /// would quietly falsify, with no compiler complaint, at every site that
+    /// had read `None` as "the local engine". It also leaves the remote
+    /// variant's shape, its `Display`, and every test that pins them
+    /// byte-identical, so "the remote path is unchanged" is true by
+    /// construction rather than by inspection.
+    ///
+    /// The cost of two variants is that a consumer could handle one and miss
+    /// the other. That is paid off by [`Self::context_refusal`], the single
+    /// tier-agnostic projection every such consumer reads instead of matching
+    /// here — the same arrangement [`Self::privacy_block_detail`] already uses.
+    ///
+    /// Carries the same two numbers in the same currency as the remote
+    /// variant, and for the same reason: they are the harness's own estimate
+    /// and the harness's own budget, so the gap between them is readable. The
+    /// engine's tokenized count is *not* carried, because it is measured in a
+    /// different currency (real BPE tokens against the engine's `n_ctx`) and
+    /// reporting it beside a word budget would make every refusal look like a
+    /// wildly wrong window.
+    #[error(
+        "the local engine refused the turn: about {assembled_tokens} words \
+         were assembled against a {budget_tokens}-word budget"
+    )]
+    LocalContextLengthExceeded {
+        /// The assembled context's size in the harness's own word estimator —
+        /// what this daemon believed it was sending.
+        assembled_tokens: usize,
+        /// The route's word budget, from the [`HarnessConfig`] the attempt ran
+        /// under — never re-derived here.
+        budget_tokens: usize,
+    },
+}
+
+/// Which tier refused a turn as larger than its context window.
+///
+/// A borrow of what the [`HarnessError`] already holds, not a second copy of
+/// it: the sentence and any remedy read the origin from here rather than
+/// re-matching the error, so the two window refusals cannot come to be worded —
+/// or acted on — differently by accident (REQ-589 ADR-3).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ContextRefusalOrigin<'a> {
+    /// A remote provider answered that the request does not fit its window.
+    Provider(&'a str),
+    /// The local engine refused the rendered prompt. Carries no id: the local
+    /// tier is transport-free and there is no provider to name.
+    LocalEngine,
+}
+
+/// A window refusal's facts, whichever tier produced it (REQ-589 ADR-3).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ContextRefusal<'a> {
+    /// The tier that refused.
+    pub origin: ContextRefusalOrigin<'a>,
+    /// The assembled context's size in the harness's own word estimator.
+    pub assembled_tokens: usize,
+    /// The word budget the attempt ran under.
+    pub budget_tokens: usize,
+}
+
+impl ContextRefusal<'_> {
+    /// The daemon's `CONTEXT_LENGTH_EXCEEDED` sentence for this refusal,
+    /// against the route's `window_label`.
+    ///
+    /// **One composer for both tiers** (conventions.md): the remote wording is
+    /// byte-identical to what REQ-586 shipped and the local tier differs only
+    /// in its subject, so a later edit cannot improve one sentence and leave
+    /// the other behind. Content-free by construction — a provider id, two
+    /// integers and a label, never a response body or prompt text (BR-11).
+    #[must_use]
+    pub fn sentence(&self, window_label: &str) -> String {
+        let subject = match self.origin {
+            ContextRefusalOrigin::Provider(id) => format!("`{id}`"),
+            ContextRefusalOrigin::LocalEngine => "the local engine".to_owned(),
+        };
+        format!(
+            "{subject} refused this turn as larger than {window_label}: about {} words \
+             were assembled against a {}-word budget",
+            self.assembled_tokens, self.budget_tokens
+        )
+    }
 }
 
 impl HarnessError {
@@ -216,6 +313,51 @@ impl HarnessError {
             HarnessError::Remote(e) => e.privacy_block_detail(),
             _ => None,
         }
+    }
+
+    /// The window refusal this error carries — which tier refused and the two
+    /// numbers — or `None` if it is not one (REQ-589 ADR-3).
+    ///
+    /// **The one place that answers "was this turn refused at the window".**
+    /// The condition has two variants because only one of the two tiers has a
+    /// provider to name; a consumer that matched them itself could handle the
+    /// remote one and quietly miss the local one, which is the tier the
+    /// reported failure ran on. Reading them through one projection is the
+    /// arrangement [`Self::privacy_block_detail`] already uses for the same
+    /// reason.
+    #[must_use]
+    pub fn context_refusal(&self) -> Option<ContextRefusal<'_>> {
+        match self {
+            HarnessError::ContextLengthExceeded {
+                provider_id,
+                assembled_tokens,
+                budget_tokens,
+            } => Some(ContextRefusal {
+                origin: ContextRefusalOrigin::Provider(provider_id),
+                assembled_tokens: *assembled_tokens,
+                budget_tokens: *budget_tokens,
+            }),
+            HarnessError::LocalContextLengthExceeded {
+                assembled_tokens,
+                budget_tokens,
+            } => Some(ContextRefusal {
+                origin: ContextRefusalOrigin::LocalEngine,
+                assembled_tokens: *assembled_tokens,
+                budget_tokens: *budget_tokens,
+            }),
+            _ => None,
+        }
+    }
+
+    /// This error's `CONTEXT_LENGTH_EXCEEDED` sentence against the route's
+    /// `window_label`, or `None` if it is not a window refusal at all.
+    ///
+    /// Defined in terms of [`Self::context_refusal`] so the predicate and the
+    /// wording cannot come to disagree about which errors are window refusals.
+    #[must_use]
+    pub fn window_refusal_sentence(&self, window_label: &str) -> Option<String> {
+        self.context_refusal()
+            .map(|refusal| refusal.sentence(window_label))
     }
 }
 
@@ -2433,6 +2575,89 @@ mod tests {
     use crate::egress::Provenance as EgressProvenance;
     use crate::harness::context::{NoopProvenanceHook, PreparedPrompt};
     use crate::harness::permissions::{PendingPermissions, PermissionConfig};
+
+    /// **REQ-589 AC-3.** The remote refusal's wording is byte-identical to what
+    /// REQ-586 shipped, and the local one differs from it in exactly one place.
+    ///
+    /// Both sentences are written out in full rather than derived, because the
+    /// claim under test *is* the bytes: this is the pin that fails if extending
+    /// the outcome to the local tier changed what a remote refusal says.
+    #[test]
+    fn one_composer_words_both_window_refusals_and_leaves_the_remote_one_unchanged() {
+        let remote = HarnessError::ContextLengthExceeded {
+            provider_id: "kimi".to_owned(),
+            assembled_tokens: 5_000,
+            budget_tokens: 4_096,
+        };
+        assert_eq!(
+            remote
+                .window_refusal_sentence("kimi's context window")
+                .expect("a window refusal"),
+            "`kimi` refused this turn as larger than kimi's context window: about 5000 \
+             words were assembled against a 4096-word budget"
+        );
+
+        let local = HarnessError::LocalContextLengthExceeded {
+            assembled_tokens: 5_000,
+            budget_tokens: 4_096,
+        };
+        assert_eq!(
+            local
+                .window_refusal_sentence("the local context window")
+                .expect("a window refusal"),
+            "the local engine refused this turn as larger than the local context window: \
+             about 5000 words were assembled against a 4096-word budget"
+        );
+
+        // Both project to the same shape, so a consumer reading the projection
+        // cannot handle one tier and silently miss the other.
+        assert_eq!(
+            remote.context_refusal().map(|r| r.origin),
+            Some(ContextRefusalOrigin::Provider("kimi"))
+        );
+        assert_eq!(
+            local.context_refusal().map(|r| r.origin),
+            Some(ContextRefusalOrigin::LocalEngine)
+        );
+        for refusal in [&remote, &local] {
+            let facts = refusal.context_refusal().expect("a window refusal");
+            assert_eq!(facts.assembled_tokens, 5_000);
+            assert_eq!(facts.budget_tokens, 4_096);
+        }
+
+        // And nothing else is one. `NoTierAvailable` is the neighbouring
+        // "the turn did not run" outcome, and it names no window.
+        assert!(HarnessError::NoTierAvailable.context_refusal().is_none());
+        assert!(HarnessError::NoTierAvailable
+            .window_refusal_sentence("the local context window")
+            .is_none());
+    }
+
+    /// The remote variant's `Display` is unchanged too — it is what the daemon
+    /// falls back to, what the stderr line renders, and what the REQ-586 suite
+    /// asserts is content-free.
+    #[test]
+    fn the_remote_window_refusals_display_is_byte_identical_to_req_586() {
+        assert_eq!(
+            HarnessError::ContextLengthExceeded {
+                provider_id: "kimi".to_owned(),
+                assembled_tokens: 5_000,
+                budget_tokens: 4_096,
+            }
+            .to_string(),
+            "provider `kimi` refused the turn: about 5000 words were assembled \
+             against a 4096-word budget"
+        );
+        assert_eq!(
+            HarnessError::LocalContextLengthExceeded {
+                assembled_tokens: 5_000,
+                budget_tokens: 4_096,
+            }
+            .to_string(),
+            "the local engine refused the turn: about 5000 words were assembled \
+             against a 4096-word budget"
+        );
+    }
 
     /// A source that reports `format` and streams a reply which fabricates the
     /// **next** turn's role header — the template-mode analogue of BUG-147's

@@ -1,7 +1,7 @@
 ---
 id: TASK-239
 title: "Produce the typed context outcome on the local engine"
-status: draft
+status: complete
 parent: REQ-589
 created: 2026-08-24
 updated: 2026-08-24
@@ -20,10 +20,10 @@ ADR-3 / D-11. `HarnessError::ContextLengthExceeded` is constructed only on the r
 
 ## Acceptance Criteria
 
-- [ ] A local-engine turn whose rendered prompt exceeds the engine window surfaces `error_code::CONTEXT_LENGTH_EXCEEDED`, not INTERNAL_ERROR
-- [ ] Driven through `WindowedEngine` (`completion.rs:1865`), which already returns a backend error above a configured byte threshold
-- [ ] The remote path's behaviour is byte-identical to today — a paired test pins it
-- [ ] No caller distinguishes local from remote by string-matching an engine sentence (LESSON-528)
+- [x] A local-engine turn whose rendered prompt exceeds the engine window surfaces `error_code::CONTEXT_LENGTH_EXCEEDED`, not INTERNAL_ERROR
+- [x] Driven through `WindowedEngine` (`completion.rs:1865`), which already returns a backend error above a configured byte threshold
+- [x] The remote path's behaviour is byte-identical to today — a paired test pins it
+- [x] No caller distinguishes local from remote by string-matching an engine sentence (LESSON-528)
 
 ## Technical Notes
 
