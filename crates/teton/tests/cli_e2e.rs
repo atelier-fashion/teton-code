@@ -4534,6 +4534,21 @@ const READ_ROWS: &[(&str, &[&str])] = &[
 /// session reports the connection it already has.
 const DOCTOR_DAEMON_LINE: &str = "daemon: running — ";
 
+/// Where `/doctor`'s **second** documented difference begins (REQ-589 BR-13).
+///
+/// The skill pre-flight is a question *about a session*: which of that
+/// session's registered skills will not fit on the route that session is on.
+/// A piped session answers it; `teton doctor` owns no session and says so
+/// instead of answering about one it picked. Neither is the other's report, so
+/// the block is removed from both sides before the diff and each side's own
+/// version is then asserted — the same shape [`DOCTOR_DAEMON_LINE`]'s carve-out
+/// takes, and for the same reason.
+const DOCTOR_SKILLS_LINE: &str = "skills:";
+
+/// Where that block ends: the first line of [`doctor_trailer`], which every
+/// report prints and which the pre-flight sits immediately above.
+const DOCTOR_TRAILER_LINE: &str = "model: the local-tier lifecycle";
+
 /// **AC-1: every read row prints exactly what its shell twin prints.**
 ///
 /// One daemon, twelve client runs: each row is driven from a shell (`teton
@@ -4621,6 +4636,67 @@ fn every_read_row_prints_exactly_what_its_shell_twin_prints() {
                 None => true,
             })
             .collect();
+        // REQ-589 BR-13's carve-out, taken before the diff and asserted after
+        // it: the pre-flight block runs from the `skills:` line to the trailer
+        // the report always ends with, and is removed whole. A row that is not
+        // `doctor` must have had **nothing** removed — otherwise the diff ran
+        // over two reports with a line quietly taken out of each and would not
+        // have noticed.
+        fn split_preflight<'a>(lines: &[&'a str]) -> (Vec<&'a str>, Vec<&'a str>) {
+            // Notices carry the plain surface's `>> ` prefix and info lines do
+            // not, and the two sides disagree about which this is — the session
+            // answers (info), the shell declines (notice) — so the marker is
+            // matched past the prefix.
+            let bare = |line: &str| line.trim_start().trim_start_matches(">> ").to_owned();
+            let Some(start) = lines
+                .iter()
+                .position(|line| bare(line).starts_with(DOCTOR_SKILLS_LINE))
+            else {
+                return (lines.to_vec(), Vec::new());
+            };
+            let end = lines[start..]
+                .iter()
+                .position(|line| bare(line).starts_with(DOCTOR_TRAILER_LINE))
+                .map_or(lines.len(), |at| start + at);
+            let mut kept = lines[..start].to_vec();
+            kept.extend_from_slice(&lines[end..]);
+            (kept, lines[start..end].to_vec())
+        }
+        let (session_lines, session_preflight) = split_preflight(&session_lines);
+        let (shell_lines, shell_preflight) = split_preflight(&shell_lines);
+        if *row == "doctor" {
+            assert!(
+                !session_preflight.is_empty(),
+                "BR-13: the session's `/doctor` owes a pre-flight answer; \
+                 session:\n{session}"
+            );
+            assert!(
+                !shell_preflight.is_empty(),
+                "`teton doctor` owes the reason it cannot answer it; shell:\n{shell}"
+            );
+            assert!(
+                session_preflight
+                    .iter()
+                    .any(|line| line.contains("no route decided yet")
+                        || line.contains("dispatchable skill")),
+                "a session either names the skills that will not fit or says no \
+                 route is decided (ADR-11): {session_preflight:?}"
+            );
+            assert!(
+                shell_preflight
+                    .iter()
+                    .any(|line| line.contains("no session here")),
+                "the shell twin owns no session and must say so rather than \
+                 answer about one it picked: {shell_preflight:?}"
+            );
+        } else {
+            assert!(
+                session_preflight.is_empty() && shell_preflight.is_empty(),
+                "`/{row}` is not `doctor`, so the pre-flight carve-out must \
+                 have removed nothing: {session_preflight:?} / {shell_preflight:?}"
+            );
+        }
+
         // Multiset equality, both directions — and only **one** of them is an
         // assertion, because the other holds by construction. Session ⊆ shell
         // is the leftovers being empty (below). Shell ⊆ session needs no

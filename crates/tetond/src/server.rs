@@ -97,9 +97,9 @@
 //! connection, and a reader loop that awaited it inline could not read the
 //! answer that would end the wait.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::path::Path;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 
 use serde::Serialize;
@@ -111,10 +111,10 @@ use tokio::sync::{mpsc, watch};
 use tokio::task::JoinHandle;
 
 use teton_protocol::events::{
-    AttachConsentRequested, AttachRefused, AttachRefusedReason, ConsentScope, DaemonClientAttach,
-    Event, EventEnvelope, PermissionRequest, PhaseTransition, ProviderSetupCompleted,
-    ProviderSetupRejected, SessionGrantMinted, WebSetupRejected, EVENT_METHOD,
-    SUBSCRIPTION_LAGGED_METHOD,
+    bytes_figure, thousands, AttachConsentRequested, AttachRefused, AttachRefusedReason,
+    ConsentScope, DaemonClientAttach, Event, EventEnvelope, PermissionRequest, PhaseTransition,
+    ProviderSetupCompleted, ProviderSetupRejected, RouteDecided, SessionGrantMinted,
+    WebSetupRejected, EVENT_METHOD, SUBSCRIPTION_LAGGED_METHOD,
 };
 use teton_protocol::handshake::{self, HandshakeParams, HandshakeResult};
 use teton_protocol::jsonrpc::{error_code, Id, Notification, Response, RpcError};
@@ -127,8 +127,9 @@ use teton_protocol::methods::{
     ProviderTestParams, RpcMethod, SessionAttachParams, SessionAttachResult, SessionClearParams,
     SessionCreateParams, SessionCreateResult, SessionListParams, SessionListResult,
     SessionPermissionsParams, SessionSetCwdParams, SessionSummary, SkillSkipped, SkillView,
-    SkillsListParams, SkillsListResult, WebOverrideParams, WebRefreshParams, WebSetupCommitParams,
-    WebSetupPlanParams, WebSetupPreviewParams,
+    SkillsListParams, SkillsListResult, SkillsPreflightParams, SkillsPreflightResult,
+    WebOverrideParams, WebRefreshParams, WebSetupCommitParams, WebSetupPlanParams,
+    WebSetupPreviewParams,
 };
 use teton_protocol::{RequestId, SessionId};
 
@@ -144,12 +145,15 @@ use crate::consent::{
     ConsentOutcome, ConsentRoute, ConsentSurfaces, PendingConsents, CONSENT_TIMEOUT,
 };
 use crate::grants::{monitor_witness, ConnectionId, Grant, GrantRegistry};
+use crate::harness::budget::{skill_fit, RouteBudget, SkillCaller, SkillFit, SkillStage};
 use crate::harness::permissions::AddressedPermissionDelivery;
+use crate::harness::tools::ToolRegistry;
+use crate::harness::turn_loop::{build_system_prompt, HarnessConfig};
 use crate::lifetime::LifetimeSupervisor;
 use crate::peer::{is_descendant_of, Ancestry, KernelParentOf, MAX_ANCESTRY_DEPTH};
 use crate::runtime::{ClientPresence, DaemonRuntime};
 use crate::sessions::{self, validate_session_cwd, SessionCreateError, SessionRegistry};
-use crate::skills::{DirLister, RealFs, SkillRegistry};
+use crate::skills::{expand, DirLister, RealFs, Skill, SkillRegistry};
 
 /// Depth of a client's outbound message queue (responses + events).
 const OUTBOUND_CAPACITY: usize = 1024;
@@ -357,6 +361,14 @@ pub struct Daemon {
     /// *arrears* behaviour by waiting it out would spend a minute proving
     /// something it can prove in milliseconds. Production never sets it.
     pub grant_announcement_window: std::time::Duration,
+    /// The route each session's last turn was decided on (REQ-589 ADR-11).
+    ///
+    /// Here rather than on the runtime because the *writer* is here: the memo
+    /// is fed from the event bus this daemon owns, by an observer
+    /// [`spawn_prompt_turn`] starts. Shared like the registry and the bus, and
+    /// in memory only — a stamp is a fact about one live conversation and
+    /// nothing here is ever persisted.
+    pub stamped_routes: Arc<StampedRoutes>,
 }
 
 impl Daemon {
@@ -389,6 +401,7 @@ impl Daemon {
             skills_fs: Arc::new(RealFs),
             consent_timeout: CONSENT_TIMEOUT,
             grant_announcement_window: GRANT_ANNOUNCEMENT_WINDOW,
+            stamped_routes: Arc::new(StampedRoutes::new()),
             // `Embedded`, for the same reason `ShutdownPolicy::Never` is above:
             // a bare `Daemon::new()` is a fixture, and a fixture is run *inside*
             // the process that also holds its clients. See
@@ -516,6 +529,7 @@ impl Daemon {
             ),
             consent_timeout: CONSENT_TIMEOUT,
             grant_announcement_window: GRANT_ANNOUNCEMENT_WINDOW,
+            stamped_routes: Arc::new(StampedRoutes::new()),
         }
     }
 }
@@ -1984,6 +1998,11 @@ fn spawn_prompt_turn(
     // not be re-joined from tokens or folded into a text block anywhere on this
     // path. The daemon expands it; the client never composes a body.
     let skill = params.skill;
+    // REQ-589 ADR-11: the stamp memo starts **before** the turn is spawned, so
+    // the very first turn's `route_decided` lands in a subscription that
+    // already exists. `subscribe` is synchronous, so this is an ordering
+    // guarantee rather than a race the observer usually wins.
+    observe_route_decisions(daemon);
     let runtime = Arc::clone(&daemon.runtime);
     let events = Arc::clone(&daemon.events);
     // The turn carries the registry, not just the summary read out of it: the
@@ -2470,6 +2489,11 @@ fn dispatch(
         // human, no network, no filesystem — so it stays on the synchronous
         // path beside the other session-scoped reads.
         SkillsListParams::METHOD => Some(handle_skills_list(daemon, conn, id, params)),
+        // REQ-589 BR-13: the pre-flight is a read too — the stored registry
+        // snapshot, the stamped route, and `skill_fit` over the two. It opens
+        // no file and resolves no route (ADR-11), so it belongs beside
+        // `skills/list` on the synchronous path rather than on a task.
+        SkillsPreflightParams::METHOD => Some(handle_skills_preflight(daemon, conn, id, params)),
         // REQ-584 BR-9. **Not on the synchronous path**: unlike `skills/list`,
         // which reads a stored snapshot, this may run BR-3's dev-folder scan —
         // up to eleven directory reads two levels deep, and on macOS the one
@@ -4522,6 +4546,354 @@ fn skills_list_result(registry: &SkillRegistry) -> SkillsListResult {
             })
             .collect(),
     }
+}
+
+// ---------------------------------------------------------------------------
+// skills/preflight — the refusal, reachable before it happens (REQ-589 BR-13)
+// ---------------------------------------------------------------------------
+
+/// The route a session's last turn was **decided** on, as this daemon
+/// announced it (REQ-589 ADR-11).
+///
+/// # Why this memo exists at all
+///
+/// `/doctor` must report against the route the session is actually on, and a
+/// diagnostic may not *decide* one: resolving a route consults provider health
+/// and can wake the local tier, so a question about the current route would
+/// change it. ADR-11's answer is to report the **stamped** budget or to say
+/// there is none, which needs somewhere for the stamp to live — the `Route` and
+/// the `HarnessConfig` that carry it are per-turn values that are gone by the
+/// time anybody asks.
+///
+/// # It is fed by the announcement, not by a second derivation
+///
+/// The writer is [`record_route_decisions`], which reads `route_decided` off
+/// the bus. That event *is* the stamp: `Router::budget_for` derives the pair
+/// once, where the route is decided, and the same value is put on the wire.
+/// Nothing here derives, estimates or re-classifies anything — the four fields
+/// a refusal quotes (both currencies, the bound, and whether the floor raised
+/// the pair) are copied out of the event verbatim.
+///
+/// # What is **not** recoverable from the announcement, and why that is safe
+///
+/// [`RouteBudget`] carries three fields the event does not: `window_label` and
+/// the two `digest` thresholds. Neither `ContextManager::would_seed_fit` nor
+/// the refusal composer reads any of them (`skill_refusal` quotes the pair, the
+/// bound, the floor flag and the provider id and nothing else), so they are
+/// left at their empty values rather than guessed. That is the deliberate
+/// choice: a plausible-looking guess would make a future reader of one of them
+/// produce a sentence that is subtly wrong, while an empty label makes it
+/// visibly wrong — and
+/// `the_preflight_quotes_the_live_refusals_sentence_for_the_same_skill` is what
+/// fails when it happens.
+///
+/// The fourth field, `provider_id`, is carried as the event spells it. On the
+/// route it is derived, `budget::sanitized_provider_id` has already replaced
+/// everything outside `[A-Za-z0-9._:-]`, and for every id a user writes the two
+/// spellings are the same bytes. They could differ for an id containing
+/// something exotic, and the one clause that would show it is the
+/// `unknown window` bound's remedy — so this reads a provider id exactly where
+/// the `/verbose` route line already reads the same field off the same event,
+/// and it never reaches a context block (this value's label is empty by
+/// construction, so `truncate_to_budget` has nothing to write).
+///
+/// # Known limitation, and it is on the surface rather than in this comment
+///
+/// The pre-flight cannot measure the *live* turn's system prompt: that one is
+/// assembled per turn from the session's probed root, its web capability and
+/// its full tool set, none of which a diagnostic may build without doing the
+/// work the turn does. [`preflight_system_prompt`] uses the daemon's default
+/// harness prompt instead, and [`PREFLIGHT_FLOOR`] says so on every answer.
+#[derive(Debug, Default)]
+pub struct StampedRoutes {
+    /// The last announced budget per session. Never persisted, and not pruned:
+    /// a `SessionId` is not reused, exactly as the runtime's own session-scoped
+    /// memos reason.
+    stamped: Mutex<HashMap<SessionId, RouteBudget>>,
+    /// Whether an observer task is already draining the bus into this memo.
+    observing: AtomicBool,
+}
+
+impl StampedRoutes {
+    /// A memo with no stamps and no observer.
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Record what `decided` announced for `session`.
+    ///
+    /// Returns whether anything was stored. A `route_decided` that carries no
+    /// budget pair is not a stamp — it is what a daemon predating REQ-586
+    /// emitted — and storing a half of one would put a surface in front of a
+    /// figure nobody derived.
+    pub fn record(&self, session: &SessionId, decided: &RouteDecided) -> bool {
+        let (Some(tokens), Some(bytes), Some(bound)) =
+            (decided.budget_tokens, decided.budget_bytes, decided.bound)
+        else {
+            return false;
+        };
+        let budget = RouteBudget {
+            budget_tokens: usize::try_from(tokens).unwrap_or(usize::MAX),
+            budget_bytes: usize::try_from(bytes).unwrap_or(usize::MAX),
+            bound,
+            // Absent on a daemon predating the field; `false` is what that
+            // daemon meant — it floored nothing it could report.
+            floored: decided.bound_floored.unwrap_or(false),
+            provider_id: Some(decided.provider_id.0.clone()),
+            // Not on the wire, and not read by anything this value is handed
+            // to. See the type's own docs for why they are left empty rather
+            // than reconstructed.
+            window_label: String::new(),
+            digest_threshold_tokens: 0,
+            digest_threshold_bytes: 0,
+        };
+        self.stamped
+            .lock()
+            .expect("stamped route mutex poisoned")
+            .insert(session.clone(), budget);
+        true
+    }
+
+    /// The budget `session`'s last turn was decided on, or `None` when no turn
+    /// has decided one (ADR-11's "no route decided yet").
+    #[must_use]
+    pub fn stamped(&self, session: &SessionId) -> Option<RouteBudget> {
+        self.stamped
+            .lock()
+            .expect("stamped route mutex poisoned")
+            .get(session)
+            .cloned()
+    }
+
+    /// Drop every stamp.
+    ///
+    /// Called when the observer stops for any reason, including the bus
+    /// evicting it for lagging. A stamp the observer can no longer keep current
+    /// is a route that may already have been re-decided, and reporting a route
+    /// the session is no longer on is worse than reporting none: "no route
+    /// decided yet" is a state the surface knows how to say.
+    pub fn forget_all(&self) {
+        self.stamped
+            .lock()
+            .expect("stamped route mutex poisoned")
+            .clear();
+    }
+
+    /// Claim the right to run the one observer, returning whether this caller
+    /// got it.
+    fn claim_observer(&self) -> bool {
+        !self.observing.swap(true, Ordering::SeqCst)
+    }
+
+    /// Release the observer claim, so the next prompt turn starts a fresh one.
+    fn release_observer(&self) {
+        self.observing.store(false, Ordering::SeqCst);
+    }
+}
+
+/// Start the one [`StampedRoutes`] observer for this daemon, if it is not
+/// already running (REQ-589 ADR-11).
+///
+/// Called from [`spawn_prompt_turn`], which is the only place a route is about
+/// to be decided — so the memo costs nothing on a daemon nobody has prompted,
+/// and it exists before the turn that will publish into it. The subscription is
+/// registered **synchronously**, before the turn task is spawned, which is what
+/// makes the first turn's own decision observable rather than a race.
+fn observe_route_decisions(daemon: &Arc<Daemon>) {
+    if !daemon.stamped_routes.claim_observer() {
+        return;
+    }
+    let subscription = daemon.events.subscribe(DEFAULT_CAPACITY);
+    let routes = Arc::clone(&daemon.stamped_routes);
+    tokio::spawn(record_route_decisions(subscription, routes));
+}
+
+/// Drain `route_decided` into the memo until the subscription ends.
+///
+/// Ends on daemon teardown, or if the bus evicts this subscriber for lagging.
+/// Either way every stamp is dropped and the claim released: the next prompt
+/// turn subscribes again, and until it does `/doctor` says there is no route
+/// rather than naming a stale one.
+async fn record_route_decisions(mut subscription: Subscription, routes: Arc<StampedRoutes>) {
+    while let Some(envelope) = subscription.recv().await {
+        if let (Some(session), Event::RouteDecided(decided)) =
+            (&envelope.session_id, &envelope.event)
+        {
+            routes.record(session, decided);
+        }
+    }
+    routes.forget_all();
+    routes.release_observer();
+}
+
+/// `skills/preflight` — which of this session's skills will not fit, before
+/// anyone types one (REQ-589 BR-13, ADR-11).
+///
+/// Gated on [`ConnState::may_drive`] exactly as [`handle_skills_list`] is, and
+/// for its reason: this reads a session's content — file-authored skill bodies
+/// from a repo the connection may have no business seeing — and a looser gate
+/// would make the refusal an oracle for which sessions exist (ADR-B). The
+/// length check comes first for the same reason it does there.
+///
+/// Answers from the stored registry snapshot and the stamped route, and opens
+/// nothing: no filesystem, no network, and — ADR-11's rule — **no router
+/// resolution**. A session whose turns have decided no route is told so.
+fn handle_skills_preflight(daemon: &Daemon, conn: &ConnState, id: Id, params: Value) -> String {
+    let params: SkillsPreflightParams = match serde_json::from_value(params) {
+        Ok(params) => params,
+        Err(_) => return error_string(id, error_code::INVALID_PARAMS, "invalid params"),
+    };
+    if let Some(refusal) = refuse_unmintable_session_id(&id, &params.session_id) {
+        return refusal;
+    }
+    if !conn.may_drive(&params.session_id) {
+        return error_string(id, error_code::NOT_ATTACHED, NOT_ATTACHED_MESSAGE);
+    }
+    let registry = daemon.sessions.skills(&params.session_id);
+    let stamped = daemon.stamped_routes.stamped(&params.session_id);
+    ok_string(
+        id,
+        &SkillsPreflightResult {
+            rendered: render_preflight(&registry, stamped.as_ref(), params.verbose),
+        },
+    )
+}
+
+/// ADR-11's answer for a session no turn has routed yet.
+///
+/// It says which question it is declining to answer and what would make it
+/// answerable, because "no route decided yet" on its own reads like a fault.
+const NO_ROUTE_DECIDED: &str = "skills: no route decided yet — this session has sent no turn, so \
+     there is no stamped route to measure against. Send one and ask again; a diagnostic does not \
+     resolve a route on your behalf.";
+
+/// BR-13's stated limitation, said out loud on every answer that has one.
+///
+/// Two halves, and both are why the answer is a **floor** rather than a
+/// clearance:
+///
+/// * Only the `Body` stage can be measured before a skill runs. A skill whose
+///   `` !`command` `` output pushes it over is refused at Stage B, and nothing
+///   before the commands run can know that — so a skill absent from this list
+///   is not thereby promised to fit.
+/// * The system prompt measured here is the daemon's **default** harness
+///   prompt. A live turn's prompt additionally carries its session's
+///   environment block and whatever tools that session exposes, so a live
+///   measurement is normally the larger of the two.
+const PREFLIGHT_FLOOR: &str = "  (a floor, not a clearance: only the `Body` stage can be measured \
+     before a skill runs, so a skill whose dynamic-context output pushes it over is not named \
+     here — and the system prompt measured is this daemon's default, which a live turn's only \
+     grows.)";
+
+/// The system prompt the pre-flight measures against.
+///
+/// [`build_system_prompt`] is the one composer — the same function the turn
+/// path calls — handed the daemon's default harness with this route's stamped
+/// budget on it. It is **not** the live turn's prompt, and cannot be: that one
+/// is assembled per turn from the session's probed root, its web capability and
+/// its full tool set, none of which a diagnostic may build without doing the
+/// work the turn does. What it is instead is a prompt this daemon really
+/// composes, which keeps `SkillStage::Body`'s clause — *"the body alone, with
+/// the system prompt, comes to"* — a true sentence, and which
+/// [`PREFLIGHT_FLOOR`] names out loud.
+fn preflight_system_prompt(budget: &RouteBudget) -> String {
+    build_system_prompt(
+        &ToolRegistry::with_builtins(),
+        &HarnessConfig::default().with_route_budget(budget.clone()),
+    )
+}
+
+/// The Stage A text of one skill, exactly as a typed `/name` with no arguments
+/// would produce it.
+///
+/// [`expand`] and [`Expansion::pending_text`](crate::skills::Expansion::pending_text)
+/// are the turn path's own composition — same frame, same prose, same
+/// `[dynamic context pending]` in each slot — so this measures the string the
+/// session would measure rather than a second reading of the file's body.
+///
+/// The arguments are empty because nobody has typed any yet. That is the
+/// honest pre-flight question and it is also the conservative one: an argument
+/// is interpolated *into* the body, so a real invocation is at least this
+/// large.
+fn preflight_body(skill: &Skill) -> String {
+    let expansion = expand(skill, "", &skill.path_display);
+    expansion.pending_text(&expansion.user_frame())
+}
+
+/// Compose the pre-flight report (BR-13, AC-17, AC-19).
+///
+/// Every figure in it comes out of [`skill_fit`] — the same classifier, the
+/// same estimator and the same composer the live refusal runs through — so
+/// there is no second measurement here to drift from the first (LESSON-456,
+/// and REQ-586's own verify M1). What this function contributes is the count,
+/// the ordering and the caveat; it words no measurement of its own.
+fn render_preflight(
+    registry: &SkillRegistry,
+    budget: Option<&RouteBudget>,
+    verbose: bool,
+) -> String {
+    let Some(budget) = budget else {
+        return NO_ROUTE_DECIDED.to_owned();
+    };
+    let system = preflight_system_prompt(budget);
+    let mut dispatchable = 0usize;
+    // The refusal sentence *is* the row: it opens with `` `/name` `` — the form
+    // the user would type — and carries the measurement, the budget and the
+    // bound. Prefixing it with the name again would be the same fact twice.
+    let mut refusals: Vec<String> = Vec::new();
+    for skill in registry.skills() {
+        // BR-13's question is "will this be refused if I type it", so the set
+        // is the one a `/name` can reach: `dispatchable_by_user` excludes a
+        // shadowed row (another file owns the name) and a model-only one
+        // (`user-invocable: false`). A model-invoked expansion is measured
+        // mid-loop by `skill_append_fit` against a turn that already exists,
+        // which is a different question and not one a diagnostic can answer.
+        if !skill.dispatchable_by_user() {
+            continue;
+        }
+        dispatchable += 1;
+        if let SkillFit::TooLarge { message } = skill_fit(
+            SkillCaller::User,
+            SkillStage::Body,
+            &skill.name,
+            &system,
+            &preflight_body(skill),
+            budget,
+            budget.provider_id.as_deref(),
+        ) {
+            refusals.push(message);
+        }
+    }
+
+    let mut report = format!(
+        "skills: {} of {} dispatchable skill(s) will not fit on this route{}",
+        refusals.len(),
+        dispatchable,
+        // AC-19: the route's budget and bound, beside the count, under
+        // `/verbose`. The figures are formatted through `teton_protocol`'s
+        // `thousands`/`bytes_figure` and `BudgetBound::words` — the one number
+        // vocabulary and the one bound vocabulary both sides of the wire read,
+        // so this line and the refusals under it cannot spell one budget two
+        // ways.
+        if verbose {
+            format!(
+                " — budget {} words / {} (bound: {}).",
+                thousands(budget.budget_tokens as u64),
+                bytes_figure(budget.budget_bytes as u64),
+                budget.bound.words()
+            )
+        } else {
+            ".".to_owned()
+        }
+    );
+    for message in &refusals {
+        report.push_str("\n  ");
+        report.push_str(message);
+    }
+    report.push('\n');
+    report.push_str(PREFLIGHT_FLOOR);
+    report
 }
 
 /// Forwards broadcast events from `sub` to the client's outbound channel until
@@ -10351,6 +10723,12 @@ mod tests {
             WebSetupPreviewParams::METHOD,
             WebSetupCommitParams::METHOD,
             SkillsListParams::METHOD,
+            // REQ-589 BR-13: `skills/preflight` joins for `skills/list`'s
+            // reason and under its gate. Its params carry `verbose` beside the
+            // id, which `#[serde(default)]` makes optional — so it is
+            // well-formed under both helpers' shapes and what refuses it is the
+            // length check rather than a parse failure wearing its code.
+            SkillsPreflightParams::METHOD,
         ] {
             let refused = route_setup(
                 &daemon,
@@ -10377,6 +10755,7 @@ mod tests {
             ProviderSetupPreviewParams::METHOD,
             ProviderSetupCommitParams::METHOD,
             SkillsListParams::METHOD,
+            SkillsPreflightParams::METHOD,
         ] {
             let refused = route_setup(
                 &daemon,
@@ -10475,6 +10854,7 @@ mod tests {
             SessionClearParams::METHOD,
             SessionSetCwdParams::METHOD,
             SkillsListParams::METHOD,
+            SkillsPreflightParams::METHOD,
         ] {
             let refused = dispatch(
                 &daemon,
@@ -10925,6 +11305,381 @@ mod tests {
             !get.contains(&error_code::METHOD_NOT_FOUND.to_string()),
             "config/get is a read that never attests, so it stays on the \
              synchronous dispatch: {get}"
+        );
+    }
+    // ── REQ-589 BR-13 / ADR-11: the pre-flight ──────────────────────────────
+
+    /// A registry holding one skill whose body is `body`, discovered the way a
+    /// session's is — through `discover`, so the row carries the same
+    /// `path_display`, source and flags a real one does.
+    struct PreflightTree {
+        root: std::path::PathBuf,
+    }
+
+    impl PreflightTree {
+        fn holding(name: &str, body: &str) -> Self {
+            use std::sync::atomic::AtomicUsize;
+            static SEQ: AtomicUsize = AtomicUsize::new(0);
+            let seq = SEQ.fetch_add(1, Ordering::SeqCst);
+            let root =
+                std::env::temp_dir().join(format!("tpre{:x}{seq:x}", std::process::id() & 0xffff));
+            let commands = root.join(".claude").join("commands");
+            std::fs::create_dir_all(&commands).expect("temp skill tree");
+            std::fs::write(commands.join(format!("{name}.md")), body).expect("temp skill body");
+            Self { root }
+        }
+
+        fn registry(&self) -> SkillRegistry {
+            crate::skills::discover(
+                None,
+                &self.root,
+                teton_protocol::methods::RootKind::Project,
+                &RealFs,
+            )
+        }
+    }
+
+    impl Drop for PreflightTree {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.root);
+        }
+    }
+
+    /// The pair `Router::budget_for` stamps for a small declared window, and the
+    /// `route_decided` that announces it — the two halves the memo bridges.
+    fn stamped_pair(window: u32) -> (crate::harness::budget::RouteBudget, RouteDecided) {
+        let derived = crate::harness::budget::derive(crate::harness::budget::BudgetInputs {
+            window,
+            cap: 0,
+            reservation: crate::harness::budget::generation_reservation(),
+            is_local: false,
+            redact_scan: false,
+            provider_id: Some("kimi"),
+        });
+        let decided = RouteDecided {
+            category: None,
+            tier: None,
+            phase: None,
+            provider_id: teton_protocol::ProviderId::from("kimi"),
+            model: Some("kimi-k2".to_owned()),
+            reason: "a fixture".to_owned(),
+            effort: None,
+            budget_tokens: Some(derived.budget_tokens as u64),
+            budget_bytes: Some(derived.budget_bytes as u64),
+            bound: Some(derived.bound),
+            spend_ceiling_micro_cents: None,
+            bound_floored: Some(derived.floored),
+        };
+        (derived, decided)
+    }
+
+    /// **AC-17, and the whole of LESSON-456 for this surface.** The sentence the
+    /// pre-flight prints for a skill is byte-for-byte the sentence the *live*
+    /// path prints when the same skill is refused on the same route.
+    ///
+    /// The two are reached through different entry points on purpose:
+    /// `render_preflight` goes through `skill_fit`, while the live refusal is
+    /// composed by `OverBudgetOffer::decline_refusal` — the sentence a declined
+    /// offer produces in `runtime.rs`. If either grew a second estimator, a
+    /// second number formatter or a second bound table, these strings part.
+    ///
+    /// It is also the guard on the memo's reconstruction: the live budget here
+    /// is the full `RouteBudget` `derive` produced (window label, digest
+    /// thresholds and all), the pre-flight's is the one `StampedRoutes::record`
+    /// rebuilt from the announcement. Byte equality is the proof that the three
+    /// fields the wire cannot carry reach neither the measurement nor the
+    /// sentence.
+    ///
+    /// **Mutation**: have `render_preflight` compose its own figure line, or
+    /// have `StampedRoutes::record` invent a `window_label` a future
+    /// `skill_refusal` reads — either way these two strings stop matching.
+    #[test]
+    fn the_preflight_quotes_the_live_refusals_sentence_for_the_same_skill() {
+        use crate::harness::budget::{OverBudgetOffer, PriorWindowRejection};
+        use crate::harness::context::ContextManager;
+        use crate::skills::SkillSource;
+
+        let tree = PreflightTree::holding("bulky", &"word ".repeat(8_000));
+        let registry = tree.registry();
+        let (derived, decided) = stamped_pair(8_000);
+
+        let routes = StampedRoutes::new();
+        let session = SessionId::from("sess-preflight");
+        assert!(
+            routes.record(&session, &decided),
+            "an announcement carrying the whole pair is a stamp"
+        );
+        let stamped = routes
+            .stamped(&session)
+            .expect("the stamp was just recorded");
+
+        let rendered = render_preflight(&registry, Some(&stamped), false);
+
+        // The live sentence: the same measurement, through the composer the
+        // turn path uses for a declined offer.
+        let skill = registry
+            .skills()
+            .iter()
+            .find(|s| s.name == "bulky")
+            .expect("the fixture registered");
+        let system = preflight_system_prompt(&stamped);
+        let measured = ContextManager::would_seed_fit(
+            &system,
+            &preflight_body(skill),
+            derived.budget_tokens,
+            derived.budget_bytes,
+        );
+        assert!(
+            !measured.fits,
+            "non-vacuity: the fixture must be over budget"
+        );
+        let live = OverBudgetOffer::new(
+            "bulky",
+            SkillStage::Body,
+            measured,
+            &derived,
+            8_000,
+            None,
+            None,
+        )
+        .decline_refusal();
+
+        assert!(
+            rendered.contains(&live),
+            "the pre-flight and the live refusal must quote one measurement.\n\
+             pre-flight: {rendered}\nlive:       {live}"
+        );
+        // ...and the offer's *question* is a different sentence, so the
+        // assertion above is not passing on a substring every arm shares.
+        let question = OverBudgetOffer::new(
+            "bulky",
+            SkillStage::Body,
+            measured,
+            &derived,
+            8_000,
+            None,
+            None,
+        )
+        .question(SkillSource::Project, PriorWindowRejection::None);
+        assert_ne!(live, question);
+    }
+
+    /// **ADR-11.** A session no turn has routed is told there is no route —
+    /// and the diagnostic resolves none to find out.
+    ///
+    /// The negative half is structural rather than asserted with a spy: nothing
+    /// in `handle_skills_preflight`'s call graph holds a `Router`. What this
+    /// pins is the sentence, and that a registry full of oversized skills does
+    /// not produce a single measurement without a stamp.
+    ///
+    /// **Mutation**: default the missing stamp to `BudgetInputs::local()` — the
+    /// report would name skills against a route the session is not on.
+    #[test]
+    fn a_session_with_no_decided_route_is_told_so_rather_than_measured() {
+        let tree = PreflightTree::holding("bulky", &"word ".repeat(8_000));
+        let registry = tree.registry();
+
+        let rendered = render_preflight(&registry, None, true);
+
+        assert_eq!(rendered, NO_ROUTE_DECIDED);
+        assert!(
+            !rendered.contains("bulky"),
+            "no route means no measurement, so no skill is named: {rendered}"
+        );
+    }
+
+    /// **AC-19.** `/verbose` puts the route's budget and bound beside the count;
+    /// the count itself is reported either way.
+    ///
+    /// The figures come from `teton_protocol`'s `thousands`/`bytes_figure` and
+    /// `BudgetBound::words` — the same three primitives the refusal sentences
+    /// under this line are built from — so the summary and the detail cannot
+    /// spell one budget two ways.
+    ///
+    /// **Mutation**: render the clause unconditionally, or drop it — either
+    /// fails one of the two halves.
+    #[test]
+    fn verbose_names_the_routes_budget_and_bound_beside_the_count() {
+        let tree = PreflightTree::holding("bulky", &"word ".repeat(8_000));
+        let registry = tree.registry();
+        let (_, decided) = stamped_pair(8_000);
+        let routes = StampedRoutes::new();
+        let session = SessionId::from("sess-verbose");
+        routes.record(&session, &decided);
+        let stamped = routes.stamped(&session).expect("stamped");
+
+        let quiet = render_preflight(&registry, Some(&stamped), false);
+        let loud = render_preflight(&registry, Some(&stamped), true);
+
+        let clause = format!(
+            "budget {} words / {} (bound: {})",
+            thousands(stamped.budget_tokens as u64),
+            bytes_figure(stamped.budget_bytes as u64),
+            stamped.bound.words()
+        );
+        assert!(
+            loud.contains(&clause),
+            "`/verbose` owes AC-19's clause: {loud}"
+        );
+        assert!(
+            !quiet.contains(&clause),
+            "the clause is what `/verbose` adds; without it the line is the count: {quiet}"
+        );
+        for report in [&quiet, &loud] {
+            assert!(
+                report.contains("1 of 1 dispatchable skill(s) will not fit"),
+                "the count is reported either way: {report}"
+            );
+        }
+    }
+
+    /// **BR-13's stated limitation, on the surface rather than in a doc.** The
+    /// answer says it is a floor and names both reasons it is one.
+    ///
+    /// **Mutation**: drop the caveat and the report reads as a clearance — "the
+    /// rest will fit" — which is the one claim BR-13 forbids it to make.
+    #[test]
+    fn the_preflight_answer_says_it_is_a_floor() {
+        let tree = PreflightTree::holding("small", "a body\n");
+        let registry = tree.registry();
+        let (_, decided) = stamped_pair(128_000);
+        let routes = StampedRoutes::new();
+        let session = SessionId::from("sess-floor");
+        routes.record(&session, &decided);
+        let stamped = routes.stamped(&session).expect("stamped");
+
+        let rendered = render_preflight(&registry, Some(&stamped), false);
+
+        assert!(
+            rendered.contains("0 of 1 dispatchable skill(s) will not fit"),
+            "non-vacuity: a small body on a wide route fits: {rendered}"
+        );
+        assert!(
+            rendered.contains(PREFLIGHT_FLOOR),
+            "the floor is stated: {rendered}"
+        );
+        assert!(
+            rendered.contains("`Body` stage"),
+            "the first reason it is a floor: {rendered}"
+        );
+    }
+
+    /// An announcement from a daemon that states no budget is **not** a stamp.
+    ///
+    /// `route_decided`'s budget fields are additive (REQ-586), so `None` means
+    /// "a daemon that predates them". Storing half a pair would put the surface
+    /// in front of a figure nobody derived; the honest answer is the one ADR-11
+    /// already has a sentence for.
+    ///
+    /// **Mutation**: `unwrap_or_default()` the three fields — the memo would
+    /// report a zero budget as the session's route, and every skill would be
+    /// named.
+    #[test]
+    fn an_announcement_without_a_budget_pair_stamps_nothing() {
+        let (_, full) = stamped_pair(8_000);
+        let routes = StampedRoutes::new();
+        let session = SessionId::from("sess-partial");
+
+        for missing in [
+            RouteDecided {
+                budget_tokens: None,
+                ..full.clone()
+            },
+            RouteDecided {
+                budget_bytes: None,
+                ..full.clone()
+            },
+            RouteDecided {
+                bound: None,
+                ..full.clone()
+            },
+        ] {
+            assert!(!routes.record(&session, &missing));
+            assert!(routes.stamped(&session).is_none());
+        }
+
+        assert!(routes.record(&session, &full));
+        assert!(routes.stamped(&session).is_some());
+    }
+
+    /// The observer is started once, by the turn that is about to decide a
+    /// route, and the announcement it hears is the stamp.
+    ///
+    /// **Mutation**: start the observer *after* spawning the turn task and the
+    /// first turn's decision is a race; drop the claim and every turn starts
+    /// another subscriber.
+    #[tokio::test]
+    async fn the_first_prompt_turn_starts_the_one_observer_and_its_announcement_is_the_stamp() {
+        let daemon = Arc::new(Daemon::new());
+        let session = SessionId::from("sess-observed");
+        let (derived, decided) = stamped_pair(8_000);
+
+        observe_route_decisions(&daemon);
+        assert!(
+            !daemon.stamped_routes.claim_observer(),
+            "the claim is taken, so a later turn starts no second observer"
+        );
+        // Restore it, or this fixture would leave the memo unable to restart.
+        daemon.stamped_routes.release_observer();
+        assert!(daemon.stamped_routes.claim_observer());
+        daemon.stamped_routes.release_observer();
+
+        daemon
+            .events
+            .publish(Some(session.clone()), Event::RouteDecided(decided));
+
+        // The observer runs on its own task; yield until it has drained.
+        let mut stamped = None;
+        for _ in 0..64 {
+            stamped = daemon.stamped_routes.stamped(&session);
+            if stamped.is_some() {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        let stamped = stamped.expect("the announcement is the stamp");
+        assert_eq!(stamped.budget_tokens, derived.budget_tokens);
+        assert_eq!(stamped.budget_bytes, derived.budget_bytes);
+        assert_eq!(stamped.bound, derived.bound);
+        assert_eq!(stamped.floored, derived.floored);
+        assert!(
+            daemon
+                .stamped_routes
+                .stamped(&SessionId::from("sess-other"))
+                .is_none(),
+            "a stamp is scoped to the session the envelope named"
+        );
+    }
+
+    /// An observer that stops forgets what it knew, and frees the claim so the
+    /// next prompt turn can start a fresh one.
+    ///
+    /// The bus evicts a subscriber that falls behind, and an evicted observer
+    /// cannot know a route was re-decided. Reporting the last route it *did*
+    /// see would be a lie about the session's current one; "no route decided
+    /// yet" is a state the surface already says truthfully.
+    ///
+    /// **Mutation**: drop the `forget_all` and a stale stamp outlives the
+    /// observer that could no longer maintain it; drop the `release_observer`
+    /// and the memo never restarts after one eviction.
+    #[test]
+    fn a_stopped_observer_leaves_no_stamp_and_no_claim() {
+        let routes = StampedRoutes::new();
+        let session = SessionId::from("sess-evicted");
+        let (_, decided) = stamped_pair(8_000);
+
+        assert!(routes.claim_observer());
+        routes.record(&session, &decided);
+        assert!(routes.stamped(&session).is_some());
+
+        // What `record_route_decisions` does when its subscription ends.
+        routes.forget_all();
+        routes.release_observer();
+
+        assert!(routes.stamped(&session).is_none());
+        assert!(
+            routes.claim_observer(),
+            "the next prompt turn must be able to start a fresh observer"
         );
     }
 }
