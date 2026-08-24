@@ -1634,3 +1634,562 @@ fn the_acknowledgment_prompt_names_the_root_its_skills_and_what_it_left_out() {
         "the turn must still complete after the answer; transcript:\n{after}"
     );
 }
+
+// ---------------------------------------------------------------------------
+// REQ-589 AC-14 / BUG-191 — the over-budget offer's bytes, at a terminal
+// ---------------------------------------------------------------------------
+//
+// BR-3 replaces a refusal with a question, and everything that makes the
+// question worth asking is *wording*: which figures it quotes, what it says the
+// window will do with a send this size, and which concrete write each answer
+// performs. None of that is a structure — ADR-16 puts the composed sentence on
+// `PermissionSubject::SkillOverBudget` as a field precisely because a client
+// that re-worded from the structure would be the second composer BR-5 forbids.
+//
+// So a renderer-unit test asserting `render_consent_subject`'s output is
+// asserting what a structure *says it would* print. That is the gap BUG-191 was
+// filed for on REQ-587's acknowledgment prompt, where the prompt bytes were
+// pinned in `session_ui.rs` and the only e2e leg asserted the refusal **without**
+// a terminal — the opposite claim. This is the leg that reads the terminal.
+//
+// The fixture is the reported failure that opened this REQ: a typed `/analyze`
+// from a repository's own `.claude/skills`, measured at Stage A against the
+// local engine's default 4,096-word / 33 KB pair, on a route that declares no
+// window — `bound: local engine`, verdict `WindowUnknown`, remedy
+// `BindTierRemote`. It is the one cell of the reachability table the report
+// actually landed in.
+//
+// What is *not* asserted here: the config file the remedy writes. Whether the
+// two remedy-bearing answers reach a durable write is asserted, because without
+// it options 1 and 2 (and 4 and 3) are indistinguishable at this surface and
+// two of the four ids would be pinned vacuously. What the write *contains* is
+// the daemon's, and lives beside the code that makes it.
+
+/// A skill body large enough to blow the local route's word budget on its own.
+///
+/// 500 lines × 13 words is ~6,500 words before the system prompt is folded in,
+/// against a 4,096-word budget. Deliberately clear of the boundary rather than
+/// one word over it as the report was: Stage A measures the body **with the
+/// system prompt**, whose size is not this test's to fix, so a fixture tuned to
+/// land at 4,097 would be measuring the harness's prompt and not the skill.
+fn over_budget_skill_body() -> String {
+    let mut body = String::from("---\ndescription: audit this repository end to end\n---\n");
+    for step in 0..500 {
+        body.push_str(&format!(
+            "step {step}: read every file in this repository and report what it does.\n"
+        ));
+    }
+    body
+}
+
+/// The budget pair the local engine's defaults derive, spelled as the terminal
+/// spells it — `LOCAL_BUDGET_TOKENS` (4,096) and 4,096 × 8 B = 32,768 B, which
+/// `bytes_figure` rounds to `33 KB`. The reported failure quoted this pair.
+const BUDGET_PAIR: &str = "4,096 words / 33 KB";
+
+/// BR-3's `WindowUnknown` clause. The route declares no window, so the daemon
+/// says it cannot promise — and names the backstop ADR-3 built for exactly this
+/// tier rather than promising the send will serve.
+const WINDOW_UNKNOWN_CLAUSE: &str = "This route declares no context window, so this daemon cannot \
+                                     promise the send will fit; if it does not, the turn ends \
+                                     with a context-length error rather than quietly losing \
+                                     anything.";
+
+/// The remedy as ADR-1 binds it: the **concrete write**, never "raise the
+/// limit".
+///
+/// `build` is the tier this fixture's classifier routes a `/analyze` turn to,
+/// and it is in the string on purpose — BR-9's write is "bind *this* tier",
+/// and a label that named no tier would be the vague promise ADR-1's precedent
+/// (`enable_permanent`, which once promised a write that was silently a no-op)
+/// exists to forbid.
+const REMEDY_WRITE: &str = "bind the `build` tier to a remote provider and declare that \
+                            provider's `capabilities.max_context` in the same change";
+
+/// BR-9's cost, which [`REMEDY_WRITE`] cannot be rendered without (AC-7a):
+/// `RemedyClause::render` is the only way out of that type and it concatenates
+/// the two unconditionally. Asserting them as one string here is what would
+/// fail if a second rendering path ever shed the risk.
+const REMEDY_RISK: &str = "either half alone leaves a provider with no declared window, which \
+                           derives this same budget again, and rebinding moves every turn that \
+                           tier serves to that provider, at that provider's prices";
+
+/// The write and its cost, joined the one way they are ever joined.
+fn remedy_clause() -> String {
+    format!("{REMEDY_WRITE} — {REMEDY_RISK}")
+}
+
+/// The daemon's finished question, with the one figure this fixture cannot fix
+/// left as a parameter.
+///
+/// Everything else is byte-exact, and that is the ADR-16 assertion: the client
+/// renders this **verbatim**. If it re-worded so much as a comma this would not
+/// be found in the transcript.
+fn offer_sentence(measured: &str) -> String {
+    format!(
+        "`/analyze` (this repository's skill) does not fit this route's context budget: the body \
+         alone, with the system prompt, comes to about {measured}, and the budget is \
+         {BUDGET_PAIR} (bound: local engine). {WINDOW_UNKNOWN_CLAUSE} The durable fix is to {}. \
+         Send it whole this once, take the durable fix, both, or neither?",
+        remedy_clause()
+    )
+}
+
+/// AC-3's refusal: today's `-32023`, in every byte, from the same measurement.
+///
+/// Two differences from [`offer_sentence`] and they are the whole of AC-3. The
+/// head is **identical** — same stage clause, same measured pair, same budget
+/// pair, same spoken bound — and the tail is `SkillCaller::consequence`'s, with
+/// no verdict, no remedy and no ASSUME-018 source marker, because today's
+/// refusal carries none of them. `` `/analyze` `` here, not
+/// `` `/analyze` (this repository's skill) ``.
+fn decline_refusal(measured: &str) -> String {
+    format!(
+        "`/analyze` does not fit this route's context budget: the body alone, with the system \
+         prompt, comes to about {measured}, and the budget is {BUDGET_PAIR} (bound: local \
+         engine). Nothing was sent and no provider saw this turn — a skill expansion is carried \
+         whole or refused, never shortened into something you did not invoke."
+    )
+}
+
+/// The four rows as the terminal draws them, numbered, in the daemon's order.
+///
+/// The order is the daemon's and this test asserts the numbers, because BR-3's
+/// "leads with the remedy" **is** the order and nothing else (ADR-14): a
+/// `WindowUnknown` verdict does not lead with it, so the one-time override is
+/// row 1. A client that sorted these rows would silently undo the rule, and the
+/// numbers are what a person types.
+///
+/// Rows 2 and 3 carry [`remedy_clause`] whole — the same rendering the sentence
+/// above them carries. Rows 1 and 4 say, in so many words, that they write
+/// nothing: ADR-1 requires a label to name its write, and "writes nothing" is
+/// the honest form of that for the two answers that make none.
+fn option_rows() -> [String; 4] {
+    [
+        "  1) Send it whole this once, over budget — writes nothing, and nothing is remembered, \
+         so the next invocation asks again"
+            .to_owned(),
+        format!("  2) Send it whole this once, and {}", remedy_clause()),
+        format!("  3) Do not send it, but {}", remedy_clause()),
+        "  4) Do not send it — refuse the turn exactly as this route does today, and write nothing"
+            .to_owned(),
+    ]
+}
+
+/// The last line of the prompt block, and therefore the marker every leg waits
+/// on: everything this file asserts is drawn above it.
+const CHOOSE_LINE: &str = "  choose 1-4 (empty refuses the turn): ";
+
+/// The clause `format_over_budget_accepted` opens with. BR-1's record is drawn
+/// **unconditionally** — a declined offer prints a refusal, so the accepted one
+/// has to print its counterpart or one question has one visible outcome and one
+/// silent one.
+const ACCEPTED_NOTICE_HEAD: &str = "over budget: skill `analyze` (project) was sent whole at your \
+                                    request — ";
+
+/// The clause `format_over_budget_remedy_applied` opens with — a file on disk
+/// changed, and this is the line that says so.
+const REMEDY_APPLIED_HEAD: &str = "over budget: wrote the going-forward fix (";
+
+/// What the scripted local engine answers a turn that was actually sent. Its
+/// presence is the proof an answer proceeded; its absence, with a refusal
+/// beside it, is the proof one did not.
+const SENT_MARKER: &str = "the oversized expansion was sent.";
+
+/// A pty session parked at REQ-589's over-budget offer.
+///
+/// The pty master is held rather than dropped: the reader thread and the writer
+/// were taken from it, and dropping it closes the terminal out from under a
+/// session this fixture still means to type at.
+struct OfferSession {
+    _master: Box<dyn portable_pty::MasterPty + Send>,
+    session: Box<dyn portable_pty::Child + Send + Sync>,
+    writer: Box<dyn Write + Send>,
+    transcript: Transcript,
+    home: PathBuf,
+    /// Killed and cleaned up by its own `Drop`, after this type's has run.
+    _daemon: TestDaemon,
+}
+
+impl OfferSession {
+    /// Type one line at the terminal.
+    fn type_line(&mut self, line: &str) {
+        self.writer
+            .write_all(format!("{line}\r").as_bytes())
+            .expect("type at the pty");
+        self.writer.flush().ok();
+    }
+
+    fn wait_for(&self, marker: &str) -> bool {
+        wait_for(&self.transcript, marker)
+    }
+
+    fn snapshot(&self) -> String {
+        snapshot(&self.transcript)
+    }
+}
+
+impl Drop for OfferSession {
+    fn drop(&mut self) {
+        let _ = self.session.kill();
+        let _ = self.session.wait();
+        let _ = std::fs::remove_dir_all(&self.home);
+    }
+}
+
+/// Drive a fresh session to the over-budget offer and leave it parked at the
+/// question, with the whole prompt block already on screen.
+///
+/// A daemon per leg, not a session per leg against one daemon: two of the four
+/// answers **write the config file** this daemon was started with, and a leg
+/// that inherited another leg's write would be answering a question about a
+/// different route.
+///
+/// The acknowledgment BR-6 puts first is answered on the way past. It is a real
+/// step of the reported path — a typed project skill is acknowledged before it
+/// expands, so before the route and before either budget stage — and answering
+/// it here keeps the leg below about the offer.
+fn park_at_the_over_budget_offer(tag: &str) -> OfferSession {
+    let daemon_path = daemon_bin();
+    let home =
+        PathBuf::from("/tmp").join(format!("tcptyob{:x}-{tag}", std::process::id() & 0xffff));
+    let _ = std::fs::remove_dir_all(&home);
+    std::fs::create_dir_all(&home).unwrap();
+
+    // Every tier on the scripted local tier, for the reason every typed-turn
+    // test in this file binds them — and here it is also the fixture itself:
+    // `BudgetBound::LocalEngine` is what the reported failure was bound by.
+    let tiers: String = ["reflex", "scan", "build", "think"]
+        .iter()
+        .map(|t| format!("[[tiers]]\ntier = \"{t}\"\nprovider_id = \"local\"\n\n"))
+        .collect();
+    let config = format!("[[providers]]\nid = \"local\"\nkind = \"local\"\n\n{tiers}");
+    let daemon =
+        TestDaemon::spawn_with_env(&daemon_path, &config, &[SENT_MARKER], &[("HOME", &home)]);
+
+    let project = daemon.root.join("proj");
+    std::fs::create_dir_all(project.join(".claude/skills/analyze")).unwrap();
+    std::fs::write(project.join("Cargo.toml"), "[package]\nname = \"proj\"\n").unwrap();
+    std::fs::write(
+        project.join(".claude/skills/analyze/SKILL.md"),
+        over_budget_skill_body(),
+    )
+    .unwrap();
+
+    // Wide enough that no line under test can hard-wrap. The client wraps
+    // nothing itself, so a terminal narrower than the sentence would soft-wrap
+    // it for display without putting bytes in the stream — but the width costs
+    // nothing and removes the question.
+    let pty = native_pty_system()
+        .openpty(PtySize {
+            rows: 60,
+            cols: 400,
+            pixel_width: 0,
+            pixel_height: 0,
+        })
+        .expect("openpty");
+    let mut cmd = CommandBuilder::new(teton_bin());
+    cmd.args(["--cwd", project.to_str().unwrap()]);
+    cmd.env("XDG_RUNTIME_DIR", &daemon.runtime_dir);
+    cmd.env("TETON_CONFIG", daemon.root.join("config.toml"));
+    cmd.env("TETON_REPO_ROOT", &daemon.root);
+    cmd.env("HOME", &home);
+    let session = pty.slave.spawn_command(cmd).expect("spawn teton under pty");
+    drop(pty.slave);
+    let transcript = spawn_reader(pty.master.try_clone_reader().expect("pty reader"));
+    let writer = pty.master.take_writer().expect("pty writer");
+    let mut parked = OfferSession {
+        _master: pty.master,
+        session,
+        writer,
+        transcript,
+        home,
+        _daemon: daemon,
+    };
+
+    assert!(
+        parked.wait_for("ready (freeform)"),
+        "the session never reached the entry prompt; transcript:\n{}",
+        parked.snapshot()
+    );
+    parked.type_line("/analyze");
+
+    // BR-6's acknowledgment, which a typed project skill now raises before it
+    // expands (ADR-10). Answered `y`, because this leg is about what comes
+    // after it.
+    assert!(
+        parked.wait_for("permission requested: project_skill_trust:"),
+        "a typed project skill must be acknowledged before it expands; transcript:\n{}",
+        parked.snapshot()
+    );
+    parked.type_line("y");
+
+    // The **last** line of the offer block, not the first: waiting on the first
+    // would let a snapshot be taken between two writes and assert about a
+    // prompt that was still arriving.
+    assert!(
+        parked.wait_for(CHOOSE_LINE),
+        "BR-3's offer must be drawn at a terminal; transcript:\n{}",
+        parked.snapshot()
+    );
+    parked
+}
+
+/// The measured pair **exactly as the terminal drew it**, read back out of the
+/// sentence it was drawn in.
+///
+/// The one figure this fixture cannot fix: Stage A measures the skill body
+/// *with the system prompt*, and pinning a literal would pin the harness's
+/// prompt size. Extracting it is not a weaker assertion than a literal would
+/// be — every other byte of the sentence is literal around it, the pair is
+/// checked for shape and for being over the budget below, and each leg then
+/// asserts that the *other* sentences of the same measurement quote this same
+/// string back (AC-2: one measurement, one set of figures).
+fn measured_pair(transcript: &str) -> String {
+    const OPENS: &str = "comes to about ";
+    const CLOSES: &str = ", and the budget is";
+    let from = transcript
+        .find(OPENS)
+        .unwrap_or_else(|| panic!("no measured pair was drawn; transcript:\n{transcript}"))
+        + OPENS.len();
+    let rest = &transcript[from..];
+    let to = rest
+        .find(CLOSES)
+        .unwrap_or_else(|| panic!("the measured pair never closed; transcript:\n{transcript}"));
+    let pair = rest[..to].to_owned();
+
+    // Shape, and that it is over: an extraction that silently captured the
+    // empty string would make every assertion below pass vacuously.
+    let (words, bytes) = pair
+        .split_once(" words / ")
+        .unwrap_or_else(|| panic!("`{pair}` is not a `N words / N KB` pair"));
+    let counted: usize = words
+        .replace(',', "")
+        .parse()
+        .unwrap_or_else(|_| panic!("`{words}` is not a grouped word count"));
+    assert!(
+        counted > 4_096,
+        "the fixture must measure over the 4,096-word budget, not `{pair}`"
+    );
+    assert!(
+        bytes.ends_with(" KB") || bytes.ends_with(" MB") || bytes.ends_with(" B"),
+        "`{bytes}` is not a byte figure"
+    );
+    pair
+}
+
+/// **AC-14 / BUG-191: BR-3's offer, at a real terminal, in the daemon's own
+/// words.**
+///
+/// Four claims, and each fails a different plausible implementation:
+///
+/// * the daemon's composed sentence reaches the screen **verbatim** — the whole
+///   of it, in one contiguous run. ADR-16 puts it on the subject as a field
+///   precisely so the client re-words nothing; a client that re-worded, or that
+///   re-composed the same facts from the structure beside it, would be BR-5's
+///   forbidden second composer and would not match this string;
+/// * the figures are drawn **once**. The client's own lead line carries no
+///   numbers at all, because `stage`, both pairs, the bound and the provider are
+///   already in the sentence — and a second spelling of one number is
+///   LESSON-456's shape in its most innocuous form;
+/// * every option label names its **concrete write** (ADR-1), and the two that
+///   write cannot shed BR-7a's risk (AC-7a);
+/// * a stray `y` — the reflex answer at a consent prompt, and the answer this
+///   one *must not* read — re-asks instead of sending an oversized turn.
+///
+/// The `WindowVerdict::Unknown` hedge is asserted **absent**. `WindowUnknown`
+/// ("this route declares no window") and `Unknown` ("this build cannot read the
+/// verdict") are different claims about a route, and ADR-13 exists because
+/// quietly relabelling one as the other would tell a user their provider
+/// declares no window on the strength of a parse failure.
+#[test]
+fn the_over_budget_offer_is_drawn_at_a_terminal_in_the_daemons_own_words() {
+    let mut parked = park_at_the_over_budget_offer("words");
+    let asking = parked.snapshot();
+
+    // One question for the whole invocation, under the skill's own key — never
+    // under `skill`, the tool, whose posture is read-only at every level.
+    assert_eq!(
+        asking
+            .matches("permission requested: skill:project:analyze")
+            .count(),
+        1,
+        "one over-budget offer per invocation, under the skill's own key; \
+         transcript:\n{asking}"
+    );
+
+    // The client's one line: the marking, in the vocabulary it already names a
+    // source in (ASSUME-018) — and not one figure of its own.
+    assert!(
+        asking.contains("  skill `analyze` (project) is over this route's budget:"),
+        "the client must mark the skill and its source; transcript:\n{asking}"
+    );
+
+    // The daemon's sentence, whole and verbatim (ADR-16).
+    let measured = measured_pair(&asking);
+    let sentence = offer_sentence(&measured);
+    assert!(
+        asking.contains(&sentence),
+        "the daemon's question must be rendered verbatim.\nexpected:\n{sentence}\n\
+         transcript:\n{asking}"
+    );
+
+    // Both pairs, once each. The client quotes neither on its own line, so a
+    // second occurrence would mean a second speller of one measurement.
+    assert_eq!(
+        asking.matches(BUDGET_PAIR).count(),
+        1,
+        "the budget pair is spelled once, by the sentence; transcript:\n{asking}"
+    );
+    assert_eq!(
+        asking.matches(&measured).count(),
+        1,
+        "the measured pair is spelled once, by the sentence; transcript:\n{asking}"
+    );
+
+    // The four rows, verbatim, numbered, in the daemon's order — and
+    // `WindowUnknown` does not lead with the remedy, so the override is row 1.
+    let rows = option_rows();
+    let at = |needle: &str| {
+        asking
+            .find(needle)
+            .unwrap_or_else(|| panic!("this row was never drawn:\n{needle}\ntranscript:\n{asking}"))
+    };
+    let (one, two, three, four) = (at(&rows[0]), at(&rows[1]), at(&rows[2]), at(&rows[3]));
+    assert!(
+        one < two && two < three && three < four,
+        "the rows must be drawn in the daemon's order; transcript:\n{asking}"
+    );
+    assert!(
+        asking.contains(CHOOSE_LINE),
+        "the prompt must say what range it reads and what silence does; \
+         transcript:\n{asking}"
+    );
+
+    // ADR-13: this verdict is readable, so the hedge has nothing to say here.
+    assert!(
+        !asking.contains("this build cannot read the window verdict this daemon sent"),
+        "a readable verdict must not draw the unreadable-verdict hedge; \
+         transcript:\n{asking}"
+    );
+
+    // The reflex answer, refused as an answer. `y` at a consent prompt means
+    // yes; at this one it means nothing, and the retry line says why rather
+    // than re-drawing the question.
+    parked.type_line("y");
+    assert!(
+        parked.wait_for(
+            "  please answer with one of the numbers above, 1-4 — this prompt reads no letters, \
+             so a stray `y` is not an answer to it"
+        ),
+        "a stray `y` must re-ask, never send; transcript:\n{}",
+        parked.snapshot()
+    );
+    let after_y = parked.snapshot();
+    assert!(
+        !after_y.contains(ACCEPTED_NOTICE_HEAD) && !after_y.contains(SENT_MARKER),
+        "a stray `y` must not have sent an oversized turn; transcript:\n{after_y}"
+    );
+
+    // Answer for real, so the session finishes rather than being killed
+    // mid-question — and so BR-1's record is on screen to compare against.
+    parked.type_line("1");
+    assert!(
+        parked.wait_for(SENT_MARKER),
+        "the turn must complete after the answer; transcript:\n{}",
+        parked.snapshot()
+    );
+    let after = parked.snapshot();
+
+    // AC-2 at the surface: the record of the send quotes the pair the question
+    // quoted, character for character, and the budget it was measured against.
+    assert!(
+        after.contains(&format!(
+            "{ACCEPTED_NOTICE_HEAD}{measured} against a budget of {BUDGET_PAIR}, on a route that \
+             declares no window; measured from its body, before any dynamic-context command ran. \
+             Nothing was shortened."
+        )),
+        "the accepted record must quote the offer's own figures; transcript:\n{after}"
+    );
+}
+
+/// **AC-14's second half: each of the four ids, answered at a terminal, settles
+/// the turn the way its own label said it would.**
+///
+/// The labels are promises about two independent things — whether the turn is
+/// sent, and whether a file on disk changes — and ADR-1 spells the four
+/// combinations as four ids because `PermissionOutcome::Selected` cannot carry
+/// two booleans. So the matrix is asserted as two booleans: a row that sent
+/// without writing and a row that sent *and* wrote must be told apart here, or
+/// two of the four ids are pinned by a test that cannot see the difference
+/// between them.
+///
+/// The fifth row is not an option id. `(empty refuses the turn)` is a promise
+/// the prompt makes in the bytes above, and BR-4's rule is that silence is never
+/// consent — so an empty line has to land on the refusal, not on a re-ask and
+/// never on a send.
+///
+/// What each row asserts is the **outcome**, not the config file: the write's
+/// contents belong to the code that makes it. `REMEDY_APPLIED_HEAD` is the
+/// client's own line for "a file on disk changed", and its presence or absence
+/// is the boolean this test is entitled to read.
+#[test]
+fn each_over_budget_answer_settles_the_turn_the_way_its_label_said() {
+    // (typed answer, tag, sends, writes)
+    let rows: &[(&str, &str, bool, bool)] = &[
+        ("1", "once", true, false),
+        ("2", "both", true, true),
+        ("3", "fix", false, true),
+        ("4", "no", false, false),
+        // Not an id — the prompt's own parenthetical, kept.
+        ("", "empty", false, false),
+    ];
+
+    for (answer, tag, sends, writes) in rows {
+        let mut parked = park_at_the_over_budget_offer(tag);
+        let measured = measured_pair(&parked.snapshot());
+        parked.type_line(answer);
+
+        // The settle point, waited on rather than slept past: the send's own
+        // reply, or the refusal that stands in for it. The remedy line, when
+        // there is one, is drawn *before* either — so by the time this returns,
+        // its absence below is a fact and not a race.
+        let settled = if *sends {
+            parked.wait_for(SENT_MARKER)
+        } else {
+            parked.wait_for(&decline_refusal(&measured))
+        };
+        let after = parked.snapshot();
+        assert!(
+            settled,
+            "answering `{answer}` must {} the turn; transcript:\n{after}",
+            if *sends { "send" } else { "refuse" }
+        );
+
+        // BR-1's record is drawn on exactly the answers that sent, and AC-3's
+        // refusal on exactly the ones that did not. One question, two outcomes,
+        // neither of them silent.
+        assert_eq!(
+            after.contains(ACCEPTED_NOTICE_HEAD),
+            *sends,
+            "answering `{answer}` must {} BR-1's accepted record; transcript:\n{after}",
+            if *sends { "draw" } else { "not draw" }
+        );
+        assert_eq!(
+            after.contains(&decline_refusal(&measured)),
+            !*sends,
+            "answering `{answer}` must {} AC-3's refusal; transcript:\n{after}",
+            if *sends { "not draw" } else { "draw" }
+        );
+
+        // The other boolean, and the one the option ids exist to carry: whether
+        // a durable write happened. Without this, `1` and `2` are the same
+        // transcript and so are `3` and `4`.
+        assert_eq!(
+            after.contains(REMEDY_APPLIED_HEAD),
+            *writes,
+            "answering `{answer}` must {} the going-forward fix; transcript:\n{after}",
+            if *writes { "write" } else { "not write" }
+        );
+    }
+}
