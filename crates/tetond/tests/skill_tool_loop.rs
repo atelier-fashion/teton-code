@@ -1731,3 +1731,125 @@ async fn at_full_the_same_three_calls_expand_and_the_dynamic_command_runs() {
         "a command was refused at `full`: {expanded}"
     );
 }
+
+/// **REQ-589 AC-5 / BR-2 — the offer is the user's alone, and the model's path
+/// is never given a choice.**
+///
+/// A model-invoked expansion is measured by `skill_append_fit` in the middle of
+/// a running loop, where there is no human to answer a per-invocation question:
+/// the Model arm keeps today's sentence, is handed back as a **tool result** the
+/// model can relay, and reaches no consent gate at all.
+///
+/// The discriminator is the second leg, on the **same harness, the same skill
+/// and the same route**, with only the asker changed. A typed `/proceedish`
+/// does raise the question — this binary installs no delivery route, so the gate
+/// answers `Unanswerable` and BR-4 turns that into today's refusal, but the
+/// question was *put*, and `skill_over_budget_offered` records it. Without that
+/// leg, "no offer was published" would be equally consistent with a build that
+/// had stopped offering entirely, or with a fixture that could not reach the
+/// budget check.
+///
+/// | Mutation | Effect |
+/// |---|---|
+/// | Stage A's offer wired into the model path | leg 1 publishes an offer and fails |
+/// | the Model arm borrowing `SkillCaller::User`'s consequence | leg 1's sentence assertion fails |
+/// | the typed path reverted to a bare refusal | leg 2 publishes nothing and fails |
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_model_invoked_over_budget_expansion_is_refused_and_never_offered_a_choice() {
+    let repo = Tree::new("br2");
+    let h = Harness::with_window(None);
+    let session = h.session_at(repo.path());
+
+    // -- leg 1: the model asks, and is refused without being asked anything ---
+    let mut sub = h.events.subscribe(512);
+    h.vendor.will_call_skill(Some("proceedish"), "REQ-587");
+    h.turn(&session, "run the orchestrator", None)
+        .await
+        .expect("a refused expansion is a tool result, and the turn goes on");
+    let published = drain(&mut sub).await;
+
+    assert!(
+        !published
+            .iter()
+            .any(|event| matches!(event, Event::SkillOverBudgetOffered(_))),
+        "BR-2: a model-invoked expansion was offered a choice there is nobody in \
+         a mid-loop tool call to answer: {:?}",
+        published
+            .iter()
+            .map(teton_protocol::events::Event::name)
+            .collect::<Vec<_>>()
+    );
+
+    let refusal = tool_results(&h.vendor)
+        .into_iter()
+        .find(|content| content.contains("does not fit this route's context budget"))
+        .expect("the expansion must be refused on the default pair");
+    assert!(
+        refusal.contains(
+            "Nothing was folded into this conversation — a skill expansion is carried whole or \
+             refused, never shortened into a partial procedure. Say what you tried to run and \
+             that it did not fit."
+        ),
+        "the Model arm's own sentence, unchanged: {refusal}"
+    );
+    assert!(
+        !refusal.contains("Nothing was sent and no provider saw this turn"),
+        "the Model arm must not borrow the user arm's consequence — a mid-loop \
+         call did not stop the turn from reaching a provider: {refusal}"
+    );
+    for offered in [
+        "Send it whole this once",
+        "The durable fix is to",
+        "take the durable fix, both, or neither?",
+    ] {
+        assert!(
+            !refusal.contains(offered),
+            "BR-2: the model was handed a question it cannot answer — `{offered}` \
+             in {refusal}"
+        );
+    }
+    let invoked = invocations(&published);
+    let over_budget = invoked
+        .iter()
+        .find(|i| i.refused.as_deref() == Some(tetond::harness::budget::OVER_BUDGET_REASON))
+        .unwrap_or_else(|| panic!("the record must carry the refusal: {invoked:#?}"));
+    assert_eq!(
+        over_budget.invoked_by,
+        teton_protocol::events::InvokedBy::Model,
+        "and it must say who asked"
+    );
+
+    // -- leg 2: the same skill, typed, on the same route ----------------------
+    let mut sub = h.events.subscribe(512);
+    let typed = h
+        .turn(
+            &session,
+            "",
+            Some(SkillInvocation {
+                name: "proceedish".to_owned(),
+                raw_arguments: String::new(),
+            }),
+        )
+        .await
+        .expect_err("no client is reachable here, so BR-4 refuses the offer");
+    assert_eq!(
+        typed.code,
+        teton_protocol::jsonrpc::error_code::SKILL_EXPANSION_TOO_LARGE,
+        "an unanswerable offer is today's refusal: {typed:?}"
+    );
+    let published = drain(&mut sub).await;
+    assert_eq!(
+        published
+            .iter()
+            .filter(|event| matches!(event, Event::SkillOverBudgetOffered(_)))
+            .count(),
+        1,
+        "control: the typed path *does* put the question on this very route, so \
+         leg 1's silence is BR-2's doing rather than a fixture that never \
+         reaches the budget check: {:?}",
+        published
+            .iter()
+            .map(teton_protocol::events::Event::name)
+            .collect::<Vec<_>>()
+    );
+}
