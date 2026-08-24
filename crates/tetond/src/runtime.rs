@@ -117,10 +117,11 @@ use teton_inference::{ChatFormat, Completion, Engine, EngineError, GenParams, Mo
 
 use teton_protocol::events::{
     BlockCause, BudgetBound, CapabilityDeadEnd, ContextCleared, ContextPressureKind, Event,
-    ModelLifecycle, ModelLifecycleStage, NotRunReason, PrivacyAction, ProviderTested,
-    SessionRootChanged, SessionTitled, SkillInvoked, TierWarming, TurnQueued,
-    WebCapabilityState as WireWebCapabilityState, WebLookup, WebSetupCompleted, WebTaintOverridden,
-    WebTier as WireWebTier,
+    ModelLifecycle, ModelLifecycleStage, NotRunReason, PermissionSubject, PrivacyAction,
+    ProviderTested, SessionRootChanged, SessionTitled, SkillInvoked, SkillOverBudgetAccepted,
+    SkillOverBudgetOffered, SkillOverBudgetRemedyApplied, SkillStage as WireSkillStage,
+    TierWarming, TurnQueued, WebCapabilityState as WireWebCapabilityState, WebLookup,
+    WebSetupCompleted, WebTaintOverridden, WebTier as WireWebTier,
 };
 use teton_protocol::jsonrpc::{error_code, RpcError};
 use teton_protocol::methods::{
@@ -164,14 +165,19 @@ use crate::egress::{
     LookupRequest, Provenance, RedactionGate, RedactionVerdict, TaintView,
 };
 use crate::grants::ConnectionId;
-use crate::harness::budget::{skill_fit, RouteBudget, SkillCaller, SkillFit, SkillStage};
+use crate::harness::budget::{
+    proposed_window, skill_fit, OverBudgetOffer, PriorWindowRejection, Remedy, RouteBudget,
+    SkillCaller, SkillFit, SkillStage,
+};
 use crate::harness::completion::{context_provenance, RemoteProviderSource};
 use crate::harness::context::{NoopProvenanceHook, PressureReport};
 use crate::harness::permissions::{AddressedPermissionDelivery, SkillConsent};
 use crate::harness::tools::shell;
 use crate::harness::tools::skill::register_skill_tool;
 use crate::harness::tools::web::{register_web_tool, tier_name, SeamError, WebLookupSeam};
-use crate::harness::turn_loop::{pressure_kind, run_session_turn_with_source, HarnessError};
+use crate::harness::turn_loop::{
+    pressure_kind, run_session_turn_with_pressure_policy, HarnessError, PressurePolicy,
+};
 use crate::harness::{
     build_system_prompt, ContextManager, DutyKind, DutyRoute, LocalEngineSource,
     PendingPermissions, PermissionGate, SessionEvents, ToolContext, ToolDuties, ToolRegistry,
@@ -1725,6 +1731,93 @@ struct SkillTurn {
     /// boundary is configured, exactly as `shell` output does, which is stricter
     /// than BR-7's letter and right in the charter's direction (ADR-9).
     unknown: bool,
+}
+
+/// What one of BR-8's two budget stages decided about a **typed** skill turn
+/// (REQ-589 BR-2, BR-3, BR-4).
+///
+/// # Three answers, and only one of them is new
+///
+/// Before REQ-589 a stage answered two things: it fits, or it is refused with
+/// [`skill_fit`]'s sentence. The offer splits the second in two — a human may
+/// now say *send it anyway* — and leaves the refusing half byte-identical
+/// (AC-3).
+///
+/// [`Self::NotSent`] is deliberately **one** variant covering every way a turn
+/// does not run: declined at the prompt, `Unanswerable`, refused by a client
+/// that asked nobody, or never offered because no connection could be asked.
+/// BR-4 gives them all the same sentence — *"a declined or unanswerable offer
+/// is exactly today's refusal"* — so a second variant would exist only to be
+/// collapsed at the one call site that reads it, and would invite a future edit
+/// to give one of them a softer answer. The distinction between them is a fact
+/// about the *record*, which is what `skill_over_budget_offered`'s presence or
+/// absence carries.
+///
+/// There is no model arm. `SkillCaller::Model` is measured by the loop's
+/// `skill_append_fit` and never reaches this type (BR-2).
+#[derive(Debug)]
+enum SkillStageVerdict {
+    /// Both currencies land inside the route's stamped budget. Nobody was
+    /// asked, nothing was published, and the turn proceeds exactly as it did
+    /// before this REQ existed.
+    Fits,
+    /// Over budget, and a human answered *send it whole* (BR-1). The expansion
+    /// goes out unshortened — this variant carries no text precisely because
+    /// there is nothing to say instead of running the turn.
+    ///
+    /// Also the answer Stage B gets for an expansion the dynamic-context fold
+    /// left byte-identical: that is not a second question, so it is not asked a
+    /// second time. See the carry at the top of
+    /// [`Self::offer_or_refuse_over_budget`](DaemonRuntime::offer_or_refuse_over_budget).
+    Accepted,
+    /// Over budget and not sent, carrying BR-4's sentence for
+    /// `SKILL_EXPANSION_TOO_LARGE`.
+    ///
+    /// The `String` is [`OverBudgetOffer::decline_refusal`], which composes
+    /// through the same `skill_refusal` arm [`skill_fit`] does, from the same
+    /// [`Fit`](crate::harness::context::Fit) and the same stamped budget — so
+    /// "byte-identical to today's refusal" is a property of the construction
+    /// rather than of two sentences being kept in step (AC-3).
+    NotSent(String),
+}
+
+/// The daemon's [`SkillStage`] as the **wire's** same-named enum (REQ-589
+/// ADR-13).
+///
+/// Two types, one name, and the collision is deliberate rather than an
+/// oversight to be tidied away. `harness::budget::SkillStage` carries
+/// [`SkillStage::measured_clause`] — the words this daemon composes its
+/// refusal from — so it could not be re-exported into `teton-protocol`, which
+/// holds no sentence and must not start: what crosses the wire is the *fact* of
+/// which stage spoke, and the sentence is composed by the surface that words it
+/// (this crate) rather than re-parsed by the one that renders it (LESSON-529).
+///
+/// So the mapping is written out, once, here — at the surface that publishes —
+/// rather than left to a `From` impl that could not live in either crate
+/// without the other depending on it. The match is exhaustive on the daemon's
+/// enum, which is what makes a third stage a compile error at this line instead
+/// of a silent [`WireSkillStage::Unknown`] on a record someone reads later.
+const fn wire_skill_stage(stage: SkillStage) -> WireSkillStage {
+    match stage {
+        SkillStage::Body => WireSkillStage::Body,
+        SkillStage::WithDynamicContext => WireSkillStage::WithDynamicContext,
+    }
+}
+
+/// A declared window or cap as a **record** spells it (REQ-589 BR-7).
+///
+/// `0` is not the number zero on either field — it is the config's own spelling
+/// of "undeclared" for a window and "no cap" for a ceiling — and a remedy
+/// record that printed a bare `0` would leave a reader unable to tell a fix
+/// from a wipe. [`SkillOverBudgetRemedyApplied`] carries both sides as strings
+/// for exactly this reason: the four remedies do not write one type, and the
+/// only consumer is a line a person reads.
+fn declared_value(tokens: u32, absent: &str) -> String {
+    if tokens == 0 {
+        format!("0 ({absent})")
+    } else {
+        tokens.to_string()
+    }
 }
 
 /// The assembled daemon runtime shared by every client task.
@@ -3471,6 +3564,406 @@ impl DaemonRuntime {
         );
     }
 
+    /// Measure one of BR-8's two budget stages for a **typed** skill turn and,
+    /// where the expansion does not fit, put BR-3's question to the user
+    /// instead of refusing it (REQ-589 BR-2, BR-3, BR-4, BR-11; ADR-1, ADR-13,
+    /// ADR-15, ADR-16).
+    ///
+    /// # BR-2: the offer is the typed caller's alone
+    ///
+    /// Both call sites are in [`Self::run_prompt_turn`], which runs only for a
+    /// user-typed `/name`. A model-issued `skill` call is measured mid-loop by
+    /// `skill_append_fit` and keeps today's refusal verbatim — there is no
+    /// human inside a tool call to answer per-invocation, and a consent nobody
+    /// could give is not one to ask for. The reroute guard below is refusal-only
+    /// for the same reason plus one more: by then the block is already in the
+    /// conversation, and the choice there is between refusing whole and
+    /// middle-eliding, which BR-8 and BR-4 both answer without asking.
+    /// [`OverBudgetOffer`]'s own composer hardcodes `SkillCaller::User`, so the
+    /// Model arm's sentence is not merely unused here — it is unreachable.
+    ///
+    /// # The measurement is the one estimator, called once
+    ///
+    /// [`ContextManager::would_seed_fit`] is what `skill_fit` calls, against the
+    /// budget `Router::budget_for` stamped on this route. Nothing here derives a
+    /// budget and nothing re-counts the text. `skill_fit` itself is not called
+    /// on this path because it consumes the [`Fit`](crate::harness::context::Fit)
+    /// and hands back only a sentence, and the offer needs the pair — ADR-11's
+    /// rule is one *estimator*, not one caller of it. The sentence a decline
+    /// produces is [`OverBudgetOffer::decline_refusal`], which composes through
+    /// the identical `skill_refusal` arm with the identical arguments, so AC-3's
+    /// "byte-identical to today's refusal" holds by construction rather than by
+    /// two sentences being kept in step.
+    ///
+    /// # `.window`, never `.cap`
+    ///
+    /// [`Router::budget_inputs_for`] hands back the provider's **raw declared**
+    /// `capabilities.max_context`, and that is what the verdict is measured
+    /// against (ADR-15): the cap is *this daemon's* policy exactly as the
+    /// generation reservation is, while the window is the provider's own bound.
+    /// Passing `.cap` here would collapse the reachable `UserCap` + `FitsWindow`
+    /// row — a measurement can be over budget, over the cap, and still
+    /// legitimately inside the window — and would tell a user their send will
+    /// blow a window it fits.
+    ///
+    /// # Nothing is remembered, and nothing remembered is read
+    ///
+    /// `PermissionGate::authorize_skill_over_budget` consults no grant and
+    /// records none (BR-10, ADR-14). What *is* read is
+    /// [`ObservedWindowRejections`] — a rejection this daemon watched a provider
+    /// perform — and it reaches the composed sentence and nothing else: it does
+    /// not suppress the question and it does not pre-answer it (BR-14.2, AC-23).
+    ///
+    /// # BR-11 holds on every not-sent path
+    ///
+    /// Every arm that returns [`SkillStageVerdict::NotSent`] returns *from the
+    /// caller* before a dispatch: no provider is reached, no `context_pressure`
+    /// is emitted, no health changes, and — at Stage A — the session-naming duty
+    /// is still below the gate, so a refused turn has not spent it.
+    #[allow(clippy::too_many_arguments)]
+    async fn offer_or_refuse_over_budget(
+        &self,
+        events: &Arc<EventBus>,
+        session_id: &SessionId,
+        config: &Config,
+        router: &Router,
+        route: &crate::router::Route,
+        gate: &PermissionGate,
+        invoker: Option<ConnectionId>,
+        stage: SkillStage,
+        skill: &SkillTurn,
+        system: &str,
+        already_accepted: Option<&str>,
+    ) -> SkillStageVerdict {
+        let budget = &route.harness.budget;
+        let measured = ContextManager::would_seed_fit(
+            system,
+            &skill.text,
+            budget.budget_tokens,
+            budget.budget_bytes,
+        );
+        if measured.fits {
+            return SkillStageVerdict::Fits;
+        }
+
+        // **One question per expansion, not one per stage.** BR-8's two stages
+        // are two questions only when the fold between them changed something:
+        // a skill with no `` !`command` `` slots — or one whose commands all
+        // failed closed — reaches Stage B with byte-identical text, and asking
+        // again there would put the *same* measurement of the *same* bytes in
+        // front of the same person twice in one turn, with the second refusal
+        // able to kill a turn they had just approved.
+        //
+        // Compared as **text**, not as a measured pair: two different
+        // expansions can measure the same figures, and this decides whether a
+        // human is asked about bytes they have not seen. This is not BR-10's
+        // remembering, either — nothing survives the invocation; what is carried
+        // is *this turn's* answer to *this turn's* question, one line up the
+        // same function.
+        if already_accepted == Some(skill.text.as_str()) {
+            return SkillStageVerdict::Accepted;
+        }
+
+        // The route's own inputs, for the two facts the *budget* does not carry:
+        // the declared window the verdict is measured against, and the shape
+        // `proposed_window` substitutes a vendor recipe into. Read, never
+        // re-derived — `budget_for` stays the single `derive` caller.
+        let inputs = router.budget_inputs_for(route.provider_id.as_ref().map(|id| id.0.as_str()));
+        let offer = OverBudgetOffer::new(
+            &skill.name,
+            stage,
+            measured,
+            budget,
+            inputs.window,
+            // BR-7c: the shipped catalog's figure or nothing. Keyed off the
+            // route's **model**, never its provider id — ids are the user's
+            // namespace (ADR-6).
+            proposed_window(route.model.as_deref(), inputs, measured),
+            // ADR-12's payload for the `LocalEngine` row: which tier a
+            // `BindTierRemote` remedy would rebind, read off the resolution the
+            // route was built from rather than re-resolved.
+            route.resolution.as_ref().map(|r| r.tier),
+        );
+
+        // No connection to address the question to — an internal driver, or a
+        // fixture. The question cannot be *put* to anyone, which is not the same
+        // as being declined; what the user gets is BR-4's sentence, which is
+        // today's refusal, and no `skill_over_budget_offered` is published
+        // because no offer was made. `settle_dynamic_context` and
+        // `accept_invocation` fail closed at their own doors the same way.
+        let Some(connection) = invoker else {
+            return SkillStageVerdict::NotSent(offer.decline_refusal());
+        };
+
+        // BR-14.2: a rejection this daemon *observed*, not a consent it
+        // remembered. It leads the sentence and changes nothing else.
+        let prior = if self.window_rejections.was_observed(
+            session_id,
+            &skill.name,
+            &RouteWindow::of(budget),
+        ) {
+            PriorWindowRejection::Observed
+        } else {
+            PriorWindowRejection::None
+        };
+
+        // Published when the offer is **raised**, not when it is answered: that
+        // is what makes "asked and declined" distinguishable from "nobody could
+        // be reached", which is REQ-585 AC-9's distinction and the reason
+        // `OVER_BUDGET_REASON` needs no second refusal token.
+        events.publish(
+            Some(session_id.clone()),
+            Event::SkillOverBudgetOffered(SkillOverBudgetOffered {
+                skill: skill.name.clone(),
+                source: skill.source,
+                stage: wire_skill_stage(stage),
+                measured_tokens: measured.tokens as u64,
+                measured_bytes: measured.bytes as u64,
+                budget_tokens: budget.budget_tokens as u64,
+                budget_bytes: budget.budget_bytes as u64,
+                bound: budget.bound,
+                window_verdict: offer.window_verdict,
+                // The fact a later reader cannot recover: the option list is
+                // gone by then, and "this bound had no remedy" is what explains
+                // an offer that presented the one-time override alone.
+                remedy_kind: offer.remedy.kind(),
+            }),
+        );
+
+        let answer = gate
+            .authorize_skill_over_budget(
+                // The **plain** key `skill:<source>:<name>`, never the digest
+                // spelling `SkillTurn::permission_key` carries: a digest exists
+                // so a remembered grant follows its substituted commands, and
+                // this door remembers nothing for it to follow (ADR-14). The
+                // gate asserts this exact spelling.
+                &crate::skills::permission_key_for(skill.source, &skill.name),
+                PermissionSubject::SkillOverBudget {
+                    skill: skill.name.clone(),
+                    source: skill.source,
+                    stage: wire_skill_stage(stage),
+                    measured_tokens: measured.tokens as u64,
+                    measured_bytes: measured.bytes as u64,
+                    budget_tokens: budget.budget_tokens as u64,
+                    budget_bytes: budget.budget_bytes as u64,
+                    bound: budget.bound,
+                    window_verdict: offer.window_verdict,
+                    // ADR-16: the daemon words it, the client renders it
+                    // verbatim. The structure around it is for presentation and
+                    // for the `Unknown` hedge — not for a second composer.
+                    sentence: offer.question(skill.source, prior),
+                    // The id the **budget** carries, which is the one the remedy
+                    // was addressed to — not a second opinion about who declared
+                    // this window, and already sanitized by `derive`.
+                    provider_id: budget.provider_id.as_deref().map(ProviderId::from),
+                },
+                // The gate words nothing (BR-5): finished text arrives, and what
+                // it decides is which options reach the prompt.
+                offer.option_labels(),
+                connection,
+            )
+            .await;
+
+        // Read **both**, and independently: `remedy_only` is a legitimate answer
+        // — fix the limit, do not send this turn — and `proceed_once` is the
+        // other (AC-7b). Applied before the accept is announced because the
+        // remedy is the going-forward half and holds whichever way the send went.
+        if answer.apply_remedy() {
+            self.apply_over_budget_remedy(events, session_id, config, &offer.remedy);
+        }
+
+        if answer.consent().is_allowed() {
+            events.publish(
+                Some(session_id.clone()),
+                Event::SkillOverBudgetAccepted(SkillOverBudgetAccepted {
+                    skill: skill.name.clone(),
+                    source: skill.source,
+                    stage: wire_skill_stage(stage),
+                    // BR-1's "whole" is these numbers: what goes out is what was
+                    // measured, and nothing on this path shortens it.
+                    measured_tokens: measured.tokens as u64,
+                    measured_bytes: measured.bytes as u64,
+                    budget_tokens: budget.budget_tokens as u64,
+                    budget_bytes: budget.budget_bytes as u64,
+                    // What the user was told before they answered.
+                    window_verdict: offer.window_verdict,
+                }),
+            );
+            // BR-5's third sentence, which the refusal's *"no provider saw this
+            // turn"* clause cannot be borrowed for: it becomes false the moment a
+            // human proceeds, and that clause is what makes `-32023` different
+            // from `-32022`. Written to the daemon's own record channel, as the
+            // taint pin and the degraded-duty lines are, because an accepted turn
+            // has no refusal frame to carry it and the typed
+            // `skill_over_budget_accepted` above deliberately holds no prose.
+            eprintln!("tetond: {}", offer.accepted_record(skill.source));
+            SkillStageVerdict::Accepted
+        } else {
+            SkillStageVerdict::NotSent(offer.decline_refusal())
+        }
+    }
+
+    /// Write the offer's **going-forward** remedy, through the one durable-write
+    /// path this daemon has (REQ-589 BR-7, BR-8; ADR-4).
+    ///
+    /// [`Self::apply_config_update`] is `config/set`'s own body, so this
+    /// inherits that method's posture verbatim — its validation, its atomic
+    /// persist, its refusals — rather than minting a second way to write the
+    /// same class of fact. **No new authority is created here**: a change
+    /// `config/set` would refuse is refused identically, and the event below is
+    /// the announcement rather than the permission.
+    ///
+    /// # What it writes, and what it deliberately does not
+    ///
+    /// The three single-write remedies are applied here, each naming exactly the
+    /// key its own option label promised (ADR-1: a label that promises a write
+    /// must make it — the `enable_permanent` comment records what a silently
+    /// no-op promise cost the last time):
+    ///
+    /// | Remedy | Write |
+    /// |---|---|
+    /// | [`Remedy::RaiseWindow`] | `capabilities.max_context` = the recipe's figure |
+    /// | [`Remedy::DeclareWindow`] | the same field, first declared |
+    /// | [`Remedy::RaiseCap`] | `capabilities.context_budget_cap` = `0` ("no cap") |
+    ///
+    /// Everything else returns without writing and without publishing:
+    ///
+    /// * [`Remedy::BindTierRemote`] is **two ordered writes** plus ADR-12's
+    ///   "which provider?" question, and belongs to the task that owns that
+    ///   ordering — a half-applied version here would leave a newly-bound remote
+    ///   tier with no declared window, which derives the same default pair and
+    ///   sends the user round the exact circle BR-9 exists to close.
+    /// * A window remedy with **no proposal** has no figure to write: BR-7c's
+    ///   catalog matched nothing, and inventing a number that gets persisted to
+    ///   a user's config is worse than the silently defaulted window REQ-586
+    ///   BR-3 exists to name (AC-21).
+    /// * [`Remedy::NotOffered`] is `RedactScan`'s answer (BR-7b) and cannot
+    ///   reach here at all — the gate drops the remedy options on that bound,
+    ///   so `apply_remedy()` is `false` — but it is answered rather than assumed
+    ///   away.
+    ///
+    /// A failure is stated rather than swallowed: the turn's own answer already
+    /// stands, and a user told their limit was raised when the write failed
+    /// would meet the same refusal next turn with no explanation.
+    // TODO(REQ-589 TASK-250): `BindTierRemote`'s ordered pair and ADR-12's
+    // provider choice land here, on this match, beside the three rows above.
+    fn apply_over_budget_remedy(
+        &self,
+        events: &Arc<EventBus>,
+        session_id: &SessionId,
+        config: &Config,
+        remedy: &Remedy,
+    ) {
+        // The rows are keyed on the remedy the classifier chose, and the
+        // provider is looked up in **this turn's** config snapshot — the same
+        // one the route was decided from, so the "previous" value the record
+        // names is the value the refusal was actually measured under.
+        let write = match remedy {
+            Remedy::RaiseWindow {
+                provider_id: Some(id),
+                proposal: Some(proposal),
+            }
+            | Remedy::DeclareWindow {
+                provider_id: Some(id),
+                proposal: Some(proposal),
+            } => config
+                .providers
+                .iter()
+                .find(|p| &p.id == id)
+                .map(|existing| {
+                    (
+                        ProviderConfig {
+                            id: ProviderId::from(existing.id.as_str()),
+                            kind: to_proto_kind(existing.kind),
+                            endpoint: existing.endpoint.clone(),
+                            // Carried, not omitted: `RegisterProvider` replaces
+                            // these three wholesale, and `apply_config_update`
+                            // refuses a remote provider with no model. A field-wise
+                            // window write therefore has to re-state the identity it
+                            // is not changing.
+                            model: existing.model.clone(),
+                            auth_ref: existing.auth_ref.clone(),
+                            max_context: Some(proposal.tokens),
+                            // `None` preserves what is stored (ADR-7's field-wise
+                            // merge). A cap the user set stays set — this remedy is
+                            // about the window.
+                            context_budget_cap: None,
+                            floored_budget: None,
+                        },
+                        declared_value(existing.capabilities.max_context, "undeclared"),
+                        declared_value(proposal.tokens, "undeclared"),
+                    )
+                }),
+            Remedy::RaiseCap {
+                provider_id: Some(id),
+            } => config
+                .providers
+                .iter()
+                .find(|p| &p.id == id)
+                .map(|existing| {
+                    (
+                        ProviderConfig {
+                            id: ProviderId::from(existing.id.as_str()),
+                            kind: to_proto_kind(existing.kind),
+                            endpoint: existing.endpoint.clone(),
+                            model: existing.model.clone(),
+                            auth_ref: existing.auth_ref.clone(),
+                            max_context: None,
+                            // **Cleared, not guessed at.** The label offers to
+                            // "raise or clear" this ceiling and the cap is the
+                            // user's own number — the daemon has no second opinion
+                            // about what it should be, and `0` is the config's own
+                            // spelling of "no cap", which is the one value this
+                            // daemon can write without inventing the user's policy.
+                            // The window underneath still bounds the route.
+                            context_budget_cap: Some(0),
+                            floored_budget: None,
+                        },
+                        declared_value(existing.capabilities.context_budget_cap, "no cap"),
+                        declared_value(0, "no cap"),
+                    )
+                }),
+            _ => None,
+        };
+
+        let Some((update, previous_value, new_value)) = write else {
+            eprintln!(
+                "tetond: an over-budget offer's remedy was accepted but nothing \
+                 was written — this bound's durable fix is not one this build \
+                 applies in-line ({:?}), so the limit still stands and the next \
+                 invocation will meet the same measurement",
+                remedy.kind()
+            );
+            return;
+        };
+
+        let provider_id = update.id.clone();
+        match self.apply_config_update(ConfigUpdate::RegisterProvider(update)) {
+            Ok(()) => events.publish(
+                Some(session_id.clone()),
+                Event::SkillOverBudgetRemedyApplied(SkillOverBudgetRemedyApplied {
+                    // Never `NotOffered` on a published event: that value means
+                    // no fix existed to take, and nothing reaches this line
+                    // without one having been written.
+                    remedy_kind: remedy.kind(),
+                    provider_id: Some(provider_id),
+                    // **Both values, always.** A record naming only the new one
+                    // leaves a reader unable to tell a raise from a first
+                    // declaration — which is the difference between
+                    // `RaiseWindow` and `DeclareWindow`, and between a fix and a
+                    // surprise.
+                    previous_value,
+                    new_value,
+                }),
+            ),
+            Err(err) => eprintln!(
+                "tetond: the over-budget remedy for `{}` could not be written \
+                 ({}); nothing was applied and the limit still stands",
+                provider_id.0, err.message
+            ),
+        }
+    }
+
     /// Run one prompt turn for `session`, streaming events over `events` and
     /// returning the turn result.
     ///
@@ -3900,23 +4393,59 @@ impl DaemonRuntime {
         // A refused turn returns from here: no `context_pressure` of any kind,
         // no health change, no degradation, no retry — none of the machinery
         // below has run.
+        //
+        // ── REQ-589 BR-2/BR-3: and the refusal is now a *question* ───────────
+        //
+        // Over budget no longer ends the turn on its own. On the user-typed path
+        // — this one, and only this one — the measurement is put to the person
+        // who typed the name, who may send it anyway, take a durable fix, or
+        // decline. Declining is byte-for-byte the refusal above it replaced
+        // (AC-3), and every not-sent arm still returns from here with BR-11
+        // intact: the naming duty is below this line, so a refused turn has
+        // spent no model call.
+        //
+        // `SkillCaller::User` is not passed because it cannot be anything else:
+        // `skill_turn` is `Some` only for a typed `/name`, and
+        // `OverBudgetOffer`'s composer hardcodes it (BR-2). The model's own
+        // expansions are measured by the loop's `skill_append_fit` and are never
+        // offered a choice.
+        //
+        // The one place this turn's pressure policy can be decided, because it
+        // is the one place an over-budget send is consented to (BR-12).
+        let mut over_budget_accepted = false;
+        let mut accepted_expansion: Option<String> = None;
         if let Some(skill) = &skill_turn {
-            if let SkillFit::TooLarge { message } = skill_fit(
-                // BR-8's two stages are the typed turn's, and only the typed
-                // turn's: a model-issued call is measured by the loop's
-                // `skill_append_fit`, never here.
-                SkillCaller::User,
-                SkillStage::Body,
-                &skill.name,
-                &system,
-                &skill.text,
-                &route.harness.budget,
-                route.provider_id.as_ref().map(|id| id.0.as_str()),
-            ) {
-                return Err(RpcError::new(
-                    error_code::SKILL_EXPANSION_TOO_LARGE,
-                    message,
-                ));
+            match self
+                .offer_or_refuse_over_budget(
+                    events,
+                    &session_id,
+                    &config,
+                    &router,
+                    &route,
+                    &gate,
+                    invoker,
+                    SkillStage::Body,
+                    skill,
+                    &system,
+                    // Nothing has been accepted yet: this is the turn's first
+                    // question.
+                    None,
+                )
+                .await
+            {
+                SkillStageVerdict::Fits => {}
+                SkillStageVerdict::Accepted => {
+                    over_budget_accepted = true;
+                    // The exact bytes the answer was about, carried to Stage B
+                    // so an unchanged expansion is not put to the user twice.
+                    accepted_expansion = Some(skill.text.clone());
+                }
+                SkillStageVerdict::NotSent(message) => {
+                    return Err(RpcError::new(
+                        error_code::SKILL_EXPANSION_TOO_LARGE,
+                        message,
+                    ));
+                }
             }
         }
 
@@ -3977,23 +4506,54 @@ impl DaemonRuntime {
         // ── REQ-585 BR-8 / ADR-11: Stage B — does it still fit with the
         // dynamic-context output folded in? ──────────────────────────────────
         //
-        // Reached only once Stage A has answered `Fits`, which is what entitles
-        // this stage's sentence to say the body itself fit. Still before
-        // `CarriedTurn::begin`, for Stage A's reason.
+        // Reached only once Stage A has answered `Fits` **or was accepted**,
+        // which is what entitles this stage's sentence to say the body itself
+        // fit. Still before `CarriedTurn::begin`, for Stage A's reason.
+        //
+        // REQ-589: this stage offers too, and the wire carries which stage
+        // spoke precisely so it can. The two are different questions and the
+        // sentence says so — Stage A's is about the body, Stage B's has to say
+        // that the dynamic-context output is what spent the room, which is a
+        // different thing for the user to act on. Leaving this one a hard
+        // refusal would mean a skill with one oversized `` !`command` `` output
+        // could never be sent even by someone who understood exactly what they
+        // were asking for, and would leave `SkillStage::WithDynamicContext`
+        // unreachable on every surface TASK-241 put it on.
+        //
+        // BR-11 reads differently here, and the difference is not new: the
+        // naming duty and the dynamic-context commands are both *above* this
+        // line, so a Stage B refusal has spent them — exactly as it did before
+        // REQ-589. What is unchanged is the invariant that matters for
+        // `-32023`: no provider has seen this turn.
         if let Some(skill) = &skill_turn {
-            if let SkillFit::TooLarge { message } = skill_fit(
-                SkillCaller::User,
-                SkillStage::WithDynamicContext,
-                &skill.name,
-                &system,
-                &skill.text,
-                &route.harness.budget,
-                route.provider_id.as_ref().map(|id| id.0.as_str()),
-            ) {
-                return Err(RpcError::new(
-                    error_code::SKILL_EXPANSION_TOO_LARGE,
-                    message,
-                ));
+            match self
+                .offer_or_refuse_over_budget(
+                    events,
+                    &session_id,
+                    &config,
+                    &router,
+                    &route,
+                    &gate,
+                    invoker,
+                    SkillStage::WithDynamicContext,
+                    skill,
+                    &system,
+                    // What Stage A's answer was about, if there was one. An
+                    // expansion the fold left untouched is the same question,
+                    // already answered a few lines up — asking again would let
+                    // a second refusal kill a turn the user had just approved.
+                    accepted_expansion.as_deref(),
+                )
+                .await
+            {
+                SkillStageVerdict::Fits => {}
+                SkillStageVerdict::Accepted => over_budget_accepted = true,
+                SkillStageVerdict::NotSent(message) => {
+                    return Err(RpcError::new(
+                        error_code::SKILL_EXPANSION_TOO_LARGE,
+                        message,
+                    ));
+                }
             }
         }
 
@@ -4117,6 +4677,19 @@ impl DaemonRuntime {
                     &stream_events,
                     conversation.ctx_mut(),
                     prompt_spend.as_ref(),
+                    // REQ-589 BR-12 / ADR-8: the one turn whose top-of-loop
+                    // pressure gate is suspended is the one whose over-budget
+                    // measurement a human was shown and accepted. Built fresh
+                    // per attempt because `PressurePolicy` is consumed by the
+                    // call — which is the type carrying the "exactly one
+                    // iteration" rule rather than a flag someone has to reset —
+                    // and because a fallback attempt re-assembles the *same*
+                    // consented prompt, so it is owed the same suspension.
+                    if over_budget_accepted {
+                        PressurePolicy::SuspendedForAcceptedTurn
+                    } else {
+                        PressurePolicy::Enforced
+                    },
                 )
                 .await;
 
@@ -5229,6 +5802,7 @@ impl DaemonRuntime {
         stream_events: &SessionEvents,
         ctx: &mut ContextManager,
         prompt_spend: Option<&Arc<teton_core::cost_ceiling::PromptSpend>>,
+        pressure: PressurePolicy,
     ) -> Result<crate::harness::TurnOutcome, HarnessError> {
         let mut hook = NoopProvenanceHook;
 
@@ -5303,7 +5877,7 @@ impl DaemonRuntime {
             AttemptSource::Local(engine, format) => {
                 let mut source = LocalEngineSource::new(engine, format, session_id.clone())
                     .metered(Arc::new(self.ledger.clone()));
-                return run_session_turn_with_source(
+                return run_session_turn_with_pressure_policy(
                     &mut source,
                     tools,
                     tool_ctx,
@@ -5315,6 +5889,7 @@ impl DaemonRuntime {
                     &digest,
                     &compact,
                     &duties,
+                    pressure,
                 )
                 .await;
             }
@@ -5383,7 +5958,7 @@ impl DaemonRuntime {
             source = source.with_category(to_protocol_category(category));
         }
 
-        let outcome = run_session_turn_with_source(
+        let outcome = run_session_turn_with_pressure_policy(
             &mut source,
             tools,
             tool_ctx,
@@ -5395,6 +5970,7 @@ impl DaemonRuntime {
             &digest,
             &compact,
             &duties,
+            pressure,
         )
         .await;
 
@@ -31456,6 +32032,893 @@ provider_id = \"deepseek\"
             );
 
             let _ = std::fs::remove_dir_all(&dir);
+        }
+    }
+    /// **REQ-589 TASK-247 — the offer, wired into Stage A.**
+    ///
+    /// Everything here drives a **real prompt turn**. That is not a style
+    /// preference: REQ-585 and REQ-587 each shipped Critical defects past a
+    /// green ~3,500-test suite because a new wire fact was pinned by a struct
+    /// literal, which leaves the *producer* unguarded (LESSON-544, LESSON-552).
+    /// Each of the three events TASK-241 added is published from exactly one
+    /// line, and deleting or mutating any of those lines reddens a named test
+    /// below:
+    ///
+    /// | Mutation | Test that fails |
+    /// |---|---|
+    /// | the `skill_over_budget_offered` publish | [`a_declined_offer_is_todays_refusal_and_no_provider_sees_the_turn`] |
+    /// | the `skill_over_budget_accepted` publish | [`an_accepted_offer_dispatches_the_expansion_whole`] |
+    /// | the `skill_over_budget_remedy_applied` publish | [`a_capped_route_reads_the_declared_window_and_its_remedy_clears_the_cap`] |
+    /// | `offer.question(..)` dropped from the subject (ADR-16) | [`the_offer_carries_the_daemons_own_words_and_the_figures_it_measured`] |
+    /// | `inputs.window` swapped for `inputs.cap` (ADR-15) | [`a_capped_route_reads_the_declared_window_and_its_remedy_clears_the_cap`] |
+    /// | the `invoker: None` arm mapped to proceed (BR-4) | [`an_offer_with_nobody_to_ask_is_todays_refusal_and_announces_nothing`] |
+    /// | an offer raised on the model's path (BR-2) | [`the_offer_is_reachable_only_from_the_typed_path`] |
+    /// | `PressurePolicy::SuspendedForAcceptedTurn` dropped (BR-12) | [`an_accepted_offer_dispatches_the_expansion_whole`] |
+    ///
+    /// The route the reported failure ran on is the **local engine**, so that is
+    /// what most of these use; the `UserCap` leg exists because it is the one
+    /// bound whose remedy this build applies in-line, and because it is the row
+    /// that discriminates `.window` from `.cap`.
+    mod the_over_budget_offer {
+        use super::*;
+        use crate::grants::GrantRegistry;
+        use crate::harness::budget::LOCAL_BUDGET_TOKENS;
+        use crate::harness::permissions::{AddressedPermissionDelivery, PermissionConfig};
+        use crate::sessions::SessionRegistry;
+        use crate::skills::{discover, RealFs};
+        use teton_protocol::events::{
+            PermissionRequest, RemedyKind, WindowVerdict, OPTION_ID_OVER_BUDGET_DECLINE,
+            OPTION_ID_OVER_BUDGET_PROCEED_ONCE, OPTION_ID_OVER_BUDGET_REMEDY_ONLY,
+        };
+        use teton_protocol::methods::PermissionOutcome;
+
+        /// A body marker no other fixture in this crate uses, so a prompt
+        /// carrying it can only have come from this expansion.
+        const MARKER: &str = "SKILLBODYMARKER-247";
+
+        /// The **last** line of that same body, and the reason it exists: the
+        /// naming duty sends a *bounded prefix* of the expansion, so a prompt
+        /// carrying [`MARKER`] alone might be the title duty rather than the
+        /// turn. Only a prompt carrying this one reached the end of the body.
+        const TAIL_MARKER: &str = "SKILLTAILMARKER-247";
+
+        /// A body comfortably past the local pair in both currencies, and past a
+        /// 6,000-token cap by a wide margin.
+        ///
+        /// Sized off [`LOCAL_BUDGET_TOKENS`] rather than a literal, so the
+        /// fixture cannot quietly stop being over budget if the pair moves.
+        fn oversized_body() -> String {
+            format!(
+                "Handle {MARKER} now.\n\n{}\n\nAnd then {TAIL_MARKER}.",
+                "word ".repeat(LOCAL_BUDGET_TOKENS * 2)
+            )
+        }
+
+        /// A remote provider declaring a large window under a small user cap —
+        /// the `UserCap` row of the reachability table, and the one that
+        /// discriminates the declared window from this daemon's own ceiling.
+        ///
+        /// Only `build` is bound to it, so the freeform classifier and the
+        /// naming duty (both `reflex`) still run on the local engine and no
+        /// transport is needed to reach the refusal.
+        const CAPPED_ROUTE: &str = "[[providers]]\n\
+             id = \"capped\"\n\
+             kind = \"openai-compatible\"\n\
+             endpoint = \"http://127.0.0.1:1/v1\"\n\
+             model = \"capped-model\"\n\
+             [providers.capabilities]\n\
+             max_context = 200000\n\
+             context_budget_cap = 6000\n\
+             \n\
+             [[tiers]]\n\
+             tier = \"build\"\n\
+             provider_id = \"capped\"\n";
+
+        /// An engine that answers `edit` — parseable as a judgment category, as
+        /// a session title, and as a finished turn — and remembers every prompt
+        /// it was handed.
+        ///
+        /// It is the **egress capture** for a local route (AC-18): on this tier
+        /// the engine *is* the provider, so "nothing was sent and no provider
+        /// saw this turn" is the statement that no prompt beyond the
+        /// classifier's ever reached it.
+        #[derive(Clone)]
+        struct RecordingEngine(Arc<Mutex<Vec<String>>>);
+
+        impl RecordingEngine {
+            fn new() -> Self {
+                Self(Arc::new(Mutex::new(Vec::new())))
+            }
+
+            fn prompts(&self) -> Vec<String> {
+                self.0.lock().expect("recorder mutex").clone()
+            }
+
+            /// Every prompt that is **not** the freeform classifier's — which,
+            /// on this tier, is every model call the turn itself spent.
+            ///
+            /// The classifier is excluded rather than counted because it runs
+            /// *above* Stage A by design (REQ-585 ADR-3: the expansion is built
+            /// before both readers of the prompt text), so a refused turn has
+            /// legitimately paid for it and BR-11 does not claim otherwise.
+            fn beyond_the_classifier(&self) -> Vec<String> {
+                self.prompts()
+                    .into_iter()
+                    .filter(|prompt| !prompt.contains("Classify one software-engineering request"))
+                    .collect()
+            }
+        }
+
+        impl Engine for RecordingEngine {
+            fn model_id(&self) -> &str {
+                "recording"
+            }
+
+            fn complete(
+                &self,
+                prompt: &str,
+                _params: &GenParams,
+                _on_token: &mut dyn FnMut(&str) -> bool,
+            ) -> Result<Completion, EngineError> {
+                self.0
+                    .lock()
+                    .expect("recorder mutex")
+                    .push(prompt.to_owned());
+                Ok(Completion::cold("edit".to_owned(), 0, 1))
+            }
+        }
+
+        /// A client that answers the project-skill acknowledgment with "allow
+        /// for this session" and the **over-budget offer** with one named option
+        /// id, recording every request it was shown.
+        ///
+        /// The option is picked by **id**, never by `PermissionOptionKind`: the
+        /// four ids are what ADR-1's single-select actually turns on, and two of
+        /// them necessarily share a kind — a fixture selecting by kind could not
+        /// tell `proceed_once` from `proceed_and_remedy`, which is the whole
+        /// distinction AC-7b is about.
+        struct Client {
+            pending: Arc<PendingPermissions>,
+            answer: &'static str,
+            asked: Mutex<Vec<PermissionRequest>>,
+        }
+
+        impl Client {
+            fn answering(pending: &Arc<PendingPermissions>, answer: &'static str) -> Arc<Self> {
+                Arc::new(Self {
+                    pending: Arc::clone(pending),
+                    answer,
+                    asked: Mutex::new(Vec::new()),
+                })
+            }
+
+            /// Only the offers — the acknowledgment is a different question and
+            /// TASK-248 owns it.
+            fn offers(&self) -> Vec<PermissionRequest> {
+                self.asked
+                    .lock()
+                    .expect("asked mutex poisoned")
+                    .iter()
+                    .filter(|request| {
+                        matches!(
+                            request.subject,
+                            Some(PermissionSubject::SkillOverBudget { .. })
+                        )
+                    })
+                    .cloned()
+                    .collect()
+            }
+        }
+
+        impl AddressedPermissionDelivery for Client {
+            fn deliver(
+                &self,
+                connection: ConnectionId,
+                _session_id: &SessionId,
+                request: PermissionRequest,
+            ) -> bool {
+                self.asked
+                    .lock()
+                    .expect("asked mutex poisoned")
+                    .push(request.clone());
+                let option_id = if matches!(
+                    request.subject,
+                    Some(PermissionSubject::SkillOverBudget { .. })
+                ) {
+                    // Asserted rather than defaulted: an id the prompt did not
+                    // carry would mean the gate narrowed the option list, and
+                    // quietly answering something else would hide that.
+                    assert!(
+                        request
+                            .options
+                            .iter()
+                            .any(|option| option.option_id == self.answer),
+                        "the offer did not carry `{}`: {:?}",
+                        self.answer,
+                        request.options
+                    );
+                    self.answer.to_owned()
+                } else {
+                    "allow_always".to_owned()
+                };
+                self.pending.resolve_from(
+                    &request.request_id,
+                    PermissionOutcome::Selected { option_id },
+                    connection,
+                )
+            }
+        }
+
+        /// One session in a fixture repo whose only skill is the oversized one,
+        /// with `client` wired as the addressed-delivery route.
+        struct Fixture {
+            runtime: Arc<DaemonRuntime>,
+            engine: RecordingEngine,
+            events: Arc<EventBus>,
+            sessions: SessionRegistry,
+            session_id: SessionId,
+            client: Arc<Client>,
+            connection: Option<ConnectionId>,
+            dir: PathBuf,
+            body: String,
+        }
+
+        impl Fixture {
+            /// A **project** skill — the shape the reported failure had, and the
+            /// one ASSUME-018 is about. `config` is `None` for that failure's own
+            /// route, the local engine, and `Some(document)` for a remote one.
+            fn new(tag: &str, answer: &'static str, config: Option<&str>) -> Self {
+                Self::build(tag, answer, config, false)
+            }
+
+            /// A **user** skill, for the one leg that has to reach Stage A with
+            /// no connection at all.
+            ///
+            /// A project skill cannot: REQ-589 ADR-10 puts the repository
+            /// acknowledgment above the expansion, and a turn with nobody to ask
+            /// fails closed there — so it never reaches a budget question. That
+            /// is BR-6 working (AC-9), and it is why this leg installs the skill
+            /// in a fixture home instead.
+            fn user_sourced(tag: &str, answer: &'static str) -> Self {
+                Self::build(tag, answer, None, true)
+            }
+
+            fn build(
+                tag: &str,
+                answer: &'static str,
+                config: Option<&str>,
+                user_sourced: bool,
+            ) -> Self {
+                let dir = scratch_dir(tag);
+                std::fs::write(dir.join("Cargo.toml"), "[package]\n").unwrap();
+                let body = oversized_body();
+                // A fixture home, never the runner's: left at the developer's own
+                // `~/.claude/skills` this session would register whatever that
+                // machine happens to have.
+                let home = dir.join("home");
+                let skill_dir = if user_sourced {
+                    home.join(".claude/skills/heavy")
+                } else {
+                    dir.join(".claude/skills/heavy")
+                };
+                std::fs::create_dir_all(&skill_dir).unwrap();
+                std::fs::write(
+                    skill_dir.join("SKILL.md"),
+                    format!("---\ndescription: heavy\n---\n\n{body}\n"),
+                )
+                .unwrap();
+
+                let engine = RecordingEngine::new();
+                let slot = EngineSlot::empty();
+                slot.install(
+                    "recording".to_owned(),
+                    Arc::new(Mutex::new(engine.clone())) as Arc<Mutex<dyn Engine>>,
+                );
+                let mut runtime = DaemonRuntime {
+                    engine: slot,
+                    local_available: AtomicBool::new(true),
+                    ..DaemonRuntime::minimal()
+                };
+                if let Some(document) = config {
+                    // Memory and disk agreeing, which is what a real start
+                    // produces — and what lets the remedy leg read the write
+                    // back off the file rather than off a return code
+                    // (LESSON-519).
+                    let path = dir.join("config.toml");
+                    std::fs::write(&path, document).expect("seed the config");
+                    runtime.config =
+                        Mutex::new(Config::load(document).expect("the fixture config loads"));
+                    runtime.config_path = Some(path);
+                }
+                let runtime = Arc::new(runtime);
+
+                let events = Arc::new(EventBus::new());
+                let sessions = SessionRegistry::new();
+                let session_id = sessions
+                    .create(SessionMode::Freeform, None, Some(dir.clone()))
+                    .expect("a freeform session")
+                    .session_id;
+                let probed = runtime.session_root_for(Some(&dir));
+                // The home is the **fixture's**, so the four discovery globs
+                // cover this tree only — these assertions are about this file
+                // rather than about whatever `~/.claude/skills` the runner
+                // happens to have.
+                sessions.set_skills(
+                    &session_id,
+                    discover(
+                        user_sourced.then_some(home.as_path()),
+                        &probed.path,
+                        probed.view.kind,
+                        &RealFs,
+                    ),
+                );
+
+                let pending = Arc::clone(runtime.pending());
+                let client = Client::answering(&pending, answer);
+                let delivery: Arc<dyn AddressedPermissionDelivery> = client.clone();
+                runtime
+                    .session_gates
+                    .lock()
+                    .expect("session gate mutex poisoned")
+                    .insert(
+                        session_id.clone(),
+                        Arc::new(
+                            PermissionGate::new(
+                                session_id.clone(),
+                                PermissionConfig::default(),
+                                Arc::clone(&events),
+                                Arc::clone(&pending),
+                            )
+                            .with_addressed_delivery(delivery),
+                        ),
+                    );
+
+                Self {
+                    connection: Some(GrantRegistry::new().next_connection_id()),
+                    runtime,
+                    engine,
+                    events,
+                    sessions,
+                    session_id,
+                    client,
+                    dir,
+                    body,
+                }
+            }
+
+            async fn invoke(&self) -> Result<PromptTurnResult, RpcError> {
+                self.runtime
+                    .run_prompt_turn(
+                        &self.events,
+                        &self.sessions,
+                        self.session_id.clone(),
+                        SessionMode::Freeform,
+                        None,
+                        Some(self.dir.clone()),
+                        String::new(),
+                        Some(SkillInvocation {
+                            name: "heavy".to_owned(),
+                            raw_arguments: String::new(),
+                        }),
+                        self.connection,
+                        ClientPresence::unwatched(),
+                    )
+                    .await
+            }
+        }
+
+        impl Drop for Fixture {
+            fn drop(&mut self) {
+                let _ = std::fs::remove_dir_all(&self.dir);
+            }
+        }
+
+        /// Everything the bus carried, in order. `publish` is synchronous, so a
+        /// drain taken after the turn returns covers everything the turn itself
+        /// published (LESSON-450: no wall-clock polling).
+        fn drain(sub: &mut crate::broadcast::Subscription) -> Vec<Event> {
+            let mut out = Vec::new();
+            while let Some(envelope) = sub.try_recv() {
+                out.push(envelope.event);
+            }
+            out
+        }
+
+        /// **BR-4, BR-11, AC-3, AC-18 — the not-sent path, by egress capture.**
+        ///
+        /// A declined offer is today’s refusal in every byte, and the turn that
+        /// carried it spent nothing: no model call beyond the classifier that
+        /// ran above Stage A, no `context_pressure`, no health change, and — the
+        /// clause that makes this `-32023` rather than `-32022` — the session’s
+        /// one naming attempt is still unspent, because the duty sits below the
+        /// gate.
+        ///
+        /// The naming duty is checked by **claiming** it: `claim_title` is the
+        /// synchronous act of spending it, so a `true` here is proof the turn
+        /// left it alone, with no dependence on whether a detached task had a
+        /// chance to run.
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn a_declined_offer_is_todays_refusal_and_no_provider_sees_the_turn() {
+            let fx = Fixture::new("ob-decline", OPTION_ID_OVER_BUDGET_DECLINE, None);
+            let mut sub = fx.events.subscribe(256);
+
+            let err = fx.invoke().await.expect_err("a declined offer refuses");
+            assert_eq!(err.code, error_code::SKILL_EXPANSION_TOO_LARGE, "{err:?}");
+            assert!(
+                err.message
+                    .contains("the body alone, with the system prompt, comes to"),
+                "Stage A’s own clause: {}",
+                err.message
+            );
+            assert!(
+                err.message
+                    .contains("Nothing was sent and no provider saw this turn"),
+                "a decline is today’s refusal, and that clause is what makes it \
+                 `-32023`: {}",
+                err.message
+            );
+            assert!(
+                !err.message.contains("You chose to send it anyway"),
+                "the accepted record must be unreachable from a refusal (BR-5): {}",
+                err.message
+            );
+
+            // The offer was actually put to a human — without this the refusal
+            // above would also be produced by a daemon that never asked.
+            assert_eq!(
+                fx.client.offers().len(),
+                1,
+                "Stage A asks exactly once: {:?}",
+                fx.client.offers()
+            );
+
+            // BR-11, by capture rather than by inspection: on a local route the
+            // engine is the provider.
+            assert!(
+                fx.engine.beyond_the_classifier().is_empty(),
+                "a refused turn reached a model call: {:?}",
+                fx.engine.beyond_the_classifier()
+            );
+            let published = drain(&mut sub);
+            assert!(
+                !published
+                    .iter()
+                    .any(|event| matches!(event, Event::ContextPressure(_))),
+                "a refused skill turn emits no context pressure of any kind: {published:?}"
+            );
+            assert!(
+                fx.runtime.health_snapshot().is_empty(),
+                "a turn that reached no provider changed a provider’s health"
+            );
+            assert_eq!(
+                fx.sessions
+                    .conversation_snapshot(&fx.session_id)
+                    .blocks()
+                    .len(),
+                0,
+                "a refused turn seeds nothing"
+            );
+            assert!(
+                fx.sessions.claim_title(&fx.session_id),
+                "the session’s one naming attempt is a model call, and a refused turn \
+                 must leave it unspent (BR-11) — the duty stays below the gate"
+            );
+
+            // The record: offered, and nothing more. A turn nobody accepted
+            // publishes no accept, and a turn that wrote nothing publishes no
+            // remedy.
+            let offered: Vec<&Event> = published
+                .iter()
+                .filter(|event| matches!(event, Event::SkillOverBudgetOffered(_)))
+                .collect();
+            assert_eq!(
+                offered.len(),
+                1,
+                "the offer is announced when it is raised: {published:?}"
+            );
+            let Event::SkillOverBudgetOffered(record) = offered[0] else {
+                unreachable!("filtered above")
+            };
+            assert_eq!(record.skill, "heavy");
+            assert_eq!(record.stage, WireSkillStage::Body);
+            assert_eq!(record.bound, BudgetBound::LocalEngine);
+            assert_eq!(record.window_verdict, WindowVerdict::WindowUnknown);
+            assert_eq!(
+                record.remedy_kind,
+                RemedyKind::BindTierRemote,
+                "BR-7’s table for the local engine"
+            );
+            assert_eq!(
+                record.budget_tokens, LOCAL_BUDGET_TOKENS as u64,
+                "the budget the router stamped, verbatim"
+            );
+            assert!(
+                record.measured_tokens > record.budget_tokens,
+                "non-vacuity: this fixture must be the over-budget case ({} vs {})",
+                record.measured_tokens,
+                record.budget_tokens
+            );
+            assert!(
+                !published
+                    .iter()
+                    .any(|event| matches!(event, Event::SkillOverBudgetAccepted(_))),
+                "a declined turn must not record an accept: {published:?}"
+            );
+            assert!(
+                !published
+                    .iter()
+                    .any(|event| matches!(event, Event::SkillOverBudgetRemedyApplied(_))),
+                "a decline writes nothing, so there is no remedy to announce: {published:?}"
+            );
+        }
+
+        /// **AC-1, AC-11, BR-1, BR-12 — accepting sends the expansion whole.**
+        ///
+        /// The reported failure’s own route, answered `over_budget_proceed_once`:
+        /// the turn runs, and what reaches the model carries **every byte** the
+        /// measurement counted. Asserting the whole body rather than a marker is
+        /// the point — a middle-elided expansion still carries its first line.
+        ///
+        /// BR-12 rides the same assertion: the accepted turn’s first iteration
+        /// runs with the pressure gate suspended, so a prompt this far over the
+        /// local pair is assembled intact instead of being truncated to fit.
+        /// Restoring `PressurePolicy::Enforced` at the call site reddens the
+        /// whole-body assertion below, because `truncate_to_budget` would
+        /// middle-elide the one block there is.
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn an_accepted_offer_dispatches_the_expansion_whole() {
+            let fx = Fixture::new("ob-accept", OPTION_ID_OVER_BUDGET_PROCEED_ONCE, None);
+            let mut sub = fx.events.subscribe(256);
+
+            fx.invoke().await.expect("an accepted offer runs the turn");
+
+            let sent = fx.engine.beyond_the_classifier();
+            // **The whole body, in one prompt.** Asserting a marker would not
+            // say this: a middle-elided expansion still carries its first line
+            // *and* its last — which is exactly what the naming duty's own
+            // bounded copy of this text looks like, and why that copy cannot
+            // satisfy this assertion. Only an unshortened send can.
+            assert!(
+                sent.iter().any(|prompt| prompt.contains(fx.body.trim())),
+                "BR-1: the expansion is carried whole — the same bytes that were \
+                 measured, unshortened. The body is {} bytes and the {} prompts the \
+                 model was handed were {:?} bytes",
+                fx.body.len(),
+                sent.len(),
+                sent.iter().map(String::len).collect::<Vec<_>>()
+            );
+            assert!(
+                sent.iter()
+                    .any(|prompt| prompt.contains(TAIL_MARKER) && prompt.contains(MARKER)),
+                "non-vacuity: both ends of this fixture's body reached the model"
+            );
+
+            let published = drain(&mut sub);
+            let accepted: Vec<&Event> = published
+                .iter()
+                .filter(|event| matches!(event, Event::SkillOverBudgetAccepted(_)))
+                .collect();
+            assert_eq!(
+                accepted.len(),
+                1,
+                "an accepted offer records the send: {published:?}"
+            );
+            let Event::SkillOverBudgetAccepted(record) = accepted[0] else {
+                unreachable!("filtered above")
+            };
+            assert_eq!(record.skill, "heavy");
+            assert_eq!(record.stage, WireSkillStage::Body);
+            assert_eq!(record.window_verdict, WindowVerdict::WindowUnknown);
+            assert!(
+                record.measured_tokens > record.budget_tokens,
+                "the record names what was over budget, not a figure that fits"
+            );
+            assert!(
+                published
+                    .iter()
+                    .any(|event| matches!(event, Event::SkillOverBudgetOffered(_))),
+                "an accept is only meaningful beside the offer it answered: {published:?}"
+            );
+            assert!(
+                !published
+                    .iter()
+                    .any(|event| matches!(event, Event::SkillOverBudgetRemedyApplied(_))),
+                "`proceed_once` writes nothing (BR-10): {published:?}"
+            );
+
+            // AC-10 / BR-10: nothing was remembered, so a second identical
+            // invocation asks a second time.
+            fx.invoke().await.expect("the second invocation runs too");
+            assert_eq!(
+                fx.client.offers().len(),
+                2,
+                "accepting twice in one session must prompt twice — there is no \
+                 “don’t ask me again” for the override"
+            );
+        }
+
+        /// **ADR-16 and AC-2 — the daemon words the question, and quotes the
+        /// figures it measured.**
+        ///
+        /// The sentence is on the subject because otherwise it reaches nobody:
+        /// only the four option labels have a surface of their own, so the
+        /// verdict clause would ship dead. This drives a real turn and reads the
+        /// subject the client was actually handed.
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn the_offer_carries_the_daemons_own_words_and_the_figures_it_measured() {
+            let fx = Fixture::new("ob-sentence", OPTION_ID_OVER_BUDGET_DECLINE, None);
+            let _ = fx.invoke().await.expect_err("declined");
+
+            let offers = fx.client.offers();
+            let Some(PermissionSubject::SkillOverBudget {
+                sentence,
+                measured_tokens,
+                budget_tokens,
+                bound,
+                ..
+            }) = offers.first().and_then(|request| request.subject.clone())
+            else {
+                panic!("the offer’s subject never reached the client: {offers:?}");
+            };
+
+            assert!(
+                sentence.starts_with("`/heavy`"),
+                "the question opens with the subject the composer writes: {sentence}"
+            );
+            assert!(
+                sentence.contains("does not fit this route's context budget"),
+                "and it is the head of the refusal it replaced, unchanged — which \
+                 is what stops the offer and its own decline quoting different \
+                 numbers for one measurement: {sentence}"
+            );
+            assert!(
+                sentence.contains("(this repository's skill)"),
+                "ASSUME-018: a project-sourced name is repository-authored text and \
+                 is marked as such rather than borrowing the harness's voice: \
+                 {sentence}"
+            );
+            assert!(
+                sentence.contains("bound: local engine"),
+                "AC-2: the bound is named verbatim, from the stamped budget: {sentence}"
+            );
+            assert!(
+                sentence.contains("cannot promise"),
+                "BR-3’s `WindowUnknown` clause is the one true thing about a route \
+                 with no window fact, and it has no other surface: {sentence}"
+            );
+            assert!(
+                !sentence.contains("Nothing was sent and no provider saw this turn"),
+                "the question is not the refusal — that clause belongs to the \
+                 sentence a decline earns (BR-5): {sentence}"
+            );
+
+            // The subject’s structure and its sentence describe one measurement.
+            assert_eq!(bound, BudgetBound::LocalEngine);
+            assert!(measured_tokens > budget_tokens);
+
+            // The four ids ADR-1 spells the two booleans as, and — on a bound
+            // BR-7 does grant a remedy — all four are present.
+            let ids: Vec<&str> = offers[0]
+                .options
+                .iter()
+                .map(|option| option.option_id.as_str())
+                .collect();
+            assert!(
+                ids.contains(&OPTION_ID_OVER_BUDGET_PROCEED_ONCE)
+                    && ids.contains(&OPTION_ID_OVER_BUDGET_DECLINE),
+                "every offer carries the one-time override and the decline: {ids:?}"
+            );
+        }
+
+        /// **ADR-15 and BR-7 — the verdict reads the declared window, and the
+        /// remedy clears the ceiling that actually bound the route.**
+        ///
+        /// A `UserCap` route is the row where `.window` and `.cap` disagree, and
+        /// the disagreement is not academic: the provider declares 200,000
+        /// tokens while the user’s ceiling is 6,000. The measurement is over
+        /// budget, over the cap, and comfortably **inside the window** — so the
+        /// honest verdict is `FitsWindow`. Passing `.cap` to
+        /// `OverBudgetOffer::new` collapses this row and tells the user their
+        /// send will blow a window it fits.
+        ///
+        /// The answer is `remedy_only`, which is BR-7’s independent half: fix
+        /// the ceiling, do not run this turn. So the turn still refuses with
+        /// `-32023` while the config is written — and the write is checked by
+        /// **reading the file back off disk and re-parsing it**, not by trusting
+        /// a return code (LESSON-519).
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn a_capped_route_reads_the_declared_window_and_its_remedy_clears_the_cap() {
+            let fx = Fixture::new(
+                "ob-usercap",
+                OPTION_ID_OVER_BUDGET_REMEDY_ONLY,
+                Some(CAPPED_ROUTE),
+            );
+            let mut sub = fx.events.subscribe(256);
+
+            let err = fx.invoke().await.expect_err("remedy-only does not send");
+            assert_eq!(err.code, error_code::SKILL_EXPANSION_TOO_LARGE, "{err:?}");
+
+            let published = drain(&mut sub);
+            let Some(Event::SkillOverBudgetOffered(record)) = published
+                .iter()
+                .find(|event| matches!(event, Event::SkillOverBudgetOffered(_)))
+            else {
+                panic!("no offer was raised on the capped route: {published:?}");
+            };
+            assert_eq!(
+                record.bound,
+                BudgetBound::UserCap,
+                "non-vacuity: this fixture must actually be the `UserCap` row, or \
+                 the verdict below proves nothing"
+            );
+            assert_eq!(
+                record.window_verdict,
+                WindowVerdict::FitsWindow,
+                "the verdict is measured against the provider’s **declared window** \
+                 (200,000), not against this daemon’s own cap (6,000) — over budget, \
+                 over the cap, and still inside the window is a reachable state \
+                 and the sentence has to say so"
+            );
+            assert_eq!(record.remedy_kind, RemedyKind::RaiseCap);
+
+            let applied: Vec<&Event> = published
+                .iter()
+                .filter(|event| matches!(event, Event::SkillOverBudgetRemedyApplied(_)))
+                .collect();
+            assert_eq!(
+                applied.len(),
+                1,
+                "a remedy that was written is announced: {published:?}"
+            );
+            let Event::SkillOverBudgetRemedyApplied(remedy) = applied[0] else {
+                unreachable!("filtered above")
+            };
+            assert_eq!(remedy.remedy_kind, RemedyKind::RaiseCap);
+            assert_eq!(
+                remedy.provider_id.as_ref().map(|id| id.0.as_str()),
+                Some("capped")
+            );
+            assert_eq!(
+                (remedy.previous_value.as_str(), remedy.new_value.as_str()),
+                ("6000", "0 (no cap)"),
+                "both values, always: a record naming only the new one cannot tell \
+                 a fix from a wipe"
+            );
+            assert!(
+                !published
+                    .iter()
+                    .any(|event| matches!(event, Event::SkillOverBudgetAccepted(_))),
+                "`remedy_only` is a decline that writes — it never records a send: \
+                 {published:?}"
+            );
+
+            // The write, read back off disk and re-parsed — the double check
+            // `config_preservation.rs` is the exemplar for.
+            let document = std::fs::read_to_string(fx.dir.join("config.toml"))
+                .expect("the config document survives the write");
+            let reloaded = Config::load(&document).expect("and still parses");
+            let provider = reloaded
+                .providers
+                .iter()
+                .find(|p| p.id == "capped")
+                .expect("the provider survives a field-wise write");
+            assert_eq!(
+                provider.capabilities.context_budget_cap, 0,
+                "the ceiling the offer promised to clear is cleared on disk: {document}"
+            );
+            assert_eq!(
+                provider.capabilities.max_context, 200_000,
+                "and the field this remedy does not touch is preserved (ADR-7’s \
+                 field-wise merge): {document}"
+            );
+            assert_eq!(
+                provider.model.as_deref(),
+                Some("capped-model"),
+                "a field-wise window write must re-state the identity it is not \
+                 changing, or `RegisterProvider` drops it: {document}"
+            );
+        }
+
+        /// **BR-4 and AC-4 — silence is never consent.**
+        ///
+        /// A turn with no connection to address the question to cannot put it to
+        /// anyone. What that earns is today’s refusal, and — because no offer
+        /// was raised — no `skill_over_budget_offered`, which is exactly the
+        /// distinction the record exists to carry: "nobody was asked" is not
+        /// "somebody was asked and said no".
+        ///
+        /// Mapping this arm to proceed would send an oversized turn nobody
+        /// approved, and nothing else in the suite would notice.
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn an_offer_with_nobody_to_ask_is_todays_refusal_and_announces_nothing() {
+            let mut fx =
+                Fixture::user_sourced("ob-unanswerable", OPTION_ID_OVER_BUDGET_PROCEED_ONCE);
+            // An internal driver or a fixture: there is no connection, so the
+            // question is unanswerable rather than declined. The client above
+            // would have said *yes* — which is what makes this the fail-closed
+            // direction rather than a fixture that simply says no.
+            fx.connection = None;
+            let mut sub = fx.events.subscribe(256);
+
+            let err = fx
+                .invoke()
+                .await
+                .expect_err("an unanswerable offer must never resolve to proceed");
+            assert_eq!(err.code, error_code::SKILL_EXPANSION_TOO_LARGE, "{err:?}");
+            assert!(
+                err.message
+                    .contains("Nothing was sent and no provider saw this turn"),
+                "{}",
+                err.message
+            );
+            assert!(
+                fx.engine.beyond_the_classifier().is_empty(),
+                "an unanswerable offer reached a model call: {:?}",
+                fx.engine.beyond_the_classifier()
+            );
+
+            let published = drain(&mut sub);
+            assert!(
+                !published
+                    .iter()
+                    .any(|event| matches!(event, Event::SkillOverBudgetOffered(_))),
+                "no offer was raised, so none is announced — that absence is what \
+                 distinguishes it from a decline: {published:?}"
+            );
+            assert!(
+                fx.client.offers().is_empty(),
+                "the question must not have been delivered to anybody"
+            );
+        }
+
+        /// **BR-2 and AC-5 — the offer is the typed caller’s alone, as a fact
+        /// about where the code is.**
+        ///
+        /// The behavioural half lives in the model path’s own suite; what that
+        /// cannot show is an offer being *added* to the loop later. A model
+        /// inside a tool call has no human to answer per-invocation, so an offer
+        /// raised there would park a waiter nobody can resolve — and the failure
+        /// would be a hung turn, not a red test.
+        ///
+        /// The scan reads production source only: every module in this crate
+        /// puts its test items last, so truncating at the first `#[cfg(test)]`
+        /// is exact today and conservative if that changes.
+        #[test]
+        fn the_offer_is_reachable_only_from_the_typed_path() {
+            let production = |relative: &str| -> String {
+                let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                    .join("src")
+                    .join(relative);
+                let text = std::fs::read_to_string(&path)
+                    .unwrap_or_else(|err| panic!("unreadable source {}: {err}", path.display()));
+                match text.find("\n#[cfg(test)]") {
+                    Some(at) => text[..at].to_owned(),
+                    None => text,
+                }
+            };
+
+            for module in ["harness/turn_loop.rs", "harness/tools/skill.rs"] {
+                let source = production(module);
+                for reached in ["OverBudgetOffer", "authorize_skill_over_budget"] {
+                    assert!(
+                        !source.contains(reached),
+                        "`{module}` reached `{reached}`: a model-invoked expansion keeps \
+                         today’s refusal and is never offered a choice (BR-2), because \
+                         there is no human in a mid-loop tool call to answer one"
+                    );
+                }
+            }
+
+            // And the typed path calls it exactly twice — BR-8's two stages —
+            // so a third check is a decision someone has to make here rather
+            // than a call site that quietly appeared.
+            let runtime = production("runtime.rs");
+            assert_eq!(
+                runtime.matches(".offer_or_refuse_over_budget(").count(),
+                2,
+                "the offer has exactly two call sites, and both are `run_prompt_turn`’s \
+                 own budget stages"
+            );
         }
     }
 }

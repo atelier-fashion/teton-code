@@ -1415,6 +1415,57 @@ pub enum PermissionSubject {
         bound: BudgetBound,
         /// What the route's declared window says about this expansion (BR-3).
         window_verdict: WindowVerdict,
+        /// **The question, worded by the daemon** — rendered verbatim, never
+        /// re-composed (REQ-589 ADR-16, BR-5).
+        ///
+        /// # Why a sentence rides a structured subject at all
+        ///
+        /// Everything else on this variant is a *fact*, and this crate's
+        /// standing rule is that the daemon states facts while the client
+        /// writes the line ([`Self::ProjectSkillTrust`]'s entries are the
+        /// exemplar). This field is the deliberate exception, and TASK-243 is
+        /// what forced it: BR-5 requires the offer question, the decline
+        /// refusal and the acceptance record to be **one** composer's three
+        /// arms, because the decline refusal has to be byte-identical to the
+        /// `-32023` sentence this route already produced (AC-3) and the three
+        /// must quote one measurement. That composer is `tetond`'s
+        /// `skill_refusal`. Of the three sentences it writes, only the option
+        /// **labels** had a surface: the four `PermissionOption`s. The verdict
+        /// clause (BR-3), BR-7b's "this bound has no durable fix" and BR-14.2's
+        /// observed-rejection lead reached no reader at all — a producer with
+        /// no consumer, invisible to a green suite (LESSON-544).
+        ///
+        /// A client that re-worded those three from `stage`, `bound` and
+        /// [`Self::window_verdict`] would be the **second composer** BR-5
+        /// forbids, and the two would drift the first time either was edited.
+        /// So the words have one home and travel finished.
+        ///
+        /// # The structure is not redundant beside it
+        ///
+        /// The client still reads every field around this one: for layout and
+        /// emphasis, for deciding which option rows to draw, and for the
+        /// [`WindowVerdict::Unknown`] hedge, which is a statement about *this
+        /// build's* vocabulary rather than about the route and therefore cannot
+        /// come out of a sentence the daemon wrote.
+        ///
+        /// # What can be in it
+        ///
+        /// Exactly what the composer admits: integers this daemon measured, two
+        /// literal config key names, the skill's name, and a sanitized provider
+        /// id. **No provider response body** — none is in scope on this path,
+        /// which is the whole difference between `-32023` and `-32022`, and is
+        /// what `a_skill_refusal_carries_no_provider_response_body` pins on the
+        /// daemon side. A project-sourced skill's name is repository-authored
+        /// text (ASSUME-018); the composer marks it, and a client defuses it at
+        /// render as it does every other file-derived string.
+        ///
+        /// Required rather than `#[serde(default)]`, unlike the tolerant arms on
+        /// [`SkillStage`] and [`WindowVerdict`]: those exist for a *value* a
+        /// later build might mint inside a known kind, whereas no daemon that
+        /// can emit this `kind` at all predates this field — the whole variant
+        /// is REQ-589's. A default would only hide a daemon that stopped
+        /// wording its own question.
+        sentence: String,
         /// The provider whose window or cap is in question, when the route has
         /// one to name.
         ///
@@ -7279,6 +7330,12 @@ mod tests {
             budget_bytes: 131_072,
             bound: BudgetBound::Window,
             window_verdict: WindowVerdict::ExceedsWindow,
+            // ADR-16: the daemon's own words, carried finished. Spelled here as
+            // a stand-in for `skill_refusal`'s output, which lives in `tetond`
+            // and cannot be reached from this crate — the *shape* is what this
+            // crate owns, and `tetond`'s own suite is where the real sentence is
+            // driven from a turn.
+            sentence: "`/analyze` does not fit this route's context budget.".to_owned(),
             provider_id: Some(ProviderId::from("kimi")),
         }
     }
@@ -7318,6 +7375,7 @@ mod tests {
                 "measured_bytes",
                 "measured_tokens",
                 "provider_id",
+                "sentence",
                 "skill",
                 "source",
                 "stage",
@@ -7325,6 +7383,16 @@ mod tests {
             ],
             "a new key on a consent subject is a decision, not a detail — and the one \
              thing it must never be is anything a provider said: {wire}"
+        );
+
+        // ADR-16's one exception to "the daemon states facts, the client writes
+        // the line", and it is in the key set rather than beside it: the words
+        // travel finished so BR-5's single composer stays single. What the key
+        // set still forbids is the *provider's* words arriving under any name.
+        assert!(
+            wire["sentence"].as_str().is_some_and(|s| !s.is_empty()),
+            "the offer's question is worded by the daemon and carried, not \
+             re-composed by whoever renders it: {wire}"
         );
 
         // The figures ride verbatim, under the spellings `route_decided` and
@@ -7354,6 +7422,7 @@ mod tests {
             budget_bytes: 32_768,
             bound: BudgetBound::LocalEngine,
             window_verdict: WindowVerdict::WindowUnknown,
+            sentence: "`/analyze` does not fit this route's context budget.".to_owned(),
             provider_id: None,
         };
         round_trip(&local);
@@ -7472,6 +7541,7 @@ mod tests {
                 "budget_bytes":131072,
                 "bound":"some_future_bound",
                 "window_verdict":"some_future_verdict",
+                "sentence":"`/analyze` does not fit this route's context budget.",
                 "provider_id":"kimi"
             }
         }"#;
