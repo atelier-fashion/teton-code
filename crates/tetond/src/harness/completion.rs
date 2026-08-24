@@ -185,6 +185,69 @@ pub trait CompletionSource: Send {
     }
 }
 
+/// The size of what an attempt actually sent, in the harness's own word
+/// estimator (REQ-586 BR-2).
+///
+/// Measured off the **prepared prompt** rather than off the [`ContextManager`],
+/// for two reasons. It is what a request is built from — system field plus the
+/// role-typed messages, which is exactly the payload the provider counted — and
+/// it is what this frame can reach: `produce_turn` is handed a prompt, never the
+/// manager that assembled it, and threading one in to read a number would hand
+/// every completion source a mutable handle on the conversation to serve an
+/// error path.
+///
+/// The same [`approx_tokens`] the budget gate measures with, so the figure this
+/// reports and the budget it is reported against are in one currency — a report
+/// mixing a word estimate with a BPE count would make every refusal look like a
+/// wildly wrong window.
+///
+/// Free-standing rather than a method on one source (REQ-589 ADR-3): both tiers
+/// now report a window refusal, and two copies of this sum are two figures that
+/// can drift apart while claiming the same currency.
+fn assembled_words(prompt: &PreparedPrompt) -> usize {
+    approx_tokens(&prompt.system)
+        + prompt
+            .messages
+            .iter()
+            .map(|m| approx_tokens(&m.text))
+            .sum::<usize>()
+}
+
+/// The local tier's failure, classified (REQ-589 ADR-3) — **the one home** of
+/// the mapping, the local twin of
+/// [`RemoteProviderSource::context_length_exceeded`].
+///
+/// The engine has two ways to refuse a turn and they want opposite handling: an
+/// inference failure is an internal error the daemon can only report, while a
+/// prompt that does not fit the window is a *context outcome* with remedies —
+/// the backstop BR-3, BR-12 and BR-14.1 all name, on the tier the reported
+/// `/analyze` failure actually ran on.
+///
+/// Told apart by [`EngineError`]'s **variant**, never by its sentence. Matching
+/// the message would be a predicate mirrored away from the precondition that
+/// produced it (LESSON-528): the wording lives in `teton_inference::over_window`,
+/// a reword there would silently reclassify every local window refusal back to
+/// an internal error, and nothing in this crate would redden.
+///
+/// The engine's own token counts are deliberately dropped. They are measured in
+/// a different currency (real BPE tokens against the engine's `n_ctx`) than the
+/// route's word budget, and a sentence pairing the two would make every refusal
+/// look like a wildly wrong window. What the report needs — the harness's
+/// estimate and the harness's budget — is in scope right here.
+fn classify_engine_failure(
+    err: EngineError,
+    prompt: &PreparedPrompt,
+    config: &HarnessConfig,
+) -> HarnessError {
+    match err {
+        EngineError::ContextWindowExceeded { .. } => HarnessError::LocalContextLengthExceeded {
+            assembled_tokens: assembled_words(prompt),
+            budget_tokens: config.context_budget_tokens,
+        },
+        other => HarnessError::Engine(other),
+    }
+}
+
 /// The local-tier source: drives the [`Engine`] behind a shared `Arc<Mutex<_>>`
 /// and parses its text reply. Transport-free — egress is impossible on this path.
 ///
@@ -342,9 +405,20 @@ impl CompletionSource for LocalEngineSource {
         // The sender is dropped when the closure returns, ending the loop above,
         // so this join is immediate. A panicked/aborted task is a backend
         // failure, not a daemon crash.
-        let (model, completion) = task.await.map_err(|_| {
-            EngineError::Backend("the local inference task did not complete".to_owned())
-        })??;
+        //
+        // REQ-589 ADR-3: the engine's own failure is classified rather than
+        // blanket-wrapped in `HarnessError::Engine` — a window refusal leaves
+        // here as the typed context outcome so the daemon can name a remedy
+        // instead of reporting an internal error. A join failure is not the
+        // engine answering about its window, so it keeps the backend shape it
+        // has always had and takes the `other` arm.
+        let completed = task.await.unwrap_or_else(|_| {
+            Err(EngineError::Backend(
+                "the local inference task did not complete".to_owned(),
+            ))
+        });
+        let (model, completion) =
+            completed.map_err(|err| classify_engine_failure(err, prompt, config))?;
         // Projected before `completion.text` is moved out, so the event
         // describes the completion the engine actually returned.
         let cache = PrefixCache {
@@ -490,30 +564,6 @@ impl<'a, T: Transport> RemoteProviderSource<'a, T> {
         self
     }
 
-    /// The size of what this attempt actually sent, in the harness's own word
-    /// estimator (REQ-586 BR-2).
-    ///
-    /// Measured off the **prepared prompt** rather than off the
-    /// [`ContextManager`], for two reasons. It is what a remote request is
-    /// built from — system field plus the role-typed messages, which is exactly
-    /// the payload the provider counted — and it is what this frame can reach:
-    /// `produce_turn` is handed a prompt, never the manager that assembled it,
-    /// and threading one in to read a number would hand every completion source
-    /// a mutable handle on the conversation to serve an error path.
-    ///
-    /// The same [`approx_tokens`] the budget gate measures with, so the figure
-    /// this reports and the budget it is reported against are in one currency —
-    /// a report mixing a word estimate with a BPE count would make every
-    /// refusal look like a wildly wrong window.
-    fn assembled_words(prompt: &PreparedPrompt) -> usize {
-        approx_tokens(&prompt.system)
-            + prompt
-                .messages
-                .iter()
-                .map(|m| approx_tokens(&m.text))
-                .sum::<usize>()
-    }
-
     /// The typed report for a provider that refused the request as too big for
     /// its window (REQ-586 BR-2, ADR-8) — **the one home** of the mapping.
     ///
@@ -534,7 +584,7 @@ impl<'a, T: Transport> RemoteProviderSource<'a, T> {
     ) -> HarnessError {
         HarnessError::ContextLengthExceeded {
             provider_id: self.provider_id.to_string(),
-            assembled_tokens: Self::assembled_words(prompt),
+            assembled_tokens: assembled_words(prompt),
             budget_tokens: config.context_budget_tokens,
         }
     }
@@ -899,6 +949,7 @@ mod tests {
     use std::sync::Arc;
 
     use crate::harness::context::{StructuredMessage, ToolProvenance};
+    use crate::harness::turn_loop::ContextRefusalOrigin;
     use async_trait::async_trait;
     use serde_json::json;
     use std::collections::BTreeSet;
@@ -1860,8 +1911,17 @@ mod tests {
     }
 
     /// An engine that mirrors `LlamaEngine`'s over-window refusal in byte
-    /// currency: `complete` returns the typed backend error when the prompt it
-    /// is handed exceeds `window_bytes`. Reports ChatML so the source renders.
+    /// currency: `complete` returns [`EngineError::ContextWindowExceeded`] —
+    /// the same variant `teton_inference::over_window` produces in production —
+    /// when the prompt it is handed exceeds `window_bytes`. Reports ChatML so
+    /// the source renders.
+    ///
+    /// The **variant** is what production shares; the currency is not. A real
+    /// engine measures tokenized prompts, and this double has no tokenizer, so
+    /// it fills the token-named fields with byte counts. That is honest here
+    /// because the harness discards those numbers (REQ-589 ADR-3) — what it
+    /// reports is its own word estimate against its own budget — so nothing
+    /// downstream can be misled by the substitution.
     struct WindowedEngine {
         window_bytes: usize,
         format: ChatFormat,
@@ -1881,14 +1941,35 @@ mod tests {
             on_token: &mut dyn FnMut(&str) -> bool,
         ) -> Result<teton_inference::Completion, EngineError> {
             if prompt.len() > self.window_bytes {
-                return Err(EngineError::Backend(format!(
-                    "prompt of {} bytes exceeds this engine's window ({})",
-                    prompt.len(),
-                    self.window_bytes
-                )));
+                let measured = u32::try_from(prompt.len()).unwrap_or(u32::MAX);
+                let window = u32::try_from(self.window_bytes).unwrap_or(u32::MAX);
+                return Err(EngineError::ContextWindowExceeded {
+                    prompt_tokens: measured,
+                    budget_tokens: window,
+                    n_ctx: window,
+                    max_tokens: 0,
+                });
             }
             on_token("ok");
             Ok(teton_inference::Completion::cold("ok".to_owned(), 1, 1))
+        }
+    }
+
+    /// An engine whose inference simply falls over — the *other* way a local
+    /// turn fails, and the non-vacuity partner of the window-refusal double.
+    struct FailingEngine;
+
+    impl Engine for FailingEngine {
+        fn model_id(&self) -> &str {
+            "failing"
+        }
+        fn complete(
+            &self,
+            _prompt: &str,
+            _params: &GenParams,
+            _on_token: &mut dyn FnMut(&str) -> bool,
+        ) -> Result<teton_inference::Completion, EngineError> {
+            Err(EngineError::Backend("the tier fell over".to_owned()))
         }
     }
 
@@ -1899,6 +1980,12 @@ mod tests {
         // is added must be refused with the typed error — proving the
         // window-checked string is the RENDERED one, template overhead
         // included, and that the refusal is an error, never a crash.
+        //
+        // REQ-589 ADR-3 / AC-1: and that typed error is now the **context
+        // outcome**, not a generic engine failure. Until this REQ the local
+        // tier's window refusal left here as `Engine(Backend(..))`, which the
+        // daemon reports as `INTERNAL_ERROR` — so BR-3, BR-12 and BR-14.1 had
+        // no backstop on the one tier the reported failure ran on.
         let content = "a".repeat(100);
         let prompt = PreparedPrompt {
             flat: content.clone(),
@@ -1920,20 +2007,42 @@ mod tests {
             LocalEngineSource::new(chatml, ChatFormat::ChatMl, SessionId::from("test-session"));
         let tools = ToolRegistry::with_builtins();
         let exposed = tools.exposed_names(None);
+        let config = HarnessConfig::default();
         let err = source
             .produce_turn(
                 &prompt,
                 &Provenance::empty(),
-                &HarnessConfig::default(),
+                &config,
                 &tools,
                 &exposed,
                 &mut |_| {},
             )
             .await
             .expect_err("the rendered prompt crosses the window");
-        assert!(
-            matches!(&err, HarnessError::Engine(EngineError::Backend(m)) if m.contains("exceeds")),
-            "expected the typed over-window refusal, got {err:?}"
+        match &err {
+            HarnessError::LocalContextLengthExceeded {
+                assembled_tokens,
+                budget_tokens,
+            } => {
+                // The harness's own currency on both sides of the gap: one
+                // whitespace word of content, against the budget this attempt
+                // actually ran under. The engine's byte figures are not here,
+                // and must not be — see `classify_engine_failure`.
+                assert_eq!(*assembled_tokens, 1, "{err:?}");
+                assert_eq!(*budget_tokens, config.context_budget_tokens, "{err:?}");
+            }
+            other => panic!(
+                "a local window refusal must be the typed context outcome; as \
+                 `Engine` the daemon reports it as an opaque internal error and \
+                 names no remedy: {other:?}"
+            ),
+        }
+        // And it reaches a consumer through the one tier-agnostic projection,
+        // naming the local origin rather than a provider it does not have.
+        assert_eq!(
+            err.context_refusal().map(|refusal| refusal.origin),
+            Some(ContextRefusalOrigin::LocalEngine),
+            "{err:?}"
         );
 
         // The SAME prompt under flat rendering fits — the overhead is what
@@ -1948,13 +2057,48 @@ mod tests {
             .produce_turn(
                 &prompt,
                 &Provenance::empty(),
-                &HarnessConfig::default(),
+                &config,
                 &tools,
                 &exposed,
                 &mut |_| {},
             )
             .await
             .expect("the flat rendering fits the same window");
+    }
+
+    /// **REQ-589 AC-4's non-vacuity.** The classification is by variant, so the
+    /// *other* way a local turn fails is untouched: an inference failure is
+    /// still [`HarnessError::Engine`], and is still not a window refusal.
+    ///
+    /// The pair matters more than either half. A blanket conversion — every
+    /// engine error becoming the context outcome — would pass the test above
+    /// and would tell a user whose backend died to go and raise a window.
+    #[tokio::test]
+    async fn a_local_inference_failure_is_not_a_window_refusal() {
+        let engine: Arc<Mutex<dyn Engine>> = Arc::new(Mutex::new(FailingEngine));
+        let mut source =
+            LocalEngineSource::new(engine, ChatFormat::Flat, SessionId::from("test-session"));
+        let tools = ToolRegistry::with_builtins();
+        let exposed = tools.exposed_names(None);
+        let err = source
+            .produce_turn(
+                &tool_using_prompt(),
+                &Provenance::empty(),
+                &HarnessConfig::default(),
+                &tools,
+                &exposed,
+                &mut |_| {},
+            )
+            .await
+            .expect_err("the engine fell over");
+        assert!(
+            matches!(&err, HarnessError::Engine(EngineError::Backend(m)) if m == "the tier fell over"),
+            "an inference failure must keep the shape it has always had, got {err:?}"
+        );
+        assert!(
+            err.context_refusal().is_none(),
+            "an inference failure is not a window refusal: {err:?}"
+        );
     }
 
     #[tokio::test]
