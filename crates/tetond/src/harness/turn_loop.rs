@@ -3499,6 +3499,178 @@ mod tests {
         );
     }
 
+    /// **ADR-8's two named edges: the exits below the gate stay enforcing
+    /// (D-7).**
+    ///
+    /// # Why this test exists
+    ///
+    /// The suspension's *edge* is as silent as the suspension itself, and the
+    /// tests above cannot see it. ADR-8 records that the `max_turns` and
+    /// `EndTurn` exits are deliberately **not** suspended, because they bound
+    /// what the *next* turn carries — after this turn's prompt was already
+    /// assembled and sent — and that record was prose. Widening the exception
+    /// to cover either of them (capturing the policy in an
+    /// `let accepted = matches!(pressure, …)` at the top of the turn and gating
+    /// an exit on it) costs nothing visible: the accepted turn still goes out
+    /// whole, still answers, still raises no error and still drops no block,
+    /// and the next turn silently inherits a conversation nothing bounded. Both
+    /// mutations were run against this crate before this test was written and
+    /// **both passed all 2,343 tests**. That is LESSON-508 exactly — a guard
+    /// that is real, correct and completely untested — so the signal is written
+    /// down here.
+    ///
+    /// # What it asserts, and what it deliberately does not
+    ///
+    /// TASK-245's warning applies in full: "no history block is dropped" is
+    /// exact only for the **prompt** and the **refusal** path. Both turns below
+    /// *succeed*, so each reaches an un-suspended exit and the context is
+    /// trimmed on the way out — that is D-7 working, not a BR-12 breach. So the
+    /// BR-12 half is asserted against the **assembled prompt** (the model was
+    /// asked with the whole conversation) and the D-7 half against what the
+    /// turn leaves behind (bounded). Asserting the post-turn block list here
+    /// would read as a violation when nothing is wrong.
+    #[tokio::test]
+    async fn the_accepted_turns_exit_gates_still_bound_what_the_next_turn_carries() {
+        // ---- the `EndTurn` exit, below the model's answer ----
+        let fx = LoopFixture::new("br12-endturn-exit");
+        let config = HarnessConfig::default();
+        let mut hook = NoopProvenanceHook;
+        let mut ctx = over_budget_context();
+
+        let mut source = RecordingSource::new(vec![ScriptedTurn::End]);
+        let outcome = run_session_turn_with_pressure_policy(
+            &mut source,
+            &fx.tools,
+            &fx.tool_ctx,
+            &fx.gate,
+            &fx.events,
+            &mut ctx,
+            &config,
+            &mut hook,
+            &DutyRoute::unresolved("no digest route in this test"),
+            &DutyRoute::unresolved("no compact route in this test"),
+            &ToolDuties {
+                triage: &DutyRoute::unresolved("no triage route in this test"),
+                shell: &DutyRoute::unresolved("no shell route in this test"),
+            },
+            PressurePolicy::SuspendedForAcceptedTurn,
+        )
+        .await
+        .expect("the accepted turn answers");
+
+        assert_eq!(
+            outcome.stop_reason,
+            StopReason::EndTurn,
+            "non-vacuity: this leg must leave by the `EndTurn` door"
+        );
+        assert!(
+            source.prompts[0].contains(OLDEST_BLOCK_MARKER),
+            "BR-12: the accepted turn was still asked with the whole conversation"
+        );
+        assert!(
+            ctx.estimated_bytes() <= SUSPENSION_BUDGET_BYTES,
+            "D-7: the `EndTurn` exit is not suspended — it bounds what the next turn \
+             carries, and this turn left {} bytes against a {SUSPENSION_BUDGET_BYTES}-byte \
+             budget",
+            ctx.estimated_bytes()
+        );
+
+        // ---- the `max_turns` exit, above the gate ----
+        //
+        // `max_turns: 1` with a single tool call is the shortest way to leave by
+        // this door *after* a model call: the first iteration is the suspended
+        // one, the tool result is folded, and the loop top then finds the
+        // ceiling reached.
+        let fx = LoopFixture::new("br12-max-turns-exit");
+        let config = HarnessConfig {
+            max_turns: 1,
+            ..HarnessConfig::default()
+        };
+        let mut ctx = over_budget_context();
+
+        let mut source = RecordingSource::new(vec![ScriptedTurn::ToolCall]);
+        let outcome = run_session_turn_with_pressure_policy(
+            &mut source,
+            &fx.tools,
+            &fx.tool_ctx,
+            &fx.gate,
+            &fx.events,
+            &mut ctx,
+            &config,
+            &mut hook,
+            &DutyRoute::unresolved("no digest route in this test"),
+            &DutyRoute::unresolved("no compact route in this test"),
+            &ToolDuties {
+                triage: &DutyRoute::unresolved("no triage route in this test"),
+                shell: &DutyRoute::unresolved("no shell route in this test"),
+            },
+            PressurePolicy::SuspendedForAcceptedTurn,
+        )
+        .await
+        .expect("the accepted turn reaches its ceiling");
+
+        assert_eq!(
+            outcome.stop_reason,
+            StopReason::MaxTurnRequests,
+            "non-vacuity: this leg must leave by the `max_turns` door"
+        );
+        assert!(
+            source.prompts[0].contains(OLDEST_BLOCK_MARKER),
+            "BR-12: the accepted turn was still asked with the whole conversation"
+        );
+        assert!(
+            ctx.estimated_bytes() <= SUSPENSION_BUDGET_BYTES,
+            "D-7: the `max_turns` exit is not suspended either — a turn that hit its \
+             ceiling left {} bytes against a {SUSPENSION_BUDGET_BYTES}-byte budget",
+            ctx.estimated_bytes()
+        );
+    }
+
+    /// **ADR-8's unreachability claim, made resident rather than left as prose.**
+    ///
+    /// The BR-12 exception is sound only because an accepted turn always
+    /// reaches the model before any exit gate can trim. A `max_turns` of `0`
+    /// breaks that: the loop would return through the truncating `max_turns`
+    /// exit *above* the model call, so an accepted turn could shed history
+    /// without ever sending anything — the one loss BR-12 exists to prevent,
+    /// arriving through the door the exception deliberately left enforcing.
+    ///
+    /// ADR-8 chose to record that as unreachable from this module's
+    /// constructors rather than widen the exception to cover it. That makes the
+    /// unreachability **load-bearing**, and load-bearing prose is the shape
+    /// LESSON-508 warns about: a constructor that grew a zero — or a
+    /// `.max(1)` dropped as redundant in a refactor — would quietly make the
+    /// exception unsound with nothing going red. So the claim is pinned here.
+    #[test]
+    fn no_harness_config_this_module_builds_admits_a_zero_turn_ceiling() {
+        let profile = HarnessProfile {
+            max_tools: None,
+            // The value `from_harness_profile`'s `.max(1)` exists for: a
+            // degraded provider that declares no tool iterations at all.
+            max_tool_iterations: 0,
+            require_verification: false,
+            allow_parallel_tool_calls: false,
+        };
+        for (name, config) in [
+            ("HarnessConfig::default", HarnessConfig::default()),
+            (
+                "HarnessConfig::for_strong_model",
+                HarnessConfig::for_strong_model(),
+            ),
+            (
+                "HarnessConfig::from_harness_profile",
+                HarnessConfig::from_harness_profile(profile),
+            ),
+        ] {
+            assert!(
+                config.max_turns >= 1,
+                "`{name}` builds a turn whose first exit is the truncating `max_turns` door, \
+                 above the model call — which would let an accepted over-budget turn shed \
+                 history without sending anything (REQ-589 ADR-8)"
+            );
+        }
+    }
+
     /// The suspension is spendable **once**, as a property of the value rather
     /// than of a reset statement (ADR-8, D-7).
     ///
