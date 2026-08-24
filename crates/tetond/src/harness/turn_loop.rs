@@ -879,6 +879,71 @@ fn announce_pressure(
     }
 }
 
+/// Whether this turn's **first** iteration runs the top-of-loop pressure gate
+/// (REQ-589 BR-12 / D-3, ADR-8).
+///
+/// The gate's ordinary answer to a conversation that does not fit is to shed
+/// older turns — compact what it can, then truncate oldest-first (REQ-561
+/// ADR-4, REQ-567 BR-4). On the one turn a user was shown an over-budget
+/// measurement for and knowingly accepted, that answer is wrong: they consented
+/// to *sending* an oversized expansion, not to *losing* their conversation, and
+/// silently deleting history to accommodate the first consent would be a second
+/// loss they were never asked about. So this turn is assembled whole, and if it
+/// then does not fit at the engine or the provider it fails with the typed
+/// [`ContextRefusal`] — a visible, recoverable error, which BR-12 holds is
+/// strictly preferable to a turn that succeeds by discarding the conversation
+/// that gave it meaning.
+///
+/// # Why this shape
+///
+/// It is a **by-value parameter of the one-turn function**, and deliberately
+/// neither `Copy` nor `Clone`. D-7 scopes the suspension to the turn that was
+/// consented to and says ordinary pressure resumes afterwards; here that is not
+/// a rule anyone has to remember but a property of the type. The value is moved
+/// into the call, spent by the first iteration
+/// ([`Self::enforces_this_iteration`] replaces it with [`Self::Enforced`]) and
+/// dropped when the turn returns. A caller cannot hold one across two turns,
+/// because passing it once consumes it; a second turn needs a second value,
+/// constructed where a second accept answer is known. Leaking it is not
+/// *avoided* here — it does not compile.
+///
+/// This is also why it is not a [`HarnessConfig`] field: that struct is a
+/// route's long-lived settings, borrowed by every turn on that route, so a flag
+/// living there would have to be set and unset, which is exactly the shape D-7
+/// asks not to depend on.
+#[derive(Debug, PartialEq, Eq)]
+pub enum PressurePolicy {
+    /// The ordinary rule: the gate runs at the top of every iteration, and a
+    /// pressured conversation is compacted and truncated to fit (REQ-561 ADR-4,
+    /// REQ-567 BR-4). Every turn that was not accepted over budget — which is
+    /// nearly all of them — runs under this.
+    Enforced,
+    /// This turn's over-budget measurement was shown to the user and accepted
+    /// (REQ-589 BR-12). The first iteration's gate is skipped so the turn is
+    /// assembled with its history intact; every later iteration of the same turn
+    /// is [`Enforced`](Self::Enforced) again, because the consent was to send
+    /// *this* prompt, not to run the rest of the turn unbounded.
+    SuspendedForAcceptedTurn,
+}
+
+impl PressurePolicy {
+    /// Whether the top-of-loop gate runs on this iteration — and, in the same
+    /// call, the one place the suspension is spent.
+    ///
+    /// Answers `false` **at most once**, on the first iteration of a turn that
+    /// was accepted over budget, and `true` on every iteration after it. The
+    /// clearing is `mem::replace`'s doing rather than a separate reset
+    /// statement, so "exactly one iteration" cannot be broken by a later edit
+    /// that moves, duplicates, or forgets the reset: there is no reset to
+    /// forget, and calling this twice cannot yield `false` twice.
+    fn enforces_this_iteration(&mut self) -> bool {
+        matches!(
+            std::mem::replace(self, PressurePolicy::Enforced),
+            PressurePolicy::Enforced
+        )
+    }
+}
+
 /// Drive one prompt turn to completion against the local engine.
 ///
 /// `ctx` must already hold the system prompt and the user's prompt (see
@@ -994,6 +1059,12 @@ pub async fn run_session_turn(
 /// handed to every tool result rather than switched on a tool name, because a
 /// category selected by a string comparison is exactly what BR-1 forbids.
 ///
+/// The turn runs under [`PressurePolicy::Enforced`] — the ordinary budget rule.
+/// A turn the user was shown an over-budget measurement for and *accepted* goes
+/// through [`run_session_turn_with_pressure_policy`] instead (REQ-589 BR-12);
+/// this entry point exists so every other caller keeps saying nothing about
+/// pressure and gets the enforcing answer.
+///
 /// # Errors
 /// [`HarnessError::Engine`] on a local backend failure, or
 /// [`HarnessError::Remote`] on a provider/transport failure (including a privacy
@@ -1011,6 +1082,57 @@ pub async fn run_session_turn_with_source(
     digest: &DutyRoute,
     compact: &DutyRoute,
     duties: &ToolDuties<'_>,
+) -> Result<TurnOutcome, HarnessError> {
+    run_session_turn_with_pressure_policy(
+        source,
+        tools,
+        tool_ctx,
+        gate,
+        events,
+        ctx,
+        config,
+        hook,
+        digest,
+        compact,
+        duties,
+        PressurePolicy::Enforced,
+    )
+    .await
+}
+
+/// [`run_session_turn_with_source`], with the turn's [`PressurePolicy`] named.
+///
+/// The same loop and the same guarantees; the only difference is that the
+/// caller states whether this turn's first iteration may shed history to fit
+/// (REQ-589 BR-12 / D-3, ADR-8). The daemon's routed path calls this with
+/// [`PressurePolicy::SuspendedForAcceptedTurn`] on the turn whose over-budget
+/// expansion the user accepted, and with [`PressurePolicy::Enforced`] — which is
+/// what [`run_session_turn_with_source`] passes — on every other turn.
+///
+/// `pressure` is taken **by value**: it is this turn's answer, spent by this
+/// turn's first iteration, and cannot be carried into the next one. See
+/// [`PressurePolicy`] for why that is a property of the type rather than a rule.
+///
+/// # Errors
+/// As [`run_session_turn_with_source`]. A suspended turn additionally reaches
+/// [`HarnessError::LocalContextLengthExceeded`] /
+/// [`HarnessError::ContextLengthExceeded`] where an enforced one would have
+/// dropped blocks to fit — that visible refusal is BR-12's intended outcome, not
+/// a regression.
+#[allow(clippy::too_many_arguments)]
+pub async fn run_session_turn_with_pressure_policy(
+    source: &mut dyn CompletionSource,
+    tools: &ToolRegistry,
+    tool_ctx: &ToolContext,
+    gate: &PermissionGate,
+    events: &SessionEvents,
+    ctx: &mut ContextManager,
+    config: &HarnessConfig,
+    hook: &mut dyn ProvenanceHook,
+    digest: &DutyRoute,
+    compact: &DutyRoute,
+    duties: &ToolDuties<'_>,
+    mut pressure: PressurePolicy,
 ) -> Result<TurnOutcome, HarnessError> {
     let exposed = tools.exposed_names(config.max_tools);
     // What "relevant" is measured against, read once: the loop appends model
@@ -1080,23 +1202,46 @@ pub async fn run_session_turn_with_source(
         //
         // A failure is never silent: this duty guards the context window, so the
         // deterministic drop standing in for it is logged with the reason.
-        let compaction = ctx.compact_if_pressured(compact).await;
-        if let Some(error) = &compaction.reason {
-            eprintln!(
-                "tetond: the `compact` duty could not be served ({error}); the \
-                 context was truncated deterministically instead"
+        //
+        // ---- REQ-589 BR-12 / D-3: the one exception to all of the above ----
+        //
+        // Both calls are skipped on the **first** iteration of a turn the user
+        // was shown an over-budget measurement for and accepted. That consent
+        // was to send an oversized expansion, not to lose the conversation, and
+        // the rule this exception is carved into — compact, then truncate,
+        // unconditionally (REQ-561 ADR-4, REQ-567 BR-4, the comment above) —
+        // would answer the first consent by silently spending something the
+        // user was never asked about. A turn that then does not fit leaves as
+        // `ContextLengthExceeded` / `LocalContextLengthExceeded`, which is a
+        // visible and recoverable outcome; a shortened conversation is neither.
+        //
+        // The exception is one iteration wide, not one turn: `pressure` is spent
+        // by this call, so a fold, a denied tool, a malformed call and the
+        // verification nudge all pass through the enforcing gate again on the way
+        // round (D-7). The two exits below — the `max_turns` gate above and the
+        // `EndTurn` gate after the model's answer — are deliberately *not*
+        // suspended: they bound what the **next** turn carries, after this one's
+        // prompt has already been assembled and sent, which is the ordinary
+        // pressure handling D-7 says resumes.
+        if pressure.enforces_this_iteration() {
+            let compaction = ctx.compact_if_pressured(compact).await;
+            if let Some(error) = &compaction.reason {
+                eprintln!(
+                    "tetond: the `compact` duty could not be served ({error}); the \
+                     context was truncated deterministically instead"
+                );
+            }
+            // BR-7: never silent. This is the gate that fires on a carried
+            // conversation meeting a smaller route (BR-10) and on a tool result
+            // that outgrew the budget, so it is where most of this event comes
+            // from.
+            announce_pressure(
+                events,
+                &ctx.truncate_to_budget(),
+                &config.budget,
+                &mut said_it_did_not_fit,
             );
         }
-        // BR-7: never silent. This is the gate that fires on a carried
-        // conversation meeting a smaller route (BR-10) and on a tool result
-        // that outgrew the budget, so it is where most of this event comes
-        // from.
-        announce_pressure(
-            events,
-            &ctx.truncate_to_budget(),
-            &config.budget,
-            &mut said_it_did_not_fit,
-        );
 
         // ---- model call ----
         // The egress provenance of the assembled context travels with the turn so
@@ -2996,6 +3141,391 @@ mod tests {
             "the turn ended {} bytes over its budget with a `compact` duty that never served",
             ctx.estimated_bytes() - BUDGET_BYTES
         );
+    }
+
+    /// The oldest block of the over-budget fixture below — the first thing the
+    /// enforcing gate drops, and therefore the witness for whether it ran.
+    const OLDEST_BLOCK_MARKER: &str = "the-oldest-block-BR-12-must-keep";
+
+    /// The byte budget the BR-12 fixtures are measured against.
+    const SUSPENSION_BUDGET_BYTES: usize = 4_000;
+
+    /// A conversation comfortably past its byte budget, whose oldest block
+    /// carries [`OLDEST_BLOCK_MARKER`].
+    ///
+    /// Asserts its own non-vacuity: a fixture that is not actually over budget
+    /// would make every test below pass for the wrong reason, since a gate with
+    /// nothing to drop is indistinguishable from a gate that did not run.
+    fn over_budget_context() -> ContextManager {
+        let mut ctx =
+            ContextManager::new("sys", 1_000_000).with_budget_bytes(SUSPENSION_BUDGET_BYTES);
+        ctx.push_user(format!("{OLDEST_BLOCK_MARKER} {}", "x".repeat(1_000)));
+        for i in 0..5 {
+            ctx.push_user(format!("block {i} {}", "x".repeat(1_000)));
+        }
+        assert!(
+            ctx.estimated_bytes() > SUSPENSION_BUDGET_BYTES,
+            "non-vacuity: the fixture must start over budget, or the gate has nothing to shed"
+        );
+        ctx
+    }
+
+    /// The loop's non-pressure furniture, so the BR-12 tests differ from one
+    /// another in the policy and the script alone.
+    struct LoopFixture {
+        gate: PermissionGate,
+        events: SessionEvents,
+        tools: ToolRegistry,
+        tool_ctx: ToolContext,
+    }
+
+    impl LoopFixture {
+        fn new(session: &str) -> Self {
+            let session_id = SessionId::from(session);
+            let bus = Arc::new(EventBus::new());
+            let gate = PermissionGate::new(
+                session_id.clone(),
+                PermissionConfig::permissive(),
+                Arc::clone(&bus),
+                Arc::new(PendingPermissions::new()),
+            );
+            Self {
+                gate,
+                events: SessionEvents::new(bus, session_id),
+                tools: ToolRegistry::with_builtins(),
+                tool_ctx: ToolContext::new(std::env::temp_dir()),
+            }
+        }
+    }
+
+    /// What [`RecordingSource`] answers on one call.
+    enum ScriptedTurn {
+        /// The window refusal the local tier produces when the rendered prompt
+        /// does not fit its context window: `EngineError::ContextWindowExceeded`
+        /// reaches the loop as [`HarnessError::LocalContextLengthExceeded`]
+        /// (REQ-589 TASK-239, `completion.rs`). The numbers are the pair the
+        /// reported `/analyze` failure measured.
+        WindowRefusal,
+        /// A `read` of a file that does not exist — the shortest route to a
+        /// folded tool result, and therefore to a second iteration.
+        ToolCall,
+        /// A plain final answer.
+        End,
+    }
+
+    /// A scripted source that records the prompt it was asked from.
+    ///
+    /// What BR-12's suspension changes is **what the model was asked** — which
+    /// blocks survived into the assembled prompt — not what it answered, so
+    /// these fixtures read the recorded prompt rather than the reply.
+    struct RecordingSource {
+        /// Every `prompt.flat` this source was called with, in order.
+        prompts: Vec<String>,
+        /// One entry per call, in call order.
+        script: Vec<ScriptedTurn>,
+    }
+
+    impl RecordingSource {
+        fn new(script: Vec<ScriptedTurn>) -> Self {
+            Self {
+                prompts: Vec::new(),
+                script,
+            }
+        }
+    }
+
+    #[async_trait]
+    impl CompletionSource for RecordingSource {
+        fn chat_format(&self) -> ChatFormat {
+            ChatFormat::Flat
+        }
+
+        async fn produce_turn(
+            &mut self,
+            prompt: &PreparedPrompt,
+            _provenance: &EgressProvenance,
+            _config: &HarnessConfig,
+            _tools: &ToolRegistry,
+            _exposed: &[&str],
+            _on_token: &mut (dyn for<'s> FnMut(&'s str) + Send),
+        ) -> Result<SourceTurn, HarnessError> {
+            self.prompts.push(prompt.flat.clone());
+            let call = self.prompts.len();
+            match self.script.get(call - 1) {
+                Some(ScriptedTurn::WindowRefusal) => {
+                    Err(HarnessError::LocalContextLengthExceeded {
+                        assembled_tokens: 4_097,
+                        budget_tokens: 4_096,
+                    })
+                }
+                Some(ScriptedTurn::ToolCall) => Ok(SourceTurn {
+                    text: "{\"tool\":\"read\",\"arguments\":{\"path\":\"nope.txt\"}}".to_owned(),
+                    decision: TurnDecision::ToolCall {
+                        name: "read".to_owned(),
+                        arguments: serde_json::json!({ "path": "nope.txt" }),
+                    },
+                    usage: TokenUsage::default(),
+                    dropped_calls: 0,
+                    cache: None,
+                    call_in_text: true,
+                }),
+                Some(ScriptedTurn::End) => Ok(SourceTurn {
+                    text: "Done.".to_owned(),
+                    decision: TurnDecision::EndTurn {
+                        final_text: "Done.".to_owned(),
+                    },
+                    usage: TokenUsage::default(),
+                    dropped_calls: 0,
+                    cache: None,
+                    call_in_text: false,
+                }),
+                None => panic!("the loop asked for turn {call} and the script has no such entry"),
+            }
+        }
+    }
+
+    /// **REQ-589 BR-12 / D-3 / ADR-8, AC-16 — the seam test LESSON-508 requires.**
+    ///
+    /// An accepted over-budget turn is assembled with its history **intact**:
+    /// the block list is byte-identical across the turn, the model is asked with
+    /// the whole conversation, and a turn that then does not fit leaves as the
+    /// typed window refusal rather than as a silently shortened conversation.
+    ///
+    /// # Why this test exists at this seam
+    ///
+    /// The suspension is a *redundant-looking* guard, and LESSON-508 is about
+    /// exactly that class: deleting it does not break anything visible. Without
+    /// it the loop sheds older turns and the turn very often **succeeds** — the
+    /// user gets an answer, no error is raised, no event says anything was lost,
+    /// and every end-to-end leg of REQ-589 (the offer renders, the accept
+    /// dispatches, the expansion goes whole) stays green while the conversation
+    /// quietly shrinks. There is no natural failing signal to rely on, so the
+    /// signal is written down here: this test compares the block list across the
+    /// turn, and deleting the `pressure.enforces_this_iteration()` guard in
+    /// [`run_session_turn_with_pressure_policy`] turns it red on its own.
+    ///
+    /// Its partner
+    /// [`the_same_turn_enforced_sheds_history_before_the_model_is_asked`] runs
+    /// the identical fixture under [`PressurePolicy::Enforced`] and asserts the
+    /// opposite, so a fixture that had drifted under budget — which would make
+    /// this test pass for no reason — cannot go unnoticed.
+    #[tokio::test]
+    async fn an_accepted_over_budget_turn_keeps_every_block_and_refuses_visibly() {
+        let fx = LoopFixture::new("br12-suspended");
+        let config = HarnessConfig::default();
+        let mut hook = NoopProvenanceHook;
+        let mut ctx = over_budget_context();
+        let before = ctx.blocks().to_vec();
+
+        let mut source = RecordingSource::new(vec![ScriptedTurn::WindowRefusal]);
+        let result = run_session_turn_with_pressure_policy(
+            &mut source,
+            &fx.tools,
+            &fx.tool_ctx,
+            &fx.gate,
+            &fx.events,
+            &mut ctx,
+            &config,
+            &mut hook,
+            &DutyRoute::unresolved("no digest route in this test"),
+            &DutyRoute::unresolved("no compact route in this test"),
+            &ToolDuties {
+                triage: &DutyRoute::unresolved("no triage route in this test"),
+                shell: &DutyRoute::unresolved("no shell route in this test"),
+            },
+            PressurePolicy::SuspendedForAcceptedTurn,
+        )
+        .await;
+
+        // The turn was asked with the whole conversation — the half a deleted
+        // suspension would silently change.
+        assert!(
+            source.prompts[0].contains(OLDEST_BLOCK_MARKER),
+            "the accepted turn must be assembled from the whole conversation"
+        );
+        // AC-16: the block list before and after, compared.
+        assert_eq!(
+            ctx.blocks(),
+            before.as_slice(),
+            "BR-12: consent to send an oversized expansion is not consent to lose history"
+        );
+        assert!(
+            !ctx.was_truncated(),
+            "BR-12: nothing may be shed on the accepted turn"
+        );
+
+        // And the turn that cannot fit says so, in the typed outcome the daemon
+        // renders as CONTEXT_LENGTH_EXCEEDED (TASK-239) — a visible, recoverable
+        // error, which BR-12 holds is strictly preferable to a turn that
+        // succeeds by discarding the conversation that gave it meaning.
+        let error = result.expect_err("the assembled turn does not fit, so it must refuse");
+        let refusal = error
+            .context_refusal()
+            .expect("a window refusal, not a generic engine failure");
+        assert_eq!(refusal.origin, ContextRefusalOrigin::LocalEngine);
+        assert_eq!(refusal.assembled_tokens, 4_097);
+        assert_eq!(refusal.budget_tokens, 4_096);
+
+        // D-7: ordinary pressure resumes on the **next** turn. The policy above
+        // was moved into that call and cannot be reused — a second turn states
+        // its own answer, and this one is the enforcing default.
+        let mut next = RecordingSource::new(vec![ScriptedTurn::End]);
+        run_session_turn_with_source(
+            &mut next,
+            &fx.tools,
+            &fx.tool_ctx,
+            &fx.gate,
+            &fx.events,
+            &mut ctx,
+            &config,
+            &mut hook,
+            &DutyRoute::unresolved("no digest route in this test"),
+            &DutyRoute::unresolved("no compact route in this test"),
+            &ToolDuties {
+                triage: &DutyRoute::unresolved("no triage route in this test"),
+                shell: &DutyRoute::unresolved("no shell route in this test"),
+            },
+        )
+        .await
+        .expect("the following turn ends");
+        assert!(
+            !next.prompts[0].contains(OLDEST_BLOCK_MARKER),
+            "D-7: the suspension is scoped to the turn that was consented to"
+        );
+        assert!(
+            ctx.estimated_bytes() <= SUSPENSION_BUDGET_BYTES,
+            "D-7: the following turn is bounded like any other"
+        );
+    }
+
+    /// The non-vacuity partner of
+    /// [`an_accepted_over_budget_turn_keeps_every_block_and_refuses_visibly`]:
+    /// the identical fixture, under the ordinary policy, sheds history before
+    /// the model is asked and the turn then completes.
+    ///
+    /// This is the behaviour D-3 overruled, and it is worth pinning: it is what
+    /// makes the suspension's absence *silent* (the turn succeeds, nothing
+    /// errors), and it proves the fixture really does put the gate to work.
+    #[tokio::test]
+    async fn the_same_turn_enforced_sheds_history_before_the_model_is_asked() {
+        let fx = LoopFixture::new("br12-enforced");
+        let config = HarnessConfig::default();
+        let mut hook = NoopProvenanceHook;
+        let mut ctx = over_budget_context();
+        let before = ctx.blocks().to_vec();
+
+        let mut source = RecordingSource::new(vec![ScriptedTurn::End]);
+        run_session_turn_with_pressure_policy(
+            &mut source,
+            &fx.tools,
+            &fx.tool_ctx,
+            &fx.gate,
+            &fx.events,
+            &mut ctx,
+            &config,
+            &mut hook,
+            &DutyRoute::unresolved("no digest route in this test"),
+            &DutyRoute::unresolved("no compact route in this test"),
+            &ToolDuties {
+                triage: &DutyRoute::unresolved("no triage route in this test"),
+                shell: &DutyRoute::unresolved("no shell route in this test"),
+            },
+            PressurePolicy::Enforced,
+        )
+        .await
+        .expect("the turn ends");
+
+        assert!(
+            !source.prompts[0].contains(OLDEST_BLOCK_MARKER),
+            "the enforcing gate drops oldest-first before the model is asked"
+        );
+        assert!(
+            ctx.blocks().len() < before.len(),
+            "the enforcing gate really did shed blocks"
+        );
+    }
+
+    /// **D-7, at the iteration boundary.** The suspension is one iteration wide,
+    /// not one turn wide: the accepted prompt goes out whole, and the very next
+    /// assembly of the same turn — after a tool result was folded — passes
+    /// through the enforcing gate again.
+    ///
+    /// Widening the exception to the whole turn (hoisting the flag out of the
+    /// loop, or re-arming it at the fold) leaves the marker in the second prompt
+    /// and turns this red; deleting the exception removes it from the first.
+    #[tokio::test]
+    async fn the_suspension_is_spent_by_the_first_iteration() {
+        let fx = LoopFixture::new("br12-one-iteration");
+        let config = HarnessConfig {
+            max_turns: 4,
+            ..HarnessConfig::default()
+        };
+        let mut hook = NoopProvenanceHook;
+        let mut ctx = over_budget_context();
+
+        let mut source = RecordingSource::new(vec![ScriptedTurn::ToolCall, ScriptedTurn::End]);
+        run_session_turn_with_pressure_policy(
+            &mut source,
+            &fx.tools,
+            &fx.tool_ctx,
+            &fx.gate,
+            &fx.events,
+            &mut ctx,
+            &config,
+            &mut hook,
+            &DutyRoute::unresolved("no digest route in this test"),
+            &DutyRoute::unresolved("no compact route in this test"),
+            &ToolDuties {
+                triage: &DutyRoute::unresolved("no triage route in this test"),
+                shell: &DutyRoute::unresolved("no shell route in this test"),
+            },
+            PressurePolicy::SuspendedForAcceptedTurn,
+        )
+        .await
+        .expect("the turn ends");
+
+        assert_eq!(
+            source.prompts.len(),
+            2,
+            "non-vacuity: the tool result was folded and the model was asked again"
+        );
+        assert!(
+            source.prompts[0].contains(OLDEST_BLOCK_MARKER),
+            "the accepted iteration is assembled whole"
+        );
+        assert!(
+            !source.prompts[1].contains(OLDEST_BLOCK_MARKER),
+            "D-7: the exception is one iteration wide — every later assembly is gated"
+        );
+    }
+
+    /// The suspension is spendable **once**, as a property of the value rather
+    /// than of a reset statement (ADR-8, D-7).
+    ///
+    /// The predicate half of the pair LESSON-508 asks for: the tests above pin
+    /// the call site, this pins the rule it calls. `PressurePolicy` is neither
+    /// `Copy` nor `Clone`, so a caller cannot carry one into a second turn —
+    /// that half is enforced by the compiler and needs no test.
+    #[test]
+    fn a_pressure_suspension_can_be_spent_only_once() {
+        let mut accepted = PressurePolicy::SuspendedForAcceptedTurn;
+        assert!(
+            !accepted.enforces_this_iteration(),
+            "the first iteration of an accepted turn is the suspended one"
+        );
+        assert!(
+            accepted.enforces_this_iteration(),
+            "and the second iteration is not"
+        );
+        assert!(accepted.enforces_this_iteration());
+        assert_eq!(
+            accepted,
+            PressurePolicy::Enforced,
+            "a spent suspension is indistinguishable from the ordinary policy"
+        );
+
+        let mut ordinary = PressurePolicy::Enforced;
+        assert!(ordinary.enforces_this_iteration());
     }
 
     /// `ToolThenEndSource` with `pad` bytes of filler on its first turn.
