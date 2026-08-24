@@ -159,6 +159,35 @@ pub struct ProviderRecipe {
     /// under-statement is Ollama's, where the honest figure is what the server
     /// *serves* by default, not what the model card claims.
     pub max_context: u32,
+    /// The date [`max_context`](Self::max_context) was last read off the
+    /// vendor's own documentation, spelled `YYYY-MM-DD` (REQ-589 ADR-7, OQ-2).
+    ///
+    /// **Promoted from a comment to a field, and the promotion is the point.**
+    /// Every entry below already carries a `Verified <date>` comment beside its
+    /// window, which is unreadable at runtime — and REQ-589 writes a recipe
+    /// window into a *user's config*, where it outlives the recipe that
+    /// produced it. Carrying the date with the value is what lets a later
+    /// `/doctor` tell a window the user measured from one inherited from a
+    /// recipe that may since have gone stale. The write is deliberately **not**
+    /// blocked on freshness (ADR-7): a dated inherited window is a better fact
+    /// than no window, and refusing to propose one would send a user back to
+    /// the guessing REQ-586 BR-3 exists to end.
+    ///
+    /// It dates **the window specifically**, not the whole entry. The
+    /// endpoints, kinds and example models here were re-read on 2026-08-14
+    /// (round 2); the windows were read on 2026-08-19, after ASSUME-016
+    /// invalidated every recalled figure the REQ had been drafted with. Two
+    /// facts about one third party move on two schedules, and only one of them
+    /// ends up in somebody's config file — so only one of them is dated here.
+    ///
+    /// `YYYY-MM-DD` because it is the one spelling that sorts, and because a
+    /// free-text date would reach a rendered offer;
+    /// [`every_recipe_dates_its_window`](tests::every_recipe_dates_its_window)
+    /// pins the shape and
+    /// [`the_window_dates_are_the_dates_the_comments_carry`](tests::the_window_dates_are_the_dates_the_comments_carry)
+    /// pins the field against the comment it was promoted from, in both
+    /// directions.
+    pub verified_on: String,
     /// One bounded clause for a fact the command shape alone does not say, or
     /// `None` when it says everything.
     pub notes: Option<String>,
@@ -210,6 +239,7 @@ pub fn recipe_catalog() -> Vec<ProviderRecipe> {
             // this catalog's third mid-draft correction, after DeepSeek's
             // model pair and Moonshot's `kimi-k2`.
             max_context: 1_000_000,
+            verified_on: "2026-08-19".to_owned(),
             // The one vendor here whose path is not `/chat/completions`: this
             // is the Messages API, a different protocol, which is exactly what
             // `--kind anthropic` selects. A reader pattern-matching the five
@@ -238,6 +268,7 @@ pub fn recipe_catalog() -> Vec<ProviderRecipe> {
             // The vendor prices input above 272k at a higher rate; a pricing
             // threshold is not a window, so it is not the figure here.
             max_context: 1_050_000,
+            verified_on: "2026-08-19".to_owned(),
             notes: None,
         },
         // Verified 2026-08-14 (round 2) against Kimi's chat API page
@@ -258,6 +289,7 @@ pub fn recipe_catalog() -> Vec<ProviderRecipe> {
             // (platform.kimi.ai/docs/guide/kimi-k3-quickstart): `kimi-k3`
             // ships "a 1M-token context window".
             max_context: 1_000_000,
+            verified_on: "2026-08-19".to_owned(),
             notes: None,
         },
         // Verified 2026-08-14 (round 2) against DeepSeek's API docs
@@ -284,6 +316,7 @@ pub fn recipe_catalog() -> Vec<ProviderRecipe> {
             // default across all official DeepSeek services", `deepseek-v4-pro`
             // named on the same page.
             max_context: 1_000_000,
+            verified_on: "2026-08-19".to_owned(),
             // The one OpenAI-compatible URL here with no `/v1` segment, which is
             // exactly the kind of small difference a user pattern-matches away
             // from its five neighbours and then spends an afternoon on. Stated
@@ -318,6 +351,7 @@ pub fn recipe_catalog() -> Vec<ProviderRecipe> {
             // served default, and the note says so, because this is the one
             // entry whose honest figure is smaller than the vendor's headline.
             max_context: 4_096,
+            verified_on: "2026-08-19".to_owned(),
             // Round 1 called this entry "keyless", which is true of the *server*
             // and false of the *command*: `teton provider add` reads a secret
             // for every kind but `local` (teton/src/main.rs), so a user told
@@ -349,9 +383,63 @@ pub fn recipe_catalog() -> Vec<ProviderRecipe> {
             // (docs.x.ai/developers/grok-4-6): "Context window | 500,000
             // tokens".
             max_context: 500_000,
+            verified_on: "2026-08-19".to_owned(),
             notes: None,
         },
     ]
+}
+
+/// The recipe describing a **model**, or `None` when this build ships none for
+/// it (REQ-589 ADR-6, BR-7c).
+///
+/// # Matched on [`example_model`], never on [`id_suggestion`]
+///
+/// This imitates the one production lookup that already exists
+/// (`runtime::derive_provider_setup`, which asks the same question of a
+/// `provider/setup_commit` candidate) and it imitates it for that caller's
+/// stated reason: **a recipe id is a suggestion and ids are the user's
+/// namespace.** Kimi registered under the id `work-model` is an ordinary
+/// registration, and a lookup keyed on the id would answer `None` for it while
+/// answering *Anthropic's* window for a provider the user happened to call
+/// `anthropic` while pointing it at something else entirely. What is being
+/// trusted is a fact about the **model**, and a model name is the same fact
+/// whatever row it is stored in.
+///
+/// The one difference from that caller: it matches the `(example_model,
+/// max_context)` **pair**, because its window arrives from a client whose
+/// catalog may be older than this build's, and the pair is what pins a
+/// superseded figure out. Nothing arrives here — the window is read off *this*
+/// build's catalog — so there is no second half to check and matching on one
+/// would be a guard against a value this function produced itself.
+///
+/// # It proposes nothing
+///
+/// A recipe is not a proposal. Whether the window this returns may actually be
+/// *offered* to a user is a question about the route's measured refusal, not
+/// about the vendor, and it is answered one layer up in
+/// [`crate::harness::budget::proposed_window`] — which is where the rule that
+/// Ollama's 4k window may never be proposed lives, because that rule is about
+/// Teton's own budget arithmetic rather than about Ollama.
+///
+/// # Trimmed for the match only
+///
+/// `model` is trimmed before comparison, exactly as the setup caller trims its
+/// candidate's model: a config row spelling ` kimi-k3 ` names the same model to
+/// a reader and the same vendor to this catalog. The trim can only widen what
+/// matches; it can never change the value returned, because the value returned
+/// is the catalog's, never the caller's.
+///
+/// Pure for [`recipe_catalog`]'s reason and pure *because* it is (LESSON-481) —
+/// it reads nothing but the list.
+///
+/// [`example_model`]: ProviderRecipe::example_model
+/// [`id_suggestion`]: ProviderRecipe::id_suggestion
+#[must_use]
+pub fn recipe_for_model(model: &str) -> Option<ProviderRecipe> {
+    let model = model.trim();
+    recipe_catalog()
+        .into_iter()
+        .find(|recipe| recipe.example_model == model)
 }
 
 /// The same catalog, in the wire vocabulary a client reads it in (REQ-579 BR-4,
@@ -482,6 +570,12 @@ mod tests {
             drift("Anthropic's context window for claude-opus-5")
         );
         assert_eq!(
+            anthropic.verified_on,
+            "2026-08-19",
+            "{}",
+            drift("Anthropic's window verification date")
+        );
+        assert_eq!(
             anthropic.notes.as_deref(),
             Some("the Messages API path, not /chat/completions"),
             "{}",
@@ -519,6 +613,12 @@ mod tests {
             1_050_000,
             "{}",
             drift("OpenAI's context window for gpt-5.6 (the gpt-5.6-sol alias)")
+        );
+        assert_eq!(
+            openai.verified_on,
+            "2026-08-19",
+            "{}",
+            drift("OpenAI's window verification date")
         );
         assert_eq!(openai.notes, None, "{}", drift("OpenAI's absent note"));
 
@@ -559,6 +659,12 @@ mod tests {
             "{}",
             drift("Moonshot's context window for kimi-k3")
         );
+        assert_eq!(
+            kimi.verified_on,
+            "2026-08-19",
+            "{}",
+            drift("Moonshot's window verification date")
+        );
         assert_eq!(kimi.notes, None, "{}", drift("Moonshot's absent note"));
 
         let deepseek = &catalog[3];
@@ -592,6 +698,12 @@ mod tests {
             1_000_000,
             "{}",
             drift("DeepSeek's context window for deepseek-v4-pro")
+        );
+        assert_eq!(
+            deepseek.verified_on,
+            "2026-08-19",
+            "{}",
+            drift("DeepSeek's window verification date")
         );
         assert_eq!(
             deepseek.notes.as_deref(),
@@ -634,6 +746,12 @@ mod tests {
                 "Ollama's window — deliberately the SERVED default context, not the model \
                  card's 128k"
             )
+        );
+        assert_eq!(
+            ollama.verified_on,
+            "2026-08-19",
+            "{}",
+            drift("Ollama's window verification date")
         );
         assert_eq!(
             ollama.notes.as_deref(),
@@ -680,6 +798,12 @@ mod tests {
             500_000,
             "{}",
             drift("Grok's context window for grok-4.6")
+        );
+        assert_eq!(
+            grok.verified_on,
+            "2026-08-19",
+            "{}",
+            drift("Grok's window verification date")
         );
         assert_eq!(grok.notes, None, "{}", drift("Grok's absent note"));
     }
@@ -1053,12 +1177,17 @@ mod tests {
                 endpoint,
                 example_model,
                 max_context,
+                verified_on,
                 notes,
             } = recipe;
             fields.push(id_suggestion);
             fields.push(label);
             fields.push(guide_spelling);
             fields.push(example_model);
+            // A date is a string, so it is swept as one rather than waved past
+            // as "obviously a date" — that judgement is what the shape checks
+            // below exist to replace.
+            fields.push(verified_on);
             fields.extend(endpoint);
             fields.extend(notes);
             // The two fields swept by inspection rather than by content: a
@@ -1069,10 +1198,11 @@ mod tests {
         }
 
         // Non-vacuity, derived rather than a bare literal so it moves with the
-        // catalog: every recipe contributes its three non-optional strings, so a
+        // catalog: every recipe contributes its non-optional strings, so a
         // sweep reading fewer than that is reading something other than this
         // catalog.
-        const ALWAYS_PRESENT_PER_RECIPE: usize = 4; // id_suggestion, label, guide_spelling, example_model
+        // id_suggestion, label, guide_spelling, example_model, verified_on
+        const ALWAYS_PRESENT_PER_RECIPE: usize = 5;
         let floor = ALWAYS_PRESENT_PER_RECIPE * recipe_count;
         assert!(
             recipe_count >= 6,
@@ -1194,8 +1324,23 @@ mod tests {
                 endpoint,
                 example_model,
                 max_context,
+                verified_on,
                 notes,
             } = recipe;
+
+            // **Decided, not overlooked (REQ-589 ADR-7).** `verified_on` stays
+            // daemon-side: it exists so a durable write can record which
+            // windows were inherited from a recipe rather than measured, and
+            // nothing a client renders is different for it. `setup_plan`'s
+            // catalog is a list a user picks a vendor from, and a date beside
+            // each row would be an invitation to shop for the freshest recipe —
+            // a judgement this repository makes for them by re-verifying, not
+            // one it delegates. If a client surface ever needs the date, the
+            // wire entry gains the field and this line becomes an assertion.
+            assert!(
+                !verified_on.is_empty(),
+                "`{id_suggestion}` carries no verification date for its window"
+            );
 
             assert_eq!(entry.id_suggestion, id_suggestion);
             assert_eq!(entry.label, label, "`{id_suggestion}`'s label");
@@ -1248,5 +1393,342 @@ mod tests {
     #[test]
     fn the_factory_needs_no_setup_and_answers_the_same_every_time() {
         assert_eq!(recipe_catalog(), recipe_catalog());
+    }
+
+    // -- REQ-589 ADR-7: the verification date is data ------------------------
+
+    /// **Every window is dated, and the date is a date** (ADR-7).
+    ///
+    /// A shape sweep rather than a value golden — the values are pinned
+    /// per-vendor above. What this refuses is the entry somebody adds with
+    /// `verified_on: "today"` or `"unknown"`: the field's whole purpose is to
+    /// let a later `/doctor` compare a recorded window's age against now, and a
+    /// free-text date is a field that reads like data and cannot be used as it.
+    ///
+    /// Not a freshness check. ADR-7 is explicit that the write is not blocked
+    /// on freshness, so nothing here asserts a date is recent — only that it is
+    /// one, and that it is not in the future, which would be a typo rather than
+    /// a fact.
+    #[test]
+    fn every_recipe_dates_its_window() {
+        let catalog = recipe_catalog();
+        assert!(
+            catalog.len() >= 6,
+            "the catalog ships {} recipes; this sweep is narrower than the roster",
+            catalog.len()
+        );
+        for recipe in catalog {
+            let date = recipe.verified_on.as_str();
+            let parts: Vec<&str> = date.split('-').collect();
+            assert_eq!(
+                parts.len(),
+                3,
+                "`{}` dates its window {date:?}, which is not `YYYY-MM-DD`. The field is read \
+                 by a `/doctor` that compares it against a clock, so it is a date or it is \
+                 nothing (REQ-589 ADR-7).",
+                recipe.id_suggestion
+            );
+            let widths = [4usize, 2, 2];
+            for (part, width) in parts.iter().zip(widths) {
+                assert!(
+                    part.len() == width && part.bytes().all(|b| b.is_ascii_digit()),
+                    "`{}` dates its window {date:?}; `{part}` is not {width} ASCII digits",
+                    recipe.id_suggestion
+                );
+            }
+            let year: u32 = parts[0].parse().expect("four digits");
+            let month: u32 = parts[1].parse().expect("two digits");
+            let day: u32 = parts[2].parse().expect("two digits");
+            assert!(
+                (2024..=2100).contains(&year)
+                    && (1..=12).contains(&month)
+                    && (1..=31).contains(&day),
+                "`{}` dates its window {date:?}, which is not a day this catalog could have \
+                 been verified on",
+                recipe.id_suggestion
+            );
+        }
+    }
+
+    /// **The field and the comment it was promoted from must agree** (ADR-7).
+    ///
+    /// The date lived in a `//` comment beside each entry before REQ-589 made
+    /// it data, and both spellings now ship. Two spellings of one fact is
+    /// exactly the drift LESSON-456 is about — so rather than delete the
+    /// comments (which are what a maintainer standing over this catalog
+    /// actually reads, next to the vendor page they name), they are gated
+    /// against the field, in both directions:
+    ///
+    /// * every shipped `verified_on` has a `Window verified <date>` comment in
+    ///   this module, and
+    /// * the number of such comments for a date equals the number of entries
+    ///   carrying it — so a re-verified vendor whose comment moved but whose
+    ///   field did not (or the reverse) is a red build, not a silent
+    ///   disagreement about when a window was last checked.
+    ///
+    /// Reading this module's own source is the only way to make the second
+    /// claim: a comment is invisible to every other kind of assertion, which is
+    /// the whole reason ADR-7 promoted the date out of one.
+    #[test]
+    fn the_window_dates_are_the_dates_the_comments_carry() {
+        use std::collections::BTreeMap;
+
+        /// This module's own bytes.
+        const SOURCE: &str = include_str!("provider_recipes.rs");
+
+        let catalog = recipe_catalog();
+        let mut entries_per_date: BTreeMap<&str, usize> = BTreeMap::new();
+        for recipe in &catalog {
+            *entries_per_date
+                .entry(recipe.verified_on.as_str())
+                .or_default() += 1;
+        }
+        assert!(
+            !entries_per_date.is_empty(),
+            "no recipe carries a verification date, so this gate has nothing to compare"
+        );
+
+        for (date, entries) in entries_per_date {
+            let phrase = format!("Window verified {date}");
+            let comments = SOURCE.matches(phrase.as_str()).count();
+            assert_eq!(
+                comments, entries,
+                "{entries} catalog entries record their window as verified on {date}, but this \
+                 module carries {comments} `{phrase}` comment(s). The field and the comment are \
+                 two spellings of one fact (REQ-589 ADR-7): when a vendor's window is \
+                 re-verified, move BOTH — the comment naming the page and what it said, and the \
+                 entry's `verified_on`. Deleting one of them is never the fix."
+            );
+        }
+    }
+
+    // -- REQ-589 ADR-6: the lookup ------------------------------------------
+
+    /// **The lookup is keyed on the example model, and on nothing else**
+    /// (ADR-6 rule 1, BR-7c).
+    ///
+    /// Three claims, and the middle one is the substance:
+    ///
+    /// 1. Every shipped example model finds its own recipe, whitespace and all
+    ///    — the trim the production setup caller performs, performed here.
+    /// 2. **No suggested id resolves to anything.** Ids are the user's
+    ///    namespace, so a lookup that matched them would answer Anthropic's
+    ///    million-token window for any provider a user happened to call
+    ///    `anthropic` — and would answer nothing for Kimi registered under
+    ///    `work-model`, which is an ordinary registration. The non-vacuity
+    ///    assertion below is what makes this claim mean something: the two
+    ///    namespaces are disjoint today, so an id that resolved could only be
+    ///    matching on the wrong field.
+    /// 3. A model no recipe names resolves to nothing — never to a neighbour,
+    ///    never to a default (BR-7c: ask, never invent).
+    #[test]
+    fn the_lookup_matches_the_example_model_and_never_the_suggested_id() {
+        let catalog = recipe_catalog();
+
+        for recipe in &catalog {
+            let found = recipe_for_model(&recipe.example_model).unwrap_or_else(|| {
+                panic!(
+                    "`{}` ships example model `{}` and the lookup does not find it",
+                    recipe.id_suggestion, recipe.example_model
+                )
+            });
+            assert_eq!(
+                &found, recipe,
+                "the lookup found a recipe other than `{}`'s for its own example model",
+                recipe.id_suggestion
+            );
+            let padded = format!("  {}\n", recipe.example_model);
+            assert_eq!(
+                recipe_for_model(&padded).as_ref(),
+                Some(recipe),
+                "a config row spelling `{}` with surrounding whitespace names the same model, \
+                 and the setup caller trims its candidate for the same reason",
+                recipe.example_model
+            );
+        }
+
+        // Non-vacuity for claim 2: an id that resolved could only be a match on
+        // the wrong field, because no id is spelled like any model.
+        let models: BTreeSet<&str> = catalog
+            .iter()
+            .map(|r| r.example_model.as_str())
+            .collect::<BTreeSet<_>>();
+        for recipe in &catalog {
+            assert!(
+                !models.contains(recipe.id_suggestion.as_str()),
+                "`{}` is both a suggested id and an example model, so the test below cannot \
+                 tell a lookup keyed on ids from one keyed on models",
+                recipe.id_suggestion
+            );
+            assert_eq!(
+                recipe_for_model(&recipe.id_suggestion),
+                None,
+                "`{}` is a suggested *id* — the user's namespace, not a model name — and the \
+                 lookup resolved it. Matching on ids proposes one vendor's window for another \
+                 vendor's provider (ADR-6 rule 1).",
+                recipe.id_suggestion
+            );
+        }
+
+        for unknown in [
+            "",
+            "   ",
+            "gpt-4",
+            "kimi-k3-turbo",
+            "llama3.2:70b",
+            "claude",
+        ] {
+            assert_eq!(
+                recipe_for_model(unknown),
+                None,
+                "`{unknown}` is not a model this build ships a recipe for, and BR-7c's rule is \
+                 ask, never invent"
+            );
+        }
+    }
+
+    /// A blank `example_model` would make every model-less provider match a
+    /// recipe, so the lookup's `""` case is refused by the catalog rather than
+    /// by a branch inside the lookup.
+    ///
+    /// The precondition belongs at the seam that establishes it (LESSON-528):
+    /// a guard inside [`recipe_for_model`] would be a second, mirrored opinion
+    /// about a property this list either has or does not.
+    #[test]
+    fn no_recipe_ships_a_blank_example_model() {
+        for recipe in recipe_catalog() {
+            assert!(
+                !recipe.example_model.trim().is_empty(),
+                "`{}` ships a blank example model, which every model-less provider would \
+                 match",
+                recipe.id_suggestion
+            );
+        }
+    }
+
+    /// **LESSON-546: a one-home rule is a test, not a grep in a task file.**
+    ///
+    /// A recipe window is a verified fact about a third party, and REQ-589
+    /// writes one into a user's config. The rule is that it is written down
+    /// **once** — here, in its catalog entry — and that everything which needs
+    /// it reads the catalog. A copy in the budget path would be a number that
+    /// keeps agreeing with the vendor's documentation only until somebody
+    /// re-verifies the entry and does not know the copy exists.
+    ///
+    /// The sweep is scoped to the two production files this rule is about: the
+    /// catalog that owns the windows, and `harness/budget.rs`, which is where a
+    /// proposal is composed and therefore the one place a window number would
+    /// plausibly be restated. A daemon-wide sweep is not possible for these
+    /// values and pretending otherwise would produce a test that fails on
+    /// unrelated edits: `1_000_000` is also micro-USD per USD and tokens per
+    /// MTok in `cost/prices.rs`, and `500_000` is a disk figure in `runtime.rs`
+    /// — different facts that happen to share a number.
+    ///
+    /// **The Ollama exception, which is the interesting row.** Its window is
+    /// numerically [`LOCAL_BUDGET_TOKENS`], the word half of Teton's own local
+    /// pair, so that literal legitimately appears once in `harness/budget.rs`
+    /// too. The two are different facts — one is what Ollama's server grants,
+    /// the other is what this daemon budgets locally — and their collision is
+    /// precisely why ADR-6's guard exists at all. The expectation below spells
+    /// that exception out by reading the constant rather than the number, so a
+    /// *second* appearance in the budget path (a hard-coded Ollama window, say)
+    /// still reddens.
+    ///
+    /// [`LOCAL_BUDGET_TOKENS`]: crate::harness::budget::LOCAL_BUDGET_TOKENS
+    #[test]
+    fn every_recipe_window_is_written_down_only_in_its_catalog_entry() {
+        use std::collections::BTreeMap;
+
+        use crate::call_sites::scan::{code_only, production_sources};
+        use crate::harness::budget::LOCAL_BUDGET_TOKENS;
+
+        /// Occurrences of `needle` that are not part of a longer number or word.
+        ///
+        /// `4_096` is a substring of `14_096` and `4096` of `40960`; a plain
+        /// substring count would charge those to a recipe window.
+        fn standalone(haystack: &str, needle: &str) -> usize {
+            let free = |c: Option<char>| !c.is_some_and(|c| c.is_ascii_alphanumeric() || c == '_');
+            haystack
+                .match_indices(needle)
+                .filter(|(at, _)| {
+                    free(haystack[..*at].chars().next_back())
+                        && free(haystack[at + needle.len()..].chars().next())
+                })
+                .count()
+        }
+
+        /// `1000000` as Rust writes it: `1_000_000`.
+        fn grouped(n: u32) -> String {
+            let plain = n.to_string();
+            let digits = plain.len();
+            plain
+                .char_indices()
+                .flat_map(|(at, digit)| {
+                    let separator = (at > 0 && (digits - at).is_multiple_of(3)).then_some('_');
+                    separator.into_iter().chain(std::iter::once(digit))
+                })
+                .collect()
+        }
+
+        const CATALOG: &str = "provider_recipes.rs";
+        const BUDGET: &str = "harness/budget.rs";
+
+        let sources: Vec<(String, String)> = production_sources()
+            .into_iter()
+            .filter(|(rel, _)| rel == CATALOG || rel == BUDGET)
+            .map(|(rel, src)| (rel, code_only(&src)))
+            .collect();
+        // Non-vacuity: the sweep really did see both files it is about. Without
+        // this a rename would make every assertion below pass over nothing.
+        assert_eq!(
+            sources
+                .iter()
+                .map(|(rel, _)| rel.as_str())
+                .collect::<Vec<_>>(),
+            vec![BUDGET, CATALOG],
+            "the scan did not find both files this rule is about"
+        );
+
+        // Counted per *distinct* window, because three vendors happen to
+        // declare 1M: that is three separate verified facts that coincide
+        // numerically, and each is written where it belongs — in its own entry.
+        // The rule the count enforces is that there is no *other* home.
+        let mut declared: BTreeMap<u32, Vec<String>> = BTreeMap::new();
+        for recipe in recipe_catalog() {
+            declared
+                .entry(recipe.max_context)
+                .or_default()
+                .push(recipe.id_suggestion);
+        }
+        assert!(!declared.is_empty(), "the catalog declares no windows");
+
+        for (window, vendors) in declared {
+            let plain = window.to_string();
+            let grouped = grouped(window);
+            let homes: Vec<(&str, usize)> = sources
+                .iter()
+                .filter_map(|(rel, code)| {
+                    let n = standalone(code, &plain) + standalone(code, &grouped);
+                    (n > 0).then_some((rel.as_str(), n))
+                })
+                .collect();
+            // `production_sources` sorts by path, so the budget file — when the
+            // exception applies — comes first.
+            let expected: Vec<(&str, usize)> = if window as usize == LOCAL_BUDGET_TOKENS {
+                vec![(BUDGET, 1), (CATALOG, vendors.len())]
+            } else {
+                vec![(CATALOG, vendors.len())]
+            };
+            assert_eq!(
+                homes, expected,
+                "{grouped} is the window {vendors:?} declare, and it must be written down once \
+                 per catalog entry and nowhere else — everything that needs it reads the \
+                 catalog (LESSON-546, LESSON-456). The one legitimate second home is \
+                 `LOCAL_BUDGET_TOKENS`, the word half of Teton's own local pair, which happens \
+                 to be the same number as Ollama's served default. If you are composing a \
+                 proposal, read `provider_recipes::recipe_for_model` instead of typing the \
+                 number."
+            );
+        }
     }
 }

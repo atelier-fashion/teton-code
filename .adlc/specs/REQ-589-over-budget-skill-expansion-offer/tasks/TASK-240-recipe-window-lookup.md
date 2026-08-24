@@ -1,7 +1,7 @@
 ---
 id: TASK-240
 title: "Recipe window lookup, verified_on field, and the clears-the-refusal guard"
-status: draft
+status: complete
 parent: REQ-589
 created: 2026-08-24
 updated: 2026-08-24
@@ -19,11 +19,11 @@ ADR-6 + ADR-7. BR-7c proposes a window value from the vendor recipes. Match on `
 
 ## Acceptance Criteria
 
-- [ ] Lookup matches the registered provider's `model` against a recipe's `example_model`, imitating `runtime.rs:6746`; matching by id is absent
-- [ ] Ollama's 4,096 recipe window — smaller than the local pair — is NOT proposed, because it would not clear the measurement; the offer asks for a value instead
-- [ ] A provider matching no recipe proposes nothing and asks (BR-7c, **AC-21**) — a test asserts the offer cannot render a number the recipe table does not contain
-- [ ] `verified_on` is a field, not a comment, and every catalog entry carries the date already in its comment
-- [ ] A resident one-home test asserts the window literal appears once (LESSON-546)
+- [x] Lookup matches the registered provider's `model` against a recipe's `example_model`, imitating `runtime.rs:6746`; matching by id is absent
+- [x] Ollama's 4,096 recipe window — smaller than the local pair — is NOT proposed, because it would not clear the measurement; the offer asks for a value instead
+- [x] A provider matching no recipe proposes nothing and asks (BR-7c, **AC-21**) — a test asserts the offer cannot render a number the recipe table does not contain
+- [x] `verified_on` is a field, not a comment, and every catalog entry carries the date already in its comment
+- [x] A resident one-home test asserts the window literal appears once (LESSON-546)
 
 ## Technical Notes
 
