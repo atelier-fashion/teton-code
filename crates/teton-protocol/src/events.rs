@@ -1322,6 +1322,49 @@ pub enum PermissionSubject {
         /// more" are different facts, and the user is being asked to trust the
         /// whole set.
         more: u32,
+        /// Who reached for a skill from this repository (REQ-589 BR-6, REQ-587
+        /// BR-5).
+        ///
+        /// **The same field [`Self::SkillDynamicContext`] carries, for the same
+        /// reason, and it arrived here late.** REQ-587 minted this question when
+        /// the model's tool was its only caller, so the prompt could name the
+        /// model outright. REQ-589 ADR-10 gave the typed `/name` path the same
+        /// door — and on that path no model asked for anything, which left a
+        /// security prompt making a false statement about who is acting, on the
+        /// one question whose whole job is letting a human decide whether to
+        /// trust a repository.
+        ///
+        /// The **answer** is invoker-independent and stays so: one key per root
+        /// (`crate::methods::project_skill_trust_key`), one answer per session,
+        /// and a grant the user gave at their own prompt still frees the model's
+        /// later reach. This field changes what the question *says*, never what
+        /// it is remembered under.
+        ///
+        /// Additive, and **absent means [`InvokedBy::Model`]** — the one
+        /// `invoked_by` on this wire whose default is not `User`, which is a
+        /// decision and not an oversight.
+        ///
+        /// Every other `invoked_by` defaults to `User` because a daemon
+        /// predating it could only ever have reported a typed invocation. Here
+        /// the history runs the other way: this subject was minted by REQ-587
+        /// with the model's tool as its *only* caller, so a request with no
+        /// `invoked_by` came from a daemon on which the model was the only thing
+        /// that could ask. Defaulting to `User` would make such a request render
+        /// as "you asked" when the model asked — the very false statement this
+        /// field exists to remove, told in the more dangerous direction, on a
+        /// prompt a human answers about trusting a repository. The default is
+        /// therefore the conservative reading, and the skip predicate follows
+        /// it: the model path writes no key, so its wire stays byte-identical to
+        /// REQ-587's and neither [`crate::PROTOCOL_VERSION`] nor
+        /// [`crate::PROTOCOL_VERSION_MIN`] moves.
+        ///
+        /// A client predating the field ignores the typed path's key and renders
+        /// REQ-587's model wording — this defect, unfixed, on that client only.
+        #[serde(
+            default = "InvokedBy::model",
+            skip_serializing_if = "InvokedBy::is_model"
+        )]
+        invoked_by: InvokedBy,
     },
     /// A skill expansion measured **larger than the route's context budget**,
     /// put to a human as a question instead of refused (REQ-589 BR-3,
@@ -3112,6 +3155,28 @@ impl InvokedBy {
     #[must_use]
     pub fn is_user(&self) -> bool {
         matches!(self, Self::User)
+    }
+
+    /// True for [`Self::Model`].
+    ///
+    /// The `skip_serializing_if` predicate for the one field whose default is
+    /// `Model` rather than `User` — see
+    /// [`PermissionSubject::ProjectSkillTrust::invoked_by`], where the history
+    /// that inverts it is written down.
+    #[must_use]
+    pub fn is_model(&self) -> bool {
+        matches!(self, Self::Model)
+    }
+
+    /// [`Self::Model`], as a `serde` `default` a field attribute can name.
+    ///
+    /// `#[derive(Default)]` picks [`Self::User`] and that stays right for every
+    /// other `invoked_by`; this exists so the one field that must default the
+    /// other way can say so at its own declaration instead of the enum
+    /// changing meaning underneath the rest.
+    #[must_use]
+    pub fn model() -> Self {
+        Self::Model
     }
 }
 
@@ -5323,6 +5388,7 @@ mod tests {
                 },
             ],
             more: 5,
+            invoked_by: InvokedBy::Model,
         };
         round_trip(&subject);
 
@@ -5468,6 +5534,79 @@ mod tests {
             crate::ProtocolVersion(2),
             "a subject variant is not a new method and moves no version — what it \
              costs an older client is a refusal, not a parse failure"
+        );
+    }
+
+    /// REQ-589 TASK-261: `ProjectSkillTrust.invoked_by` is additive, and its
+    /// default runs **the opposite way** from every other `invoked_by`.
+    ///
+    /// The rule elsewhere is "absent means the user", because a daemon
+    /// predating the field could only report a typed invocation. This subject's
+    /// history is inverted: REQ-587 minted it with the model's tool as its only
+    /// caller, so a request with no `invoked_by` came from a daemon on which the
+    /// model was the only thing that could ask. Defaulting to `User` there would
+    /// print "you asked" over a question the model raised — the same false
+    /// attribution this field exists to remove, told in the direction that
+    /// misleads rather than alarms.
+    ///
+    /// Both halves are pinned, because each is a separate way to get it wrong:
+    /// the model path writes **no key** (so REQ-587's wire is byte-identical and
+    /// no version moves), and the typed path writes one.
+    #[test]
+    fn the_trust_subjects_invoker_defaults_to_the_model_that_was_once_its_only_caller() {
+        // A pre-TASK-261 request: the known kind, no `invoked_by`. Only the
+        // model could have sent it.
+        let wire = serde_json::json!({
+            "kind": "project_skill_trust",
+            "root": "~/dev/teton",
+            "skills": [],
+            "more": 0,
+        });
+        let back: PermissionSubject = serde_json::from_value(wire).unwrap();
+        match back {
+            PermissionSubject::ProjectSkillTrust { invoked_by, .. } => assert_eq!(
+                invoked_by,
+                InvokedBy::Model,
+                "an old daemon's acknowledgment is the model's, and must not be \
+                 rendered as the user's"
+            ),
+            other => panic!("the kind still resolves to its own variant: {other:?}"),
+        }
+
+        // The model path adds nothing to the wire, so REQ-587's bytes stand.
+        let model = serde_json::to_value(PermissionSubject::ProjectSkillTrust {
+            root: "~/dev/teton".to_owned(),
+            skills: vec![],
+            more: 0,
+            invoked_by: InvokedBy::Model,
+        })
+        .unwrap();
+        assert!(model.get("invoked_by").is_none(), "{model}");
+
+        // The typed path says so explicitly — the whole point of the field, and
+        // the half a `skip_serializing_if` pointed at the wrong arm would eat
+        // with nothing else going red.
+        let typed = serde_json::to_value(PermissionSubject::ProjectSkillTrust {
+            root: "~/dev/teton".to_owned(),
+            skills: vec![],
+            more: 0,
+            invoked_by: InvokedBy::User,
+        })
+        .unwrap();
+        assert_eq!(typed["invoked_by"], "user", "{typed}");
+        let round: PermissionSubject = serde_json::from_value(typed).unwrap();
+        assert!(matches!(
+            round,
+            PermissionSubject::ProjectSkillTrust {
+                invoked_by: InvokedBy::User,
+                ..
+            }
+        ));
+
+        assert_eq!(
+            crate::PROTOCOL_VERSION,
+            crate::ProtocolVersion(2),
+            "an additive field moves no version"
         );
     }
 
@@ -7504,6 +7643,7 @@ mod tests {
             root: "~/dev/teton".to_owned(),
             skills: vec![],
             more: 0,
+            invoked_by: InvokedBy::Model,
         })
         .unwrap();
         let old: PreOfferSubject = serde_json::from_str(&known).unwrap();

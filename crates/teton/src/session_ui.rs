@@ -3416,7 +3416,7 @@ fn render_consent_subject(subject: Option<&PermissionSubject>, surface: &mut dyn
                 &format!(
                     "  skill `{skill}` ({}){} wants to run {} dynamic-context command{}:",
                     slash::source_word(*source),
-                    invoker_clause(*invoked_by),
+                    invoker_clause(*invoked_by, InvokerVoice::Aside),
                     commands.len(),
                     if commands.len() == 1 { "" } else { "s" },
                 ),
@@ -3431,11 +3431,17 @@ fn render_consent_subject(subject: Option<&PermissionSubject>, surface: &mut dyn
         // REQ-587 BR-4's acknowledgment: the root, then the named set, one
         // `Surface::line` per entry for the reason the command list is one per
         // line — `line` defuses, and defusing destroys newlines.
-        Some(PermissionSubject::ProjectSkillTrust { root, skills, more }) => {
+        Some(PermissionSubject::ProjectSkillTrust {
+            root,
+            skills,
+            more,
+            invoked_by,
+        }) => {
             surface.line(
                 LineKind::Prompt,
                 &format!(
-                    "  the model wants to run this repository's skills as instructions: {root}",
+                    "  {lead} run this repository's skills as instructions: {root}",
+                    lead = invoker_clause(*invoked_by, InvokerVoice::Lead),
                 ),
             );
             for entry in skills {
@@ -3546,20 +3552,63 @@ fn project_skill_entry(entry: &events::ProjectSkillTrustEntry) -> String {
     }
 }
 
+/// Where in a sentence [`invoker_clause`] is being asked to stand.
+///
+/// Two skill consents name the invoker and they are built the opposite way
+/// round, which is a fact about their sentences and not about the invoker:
+///
+/// - [`Self::Aside`] — the dynamic-context prompt already has a subject (the
+///   skill), so "who asked" rides as an appositive inside it, and the *user*
+///   arm is empty because a sentence with no aside is REQ-585's sentence.
+/// - [`Self::Lead`] — the acknowledgment prompt's subject **is** the invoker
+///   ("the model wants to run …"), so neither arm can be empty: dropping the
+///   clause here does not shorten the sentence, it deletes the sentence's
+///   subject.
+///
+/// One function keeps both, rather than a second helper beside it, so the words
+/// "the model" have exactly one home (LESSON-456). A second helper would let
+/// the two arms come to disagree about what the model is called, and nothing
+/// green would notice.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum InvokerVoice {
+    /// Mid-sentence, between commas, around a subject that is already there.
+    Aside,
+    /// Sentence-leading, as the subject itself.
+    Lead,
+}
+
 /// The clause BR-5 adds to a skill consent: **who asked**.
 ///
 /// "You asked for `deploy`" and "the model decided to run `deploy`" are
 /// different questions carrying the same command list, and the human at
 /// `guarded` is entitled to know which one is on the screen.
 ///
-/// A user invocation adds nothing, so REQ-585's prompt keeps its bytes exactly —
-/// the words it renders are the words `pty_e2e` already pins. The model's clause
-/// is the vocabulary [`skill_echo_line`] uses for the same fact, so a user who
-/// answered a prompt reads the same phrase back in the echo line that follows.
-fn invoker_clause(invoked_by: events::InvokedBy) -> &'static str {
-    match invoked_by {
-        events::InvokedBy::User => "",
-        events::InvokedBy::Model => ", invoked by the model,",
+/// In [`InvokerVoice::Aside`] a user invocation adds nothing, so REQ-585's
+/// prompt keeps its bytes exactly — the words it renders are the words
+/// `pty_e2e` already pins. The model's clause is the vocabulary
+/// [`skill_echo_line`] uses for the same fact, so a user who answered a prompt
+/// reads the same phrase back in the echo line that follows.
+///
+/// # Why [`InvokerVoice::Lead`] exists (REQ-589 TASK-261)
+///
+/// REQ-587 minted the project-skill acknowledgment when the model's tool was
+/// its only caller and wrote the model into the sentence's subject. REQ-589
+/// ADR-10 gave the typed `/name` path the same door, and the sentence went on
+/// naming the model — telling a user who had just typed `/analyze` that "the
+/// model wants to run this repository's skills as instructions", on the one
+/// prompt whose whole job is letting a human decide whether to trust a
+/// repository.
+///
+/// The model arm is REQ-587's four words unchanged, and deliberately so: that
+/// caller's sentence was never false, and re-wording it would move bytes a
+/// terminal test pins for no gain. What the user arm must not do is inherit
+/// them.
+fn invoker_clause(invoked_by: events::InvokedBy, voice: InvokerVoice) -> &'static str {
+    match (voice, invoked_by) {
+        (InvokerVoice::Aside, events::InvokedBy::User) => "",
+        (InvokerVoice::Aside, events::InvokedBy::Model) => ", invoked by the model,",
+        (InvokerVoice::Lead, events::InvokedBy::User) => "you asked to",
+        (InvokerVoice::Lead, events::InvokedBy::Model) => "the model wants to",
     }
 }
 
@@ -8262,7 +8311,17 @@ mod skill_tests {
     /// BR-4's acknowledgment subject, as the daemon mints one: the root
     /// home-relative, the named set in registry order with the shadowing entry
     /// marked, and the tail as a count.
+    ///
+    /// **Model-invoked**, which is REQ-587's only caller and therefore the
+    /// prompt every existing test in this module pins. `trust_subject_from`
+    /// carries the other one.
     fn trust_subject(more: u32) -> PermissionSubject {
+        trust_subject_from(more, events::InvokedBy::Model)
+    }
+
+    /// [`trust_subject`], with who asked (REQ-589 TASK-261) — the same pairing
+    /// [`skill_subject`] and [`skill_subject_from`] already have.
+    fn trust_subject_from(more: u32, invoked_by: events::InvokedBy) -> PermissionSubject {
         PermissionSubject::ProjectSkillTrust {
             root: "~/dev/teton".to_owned(),
             skills: vec![
@@ -8276,6 +8335,7 @@ mod skill_tests {
                 },
             ],
             more,
+            invoked_by,
         }
     }
 
@@ -8528,6 +8588,11 @@ mod skill_tests {
     /// One `Surface::line` per entry, for the command list's mechanical reason:
     /// `line` defuses, and defusing destroys newlines, so a joined list would
     /// arrive as one run-on line.
+    ///
+    /// **This is now the model path's byte pin (REQ-589 TASK-261).** The
+    /// invoker clause split the first line in two, and REQ-587's caller keeps
+    /// its four words unchanged — that sentence was never false of the model.
+    /// The sibling below pins the typed one.
     #[test]
     fn the_acknowledgment_names_the_root_marks_shadowing_and_counts_the_tail() {
         let req = trust_permission_request(Some(trust_subject(5)));
@@ -8564,6 +8629,57 @@ mod skill_tests {
         assert!(
             !lines.iter().any(|line| line.contains("/Users/")),
             "a username reached the prompt: {lines:?}"
+        );
+    }
+
+    /// **The typed door names the person who typed (REQ-589 TASK-261).**
+    ///
+    /// The test above pins the model's sentence byte for byte; this one pins the
+    /// user's, and the pair is the whole fix. A user who types `/analyze` is
+    /// being asked whether to trust a repository, and the prompt that asks must
+    /// not open by telling them a model wanted this — no model did.
+    ///
+    /// Everything below the first line is the *same* material in the same order,
+    /// because the question is the same question: only the subject of the
+    /// sentence moved.
+    ///
+    /// **Mutation:** pass `InvokedBy::Model` from `accept_invocation`, or
+    /// collapse [`InvokerVoice::Lead`]'s two arms onto one string, and this
+    /// reddens.
+    #[test]
+    fn a_typed_acknowledgment_says_the_user_asked_and_never_names_the_model() {
+        let req = trust_permission_request(Some(trust_subject_from(
+            5,
+            teton_protocol::events::InvokedBy::User,
+        )));
+        let mut surface = RecordingSurface::new();
+        let mut prompter = ScriptedPrompter::new(&["y"]);
+        let mut grants = SessionGrants::default();
+
+        resolve_permission(&req, &mut surface, &mut prompter, &mut grants, true);
+
+        let lines = surface.lines_of(LineKind::Prompt);
+        let at = lines
+            .iter()
+            .position(|line| line.contains("this repository's skills"))
+            .unwrap_or_else(|| panic!("no acknowledgment block: {lines:?}"));
+        assert_eq!(
+            &lines[at..at + 4],
+            [
+                "  you asked to run this repository's skills as instructions: ~/dev/teton",
+                "    validate (project — shadows your user skill)",
+                "    canary",
+                "    +5 more",
+            ],
+            "{lines:?}"
+        );
+        // The falsifier, stated as its own claim: the defect was not a missing
+        // clause, it was a **false** one, and a fix that added "you asked" while
+        // leaving "the model wants to" standing would satisfy the assertion
+        // above.
+        assert!(
+            !lines.iter().any(|line| line.contains("the model")),
+            "no model asked for anything on this path: {lines:?}"
         );
     }
 
