@@ -573,9 +573,55 @@ impl Router {
     ///   the budget leaves room for the generation the same config asks for.
     /// - the id travels into the inputs because the window's *name* is part of
     ///   the fact: the in-prompt elision marker says whose window ran out (BR-7).
+    ///
+    /// That classification is assembled by [`Router::budget_inputs_for`]
+    /// (REQ-589 TASK-259), which the offer path also reads for the *declared*
+    /// window. This method is where it meets `derive`, and the only place it
+    /// does.
     #[must_use]
     pub fn budget_for(&self, provider_id: Option<&str>) -> RouteBudget {
-        let inputs = match provider_id {
+        budget::derive(self.budget_inputs_for(provider_id))
+    }
+
+    /// The inputs [`Router::budget_for`] derives from — for the surfaces that
+    /// need a route's **declared window** rather than its budget (REQ-589 BR-3).
+    ///
+    /// The two are different facts and neither substitutes for the other.
+    /// `RouteBudget::budget_tokens` is *this daemon's* policy: the window less
+    /// the generation reservation, floored, and byte-clamped when the redact
+    /// scan binds. [`BudgetInputs::window`] is the *provider's* declared
+    /// `capabilities.max_context`, which is what
+    /// [`budget::window_verdict`](crate::harness::budget::window_verdict)
+    /// measures against (ADR-15: the reservation is deliberately not subtracted
+    /// there) and what
+    /// [`budget::proposed_window`](crate::harness::budget::proposed_window)
+    /// substitutes to test a vendor recipe. A `Route` carries only the budget
+    /// and `capability_of` is private, so until now there was no way to ask.
+    ///
+    /// # This hands out the inputs. It is not a licence to derive.
+    ///
+    /// `derive` is called from **exactly one place in this crate's routing
+    /// layer** — `budget_for`, immediately above — and that is REQ-586 AC-12,
+    /// not a style preference. A caller that takes these inputs and derives its
+    /// own budget has minted a *second* figure: correct at the instant it is
+    /// computed, and wrong as soon as the route is re-decided mid-turn, with
+    /// nothing to say which of the two the turn actually ran under. REQ-586's
+    /// own verify pass caught precisely that — `/verbose` naming a budget the
+    /// turn was not running under — which is why the budget has one home at all.
+    ///
+    /// So **read a field; never re-derive**. Anything that wants the budget
+    /// already has one: `Route::budget`, `HarnessConfig::budget`, or
+    /// `budget_for` above, each a copy of the pair the route was decided with.
+    /// `the_routing_layer_derives_a_budget_in_exactly_one_place` fails if that
+    /// is broken, because a rule only a comment enforces is a convention rather
+    /// than a guard.
+    ///
+    /// `pub(crate)` is part of the same answer: the offer path lives in this
+    /// crate, and no client outside it may repeat the derivation at all (BR-8,
+    /// AC-12) — so the reach of these inputs stops at the crate boundary.
+    #[must_use]
+    pub(crate) fn budget_inputs_for<'a>(&self, provider_id: Option<&'a str>) -> BudgetInputs<'a> {
+        match provider_id {
             Some(id) if !self.is_local_tier(id) => {
                 let capabilities = self.capability_of(id);
                 BudgetInputs {
@@ -591,8 +637,7 @@ impl Router {
             // cap, and the engine's own `n_ctx` — not a provider declaration —
             // is what the default pair is sized against (OQ-3).
             _ => BudgetInputs::local(),
-        };
-        budget::derive(inputs)
+        }
     }
 
     /// Set the category a freeform judgment turn falls back to (BR-9). Read from
@@ -2449,18 +2494,18 @@ mod tests {
 
     // ---- REQ-586: the budget is a property of the route attempt ----------
 
-    /// **AC-1 / BR-1, BR-2, BR-5, BR-8**, as a table: what each shape of route
-    /// is budgeted at, and which constraint gets the credit.
+    /// A router that reaches **all five** [`BudgetBound`]s: `wide` declares a
+    /// window, `silent` declares none, `capped` carries a user cap below its
+    /// window, `local` is the routing table's local tier, and the fifth —
+    /// `RedactScan` — comes from the same router under
+    /// [`Router::with_redact_scan`].
     ///
-    /// The arithmetic belongs to `harness::budget` and is table-tested there;
-    /// what this pins is the router's half — the *classification* that reaches
-    /// it. Every wrong classification still produces a plausible pair, so the
-    /// bound is what gives it away: reading the window off the wrong provider,
-    /// calling a defaulted provider "local", or missing `[privacy] redact`
-    /// each change the bound while leaving a number that looks fine.
-    #[test]
-    fn the_route_budget_is_derived_from_the_routes_own_window() {
-        let router = Router::new(CategoryTable::new().with_local_provider("local"), None)
+    /// Shared by the classification table below and by
+    /// `budget_for_is_byte_identical_on_every_bound`, because a golden pin and
+    /// the classification it guards must be reading the same five routes; two
+    /// fixtures would let one drift out from under the other.
+    fn five_bound_router() -> Router {
+        Router::new(CategoryTable::new().with_local_provider("local"), None)
             .with_provider(
                 "wide",
                 ProviderKind::OpenaiCompatible,
@@ -2491,7 +2536,21 @@ mod tests {
                     ..native()
                 },
                 ProviderHealth::Healthy,
-            );
+            )
+    }
+
+    /// **AC-1 / BR-1, BR-2, BR-5, BR-8**, as a table: what each shape of route
+    /// is budgeted at, and which constraint gets the credit.
+    ///
+    /// The arithmetic belongs to `harness::budget` and is table-tested there;
+    /// what this pins is the router's half — the *classification* that reaches
+    /// it. Every wrong classification still produces a plausible pair, so the
+    /// bound is what gives it away: reading the window off the wrong provider,
+    /// calling a defaulted provider "local", or missing `[privacy] redact`
+    /// each change the bound while leaving a number that looks fine.
+    #[test]
+    fn the_route_budget_is_derived_from_the_routes_own_window() {
+        let router = five_bound_router();
 
         // A declared window, less the 1,024-token generation reservation the
         // adapters actually send: (128,000 − 1,024) words ÷ the 3/2 safety
@@ -2552,6 +2611,308 @@ mod tests {
         // default pair its `HarnessConfig::default()` harness carries.
         let nowhere = router.budget_for(None);
         assert_eq!(nowhere, HarnessConfig::default().budget);
+    }
+
+    /// **REQ-589 TASK-259's before/after guard.** Every field of every bound's
+    /// budget, pinned verbatim.
+    ///
+    /// The table above pins the pair and the bound, which is the
+    /// *classification* it is about. This pins the whole `RouteBudget` — window
+    /// label, both digest thresholds, the floor fact and the carried provider
+    /// id included — as its own `Debug` rendering, because TASK-259 lifts the
+    /// input construction out of `budget_for` into
+    /// [`Router::budget_inputs_for`] and claims the results are unchanged. A
+    /// refactor that is *supposed* to be invisible needs a test that can see
+    /// everything: a lifted arm that dropped `redact_scan`, or handed
+    /// `labelled_provider` the wrong id, changes none of the numbers the table
+    /// above reads.
+    ///
+    /// The bounds are asserted separately from the snapshot so the five rows
+    /// cannot quietly become five readings of one route — a snapshot updated
+    /// wholesale would otherwise still look like five rows.
+    #[test]
+    fn budget_for_is_byte_identical_on_every_bound() {
+        let router = five_bound_router();
+        let scanning = router.clone().with_redact_scan(true);
+        let rows = [
+            ("local_engine", router.budget_for(Some("local"))),
+            ("default_unknown", router.budget_for(Some("silent"))),
+            ("window", router.budget_for(Some("wide"))),
+            ("user_cap", router.budget_for(Some("capped"))),
+            ("redact_scan", scanning.budget_for(Some("wide"))),
+        ];
+
+        assert_eq!(
+            rows.iter().map(|(_, b)| b.bound).collect::<Vec<_>>(),
+            vec![
+                BudgetBound::LocalEngine,
+                BudgetBound::DefaultUnknown,
+                BudgetBound::Window,
+                BudgetBound::UserCap,
+                BudgetBound::RedactScan,
+            ],
+            "the five rows must be the five bounds, or the snapshot below pins \
+             one route five times"
+        );
+
+        let snapshot = rows
+            .iter()
+            .map(|(name, budget)| format!("{name}: {budget:?}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert_eq!(
+            snapshot,
+            BUDGET_FOR_GOLDEN.join("\n"),
+            "a `budget_for` result changed. TASK-259's refactor is required to be \
+             additive, so this is either a real behaviour change that needs its own \
+             decision, or an input the extracted `budget_inputs_for` no longer passes \
+             through."
+        );
+    }
+
+    /// The five budgets exactly as `budget_for` produced them **before**
+    /// TASK-259 extracted [`Router::budget_inputs_for`] — captured from the
+    /// running code at `5a2ee33`, not hand-computed, so it is a record of
+    /// behaviour rather than a restatement of the arithmetic.
+    const BUDGET_FOR_GOLDEN: [&str; 5] = [
+        "local_engine: RouteBudget { budget_tokens: 4096, budget_bytes: 32768, bound: LocalEngine, window_label: \"the local context window\", digest_threshold_tokens: 1500, digest_threshold_bytes: 12000, floored: false, provider_id: None }",
+        "default_unknown: RouteBudget { budget_tokens: 4096, budget_bytes: 32768, bound: DefaultUnknown, window_label: \"silent's context window\", digest_threshold_tokens: 1500, digest_threshold_bytes: 12000, floored: false, provider_id: Some(\"silent\") }",
+        "window: RouteBudget { budget_tokens: 84650, budget_bytes: 253952, bound: Window, window_label: \"wide's context window\", digest_threshold_tokens: 20000, digest_threshold_bytes: 93000, floored: false, provider_id: Some(\"wide\") }",
+        "user_cap: RouteBudget { budget_tokens: 25984, budget_bytes: 77952, bound: UserCap, window_label: \"capped's context window\", digest_threshold_tokens: 9515, digest_threshold_bytes: 28546, floored: false, provider_id: Some(\"capped\") }",
+        "redact_scan: RouteBudget { budget_tokens: 84650, budget_bytes: 88196, bound: RedactScan, window_label: \"the redact-scannable window\", digest_threshold_tokens: 20000, digest_threshold_bytes: 32298, floored: false, provider_id: Some(\"wide\") }",
+    ];
+
+    /// **REQ-589 TASK-259.** What the accessor is *for*: the provider's declared
+    /// window, unreduced, beside the flags the recipe probe re-derives under.
+    ///
+    /// Deliberately not "and it derives the same budget" — after the extraction
+    /// that is true by construction and would assert nothing.
+    /// `budget_for_is_byte_identical_on_every_bound` is what pins the results.
+    #[test]
+    fn the_inputs_carry_the_declared_window_the_budget_does_not() {
+        let router = five_bound_router();
+        let scanning = router.clone().with_redact_scan(true);
+
+        // The provider's own `capabilities.max_context`, verbatim: not reduced
+        // by the generation reservation, and not by the user's cap. ADR-15
+        // measures against exactly this figure, and the reason it can is that
+        // this is the one place the raw declaration survives — every other
+        // surface sees the pair `derive` made of it.
+        assert_eq!(router.budget_inputs_for(Some("wide")).window, 128_000);
+        let capped = router.budget_inputs_for(Some("capped"));
+        assert_eq!((capped.window, capped.cap), (200_000, 40_000));
+        assert_eq!(
+            router.budget_for(Some("capped")).bound,
+            BudgetBound::UserCap,
+            "the cap binds the budget while leaving the declared window alone — \
+             the daemon's policy against the provider's bound, which is the whole \
+             distinction the window verdict rests on (ADR-15)"
+        );
+
+        // An undeclared window is `0`, which the derivation reads as the
+        // *absence* of a window fact rather than a window of size zero.
+        assert_eq!(router.budget_inputs_for(Some("silent")).window, 0);
+
+        // The local tier and the unresolvable route say so as `is_local`, and
+        // carry no provider id for the window's name to be built from.
+        let local = router.budget_inputs_for(Some("local"));
+        assert!(local.is_local && local.provider_id.is_none());
+        assert!(router.budget_inputs_for(None).is_local);
+        assert!(
+            !router.budget_inputs_for(Some("silent")).is_local,
+            "a provider that declared no window is not the local tier (gotcha #9)"
+        );
+
+        // `[privacy] redact` and the reservation ride the inputs, so a vendor
+        // recipe tried through `budget::proposed_window` is tried under the same
+        // clamp and the same reserved room the route actually runs under.
+        assert!(!router.budget_inputs_for(Some("wide")).redact_scan);
+        assert!(scanning.budget_inputs_for(Some("wide")).redact_scan);
+        assert_eq!(
+            router.budget_inputs_for(Some("wide")).reservation,
+            budget::generation_reservation()
+        );
+    }
+
+    /// Every call the scan below recognizes. `crate::harness::budget::derive(`
+    /// and `super::budget::derive(` both end in it, so one needle covers the
+    /// crate's three spellings.
+    const DERIVE_CALL: &str = "budget::derive(";
+
+    /// Where `derive` is **defined**, and the one file excluded from the sweep
+    /// below: `proposed_window` derives a *candidate* budget there to answer
+    /// whether a recipe's window would clear a refusal, which is the module
+    /// deciding its own question. Its calls are unqualified for the same reason,
+    /// so [`DERIVE_CALL`] would not see them anyway — the exclusion is checked
+    /// against the definition rather than assumed.
+    const BUDGET_MODULE: &str = "harness/budget.rs";
+
+    /// Every `use` statement in `source`, flattened to one line each.
+    ///
+    /// Flattened because imports wrap: `turn_loop.rs` opens
+    /// `use super::budget::{` and lists its items over the next three lines, and
+    /// a `derive` on one of those continuation lines is exactly the import a
+    /// line-at-a-time scan would miss.
+    fn use_statements(source: &str) -> Vec<String> {
+        let mut statements = Vec::new();
+        let mut current: Option<String> = None;
+        for line in source.lines() {
+            let trimmed = line.trim();
+            match current.as_mut() {
+                Some(open) => open.push_str(trimmed),
+                None if trimmed.starts_with("use ") || trimmed.starts_with("pub use ") => {
+                    current = Some(trimmed.to_owned());
+                }
+                None => continue,
+            }
+            if trimmed.contains(';') {
+                statements.extend(current.take());
+            }
+        }
+        statements
+    }
+
+    /// Whether `source` could call `derive` in a spelling [`DERIVE_CALL`] cannot
+    /// see — an unqualified import of it, or a glob of the module.
+    ///
+    /// The scan reads a qualified path, so an import is the one way to put a
+    /// call beyond its reach; a scan that cannot see the thing it forbids passes
+    /// vacuously forever after. `BudgetInputs` and `skill_fit` are imported
+    /// unqualified all over the daemon and are not this — the token has to be
+    /// `derive` itself.
+    fn can_derive_unqualified(source: &str) -> Option<String> {
+        use_statements(source).into_iter().find(|statement| {
+            statement.contains("budget::")
+                && (statement.contains("budget::*")
+                    || statement
+                        .split(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
+                        .any(|token| token == "derive"))
+        })
+    }
+
+    /// **REQ-586 AC-12, derived rather than trusted.** The routing layer mints a
+    /// budget in exactly one place, and TASK-259's accessor did not quietly
+    /// become a second one.
+    ///
+    /// The rule is stated in `budget_inputs_for`'s doc comment, and a rule only
+    /// a doc comment enforces is a convention. This reads `router.rs` as text
+    /// and checks it: one `derive` call, inside `budget_for`, and no import that
+    /// would let a second one be spelled in a way this scan cannot see.
+    #[test]
+    fn the_routing_layer_derives_a_budget_in_exactly_one_place() {
+        use crate::call_sites::scan::{code_only, count, daemon_src, production_source};
+
+        let source = code_only(&production_source(&daemon_src().join("router.rs")));
+
+        assert_eq!(
+            count(&source, DERIVE_CALL),
+            1,
+            "`router.rs` derives a budget {} time(s). REQ-586 AC-12 gives the budget one \
+             home so no surface can name a figure the turn is not running under — read \
+             `Route::budget` or call `budget_for`, never `derive`.",
+            count(&source, DERIVE_CALL)
+        );
+
+        let at = source.find(DERIVE_CALL).expect("the one derivation");
+        assert_eq!(
+            enclosing_fn(&source, at),
+            "budget_for",
+            "the routing layer's one `derive` call moved out of `budget_for`. Wherever it \
+             is now is the new single source of the route's budget, which is a decision \
+             REQ-586 ADR-1 made deliberately and not one to make by moving a line."
+        );
+
+        assert_eq!(
+            can_derive_unqualified(&source),
+            None,
+            "an import would let `router.rs` call `derive` unqualified, which this test \
+             cannot see. Keep the `budget::derive(...)` spelling."
+        );
+    }
+
+    /// The other half of TASK-259's risk: handing out `BudgetInputs` must not
+    /// grow a second derivation *somewhere else* in the daemon.
+    ///
+    /// An exact set rather than a direction, so both rots are loud — a new
+    /// caller appearing, and the documented one being deleted while its
+    /// justification stays behind. `harness/turn_loop.rs` is the one non-routing
+    /// caller and is not a route's budget at all: `HarnessConfig::default()`
+    /// derives the *local default* pair, the value a config carries before any
+    /// route has been decided.
+    ///
+    /// A file that merely *could* call `derive` unqualified counts as a caller
+    /// here rather than being waved through, because from this scan's side the
+    /// two are indistinguishable and the permissive reading is the one that goes
+    /// quiet.
+    #[test]
+    fn no_second_derivation_grew_elsewhere_in_the_daemon() {
+        use crate::call_sites::scan::{code_only, count, production_sources};
+
+        let sources = production_sources();
+
+        // The exclusion below names a file, so it is only sound while the
+        // definition is in it: a moved `derive` would take a whole module out of
+        // the sweep silently.
+        let (_, home) = sources
+            .iter()
+            .find(|(rel, _)| rel == BUDGET_MODULE)
+            .expect("the budget module is a production source");
+        assert!(
+            code_only(home).contains("pub fn derive("),
+            "`derive` no longer lives in {BUDGET_MODULE}, which this sweep excludes by \
+             name. The exclusion has to move with it."
+        );
+
+        let callers: Vec<String> = sources
+            .iter()
+            .filter(|(rel, source)| {
+                let code = code_only(source);
+                rel != BUDGET_MODULE
+                    && (count(&code, DERIVE_CALL) > 0 || can_derive_unqualified(&code).is_some())
+            })
+            .map(|(rel, _)| rel.clone())
+            .collect();
+
+        assert_eq!(
+            callers,
+            vec!["harness/turn_loop.rs".to_owned(), "router.rs".to_owned()],
+            "the set of `derive` callers changed. A new one means a second budget that can \
+             disagree with the route's — REQ-586's verify pass caught exactly that, \
+             `/verbose` naming a budget the turn was not running under. Take \
+             `Route::budget` / `HarnessConfig::budget`, or call `Router::budget_for`; \
+             `Router::budget_inputs_for` hands out the inputs so a window can be *read*, \
+             not so a second pair can be minted from them."
+        );
+    }
+
+    /// AC-4's crate boundary, which no compiler check can state: the inputs stop
+    /// at `tetond`. A thin client may not repeat the derivation at all (BR-8),
+    /// and `pub` here would be the first step toward its being able to.
+    #[test]
+    fn the_inputs_accessor_stops_at_the_crate_boundary() {
+        use crate::call_sites::scan::{code_only, count, daemon_src, production_source};
+
+        let source = code_only(&production_source(&daemon_src().join("router.rs")));
+        assert_eq!(
+            count(&source, "pub(crate) fn budget_inputs_for"),
+            1,
+            "`budget_inputs_for` is `pub(crate)` on purpose: `budget_for` is the public \
+             way to ask this router about a budget, and the raw inputs reach no further \
+             than the offer path that needs the declared window."
+        );
+    }
+
+    /// The name of the function whose body contains byte `at` — the last `fn `
+    /// declared above it. Whole-line comments are already stripped by
+    /// `code_only`, so this reads code.
+    fn enclosing_fn(source: &str, at: usize) -> String {
+        let start = source[..at]
+            .rfind("fn ")
+            .expect("a call site inside some function");
+        source[start + "fn ".len()..]
+            .chars()
+            .take_while(|c| c.is_ascii_alphanumeric() || *c == '_')
+            .collect()
     }
 
     /// **TASK-194 2b, the producer's half.** A route the floor overruled says so
