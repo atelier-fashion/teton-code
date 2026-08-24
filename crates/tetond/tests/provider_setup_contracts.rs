@@ -178,8 +178,21 @@ fn every_recipe_reaches_the_plan_field_for_field() {
             endpoint,
             example_model,
             max_context,
+            verified_on,
             notes,
         } = recipe;
+
+        // Daemon-side by decision, not by omission (REQ-589 ADR-7): the window's
+        // verification date exists so a durable `config/set` write can record
+        // which windows were inherited from a recipe rather than measured, and
+        // no client surface renders it. The catalog-side gate
+        // (`provider_recipes::tests::the_window_dates_are_the_dates_the_comments_carry`)
+        // is what keeps it honest; this end asserts only that every entry the
+        // plan serves has one behind it.
+        assert!(
+            !verified_on.is_empty(),
+            "`{id_suggestion}` reaches the plan with no verification date behind its window"
+        );
 
         assert_eq!(
             entry.id_suggestion, id_suggestion,

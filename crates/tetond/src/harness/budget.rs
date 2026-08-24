@@ -1045,6 +1045,133 @@ fn bound_clause(budget: &RouteBudget, provider_id: Option<&str>) -> String {
     clause
 }
 
+// -- What a window remedy may propose (REQ-589 BR-7c, ADR-6) -----------------
+
+/// A `capabilities.max_context` value a remedy may offer to write, and the
+/// provenance that qualifies it (REQ-589 BR-7c, ADR-6, ADR-7).
+///
+/// Every field is a fact read off the shipped catalog. Nothing here is
+/// computed, rounded, or scaled from a measurement: BR-7c's rule is that a
+/// proposed window is **looked up, never invented**, because this value is
+/// written to a user's config and outlives the offer that produced it.
+///
+/// The recipe's `id_suggestion` is deliberately **not** carried. It is a
+/// suggestion in the user's own namespace, it matched nothing on the way here,
+/// and a downstream that had it in hand could start keying on it — which is the
+/// one thing ADR-6 forbids.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProposedWindow {
+    /// The window to write, in provider tokens — a vendor recipe's own figure.
+    pub tokens: u32,
+    /// The vendor the figure was read from, spelled the way the vendor spells
+    /// it (`ProviderRecipe::label`) — so an offer can say whose published
+    /// window it is proposing rather than presenting a bare number.
+    pub vendor: String,
+    /// The date that figure was last read off that vendor's documentation,
+    /// `YYYY-MM-DD` (ADR-7): what lets the offer — and a later `/doctor` —
+    /// distinguish an inherited window from a measured one.
+    pub verified_on: String,
+}
+
+/// The window value a remedy may propose for this route, or `None` when it must
+/// **ask** (REQ-589 BR-7c, ADR-6).
+///
+/// # Two rules, and `None` is a real answer
+///
+/// 1. **The recipe is found by `model`, never by a provider id.** That lookup
+///    is [`crate::provider_recipes::recipe_for_model`], and its doc carries the
+///    reasoning: ids are the user's namespace, so Kimi registered as
+///    `work-model` must still get Kimi's window and a provider merely *called*
+///    `anthropic` must not get Anthropic's. `route.provider_id` is not consulted
+///    here at all — it names the window's *label*, not the vendor.
+/// 2. **A value that would not clear the measured expansion is not proposed.**
+///    An offer whose remedy leaves the user hitting the same wall next turn is
+///    worse than an offer with no remedy: it spends the user's consent on a
+///    write that changes nothing, and it does it in a sentence that promised it
+///    would stop happening.
+///
+/// A provider whose model matches no recipe proposes nothing, and the caller
+/// asks for a value instead (BR-7c). Nothing here invents, rounds, or scales a
+/// number — the only figures that can leave this function are figures the
+/// shipped catalog contains.
+///
+/// # The guard is two terms, and both are load-bearing
+///
+/// The candidate is put through [`derive`] — the one classifier (BR-8, AC-12),
+/// never a second opinion about what a window is worth — and the proposal
+/// survives only if:
+///
+/// * the derived pair is **not** [`floored`](RouteBudget::floored), and
+/// * the measurement lands inside it in **both** currencies.
+///
+/// Ollama is the live case for the first term and the reason ADR-6 exists. Its
+/// recipe window is 4k — the served default, honestly recorded, and *smaller*
+/// than Teton's own local pair. Deriving from it gives (2,048 words, 16 KiB),
+/// which is below the floor, so the pair is raised and reported `floored`:
+/// a declared ceiling that is not in force. Writing that window into a config to
+/// fix an over-budget skill would record a smaller declaration than the route
+/// already had, and change nothing about the refusal.
+///
+/// Neither term subsumes the other. On a route that actually refused, the
+/// clearance test alone already rejects Ollama — the smallest budget any route
+/// can derive *is* the floor, so a floored candidate can never hold a
+/// measurement that overflowed one. But this function is also the answer to
+/// "what would you propose here?" asked ahead of any refusal (BR-13's
+/// pre-flight), where the measurement clears trivially and `floored` is the only
+/// thing standing between a user and a config line that shrinks their window.
+/// Both arms are pinned.
+///
+/// # The candidate is always a remote route
+///
+/// `route` supplies the facts that are not the window — the cap, the generation
+/// reservation, the redact-scan posture — and `is_local` is deliberately
+/// **not** among them: `capabilities.max_context` is a remote provider's field,
+/// [`derive`]'s local arm ignores the window entirely, and on the
+/// [`BudgetBound::LocalEngine`] bound the remedy is BR-9's `BindTierRemote`,
+/// whose whole point is that the route the user ends up on is a remote one.
+/// Carrying `is_local` across would answer `None` for every local route, for a
+/// reason about the route being left rather than the one being proposed.
+///
+/// The caller supplies the reservation the *proposed* route would run under —
+/// [`generation_reservation`] for a real route. [`BudgetInputs::local`]'s zero
+/// makes the candidate marginally optimistic, by at most one generation
+/// reservation out of the whole window; it cannot flip any shipped recipe.
+///
+/// # The measurement is a [`Fit`], not two integers
+///
+/// So it can only have come from `ContextManager::would_seed_fit` /
+/// `would_append_fit` — the estimators the pressure path itself runs on. A
+/// caller that could pass loose numbers could pass numbers it estimated
+/// itself, which is the second estimator ADR-11 exists to prevent, and the
+/// figures here decide whether a durable write is offered.
+/// [`Fit::fits`](Fit) is deliberately not read: this answers "would this window
+/// hold it", which is a question worth asking before anything has refused.
+///
+/// Pure, like the rest of this module: [`crate::provider_recipes::recipe_catalog`]
+/// takes nothing and reads nothing (LESSON-481), so reading it costs this
+/// module neither its purity nor its table-testability.
+#[must_use]
+pub fn proposed_window(
+    model: Option<&str>,
+    route: BudgetInputs<'_>,
+    measured: Fit,
+) -> Option<ProposedWindow> {
+    let recipe = crate::provider_recipes::recipe_for_model(model?)?;
+    let candidate = derive(BudgetInputs {
+        window: recipe.max_context,
+        is_local: false,
+        ..route
+    });
+    let clears = !candidate.floored
+        && measured.tokens <= candidate.budget_tokens
+        && measured.bytes <= candidate.budget_bytes;
+    clears.then_some(ProposedWindow {
+        tokens: recipe.max_context,
+        vendor: recipe.label,
+        verified_on: recipe.verified_on,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2672,6 +2799,385 @@ mod tests {
                 None,
             ),
             SkillFit::Fits
+        );
+    }
+
+    // -- REQ-589 BR-7c / ADR-6: what a window remedy may propose -------------
+
+    /// A measurement in the shape the estimators return one.
+    ///
+    /// `fits` is what the pressure path would have said; [`proposed_window`]
+    /// does not read it, and the rows below set it honestly so the two callers
+    /// this function has — a refusal and a pre-flight — are both represented.
+    const fn measured(tokens: usize, bytes: usize, fits: bool) -> Fit {
+        Fit {
+            tokens,
+            bytes,
+            fits,
+        }
+    }
+
+    /// The window a shipped recipe declares for `model`, read from the catalog
+    /// rather than typed out — the one-home rule applied to the test that
+    /// checks it (LESSON-546).
+    fn shipped_window(model: &str) -> u32 {
+        crate::provider_recipes::recipe_for_model(model)
+            .unwrap_or_else(|| panic!("`{model}` is a shipped recipe's example model"))
+            .max_context
+    }
+
+    /// **The proposal is the recipe's own figure, with its provenance**
+    /// (BR-7c, ADR-7).
+    ///
+    /// The `DefaultUnknown` route a new user meets: a remote provider with no
+    /// declared window, a skill that overflowed the defaulted pair, and a model
+    /// this build ships a recipe for. The value offered is the vendor's
+    /// published window — not a figure derived from what was measured — and it
+    /// arrives with the vendor's name and the date the figure was read, which
+    /// is what makes it something a user can check.
+    #[test]
+    fn the_proposal_for_a_recognized_model_is_the_recipes_own_figure() {
+        let proposal = proposed_window(
+            Some("kimi-k3"),
+            remote(0, 0, false),
+            measured(100_000, 400_000, false),
+        )
+        .expect("Moonshot's window clears a skill this size");
+        assert_eq!(
+            proposal,
+            ProposedWindow {
+                tokens: shipped_window("kimi-k3"),
+                vendor: "Moonshot (Kimi)".to_owned(),
+                verified_on: "2026-08-19".to_owned(),
+            }
+        );
+    }
+
+    /// **A model no recipe names proposes nothing — AC-21.**
+    ///
+    /// The offer asks for a value instead. Nothing about the route changes the
+    /// answer: an unrecognized model has no published window to offer, and
+    /// BR-7c's rule is ask, never invent — a silently invented window would be
+    /// the defect class REQ-586 BR-3 exists to name, made worse by being
+    /// written to disk.
+    #[test]
+    fn an_unrecognized_model_proposes_nothing() {
+        for model in [
+            "gpt-4",
+            "kimi-k3-turbo",
+            "llama3.2:70b",
+            "some-model-nobody-shipped",
+            "",
+        ] {
+            for route in [remote(0, 0, false), remote(128_000, 0, false)] {
+                assert_eq!(
+                    proposed_window(Some(model), route, measured(1, 1, false)),
+                    None,
+                    "`{model}` matches no shipped recipe, so there is no published window to \
+                     propose (BR-7c, AC-21)"
+                );
+            }
+        }
+    }
+
+    /// A provider with no model recorded at all proposes nothing — the same
+    /// answer, one step earlier.
+    #[test]
+    fn a_route_with_no_model_proposes_nothing() {
+        assert_eq!(
+            proposed_window(None, remote(0, 0, false), measured(1, 1, false)),
+            None
+        );
+    }
+
+    /// **AC-21's negative half: the offer cannot render a number the recipe
+    /// table does not contain.**
+    ///
+    /// A sweep rather than a row, because the claim is about the whole output
+    /// range and not about one input: every model this daemon could plausibly
+    /// be asked about — every shipped example model, every suggested id, and a
+    /// handful of near-misses — over several route shapes, and **every** value
+    /// that comes back is one of the six figures the catalog ships.
+    ///
+    /// Non-vacuity twice: the sweep must produce at least one proposal (or it
+    /// proves nothing), and the shipped-window set must not be empty.
+    #[test]
+    fn the_proposal_can_only_ever_be_a_number_the_catalog_ships() {
+        let catalog = crate::provider_recipes::recipe_catalog();
+        let shipped: std::collections::BTreeSet<u32> =
+            catalog.iter().map(|r| r.max_context).collect();
+        assert!(!shipped.is_empty(), "the catalog ships no windows to check");
+
+        let mut asked: Vec<String> = Vec::new();
+        for recipe in &catalog {
+            asked.push(recipe.example_model.clone());
+            asked.push(recipe.id_suggestion.clone());
+        }
+        asked.extend(
+            ["gpt-4", "claude", "llama3.2:70b", "", "  "]
+                .into_iter()
+                .map(ToOwned::to_owned),
+        );
+
+        let routes = [
+            BudgetInputs::local(),
+            remote(0, 0, false),
+            remote(128_000, 0, false),
+            remote(200_000, 40_000, false),
+            remote(128_000, 0, true),
+        ];
+        let measurements = [
+            measured(0, 0, true),
+            measured(5_000, 40_000, false),
+            measured(100_000, 400_000, false),
+        ];
+
+        let mut proposals = 0usize;
+        for model in &asked {
+            for route in routes {
+                for fit in measurements {
+                    let Some(proposal) = proposed_window(Some(model), route, fit) else {
+                        continue;
+                    };
+                    proposals += 1;
+                    assert!(
+                        shipped.contains(&proposal.tokens),
+                        "the offer would render {} for model `{model}`, which is not a figure \
+                         the recipe table contains (BR-7c, AC-21). Every proposable window is \
+                         read off `provider_recipes.rs`; nothing computes one.",
+                        proposal.tokens
+                    );
+                }
+            }
+        }
+        assert!(
+            proposals > 0,
+            "no route in the sweep produced a proposal, so it proves nothing about what a \
+             proposal may contain"
+        );
+    }
+
+    /// **Ollama's served default is never proposed, on either arm of the
+    /// guard** (ADR-6 rule 2).
+    ///
+    /// Its recipe window is honestly smaller than Teton's own local pair, so
+    /// writing it would record a *smaller* declaration than the route already
+    /// had — a remedy that fixes nothing and shrinks something.
+    ///
+    /// Two arms, because the two terms of the guard are independent:
+    ///
+    /// * a measurement that actually overflowed — the clearance term refuses
+    ///   it, since a floored candidate is the smallest pair any route derives;
+    /// * a measurement that clears trivially, as a pre-flight's does (BR-13) —
+    ///   here the `floored` term is the only thing refusing, and deleting it
+    ///   reddens this test alone.
+    ///
+    /// The derived candidate is asserted `floored` first, so a reader knows the
+    /// refusal is about the window and not about the arithmetic of this route.
+    #[test]
+    fn ollamas_served_default_is_never_proposed() {
+        let route = remote(0, 0, false);
+        let candidate = derive(BudgetInputs {
+            window: shipped_window("llama3.2"),
+            is_local: false,
+            ..route
+        });
+        assert!(
+            candidate.floored,
+            "Ollama's recipe window derives an unfloored pair, so the premise of ADR-6's guard \
+             has changed and this test is checking the wrong thing"
+        );
+
+        assert_eq!(
+            proposed_window(Some("llama3.2"), route, measured(5_000, 40_000, false)),
+            None,
+            "a window whose budget cannot hold the expansion that refused is not a remedy"
+        );
+        assert_eq!(
+            proposed_window(Some("llama3.2"), route, measured(0, 0, true)),
+            None,
+            "even with nothing to clear, a window that derives a floored budget is a \
+             declaration that would not be in force — proposing it writes a smaller ceiling \
+             than the route already had"
+        );
+    }
+
+    /// **A proposal that would not clear the measurement is not made — and one
+    /// that would, is.**
+    ///
+    /// The contrast is the test. A guard that refused everything would pass the
+    /// Ollama rows above and be useless, so the same vendor is asked twice
+    /// about the same route with two measurements either side of what its
+    /// published window can hold.
+    #[test]
+    fn a_proposal_is_made_exactly_when_the_recipes_window_would_clear_it() {
+        let route = remote(0, 0, false);
+        let window = shipped_window("grok-4.6");
+        let derived = derive(BudgetInputs {
+            window,
+            is_local: false,
+            ..route
+        });
+        assert!(!derived.floored, "Grok's window is well clear of the floor");
+
+        let inside = measured(derived.budget_tokens, derived.budget_bytes, false);
+        assert_eq!(
+            proposed_window(Some("grok-4.6"), route, inside)
+                .expect("a measurement exactly at the derived budget clears it")
+                .tokens,
+            window
+        );
+
+        for over in [
+            measured(derived.budget_tokens + 1, derived.budget_bytes, false),
+            measured(derived.budget_tokens, derived.budget_bytes + 1, false),
+        ] {
+            assert_eq!(
+                proposed_window(Some("grok-4.6"), route, over),
+                None,
+                "one currency over is over: an offer whose remedy leaves the user at the same \
+                 wall next turn has spent their consent on nothing"
+            );
+        }
+    }
+
+    /// **The recipe follows the model, never the provider id** (ADR-6 rule 1).
+    ///
+    /// Ids are the user's namespace. The two rows are chosen so the two keys
+    /// give *different* answers: a provider registered as `openai` serving
+    /// Moonshot's model gets Moonshot's window, and one registered as `kimi`
+    /// serving OpenAI's model gets OpenAI's — which is only possible if the
+    /// model is what was read.
+    #[test]
+    fn the_proposal_follows_the_model_and_not_the_provider_id() {
+        let kimi_window = shipped_window("kimi-k3");
+        let openai_window = shipped_window("gpt-5.6");
+        assert_ne!(
+            kimi_window, openai_window,
+            "the two vendors must declare different windows or this test cannot tell the two \
+             lookup keys apart"
+        );
+
+        let route = |id| BudgetInputs {
+            provider_id: Some(id),
+            ..remote(0, 0, false)
+        };
+        let fit = measured(100_000, 400_000, false);
+
+        assert_eq!(
+            proposed_window(Some("kimi-k3"), route("openai"), fit)
+                .expect("a recognized model")
+                .tokens,
+            kimi_window,
+            "the window proposed for a provider serving `kimi-k3` is Moonshot's, whatever the \
+             user called the row"
+        );
+        assert_eq!(
+            proposed_window(Some("gpt-5.6"), route("kimi"), fit)
+                .expect("a recognized model")
+                .tokens,
+            openai_window
+        );
+        // And a row named after a vendor it is not serving gets no window from
+        // that vendor: `work-model` is an ordinary registration.
+        assert_eq!(
+            proposed_window(Some("kimi-k3"), route("work-model"), fit)
+                .expect("a recognized model")
+                .tokens,
+            kimi_window
+        );
+    }
+
+    /// **A local route still gets a proposal, for the route it would move to**
+    /// (BR-9's `BindTierRemote`).
+    ///
+    /// `derive`'s local arm ignores the window entirely, so carrying the
+    /// route's `is_local` into the candidate would answer `None` for every
+    /// local route — for a reason about the route being left rather than the
+    /// one being proposed, on the exact bound whose remedy is *becoming*
+    /// remote. Deleting the `is_local: false` in [`proposed_window`] reddens
+    /// this.
+    #[test]
+    fn a_local_route_is_offered_the_window_of_the_provider_it_would_bind_to() {
+        let busts_the_local_pair = measured(LOCAL_BUDGET_TOKENS + 1, LOCAL_BUDGET_BYTES + 1, false);
+        assert_eq!(
+            proposed_window(Some("kimi-k3"), BudgetInputs::local(), busts_the_local_pair)
+                .expect("the tier would be bound to a remote provider, and that route has a window")
+                .tokens,
+            shipped_window("kimi-k3")
+        );
+    }
+
+    /// **No surviving proposal derives a floored budget** — the invariant, over
+    /// the whole catalog and a table of route shapes.
+    ///
+    /// [`proposed_window`] names this rule directly; this asserts it holds of
+    /// the *output* rather than trusting the branch, and it is what would go
+    /// red if the floor arithmetic ever moved far enough that a small recipe
+    /// window started clearing measurements.
+    #[test]
+    fn no_surviving_proposal_derives_a_floored_budget() {
+        let mut proposals = 0usize;
+        for recipe in crate::provider_recipes::recipe_catalog() {
+            for route in [
+                BudgetInputs::local(),
+                remote(0, 0, false),
+                remote(128_000, 0, false),
+                remote(200_000, 40_000, true),
+            ] {
+                for fit in [measured(0, 0, true), measured(50_000, 200_000, false)] {
+                    let Some(proposal) = proposed_window(Some(&recipe.example_model), route, fit)
+                    else {
+                        continue;
+                    };
+                    proposals += 1;
+                    let derived = derive(BudgetInputs {
+                        window: proposal.tokens,
+                        is_local: false,
+                        ..route
+                    });
+                    assert!(
+                        !derived.floored,
+                        "`{}`'s window was proposed and derives a floored pair — a declaration \
+                         that would not be in force the moment it was written",
+                        recipe.id_suggestion
+                    );
+                }
+            }
+        }
+        assert!(proposals > 0, "the sweep produced no proposals to check");
+    }
+
+    /// **A redact-scanned route is only offered a window the clamp lets it
+    /// keep** (BR-7b).
+    ///
+    /// The byte clamp is an egress-privacy guarantee and is never a remedy, so
+    /// the candidate is derived *with* it in force. Raising a window buys words
+    /// on such a route and buys no bytes at all — so a byte-heavy expansion
+    /// gets no proposal, and a word-heavy one does. Anything else would offer a
+    /// write that only appears to fix the refusal.
+    #[test]
+    fn a_redact_scanned_route_is_offered_no_window_the_clamp_would_defeat() {
+        let scanned = remote(0, 0, true);
+        assert_eq!(
+            proposed_window(
+                Some("kimi-k3"),
+                scanned,
+                measured(1_000, REDACT_SCANNABLE_CONTEXT_BYTES + 1, false)
+            ),
+            None,
+            "no window raises the scannable byte bound, so proposing one for a byte-bound \
+             refusal offers a fix that is not one (BR-7b)"
+        );
+        assert_eq!(
+            proposed_window(
+                Some("kimi-k3"),
+                scanned,
+                measured(100_000, REDACT_SCANNABLE_CONTEXT_BYTES, false)
+            )
+            .expect("the words half is what a bigger window buys, and it clears")
+            .tokens,
+            shipped_window("kimi-k3")
         );
     }
 }
