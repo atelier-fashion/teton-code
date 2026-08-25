@@ -43,11 +43,11 @@ other key (`allowed-tools`, `model`, `agent`, `hooks`, …) is inert, listed by
 
 Before a **project** skill expands, its repository is acknowledged once per
 session, on both doors; declining refuses the turn. A user skill asks nothing;
-`full` asks only where a project skill shadows a user one. With no terminal the
-client refuses this and the command prompt below without reading a line — the
-next line is a prompt, never a `y` — so an unattended run needs the root in
-`[skills] trusted_project_roots`: consulted, matched whole, never written
-unattended.
+`full` asks only on a shadow. With no terminal this and the command prompt
+below refuse unread: the next line is a prompt, never a `y`. A **typed** run
+needs the root in `[skills] trusted_project_roots`: matched whole, never
+written unattended. No row answers for the model's door: an unattended model
+reaches no project skill.
 
 ## Dynamic context — `` !`cmd` ``
 
