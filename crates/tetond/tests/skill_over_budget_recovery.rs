@@ -77,7 +77,7 @@ use teton_protocol::{SessionId, SessionMode, Tier};
 
 use tetond::broadcast::{EventBus, Subscription};
 use tetond::grants::{ConnectionId, GrantRegistry};
-use tetond::harness::permissions::AddressedPermissionDelivery;
+use tetond::harness::permissions::{AddressedPermissionDelivery, CommitmentAttestation};
 use tetond::runtime::{ClientPresence, DaemonRuntime};
 use tetond::sessions::SessionRegistry;
 use tetond::skills::RealFs;
@@ -362,6 +362,26 @@ struct Fixture {
 
 impl Fixture {
     fn new(config: &str, body: &str, answer: Answer) -> Self {
+        Self::built(config, body, answer, None)
+    }
+
+    /// As [`Self::new`], with `attestation` wired as the runtime's
+    /// [`CommitmentAttestation`] — REQ-591 D-1's seam.
+    fn attesting(
+        config: &str,
+        body: &str,
+        answer: Answer,
+        attestation: Arc<StandingAttestation>,
+    ) -> Self {
+        Self::built(config, body, answer, Some(attestation))
+    }
+
+    fn built(
+        config: &str,
+        body: &str,
+        answer: Answer,
+        attestation: Option<Arc<StandingAttestation>>,
+    ) -> Self {
         seams();
         let tree = Tree::new();
         tree.write("config.toml", config);
@@ -379,6 +399,13 @@ impl Fixture {
         let client = Client::new(runtime.pending(), answer);
         runtime
             .install_addressed_delivery(Arc::clone(&client) as Arc<dyn AddressedPermissionDelivery>);
+        // Absent by default, which is the pre-D-1 posture and the one every
+        // other test in this file is about: with no seam wired the remedy
+        // writes on the connection's standing alone, exactly as a build with no
+        // presence mechanism does.
+        if let Some(attestation) = attestation {
+            runtime.install_commitment_attestation(attestation as Arc<dyn CommitmentAttestation>);
+        }
 
         Self {
             runtime,
@@ -1245,4 +1272,148 @@ fn the_observed_rejection_record_has_no_client_half() {
         "the field block was mis-sliced — the two grant sets `SessionGrants` is made of \
          are not in it, so the absences above are about nothing:\n{fields}"
     );
+}
+
+// ---------------------------------------------------------------------------
+// REQ-591 D-1 — the remedy is a machine-wide commitment
+// ---------------------------------------------------------------------------
+
+/// A [`CommitmentAttestation`] that answers as instructed and records who it was
+/// asked about (REQ-591 D-1).
+struct StandingAttestation {
+    refusal: Option<&'static str>,
+    asked: Mutex<Vec<ConnectionId>>,
+}
+
+impl StandingAttestation {
+    fn new(refusal: Option<&'static str>) -> Arc<Self> {
+        Arc::new(Self {
+            refusal,
+            asked: Mutex::new(Vec::new()),
+        })
+    }
+
+    fn asked(&self) -> Vec<ConnectionId> {
+        self.asked.lock().expect("attestation mutex").clone()
+    }
+}
+
+impl CommitmentAttestation for StandingAttestation {
+    fn attest_daemon_wide_commitment(&self, addressee: ConnectionId) -> Result<(), String> {
+        self.asked
+            .lock()
+            .expect("attestation mutex")
+            .push(addressee);
+        match self.refusal {
+            Some(why) => Err(why.to_owned()),
+            None => Ok(()),
+        }
+    }
+}
+
+/// **D-1 — the remedy writes `config.toml`, so it needs what `config/set` needs.**
+///
+/// ADR-4 routes every remedy through [`DaemonRuntime::apply_config_update`],
+/// `config/set`'s own body, and says it inherits that method's posture
+/// "verbatim". It inherited the body and not the two gates around it:
+/// `refuse_daemon_wide` (REQ-570 BR-10(a)) and `refuse_unattested_commitment`
+/// (BR-10(b)) live in `server.rs::handle_config_set`, and the remedy reaches the
+/// body from the other side — through a `permission/respond` frame that
+/// `handle_permission_respond` never presence-checks.
+/// `config_set_attestation.rs` pinned that gap as a fact. This closes it, on the
+/// same seam that closes it for the acknowledgment's own durable row, because
+/// the two are one question and answering them differently is how a gate comes
+/// to mean two things.
+///
+/// **The pairing is the test** (LESSON-520): the same fixture, the same route,
+/// the same oversized body, the same `remedy_only` answer. Only what the seam
+/// says changes. So a build that stopped consulting the seam fails the refused
+/// leg, and one that never wrote fails the attested leg.
+///
+/// The durable claim is read **off the file and re-parsed** on both legs
+/// (LESSON-519, BR-9), because a refusal that left a half-written document would
+/// satisfy a "the write returned an error" assertion and be a worse outcome than
+/// the gap.
+///
+/// **What a refusal deliberately does not do** is change the turn. The human
+/// answering the offer decided whether to send *this* expansion; only the
+/// going-forward fix is a fact about the machine. Both legs therefore refuse the
+/// turn identically — `remedy_only` means "do not send this one" — and the
+/// difference between them is entirely on disk.
+///
+/// **Mutation:** delete the `commitment_attestation` block from
+/// `apply_over_budget_remedy` and the refused leg goes red on the window it did
+/// not expect.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_remedy_is_written_only_where_a_verified_human_stands_behind_it() {
+    for (refusal, expect_window, what) in [
+        (None, true, "a verified human"),
+        (
+            Some("no human answered the sensor"),
+            false,
+            "a mechanism that was not satisfied",
+        ),
+    ] {
+        let provider = MockProvider::start(Vec::new(), served_turn());
+        let attestation = StandingAttestation::new(refusal);
+        let fx = Fixture::attesting(
+            &local_route_with_one_remote(&provider.openai_endpoint()),
+            &oversized_for_the_local_pair(),
+            Answer::Select(OPTION_ID_OVER_BUDGET_REMEDY_ONLY),
+            Arc::clone(&attestation),
+        );
+        let mut sub = fx.events.subscribe(512);
+        let session = fx.session();
+
+        let refused = fx
+            .invoke(&session)
+            .await
+            .expect_err("`remedy_only` refuses the turn it was asked about");
+        assert_eq!(
+            refused.code,
+            error_code::SKILL_EXPANSION_TOO_LARGE,
+            "{what}: the turn's own answer is the human's and no presence check \
+             touches it: {refused:?}"
+        );
+
+        assert_eq!(
+            attestation.asked(),
+            vec![fx.connection],
+            "{what}: the subject is the connection that answered the offer"
+        );
+
+        // Read off the file, then through the production loader — the two halves
+        // of LESSON-519's check, on the leg that wrote and on the leg that did
+        // not.
+        let document = fx.config_on_disk();
+        assert_eq!(
+            document.contains(&format!("max_context = {RECIPE_WINDOW}")),
+            expect_window,
+            "{what}: the remedy's durable half is a machine-wide commitment, and \
+             this is the document it did or did not reach:\n{document}"
+        );
+        let declared = fx
+            .config_as_reloaded()
+            .providers
+            .iter()
+            .find(|p| p.id.0 == "frontier")
+            .expect("`frontier` survives either way — a refusal writes nothing, it \
+                     does not corrupt")
+            .max_context;
+        assert_eq!(
+            declared == Some(RECIPE_WINDOW),
+            expect_window,
+            "{what}: and the production loader agrees with the bytes: {declared:?}"
+        );
+
+        // The announcement follows the write, not the answer: a
+        // `skill_over_budget_remedy_applied` on the refused leg would be BR-10's
+        // own defect — a surface claiming something that did not happen.
+        let applied = remedies(&drain(&mut sub));
+        assert_eq!(
+            applied.len(),
+            usize::from(expect_window),
+            "{what}: the event announces the write and must not outlive it: {applied:#?}"
+        );
+    }
 }

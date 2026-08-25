@@ -232,6 +232,16 @@ operational question of whether `req589-pre-carveout` is pushed for redundancy.*
 
 ## Open Questions
 
+- [x] **OQ-1 — ANSWERED by D-1, implemented.** `CommitmentAttestation` is a new seam on
+  `PermissionGate` and `DaemonRuntime`; the daemon implements it over the verifier it
+  already holds, and `attest_commitment` is now the one body both it and
+  `refuse_unattested_commitment` run. **Both halves of the seam are covered**: the
+  acknowledgment's `[skills] trusted_project_roots` row and REQ-589's over-budget remedy
+  consult the same object, wired from the same place. The gate is on the *durable* half
+  only — the session grant a human gave at the prompt stands either way — and it degrades
+  to allow where no mechanism exists, stated on stderr, which is BR-10(b)'s own rule.
+  Original question follows.
+
 - [ ] **OQ-1: Does the durable trust write pass the daemon-wide commitment gates?**
   `persist_trusted_project_root` passes neither `refuse_daemon_wide` nor
   `refuse_unattested_commitment`. On a `--features presence` build, `config/set` demands a

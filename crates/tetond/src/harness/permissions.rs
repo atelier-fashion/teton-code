@@ -816,6 +816,58 @@ pub trait ProjectTrustPersistence: Send + Sync {
     fn persist_trusted_project_root(&self, root: &str) -> Result<(), String>;
 }
 
+/// Whether a **verified human** stands behind a daemon-wide commitment that is
+/// being made from inside a consent answer (REQ-591 D-1, REQ-570 BR-10(b)).
+///
+/// ## The gap this closes
+///
+/// `config/set` — the RPC that writes `config.toml` — runs two gates before it
+/// touches anything: [`crate::server::refuse_daemon_wide`] (BR-10(a): the
+/// caller may hold session access at all) and
+/// `refuse_unattested_commitment` (BR-10(b): a human proved presence *just
+/// now*). Two later writes reach the same file without either, because they are
+/// not RPCs — they are the *effects of answering a permission prompt*:
+///
+/// - `[skills] trusted_project_roots` (REQ-589 D-13), and
+/// - REQ-589's over-budget remedy, which routes through `apply_config_update`,
+///   `config/set`'s body, rather than through its handler.
+///
+/// Both demanded only a `permission/respond` frame, and
+/// `handle_permission_respond` performs no presence check. On a shipped build
+/// that adds no authority — the same actor could call `config/set` directly
+/// with strictly more power — so the exposure was confined to `--features
+/// presence` builds. It was still a *daemon-wide* fact answered through a
+/// *session-scoped* consent, which is BUG-162's shape, and the two writes are
+/// one seam: answering them differently is how a gate comes to mean two things.
+///
+/// ## Why this is a seam and not the check itself
+///
+/// The same reason [`ProjectTrustPersistence`] and [`WebTierPersistence`] are
+/// seams: this module is the permission *model* and owns no verifier, no
+/// process table and no connection registry. What it can name is the
+/// **addressee** — the one connection a prompt was routed to (ADR-7) — and the
+/// question "may this connection speak for the machine?". The daemon answers it
+/// over the verifier it already holds.
+///
+/// ## The absence is an allow, and that is not an oversight
+///
+/// A gate nobody wired one into performs the write, which is
+/// [`WebTierPersistence`]'s posture rather than
+/// [`AddressedPermissionDelivery`]'s. BR-10(b)'s own rule is that where **no
+/// mechanism exists this degrades to layer (a) rather than refusing** — the
+/// `presence` feature is not default, so a refusal here would stop every
+/// shipped build from writing a trust row and take D-13's automation with it.
+/// The reduced posture is stated on stderr rather than being silent, which is
+/// the part of BR-8 that does apply.
+pub trait CommitmentAttestation: Send + Sync {
+    /// Refuse unless a human proved presence for `addressee` just now.
+    ///
+    /// # Errors
+    /// A human-readable sentence naming what stopped it, for an operator
+    /// reading the daemon's log.
+    fn attest_daemon_wide_commitment(&self, addressee: ConnectionId) -> Result<(), String>;
+}
+
 /// Where an **addressed** permission request is delivered (REQ-585 ADR-7).
 ///
 /// A seam rather than a connection registry handle for the reason
@@ -1449,6 +1501,15 @@ pub struct PermissionGate {
     /// durable is reported. An unwired sink is a gate that cannot promise
     /// permanence, not a gate that lies about it.
     project_trust_persistence: Option<Arc<dyn ProjectTrustPersistence>>,
+    /// What proves a human stands behind a durable write made from inside a
+    /// consent answer (REQ-591 D-1).
+    ///
+    /// `None` on a gate nobody wired one into, with
+    /// [`Self::project_trust_persistence`]'s consequence and **not**
+    /// [`Self::addressed`]'s: the write happens. See [`CommitmentAttestation`]
+    /// for why an absent mechanism is an allow rather than a refusal, and why
+    /// this gate and REQ-589's remedy consult the same seam.
+    commitment_attestation: Option<Arc<dyn CommitmentAttestation>>,
     /// Where an addressed request is routed (REQ-585 ADR-7).
     ///
     /// `None` on a gate nobody wired one into — which, unlike
@@ -1513,6 +1574,7 @@ impl PermissionGate {
             web_persistence: None,
             trusted_project_roots: Vec::new(),
             project_trust_persistence: None,
+            commitment_attestation: None,
             addressed: None,
         }
     }
@@ -1632,6 +1694,17 @@ impl PermissionGate {
         sink: Arc<dyn ProjectTrustPersistence>,
     ) -> Self {
         self.project_trust_persistence = Some(sink);
+        self
+    }
+
+    /// Wire what attests a human behind a durable write this gate performs
+    /// (REQ-591 D-1).
+    ///
+    /// The same seam REQ-589's remedy consults, wired from the same place, so
+    /// the two halves of BUG-162's question cannot be answered differently.
+    #[must_use]
+    pub fn with_commitment_attestation(mut self, seam: Arc<dyn CommitmentAttestation>) -> Self {
+        self.commitment_attestation = Some(seam);
         self
     }
 
@@ -2516,7 +2589,7 @@ impl PermissionGate {
         }
 
         match rx.await {
-            Ok(outcome) => self.interpret(tool_name, outcome, &question),
+            Ok(outcome) => self.interpret(tool_name, outcome, &question, addressee),
             // Client disconnected before answering: deny (never run unapproved).
             // Not a consent decision — nobody decided it — so nothing is
             // published; a `web_consent_decided { granted: false }` here would
@@ -2534,6 +2607,7 @@ impl PermissionGate {
         tool_name: &str,
         outcome: PermissionOutcome,
         question: &Question,
+        addressee: Option<ConnectionId>,
     ) -> Settled {
         // A client that refused fail-closed did not make a consent decision —
         // nobody decided it. Deny, remember nothing, and publish nothing, for
@@ -2591,7 +2665,10 @@ impl PermissionGate {
                 // the scope below is inert and exists only to satisfy the tuple.
                 OPTION_ID_ENABLE_PERMANENT if question.durable_project_root().is_some() => {
                     self.remember(tool_name, RememberedGrant::AllowAlways);
-                    self.persist_project_trust(question.durable_project_root().unwrap_or_default());
+                    self.persist_project_trust(
+                        question.durable_project_root().unwrap_or_default(),
+                        addressee,
+                    );
                     (PermissionDecision::Allowed, WebConsentScope::Session)
                 }
                 OPTION_REJECT_ALWAYS => {
@@ -2691,7 +2768,48 @@ impl PermissionGate {
     /// unlike a web consent, this answer's session half is the ordinary
     /// `allow_always` grant recorded beside it, and the durable half is visible
     /// where the label said it would be — in the file.
-    fn persist_project_trust(&self, root: &str) {
+    ///
+    /// # The presence gate is on the durable half only (REQ-591 D-1)
+    ///
+    /// A row in `[skills] trusted_project_roots` is a fact about the **machine**
+    /// — it answers for every future session at that root, including ones this
+    /// user will not be watching — while the `allow_always` grant recorded above
+    /// is a fact about *this* session, already answered by the human at this
+    /// prompt. BR-10(b) is about the first kind, so that is the half
+    /// [`CommitmentAttestation`] guards. Refusing the session grant too would
+    /// discard an answer a human demonstrably gave.
+    ///
+    /// A refusal therefore lands in exactly the place a sink failure lands, and
+    /// says so in the same shape: the session holds, the row does not exist, and
+    /// an unattended run will still refuse. That is the honest reading — the
+    /// user chose a durable option and only the durable part did not happen.
+    fn persist_project_trust(&self, root: &str, addressee: Option<ConnectionId>) {
+        // Before the sink, never after: a write that has already landed cannot
+        // be un-made by a refusal, and "the gate ran but the row is there" is
+        // the shape BR-10 is written against.
+        if let Some(seam) = &self.commitment_attestation {
+            // No addressee is not an excuse to skip the check. Every prompt that
+            // can carry `enable_permanent` is an addressed one (ADR-7), so a
+            // `None` here is a question this build cannot attribute to a
+            // connection — and an unattributable answer is exactly what must not
+            // authorize a machine-wide fact.
+            let refusal = match addressee {
+                Some(addressee) => seam.attest_daemon_wide_commitment(addressee).err(),
+                None => Some(
+                    "the answer names no connection, so nobody can be verified for it"
+                        .to_owned(),
+                ),
+            };
+            if let Some(err) = refusal {
+                eprintln!(
+                    "teton: `{root}`'s skills were acknowledged for this session only — \
+                     `[skills] trusted_project_roots` is a machine-wide commitment and no \
+                     verified human stands behind this answer ({err}), so nothing was \
+                     written and an unattended session will still refuse them."
+                );
+                return;
+            }
+        }
         let Some(sink) = &self.project_trust_persistence else {
             eprintln!(
                 "teton: `{root}`'s skills were acknowledged for this session only — this daemon \
@@ -5828,6 +5946,178 @@ mod tests {
                  it is the one whose label said so"
             );
         }
+    }
+
+    /// A [`CommitmentAttestation`] that answers as instructed and counts.
+    struct StandingAttestation {
+        refusal: Option<&'static str>,
+        asked: Mutex<Vec<ConnectionId>>,
+    }
+
+    impl StandingAttestation {
+        fn new(refusal: Option<&'static str>) -> Arc<Self> {
+            Arc::new(Self {
+                refusal,
+                asked: Mutex::new(Vec::new()),
+            })
+        }
+
+        fn asked(&self) -> Vec<ConnectionId> {
+            self.asked.lock().expect("attestation mutex").clone()
+        }
+    }
+
+    impl CommitmentAttestation for StandingAttestation {
+        fn attest_daemon_wide_commitment(&self, addressee: ConnectionId) -> Result<(), String> {
+            self.asked
+                .lock()
+                .expect("attestation mutex")
+                .push(addressee);
+            match self.refusal {
+                Some(why) => Err(why.to_owned()),
+                None => Ok(()),
+            }
+        }
+    }
+
+    /// **D-1 — the machine-wide half of a `p` answer needs a verified human, and
+    /// the session half does not.**
+    ///
+    /// `[skills] trusted_project_roots` is a fact about the machine: it answers
+    /// for every future session at that root, including ones nobody will be
+    /// watching. `config/set` — the RPC that writes the same file — has demanded
+    /// a verified human since REQ-576, and this write demanded only a
+    /// `permission/respond` frame, which `handle_permission_respond` never
+    /// presence-checks. That is BUG-162's shape: a `request_id` minted in a
+    /// session scope and honoured in a machine-wide one.
+    ///
+    /// **The pairing is the test** (LESSON-520). Both legs are the same fixture,
+    /// the same door, the same root and the same answer; only what the seam says
+    /// changes. So a gate that stopped consulting the seam fails the refused
+    /// leg, and a gate that never wrote fails the attested one — neither can be
+    /// green by accident.
+    ///
+    /// The **third** assertion is the one the fix is shaped around: a refusal
+    /// leaves the `allow_always` session grant standing. A human answered this
+    /// prompt and their answer about *this session* is not in doubt; only the
+    /// part that outlives it is. Discarding both would refuse a consent that was
+    /// demonstrably given.
+    ///
+    /// **Mutation:** delete the `commitment_attestation` block from
+    /// `persist_project_trust` and the refused leg goes red on the row it did
+    /// not expect.
+    #[tokio::test]
+    async fn a_row_is_written_only_where_a_verified_human_stands_behind_it() {
+        for (refusal, expected, what) in [
+            (None, vec![DURABLE.to_owned()], "a verified human"),
+            (
+                Some("no human answered the sensor"),
+                Vec::new(),
+                "a mechanism that was not satisfied",
+            ),
+        ] {
+            let sink = RecordingTrustSink::new(false);
+            let attestation = StandingAttestation::new(refusal);
+            let (gate, _route, _bus, _pending, conn) = wired(
+                {
+                    let sink = Arc::clone(&sink);
+                    let attestation = Arc::clone(&attestation);
+                    move |bus, pending| {
+                        PermissionGate::new(
+                            SessionId::from("s1"),
+                            PermissionConfig::with_default(PermissionPolicy::Ask),
+                            bus,
+                            pending,
+                        )
+                        .with_project_trust_persistence(sink as Arc<dyn ProjectTrustPersistence>)
+                        .with_commitment_attestation(attestation as Arc<dyn CommitmentAttestation>)
+                    }
+                },
+                RouteBehaviour::Answers(OPTION_ID_ENABLE_PERMANENT),
+            );
+            let settled = ask_trust(&gate, Some(DURABLE), InvokedBy::User, conn).await;
+
+            assert_eq!(
+                sink.written(),
+                expected,
+                "{what}: the durable row is the machine-wide half, and BR-10(b) \
+                 is about exactly that half"
+            );
+            assert_eq!(
+                attestation.asked(),
+                vec![conn],
+                "{what}: and the subject is the connection the prompt was \
+                 addressed to — the actor who chose the durable option"
+            );
+            // The session half, both legs. This is what makes the refusal a
+            // narrowing of the *write* rather than a second way to decline a
+            // question a human already answered.
+            assert_eq!(
+                settled,
+                SkillConsent::Allowed,
+                "{what}: the human at the prompt allowed this session either way"
+            );
+            assert_eq!(
+                gate.grant_keys(),
+                vec![project_skill_trust_key(DISPLAY)],
+                "{what}: and their answer is remembered for the session, which \
+                 is the half no presence check governs"
+            );
+        }
+    }
+
+    /// **D-1's other arm: an answer no connection can be named for authorizes
+    /// no machine-wide fact.**
+    ///
+    /// Every prompt that can carry `enable_permanent` is an addressed one
+    /// (ADR-7), so `None` here is not a shape production reaches — it is what a
+    /// *later* caller would produce by asking this question on the bus. The
+    /// seam cannot verify a human for a connection nobody named, and "could not
+    /// be attributed" must fail the same way "was not satisfied" does rather
+    /// than falling through to the write.
+    ///
+    /// Reached through [`PermissionGate::interpret`] directly, because `settle`
+    /// will not produce it: this is the arm that exists so a future edit lands
+    /// on a refusal instead of on a hole.
+    #[test]
+    fn an_answer_that_names_no_connection_writes_no_row() {
+        let sink = RecordingTrustSink::new(false);
+        let attestation = StandingAttestation::new(None);
+        let gate = PermissionGate::new(
+            SessionId::from("s1"),
+            PermissionConfig::with_default(PermissionPolicy::Ask),
+            Arc::new(EventBus::new()),
+            Arc::new(PendingPermissions::new()),
+        )
+        .with_project_trust_persistence(Arc::clone(&sink) as Arc<dyn ProjectTrustPersistence>)
+        .with_commitment_attestation(Arc::clone(&attestation) as Arc<dyn CommitmentAttestation>);
+
+        let settled = gate.interpret(
+            &project_skill_trust_key(DISPLAY),
+            PermissionOutcome::Selected {
+                option_id: OPTION_ID_ENABLE_PERMANENT.to_owned(),
+            },
+            &Question::ProjectTrust {
+                durable_root: Some(DURABLE.to_owned()),
+            },
+            None,
+        );
+
+        assert_eq!(
+            settled,
+            Settled::ByHuman(PermissionDecision::Allowed),
+            "the session half still stands: a human picked an allow-shaped id"
+        );
+        assert!(
+            sink.written().is_empty(),
+            "an unattributable answer wrote a machine-wide row: {:?}",
+            sink.written()
+        );
+        assert!(
+            attestation.asked().is_empty(),
+            "and it did so without even asking the seam, which is worse — there \
+             is no connection to ask about"
+        );
     }
 
     /// **BR-7 / AC-13: the label and the write are one fact, pinned by one

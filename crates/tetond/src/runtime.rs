@@ -181,8 +181,9 @@ use crate::harness::turn_loop::{
     pressure_kind, run_session_turn_with_pressure_policy, HarnessError, PressurePolicy,
 };
 use crate::harness::{
-    build_system_prompt, ContextManager, DutyKind, DutyRoute, LocalEngineSource,
-    PendingPermissions, PermissionGate, ProjectTrustPersistence, SessionEvents, ToolContext,
+    build_system_prompt, CommitmentAttestation, ContextManager, DutyKind, DutyRoute,
+    LocalEngineSource, PendingPermissions, PermissionGate, ProjectTrustPersistence, SessionEvents,
+    ToolContext,
     ToolDuties, ToolRegistry, WebTierPersistence, COMPACT_DUTY, DIGEST_DUTY, REDACT_DUTY,
     SHELL_DUTY, TITLE_DUTY, TRIAGE_DUTY,
 };
@@ -2572,6 +2573,23 @@ pub struct DaemonRuntime {
     /// on a runtime nobody wired one into, which is **no prompt** rather than a
     /// degraded one — see [`AddressedPermissionDelivery`].
     addressed_delivery: OnceLock<Arc<dyn AddressedPermissionDelivery>>,
+    /// What attests a human behind a **daemon-wide** commitment made from
+    /// inside a consent answer (REQ-591 D-1).
+    ///
+    /// A [`OnceLock`] for [`Self::addressed_delivery`]'s reason and wired from
+    /// the same place: the verifier belongs to the daemon, and the daemon holds
+    /// the runtime rather than the other way round.
+    ///
+    /// Two writers consult it and they must not diverge — the acknowledgment's
+    /// `[skills] trusted_project_roots` row, through the gate this runtime
+    /// builds, and REQ-589's over-budget remedy, through
+    /// [`Self::apply_over_budget_remedy`]. They are the two halves of BUG-162's
+    /// question, and one seam is what stops them being answered differently.
+    ///
+    /// Empty on a runtime nobody wired one into, which **performs the write** —
+    /// the opposite of [`Self::addressed_delivery`]'s absence and deliberately
+    /// so; see [`CommitmentAttestation`].
+    commitment_attestation: OnceLock<Arc<dyn CommitmentAttestation>>,
     /// The per-command deadline a skill's dynamic context runs under (REQ-585
     /// BR-6: "the `shell` tool's jail, timeout and output cap").
     ///
@@ -2647,6 +2665,7 @@ impl DaemonRuntime {
             provider_health: Mutex::new(BTreeMap::new()),
             secret_resolver: SecretResolver::with_default_backend(),
             addressed_delivery: OnceLock::new(),
+            commitment_attestation: OnceLock::new(),
             skill_command_timeout_ms: shell::DEFAULT_TIMEOUT_MS,
             // In memory: a `minimal()` runtime has no state dir, and a test
             // must never be able to write the real machine's project list.
@@ -2669,6 +2688,20 @@ impl DaemonRuntime {
     /// consent *off* the bus is the whole of ADR-7.
     pub fn install_addressed_delivery(&self, route: Arc<dyn AddressedPermissionDelivery>) {
         let _ = self.addressed_delivery.set(route);
+    }
+
+    /// Wire what attests a human behind this runtime's daemon-wide commitments
+    /// (REQ-591 D-1).
+    ///
+    /// Idempotent-by-first-writer, like
+    /// [`Self::install_addressed_delivery`] and for its reason.
+    ///
+    /// Without it both durable writes proceed on the connection's standing
+    /// alone, which is the pre-D-1 posture and is what a build with no presence
+    /// mechanism gets anyway — see [`CommitmentAttestation`] for why an absent
+    /// mechanism is an allow rather than a refusal.
+    pub fn install_commitment_attestation(&self, seam: Arc<dyn CommitmentAttestation>) {
+        let _ = self.commitment_attestation.set(seam);
     }
 
     /// Replace the per-command deadline a skill's dynamic context runs under
@@ -2865,6 +2898,7 @@ impl DaemonRuntime {
             provider_health: Mutex::new(BTreeMap::new()),
             secret_resolver: SecretResolver::with_default_backend(),
             addressed_delivery: OnceLock::new(),
+            commitment_attestation: OnceLock::new(),
             skill_command_timeout_ms: shell::DEFAULT_TIMEOUT_MS,
             projects: Arc::new(crate::projects::ProjectStore::open(
                 &teton_protocol::socket_path::projects_path(base_dir),
@@ -4471,7 +4505,7 @@ impl DaemonRuntime {
         // remedy is the going-forward half and holds whichever way the send went.
         if answer.apply_remedy() {
             match plan {
-                Some(plan) => self.apply_over_budget_remedy(events, session_id, plan),
+                Some(plan) => self.apply_over_budget_remedy(events, session_id, plan, connection),
                 // Unreachable, and stated rather than assumed away: the two
                 // remedy ids are denied by `interpret_over_budget` unless the
                 // option list carried them, and it carried them only where a
@@ -4581,7 +4615,46 @@ impl DaemonRuntime {
         events: &Arc<EventBus>,
         session_id: &SessionId,
         plan: RemedyPlan,
+        answered_by: ConnectionId,
     ) {
+        // REQ-591 D-1, and the half of BUG-162's question REQ-589 owns.
+        //
+        // `config/set` runs `refuse_daemon_wide` and `refuse_unattested_commitment`
+        // before it reaches `apply_config_update`; this path reaches the same
+        // body from the other side, through a `permission/respond` frame that
+        // `handle_permission_respond` never presence-checks. ADR-4's claim that
+        // the remedy inherits `config/set`'s posture "verbatim" was true of the
+        // *body* and false of the two gates around it — which is what
+        // `config_set_attestation::the_remedys_gate_sits_at_its_own_door_and_not_in_the_shared_config_body`
+        // pinned as a fact rather than as a footnote, and now pins the placement
+        // this block chose.
+        //
+        // Checked **before** the writes and not inside them: gating
+        // `apply_config_update` itself would put a second presence check under
+        // `config/set`, which already ran one, and the seam a test drives
+        // directly would stop being the seam production uses. The subject is the
+        // connection that *answered the offer* — the addressee, not the
+        // submitter, because those can differ and BR-10(b) asks about the actor
+        // who chose the durable option.
+        //
+        // A refusal leaves the turn's own answer standing, for
+        // `PermissionGate::persist_project_trust`'s reason: the human at the
+        // prompt decided whether to send *this* expansion, and only the
+        // going-forward half is a machine-wide fact. It is stated rather than
+        // swallowed, in the same shape a failed write is, because a user told
+        // their limit was raised when nothing was written meets the same
+        // refusal next turn with no explanation.
+        if let Some(seam) = self.commitment_attestation.get() {
+            if let Err(err) = seam.attest_daemon_wide_commitment(answered_by) {
+                eprintln!(
+                    "tetond: the over-budget remedy was not applied — it is a machine-wide \
+                     commitment and no verified human stands behind this answer ({err}). \
+                     This turn's own answer stands; the limit still stands too, and the next \
+                     invocation will meet the same measurement."
+                );
+                return;
+            }
+        }
         let RemedyPlan {
             kind,
             provider_id,
@@ -6399,6 +6472,14 @@ impl DaemonRuntime {
             // asks nobody rather than falling back to the bus.
             if let Some(route) = self.addressed_delivery.get() {
                 gate = gate.with_addressed_delivery(Arc::clone(route));
+            }
+            // REQ-591 D-1: and what proves a human behind the durable half of a
+            // `p` answer. Wired here rather than folded into the sink above
+            // because the *same* seam gates the over-budget remedy, which does
+            // not go through this gate at all — one answer to BUG-162's
+            // question, consulted from both places that ask it.
+            if let Some(seam) = self.commitment_attestation.get() {
+                gate = gate.with_commitment_attestation(Arc::clone(seam));
             }
             Arc::new(gate)
         }))

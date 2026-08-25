@@ -139,7 +139,7 @@ impl TestDaemon {
         daemon: &Path,
         extra: &str,
         replies: &[&str],
-        extra_env: &[(&str, &Path)],
+        extra_env: &[(&str, &std::ffi::OsStr)],
     ) -> Self {
         static SEQ: AtomicUsize = AtomicUsize::new(0);
         // Per-daemon, so two tests in this file never share a root, a socket, or
@@ -1229,7 +1229,7 @@ fn a_move_to_a_non_project_root_re_fires_the_notice_at_a_terminal() {
     let _ = std::fs::remove_dir_all(&home);
     std::fs::create_dir_all(&home).unwrap();
     let daemon =
-        TestDaemon::spawn_with_env(&daemon_path, "", &["scripted reply"], &[("HOME", &home)]);
+        TestDaemon::spawn_with_env(&daemon_path, "", &["scripted reply"], &[("HOME", home.as_os_str())]);
     let project = daemon.root.join("proj");
     let plain = daemon.root.join("plain");
     std::fs::create_dir_all(&project).unwrap();
@@ -1407,7 +1407,7 @@ fn a_skill_consent_asks_once_at_a_terminal_and_lists_every_command_verbatim() {
         &daemon_path,
         &config,
         &["scripted reply"],
-        &[("HOME", &home)],
+        &[("HOME", home.as_os_str())],
     );
     let project = daemon.root.join("proj");
     std::fs::create_dir_all(&project).unwrap();
@@ -1543,7 +1543,7 @@ fn the_acknowledgment_prompt_names_the_root_its_skills_and_what_it_left_out() {
             r#"{"tool": "skill", "arguments": {"name": "validate", "args": ""}}"#,
             "the project skill landed.",
         ],
-        &[("HOME", &home)],
+        &[("HOME", home.as_os_str())],
     );
 
     let project = daemon.root.join("proj");
@@ -1633,6 +1633,151 @@ fn the_acknowledgment_prompt_names_the_root_its_skills_and_what_it_left_out() {
         done,
         "the turn must still complete after the answer; transcript:\n{after}"
     );
+}
+
+// ---------------------------------------------------------------------------
+// REQ-591 D-1 — the durable acknowledgment, on both presence configurations
+// ---------------------------------------------------------------------------
+
+/// **D-1 — `p` writes a machine-wide row, so on a build that can ask a human it
+/// asks one; and the answer's session half is untouched either way.**
+///
+/// The two seams and the two gate doors are pinned in-process against doubles.
+/// What only a spawned daemon can say is that the check is **wired** in a real
+/// process, over the verifier that build actually loaded, with a real
+/// `config.toml` on disk to inspect afterwards — LESSON-519's "inspect the
+/// artifact" and the reason `config_set_attestation.rs` spawns one for
+/// `config/set`.
+///
+/// The two legs are the same fixture, the same repository, the same typed
+/// invocation and the same `p`; only `TETON_PRESENCE_ACCEPT` changes, which
+/// selects `AcceptingVerifier` (`1`) or `AlwaysFailsVerifier` (`fail`) through
+/// `default_verifier`. Both ride the `TETON_TEST_SEAMS` master switch a release
+/// build refuses to start under, so neither exists in the shipped binary.
+///
+/// **The pairing is the test** (LESSON-520). A daemon that never wrote the row
+/// fails the accepting leg; one that stopped consulting the seam fails the
+/// refusing leg. Neither can be green because the fixture was mis-built — and
+/// the file is re-parsed by `Config::load`, not merely grepped, because a
+/// document that reads right and does not load right is not a durable answer
+/// (BR-9).
+///
+/// The **third** assertion is D-1's shape: on both legs the skill still runs.
+/// The human at this terminal answered a question about this session and their
+/// answer to it is not in doubt; only the part that outlives the session is a
+/// commitment about the machine.
+#[test]
+fn a_permanent_acknowledgment_writes_its_row_only_where_presence_is_satisfied() {
+    for (presence, expect_row) in [("1", true), ("fail", false)] {
+        let daemon_path = daemon_bin();
+        let home = PathBuf::from("/tmp").join(format!(
+            "tcptyd1{presence}{:x}",
+            std::process::id() & 0xffff
+        ));
+        let _ = std::fs::remove_dir_all(&home);
+        std::fs::create_dir_all(home.join(".claude/skills")).unwrap();
+
+        let tiers: String = ["reflex", "scan", "build", "think"]
+            .iter()
+            .map(|t| format!("[[tiers]]\ntier = \"{t}\"\nprovider_id = \"local\"\n\n"))
+            .collect();
+        let config = format!("[[providers]]\nid = \"local\"\nkind = \"local\"\n\n{tiers}");
+        let daemon = TestDaemon::spawn_with_env(
+            &daemon_path,
+            &config,
+            &["the project skill landed."],
+            &[
+                ("HOME", home.as_os_str()),
+                // The REQ-575 seam, the same one `config_set_attestation.rs`
+                // drives `config/set` under. `TETON_TEST_SEAMS` is already on
+                // this fixture's daemon.
+                ("TETON_PRESENCE_ACCEPT", std::ffi::OsStr::new(presence)),
+            ],
+        );
+
+        let project = daemon.root.join("proj");
+        std::fs::create_dir_all(project.join(".claude/skills/deploy")).unwrap();
+        std::fs::write(project.join("Cargo.toml"), "[package]\nname = \"proj\"\n").unwrap();
+        std::fs::write(
+            project.join(".claude/skills/deploy/SKILL.md"),
+            "---\ndescription: the project deploy\n---\nDeploy body.\n",
+        )
+        .unwrap();
+
+        let pty = native_pty_system()
+            .openpty(PtySize {
+                rows: 60,
+                cols: 300,
+                pixel_width: 0,
+                pixel_height: 0,
+            })
+            .expect("openpty");
+        let mut cmd = CommandBuilder::new(teton_bin());
+        cmd.args(["--cwd", project.to_str().unwrap()]);
+        cmd.env("XDG_RUNTIME_DIR", &daemon.runtime_dir);
+        cmd.env("TETON_CONFIG", daemon.root.join("config.toml"));
+        cmd.env("TETON_REPO_ROOT", &daemon.root);
+        cmd.env("HOME", &home);
+        let mut session = pty.slave.spawn_command(cmd).expect("spawn teton under pty");
+        drop(pty.slave);
+        let transcript = spawn_reader(pty.master.try_clone_reader().expect("pty reader"));
+        let mut writer = pty.master.take_writer().expect("pty writer");
+
+        assert!(
+            wait_for(&transcript, "ready (freeform)"),
+            "{presence}: the session never reached the entry prompt; transcript:\n{}",
+            snapshot(&transcript)
+        );
+        writer.write_all(b"/deploy\r").expect("type the invocation");
+        writer.flush().ok();
+
+        assert!(
+            wait_for(&transcript, "permission requested: project_skill_trust:"),
+            "{presence}: a typed project skill must be acknowledged; transcript:\n{}",
+            snapshot(&transcript)
+        );
+        let asking = snapshot(&transcript);
+        assert!(
+            asking.contains("[p]ermanently"),
+            "{presence}: the durable option must be on the prompt, or `p` below \
+             answers something else; transcript:\n{asking}"
+        );
+        writer.write_all(b"p\r").expect("answer permanently");
+        writer.flush().ok();
+
+        let ran = wait_for(&transcript, "the project skill landed.");
+        let after = snapshot(&transcript);
+        let _ = session.kill();
+        let _ = session.wait();
+
+        // The session half, on both legs: a human said yes to this session and
+        // no presence check governs that.
+        assert!(
+            ran,
+            "{presence}: the acknowledged skill must still run — the presence \
+             check is on the durable half only; transcript:\n{after}"
+        );
+
+        // The durable half. Read off the file, then through the production
+        // loader (BR-9, LESSON-519).
+        let document = std::fs::read_to_string(daemon.root.join("config.toml"))
+            .expect("the daemon's config file");
+        let listed = teton_core::config::Config::load(&document)
+            .expect("the document still parses whichever way the gate answered")
+            .skills
+            .trusted_project_roots;
+        assert_eq!(
+            !listed.is_empty(),
+            expect_row,
+            "{presence}: `[skills] trusted_project_roots` is a machine-wide \
+             commitment, and this is the list it did or did not join: {listed:?}\n\
+             document:\n{document}\ndaemon log:\n{}",
+            std::fs::read_to_string(daemon.root.join("tetond.log")).unwrap_or_default()
+        );
+
+        drop(daemon);
+        let _ = std::fs::remove_dir_all(&home);
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1879,7 +2024,7 @@ fn park_at_the_over_budget_offer(tag: &str) -> OfferSession {
         .collect();
     let config = format!("[[providers]]\nid = \"local\"\nkind = \"local\"\n\n{tiers}");
     let daemon =
-        TestDaemon::spawn_with_env(&daemon_path, &config, &[SENT_MARKER], &[("HOME", &home)]);
+        TestDaemon::spawn_with_env(&daemon_path, &config, &[SENT_MARKER], &[("HOME", home.as_os_str())]);
 
     let project = daemon.root.join("proj");
     std::fs::create_dir_all(project.join(".claude/skills/analyze")).unwrap();
