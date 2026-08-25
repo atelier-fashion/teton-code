@@ -1215,8 +1215,7 @@ enum Question {
         /// write one at all.
         ///
         /// `None` — and therefore the standard four options, byte for byte as
-        /// REQ-587 shipped them — in two cases, and the second is the
-        /// interesting one:
+        /// REQ-587 shipped them — in three cases:
         ///
         /// - the root will not canonicalise, so there is no name to write;
         /// - **the model raised this prompt.** A durable config write is
@@ -1225,14 +1224,19 @@ enum Question {
         ///   typed `/name`; this door's other caller exists because the model
         ///   reached for a skill, which is the "a file on disk would be
         ///   choosing when it gets a consent prompt" shape BR-6 is written
-        ///   against.
+        ///   against;
+        /// - **the session is at `plan`** (REQ-591 D-8). The row is a write to
+        ///   the user's config and a standing answer for every future session at
+        ///   that root, and `plan`'s promise is that nothing changes. See
+        ///   [`PermissionGate::may_offer_durable_row`], and note that the
+        ///   *consultation* is untouched: a `plan` session at a root somebody
+        ///   already listed still proceeds.
         ///
-        /// The **session** answer is still shared — one key per root, read by
-        /// both callers — so a repository acknowledged at the typed prompt needs
-        /// no second acknowledgment when the model reaches for it in that
-        /// session. The **durable** answer is not, since REQ-591 D-2: neither
-        /// the write nor the consultation reaches this door, and
-        /// [`durable_row_for`] is the one place that decides so.
+        /// Since REQ-591 D-7 the **session** answer is not shared either: the
+        /// grant key carries the door, so an answer at the typed prompt does not
+        /// settle the model's. The two narrowings are the same rule at two
+        /// ranges — [`durable_row_for`] for the durable answer, the key itself
+        /// for the session one.
         durable_root: Option<String>,
     },
 }
@@ -2435,13 +2439,28 @@ impl PermissionGate {
         } else {
             LevelAllow::Settles
         };
-        // REQ-591 D-2. **One** name, derived once, for both the offer to write
-        // and the consultation — see [`durable_row_for`] for why the derivation
-        // is a function of the invoker rather than a condition at each use.
+        // REQ-591 D-2. **One** name, derived once — see [`durable_row_for`] for
+        // why the derivation is a function of the invoker rather than a
+        // condition at each use.
         let durable_row = durable_row_for(invoked_by, durable_root);
+        // REQ-591 D-8, and the one place a level narrows it. `durable_row` is
+        // still the single answer to *which row answers for this door*; this is
+        // the separate question of whether **this session** may create one, and
+        // it is asked once, here, on the way to the offer only.
+        //
+        // The asymmetry with `acknowledged_unattended` below is deliberate and
+        // is the decision itself — which is why it is spelled rather than
+        // implied. `durable_row_for`'s doc records the *other* asymmetry, at
+        // `InvokedBy::Model`, as the defect LESSON-495 warns about: a condition
+        // at the write and none at the read, for the **same** question. These
+        // are two questions. "Does a row a human already wrote answer here?" is
+        // D-13's widening, bought deliberately and not `plan`'s to revoke.
+        // "May this session append a row?" is a change to the machine, and
+        // `plan` is the level whose promise is that nothing changes.
+        let offered_row = durable_row.clone().filter(|_| self.may_offer_durable_row());
         let question = Question::ProjectTrust {
             invoked_by,
-            durable_root: durable_row.clone(),
+            durable_root: offered_row,
         };
         // No `description`, for [`Self::authorize_skill`]'s reason: the subject
         // carries the root and the named set, and a sentence restating them
@@ -2450,6 +2469,30 @@ impl PermissionGate {
             .settle_skill_consent(key, addressed, question, level_allow)
             .await;
         self.acknowledged_unattended(settled, durable_row.as_deref())
+    }
+
+    /// Whether this session's level may put a durable option on the
+    /// acknowledgment prompt (REQ-591 D-8).
+    ///
+    /// Every level but `plan`. Answering `p` appends to
+    /// `[skills] trusted_project_roots`, which is a write to the user's config
+    /// file and a standing answer for every future session at that root —
+    /// exactly the kind of change `plan` exists to promise it will not make.
+    /// This module already refuses to let `[web] permission_allow` punch through
+    /// `plan` one screen up, for the same reason and in the same words.
+    ///
+    /// **Only the offer.** `acknowledged_unattended` still receives the full
+    /// row, so an unattended `plan` session at a root a human already listed
+    /// proceeds. That is D-13's widening, which the owner bought deliberately;
+    /// `plan` declining to *create* a standing answer is not `plan` declining to
+    /// honour one somebody else already gave.
+    ///
+    /// `None` — a gate pinned to an exact table rather than a level — offers.
+    /// A deny-default fixed table settles this question `DeniedByLevel` before
+    /// any option set is composed, so there is no prompt for the answer to
+    /// matter to.
+    fn may_offer_durable_row(&self) -> bool {
+        self.level() != Some(PermissionLevel::Plan)
     }
 
     /// D-13's widening, and the whole of it: a `NoTerminal` refusal at a root a
@@ -5679,6 +5722,155 @@ mod tests {
             from,
         )
         .await
+    }
+
+    /// **D-8: `plan` may read a row it did not write, and may not write one.**
+    ///
+    /// Answering `p` appends to `[skills] trusted_project_roots` — a write to
+    /// the user's config file and a standing answer for every future session at
+    /// that root. `plan` is the level whose promise is that nothing changes and
+    /// nothing leaves, and this module already refuses to let
+    /// `[web] permission_allow` punch through it one screen up, for this reason
+    /// and in these words. D-3 gave `plan` the *acknowledgment*; it did not give
+    /// it the config file.
+    ///
+    /// **Two things are asserted, and the second is the one that matters.** The
+    /// label going is cosmetic on its own — a client can send any option id it
+    /// likes. So this also drives an `enable_permanent` answer at `plan` through
+    /// the real route and asserts the sink stayed empty: the write is refused by
+    /// `Question::durable_project_root` being `None`, not by the option being
+    /// unrendered.
+    ///
+    /// That unoffered answer settles **`Declined`**, not `Allowed`, and the test
+    /// pins it: `interpret`'s existing rule is that an id which was not on the
+    /// prompt is not an answer to it, so it falls to the deny arm. Fail-closed,
+    /// and a third independent guard — but it is also why the final leg below
+    /// answers `allow_always`, so this test cannot be read as saying `plan`
+    /// refuses the acknowledgment.
+    ///
+    /// **The pairing is the test** (LESSON-520). `guarded` is the same fixture,
+    /// the same root, the same canonical name and the same answer — and it
+    /// offers the option and performs the write. Without it, a build that had
+    /// broken the durable path outright would pass this.
+    ///
+    /// The **read** is deliberately untouched, and
+    /// [`a_row_never_lifts_a_level_that_would_not_have_asked`]'s `plan` leg is
+    /// where that is pinned: an unattended `plan` session at a listed root still
+    /// proceeds. `plan` declining to create a standing answer is not `plan`
+    /// declining to honour one somebody else already gave — that widening is
+    /// D-13's and was bought deliberately.
+    ///
+    /// **Mutation:** delete the `may_offer_durable_row` filter and the `plan`
+    /// leg goes red twice — on the option set and on the row.
+    #[tokio::test]
+    async fn plan_offers_no_durable_row_and_writes_none() {
+        for (level, durable) in [
+            (PermissionLevel::Plan, false),
+            (PermissionLevel::Guarded, true),
+        ] {
+            let sink = RecordingTrustSink::new(false);
+            let (gate, route, _bus, _pending, conn) = wired(
+                {
+                    let sink = Arc::clone(&sink);
+                    move |bus, pending| {
+                        PermissionGate::with_level(
+                            SessionId::from("s1"),
+                            level,
+                            Vec::new(),
+                            bus,
+                            pending,
+                        )
+                        .with_project_trust_persistence(sink as Arc<dyn ProjectTrustPersistence>)
+                    }
+                },
+                // The client answers `enable_permanent` **whether or not it was
+                // offered**, which is the whole point: an id is a string a
+                // client sends, and the gate may not take the label's absence
+                // for a guard.
+                RouteBehaviour::Answers(OPTION_ID_ENABLE_PERMANENT),
+            );
+
+            let settled = ask_trust(&gate, Some(DURABLE), InvokedBy::User, conn).await;
+
+            assert_eq!(
+                route.delivered().len(),
+                1,
+                "{level:?}: the acknowledgment must still be *asked* — D-3 is what \
+                 put this question at `plan`, and a leg that never asked would \
+                 assert nothing about its options"
+            );
+            assert_eq!(
+                route
+                    .option_ids(0)
+                    .iter()
+                    .any(|id| id == OPTION_ID_ENABLE_PERMANENT),
+                durable,
+                "{level:?}: the durable option's presence on the prompt; ids were \
+                 {:?}",
+                route.option_ids(0)
+            );
+            assert_eq!(
+                route
+                    .option_ids(0)
+                    .iter()
+                    .filter(|id| id.as_str() != OPTION_ID_ENABLE_PERMANENT)
+                    .cloned()
+                    .collect::<Vec<_>>(),
+                vec![
+                    OPTION_ALLOW_ONCE.to_owned(),
+                    OPTION_ALLOW_ALWAYS.to_owned(),
+                    OPTION_REJECT_ONCE.to_owned(),
+                    OPTION_REJECT_ALWAYS.to_owned(),
+                ],
+                "{level:?}: the other four are REQ-587's, byte for byte, at every \
+                 level — only the fifth slot is D-8's"
+            );
+            assert_eq!(
+                sink.written(),
+                if durable {
+                    vec![DURABLE.to_owned()]
+                } else {
+                    Vec::new()
+                },
+                "{level:?}: and this is the assertion the label cannot make — the \
+                 client sent `enable_permanent` on both legs, so a `plan` that \
+                 only stopped *rendering* the option would fail here"
+            );
+            assert_eq!(
+                settled,
+                if durable {
+                    SkillConsent::Allowed
+                } else {
+                    SkillConsent::Declined
+                },
+                "{level:?}: an id that was not on the prompt is not an answer to \
+                 it, so `enable_permanent` at `plan` falls to `interpret`'s deny \
+                 arm — a second guard, independent of the empty sink above, and \
+                 fail-closed rather than a silent downgrade to allow-once"
+            );
+        }
+
+        // And the answer a real client at `plan` can actually give still works,
+        // so the leg above is a statement about the fifth option rather than
+        // about `plan` being unanswerable.
+        let (gate, _route, _bus, _pending, conn) = wired(
+            |bus, pending| {
+                PermissionGate::with_level(
+                    SessionId::from("s1"),
+                    PermissionLevel::Plan,
+                    Vec::new(),
+                    bus,
+                    pending,
+                )
+            },
+            RouteBehaviour::Answers(OPTION_ALLOW_ALWAYS),
+        );
+        assert_eq!(
+            ask_trust(&gate, Some(DURABLE), InvokedBy::User, conn).await,
+            SkillConsent::Allowed,
+            "at `plan` a human can still acknowledge the repository — D-3's whole \
+             point — and every command in the body stays denied by the level"
+        );
     }
 
     /// **The load-bearing test. An unattended session at a root nobody listed
