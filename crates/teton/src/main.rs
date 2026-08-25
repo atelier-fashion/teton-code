@@ -33,7 +33,7 @@ use teton_protocol::methods::{
     ConfigUpdate, ContentClass, CostQueryParams, CostQueryResult, CostReportView, ModelListParams,
     ModelListResult, ModelSetParams, ModelStatusParams, ModelStatusResult, PrivacyBoundaryConfig,
     PromptTurnParams, ProviderConfig, SessionCreateParams, SessionPermissionsParams,
-    SkillInvocation, TierBindingConfig,
+    SkillInvocation, SkillsPreflightParams, TierBindingConfig,
 };
 use teton_protocol::SessionId;
 use teton_protocol::{
@@ -1962,7 +1962,73 @@ pub(crate) fn doctor_report_on(
             &format!("config query failed: {}", err.message),
         ),
     }
+    report_skill_preflight(conn, ctx)?;
     doctor_trailer(ctx.surface);
+    Ok(())
+}
+
+/// Ask which of this session's skills will not fit, and print the daemon's
+/// answer (REQ-589 BR-13, AC-17/AC-19).
+///
+/// # Why the CLI composes none of it
+///
+/// Every figure in the report is the one `skill_fit` produced daemon-side,
+/// against the budget the router stamped on this session's route. A client that
+/// re-worded any of it would be the second estimator ADR-11 exists to prevent —
+/// the failure REQ-586's own verify pass found on `/verbose` — so what crosses
+/// the wire is text and what this function does is print it, line by line, on
+/// `projects/list`'s precedent.
+///
+/// `/verbose` rides in the params rather than being applied here for the same
+/// reason: AC-19's clause names the route's budget and bound, and the side that
+/// holds the budget is the side that words it.
+///
+/// # Three states, three different things to say
+///
+/// * **No session** — the shell's `teton doctor` owns none, and the question is
+///   about one session's registry on one session's route. It says so rather
+///   than answering about a session it picked.
+/// * **`METHOD_NOT_FOUND`** — a daemon predating this method. Reported as a
+///   pending capability, exactly as the `config/get` arm above does, and never
+///   as an error: the capability is proven by a successful call.
+/// * **Anything else** — the daemon's own message, on the error surface.
+///
+/// # Errors
+///
+/// Propagates a transport error from the call, as the `config/get` above it
+/// does; a daemon that answers is reported on the surface and returns `Ok`.
+fn report_skill_preflight(conn: &mut Connection, ctx: &mut UiContext<'_>) -> anyhow::Result<()> {
+    let Some(session_id) = ctx.session_id.clone() else {
+        ctx.surface.line(
+            LineKind::Notice,
+            "skills: no session here — `/doctor` inside a session reports which of its skills \
+             will not fit on the route that session is on.",
+        );
+        return Ok(());
+    };
+    let verbose = ctx.state.verbose;
+    match conn.call(
+        SkillsPreflightParams {
+            session_id,
+            verbose,
+        },
+        ctx,
+    )? {
+        Ok(report) => {
+            for line in report.rendered.lines() {
+                ctx.surface.line(LineKind::Info, line);
+            }
+        }
+        Err(err) if err.code == error_code::METHOD_NOT_FOUND => ctx.surface.line(
+            LineKind::Notice,
+            "skills: this daemon build cannot pre-measure skill expansions yet \
+             (skills/preflight pending).",
+        ),
+        Err(err) => ctx.surface.line(
+            LineKind::Error,
+            &format!("skill pre-flight failed: {}", err.message),
+        ),
+    }
     Ok(())
 }
 

@@ -101,12 +101,14 @@ impl Completion {
 /// against a laxer guard than production runs (AC-8).
 #[must_use]
 pub fn over_window(prompt_tokens: u32, n_ctx: u32, max_tokens: u32) -> Option<EngineError> {
-    let budget = n_ctx.saturating_sub(max_tokens);
-    if prompt_tokens > budget {
-        return Some(EngineError::Backend(format!(
-            "prompt of {prompt_tokens} tokens exceeds this engine's window \
-             ({budget} = {n_ctx} context minus {max_tokens} generation)"
-        )));
+    let budget_tokens = n_ctx.saturating_sub(max_tokens);
+    if prompt_tokens > budget_tokens {
+        return Some(EngineError::ContextWindowExceeded {
+            prompt_tokens,
+            budget_tokens,
+            n_ctx,
+            max_tokens,
+        });
     }
     None
 }
@@ -126,6 +128,41 @@ pub enum EngineError {
     /// prompt content, so it is safe to log.
     #[error("inference backend error: {0}")]
     Backend(String),
+    /// The prompt does not fit this engine's context window — the refusal
+    /// [`over_window`] produces, and its only constructor (REQ-589 ADR-3).
+    ///
+    /// **Typed rather than a [`Backend`](Self::Backend) string** because the
+    /// harness has to tell "this prompt is too big for the window" apart from
+    /// "inference fell over" in order to report the first as a context outcome
+    /// with a remedy instead of an opaque internal error — and the only other
+    /// way to tell them apart is to match this sentence at the consumer, a
+    /// predicate mirrored away from the precondition that produced it
+    /// (LESSON-528). A reword here would then silently reclassify every local
+    /// window refusal; with a variant, it cannot.
+    ///
+    /// The wording is byte-identical to the `Backend` message this replaced
+    /// (minus that variant's `inference backend error: ` prefix, which was
+    /// never true of this condition), so surfaces that only render it are
+    /// unchanged.
+    ///
+    /// `budget_tokens` is carried rather than re-derived at each surface: the
+    /// guard already computed it, and a second derivation is a second place for
+    /// the saturating subtraction to be got wrong — the direction that admits
+    /// an over-window prompt and aborts the process (LESSON-444).
+    #[error(
+        "prompt of {prompt_tokens} tokens exceeds this engine's window \
+         ({budget_tokens} = {n_ctx} context minus {max_tokens} generation)"
+    )]
+    ContextWindowExceeded {
+        /// The full tokenized prompt's size, template overhead included.
+        prompt_tokens: u32,
+        /// What was left for the prompt: `n_ctx` minus the generation reserve.
+        budget_tokens: u32,
+        /// The engine's whole context window.
+        n_ctx: u32,
+        /// The generation reserve held back from it.
+        max_tokens: u32,
+    },
 }
 
 impl EngineError {

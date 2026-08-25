@@ -35,6 +35,13 @@
 //! REQ-585 adds `skill_invoked` (BR-12), which announces that a user-typed
 //! `/name` expanded into a prompt turn, and carries what the echo line and
 //! `/verbose` render — never the body, which stays in the file.
+//! REQ-589 adds the over-budget offer's three announcements —
+//! `skill_over_budget_offered`, `skill_over_budget_accepted` and
+//! `skill_over_budget_remedy_applied` (BR-13). They record that an expansion
+//! too large for the route's budget was put to the user as a *question*
+//! rather than refused outright, what was answered, and what durable write
+//! the answer caused — the three facts that tell "nobody was asked" from
+//! "somebody was asked and said no".
 //!
 //! This list is an index, not decoration: a new variant of [`Event`] that is not
 //! named here makes the paragraph above wrong.
@@ -195,6 +202,14 @@ pub enum Event {
     SkillRefused(SkillRefused),
     /// The `projects` tool found a project this turn (REQ-584 BR-11).
     ProjectMatch(ProjectMatch),
+    /// An over-budget skill expansion was put to a human as a question
+    /// instead of being refused (REQ-589 BR-3).
+    SkillOverBudgetOffered(SkillOverBudgetOffered),
+    /// A human answered an over-budget offer with "send it" (REQ-589 BR-1).
+    SkillOverBudgetAccepted(SkillOverBudgetAccepted),
+    /// An over-budget offer's going-forward remedy was written through
+    /// `config/set` (REQ-589 BR-7, BR-8).
+    SkillOverBudgetRemedyApplied(SkillOverBudgetRemedyApplied),
 }
 
 impl Event {
@@ -236,6 +251,9 @@ impl Event {
             Event::SkillInvoked(_) => "skill_invoked",
             Event::SkillRefused(_) => "skill_refused",
             Event::ProjectMatch(_) => "project_match",
+            Event::SkillOverBudgetOffered(_) => "skill_over_budget_offered",
+            Event::SkillOverBudgetAccepted(_) => "skill_over_budget_accepted",
+            Event::SkillOverBudgetRemedyApplied(_) => "skill_over_budget_remedy_applied",
         }
     }
 }
@@ -1305,6 +1323,159 @@ pub enum PermissionSubject {
         /// whole set.
         more: u32,
     },
+    /// A skill expansion measured **larger than the route's context budget**,
+    /// put to a human as a question instead of refused (REQ-589 BR-3,
+    /// architecture ADR-2).
+    ///
+    /// Raised on the **user-typed path only**. A model-invoked expansion keeps
+    /// today's refusal and is never offered a choice (BR-2): there is no human
+    /// inside a mid-loop tool call to answer per-invocation, and a consent
+    /// nobody could give is not one to ask for.
+    ///
+    /// # Facts the daemon already has, never a second measurement
+    ///
+    /// Every figure here is **read off the measurement that already
+    /// happened** — `skill_fit`'s pair and the router's stamped
+    /// [`BudgetBound`] — and none of it is re-derived to be shown. A second
+    /// estimator beside the one that refused is LESSON-456's shape, and
+    /// REQ-586's own verify pass caught exactly that once already.
+    ///
+    /// The daemon says what it expects and asks anyway. There is no overrun
+    /// ceiling above which it stops asking, because a prediction of failure is
+    /// a thing to *say*, not a reason to withhold the choice (BR-3);
+    /// [`Self::window_verdict`] is what selects which true sentence is said.
+    ///
+    /// # What is deliberately absent
+    ///
+    /// **No provider response body, and no field one could ride in.** The
+    /// daemon-side invariant `a_skill_refusal_carries_no_provider_response_body`
+    /// exists because a provider's error text is remote-supplied prose with no
+    /// business on a consent prompt — it is the one string on this path that
+    /// something upstream of the user controls. What travels instead is
+    /// [`WindowVerdict`]: a typed verdict computed from integers, never a
+    /// quotation.
+    ///
+    /// **No overrun pair.** `measured − budget` is a `saturating_sub` at the
+    /// surface that renders it. Carrying it as well would be two ways to say
+    /// one fact — LESSON-545's shape — and the two could then disagree.
+    ///
+    /// **No remedy.** What a durable fix would be rides the request's
+    /// [`PermissionOption`] list instead (ADR-1): the remedy-bearing option ids
+    /// appear only where BR-7 grants this bound a remedy, and each label names
+    /// the concrete write. A `remedy` field here could say a remedy exists
+    /// while the options offered none, which is the disagreement the single
+    /// representation rules out.
+    ///
+    /// # A new variant is a refusal on an older client, and that is the point
+    ///
+    /// [`Self::ProjectSkillTrust`]'s note applies verbatim. A client that
+    /// predates this `kind` lands on [`Self::Unrecognized`] and answers
+    /// [`crate::methods::RefusalReason::UnrecognizedSubject`] without asking
+    /// anyone; the turn then refuses under today's sentence, which is precisely
+    /// what BR-4 requires — a declined or unanswerable offer *is* today's
+    /// refusal, and silence is never consent. So the catch-all arm below must
+    /// stay a refusal rather than be softened; an old client that guessed here
+    /// would send an oversized turn nobody approved.
+    SkillOverBudget {
+        /// The skill's dispatchable name, already matched
+        /// `^[a-z0-9][a-z0-9_-]{0,63}$` to be registered at all.
+        skill: String,
+        /// Which root it came from.
+        ///
+        /// Carried for the reason ASSUME-018 states: the name in a
+        /// project-sourced offer is **repository-authored** text, and it has to
+        /// render under the same distinguishing treatment project skills
+        /// already get rather than as bare harness vocabulary. The client
+        /// cannot apply that treatment from a name alone, so the source travels
+        /// with it — the same pairing [`Self::SkillDynamicContext`] carries.
+        source: SkillSource,
+        /// Which of BR-8's two budget checks measured this expansion.
+        ///
+        /// It changes what the user can *do* about the answer, which is why it
+        /// is on the prompt: a Stage A refusal is about the body, while a
+        /// Stage B one has to say that the dynamic context output is what spent
+        /// the room.
+        stage: SkillStage,
+        /// The word figure `skill_fit` measured, verbatim.
+        ///
+        /// Spelled `tokens` because that is what [`ContextPressure`] and
+        /// [`RouteDecided`] already call this figure on the wire. A third
+        /// spelling for one number is LESSON-528's shape — identical today,
+        /// and identical only until one of them is edited.
+        measured_tokens: u64,
+        /// The byte figure `skill_fit` measured, verbatim.
+        measured_bytes: u64,
+        /// The word budget the router stamped for this route, verbatim — the
+        /// same value [`RouteDecided::budget_tokens`] carried.
+        budget_tokens: u64,
+        /// The byte budget the router stamped for this route, verbatim.
+        budget_bytes: u64,
+        /// Which constraint bound that budget, read off the stamped
+        /// [`RouteDecided::bound`] and never re-derived here.
+        bound: BudgetBound,
+        /// What the route's declared window says about this expansion (BR-3).
+        window_verdict: WindowVerdict,
+        /// **The question, worded by the daemon** — rendered verbatim, never
+        /// re-composed (REQ-589 ADR-16, BR-5).
+        ///
+        /// # Why a sentence rides a structured subject at all
+        ///
+        /// Everything else on this variant is a *fact*, and this crate's
+        /// standing rule is that the daemon states facts while the client
+        /// writes the line ([`Self::ProjectSkillTrust`]'s entries are the
+        /// exemplar). This field is the deliberate exception, and TASK-243 is
+        /// what forced it: BR-5 requires the offer question, the decline
+        /// refusal and the acceptance record to be **one** composer's three
+        /// arms, because the decline refusal has to be byte-identical to the
+        /// `-32023` sentence this route already produced (AC-3) and the three
+        /// must quote one measurement. That composer is `tetond`'s
+        /// `skill_refusal`. Of the three sentences it writes, only the option
+        /// **labels** had a surface: the four `PermissionOption`s. The verdict
+        /// clause (BR-3), BR-7b's "this bound has no durable fix" and BR-14.2's
+        /// observed-rejection lead reached no reader at all — a producer with
+        /// no consumer, invisible to a green suite (LESSON-544).
+        ///
+        /// A client that re-worded those three from `stage`, `bound` and
+        /// [`Self::window_verdict`] would be the **second composer** BR-5
+        /// forbids, and the two would drift the first time either was edited.
+        /// So the words have one home and travel finished.
+        ///
+        /// # The structure is not redundant beside it
+        ///
+        /// The client still reads every field around this one: for layout and
+        /// emphasis, for deciding which option rows to draw, and for the
+        /// [`WindowVerdict::Unknown`] hedge, which is a statement about *this
+        /// build's* vocabulary rather than about the route and therefore cannot
+        /// come out of a sentence the daemon wrote.
+        ///
+        /// # What can be in it
+        ///
+        /// Exactly what the composer admits: integers this daemon measured, two
+        /// literal config key names, the skill's name, and a sanitized provider
+        /// id. **No provider response body** — none is in scope on this path,
+        /// which is the whole difference between `-32023` and `-32022`, and is
+        /// what `a_skill_refusal_carries_no_provider_response_body` pins on the
+        /// daemon side. A project-sourced skill's name is repository-authored
+        /// text (ASSUME-018); the composer marks it, and a client defuses it at
+        /// render as it does every other file-derived string.
+        ///
+        /// Required rather than `#[serde(default)]`, unlike the tolerant arms on
+        /// [`SkillStage`] and [`WindowVerdict`]: those exist for a *value* a
+        /// later build might mint inside a known kind, whereas no daemon that
+        /// can emit this `kind` at all predates this field — the whole variant
+        /// is REQ-589's. A default would only hide a daemon that stopped
+        /// wording its own question.
+        sentence: String,
+        /// The provider whose window or cap is in question, when the route has
+        /// one to name.
+        ///
+        /// Absent for a route whose bound names no provider — and absent is a
+        /// *fact* rather than a gap, since a remedy the offer cannot address to
+        /// a provider is one the user cannot act on. Sanitized and bounded by
+        /// the daemon like every other identifier that reaches a prompt.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        provider_id: Option<ProviderId>,
+    },
     /// A subject this build does not know. Never constructed by a daemon —
     /// serde produces it when the `kind` is one this build has never heard of,
     /// which is exactly the case the client must refuse rather than guess at.
@@ -1367,6 +1538,52 @@ pub struct PermissionOption {
 /// kind alone can never reach it by accident, which is deliberate: writing
 /// config is not a fallback for "allow for this session".
 pub const OPTION_ID_ENABLE_PERMANENT: &str = "enable_permanent";
+
+// The four `option_id`s of REQ-589's over-budget offer (BR-7, ADR-1).
+//
+// BR-7's answer is two independent booleans — send *this* turn's expansion, and
+// write the going-forward fix — while [`crate::methods::PermissionOutcome`] is
+// single-choice. Rather than widen that outcome for one caller, or ask two
+// sequential questions whose second is unanswerable once the first is declined,
+// the four combinations ship as four named ids on the wire that already exists.
+// The remedy-bearing pair is appended to the option list **only** where BR-7
+// grants that bound a remedy, exactly as the daemon appends
+// [`OPTION_ID_ENABLE_PERMANENT`] only when a web tier is in hand.
+//
+// They are told apart **by id** for that constant's reason: all four share the
+// same handful of [`PermissionOptionKind`] values, so a client selecting by kind
+// alone could not tell "send it once" from "send it and write the fix". They
+// live here beside it because this is where the option-id vocabulary lives — a
+// second home for the same class of string is what makes two crates agree only
+// until one of them is edited.
+//
+// The **labels** are the daemon's, and ADR-1 binds them: an option that writes
+// config names the concrete write (`capabilities.max_context = 1000000` for
+// `kimi`), never "raise the limit". `enable_permanent` carries a comment
+// recording that an earlier version promised a write that was silently a no-op,
+// which is the failure that rule exists to prevent.
+
+/// Send this turn's expansion whole and write nothing.
+///
+/// Per-invocation and never persisted (BR-10): the next oversized expansion
+/// asks again, because a stored consent could send something nobody approved.
+pub const OPTION_ID_OVER_BUDGET_PROCEED_ONCE: &str = "over_budget_proceed_once";
+
+/// Send this turn's expansion whole **and** write the going-forward remedy.
+///
+/// Offered only where BR-7 gives this bound a remedy, so its presence in an
+/// option list is itself the statement that a durable fix exists.
+pub const OPTION_ID_OVER_BUDGET_PROCEED_AND_REMEDY: &str = "over_budget_proceed_and_remedy";
+
+/// Write the going-forward remedy and **do not** send this turn.
+///
+/// A legitimate answer, not a degenerate one: it is the right choice for a user
+/// who wants the limit fixed but does not want this particular oversized turn to
+/// run. The turn refuses exactly as BR-4 describes, with the fix already made.
+pub const OPTION_ID_OVER_BUDGET_REMEDY_ONLY: &str = "over_budget_remedy_only";
+
+/// Send nothing and write nothing — today's refusal, chosen rather than imposed.
+pub const OPTION_ID_OVER_BUDGET_DECLINE: &str = "over_budget_decline";
 
 /// Semantic kind of a permission option. ACP: `PermissionOptionKind`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -3203,6 +3420,287 @@ pub enum NotRunReason {
     Unknown,
 }
 
+// ---------------------------------------------------------------------------
+// skill_over_budget_offered / _accepted / _remedy_applied (REQ-589)
+// ---------------------------------------------------------------------------
+//
+// Three announcements around one question. They exist because
+// `SkillInvoked::refused` keeps `over_budget` as the single reason token for
+// every not-sent outcome (REQ-585 AC-9's rule, kept where it already lives), so
+// the *record* — not a second refusal token — is what tells "nobody was asked"
+// from "somebody was asked and said no" from "somebody said yes".
+//
+// A turn refused without ever reaching a human publishes none of them. A turn
+// that was offered and declined publishes `skill_over_budget_offered` alone. A
+// turn that was offered and accepted publishes that and
+// `skill_over_budget_accepted`. Only a durable write publishes
+// `skill_over_budget_remedy_applied`, and it is the one of the three that may
+// appear without an accept, because remedy-only is a legitimate answer.
+
+/// Which of BR-8's two budget checks measured an expansion (REQ-585 ADR-11).
+///
+/// The wire half of the daemon's `harness::budget::SkillStage`. That type is
+/// not re-exported here because it carries the refusal *clause* it words, and
+/// `tetond` composing a sentence a client re-parses is LESSON-529's shape: what
+/// crosses the wire is the fact of which stage spoke, and the sentence is
+/// composed at the surface that renders it — this crate's standing rule for
+/// [`PermissionSubject`], and the reason [`BudgetBound::words`] lives here
+/// rather than in either binary.
+///
+/// The distinction is what a user can *do* about the answer, which is why it is
+/// carried at all: a body that will not fit is refused before consent is asked,
+/// so nobody approves four commands, watches them run and is then told the turn
+/// was refused — and when the refusal does land after the commands, the message
+/// has to say their output is what spent the room.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SkillStage {
+    /// **Stage A** — the body with a `[dynamic context pending]` placeholder
+    /// standing in each `` !`command` `` slot, measured before consent.
+    Body,
+    /// **Stage B** — the same expansion with the dynamic-context outcomes
+    /// folded in, measured after they ran.
+    WithDynamicContext,
+    /// A stage this build does not know.
+    ///
+    /// Tolerant, and the direction is chosen rather than inherited. This rides
+    /// [`PermissionSubject::SkillOverBudget`], where the closed, fail-closed
+    /// decision lives one level up at the `kind` tag: an unknown *kind* is a
+    /// refusal, which is the guard. An unknown *stage* changes no authority —
+    /// the question is still "send this over-budget expansion" — so failing
+    /// closed here buys nothing and costs a great deal. Without this arm a
+    /// future stage fails the whole `permission_request` frame at
+    /// `serde_json::from_value`: nothing renders on any screen, and the
+    /// daemon's waiter parks with no timeout of its own, so BR-4's "a declined
+    /// or unanswerable offer is exactly today's refusal" never fires because
+    /// nobody ever refuses. Degrading one adjective is strictly better than
+    /// dropping the question that carries it (BUG-186, applied where it counts).
+    #[serde(other)]
+    Unknown,
+}
+
+/// What the route's declared window says about an over-budget expansion
+/// (REQ-589 BR-3).
+///
+/// Over-budget and over-window are **not the same event**: over-budget is this
+/// daemon's own policy refusing, over-window is the provider refusing. The
+/// daemon knows which one it is looking at and BR-3 requires it to say so — and
+/// then to ask anyway, rather than deciding on the user's behalf.
+///
+/// This is what selects which true sentence the client renders, and it is a
+/// typed verdict computed from integers rather than anything a provider said.
+/// That is deliberate: see [`PermissionSubject::SkillOverBudget`] on why no
+/// provider response body may reach a consent prompt.
+///
+/// **The verdict and the [`BudgetBound`] are not independent axes.** A verdict
+/// exists only where a window was declared, so most of the 5 × 3 cross product
+/// is unreachable: `LocalEngine` and `DefaultUnknown` reach [`Self::WindowUnknown`]
+/// alone, while `Window`, `UserCap` and `RedactScan` reach [`Self::FitsWindow`]
+/// and [`Self::ExceedsWindow`]. A test written for any other cell passes
+/// vacuously (LESSON-520).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum WindowVerdict {
+    /// Over budget, but inside the window the route declares.
+    ///
+    /// **Not a promise that the send will serve** (ADR-15). On a window- or
+    /// cap-bound route the band between the budget and the declared window *is*
+    /// the generation reservation, so an expansion that clears the window while
+    /// overflowing the budget is eating the room held back for the reply — the
+    /// offer says the prompt fits the declared window and may leave the response
+    /// very little to work with, and claims nothing further. On the byte-clamped
+    /// `RedactScan` bound the band is the egress scanner's ceiling instead, and
+    /// the offer says only that this daemon's own budget is what refused
+    /// (ADR-17). A test in `harness::budget` pins that neither sentence says the
+    /// send is expected to serve.
+    FitsWindow,
+    /// The route declares a window and the expansion exceeds it. Proceeding
+    /// without raising it will very likely be rejected by the provider — which
+    /// the offer states plainly, while still leaving both choices open.
+    ExceedsWindow,
+    /// No window fact exists — the local tier, or a remote provider with
+    /// `capabilities.max_context = 0`. The daemon **cannot promise** the send
+    /// will fit and says exactly that, rather than implying either of the
+    /// above; the typed `context_length_exceeded` outcome is the backstop.
+    WindowUnknown,
+    /// A verdict this build does not know.
+    ///
+    /// Tolerant for the reason spelled out on [`SkillStage::Unknown`], and with
+    /// one addition: this arm must be rendered as a *hedge*, never silently
+    /// relabelled [`Self::WindowUnknown`]. "No window fact exists" and "this
+    /// build cannot read the verdict" are different statements, and only the
+    /// second is true here.
+    #[serde(other)]
+    Unknown,
+}
+
+/// What a **durable** fix for an over-budget route would be (REQ-589 BR-7).
+///
+/// The *record* half of ADR-1's decision. The offer itself expresses the remedy
+/// as named [`PermissionOption`] ids whose labels state the concrete write; this
+/// enum is what the events carry, so a reader can tell which fix was proposed
+/// and which was taken without re-parsing an option label (LESSON-529).
+///
+/// **One representation**, and absence is [`Self::NotOffered`] rather than an
+/// `Option<RemedyKind>` — two ways to say "no remedy" is LESSON-545's shape.
+/// `NotOffered` is reachable and not an oversight: `RedactScan` has no durable
+/// fix (BR-7b), and that offer must present the one-time override alone rather
+/// than imply a fix exists.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RemedyKind {
+    /// The provider declares no window, so the default pair bound the budget:
+    /// write `capabilities.max_context`.
+    DeclareWindow,
+    /// A user cap sat below the window and is what bound the budget: raise
+    /// `capabilities.context_budget_cap`.
+    RaiseCap,
+    /// The declared window is what bound the budget: raise
+    /// `capabilities.max_context`.
+    RaiseWindow,
+    /// The route is the local engine: register a remote provider carrying a
+    /// declared window, then bind the tier to it. Two writes, made safe by
+    /// **ordering** rather than by atomicity (ADR-5) — the reverse order is the
+    /// only one that can leave a newly-bound remote tier with no window.
+    BindTierRemote,
+    /// This bound has no durable fix (BR-7b).
+    NotOffered,
+    /// A remedy this build does not know.
+    ///
+    /// Tolerant on [`SkillStage::Unknown`]'s reasoning; distinct from
+    /// [`Self::NotOffered`], which is the daemon stating that no fix exists.
+    /// "There is no remedy" and "this build cannot name the remedy" must not
+    /// collapse into one line on a record someone reads later.
+    #[serde(other)]
+    Unknown,
+}
+
+/// An over-budget skill expansion was put to a human as a question (REQ-589
+/// BR-3).
+///
+/// Published when the offer is **raised**, not when it is answered, so a turn
+/// that was asked about and declined is distinguishable from one where no human
+/// could be reached — the distinction REQ-585 AC-9 draws, and the reason
+/// `OVER_BUDGET_REASON` does not need a second refusal token to carry it.
+///
+/// **Typed, not pre-rendered** (LESSON-544): the figures ride as integers and
+/// the sentence is composed at the surface. A test that built this value by
+/// hand would leave the producer unguarded, which is why the acceptance leg
+/// drives it from a real turn instead.
+///
+/// The session is named by [`EventEnvelope::session_id`], not by a field here:
+/// [`Event`] is internally tagged and flattened, so a `session_id` on this
+/// struct would emit the key twice and fail to deserialize — the shape
+/// [`ContextCleared`], [`SessionTitled`] and [`PrefixCache`] document.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SkillOverBudgetOffered {
+    /// The skill whose expansion was measured.
+    pub skill: String,
+    /// Which root it came from (ASSUME-018: a project name is
+    /// repository-authored text and renders as such).
+    pub source: SkillSource,
+    /// Which of BR-8's two checks measured it.
+    pub stage: SkillStage,
+    /// The word figure `skill_fit` measured, verbatim.
+    pub measured_tokens: u64,
+    /// The byte figure `skill_fit` measured, verbatim.
+    pub measured_bytes: u64,
+    /// The word budget the router stamped, verbatim.
+    pub budget_tokens: u64,
+    /// The byte budget the router stamped, verbatim.
+    pub budget_bytes: u64,
+    /// Which constraint bound that budget — the route's, never re-derived.
+    pub bound: BudgetBound,
+    /// What the declared window says about this expansion.
+    pub window_verdict: WindowVerdict,
+    /// Which durable fix the offer named, or [`RemedyKind::NotOffered`].
+    ///
+    /// Recorded because it is the fact a later reader cannot recover: the
+    /// option list is gone by then, and "this bound had no remedy" is what
+    /// explains an offer that presented the one-time override alone.
+    pub remedy_kind: RemedyKind,
+}
+
+/// A human answered an over-budget offer with "send it" (REQ-589 BR-1).
+///
+/// The expansion goes out **whole** — the same bytes `skill_fit` measured,
+/// unshortened. No path this REQ introduces may middle-elide, truncate or
+/// summarize it, so the figures below are the figures that were actually sent
+/// and this event is the record of that promise being kept.
+///
+/// Published for an accept, and only an accept. `over_budget_remedy_only` is
+/// not one: it writes the fix and refuses the turn, so it publishes a
+/// [`SkillOverBudgetRemedyApplied`] and no accept — which is what makes "was
+/// this oversized turn actually sent?" answerable from the record alone.
+///
+/// The bound is **not** repeated here: [`SkillOverBudgetOffered`] carries it
+/// and the two events are correlated by session and sequence. What is repeated
+/// is what BR-1's promise is about — the measured pair, the budget it exceeded,
+/// and the verdict the user was told before they answered.
+///
+/// The session is named by [`EventEnvelope::session_id`] — see
+/// [`SkillOverBudgetOffered`] on why that is not a field.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SkillOverBudgetAccepted {
+    /// The skill whose expansion was sent.
+    pub skill: String,
+    /// Which root it came from.
+    pub source: SkillSource,
+    /// Which of BR-8's two checks had measured it.
+    pub stage: SkillStage,
+    /// The word figure that was sent, verbatim — BR-1's "whole" is this
+    /// number, not a shortened one.
+    pub measured_tokens: u64,
+    /// The byte figure that was sent, verbatim.
+    pub measured_bytes: u64,
+    /// The word budget it exceeded.
+    pub budget_tokens: u64,
+    /// The byte budget it exceeded.
+    pub budget_bytes: u64,
+    /// What the user was told the window would do, before they answered.
+    pub window_verdict: WindowVerdict,
+}
+
+/// An over-budget offer's going-forward remedy was written (REQ-589 BR-7,
+/// BR-8).
+///
+/// The write itself goes through `config/set` and nowhere else (ADR-4),
+/// inheriting that method's posture verbatim rather than minting a second
+/// durable-write path for the same class of fact. This event is the
+/// announcement, not the authority: no new authority is minted here, and a user
+/// `config/set` would already refuse is refused identically.
+///
+/// **Both values, always.** A record that named only the new one would leave a
+/// reader unable to tell a raise from a first declaration, which is the
+/// difference between [`RemedyKind::RaiseWindow`] and
+/// [`RemedyKind::DeclareWindow`] and the difference between a fix and a
+/// surprise.
+///
+/// The session is named by [`EventEnvelope::session_id`] — see
+/// [`SkillOverBudgetOffered`] on why that is not a field.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SkillOverBudgetRemedyApplied {
+    /// Which fix was written. Never [`RemedyKind::NotOffered`] on a published
+    /// event — that value means no fix existed to take.
+    pub remedy_kind: RemedyKind,
+    /// The provider the write addressed, when the remedy names one.
+    ///
+    /// Absent for a remedy that addresses no single provider. Sanitized and
+    /// bounded by the daemon, like every identifier that reaches a surface.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provider_id: Option<ProviderId>,
+    /// What the setting read before the write, spelled by the daemon.
+    ///
+    /// A **string** rather than a number because the four remedies do not write
+    /// one type: a window and a cap are integers, a tier binding is a name. A
+    /// client that had to know which is which per [`RemedyKind`] would be a
+    /// second classifier of the daemon's own decision (LESSON-456), and the
+    /// only consumer of these two is a line a person reads.
+    pub previous_value: String,
+    /// What the setting reads after the write, spelled the same way.
+    pub new_value: String,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -4202,6 +4700,14 @@ mod tests {
             // below mean "unknown to this build" instead of "anything else".
             PermissionSubject::ProjectSkillTrust { .. } => {
                 panic!("a dynamic-context subject must not read as the acknowledgment")
+            }
+            // REQ-589's variant, matched for REQ-587's reason one line up. It
+            // is also the first place ADR-2's forcing function lands: adding a
+            // subject reddens every exhaustive match on the enum, which is the
+            // property that keeps a client from silently skipping a consent it
+            // has never heard of.
+            PermissionSubject::SkillOverBudget { .. } => {
+                panic!("a dynamic-context subject must not read as the over-budget offer")
             }
             PermissionSubject::Unrecognized => panic!("a known kind must not read as unrecognized"),
         }
@@ -6819,5 +7325,472 @@ mod tests {
             "a monitor request asks for every session, so it names none: {wire}"
         );
         assert_eq!(wire["scope"], "monitor");
+    }
+
+    /// A representative over-budget subject: a project skill's body measured
+    /// past a window-bound remote budget, with a provider to address a fix to.
+    fn sample_over_budget_subject() -> PermissionSubject {
+        PermissionSubject::SkillOverBudget {
+            skill: "analyze".to_owned(),
+            source: SkillSource::Project,
+            stage: SkillStage::Body,
+            measured_tokens: 41_200,
+            measured_bytes: 164_800,
+            budget_tokens: 32_768,
+            budget_bytes: 131_072,
+            bound: BudgetBound::Window,
+            window_verdict: WindowVerdict::ExceedsWindow,
+            // ADR-16: the daemon's own words, carried finished. Spelled here as
+            // a stand-in for `skill_refusal`'s output, which lives in `tetond`
+            // and cannot be reached from this crate — the *shape* is what this
+            // crate owns, and `tetond`'s own suite is where the real sentence is
+            // driven from a turn.
+            sentence: "`/analyze` does not fit this route's context budget.".to_owned(),
+            provider_id: Some(ProviderId::from("kimi")),
+        }
+    }
+
+    /// ADR-2: the offer's subject carries measured integers, the stamped bound,
+    /// the verdict, the skill and a provider id — **and nothing else**.
+    ///
+    /// The key-set assertion is the point of the test, not decoration. The
+    /// daemon-side invariant `a_skill_refusal_carries_no_provider_response_body`
+    /// exists because a provider's error text is remote-supplied prose that must
+    /// never reach a consent prompt, and the way that invariant is broken here
+    /// is by somebody adding one more helpful field. An exact key set makes that
+    /// addition redden rather than ship; a `assert!(!wire.contains("body"))`
+    /// would not, because the next field will not be called `body`.
+    #[test]
+    fn the_over_budget_subject_carries_figures_and_no_provider_response_body() {
+        let subject = sample_over_budget_subject();
+        round_trip(&subject);
+
+        let wire = serde_json::to_value(&subject).unwrap();
+        assert_eq!(wire["kind"], "skill_over_budget", "{wire}");
+
+        let mut keys: Vec<&str> = wire
+            .as_object()
+            .expect("the subject is an object")
+            .keys()
+            .map(String::as_str)
+            .collect();
+        keys.sort_unstable();
+        assert_eq!(
+            keys,
+            [
+                "bound",
+                "budget_bytes",
+                "budget_tokens",
+                "kind",
+                "measured_bytes",
+                "measured_tokens",
+                "provider_id",
+                "sentence",
+                "skill",
+                "source",
+                "stage",
+                "window_verdict",
+            ],
+            "a new key on a consent subject is a decision, not a detail — and the one \
+             thing it must never be is anything a provider said: {wire}"
+        );
+
+        // ADR-16's one exception to "the daemon states facts, the client writes
+        // the line", and it is in the key set rather than beside it: the words
+        // travel finished so BR-5's single composer stays single. What the key
+        // set still forbids is the *provider's* words arriving under any name.
+        assert!(
+            wire["sentence"].as_str().is_some_and(|s| !s.is_empty()),
+            "the offer's question is worded by the daemon and carried, not \
+             re-composed by whoever renders it: {wire}"
+        );
+
+        // The figures ride verbatim, under the spellings `route_decided` and
+        // `context_pressure` already use for the same two numbers.
+        assert_eq!(wire["measured_tokens"], 41_200, "{wire}");
+        assert_eq!(wire["budget_tokens"], 32_768, "{wire}");
+        assert_eq!(wire["bound"], "window", "{wire}");
+        assert_eq!(wire["window_verdict"], "exceeds_window", "{wire}");
+        assert_eq!(wire["stage"], "body", "{wire}");
+        assert_eq!(wire["provider_id"], "kimi", "{wire}");
+
+        // The overrun is derived where it is rendered, so it is deliberately
+        // absent: two ways to state one fact could disagree (LESSON-545).
+        assert!(wire.get("overrun_tokens").is_none(), "{wire}");
+        assert!(wire.get("overrun_words").is_none(), "{wire}");
+        assert!(wire.get("overrun_bytes").is_none(), "{wire}");
+
+        // A route whose bound names no provider omits the key rather than
+        // sending an empty string — absent is the fact, not a gap.
+        let local = PermissionSubject::SkillOverBudget {
+            skill: "analyze".to_owned(),
+            source: SkillSource::User,
+            stage: SkillStage::WithDynamicContext,
+            measured_tokens: 9_000,
+            measured_bytes: 36_000,
+            budget_tokens: 4_096,
+            budget_bytes: 32_768,
+            bound: BudgetBound::LocalEngine,
+            window_verdict: WindowVerdict::WindowUnknown,
+            sentence: "`/analyze` does not fit this route's context budget.".to_owned(),
+            provider_id: None,
+        };
+        round_trip(&local);
+        let wire = serde_json::to_value(&local).unwrap();
+        assert!(wire.get("provider_id").is_none(), "{wire}");
+        assert_eq!(wire["stage"], "with_dynamic_context", "{wire}");
+        assert_eq!(wire["window_verdict"], "window_unknown", "{wire}");
+    }
+
+    /// REQ-589 ADR-2 / BR-4: `SkillOverBudget` is a new **variant**, and a
+    /// client that predates it refuses rather than mis-renders.
+    ///
+    /// `project_skill_trust_is_a_variant_an_older_client_refuses` pins the same
+    /// property for REQ-587's subject; this is its own leg because a test over
+    /// *that* variant would stay green whether or not this one existed. What is
+    /// pinned is a consequence rather than a compatibility: an old client
+    /// answers [`crate::methods::RefusalReason::UnrecognizedSubject`] without
+    /// asking anyone, the turn refuses under today's sentence, and BR-4 is
+    /// satisfied — an unanswerable offer *is* today's refusal, and silence is
+    /// never consent.
+    #[test]
+    fn skill_over_budget_is_a_variant_an_older_client_refuses() {
+        let subject = sample_over_budget_subject();
+
+        // The subject enum exactly as a REQ-587-vintage client compiled it.
+        #[derive(Debug, Deserialize)]
+        #[serde(tag = "kind", rename_all = "snake_case")]
+        #[allow(dead_code)]
+        enum PreOfferSubject {
+            SkillDynamicContext {
+                skill: String,
+                source: SkillSource,
+                commands: Vec<String>,
+            },
+            ProjectSkillTrust {
+                root: String,
+                skills: Vec<ProjectSkillTrustEntry>,
+                more: u32,
+            },
+            #[serde(other)]
+            Unrecognized,
+        }
+        #[derive(Debug, Deserialize)]
+        #[allow(dead_code)]
+        struct PreOfferRequest {
+            request_id: RequestId,
+            tool_name: String,
+            subject: Option<PreOfferSubject>,
+        }
+
+        let wire = serde_json::to_string(&PermissionRequest {
+            request_id: RequestId::from("r1"),
+            tool_name: "skill:project:analyze".to_owned(),
+            description: None,
+            options: vec![PermissionOption {
+                option_id: OPTION_ID_OVER_BUDGET_PROCEED_ONCE.to_owned(),
+                label: "send it this once".to_owned(),
+                kind: PermissionOptionKind::AllowOnce,
+            }],
+            subject: Some(subject),
+        })
+        .unwrap();
+        assert!(
+            wire.contains(r#""kind":"skill_over_budget""#),
+            "the fixture must actually carry the new kind: {wire}"
+        );
+        let old: PreOfferRequest = serde_json::from_str(&wire)
+            .expect("an unknown kind must not take the whole request down with it");
+        assert!(
+            matches!(old.subject, Some(PreOfferSubject::Unrecognized)),
+            "a new variant lands on the catch-all, which is a refusal: {old:?}"
+        );
+
+        // Non-vacuity, both halves: the vintage reader still resolves a kind it
+        // *does* know, so the leg above is reached by the tag being new rather
+        // than by a catch-all that swallows everything — and this build resolves
+        // the new kind to its own variant.
+        let known = serde_json::to_string(&PermissionSubject::ProjectSkillTrust {
+            root: "~/dev/teton".to_owned(),
+            skills: vec![],
+            more: 0,
+        })
+        .unwrap();
+        let old: PreOfferSubject = serde_json::from_str(&known).unwrap();
+        assert!(matches!(old, PreOfferSubject::ProjectSkillTrust { .. }));
+        let mine: PermissionSubject =
+            serde_json::from_str(&serde_json::to_string(&sample_over_budget_subject()).unwrap())
+                .unwrap();
+        assert!(matches!(mine, PermissionSubject::SkillOverBudget { .. }));
+    }
+
+    /// The subject's inner vocabularies degrade rather than take the question
+    /// down with them.
+    ///
+    /// The fail-closed decision lives one level up, at the `kind` tag: an
+    /// unknown kind is a refusal, and that is the guard. An unknown *stage*,
+    /// *verdict* or *bound* changes no authority — the question is still "send
+    /// this over-budget expansion" — so the alternative to tolerance is the
+    /// whole `permission_request` frame failing to deserialize, which renders
+    /// nothing on any screen and parks the daemon's waiter with no timeout of
+    /// its own. That is not fail-closed; it is a question nobody is ever asked.
+    #[test]
+    fn an_unknown_stage_or_verdict_degrades_instead_of_dropping_the_offer() {
+        let wire = r#"{
+            "request_id":"r1",
+            "tool_name":"skill:project:analyze",
+            "options":[],
+            "subject":{
+                "kind":"skill_over_budget",
+                "skill":"analyze",
+                "source":"project",
+                "stage":"some_future_stage",
+                "measured_tokens":41200,
+                "measured_bytes":164800,
+                "budget_tokens":32768,
+                "budget_bytes":131072,
+                "bound":"some_future_bound",
+                "window_verdict":"some_future_verdict",
+                "sentence":"`/analyze` does not fit this route's context budget.",
+                "provider_id":"kimi"
+            }
+        }"#;
+        let request: PermissionRequest = serde_json::from_str(wire)
+            .expect("a future stage must not cost the user the whole question");
+        let PermissionSubject::SkillOverBudget {
+            stage,
+            bound,
+            window_verdict,
+            measured_tokens,
+            ..
+        } = request.subject.expect("the subject survives")
+        else {
+            panic!("a known kind must reach its own variant");
+        };
+        assert_eq!(stage, SkillStage::Unknown);
+        assert_eq!(bound, BudgetBound::Unknown);
+        assert_eq!(window_verdict, WindowVerdict::Unknown);
+        // The figures — which are what the user actually decides on — survive
+        // the words this build cannot read.
+        assert_eq!(measured_tokens, 41_200);
+
+        // Non-vacuity: the known spellings still reach their own variants, so
+        // the assertions above are reached by the values being new rather than
+        // by a catch-all that swallows every value.
+        for (json, expected) in [
+            (r#""body""#, SkillStage::Body),
+            (r#""with_dynamic_context""#, SkillStage::WithDynamicContext),
+        ] {
+            assert_eq!(serde_json::from_str::<SkillStage>(json).unwrap(), expected);
+        }
+        for (json, expected) in [
+            (r#""fits_window""#, WindowVerdict::FitsWindow),
+            (r#""exceeds_window""#, WindowVerdict::ExceedsWindow),
+            (r#""window_unknown""#, WindowVerdict::WindowUnknown),
+        ] {
+            assert_eq!(
+                serde_json::from_str::<WindowVerdict>(json).unwrap(),
+                expected
+            );
+        }
+        for (json, expected) in [
+            (r#""declare_window""#, RemedyKind::DeclareWindow),
+            (r#""raise_cap""#, RemedyKind::RaiseCap),
+            (r#""raise_window""#, RemedyKind::RaiseWindow),
+            (r#""bind_tier_remote""#, RemedyKind::BindTierRemote),
+            (r#""not_offered""#, RemedyKind::NotOffered),
+        ] {
+            assert_eq!(serde_json::from_str::<RemedyKind>(json).unwrap(), expected);
+        }
+        assert_eq!(
+            serde_json::from_str::<RemedyKind>(r#""a_fifth_fix""#).unwrap(),
+            RemedyKind::Unknown,
+            "an unreadable remedy must not be silently reported as `not_offered` — \
+             \"there is no fix\" and \"this build cannot name the fix\" are different facts"
+        );
+    }
+
+    /// ADR-1: the four combinations of BR-7's two independent answers ship as
+    /// four **option ids** on the wire that already exists.
+    ///
+    /// The spellings are pinned because they are the contract: the daemon
+    /// offers them and the client selects on them by string, exactly as
+    /// [`OPTION_ID_ENABLE_PERMANENT`] is. Renaming one silently turns an accept
+    /// into an unrecognized answer, which on this path means an oversized turn
+    /// that was approved and never sent.
+    #[test]
+    fn the_four_over_budget_option_ids_are_the_wire_contract() {
+        let ids = [
+            OPTION_ID_OVER_BUDGET_PROCEED_ONCE,
+            OPTION_ID_OVER_BUDGET_PROCEED_AND_REMEDY,
+            OPTION_ID_OVER_BUDGET_REMEDY_ONLY,
+            OPTION_ID_OVER_BUDGET_DECLINE,
+        ];
+        assert_eq!(
+            ids,
+            [
+                "over_budget_proceed_once",
+                "over_budget_proceed_and_remedy",
+                "over_budget_remedy_only",
+                "over_budget_decline",
+            ]
+        );
+
+        // Four distinct answers, and none of them is the web flow's id — a
+        // collision would make one consent selectable from the other's prompt.
+        let mut sorted = ids;
+        sorted.sort_unstable();
+        let mut deduped = sorted.to_vec();
+        deduped.dedup();
+        assert_eq!(deduped.len(), 4, "the four answers must be four ids");
+        assert!(!ids.contains(&OPTION_ID_ENABLE_PERMANENT));
+    }
+
+    /// The three announcements round-trip under the spec's own event names, and
+    /// each carries what its Events-table row says it carries.
+    ///
+    /// They are separate rows rather than one folded variant (the
+    /// [`WebLookup`] treatment) because they are not one story with three
+    /// endings: an offer that was declined publishes only the first, and a
+    /// remedy-only answer publishes the third with no second. Folding them
+    /// would make "was this turn actually sent?" a question about a field
+    /// instead of about which events exist.
+    #[test]
+    fn skill_over_budget_events_round_trip_under_their_wire_names() {
+        let offered = SkillOverBudgetOffered {
+            skill: "analyze".to_owned(),
+            source: SkillSource::Project,
+            stage: SkillStage::Body,
+            measured_tokens: 41_200,
+            measured_bytes: 164_800,
+            budget_tokens: 32_768,
+            budget_bytes: 131_072,
+            bound: BudgetBound::Window,
+            window_verdict: WindowVerdict::ExceedsWindow,
+            remedy_kind: RemedyKind::RaiseWindow,
+        };
+        round_trip(&offered);
+        let wire = envelope_wire(Event::SkillOverBudgetOffered(offered));
+        assert_eq!(wire["event"], "skill_over_budget_offered", "{wire}");
+        assert_eq!(wire["skill"], "analyze", "{wire}");
+        assert_eq!(wire["source"], "project", "{wire}");
+        assert_eq!(wire["stage"], "body", "{wire}");
+        assert_eq!(wire["measured_tokens"], 41_200, "{wire}");
+        assert_eq!(wire["measured_bytes"], 164_800, "{wire}");
+        assert_eq!(wire["budget_tokens"], 32_768, "{wire}");
+        assert_eq!(wire["bound"], "window", "{wire}");
+        assert_eq!(wire["window_verdict"], "exceeds_window", "{wire}");
+        assert_eq!(wire["remedy_kind"], "raise_window", "{wire}");
+
+        // BR-7b's reachable cell: a `redact_scan` bound has no durable fix, and
+        // the record says so rather than leaving the field off.
+        let no_remedy = SkillOverBudgetOffered {
+            skill: "analyze".to_owned(),
+            source: SkillSource::User,
+            stage: SkillStage::WithDynamicContext,
+            measured_tokens: 9_000,
+            measured_bytes: 36_000,
+            budget_tokens: 4_096,
+            budget_bytes: 32_768,
+            bound: BudgetBound::RedactScan,
+            window_verdict: WindowVerdict::FitsWindow,
+            remedy_kind: RemedyKind::NotOffered,
+        };
+        round_trip(&no_remedy);
+        let wire = envelope_wire(Event::SkillOverBudgetOffered(no_remedy));
+        assert_eq!(wire["remedy_kind"], "not_offered", "{wire}");
+
+        let accepted = SkillOverBudgetAccepted {
+            skill: "analyze".to_owned(),
+            source: SkillSource::Project,
+            stage: SkillStage::Body,
+            measured_tokens: 41_200,
+            measured_bytes: 164_800,
+            budget_tokens: 32_768,
+            budget_bytes: 131_072,
+            window_verdict: WindowVerdict::ExceedsWindow,
+        };
+        round_trip(&accepted);
+        let wire = envelope_wire(Event::SkillOverBudgetAccepted(accepted));
+        assert_eq!(wire["event"], "skill_over_budget_accepted", "{wire}");
+        // BR-1: the figure in the record is the figure that was sent, whole.
+        assert_eq!(wire["measured_bytes"], 164_800, "{wire}");
+        assert_eq!(wire["window_verdict"], "exceeds_window", "{wire}");
+
+        let applied = SkillOverBudgetRemedyApplied {
+            remedy_kind: RemedyKind::RaiseWindow,
+            provider_id: Some(ProviderId::from("kimi")),
+            previous_value: "131072".to_owned(),
+            new_value: "1000000".to_owned(),
+        };
+        round_trip(&applied);
+        let wire = envelope_wire(Event::SkillOverBudgetRemedyApplied(applied));
+        assert_eq!(wire["event"], "skill_over_budget_remedy_applied", "{wire}");
+        assert_eq!(wire["remedy_kind"], "raise_window", "{wire}");
+        assert_eq!(wire["provider_id"], "kimi", "{wire}");
+        // Both values, always: a record naming only the new one cannot tell a
+        // raise from a first declaration.
+        assert_eq!(wire["previous_value"], "131072", "{wire}");
+        assert_eq!(wire["new_value"], "1000000", "{wire}");
+
+        // A remedy that addresses no single provider omits the key.
+        let bound_tier = SkillOverBudgetRemedyApplied {
+            remedy_kind: RemedyKind::BindTierRemote,
+            provider_id: None,
+            previous_value: "local".to_owned(),
+            new_value: "kimi".to_owned(),
+        };
+        round_trip(&bound_tier);
+        let wire = envelope_wire(Event::SkillOverBudgetRemedyApplied(bound_tier));
+        assert!(wire.get("provider_id").is_none(), "{wire}");
+
+        // `name()` and the serialized tag are the same string, which is the
+        // property the dispatch table exists to keep.
+        for (event, expected) in [
+            (
+                Event::SkillOverBudgetOffered(SkillOverBudgetOffered {
+                    skill: "s".to_owned(),
+                    source: SkillSource::User,
+                    stage: SkillStage::Body,
+                    measured_tokens: 1,
+                    measured_bytes: 2,
+                    budget_tokens: 3,
+                    budget_bytes: 4,
+                    bound: BudgetBound::DefaultUnknown,
+                    window_verdict: WindowVerdict::WindowUnknown,
+                    remedy_kind: RemedyKind::DeclareWindow,
+                }),
+                "skill_over_budget_offered",
+            ),
+            (
+                Event::SkillOverBudgetAccepted(SkillOverBudgetAccepted {
+                    skill: "s".to_owned(),
+                    source: SkillSource::User,
+                    stage: SkillStage::Body,
+                    measured_tokens: 1,
+                    measured_bytes: 2,
+                    budget_tokens: 3,
+                    budget_bytes: 4,
+                    window_verdict: WindowVerdict::WindowUnknown,
+                }),
+                "skill_over_budget_accepted",
+            ),
+            (
+                Event::SkillOverBudgetRemedyApplied(SkillOverBudgetRemedyApplied {
+                    remedy_kind: RemedyKind::DeclareWindow,
+                    provider_id: None,
+                    previous_value: "0".to_owned(),
+                    new_value: "200000".to_owned(),
+                }),
+                "skill_over_budget_remedy_applied",
+            ),
+        ] {
+            assert_eq!(event.name(), expected, "name() mismatch");
+            assert_eq!(
+                EventEnvelope::new(0, None, event).event_name(),
+                expected,
+                "envelope name mismatch"
+            );
+        }
     }
 }

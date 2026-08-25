@@ -92,6 +92,35 @@
 //! model-issued `skill` call of the same skill with different arguments do not
 //! share an answer — and it is why `authorize_skill`'s second assertion and that
 //! minting function are one decision rather than two.
+//!
+//! ## A fourth door that remembers nothing (REQ-589)
+//!
+//! [`PermissionGate::authorize_skill_over_budget`] asks BR-7's question: a skill
+//! expansion measured **larger than the route's context budget** is put to the
+//! user as a choice instead of refused outright. It is the fourth door and it
+//! asks under the *same* `skill:` family as [`PermissionGate::authorize_skill`]
+//! — BR-10 requires exactly that, so the question cannot be smuggled through
+//! another key family — but it inverts this module's oldest habit:
+//!
+//! - **it consults no remembered grant**, because the answer to "may `/deploy`'s
+//!   commands run?" is not an answer to "may this oversized expansion be sent?",
+//!   and the two questions share a key. Without that, one "allow for this
+//!   session" on a skill's dynamic context would auto-answer every later
+//!   over-budget offer for the same skill with no prompt on any screen;
+//! - **it records none either**, so accepting twice in one session asks twice
+//!   (BR-10, AC-10). There is deliberately no "don't ask me again" for the
+//!   one-time override: the fix for being asked repeatedly is the *remedy*,
+//!   which changes the derivation so later turns simply fit, never a stored
+//!   bypass of a measurement that is route-specific.
+//!
+//! Both of those are [`Question`]'s doing rather than a rule someone remembered
+//! to follow at the door, and both are pinned at their own seam — they are
+//! LESSON-508's shape, guards whose deletion nothing else would notice.
+//!
+//! The offer is a **single-select with a conditionally widened option set**
+//! (architecture ADR-1), the same construction [`options_for`] already uses to
+//! append `enable_permanent` only when a tier is in hand: the two
+//! remedy-bearing ids appear only where BR-7 grants that bound a remedy.
 
 use std::collections::hash_map::Entry;
 use std::collections::HashMap;
@@ -102,8 +131,11 @@ use tokio::sync::oneshot;
 
 use teton_core::config::WebTier;
 use teton_protocol::events::{
-    Event, InvokedBy, PermissionOption, PermissionOptionKind, PermissionRequest, PermissionSubject,
-    ProjectSkillTrustEntry, WebConsentDecided, WebConsentScope, OPTION_ID_ENABLE_PERMANENT,
+    BudgetBound, Event, InvokedBy, PermissionOption, PermissionOptionKind, PermissionRequest,
+    PermissionSubject, ProjectSkillTrustEntry, WebConsentDecided, WebConsentScope, WindowVerdict,
+    OPTION_ID_ENABLE_PERMANENT, OPTION_ID_OVER_BUDGET_DECLINE,
+    OPTION_ID_OVER_BUDGET_PROCEED_AND_REMEDY, OPTION_ID_OVER_BUDGET_PROCEED_ONCE,
+    OPTION_ID_OVER_BUDGET_REMEDY_ONLY,
 };
 use teton_protocol::methods::{
     expires_on_session_root_change, is_project_acknowledgment_key, project_skill_trust_key,
@@ -789,6 +821,24 @@ enum Settled {
     ByGrant(PermissionDecision),
     /// A human answered this prompt.
     ByHuman(PermissionDecision),
+    /// A human answered REQ-589's over-budget offer (ADR-1).
+    ///
+    /// Separate from [`Self::ByHuman`] because that variant carries a
+    /// [`PermissionDecision`] and nothing else, while the offer's four option
+    /// ids encode **two** independent booleans — send this turn's expansion,
+    /// and write the going-forward fix. Folding the second into `ByHuman` would
+    /// hand every existing caller a field it cannot act on, which is the reason
+    /// [`SkillConsent`] is a separate type from `PermissionDecision` one level
+    /// down.
+    ByHumanOverBudget {
+        /// Whether this turn's expansion may be sent.
+        decision: PermissionDecision,
+        /// Whether the going-forward remedy was accepted. **Only ever `true`
+        /// here**, which is what makes "silence never authorizes a durable
+        /// write" a property of this enum rather than of a check at each call
+        /// site — see [`Self::apply_remedy`].
+        apply_remedy: bool,
+    },
     /// The client refused without asking anyone (BR-11).
     Refused(RefusalReason),
     /// Nobody could be asked: no route to the addressee, or it went away.
@@ -799,12 +849,126 @@ impl Settled {
     /// What the caller may do, with the provenance dropped.
     const fn decision(self) -> PermissionDecision {
         match self {
-            Self::ByLevel(decision) | Self::ByGrant(decision) | Self::ByHuman(decision) => decision,
+            Self::ByLevel(decision)
+            | Self::ByGrant(decision)
+            | Self::ByHuman(decision)
+            | Self::ByHumanOverBudget { decision, .. } => decision,
             // Every non-answer denies. This is the safe default the whole
             // module is built on, stated once.
             Self::Refused(_) | Self::Unanswerable => PermissionDecision::Denied,
         }
     }
+
+    /// Whether a **durable** config write was authorized (REQ-589 BR-7, BR-8).
+    ///
+    /// Stated once, here, because BR-4's "silence is never consent" has a
+    /// second half that is easy to miss: an unanswered offer must authorize no
+    /// *write* either. Every arm but [`Self::ByHumanOverBudget`] is a question
+    /// nobody answered with a remedy — a level row, a remembered grant, a
+    /// client refusal, a connection that went away — and each of them answers
+    /// `false` by construction rather than by a caller remembering to check.
+    const fn apply_remedy(self) -> bool {
+        match self {
+            Self::ByHumanOverBudget { apply_remedy, .. } => apply_remedy,
+            Self::ByLevel(_) | Self::ByGrant(_) | Self::ByHuman(_) => false,
+            Self::Refused(_) | Self::Unanswerable => false,
+        }
+    }
+}
+
+/// The answer to REQ-589's over-budget offer: the two independent booleans
+/// BR-7's question actually asks, recovered from the single option id that
+/// carried them (architecture ADR-1).
+///
+/// **The consent half stays in the existing vocabulary** ([`SkillConsent`]),
+/// which is ASSUME-B's promise: `Allowed` for either proceed answer, `Declined`
+/// for a decline *and* for remedy-only (the turn does not run either way,
+/// decided by a human), `DeniedByLevel` for a `plan` session, and
+/// [`SkillConsent::Refused`]/[`SkillConsent::Unanswerable`] for the two ways
+/// nobody was asked. No arm was added; the remedy rides beside the answer
+/// rather than inside it.
+///
+/// The fields are private and there is no public constructor, so
+/// [`Self::apply_remedy`] cannot be set by anything but a human choosing a
+/// remedy-bearing option that was actually offered. That is BR-4's second half
+/// made structural: an offer nobody could answer must authorize no durable
+/// write.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct OverBudgetAnswer {
+    consent: SkillConsent,
+    apply_remedy: bool,
+}
+
+impl OverBudgetAnswer {
+    /// Whether this turn's expansion may be sent, and — when it may not — which
+    /// sentence the refusal earns (REQ-585 AC-9's distinction, unchanged).
+    #[must_use]
+    pub const fn consent(self) -> SkillConsent {
+        self.consent
+    }
+
+    /// Whether the user accepted the **going-forward** remedy: a durable
+    /// `config/set` write, offered only where BR-7 grants this bound one.
+    ///
+    /// Independent of [`Self::consent`] in both directions. `remedy_only` is a
+    /// legitimate answer — fix the limit, do not send this turn — and
+    /// `proceed_once` is the other, so a caller must read both.
+    #[must_use]
+    pub const fn apply_remedy(self) -> bool {
+        self.apply_remedy
+    }
+
+    /// The answer for a question that reached no human, in the one shape BR-4
+    /// allows: whatever the consent says, **nothing** was authorized to be
+    /// written.
+    const fn not_answered(consent: SkillConsent) -> Self {
+        Self {
+            consent,
+            apply_remedy: false,
+        }
+    }
+}
+
+/// The labels of the over-budget offer's options, composed by the caller
+/// (REQ-589 BR-5).
+///
+/// **The gate composes no sentences.** BR-5 keeps one composer for the offer,
+/// the decline refusal and the acceptance record, and it is not this module: a
+/// second place that words the same facts is what makes two accounts of one
+/// refusal drift (LESSON-456). What arrives here is finished text, and what the
+/// gate decides is *which* of these options are put on the prompt at all.
+///
+/// ADR-1 binds the composer, and the binding is worth restating where the
+/// strings land: an option that writes config **names the concrete write** —
+/// `capabilities.max_context = 1000000` for `kimi`, never "raise the limit".
+/// The `enable_permanent` label carries a comment recording that an earlier
+/// version promised a write that was silently a no-op; that is the failure the
+/// rule exists to prevent.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OverBudgetOptionLabels {
+    /// Send this turn's expansion whole and write nothing.
+    pub proceed_once: String,
+    /// Send nothing and write nothing — today's refusal, chosen rather than
+    /// imposed.
+    pub decline: String,
+    /// The two remedy-bearing labels, present only where BR-7 grants this
+    /// bound a remedy.
+    ///
+    /// **One `Option` around the pair, never one around each.** Two independent
+    /// options could express a half-widened set — an offer to "send it and
+    /// write the fix" with no way to write the fix alone, or the reverse — and
+    /// that is not a question BR-7 asks. The pair is the unit that is either
+    /// granted or not (LESSON-545's shape, applied to an option list).
+    pub remedy: Option<OverBudgetRemedyLabels>,
+}
+
+/// The two remedy-bearing labels of an over-budget offer (REQ-589 BR-7).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OverBudgetRemedyLabels {
+    /// Send this turn's expansion whole **and** write the going-forward remedy.
+    pub proceed_and_remedy: String,
+    /// Write the going-forward remedy and do **not** send this turn.
+    pub remedy_only: String,
 }
 
 /// Whether the level table's `allow` row settles a question (REQ-587 BR-4).
@@ -834,7 +998,95 @@ enum LevelAllow {
     Settles,
     /// The level's `allow` does not settle it; the grant map is consulted and,
     /// failing that, the question is put to the addressee.
+    ///
+    /// Two callers now. REQ-587's shadowing acknowledgment is the first; the
+    /// second is REQ-589's over-budget offer, and its reason is the same shape
+    /// pointed at a different surprise. `full` means "do not ask me about tool
+    /// calls", and an over-budget expansion is not a tool call — it is a turn
+    /// the daemon has measured and expects the provider to reject. Letting an
+    /// `allow` row settle it would turn today's refusal into an oversized send
+    /// nobody approved, in the posture where nobody is watching. `deny` still
+    /// denies, so `plan` still refuses; the range of this knob is "ask anyway",
+    /// which cannot widen anything.
     DoesNotSettle,
+}
+
+/// What a [`PermissionGate::settle`] call is asking, and therefore which
+/// options the prompt carries, how an answer is read, and whether a remembered
+/// grant may answer it at all.
+///
+/// **One parameter rather than several `Option`s**, because the alternatives are
+/// mutually exclusive facts and separate options could express a question that
+/// does not exist — a prompt carrying both `enable_permanent` and
+/// `over_budget_remedy_only`, or an over-budget offer that also persists a web
+/// tier. The enum makes those unrepresentable rather than merely unreachable.
+enum Question {
+    /// Every caller but REQ-589's: the four standard options, plus
+    /// `enable_permanent` when the payload names the tier a decision could be
+    /// written down at.
+    Standard(Option<WebTier>),
+    /// REQ-589's over-budget offer (architecture ADR-1).
+    OverBudget {
+        /// The labels, composed elsewhere (BR-5).
+        labels: OverBudgetOptionLabels,
+        /// Whether the remedy is presented ahead of the one-time override.
+        ///
+        /// BR-3: where the expansion **exceeds the declared window**, the offer
+        /// leads with the remedy rather than the override, because proceeding
+        /// without it will very likely be rejected by the provider. Both
+        /// choices stay on the prompt in either order — the user is informed,
+        /// not overruled.
+        lead_with_remedy: bool,
+    },
+}
+
+impl Question {
+    /// The tier a `web_consent_decided` event would name, if this is a web
+    /// decision at all.
+    const fn web(&self) -> Option<WebTier> {
+        match self {
+            Self::Standard(web) => *web,
+            Self::OverBudget { .. } => None,
+        }
+    }
+
+    /// Whether a remembered session grant may settle this question.
+    ///
+    /// True for everything this module has ever asked, and **false for the
+    /// over-budget offer** (REQ-589 BR-10). Two reasons, and the first is not a
+    /// hypothetical:
+    ///
+    /// 1. The offer asks under the skill's own `skill:<source>:<name>` key, the
+    ///    same key [`PermissionGate::authorize_skill`] remembers a
+    ///    dynamic-context answer under. A remembered answer is attached to its
+    ///    key, not to the question that produced it (LESSON-495) — so without
+    ///    this, one "allow for this session" on `/deploy`'s commands would
+    ///    silently authorize every later over-budget expansion of `/deploy`,
+    ///    with no prompt on any screen. That is a consent nobody gave, to a
+    ///    question nobody was asked.
+    /// 2. The measurement is **route-specific**. A "yes" recorded on one
+    ///    route's budget is not an answer about another's, so there is no
+    ///    honest way to replay it — which is why BR-10 offers the *remedy* as
+    ///    the cure for being asked repeatedly, and no stored bypass at all.
+    ///
+    /// Nothing is recorded either; that half is [`interpret_over_budget`],
+    /// which holds no `&self` and so has no spelling of "remember this"
+    /// available to it.
+    const fn consults_grants(&self) -> bool {
+        match self {
+            Self::Standard(_) => true,
+            Self::OverBudget { .. } => false,
+        }
+    }
+
+    /// Whether the two remedy-bearing option ids were actually put on the
+    /// prompt — the precondition for treating either as an answer.
+    const fn remedy_offered(&self) -> bool {
+        match self {
+            Self::Standard(_) => false,
+            Self::OverBudget { labels, .. } => labels.remedy.is_some(),
+        }
+    }
 }
 
 /// The most model-invocable project skills the acknowledgment prompt names
@@ -1440,6 +1692,184 @@ impl PermissionGate {
             .await
     }
 
+    /// Put an **over-budget skill expansion** to the user as a question instead
+    /// of refusing it (REQ-589 BR-3, BR-7, BR-10; architecture ADR-1).
+    ///
+    /// The fourth door. `subject` must be
+    /// [`PermissionSubject::SkillOverBudget`] — the measurement that already
+    /// happened, carried verbatim — and `labels` are the finished sentences the
+    /// one composer produced for each option (BR-5). This function words
+    /// nothing and measures nothing; it decides **which options the prompt
+    /// carries**, and reads the single id that comes back as the two booleans
+    /// BR-7's question asks.
+    ///
+    /// ## A conditionally widened single-select
+    ///
+    /// [`PermissionOutcome::Selected`] is single-choice, so ADR-1 spells the
+    /// four combinations as four named ids and widens the option list only when
+    /// the bound has a remedy — exactly the construction [`options_for`] uses
+    /// to append `enable_permanent` only when a tier is in hand. On a bound
+    /// BR-7 gives no remedy the user sees the one-time override and the
+    /// decline, and nothing on the prompt implies a durable fix exists (BR-7b).
+    ///
+    /// ## Silence is never consent (BR-4, AC-4)
+    ///
+    /// Every way this question can fail to reach a human resolves to
+    /// [`SkillConsent::Unanswerable`] or [`SkillConsent::Refused`], never to
+    /// proceed, and **never to a remedy**:
+    ///
+    /// - a key that is not a `skill:` key, or a subject that is not this one —
+    ///   refused at the door below, before a waiter exists;
+    /// - no addressed-delivery route wired — [`Self::settle`] answers
+    ///   `Unanswerable` before registering anything;
+    /// - the connection would not take the frame — the waiter is withdrawn and
+    ///   the answer is `Unanswerable`;
+    /// - the connection went away before answering — the sender drops and the
+    ///   receive errors into `Unanswerable`;
+    /// - the client refused without asking anyone (no terminal, unrecognized
+    ///   subject) — `Refused(reason)`.
+    ///
+    /// There is no timeout that yields "yes" because there is no timeout at
+    /// all: a parked waiter is answered by a client or by its connection
+    /// dying, and both of those land above.
+    ///
+    /// ## Nothing survives the invocation (BR-10, AC-10)
+    ///
+    /// No grant is consulted and none is recorded — see
+    /// [`Question::consults_grants`] for why *consulting* one would be the
+    /// worse of the two holes. Accepting twice in one session asks twice.
+    ///
+    /// ## Why the key is still a `skill:` key
+    ///
+    /// BR-10 says so, and REQ-587's ADR-7 is why it is checked rather than
+    /// assumed: this daemon has three key families and each door drops the
+    /// misroute it can see. The **plain** key `skill:<source>:<name>` is the
+    /// one this question asks under, never the digest spelling — the digest
+    /// exists so a remembered grant follows its substituted commands
+    /// ([`skill_grant_key`]), and this door remembers nothing for it to follow.
+    pub async fn authorize_skill_over_budget(
+        &self,
+        key: &str,
+        subject: PermissionSubject,
+        labels: OverBudgetOptionLabels,
+        addressee: ConnectionId,
+    ) -> OverBudgetAnswer {
+        // The misroute this door drops, and the reason it is a **hard return
+        // rather than a `debug_assert!`**: an assertion is compiled out of the
+        // shipped binary, so in release the family check would be enforced by
+        // nothing but each door happening to have one caller that mints
+        // correctly. REQ-587's verify pass turned the other two doors' family
+        // checks into refusals for exactly that reason and this one is minted
+        // the same way. `Unanswerable` and not `Declined`: nobody was asked and
+        // nobody decided (REQ-585 AC-9), and of the two no-one-was-asked arms
+        // this is the daemon's own defect rather than the client's.
+        if !is_skill_permission_key(key) {
+            eprintln!(
+                "tetond: refusing an over-budget skill offer asked under `{key}`, \
+                 which is not a skill consent key — BR-10 asks this question \
+                 under `skill:<source>:<name>` so it cannot be smuggled through \
+                 another key family, never under a tool's name and never under \
+                 the project-skill acknowledgment's key (ADR-7)"
+            );
+            return OverBudgetAnswer::not_answered(SkillConsent::Unanswerable);
+        }
+
+        // The second misroute, and the one the key check cannot see: a subject
+        // that is not this question. The prompt's whole content is the subject
+        // — there is no `description` — so a `SkillDynamicContext` delivered
+        // with these four option ids would show a user a list of commands and
+        // ask them to approve an oversized *send*. Hard for the reason above:
+        // the caller hands an owned enum and nothing in the types narrows it.
+        let PermissionSubject::SkillOverBudget {
+            skill,
+            source,
+            bound,
+            window_verdict,
+            ..
+        } = &subject
+        else {
+            eprintln!(
+                "tetond: refusing an over-budget skill offer whose subject is not \
+                 `skill_over_budget` — the offer's option ids answer that question \
+                 and no other, and a subject that describes something else would \
+                 put the wrong facts in front of the person answering (ADR-1)"
+            );
+            return OverBudgetAnswer::not_answered(SkillConsent::Unanswerable);
+        };
+        // The exact-key equality stays an **assertion**, as it does at the other
+        // two doors: the *family* is what a wrong caller gets wrong, and this
+        // polices a lockstep between the key the caller minted and the skill the
+        // subject names. It is the plain key rather than either spelling
+        // `is_grant_key_for` admits, because a digest exists to make a
+        // remembered grant follow its substituted commands and this question
+        // remembers nothing — a digest here would name a fact the answer does
+        // not depend on.
+        debug_assert_eq!(
+            key,
+            skill_permission_key_for(*source, skill),
+            "an over-budget offer must ask under the plain key its own skill's \
+             name and source mint, or the prompt names one skill and the level \
+             row is read for another"
+        );
+        let (bound, window_verdict) = (*bound, *window_verdict);
+
+        // BR-7b, guarded at the door that would show it. `budget.rs`'s BR-7
+        // table decides *which* remedy a bound earns; this decides only whether
+        // a remedy may be offered here at all, and it exists because the one
+        // bound that earns none is protecting an egress-privacy guarantee — the
+        // redact scan's byte clamp — and wanting to run a large skill is not
+        // wanting weaker redaction. An invariant enforced at two seams needs an
+        // adversarial test at each (LESSON-502); this is the second seam.
+        //
+        // Narrowed rather than refused: the remaining offer — proceed once, or
+        // decline — is true, answerable, and exactly what BR-7b describes.
+        // Refusing the whole question would cost the user a choice they are
+        // entitled to over a defect in the caller.
+        let labels = if labels.remedy.is_some() && !remedy_may_be_offered_on(bound) {
+            eprintln!(
+                "tetond: dropping the remedy options from an over-budget offer bound \
+                 by `{}` — BR-7 grants that bound no durable fix, and an option that \
+                 offered one would imply a write this daemon must not make",
+                bound.wire_name()
+            );
+            OverBudgetOptionLabels {
+                remedy: None,
+                ..labels
+            }
+        } else {
+            labels
+        };
+
+        let question = Question::OverBudget {
+            // BR-3: where the send will very likely be rejected at the window,
+            // the remedy is presented ahead of the one-time override.
+            lead_with_remedy: window_verdict == WindowVerdict::ExceedsWindow
+                && labels.remedy.is_some(),
+            labels,
+        };
+        let addressed = Addressed {
+            connection: addressee,
+            subject,
+        };
+
+        // No `description`, for [`Self::authorize_skill`]'s reason: every figure
+        // the question turns on is already on the subject, and a sentence
+        // restating them would be a second spelling of one fact (LESSON-456).
+        let settled = self
+            .settle(
+                key,
+                None,
+                question,
+                Some(addressed),
+                LevelAllow::DoesNotSettle,
+            )
+            .await;
+        OverBudgetAnswer {
+            consent: skill_consent_for(settled),
+            apply_remedy: settled.apply_remedy(),
+        }
+    }
+
     /// Decide whether the model may run **this repository's** skills as
     /// instructions at all — the project-skill acknowledgment (REQ-587 BR-4,
     /// architecture ADR-7).
@@ -1567,19 +1997,16 @@ impl PermissionGate {
         addressed: Addressed,
         level_allow: LevelAllow,
     ) -> SkillConsent {
-        match self
-            .settle(key, None, None, Some(addressed), level_allow)
-            .await
-        {
-            Settled::ByLevel(PermissionDecision::Allowed)
-            | Settled::ByGrant(PermissionDecision::Allowed)
-            | Settled::ByHuman(PermissionDecision::Allowed) => SkillConsent::Allowed,
-            Settled::ByLevel(PermissionDecision::Denied) => SkillConsent::DeniedByLevel,
-            Settled::ByGrant(PermissionDecision::Denied)
-            | Settled::ByHuman(PermissionDecision::Denied) => SkillConsent::Declined,
-            Settled::Refused(reason) => SkillConsent::Refused(reason),
-            Settled::Unanswerable => SkillConsent::Unanswerable,
-        }
+        skill_consent_for(
+            self.settle(
+                key,
+                None,
+                Question::Standard(None),
+                Some(addressed),
+                level_allow,
+            )
+            .await,
+        )
     }
 
     /// Forget every remembered grant a session root move invalidates (REQ-585
@@ -1677,9 +2104,15 @@ impl PermissionGate {
         description: Option<String>,
         web: Option<WebTier>,
     ) -> PermissionDecision {
-        self.settle(tool_name, description, web, None, LevelAllow::Settles)
-            .await
-            .decision()
+        self.settle(
+            tool_name,
+            description,
+            Question::Standard(web),
+            None,
+            LevelAllow::Settles,
+        )
+        .await
+        .decision()
     }
 
     /// [`Self::decide`] with the provenance of the answer kept (REQ-585 AC-9)
@@ -1697,7 +2130,7 @@ impl PermissionGate {
         &self,
         tool_name: &str,
         description: Option<String>,
-        web: Option<WebTier>,
+        question: Question,
         addressed: Option<Addressed>,
         level_allow: LevelAllow,
     ) -> Settled {
@@ -1739,11 +2172,21 @@ impl PermissionGate {
         // No consent event here, deliberately: the decision this replays was
         // published when it was *made*, and re-announcing it per lookup would
         // turn one decision into a stream of them.
-        if let Some(grant) = self.session_grant(tool_name) {
-            return match grant {
-                RememberedGrant::AllowAlways => Settled::ByGrant(PermissionDecision::Allowed),
-                RememberedGrant::RejectAlways => Settled::ByGrant(PermissionDecision::Denied),
-            };
+        //
+        // **Skipped entirely for REQ-589's over-budget offer** (BR-10). That is
+        // not a refinement of the replay policy — it is the guard: the offer
+        // asks under the very key a skill's dynamic-context answer is
+        // remembered under, so consulting the map here would let one "allow for
+        // this session" about `/deploy`'s commands send an oversized `/deploy`
+        // expansion with no prompt on any screen. See
+        // [`Question::consults_grants`].
+        if question.consults_grants() {
+            if let Some(grant) = self.session_grant(tool_name) {
+                return match grant {
+                    RememberedGrant::AllowAlways => Settled::ByGrant(PermissionDecision::Allowed),
+                    RememberedGrant::RejectAlways => Settled::ByGrant(PermissionDecision::Denied),
+                };
+            }
         }
 
         // An addressed request has exactly one recipient, and a gate with no
@@ -1780,7 +2223,7 @@ impl PermissionGate {
             // **without parsing the key** (REQ-585 BR-11). Every request raised
             // for a tool call is a tool call, and has no subject.
             subject: addressed.map(|a| a.subject),
-            options: options_for(web),
+            options: options_for(&question),
         };
 
         match route {
@@ -1805,7 +2248,7 @@ impl PermissionGate {
         }
 
         match rx.await {
-            Ok(outcome) => self.interpret(tool_name, outcome, web),
+            Ok(outcome) => self.interpret(tool_name, outcome, &question),
             // Client disconnected before answering: deny (never run unapproved).
             // Not a consent decision — nobody decided it — so nothing is
             // published; a `web_consent_decided { granted: false }` here would
@@ -1822,7 +2265,7 @@ impl PermissionGate {
         &self,
         tool_name: &str,
         outcome: PermissionOutcome,
-        web: Option<WebTier>,
+        question: &Question,
     ) -> Settled {
         // A client that refused fail-closed did not make a consent decision —
         // nobody decided it. Deny, remember nothing, and publish nothing, for
@@ -1838,6 +2281,16 @@ impl PermissionGate {
         if let PermissionOutcome::Refused { reason } = outcome {
             return Settled::Refused(reason);
         }
+
+        // REQ-589's offer is read by a **free function**, and that placement is
+        // the BR-10 guard rather than a comment about it: `interpret_over_budget`
+        // holds no `&self`, so there is no spelling of "remember this answer"
+        // available inside it. Everything below this line can reach the grant
+        // map; nothing above it needs to.
+        if let Question::OverBudget { .. } = question {
+            return interpret_over_budget(outcome, question.remedy_offered());
+        }
+        let web = question.web();
 
         let (decision, scope) = match outcome {
             PermissionOutcome::Selected { option_id } => match option_id.as_str() {
@@ -1968,12 +2421,156 @@ impl PermissionGate {
             .expect("permission grants mutex poisoned")
             .insert(tool_name.to_owned(), grant);
     }
+
+    /// Every key the session grant map currently holds, sorted.
+    ///
+    /// Test-only, and deliberately the **whole map** rather than one more
+    /// lookup. BR-10's claim is that nothing survives an over-budget offer, and
+    /// [`Self::remembered`] can only ask about a key someone already thought
+    /// of — which is not the same question. A skill's grant has two legal
+    /// spellings ([`skill_grant_key`]: the plain `skill:<source>:<name>` and
+    /// that plus a digest of its substituted commands), the offer is asked
+    /// under the plain one, and `authorize_skill` asks under whichever the
+    /// expansion minted. So a grant left behind under the digest is invisible
+    /// to a lookup at the plain key and fully visible to the door that consults
+    /// it. See
+    /// [`no_over_budget_answer_reaches_the_grant_map_under_any_spelling_of_the_key`](tests::no_over_budget_answer_reaches_the_grant_map_under_any_spelling_of_the_key).
+    #[cfg(test)]
+    fn grant_keys(&self) -> Vec<String> {
+        let mut keys: Vec<String> = self
+            .grants
+            .lock()
+            .expect("permission grants mutex poisoned")
+            .keys()
+            .cloned()
+            .collect();
+        keys.sort();
+        keys
+    }
 }
 
 const OPTION_ALLOW_ONCE: &str = "allow_once";
 const OPTION_ALLOW_ALWAYS: &str = "allow_always";
 const OPTION_REJECT_ONCE: &str = "reject_once";
 const OPTION_REJECT_ALWAYS: &str = "reject_always";
+
+/// Narrow a settlement to the five answers a skill caller can act on.
+///
+/// One body for every skill door, so they cannot come to disagree about which
+/// settlement is a *decline* and which is a *refusal* — the distinction REQ-585
+/// AC-9 exists for, and the one a second copy would drift on first.
+///
+/// A free function rather than a method because REQ-589's door needs the same
+/// narrowing **and** the remedy bit beside it ([`Settled::apply_remedy`]), and a
+/// method that returned only the consent would have made that a second read of
+/// a value it had already thrown away.
+const fn skill_consent_for(settled: Settled) -> SkillConsent {
+    match settled {
+        Settled::ByLevel(PermissionDecision::Allowed)
+        | Settled::ByGrant(PermissionDecision::Allowed)
+        | Settled::ByHuman(PermissionDecision::Allowed)
+        | Settled::ByHumanOverBudget {
+            decision: PermissionDecision::Allowed,
+            ..
+        } => SkillConsent::Allowed,
+        Settled::ByLevel(PermissionDecision::Denied) => SkillConsent::DeniedByLevel,
+        // `remedy_only` lands here beside a plain decline, and correctly: a
+        // human decided this turn does not run. What they *did* choose to write
+        // rides on [`OverBudgetAnswer::apply_remedy`], not on the consent.
+        Settled::ByGrant(PermissionDecision::Denied)
+        | Settled::ByHuman(PermissionDecision::Denied)
+        | Settled::ByHumanOverBudget {
+            decision: PermissionDecision::Denied,
+            ..
+        } => SkillConsent::Declined,
+        Settled::Refused(reason) => SkillConsent::Refused(reason),
+        Settled::Unanswerable => SkillConsent::Unanswerable,
+    }
+}
+
+/// Read REQ-589's four option ids back into the two booleans they encode
+/// (architecture ADR-1).
+///
+/// ## This function is where BR-10 is enforced, by having no way to break it
+///
+/// It takes **no `&self`**. The grant map, `remember`, and the persistence sink
+/// all hang off [`PermissionGate`], so none of them is in scope here: an
+/// over-budget answer cannot be recorded, at any scope, without first moving
+/// this code somewhere it can reach them. That is deliberate and it is the
+/// guard LESSON-508 asks to be pinned at its own seam — nothing else in the
+/// suite would redden if a `self.remember(…)` appeared beside one of these
+/// arms.
+///
+/// ## `remedy_offered` is a precondition, not a hint
+///
+/// An id that was not on the prompt is not an answer to it — the rule
+/// [`OPTION_ID_ENABLE_PERMANENT`] already follows one function down. Both
+/// remedy-bearing ids therefore deny and write nothing when the option list did
+/// not carry them, which is what stops a client that offers options this daemon
+/// did not from authorizing a write on a `RedactScan` bound (BR-7b).
+///
+/// ## Every unrecognized answer denies
+///
+/// Including the four *standard* ids. An older client that fell through to its
+/// own `allow_once` prompt has not answered this question, and treating its
+/// `allow_once` as "send the oversized expansion" is precisely the mis-answer
+/// addressing exists to prevent (REQ-585 ADR-7).
+fn interpret_over_budget(outcome: PermissionOutcome, remedy_offered: bool) -> Settled {
+    let option_id = match outcome {
+        PermissionOutcome::Selected { option_id } => option_id,
+        // A dismissed prompt is a human declining, exactly as it is for every
+        // other question. `Refused` is handled by the caller, ahead of this.
+        PermissionOutcome::Cancelled | PermissionOutcome::Refused { .. } => {
+            return Settled::ByHumanOverBudget {
+                decision: PermissionDecision::Denied,
+                apply_remedy: false,
+            }
+        }
+    };
+    let (decision, apply_remedy) = match option_id.as_str() {
+        OPTION_ID_OVER_BUDGET_PROCEED_ONCE => (PermissionDecision::Allowed, false),
+        OPTION_ID_OVER_BUDGET_PROCEED_AND_REMEDY if remedy_offered => {
+            (PermissionDecision::Allowed, true)
+        }
+        OPTION_ID_OVER_BUDGET_REMEDY_ONLY if remedy_offered => (PermissionDecision::Denied, true),
+        // `over_budget_decline`, a remedy id that was never offered, a standard
+        // option id, and anything else: refuse this once and write nothing.
+        _ => (PermissionDecision::Denied, false),
+    };
+    Settled::ByHumanOverBudget {
+        decision,
+        apply_remedy,
+    }
+}
+
+/// Whether an over-budget offer bound by `bound` may carry remedy options at
+/// all (REQ-589 BR-7b).
+///
+/// **Not BR-7's table.** Which remedy a bound earns, and whether one can be
+/// proposed for *this* provider at all (BR-7c), is decided upstream where the
+/// route's facts live; this is the floor beneath that decision, and it has one
+/// job — refuse to widen the option set on a bound BR-7 grants no durable fix.
+/// It is a second seam on a privacy guarantee rather than a second classifier
+/// (LESSON-502), and the distinction matters: this function can only ever
+/// remove options.
+///
+/// Exhaustive on purpose, so a sixth bound cannot inherit an answer by
+/// defaulting into one. `Unknown` is `false` for the same reason the `kind` tag
+/// one crate over is closed: a bound this build cannot name is a bound whose
+/// remedy this build cannot vouch for.
+const fn remedy_may_be_offered_on(bound: BudgetBound) -> bool {
+    match bound {
+        // BR-7: `RaiseWindow`, `DeclareWindow`, `RaiseCap`, `BindTierRemote`.
+        BudgetBound::Window
+        | BudgetBound::DefaultUnknown
+        | BudgetBound::UserCap
+        | BudgetBound::LocalEngine => true,
+        // BR-7b: the redact scan's byte clamp is an egress-privacy guarantee,
+        // and wanting to run a large skill is not wanting weaker redaction.
+        BudgetBound::RedactScan => false,
+        BudgetBound::Unknown => false,
+    }
+}
 
 /// Whether `tool_name` is one of the web tiers' consent keys (REQ-563 BR-3).
 ///
@@ -2052,7 +2649,23 @@ fn skill_key_prefix(source: SkillSource) -> String {
 /// commands in a file the daemon re-reads every session — a promise a consent
 /// prompt has no business making. The absence is asserted rather than assumed,
 /// because it is the kind of option that gets added for symmetry.
-fn options_for(web: Option<WebTier>) -> Vec<PermissionOption> {
+///
+/// REQ-589's over-budget offer is the second question whose option set is
+/// widened by a fact in hand, and it is deliberately built the same way — see
+/// [`over_budget_options`].
+fn options_for(question: &Question) -> Vec<PermissionOption> {
+    match question {
+        Question::Standard(web) => standard_options(*web),
+        Question::OverBudget {
+            labels,
+            lead_with_remedy,
+        } => over_budget_options(labels, *lead_with_remedy),
+    }
+}
+
+/// The four standard options, plus the persistent enable when `web` names a
+/// tier — every question this module asked before REQ-589.
+fn standard_options(web: Option<WebTier>) -> Vec<PermissionOption> {
     let mut options = vec![
         PermissionOption {
             option_id: OPTION_ALLOW_ONCE.to_owned(),
@@ -2096,6 +2709,76 @@ fn options_for(web: Option<WebTier>) -> Vec<PermissionOption> {
         option_id: OPTION_REJECT_ALWAYS.to_owned(),
         label: "Reject for this session".to_owned(),
         kind: PermissionOptionKind::RejectAlways,
+    });
+    options
+}
+
+/// The over-budget offer's option set: two options, or four where BR-7 grants
+/// this bound a remedy (REQ-589, architecture ADR-1).
+///
+/// ## Two `PermissionOptionKind`s are deliberately absent
+///
+/// Neither `RejectAlways` nor a second `AllowAlways`-shaped "don't ask me
+/// again" appears, because this prompt remembers nothing (BR-10). An `always`
+/// kind on a question whose answer is discarded the moment it is read would be
+/// a promise the daemon does not keep, and the standard four options are absent
+/// for the same reason — an `allow_always` answered here would mean nothing.
+///
+/// The kinds that *are* used cannot tell the four apart on their own — both
+/// proceed answers are allow-shaped and both refusals are reject-shaped — which
+/// is exactly why ADR-1 gives each its own id and why
+/// [`interpret_over_budget`] matches on the id and never on the kind.
+///
+/// ## Order
+///
+/// `lead_with_remedy` is BR-3's rule and nothing more: where the expansion
+/// exceeds the declared window, the durable fix is presented before the
+/// one-time override, because proceeding without it will very likely be
+/// rejected by the provider. The decline is always last, and both proceed
+/// answers are always present — the ordering informs, it does not withhold.
+fn over_budget_options(
+    labels: &OverBudgetOptionLabels,
+    lead_with_remedy: bool,
+) -> Vec<PermissionOption> {
+    let proceed_once = PermissionOption {
+        option_id: OPTION_ID_OVER_BUDGET_PROCEED_ONCE.to_owned(),
+        label: labels.proceed_once.clone(),
+        kind: PermissionOptionKind::AllowOnce,
+    };
+    let mut options = Vec::with_capacity(4);
+    match &labels.remedy {
+        // BR-7b's cell, and it is reachable rather than an oversight: the
+        // one-time override alone, with nothing on the prompt implying a
+        // durable fix exists.
+        None => options.push(proceed_once),
+        Some(remedy) => {
+            let proceed_and_remedy = PermissionOption {
+                option_id: OPTION_ID_OVER_BUDGET_PROCEED_AND_REMEDY.to_owned(),
+                label: remedy.proceed_and_remedy.clone(),
+                // The slot `enable_permanent` occupies, for the same reason: it
+                // is the answer that both allows and writes.
+                kind: PermissionOptionKind::AllowAlways,
+            };
+            if lead_with_remedy {
+                options.push(proceed_and_remedy);
+                options.push(proceed_once);
+            } else {
+                options.push(proceed_once);
+                options.push(proceed_and_remedy);
+            }
+            options.push(PermissionOption {
+                option_id: OPTION_ID_OVER_BUDGET_REMEDY_ONLY.to_owned(),
+                label: remedy.remedy_only.clone(),
+                // Reject-shaped because this turn does not run. That it also
+                // writes is what the label says and what the id carries.
+                kind: PermissionOptionKind::RejectOnce,
+            });
+        }
+    }
+    options.push(PermissionOption {
+        option_id: OPTION_ID_OVER_BUDGET_DECLINE.to_owned(),
+        label: labels.decline.clone(),
+        kind: PermissionOptionKind::RejectOnce,
     });
     options
 }
@@ -4115,5 +4798,1118 @@ mod tests {
                 "`off` granted `{key}`"
             );
         }
+    }
+
+    // ------------------------------------------------------------------
+    // REQ-589: the over-budget offer (BR-3, BR-4, BR-7, BR-10; ADR-1)
+    // ------------------------------------------------------------------
+
+    use teton_protocol::events::SkillStage;
+
+    /// What the addressed route does with the frame it is handed.
+    ///
+    /// Five behaviours because the ways an offer can fail to reach a human are
+    /// **different things** and BR-4 requires all of them to land somewhere that
+    /// is not "proceed". A single "does not answer" double would collapse three
+    /// of them and could not tell a withdrawn waiter from a parked one.
+    enum RouteBehaviour {
+        /// A human picked this option id.
+        Answers(&'static str),
+        /// A human dismissed the prompt without choosing.
+        Cancels,
+        /// The client refused **without asking anyone** (REQ-585 BR-11).
+        RefusesWithoutAsking(RefusalReason),
+        /// The connection would not take the frame: no such live connection, or
+        /// an outbound channel that is full or closed.
+        RefusesTheFrame,
+        /// The connection took the frame and then went away without answering.
+        /// Modelled by dropping the waiter, which is what a disconnect does to
+        /// it — the sender falls, the receive errors, and `settle` takes its
+        /// `Unanswerable` arm.
+        GoesAway,
+    }
+
+    /// An [`AddressedPermissionDelivery`] that records every request it is
+    /// handed and then behaves as instructed.
+    ///
+    /// It answers through [`PendingPermissions::resolve_from`] and never
+    /// [`PendingPermissions::resolve`], because an addressed waiter treats an
+    /// answer that cannot name a connection exactly as it treats the wrong one
+    /// (REQ-585 ADR-7).
+    struct OverBudgetRoute {
+        pending: Arc<PendingPermissions>,
+        delivered: Mutex<Vec<PermissionRequest>>,
+        behaviour: RouteBehaviour,
+    }
+
+    impl OverBudgetRoute {
+        fn delivered(&self) -> Vec<PermissionRequest> {
+            self.delivered
+                .lock()
+                .expect("the route is not poisoned")
+                .clone()
+        }
+
+        /// The option ids of the `n`th prompt this route was handed, in order.
+        fn option_ids(&self, n: usize) -> Vec<String> {
+            self.delivered()[n]
+                .options
+                .iter()
+                .map(|option| option.option_id.clone())
+                .collect()
+        }
+    }
+
+    impl AddressedPermissionDelivery for OverBudgetRoute {
+        fn deliver(
+            &self,
+            connection: ConnectionId,
+            _session_id: &SessionId,
+            request: PermissionRequest,
+        ) -> bool {
+            self.delivered
+                .lock()
+                .expect("the route is not poisoned")
+                .push(request.clone());
+            let outcome = match &self.behaviour {
+                RouteBehaviour::Answers(option_id) => PermissionOutcome::Selected {
+                    option_id: (*option_id).to_owned(),
+                },
+                RouteBehaviour::Cancels => PermissionOutcome::Cancelled,
+                RouteBehaviour::RefusesWithoutAsking(reason) => {
+                    PermissionOutcome::Refused { reason: *reason }
+                }
+                RouteBehaviour::RefusesTheFrame => return false,
+                RouteBehaviour::GoesAway => {
+                    self.pending.withdraw(&request.request_id);
+                    return true;
+                }
+            };
+            self.pending
+                .resolve_from(&request.request_id, outcome, connection)
+        }
+    }
+
+    /// A gate with an over-budget route wired into it, plus the bus, the route,
+    /// and the connection the offer is addressed to.
+    fn wired(
+        make: impl FnOnce(Arc<EventBus>, Arc<PendingPermissions>) -> PermissionGate,
+        behaviour: RouteBehaviour,
+    ) -> (
+        PermissionGate,
+        Arc<OverBudgetRoute>,
+        Arc<EventBus>,
+        Arc<PendingPermissions>,
+        ConnectionId,
+    ) {
+        let bus = Arc::new(EventBus::new());
+        let pending = Arc::new(PendingPermissions::new());
+        let route = Arc::new(OverBudgetRoute {
+            pending: Arc::clone(&pending),
+            delivered: Mutex::new(Vec::new()),
+            behaviour,
+        });
+        let gate = make(Arc::clone(&bus), Arc::clone(&pending))
+            .with_addressed_delivery(Arc::clone(&route) as Arc<dyn AddressedPermissionDelivery>);
+        (
+            gate,
+            route,
+            bus,
+            pending,
+            GrantRegistry::new().next_connection_id(),
+        )
+    }
+
+    fn over_budget_gate(
+        config: PermissionConfig,
+        behaviour: RouteBehaviour,
+    ) -> (
+        PermissionGate,
+        Arc<OverBudgetRoute>,
+        Arc<EventBus>,
+        Arc<PendingPermissions>,
+        ConnectionId,
+    ) {
+        wired(
+            |bus, pending| PermissionGate::new(SessionId::from("s1"), config, bus, pending),
+            behaviour,
+        )
+    }
+
+    fn leveled_over_budget_gate(
+        level: PermissionLevel,
+        behaviour: RouteBehaviour,
+    ) -> (
+        PermissionGate,
+        Arc<OverBudgetRoute>,
+        Arc<EventBus>,
+        Arc<PendingPermissions>,
+        ConnectionId,
+    ) {
+        wired(
+            |bus, pending| {
+                PermissionGate::with_level(SessionId::from("s1"), level, Vec::new(), bus, pending)
+            },
+            behaviour,
+        )
+    }
+
+    /// The key the offer asks under — the plain one its own name and source
+    /// mint, which is what the door's `debug_assert_eq!` requires.
+    fn over_budget_key() -> String {
+        skill_permission_key_for(SkillSource::User, "deploy")
+    }
+
+    /// A subject carrying figures a route could plausibly have measured. Only
+    /// `bound` and `window_verdict` change across the tests, because they are
+    /// the only two fields the gate reads.
+    fn over_budget_subject(bound: BudgetBound, window_verdict: WindowVerdict) -> PermissionSubject {
+        PermissionSubject::SkillOverBudget {
+            skill: "deploy".to_owned(),
+            source: SkillSource::User,
+            stage: SkillStage::Body,
+            measured_tokens: 5_400,
+            measured_bytes: 21_600,
+            budget_tokens: 4_096,
+            budget_bytes: 32_768,
+            bound,
+            window_verdict,
+            // ADR-16: the daemon's own words travel finished. A stand-in here —
+            // the gate never reads this field (it reads `skill`, `source`,
+            // `bound` and `window_verdict`), and `skill_refusal`'s real output
+            // is driven from a turn by the composer's own tests.
+            sentence: "`/deploy` does not fit this route's context budget.".to_owned(),
+            provider_id: None,
+        }
+    }
+
+    /// Labels shaped like the ones ADR-1 binds the composer to produce: the
+    /// remedy options **name the concrete write**.
+    fn labels_with_remedy() -> OverBudgetOptionLabels {
+        OverBudgetOptionLabels {
+            proceed_once: "Send it this once (writes nothing)".to_owned(),
+            decline: "Do not send it".to_owned(),
+            remedy: Some(OverBudgetRemedyLabels {
+                proceed_and_remedy:
+                    "Send it and write `capabilities.max_context = 1000000` for `kimi`".to_owned(),
+                remedy_only:
+                    "Write `capabilities.max_context = 1000000` for `kimi` and do not send it"
+                        .to_owned(),
+            }),
+        }
+    }
+
+    fn labels_without_remedy() -> OverBudgetOptionLabels {
+        OverBudgetOptionLabels {
+            remedy: None,
+            ..labels_with_remedy()
+        }
+    }
+
+    /// **The door's family guard, in the build that ships** (BR-10, REQ-587
+    /// ADR-7).
+    ///
+    /// BR-10 requires this question to be asked under a `skill:` key precisely
+    /// so it cannot be smuggled through another key family. The check is an
+    /// ordinary refusal rather than a `debug_assert!` for the reason the other
+    /// two doors' checks are: an assertion is absent from the shipped binary,
+    /// and what would enforce the separation there is each door happening to
+    /// have one caller that mints correctly.
+    ///
+    /// The route **answers `proceed_once`** deliberately: that is what the door
+    /// would return with the guard removed, so the assertion below cannot pass
+    /// for a second reason.
+    #[tokio::test]
+    async fn the_over_budget_door_refuses_a_key_that_is_not_the_skills_own() {
+        for key in [
+            "shell",
+            "edit",
+            &project_skill_trust_key("~/dev/teton"),
+            // A bare prefix names no skill, so it is not a key this daemon
+            // could have minted.
+            "skill:user:",
+            "",
+        ] {
+            let (gate, route, _bus, _pending, conn) = over_budget_gate(
+                PermissionConfig::with_default(PermissionPolicy::Ask),
+                RouteBehaviour::Answers(OPTION_ID_OVER_BUDGET_PROCEED_ONCE),
+            );
+            let answer = gate
+                .authorize_skill_over_budget(
+                    key,
+                    over_budget_subject(BudgetBound::Window, WindowVerdict::FitsWindow),
+                    labels_with_remedy(),
+                    conn,
+                )
+                .await;
+            assert_eq!(
+                answer.consent(),
+                SkillConsent::Unanswerable,
+                "`{key}` is not a skill consent key and must not carry BR-7's question"
+            );
+            assert!(!answer.apply_remedy(), "`{key}` authorized a durable write");
+            assert!(
+                route.delivered().is_empty(),
+                "`{key}` reached a client before the family guard"
+            );
+        }
+    }
+
+    /// The second misroute, and the one the key cannot see: the prompt carries
+    /// **no description**, so the subject is the whole of what the person
+    /// answering reads. A `SkillDynamicContext` delivered with these four option
+    /// ids would list a skill's commands and ask the user to approve an
+    /// oversized *send*.
+    #[tokio::test]
+    async fn the_over_budget_door_refuses_a_subject_that_is_not_the_offer() {
+        let (gate, route, _bus, _pending, conn) = over_budget_gate(
+            PermissionConfig::with_default(PermissionPolicy::Ask),
+            RouteBehaviour::Answers(OPTION_ID_OVER_BUDGET_PROCEED_ONCE),
+        );
+        let answer = gate
+            .authorize_skill_over_budget(
+                &over_budget_key(),
+                PermissionSubject::SkillDynamicContext {
+                    skill: "deploy".to_owned(),
+                    source: SkillSource::User,
+                    commands: vec!["git status".to_owned()],
+                    invoked_by: InvokedBy::User,
+                },
+                labels_with_remedy(),
+                conn,
+            )
+            .await;
+        assert_eq!(answer.consent(), SkillConsent::Unanswerable);
+        assert!(!answer.apply_remedy());
+        assert!(route.delivered().is_empty());
+    }
+
+    /// **BR-4 / AC-4: silence is never consent, on every path there is.**
+    ///
+    /// Three ways the question fails to reach a human, and none of them may
+    /// resolve to proceed — or to a durable write, which is the half that is
+    /// easy to miss: an offer nobody answered must authorize no `config/set`
+    /// either.
+    ///
+    /// There is no timeout leg because there is no timeout: a waiter is
+    /// answered by a client or by its connection dying, and the third case
+    /// below is the second of those.
+    #[tokio::test]
+    async fn silence_is_never_consent_on_any_unanswerable_path() {
+        // (a) No addressed route at all. `settle` answers before a waiter is
+        // registered, and never by falling back to the bus — the one thing
+        // addressing exists to prevent (REQ-585 ADR-7).
+        let (_bus, _pending, unrouted) =
+            gate(PermissionConfig::with_default(PermissionPolicy::Ask));
+        let answer = unrouted
+            .authorize_skill_over_budget(
+                &over_budget_key(),
+                over_budget_subject(BudgetBound::Window, WindowVerdict::ExceedsWindow),
+                labels_with_remedy(),
+                GrantRegistry::new().next_connection_id(),
+            )
+            .await;
+        assert_eq!(answer.consent(), SkillConsent::Unanswerable, "no route");
+        assert!(!answer.apply_remedy(), "no route authorized a write");
+
+        // (b) The connection would not take the frame. The waiter is withdrawn
+        // rather than left parked on an answer that cannot come.
+        let (gate_b, route_b, _bus_b, pending_b, conn_b) = over_budget_gate(
+            PermissionConfig::with_default(PermissionPolicy::Ask),
+            RouteBehaviour::RefusesTheFrame,
+        );
+        let answer = gate_b
+            .authorize_skill_over_budget(
+                &over_budget_key(),
+                over_budget_subject(BudgetBound::Window, WindowVerdict::ExceedsWindow),
+                labels_with_remedy(),
+                conn_b,
+            )
+            .await;
+        assert_eq!(
+            answer.consent(),
+            SkillConsent::Unanswerable,
+            "a refused frame"
+        );
+        assert!(!answer.apply_remedy(), "a refused frame authorized a write");
+        assert_eq!(route_b.delivered().len(), 1, "the frame was attempted");
+        assert_eq!(
+            pending_b.pending_count(),
+            0,
+            "a prompt nobody will see must not stay registered"
+        );
+
+        // (c) The connection took the frame and went away without answering.
+        let (gate_c, _route_c, _bus_c, pending_c, conn_c) = over_budget_gate(
+            PermissionConfig::with_default(PermissionPolicy::Ask),
+            RouteBehaviour::GoesAway,
+        );
+        let answer = gate_c
+            .authorize_skill_over_budget(
+                &over_budget_key(),
+                over_budget_subject(BudgetBound::Window, WindowVerdict::ExceedsWindow),
+                labels_with_remedy(),
+                conn_c,
+            )
+            .await;
+        assert_eq!(
+            answer.consent(),
+            SkillConsent::Unanswerable,
+            "a disconnected channel"
+        );
+        assert!(!answer.apply_remedy(), "a disconnect authorized a write");
+        assert_eq!(pending_c.pending_count(), 0);
+    }
+
+    /// A dismissal and a client-side refusal are **different sentences** and
+    /// neither proceeds (REQ-585 AC-9, REQ-589 BR-4).
+    #[tokio::test]
+    async fn a_dismissed_or_client_refused_offer_never_proceeds() {
+        for (behaviour, expected) in [
+            (RouteBehaviour::Cancels, SkillConsent::Declined),
+            (
+                RouteBehaviour::RefusesWithoutAsking(RefusalReason::NoTerminal),
+                SkillConsent::Refused(RefusalReason::NoTerminal),
+            ),
+            (
+                RouteBehaviour::RefusesWithoutAsking(RefusalReason::UnrecognizedSubject),
+                SkillConsent::Refused(RefusalReason::UnrecognizedSubject),
+            ),
+        ] {
+            let (gate, _route, _bus, _pending, conn) = over_budget_gate(
+                PermissionConfig::with_default(PermissionPolicy::Ask),
+                behaviour,
+            );
+            let answer = gate
+                .authorize_skill_over_budget(
+                    &over_budget_key(),
+                    over_budget_subject(BudgetBound::UserCap, WindowVerdict::FitsWindow),
+                    labels_with_remedy(),
+                    conn,
+                )
+                .await;
+            assert_eq!(answer.consent(), expected);
+            assert!(!answer.apply_remedy(), "{expected:?} authorized a write");
+        }
+    }
+
+    /// **ADR-1's four ids, each answering exactly what it names.**
+    ///
+    /// The pairing is the point: `remedy_only` is a legitimate answer rather
+    /// than a degenerate one, so the consent and the remedy are read
+    /// independently and a caller that read only one of them would get two of
+    /// these four cases wrong.
+    #[tokio::test]
+    async fn each_over_budget_option_id_answers_exactly_what_it_names() {
+        for (option_id, consent, apply_remedy) in [
+            (
+                OPTION_ID_OVER_BUDGET_PROCEED_ONCE,
+                SkillConsent::Allowed,
+                false,
+            ),
+            (
+                OPTION_ID_OVER_BUDGET_PROCEED_AND_REMEDY,
+                SkillConsent::Allowed,
+                true,
+            ),
+            (
+                OPTION_ID_OVER_BUDGET_REMEDY_ONLY,
+                SkillConsent::Declined,
+                true,
+            ),
+            (OPTION_ID_OVER_BUDGET_DECLINE, SkillConsent::Declined, false),
+        ] {
+            let (gate, _route, _bus, _pending, conn) = over_budget_gate(
+                PermissionConfig::with_default(PermissionPolicy::Ask),
+                RouteBehaviour::Answers(option_id),
+            );
+            let answer = gate
+                .authorize_skill_over_budget(
+                    &over_budget_key(),
+                    over_budget_subject(BudgetBound::Window, WindowVerdict::FitsWindow),
+                    labels_with_remedy(),
+                    conn,
+                )
+                .await;
+            assert_eq!(answer.consent(), consent, "`{option_id}`");
+            assert_eq!(answer.apply_remedy(), apply_remedy, "`{option_id}`");
+        }
+    }
+
+    /// An id that was **not on the prompt is not an answer to it** — the rule
+    /// `enable_permanent` already follows, applied to the pair BR-7b withholds.
+    ///
+    /// The standard four ids are in the table for the case that actually
+    /// happens: an older client that fell through to its own `prompter.ask`.
+    /// Its `allow_once` must not send an oversized expansion.
+    #[tokio::test]
+    async fn an_option_the_prompt_did_not_carry_is_not_an_answer_to_it() {
+        for option_id in [
+            OPTION_ID_OVER_BUDGET_PROCEED_AND_REMEDY,
+            OPTION_ID_OVER_BUDGET_REMEDY_ONLY,
+            OPTION_ALLOW_ONCE,
+            OPTION_ALLOW_ALWAYS,
+            OPTION_ID_ENABLE_PERMANENT,
+            "something this daemon has never heard of",
+        ] {
+            let (gate, _route, _bus, _pending, conn) = over_budget_gate(
+                PermissionConfig::with_default(PermissionPolicy::Ask),
+                RouteBehaviour::Answers(option_id),
+            );
+            let answer = gate
+                .authorize_skill_over_budget(
+                    &over_budget_key(),
+                    over_budget_subject(BudgetBound::Window, WindowVerdict::FitsWindow),
+                    // No remedy on this prompt, so the two remedy ids were never
+                    // offered.
+                    labels_without_remedy(),
+                    conn,
+                )
+                .await;
+            assert_eq!(answer.consent(), SkillConsent::Declined, "`{option_id}`");
+            assert!(!answer.apply_remedy(), "`{option_id}` authorized a write");
+        }
+    }
+
+    /// **BR-10 / AC-10, at its own seam (LESSON-508).**
+    ///
+    /// Nothing survives the invocation: no grant is recorded at any scope, so
+    /// accepting twice in one session asks twice. This needs its own test
+    /// precisely because it is a *redundant* guard — the end-to-end paths would
+    /// still work if an answer were quietly remembered, and would simply stop
+    /// asking. The failure is silent by construction, so the usual signal (a
+    /// test goes red) is structurally unavailable unless it is written here.
+    ///
+    /// **Mutation:** add `self.remember(tool_name, RememberedGrant::AllowAlways)`
+    /// beside the `proceed_once` arm and the second call below stops reaching
+    /// the route.
+    #[tokio::test]
+    async fn no_over_budget_answer_is_remembered_and_accepting_twice_asks_twice() {
+        for option_id in [
+            OPTION_ID_OVER_BUDGET_PROCEED_ONCE,
+            OPTION_ID_OVER_BUDGET_PROCEED_AND_REMEDY,
+            OPTION_ID_OVER_BUDGET_REMEDY_ONLY,
+            OPTION_ID_OVER_BUDGET_DECLINE,
+        ] {
+            let (gate, route, _bus, _pending, conn) = over_budget_gate(
+                PermissionConfig::with_default(PermissionPolicy::Ask),
+                RouteBehaviour::Answers(option_id),
+            );
+            let key = over_budget_key();
+            for round in 1..=2 {
+                let answer = gate
+                    .authorize_skill_over_budget(
+                        &key,
+                        over_budget_subject(BudgetBound::Window, WindowVerdict::FitsWindow),
+                        labels_with_remedy(),
+                        conn,
+                    )
+                    .await;
+                assert_eq!(
+                    route.delivered().len(),
+                    round,
+                    "`{option_id}` was replayed instead of asked again on round {round}"
+                );
+                assert!(
+                    gate.remembered(&key).is_none(),
+                    "`{option_id}` left a session grant behind"
+                );
+                // The answer itself is unchanged by having been given before —
+                // it is being asked afresh, not replayed.
+                assert_eq!(
+                    answer.consent().is_allowed(),
+                    option_id == OPTION_ID_OVER_BUDGET_PROCEED_ONCE
+                        || option_id == OPTION_ID_OVER_BUDGET_PROCEED_AND_REMEDY
+                );
+            }
+        }
+    }
+
+    /// **BR-10 / AC-10 stated about the map instead of about one key
+    /// (LESSON-508).**
+    ///
+    /// # Why this test exists, given the one above it
+    ///
+    /// [`no_over_budget_answer_is_remembered_and_accepting_twice_asks_twice`]
+    /// asks `remembered(&key)` — a lookup at the one spelling this test file
+    /// happened to mint. That is a weaker claim than BR-10's, and the gap
+    /// between them is reachable rather than theoretical: a skill's grant has
+    /// **two** legal spellings ([`skill_grant_key`]), the plain
+    /// `skill:<source>:<name>` and that plus a digest of its substituted
+    /// commands. The offer is always asked under the plain one. `/deploy`'s
+    /// ordinary dynamic-context question is asked under whichever spelling its
+    /// expansion minted — the digest one whenever the body interpolated its
+    /// arguments (`skills/expand.rs`, `SkillTurn`'s `permission_key`).
+    ///
+    /// So an accepted offer recorded under the digest spelling would be
+    /// **invisible** to every assertion above — the offer itself never consults
+    /// grants, so accepting twice still asks twice — and fully visible to
+    /// `authorize_skill`, which would then run that skill's commands for the
+    /// rest of the session with no prompt on any screen. That is precisely the
+    /// consent nobody gave that BR-10 exists to forbid, and it is the silent
+    /// class LESSON-508 is about: nothing fails, the daemon simply stops
+    /// asking.
+    ///
+    /// **Mutation:** remember the accept arm under `format!("{key}#…")` instead
+    /// of `key`. The whole crate stays green (verified: 2,343 passed) and this
+    /// test alone goes red.
+    #[tokio::test]
+    async fn no_over_budget_answer_reaches_the_grant_map_under_any_spelling_of_the_key() {
+        // Non-vacuity, first: the accessor can see a grant at all. An accessor
+        // that always answered "empty" would make every assertion below pass
+        // forever — the inert-sweep failure mode, which is the likeliest thing
+        // to be wrong about a test shaped like this one.
+        let (planted, _route, _bus, _pending, _conn) = over_budget_gate(
+            PermissionConfig::with_default(PermissionPolicy::Ask),
+            RouteBehaviour::Answers(OPTION_ID_OVER_BUDGET_DECLINE),
+        );
+        let digest_spelling = format!("{}#{}", over_budget_key(), "0".repeat(64));
+        planted.remember(&digest_spelling, RememberedGrant::AllowAlways);
+        assert_eq!(
+            planted.grant_keys(),
+            vec![digest_spelling],
+            "non-vacuity: the map accessor cannot see a grant it is asked about"
+        );
+
+        for option_id in [
+            OPTION_ID_OVER_BUDGET_PROCEED_ONCE,
+            OPTION_ID_OVER_BUDGET_PROCEED_AND_REMEDY,
+            OPTION_ID_OVER_BUDGET_REMEDY_ONLY,
+            OPTION_ID_OVER_BUDGET_DECLINE,
+        ] {
+            let (gate, route, _bus, _pending, conn) = over_budget_gate(
+                PermissionConfig::with_default(PermissionPolicy::Ask),
+                RouteBehaviour::Answers(option_id),
+            );
+            gate.authorize_skill_over_budget(
+                &over_budget_key(),
+                over_budget_subject(BudgetBound::Window, WindowVerdict::FitsWindow),
+                labels_with_remedy(),
+                conn,
+            )
+            .await;
+            assert_eq!(
+                route.delivered().len(),
+                1,
+                "non-vacuity: `{option_id}` was never actually asked"
+            );
+            assert!(
+                gate.grant_keys().is_empty(),
+                "`{option_id}` left {:?} in the session grant map. BR-10: consent to send \
+                 one oversized expansion is not a standing answer about this skill under \
+                 any key — and a grant under the digest spelling would be read by \
+                 `authorize_skill` while `remembered` at the plain key saw nothing",
+                gate.grant_keys()
+            );
+        }
+    }
+
+    /// **The other half of BR-10, and the hole that is actually reachable in
+    /// production (LESSON-508, LESSON-495).**
+    ///
+    /// The offer asks under the *same* `skill:<source>:<name>` key that
+    /// [`PermissionGate::authorize_skill`] remembers a dynamic-context answer
+    /// under. A remembered answer is attached to its key, not to the question
+    /// that produced it — so a user who answered "allow for this session" to
+    /// `/deploy`'s `` !`command` `` slots earlier in the session has, without
+    /// this guard, also authorized every later oversized `/deploy` expansion,
+    /// with **no prompt on any screen**. That is a consent nobody gave, and the
+    /// suite would not otherwise notice: every other test here starts from an
+    /// empty grant map.
+    ///
+    /// The grant is planted directly rather than earned through the other door,
+    /// because this is a test of the predicate, not of the route that reaches
+    /// it (LESSON-508's "pure-predicate" rule).
+    ///
+    /// **Mutation:** drop the `question.consults_grants()` guard in `settle` and
+    /// the first leg returns `Allowed` having asked nobody.
+    #[tokio::test]
+    async fn a_remembered_skill_grant_cannot_settle_an_over_budget_offer() {
+        for (grant, answers, expected) in [
+            (
+                RememberedGrant::AllowAlways,
+                OPTION_ID_OVER_BUDGET_DECLINE,
+                SkillConsent::Declined,
+            ),
+            (
+                RememberedGrant::RejectAlways,
+                OPTION_ID_OVER_BUDGET_PROCEED_ONCE,
+                SkillConsent::Allowed,
+            ),
+        ] {
+            let (gate, route, _bus, _pending, conn) = over_budget_gate(
+                PermissionConfig::with_default(PermissionPolicy::Ask),
+                RouteBehaviour::Answers(answers),
+            );
+            let key = over_budget_key();
+            gate.remember(&key, grant);
+
+            let answer = gate
+                .authorize_skill_over_budget(
+                    &key,
+                    over_budget_subject(BudgetBound::Window, WindowVerdict::FitsWindow),
+                    labels_with_remedy(),
+                    conn,
+                )
+                .await;
+            assert_eq!(
+                route.delivered().len(),
+                1,
+                "a {grant:?} on the skill's own key answered a question it was \
+                 never asked"
+            );
+            assert_eq!(answer.consent(), expected, "{grant:?}");
+            // And the offer left the dynamic-context grant exactly as it found
+            // it — it neither reads nor writes that map.
+            assert_eq!(gate.remembered(&key), Some(grant));
+        }
+    }
+
+    /// The level still decides, and it decides in one direction only.
+    ///
+    /// `plan` denies without asking — today's refusal, reached by
+    /// configuration rather than by silence. `full` no longer settles it
+    /// ([`LevelAllow::DoesNotSettle`]): `full` means "do not ask me about tool
+    /// calls", and an over-budget expansion is a turn the daemon has measured
+    /// and expects the provider to reject. Letting an `allow` row settle it
+    /// would turn today's refusal into an oversized send nobody approved, in
+    /// the posture where nobody is watching.
+    #[tokio::test]
+    async fn the_level_still_denies_but_an_allow_row_no_longer_settles() {
+        let (planning, plan_route, _bus, _pending, conn) = leveled_over_budget_gate(
+            PermissionLevel::Plan,
+            RouteBehaviour::Answers(OPTION_ID_OVER_BUDGET_PROCEED_AND_REMEDY),
+        );
+        let answer = planning
+            .authorize_skill_over_budget(
+                &over_budget_key(),
+                over_budget_subject(BudgetBound::Window, WindowVerdict::FitsWindow),
+                labels_with_remedy(),
+                conn,
+            )
+            .await;
+        assert_eq!(answer.consent(), SkillConsent::DeniedByLevel);
+        assert!(!answer.apply_remedy(), "`plan` authorized a durable write");
+        assert!(
+            plan_route.delivered().is_empty(),
+            "`plan` has no question to put to anyone"
+        );
+
+        let (unattended, full_route, _bus, _pending, conn) = leveled_over_budget_gate(
+            PermissionLevel::Full,
+            RouteBehaviour::Answers(OPTION_ID_OVER_BUDGET_DECLINE),
+        );
+        let answer = unattended
+            .authorize_skill_over_budget(
+                &over_budget_key(),
+                over_budget_subject(BudgetBound::Window, WindowVerdict::FitsWindow),
+                labels_with_remedy(),
+                conn,
+            )
+            .await;
+        assert_eq!(
+            full_route.delivered().len(),
+            1,
+            "`full` sent an oversized expansion without asking"
+        );
+        assert_eq!(answer.consent(), SkillConsent::Declined);
+    }
+
+    /// **BR-7 / BR-7b / AC-7: the remedy-bearing ids appear only where the bound
+    /// has a remedy.**
+    ///
+    /// The pairs are the architecture's reachability table verbatim — a verdict
+    /// exists only where a window was declared, so a test written for any other
+    /// cell would pass vacuously (LESSON-520). `RedactScan` is the one bound
+    /// BR-7 leaves remedy-less, and it is offered the same labels as every
+    /// other row here: the narrowing is the gate's, not the caller's.
+    #[tokio::test]
+    async fn remedy_options_appear_only_where_the_bound_has_a_remedy() {
+        let with_remedy = [
+            OPTION_ID_OVER_BUDGET_PROCEED_ONCE,
+            OPTION_ID_OVER_BUDGET_PROCEED_AND_REMEDY,
+            OPTION_ID_OVER_BUDGET_REMEDY_ONLY,
+            OPTION_ID_OVER_BUDGET_DECLINE,
+        ];
+        let without = [
+            OPTION_ID_OVER_BUDGET_PROCEED_ONCE,
+            OPTION_ID_OVER_BUDGET_DECLINE,
+        ];
+        for (bound, verdict, expected) in [
+            (
+                BudgetBound::LocalEngine,
+                WindowVerdict::WindowUnknown,
+                &with_remedy[..],
+            ),
+            (
+                BudgetBound::DefaultUnknown,
+                WindowVerdict::WindowUnknown,
+                &with_remedy[..],
+            ),
+            (
+                BudgetBound::Window,
+                WindowVerdict::FitsWindow,
+                &with_remedy[..],
+            ),
+            (
+                BudgetBound::UserCap,
+                WindowVerdict::ExceedsWindow,
+                &with_remedy[..],
+            ),
+            // BR-7b. Reachable and not an oversight: the byte clamp is an
+            // egress-privacy guarantee, and wanting to run a large skill is not
+            // wanting weaker redaction.
+            (
+                BudgetBound::RedactScan,
+                WindowVerdict::FitsWindow,
+                &without[..],
+            ),
+            (
+                BudgetBound::RedactScan,
+                WindowVerdict::ExceedsWindow,
+                &without[..],
+            ),
+            // Not in the reachability table — the daemon produces the bound, so
+            // it cannot produce this one. It is here because the guard is
+            // exhaustive and fail-closed: a bound this build cannot name is a
+            // bound whose remedy it cannot vouch for.
+            (BudgetBound::Unknown, WindowVerdict::Unknown, &without[..]),
+        ] {
+            let (gate, route, _bus, _pending, conn) = over_budget_gate(
+                PermissionConfig::with_default(PermissionPolicy::Ask),
+                RouteBehaviour::Answers(OPTION_ID_OVER_BUDGET_DECLINE),
+            );
+            let _ = gate
+                .authorize_skill_over_budget(
+                    &over_budget_key(),
+                    over_budget_subject(bound, verdict),
+                    labels_with_remedy(),
+                    conn,
+                )
+                .await;
+            let mut ids = route.option_ids(0);
+            ids.sort();
+            let mut want: Vec<String> = expected.iter().map(|id| (*id).to_owned()).collect();
+            want.sort();
+            assert_eq!(ids, want, "{bound:?} / {verdict:?}");
+        }
+
+        // The caller's own withholding is honoured too: BR-7c can decline to
+        // propose a value on a bound that *does* have a remedy, and the prompt
+        // then carries the same two options.
+        let (gate, route, _bus, _pending, conn) = over_budget_gate(
+            PermissionConfig::with_default(PermissionPolicy::Ask),
+            RouteBehaviour::Answers(OPTION_ID_OVER_BUDGET_DECLINE),
+        );
+        let _ = gate
+            .authorize_skill_over_budget(
+                &over_budget_key(),
+                over_budget_subject(BudgetBound::Window, WindowVerdict::ExceedsWindow),
+                labels_without_remedy(),
+                conn,
+            )
+            .await;
+        assert_eq!(route.option_ids(0), without);
+    }
+
+    /// **BR-7b's adversarial half**: even a client that answers with an id the
+    /// prompt never carried gets no write on a `RedactScan` bound.
+    ///
+    /// The narrowing above removes the options; this asserts the answer is
+    /// narrowed too. A guard that only edits the prompt would still honour a
+    /// hand-written `over_budget_proceed_and_remedy` from a client that offers
+    /// its own choices (LESSON-502: the same invariant, at the second seam).
+    #[tokio::test]
+    async fn a_redact_scan_offer_cannot_authorize_a_write() {
+        for option_id in [
+            OPTION_ID_OVER_BUDGET_PROCEED_AND_REMEDY,
+            OPTION_ID_OVER_BUDGET_REMEDY_ONLY,
+        ] {
+            let (gate, _route, _bus, _pending, conn) = over_budget_gate(
+                PermissionConfig::with_default(PermissionPolicy::Ask),
+                RouteBehaviour::Answers(option_id),
+            );
+            let answer = gate
+                .authorize_skill_over_budget(
+                    &over_budget_key(),
+                    over_budget_subject(BudgetBound::RedactScan, WindowVerdict::ExceedsWindow),
+                    // Offered a remedy the bound does not earn — the caller's
+                    // defect, which this door refuses to pass on.
+                    labels_with_remedy(),
+                    conn,
+                )
+                .await;
+            assert!(
+                !answer.apply_remedy(),
+                "`{option_id}` weakened the redact clamp"
+            );
+            assert_eq!(answer.consent(), SkillConsent::Declined, "`{option_id}`");
+        }
+    }
+
+    /// **BR-3's ordering**: where the expansion exceeds the declared window, the
+    /// durable fix is presented ahead of the one-time override, because
+    /// proceeding without it will very likely be rejected by the provider.
+    ///
+    /// Both choices are on the prompt in either order — the ordering informs, it
+    /// does not withhold — and the decline is always last.
+    #[tokio::test]
+    async fn the_offer_leads_with_the_remedy_only_when_the_expansion_exceeds_the_window() {
+        for (verdict, first) in [
+            (
+                WindowVerdict::ExceedsWindow,
+                OPTION_ID_OVER_BUDGET_PROCEED_AND_REMEDY,
+            ),
+            (
+                WindowVerdict::FitsWindow,
+                OPTION_ID_OVER_BUDGET_PROCEED_ONCE,
+            ),
+        ] {
+            let (gate, route, _bus, _pending, conn) = over_budget_gate(
+                PermissionConfig::with_default(PermissionPolicy::Ask),
+                RouteBehaviour::Answers(OPTION_ID_OVER_BUDGET_DECLINE),
+            );
+            let _ = gate
+                .authorize_skill_over_budget(
+                    &over_budget_key(),
+                    over_budget_subject(BudgetBound::Window, verdict),
+                    labels_with_remedy(),
+                    conn,
+                )
+                .await;
+            let ids = route.option_ids(0);
+            assert_eq!(ids.first().map(String::as_str), Some(first), "{verdict:?}");
+            assert_eq!(
+                ids.last().map(String::as_str),
+                Some(OPTION_ID_OVER_BUDGET_DECLINE),
+                "the decline is always last ({verdict:?})"
+            );
+        }
+    }
+
+    /// The offer is **addressed** and never published, for the reason every
+    /// skill consent is (REQ-585 ADR-7): the bus reaches every connection
+    /// attached to the session, including a client that understands no
+    /// `PermissionSubject` and would fall through to its own `prompter.ask`.
+    ///
+    /// It also carries no `description`: every figure is on the subject, and a
+    /// sentence restating them would be a second spelling of one fact
+    /// (LESSON-456).
+    #[tokio::test]
+    async fn an_over_budget_offer_is_addressed_and_never_published() {
+        let (gate, route, bus, _pending, conn) = over_budget_gate(
+            PermissionConfig::with_default(PermissionPolicy::Ask),
+            RouteBehaviour::Answers(OPTION_ID_OVER_BUDGET_PROCEED_ONCE),
+        );
+        let mut sub = bus.subscribe(16);
+        let answer = gate
+            .authorize_skill_over_budget(
+                &over_budget_key(),
+                over_budget_subject(BudgetBound::Window, WindowVerdict::FitsWindow),
+                labels_with_remedy(),
+                conn,
+            )
+            .await;
+        assert!(answer.consent().is_allowed());
+        assert!(
+            sub.try_recv().is_none(),
+            "an over-budget offer must not reach the bus"
+        );
+        let request = &route.delivered()[0];
+        assert_eq!(request.tool_name, over_budget_key());
+        assert_eq!(request.description, None);
+        assert!(matches!(
+            request.subject,
+            Some(PermissionSubject::SkillOverBudget { .. })
+        ));
+    }
+
+    /// The prompt offers no `*_always` answer, in **either** direction, and none
+    /// of the standard four ids.
+    ///
+    /// Asserted rather than assumed because it is exactly the option that gets
+    /// added for symmetry — the reason
+    /// [`only_the_web_keys_are_offered_the_persistent_option`] exists one
+    /// question over. Here it would be worse than a missing feature: this door
+    /// remembers nothing (BR-10), so an "always" the daemon then discarded would
+    /// be a promise it does not keep.
+    #[tokio::test]
+    async fn no_over_budget_prompt_offers_an_always_answer() {
+        let (gate, route, _bus, _pending, conn) = over_budget_gate(
+            PermissionConfig::with_default(PermissionPolicy::Ask),
+            RouteBehaviour::Answers(OPTION_ID_OVER_BUDGET_DECLINE),
+        );
+        let _ = gate
+            .authorize_skill_over_budget(
+                &over_budget_key(),
+                over_budget_subject(BudgetBound::Window, WindowVerdict::ExceedsWindow),
+                labels_with_remedy(),
+                conn,
+            )
+            .await;
+        let request = &route.delivered()[0];
+        for option in &request.options {
+            assert_ne!(
+                option.kind,
+                PermissionOptionKind::RejectAlways,
+                "`{}` offers to stop asking",
+                option.option_id
+            );
+            for standard in [
+                OPTION_ALLOW_ONCE,
+                OPTION_ALLOW_ALWAYS,
+                OPTION_REJECT_ONCE,
+                OPTION_REJECT_ALWAYS,
+                OPTION_ID_ENABLE_PERMANENT,
+            ] {
+                assert_ne!(option.option_id, standard);
+            }
+        }
+    }
+
+    /// The **pure predicate** behind all of the above, table-tested without a
+    /// socket (LESSON-508's prescription).
+    ///
+    /// Two properties this seam owns and no end-to-end path can distinguish:
+    /// `remedy_offered` is a precondition rather than a hint, and *nothing* but
+    /// a human choosing an offered remedy id sets `apply_remedy`.
+    #[test]
+    fn interpreting_an_over_budget_answer_is_a_pure_function_of_id_and_offer() {
+        let selected = |id: &str| PermissionOutcome::Selected {
+            option_id: id.to_owned(),
+        };
+        for (outcome, remedy_offered, decision, apply_remedy) in [
+            (
+                selected(OPTION_ID_OVER_BUDGET_PROCEED_ONCE),
+                true,
+                PermissionDecision::Allowed,
+                false,
+            ),
+            (
+                selected(OPTION_ID_OVER_BUDGET_PROCEED_ONCE),
+                false,
+                PermissionDecision::Allowed,
+                false,
+            ),
+            (
+                selected(OPTION_ID_OVER_BUDGET_PROCEED_AND_REMEDY),
+                true,
+                PermissionDecision::Allowed,
+                true,
+            ),
+            // Not offered: not an answer to this prompt.
+            (
+                selected(OPTION_ID_OVER_BUDGET_PROCEED_AND_REMEDY),
+                false,
+                PermissionDecision::Denied,
+                false,
+            ),
+            (
+                selected(OPTION_ID_OVER_BUDGET_REMEDY_ONLY),
+                true,
+                PermissionDecision::Denied,
+                true,
+            ),
+            (
+                selected(OPTION_ID_OVER_BUDGET_REMEDY_ONLY),
+                false,
+                PermissionDecision::Denied,
+                false,
+            ),
+            (
+                selected(OPTION_ID_OVER_BUDGET_DECLINE),
+                true,
+                PermissionDecision::Denied,
+                false,
+            ),
+            (
+                selected(OPTION_ALLOW_ONCE),
+                true,
+                PermissionDecision::Denied,
+                false,
+            ),
+            (
+                PermissionOutcome::Cancelled,
+                true,
+                PermissionDecision::Denied,
+                false,
+            ),
+            (
+                PermissionOutcome::Refused {
+                    reason: RefusalReason::NoTerminal,
+                },
+                true,
+                PermissionDecision::Denied,
+                false,
+            ),
+        ] {
+            let settled = interpret_over_budget(outcome.clone(), remedy_offered);
+            assert_eq!(
+                settled,
+                Settled::ByHumanOverBudget {
+                    decision,
+                    apply_remedy,
+                },
+                "{outcome:?} with remedy_offered={remedy_offered}"
+            );
+            assert_eq!(settled.apply_remedy(), apply_remedy);
+        }
+    }
+
+    /// The other half of "silence authorizes no write", stated at the type:
+    /// **no settlement but a human's over-budget answer can carry a remedy.**
+    ///
+    /// A seam test for a guard whose absence is silent — every one of these arms
+    /// would still return the right *decision* if `apply_remedy` leaked, and the
+    /// only visible symptom would be a `config.toml` edit nobody asked for.
+    #[test]
+    fn no_settlement_but_a_human_over_budget_answer_authorizes_a_write() {
+        for settled in [
+            Settled::ByLevel(PermissionDecision::Allowed),
+            Settled::ByLevel(PermissionDecision::Denied),
+            Settled::ByGrant(PermissionDecision::Allowed),
+            Settled::ByHuman(PermissionDecision::Allowed),
+            Settled::Refused(RefusalReason::NoTerminal),
+            Settled::Refused(RefusalReason::UnrecognizedSubject),
+            Settled::Unanswerable,
+            Settled::ByHumanOverBudget {
+                decision: PermissionDecision::Allowed,
+                apply_remedy: false,
+            },
+        ] {
+            assert!(!settled.apply_remedy(), "{settled:?}");
+        }
+        assert!(Settled::ByHumanOverBudget {
+            decision: PermissionDecision::Denied,
+            apply_remedy: true,
+        }
+        .apply_remedy());
+    }
+
+    /// `remedy_only` is a **decline of the send** in the existing vocabulary,
+    /// and the remedy rides beside it — the shape ASSUME-B bets on, asserted
+    /// rather than assumed.
+    #[test]
+    fn the_over_budget_answer_narrows_into_the_existing_consent_vocabulary() {
+        assert_eq!(
+            skill_consent_for(Settled::ByHumanOverBudget {
+                decision: PermissionDecision::Allowed,
+                apply_remedy: true,
+            }),
+            SkillConsent::Allowed
+        );
+        assert_eq!(
+            skill_consent_for(Settled::ByHumanOverBudget {
+                decision: PermissionDecision::Denied,
+                apply_remedy: true,
+            }),
+            SkillConsent::Declined,
+            "a remedy-only answer is a human declining this turn, not a level or \
+             a client refusing"
+        );
+        // And an unanswered offer carries nothing at all.
+        let unanswered = OverBudgetAnswer::not_answered(SkillConsent::Unanswerable);
+        assert_eq!(unanswered.consent(), SkillConsent::Unanswerable);
+        assert!(!unanswered.apply_remedy());
     }
 }
