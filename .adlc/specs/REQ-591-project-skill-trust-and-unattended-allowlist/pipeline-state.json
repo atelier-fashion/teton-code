@@ -98,7 +98,7 @@
       "ADR-4 checked one direction only. No offer commit CARRIES trust code, but 4be0c34 COMPILES AGAINST offer code \u2014 Question and the addressed-route double from e8b1bfb had to travel, narrowed. Both branches will now define their own; a merge-time reconciliation under AC-10 (ADR-8)."
     ]
   },
-  "openQuestions": "OQ-1 (daemon-wide gates on the trust write), OQ-2 (does one row answer both doors), OQ-3 (plan refusing typed project skills \u2014 NO LEAN) are unanswered and are the owner's. The carve-out proceeds without them; they gate the MERGE, not the split.",
+  "openQuestions": "CLOSED. All five are decided and implemented: D-1 (OQ-1) gates both durable consent-answer writes on a presence check; D-2 (OQ-2) scopes a row to the typed door and gives the model's door no durable answer at all; D-3 (OQ-3) gives `plan` an `ask` row so a typed project skill expands unrun; D-4 mints the durable row absolutely; D-5 refuses at load a row the minter could never produce. Recorded here because leaving a stale `unanswered` is LESSON-521's shape \u2014 the next reader takes the pipeline state for the state.",
   "destructiveNote": "feat/REQ-589 is PUSHED (remote tip 9067374). Removing the 5 trust commits from it requires a FORCE-PUSH of a shared branch. Must be surfaced before it happens.",
   "recoveryPoint": {
     "tag": "req589-pre-carveout",
@@ -126,5 +126,18 @@
     },
     "recoveryTag": "req589-pre-carveout -> 6d4d2fd (local, intact)",
     "sharpestCheck": "cli_e2e::a_typed_invocation_names_the_swap... passes on REQ-589 BYTE-IDENTICAL to origin/main's version; spawn_scripted_trusting has zero hits. The gate is absent, not disabled."
+  },
+  "phase5": {
+    "startedAt": "2026-08-25T00:00:00Z",
+    "tip": "2c86132",
+    "baseline": "68 targets, 3879 passed, 0 failed; clippy clean; fmt clean",
+    "panel": [
+      "security-auditor",
+      "correctness-reviewer",
+      "adversary",
+      "reflector",
+      "test-auditor"
+    ],
+    "note": "D-1..D-5 are new code, never reviewed. The trust gate itself was reviewed under REQ-589 and its findings are what caused the split; this pass checks they are actually closed."
   }
 }

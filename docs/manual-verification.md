@@ -2770,10 +2770,19 @@ Three things, and the third is the one nobody can fixture:
   whatever `/tmp` → `/private/tmp` firmlinking macOS applies on the way.
 - **The unattended refusal is legible on a pipe**, arriving as a message a
   script's author can act on rather than as a silent empty turn.
-- **OQ-4 in the flesh.** A row's meaning depends on `$HOME` *at consult time*.
-  A daemon launched with a different `HOME` than the session's environment
-  reads the same file and can resolve the same row differently. This runbook is
-  where that stops being a paragraph in the spec.
+- **The gap between the prompt and the file.** The acknowledgment shows
+  `~/dev/repo`; the row that matches is absolute. D-5 turns the natural mistake
+  into a refusal to start, and only a person retyping the row by hand finds out
+  whether that refusal is legible or merely correct.
+- **The two behaviour reversals, seen rather than asserted.** A listed row does
+  not open the model's door (D-2), and `plan` now expands a typed project skill
+  with its commands unrun (D-3). Both are places the product does something
+  *different* from what it did last release, and a green suite says only that
+  the new answer is the one the code was written to give.
+
+(OQ-4 — whether a daemon's `HOME` changes what a row means — is closed
+structurally rather than by this runbook: D-4 mints the row absolutely, so there
+is no `~` left for a `HOME` to resolve.)
 
 ## Prerequisites
 
@@ -2858,28 +2867,68 @@ Three things, and the third is the one nobody can fixture:
 4. Decline the same prompt in a fresh session (answer reject) and confirm the
    turn is refused with the trust sentence — and that nothing was appended.
 
-### Leg (d) — OQ-4: a daemon whose `$HOME` is not its launch environment's
+### Leg (d) — the row a user would *naturally* write is refused at load (D-5)
 
-This is the leg the spec's OQ-4 is about, and it is the reason this runbook
-exists rather than one more integration test.
+This leg replaces the one that gathered data for OQ-4. D-4 closed OQ-4
+structurally: a durable row is minted absolutely and carries no `~`, so a
+daemon's `HOME` can no longer change what a row means. What is left is the
+failure D-4 created and D-5 caught — and it is the one a real user hits first,
+because the acknowledgment prompt shows them `~/dev/teton-trusted` while the row
+that matches is `/Users/<you>/dev/teton-trusted`.
 
-1. With leg (b)'s row in place and working, stop the daemon.
-2. Start the daemon with a **different** `HOME` than the shell that will run
-   `teton`:
-   ```sh
-   mkdir -p /tmp/teton-other-home
-   HOME=/tmp/teton-other-home teton-code &   # or the launchd/brew service, edited
+1. With leg (b) working, stop the daemon and edit the row to the home-relative
+   spelling by hand:
+   ```toml
+   [skills]
+   trusted_project_roots = ["~/dev/teton-trusted"]
    ```
-   Keep `$TETON_CONFIG` (or the state dir) pointing at the *same* config file, so
-   the only thing that moved is `HOME`.
-3. Re-run leg (b) step 3 from your ordinary shell.
-4. **Record what happens, both ways.** A home-relative row (`~/dev/…`) resolved
-   against the daemon's `HOME` now names `/tmp/teton-other-home/dev/…`, a tree
-   nobody wrote a row for; an absolute row is unaffected. Either outcome is
-   data for OQ-4 — what must not happen is a session *trusting a tree nobody
-   named*, so if the invocation proceeds, record which directory's bytes it
-   actually expanded.
-5. Restore the daemon's environment before signing off.
+2. Start the daemon. It must **refuse to start**, and the message must name the
+   correct form and say Teton writes the row for you when you answer `p`.
+   A daemon that starts and silently never matches is the exact failure D-5
+   exists to prevent — the allowlist appears to contain your repository and does
+   not.
+3. Repeat with `/Users/<you>/dev/teton-trusted/` (trailing slash) and with a
+   relative `dev/teton-trusted`. Both must be refused for the same reason.
+4. Restore leg (b)'s row and confirm the daemon starts again.
+
+### Leg (e) — a listed row does **not** open the model's door (D-2)
+
+The behaviour reversal a person most needs to see, because the automated legs
+all drive the typed door and this is the door that is now *narrower* than the
+row implies.
+
+1. With leg (b)'s row in place and working — so the typed door at that root is
+   demonstrably proceeding unattended — run a piped session at the same root and
+   ask the **model** to use the skill rather than typing it:
+   ```sh
+   printf 'Use the dogfood skill.\n' | teton --cwd ~/dev/teton-trusted
+   ```
+2. Expect a refusal. The row answers for the typed path and for nothing else, so
+   there must be **no** expansion of the repository's body here even though the
+   very same root ran it in leg (b).
+3. Read the refusal. It must not tell the user to add a row — there is no row
+   that would help, and a sentence proposing one is BUG-181's shape.
+
+### Leg (f) — `plan` expands a typed project skill, unrun (D-3)
+
+Before D-3 the acknowledgment fell to `plan`'s deny default, so `plan` refused a
+typed project skill outright: no body, no prompt, nothing. That was the most
+restrictive outcome at the level a user picks *because* they want to read a
+repository.
+
+1. At a real terminal in `~/dev/teton-unlisted`, run `teton`, then
+   `/permissions plan`.
+2. Type `/dogfood`. Expect the acknowledgment prompt to be **put** — `plan` asks,
+   it does not refuse. Answer `y` (allow once).
+3. Expect the body to expand and the turn to run.
+4. Now the half `plan` still denies. Add a dynamic-context slot to the skill:
+   ```sh
+   printf -- '---\ndescription: dogfood\n---\n\nHost is !`hostname`. Say OK.\n' \
+     > ~/dev/teton-unlisted/.claude/skills/dogfood/SKILL.md
+   ```
+   Restart, repeat steps 1–3, and confirm the body still arrives while the
+   command is **not run** — a placeholder, never a hostname. `plan`'s promise is
+   that nothing changes and nothing leaves; D-3 relaxed the refusal, not that.
 
 ## Sign-off
 
@@ -2906,9 +2955,14 @@ Config file the daemon read      :
 (c) the `p` label named the exact row              : yes / no
 (c) the row in the file matched the label byte for byte : yes / no
 (c) a declined prompt wrote nothing                : yes / no
-(d) daemon HOME differed from the shell's          : yes / no
-(d) the listed root still resolved / still ran     : ran / refused
-(d) if it ran — which directory's bytes expanded?  :
-(d) any tree was trusted that nobody named         : yes / no   <-- must be "no"
+(d) a `~/…` row made the daemon refuse to start    : yes / no   <-- must be "yes"
+(d) the message named the canonical form + the `p` remedy : yes / no
+(d) trailing-slash and relative rows also refused  : yes / no
+(d) leg (b)'s row restored and the daemon started  : yes / no
+(e) the MODEL's door at the LISTED root refused    : yes / no   <-- must be "yes"
+(e) the refusal proposed no config row             : yes / no   <-- must be "yes"
+(f) `plan` PUT the acknowledgment (did not refuse) : yes / no
+(f) the body expanded at `plan` after `y`          : yes / no
+(f) the `!`cmd`` slot was NOT run at `plan`        : yes / no   <-- must be "yes"
 Notes / findings :
 ```
