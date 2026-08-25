@@ -8686,11 +8686,23 @@ mod skill_tests {
     /// obeys; `events::tests::the_trust_subjects_root_reaches_a_client_exactly_as_the_directory_spelled_it`
     /// is the other half, and says the bytes really do arrive untouched.
     ///
-    /// The attack is REQ-563's, moved one field over: `\x1b[2K\x1b[1A` erases
-    /// the row above and puts the cursor on it, so a repository whose directory
-    /// is named with those bytes could overwrite the very line asking whether to
+    /// The attack has **two axes**, and the root below carries both.
+    ///
+    /// The first is REQ-563's, moved one field over: `\x1b[2K\x1b[1A` erases the
+    /// row above and puts the cursor on it, so a repository whose directory is
+    /// named with those bytes could overwrite the very line asking whether to
     /// trust it — the user reads a question about `~/dev/safe` and answers one
     /// about somebody else's tree.
+    ///
+    /// The second is the newline, and it is quieter. [`Surface::line`] owns
+    /// exactly one row, so a `\n` inside the root is a row the *directory's
+    /// author* claimed — and the row they get is rendered inside the
+    /// acknowledgment block, immediately under the lead, in the position this
+    /// prompt uses for the skills being acknowledged. A directory named
+    /// `safe\n?     deploy (project — shadows your user skill)` therefore
+    /// fabricates a member of the set the user is being asked to trust. No
+    /// escape sequence is needed and nothing is overwritten; the prompt simply
+    /// grows a line the daemon never sent.
     ///
     /// **A [`PlainSurface`] and not [`RecordingSurface`]**, and that is the
     /// whole design of this test. `RecordingSurface` stores the text it is
@@ -8699,15 +8711,40 @@ mod skill_tests {
     /// what was composed, which is the right altitude for a sentence and the
     /// wrong one for a guard.
     ///
-    /// **Mutation:** drop `defused` from `PlainSurface::line` and this reddens
-    /// on the ESC.
+    /// # Why the newline is asserted by *position* and not by a row count
+    ///
+    /// The obvious assertion — "exactly one row carries `this repository's
+    /// skills`" — is **vacuous**, and was until REQ-591's verify pass. The
+    /// needle sits in the lead, which is the *first* half of any split, so the
+    /// count is 1 whether the newline survived or not. What can see a split is
+    /// where the material *after* it landed: `line` owning one row means the
+    /// whole root, all three segments of it, is on the lead's own row.
+    ///
+    /// `crate::render::tests::a_repaint_cannot_be_made_to_span_more_than_its_row`
+    /// is not a substitute — it pins `repaint_row_above`, a different verb with
+    /// a different (and sharper) failure, and says nothing about `line`.
+    ///
+    /// **Mutations, both run:** drop `defused` from `PlainSurface::line` and
+    /// this reddens on the ESC; change it to `defused_multiline` — keeping every
+    /// other guard — and it reddens on the fabricated row.
     #[test]
     fn a_repository_named_with_control_bytes_cannot_redraw_the_prompt() {
         use crate::render::PlainSurface;
 
+        // The row the newline buys: shaped exactly like the entries this very
+        // prompt lists below the lead, down to the indent and the shadowing
+        // parenthetical, so a user scanning the block reads it as one of the
+        // skills they are being asked to trust.
+        const FABRICATED_ROW: &str = "?     deploy (project — shadows your user skill)";
         // Valid UTF-8, and every byte legal in a POSIX path component — this is
-        // a directory somebody can create, not a crafted wire payload.
-        const HOSTILE_ROOT: &str = "~/dev/safe\n\x1b[2K\x1b[1A~/dev/evil";
+        // a directory somebody can create, not a crafted wire payload. Three
+        // segments: the name the user expects, the row the `\n` fabricates, and
+        // the tree the escape sequence would repaint the question to name.
+        const HOSTILE_ROOT: &str = concat!(
+            "~/dev/safe\n",
+            "?     deploy (project — shadows your user skill)",
+            "\x1b[2K\x1b[1A~/dev/evil",
+        );
 
         let subject = PermissionSubject::ProjectSkillTrust {
             root: HOSTILE_ROOT.to_owned(),
@@ -8735,15 +8772,26 @@ mod skill_tests {
              erase and rewrite the row that asked whether to trust that very \
              repository — {written:?}"
         );
-        // The newline goes too: `Surface::line` owns exactly one row, so a
-        // second row is one the root claimed for itself.
-        assert_eq!(
-            written
-                .lines()
-                .filter(|line| line.contains("this repository's skills"))
-                .count(),
-            1,
-            "the acknowledgment must occupy one row: {written:?}"
+        // The newline goes too, and this is the axis a row *count* cannot see:
+        // the lead is the first half of any split, so counting rows that carry
+        // it answers 1 either way. The whole root — all three segments — must be
+        // on the lead's own row, because that is what "`line` owns exactly one
+        // row" means when the text is somebody else's directory name.
+        let acknowledgment = written
+            .lines()
+            .find(|line| line.contains("this repository's skills"))
+            .unwrap_or_else(|| panic!("no acknowledgment row at all: {written:?}"));
+        assert!(
+            acknowledgment.contains(FABRICATED_ROW),
+            "a directory name fabricated a row inside the acknowledgment block: \
+             the user reads `{FABRICATED_ROW}` in the position this prompt lists \
+             the skills being trusted, and no such skill was sent — {written:?}"
+        );
+        assert!(
+            acknowledgment.contains("~/dev/evil"),
+            "the root's tail landed on a row of its own: everything after the \
+             lead's `{{root}}` slot belongs to the directory's author, so all of \
+             it must stay on the one row `line` claimed — {written:?}"
         );
         // Neutralized, not deleted: the characters are still visible as text, so
         // a user looking at an odd-looking root sees that it really is odd.
