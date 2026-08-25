@@ -57,8 +57,10 @@
     "teton-code"
   ],
   "phase4": {
-    "currentTask": null,
-    "completedTasks": [],
+    "currentTask": "TASK-264",
+    "completedTasks": [
+      "TASK-263"
+    ],
     "failedTasks": [],
     "waves": [
       [
@@ -79,5 +81,13 @@
     "gatedStep": "TASK-267 surfaces the force-push for owner confirmation and does NOT perform it (ADR-6)"
   },
   "openQuestions": "OQ-1 (daemon-wide gates on the trust write), OQ-2 (does one row answer both doors), OQ-3 (plan refusing typed project skills \u2014 NO LEAN) are unanswered and are the owner's. The carve-out proceeds without them; they gate the MERGE, not the split.",
-  "destructiveNote": "feat/REQ-589 is PUSHED (remote tip 9067374). Removing the 5 trust commits from it requires a FORCE-PUSH of a shared branch. Must be surfaced before it happens."
+  "destructiveNote": "feat/REQ-589 is PUSHED (remote tip 9067374). Removing the 5 trust commits from it requires a FORCE-PUSH of a shared branch. Must be surfaced before it happens.",
+  "recoveryPoint": {
+    "tag": "req589-pre-carveout",
+    "sha": "6d4d2fd2dde4341fa388f4ffe3d2f6304d0f015f",
+    "treeVerified": true,
+    "pushed": false,
+    "note": "Local tip 6d4d2fd is AHEAD of remote 9067374. Of the five trust commits, THREE are pushed (b4e4b01, 4be0c34, b071da5) and TWO are local-only (37a2e6c, bda079d). The force-push removes the pushed three."
+  },
+  "remoteTipForLease": "90673743edf4b3a073c2497dd80af31e97b04c19"
 }

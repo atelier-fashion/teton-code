@@ -1,7 +1,7 @@
 ---
 id: TASK-263
 title: "Record the recovery point before anything is rewritten"
-status: draft
+status: complete
 parent: REQ-591
 created: 2026-08-25
 updated: 2026-08-25
