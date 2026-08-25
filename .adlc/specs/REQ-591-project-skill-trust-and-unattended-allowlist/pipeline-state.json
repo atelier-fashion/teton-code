@@ -57,9 +57,11 @@
     "teton-code"
   ],
   "phase4": {
-    "currentTask": "TASK-264",
+    "currentTask": "TASK-266 + TASK-268 (wave 3)",
     "completedTasks": [
-      "TASK-263"
+      "TASK-263",
+      "TASK-264",
+      "TASK-265"
     ],
     "failedTasks": [],
     "waves": [
@@ -78,7 +80,13 @@
         "TASK-267"
       ]
     ],
-    "gatedStep": "TASK-267 surfaces the force-push for owner confirmation and does NOT perform it (ADR-6)"
+    "gatedStep": "TASK-267 surfaces the force-push for owner confirmation and does NOT perform it (ADR-6)",
+    "req591Branch": "8 commits ahead of origin/main; 3697 passed / 0 failed; both mutations bite; zero offer symbols",
+    "correctionsFromTASK264": [
+      "37a2e6c does NOT travel \u2014 its tests assert a prompt log containing the BUDGET question, so on this branch they would pass while asserting nothing (ADR-9). AC-1's ordering leg is authored fresh in TASK-268.",
+      "My TASK-264 brief conflated numbering: I wrote 'AC-9 ordering' but REQ-591's AC-9 is cargo audit; the ordering is AC-1. Caught by the implementer.",
+      "ADR-4 checked one direction only. No offer commit CARRIES trust code, but 4be0c34 COMPILES AGAINST offer code \u2014 Question and the addressed-route double from e8b1bfb had to travel, narrowed. Both branches will now define their own; a merge-time reconciliation under AC-10 (ADR-8)."
+    ]
   },
   "openQuestions": "OQ-1 (daemon-wide gates on the trust write), OQ-2 (does one row answer both doors), OQ-3 (plan refusing typed project skills \u2014 NO LEAN) are unanswered and are the owner's. The carve-out proceeds without them; they gate the MERGE, not the split.",
   "destructiveNote": "feat/REQ-589 is PUSHED (remote tip 9067374). Removing the 5 trust commits from it requires a FORCE-PUSH of a shared branch. Must be surfaced before it happens.",

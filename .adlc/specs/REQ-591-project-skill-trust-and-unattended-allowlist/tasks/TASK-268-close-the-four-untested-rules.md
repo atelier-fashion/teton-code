@@ -41,6 +41,11 @@ shipping four documented rules that are actually checked.
 - [ ] **AC-15 (BR-12)**: `skills.md` documents the acknowledgment and `trusted_project_roots`,
       and the existing byte-ceiling test still passes. **Measure headroom first** — the file is
       4,092 bytes against a 4,096 ceiling — and state in the commit what was cut to pay for it.
+- [ ] **AC-1 (ordering) — AUTHORED HERE, not moved (ADR-9)**. `37a2e6c` could not travel: its
+      tests assert a prompt log containing the budget question, which this branch does not have,
+      so they would pass while asserting nothing. Write the ordering assertion against the two
+      gates this branch HAS — trust, then `authorize_skill` — reading the RAW log, not a
+      filtered view. **Verify it bites**: skip the trust block, observe the failure, revert.
 - [ ] **AC-11**: the dogfood runbook is written into `docs/manual-verification.md`, covering a
       listed root, an unlisted root, and a daemon whose `$HOME` differs from its launch
       environment (OQ-4's case).

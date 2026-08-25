@@ -102,6 +102,49 @@ initialized to empty and "work".
 **Decision:** remove them. Dead fields on a permission gate are exactly the surface a later
 reader mistakes for a live control.
 
+### ADR-8 — ADR-4 checked one direction only (correction, from TASK-264)
+
+ADR-4 verified by `git log -S` that **no offer commit carries trust code**. It never asked the
+reverse: whether **trust code compiles against offer code**. `4be0c34` does.
+
+Two seams from `e8b1bfb` (TASK-244, an offer commit) had to travel, narrowed:
+
+- **`Question`** — `4be0c34` constructs `Question::ProjectTrust { durable_root }` and reads
+  `durable_project_root()`. On `origin/main`, `settle`/`interpret` take a bare
+  `web: Option<WebTier>`. Carried with **two** variants (`Standard`, `ProjectTrust`), leaving
+  `OverBudget`/`consults_grants`/`remedy_offered` behind.
+- **The addressed-route test double + `wired()`** — all eight of `4be0c34`'s D-13 tests are
+  written through them. Carried, renamed `OverBudgetRoute` → `AddressedRoute`. Also needed
+  `grant_keys()` from `a23c9f2`.
+
+**Consequence, and it is a real one:** when TASK-266 rebases REQ-589 onto `origin/main`,
+`e8b1bfb` re-introduces both — so **each branch will define its own `Question` and route
+double**. That is a merge-time reconciliation, not a split defect, but ADR-3 did not predict it
+and whoever merges second inherits it. It belongs under AC-10.
+
+**The lesson for any future carve-out in this repo:** "does A carry B's code" and "does A
+compile against B's code" are different questions, and only the first is answerable by
+`git log -S`.
+
+### ADR-9 — `37a2e6c` does not travel, and AC-1's ordering leg is authored here
+
+Both of `37a2e6c`'s tests live in `skill_over_budget_offer.rs` — a file created by offer commit
+`53f1c71` — and both assert a prompt log containing the **budget** question. On a branch with no
+budget question, `["project trust", "over-budget offer"]` degenerates to a one-element list and
+its sibling to an empty one. **Ported, they would pass while asserting nothing** — the vacuity
+the criterion exists to prevent.
+
+**Decision:** `37a2e6c` stays with REQ-589. REQ-591's AC-1 ordering leg is **authored fresh**
+against the two gates this branch actually has (trust, then `authorize_skill`). TASK-268 owns it.
+
+The ordering is not unwitnessed in the meantime: `b4e4b01` carried
+`declining_the_repository_refuses_the_turn_and_asks_no_budget_question`, which asserts the same
+order from the engine's prompt list and reddens under the skip-the-trust-block mutation.
+
+**Also corrected here:** the TASK-264 brief said "AC-9 ordering". REQ-591's AC-9 is
+`cargo audit`; the ordering is **AC-1**. REQ-589's AC-9 was the ordering. Two numbering schemes,
+one conflated instruction — caught by the implementer, not by me.
+
 ## What the split must preserve
 
 - **REQ-589 behaves identically** — this is the constraint that decided ADR-1, and AC-10.
