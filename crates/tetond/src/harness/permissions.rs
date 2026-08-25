@@ -1232,12 +1232,28 @@ enum Question {
         ///   *consultation* is untouched: a `plan` session at a root somebody
         ///   already listed still proceeds.
         ///
+        /// **Not what the label shows.** Since REQ-591 D-9 the option names the
+        /// repository by [`Self::ProjectTrust::display_root`] — the
+        /// home-relative spelling — while this absolute name is what the write
+        /// appends. The label is worded so that both are true of it at once; see
+        /// [`project_trust_options`].
+        ///
         /// Since REQ-591 D-7 the **session** answer is not shared either: the
         /// grant key carries the door, so an answer at the typed prompt does not
         /// settle the model's. The two narrowings are the same rule at two
         /// ranges — [`durable_row_for`] for the durable answer, the key itself
         /// for the session one.
         durable_root: Option<String>,
+        /// The repository's **home-relative** name, as the prompt shows it
+        /// (REQ-591 D-9, BR-1's entity table).
+        ///
+        /// The same string the subject's `root` carries, and carried here for
+        /// one reason: [`options_for`] sees a [`Question`] and nothing else, and
+        /// after D-4 the durable row is absolute. A label built from
+        /// [`Self::ProjectTrust::durable_root`] alone would put
+        /// `/Users/<you>/dev/repo` on the one prompt whose `root` field is
+        /// deliberately home-relative so no username reaches a transcript.
+        display_root: String,
     },
 }
 
@@ -2461,6 +2477,7 @@ impl PermissionGate {
         let question = Question::ProjectTrust {
             invoked_by,
             durable_root: offered_row,
+            display_root: root.to_owned(),
         };
         // No `description`, for [`Self::authorize_skill`]'s reason: the subject
         // carries the root and the named set, and a sentence restating them
@@ -3311,9 +3328,11 @@ fn options_for(question: &Question) -> Vec<PermissionOption> {
             labels,
             lead_with_remedy,
         } => over_budget_options(labels, *lead_with_remedy),
-        Question::ProjectTrust { durable_root, .. } => {
-            project_trust_options(durable_root.as_deref())
-        }
+        Question::ProjectTrust {
+            durable_root,
+            display_root,
+            ..
+        } => project_trust_options(display_root, durable_root.as_deref()),
     }
 }
 
@@ -3345,11 +3364,33 @@ fn standard_options(web: Option<WebTier>) -> Vec<PermissionOption> {
 ///
 /// **The label names the concrete write**, which is ADR-1's binding rule and
 /// `enable_permanent`'s own hard-won lesson: that option once promised a key it
-/// silently did not write. So this one spells the table, the key, the `+=` and
-/// the exact string that lands in it — and then names the consequence in the
-/// words the person answering actually cares about, because "a row in a list" is
-/// not what they are deciding. They are deciding whether a session with nobody
-/// watching may run this repository's skills.
+/// silently did not write. So this one spells the table, the key, and the
+/// repository — and then names the consequence in the words the person answering
+/// actually cares about, because "a row in a list" is not what they are
+/// deciding. They are deciding whether a session with nobody watching may run
+/// this repository's skills.
+///
+/// # It shows the home-relative name and appends the absolute one (REQ-591 D-9)
+///
+/// D-4 made the durable row absolute, which put `/Users/<you>/dev/repo` on the
+/// one prompt whose `root` field is deliberately home-relative precisely so no
+/// username reaches a transcript. The label now shows `display_root`.
+///
+/// **The trap here is LESSON-495's, and it is why the wording is what it is.**
+/// A label reading ``writes `trusted_project_roots += "~/dev/repo"` `` would
+/// name a row that is *never written* — strictly worse than the username,
+/// because a user who then grepped their config for it would find nothing, and
+/// one who typed it in by hand would meet D-5's refusal. So the label does not
+/// quote a row at all. It says the repository is **added** to the named table
+/// **by its full path**: true of an absolute row, and true while displaying the
+/// home-relative name. What BR-7 requires is that the label name the write that
+/// actually happens, not that it be a copy-and-paste of it — and the sentence
+/// that *is* a copy-and-paste, `project_trust_refusal`'s, keeps the absolute row
+/// because there the user is being told what to type.
+///
+/// `the_label_promises_exactly_the_row_the_write_appends` holds the two together
+/// in both directions: the name shown is the display, the row appended is the
+/// canonical one, and neither string appears where the other belongs.
 ///
 /// It rides [`OPTION_ID_ENABLE_PERMANENT`] rather than an id of its own,
 /// deliberately. That constant is the protocol's word for *the durable option on
@@ -3357,12 +3398,12 @@ fn standard_options(web: Option<WebTier>) -> Vec<PermissionOption> {
 /// second id would be a second thing for both sides to agree about for no
 /// behaviour anyone can observe. Which write it authorizes is decided by the
 /// **question**, not by the id — see [`Question::durable_project_root`].
-fn project_trust_options(durable_root: Option<&str>) -> Vec<PermissionOption> {
-    options_around(durable_root.map(|root| {
+fn project_trust_options(display_root: &str, durable_root: Option<&str>) -> Vec<PermissionOption> {
+    options_around(durable_root.map(|_| {
         format!(
-            "Trust this repository permanently (writes \
-             `[skills] trusted_project_roots += \"{root}\"` — a session with nobody at the \
-             terminal may then run its skills without asking)"
+            "Trust this repository permanently (adds `{display_root}` to \
+             `[skills] trusted_project_roots`, by its full path — a session with nobody at \
+             the terminal may then run its skills without asking)"
         )
     }))
 }
@@ -5697,7 +5738,14 @@ mod tests {
     /// it tests the string for membership and nothing else — so a literal keeps
     /// the fixture off the filesystem. `durable_trust_root_name`'s own suite owns
     /// the question of what this string *is*.
-    const DURABLE: &str = "~/dev/acknowledged";
+    ///
+    /// **The two are deliberately different strings** (REQ-591 D-9). They name
+    /// one tree in the two spellings production uses — `trust_root_name`'s
+    /// home-relative one for the prompt, `durable_trust_root_name`'s absolute one
+    /// for the row — and they were the *same* literal until D-9, which left
+    /// every label/row assertion here unable to tell which one it was looking
+    /// at.
+    const DURABLE: &str = "/Users/fixture/dev/acknowledged";
     const DISPLAY: &str = "~/dev/acknowledged";
 
     /// Ask BR-4's acknowledgment of `gate`, as the typed path does.
@@ -6358,10 +6406,17 @@ mod tests {
             .clone();
         assert!(
             label.contains(&format!(
-                "`[skills] trusted_project_roots += \"{DURABLE}\"`"
+                "adds `{DISPLAY}` to `[skills] trusted_project_roots`, by its full path"
             )),
-            "ADR-1: the label must name the concrete write, table, key, `+=` and \
-             the exact string — never \"trust this permanently\": {label}"
+            "ADR-1: the label must name the concrete write — the table, the key, \
+             the repository, and (since REQ-591 D-9) that the stored form is the \
+             full path — never \"trust this permanently\": {label}"
+        );
+        assert!(
+            !label.contains(DURABLE),
+            "REQ-591 D-9: the absolute row belongs in `project_trust_refusal`, \
+             where the user is being told what to type, and not on the prompt \
+             whose root is home-relative for BR-1's reason: {label}"
         );
         assert!(
             label.contains("nobody at the terminal"),
@@ -6594,6 +6649,7 @@ mod tests {
             &Question::ProjectTrust {
                 invoked_by: InvokedBy::User,
                 durable_root: Some(DURABLE.to_owned()),
+                display_root: DISPLAY.to_owned(),
             },
             None,
         );
@@ -6628,18 +6684,34 @@ mod tests {
     /// half each one watches. Drift is a change to **one** of them, and only a
     /// test holding both at once can see it.
     ///
-    /// So the row is **read out of the label the user was shown** and compared
-    /// with the string the sink was handed. Nothing in this test spells the
-    /// write twice: change the label's table, key or `+=`, and the parse below
-    /// finds nothing; change *which* string the label names, or which string the
-    /// write appends, and the two stop matching. There is no edit to either side
-    /// alone that leaves this green.
+    /// So the repository is **read out of the label the user was shown**, and
+    /// the row is read off the sink. Change the label's verb, table or key and
+    /// the parse finds nothing; change which repository it names, or which row
+    /// the write appends, and the assertions below stop agreeing.
     ///
-    /// The third assertion is what keeps the derivation from being circular. A
-    /// label promising `+= ""` beside a write of `""` would satisfy the
-    /// comparison and describe nothing, so the row is also pinned to the root
-    /// this door was actually asked about — which is a fact about the fixture's
-    /// own input, not a second copy of the mint.
+    /// # The two are no longer the same string, and that is D-9
+    ///
+    /// Until REQ-591 D-9 the label quoted the row verbatim, and the test
+    /// compared them for equality. D-4 had by then made the row absolute, so
+    /// that label put `/Users/<you>/dev/repo` on the one prompt whose root is
+    /// deliberately home-relative.
+    ///
+    /// Equality is therefore the wrong binding now — but "loosen it until it
+    /// passes" is the LESSON-495 failure this test exists to prevent, so the
+    /// binding is made in four parts instead, and each names a different way the
+    /// pair can drift:
+    ///
+    /// - the label names `DISPLAY`, the spelling the rest of the prompt uses;
+    /// - the label does **not** contain `DURABLE` — D-9's privacy half;
+    /// - the label says "by its full path", without which it reads as a promise
+    ///   to write the string it displays. That is the trap: a label promising a
+    ///   row that is never written is worse than the username, because grepping
+    ///   for it finds nothing and typing it in meets D-5's refusal;
+    /// - the sink was handed `DURABLE`, which is the half no label can state.
+    ///
+    /// `DISPLAY` and `DURABLE` are distinct literals as of D-9. They were the
+    /// same string before it, which left every assertion here unable to tell
+    /// which of the two it was looking at.
     #[tokio::test]
     async fn the_label_promises_exactly_the_row_the_write_appends() {
         let sink = RecordingTrustSink::new(false);
@@ -6680,33 +6752,46 @@ mod tests {
             .label
             .clone();
 
-        // The parse *is* the assertion about the label's shape: table, key and
-        // `+=` all have to read exactly as a user would grep for them, or there
-        // is no row to extract.
+        // The parse *is* the assertion about the label's shape: the verb, the
+        // table and the key all have to read exactly as a user would grep for
+        // them, or there is no repository to extract.
         let promised = label
-            .split_once("`[skills] trusted_project_roots += \"")
-            .and_then(|(_, rest)| rest.split_once('"'))
-            .map(|(row, _)| row.to_owned())
+            .split_once("adds `")
+            .and_then(|(_, rest)| rest.split_once("` to `[skills] trusted_project_roots`"))
+            .map(|(root, _)| root.to_owned())
             .unwrap_or_else(|| {
                 panic!(
-                    "the label names no `[skills] trusted_project_roots += \"…\"` \
-                     write, so a user who picked it and then grepped their config \
-                     has nothing to grep for: {label}"
+                    "the label names no repository being added to \
+                     `[skills] trusted_project_roots`, so a user who picked it has \
+                     no idea what it is about to do: {label}"
                 )
             });
 
         assert_eq!(
-            sink.written(),
-            vec![promised.clone()],
-            "the label promised `{promised}` and the write appended something \
-             else — LESSON-495's failure exactly: a prompt describing a write \
-             that did not happen"
+            promised, DISPLAY,
+            "the label must name the repository the prompt is about, in the \
+             spelling the prompt uses everywhere else"
+        );
+        assert!(
+            !label.contains(DURABLE),
+            "REQ-591 D-9: the absolute row reached the acknowledgment label, \
+             which is the one prompt whose root is home-relative so no username \
+             enters a transcript: {label}"
+        );
+        assert!(
+            label.contains("by its full path"),
+            "BR-7: the label shows `{DISPLAY}` and the write appends \
+             `{DURABLE}`, so it has to say the stored form is the full path — \
+             without that clause the label reads as a promise to write the \
+             string it displays, and a user who grepped their config for it \
+             would find nothing (LESSON-495): {label}"
         );
         assert_eq!(
-            promised, DURABLE,
-            "non-vacuity: the row named must be the root this door was asked \
-             about, or label and write could agree on a string that names no \
-             repository"
+            sink.written(),
+            vec![DURABLE.to_owned()],
+            "the write must append the canonical row, whatever the label \
+             displayed — the two halves are one fact and this is the half a \
+             label cannot state"
         );
     }
 

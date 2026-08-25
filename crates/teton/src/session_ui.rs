@@ -8404,16 +8404,44 @@ mod skill_tests {
     }
 
     /// The acknowledgment as the daemon raises it: under
-    /// `project_skill_trust:<root>`, never a skill's key and never a tool's
-    /// name, and with no `description` — the subject carries the facts.
+    /// `project_skill_trust:<invoker>:<root>`, never a skill's key and never a
+    /// tool's name, and with no `description` — the subject carries the facts.
+    ///
+    /// **It carries the durable option** (REQ-591 D-9). The base fixture builds
+    /// the three ordinary ids; this is the one prompt in the product that also
+    /// offers `enable_permanent` — `project_trust_options` puts it on the
+    /// acknowledgment and nowhere else, so putting it on the shared skill
+    /// fixture instead would be a fixture that lies about every other prompt.
+    ///
+    /// The label is the daemon's, wording for wording, and that is the point: it
+    /// is the only string on this prompt that could carry an absolute path, and
+    /// without it
+    /// `the_acknowledgment_names_the_root_marks_shadowing_and_counts_the_tail`'s
+    /// "no `/Users/` anywhere" assertion had nothing to bite on.
     fn trust_permission_request(subject: Option<PermissionSubject>) -> PermissionRequest {
+        let base = skill_permission_request(subject);
+        let mut options = base.options;
+        // The fifth slot, between the allows and the rejects, exactly where
+        // `options_around` puts it.
+        options.insert(
+            2,
+            PermissionOption {
+                option_id: teton_protocol::events::OPTION_ID_ENABLE_PERMANENT.to_owned(),
+                label: "Trust this repository permanently (adds `~/dev/teton` to \
+                        `[skills] trusted_project_roots`, by its full path — a session with \
+                        nobody at the terminal may then run its skills without asking)"
+                    .to_owned(),
+                kind: PermissionOptionKind::AllowAlways,
+            },
+        );
         PermissionRequest {
             request_id: RequestId::from("r-trust"),
             tool_name: teton_protocol::methods::project_skill_trust_key(
                 events::InvokedBy::User,
                 "~/dev/teton",
             ),
-            ..skill_permission_request(subject)
+            options,
+            ..base
         }
     }
 
@@ -8693,10 +8721,62 @@ mod skill_tests {
         );
         // The root is home-relative wherever it is rendered: BR-1's entity
         // table, and the reason the daemon sends a display and not a path.
+        //
+        // **Everything this prompt puts in front of a human**: the rendered
+        // block *and* the question line, which carries the request's key and
+        // therefore the root a second time.
+        //
+        // # What this covers, stated exactly, because it was vacuous before
+        //
+        // REQ-591's verify pass found this assertion inspecting `lines` alone
+        // while the fixture built no `enable_permanent` option — so the one
+        // string on this prompt that names a config write could not appear, and
+        // the assertion could not fail. The fixture now carries that option,
+        // which is faithful to what the daemon sends.
+        //
+        // It still does not make this a check on the **label**, and the reason
+        // is worth writing down rather than rediscovering: this client never
+        // renders the acknowledgment's option labels. Labels are drawn as
+        // numbered rows by `resolve_over_budget_offer` and by nothing else; the
+        // acknowledgment goes through the compact key prompt
+        // (`[y]es / … / [p]ermanently / …`), so its labels ride the wire for
+        // other ACP clients and are never shown here. The assertion below
+        // therefore pins what it can: that **this client** introduces no
+        // absolute path into anything it draws, given home-relative input.
+        //
+        // The label's own privacy is the daemon's to guarantee and is pinned
+        // there, twice — `permissions::tests::the_label_promises_exactly_the_row_the_write_appends`
+        // and `the_typed_prompt_names_the_write_and_the_models_prompt_has_none`
+        // both assert the label names the home-relative root and never the
+        // absolute row.
         assert!(
-            !lines.iter().any(|line| line.contains("/Users/")),
-            "a username reached the prompt: {lines:?}"
+            req.options.iter().any(
+                |option| option.option_id == teton_protocol::events::OPTION_ID_ENABLE_PERMANENT
+            ),
+            "the fixture stopped offering the durable option, which is the only \
+             one whose label names a config write"
         );
+        assert!(
+            !prompter
+                .questions
+                .iter()
+                .any(|question| question.contains("trusted_project_roots")),
+            "this client has started rendering the acknowledgment's option \
+             labels. That is not a regression — but the sweep below now has a \
+             daemon-authored string in range, so make it assert the label's \
+             privacy properly rather than leaving this comment stale: {:?}",
+            prompter.questions
+        );
+        for shown in lines
+            .iter()
+            .map(AsRef::<str>::as_ref)
+            .chain(prompter.questions.iter().map(AsRef::<str>::as_ref))
+        {
+            assert!(
+                !shown.contains("/Users/"),
+                "a username reached the prompt: {shown}"
+            );
+        }
     }
 
     /// **REQ-591 BR-11 / AC-14: this client's half of the corrected contract.**
