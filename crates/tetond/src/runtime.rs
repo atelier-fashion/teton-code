@@ -2575,9 +2575,19 @@ pub struct DaemonRuntime {
     /// What attests a human behind a **daemon-wide** commitment made from
     /// inside a consent answer (REQ-591 D-1).
     ///
-    /// A [`OnceLock`] for [`Self::addressed_delivery`]'s reason and wired from
-    /// the same place: the verifier belongs to the daemon, and the daemon holds
-    /// the runtime rather than the other way round.
+    /// Filled from the same place as [`Self::addressed_delivery`] and for its
+    /// reason: the verifier belongs to the daemon, and the daemon holds the
+    /// runtime rather than the other way round.
+    ///
+    /// **Replaceable**, which [`Self::addressed_delivery`] is not, and the
+    /// difference is not a preference — it is what the seam is *for*.
+    /// `Daemon::with_presence_verifier` is a builder step, so it necessarily
+    /// runs after a constructor already wired the shipped verifier here. Under a
+    /// first-writer-wins slot that method would be a quiet no-op on exactly the
+    /// paths a fixture installs a verifier to exercise, and the daemon's own
+    /// `verifier` field (which `refuse_unattested_commitment` reads) would be
+    /// answering over a *different* verifier from this one — the two halves D-1
+    /// exists to keep in step, drifted apart by their wiring.
     ///
     /// Two writers consult it and they must not diverge — the acknowledgment's
     /// `[skills] trusted_project_roots` row, through the gate this runtime
@@ -2588,7 +2598,7 @@ pub struct DaemonRuntime {
     /// Empty on a runtime nobody wired one into, which **performs the write** —
     /// the opposite of [`Self::addressed_delivery`]'s absence and deliberately
     /// so; see [`CommitmentAttestation`].
-    commitment_attestation: OnceLock<Arc<dyn CommitmentAttestation>>,
+    commitment_attestation: Mutex<Option<Arc<dyn CommitmentAttestation>>>,
     /// The per-command deadline a skill's dynamic context runs under (REQ-585
     /// BR-6: "the `shell` tool's jail, timeout and output cap").
     ///
@@ -2664,7 +2674,7 @@ impl DaemonRuntime {
             provider_health: Mutex::new(BTreeMap::new()),
             secret_resolver: SecretResolver::with_default_backend(),
             addressed_delivery: OnceLock::new(),
-            commitment_attestation: OnceLock::new(),
+            commitment_attestation: Mutex::new(None),
             skill_command_timeout_ms: shell::DEFAULT_TIMEOUT_MS,
             // In memory: a `minimal()` runtime has no state dir, and a test
             // must never be able to write the real machine's project list.
@@ -2692,15 +2702,33 @@ impl DaemonRuntime {
     /// Wire what attests a human behind this runtime's daemon-wide commitments
     /// (REQ-591 D-1).
     ///
-    /// Idempotent-by-first-writer, like
-    /// [`Self::install_addressed_delivery`] and for its reason.
+    /// **Last writer wins**, unlike [`Self::install_addressed_delivery`]:
+    /// `Daemon::with_presence_verifier` states a verifier *after* the
+    /// constructor has already wired the shipped one, so a first-writer-wins
+    /// slot would silently discard exactly the call a fixture makes to exercise
+    /// this path. See [`Self::commitment_attestation`].
     ///
     /// Without it both durable writes proceed on the connection's standing
     /// alone, which is the pre-D-1 posture and is what a build with no presence
     /// mechanism gets anyway — see [`CommitmentAttestation`] for why an absent
     /// mechanism is an allow rather than a refusal.
     pub fn install_commitment_attestation(&self, seam: Arc<dyn CommitmentAttestation>) {
-        let _ = self.commitment_attestation.set(seam);
+        *self
+            .commitment_attestation
+            .lock()
+            .expect("commitment attestation mutex poisoned") = Some(seam);
+    }
+
+    /// The commitment seam this runtime currently holds, if any.
+    ///
+    /// A clone rather than a borrow: the slot is replaceable, so a caller that
+    /// held the lock across the check *and* the call would hold it across a
+    /// verifier that may block on a human at a sensor.
+    fn commitment_attestation(&self) -> Option<Arc<dyn CommitmentAttestation>> {
+        self.commitment_attestation
+            .lock()
+            .expect("commitment attestation mutex poisoned")
+            .clone()
     }
 
     /// Replace the per-command deadline a skill's dynamic context runs under
@@ -2897,7 +2925,7 @@ impl DaemonRuntime {
             provider_health: Mutex::new(BTreeMap::new()),
             secret_resolver: SecretResolver::with_default_backend(),
             addressed_delivery: OnceLock::new(),
-            commitment_attestation: OnceLock::new(),
+            commitment_attestation: Mutex::new(None),
             skill_command_timeout_ms: shell::DEFAULT_TIMEOUT_MS,
             projects: Arc::new(crate::projects::ProjectStore::open(
                 &teton_protocol::socket_path::projects_path(base_dir),
@@ -4643,7 +4671,7 @@ impl DaemonRuntime {
         // swallowed, in the same shape a failed write is, because a user told
         // their limit was raised when nothing was written meets the same
         // refusal next turn with no explanation.
-        if let Some(seam) = self.commitment_attestation.get() {
+        if let Some(seam) = self.commitment_attestation() {
             if let Err(err) = seam.attest_daemon_wide_commitment(answered_by) {
                 eprintln!(
                     "tetond: the over-budget remedy was not applied — it is a machine-wide \
@@ -6477,8 +6505,8 @@ impl DaemonRuntime {
             // because the *same* seam gates the over-budget remedy, which does
             // not go through this gate at all — one answer to BUG-162's
             // question, consulted from both places that ask it.
-            if let Some(seam) = self.commitment_attestation.get() {
-                gate = gate.with_commitment_attestation(Arc::clone(seam));
+            if let Some(seam) = self.commitment_attestation() {
+                gate = gate.with_commitment_attestation(seam);
             }
             Arc::new(gate)
         }))
@@ -32959,6 +32987,14 @@ provider_id = \"deepseek\"
             if let Some(sink) = sink {
                 gate = gate.with_project_trust_persistence(sink);
             }
+            // REQ-591 D-1: whatever a daemon over this runtime wired, taken
+            // exactly as `permission_gate_for` takes it — so a leg that builds a
+            // `Daemon` gets the seam that daemon installed rather than none.
+            // Empty on a bare `minimal()` runtime, which is every other leg in
+            // this module.
+            if let Some(seam) = runtime.commitment_attestation() {
+                gate = gate.with_commitment_attestation(seam);
+            }
             runtime
                 .session_gates
                 .lock()
@@ -33404,6 +33440,139 @@ provider_id = \"deepseek\"
                          for one"
                     );
                 }
+
+                let _ = std::fs::remove_dir_all(&dir);
+            }
+        }
+
+        /// **D-1's *wiring*, not its body: the verifier a fixture injects is the
+        /// one the durable row asks.**
+        ///
+        /// [`crate::server::Daemon::with_presence_verifier`] is a builder step,
+        /// so it necessarily runs *after* the constructor has already filled the
+        /// runtime's commitment seam from [`crate::attest::default_verifier`].
+        /// If that slot were first-writer-wins, the method would be a quiet
+        /// no-op on exactly the paths a fixture installs a verifier to exercise:
+        /// `refuse_unattested_commitment` reads the daemon's own `verifier`
+        /// while this write would still be consulting the constructor's — the
+        /// two halves D-1 exists to keep in step, answering over *different*
+        /// verifiers.
+        ///
+        /// [`the_permanent_answer_reaches_the_config_file_and_only_that_answer`]
+        /// proves the write happens and
+        /// `a_row_is_written_only_where_a_verified_human_stands_behind_it` proves
+        /// the gate consults a seam handed straight to it. Neither can see this:
+        /// both hand the gate its seam directly, and the question here is
+        /// whether the *daemon* got it there.
+        ///
+        /// **The pairing is the test** (LESSON-520). Same fixture, same root,
+        /// same `enable_permanent` answer, same real config file; only the
+        /// injected verifier changes. A build that never re-wires fails the
+        /// refusing leg — the shipped default on a build with no presence
+        /// mechanism is [`crate::attest::UnavailableVerifier`], which degrades to
+        /// *allow* and writes the row — and a build that stopped writing fails
+        /// the attesting leg.
+        ///
+        /// **Mutation:** make `install_commitment_attestation` first-writer-wins
+        /// again (return early when the slot is `Some`) and the refusing leg goes
+        /// red on a row it did not expect.
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn an_injected_verifier_is_the_one_the_durable_write_asks() {
+            for (refuses, what) in [
+                (false, "an injected verifier that attests"),
+                (true, "an injected verifier that refuses"),
+            ] {
+                let dir = project_root(&format!("trust-inject-{refuses}"), "marked");
+                let config_path = dir.join("teton-config.toml");
+                let seed = "[permissions]\ndefault_level = \"guarded\"\n";
+                std::fs::write(&config_path, seed).unwrap();
+
+                let engine = Recorder::new();
+                let slot = EngineSlot::empty();
+                slot.install(
+                    "recording".to_owned(),
+                    Arc::new(Mutex::new(engine.clone())) as Arc<Mutex<dyn Engine>>,
+                );
+                let runtime = Arc::new(DaemonRuntime {
+                    engine: slot,
+                    local_available: AtomicBool::new(true),
+                    config_path: Some(config_path.clone()),
+                    ..DaemonRuntime::minimal()
+                });
+
+                // The daemon, over *this* runtime. Its constructor wires the
+                // shipped verifier into the commitment seam and the builder step
+                // states the fixture's — which is the whole ordering under test.
+                // Dropped straight away: what it installed lives on the runtime,
+                // which is the object the turn below runs through.
+                let verifier: Box<dyn crate::attest::PresenceVerifier> = if refuses {
+                    Box::new(crate::attest::AlwaysFailsVerifier::new(
+                        crate::attest::AttestationMethod::OsBiometric,
+                    ))
+                } else {
+                    Box::new(crate::attest::AcceptingVerifier::default())
+                };
+                drop(
+                    crate::server::Daemon::with_runtime(
+                        Arc::new(EventBus::new()),
+                        Arc::clone(&runtime),
+                    )
+                    .with_presence_verifier(verifier),
+                );
+
+                let client = Client::selecting(runtime.pending(), OPTION_ID_ENABLE_PERMANENT);
+                let expected = crate::harness::tools::skill::durable_trust_root_name_by_resolving(
+                    &runtime.session_root_for(Some(&dir)).path,
+                )
+                .expect("the fixture root canonicalises");
+
+                typed_turn_in(&dir, &engine, &runtime, |runtime, events, session_id| {
+                    install_gate_trusting(
+                        runtime,
+                        events,
+                        session_id,
+                        Arc::clone(&client) as Arc<dyn AddressedPermissionDelivery>,
+                        Vec::new(),
+                        Some(Arc::clone(runtime)
+                            as Arc<
+                                dyn crate::harness::permissions::ProjectTrustPersistence,
+                            >),
+                    )
+                })
+                .await
+                .unwrap_or_else(|err| panic!("{what}: the turn must run — {err:?}"));
+
+                let bytes = std::fs::read_to_string(&config_path).expect("the file is still there");
+                let reloaded = load_config(Some(&config_path)).expect("the written config loads");
+                if refuses {
+                    assert_eq!(
+                        bytes, seed,
+                        "{what}: the machine-wide row was written anyway, so the \
+                         injected verifier never reached this write"
+                    );
+                    assert!(
+                        reloaded.skills.trusted_project_roots.is_empty(),
+                        "{what}: a row survives the reload a later session performs"
+                    );
+                } else {
+                    assert_eq!(
+                        reloaded.skills.trusted_project_roots,
+                        vec![expected.clone()],
+                        "{what}: the durable half must still happen — a verified \
+                         human is exactly what BR-10(b) asks for; file:\n{bytes}"
+                    );
+                }
+                // The session half, both legs: a human picked an allow-shaped id
+                // and no presence check governs *that*. Without this the refusing
+                // leg would also pass on a build that refused the whole answer.
+                assert!(
+                    engine
+                        .prompts()
+                        .iter()
+                        .any(|prompt| prompt.contains(MARKER)),
+                    "{what}: the acknowledged skill must still expand — the \
+                     presence check is on the durable half only"
+                );
 
                 let _ = std::fs::remove_dir_all(&dir);
             }
