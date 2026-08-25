@@ -3,10 +3,11 @@
   "branch": "feat/REQ-590-engine-derived-local-context-budget",
   "startedAt": "2026-08-25T00:00:00Z",
   "completed": false,
-  "currentPhase": 2,
+  "currentPhase": 3,
   "completedPhases": [
     0,
-    1
+    1,
+    2
   ],
   "integrationBranch": "main",
   "phaseHistory": [
@@ -22,6 +23,14 @@
       "completedAt": "2026-08-25T00:00:00Z",
       "result": "approved after 2 blockers fixed: BR-8 (the latent floor rule) and BR-12 (observability) had no acceptance criterion \u2014 added AC-15 and AC-16",
       "note": "LESSON-560's failure shape, caught by the gate one day after the lesson was written"
+    },
+    {
+      "phase": 2,
+      "name": "Architect & break into tasks",
+      "completedAt": "2026-08-25T00:00:00Z",
+      "adrs": 8,
+      "tasks": 7,
+      "note": "Both exploration agents assumed the LOCAL_BUDGET_* constants move; BR-5 keeps them. ADR-8 records the corrections. Also refuted: the claim that LOCAL_ENGINE_N_CTX is cfg(llama)-gated \u2014 redact.rs imports it ungated, which is what makes the whole approach viable."
     }
   ],
   "repos": {
