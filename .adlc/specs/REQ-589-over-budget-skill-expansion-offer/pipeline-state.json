@@ -2,14 +2,18 @@
   "req": "REQ-589",
   "branch": "feat/REQ-589-over-budget-skill-expansion-offer",
   "startedAt": "2026-08-24T19:38:00Z",
-  "completed": false,
-  "currentPhase": 5,
+  "completed": true,
+  "currentPhase": 8,
   "completedPhases": [
     0,
     1,
     2,
     3,
-    4
+    4,
+    5,
+    6,
+    7,
+    8
   ],
   "integrationBranch": "main",
   "phaseHistory": [
@@ -47,6 +51,14 @@
       "completedAt": "2026-08-24T23:30:00Z",
       "tasks": 24,
       "suite": "3854 passed / 0 failed"
+    },
+    {
+      "phase": 8,
+      "name": "Wrapup",
+      "completedAt": "2026-08-25T21:00:00Z",
+      "mergeCommit": "8956a93",
+      "pr": "https://github.com/atelier-fashion/teton-code/pull/212",
+      "note": "Phases 5-8 were never recorded live: Phase 5's review panel found every serious finding traced to the trust-gate work rather than the offer, and the owner split that work into REQ-591 mid-pipeline. The merge went ahead; this record is written retroactively at wrapup."
     }
   ],
   "repos": {
@@ -56,9 +68,9 @@
       "worktree": "/Users/brettluelling/Documents/GitHub/teton-code/.worktrees/REQ-589",
       "branch": "feat/REQ-589-over-budget-skill-expansion-offer",
       "touched": true,
-      "prUrl": null,
+      "prUrl": "https://github.com/atelier-fashion/teton-code/pull/212",
       "prNumber": null,
-      "merged": false
+      "merged": true
     }
   },
   "mergeOrder": [
