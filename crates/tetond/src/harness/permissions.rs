@@ -1984,8 +1984,8 @@ impl PermissionGate {
             None,
             LevelAllow::Settles,
         )
-            .await
-            .decision()
+        .await
+        .decision()
     }
 
     /// [`Self::decide`] with the provenance of the answer kept (REQ-585 AC-9)
@@ -4577,7 +4577,6 @@ mod tests {
     // ------------------------------------------------------------------
     // The addressed-route double these legs are asked through (REQ-589)
     // ------------------------------------------------------------------
-
 
     /// What the addressed route does with the frame it is handed.
     ///
