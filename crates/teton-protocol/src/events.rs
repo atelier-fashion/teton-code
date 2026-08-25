@@ -3566,8 +3566,18 @@ pub enum SkillStage {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum WindowVerdict {
-    /// Over budget, but inside the window the route declares: the send is
-    /// expected to serve, and the offer says so.
+    /// Over budget, but inside the window the route declares.
+    ///
+    /// **Not a promise that the send will serve** (ADR-15). On a window- or
+    /// cap-bound route the band between the budget and the declared window *is*
+    /// the generation reservation, so an expansion that clears the window while
+    /// overflowing the budget is eating the room held back for the reply — the
+    /// offer says the prompt fits the declared window and may leave the response
+    /// very little to work with, and claims nothing further. On the byte-clamped
+    /// `RedactScan` bound the band is the egress scanner's ceiling instead, and
+    /// the offer says only that this daemon's own budget is what refused
+    /// (ADR-17). A test in `harness::budget` pins that neither sentence says the
+    /// send is expected to serve.
     FitsWindow,
     /// The route declares a window and the expansion exceeds it. Proceeding
     /// without raising it will very likely be rejected by the provider — which

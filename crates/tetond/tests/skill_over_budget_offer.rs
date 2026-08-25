@@ -28,6 +28,15 @@
 //! | AC-11 (no "no provider saw this turn") | [`the_accepted_path_never_says_no_provider_saw_this_turn`] |
 //! | AC-18 (BR-11 on every not-sent path) | [`every_not_sent_path_reaches_no_provider_and_spends_nothing`] |
 //!
+//! The Phase-5 review pass added two tests and widened one, none of which an AC
+//! names because they close defects rather than criteria:
+//!
+//! | Defect | Test |
+//! |---|---|
+//! | `RaiseCap` deleted a spend ceiling that cleared nothing (ADR-6 rule 2) | [`a_cap_is_only_offered_for_clearing_where_clearing_it_would_help`] |
+//! | the remedy reverted a provider changed while the offer waited | [`a_provider_changed_while_the_offer_waits_is_not_reverted_by_the_remedy`] |
+//! | the closing question offered options the prompt did not draw (ADR-1) | [`a_cap_is_only_offered_for_clearing_where_clearing_it_would_help`], [`a_raise_window_offer_cannot_be_rendered_without_its_risk`] |
+//!
 //! AC-5 (the model path is never offered a choice) is in `skill_tool_loop.rs`,
 //! beside the model-invoked refusal it extends; the choke-point half of BR-11 is
 //! in `egress_capture.rs`.
@@ -48,12 +57,15 @@
 //! | the offer consults a grant | [`accepting_twice_asks_twice_and_no_grant_survives_the_invocation`] |
 //! | the naming duty moves above Stage A | [`every_not_sent_path_reaches_no_provider_and_spends_nothing`] |
 //! | `apply_remedy` folded into the consent decision | [`proceed_and_remedy_are_answered_independently_in_all_four_combinations`] |
+//! | the `clearing_the_cap_clears` gate dropped from `plan_over_budget_remedy` | [`a_cap_is_only_offered_for_clearing_where_clearing_it_would_help`] |
+//! | the closing question read back off `Remedy::is_offered` | [`a_cap_is_only_offered_for_clearing_where_clearing_it_would_help`], [`a_raise_window_offer_cannot_be_rendered_without_its_risk`] |
+//! | the `provider_identity_unchanged` guard dropped from the apply | [`a_provider_changed_while_the_offer_waits_is_not_reverted_by_the_remedy`] |
 //!
 //! ## Only reachable cells (LESSON-520)
 //!
-//! Verdict and bound are not independent axes; nine of the fifteen cells cannot
-//! occur and a test for one would pass vacuously. What this file exercises,
-//! against the normative table in `architecture.md`:
+//! Verdict and bound are not independent axes; seven of the fifteen cells cannot
+//! occur and a test for one would pass vacuously. Of the eight that do, this
+//! file exercises seven — against the normative table in `architecture.md`:
 //!
 //! | Bound | Verdict | Where |
 //! |---|---|---|
@@ -286,6 +298,15 @@ struct Client {
     answer: Mutex<Answer>,
     trust: Trust,
     asked: Mutex<Vec<PermissionRequest>>,
+    /// Something to do **while the offer is on screen and before it is
+    /// answered**.
+    ///
+    /// The whole of the gap this file could not otherwise reach: the plan is
+    /// built before the question is put and applied after the answer, with no
+    /// timeout in between, so everything a user can do to their config in those
+    /// minutes happens here.
+    #[allow(clippy::type_complexity)]
+    while_offered: Mutex<Option<Box<dyn Fn() + Send>>>,
 }
 
 impl Client {
@@ -295,7 +316,13 @@ impl Client {
             answer: Mutex::new(answer),
             trust,
             asked: Mutex::new(Vec::new()),
+            while_offered: Mutex::new(None),
         })
+    }
+
+    /// Install the mid-flight action described on [`Client::while_offered`].
+    fn while_offered(&self, action: impl Fn() + Send + 'static) {
+        *self.while_offered.lock().expect("while_offered mutex") = Some(Box::new(action));
     }
 
     /// Only the over-budget offers — the acknowledgment is a different question.
@@ -342,6 +369,16 @@ impl AddressedPermissionDelivery for Client {
             Some(PermissionSubject::SkillOverBudget { .. })
         );
         let outcome = if is_offer {
+            // Before the answer, never after: what this simulates is the user
+            // reaching for `config/set` while the question sits unanswered.
+            if let Some(action) = self
+                .while_offered
+                .lock()
+                .expect("while_offered mutex")
+                .as_ref()
+            {
+                action();
+            }
             match self.answer.lock().expect("answer mutex").clone() {
                 Answer::Select(id) => {
                     // Asserted rather than defaulted: an id the prompt did not
@@ -1495,7 +1532,8 @@ async fn every_bound_offers_exactly_the_remedy_the_table_names() {
             BudgetBound::UserCap,
             RemedyKind::RaiseCap,
             true,
-            "raise or clear `capabilities.context_budget_cap` for `frontier`",
+            "write `capabilities.context_budget_cap = 0` for `frontier`, which removes \
+             the ceiling you set rather than raising it",
         ),
         (
             BudgetBound::Window,
@@ -1731,8 +1769,263 @@ async fn a_raise_window_offer_cannot_be_rendered_without_its_risk() {
                 "{tag}: and the sentence says so: {}",
                 offer.sentence
             );
+            // **ADR-1: the sentence may not offer an answer the prompt has no
+            // row for.** This leg is the live BR-7c case — the classification
+            // says `RaiseWindow`, the plan is `None`, and the question used to
+            // close "Send it whole this once, take the durable fix, both, or
+            // neither?" above two options, neither of which is the durable fix.
+            assert!(
+                offer.sentence.ends_with(CLOSING_ONE_TIME_ONLY),
+                "{tag}: no remedy row was drawn, so the closing must not offer one: {}",
+                offer.sentence
+            );
+            assert!(
+                !offer.sentence.contains(CLOSING_WITH_REMEDY),
+                "{tag}: {}",
+                offer.sentence
+            );
+            // The fix is still *named* — BR-7c's posture is to state it and ask
+            // for the value — so this is not the sentence going quiet.
+            assert!(
+                offer.sentence.contains("The durable fix is to"),
+                "{tag}: {}",
+                offer.sentence
+            );
         }
     }
+}
+
+// ---------------------------------------------------------------------------
+// The review pass (REQ-589 Phase 5)
+// ---------------------------------------------------------------------------
+
+/// **ADR-6 rule 2: a spend ceiling is never cleared for a refusal that would
+/// stand anyway** (REQ-589 review pass).
+///
+/// The reviewer's construction, driven through a real turn. One provider,
+/// `max_context = 30000` and `context_budget_cap = 10000`, so every leg stamps
+/// `bound: user cap` and classifies `RaiseCap`. The legs differ only in the
+/// size of the expansion:
+///
+/// * **hopeless** — past the pair the *declared window* derives on its own.
+///   Clearing the cap writes `0`, the route re-derives at `bound: window`, and
+///   the very next invocation meets the identical refusal — with the user's
+///   spend ceiling deleted for nothing. No option may offer that, and the
+///   closing question must not gesture at it either.
+/// * **resolvable** — over the cap and comfortably inside the window behind it.
+///   This is what BR-7 wrote the remedy for, and it is the non-vacuity guard:
+///   the same fixture, the same bound, the same classification, and both
+///   durable options present.
+///
+/// **Mutation**: drop the `clearing_the_cap_clears` gate in
+/// `plan_over_budget_remedy` and the hopeless leg fails at the option list;
+/// point the closing question back at `Remedy::is_offered` and it fails at the
+/// sentence.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_cap_is_only_offered_for_clearing_where_clearing_it_would_help() {
+    // (tag, body words, body bytes, the clearing is worth offering)
+    let legs: [(&'static str, usize, usize, bool); 2] = [
+        ("v5hope", 25_000, 55_000, false),
+        ("v5fix", 8_000, 30_000, true),
+    ];
+
+    for (tag, words, bytes, offerable) in legs {
+        let provider = vendor();
+        let fx = Fixture::new(Spec::new(
+            tag,
+            remote_route(
+                &provider.openai_endpoint(),
+                RECIPE_MODEL,
+                Some(30_000),
+                Some(10_000),
+            ),
+            sized_body(words, bytes),
+        ));
+        let session = fx.session();
+        let mut sub = fx.events.subscribe(512);
+        fx.invoke(&session).await.expect_err("declined");
+        let request = fx.client.sole_offer();
+        let offer = subject_of(&request);
+        let published = drain(&mut sub);
+
+        // Both legs are the same cell of the reachability table, and both are
+        // classified `RaiseCap`: whatever separates them below is not the bound
+        // and not BR-7's table.
+        assert_eq!(offer.bound, BudgetBound::UserCap, "{tag}");
+        assert_eq!(
+            offered(&published)[0].remedy_kind,
+            RemedyKind::RaiseCap,
+            "{tag}"
+        );
+
+        let durable: Vec<&PermissionOption> = request
+            .options
+            .iter()
+            .filter(|o| {
+                o.option_id == OPTION_ID_OVER_BUDGET_PROCEED_AND_REMEDY
+                    || o.option_id == OPTION_ID_OVER_BUDGET_REMEDY_ONLY
+            })
+            .collect();
+
+        if offerable {
+            assert_eq!(
+                durable.len(),
+                2,
+                "{tag}: clearing this cap does clear the measurement, so BR-7's remedy \
+                 stands: {:?}",
+                option_ids(&request)
+            );
+            for option in durable {
+                // ADR-1, on the one write that deletes rather than sets.
+                assert!(
+                    option
+                        .label
+                        .contains("write `capabilities.context_budget_cap = 0` for `frontier`"),
+                    "{tag}: the label must name the concrete write: {}",
+                    option.label
+                );
+                assert!(
+                    option
+                        .label
+                        .contains("removes the ceiling you set rather than raising it"),
+                    "{tag}: and that the write is a removal: {}",
+                    option.label
+                );
+            }
+            assert!(
+                offer.sentence.ends_with(CLOSING_WITH_REMEDY),
+                "{tag}: {}",
+                offer.sentence
+            );
+        } else {
+            assert!(
+                durable.is_empty(),
+                "{tag}: clearing this cap leaves the expansion over the window-derived \
+                 budget, so no option may spend the user's spend ceiling on it: {:?}",
+                option_ids(&request)
+            );
+            assert!(
+                offer.sentence.ends_with(CLOSING_ONE_TIME_ONLY),
+                "{tag}: no remedy row was drawn, so the closing must not offer one: {}",
+                offer.sentence
+            );
+        }
+
+        // Neither leg wrote anything: this test is about what is *offered*.
+        assert!(remedies(&published).is_empty(), "{tag}");
+        assert!(
+            fx.config_on_disk().contains("context_budget_cap = 10000"),
+            "{tag}: the ceiling is still on disk"
+        );
+    }
+}
+
+/// **A provider that moved while the offer waited is not silently restored to
+/// what the offer was composed from** (REQ-589 review pass).
+///
+/// `RegisterProvider` replaces `endpoint`, `model` and `auth_ref` wholesale —
+/// only the two capability fields merge field-wise — and the plan captured all
+/// three from the config snapshot the *question* was built under. The answer
+/// arrives after an await on a human that has no timeout, so `config/set` and
+/// `teton provider add` are open the whole time.
+///
+/// This drives exactly that: the offer goes up, the user re-registers
+/// `frontier` against a different model while it is on screen, and only then
+/// answers *"do not send it, but take the durable fix"*. Unguarded, the remedy's
+/// write restores the model the offer was composed from — a change silently
+/// undone, with the next turn calling the old registration.
+///
+/// What must happen instead: the remedy is refused, nothing is written, and the
+/// user's change stands. `previous_value` is not merely absent here — the whole
+/// record is, because no write landed.
+///
+/// **Mutation**: remove the `provider_identity_unchanged` guard from
+/// `apply_over_budget_remedy` and this fails on the very first assertion, with
+/// the stale model back on disk.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_provider_changed_while_the_offer_waits_is_not_reverted_by_the_remedy() {
+    use teton_protocol::methods::{ConfigUpdate, ProviderConfig};
+    use teton_protocol::{ProviderId, ProviderKind};
+
+    let provider = vendor();
+    let endpoint = provider.openai_endpoint();
+    let fx = Fixture::new(
+        Spec::new(
+            "v5race",
+            remote_route(&endpoint, RECIPE_MODEL, Some(200_000), Some(6_000)),
+            sized_body(6_000, 24_000),
+        )
+        .answering(Answer::Select(OPTION_ID_OVER_BUDGET_REMEDY_ONLY)),
+    );
+    let before = fx.config_on_disk();
+    assert!(
+        before.contains(RECIPE_MODEL) && before.contains("context_budget_cap = 6000"),
+        "the fixture must start from the registration the offer is composed under: {before}"
+    );
+
+    // The user, at 10:02, with the question from 10:00 still on screen.
+    let runtime = Arc::clone(&fx.runtime);
+    let moved_to = endpoint.clone();
+    fx.client.while_offered(move || {
+        runtime
+            .apply_config_update(ConfigUpdate::RegisterProvider(ProviderConfig {
+                id: ProviderId::from("frontier"),
+                kind: ProviderKind::OpenaiCompatible,
+                endpoint: Some(moved_to.clone()),
+                model: Some(UNRECOGNIZED_MODEL.to_owned()),
+                auth_ref: None,
+                max_context: None,
+                context_budget_cap: None,
+                floored_budget: None,
+            }))
+            .expect("the user's own re-registration lands");
+    });
+
+    let session = fx.session();
+    let mut sub = fx.events.subscribe(512);
+    fx.invoke(&session)
+        .await
+        .expect_err("remedy_only does not send the turn");
+    let published = drain(&mut sub);
+
+    // The offer was really raised and really carried the remedy, or there is
+    // nothing here to have gone wrong.
+    let request = fx.client.sole_offer();
+    assert!(
+        option_ids(&request).contains(&OPTION_ID_OVER_BUDGET_REMEDY_ONLY.to_owned()),
+        "non-vacuity: the fixture must offer the durable fix: {:?}",
+        option_ids(&request)
+    );
+
+    let after = fx.config_on_disk();
+    assert!(
+        after.contains(UNRECOGNIZED_MODEL),
+        "the user's change was undone by a write planned before they made it: {after}"
+    );
+    assert!(
+        !after.contains(RECIPE_MODEL),
+        "the model the offer was composed under came back: {after}"
+    );
+    // The remedy failed rather than half-applied, and said so rather than
+    // publishing a record of a write that did not happen.
+    assert!(
+        after.contains("context_budget_cap = 6000"),
+        "the cap was cleared by a plan whose provider had moved: {after}"
+    );
+    assert!(
+        remedies(&published).is_empty(),
+        "a durable write was recorded that must not have happened: {:?}",
+        remedies(&published)
+    );
+    // And the document still loads, with both facts as the user left them.
+    let reparsed = teton_core::Config::load(&after).expect("the config still loads");
+    let frontier = reparsed
+        .providers
+        .iter()
+        .find(|p| p.id == "frontier")
+        .expect("the provider is still registered");
+    assert_eq!(frontier.declared_model(), Some(UNRECOGNIZED_MODEL));
+    assert_eq!(frontier.capabilities.context_budget_cap, 6_000);
 }
 
 // ---------------------------------------------------------------------------
