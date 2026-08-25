@@ -81,7 +81,8 @@ this section is worded carefully.** Three things the naive version gets wrong:
   `derive(BudgetInputs::local())` (`turn_loop.rs:493`), and `generation_reservation()` calls
   `HarnessConfig::default()` (`budget.rs:614`). The short-circuit is the only thing keeping that
   cycle open. See BR-2 and BR-3.
-- Lowering the byte half is **a user-visible regression**, not a free correction. See BR-7.
+- Lowering the byte half is **a user-visible regression**, not a free correction — accepted, and
+  absorbed by REQ-589's offer. See BR-7 and D-4.
 
 ## System Model
 
@@ -143,8 +144,11 @@ local engine a default-feature build can have.*
   conjunctively. Lowering the byte half 32,768 → 30,720 newly refuses byte-dense local content
   in that 2,048-byte band — minified JSON, base64, path-heavy build logs, the classes
   `budget.rs:55-62` names as measured. For an ordinary turn that is a new elision; for a skill
-  turn it is a **new over-budget offer on content that has never raised one**. If the byte half
-  is to fall, this rule is what must be consciously overridden, with the affected classes named.
+  turn it is a **new over-budget offer on content that has never raised one**.
+  **D-4 overrides this rule deliberately**: the byte half falls, the regression is accepted, and
+  REQ-589's offer is the surface that absorbs it. The rule stays stated because an override is
+  only honest if the thing overridden is written down — and because AC-7 must pin the chosen
+  behaviour rather than the improving direction only.
 
 - [ ] **BR-8 (floor): `MIN_BUDGET_*` may never raise the local pair above what the engine holds.**
   The floor's "only ever raises" property is safe for a remote route with a declared window and is
@@ -155,11 +159,13 @@ local engine a default-feature build can have.*
   is 6,144, which `budget.rs:126-133` documents as **below the smallest prompt the harness can
   produce**. That case is OQ-2, and BR-8 does not pretend to resolve it.
 
-- [ ] **BR-9: `COMPACT_OUTPUT_MAX_BYTES` must not exceed the local budget it repairs to.**
-  It is defined as `LOCAL_BUDGET_BYTES` (`compact.rs:134`) and its doc states the invariant:
-  a repair may not return more than the budget it is repairing to. If the local byte budget falls
-  below that constant, a compaction landing in the gap is rejected and the turn degrades to
-  oldest-first eviction — on exactly the route that most needed the model's judgement.
+- [ ] **BR-9: `COMPACT_OUTPUT_MAX_BYTES` tracks the local byte budget.** It is defined as
+  `LOCAL_BUDGET_BYTES` (`compact.rs:134`) and its doc states the invariant it holds: a repair may
+  not return more than the budget it is repairing to. **D-4 breaks that invariant** — 32,768 would
+  exceed the new 30,720 budget, so a compaction landing in the gap is rejected and the turn
+  degrades to oldest-first eviction, on exactly the route that most needed the model's judgement.
+  This REQ must re-point the constant at the budget it repairs to; leaving it is not an option
+  the decision authorizes.
 
 - [ ] **BR-10: The word half must not lose its slack silently.** Today 4,096 words claim at most
   ~6,144 tokens against 15,360 usable — 2.5× headroom. The derived pair sets
@@ -167,9 +173,11 @@ local engine a default-feature build can have.*
   per whitespace word overruns the engine at full budget. `budget.rs:205-212` measures Rust at
   1.69. The byte guard covers dense-and-heavy content; it does not cover **token-dense but
   byte-light** content (whitespace-separated single-character tokens, numeric columns), which
-  passes the byte guard and overruns anyway. Either the derivation carries explicit margin, or
-  this REQ states that `context_length_exceeded` becomes an ordinary local outcome and REQ-589's
-  offer is the intended catch.
+  passes the byte guard and overruns anyway. **D-3 accepts this**: no explicit margin is added,
+  `context_length_exceeded` becomes an ordinary local outcome, and REQ-589's offer plus the
+  engine's typed refusal are the intended catches. AC-9 measures how wide the uncovered gap
+  actually is, with a real tokenizer — the one thing that would turn this accepted risk into a
+  known quantity.
 
 - [ ] **BR-11: A larger local budget does not degrade a local turn below REQ-544's BR-8 latency
   duty** (`router.rs:405` — named by REQ id because this document has its own BR-8).
@@ -246,29 +254,43 @@ local engine a default-feature build can have.*
   meaning. Not `generation_reservation()` either, which would close the BR-3 cycle. A constant
   with its own home, cited by both the local derivation and its test.
 
-- **D-3 — OPEN, and it is the REQ's real decision. How much to raise the word half?**
-  The first draft asserted "a budget is a ceiling, not a target", concluded REQ-586 OQ-3's
-  prefix-cache concern did not apply, and shipped the full derivation. **The premise is false in
-  this codebase:** `under_pressure` fires compaction at 70% of the budget (`compact.rs:397`) and
-  `digest_thresholds` scales the condense trigger off it (`budget.rs:598`). The budget decides
-  what enters a prompt.
+- **D-3 — DECIDED (owner, 2026-08-25): take the full window.** The local pair derives from
+  `LOCAL_ENGINE_N_CTX − 1,024` with no additional margin:
 
-  | | word budget | compaction fires at | digest folds raw above |
-  |---|---|---|---|
-  | today | 4,096 | 2,867 words | 1,500 words |
-  | full derivation | 10,240 | 7,168 words | 3,750 words |
+  | | today | decided |
+  |---|---|---|
+  | words | 4,096 | **10,240** |
+  | bytes | 32,768 | **30,720** |
+  | compaction fires at | 2,867 w / 22,937 B | 7,168 w / 21,504 B |
+  | digest folds raw above | 1,500 w / 12,000 B | 3,750 w / 11,250 B |
 
-  So the full raise means a local session accumulates ~2.5× more conversation before anything is
-  forgotten, and every turn after that point prefills ~2.5× more — on the machine that must also
-  serve routing and redaction. That is precisely the cost REQ-586 deferred on, and it is a
-  product decision: **fix the 4,097-word refusal with the smallest raise that does it, or take
-  the full window and accept the compaction change?** AC-10 and AC-11 are the measurements.
+  The compaction and digest movements are **accepted consequences, not oversights** — the draft's
+  error was dismissing them as impossible, and they are recorded here so the architecture phase
+  treats them as designed behaviour. A local session now holds ~2.5× more conversation before
+  anything is forgotten. AC-10 and AC-11 measure what that costs; they do not gate the decision.
 
-- **D-4 — OPEN: does the byte half fall?** Lowering it to 30,720 is what gives the reply room and
-  satisfies AC-4, and it is a regression for byte-dense content (BR-7) and breaks
-  `COMPACT_OUTPUT_MAX_BYTES` (BR-9). Holding it at 32,768 avoids both and leaves the reply with no
-  reserved room at the 2 B/token floor. There is no free option; the spec declines to pick one
-  silently.
+  *Note the digest byte threshold moves **down** (12,000 → 11,250) while the word threshold moves
+  up. That is the ratio arithmetic, not a mistake: `digest_thresholds` scales each half by its own
+  constant, and the byte half of the budget fell.*
+
+- **D-4 — DECIDED by D-3: the byte half falls to 30,720.** Not a separate choice — 30,720 *is*
+  the full-window derivation. This resolves BR-7 and BR-9 as follows, and both need work in
+  architecture rather than merely being noted:
+
+  - **BR-7's regression is accepted and is now catchable.** Byte-dense local content in the
+    2,048-byte band between 30,720 and 32,768 is newly over budget. REQ-589 shipped the
+    over-budget offer immediately before this REQ, so the outcome is *an offer to proceed*, not a
+    hard refusal — the regression lands on the one surface built to absorb it. AC-7 pins that:
+    exactly one offer, no silent elision.
+  - **BR-9 must be fixed, not just observed.** `COMPACT_OUTPUT_MAX_BYTES = LOCAL_BUDGET_BYTES`
+    (32,768) would exceed the 30,720 budget it repairs to, so a compaction landing in the gap is
+    rejected and the turn degrades to oldest-first eviction. It has to track the local budget.
+  - **BR-10's slack is gone, deliberately.** `10,240 × 3/2 = 15,360 = usable`, exactly zero
+    margin, where today there is 2.5×. Content denser than 1.5 real tokens per whitespace word
+    overruns at full budget; `budget.rs:205` measures Rust at 1.69. The catches are the byte
+    guard (for dense-and-heavy content), the engine's typed `context_length_exceeded`, and
+    REQ-589's offer. AC-9 measures the gap the byte guard does *not* cover — token-dense but
+    byte-light content — and records the outcome rather than assuming it.
 
 ## External Dependencies
 
@@ -310,9 +332,9 @@ local engine a default-feature build can have.*
   harness's own 5,979-byte system prompt plus the 1 KiB truncation floor — a tier that cannot
   serve anything. Is the answer a proportionally tiny budget, or should the tier decline to serve
   and say why? BR-8 keeps this honest; it does not resolve it.
-- [ ] OQ-3: D-3 and D-4 above are open product decisions, not analysis gaps. They need the AC-10
-  and AC-11 measurements, and REQ-589 AC-15's runbook — never written — was to have been the
-  first data point.
+- [ ] OQ-3: **CLOSED** — D-3 and D-4 decided by the owner, 2026-08-25: the full window. AC-10 and
+  AC-11 still measure the cost, but they report rather than gate. REQ-589 AC-15's runbook remains
+  unwritten and is the natural place to take AC-11's reading.
 
 ### Resolved from the placeholder
 
