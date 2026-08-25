@@ -154,6 +154,21 @@ knowing before you configure a boundary: dynamic-context output is unattributed,
 like all shell output, so an invocation that ran one pins that turn to this
 machine.
 
+A skill the **repository** supplies is a file you did not write, expanded into a
+turn as instructions, so the session asks once per repository whether you trust
+its skills before the first one runs — whether you typed the name or the model
+reached for it, and at every permission level, `full` included, when the
+repository's skill takes its name from one of your own.
+
+That question needs a person, which leaves a piped or scripted session with no
+way to answer it. So the prompt you get from typing `/name` yourself carries a
+fifth answer, `p`, which records the repository's root in
+`[skills] trusted_project_roots` — and a session with **nobody at the terminal**
+reads that list: at a listed root the turn goes ahead without asking, and at any
+other root it refuses exactly as it would have. The row is a standing "yes" for
+a directory, given once and read later by runs you are not watching, so treat
+adding one as the security decision it is. Delete it to go back to being asked.
+
 What this is **not** is a Claude Code runtime. Frontmatter other than `name`,
 `description` and `argument-hint` is inert — nothing in a file changes your
 permission level, your routing or your boundaries — and the body is passed as

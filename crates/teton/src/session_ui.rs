@@ -3197,7 +3197,35 @@ fn invoker_clause(invoked_by: events::InvokedBy, voice: InvokerVoice) -> &'stati
 /// request's key instead — *rendered*, never parsed: what a client may not do
 /// is **select** on that string (ADR-7), and printing the thing the daemon
 /// called this request is how a user finds it in a log.
+///
+/// # The project-skill acknowledgment gets a second remedy, because the first
+/// one is only half true for it
+///
+/// `/permissions full` settles the acknowledgment for an ordinary project skill
+/// — that half is real, and it is why the standard sentence is **kept** here
+/// rather than replaced. It settles **nothing** when the repository's skill
+/// shadows one of the user's own: that case asks even at `full` (REQ-587 BR-4),
+/// and it is exactly the case an unattended run trips over. Stopping at the
+/// standard remedy would send such a user to set a level, watch it change
+/// nothing, and conclude the refusal is a bug.
+///
+/// So the D-13 answer is named after it, with the condition that distinguishes
+/// them: `[skills] trusted_project_roots` covers both, and a turn at a listed
+/// root **goes ahead** — which is also why that clause is worded as a condition
+/// rather than as a flat refusal. Since D-13 this client's `NoTerminal` no longer
+/// settles the turn; the daemon consults the list afterwards, and a line
+/// promising a refusal would be contradicted two lines later by the skill's own
+/// echo.
+///
+/// The exact row is deliberately not spelled here — it is the root's *canonical*
+/// name, which this client cannot derive from the subject's and would therefore
+/// have to guess at. The daemon's own refusal, which arrives right behind this
+/// line when the turn does refuse, prints it exactly.
 fn refusal_line(req: &PermissionRequest, reason: RefusalReason) -> String {
+    let project_trust = matches!(
+        &req.subject,
+        Some(PermissionSubject::ProjectSkillTrust { .. })
+    );
     let subject = match &req.subject {
         Some(PermissionSubject::SkillDynamicContext { skill, .. }) => {
             format!("skill `{skill}`'s dynamic context")
@@ -3214,6 +3242,14 @@ fn refusal_line(req: &PermissionRequest, reason: RefusalReason) -> String {
         _ => format!("`{}`", req.tool_name),
     };
     match reason {
+        RefusalReason::NoTerminal if project_trust => format!(
+            "{subject} was refused without asking: this session's input is not a terminal, so \
+             nobody could be asked — send `/permissions full` ahead of it, or set \
+             `[permissions] default_level`, to allow it unattended. That does not cover a \
+             repository whose skill shadows one of your own; `[skills] trusted_project_roots` \
+             does, and the turn goes ahead where it already names this repository — acknowledge \
+             it once at a terminal and answer `p` to add it."
+        ),
         RefusalReason::NoTerminal => format!(
             "{subject} was refused without asking: this session's input is not a terminal, so \
              nobody could be asked — send `/permissions full` ahead of it, or set \
@@ -3233,6 +3269,13 @@ fn refusal_line(req: &PermissionRequest, reason: RefusalReason) -> String {
 /// is indistinguishable from the plain session grant by kind alone. Picking it
 /// by kind would let [`allow_outcome`] reach it by accident — a user answering
 /// "allow for this session" would have edited their config.
+///
+/// **Two questions carry it since REQ-589 D-13** — the web tier and the
+/// project-skill acknowledgment — and this function is right to be indifferent
+/// to which. The id means *the durable option on this prompt*; which key it
+/// writes is decided by the daemon, from the question it asked, and is named in
+/// the label the user reads. A client that tried to tell them apart here would
+/// be a second place deciding what an answer means.
 fn permanent_option(options: &[PermissionOption]) -> Option<String> {
     options
         .iter()
