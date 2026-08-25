@@ -32,6 +32,7 @@
 //! | ADR-6/ADR-7: the skill's own key, addressed, never on the bus | [`the_consent_asks_under_the_skills_own_key_and_is_addressed_to_the_typing_connection`] |
 //! | AC-8: declining fills every slot and the turn still runs | [`declining_leaves_a_placeholder_in_every_slot_and_the_turn_still_runs`] |
 //! | AC-9: `plan` names the level; `full` asks nothing | [`at_plan_the_commands_are_not_run_and_the_placeholder_names_the_level`], [`at_full_the_commands_run_with_no_prompt_at_all`] |
+//! | **REQ-591 D-3: `plan` expands a typed project skill, unrun** | [`at_plan_a_typed_project_skill_expands_with_its_commands_unrun`] |
 //! | AC-9: a fail-closed refusal is never a decline | [`a_client_that_refused_without_asking_never_gets_the_decline_text`], [`a_consent_no_connection_would_take_runs_nothing_and_blames_nobody`] |
 //! | BR-6: document order, session root as cwd | [`the_commands_run_sequentially_in_document_order_with_the_session_root_as_cwd`] |
 //! | AC-10: failure and deadline legs still produce a turn | [`a_failing_command_leaves_a_failed_placeholder_and_the_turn_still_runs`], [`a_command_past_the_deadline_leaves_a_timed_out_placeholder_and_the_turn_still_runs`] |
@@ -245,6 +246,21 @@ fn fixture_home() -> &'static Path {
             ".claude/skills/homeonly/SKILL.md",
             "---\ndescription: a user skill outside any repo\n---\n\nThe user skill's body.\n",
         );
+        // The three-command skill again, **user**-authored. REQ-589 ADR-10 asks
+        // a project skill's repository acknowledgment before it expands, and
+        // `plan` denies that question outright — so the `plan` leg of AC-9,
+        // which is about what the *dynamic-context* door does at that level,
+        // needs a skill that raises no acknowledgment at all. A user skill is
+        // that skill (BR-6: the current order stands for a file the user
+        // installed themselves), and the door it meets at `plan` is the same
+        // door with the same sentence.
+        home.write(
+            ".claude/skills/homethree/SKILL.md",
+            &skill_file(
+                "runs three commands",
+                "Alpha: !`echo one`\nBeta: !`echo two`\nGamma: !`echo three`\n",
+            ),
+        );
         std::env::set_var("HOME", home.path());
         home
     })
@@ -285,10 +301,32 @@ fn filler(bytes: usize) -> String {
 struct Consent {
     pending: Arc<PendingPermissions>,
     asked: Mutex<Vec<(ConnectionId, SessionId, PermissionRequest)>>,
+    /// REQ-589 ADR-10's acknowledgment, kept in its own list.
+    ///
+    /// The typed `/name` path now asks whether the user trusts *this
+    /// repository* before it expands anything, which is a different question
+    /// from the one every test in this file is written about — and it arrives
+    /// first, so folding it into `asked` would move every index and every count
+    /// below without any of those assertions changing meaning. This client says
+    /// yes to it and records it here, so it is still observable; the
+    /// acknowledgment's own witnesses live in `runtime.rs`'s in-crate
+    /// `a_typed_project_skill_is_acknowledged_first` (both doors, one gate).
+    acknowledged: Mutex<Vec<PermissionRequest>>,
     answer: Mutex<Answer>,
     /// Whether the addressee would take the frame at all. `false` models a
     /// connection that has gone away — the gate's `Unanswerable` arm.
+    ///
+    /// It models it for the question under test. The acknowledgment above is
+    /// answered either way: a fixture that let this flag swallow it would refuse
+    /// every project skill before its own subject was ever reached.
     reachable: Mutex<bool>,
+    /// Whether this client **declines** the acknowledgment instead of allowing
+    /// it (REQ-591 D-3).
+    ///
+    /// Opt-in, because saying yes is what lets every other test in this file
+    /// reach the door it was written about. The one test that turns it on is
+    /// the one asking whether `plan`'s new `ask` is really an ask.
+    declines_acknowledgment: Mutex<bool>,
 }
 
 /// How the stand-in client answers.
@@ -305,12 +343,19 @@ impl Consent {
         Self {
             pending,
             asked: Mutex::new(Vec::new()),
+            acknowledged: Mutex::new(Vec::new()),
             // A user who says no, so a test that wants the commands to run has
             // to say so out loud — the direction that cannot make a test pass
             // by accident.
             answer: Mutex::new(Answer::Select(PermissionOptionKind::RejectOnce)),
             reachable: Mutex::new(true),
+            declines_acknowledgment: Mutex::new(false),
         }
+    }
+
+    /// Answer the repository acknowledgment `reject_once` (REQ-591 D-3).
+    fn declines_acknowledgment(&self) {
+        *self.declines_acknowledgment.lock().unwrap() = true;
     }
 
     fn answers(&self, answer: Answer) {
@@ -330,6 +375,11 @@ impl Consent {
             .collect()
     }
 
+    /// Every repository acknowledgment this client answered (REQ-589 BR-6).
+    fn acknowledgments(&self) -> Vec<PermissionRequest> {
+        self.acknowledged.lock().unwrap().clone()
+    }
+
     fn addressees(&self) -> Vec<ConnectionId> {
         self.asked
             .lock()
@@ -347,6 +397,27 @@ impl AddressedPermissionDelivery for Consent {
         session_id: &SessionId,
         request: PermissionRequest,
     ) -> bool {
+        // REQ-589 ADR-10, before anything this file asserts on: a typed project
+        // skill is acknowledged before it expands. Answered "allow for this
+        // session", so each test below reaches the door it was written about.
+        if matches!(
+            request.subject,
+            Some(PermissionSubject::ProjectSkillTrust { .. })
+        ) {
+            self.acknowledged.lock().unwrap().push(request.clone());
+            let option_id = if *self.declines_acknowledgment.lock().unwrap() {
+                "reject_once"
+            } else {
+                "allow_always"
+            };
+            return self.pending.resolve_from(
+                &request.request_id,
+                PermissionOutcome::Selected {
+                    option_id: option_id.to_owned(),
+                },
+                connection,
+            );
+        }
         self.asked
             .lock()
             .unwrap()
@@ -1804,16 +1875,22 @@ async fn declining_leaves_a_placeholder_in_every_slot_and_the_turn_still_runs() 
 
 /// **AC-9's `plan` leg.** The level settles it and nobody is asked, so the
 /// placeholder names the level rather than a decision no user made.
+///
+/// The skill is the **user**-authored copy of the same three commands, which is
+/// what keeps this leg about the *dynamic-context* door alone: a project skill
+/// reaches the same placeholders only after an acknowledgment, and folding that
+/// second question in here would make a failure ambiguous between the two
+/// doors. The project-sourced version of this claim is
+/// [`at_plan_a_typed_project_skill_expands_with_its_commands_unrun`].
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn at_plan_the_commands_are_not_run_and_the_placeholder_names_the_level() {
     let repo = Tree::new("planlevel");
-    repo.write(".claude/skills/three/SKILL.md", &three_command_skill());
     let h = Harness::with_window(128_000);
     let session = h.session_at(repo.path());
     h.at_level(&session, PermissionLevel::Plan);
     let mut sub = h.events.subscribe(256);
 
-    h.turn(&session, "", Harness::invoke("three", ""))
+    h.turn(&session, "", Harness::invoke("homethree", ""))
         .await
         .expect("a `plan` invocation still produces its turn");
 
@@ -1840,6 +1917,119 @@ async fn at_plan_the_commands_are_not_run_and_the_placeholder_names_the_level() 
         !sent.contains("— declined]"),
         "nobody declined anything at `plan`: {}",
         &sent[..sent.len().min(1200)]
+    );
+}
+
+/// **REQ-591 D-3 — `plan` expands a typed project skill's body and runs none of
+/// its commands. This reverses what REQ-589 D-10 shipped.**
+///
+/// D-10 put the acknowledgment on the typed path, where it was asked under
+/// `project_skill_trust:<root>` — a key no level enumerates, so it took the
+/// level's default, and `plan`'s default is deny. The result was that `plan`
+/// refused a typed project skill outright: no body, no prompt, nothing.
+///
+/// That is inverted. `plan` is the level a user picks to explore a repository
+/// **read-only**, and refusing to expand that repository's own instructions is
+/// the most restrictive outcome at the safest level — strictly more restrictive
+/// than `guarded`, which asks. Before D-10 the body expanded here with its
+/// command slots unrun, and this restores that.
+///
+/// # What it restores, and what it does not
+///
+/// `plan` now answers `ask` for the acknowledgment family
+/// (`PROJECT_TRUST_LEVEL_KEY`), not `allow`. BR-1's rule is that a
+/// project-authored body is acknowledged on *every* path that can run one, and
+/// D-3 is about `plan` not **refusing** rather than about `plan` not **asking**.
+/// The second leg below is what makes that difference observable: decline, and
+/// the turn still refuses exactly as an acknowledgment should let it.
+///
+/// Everything the body would *do* is still denied, and by the same default that
+/// used to swallow the acknowledgment: `skill:project:three` is a tool key, so
+/// each command slot carries `NotRunReason::Level` and names `plan`. The body
+/// arrives; nothing in it executes.
+///
+/// **Mutation:** drop the `PROJECT_TRUST_LEVEL_KEY` row from `table_for`'s
+/// `Plan` arm and the first leg goes red on the refusal it used to expect.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn at_plan_a_typed_project_skill_expands_with_its_commands_unrun() {
+    let repo = Tree::new("planproject");
+    repo.write(".claude/skills/three/SKILL.md", &three_command_skill());
+    let h = Harness::with_window(128_000);
+    let session = h.session_at(repo.path());
+    h.at_level(&session, PermissionLevel::Plan);
+    let mut sub = h.events.subscribe(256);
+
+    h.turn(&session, "", Harness::invoke("three", ""))
+        .await
+        .expect("`plan` expands an acknowledged repository's skill");
+
+    // The acknowledgment is still asked — `plan` answers `ask`, not `allow`,
+    // and BR-1 is not weakened by D-3.
+    assert_eq!(
+        h.consent.acknowledgments().len(),
+        1,
+        "the repository is still acknowledged at `plan`: {:?}",
+        h.consent.acknowledgments()
+    );
+
+    let sent = h.vendor.sent().join("\n");
+    assert!(
+        sent.contains("Alpha:") && sent.contains("Gamma:"),
+        "the body must reach the model — that is the whole of what `plan` \
+         stopped doing: {}",
+        &sent[..sent.len().min(1200)]
+    );
+    for command in ["echo one", "echo two", "echo three"] {
+        assert!(
+            sent.contains(&format!(
+                "[dynamic context not run: `{command}` — plan permission level]"
+            )),
+            "every slot must name its command and the level that closed it: {}",
+            &sent[..sent.len().min(1600)]
+        );
+    }
+    // Read off the typed record too, not only the prose: `Level` and a user's
+    // decline are different facts and the placeholder alone cannot tell them
+    // apart for a machine.
+    let invoked = invocations(&drain(&mut sub).await);
+    assert!(
+        invoked[0].outcomes.iter().all(|view| view.outcome
+            == WireDynamicOutcome::NotRun {
+                reason: NotRunReason::Level
+            }),
+        "the level closed these doors, not a user: {:?}",
+        invoked[0].outcomes
+    );
+    assert!(
+        !sent.contains("<tool-result tool=\\\"skill:three\\\""),
+        "no command may actually have run at `plan`: {}",
+        &sent[..sent.len().min(1600)]
+    );
+
+    // ── the second leg: `ask` is an ask ──────────────────────────────────────
+    //
+    // Same repository, same level, same skill; the only change is the answer.
+    // Without this, `plan` answering `allow` would pass every assertion above
+    // and BR-1 would be silently gone at one level.
+    let declined = Harness::with_window(128_000);
+    declined.consent.declines_acknowledgment();
+    let session = declined.session_at(repo.path());
+    declined.at_level(&session, PermissionLevel::Plan);
+
+    let err = declined
+        .turn(&session, "", Harness::invoke("three", ""))
+        .await
+        .expect_err("a declined acknowledgment refuses the turn at `plan` too");
+    assert_eq!(err.code, error_code::CONSENT_DENIED, "{err:?}");
+    assert!(
+        err.message.contains("you declined it"),
+        "and it is the human's decline that is named, not the level: {}",
+        err.message
+    );
+    assert_eq!(
+        declined.vendor.hits(),
+        0,
+        "a declined repository's body must not reach a provider"
     );
 }
 
@@ -2136,10 +2326,17 @@ async fn ran_output_enters_inside_the_untrusted_envelope_with_its_markers_neutra
 /// makes the egress inspector fail closed on a boundary-configured machine — so
 /// an invocation that ran a command pins its turn local.
 ///
-/// The control is the same skill at `plan`, where no command runs: the block
-/// then carries only the skill file's own identity and is pinnable, which is what
-/// makes the assertion above a statement about the *output* rather than about
-/// skill turns in general.
+/// The control is the same skill with its command **declined**, where no command
+/// runs: the block then carries only the skill file's own identity and is
+/// pinnable, which is what makes the assertion above a statement about the
+/// *output* rather than about skill turns in general.
+///
+/// The control used to run at `plan`, which closed the same door. Since REQ-589
+/// ADR-10 a typed **project** skill is acknowledged before it expands and `plan`
+/// denies that acknowledgment outright, so a `plan` leg here would be a turn
+/// that never happened rather than a turn whose command did not run — and the
+/// control has to be the same skill from the same file, or it stops controlling
+/// for the thing it is here to control for.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn an_invocation_that_ran_a_command_seeds_a_block_that_cannot_be_pinned() {
     let repo = Tree::new("unpinned");
@@ -2155,8 +2352,9 @@ async fn an_invocation_that_ran_a_command_seeds_a_block_that_cannot_be_pinned() 
         .await
         .expect("the skill runs");
 
+    // The fixture client's default answer is a decline, so this leg says no to
+    // the one command and the turn still runs (AC-8).
     let did_not_run = h.session_at(repo.path());
-    h.at_level(&did_not_run, PermissionLevel::Plan);
     h.turn(&did_not_run, "", Harness::invoke("ran", ""))
         .await
         .expect("the skill runs");
@@ -2397,15 +2595,17 @@ fn stage_b_repo(tag: &str) -> Tree {
 /// check, never after. Emitting it afterwards would leave that turn with no echo
 /// line and no `/verbose` outcomes, while BR-12 says every invocation echoes one.
 ///
-/// The `plan` half is the non-vacuity control: same body, same route, and it
-/// *fits* — so the refusal below is the dynamic output's doing.
+/// The first half is the non-vacuity control: same body, same route, its command
+/// declined so nothing is folded in — and it *fits*, so the refusal below is the
+/// dynamic output's doing. (It ran at `plan` until REQ-589 ADR-10 made `plan`
+/// deny a typed project skill's acknowledgment outright, which would have made
+/// the control a turn that never happened.)
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn the_invocation_event_is_published_before_the_stage_b_refusal_not_after() {
     let repo = stage_b_repo("stageb");
     let h = Harness::with_window(16_000);
 
     let fits = h.session_at(repo.path());
-    h.at_level(&fits, PermissionLevel::Plan);
     h.turn(&fits, "", Harness::invoke("heavy", ""))
         .await
         .expect("control: the body alone fits this route");
@@ -2595,6 +2795,7 @@ async fn a_skill_consent_reaches_the_client_that_typed_it_and_is_answerable_by_i
         .await;
 
     let mut answered = false;
+    let mut acknowledged = false;
     let turn = loop {
         let frame = client.frame().await;
         if frame.get("id").and_then(Value::as_i64) == Some(prompt) {
@@ -2611,6 +2812,29 @@ async fn a_skill_consent_reaches_the_client_that_typed_it_and_is_answerable_by_i
             json!(session),
             "the routed frame is scoped to the session whose turn is waiting: {frame}"
         );
+        // REQ-589 ADR-10's acknowledgment, which this turn meets first: it
+        // travels the same routed frame, so answering it here is also what
+        // proves *it* reaches a real client over a real socket. The assertions
+        // below are about the question this test is named for.
+        if request["subject"]["kind"] == json!("project_skill_trust") {
+            let option = request["options"]
+                .as_array()
+                .expect("a prompt offers options")
+                .iter()
+                .find(|option| option["kind"] == json!("allow_once"))
+                .expect("allow_once is offered");
+            client
+                .send(
+                    "permission/respond",
+                    json!({
+                        "request_id": request["request_id"],
+                        "outcome": {"outcome": "selected", "option_id": option["option_id"]},
+                    }),
+                )
+                .await;
+            acknowledged = true;
+            continue;
+        }
         assert_eq!(
             request["subject"]["kind"],
             json!("skill_dynamic_context"),
@@ -2640,6 +2864,10 @@ async fn a_skill_consent_reaches_the_client_that_typed_it_and_is_answerable_by_i
         answered = true;
     };
 
+    assert!(
+        acknowledged,
+        "the repository acknowledgment never reached the client (REQ-589 BR-6): {turn}"
+    );
     assert!(answered, "the consent never reached the client: {turn}");
     assert!(
         turn.get("result").is_some(),

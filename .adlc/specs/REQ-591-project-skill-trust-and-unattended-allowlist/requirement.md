@@ -1,7 +1,7 @@
 ---
 id: REQ-591
 title: "The project-skill trust gate and its unattended allowlist"
-status: draft
+status: approved
 deployable: true
 created: 2026-08-25
 updated: 2026-08-25
@@ -135,6 +135,13 @@ Two things, and the second exists only because the first broke automation:
   log-scraper cannot tell a genuine refusal from a successful trusted run. This is the same
   class as BR-7 — a surface describing an outcome that did not occur.
 
+  > **Discharged by D-6 (2026-08-25).** The `NoTerminal if project_trust` arm of
+  > `session_ui::refusal_line` now opens *"could not be asked here"* — what the client did,
+  > which is all it is in a position to say. The other three arms keep *"was refused without
+  > asking"*, and that was checked rather than assumed: `acknowledged_unattended` is the only
+  > rewrite of a `Refused(NoTerminal)` in the daemon and its only caller is
+  > `authorize_project_skill_trust`, so no other arm is overridable.
+
 - [ ] **BR-11: A repository-authored string on the wire is bounded and control-stripped at
   the door that mints it.** `ProjectSkillTrust::root`'s contract claims it is `display_for`-
   minted and *"bounded"*. Neither is true: it is `trust_root_name`, deliberately untruncated,
@@ -168,6 +175,16 @@ Two things, and the second exists only because the first broke automation:
   decides it should, a test asserts that breadth deliberately and the label says so (BR-8).
 - [ ] AC-8: No surface claims a refusal that did not happen (BR-10). The existing test that
   pins the contradictory line is corrected, not preserved.
+
+  > **Discharged by D-6 (2026-08-25).** Both pinning tests move to the neutral phrase, and the
+  > *listed* leg of each gains `!stdout.contains("was refused without asking")` — the assertion
+  > with the bite, and the one whose absence is why this criterion was previously
+  > implemented-as-zero. A third site the verify panel had not found, the model's-door pipe leg
+  > in `cli_e2e`, renders the same subject through the same arm and moved with them.
+  >
+  > Mutation-verified in isolation: reverting the wording outright reddens the *positive*
+  > assertion first and proves nothing about the negative, so the mutation used was a line
+  > carrying both phrases. That reddens only the new negative, in both tests.
 - [ ] AC-9: `cargo audit` clean; the previously verified non-exploitable vectors stay
   non-exploitable — symlink at a listed path, `..` traversal, percent-escape collisions,
   home-prefix confusion, case-insensitive and firmlinked filesystems.
@@ -210,7 +227,73 @@ Two things, and the second exists only because the first broke automation:
   are separable by path, but `b4e4b01` made `accept_invocation` async and that signature
   change reaches callers the offer also touches.
 
+## Decisions (product owner, 2026-08-25)
+
+- **D-1 — fix the daemon-wide gate gap (OQ-1).** `persist_trusted_project_root` must pass the
+  presence gate. The fix needs only the verifier handle and the addressee `ConnectionId`, both
+  already at the gate — not `&Daemon`/`&ConnState` threaded through a turn. **REQ-589 owns the
+  other half of this seam** (the remedy's capability write, merged at `8956a93`); the two must
+  not end up answered differently, so this fix should be shaped to cover both or to be trivially
+  extended to it.
+- **D-2 — scope the allowlist row by invoker (OQ-2).** A row must not silently answer for the
+  model's door as well as the typed one. Per LESSON-495, make the key a function of the invoker
+  dimension so adding a caller is a compile error rather than a silent grant.
+- **D-3 — `plan` must NOT refuse a typed project skill (OQ-3).** **This reverses current
+  behaviour.** `plan` is the level a user selects to explore a repository read-only; refusing to
+  expand that repository's own instructions is the most restrictive outcome at the safest level.
+  Restore the pre-REQ-589 posture — the body expands, its command slots do not run — without
+  weakening the acknowledgment for any other level.
+- **D-4 — store the canonical ABSOLUTE path, not the `$HOME`-relative one (OQ-4).** The security
+  argument is weak on its own; the reason is truthfulness. The row is documented as naming a
+  *tree*, and a `$HOME`-relative string does not — the same defect class as BR-7, BR-10 and
+  BR-11, and shipping a fourth knowingly in the same change would be incoherent. `TrustRoot`
+  already models the split: `display` stays home-relative (rendering is a rendering concern),
+  `durable` becomes the canonical absolute path. A row written in the old form fails **closed**.
+- **D-5 — one validation rule, no caps (OQ-5).** No entry-length or list-length cap; config is
+  user-owned and those guard nothing. `Config::validate` rejects a row that is not a well-formed
+  canonical mint, with an error naming the correct form — converting a silent no-op (the
+  allowlist appears to contain a repository and does not) into a loud error at load time.
+
+### Second round (product owner, 2026-08-25, after the five-agent verify panel)
+
+The panel reported four findings that needed a product decision rather than a fix. All four
+were decided and implemented in the same pass.
+
+- **D-6 — BR-10/AC-8: the client's line stops claiming an outcome.** Only the
+  `NoTerminal if project_trust` arm. The client answers `NoTerminal` and the daemon may then
+  rewrite the settlement to `Allowed`, so a line claiming a refusal is contradicted two lines
+  later by the skill's own echo. The other three arms are genuine refusals and keep their
+  wording.
+- **D-7 — the session grant is keyed by (invoker, root).** Both doors minted
+  `project_skill_trust:<root>` from the same tree, so a typed `allow_always` also settled the
+  *model's* door for the session with no prompt. REQ-591 created that widening: before it the
+  typed path had no gate and minted no grant. D-2's rule for the durable row, applied to the
+  session answer, which is the same question at a shorter range.
+- **D-8 — `plan` may READ a row and may not WRITE one.** Answering `p` appends to the user's
+  config; `plan`'s promise is that nothing changes. The *consultation* is untouched — an
+  unattended `plan` session at an already-listed root still proceeds, which is D-13's widening
+  and not `plan`'s to revoke.
+- **D-9 — the prompt shows `~/dev/repo`; the absolute row appears only where it is
+  actionable.** The acknowledgment label names the repository home-relatively;
+  `project_trust_refusal` keeps the absolute row, because there the user is being told what to
+  paste. The label is worded so it is true of an absolute row while displaying the
+  home-relative name — a label quoting `~/dev/repo` as the row would name a write that never
+  happens, which is strictly worse than the username.
+
+*Not yet answered: the operational question of whether `req589-pre-carveout` is pushed for
+redundancy. OQ-1..OQ-5 are all decided (D-1..D-5) and implemented, as are D-6..D-9.*
+
 ## Open Questions
+
+- [x] **OQ-1 — ANSWERED by D-1, implemented.** `CommitmentAttestation` is a new seam on
+  `PermissionGate` and `DaemonRuntime`; the daemon implements it over the verifier it
+  already holds, and `attest_commitment` is now the one body both it and
+  `refuse_unattested_commitment` run. **Both halves of the seam are covered**: the
+  acknowledgment's `[skills] trusted_project_roots` row and REQ-589's over-budget remedy
+  consult the same object, wired from the same place. The gate is on the *durable* half
+  only — the session grant a human gave at the prompt stands either way — and it degrades
+  to allow where no mechanism exists, stated on stderr, which is BR-10(b)'s own rule.
+  Original question follows.
 
 - [ ] **OQ-1: Does the durable trust write pass the daemon-wide commitment gates?**
   `persist_trusted_project_root` passes neither `refuse_daemon_wide` nor
@@ -227,6 +310,13 @@ Two things, and the second exists only because the first broke automation:
   threaded into a turn. **REQ-589's remedy write is the other half of this seam; the two
   REQs must not answer it differently.** (informed by BUG-162)
 
+- [x] **OQ-2 — ANSWERED by D-2, implemented.** No. `durable_row_for(invoked_by, root)` is
+  now the one derivation, feeding **both** what may be written and what may be read:
+  `InvokedBy::User` maps to the canonical root, `InvokedBy::Model` to `None`. The model's
+  door has no durable answer at all — not a different row, none — which is REQ-587's
+  posture restored rather than a new restriction. Adding an `InvokedBy` variant is a
+  compile error in the one place that decides both halves. Original question follows.
+
 - [ ] **OQ-2: Should one row authorize both doors?** Today `durable_root` is `None` for
   `InvokedBy::Model` — correctly withholding the *offer to write* — but the *consultation*
   passes the raw root unconditionally, so a row answers for both. A user who adds a row so
@@ -238,17 +328,43 @@ Two things, and the second exists only because the first broke automation:
   invoker — LESSON-495's prescription is to make the key a function of the dimension so
   adding one is a compile error rather than a silent grant. (informed by LESSON-495)
 
+- [x] **OQ-3 — ANSWERED by D-3, implemented.** No. `plan` now carries the acknowledgment
+  family's own row (`PROJECT_TRUST_LEVEL_KEY = ask`), reached through
+  `Question::level_key()` — so it is scoped to the **typed** door, which is the door OQ-3
+  is about. The body expands after the acknowledgment; every command in it still falls to
+  `plan`'s deny default and does not run. No other level's answer changed, and the model's
+  door keeps `plan`'s deny default, which is what it had before REQ-589 too. Original
+  question follows.
+
 - [ ] **OQ-3: Should `plan` refuse a typed project skill outright?** It now does, where it
   previously ran the body with *"not run at plan"* in its command slots. The counter-argument:
   `plan` is the level users select to explore a repository **read-only**, so refusing to
   expand that repository's own instructions is the most restrictive outcome at the safest
   level — inverted. *Lean:* no lean. This one genuinely needs the owner.
 
+- [x] **OQ-4 — ANSWERED by D-4, implemented.** No. `durable_trust_root_name` takes no `$HOME`
+  at all now — it is `percent_escaped` over the resolution the bodies were read under, so the
+  row is a canonical absolute path. `TrustRoot::display` is unchanged and still home-relative,
+  because what a human reads on the prompt is a rendering concern. A row left in the old
+  home-relative spelling matches nothing and the unattended session refuses — fail-closed, and
+  D-5 makes it loud. No shipped release carries a `trusted_project_roots` row (the table is new
+  on this branch), so nothing in the wild migrates. Original question follows.
+
 - [ ] **OQ-4: Is a `$HOME`-relative durable identity right for a row that outlives its
   session?** A row's meaning depends on `$HOME` at consult time, so a daemon later launched
   with a different `HOME` silently trusts a tree nobody named. Not an escalation on its own
   (an actor who can rewrite the daemon's environment can rewrite `config.toml`), but the row
   is documented as naming *a tree*, and a `$HOME`-relative string does not.
+
+- [x] **OQ-5 — ANSWERED by D-5, implemented.** One rule, no caps.
+  `teton_core::config::is_canonical_trust_root` rejects a row that is not a well-formed
+  canonical mint — absolute, no `.`/`..`/empty component, no trailing slash, well-formed
+  upper-case `%XX` escapes — and `Config::validate` refuses it at load with
+  `MalformedTrustedProjectRoot`, whose message names the correct form and how to obtain it.
+  Entry-length and list-length caps were considered and dropped: they guard nothing real and
+  config is user-owned. The predicate lives in `teton-core` (I/O-free) while the mint lives in
+  `tetond` (reads the filesystem), so they are bound by a test rather than by a call —
+  `every_name_the_minter_produces_is_a_row_this_config_accepts`. Original question follows.
 
 - [ ] **OQ-5: Should `trusted_project_roots` be validated?** No entry-length cap, no list
   cap, no `Config::validate` rule. Impact is negligible today — mismatches fail closed — but

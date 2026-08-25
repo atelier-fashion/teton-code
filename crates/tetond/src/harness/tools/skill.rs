@@ -632,6 +632,144 @@ pub(crate) fn trust_root_name(root: &Path, home: Option<&Path>) -> String {
     percent_escaped(root)
 }
 
+/// The name a **durable** acknowledgment of this root is written and matched
+/// under (REQ-589 D-13): [`trust_root_name`] over the session root **as
+/// discovery resolved it**.
+///
+/// # The argument is `SkillRegistry::read_under`, and that is the whole fix
+///
+/// `resolved_root` is not a path to resolve. It is the path
+/// [`crate::skills::discover`] *already* resolved, kept on the snapshot it
+/// built, and every project body this name can authorize was read out of it.
+/// Both callers take it from the registry they are about to expand a skill
+/// from — never from `ProbedRoot::path`, and never from anything they
+/// canonicalise themselves.
+///
+/// That rule is not decoration. Bodies are read eagerly and exactly twice per
+/// session, at `session/create` and at `/cd`
+/// (`discovery_is_paid_at_create_and_at_cd_and_never_per_turn`); the registry is
+/// frozen from then on. This name used to be minted per turn by canonicalising
+/// `ProbedRoot::path`, which `ProbedRoot::probe` deliberately leaves unresolved
+/// — so the identity that authorized the bodies and the identity the bodies were
+/// read under were two resolutions of one path, taken as much as a session
+/// apart. A link at the session root, re-pointed in between, made the second one
+/// name a tree the first one had never read: an unattended run whose skills came
+/// out of `~/evil` spent a row a human wrote for `~/dev/trusted`, exact match and
+/// all. Minting from the resolution the reads went through is what makes the
+/// substitution miss.
+///
+/// # The window is **narrowed**, and here is the residual
+///
+/// Not closed. `discover` performs two resolutions of the session root, not one:
+/// `fs.canonicalize(session_root)` takes the `boundary` this name is minted
+/// from, and the bodies are then read through each root's own unresolved path
+/// (`fs.list`, then `SKILL.md` per candidate), which traverses the link again.
+/// A flip that lands between those two is a flip this name cannot see.
+///
+/// Both earlier flips fail closed, which is what makes the residual small:
+/// re-pointed *before* the `canonicalize`, the name minted is the substituted
+/// tree's and matches no row a human wrote; re-pointed between the
+/// `canonicalize` and the `resolves_under` check, the project root no longer
+/// resolves under the boundary and is skipped as `EscapingRoot`. Only a flip
+/// after the boundary check and before the reads leaves the good name on bytes
+/// from elsewhere.
+///
+/// That window is sub-millisecond and requires write access to the session-root
+/// symlink itself — an attacker who already has it has cheaper moves. It is
+/// stated here rather than closed because closing it needs the device/inode
+/// mechanism the parenthesis below rejects, and the cost of that mechanism is
+/// unchanged by the size of this window.
+///
+/// (The alternative — pin device and inode at discovery and re-`stat` at the
+/// door — closes the same hole, but it adds a *second* identity mechanism beside
+/// the name, and the name is what a human writes in `config.toml` and audits
+/// there. Pinning the resolution keeps one identity and one comparison; the
+/// section below is unchanged by either choice.)
+///
+/// # Why this is not [`trust_root_name`]
+///
+/// That function names the root *as the session stands on it*, which is right
+/// for a key and a prompt: both are scoped to one session, and the session is
+/// already standing on whatever that path resolves to. A row in `config.toml`
+/// is not. It is read months later, by a session the person who wrote it is not
+/// watching, and matched against a path that has had every opportunity to
+/// change what it points at. A list of *paths* is therefore a bypass waiting to
+/// happen: drop a symlink at `~/dev/repo` and a repository nobody acknowledged
+/// inherits the trust of one somebody did, with the same string on both sides
+/// of the comparison. The resolution behind `resolved_root` follows the link, so
+/// the name this mints is the name of a **tree** and the substitution simply
+/// misses.
+///
+/// It also normalises the two ways one tree is spelled — a `..` in the middle,
+/// macOS's `/private` prefix and its `/System/Volumes/Data` firmlink — so a
+/// user who typed `--cwd ../repo` is the same acknowledgment as one who typed
+/// the path in full, rather than a second one nobody wrote down.
+///
+/// # It names an absolute path, and takes no `$HOME` (REQ-591 D-4)
+///
+/// It used to be home-relative — `~/dev/repo` — which made a row's meaning a
+/// function of `$HOME` **at consult time**. A daemon later launched with a
+/// different `HOME` (a launchd plist edit, a changed profile, a service account)
+/// would resolve the same row against a different tree, and one nobody named.
+///
+/// The security argument for changing that is weak on its own: an actor who can
+/// rewrite the daemon's environment can rewrite `config.toml` directly. **That
+/// is not why.** The row is documented as naming *a tree*, and a
+/// `$HOME`-relative string does not name one — it names a tree *and* an
+/// environment variable. That is the same defect class this REQ already fixes
+/// three times over: BR-7 (a label naming a write it does not perform), BR-10 (a
+/// surface claiming a refusal that did not happen), BR-11 (a contract claiming a
+/// bounding that does not exist). Shipping a fourth knowingly, in the same
+/// change, would be incoherent.
+///
+/// [`TrustRoot`](crate::harness::permissions::TrustRoot) already models the
+/// split this needs: `display` stays home-relative, because rendering is a
+/// rendering concern and `~/dev/repo` is what a human reads; `durable` is this
+/// name, absolute, because a stored identity should be stable under the one
+/// thing that can move it.
+///
+/// # What it deliberately does not defend against
+///
+/// **Replacement of the tree at a listed path.** Delete `~/dev/repo` and clone
+/// a different repository there and the row still matches, because it is the
+/// same directory. No name for a location can tell those apart, and the
+/// alternatives that could — a device/inode pair, a content digest — are
+/// unwritable by hand, unreadable by the person auditing the file, and would
+/// not survive a restore from backup. `[web] permission_allow` has exactly this
+/// character too: it records a decision about a *thing*, and the thing can be
+/// changed by whoever owns it. What the row promises is that a human named this
+/// tree; it does not promise the tree never changes, and neither does the
+/// in-session acknowledgment it stands in for.
+///
+/// # `None` is still a refusal — it just arrives one step earlier
+///
+/// A session root that will not resolve mints no `read_under`, so the caller
+/// holds `None`, nothing in the list can match it and nothing can be written for
+/// it. It is fail-closed twice over now rather than once: that same root
+/// registers **no project skill at all**, because `discover`'s containment test
+/// has nothing to compare against, so the door it would have refused is not
+/// reached either.
+pub(crate) fn durable_trust_root_name(resolved_root: &Path) -> String {
+    percent_escaped(resolved_root)
+}
+
+/// [`durable_trust_root_name`] over a path this resolves **itself** — the shape
+/// production had, and must never have again.
+///
+/// `#[cfg(test)]` is the point of it. Every production caller now takes the
+/// resolution from the snapshot whose bodies it authorizes
+/// ([`crate::skills::SkillRegistry::read_under`]), and the defect that shape
+/// replaced was precisely a mint that resolved a path of its own at a moment
+/// nobody had read anything at. A function that resolves-then-names is still
+/// what the *rule* is, and the tests below are about the rule; making it
+/// unavailable outside them is what stops the rule from being reached for again
+/// at a call site where the timing is wrong.
+#[cfg(test)]
+pub(crate) fn durable_trust_root_name_by_resolving(root: &Path) -> Option<String> {
+    let root = std::fs::canonicalize(root).ok()?;
+    Some(durable_trust_root_name(&root))
+}
+
 /// `path`'s bytes as a string that names exactly those bytes: each byte outside
 /// a valid UTF-8 sequence, and each literal `%`, written `%XX`.
 ///
@@ -1565,15 +1703,53 @@ impl SkillTool {
                 door: NotRunReason::NoTerminal,
             });
         };
+        // REQ-589 D-13, and the one place this caller may read the durable name
+        // from: the snapshot holding the body it is about to expand. After the
+        // guard above, which needs no filesystem to answer.
+        let durable_root = self.registry.read_under().map(durable_trust_root_name);
         let entries = project_trust_entries(&self.registry);
         let shadows = shadows_user_skill(&self.registry, name);
         let consent = self
             .gate
             .authorize_project_skill_trust(
-                &project_skill_trust_key(&root),
-                &root,
+                &project_skill_trust_key(InvokedBy::Model, &root),
+                crate::harness::permissions::TrustRoot {
+                    display: &root,
+                    // REQ-589 D-13's canonical name, **discarded on this
+                    // caller since REQ-591 D-2** — and passed anyway, on
+                    // purpose.
+                    //
+                    // `durable_row_for` is the one place the invoker decides
+                    // what a row means, and for the model it decides `None`:
+                    // there is no row a human can write that lets an unattended
+                    // model reach a project skill. So nothing downstream reads
+                    // this value today.
+                    //
+                    // It stays because it is the *correct input* to that
+                    // decision, and the correctness is the hard-won part. It is
+                    // minted from **this registry's** resolution, not from
+                    // `ctx.repo_root()`: the bodies an answer here would
+                    // authorize are the ones in `self.registry`, and the name
+                    // that authorizes them has to be the name they were read
+                    // under (BR-4). Dropping it would leave a re-scoping
+                    // decision to re-derive an identity whose first derivation
+                    // was a TOCTOU. See `durable_trust_root_name`.
+                    durable: durable_root.as_deref(),
+                },
                 &entries,
                 shadows,
+                // TASK-261: the model reached for this one. The typed path
+                // passes `InvokedBy::User` at its own call site, and the prompt
+                // reads as it always has here — REQ-587's wording is this
+                // caller's wording, byte for byte, because on this caller it
+                // was always true.
+                //
+                // Since REQ-591 D-7 it is also the door's half of the key
+                // above, and the two must be the same value: a mismatch means
+                // the question is asked at one door and the answer remembered
+                // at the other. `authorize_project_skill_trust`'s own
+                // `debug_assert_eq!` is what holds them together.
+                InvokedBy::Model,
                 connection,
             )
             .await;
@@ -3523,8 +3699,8 @@ mod tests {
              character that stood for every unnameable byte: {name_one}"
         );
         assert_ne!(
-            project_skill_trust_key(&name_one),
-            project_skill_trust_key(&name_two),
+            project_skill_trust_key(InvokedBy::Model, &name_one),
+            project_skill_trust_key(InvokedBy::Model, &name_two),
             "the key is minted from the name, so the two follow"
         );
 
@@ -3549,6 +3725,406 @@ mod tests {
             "the escape is injective: a path spelling `%FF` is not the path \
              holding the byte 0xFF"
         );
+    }
+
+    /// **The durable name is a name for a *tree*, not for a path (REQ-589
+    /// D-13).**
+    ///
+    /// This is the anti-spoofing property the `[skills] trusted_project_roots`
+    /// list stands on, and it is worth stating what fails without it. A row in
+    /// that list is a standing "yes" read by sessions its author is not
+    /// watching. If the row named a *path*, anyone who could create a file where
+    /// that path points — a checked-in `install.sh`, a dependency's postinstall,
+    /// a stray `ln -s` — could hand an unacknowledged repository the trust of an
+    /// acknowledged one, with the same string on both sides of the comparison
+    /// and nothing for the daemon to notice. Resolving the link first is what
+    /// makes the substitution simply miss.
+    ///
+    /// Four claims:
+    ///
+    /// 1. **the premise** — the un-canonical mint really does collapse the link
+    ///    onto the tree's name, so there is a hazard here to close;
+    /// 2. **the fix** — the durable mint does not: a link and its target are two
+    ///    names, and the link's is the target's, so a row written for one tree
+    ///    cannot be matched by a link standing somewhere else;
+    /// 3. **not a prefix** — a nested directory under an acknowledged root mints
+    ///    a different name, so nothing extends one answer over a tree a
+    ///    dependency dropped inside another;
+    /// 4. **two spellings, one tree** — `dir/../dir` is the same acknowledgment
+    ///    as `dir`, so a `--cwd` a user typed relatively is not a second row
+    ///    nobody wrote.
+    ///
+    /// **Mutation:** drop the `canonicalize` in
+    /// `durable_trust_root_name_by_resolving` and (2) and (4) both fail.
+    ///
+    /// The composition is `#[cfg(test)]` since the TOCTOU fix, and this test is
+    /// why it still exists: it is the *rule* a durable name obeys, exercised
+    /// where the timing is a fixture's. Production reaches the same rule from
+    /// the other end — `SkillRegistry::read_under` is the resolution, taken once
+    /// where the bodies were read, and `durable_trust_root_name` names it.
+    #[test]
+    fn the_durable_name_resolves_the_link_and_names_the_tree() {
+        let base = std::env::temp_dir().join(format!(
+            "teton-durable-root-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_or(0, |d| d.as_nanos())
+        ));
+        let real = base.join("real");
+        let decoy = base.join("decoy");
+        std::fs::create_dir_all(real.join("nested")).unwrap();
+        std::fs::create_dir_all(&decoy).unwrap();
+        // The substitution: a link standing where an acknowledged root stood.
+        let link = base.join("link");
+        std::os::unix::fs::symlink(&decoy, &link).unwrap();
+
+        let durable = |path: &Path| {
+            durable_trust_root_name_by_resolving(path).unwrap_or_else(|| {
+                panic!("{} did not canonicalise", path.display());
+            })
+        };
+
+        // (1) The premise: the un-canonical mint cannot tell the link from a
+        // real directory of that name, which is the whole reason the durable one
+        // is a second function.
+        assert_eq!(
+            trust_root_name(&link, None),
+            trust_root_name(&link, None),
+            "sanity"
+        );
+        assert!(
+            trust_root_name(&link, None).ends_with("/link"),
+            "the un-canonical mint names the path as given: {}",
+            trust_root_name(&link, None)
+        );
+
+        // (2) The fix. The link mints its *target's* name, so a row written for
+        // `real` is not matched by a link, and a row written for the link's own
+        // spelling is not what this list ever holds.
+        assert_eq!(
+            durable(&link),
+            durable(&decoy),
+            "a link must name the tree it points at, or the list is a list of \
+             paths and a path can be pointed anywhere"
+        );
+        assert_ne!(
+            durable(&link),
+            durable(&real),
+            "the acknowledged tree and the decoy must never mint one name"
+        );
+
+        // (3) Not a prefix. Trusting a repository says nothing about a
+        // repository nested inside it — the membership test is exact equality,
+        // and this is the half that makes that meaningful.
+        assert_ne!(
+            durable(&real.join("nested")),
+            durable(&real),
+            "a nested directory must be its own acknowledgment"
+        );
+        assert!(
+            durable(&real.join("nested")).starts_with(&durable(&real)),
+            "non-vacuity: the two names really do share a prefix, so an exact \
+             match is doing the work rather than the strings being unrelated"
+        );
+
+        // (4) Two spellings, one tree.
+        assert_eq!(
+            durable(&real.join("nested").join("..")),
+            durable(&real),
+            "`dir/../dir` is the same repository, and a user who typed it \
+             relatively must not need a second row"
+        );
+
+        // A root that does not resolve mints nothing, so nothing in the list can
+        // match it and nothing can be written for it.
+        assert_eq!(
+            durable_trust_root_name_by_resolving(&base.join("nothing-here")),
+            None,
+            "a name derived from a path the filesystem will not resolve names \
+             nothing, and must not be matched"
+        );
+
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// **REQ-591 D-5 — the rule `Config::validate` enforces is the shape this
+    /// crate mints** (LESSON-552: test the derivation, not the minter).
+    ///
+    /// `teton_core` is I/O-free by construction and the mint reads the
+    /// filesystem, so they cannot be one function. That makes them exactly the
+    /// pair LESSON-495 warns about — two places deciding what one string means
+    /// — and this test is what binds them: every name the real minter produces
+    /// is fed to the real predicate. A change to either side that separates
+    /// them reddens here, where a shared function would have caught it.
+    ///
+    /// The fixture spells the three shapes the mint can take: an ordinary tree,
+    /// a directory whose name is not valid UTF-8 (`%XX`), and one containing a
+    /// literal `%` (`%25`). The last two are the only reason the predicate has a
+    /// percent rule at all, and a test that used plain names would leave that
+    /// rule unbound.
+    ///
+    /// **The negative half is the point of the pairing**: the *display* name of
+    /// the same tree — home-relative, which is what a user reads on the prompt
+    /// and therefore what they are most likely to paste — is rejected. Without
+    /// it, a predicate that accepted everything would pass the positive legs.
+    #[test]
+    fn every_name_the_minter_produces_is_a_row_this_config_accepts() {
+        use teton_core::config::is_canonical_trust_root;
+
+        let base = std::env::temp_dir().join(format!(
+            "teton-mint-accepted-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_or(0, |d| d.as_nanos())
+        ));
+        let home = base.join("home");
+        std::fs::create_dir_all(&home).unwrap();
+        let canonical_home = std::fs::canonicalize(&home).unwrap();
+
+        // Real trees, canonicalised the way production's `read_under` is, so
+        // this half binds the predicate to what the *filesystem* hands back —
+        // `/private` prefixes and all.
+        let mut rows = Vec::new();
+        for name in ["dev/repo", "one hundred % sure"] {
+            let tree = home.join(name);
+            std::fs::create_dir_all(&tree).unwrap();
+            let resolved = std::fs::canonicalize(&tree).expect("the fixture tree canonicalises");
+            rows.push(durable_trust_root_name(&resolved));
+
+            // The negative, on the same tree: the home-relative spelling — what
+            // the prompt shows and what a user is most likely to paste — is not
+            // a row, and must be refused loudly rather than never matching.
+            let displayed = trust_root_name(&resolved, Some(&canonical_home));
+            assert!(
+                displayed.starts_with('~'),
+                "the fixture is only meaningful if the display name really is \
+                 home-relative here: {displayed}"
+            );
+            assert!(
+                !is_canonical_trust_root(&displayed),
+                "the spelling a user is most likely to paste must be refused: \
+                 {displayed}"
+            );
+        }
+
+        // A directory name that is not valid UTF-8 — the only thing that makes
+        // the mint emit a `%XX` escape, and **not** creatable on this test's
+        // filesystem (APFS refuses the byte sequence). The path is constructed
+        // instead, which is exactly what the mint is a function of: since D-4 it
+        // resolves nothing itself and names the bytes it is handed.
+        {
+            use std::os::unix::ffi::OsStrExt;
+            let weird = canonical_home.join(std::ffi::OsStr::from_bytes(b"weird\xffname"));
+            rows.push(durable_trust_root_name(&weird));
+        }
+
+        for row in &rows {
+            assert!(
+                is_canonical_trust_root(row),
+                "the minter produced a row `Config::validate` would refuse at \
+                 load: {row}"
+            );
+        }
+
+        // Non-vacuity for the percent rule: both escape kinds really occurred,
+        // or that half of the predicate is unbound by this test.
+        assert!(
+            rows.iter().any(|row| row.contains("%25")),
+            "a literal `%` in a directory name must reach the row as `%25`: \
+             {rows:?}"
+        );
+        assert!(
+            rows.iter().any(|row| row.contains("%FF")),
+            "a non-UTF-8 byte must reach the row as an upper-case `%XX`: {rows:?}"
+        );
+
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// **REQ-591 D-4 — a row outlives the `$HOME` it was written under, and the
+    /// spelling a human reads does not have to.**
+    ///
+    /// A row is a standing answer consulted months later by sessions its author
+    /// is not watching. While the durable name was home-relative — `~/dev/repo`
+    /// — its meaning was a function of `$HOME` **at consult time**, so a daemon
+    /// relaunched with a different `HOME` (a launchd plist edit, a changed
+    /// profile, a service account) resolved the same row against a tree nobody
+    /// named.
+    ///
+    /// The security case for changing that is weak on its own and is not the
+    /// reason: an actor who can rewrite the daemon's environment can rewrite
+    /// `config.toml`. The reason is that the row is documented as naming **a
+    /// tree**, and a `$HOME`-relative string names a tree *and* an environment
+    /// variable — the same defect class as a label naming a write it does not
+    /// perform (BR-7), a surface claiming a refusal that did not happen (BR-10)
+    /// and a contract claiming a bounding that does not exist (BR-11).
+    ///
+    /// # The three legs, and why the middle one is the test
+    ///
+    /// 1. The **display** name still moves with `$HOME`. That is correct and it
+    ///    is what makes the rest non-vacuous: `~/dev/repo` is what a human reads
+    ///    on the prompt, and rendering is a rendering concern.
+    /// 2. The **durable** name does not move, so the row written under one home
+    ///    still names the same tree under another. Asserted against a name
+    ///    minted for the *other* home in the same breath, so it is a comparison
+    ///    rather than a restatement.
+    /// 3. The **old shape would have failed**, on this exact fixture. Without
+    ///    this the second leg would be satisfied by any pair of equal strings
+    ///    and would say nothing about the hazard it closes.
+    ///
+    /// # What happens to a row written in the old form
+    ///
+    /// **Two independent guards, and the fourth leg is the second one.**
+    /// REQ-591 D-5 refuses such a row at *load*, by name, with the correct form
+    /// in the message — so it cannot reach a running daemon at all. Underneath
+    /// that, the gate itself matches nothing against it and the unattended
+    /// session refuses exactly as one at an unlisted root does. That is the
+    /// direction a stale row has to fail in, and it is pinned here rather than
+    /// left to the load-time rule alone: the gate takes its list as a `Vec` and
+    /// has no idea a validator ran.
+    ///
+    /// # Where the bite is, stated because it is not here
+    ///
+    /// This test cannot redden under the pre-D-4 mint, and saying so is more
+    /// useful than implying otherwise: its tree is under the temp directory,
+    /// not under the process's real `$HOME`, so a home-relative mint would find
+    /// no prefix to strip and produce the same absolute string. Only a fixture
+    /// whose **daemon** runs with a `HOME` containing the project can tell the
+    /// two mints apart, and that needs a spawned daemon —
+    /// `cli_e2e::a_row_written_under_one_home_still_names_its_tree_under_another`
+    /// is it, and it is mutation-verified in both directions. What this test
+    /// owns is the rule and the fail-closed consult; what that one owns is that
+    /// the rule is the one production runs.
+    #[tokio::test]
+    async fn the_durable_name_outlives_the_home_it_was_minted_under() {
+        let base = std::env::temp_dir().join(format!(
+            "teton-durable-home-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_or(0, |d| d.as_nanos())
+        ));
+        // The tree lives under `home_a`, so the home-relative spelling of it is
+        // genuinely shorter there — the fixture has to be able to produce the
+        // old form or leg 3 asserts nothing.
+        let home_a = base.join("home-a");
+        let home_b = base.join("home-b");
+        let repo = home_a.join("dev/repo");
+        std::fs::create_dir_all(&repo).unwrap();
+        std::fs::create_dir_all(&home_b).unwrap();
+        let resolved = std::fs::canonicalize(&repo).expect("the fixture tree canonicalises");
+        let canonical_home_a = std::fs::canonicalize(&home_a).unwrap();
+        let canonical_home_b = std::fs::canonicalize(&home_b).unwrap();
+
+        // 1. The display name is the human's, and it moves with the home.
+        assert_eq!(
+            trust_root_name(&resolved, Some(&canonical_home_a)),
+            "~/dev/repo",
+            "the prompt still reads home-relative under the home the tree is in"
+        );
+        let displayed_elsewhere = trust_root_name(&resolved, Some(&canonical_home_b));
+        assert_ne!(
+            displayed_elsewhere, "~/dev/repo",
+            "and it genuinely moves under another home, or leg 3 is vacuous"
+        );
+
+        // 2. The durable name is the tree's, and it does not.
+        let row = durable_trust_root_name(&resolved);
+        assert!(
+            row.starts_with('/'),
+            "a stored identity names a tree, absolutely: {row}"
+        );
+        assert_eq!(
+            row,
+            durable_trust_root_name(&resolved),
+            "and it is a function of the tree alone — no environment is read \
+             anywhere on this path"
+        );
+
+        // 3. The old shape, on this fixture: a row minted home-relative under
+        // `home_a` is a different string from the same tree minted under
+        // `home_b`, so it would have stopped matching on relaunch.
+        assert_ne!(
+            trust_root_name(&resolved, Some(&canonical_home_a)),
+            displayed_elsewhere,
+            "the hazard is real on this fixture: the pre-D-4 mint of one tree \
+             is two strings under two homes"
+        );
+
+        /// The client an unattended session has: nobody to ask, answered
+        /// without a line being read.
+        struct Unattended(Arc<PendingPermissions>);
+        impl crate::harness::permissions::AddressedPermissionDelivery for Unattended {
+            fn deliver(
+                &self,
+                connection: ConnectionId,
+                _session_id: &SessionId,
+                request: teton_protocol::events::PermissionRequest,
+            ) -> bool {
+                self.0.resolve_from(
+                    &request.request_id,
+                    teton_protocol::methods::PermissionOutcome::Refused {
+                        reason: teton_protocol::methods::RefusalReason::NoTerminal,
+                    },
+                    connection,
+                )
+            }
+        }
+
+        // 4. The consult, paired on one fixture (LESSON-520): the row this
+        // build writes matches, and a row left in the pre-D-4 home-relative
+        // spelling matches nothing. The second is the migration answer — a
+        // stale row fails **closed**, so an unattended session at that root
+        // refuses exactly as one at an unlisted root does. D-5 turns that
+        // silent no-op into a load-time error; both directions are pinned here
+        // so the two decisions cannot drift.
+        use crate::harness::permissions::{SkillConsent, TrustRoot};
+        use teton_protocol::methods::RefusalReason;
+
+        for (listed, expected, what) in [
+            (
+                row.clone(),
+                SkillConsent::Allowed,
+                "the row this build writes",
+            ),
+            (
+                "~/dev/repo".to_owned(),
+                SkillConsent::Refused(RefusalReason::NoTerminal),
+                "a row left in the pre-D-4 home-relative spelling",
+            ),
+        ] {
+            let pending = Arc::new(PendingPermissions::new());
+            let gate = PermissionGate::new(
+                SessionId::from("durable-home"),
+                PermissionConfig::with_default(PermissionPolicy::Ask),
+                Arc::new(EventBus::new()),
+                Arc::clone(&pending),
+            )
+            .with_addressed_delivery(Arc::new(Unattended(Arc::clone(&pending))))
+            .with_trusted_project_roots(vec![listed]);
+            let grants = crate::grants::GrantRegistry::default();
+            assert_eq!(
+                gate.authorize_project_skill_trust(
+                    &project_skill_trust_key(InvokedBy::User, "~/dev/repo"),
+                    TrustRoot {
+                        display: "~/dev/repo",
+                        durable: Some(&row),
+                    },
+                    &[],
+                    false,
+                    InvokedBy::User,
+                    grants.next_connection_id(),
+                )
+                .await,
+                expected,
+                "{what}: the unattended session consults the durable name this \
+                 build mints, and nothing else"
+            );
+        }
+
+        let _ = std::fs::remove_dir_all(&base);
     }
 
     /// **The acknowledgment really asks under that name (BR-4, ADR-7).**
@@ -3652,17 +4228,211 @@ mod tests {
         );
         assert_eq!(
             request.tool_name,
-            project_skill_trust_key(&expected),
+            project_skill_trust_key(InvokedBy::Model, &expected),
             "the acknowledgment is remembered under the faithful name of its root"
         );
         match request.subject {
-            Some(PermissionSubject::ProjectSkillTrust { root, .. }) => assert_eq!(
-                root, expected,
-                "the prompt names the same string the key is minted from — \
-                 `authorize_project_skill_trust` asserts they are one value"
-            ),
+            Some(PermissionSubject::ProjectSkillTrust {
+                root, invoked_by, ..
+            }) => {
+                assert_eq!(
+                    root, expected,
+                    "the prompt names the same string the key is minted from — \
+                     `authorize_project_skill_trust` asserts they are one value"
+                );
+                // REQ-589 TASK-261. The typed path now knocks on this same door
+                // and passes `InvokedBy::User`, so "the model wants to run this
+                // repository's skills as instructions" is a claim this caller
+                // has to keep making rather than one the prompt can assume.
+                // Swap this argument and the client's model-path byte pin in
+                // `session_ui` reddens with it.
+                assert_eq!(
+                    invoked_by,
+                    InvokedBy::Model,
+                    "the model's tool asked, and the prompt says so"
+                );
+            }
             other => panic!("BR-4's own subject, never another: {other:?}"),
         }
+    }
+
+    /// **REQ-591 D-2 — no `[skills] trusted_project_roots` row reaches the
+    /// model's door, whichever tree it names.**
+    ///
+    /// This test was written for REQ-589 D-13's other posture, where a row
+    /// answered for both doors and the only thing standing between an attacker
+    /// and a listed tree's trust was the identity the name was minted from. D-2
+    /// removes the premise: the model's door consults no row at all, so the
+    /// substitution below cannot succeed *and neither can its inverse*.
+    ///
+    /// **Three rows, and all three refuse.** Listing the tree the bodies were
+    /// actually read from is the leg that used to allow, and it is now the most
+    /// important one — it is the row a user really does write (so their CI's
+    /// `teton --skill deploy` runs), and D-2's whole content is that writing it
+    /// does not also hand an injected model standing permission over that tree.
+    ///
+    /// **The fourth leg is the non-vacuity**, and it is what keeps this from
+    /// being a test that a broken door always refuses: the *typed* door, on the
+    /// same gate, the same list and the same durable name, allows. So each
+    /// refusal above is a fact about **who asked**.
+    ///
+    /// The identity rule those refusals used to protect is not orphaned. It is
+    /// checked where it is a rule rather than a consequence —
+    /// [`the_durable_name_resolves_the_link_and_names_the_tree`] for the mint,
+    /// and `runtime`'s
+    /// `a_root_re_pointed_after_discovery_cannot_spend_the_listed_trees_trust`
+    /// for the door that still spends rows. The last assertion here keeps this
+    /// caller's *input* honest: `SkillTool` mints from
+    /// [`crate::skills::SkillRegistry::read_under`], the resolution the bodies
+    /// were read under, so a future decision to re-scope rows toward this door
+    /// starts from the right name rather than from `ctx.repo_root()`.
+    ///
+    /// **Mutation:** make `durable_row_for` answer `root` for
+    /// `InvokedBy::Model` and the first leg allows — an injected model
+    /// expanding repository text in a session nobody is watching, on a row that
+    /// was written about a name a human types.
+    #[tokio::test]
+    async fn the_models_door_spends_no_row_whichever_tree_it_names() {
+        use crate::harness::permissions::AddressedPermissionDelivery;
+        use teton_protocol::events::PermissionRequest;
+        use teton_protocol::methods::{PermissionOutcome, RefusalReason};
+
+        /// The client an unattended session has: nobody to ask, answered
+        /// without a line being read.
+        struct Unattended(Arc<PendingPermissions>);
+
+        impl AddressedPermissionDelivery for Unattended {
+            fn deliver(
+                &self,
+                connection: ConnectionId,
+                _session_id: &SessionId,
+                request: PermissionRequest,
+            ) -> bool {
+                self.0.resolve_from(
+                    &request.request_id,
+                    PermissionOutcome::Refused {
+                        reason: RefusalReason::NoTerminal,
+                    },
+                    connection,
+                )
+            }
+        }
+
+        let fx = Fixture::new();
+        // The tree the body is read from.
+        let unlisted = fx.root.join("unlisted");
+        fx.skill(&unlisted, "gamma", "", "Gamma body.\n");
+        // A second tree, which the link is re-pointed at after the read.
+        let acknowledged = fx.root.join("acknowledged");
+        std::fs::create_dir_all(&acknowledged).unwrap();
+
+        // The session stands on a link, and discovery reads through it.
+        let link = fx.root.join("proj");
+        std::os::unix::fs::symlink(&unlisted, &link).unwrap();
+        let registry = Arc::new(discover(None, &link, RootKind::Plain, &RealFs));
+        assert!(
+            registry.invocable_by_model("gamma").is_some(),
+            "non-vacuity: the body really was read through the link"
+        );
+
+        // The substitution, after the read and before the call. It changes
+        // nothing on this door now, which is the point.
+        std::fs::remove_file(&link).unwrap();
+        std::os::unix::fs::symlink(&acknowledged, &link).unwrap();
+
+        let row_for = |tree: &Path| {
+            durable_trust_root_name_by_resolving(tree).expect("the fixture tree canonicalises")
+        };
+
+        let wired = |rows: Vec<String>| {
+            let pending = Arc::new(PendingPermissions::new());
+            Arc::new(
+                PermissionGate::new(
+                    SessionId::from("skill-tool-repoint"),
+                    PermissionConfig::with_default(PermissionPolicy::Ask),
+                    Arc::new(EventBus::new()),
+                    Arc::clone(&pending),
+                )
+                .with_addressed_delivery(Arc::new(Unattended(Arc::clone(&pending))))
+                .with_trusted_project_roots(rows),
+            )
+        };
+
+        for (rows, what) in [
+            (
+                vec![row_for(&unlisted)],
+                "the tree the registry read is listed — the row a user really \
+                 writes, and the one D-2 refuses to let the model spend",
+            ),
+            (
+                vec![row_for(&acknowledged)],
+                "the tree the link now points at is listed, which is what an \
+                 attacker can arrange",
+            ),
+            (Vec::new(), "nothing is listed at all"),
+        ] {
+            let gate = wired(rows);
+            let grants = crate::grants::GrantRegistry::default();
+            let tool = SkillTool::new(
+                Arc::clone(&registry),
+                gate,
+                Some(grants.next_connection_id()),
+                Handle::current(),
+                1_000,
+            );
+            // The jail is the link, as every surface spells it.
+            let outcome = tool
+                .invoke(&ToolContext::new(link.clone()), &call(Some("gamma"), ""))
+                .await;
+            assert!(
+                outcome.is_error,
+                "{what}: the model's door must refuse where nobody can be \
+                 asked: {}",
+                outcome.content
+            );
+        }
+
+        // The non-vacuity leg: the same list, the same durable name, the typed
+        // door. If this refused too, every assertion above would be about a
+        // fixture that can never proceed rather than about the invoker.
+        let gate = wired(vec![row_for(&unlisted)]);
+        let grants = crate::grants::GrantRegistry::default();
+        assert_eq!(
+            gate.authorize_project_skill_trust(
+                &project_skill_trust_key(
+                    InvokedBy::User,
+                    &trust_root_name(&link, home().as_deref()),
+                ),
+                crate::harness::permissions::TrustRoot {
+                    display: &trust_root_name(&link, home().as_deref()),
+                    durable: Some(&row_for(&unlisted)),
+                },
+                &project_trust_entries(&registry),
+                false,
+                InvokedBy::User,
+                grants.next_connection_id(),
+            )
+            .await,
+            crate::harness::permissions::SkillConsent::Allowed,
+            "the same row, the same tree, the same unattended client — the typed \
+             door spends it, which is what makes the three refusals above a \
+             statement about who asked"
+        );
+
+        // And this caller's input stays the resolution the bodies were read
+        // under, so re-scoping toward this door would start from the right name
+        // rather than from the link the session spells.
+        let read_under = registry
+            .read_under()
+            .expect("the fixture registry resolved its root");
+        assert_eq!(
+            durable_trust_root_name(read_under),
+            row_for(&unlisted),
+            "the mint follows the bodies, not the link: `{}` was re-pointed at \
+             `{}` after the read",
+            link.display(),
+            acknowledged.display()
+        );
     }
 
     /// The acknowledgment's entry list is the project's model-invocable set,

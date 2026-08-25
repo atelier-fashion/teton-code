@@ -138,6 +138,7 @@ use teton_core::session_root::bounded_field;
 
 use crate::attest::{
     AttestationRefusal, AttestationRegistry, MechanismAvailability, PresenceVerifier,
+    UnavailableReason,
 };
 use crate::auth::{self, PeerIdentity};
 use crate::broadcast::{EventBus, Subscription, DEFAULT_CAPACITY};
@@ -146,7 +147,7 @@ use crate::consent::{
 };
 use crate::grants::{monitor_witness, ConnectionId, Grant, GrantRegistry};
 use crate::harness::budget::{skill_fit, RouteBudget, SkillCaller, SkillFit, SkillStage};
-use crate::harness::permissions::AddressedPermissionDelivery;
+use crate::harness::permissions::{AddressedPermissionDelivery, CommitmentAttestation};
 use crate::harness::tools::ToolRegistry;
 use crate::harness::turn_loop::{build_system_prompt, HarnessConfig};
 use crate::lifetime::LifetimeSupervisor;
@@ -327,7 +328,7 @@ pub struct Daemon {
     /// Default and CI builds get [`UnavailableVerifier`], which refuses: on a
     /// build with no mechanism, cross-session attach is **refused** rather than
     /// silently self-approved (BR-8, BR-11).
-    pub verifier: Box<dyn PresenceVerifier>,
+    pub verifier: Arc<dyn PresenceVerifier>,
     /// The process whose descendants may never attach or monitor (BR-4, ADR-A).
     pub process: DaemonProcess,
     /// How long a consent request waits before it defaults closed (BR-7).
@@ -388,6 +389,8 @@ impl Daemon {
         ));
         let runtime = Arc::new(DaemonRuntime::minimal());
         let surfaces = wire_addressed_delivery(&runtime, &events);
+        let verifier: Arc<dyn PresenceVerifier> = Arc::from(crate::attest::default_verifier());
+        wire_commitment_attestation(&runtime, &verifier);
         Self {
             sessions: SessionRegistry::new(),
             events,
@@ -397,7 +400,7 @@ impl Daemon {
             consents: PendingConsents::new(),
             surfaces,
             attestations: AttestationRegistry::new(),
-            verifier: crate::attest::default_verifier(),
+            verifier,
             skills_fs: Arc::new(RealFs),
             consent_timeout: CONSENT_TIMEOUT,
             grant_announcement_window: GRANT_ANNOUNCEMENT_WINDOW,
@@ -451,6 +454,13 @@ impl Daemon {
     /// always-succeeding verifier can never be reached by a build that ships.
     #[must_use]
     pub fn with_presence_verifier(mut self, verifier: Box<dyn PresenceVerifier>) -> Self {
+        let verifier: Arc<dyn PresenceVerifier> = Arc::from(verifier);
+        // Re-wired, not merely stored (REQ-591 D-1). The runtime's commitment
+        // seam was filled in by the constructor from the *shipped* verifier, and
+        // a fixture that injected an accepting one and got the fail-closed
+        // answer on the durable writes would be testing the constructor rather
+        // than its own daemon — the quiet-no-op shape this whole REQ is about.
+        wire_commitment_attestation(&self.runtime, &verifier);
         self.verifier = verifier;
         self
     }
@@ -509,6 +519,8 @@ impl Daemon {
         lifetime: Arc<LifetimeSupervisor>,
     ) -> Self {
         let surfaces = wire_addressed_delivery(&runtime, &events);
+        let verifier: Arc<dyn PresenceVerifier> = Arc::from(crate::attest::default_verifier());
+        wire_commitment_attestation(&runtime, &verifier);
         Self {
             sessions: SessionRegistry::new(),
             events,
@@ -518,7 +530,7 @@ impl Daemon {
             consents: PendingConsents::new(),
             surfaces,
             attestations: AttestationRegistry::new(),
-            verifier: crate::attest::default_verifier(),
+            verifier,
             skills_fs: Arc::new(RealFs),
             // The production answer, and taken here rather than passed in so
             // `main` cannot ship a daemon that forgot to state it: this daemon
@@ -1074,26 +1086,16 @@ async fn refuse_unattested_commitment(
     //
     // The reduced posture is **stated rather than silent**, which is the part of
     // BR-8 that does apply here.
-    if let MechanismAvailability::Unavailable(reason) = daemon.verifier.availability() {
-        eprintln!(
-            "teton-code: daemon-wide commitment allowed on connection standing alone — \
-             this build has no presence mechanism ({}). BR-10(a) still applies; \
-             BR-10(b) is unavailable here.",
-            reason.describe()
-        );
-        return None;
-    }
-    // A synthetic binding id: these methods carry no consent request, and the
-    // verifier binds to whatever it is handed. Keying it to the connection stops
-    // two concurrent commitments from sharing one human's answer.
-    let request = RequestId::from(format!("commit-{:?}", conn.id));
-    let verifier = &daemon.verifier;
-    let subject = conn.id;
-    let verified =
-        crate::runtime::block_in_place_if_multithread(|| verifier.verify(subject, &request));
-    match verified {
-        Ok(_) => None,
-        Err(refusal) => {
+    // The body is [`attest_commitment`], shared with the two consent-answer
+    // writes REQ-591 D-1 gates. What stays here is what is local to an RPC: the
+    // requester this connection announced, and a JSON-RPC frame to refuse with.
+    match attest_commitment(daemon.verifier.as_ref(), conn.id) {
+        CommitmentStanding::Attested => None,
+        CommitmentStanding::NoMechanism(reason) => {
+            eprintln!("{}", commitment_degraded_line(reason));
+            None
+        }
+        CommitmentStanding::Refused(refusal) => {
             eprintln!("{}", attestation_refusal_line(&conn.requester, &refusal));
             Some(error_string(
                 id.clone(),
@@ -1102,6 +1104,22 @@ async fn refuse_unattested_commitment(
             ))
         }
     }
+}
+
+/// BR-8's stated posture, in one place, for every daemon-wide commitment that
+/// proceeds because this build can ask nobody.
+///
+/// A function rather than a bare `eprintln!` for [`attestation_refusal_line`]'s
+/// reason: the sentence is the *whole* of "the reduced posture is stated rather
+/// than silent", and an operator reading a log needs the same words whichever
+/// commitment took the degraded path.
+fn commitment_degraded_line(reason: UnavailableReason) -> String {
+    format!(
+        "teton-code: daemon-wide commitment allowed on connection standing alone — \
+         this build has no presence mechanism ({}). BR-10(a) still applies; \
+         BR-10(b) is unavailable here.",
+        reason.describe()
+    )
 }
 
 /// The refusal a connection gets when it already has
@@ -3533,6 +3551,98 @@ fn wire_addressed_delivery(
     surfaces
 }
 
+/// Give `runtime` the presence check its two durable consent-answer writes owe
+/// BR-10(b) (REQ-591 D-1).
+///
+/// Wired here for [`wire_addressed_delivery`]'s reason — the verifier belongs to
+/// the daemon and the daemon holds the runtime — and **replaceable**, which that
+/// one is not: [`Daemon::with_presence_verifier`] states a verifier *after* the
+/// constructor already wired the shipped one, and a first-writer-wins slot would
+/// leave an injected verifier inert on exactly the paths a fixture installed it
+/// to exercise.
+///
+/// That paragraph described the slot before it was one:
+/// `install_commitment_attestation` was `let _ = OnceLock::set`, so the second
+/// call really was discarded and this comment was a claim the code did not have.
+/// `runtime::tests::a_typed_project_skill_is_acknowledged_first::an_injected_verifier_is_the_one_the_durable_write_asks`
+/// is what now holds it to it.
+fn wire_commitment_attestation(runtime: &Arc<DaemonRuntime>, verifier: &Arc<dyn PresenceVerifier>) {
+    runtime.install_commitment_attestation(Arc::new(VerifiedCommitment {
+        verifier: Arc::clone(verifier),
+    }));
+}
+
+/// [`CommitmentAttestation`] over this daemon's [`PresenceVerifier`] — BR-10(b)
+/// for the two writes that are answers rather than RPCs (REQ-591 D-1).
+///
+/// The body is [`refuse_unattested_commitment`]'s, reached through
+/// [`attest_commitment`] so the two cannot drift: same availability degrade,
+/// same connection-keyed synthetic binding id, same live single-use check with
+/// nothing recorded. What differs is only what a refusal *is* — a JSON-RPC error
+/// there, a sentence for the caller to log here, because there is no frame to
+/// refuse: the human already answered the prompt, and the only thing being
+/// withheld is the machine-wide half of their answer.
+struct VerifiedCommitment {
+    verifier: Arc<dyn PresenceVerifier>,
+}
+
+impl CommitmentAttestation for VerifiedCommitment {
+    fn attest_daemon_wide_commitment(&self, addressee: ConnectionId) -> Result<(), String> {
+        match attest_commitment(self.verifier.as_ref(), addressee) {
+            CommitmentStanding::Attested => Ok(()),
+            CommitmentStanding::NoMechanism(reason) => {
+                eprintln!("{}", commitment_degraded_line(reason));
+                Ok(())
+            }
+            CommitmentStanding::Refused(refusal) => Err(refusal_message(&refusal).to_owned()),
+        }
+    }
+}
+
+/// What a daemon-wide commitment's presence check answered — the shared body of
+/// [`refuse_unattested_commitment`] and [`VerifiedCommitment`] (REQ-591 D-1).
+///
+/// Three outcomes rather than a `Result`, because "no mechanism on this build"
+/// and "a human was verified" both proceed and must not be *told apart by
+/// accident*: BR-8 requires the first to be stated rather than silent, and a
+/// two-armed answer would let a caller print the wrong sentence for it.
+enum CommitmentStanding {
+    /// A human proved presence for this connection, just now.
+    Attested,
+    /// This build has no mechanism, so BR-10(b) is unavailable and BR-10(a)
+    /// stands alone. Carries the reason, which the caller states.
+    NoMechanism(UnavailableReason),
+    /// A mechanism exists and was not satisfied.
+    Refused(AttestationRefusal),
+}
+
+/// Ask `verifier` whether a human stands behind a daemon-wide commitment by
+/// `subject`, right now (REQ-570 BR-10(b), REQ-591 D-1).
+///
+/// One body for every daemon-wide commitment this process performs — the four
+/// gated RPCs through [`refuse_unattested_commitment`], and the two consent
+/// answers through [`VerifiedCommitment`]. They are the same question about the
+/// same machine, and BUG-162's lesson is what a second copy of it costs: a
+/// `request_id` minted in one scope and honoured in a wider one, because two
+/// places decided separately what "may this connection speak for the machine"
+/// means.
+///
+/// The synthetic binding id is keyed to the connection, so two concurrent
+/// commitments cannot share one human's answer. Nothing is recorded in the
+/// attestation registry: there is no consent `request_id` to bind to, the check
+/// is used once immediately, and BR-6's single-use property holds by
+/// construction rather than by bookkeeping.
+fn attest_commitment(verifier: &dyn PresenceVerifier, subject: ConnectionId) -> CommitmentStanding {
+    if let MechanismAvailability::Unavailable(reason) = verifier.availability() {
+        return CommitmentStanding::NoMechanism(reason);
+    }
+    let request = RequestId::from(format!("commit-{subject:?}"));
+    match crate::runtime::block_in_place_if_multithread(|| verifier.verify(subject, &request)) {
+        Ok(_) => CommitmentStanding::Attested,
+        Err(refusal) => CommitmentStanding::Refused(refusal),
+    }
+}
+
 /// Tell the surfaces a request was offered to how it ended (BR-5).
 ///
 /// Published on the request's own route, so exactly the people who were asked
@@ -5638,6 +5748,83 @@ mod tests {
                 "`{method}` must not refuse an ordinary connection on ancestry: {response}"
             );
         }
+    }
+
+    /// **REQ-591 D-1 — the seam the two consent-answer writes consult is the
+    /// same check the four gated RPCs run, over every posture a verifier has.**
+    ///
+    /// [`VerifiedCommitment`] is what carries BR-10(b) to the writes that are
+    /// *answers* rather than methods — the acknowledgment's
+    /// `[skills] trusted_project_roots` row and REQ-589's over-budget remedy.
+    /// Those two are wired through seams and are tested against doubles at their
+    /// own doors; what only this test can say is that the seam production wires
+    /// them to gives the same three answers `refuse_unattested_commitment` does,
+    /// because both go through [`attest_commitment`].
+    ///
+    /// **Three postures, and the middle one is the reason the enum has three
+    /// arms.** `TETON_PRESENCE_ACCEPT=1` selects [`AcceptingVerifier`], `=fail`
+    /// selects [`AlwaysFailsVerifier`], and a shipped build gets
+    /// [`UnavailableVerifier`] — so these are the three real configurations,
+    /// named by their types rather than by an environment this process would
+    /// have to mutate globally.
+    ///
+    /// The unavailable arm **proceeds**, which is not the gate switched off: it
+    /// is BR-10(b)'s own rule that where no mechanism exists the posture degrades
+    /// to layer (a) rather than refusing. Refusing there would stop every shipped
+    /// build from writing a trust row and take D-13's automation with it. What
+    /// BR-8 requires instead is that the reduced posture be *stated*, which
+    /// [`commitment_degraded_line`] is and which the last assertion pins.
+    #[test]
+    fn the_commitment_seam_answers_every_posture_a_verifier_has() {
+        let subject = GrantRegistry::new().next_connection_id();
+
+        let attested = VerifiedCommitment {
+            verifier: Arc::new(crate::attest::AcceptingVerifier::default()),
+        };
+        assert_eq!(
+            attested.attest_daemon_wide_commitment(subject),
+            Ok(()),
+            "a satisfied mechanism must let the durable half of an answer through, \
+             or `p` writes nothing on any presence build"
+        );
+
+        let refusing = VerifiedCommitment {
+            verifier: Arc::new(crate::attest::AlwaysFailsVerifier::new(
+                crate::attest::AttestationMethod::OsBiometric,
+            )),
+        };
+        let refusal = refusing
+            .attest_daemon_wide_commitment(subject)
+            .expect_err("a present-but-unsatisfied mechanism refuses");
+        assert_eq!(
+            refusal,
+            refusal_message(&AttestationRefusal::Failed),
+            "and it refuses in the daemon's own vocabulary — the same sentence the \
+             RPC surface returns for the same refusal, because both read it off \
+             `refusal_message`"
+        );
+
+        let unavailable = VerifiedCommitment {
+            verifier: Arc::new(crate::attest::UnavailableVerifier::new(
+                UnavailableReason::PlatformUnsupported,
+            )),
+        };
+        assert_eq!(
+            unavailable.attest_daemon_wide_commitment(subject),
+            Ok(()),
+            "BR-10(b) degrades to layer (a) where no mechanism exists — a refusal \
+             here would break every shipped build's durable acknowledgment"
+        );
+
+        // The degrade is stated rather than silent (BR-8), and it says which of
+        // the two layers is missing — an operator reading this line is deciding
+        // whether their machine can enforce the check at all.
+        let stated = commitment_degraded_line(UnavailableReason::PlatformUnsupported);
+        assert!(
+            stated.contains("BR-10(b) is unavailable here")
+                && stated.contains("BR-10(a) still applies"),
+            "the degraded posture must name what is and is not still enforced: {stated}"
+        );
     }
 
     /// **REQ-570 AC-10, layer (b) — BR-10.** A daemon-wide *commitment* refuses

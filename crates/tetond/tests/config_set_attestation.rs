@@ -23,10 +23,10 @@
 //! method (ADR-4), so its two payload shapes join the pairs above, and AC-20
 //! asks a further question this file is the right place for: does the offer's
 //! wording claim an attestation the running build does not perform? The answer
-//! turns out to be sharper than the AC anticipated — the remedy's durable write
-//! does not pass the daemon-wide commitment gates at all (ADR-18 item 3) — and
-//! the last section tests what is true rather than what ADR-4 says. See the
-//! section header below.
+//! turned out to be sharper than the AC anticipated — the remedy's durable write
+//! did not pass the daemon-wide commitment gates at all (ADR-18 item 3). REQ-591
+//! D-1 closed that, and the last section now pins **where** the gate went rather
+//! than recording that there was none. See the section header below.
 
 use std::sync::Arc;
 
@@ -447,14 +447,18 @@ fn a_window_bound_offer() -> OverBudgetOffer {
 /// client renders it verbatim), so guarding that home guards every surface they
 /// reach. What is guarded is narrow and checkable: the question and all four
 /// option labels may not claim a verified human, an attestation, or a presence
-/// check — because on a shipped build there is none (ASSUME-C), and because for
-/// the remedy specifically there is none on *any* build (see the next test).
+/// check — because on a shipped build there is none (ASSUME-C).
+///
+/// **REQ-591 D-1 changed what the build does and not what it says.** The remedy
+/// now passes the commitment gate on a presence build, so a claim of
+/// attestation would be *true there* — and still false on every shipped build,
+/// where the mechanism degrades to allow. That is exactly why the rule is worded
+/// as an absence: the only sentence that is honest under both postures is one
+/// that claims nothing.
 ///
 /// **Run under both presence configurations**, with what the build actually did
 /// recorded beside the assertion. The wording is identical in both, which is
-/// the point rather than an accident: a sentence that varied with presence
-/// would have to be true under both postures, and the only such sentence is one
-/// that claims nothing.
+/// the point rather than an accident.
 ///
 /// Non-vacuous by construction: the fixture is asserted to carry the remedy
 /// pair, so the labels under test exist and name a concrete write. An offer
@@ -535,33 +539,36 @@ fn the_offer_claims_no_attestation_under_either_presence_configuration() {
     }
 }
 
-/// **ADR-18 item 3, as a fact rather than a footnote: the remedy's durable
-/// write does not pass either daemon-wide commitment gate.**
+/// **Where the remedy's commitment gate sits, pinned so it cannot move
+/// silently (REQ-591 D-1; was ADR-18 item 3).**
 ///
-/// ADR-4 routes every remedy through `config/set` and says it inherits that
-/// method's posture "verbatim". It inherits `DaemonRuntime::apply_config_update`
+/// ADR-4 routes every remedy through `config/set` and said it inherits that
+/// method's posture "verbatim". It inherited `DaemonRuntime::apply_config_update`
 /// — validation, `reject_unusable_binding`, the atomic document-preserving
-/// persist, the identical refusals — but **not** `refuse_daemon_wide`
+/// persist, the identical refusals — and **not** `refuse_daemon_wide`
 /// (REQ-570 BR-10(a)) or `refuse_unattested_commitment` (BR-10(b)), which wrap
-/// that body in `server.rs::handle_config_set` and would need `&Daemon` and
-/// `&ConnState` threaded into a turn. `RemedyWrites::apply` calls
-/// `apply_config_update` directly, and no environment changes that: the seam
-/// has no verifier in scope to consult.
+/// that body in `server.rs::handle_config_set`. This test recorded that gap as
+/// a fact rather than a footnote; D-1 closed it, and the test now records
+/// **where** it was closed, which is the thing a later edit can get wrong.
 ///
-/// **So this test asserts what is true, not what ADR-4 says.** The same payload
-/// the wire refuses under `TETON_PRESENCE_ACCEPT=fail` is applied by the seam
-/// the remedy actually uses. AC-20 is satisfied *by construction* — nothing in
-/// the offer's wording claims an attestation, which the test above pins — but
-/// the gap is real and is exactly what a security reviewer should examine.
-/// Narrow, for two stated reasons: presence degrades to allow on a shipped
-/// build anyway (ASSUME-C), and the write is authorized by an addressed consent
-/// from the submitting connection. Neither of those is the ancestry gate.
+/// The gate went to the remedy's own door — `apply_over_budget_remedy`, through
+/// the `CommitmentAttestation` seam the acknowledgment's durable row also
+/// consults — and deliberately **not** into `apply_config_update`. Pushing it
+/// down would put a second presence check underneath `config/set`, which has
+/// already run one, and would make the seam a test drives directly stop being
+/// the seam production uses.
 ///
-/// If the remedy is ever routed through `handle_config_set`, or the gates are
-/// pushed down into `apply_config_update`, this test goes red — which is the
-/// point: the deviation stops being silent.
+/// **So the two legs pin the two ends of that decision.** (a) The wire still
+/// refuses and still writes nothing — `config/set`'s own gate, untouched.
+/// (b) The shared body is still reachable and still writes, because the body is
+/// not where the check belongs.
+///
+/// The remedy's own paired witness — refused write versus attested write, on
+/// the same fixture, driven through a real over-budget turn — is
+/// `skill_over_budget_recovery::the_remedy_is_written_only_where_a_verified_human_stands_behind_it`.
+/// This test is about placement; that one is about behaviour.
 #[test]
-fn the_remedys_durable_write_does_not_pass_the_daemon_wide_commitment_gates() {
+fn the_remedys_gate_sits_at_its_own_door_and_not_in_the_shared_config_body() {
     assert!(
         std::env::var_os("TETON_CONFIG").is_none(),
         "the in-process half relies on `from_env` resolving `base_dir/config.toml`; the \
@@ -588,9 +595,13 @@ fn the_remedys_durable_write_does_not_pass_the_daemon_wide_commitment_gates() {
         "and writes nothing when it refuses"
     );
 
-    // (b) The seam the remedy actually writes through, same payload, same
-    // fixture shape: applied. Read back off the file and re-parsed, not
-    // inferred from the return (LESSON-519).
+    // (b) The shared body, same payload, same fixture shape: applied. This is
+    // `config/set`'s own persist path, reached without `config/set`'s handler —
+    // and it must stay reachable, because the remedy's gate is one level up. A
+    // failure here means the check was pushed into the body, which double-gates
+    // the RPC above and moves the seam out from under every test that drives it.
+    // Read back off the file and re-parsed, not inferred from the return
+    // (LESSON-519).
     let seam_ws = Workspace::new("req589-gap-seam");
     seam_ws.write_config(&rebind_config());
     let events = Arc::new(EventBus::new());
@@ -607,15 +618,16 @@ fn the_remedys_durable_write_does_not_pass_the_daemon_wide_commitment_gates() {
             floored_budget: None,
         }))
         .expect(
-            "**the gap**: the remedy's seam has no presence gate to fail. If this ever \
-             starts erroring, the gates moved down and this test should be rewritten to \
-             assert the new posture",
+            "the shared config body has no presence gate of its own, by design (REQ-591 \
+             D-1). If this starts erroring, the check moved down into it — re-read the \
+             doc above before changing this expectation",
         );
 
     let document = std::fs::read_to_string(&seam_ws.config_path).expect("config exists");
     assert!(
         document.contains("max_context = 1000000"),
-        "the ungated seam wrote the window the gated RPC refused:\n{document}"
+        "the shared body wrote the window the gated RPC refused — which is the \
+         placement claim, not a hole:\n{document}"
     );
     assert_eq!(
         Config::load(&document)

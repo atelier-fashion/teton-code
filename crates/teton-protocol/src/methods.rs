@@ -498,7 +498,39 @@ pub fn is_project_skill_key(key: &str) -> bool {
 pub const PROJECT_SKILL_TRUST_KEY_PREFIX: &str = "project_skill_trust:";
 
 /// The permission key the project-skill acknowledgment is remembered under:
-/// `project_skill_trust:<root>` (REQ-587 BR-4, architecture ADR-7).
+/// `project_skill_trust:<invoker>:<root>` (REQ-587 BR-4, architecture ADR-7,
+/// REQ-591 D-7).
+///
+/// # The invoker is in the key, for `durable_row_for`'s reason (REQ-591 D-7)
+///
+/// It was `project_skill_trust:<root>` until D-7, and both doors minted it from
+/// the same tree: the typed path from `probed.path`, the model's `skill` tool
+/// from `ctx.repo_root()`, which `ToolContext::for_root` sets from that same
+/// `probed`. One string, so a human answering "allow for this session" to a
+/// `/deploy` **they typed** also settled the *model's* door in that tree for the
+/// rest of the session, with no second prompt and nothing on any screen saying
+/// so.
+///
+/// That widening is REQ-591's own: before it the typed path had no gate at all
+/// and minted no grant, so there was no answer for the model's door to inherit.
+///
+/// D-2 already decided that the two doors are not the same question — a durable
+/// row answers for the typed path and for nothing else. A **session** answer is
+/// the same question asked at a shorter range, so it gets the same rule, applied
+/// where [`crate::events::InvokedBy`] can be seen rather than at a call site
+/// that might forget (LESSON-495: "make the key a function of the level … so
+/// adding a level is a compile error rather than a silent grant"). Taking
+/// `invoked_by` by value is that compile error.
+///
+/// The two invoker segments are fixed strings, so the families are disjoint
+/// however a root is spelled: no `project_skill_trust:user:X` can equal a
+/// `project_skill_trust:model:Y`, and within a door the key is injective in the
+/// root exactly as it was before.
+///
+/// **Not** the level key. [`crate::events::InvokedBy`] scopes the *grant*; the
+/// row a level's table decides this family by is `project_skill_trust`, spelled
+/// once in the daemon and consulted through `Question::level_key`. They answer
+/// different questions and neither is derived from the other.
 ///
 /// **A different question, so a different key.** `skill:<source>:<name>` asks
 /// "may these commands run?"; this one asks "may the model run *this
@@ -549,19 +581,59 @@ pub const PROJECT_SKILL_TRUST_KEY_PREFIX: &str = "project_skill_trust:";
 /// and `expires_on_session_root_change` bounds the exposure further: the key
 /// does not outlive the root it was answered for.
 #[must_use]
-pub fn project_skill_trust_key(root: &str) -> String {
-    format!("{PROJECT_SKILL_TRUST_KEY_PREFIX}{root}")
+pub fn project_skill_trust_key(invoked_by: crate::events::InvokedBy, root: &str) -> String {
+    format!(
+        "{PROJECT_SKILL_TRUST_KEY_PREFIX}{door}:{root}",
+        door = trust_door_segment(invoked_by)
+    )
 }
 
-/// True when `key` is a project-skill **acknowledgment** key (REQ-587 BR-4).
+/// The key segment naming which door asked (REQ-591 D-7) — **the one spelling**,
+/// read by [`project_skill_trust_key`] and by [`is_project_acknowledgment_key`].
 ///
-/// A bare prefix names no root, and a grant under it would be an answer to no
-/// question — the rule `is_skill_permission_key` already applies to a bare
-/// `skill:project:`.
+/// An exhaustive `match`, so a third [`crate::events::InvokedBy`] is a compile
+/// error here rather than a door whose grants quietly stop expiring on `/cd`.
+/// [`TRUST_DOORS`] is the enumeration the predicate walks; keep the two together.
+const fn trust_door_segment(invoked_by: crate::events::InvokedBy) -> &'static str {
+    match invoked_by {
+        crate::events::InvokedBy::User => "user",
+        crate::events::InvokedBy::Model => "model",
+    }
+}
+
+/// Every door a project-skill acknowledgment can be asked at (REQ-591 D-7).
+///
+/// Walked by [`is_project_acknowledgment_key`], which cannot `match` on a `&str`
+/// back into the enum. `every_door_round_trips_through_the_acknowledgment_key`
+/// is what keeps this list and [`trust_door_segment`] in step.
+const TRUST_DOORS: [crate::events::InvokedBy; 2] = [
+    crate::events::InvokedBy::User,
+    crate::events::InvokedBy::Model,
+];
+
+/// True when `key` is a project-skill **acknowledgment** key (REQ-587 BR-4,
+/// REQ-591 D-7).
+///
+/// Three things must hold, and each is a way the string could name no question:
+/// the family prefix, a door segment [`trust_door_segment`] produces, and a
+/// **non-empty** root after it. A bare prefix names no root, and a grant under
+/// it would be an answer to nothing — the rule `is_skill_permission_key` already
+/// applies to a bare `skill:project:`.
+///
+/// The door check is not decoration. Without it `project_skill_trust:model:`
+/// reads as an acknowledgment key, clears
+/// `PermissionGate::authorize_project_skill_trust`'s family guard, and reaches a
+/// `debug_assert` — which in a release build is no guard at all, leaving an
+/// answer remembered under a key naming no repository.
 #[must_use]
 pub fn is_project_acknowledgment_key(key: &str) -> bool {
-    key.strip_prefix(PROJECT_SKILL_TRUST_KEY_PREFIX)
-        .is_some_and(|root| !root.is_empty())
+    let Some(rest) = key.strip_prefix(PROJECT_SKILL_TRUST_KEY_PREFIX) else {
+        return false;
+    };
+    let Some((door, root)) = rest.split_once(':') else {
+        return false;
+    };
+    !root.is_empty() && TRUST_DOORS.iter().any(|&d| trust_door_segment(d) == door)
 }
 
 /// True when a session root move invalidates `key` — **the** invalidation rule,
@@ -4727,6 +4799,37 @@ mod tests {
         );
     }
 
+    /// **Every door round-trips, and that is what keeps the two lists in step**
+    /// (REQ-591 D-7).
+    ///
+    /// `project_skill_trust_key` matches exhaustively on [`crate::events::InvokedBy`],
+    /// so a third invoker is a compile error there. `is_project_acknowledgment_key`
+    /// cannot match a `&str` back into the enum and walks `TRUST_DOORS` instead,
+    /// which a third invoker would *not* break at compile time. This is the
+    /// assertion that notices: a door missing from that list mints a key its own
+    /// predicate rejects, and a rejected key is a grant that never expires on
+    /// `/cd` (ASSUME-017's harm, arriving from the other side).
+    #[test]
+    fn every_door_round_trips_through_the_acknowledgment_key() {
+        for door in TRUST_DOORS {
+            let key = project_skill_trust_key(door, "~/dev/teton");
+            assert!(
+                is_project_acknowledgment_key(&key),
+                "{door:?} mints `{key}`, which its own predicate does not recognize"
+            );
+            assert!(expires_on_session_root_change(&key), "{key}");
+        }
+        assert_eq!(
+            TRUST_DOORS
+                .iter()
+                .map(|&door| project_skill_trust_key(door, "~/dev/teton"))
+                .collect::<std::collections::BTreeSet<_>>()
+                .len(),
+            TRUST_DOORS.len(),
+            "two doors minted one key for one root, which is the widening D-7 removed"
+        );
+    }
+
     /// REQ-587 BR-4 / ADR-7: the acknowledgment key is its **own** family, it
     /// is nobody's skill key, and one predicate decides what a `/cd` expires.
     ///
@@ -4737,8 +4840,23 @@ mod tests {
     /// root's question with the old root's answer before a human saw anything.
     #[test]
     fn the_acknowledgment_key_is_its_own_family_and_expires_with_the_root() {
-        let key = project_skill_trust_key("~/dev/teton");
-        assert_eq!(key, "project_skill_trust:~/dev/teton");
+        let key = project_skill_trust_key(crate::events::InvokedBy::User, "~/dev/teton");
+        assert_eq!(key, "project_skill_trust:user:~/dev/teton");
+        // REQ-591 D-7: the other door is a different key for the same tree, so
+        // a session answer at one cannot free the other.
+        assert_eq!(
+            project_skill_trust_key(crate::events::InvokedBy::Model, "~/dev/teton"),
+            "project_skill_trust:model:~/dev/teton"
+        );
+        assert_ne!(
+            key,
+            project_skill_trust_key(crate::events::InvokedBy::Model, "~/dev/teton"),
+            "one tree, two doors, two keys"
+        );
+        assert!(is_project_acknowledgment_key(&project_skill_trust_key(
+            crate::events::InvokedBy::Model,
+            "~/dev/teton"
+        )));
         assert!(is_project_acknowledgment_key(&key));
 
         // Not a skill key, in either crate's spelling of that question. The
@@ -4762,6 +4880,22 @@ mod tests {
         assert!(!is_project_acknowledgment_key(
             PROJECT_SKILL_TRUST_KEY_PREFIX
         ));
+        // REQ-591 D-7: nor does a door segment with nothing after it, and nor
+        // does a segment no door mints. Both would otherwise clear the gate's
+        // family guard and land on a `debug_assert` — which a release build does
+        // not have.
+        for near_miss in [
+            "project_skill_trust:user:",
+            "project_skill_trust:model:",
+            "project_skill_trust:~/dev/teton",
+            "project_skill_trust:admin:~/dev/teton",
+            "project_skill_trust:user~/dev/teton",
+        ] {
+            assert!(
+                !is_project_acknowledgment_key(near_miss),
+                "`{near_miss}` names no question this daemon can have asked"
+            );
+        }
 
         // Two roots, two keys — never one. The root is not truncated on its way
         // into a key, because a key is compared and not read: two long roots
@@ -4771,16 +4905,21 @@ mod tests {
         let long_a = format!("~/dev/{}/alpha", "nested/".repeat(40));
         let long_b = format!("~/dev/{}/beta", "nested/".repeat(40));
         assert_ne!(
-            project_skill_trust_key(&long_a),
-            project_skill_trust_key(&long_b)
+            project_skill_trust_key(crate::events::InvokedBy::User, &long_a),
+            project_skill_trust_key(crate::events::InvokedBy::User, &long_b)
         );
-        assert!(project_skill_trust_key(&long_a).ends_with("/alpha"));
+        assert!(
+            project_skill_trust_key(crate::events::InvokedBy::User, &long_a).ends_with("/alpha")
+        );
 
         // The root rides exactly as the caller spelled it, so the key the
         // answer is remembered under and the root the prompt showed name one
         // repository — and a home-relative display stays home-relative, since
         // an unrecognizing client renders this key on its refusal line.
-        assert!(!project_skill_trust_key("~/dev/teton").contains("/Users/"));
+        assert!(
+            !project_skill_trust_key(crate::events::InvokedBy::User, "~/dev/teton")
+                .contains("/Users/")
+        );
 
         // One invalidation rule, both families, and only those two: a user
         // skill's file is the same file whatever the root is, so its grant

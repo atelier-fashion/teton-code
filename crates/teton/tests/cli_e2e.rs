@@ -139,10 +139,38 @@ impl TestDaemon {
         Self::spawn_with_script_env(daemon, replies, extra_config, &[])
     }
 
+    /// A scripted daemon whose config carries a `[skills]` table naming the
+    /// project root this test is about (REQ-589 D-13).
+    ///
+    /// The config is built from a **closure over the fixture root**, which is the
+    /// only shape that works here: `[skills] trusted_project_roots` holds the
+    /// *canonical* name of a directory, the fixture's directory lives under the
+    /// root this function is about to mint, and the daemon reads its config once
+    /// at start. So the row cannot be written before the root exists and cannot
+    /// be added after the daemon has read it — it has to be composed in between,
+    /// which is exactly where this hook sits.
+    fn spawn_scripted_trusting(
+        daemon: &Path,
+        replies: &[&str],
+        extra_env: &[(&str, &str)],
+        config_for_root: &dyn Fn(&Path) -> String,
+    ) -> Self {
+        Self::spawn_for_root(daemon, Some(replies), config_for_root, extra_env)
+    }
+
     fn spawn_with_script_env(
         daemon: &Path,
         replies: Option<&[&str]>,
         extra_config: &str,
+        extra_env: &[(&str, &str)],
+    ) -> Self {
+        Self::spawn_for_root(daemon, replies, &|_| extra_config.to_owned(), extra_env)
+    }
+
+    fn spawn_for_root(
+        daemon: &Path,
+        replies: Option<&[&str]>,
+        extra_config: &dyn Fn(&Path) -> String,
         extra_env: &[(&str, &str)],
     ) -> Self {
         static SEQ: AtomicUsize = AtomicUsize::new(0);
@@ -192,8 +220,9 @@ impl TestDaemon {
                  [[providers]]\nid = \"local\"\nkind = \"local\"\n\n\
                  {tiers}\
                  [local_model]\nauto_accept = false\nbase_url = \"http://127.0.0.1:{}\"\n\n\
-                 {extra_config}",
-                closed_port()
+                 {}",
+                closed_port(),
+                extra_config(&root)
             ),
         )
         .unwrap();
@@ -5949,6 +5978,30 @@ fn skill_file_with(description: &str, frontmatter: &[&str], body: &str) -> Strin
     out
 }
 
+/// The `[skills]` table naming `project` as durably acknowledged (REQ-589
+/// D-13) — the one unattended answer to D-10's trust gate.
+///
+/// The row is the root's **canonical** name, because that is what the daemon
+/// matches: a row naming a *path* would let a symlink dropped at that path hand
+/// an unacknowledged repository the trust of an acknowledged one. On macOS this
+/// is the difference between `/tmp/x` and `/private/tmp/x`, which is exactly the
+/// spelling every fixture here has — so a build that stopped canonicalising
+/// fails the listed leg on this platform rather than passing by coincidence.
+///
+/// The rule is spelled out here rather than imported because the minter is
+/// `pub(crate)` to `tetond` and this is a black-box client test. Its own suite
+/// (`harness::tools::skill::tests::the_durable_name_resolves_the_link_and_names_the_tree`)
+/// owns the question of what the name *is*; what this restates is only enough of
+/// it to write a row a user could have written by hand.
+fn trusting(project: &Path) -> String {
+    let canonical = std::fs::canonicalize(project)
+        .unwrap_or_else(|err| panic!("{} does not resolve: {err}", project.display()));
+    format!(
+        "[skills]\ntrusted_project_roots = [{:?}]\n\n",
+        canonical.display().to_string()
+    )
+}
+
 /// A project fixture under `root`: a `Cargo.toml` (so the root classifies as a
 /// project) and nothing else.
 fn project_at(root: &Path, name: &str) -> PathBuf {
@@ -6770,10 +6823,19 @@ fn a_typed_invocation_names_the_swap_and_its_flags_and_counts_no_turn_budget() {
         ),
     );
 
-    let daemon = TestDaemon::spawn_scripted_with_env(
+    // REQ-589 D-13, and the reason this fixture needs a `[skills]` table at all.
+    // D-10 put an acknowledgment on the typed path, and `validate` **shadows** a
+    // user skill — the one case that is asked even at `full` — so this piped
+    // session has no permission level that would let it run the repository's
+    // skill. A human's durable row is the only unattended answer there is, and
+    // seeding one is what makes the rest of this test about what it is named for.
+    // Its unlisted counterpart is
+    // `an_unattended_session_at_an_unlisted_root_refuses_and_names_the_row`.
+    let daemon = TestDaemon::spawn_scripted_trusting(
         &daemon_bin,
         TURN_REPLIES,
         &[("HOME", home.path().to_str().unwrap())],
+        &|root| trusting(&project_at(root, "proj")),
     );
     let project = project_at(&daemon.root, "proj");
     std::fs::create_dir_all(project.join(".claude/skills/validate")).unwrap();
@@ -6842,6 +6904,283 @@ fn a_typed_invocation_names_the_swap_and_its_flags_and_counts_no_turn_budget() {
         "a typed invocation was given a per-turn budget it does not draw on; \
          output:\n{stdout}"
     );
+}
+
+/// **REQ-589 D-13 / TASK-262: the unattended trust path, both legs, end to end.**
+///
+/// This is a **deliberate security widening** and the test is written to hold it
+/// to its bound rather than to celebrate it. D-10 put an acknowledgment on the
+/// user-typed `/name` path; a piped session has nobody to ask, and `validate`
+/// here shadows a user skill, which is the case asked even at `full`. So before
+/// D-13 no permission level let an automated run invoke a typed project skill,
+/// and after it exactly one thing does: a row a human wrote in
+/// `[skills] trusted_project_roots`.
+///
+/// **The two legs are the whole test, and neither is worth anything alone.**
+/// They are the same fixture, the same piped session, the same shadowing skill
+/// and the same client refusal — only the row in config differs. So:
+///
+/// - a build that deleted the consultation fails the **listed** leg;
+/// - a build that let any unattended session through fails the **unlisted** leg;
+/// - and "it refused" cannot be an accident of a fixture that always refuses,
+///   because the leg beside it does not.
+///
+/// The unlisted leg is the one that matters most. Without it the gate is
+/// decorative: "no human is here" would itself be the permission, and every
+/// scripted run on every machine would expand every repository's skills.
+///
+/// It also pins the **remedy**, because a refusal a scripted run meets is a dead
+/// end without one — and pins it as the *canonical* row, which on macOS is
+/// `/private/tmp/…` where the fixture's own spelling is `/tmp/…`. A user who
+/// pasted the other one would have added a line that silently never matches.
+#[test]
+fn an_unattended_session_at_an_unlisted_root_refuses_and_names_the_row() {
+    let daemon_bin = daemon_bin();
+    let teton = teton_bin();
+
+    for listed in [true, false] {
+        let home = SkillTree::new(if listed { "tl" } else { "tu" });
+        // The user's own `validate`, so the repository's shadows it — the case
+        // no permission level settles, which is why the row is the only answer.
+        home.write(
+            ".claude/skills/validate/SKILL.md",
+            &skill_file("the user validate", None, "User body.\n"),
+        );
+
+        let daemon = TestDaemon::spawn_scripted_trusting(
+            &daemon_bin,
+            TURN_REPLIES,
+            &[("HOME", home.path().to_str().unwrap())],
+            &|root| {
+                let project = project_at(root, "proj");
+                if listed {
+                    trusting(&project)
+                } else {
+                    // A non-empty list naming somewhere else: the refusal must
+                    // be about *this* root's absence rather than about a machine
+                    // that has never acknowledged anything.
+                    trusting(&project_at(root, "other"))
+                }
+            },
+        );
+        let project = project_at(&daemon.root, "proj");
+        std::fs::create_dir_all(project.join(".claude/skills/validate")).unwrap();
+        std::fs::write(
+            project.join(".claude/skills/validate/SKILL.md"),
+            skill_file(
+                "the project validate",
+                None,
+                "Validate the repository's way.\n",
+            ),
+        )
+        .unwrap();
+
+        let (stdout, stderr, status) = daemon.run_cli_from(
+            &teton,
+            &["--cwd", project.to_str().unwrap()],
+            "/validate\n",
+            None,
+            &[("HOME", home.path())],
+        );
+        assert!(status.success(), "stdout:\n{stdout}\nstderr:\n{stderr}");
+
+        // True of both legs, and the reason the listed one is the *list*'s doing
+        // rather than a session that was never gated: the daemon asked, and this
+        // client answered that there is nobody here to ask.
+        assert!(
+            stdout.contains("could not be asked here")
+                && stdout.contains("[skills] trusted_project_roots"),
+            "the client must report that it could not ask, and name where the \
+             standing answer lives; listed={listed}, output:\n{stdout}"
+        );
+
+        let row = trusting(&project);
+        let row = row
+            .trim_end()
+            .trim_start_matches("[skills]\ntrusted_project_roots = [\"")
+            .trim_end_matches("\"]")
+            .to_owned();
+        if listed {
+            assert!(
+                stdout.contains("/validate → skill validate (project — shadows your user skill"),
+                "a root a human durably acknowledged must run its skills with \
+                 nobody at the terminal — that is what D-13 bought; output:\n{stdout}"
+            );
+            // **BR-10/AC-8, and the assertion with the bite** (REQ-591 D-6).
+            // This leg is the one where the client's line and the session's
+            // outcome disagree: the client answered `NoTerminal`, the daemon
+            // rewrote it to `Allowed` from the row, and the skill echoes two
+            // lines below. A client that claimed a refusal here would be
+            // contradicted by its own transcript — which is what AC-8 is about,
+            // and what the shared assertion above cannot see because "could not
+            // be asked" is true of both legs.
+            assert!(
+                !stdout.contains("was refused without asking"),
+                "the client claimed an outcome it cannot know: the row made this \
+                 turn go ahead, and the line above says it was refused; \
+                 output:\n{stdout}"
+            );
+            assert!(
+                !stdout.contains("has not acknowledged"),
+                "the turn both ran and refused; output:\n{stdout}"
+            );
+        } else {
+            assert!(
+                stdout.contains("has not acknowledged")
+                    && stdout.contains("there was no client to ask"),
+                "an unattended session at a root nobody listed must refuse \
+                 exactly as it did before D-13 — this is the assertion that \
+                 keeps the gate from being decorative; output:\n{stdout}"
+            );
+            assert!(
+                !stdout.contains("/validate → skill validate"),
+                "the repository's skill ran anyway; output:\n{stdout}"
+            );
+            assert!(
+                stdout.contains(&row),
+                "the refusal must name the canonical row to add, or the remedy \
+                 is a guess — expected `{row}` in:\n{stdout}"
+            );
+        }
+    }
+}
+
+/// **REQ-591 D-4 — a row names a tree, and a tree does not move when `$HOME`
+/// does.**
+///
+/// The durable name used to be home-relative (`~/proj`), which made a row's
+/// meaning a function of `$HOME` **at consult time**: a daemon later launched
+/// with a different `HOME` resolved the same row against a different tree. The
+/// security argument for changing that is weak on its own — anyone who can
+/// rewrite the daemon's environment can rewrite `config.toml` — and it is not
+/// the reason. The row is *documented as naming a tree*, and a home-relative
+/// string names a tree and an environment variable.
+///
+/// # Why the project lives inside `HOME` here
+///
+/// That is the whole fixture, and it is what gives this test its bite.
+/// Everywhere else in this file the project sits *beside* the fixture home,
+/// where the absolute and home-relative spellings of a tree coincide and
+/// neither mint can be told from the other. Under a home that **contains** the
+/// project they diverge — `~/proj` against `/private/tmp/…/proj` — so the
+/// listed leg below runs the skill today and would **refuse** under the pre-D-4
+/// mint, because the row would no longer be a string this build ever produces.
+///
+/// The unlisted leg is the pairing (LESSON-520): the same daemon, the same
+/// home, the same piped invocation, and a well-formed row naming a *sibling*
+/// tree. Without it "it ran" would be satisfied by a build that matched
+/// everything.
+///
+/// # Where the old spelling went
+///
+/// A row left in the pre-D-4 home-relative form cannot appear in a config this
+/// daemon will start on: REQ-591 D-5 refuses it at load, by name, with the
+/// correct form in the message. That is louder than the fail-closed consult it
+/// replaces, and the consult is still underneath it —
+/// `skill::tests::the_durable_name_outlives_the_home_it_was_minted_under`
+/// drives the gate with such a row directly and it still matches nothing.
+///
+/// Piped, and shadowing, for the reason
+/// [`an_unattended_session_at_an_unlisted_root_refuses_and_names_the_row`] is:
+/// no permission level settles this question, so the row is the only answer
+/// there is and what the row *says* is the entire subject of the test.
+#[test]
+fn a_row_written_under_one_home_still_names_its_tree_under_another() {
+    let daemon_bin = daemon_bin();
+    let teton = teton_bin();
+
+    for (listed, expect_run) in [(true, true), (false, false)] {
+        let home = SkillTree::new(if listed { "ha" } else { "hr" });
+        // The user's own `validate`, so the repository's shadows it — the case
+        // no permission level settles.
+        home.write(
+            ".claude/skills/validate/SKILL.md",
+            &skill_file(
+                "the user validate",
+                None,
+                "User body.
+",
+            ),
+        );
+        // **Inside** the home, which is what makes the two spellings differ.
+        let project = project_at(home.path(), "proj");
+        std::fs::create_dir_all(project.join(".claude/skills/validate")).unwrap();
+        std::fs::write(
+            project.join(".claude/skills/validate/SKILL.md"),
+            skill_file(
+                "the project validate",
+                None,
+                "Validate the repository's way.
+",
+            ),
+        )
+        .unwrap();
+
+        // Both rows are well-formed absolute mints — D-5 refuses anything else
+        // at load, so a home-relative row cannot be the pairing here. What
+        // differs is only *which tree* the row names.
+        let row = if listed {
+            trusting(&project)
+        } else {
+            trusting(&project_at(home.path(), "other"))
+        };
+        let daemon = TestDaemon::spawn_scripted_trusting(
+            &daemon_bin,
+            TURN_REPLIES,
+            &[("HOME", home.path().to_str().unwrap())],
+            &|_| row.clone(),
+        );
+
+        let (stdout, stderr, status) = daemon.run_cli_from(
+            &teton,
+            &["--cwd", project.to_str().unwrap()],
+            "/validate
+",
+            None,
+            &[("HOME", home.path())],
+        );
+        assert!(
+            status.success(),
+            "stdout:
+{stdout}
+stderr:
+{stderr}"
+        );
+
+        // True of both legs: the daemon asked, and this client answered that
+        // there is nobody here to ask. So whatever happens next is the *row*'s
+        // doing.
+        assert!(
+            stdout.contains("could not be asked here"),
+            "listed={listed}: the client must report that it could not ask; \
+             output:\n{stdout}"
+        );
+        assert_eq!(
+            stdout.contains("/validate → skill validate (project — shadows your user skill"),
+            expect_run,
+            "listed={listed}: the row this build mints for a tree **inside** \
+             `$HOME` is that tree's absolute path, so it matches here — a \
+             home-relative mint would name `~/proj` and this row would match \
+             nothing; output:\n{stdout}"
+        );
+        assert_eq!(
+            !stdout.contains("has not acknowledged"),
+            expect_run,
+            "listed={listed}: and the refusal and the run are exclusive — a \
+             build that did both would be BR-10's defect; output:\n{stdout}"
+        );
+        if expect_run {
+            // REQ-591 D-6, as in
+            // [`an_unattended_session_at_an_unlisted_root_refuses_and_names_the_row`]:
+            // on the leg the row rescues, the client must not have claimed a
+            // refusal it does not get to observe.
+            assert!(
+                !stdout.contains("was refused without asking"),
+                "listed={listed}: the client claimed an outcome the daemon then \
+                 reversed; output:\n{stdout}"
+            );
+        }
+    }
 }
 
 /// **AC-14: `/cd` re-derives the project skills and leaves the user skills
@@ -7178,7 +7517,7 @@ fn on_a_pipe_at_guarded_a_model_issued_project_skill_is_refused_without_eating_t
         "the refusal must still show what it refused; output:\n{stdout}"
     );
     assert!(
-        stdout.contains("was refused without asking: this session's input is not a terminal"),
+        stdout.contains("could not be asked here: this session's input is not a terminal"),
         "BR-11's refusal line is missing; output:\n{stdout}"
     );
     assert!(

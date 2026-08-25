@@ -485,6 +485,7 @@ impl fmt::Display for SkipReason {
 pub struct SkillRegistry {
     skills: Vec<Skill>,
     skipped: Vec<Skipped>,
+    read_under: Option<PathBuf>,
 }
 
 impl SkillRegistry {
@@ -548,6 +549,51 @@ impl SkillRegistry {
     #[must_use]
     pub fn is_empty(&self) -> bool {
         self.skills.is_empty() && self.skipped.is_empty()
+    }
+
+    /// The session root **as discovery resolved it** — the tree every project
+    /// body in this snapshot was read out of — or `None` when it did not
+    /// resolve (REQ-589 D-13).
+    ///
+    /// # Why the snapshot carries this at all
+    ///
+    /// Because a snapshot's bodies and the identity that authorizes them must be
+    /// one fact, and for one release they were two. Bodies are read **once**, at
+    /// `session/create` and at `/cd`
+    /// (`discovery_is_paid_at_create_and_at_cd_and_never_per_turn`); the durable
+    /// trust name was minted **per turn**, by canonicalising the path the
+    /// session registry stores — which `ProbedRoot::probe` deliberately leaves
+    /// unresolved. So a link at the session root could be re-pointed at any
+    /// point in the session's life, and the name minted afterwards named a tree
+    /// the bodies had never been read from: an unlisted repository's text
+    /// running unattended on a row written for somebody else's repository.
+    /// `a_root_re_pointed_after_discovery_cannot_spend_the_listed_trees_trust`
+    /// is that attack.
+    ///
+    /// This is the resolution [`discovery::discover`] took *once* and used for
+    /// its own containment test: every project root it listed resolved to at or
+    /// under this path. The trust door names **this**, never the path as
+    /// spelled, which is what makes the identity that authorizes the bodies the
+    /// identity the bodies were read under.
+    ///
+    /// The window that leaves is discovery's own, and it is inherent to reading
+    /// by path: a root is resolved for the containment test and then listed and
+    /// read through its unresolved spelling, so a link re-pointed *between those
+    /// two syscalls* still moves the bytes. That is microseconds inside one
+    /// function rather than the whole life of a session, it is the same race
+    /// [`discovery::discover`]'s containment test has always had, and closing it
+    /// would take `openat`-relative reads off a held descriptor rather than a
+    /// name. What this field removes is the part that was not a race at all —
+    /// an identity minted hours later, from a path nothing had been read
+    /// through.
+    ///
+    /// `None` is fail-closed twice over: a session root that will not resolve
+    /// mints no durable name and matches no row, *and* registers no project
+    /// skill at all, because the containment test has nothing to compare
+    /// against.
+    #[must_use]
+    pub fn read_under(&self) -> Option<&Path> {
+        self.read_under.as_deref()
     }
 }
 
@@ -645,7 +691,14 @@ fn assemble(candidates: Vec<Skill>, skipped: Vec<Skipped>) -> SkillRegistry {
     // order they arrived in, so the dispatchable one is always the first of its
     // group and `/help` reads winner-then-shadowed.
     skills.sort_by(|a, b| a.name.cmp(&b.name));
-    SkillRegistry { skills, skipped }
+    // `None` here rather than a parameter: the contest is the *rule* half of
+    // BR-2 and knows nothing about the filesystem. [`discovery::discover`] is
+    // the one caller that resolved anything, and it fills the field in.
+    SkillRegistry {
+        skills,
+        skipped,
+        read_under: None,
+    }
 }
 
 /// The four roots, in **precedence order** (highest first), for a session on

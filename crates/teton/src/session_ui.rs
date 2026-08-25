@@ -3416,7 +3416,7 @@ fn render_consent_subject(subject: Option<&PermissionSubject>, surface: &mut dyn
                 &format!(
                     "  skill `{skill}` ({}){} wants to run {} dynamic-context command{}:",
                     slash::source_word(*source),
-                    invoker_clause(*invoked_by),
+                    invoker_clause(*invoked_by, InvokerVoice::Aside),
                     commands.len(),
                     if commands.len() == 1 { "" } else { "s" },
                 ),
@@ -3431,11 +3431,17 @@ fn render_consent_subject(subject: Option<&PermissionSubject>, surface: &mut dyn
         // REQ-587 BR-4's acknowledgment: the root, then the named set, one
         // `Surface::line` per entry for the reason the command list is one per
         // line — `line` defuses, and defusing destroys newlines.
-        Some(PermissionSubject::ProjectSkillTrust { root, skills, more }) => {
+        Some(PermissionSubject::ProjectSkillTrust {
+            root,
+            skills,
+            more,
+            invoked_by,
+        }) => {
             surface.line(
                 LineKind::Prompt,
                 &format!(
-                    "  the model wants to run this repository's skills as instructions: {root}",
+                    "  {lead} run this repository's skills as instructions: {root}",
+                    lead = invoker_clause(*invoked_by, InvokerVoice::Lead),
                 ),
             );
             for entry in skills {
@@ -3546,20 +3552,63 @@ fn project_skill_entry(entry: &events::ProjectSkillTrustEntry) -> String {
     }
 }
 
+/// Where in a sentence [`invoker_clause`] is being asked to stand.
+///
+/// Two skill consents name the invoker and they are built the opposite way
+/// round, which is a fact about their sentences and not about the invoker:
+///
+/// - [`Self::Aside`] — the dynamic-context prompt already has a subject (the
+///   skill), so "who asked" rides as an appositive inside it, and the *user*
+///   arm is empty because a sentence with no aside is REQ-585's sentence.
+/// - [`Self::Lead`] — the acknowledgment prompt's subject **is** the invoker
+///   ("the model wants to run …"), so neither arm can be empty: dropping the
+///   clause here does not shorten the sentence, it deletes the sentence's
+///   subject.
+///
+/// One function keeps both, rather than a second helper beside it, so the words
+/// "the model" have exactly one home (LESSON-456). A second helper would let
+/// the two arms come to disagree about what the model is called, and nothing
+/// green would notice.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum InvokerVoice {
+    /// Mid-sentence, between commas, around a subject that is already there.
+    Aside,
+    /// Sentence-leading, as the subject itself.
+    Lead,
+}
+
 /// The clause BR-5 adds to a skill consent: **who asked**.
 ///
 /// "You asked for `deploy`" and "the model decided to run `deploy`" are
 /// different questions carrying the same command list, and the human at
 /// `guarded` is entitled to know which one is on the screen.
 ///
-/// A user invocation adds nothing, so REQ-585's prompt keeps its bytes exactly —
-/// the words it renders are the words `pty_e2e` already pins. The model's clause
-/// is the vocabulary [`skill_echo_line`] uses for the same fact, so a user who
-/// answered a prompt reads the same phrase back in the echo line that follows.
-fn invoker_clause(invoked_by: events::InvokedBy) -> &'static str {
-    match invoked_by {
-        events::InvokedBy::User => "",
-        events::InvokedBy::Model => ", invoked by the model,",
+/// In [`InvokerVoice::Aside`] a user invocation adds nothing, so REQ-585's
+/// prompt keeps its bytes exactly — the words it renders are the words
+/// `pty_e2e` already pins. The model's clause is the vocabulary
+/// [`skill_echo_line`] uses for the same fact, so a user who answered a prompt
+/// reads the same phrase back in the echo line that follows.
+///
+/// # Why [`InvokerVoice::Lead`] exists (REQ-589 TASK-261)
+///
+/// REQ-587 minted the project-skill acknowledgment when the model's tool was
+/// its only caller and wrote the model into the sentence's subject. REQ-589
+/// ADR-10 gave the typed `/name` path the same door, and the sentence went on
+/// naming the model — telling a user who had just typed `/analyze` that "the
+/// model wants to run this repository's skills as instructions", on the one
+/// prompt whose whole job is letting a human decide whether to trust a
+/// repository.
+///
+/// The model arm is REQ-587's four words unchanged, and deliberately so: that
+/// caller's sentence was never false, and re-wording it would move bytes a
+/// terminal test pins for no gain. What the user arm must not do is inherit
+/// them.
+fn invoker_clause(invoked_by: events::InvokedBy, voice: InvokerVoice) -> &'static str {
+    match (voice, invoked_by) {
+        (InvokerVoice::Aside, events::InvokedBy::User) => "",
+        (InvokerVoice::Aside, events::InvokedBy::Model) => ", invoked by the model,",
+        (InvokerVoice::Lead, events::InvokedBy::User) => "you asked to",
+        (InvokerVoice::Lead, events::InvokedBy::Model) => "the model wants to",
     }
 }
 
@@ -3579,6 +3628,51 @@ fn invoker_clause(invoked_by: events::InvokedBy) -> &'static str {
 /// is **select** on that string (ADR-7), and printing the thing the daemon
 /// called this request is how a user finds it in a log.
 ///
+/// # The project-skill acknowledgment gets a second remedy, because the first
+/// one is only half true for it
+///
+/// `/permissions full` settles the acknowledgment for an ordinary project skill
+/// — that half is real, and it is why the standard sentence is **kept** here
+/// rather than replaced. It settles **nothing** when the repository's skill
+/// shadows one of the user's own: that case asks even at `full` (REQ-587 BR-4),
+/// and it is exactly the case an unattended run trips over. Stopping at the
+/// standard remedy would send such a user to set a level, watch it change
+/// nothing, and conclude the refusal is a bug.
+///
+/// So the D-13 answer is named after it, with the condition that distinguishes
+/// them: `[skills] trusted_project_roots` covers both, and a turn at a listed
+/// root **goes ahead** — which is also why that clause is worded as a condition
+/// rather than as a flat refusal. Since D-13 this client's `NoTerminal` no longer
+/// settles the turn; the daemon consults the list afterwards, and a line
+/// promising a refusal would be contradicted two lines later by the skill's own
+/// echo.
+///
+/// The exact row is deliberately not spelled here — it is the root's *canonical*
+/// name, which this client cannot derive from the subject's and would therefore
+/// have to guess at. The daemon's own refusal, which arrives right behind this
+/// line when the turn does refuse, prints it exactly.
+///
+/// # And it is the one arm that does not claim an outcome (REQ-591 BR-10/AC-8)
+///
+/// The other three open "was refused without asking", which is a statement about
+/// what *happened*. This client is not in a position to make that statement
+/// here: it answers `NoTerminal`, and for the acknowledgment the daemon may then
+/// rewrite the settlement to `Allowed` from `[skills] trusted_project_roots`
+/// (`PermissionGate::acknowledged_unattended`). A line claiming a refusal is
+/// contradicted two lines later by the skill's own echo — the client telling the
+/// user one thing while the session does another.
+///
+/// So this arm states what the client **did**: the question could not be asked
+/// here. That is true whichever way the daemon settles it, and it is why the
+/// remedy clause below is worded as a condition ("the turn goes ahead where it
+/// already names this repository") rather than as a fix for a refusal.
+///
+/// The other three arms keep "was refused without asking", and keep it
+/// correctly: `acknowledged_unattended` is the only rewrite of a
+/// `Refused(NoTerminal)` anywhere in the daemon and it is reached only from
+/// `authorize_project_skill_trust`, so the over-budget question, an ordinary
+/// tool and an unrecognized subject are all genuinely settled by the time this
+/// line is composed.
 /// # The over-budget offer gets a different remedy, because the usual one is
 /// false for it
 ///
@@ -3596,6 +3690,10 @@ fn invoker_clause(invoked_by: events::InvokedBy) -> &'static str {
 /// one bound has none (BR-7b) and this line cannot see which bound it is
 /// looking at.
 fn refusal_line(req: &PermissionRequest, reason: RefusalReason) -> String {
+    let project_trust = matches!(
+        &req.subject,
+        Some(PermissionSubject::ProjectSkillTrust { .. })
+    );
     let over_budget = matches!(
         &req.subject,
         Some(PermissionSubject::SkillOverBudget { .. })
@@ -3622,6 +3720,14 @@ fn refusal_line(req: &PermissionRequest, reason: RefusalReason) -> String {
         _ => format!("`{}`", req.tool_name),
     };
     match reason {
+        RefusalReason::NoTerminal if project_trust => format!(
+            "{subject} could not be asked here: this session's input is not a terminal, so \
+             nobody could answer — send `/permissions full` ahead of it, or set \
+             `[permissions] default_level`, to allow it unattended. That does not cover a \
+             repository whose skill shadows one of your own; `[skills] trusted_project_roots` \
+             does, and the turn goes ahead where it already names this repository — acknowledge \
+             it once at a terminal and answer `p` to add it."
+        ),
         RefusalReason::NoTerminal if over_budget => format!(
             "{subject} was refused without asking: this session's input is not a terminal, so \
              nobody could be asked. This question has no unattended answer — `/permissions full` \
@@ -3647,6 +3753,13 @@ fn refusal_line(req: &PermissionRequest, reason: RefusalReason) -> String {
 /// is indistinguishable from the plain session grant by kind alone. Picking it
 /// by kind would let [`allow_outcome`] reach it by accident — a user answering
 /// "allow for this session" would have edited their config.
+///
+/// **Two questions carry it since REQ-589 D-13** — the web tier and the
+/// project-skill acknowledgment — and this function is right to be indifferent
+/// to which. The id means *the durable option on this prompt*; which key it
+/// writes is decided by the daemon, from the question it asked, and is named in
+/// the label the user reads. A client that tried to tell them apart here would
+/// be a second place deciding what an answer means.
 fn permanent_option(options: &[PermissionOption]) -> Option<String> {
     options
         .iter()
@@ -8262,7 +8375,17 @@ mod skill_tests {
     /// BR-4's acknowledgment subject, as the daemon mints one: the root
     /// home-relative, the named set in registry order with the shadowing entry
     /// marked, and the tail as a count.
+    ///
+    /// **Model-invoked**, which is REQ-587's only caller and therefore the
+    /// prompt every existing test in this module pins. `trust_subject_from`
+    /// carries the other one.
     fn trust_subject(more: u32) -> PermissionSubject {
+        trust_subject_from(more, events::InvokedBy::Model)
+    }
+
+    /// [`trust_subject`], with who asked (REQ-589 TASK-261) — the same pairing
+    /// [`skill_subject`] and [`skill_subject_from`] already have.
+    fn trust_subject_from(more: u32, invoked_by: events::InvokedBy) -> PermissionSubject {
         PermissionSubject::ProjectSkillTrust {
             root: "~/dev/teton".to_owned(),
             skills: vec![
@@ -8276,17 +8399,49 @@ mod skill_tests {
                 },
             ],
             more,
+            invoked_by,
         }
     }
 
     /// The acknowledgment as the daemon raises it: under
-    /// `project_skill_trust:<root>`, never a skill's key and never a tool's
-    /// name, and with no `description` — the subject carries the facts.
+    /// `project_skill_trust:<invoker>:<root>`, never a skill's key and never a
+    /// tool's name, and with no `description` — the subject carries the facts.
+    ///
+    /// **It carries the durable option** (REQ-591 D-9). The base fixture builds
+    /// the three ordinary ids; this is the one prompt in the product that also
+    /// offers `enable_permanent` — `project_trust_options` puts it on the
+    /// acknowledgment and nowhere else, so putting it on the shared skill
+    /// fixture instead would be a fixture that lies about every other prompt.
+    ///
+    /// The label is the daemon's, wording for wording, and that is the point: it
+    /// is the only string on this prompt that could carry an absolute path, and
+    /// without it
+    /// `the_acknowledgment_names_the_root_marks_shadowing_and_counts_the_tail`'s
+    /// "no `/Users/` anywhere" assertion had nothing to bite on.
     fn trust_permission_request(subject: Option<PermissionSubject>) -> PermissionRequest {
+        let base = skill_permission_request(subject);
+        let mut options = base.options;
+        // The fifth slot, between the allows and the rejects, exactly where
+        // `options_around` puts it.
+        options.insert(
+            2,
+            PermissionOption {
+                option_id: teton_protocol::events::OPTION_ID_ENABLE_PERMANENT.to_owned(),
+                label: "Trust this repository permanently (adds `~/dev/teton` to \
+                        `[skills] trusted_project_roots`, by its full path — a session with \
+                        nobody at the terminal may then run its skills without asking)"
+                    .to_owned(),
+                kind: PermissionOptionKind::AllowAlways,
+            },
+        );
         PermissionRequest {
             request_id: RequestId::from("r-trust"),
-            tool_name: teton_protocol::methods::project_skill_trust_key("~/dev/teton"),
-            ..skill_permission_request(subject)
+            tool_name: teton_protocol::methods::project_skill_trust_key(
+                events::InvokedBy::User,
+                "~/dev/teton",
+            ),
+            options,
+            ..base
         }
     }
 
@@ -8528,6 +8683,11 @@ mod skill_tests {
     /// One `Surface::line` per entry, for the command list's mechanical reason:
     /// `line` defuses, and defusing destroys newlines, so a joined list would
     /// arrive as one run-on line.
+    ///
+    /// **This is now the model path's byte pin (REQ-589 TASK-261).** The
+    /// invoker clause split the first line in two, and REQ-587's caller keeps
+    /// its four words unchanged — that sentence was never false of the model.
+    /// The sibling below pins the typed one.
     #[test]
     fn the_acknowledgment_names_the_root_marks_shadowing_and_counts_the_tail() {
         let req = trust_permission_request(Some(trust_subject(5)));
@@ -8561,9 +8721,240 @@ mod skill_tests {
         );
         // The root is home-relative wherever it is rendered: BR-1's entity
         // table, and the reason the daemon sends a display and not a path.
+        //
+        // **Everything this prompt puts in front of a human**: the rendered
+        // block *and* the question line, which carries the request's key and
+        // therefore the root a second time.
+        //
+        // # What this covers, stated exactly, because it was vacuous before
+        //
+        // REQ-591's verify pass found this assertion inspecting `lines` alone
+        // while the fixture built no `enable_permanent` option — so the one
+        // string on this prompt that names a config write could not appear, and
+        // the assertion could not fail. The fixture now carries that option,
+        // which is faithful to what the daemon sends.
+        //
+        // It still does not make this a check on the **label**, and the reason
+        // is worth writing down rather than rediscovering: this client never
+        // renders the acknowledgment's option labels. Labels are drawn as
+        // numbered rows by `resolve_over_budget_offer` and by nothing else; the
+        // acknowledgment goes through the compact key prompt
+        // (`[y]es / … / [p]ermanently / …`), so its labels ride the wire for
+        // other ACP clients and are never shown here. The assertion below
+        // therefore pins what it can: that **this client** introduces no
+        // absolute path into anything it draws, given home-relative input.
+        //
+        // The label's own privacy is the daemon's to guarantee and is pinned
+        // there, twice — `permissions::tests::the_label_promises_exactly_the_row_the_write_appends`
+        // and `the_typed_prompt_names_the_write_and_the_models_prompt_has_none`
+        // both assert the label names the home-relative root and never the
+        // absolute row.
         assert!(
-            !lines.iter().any(|line| line.contains("/Users/")),
-            "a username reached the prompt: {lines:?}"
+            req.options.iter().any(
+                |option| option.option_id == teton_protocol::events::OPTION_ID_ENABLE_PERMANENT
+            ),
+            "the fixture stopped offering the durable option, which is the only \
+             one whose label names a config write"
+        );
+        assert!(
+            !prompter
+                .questions
+                .iter()
+                .any(|question| question.contains("trusted_project_roots")),
+            "this client has started rendering the acknowledgment's option \
+             labels. That is not a regression — but the sweep below now has a \
+             daemon-authored string in range, so make it assert the label's \
+             privacy properly rather than leaving this comment stale: {:?}",
+            prompter.questions
+        );
+        for shown in lines
+            .iter()
+            .map(AsRef::<str>::as_ref)
+            .chain(prompter.questions.iter().map(AsRef::<str>::as_ref))
+        {
+            assert!(
+                !shown.contains("/Users/"),
+                "a username reached the prompt: {shown}"
+            );
+        }
+    }
+
+    /// **REQ-591 BR-11 / AC-14: this client's half of the corrected contract.**
+    ///
+    /// `PermissionSubject::ProjectSkillTrust::root` is a **directory name**, so
+    /// its bytes belong to whoever created the directory. The daemon does not
+    /// bound or strip it — truncating would make two repositories share one
+    /// grant key, and stripping would make the prompt name a repository the
+    /// answer is not remembered under — so the wire contract says the client
+    /// defuses at render, exactly as it already says of `skills[].name`. This is
+    /// the assertion that the contract's instruction is one Teton's own client
+    /// obeys; `events::tests::the_trust_subjects_root_reaches_a_client_exactly_as_the_directory_spelled_it`
+    /// is the other half, and says the bytes really do arrive untouched.
+    ///
+    /// The attack has **two axes**, and the root below carries both.
+    ///
+    /// The first is REQ-563's, moved one field over: `\x1b[2K\x1b[1A` erases the
+    /// row above and puts the cursor on it, so a repository whose directory is
+    /// named with those bytes could overwrite the very line asking whether to
+    /// trust it — the user reads a question about `~/dev/safe` and answers one
+    /// about somebody else's tree.
+    ///
+    /// The second is the newline, and it is quieter. [`Surface::line`] owns
+    /// exactly one row, so a `\n` inside the root is a row the *directory's
+    /// author* claimed — and the row they get is rendered inside the
+    /// acknowledgment block, immediately under the lead, in the position this
+    /// prompt uses for the skills being acknowledged. A directory named
+    /// `safe\n?     deploy (project — shadows your user skill)` therefore
+    /// fabricates a member of the set the user is being asked to trust. No
+    /// escape sequence is needed and nothing is overwritten; the prompt simply
+    /// grows a line the daemon never sent.
+    ///
+    /// **A [`PlainSurface`] and not [`RecordingSurface`]**, and that is the
+    /// whole design of this test. `RecordingSurface` stores the text it is
+    /// handed; the defusing lives in `PlainSurface::line`, on the way to the
+    /// bytes a terminal actually reads. Every other test in this module asserts
+    /// what was composed, which is the right altitude for a sentence and the
+    /// wrong one for a guard.
+    ///
+    /// # Why the newline is asserted by *position* and not by a row count
+    ///
+    /// The obvious assertion — "exactly one row carries `this repository's
+    /// skills`" — is **vacuous**, and was until REQ-591's verify pass. The
+    /// needle sits in the lead, which is the *first* half of any split, so the
+    /// count is 1 whether the newline survived or not. What can see a split is
+    /// where the material *after* it landed: `line` owning one row means the
+    /// whole root, all three segments of it, is on the lead's own row.
+    ///
+    /// `crate::render::tests::a_repaint_cannot_be_made_to_span_more_than_its_row`
+    /// is not a substitute — it pins `repaint_row_above`, a different verb with
+    /// a different (and sharper) failure, and says nothing about `line`.
+    ///
+    /// **Mutations, both run:** drop `defused` from `PlainSurface::line` and
+    /// this reddens on the ESC; change it to `defused_multiline` — keeping every
+    /// other guard — and it reddens on the fabricated row.
+    #[test]
+    fn a_repository_named_with_control_bytes_cannot_redraw_the_prompt() {
+        use crate::render::PlainSurface;
+
+        // The row the newline buys: shaped exactly like the entries this very
+        // prompt lists below the lead, down to the indent and the shadowing
+        // parenthetical, so a user scanning the block reads it as one of the
+        // skills they are being asked to trust.
+        const FABRICATED_ROW: &str = "?     deploy (project — shadows your user skill)";
+        // Valid UTF-8, and every byte legal in a POSIX path component — this is
+        // a directory somebody can create, not a crafted wire payload. Three
+        // segments: the name the user expects, the row the `\n` fabricates, and
+        // the tree the escape sequence would repaint the question to name.
+        const HOSTILE_ROOT: &str = concat!(
+            "~/dev/safe\n",
+            "?     deploy (project — shadows your user skill)",
+            "\x1b[2K\x1b[1A~/dev/evil",
+        );
+
+        let subject = PermissionSubject::ProjectSkillTrust {
+            root: HOSTILE_ROOT.to_owned(),
+            skills: vec![events::ProjectSkillTrustEntry {
+                name: "deploy".to_owned(),
+                shadows_user_skill: false,
+            }],
+            more: 0,
+            invoked_by: events::InvokedBy::User,
+        };
+        let req = trust_permission_request(Some(subject));
+
+        let mut bytes: Vec<u8> = Vec::new();
+        {
+            let mut surface = PlainSurface::new(&mut bytes);
+            let mut prompter = ScriptedPrompter::new(&["y"]);
+            let mut grants = SessionGrants::default();
+            let _ = resolve_permission(&req, &mut surface, &mut prompter, &mut grants, true);
+        }
+        let written = String::from_utf8(bytes).expect("the surface writes UTF-8");
+
+        assert!(
+            !written.contains('\x1b'),
+            "a directory name put an escape sequence on the terminal: it can \
+             erase and rewrite the row that asked whether to trust that very \
+             repository — {written:?}"
+        );
+        // The newline goes too, and this is the axis a row *count* cannot see:
+        // the lead is the first half of any split, so counting rows that carry
+        // it answers 1 either way. The whole root — all three segments — must be
+        // on the lead's own row, because that is what "`line` owns exactly one
+        // row" means when the text is somebody else's directory name.
+        let acknowledgment = written
+            .lines()
+            .find(|line| line.contains("this repository's skills"))
+            .unwrap_or_else(|| panic!("no acknowledgment row at all: {written:?}"));
+        assert!(
+            acknowledgment.contains(FABRICATED_ROW),
+            "a directory name fabricated a row inside the acknowledgment block: \
+             the user reads `{FABRICATED_ROW}` in the position this prompt lists \
+             the skills being trusted, and no such skill was sent — {written:?}"
+        );
+        assert!(
+            acknowledgment.contains("~/dev/evil"),
+            "the root's tail landed on a row of its own: everything after the \
+             lead's `{{root}}` slot belongs to the directory's author, so all of \
+             it must stay on the one row `line` claimed — {written:?}"
+        );
+        // Neutralized, not deleted: the characters are still visible as text, so
+        // a user looking at an odd-looking root sees that it really is odd.
+        assert!(
+            written.contains("~/dev/safe") && written.contains("~/dev/evil"),
+            "defusing must leave the name legible rather than silently drop \
+             half of it: {written:?}"
+        );
+    }
+
+    /// **The typed door names the person who typed (REQ-589 TASK-261).**
+    ///
+    /// The test above pins the model's sentence byte for byte; this one pins the
+    /// user's, and the pair is the whole fix. A user who types `/analyze` is
+    /// being asked whether to trust a repository, and the prompt that asks must
+    /// not open by telling them a model wanted this — no model did.
+    ///
+    /// Everything below the first line is the *same* material in the same order,
+    /// because the question is the same question: only the subject of the
+    /// sentence moved.
+    ///
+    /// **Mutation:** pass `InvokedBy::Model` from `accept_invocation`, or
+    /// collapse [`InvokerVoice::Lead`]'s two arms onto one string, and this
+    /// reddens.
+    #[test]
+    fn a_typed_acknowledgment_says_the_user_asked_and_never_names_the_model() {
+        let req = trust_permission_request(Some(trust_subject_from(
+            5,
+            teton_protocol::events::InvokedBy::User,
+        )));
+        let mut surface = RecordingSurface::new();
+        let mut prompter = ScriptedPrompter::new(&["y"]);
+        let mut grants = SessionGrants::default();
+
+        resolve_permission(&req, &mut surface, &mut prompter, &mut grants, true);
+
+        let lines = surface.lines_of(LineKind::Prompt);
+        let at = lines
+            .iter()
+            .position(|line| line.contains("this repository's skills"))
+            .unwrap_or_else(|| panic!("no acknowledgment block: {lines:?}"));
+        assert_eq!(
+            &lines[at..at + 4],
+            [
+                "  you asked to run this repository's skills as instructions: ~/dev/teton",
+                "    validate (project — shadows your user skill)",
+                "    canary",
+                "    +5 more",
+            ],
+            "{lines:?}"
+        );
+        // The falsifier, stated as its own claim: the defect was not a missing
+        // clause, it was a **false** one, and a fix that added "you asked" while
+        // leaving "the model wants to" standing would satisfy the assertion
+        // above.
+        assert!(
+            !lines.iter().any(|line| line.contains("the model")),
+            "no model asked for anything on this path: {lines:?}"
         );
     }
 
@@ -9730,7 +10121,8 @@ mod skill_tests {
         let user = skill_permission_key(SkillSource::User, "status");
         // REQ-587 BR-4 / ASSUME-017: the acknowledgment is the second family a
         // root move invalidates, and the one whose survival costs most.
-        let acknowledgment = project_skill_trust_key("~/dev/before");
+        let acknowledgment =
+            project_skill_trust_key(teton_protocol::events::InvokedBy::User, "~/dev/before");
         state.grants.allow_always(&project);
         state.grants.allow_always(&user);
         state.grants.allow_always("shell");

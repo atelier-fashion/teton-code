@@ -1298,12 +1298,48 @@ pub enum PermissionSubject {
     /// pass while this held or failed.
     ProjectSkillTrust {
         /// The session root the acknowledgment is scoped to, **home-relative**
-        /// (`session_root::display_for`) and bounded — never an absolute path
-        /// carrying a username into a transcript (REQ-585 BR-1's entity table).
+        /// — never an absolute path carrying a username into a transcript
+        /// (REQ-585 BR-1's entity table).
         ///
         /// It is the same spelling [`crate::methods::project_skill_trust_key`]
         /// builds the grant key from, so what the user sees and what the answer
         /// is remembered under cannot name two different repositories.
+        ///
+        /// # Repository-authored: unbounded, not control-stripped, and the
+        /// client defuses (REQ-591 BR-11)
+        ///
+        /// **This paragraph is a correction.** The contract used to say this
+        /// field was `session_root::display_for`-minted and *"bounded"*, and
+        /// both halves were false. The minter is the daemon's
+        /// `tools::skill::trust_root_name` — `display_for` was replaced because
+        /// it renders every non-UTF-8 byte as `U+FFFD`, which is not injective
+        /// and so let two repositories mint one grant key — and nothing anywhere
+        /// truncates or filters the result. A client that read the old sentence
+        /// at face value would render this string raw, and a **directory name**
+        /// is repository-authored input: a newline or an ESC in it is valid
+        /// UTF-8 and arrives here exactly as it sits on disk.
+        ///
+        /// The daemon does not bound or strip it, and that is a decision rather
+        /// than an omission:
+        ///
+        /// - **Truncating would re-open the collision the minter closed.** This
+        ///   string is the grant key's source, and
+        ///   [`crate::methods::project_skill_trust_key`]'s own doc refuses
+        ///   truncation for exactly that reason — two roots cut to one prefix
+        ///   are one key, so an acknowledgment given about one repository would
+        ///   answer for another.
+        /// - **Stripping is not injective either**, and it would break the
+        ///   guarantee two paragraphs up: the prompt would name one string and
+        ///   the answer be remembered under a different one, which is the
+        ///   LESSON-495 failure in miniature.
+        ///
+        /// So the contract is the one `skills` already carries, for the same
+        /// reason: **the client defuses at render, as it does every other
+        /// file-derived string.** Teton's own CLI writes it through
+        /// `render::Surface::line`, which neutralizes every control character —
+        /// so there is no exploit on the shipped client — but a third-party
+        /// client that writes this field straight to a terminal lets a directory
+        /// name move the cursor and rewrite the row that asked the question.
         root: String,
         /// The project's model-invocable skills, so the user is answering about
         /// a named set rather than a category (BR-4).
@@ -1322,6 +1358,49 @@ pub enum PermissionSubject {
         /// more" are different facts, and the user is being asked to trust the
         /// whole set.
         more: u32,
+        /// Who reached for a skill from this repository (REQ-589 BR-6, REQ-587
+        /// BR-5).
+        ///
+        /// **The same field [`Self::SkillDynamicContext`] carries, for the same
+        /// reason, and it arrived here late.** REQ-587 minted this question when
+        /// the model's tool was its only caller, so the prompt could name the
+        /// model outright. REQ-589 ADR-10 gave the typed `/name` path the same
+        /// door — and on that path no model asked for anything, which left a
+        /// security prompt making a false statement about who is acting, on the
+        /// one question whose whole job is letting a human decide whether to
+        /// trust a repository.
+        ///
+        /// The **answer** is invoker-independent and stays so: one key per root
+        /// (`crate::methods::project_skill_trust_key`), one answer per session,
+        /// and a grant the user gave at their own prompt still frees the model's
+        /// later reach. This field changes what the question *says*, never what
+        /// it is remembered under.
+        ///
+        /// Additive, and **absent means [`InvokedBy::Model`]** — the one
+        /// `invoked_by` on this wire whose default is not `User`, which is a
+        /// decision and not an oversight.
+        ///
+        /// Every other `invoked_by` defaults to `User` because a daemon
+        /// predating it could only ever have reported a typed invocation. Here
+        /// the history runs the other way: this subject was minted by REQ-587
+        /// with the model's tool as its *only* caller, so a request with no
+        /// `invoked_by` came from a daemon on which the model was the only thing
+        /// that could ask. Defaulting to `User` would make such a request render
+        /// as "you asked" when the model asked — the very false statement this
+        /// field exists to remove, told in the more dangerous direction, on a
+        /// prompt a human answers about trusting a repository. The default is
+        /// therefore the conservative reading, and the skip predicate follows
+        /// it: the model path writes no key, so its wire stays byte-identical to
+        /// REQ-587's and neither [`crate::PROTOCOL_VERSION`] nor
+        /// [`crate::PROTOCOL_VERSION_MIN`] moves.
+        ///
+        /// A client predating the field ignores the typed path's key and renders
+        /// REQ-587's model wording — this defect, unfixed, on that client only.
+        #[serde(
+            default = "InvokedBy::model",
+            skip_serializing_if = "InvokedBy::is_model"
+        )]
+        invoked_by: InvokedBy,
     },
     /// A skill expansion measured **larger than the route's context budget**,
     /// put to a human as a question instead of refused (REQ-589 BR-3,
@@ -3112,6 +3191,28 @@ impl InvokedBy {
     #[must_use]
     pub fn is_user(&self) -> bool {
         matches!(self, Self::User)
+    }
+
+    /// True for [`Self::Model`].
+    ///
+    /// The `skip_serializing_if` predicate for the one field whose default is
+    /// `Model` rather than `User` — see
+    /// [`PermissionSubject::ProjectSkillTrust::invoked_by`], where the history
+    /// that inverts it is written down.
+    #[must_use]
+    pub fn is_model(&self) -> bool {
+        matches!(self, Self::Model)
+    }
+
+    /// [`Self::Model`], as a `serde` `default` a field attribute can name.
+    ///
+    /// `#[derive(Default)]` picks [`Self::User`] and that stays right for every
+    /// other `invoked_by`; this exists so the one field that must default the
+    /// other way can say so at its own declaration instead of the enum
+    /// changing meaning underneath the rest.
+    #[must_use]
+    pub fn model() -> Self {
+        Self::Model
     }
 }
 
@@ -5333,6 +5434,7 @@ mod tests {
                 },
             ],
             more: 5,
+            invoked_by: InvokedBy::Model,
         };
         round_trip(&subject);
 
@@ -5375,7 +5477,7 @@ mod tests {
         }
         let wire = serde_json::to_string(&PermissionRequest {
             request_id: RequestId::from("r1"),
-            tool_name: crate::methods::project_skill_trust_key("~/dev/teton"),
+            tool_name: crate::methods::project_skill_trust_key(InvokedBy::User, "~/dev/teton"),
             description: None,
             options: vec![],
             subject: Some(subject),
@@ -5466,7 +5568,7 @@ mod tests {
         // And the key the refusal line renders is the acknowledgment's own —
         // the client prints it, and may not parse it (ADR-7). It names the
         // question, is nobody's skill key, and carries no username.
-        assert_eq!(old.tool_name, "project_skill_trust:~/dev/teton");
+        assert_eq!(old.tool_name, "project_skill_trust:user:~/dev/teton");
         assert!(!crate::methods::is_project_skill_key(&old.tool_name));
         assert!(crate::methods::is_project_acknowledgment_key(
             &old.tool_name
@@ -5479,6 +5581,141 @@ mod tests {
             "a subject variant is not a new method and moves no version — what it \
              costs an older client is a refusal, not a parse failure"
         );
+    }
+
+    /// REQ-589 TASK-261: `ProjectSkillTrust.invoked_by` is additive, and its
+    /// default runs **the opposite way** from every other `invoked_by`.
+    ///
+    /// The rule elsewhere is "absent means the user", because a daemon
+    /// predating the field could only report a typed invocation. This subject's
+    /// history is inverted: REQ-587 minted it with the model's tool as its only
+    /// caller, so a request with no `invoked_by` came from a daemon on which the
+    /// model was the only thing that could ask. Defaulting to `User` there would
+    /// print "you asked" over a question the model raised — the same false
+    /// attribution this field exists to remove, told in the direction that
+    /// misleads rather than alarms.
+    ///
+    /// Both halves are pinned, because each is a separate way to get it wrong:
+    /// the model path writes **no key** (so REQ-587's wire is byte-identical and
+    /// no version moves), and the typed path writes one.
+    #[test]
+    fn the_trust_subjects_invoker_defaults_to_the_model_that_was_once_its_only_caller() {
+        // A pre-TASK-261 request: the known kind, no `invoked_by`. Only the
+        // model could have sent it.
+        let wire = serde_json::json!({
+            "kind": "project_skill_trust",
+            "root": "~/dev/teton",
+            "skills": [],
+            "more": 0,
+        });
+        let back: PermissionSubject = serde_json::from_value(wire).unwrap();
+        match back {
+            PermissionSubject::ProjectSkillTrust { invoked_by, .. } => assert_eq!(
+                invoked_by,
+                InvokedBy::Model,
+                "an old daemon's acknowledgment is the model's, and must not be \
+                 rendered as the user's"
+            ),
+            other => panic!("the kind still resolves to its own variant: {other:?}"),
+        }
+
+        // The model path adds nothing to the wire, so REQ-587's bytes stand.
+        let model = serde_json::to_value(PermissionSubject::ProjectSkillTrust {
+            root: "~/dev/teton".to_owned(),
+            skills: vec![],
+            more: 0,
+            invoked_by: InvokedBy::Model,
+        })
+        .unwrap();
+        assert!(model.get("invoked_by").is_none(), "{model}");
+
+        // The typed path says so explicitly — the whole point of the field, and
+        // the half a `skip_serializing_if` pointed at the wrong arm would eat
+        // with nothing else going red.
+        let typed = serde_json::to_value(PermissionSubject::ProjectSkillTrust {
+            root: "~/dev/teton".to_owned(),
+            skills: vec![],
+            more: 0,
+            invoked_by: InvokedBy::User,
+        })
+        .unwrap();
+        assert_eq!(typed["invoked_by"], "user", "{typed}");
+        let round: PermissionSubject = serde_json::from_value(typed).unwrap();
+        assert!(matches!(
+            round,
+            PermissionSubject::ProjectSkillTrust {
+                invoked_by: InvokedBy::User,
+                ..
+            }
+        ));
+
+        assert_eq!(
+            crate::PROTOCOL_VERSION,
+            crate::ProtocolVersion(2),
+            "an additive field moves no version"
+        );
+    }
+
+    /// **REQ-591 BR-11 / AC-14: the corrected contract, asserted rather than
+    /// asserted-away.**
+    ///
+    /// `ProjectSkillTrust::root` used to be documented as
+    /// `display_for`-minted and *"bounded"*. It is neither, and the resolution
+    /// chosen was to **correct the contract** rather than bound the string —
+    /// truncating it would make two repositories share one grant key, which is
+    /// the collision the minter exists to prevent, and stripping it would make
+    /// the prompt name a repository the answer is not remembered under.
+    ///
+    /// A doc paragraph is not a guarantee, so this is the guarantee: the wire is
+    /// **transparent**. A directory name carrying a newline and an ESC survives
+    /// serialization and deserialization byte for byte, so a client implementor
+    /// reading the corrected contract can rely on it — the string they receive
+    /// is the repository's, and defusing it is theirs to do.
+    ///
+    /// This test is deliberately the mirror image of a bounding test. If a later
+    /// change *does* strip or truncate at this door, this goes red and its
+    /// failure message says which paragraph now has to change with it — which is
+    /// the only way a contract and a behaviour stay welded once they have come
+    /// apart once.
+    ///
+    /// The other half — that Teton's own client neutralizes it before it reaches
+    /// a terminal — is pinned where that rendering lives:
+    /// `session_ui::tests::a_repository_named_with_control_bytes_cannot_redraw_the_prompt`.
+    #[test]
+    fn the_trust_subjects_root_reaches_a_client_exactly_as_the_directory_spelled_it() {
+        // A directory name a repository can genuinely have: every byte here is
+        // valid UTF-8 and legal in a POSIX path component.
+        const HOSTILE: &str = "~/dev/repo\n\x1b[2K\x1b[1Aharmless";
+
+        let wire = serde_json::to_value(PermissionSubject::ProjectSkillTrust {
+            root: HOSTILE.to_owned(),
+            skills: vec![ProjectSkillTrustEntry {
+                name: "deploy".to_owned(),
+                shadows_user_skill: false,
+            }],
+            more: 0,
+            invoked_by: InvokedBy::User,
+        })
+        .unwrap();
+
+        assert_eq!(
+            wire["root"], HOSTILE,
+            "the daemon neither truncated nor stripped this root, which is what \
+             the field's own contract now says — if that changed on purpose, the \
+             `Repository-authored` paragraph on `ProjectSkillTrust::root` has to \
+             change with it, and the CLI's defusing leg is no longer the only \
+             thing standing between a directory name and the user's terminal"
+        );
+
+        let back: PermissionSubject = serde_json::from_value(wire).unwrap();
+        match back {
+            PermissionSubject::ProjectSkillTrust { root, .. } => assert_eq!(
+                root, HOSTILE,
+                "a client receives the repository's bytes, so the contract's \
+                 instruction to defuse at render is addressed to something real"
+            ),
+            other => panic!("the kind still resolves to its own variant: {other:?}"),
+        }
     }
 
     /// REQ-585 BR-12 / ADR-15: the echo line and `/verbose`'s detail are
@@ -7514,6 +7751,7 @@ mod tests {
             root: "~/dev/teton".to_owned(),
             skills: vec![],
             more: 0,
+            invoked_by: InvokedBy::Model,
         })
         .unwrap();
         let old: PreOfferSubject = serde_json::from_str(&known).unwrap();

@@ -89,8 +89,8 @@ pub use category::{
 pub use config::{
     is_absolute_http_url, is_cleartext_to_a_remote_host, is_recognized_auth_ref, url_host, Config,
     ConfigError, LegacyRoutingRule, LifetimeConfig, LoadError, LocalModelConfig, MigratedPhase,
-    PermissionsConfig, PrivacyConfig, RoutingMigration, ShutdownPolicyKind, SkippedRule, WebConfig,
-    WebTier,
+    PermissionsConfig, PrivacyConfig, RoutingMigration, ShutdownPolicyKind, SkillsConfig,
+    SkippedRule, WebConfig, WebTier,
 };
 // REQ-574: re-exported at the crate root for the same reason the config schema
 // is — the daemon's one config-write body and the `/web setup` preview both
