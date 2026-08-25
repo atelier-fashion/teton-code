@@ -3,11 +3,12 @@
   "branch": "feat/REQ-590-engine-derived-local-context-budget",
   "startedAt": "2026-08-25T00:00:00Z",
   "completed": false,
-  "currentPhase": 3,
+  "currentPhase": 4,
   "completedPhases": [
     0,
     1,
-    2
+    2,
+    3
   ],
   "integrationBranch": "main",
   "phaseHistory": [
@@ -31,6 +32,12 @@
       "adrs": 8,
       "tasks": 7,
       "note": "Both exploration agents assumed the LOCAL_BUDGET_* constants move; BR-5 keeps them. ADR-8 records the corrections. Also refuted: the claim that LOCAL_ENGINE_N_CTX is cfg(llama)-gated \u2014 redact.rs imports it ungated, which is what makes the whole approach viable."
+    },
+    {
+      "phase": 3,
+      "name": "Validate architecture & tasks",
+      "completedAt": "2026-08-25T00:00:00Z",
+      "result": "approved \u2014 7 tasks, valid DAG, max 2 deps, all 16 ACs covered, no conflicting in-flight work"
     }
   ],
   "repos": {
