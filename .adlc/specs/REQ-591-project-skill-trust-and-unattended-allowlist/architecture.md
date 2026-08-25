@@ -145,6 +145,48 @@ order from the engine's prompt list and reddens under the skip-the-trust-block m
 `cargo audit`; the ordering is **AC-1**. REQ-589's AC-9 was the ordering. Two numbering schemes,
 one conflated instruction — caught by the implementer, not by me.
 
+### ADR-10 — The third form: a kept test depending on a dropped feature's runtime behaviour
+
+TASK-266's first full run was 3,834 pass / **3 fail**, and the failures were *offer* tests
+added by *kept* commits:
+
+- `pty_e2e::park_at_the_over_budget_offer` (TASK-255, kept) typed `/analyze`, then waited on
+  `"permission requested: project_skill_trust:"` and answered `y`.
+- `skill_over_budget_offer::every_not_sent_path_reaches_no_provider_and_spends_nothing`
+  (TASK-253, kept) carried a fourth `"trust declined"` leg.
+
+Neither names a trust **symbol**. They name the gate in prose, in a string literal, and in
+fixture builders (`declining_trust()`, `Trust::Decline`). `git log -S` is blind to all three.
+
+**So the complete set of questions a carve-out must ask is:**
+
+1. Does A **carry** B's code? — answerable by `git log -S` (ADR-4)
+2. Does A **compile against** B's code? — not answerable by symbol search (ADR-8)
+3. Does A's **test depend on B's runtime behaviour**? — not answerable by symbol search, and
+   only a full suite run finds it (this ADR)
+
+Resolution: both legs removed, along with `Trust`, `declining_trust()`, `Spec.trust`,
+`Client.trust`. The fixture client's non-offer arm now **panics** rather than silently
+allowing — verified unreachable (13/13 offer tests green with the panic in place), so a future
+second question is *seen* rather than defaulted.
+
+### ADR-7 — CORRECTED: the prediction did not materialize
+
+ADR-7 predicted that dropping the trust commits would leave `PermissionGate` with
+`trusted_project_roots` and `project_trust_persistence` initialized-and-unread, requiring
+manual removal.
+
+**It did not.** Both were introduced *and* read only by `4be0c34`, so the drop took them.
+`PermissionGate`'s struct is byte-identical to `origin/main`. TASK-266 verified this against the
+struct rather than assuming the ADR was right — which is the only reason we know the ADR was
+wrong rather than the cleanup silently skipped.
+
+**Also corrected — my grep list was wrong.** The TASK-266 brief added `authorize_project_skill_trust`
+and `trust_root_name` to the residue sweep. Both return hits, and both are **pre-existing
+`origin/main` code** — main's own model-invoked trust door, exactly as ADR-2 describes. Removing
+them would have deleted a door that predates this REQ entirely. The task file's four-symbol grep
+was the correct one.
+
 ## What the split must preserve
 
 - **REQ-589 behaves identically** — this is the constraint that decided ADR-1, and AC-10.
