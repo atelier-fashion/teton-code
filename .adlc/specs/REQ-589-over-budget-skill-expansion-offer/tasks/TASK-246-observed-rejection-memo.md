@@ -22,7 +22,7 @@ BR-14.2 / ADR-9. Remember that this skill on this route was actually rejected at
 - [x] `mark()` returns the first-time transition so the caller can announce once
 - [x] The record does NOT suppress the next offer and does NOT pre-answer it — two negative assertions (AC-23, BR-10 boundary)
 - [x] The record lives in ONE store, daemon-side; the CLI does not memoize it (ASSUME-017)
-- [ ] A resident system-prompt fact states that consents are not persisted and observations are, so the model cannot claim it 'remembers' a consent (LESSON-543) — **deferred, see below**
+- [x] A resident system-prompt fact — DISCHARGED by TASK-258 (`31d7f15`) states that consents are not persisted and observations are, so the model cannot claim it 'remembers' a consent (LESSON-543) — **deferred, see below**
 
 ## Technical Notes
 

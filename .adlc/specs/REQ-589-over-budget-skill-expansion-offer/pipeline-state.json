@@ -3,12 +3,13 @@
   "branch": "feat/REQ-589-over-budget-skill-expansion-offer",
   "startedAt": "2026-08-24T19:38:00Z",
   "completed": false,
-  "currentPhase": 4,
+  "currentPhase": 5,
   "completedPhases": [
     0,
     1,
     2,
-    3
+    3,
+    4
   ],
   "integrationBranch": "main",
   "phaseHistory": [
@@ -39,6 +40,13 @@
         "TASK-253 dep count 4->3 (split to TASK-257)",
         "TASK-249/251 missing test requirements"
       ]
+    },
+    {
+      "phase": 4,
+      "name": "Implement",
+      "completedAt": "2026-08-24T23:30:00Z",
+      "tasks": 24,
+      "suite": "3854 passed / 0 failed"
     }
   ],
   "repos": {
@@ -58,7 +66,115 @@
   ],
   "phase4": {
     "currentTask": null,
-    "completedTasks": [],
-    "failedTasks": []
+    "completedTasks": [
+      "TASK-239",
+      "TASK-240",
+      "TASK-241",
+      "TASK-242",
+      "TASK-243",
+      "TASK-244",
+      "TASK-245",
+      "TASK-246",
+      "TASK-247",
+      "TASK-248",
+      "TASK-251",
+      "TASK-256",
+      "TASK-258",
+      "TASK-259",
+      "TASK-250",
+      "TASK-255",
+      "TASK-254",
+      "TASK-249",
+      "TASK-253",
+      "TASK-252",
+      "TASK-257",
+      "TASK-261",
+      "TASK-260",
+      "TASK-262"
+    ],
+    "failedTasks": [],
+    "waves": [
+      [
+        "TASK-239",
+        "TASK-240",
+        "TASK-241"
+      ],
+      [
+        "TASK-245",
+        "TASK-246"
+      ],
+      [
+        "TASK-242",
+        "TASK-244",
+        "TASK-256"
+      ],
+      [
+        "TASK-243",
+        "TASK-248",
+        "TASK-249",
+        "TASK-250",
+        "TASK-252"
+      ],
+      [
+        "TASK-247",
+        "TASK-251",
+        "TASK-254",
+        "TASK-257"
+      ],
+      [
+        "TASK-253",
+        "TASK-255"
+      ]
+    ],
+    "note": "waves are file-disjoint execution groups, NOT the logical DAG tiers: TASK-239 shares turn_loop.rs with 245 and runtime.rs with 246, so they cannot run concurrently in one worktree",
+    "workspaceRed": "expected until TASK-251 lands the CLI arms (ADR-2 forcing function)",
+    "commitProtocol": "git commit --only <paths> \u2014 shared-index race; `git add` swallowed a sibling's staged work once",
+    "openRisk": "RESOLVED \u2014 TASK-247 committed the protocol sentence field; workspace clean at 607cb74, 2354 passed",
+    "ownerDecisionPending": "TASK-248 item 1: `plan` level now REFUSES a typed project skill outright (previously ran with 'not run at plan' in command slots). Falls out of reusing the gate verbatim. Pinned by at_plan_a_typed_project_skill_is_refused_before_it_expands. Surfaced to owner; carry to Phase 5 verify.",
+    "ownerDecisions": [
+      "TASK-248 #1: `plan` now REFUSES a typed project skill outright (previously ran with 'not run at plan' in command slots).",
+      "TASK-248 #2 (found by TASK-251): a PIPED or UNATTENDED session can no longer run a typed project skill that SHADOWS a user skill \u2014 LevelAllow::DoesNotSettle means no level clears it, /permissions full included. Breaks cli_e2e::a_typed_invocation_names_the_swap_and_its_flags_and_counts_no_turn_budget. This is an automation-visible regression.",
+      "TASK-251: refusal_line's NoTerminal sentence named `/permissions full` as the remedy \u2014 false for this subject; corrected."
+    ],
+    "lessonCandidates": [
+      "Parallel agents in one worktree need a COMMIT PROTOCOL (git commit --only), not just a file-ownership contract \u2014 `git add` swallowed a sibling's staged work.",
+      "A permission decision has two stores (daemon + CLI) and a new consent question needs the grant guard in BOTH \u2014 daemon-side (TASK-244 consults_grants=false) and client-side (TASK-251 branch above allow_outcome/deny_outcome). Each agent could only see its own half; the deny direction produced a CONFIG WRITE from a grant that said deny.",
+      "A one-home sweep that searches for a qualified call (`budget::derive(`) is inert against unqualified imports and multi-line `use` statements \u2014 TASK-259's own first draft.",
+      "STRONGEST: mutate the guard BEFORE writing its test. TASK-256 found THREE mutations that survived a green 2,343-test suite \u2014 including one where an over-budget consent recorded under a skill grant's DIGEST spelling would be invisible to every assertion while fully visible to the door that consults grants, running that skill's commands for the rest of the session with no prompt on any screen. State an invariant about the MAP, not about a key.",
+      "A rule that lives only in an ADR paragraph is not a guard. ADR-8 named max_turns/EndTurn as deliberately un-suspended; widening the exception to cover them passed all 2,343 tests, because the accepted turn still succeeds and only the NEXT turn inherits an unbounded conversation.",
+      "A one-home sweep must be daemon-wide and NAME its unrelated collisions, not retreat from them \u2014 the narrowed sweep did not cover the very code this REQ added.",
+      "Parallel agents in ONE worktree share a cargo target dir: concurrent rebuilds can CORRUPT e2e test binaries, not merely produce confusing results (TASK-252 discarded a whole run for this). Combined with the shared-index race and the stale-daemon trap, one worktree needs three protocols, not one: commit with `git commit --only`, treat any mid-phase failure as suspect until re-run in isolation, and build the workspace before any targeted test."
+    ],
+    "openDecisions": [
+      "TASK-248 #1: `plan` now REFUSES a typed project skill outright (previously ran with 'not run at plan' in command slots).",
+      "TASK-248 #2 (found by TASK-251): a PIPED or UNATTENDED session can no longer run a typed project skill that SHADOWS a user skill \u2014 LevelAllow::DoesNotSettle means no level clears it, /permissions full included. Breaks cli_e2e::a_typed_invocation_names_the_swap_and_its_flags_and_counts_no_turn_budget. This is an automation-visible regression.",
+      "TASK-251: refusal_line's NoTerminal sentence named `/permissions full` as the remedy \u2014 false for this subject; corrected.",
+      "TASK-247: OverBudgetOffer::accepted_record (BR-5's third sentence) still has NO wire surface \u2014 it goes to stderr. SkillOverBudgetAccepted is typed and holds no prose. Decide at Phase 5 whether it deserves one.",
+      "TASK-247: Stage B now offers too (leaving it a hard refusal would refuse a turn the user just approved at Stage A). Guarded by a byte-identical carry so the same question is not asked twice.",
+      "TASK-255 finding 2 (minor): context pressure is drawn INSIDE the accepted turn \u2014 the terminal shows '1 older block dropped' right after the assistant reply, while ACCEPTED_TAIL says pressure resumes 'on the turn after this one'. Substantively right (it is the post-turn refit) but reads as part of this turn. Phase 5.",
+      "TASK-255 finding 3 (cosmetic): the offer block is ~20 display lines at 80 columns (sentence ~750 chars, remedy rows ~250 each). No spec violation \u2014 every byte is load-bearing under ADR-1/AC-7a \u2014 but ADR-14's 'lead with the remedy' is weaker when the reader must scroll to see all four rows."
+    ],
+    "securityDecisionForOwner": "ADR-18 item 3 ESCALATED: the remedy's durable config write passes NEITHER daemon-wide gate (refuse_daemon_wide / refuse_unattested_commitment). My mitigation (addressed consent) was refuted by TASK-254: consent on a connection is not evidence of that connection's ANCESTRY, and refuse_daemon_wide exists to stop the daemon's own children. BR-8 claims the remedy 'mints no new authority'; on the BR-10(a) leg it arguably does. Needs an owner decision at Phase 5: route through handle_config_set, thread &Daemon/&ConnState, or accept explicitly.",
+    "ownerDecisionBR14_1": "TASK-249 found BR-14.1's withdrawal is UNOBSERVABLE: run_prompt_turn's failure arm calls CarriedTurn::abandon, which writes nothing, so the session already returns to what it was and the expansion never enters it. AC-22 is true by construction; no test distinguishes withdraw_block from its deletion (LESSON-544). TASK-249 made the withdrawal COMMIT on that one path so it is observable \u2014 which NARROWS REQ-567 BR-6 (a failed turn now mutates the session). ORCHESTRATOR RECOMMENDATION: revert to abandon and STRIKE BR-14.1's mechanism \u2014 when code is unobservable because the guarantee already holds, delete the code rather than change semantics to justify it. BR-14.2's memo already delivers the residual value. This is REQ-567's invariant, so it needs the owner.",
+    "verifyFlags": [
+      "TASK-253: an UNANSWERABLE offer still publishes skill_over_budget_offered \u2014 the publish sits above the gate, so 'put but undeliverable' reads as offered. Defensible, encoded as two booleans, flagged rather than changed.",
+      "TASK-253: context_pressure.rs's three pre-REQ-589 refusal tests now pass for a DIFFERENT reason \u2014 its spawned client auto-answers allow_once, which falls through interpret_over_budget's `_ =>` arm. Verify they still assert what they were written to assert.",
+      "TASK-253: AC-9 is half-covered \u2014 the trust-DECLINED leg is proven; the positive half (a user skill reaching the budget question with no acknowledgment) is only incidental. Belongs with TASK-248.",
+      "TASK-253: AC-15's runbook is authored in the task file, NOT in docs/manual-verification.md. Transcribe verbatim at wrapup.",
+      "TASK-252 self-flagged: the pre-flight's system prompt is the daemon's DEFAULT harness prompt, not the live turn's (build_system_prompt needs a per-turn ToolRegistry/HarnessConfig the diagnostic never has). AC-17's one-classifier equality therefore holds for composer, estimator and stamped budget but NOT for the prompt component. The FLOOR caveat states it. Weakest claim in that change.",
+      "TASK-252: AC-19 is met on /doctor, not on the literal /verbose per-turn route line (that needs session_ui.rs + a new route_decided field).",
+      "TASK-257 + TASK-253 independently found the same thing: context_pressure.rs's spawned harness auto-answers allow_once, which interpret_over_budget DENIES by design (REQ-585 ADR-7: unrecognized ids deny). No test can select an over-budget option through it. My task-file fixture note was wrong twice.",
+      "TASK-257 fixture calibration: a declared window under ~13,000 derives a FLOORED pair, so the Window+ExceedsWindow cell needs 20,000 (8,000 yields 'bound: window \u2014 floored').",
+      "TASK-260: NEW DRIFT SURFACE the one-home guard cannot see. pty_e2e.rs now holds the literals 1000000 and 2026-08-19, but recipe_window_one_home.rs sweeps tetond/src only and crates/teton has no tetond dependency (its manifest forbids transport-side deps). A catalog re-verification will redden that pty test with no pointer to why. Decide: widen the sweep to test files, accept the drift, or assert the figure indirectly.",
+      "TASK-262 #4 \u2014 the model-invoked path IS affected, contrary to a literal reading of 'unchanged'. The list consultation is shared by BOTH doors (one key per root has meant one answer per root since REQ-587), so a root a human listed lets the MODEL door proceed unattended too. Only the OFFER TO WRITE stays typed-path-only. The agent chose the module invariant over the literal AC and pinned the prompt bytes. Worth the reviewer's eye.",
+      "TASK-262 #5 \u2014 a listed root STILL asks an attended session every time, unlike [web] permission_allow which stops asking. Deliberate, and the option label says so, but a real asymmetry with the precedent it mirrors.",
+      "TASK-262 #6 \u2014 skills.md could not document the new key: 4092 bytes against a 4096 ceiling, and paying for words means cutting needles other tests pin. Documented in README.md instead. That topic still does not mention D-10's acknowledgment at all."
+    ],
+    "mustResolveBeforeMerge": [
+      "FAILING TEST: cli_e2e::a_typed_invocation_names_the_swap_and_its_flags_and_counts_no_turn_budget. TASK-248's typed-path trust gate refuses a piped/unattended session ('there was no client to ask'), so a typed project skill that SHADOWS a user skill can no longer run unattended at ANY level, /permissions full included. Flagged by TASK-251, CONFIRMED by TASK-252 with its own changes stashed. This is an automation-visible regression and needs an owner decision: accept it and update the fixture, or give the gate an unattended path.",
+      "SECURITY: ADR-18 item 3 \u2014 the remedy's durable config write passes neither daemon-wide gate; my mitigation was refuted by TASK-254.",
+      "ARCHITECTURE: BR-14.1's withdrawal is unobservable under REQ-567's abandon protocol; TASK-249 made it commit, narrowing REQ-567 BR-6. Recommendation: strike the mechanism instead."
+    ],
+    "evidenceForBR14_1": "TASK-257 MEASURED it: THREE independent mechanisms already remove the expansion from the next turn \u2014 the failure arm abandons, REQ-586 BR-10's budget re-assertion drops the oversized block AT THE COMMIT, and ordinary pressure drops it again next turn. Its control test proves the expansion is gone even on the path where the turn SERVES and nothing is withdrawn. So the withdrawal's ONLY unique contribution is leaving the REFUSAL in the conversation \u2014 which is what TASK-249 had to narrow REQ-567 BR-6 to make observable. Phase 5 should weigh whether that record is worth the narrowing, given BR-14.2's memo already carries the same fact into the next offer."
   }
 }
