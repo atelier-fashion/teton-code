@@ -2,14 +2,18 @@
   "req": "REQ-591",
   "branch": "feat/REQ-591-project-skill-trust-and-unattended-allowlist",
   "startedAt": "2026-08-25T00:00:00Z",
-  "completed": false,
-  "currentPhase": 5,
+  "completed": true,
+  "currentPhase": 8,
   "completedPhases": [
     0,
     1,
     2,
     3,
-    4
+    4,
+    5,
+    6,
+    7,
+    8
   ],
   "integrationBranch": "main",
   "pipelineShape": "RE-AIMED AT THE CARVE-OUT. REQ-591's code already exists as 5 commits on feat/REQ-589 (b4e4b01, 4be0c34, b071da5, bda079d, 37a2e6c) interleaved among 33. Phase 2 architects the SPLIT, not the feature; Phase 4 executes it; Phase 5's reviewers check the split itself. Running the pipeline as written would have produced a SECOND implementation diverging from the one six agents already reviewed.",
@@ -38,7 +42,7 @@
       "completedAt": "2026-08-25T00:00:00Z",
       "result": "approved",
       "fixed": [
-        "13 of 15 spec ACs had no task — split into Group A (satisfied by tests that travel; now cited by name in TASK-264/266) and Group B (AC-11..AC-15, genuinely unbuilt; now TASK-268)"
+        "13 of 15 spec ACs had no task \u2014 split into Group A (satisfied by tests that travel; now cited by name in TASK-264/266) and Group B (AC-11..AC-15, genuinely unbuilt; now TASK-268)"
       ]
     },
     {
@@ -46,6 +50,14 @@
       "name": "Execute the carve-out",
       "completedAt": "2026-08-25T00:00:00Z",
       "result": "BOTH BRANCHES PUSHED. REQ-589 rewritten 9067374 -> e8a6e77 (force-with-lease held); REQ-591 new at 6a4b11a."
+    },
+    {
+      "phase": 8,
+      "name": "Wrapup",
+      "completedAt": "2026-08-25T21:00:00Z",
+      "mergeCommit": "674ac56",
+      "pr": "https://github.com/atelier-fashion/teton-code/pull/213",
+      "note": "Phase 5 ran a five-agent panel (security, correctness, adversarial, test, reflection). It found AC-8 had never been implemented and that four doc comments asserted properties the code lacked. Four further owner decisions (D-6..D-9) were taken and shipped before merge."
     }
   ],
   "repos": {
@@ -55,9 +67,9 @@
       "worktree": "/Users/brettluelling/Documents/GitHub/teton-code/.worktrees/REQ-591",
       "branch": "feat/REQ-591-project-skill-trust-and-unattended-allowlist",
       "touched": true,
-      "prUrl": null,
+      "prUrl": "https://github.com/atelier-fashion/teton-code/pull/213",
       "prNumber": null,
-      "merged": false
+      "merged": true
     }
   },
   "mergeOrder": [
@@ -93,12 +105,12 @@
     "gatedStep": "TASK-267 surfaces the force-push for owner confirmation and does NOT perform it (ADR-6)",
     "req591Branch": "8 commits ahead of origin/main; 3697 passed / 0 failed; both mutations bite; zero offer symbols",
     "correctionsFromTASK264": [
-      "37a2e6c does NOT travel — its tests assert a prompt log containing the BUDGET question, so on this branch they would pass while asserting nothing (ADR-9). AC-1's ordering leg is authored fresh in TASK-268.",
+      "37a2e6c does NOT travel \u2014 its tests assert a prompt log containing the BUDGET question, so on this branch they would pass while asserting nothing (ADR-9). AC-1's ordering leg is authored fresh in TASK-268.",
       "My TASK-264 brief conflated numbering: I wrote 'AC-9 ordering' but REQ-591's AC-9 is cargo audit; the ordering is AC-1. Caught by the implementer.",
-      "ADR-4 checked one direction only. No offer commit CARRIES trust code, but 4be0c34 COMPILES AGAINST offer code — Question and the addressed-route double from e8b1bfb had to travel, narrowed. Both branches will now define their own; a merge-time reconciliation under AC-10 (ADR-8)."
+      "ADR-4 checked one direction only. No offer commit CARRIES trust code, but 4be0c34 COMPILES AGAINST offer code \u2014 Question and the addressed-route double from e8b1bfb had to travel, narrowed. Both branches will now define their own; a merge-time reconciliation under AC-10 (ADR-8)."
     ]
   },
-  "openQuestions": "CLOSED. All five are decided and implemented: D-1 (OQ-1) gates both durable consent-answer writes on a presence check; D-2 (OQ-2) scopes a row to the typed door and gives the model's door no durable answer at all; D-3 (OQ-3) gives `plan` an `ask` row so a typed project skill expands unrun; D-4 mints the durable row absolutely; D-5 refuses at load a row the minter could never produce. Recorded here because leaving a stale `unanswered` is LESSON-521's shape — the next reader takes the pipeline state for the state.",
+  "openQuestions": "CLOSED. All five are decided and implemented: D-1 (OQ-1) gates both durable consent-answer writes on a presence check; D-2 (OQ-2) scopes a row to the typed door and gives the model's door no durable answer at all; D-3 (OQ-3) gives `plan` an `ask` row so a typed project skill expands unrun; D-4 mints the durable row absolutely; D-5 refuses at load a row the minter could never produce. Recorded here because leaving a stale `unanswered` is LESSON-521's shape \u2014 the next reader takes the pipeline state for the state.",
   "destructiveNote": "feat/REQ-589 is PUSHED (remote tip 9067374). Removing the 5 trust commits from it requires a FORCE-PUSH of a shared branch. Must be surfaced before it happens.",
   "recoveryPoint": {
     "tag": "req589-pre-carveout",

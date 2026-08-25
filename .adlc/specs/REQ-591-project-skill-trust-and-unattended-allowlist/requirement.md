@@ -1,7 +1,7 @@
 ---
 id: REQ-591
 title: "The project-skill trust gate and its unattended allowlist"
-status: approved
+status: complete
 deployable: true
 created: 2026-08-25
 updated: 2026-08-25
@@ -410,3 +410,37 @@ redundancy. OQ-1..OQ-5 are all decided (D-1..D-5) and implemented, as are D-6..D
 REQ-589's Phase-5 diff), so LESSON-495 and BUG-162 — the two load-bearing for OQ-1 and OQ-2 —
 were read directly and the remainder were used from their frontmatter and prior-session
 context. That is a partial fallback, stated rather than hidden.*
+
+## Verification record (added at wrapup, 2026-08-25)
+
+Merged as PR #213, `674ac56`. Suite at merge: 68 targets, 3,882 passed, 0 failed; clippy and
+`cargo fmt --check` clean; `cargo audit` clean (AC-9).
+
+**The BR/AC checkboxes above were not maintained during the pipeline and are deliberately left
+as they are.** Ticking them retroactively would assert per-rule verification that was not
+performed per-rule. What *was* performed is recorded here instead.
+
+A five-agent panel (security, correctness, adversarial, test, reflection) attacked the merged
+state. It could not construct a bypass of the security core: `durable_row_for`'s invoker scoping,
+the `NoTerminal`-only settlement rewrite, exact-match consultation, `read_under` as the trust
+identity, and the `durable_project_root().is_some()` precondition on the durable write all held.
+Filesystem confusions were exercised live on macOS — case, firmlinks, `..`, trailing separator —
+and every spelling converges on one row, failing closed in the only direction it can fail.
+
+**AC-8 / BR-10 had not been implemented at merge-time of the first pass**, and the two `cli_e2e`
+tests AC-8 named were asserting the contradiction rather than correcting it. Closed by D-6: the
+client's line now states what the client did rather than an outcome it cannot know, and the
+listed leg asserts the contradictory phrase is absent. See LESSON-560 for why this rule, and only
+this rule, was dropped.
+
+**Four decisions were taken after the panel reported** — D-6 (AC-8's discharge), D-7 (the session
+grant keyed by door as well as root), D-8 (`plan` reads a row and writes none), D-9 (the prompt
+shows the home-relative root). Each is mutation-verified, and D-6, D-7 and D-8 were independently
+re-mutated by a second reviewer rather than accepted on report.
+
+**Open, and not closed by this REQ:**
+
+- AC-11's dogfood runbook has not been run by hand. `docs/manual-verification.md` carries legs
+  for D-2 and D-3.
+- ASSUME-020 (a canonicalized path stays stable for a row's life) is unresolved.
+- The recovery tag `req589-pre-carveout` is retained until the combined state is dogfooded.

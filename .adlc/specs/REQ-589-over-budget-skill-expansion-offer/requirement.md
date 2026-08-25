@@ -1,10 +1,10 @@
 ---
 id: REQ-589
 title: "Offer to proceed when a skill expansion exceeds the route's context budget"
-status: approved
+status: complete
 deployable: true
 created: 2026-08-24
-updated: 2026-08-24
+updated: 2026-08-25
 component: "daemon/session"
 domain: "harness"
 stack: ["rust", "daemon"]
@@ -607,3 +607,24 @@ permission). REQ-591 OQ-1 is where the question is stated in full.
 - LESSON-501 (lesson, score 9): Carried state sheds its invariants silently
 - LESSON-544 (lesson, score 8): A hand-built wire value leaves its producer unguarded
 - LESSON-545 (lesson, score 8): Splitting one decision into two fields repoints its callers
+
+## Verification record (added at wrapup, 2026-08-25)
+
+Merged as PR #212, `8956a93`. CI 7/7 green.
+
+**Phases 5-8 were never recorded live.** Phase 5's review panel found that every serious finding
+traced to the project-skill trust gate rather than to the offer, and the owner split that work
+into REQ-591 mid-pipeline. The offer's own consent path was audited with no constructible bypass,
+its injection surface was clean, its refusal invariant intact, and `cargo audit` clean. This
+record is written retroactively.
+
+**The BR/AC checkboxes above were not maintained and are left as they are** — see the same note
+on REQ-591. Retroactive ticks would assert verification that was not performed per-rule.
+
+**Known open items carried out of this REQ:**
+
+- `accepted_record` has no wire surface.
+- BR-12 versus the commit's budget re-assertion was raised in review and not resolved.
+- REQ-590 (an engine-derived local context budget) remains filed and unspecced. It is the
+  proportionate fix for the one-word overrun that motivated this REQ; what shipped here is the
+  consent path, not a correction to the budget itself.
