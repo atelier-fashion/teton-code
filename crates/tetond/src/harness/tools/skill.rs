@@ -1686,21 +1686,25 @@ impl SkillTool {
                 &project_skill_trust_key(&root),
                 crate::harness::permissions::TrustRoot {
                     display: &root,
-                    // REQ-589 D-13: the canonical name a durable acknowledgment
-                    // is matched under. Passed on **this** caller too, and the
-                    // door's own doc says why the two uses of it differ: the
-                    // model may not be offered the write (a config write is
-                    // authorized at a moment a human chose, and this moment is
-                    // one the model chose), but a root a human already listed
-                    // answers for both callers — one key per root has meant one
-                    // answer per root since REQ-587, and a durable answer the
-                    // model's door could not read would make that two.
+                    // REQ-589 D-13's canonical name, **discarded on this
+                    // caller since REQ-591 D-2** — and passed anyway, on
+                    // purpose.
                     //
-                    // Minted from **this registry's** resolution, not from
-                    // `ctx.repo_root()`: the bodies this answer authorizes are
-                    // the ones in `self.registry`, and the name that authorizes
-                    // them has to be the name they were read under. See
-                    // `durable_trust_root_name`.
+                    // `durable_row_for` is the one place the invoker decides
+                    // what a row means, and for the model it decides `None`:
+                    // there is no row a human can write that lets an unattended
+                    // model reach a project skill. So nothing downstream reads
+                    // this value today.
+                    //
+                    // It stays because it is the *correct input* to that
+                    // decision, and the correctness is the hard-won part. It is
+                    // minted from **this registry's** resolution, not from
+                    // `ctx.repo_root()`: the bodies an answer here would
+                    // authorize are the ones in `self.registry`, and the name
+                    // that authorizes them has to be the name they were read
+                    // under (BR-4). Dropping it would leave a re-scoping
+                    // decision to re-derive an identity whose first derivation
+                    // was a TOCTOU. See `durable_trust_root_name`.
                     durable: durable_root.as_deref(),
                 },
                 &entries,
@@ -3938,29 +3942,43 @@ mod tests {
         }
     }
 
-    /// **The model's door spends the trust of the tree its bodies came from,
-    /// and of no other (REQ-589 D-13).**
+    /// **REQ-591 D-2 — no `[skills] trusted_project_roots` row reaches the
+    /// model's door, whichever tree it names.**
     ///
-    /// The typed path's leg for this lives in `runtime`, where a whole turn is
-    /// available; this is the other caller, which reaches the same door with the
-    /// same durable name and had the same defect. `SkillTool` holds the frozen
-    /// registry directly, so the identity it names comes off that registry —
-    /// never off `ToolContext::repo_root`, which is the path as the session
-    /// spells it and resolves to whatever the link points at *now*.
+    /// This test was written for REQ-589 D-13's other posture, where a row
+    /// answered for both doors and the only thing standing between an attacker
+    /// and a listed tree's trust was the identity the name was minted from. D-2
+    /// removes the premise: the model's door consults no row at all, so the
+    /// substitution below cannot succeed *and neither can its inverse*.
     ///
-    /// Two legs, one fixture, one substitution, and the row is the only thing
-    /// that differs:
+    /// **Three rows, and all three refuse.** Listing the tree the bodies were
+    /// actually read from is the leg that used to allow, and it is now the most
+    /// important one — it is the row a user really does write (so their CI's
+    /// `teton --skill deploy` runs), and D-2's whole content is that writing it
+    /// does not also hand an injected model standing permission over that tree.
     ///
-    /// - the **allow** leg lists the tree the bodies were actually read from, so
-    ///   the unattended widening is live here and a refusal below is a fact
-    ///   about identity rather than about a fixture that could never have run;
-    /// - the **refuse** leg lists the tree the link was re-pointed at, which is
-    ///   exactly what an attacker can arrange and exactly what must not work.
+    /// **The fourth leg is the non-vacuity**, and it is what keeps this from
+    /// being a test that a broken door always refuses: the *typed* door, on the
+    /// same gate, the same list and the same durable name, allows. So each
+    /// refusal above is a fact about **who asked**.
     ///
-    /// **Mutation:** name `ctx.repo_root()` again and the refuse leg allows —
-    /// an unlisted repository's text reaching the model with nobody asked.
+    /// The identity rule those refusals used to protect is not orphaned. It is
+    /// checked where it is a rule rather than a consequence —
+    /// [`the_durable_name_resolves_the_link_and_names_the_tree`] for the mint,
+    /// and `runtime`'s
+    /// `a_root_re_pointed_after_discovery_cannot_spend_the_listed_trees_trust`
+    /// for the door that still spends rows. The last assertion here keeps this
+    /// caller's *input* honest: `SkillTool` mints from
+    /// [`crate::skills::SkillRegistry::read_under`], the resolution the bodies
+    /// were read under, so a future decision to re-scope rows toward this door
+    /// starts from the right name rather than from `ctx.repo_root()`.
+    ///
+    /// **Mutation:** make `durable_row_for` answer `root` for
+    /// `InvokedBy::Model` and the first leg allows — an injected model
+    /// expanding repository text in a session nobody is watching, on a row that
+    /// was written about a name a human types.
     #[tokio::test]
-    async fn the_models_door_names_the_tree_its_registry_read_not_the_link() {
+    async fn the_models_door_spends_no_row_whichever_tree_it_names() {
         use crate::harness::permissions::AddressedPermissionDelivery;
         use teton_protocol::events::PermissionRequest;
         use teton_protocol::methods::{PermissionOutcome, RefusalReason};
@@ -3987,10 +4005,10 @@ mod tests {
         }
 
         let fx = Fixture::new();
-        // The tree the body is read from, and which nobody lists.
+        // The tree the body is read from.
         let unlisted = fx.root.join("unlisted");
         fx.skill(&unlisted, "gamma", "", "Gamma body.\n");
-        // The tree somebody did acknowledge.
+        // A second tree, which the link is re-pointed at after the read.
         let acknowledged = fx.root.join("acknowledged");
         std::fs::create_dir_all(&acknowledged).unwrap();
 
@@ -4003,7 +4021,8 @@ mod tests {
             "non-vacuity: the body really was read through the link"
         );
 
-        // The attack, after the read and before the call.
+        // The substitution, after the read and before the call. It changes
+        // nothing on this door now, which is the point.
         std::fs::remove_file(&link).unwrap();
         std::os::unix::fs::symlink(&acknowledged, &link).unwrap();
 
@@ -4012,23 +4031,9 @@ mod tests {
                 .expect("the fixture tree canonicalises")
         };
 
-        for (tree, listed, expect_error, what) in [
-            (
-                &unlisted,
-                row_for(&unlisted),
-                false,
-                "the tree the registry read is listed, so the widening runs it",
-            ),
-            (
-                &acknowledged,
-                row_for(&acknowledged),
-                true,
-                "the tree the link now points at is listed, and that is not an \
-                 answer about the bodies in this registry",
-            ),
-        ] {
+        let wired = |rows: Vec<String>| {
             let pending = Arc::new(PendingPermissions::new());
-            let gate = Arc::new(
+            Arc::new(
                 PermissionGate::new(
                     SessionId::from("skill-tool-repoint"),
                     PermissionConfig::with_default(PermissionPolicy::Ask),
@@ -4036,8 +4041,24 @@ mod tests {
                     Arc::clone(&pending),
                 )
                 .with_addressed_delivery(Arc::new(Unattended(Arc::clone(&pending))))
-                .with_trusted_project_roots(vec![listed]),
-            );
+                .with_trusted_project_roots(rows),
+            )
+        };
+
+        for (rows, what) in [
+            (
+                vec![row_for(&unlisted)],
+                "the tree the registry read is listed — the row a user really \
+                 writes, and the one D-2 refuses to let the model spend",
+            ),
+            (
+                vec![row_for(&acknowledged)],
+                "the tree the link now points at is listed, which is what an \
+                 attacker can arrange",
+            ),
+            (Vec::new(), "nothing is listed at all"),
+        ] {
+            let gate = wired(rows);
             let grants = crate::grants::GrantRegistry::default();
             let tool = SkillTool::new(
                 Arc::clone(&registry),
@@ -4046,28 +4067,56 @@ mod tests {
                 Handle::current(),
                 1_000,
             );
-
-            // The jail is the link, as every surface spells it — which is
-            // precisely the spelling that must not decide this.
+            // The jail is the link, as every surface spells it.
             let outcome = tool
                 .invoke(&ToolContext::new(link.clone()), &call(Some("gamma"), ""))
                 .await;
-            assert_eq!(
+            assert!(
                 outcome.is_error,
-                expect_error,
-                "{what} (listing {}): {}",
-                tree.display(),
+                "{what}: the model's door must refuse where nobody can be \
+                 asked: {}",
                 outcome.content
             );
-            if !expect_error {
-                assert!(
-                    outcome.content.contains("Gamma body."),
-                    "the allow leg must really expand the body, or it pairs \
-                     nothing: {}",
-                    outcome.content
-                );
-            }
         }
+
+        // The non-vacuity leg: the same list, the same durable name, the typed
+        // door. If this refused too, every assertion above would be about a
+        // fixture that can never proceed rather than about the invoker.
+        let gate = wired(vec![row_for(&unlisted)]);
+        let grants = crate::grants::GrantRegistry::default();
+        assert_eq!(
+            gate.authorize_project_skill_trust(
+                &project_skill_trust_key(&trust_root_name(&link, home().as_deref())),
+                crate::harness::permissions::TrustRoot {
+                    display: &trust_root_name(&link, home().as_deref()),
+                    durable: Some(&row_for(&unlisted)),
+                },
+                &project_trust_entries(&registry),
+                false,
+                InvokedBy::User,
+                grants.next_connection_id(),
+            )
+            .await,
+            crate::harness::permissions::SkillConsent::Allowed,
+            "the same row, the same tree, the same unattended client — the typed \
+             door spends it, which is what makes the three refusals above a \
+             statement about who asked"
+        );
+
+        // And this caller's input stays the resolution the bodies were read
+        // under, so re-scoping toward this door would start from the right name
+        // rather than from the link the session spells.
+        let read_under = registry
+            .read_under()
+            .expect("the fixture registry resolved its root");
+        assert_eq!(
+            durable_trust_root_name(read_under, home().as_deref()),
+            row_for(&unlisted),
+            "the mint follows the bodies, not the link: `{}` was re-pointed at \
+             `{}` after the read",
+            link.display(),
+            acknowledged.display()
+        );
     }
 
     /// The acknowledgment's entry list is the project's model-invocable set,

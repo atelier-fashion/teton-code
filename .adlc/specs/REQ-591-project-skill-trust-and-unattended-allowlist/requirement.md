@@ -257,6 +257,13 @@ operational question of whether `req589-pre-carveout` is pushed for redundancy.*
   threaded into a turn. **REQ-589's remedy write is the other half of this seam; the two
   REQs must not answer it differently.** (informed by BUG-162)
 
+- [x] **OQ-2 — ANSWERED by D-2, implemented.** No. `durable_row_for(invoked_by, root)` is
+  now the one derivation, feeding **both** what may be written and what may be read:
+  `InvokedBy::User` maps to the canonical root, `InvokedBy::Model` to `None`. The model's
+  door has no durable answer at all — not a different row, none — which is REQ-587's
+  posture restored rather than a new restriction. Adding an `InvokedBy` variant is a
+  compile error in the one place that decides both halves. Original question follows.
+
 - [ ] **OQ-2: Should one row authorize both doors?** Today `durable_root` is `None` for
   `InvokedBy::Model` — correctly withholding the *offer to write* — but the *consultation*
   passes the raw root unconditionally, so a row answers for both. A user who adds a row so

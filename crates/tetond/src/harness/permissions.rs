@@ -1165,10 +1165,14 @@ enum Question {
         ///   typed `/name`; this door's other caller exists because the model
         ///   reached for a skill, which is the "a file on disk would be
         ///   choosing when it gets a consent prompt" shape BR-6 is written
-        ///   against. The *answer* is still shared — one key per root, read by
-        ///   both callers — so a repository trusted at the typed prompt needs no
-        ///   second acknowledgment when the model reaches for it. Only the offer
-        ///   to write is withheld.
+        ///   against.
+        ///
+        /// The **session** answer is still shared — one key per root, read by
+        /// both callers — so a repository acknowledged at the typed prompt needs
+        /// no second acknowledgment when the model reaches for it in that
+        /// session. The **durable** answer is not, since REQ-591 D-2: neither
+        /// the write nor the consultation reaches this door, and
+        /// [`durable_row_for`] is the one place that decides so.
         durable_root: Option<String>,
     },
 }
@@ -1234,6 +1238,59 @@ impl Question {
             Self::ProjectTrust { durable_root } => durable_root.as_deref(),
             Self::Standard(_) | Self::OverBudget { .. } => None,
         }
+    }
+}
+
+/// The `[skills] trusted_project_roots` row that answers for `invoked_by` at
+/// `root` — the whole of REQ-591 D-2, and the only place the invoker dimension
+/// touches the durable answer.
+///
+/// ## Why a row is scoped to the door at all
+///
+/// A row is a standing answer consulted by sessions its author is not watching.
+/// Before D-2 it was keyed by root alone, so it answered for **both** doors —
+/// and the two doors are not the same question. A user adds a row so
+/// `teton --skill deploy` works in CI; with one key that same row grants an
+/// **injected model** standing permission to invoke any project skill in that
+/// tree, unattended, forever. Chained with `permission_level = "full"` that
+/// reaches unattended arbitrary shell from repository-authored text. On the
+/// typed door the row is strictly stronger than the pre-REQ-589 status quo; on
+/// the model door it is a widening relative to REQ-587, and nobody asked for it.
+///
+/// So the model's door has **no durable answer at all**. It is not "a different
+/// row" — there is no row a human can write that lets an unattended model reach
+/// a project skill, which is REQ-587's posture restored rather than a new
+/// restriction. `InvokedBy::Model` therefore maps to `None`, and `None` matches
+/// nothing.
+///
+/// ## Why a function, and why it feeds both uses
+///
+/// LESSON-495's prescription, applied literally: *"make the key a function of
+/// the level — `permission_key_for(tier)` — so adding a level is a compile
+/// error rather than a silent grant."* The bug it records is a grant whose key
+/// carried fewer dimensions than the question, and the shape it warns about is
+/// exactly the one this replaces — a condition at the *write* site and no
+/// condition at the *read* site, which is how the offer-to-write came to be
+/// withheld from the model while the consultation answered for it anyway.
+///
+/// One `match` on [`InvokedBy`], exhaustive, feeding both
+/// [`Question::ProjectTrust::durable_root`] (what may be written) and
+/// [`PermissionGate::acknowledged_unattended`] (what may be read). A third
+/// caller cannot be added without deciding here what its rows mean, and it
+/// cannot be given a read without a write or a write without a read.
+///
+/// The row's **spelling** is unchanged — the canonical root, verbatim. There is
+/// no second door with a durable answer, so a scoping prefix would distinguish
+/// nothing and would cost every existing row its meaning.
+fn durable_row_for(invoked_by: InvokedBy, root: Option<&str>) -> Option<String> {
+    match invoked_by {
+        // The typed path. A human typed `/name`, and a human wrote the row.
+        InvokedBy::User => root.map(str::to_owned),
+        // The model's `skill` tool. A durable config write is authorized at a
+        // moment, and the moment this door exists in is one a *file on disk*
+        // chose — the shape BR-2 is written against. There is no row for it to
+        // write and none for it to read.
+        InvokedBy::Model => None,
     }
 }
 
@@ -2164,9 +2221,17 @@ impl PermissionGate {
     /// and ADR-10's typed path made "the model wants to run this repository's
     /// skills as instructions" false for the human reading it. It changes what
     /// the question **says**. It does not touch what the answer is remembered
-    /// under: the key is still the root's alone, so the paragraph above holds
-    /// unchanged — one answer per root per session, shared by both callers.
-    /// ## The unattended path, and what it costs (REQ-589 D-13)
+    /// under: the **session** key is still the root's alone, so the paragraph
+    /// above holds unchanged — one answer per root per session, shared by both
+    /// callers.
+    ///
+    /// The **durable** row is a different key, and since REQ-591 D-2 it *is* a
+    /// function of the invoker — see [`durable_row_for`]. The two are not in
+    /// tension: a session grant is an answer a human gave in the session that
+    /// is about to send the bytes, and a row is a standing answer consulted by
+    /// sessions nobody is watching. LESSON-495's rule is about the second kind.
+    ///
+    /// ## The unattended path, and what it costs (REQ-589 D-13, REQ-591 D-2)
     ///
     /// **This is a security widening the product owner chose deliberately, and
     /// it should be read as one.** Everything above describes a question put to
@@ -2192,6 +2257,12 @@ impl PermissionGate {
     /// - **It never writes that list from the unattended path.** A root nobody
     ///   listed still refuses, forever, however many times it is invoked. The
     ///   list is consulted; a decision is never invented.
+    /// - **It is scoped to the door the row was written about** (REQ-591 D-2).
+    ///   A row answers for the typed path and for nothing else, so a user who
+    ///   lists a tree so their CI can run `teton --skill deploy` has not also
+    ///   handed an injected model standing permission over that tree. The
+    ///   model's door keeps REQ-587's posture exactly: it asks, and where
+    ///   nobody can be asked it refuses.
     /// - **It is consulted after the level, not before it.** The rewrite acts on
     ///   a settlement, so `plan`'s `deny` has already returned and no row here
     ///   can lift it — REQ-560 BR-5's ordering, preserved by construction.
@@ -2273,21 +2344,12 @@ impl PermissionGate {
         } else {
             LevelAllow::Settles
         };
-        // REQ-589 D-13. Two different uses of one name, and the asymmetry is
-        // deliberate — see `Question::ProjectTrust::durable_root`:
-        //
-        // - the **offer to write** is withheld from the model's caller, because
-        //   a durable config write is authorized at a moment and only the typed
-        //   path's moment was chosen by a human;
-        // - the **consultation** below takes the name whoever asked, because the
-        //   answer is one answer per root and splitting it would mean a
-        //   repository a human trusted was trusted for `/deploy` typed and not
-        //   for the model's `skill { name: "deploy" }`.
+        // REQ-591 D-2. **One** name, derived once, for both the offer to write
+        // and the consultation — see [`durable_row_for`] for why the derivation
+        // is a function of the invoker rather than a condition at each use.
+        let durable_row = durable_row_for(invoked_by, durable_root);
         let question = Question::ProjectTrust {
-            durable_root: match invoked_by {
-                InvokedBy::User => durable_root.map(str::to_owned),
-                InvokedBy::Model => None,
-            },
+            durable_root: durable_row.clone(),
         };
         // No `description`, for [`Self::authorize_skill`]'s reason: the subject
         // carries the root and the named set, and a sentence restating them
@@ -2295,7 +2357,7 @@ impl PermissionGate {
         let settled = self
             .settle_skill_consent(key, addressed, question, level_allow)
             .await;
-        self.acknowledged_unattended(settled, durable_root)
+        self.acknowledged_unattended(settled, durable_row.as_deref())
     }
 
     /// D-13's widening, and the whole of it: a `NoTerminal` refusal at a root a
@@ -5581,18 +5643,40 @@ mod tests {
         }
     }
 
-    /// **The widening itself: an unattended session at a listed root proceeds.**
+    /// **The widening itself, and its bound: an unattended session at a listed
+    /// root proceeds when the *user typed the name*, and never when the model
+    /// reached for it (REQ-591 D-2).**
     ///
-    /// The counterpart that makes the test above non-vacuous — take the
-    /// consultation out and this one goes red, so "it refused" is a fact about
-    /// the list rather than about a fixture that always refuses.
+    /// The first leg is the counterpart that makes
+    /// `an_unattended_session_at_a_root_nobody_listed_still_refuses`
+    /// non-vacuous — take the consultation out and it goes red, so "it refused"
+    /// is a fact about the list rather than about a fixture that always refuses.
     ///
-    /// No human answered anything here: the client refused *without asking*,
-    /// which is what `RefusesWithoutAsking` models and what the CLI does on a
-    /// pipe. The allow comes from the row, and the row came from a human, once,
-    /// out of band.
+    /// No human answered anything on either leg: the client refused *without
+    /// asking*, which is what `RefusesWithoutAsking` models and what the CLI
+    /// does on a pipe. The allow on the first leg comes from the row, and the
+    /// row came from a human, once, out of band.
+    ///
+    /// # The second leg reverses what REQ-589 D-13 shipped, deliberately
+    ///
+    /// It used to read the same answer out of the same list, on the argument
+    /// that one key per root means one answer per root. D-2 rejects the
+    /// premise: **the two doors are not one question.** A user who adds a row
+    /// so `teton --skill deploy` runs in CI is answering about a name *they*
+    /// type; with one key that same row hands an injected model standing
+    /// permission to invoke any project skill in the tree, unattended, forever
+    /// — and with `permission_level = "full"` that reaches unattended arbitrary
+    /// shell from repository-authored text.
+    ///
+    /// So the model's door keeps REQ-587's posture: it asks, and where nobody
+    /// can be asked it refuses. There is no row that changes that, which is why
+    /// [`durable_row_for`] answers `None` rather than a different string.
+    ///
+    /// **Mutation:** make `durable_row_for` return the root for `InvokedBy::Model`
+    /// and the second leg goes red — which is the same edit as deleting the
+    /// scoping, because there is only one place to delete it from.
     #[tokio::test]
-    async fn an_unattended_session_at_a_listed_root_runs_the_repositorys_skills() {
+    async fn a_row_answers_the_typed_door_and_never_the_models() {
         let (gate, route, _bus, _pending, conn) = wired(
             |bus, pending| {
                 PermissionGate::new(
@@ -5615,15 +5699,59 @@ mod tests {
             "a root a human durably acknowledged must not refuse in the posture \
              the acknowledgment was written for"
         );
-        // The model's caller reads the same answer out of the same list: one key
-        // per root has meant one answer per root since REQ-587, and a durable
-        // answer only the typed door could see would make that two.
         assert_eq!(
             ask_trust(&gate, Some(DURABLE), InvokedBy::Model, conn).await,
-            SkillConsent::Allowed,
-            "the acknowledgment is the repository's, not the caller's"
+            SkillConsent::Refused(RefusalReason::NoTerminal),
+            "the row is a standing answer about a name the user types; it must \
+             not also be a standing answer about what an injected model reaches \
+             for in a session nobody is watching"
         );
+        // Both legs were genuinely put — the second refusal is the *list*
+        // declining to answer, not a door that never asked. Without this the
+        // second assertion would pass on a gate that had stopped raising the
+        // question at all, which is a different (and also wrong) build.
         assert_eq!(route.delivered().len(), 2);
+    }
+
+    /// **D-2's derivation, in one place, for every dimension it is a function
+    /// of** (LESSON-495).
+    ///
+    /// The lesson's failure mode is a grant whose key carries fewer dimensions
+    /// than the question, and the specific shape it warns about is a condition
+    /// at the *write* site with none at the *read* site — which is precisely
+    /// what REQ-589 D-13 shipped: the offer to write was withheld from the model
+    /// and the consultation answered for it anyway.
+    ///
+    /// [`durable_row_for`] is the single derivation both sites now call, so the
+    /// two cannot disagree, and this test pins the mapping itself rather than
+    /// the behaviour at either door. Adding an [`InvokedBy`] variant is a
+    /// compile error here — in the one place that decides *both* what a row may
+    /// say and who may read it.
+    ///
+    /// The `None`-root legs are the fail-closed half: a root the filesystem will
+    /// not canonicalize mints nothing on either door, so there is no spelling a
+    /// row could take that would match it.
+    #[test]
+    fn the_durable_row_is_a_function_of_the_invoker() {
+        assert_eq!(
+            durable_row_for(InvokedBy::User, Some(DURABLE)),
+            Some(DURABLE.to_owned()),
+            "the typed door is the one D-13 bought automation for"
+        );
+        assert_eq!(
+            durable_row_for(InvokedBy::Model, Some(DURABLE)),
+            None,
+            "the model's door has no durable answer at all — not a different \
+             row, none"
+        );
+        for invoked_by in [InvokedBy::User, InvokedBy::Model] {
+            assert_eq!(
+                durable_row_for(invoked_by, None),
+                None,
+                "{invoked_by:?}: a root that mints no canonical name matches \
+                 nothing, whichever door asked"
+            );
+        }
     }
 
     /// **BR-6 / AC-12: a row is matched whole. Trusting `~/dev/repo` says
