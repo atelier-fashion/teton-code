@@ -1510,19 +1510,54 @@ fn remedy_clause_of(remedy: &Remedy) -> Option<RemedyClause> {
         }),
         // BR-9, and the half that is *not* here matters as much as the halves
         // that are: there is no `capabilities.max_context` write addressed to
-        // the local tier, because the local engine has no such field and
-        // `Remedy::BindTierRemote` carries no provider to address one to. The
-        // window declared is the window of the provider being bound *to*.
-        Remedy::BindTierRemote { tier } => Some(RemedyClause {
-            write: format!(
-                "bind the {} to a remote provider and declare that provider's \
-                 `capabilities.max_context` in the same change",
-                tier_phrase(*tier)
-            ),
+        // the local tier, because the local engine has no such field. The
+        // window declared is the window of the provider being bound *to*, and
+        // the name is that provider's — never the one the route is leaving,
+        // which is the id [`Remedy::for_bound`] drops on the way in.
+        Remedy::BindTierRemote { tier, target } => Some(RemedyClause {
+            write: rebind_write(*tier, target.as_ref()),
             consequence: RemedyConsequence::RebindingATier,
         }),
         Remedy::NotOffered => None,
     }
+}
+
+/// **BR-9's two halves, worded — with the target named where the daemon knows
+/// it** (REQ-589 BR-9, ADR-1, ADR-12).
+///
+/// # Why there are two arms and not one
+///
+/// ADR-1's rule is that a label names the *concrete* write, on the
+/// `enable_permanent` precedent whose own comment records an earlier version
+/// promising a write that was silently a no-op. "A remote provider" is that
+/// vagueness: it promises a binding without saying what to. So where a
+/// [`RebindTarget`] has been named — ADR-12's exactly-one case, the only shape
+/// in which this remedy is ever *applied* — both halves are concrete: the
+/// provider by id, and its window by figure.
+///
+/// The `None` arm is not a fallback dressed up as one. It is the honest wording
+/// for the two counts ADR-12 refuses to decide between: at **zero** configured
+/// remotes there is nothing to name, and at **two or more** naming one would be
+/// the silent routing choice this remedy must not make. Both withhold the
+/// remedy-bearing options entirely, so this text reaches a reader only as the
+/// sentence's account of what the durable fix *is* — which is BR-7c's posture,
+/// the same one a window remedy with no catalogued figure takes.
+///
+/// The tier is named in both, because BR-9's write is "bind *this* tier" and a
+/// label naming no tier would be vague in the other direction.
+fn rebind_write(tier: Option<Tier>, target: Option<&RebindTarget>) -> String {
+    let tier = tier_phrase(tier);
+    let Some(target) = target else {
+        return format!(
+            "bind the {tier} to a remote provider and declare that provider's \
+             `capabilities.max_context` in the same change"
+        );
+    };
+    format!(
+        "bind the {tier} to {} and {}",
+        provider_phrase(Some(&target.provider_id)),
+        target.window.write()
+    )
 }
 
 /// The tier a [`Remedy::BindTierRemote`] would rebind, named.
@@ -1672,6 +1707,102 @@ pub fn proposed_window(
     })
 }
 
+// -- Who BR-9's rebind would bind the tier to (REQ-589 BR-9, ADR-12) ---------
+
+/// The provider a [`Remedy::BindTierRemote`] would bind the tier **to**, and
+/// the window its half of the ordered pair declares (REQ-589 BR-9, ADR-1,
+/// ADR-12).
+///
+/// # This is the target, never the provider being left
+///
+/// [`Remedy::for_bound`] drops the route's own `provider_id` on this arm on
+/// purpose — a remedy addressed to the provider the route is *leaving* would be
+/// worse than a vague one, because it would be confidently wrong. This type is
+/// the other half of that decision: the slot exists, and the only thing that may
+/// fill it is a target the applying surface **chose**, by the same lookup that
+/// builds the writes. `OverBudgetOffer::name_rebind_target` is the one door in.
+///
+/// # Both facts arrive together, or neither does
+///
+/// BR-9's remedy is a pair — bind the tier *and* declare that provider's window
+/// — and either half alone leaves a provider with `max_context = 0`, which
+/// derives the same default pair under `bound: unknown window`. That is the
+/// circle the reported `/analyze` failure was already sitting in. So the id and
+/// the window are one value rather than two optional ones: there is no
+/// representable state in which the offer names a provider it has no window for,
+/// which is the state a reader could not tell from the fix.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RebindTarget {
+    /// The target provider's id. Sanitized on the way *out* by
+    /// [`provider_phrase`] rather than trusted on the way in — this text is
+    /// quoted at a user and turned into an option label, and the guarantee
+    /// belongs at the boundary rather than in an assumption about who built the
+    /// value.
+    pub provider_id: String,
+    /// The `capabilities.max_context` the rebind's first write declares for it,
+    /// and where that figure came from.
+    pub window: RebindWindow,
+}
+
+/// Where BR-9's declared window came from — the **one** home for that figure
+/// in a rebind clause (REQ-589 BR-7c, ADR-7).
+///
+/// A bare `u32` beside an optional provenance would be two ways to say one
+/// fact, and the two could disagree about which number is being written
+/// (LESSON-545). Here the figure is reachable only through the variant that
+/// says where it was read, so a clause cannot quote a value whose source it
+/// cannot state.
+///
+/// Both variants are the *same* write — `capabilities.max_context = N` on the
+/// target provider — and they differ only in what a user can check about `N`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RebindWindow {
+    /// The shipped vendor catalog's figure, looked up by **model** and carrying
+    /// ADR-7's provenance: whose published window it is, and the date it was
+    /// read off that vendor's documentation.
+    Catalogued(ProposedWindow),
+    /// The window the user already declared for this provider, re-stated.
+    ///
+    /// The write still happens — `RegisterProvider` replaces the capability
+    /// block wholesale, so the pair's first half has to carry it — and the label
+    /// says so rather than claiming a declaration the user already made. There
+    /// is no vendor and no date to quote here, and inventing either would be the
+    /// provenance claim ADR-7 exists to keep honest.
+    Declared(u32),
+}
+
+impl RebindWindow {
+    /// The figure, in provider tokens — read from the one place that holds it.
+    #[must_use]
+    pub const fn tokens(&self) -> u32 {
+        match self {
+            RebindWindow::Catalogued(proposal) => proposal.tokens,
+            RebindWindow::Declared(tokens) => *tokens,
+        }
+    }
+
+    /// The second half of BR-9's pair, worded as the **write** it is (ADR-1),
+    /// with whatever provenance is true of the figure trailing it (ADR-7).
+    ///
+    /// One method rather than a figure and a separate provenance accessor, for
+    /// [`RemedyClause`]'s reason: a caller that could take the value without the
+    /// date would eventually be one that did, and ADR-7's whole claim is that
+    /// the two travel together where a human can check them.
+    fn write(&self) -> String {
+        match self {
+            RebindWindow::Catalogued(proposal) => format!(
+                "declare its `capabilities.max_context = {}` in the same change ({}'s own \
+                 published window, read {})",
+                proposal.tokens, proposal.vendor, proposal.verified_on
+            ),
+            RebindWindow::Declared(tokens) => format!(
+                "re-state its already-declared `capabilities.max_context = {tokens}` in the \
+                 same change"
+            ),
+        }
+    }
+}
+
 // -- The over-budget offer (REQ-589 BR-3, BR-7) ------------------------------
 
 /// The provider tokens a measured pair may claim — **this module's own bound,
@@ -1812,9 +1943,19 @@ pub fn window_verdict(bound: BudgetBound, window: u32, measured: Fit) -> WindowV
 /// "present only for `DeclareWindow` / `RaiseCap` / `RaiseWindow`" and a `tier`
 /// "present only for `BindTierRemote`". Those two "present only for" rules are
 /// exactly what a Rust enum expresses without leaving the invalid combination
-/// constructible — a `RaiseCap` carrying a tier, or a `BindTierRemote` carrying
-/// a provider's `max_context`, cannot be built. [`Remedy::kind`] projects back
-/// to the wire's flat [`RemedyKind`] for the record the events carry.
+/// constructible — a `RaiseCap` carrying a tier cannot be built.
+/// [`Remedy::kind`] projects back to the wire's flat [`RemedyKind`] for the
+/// record the events carry.
+///
+/// **Correction (TASK-260).** This doc used to add "or a `BindTierRemote`
+/// carrying a provider's `max_context`" to that list, and it was the wrong
+/// exclusion to be proud of. BR-9's remedy is *precisely* a provider's window
+/// plus a tier binding, and refusing to carry the first half is what left the
+/// sentence and both option labels saying "a remote provider" where ADR-1
+/// requires the concrete write (ADR-18 item 2). What `BindTierRemote` must not
+/// carry is the window of the provider the route is **leaving** — which is a
+/// rule about *which* provider, not about the field — and
+/// [`RebindTarget`]'s doc records how that one is held instead.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Remedy {
     /// The provider declares no window, so the default pair bound the budget:
@@ -1888,6 +2029,20 @@ pub enum Remedy {
         /// spell wrong. `None` is defensive, for a caller that has no tier in
         /// hand.
         tier: Option<Tier>,
+        /// The provider the tier would be bound **to**, once the applying
+        /// surface has chosen one (BR-9, ADR-12).
+        ///
+        /// `None` from [`Remedy::for_bound`], always: a classifier keyed on the
+        /// bound has no business reading the provider list, and the one id it
+        /// *does* hold is the one the route is leaving — which is precisely the
+        /// name this remedy must never wear. The slot is filled afterwards, by
+        /// [`OverBudgetOffer::name_rebind_target`], from the same lookup that
+        /// builds the writes.
+        ///
+        /// It stays `None` for good on ADR-12's two withholding counts (no
+        /// configured remote, or more than one), and the clause then says the
+        /// fix without naming a provider it did not choose.
+        target: Option<RebindTarget>,
     },
     /// This bound has no durable fix (BR-7b).
     ///
@@ -1939,7 +2094,12 @@ impl Remedy {
                 proposal,
             },
             BudgetBound::UserCap => Remedy::RaiseCap { provider_id },
-            BudgetBound::LocalEngine => Remedy::BindTierRemote { tier },
+            // `provider_id` is dropped here and the target slot is left empty:
+            // the id in hand names the route being *left*, and BR-9's remedy is
+            // addressed to the one being bound **to**. Naming it is
+            // `OverBudgetOffer::name_rebind_target`'s job, after ADR-12's count
+            // has decided whether there is a name to give.
+            BudgetBound::LocalEngine => Remedy::BindTierRemote { tier, target: None },
             // BR-7b, and the one bound left remedy-less on purpose: raising the
             // redact clamp to fit a skill would trade a privacy guarantee for a
             // convenience, and a user asking to send a skill is not the same as
@@ -2082,6 +2242,40 @@ impl OverBudgetOffer {
             window_verdict: window_verdict(budget.bound, window, measured),
             remedy: Remedy::for_bound(budget.bound, budget.provider_id.as_deref(), proposal, tier),
             budget: budget.clone(),
+        }
+    }
+
+    /// **Name the provider BR-9's rebind would bind the tier to** (REQ-589
+    /// BR-9, ADR-1, ADR-12; ADR-18 item 2).
+    ///
+    /// The one door into [`Remedy::BindTierRemote`]'s target slot, and it takes
+    /// the choice rather than making it. [`Remedy::for_bound`] cannot fill that
+    /// slot: it is keyed on the bound alone, and the only provider id it holds
+    /// is the one the route is *leaving*. The choice belongs to the surface that
+    /// reads
+    /// [`Router::remote_providers`](crate::router::Router::remote_providers)
+    /// and builds the writes — so the name quoted at a user is, by
+    /// construction, the name that gets written.
+    ///
+    /// Call it with the target that surface chose, and call it before
+    /// [`OverBudgetOffer::question`] or [`OverBudgetOffer::option_labels`]:
+    /// both read the remedy as it stands, so a target named afterwards would
+    /// reach neither. Not calling it is a legitimate outcome — ADR-12's zero
+    /// and two-or-more counts have no name to give — and the clause then states
+    /// BR-9's fix without naming a provider nobody chose.
+    ///
+    /// Every other remedy is a no-op here rather than an error. `RaiseWindow`,
+    /// `DeclareWindow` and `RaiseCap` are already addressed to a provider — the
+    /// route's own, which is the right one for a field on that provider — and
+    /// `NotOffered` has nothing to address. The match is exhaustive so that a
+    /// sixth remedy has to answer this deliberately.
+    pub fn name_rebind_target(&mut self, target: RebindTarget) {
+        match &mut self.remedy {
+            Remedy::BindTierRemote { target: slot, .. } => *slot = Some(target),
+            Remedy::DeclareWindow { .. }
+            | Remedy::RaiseWindow { .. }
+            | Remedy::RaiseCap { .. }
+            | Remedy::NotOffered => {}
         }
     }
 
@@ -4464,11 +4658,26 @@ mod tests {
                     // `RaiseCap` has nowhere to put one — structurally.
                     assert_eq!(provider_id.as_deref(), Some("kimi"));
                 }
-                Remedy::BindTierRemote { tier } => {
+                Remedy::BindTierRemote { tier, target } => {
                     // BR-9's remedy is addressed to the tier being rebound, not
-                    // to the provider the route is leaving — and there is no
-                    // `provider_id` on this arm to address it wrongly with.
+                    // to the provider the route is leaving. `for_bound` was
+                    // handed `kimi` — the route's own id — and the target slot
+                    // is still empty, which is the whole guarantee TASK-260 had
+                    // to preserve while filling that slot from somewhere else.
                     assert_eq!(*tier, Some(Tier::Think));
+                    assert_eq!(
+                        *target, None,
+                        "the classifier must not name a target: the only provider it holds is \
+                         the one the route is leaving"
+                    );
+                    let rendered = remedy_clause_of(&remedy)
+                        .expect("BR-9 grants the local engine a remedy")
+                        .render();
+                    assert!(
+                        !rendered.contains("kimi"),
+                        "the id handed to `for_bound` reached a rebind clause it must never be \
+                         addressed to: {rendered}"
+                    );
                 }
                 Remedy::NotOffered => {}
             }
@@ -5149,6 +5358,125 @@ mod tests {
         }
         // The bound is still spoken in the head, unchanged.
         assert!(question.contains("bound: local engine"), "{question}");
+    }
+
+    /// **BR-9 / ADR-1 / ADR-18 item 2 — a named target makes both halves
+    /// concrete, and the cost survives the naming.**
+    ///
+    /// The defect TASK-260 closes: `Remedy::BindTierRemote` carried no provider,
+    /// so the sentence and both option labels said "a remote provider" where
+    /// ADR-1 requires the concrete write. `enable_permanent`'s comment is the
+    /// precedent — an earlier version promised a write that was silently a
+    /// no-op — and a binding with no named subject is that promise.
+    ///
+    /// Both window provenances are walked, because they are the two shapes
+    /// `rebind_window` can answer with and they say different true things: a
+    /// catalogued figure carries ADR-7's vendor and date, and a window the user
+    /// already declared carries neither and must not pretend to. The `verified_on`
+    /// assertion is TASK-254's, which could not be made on this remedy before —
+    /// the clause named neither the figure nor its date.
+    #[test]
+    fn a_named_rebind_target_makes_both_halves_concrete() {
+        let proposal = kimi_proposal();
+        let rows: &[(&str, RebindWindow, &[&str])] = &[
+            (
+                "catalogued",
+                RebindWindow::Catalogued(proposal.clone()),
+                &["Moonshot (Kimi)", "2026-08-19"],
+            ),
+            ("already declared", RebindWindow::Declared(200_000), &[]),
+        ];
+        for (name, window, provenance) in rows {
+            let mut offer = offer_over(
+                BudgetInputs::local(),
+                measured(5_000, 40_000, false),
+                Some(proposal.clone()),
+                Some(Tier::Think),
+            );
+            offer.name_rebind_target(RebindTarget {
+                provider_id: "frontier".to_owned(),
+                window: window.clone(),
+            });
+            let question = offer.question(SkillSource::User, PriorWindowRejection::None);
+            let labels = offer
+                .option_labels()
+                .remedy
+                .expect("BR-9 grants the local engine a remedy");
+            for (surface, text) in [
+                ("question", question.clone()),
+                ("proceed_and_remedy", labels.proceed_and_remedy),
+                ("remedy_only", labels.remedy_only),
+            ] {
+                assert!(
+                    text.contains("bind the `think` tier to `frontier`"),
+                    "{name}/{surface}: BR-9's first half, named: {text}"
+                );
+                assert!(
+                    text.contains(&format!("`capabilities.max_context = {}`", window.tokens())),
+                    "{name}/{surface}: BR-9's second half, with its figure: {text}"
+                );
+                for fact in *provenance {
+                    assert!(
+                        text.contains(fact),
+                        "{name}/{surface}: ADR-7's provenance rides the figure: {text}"
+                    );
+                }
+                // BR-9's cost is not something the naming may buy off. It
+                // rides `RemedyClause::render`, the only rendering there is.
+                assert!(
+                    text.contains("either half alone")
+                        && text.contains("at that provider's prices"),
+                    "{name}/{surface}: this remedy's blast radius exceeds the problem it \
+                     solves, and the user is told before answering: {text}"
+                );
+                // AC-8, unchanged by the naming: still exactly one
+                // `capabilities.max_context`, and it belongs to the provider
+                // being bound *to*.
+                assert_eq!(
+                    text.matches("capabilities.max_context").count(),
+                    1,
+                    "{name}/{surface}: {text}"
+                );
+            }
+            // Non-vacuity in the other direction: the vague wording is gone
+            // from the surfaces that now have a name to use.
+            assert!(
+                !question.contains("to a remote provider"),
+                "{name}: the vagueness ADR-1 forbids survived a named target: {question}"
+            );
+        }
+    }
+
+    /// **ADR-12 — with no target named, the clause states the fix and invents no
+    /// provider.**
+    ///
+    /// Zero configured remotes and two-or-more are the counts that withhold the
+    /// choice, and this is what their sentence says. It is BR-7c's posture, one
+    /// remedy over: the fix is still named, and what the daemon does not have it
+    /// does not pretend to. The negative assertion is the sharp one — an
+    /// unnamed target must not fall back to the route's own provider, which is
+    /// the one id in the neighbourhood and the one this remedy must never wear.
+    #[test]
+    fn an_unnamed_rebind_states_the_fix_without_naming_a_provider() {
+        let offer = offer_over(
+            BudgetInputs::local(),
+            measured(5_000, 40_000, false),
+            Some(kimi_proposal()),
+            Some(Tier::Think),
+        );
+        let question = offer.question(SkillSource::User, PriorWindowRejection::None);
+        assert!(
+            question.contains(
+                "bind the `think` tier to a remote provider and declare that provider's \
+                 `capabilities.max_context` in the same change"
+            ),
+            "{question}"
+        );
+        assert!(
+            !question.chars().any(|c| c.is_ascii_digit())
+                || !question.contains("capabilities.max_context = "),
+            "no figure is quoted for a provider nobody chose: {question}"
+        );
     }
 
     /// **BR-7b / AC-7: the redact clamp is the one bound with no durable fix,

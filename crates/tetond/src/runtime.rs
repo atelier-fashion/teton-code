@@ -167,8 +167,8 @@ use crate::egress::{
 };
 use crate::grants::ConnectionId;
 use crate::harness::budget::{
-    proposed_window, skill_fit, OverBudgetOffer, PriorWindowRejection, Remedy, RouteBudget,
-    SkillCaller, SkillFit, SkillStage,
+    proposed_window, skill_fit, OverBudgetOffer, PriorWindowRejection, RebindTarget, RebindWindow,
+    Remedy, RouteBudget, SkillCaller, SkillFit, SkillStage,
 };
 use crate::harness::completion::{context_provenance, RemoteProviderSource};
 use crate::harness::context::{Fit, NoopProvenanceHook, PressureReport};
@@ -1815,6 +1815,20 @@ struct RemedyPlan {
     new_value: String,
     /// The updates themselves, in the order they must be applied.
     writes: RemedyWrites,
+    /// **BR-9's target, for the offer to quote** — `Some` only on a rebind
+    /// (REQ-589 BR-9, ADR-1; ADR-18 item 2).
+    ///
+    /// The provider name and the window figure that the sentence and both
+    /// remedy labels must state, taken from *this* plan rather than looked up a
+    /// second time. That is the whole point of putting it here: ADR-1's rule is
+    /// that a label names the concrete write, and a label composed from an
+    /// independent lookup could name a different provider than the one
+    /// [`RemedyWrites`] carries — which is a worse failure than the vagueness it
+    /// replaced, because it would be confidently wrong.
+    ///
+    /// `None` for the three single-write remedies. They are addressed to the
+    /// route's own provider, which the offer already holds and already quotes.
+    rebind_target: Option<RebindTarget>,
 }
 
 /// The `config/set` updates one [`RemedyPlan`] performs, **in order**
@@ -1965,6 +1979,9 @@ fn plan_over_budget_remedy(
                     Some(proposal.tokens),
                     None,
                 )),
+                // Addressed to the route's own provider, which the offer
+                // already names — there is no second party for it to quote.
+                rebind_target: None,
             })
         }
         Remedy::RaiseCap {
@@ -1983,11 +2000,12 @@ fn plan_over_budget_remedy(
                 // The window underneath still bounds the route.
                 new_value: declared_value(0, "no cap"),
                 writes: RemedyWrites::Provider(field_wise_registration(existing, None, Some(0))),
+                rebind_target: None,
             })
         }
-        Remedy::BindTierRemote { tier: Some(tier) } => {
-            plan_tier_rebind(config, router, *tier, measured)
-        }
+        Remedy::BindTierRemote {
+            tier: Some(tier), ..
+        } => plan_tier_rebind(config, router, *tier, measured),
         // Exhaustive rather than a `_`: a sixth remedy must be answered here
         // deliberately, and the answer "no write" is a decision rather than a
         // fall-through. The reachable members are listed above.
@@ -2077,11 +2095,22 @@ fn plan_tier_rebind(
         .iter()
         .find(|binding| binding.tier == tier)
         .map_or("unbound", |binding| binding.provider_id.as_str());
+    // **The chosen target, built once and read by everything downstream**
+    // (ADR-1, ADR-18 item 2). The plan's `provider_id`, the record's
+    // `new_value`, both writes, and the name the offer's sentence and option
+    // labels quote all come off this one value, so ADR-1's "the label names the
+    // concrete write" is a property of the construction rather than of two
+    // lookups agreeing.
+    let target = RebindTarget {
+        provider_id: existing.id.clone(),
+        window,
+    };
+    let tokens = target.window.tokens();
     Some(RemedyPlan {
         // The one remedy that reaches here, so it is named rather than
         // projected from a `Remedy` this function does not hold.
         kind: RemedyKind::BindTierRemote,
-        provider_id: ProviderId::from(existing.id.as_str()),
+        provider_id: ProviderId::from(target.provider_id.as_str()),
         // **Both halves on both sides.** BR-9's remedy is a pair, so a record
         // naming only the binding would leave a reader unable to tell the fix
         // from the circle — a tier bound to a provider with no declared window
@@ -2093,35 +2122,43 @@ fn plan_tier_rebind(
         ),
         new_value: format!(
             "{}, capabilities.max_context {}",
-            existing.id,
-            declared_value(window, "undeclared")
+            target.provider_id,
+            declared_value(tokens, "undeclared")
         ),
         writes: RemedyWrites::TierRebind {
-            window: field_wise_registration(existing, Some(window), None),
+            window: field_wise_registration(existing, Some(tokens), None),
             binding: TierBindingConfig {
                 tier: to_protocol_tier(tier),
-                provider_id: ProviderId::from(existing.id.as_str()),
+                provider_id: ProviderId::from(target.provider_id.as_str()),
                 // Not invented: a fallback is a second routing decision, and
                 // nobody was asked for one.
                 fallback_id: None,
             },
         },
+        rebind_target: Some(target),
     })
 }
 
 /// The window BR-9's second half declares for `candidate`, or `None` when this
 /// build cannot name one (REQ-589 BR-7c, BR-9; ADR-6).
 ///
-/// Two sources, in this order and no others:
+/// Two sources, in this order and no others — and **which** one answered rides
+/// out with the figure, as a [`RebindWindow`], because ADR-7's provenance is
+/// only true of one of them:
 ///
 /// 1. **The provider's own declaration**, where it has one that actually holds
 ///    the measurement. A user who declared this provider's window months ago
 ///    should not be told the daemon ships no figure for it, and re-stating the
-///    value they wrote invents nothing.
+///    value they wrote invents nothing. There is no vendor and no date to quote
+///    about a number the user wrote themselves, and
+///    [`RebindWindow::Declared`] is what says so.
 /// 2. **The shipped vendor catalog**, through [`proposed_window`] — keyed off
 ///    the candidate's **model**, never its id (ADR-6 rule 1: ids are the user's
 ///    namespace), and only where the recipe's window would actually clear what
 ///    was measured (rule 2, the rule Ollama's honest 4,096 exists to trip).
+///    This is the one that carries a vendor and a date, and
+///    [`RebindWindow::Catalogued`] carries them whole rather than reducing the
+///    proposal to its integer (ADR-7).
 ///
 /// `None` is the honest third answer, and it withholds the **whole** remedy
 /// rather than half of it. Binding a tier to a provider with no declared window
@@ -2133,7 +2170,11 @@ fn plan_tier_rebind(
 /// the routing layer's single caller of `budget::derive` (REQ-586 AC-12) — a
 /// second derivation would be a second figure, correct when computed and wrong
 /// the moment the route is re-decided.
-fn rebind_window(router: &Router, candidate: &RemoteProvider, measured: Fit) -> Option<u32> {
+fn rebind_window(
+    router: &Router,
+    candidate: &RemoteProvider,
+    measured: Fit,
+) -> Option<RebindWindow> {
     let inputs = router.budget_inputs_for(Some(&candidate.id));
     if inputs.window > 0 {
         let declared = router.budget_for(Some(&candidate.id));
@@ -2141,10 +2182,10 @@ fn rebind_window(router: &Router, candidate: &RemoteProvider, measured: Fit) -> 
             && measured.tokens <= declared.budget_tokens
             && measured.bytes <= declared.budget_bytes
         {
-            return Some(inputs.window);
+            return Some(RebindWindow::Declared(inputs.window));
         }
     }
-    proposed_window(Some(&candidate.model), inputs, measured).map(|proposal| proposal.tokens)
+    proposed_window(Some(&candidate.model), inputs, measured).map(RebindWindow::Catalogued)
 }
 
 /// The assembled daemon runtime shared by every client task.
@@ -3918,7 +3959,7 @@ impl DaemonRuntime {
         // `proposed_window` substitutes a vendor recipe into. Read, never
         // re-derived — `budget_for` stays the single `derive` caller.
         let inputs = router.budget_inputs_for(route.provider_id.as_ref().map(|id| id.0.as_str()));
-        let offer = OverBudgetOffer::new(
+        let mut offer = OverBudgetOffer::new(
             &skill.name,
             stage,
             measured,
@@ -3990,6 +4031,23 @@ impl DaemonRuntime {
         // [`RemedyPlan`]'s doc records why that is the same defect
         // `enable_permanent` shipped once already.
         let plan = plan_over_budget_remedy(config, router, &offer.remedy, measured);
+
+        // **BR-9's provider, named** (ADR-1; ADR-18 item 2). The rebind is the
+        // one remedy whose target `Remedy::for_bound` could not know: it is
+        // keyed on the bound, and the only provider id in its hand names the
+        // route being *left*. The planner above is where the choice was made —
+        // ADR-12's exactly-one case — so the name is taken from that plan and
+        // from nowhere else, which is what makes the sentence's provider and the
+        // written provider the same value rather than two lookups that agree
+        // today. Where ADR-12 withheld the choice there is no plan and no name,
+        // and the clause states BR-9's fix without inventing one.
+        //
+        // Before the labels and the sentence, both of which read the remedy as
+        // it stands.
+        if let Some(target) = plan.as_ref().and_then(|plan| plan.rebind_target.clone()) {
+            offer.name_rebind_target(target);
+        }
+
         let labels = if plan.is_some() {
             offer.option_labels()
         } else {
@@ -4131,6 +4189,11 @@ impl DaemonRuntime {
             previous_value,
             new_value,
             writes,
+            // Spent before this point, on the offer's own wording: the target
+            // is what the *question* had to name, and by the time an answer
+            // reaches here the writes carry it. Destructured rather than
+            // ignored with `..` so a later field cannot slip past unread.
+            rebind_target: _,
         } = plan;
         match writes.apply(|update| self.apply_config_update(update)) {
             Ok(()) => events.publish(
@@ -32785,14 +32848,27 @@ provider_id = \"deepseek\"
             let plan = plan_over_budget_remedy(
                 &config,
                 &router,
+                // As the classifier mints it: no target, because the only
+                // provider id `for_bound` holds names the route being left.
+                // Choosing one is this planner's job, and the assertion below
+                // is that it did.
                 &Remedy::BindTierRemote {
                     tier: Some(Tier::Build),
+                    target: None,
                 },
                 measured,
             )
             .expect("one configured remote with a catalogued model is ADR-12's proposed case");
             assert_eq!(plan.kind, RemedyKind::BindTierRemote);
             assert_eq!(plan.provider_id.0, "kimi");
+            assert_eq!(
+                plan.rebind_target
+                    .as_ref()
+                    .map(|target| target.provider_id.as_str()),
+                Some("kimi"),
+                "the plan carries the name the offer must quote, so the sentence and the \
+                 write cannot name two different providers (ADR-1)"
+            );
 
             let runtime = Arc::new(DaemonRuntime {
                 config: Mutex::new(config.clone()),
@@ -33067,6 +33143,131 @@ provider_id = \"deepseek\"
             );
         }
 
+        /// **BR-9 / ADR-1 / ADR-18 item 2 — the provider the offer names is the
+        /// provider the write binds.**
+        ///
+        /// The defect: `Remedy::BindTierRemote` carried no provider, so the
+        /// sentence and both remedy labels said "a remote provider" where BR-9
+        /// requires the tier, the provider and the cost, and where ADR-1
+        /// requires the concrete write. At ADR-12's one-provider count the
+        /// daemon *does* know the name — it binds by it — so saying it was never
+        /// a question of knowledge.
+        ///
+        /// **The assertion is a tie, not a spelling.** Nothing here is compared
+        /// against the literal `kimi`. The id and the window are read back off
+        /// the config document the answer actually wrote, and the sentence and
+        /// both labels are required to quote *those*. A build whose composer and
+        /// whose planner picked different providers would pass a `contains("some
+        /// name")` check and fail this one — and it is the reachable failure,
+        /// because the offer's own budget carries the id of the route being
+        /// **left**, one field away from the composer.
+        ///
+        /// The route is `LocalEngine` with one unbound remote, which is the
+        /// shape the reported `/analyze` failure ran in.
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn the_rebind_offer_names_the_provider_the_write_actually_binds() {
+            let fx = Fixture::new(
+                "ob-namedrebind",
+                OPTION_ID_OVER_BUDGET_REMEDY_ONLY,
+                Some(ONE_REMOTE),
+            );
+            let mut sub = fx.events.subscribe(256);
+            let err = fx.invoke().await.expect_err("remedy-only does not send");
+            assert_eq!(err.code, error_code::SKILL_EXPANSION_TOO_LARGE, "{err:?}");
+
+            // Non-vacuity: this is the rebind row, and it is the one whose
+            // remedy `for_bound` cannot address.
+            let published = drain(&mut sub);
+            let Some(Event::SkillOverBudgetOffered(record)) = published
+                .iter()
+                .find(|event| matches!(event, Event::SkillOverBudgetOffered(_)))
+            else {
+                panic!("no offer was raised: {published:?}");
+            };
+            assert_eq!(
+                (record.bound, record.remedy_kind),
+                (BudgetBound::LocalEngine, RemedyKind::BindTierRemote),
+            );
+
+            // --- what the write actually did, read off disk (LESSON-519) ----
+            let document = std::fs::read_to_string(fx.dir.join("config.toml"))
+                .expect("the config document survives the write");
+            let reloaded = Config::load(&document).expect("and still parses");
+            let bound_to = reloaded
+                .tiers
+                .iter()
+                .find(|binding| binding.tier == Tier::Build)
+                .expect("the rebind bound the tier on disk")
+                .provider_id
+                .clone();
+            let declared = reloaded
+                .providers
+                .iter()
+                .find(|provider| provider.id == bound_to)
+                .expect("and declared a window for the provider it bound to")
+                .capabilities
+                .max_context;
+            assert_ne!(
+                bound_to, "local",
+                "non-vacuity: the tier moved to a remote provider, which is what makes \
+                 naming the wrong one reachable: {document}"
+            );
+
+            // --- and what the human was shown, tied to it -------------------
+            let offers = fx.client.offers();
+            assert_eq!(offers.len(), 1, "{offers:?}");
+            let Some(PermissionSubject::SkillOverBudget { sentence, .. }) =
+                offers[0].subject.clone()
+            else {
+                panic!("the offer's subject never reached the client: {offers:?}");
+            };
+            let labels: Vec<&str> = offers[0]
+                .options
+                .iter()
+                .filter(|option| {
+                    matches!(
+                        option.option_id.as_str(),
+                        OPTION_ID_OVER_BUDGET_PROCEED_AND_REMEDY
+                            | OPTION_ID_OVER_BUDGET_REMEDY_ONLY
+                    )
+                })
+                .map(|option| option.label.as_str())
+                .collect();
+            assert_eq!(
+                labels.len(),
+                2,
+                "ADR-1's two remedy-bearing options: {:?}",
+                offers[0].options
+            );
+
+            let first_half = format!("to `{bound_to}`");
+            let second_half = format!("`capabilities.max_context = {declared}`");
+            for (surface, text) in std::iter::once(("sentence", sentence.as_str()))
+                .chain(labels.iter().map(|label| ("label", *label)))
+            {
+                assert!(
+                    text.contains(&first_half),
+                    "{surface}: the provider named must be the provider bound — expected \
+                     {first_half}: {text}"
+                );
+                assert!(
+                    text.contains(&second_half),
+                    "{surface}: and the window named must be the window declared — expected \
+                     {second_half}: {text}"
+                );
+                assert!(
+                    !text.contains("to a remote provider"),
+                    "{surface}: the vagueness ADR-18 item 2 recorded: {text}"
+                );
+                // BR-9's cost consequence, which the naming does not buy off.
+                assert!(
+                    text.contains("at that provider's prices"),
+                    "{surface}: this remedy moves a whole category's spend, and says so \
+                     before it is answered: {text}"
+                );
+            }
+        }
+
         /// **ADR-12 — where the daemon would have to choose, it does not.**
         ///
         /// Zero configured remotes and two configured remotes are the same
@@ -33128,6 +33329,32 @@ provider_id = \"deepseek\"
                         .any(|event| matches!(event, Event::SkillOverBudgetRemedyApplied(_))),
                     "and nothing was written: {published:?}"
                 );
+
+                // TASK-260: naming the target where there IS one must not have
+                // taught the sentence to name one where there is not. Silence
+                // about *which* provider is the whole of ADR-12's guarantee at
+                // these two counts — a sentence that named `kimi` here would be
+                // the silent routing choice, made in prose instead of in
+                // config.
+                let Some(PermissionSubject::SkillOverBudget { sentence, .. }) =
+                    offers[0].subject.clone()
+                else {
+                    panic!("the offer's subject never reached the client: {offers:?}");
+                };
+                assert!(
+                    sentence.contains(
+                        "bind the `build` tier to a remote provider and declare that \
+                         provider's `capabilities.max_context` in the same change"
+                    ),
+                    "{why}: the fix is still stated, unnamed: {sentence}"
+                );
+                for candidate in ["`kimi`", "`anthropic`"] {
+                    assert!(
+                        !sentence.contains(candidate),
+                        "{why}: {candidate} was named in a sentence that chose nobody: \
+                         {sentence}"
+                    );
+                }
             }
         }
 
