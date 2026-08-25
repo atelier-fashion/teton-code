@@ -51,6 +51,7 @@ use crate::broadcast::EventBus;
 use super::budget::{
     self, skill_append_fit, BudgetInputs, RouteBudget, SkillCaller, SkillStage, LOCAL_BUDGET_BYTES,
     LOCAL_BUDGET_TOKENS, LOCAL_DIGEST_THRESHOLD_BYTES, LOCAL_DIGEST_THRESHOLD_TOKENS,
+    LOCAL_GENERATION_RESERVATION,
 };
 use super::compact::COMPACT_DUTY;
 use super::completion::{
@@ -478,8 +479,13 @@ impl Default for HarnessConfig {
             // 256-token `GenParams` default is sized for the local tier's
             // summarize/classify duties and cut tool calls mid-JSON (BUG-147);
             // the reply scanner ends well-formed turns long before this cap.
+            //
+            // The number lives in `budget` (ADR-1), because that is where
+            // `derive` has to subtract it — and reading it here rather than
+            // reading this field there is what keeps `default() → derive() →
+            // generation_reservation()` from closing on itself.
             gen_params: GenParams {
-                max_tokens: 1_024,
+                max_tokens: LOCAL_GENERATION_RESERVATION,
                 temperature: 0.2,
             },
             // Unsupplied, not "off": see the field's docs. The prompt falls back
@@ -4367,6 +4373,33 @@ mod tests {
         // reply scanner ends well-formed turns long before the cap.
         let config = HarnessConfig::default();
         assert!(config.gen_params.max_tokens >= 1_024);
+    }
+
+    /// ADR-1: the generation reservation has one home, and the arrow between
+    /// that home and this config runs one way.
+    ///
+    /// `gen_params.max_tokens` reads `LOCAL_GENERATION_RESERVATION`;
+    /// `budget::generation_reservation()` returns the same constant instead of
+    /// reading this field back off a fresh `HarnessConfig::default()`. Pinning
+    /// both ends equal is what makes the hoist a refactor rather than a second
+    /// number: the six callers that subtract the reservation and the adapters
+    /// that send it as `max_tokens` cannot drift apart.
+    ///
+    /// The literal is restated here deliberately. This is the assertion that
+    /// says the value did not move when its home did.
+    #[test]
+    fn the_generation_reservation_has_one_home() {
+        assert_eq!(
+            HarnessConfig::default().gen_params.max_tokens,
+            LOCAL_GENERATION_RESERVATION,
+            "the config sends exactly what `derive` reserves"
+        );
+        assert_eq!(
+            budget::generation_reservation(),
+            LOCAL_GENERATION_RESERVATION,
+            "and the accessor hands out the constant, not a field read"
+        );
+        assert_eq!(LOCAL_GENERATION_RESERVATION, 1_024);
     }
 
     #[test]

@@ -199,6 +199,37 @@ pub const LOCAL_DIGEST_THRESHOLD_TOKENS: usize = 1_500;
 pub const LOCAL_DIGEST_THRESHOLD_BYTES: usize =
     LOCAL_DIGEST_THRESHOLD_TOKENS * APPROX_BYTES_PER_TOKEN;
 
+/// Provider tokens every route reserves for the generation — **the one home**
+/// of the 1,024 literal (ADR-1, LESSON-456).
+///
+/// This is the `max_tokens` the adapters actually send: `HarnessConfig`'s
+/// default `gen_params` reads this constant rather than restating it, and
+/// [`generation_reservation`] hands the same number to every caller that has to
+/// subtract it, so the budget a user is *told about* at registration is the
+/// budget their turns get.
+///
+/// # Why this is a constant and not a field read
+///
+/// `HarnessConfig::default()` builds its budget by calling [`derive`] with
+/// [`BudgetInputs::local`], and [`generation_reservation`] used to call
+/// `HarnessConfig::default()` back to read this one `u32` off its `gen_params`.
+/// That is a cycle: `default() → derive() → generation_reservation() →
+/// default()`. It is open today only because [`derive`]'s `is_local` arm
+/// returns before it reads any input — an accident of the short-circuit, not a
+/// guard.
+///
+/// **TASK-270 gives that arm a body**, and the body reads the reservation. A
+/// field read here would then recurse without bound while constructing the
+/// most-constructed value in the crate. Reading the constant makes the cycle
+/// structurally impossible rather than avoided by care (LESSON-508: a guard
+/// that depends on someone remembering it is not a guard).
+///
+/// So: do **not** "simplify" [`generation_reservation`] back into
+/// `HarnessConfig::default().gen_params.max_tokens`, and do not give
+/// `gen_params` its literal back. The arrow runs one way — config reads the
+/// constant, the constant never reads the config.
+pub const LOCAL_GENERATION_RESERVATION: u32 = 1_024;
+
 /// Safety ratio between whitespace words and real BPE tokens, numerator: a
 /// word budget of N claims at most `N × 3/2` provider tokens.
 ///
@@ -365,7 +396,8 @@ pub struct BudgetInputs<'a> {
     /// recomputed from the smaller value (BR-5).
     pub cap: u32,
     /// Provider tokens reserved for generation — the `max_tokens` the
-    /// adapters send (ADR-1: `HarnessConfig::default().gen_params.max_tokens`).
+    /// adapters send ([`LOCAL_GENERATION_RESERVATION`], handed over by
+    /// [`generation_reservation`]; ADR-1).
     pub reservation: u32,
     /// Whether the route is the local tier (routing-table classification).
     pub is_local: bool,
@@ -603,18 +635,22 @@ fn digest_thresholds(budget_tokens: usize, budget_bytes: usize) -> (usize, usize
     (tokens, bytes)
 }
 
-/// Provider tokens every route reserves for the generation — **the one home**
-/// of the reservation [`derive`] subtracts (ADR-1).
+/// The reservation [`derive`] subtracts — [`LOCAL_GENERATION_RESERVATION`],
+/// returned directly (ADR-1).
 ///
-/// The `max_tokens` the adapters actually send, read off the config that sends
-/// it rather than restated as a literal: `Router::budget_for` and
-/// [`big_window_notice`] both derive under the same reservation, so the budget
-/// a user is *told about* at registration is the budget their turns get.
+/// `Router::budget_for` and [`big_window_notice`] both derive under this one
+/// number, and the harness's default `gen_params` sends the same constant as
+/// `max_tokens`, so the budget a user is *told about* at registration is the
+/// budget their turns get.
+///
+/// **This function reads no config, and must not start.** Reading the number
+/// back off a default-constructed harness config closes a cycle the moment
+/// [`derive`]'s local arm reads its inputs; [`LOCAL_GENERATION_RESERVATION`]
+/// carries the full account, and why TASK-270 turns that cycle from latent
+/// into fatal.
 #[must_use]
-pub fn generation_reservation() -> u32 {
-    super::turn_loop::HarnessConfig::default()
-        .gen_params
-        .max_tokens
+pub const fn generation_reservation() -> u32 {
+    LOCAL_GENERATION_RESERVATION
 }
 
 /// The one sentence a registration that records a big context window earns, or
@@ -2601,7 +2637,10 @@ mod tests {
     use super::*;
     use crate::harness::turn_loop::HarnessConfig;
 
-    /// The reservation ADR-1 names: `HarnessConfig::default().gen_params.max_tokens`.
+    /// The reservation ADR-1 names, restated as a literal **on purpose**: the
+    /// table below hand-computes its expectations under 1,024, so a change to
+    /// [`LOCAL_GENERATION_RESERVATION`] must redden those rows rather than
+    /// travel through them unnoticed.
     const RESERVATION: u32 = 1_024;
 
     fn remote<'a>(window: u32, cap: u32, redact_scan: bool) -> BudgetInputs<'a> {

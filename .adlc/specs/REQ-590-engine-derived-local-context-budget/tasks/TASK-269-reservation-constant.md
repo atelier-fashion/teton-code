@@ -1,7 +1,7 @@
 ---
 id: TASK-269
 title: "Give the generation reservation a constant home"
-status: draft
+status: complete
 parent: REQ-590
 created: 2026-08-25
 updated: 2026-08-25
@@ -29,11 +29,11 @@ stack overflow in the most-constructed value in the crate.
 
 ## Acceptance Criteria
 
-- [ ] `generation_reservation()` does not mention `HarnessConfig` — grep proves it
-- [ ] `HarnessConfig::default().gen_params.max_tokens == LOCAL_GENERATION_RESERVATION`, asserted
-- [ ] All six existing callers still compile and get 1,024: `router.rs:630`, `:2733`,
+- [x] `generation_reservation()` does not mention `HarnessConfig` — grep proves it
+- [x] `HarnessConfig::default().gen_params.max_tokens == LOCAL_GENERATION_RESERVATION`, asserted
+- [x] All six existing callers still compile and get 1,024: `router.rs:630`, `:2733`,
       `server.rs:11541`, `budget.rs:655`, `:3389`, `context.rs:1732`
-- [ ] Full suite green — this task changes no behaviour, only where a number lives
+- [x] Full suite green — this task changes no behaviour, only where a number lives
 
 ## Technical Notes
 
