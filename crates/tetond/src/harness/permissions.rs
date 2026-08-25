@@ -406,48 +406,6 @@ impl Default for PermissionConfig {
 /// `the_permission_row_and_the_registrys_name_are_one_value` pins it.
 const READ_ONLY_TOOLS: &[&str] = &["read", "glob", "grep", DOCS_TOOL_NAME, SKILL_TOOL_NAME];
 
-/// Expand a [`PermissionLevel`] into the policy table the gate enforces.
-///
-/// **This is the classifier** (REQ-560 BR-1, BR-15). One function, one
-/// exhaustive match, and the only place in the daemon where a level becomes
-/// policy. `coding_defaults()` and `permissive()` delegate here rather than
-/// holding their own rows, so there is no second table left to drift from.
-///
-/// ## How a level classifies a tool it has never heard of (REQ-560 OQ-2)
-///
-/// By its `default` policy, and never by name. MCP tool names are
-/// server-supplied and untrusted (ADR-003, ADR-009's residual), so a level that
-/// enumerated mutating tools could not cover them and would be wrong the moment
-/// a user registered a server. It does not have to: every name a level does not
-/// mention falls to `default`, and `default` **is** the level's answer to
-/// "something I do not recognise". So an MCP tool asks at `guarded` and `edits`,
-/// **denies at `plan`**, and allows at `full`.
-///
-/// That inverts the risk in the direction it should be inverted. Adding a tool
-/// to the tree without touching this function gets the conservative treatment at
-/// every level, rather than being silently unclassified.
-///
-/// **What that costs a first-party read-only tool, stated accurately.** This
-/// comment used to end "a new *read-only* first-party tool that nobody adds to
-/// [`READ_ONLY_TOOLS`] merely asks — a degradation, not a hole", and REQ-577's
-/// own live run falsified it. `teton_docs` was exactly that tool, and the
-/// consequence was not "merely asks": at `guarded` it interrupted the turn with
-/// a prompt for a read of bytes compiled into the binary, and at `plan` — the
-/// level a user picks *because* they want reading and nothing else — the
-/// default is `Deny`, so the daemon refused to read its own documentation
-/// outright. The omission is silent in CI, too, because exposure tests assert
-/// the tool is in the list and being *callable* is a different claim. So: the
-/// fallback is safe in the direction that matters (nothing is silently
-/// permitted), and it is not free — an unclassified read-only tool is denied at
-/// `plan`, which for a knowledge tool is indistinguishable from not shipping it.
-///
-/// ## `full` is an allow-all table, not a skipped gate (REQ-560 BR-4)
-///
-/// Every level, including `full`, produces a table that
-/// [`PermissionGate::decide`] evaluates. There is no `if level == Full { skip }`
-/// anywhere, because a gate skipped when a flag is set is a guard whose
-/// condition names something unrelated to what it guards — it becomes a silent
-/// no-op the moment anything else moves that condition (LESSON-443).
 /// The row a level's table decides the **project-skill acknowledgment** under
 /// (REQ-591 D-3).
 ///
@@ -473,6 +431,48 @@ const READ_ONLY_TOOLS: &[&str] = &["read", "glob", "grep", DOCS_TOOL_NAME, SKILL
 /// nothing else, so the only writer is [`table_for`].
 const PROJECT_TRUST_LEVEL_KEY: &str = "project_skill_trust";
 
+/// Expand a [`PermissionLevel`] into the policy table the gate enforces.
+///
+/// **This is the classifier** (REQ-560 BR-1, BR-15). One function, one
+/// exhaustive match, and the only place in the daemon where a level becomes
+/// policy. `coding_defaults()` and `permissive()` delegate here rather than
+/// holding their own rows, so there is no second table left to drift from.
+///
+/// ## How a level classifies a tool it has never heard of (REQ-560 OQ-2)
+///
+/// By its `default` policy, and never by name. MCP tool names are
+/// server-supplied and untrusted (ADR-003, ADR-009's residual), so a level that
+/// enumerated mutating tools could not cover them and would be wrong the moment
+/// a user registered a server. It does not have to: every name a level does not
+/// mention falls to `default`, and `default` **is** the level's answer to
+/// "something I do not recognise". So an MCP tool asks at `guarded` and `edits`,
+/// **denies at `plan`**, and allows at `full`.
+///
+/// That inverts the risk in the direction it should be inverted. Adding a tool
+/// to the tree without touching this function gets the conservative treatment at
+/// every level, rather than being silently unclassified.
+///
+/// **What that costs a first-party read-only tool, stated accurately.** This
+/// comment used to end "a new *read-only* first-party tool that nobody adds to
+/// `READ_ONLY_TOOLS` merely asks — a degradation, not a hole", and REQ-577's
+/// own live run falsified it. `teton_docs` was exactly that tool, and the
+/// consequence was not "merely asks": at `guarded` it interrupted the turn with
+/// a prompt for a read of bytes compiled into the binary, and at `plan` — the
+/// level a user picks *because* they want reading and nothing else — the
+/// default is `Deny`, so the daemon refused to read its own documentation
+/// outright. The omission is silent in CI, too, because exposure tests assert
+/// the tool is in the list and being *callable* is a different claim. So: the
+/// fallback is safe in the direction that matters (nothing is silently
+/// permitted), and it is not free — an unclassified read-only tool is denied at
+/// `plan`, which for a knowledge tool is indistinguishable from not shipping it.
+///
+/// ## `full` is an allow-all table, not a skipped gate (REQ-560 BR-4)
+///
+/// Every level, including `full`, produces a table that
+/// `PermissionGate::decide` evaluates. There is no `if level == Full { skip }`
+/// anywhere, because a gate skipped when a flag is set is a guard whose
+/// condition names something unrelated to what it guards — it becomes a silent
+/// no-op the moment anything else moves that condition (LESSON-443).
 #[must_use]
 pub fn table_for(level: PermissionLevel) -> PermissionConfig {
     match level {
