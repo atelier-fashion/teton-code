@@ -1,7 +1,7 @@
 ---
 id: TASK-268
 title: "Close the four rules that have never had a test"
-status: draft
+status: complete
 parent: REQ-591
 created: 2026-08-25
 updated: 2026-08-25
@@ -59,3 +59,27 @@ unpinned lines — read that commit (`31d7f15`) before reaching for the ceiling 
 AC-14 is a judgment call, not a mechanical fix: bounding the string daemon-side changes what
 existing clients render, while correcting the contract leaves a third-party client to defuse.
 Say which you chose and why.
+
+## Outcome
+
+**AC-14 was decided by correcting the wire contract, not by bounding the string.**
+`ProjectSkillTrust::root` is the grant key's source, and
+`project_skill_trust_key`'s own doc refuses truncation because two roots cut to
+one prefix are one key — an acknowledgment given about one repository answering
+for another. Stripping is not injective either, and it would make the prompt name
+a string the answer is not remembered under. Both remedies re-open a collision
+the minter exists to close, so the field's doc now states what is true — the
+minter is `trust_root_name`, the value is untruncated and not control-stripped —
+and carries the contract `skills[].name` already carries: the client defuses at
+render. Two tests hold the halves together: the wire is transparent
+(`events.rs`), and the shipped CLI neutralizes it before a terminal sees it
+(`session_ui.rs`, mutation-verified against `PlainSurface::line`).
+
+**AC-1's file placement.** The ordering leg is in `runtime.rs`, not the files
+this task listed: the two gates it orders are `accept_invocation`'s and
+`run_prompt_turn`'s, and only a whole turn puts both prompts in one log.
+
+**AC-12's file placement.** In `permissions.rs`, not `skill.rs`.
+`skill.rs`'s `the_durable_name_resolves_the_link_and_names_the_tree` already
+proves the two *names* differ; what had never been tested is the *membership
+test* in `acknowledged_unattended`, which is what a prefix match would change.

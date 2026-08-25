@@ -30530,6 +30530,131 @@ provider_id = \"deepseek\"
             dir
         }
 
+        /// [`project_root`], with a dynamic-context slot in the body.
+        ///
+        /// The fixture AC-1's ordering leg needs and the only thing it adds:
+        /// `project_root`'s skill raises **one** question, and an ordering is a
+        /// claim about two. A `` !`…` `` in the body is what makes the second
+        /// gate — `PermissionGate::authorize_skill`, through
+        /// [`DaemonRuntime::settle_dynamic_context`] — reachable in the same
+        /// turn, so both prompts land in one log with a position apiece.
+        fn project_root_with_dynamic_context(tag: &str, name: &str) -> PathBuf {
+            let dir = project_root(tag, name);
+            std::fs::write(
+                dir.join(format!(".claude/skills/{name}/SKILL.md")),
+                format!(
+                    "---\ndescription: {name}\n---\n\nPlease handle {MARKER} now: \
+                     !`echo {MARKER}`\n"
+                ),
+            )
+            .unwrap();
+            dir
+        }
+
+        /// **AC-1's ordering leg (REQ-591 ADR-9), authored here.**
+        ///
+        /// REQ-589's version of this assertion could not travel. Both of
+        /// `37a2e6c`'s tests read a prompt log for the **budget** question, and
+        /// this branch has no budget question — ported, they would compare a
+        /// one-element list against a one-element list and pass while asserting
+        /// nothing. So the claim is re-stated against the two gates that exist
+        /// here: BR-2's acknowledgment, and then the dynamic-context consent.
+        ///
+        /// **The raw log, not a filtered view.** `Client::subjects` is every
+        /// request this turn delivered, in delivery order, including any with no
+        /// subject at all; `trust_questions` — the counter the neighbouring legs
+        /// use — is the filtered one, and a filter is exactly what cannot see a
+        /// question arriving in the wrong place. Matching the whole slice
+        /// therefore pins three facts at once: two prompts, in that order, and
+        /// no third.
+        ///
+        /// Why the order is the rule and not an accident of the code: the
+        /// acknowledgment asks whether this *repository's* text may act as
+        /// instructions at all, and the dynamic-context prompt asks the user to
+        /// approve commands **that repository wrote**. Reversed, a human would
+        /// be reading a repository's command list — and deciding on it — before
+        /// they had been asked whether they trust the repository that composed
+        /// it, which is BR-2's "a file on disk would be choosing when it gets a
+        /// consent prompt" with the file choosing the *first* prompt.
+        ///
+        /// **Mutation, run:** `if false && skill.source == SkillSource::Project`
+        /// in `accept_invocation` — the acknowledgment is skipped, the log
+        /// becomes `[SkillDynamicContext]`, and the match arm below falls
+        /// through to its panic. Reverted.
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn the_repository_is_acknowledged_before_its_commands_are_authorized() {
+            let dir = project_root_with_dynamic_context("trust-order", "marked");
+            let engine = Recorder::new();
+            let runtime = runtime_with(&engine);
+            let events = Arc::new(EventBus::new());
+            let sessions = SessionRegistry::new();
+            let session_id = sessions
+                .create(SessionMode::Freeform, None, Some(dir.clone()))
+                .expect("a freeform session")
+                .session_id;
+            let probed = runtime.session_root_for(Some(&dir));
+            sessions.set_skills(
+                &session_id,
+                discover(None, &probed.path, probed.view.kind, &RealFs),
+            );
+            // Says yes to both, so neither prompt can be missing because an
+            // earlier answer ended the turn — the only thing that can vary here
+            // is which question was put, and when.
+            let client = Client::answering(runtime.pending(), PermissionOptionKind::AllowOnce);
+            install_gate(&runtime, &events, &session_id, Arc::clone(&client));
+            let conn = GrantRegistry::new().next_connection_id();
+
+            runtime
+                .run_prompt_turn(
+                    &events,
+                    &sessions,
+                    session_id,
+                    SessionMode::Freeform,
+                    None,
+                    Some(dir.clone()),
+                    String::new(),
+                    Some(SkillInvocation {
+                        name: "marked".to_owned(),
+                        raw_arguments: String::new(),
+                    }),
+                    Some(conn),
+                    ClientPresence::unwatched(),
+                )
+                .await
+                .expect("both answers were yes, so the turn runs");
+
+            match client.subjects().as_slice() {
+                [Some(PermissionSubject::ProjectSkillTrust { .. }), Some(PermissionSubject::SkillDynamicContext {
+                    skill, commands, ..
+                })] => {
+                    assert_eq!(skill, "marked");
+                    // Non-vacuity: the second prompt really is this
+                    // repository's command, so the two questions are the two
+                    // BR-2 orders rather than one of them and something else.
+                    assert_eq!(commands, &vec![format!("echo {MARKER}")]);
+                }
+                other => panic!(
+                    "BR-2: the acknowledgment is put first, the repository's own \
+                     commands second, and nothing else is asked — {other:?}"
+                ),
+            }
+
+            // And the turn really did run the body it was asking about: an
+            // ordering pinned over a turn that expanded nothing would be an
+            // ordering of two questions about a skill that never reached the
+            // model.
+            assert!(
+                engine
+                    .prompts()
+                    .iter()
+                    .any(|prompt| prompt.contains(MARKER)),
+                "the expansion never reached the engine, so the two prompts above \
+                 gated nothing"
+            );
+
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+
         /// A home carrying one user skill, `~/.claude/skills/<name>`.
         fn user_home(tag: &str, name: &str) -> PathBuf {
             let home = scratch_dir(tag);

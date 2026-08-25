@@ -1280,12 +1280,48 @@ pub enum PermissionSubject {
     /// pass while this held or failed.
     ProjectSkillTrust {
         /// The session root the acknowledgment is scoped to, **home-relative**
-        /// (`session_root::display_for`) and bounded — never an absolute path
-        /// carrying a username into a transcript (REQ-585 BR-1's entity table).
+        /// — never an absolute path carrying a username into a transcript
+        /// (REQ-585 BR-1's entity table).
         ///
         /// It is the same spelling [`crate::methods::project_skill_trust_key`]
         /// builds the grant key from, so what the user sees and what the answer
         /// is remembered under cannot name two different repositories.
+        ///
+        /// # Repository-authored: unbounded, not control-stripped, and the
+        /// client defuses (REQ-591 BR-11)
+        ///
+        /// **This paragraph is a correction.** The contract used to say this
+        /// field was `session_root::display_for`-minted and *"bounded"*, and
+        /// both halves were false. The minter is the daemon's
+        /// `tools::skill::trust_root_name` — `display_for` was replaced because
+        /// it renders every non-UTF-8 byte as `U+FFFD`, which is not injective
+        /// and so let two repositories mint one grant key — and nothing anywhere
+        /// truncates or filters the result. A client that read the old sentence
+        /// at face value would render this string raw, and a **directory name**
+        /// is repository-authored input: a newline or an ESC in it is valid
+        /// UTF-8 and arrives here exactly as it sits on disk.
+        ///
+        /// The daemon does not bound or strip it, and that is a decision rather
+        /// than an omission:
+        ///
+        /// - **Truncating would re-open the collision the minter closed.** This
+        ///   string is the grant key's source, and
+        ///   [`crate::methods::project_skill_trust_key`]'s own doc refuses
+        ///   truncation for exactly that reason — two roots cut to one prefix
+        ///   are one key, so an acknowledgment given about one repository would
+        ///   answer for another.
+        /// - **Stripping is not injective either**, and it would break the
+        ///   guarantee two paragraphs up: the prompt would name one string and
+        ///   the answer be remembered under a different one, which is the
+        ///   LESSON-495 failure in miniature.
+        ///
+        /// So the contract is the one `skills` already carries, for the same
+        /// reason: **the client defuses at render, as it does every other
+        /// file-derived string.** Teton's own CLI writes it through
+        /// `render::Surface::line`, which neutralizes every control character —
+        /// so there is no exploit on the shipped client — but a third-party
+        /// client that writes this field straight to a terminal lets a directory
+        /// name move the cursor and rewrite the row that asked the question.
         root: String,
         /// The project's model-invocable skills, so the user is answering about
         /// a named set rather than a category (BR-4).
@@ -5112,6 +5148,68 @@ mod tests {
             crate::ProtocolVersion(2),
             "an additive field moves no version"
         );
+    }
+
+    /// **REQ-591 BR-11 / AC-14: the corrected contract, asserted rather than
+    /// asserted-away.**
+    ///
+    /// `ProjectSkillTrust::root` used to be documented as
+    /// `display_for`-minted and *"bounded"*. It is neither, and the resolution
+    /// chosen was to **correct the contract** rather than bound the string —
+    /// truncating it would make two repositories share one grant key, which is
+    /// the collision the minter exists to prevent, and stripping it would make
+    /// the prompt name a repository the answer is not remembered under.
+    ///
+    /// A doc paragraph is not a guarantee, so this is the guarantee: the wire is
+    /// **transparent**. A directory name carrying a newline and an ESC survives
+    /// serialization and deserialization byte for byte, so a client implementor
+    /// reading the corrected contract can rely on it — the string they receive
+    /// is the repository's, and defusing it is theirs to do.
+    ///
+    /// This test is deliberately the mirror image of a bounding test. If a later
+    /// change *does* strip or truncate at this door, this goes red and its
+    /// failure message says which paragraph now has to change with it — which is
+    /// the only way a contract and a behaviour stay welded once they have come
+    /// apart once.
+    ///
+    /// The other half — that Teton's own client neutralizes it before it reaches
+    /// a terminal — is pinned where that rendering lives:
+    /// `session_ui::tests::a_repository_named_with_control_bytes_cannot_redraw_the_prompt`.
+    #[test]
+    fn the_trust_subjects_root_reaches_a_client_exactly_as_the_directory_spelled_it() {
+        // A directory name a repository can genuinely have: every byte here is
+        // valid UTF-8 and legal in a POSIX path component.
+        const HOSTILE: &str = "~/dev/repo\n\x1b[2K\x1b[1Aharmless";
+
+        let wire = serde_json::to_value(PermissionSubject::ProjectSkillTrust {
+            root: HOSTILE.to_owned(),
+            skills: vec![ProjectSkillTrustEntry {
+                name: "deploy".to_owned(),
+                shadows_user_skill: false,
+            }],
+            more: 0,
+            invoked_by: InvokedBy::User,
+        })
+        .unwrap();
+
+        assert_eq!(
+            wire["root"], HOSTILE,
+            "the daemon neither truncated nor stripped this root, which is what \
+             the field's own contract now says — if that changed on purpose, the \
+             `Repository-authored` paragraph on `ProjectSkillTrust::root` has to \
+             change with it, and the CLI's defusing leg is no longer the only \
+             thing standing between a directory name and the user's terminal"
+        );
+
+        let back: PermissionSubject = serde_json::from_value(wire).unwrap();
+        match back {
+            PermissionSubject::ProjectSkillTrust { root, .. } => assert_eq!(
+                root, HOSTILE,
+                "a client receives the repository's bytes, so the contract's \
+                 instruction to defuse at render is addressed to something real"
+            ),
+            other => panic!("the kind still resolves to its own variant: {other:?}"),
+        }
     }
 
     /// REQ-585 BR-12 / ADR-15: the echo line and `/verbose`'s detail are

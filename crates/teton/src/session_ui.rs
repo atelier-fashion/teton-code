@@ -8155,6 +8155,86 @@ mod skill_tests {
         );
     }
 
+    /// **REQ-591 BR-11 / AC-14: this client's half of the corrected contract.**
+    ///
+    /// `PermissionSubject::ProjectSkillTrust::root` is a **directory name**, so
+    /// its bytes belong to whoever created the directory. The daemon does not
+    /// bound or strip it — truncating would make two repositories share one
+    /// grant key, and stripping would make the prompt name a repository the
+    /// answer is not remembered under — so the wire contract says the client
+    /// defuses at render, exactly as it already says of `skills[].name`. This is
+    /// the assertion that the contract's instruction is one Teton's own client
+    /// obeys; `events::tests::the_trust_subjects_root_reaches_a_client_exactly_as_the_directory_spelled_it`
+    /// is the other half, and says the bytes really do arrive untouched.
+    ///
+    /// The attack is REQ-563's, moved one field over: `\x1b[2K\x1b[1A` erases
+    /// the row above and puts the cursor on it, so a repository whose directory
+    /// is named with those bytes could overwrite the very line asking whether to
+    /// trust it — the user reads a question about `~/dev/safe` and answers one
+    /// about somebody else's tree.
+    ///
+    /// **A [`PlainSurface`] and not [`RecordingSurface`]**, and that is the
+    /// whole design of this test. `RecordingSurface` stores the text it is
+    /// handed; the defusing lives in `PlainSurface::line`, on the way to the
+    /// bytes a terminal actually reads. Every other test in this module asserts
+    /// what was composed, which is the right altitude for a sentence and the
+    /// wrong one for a guard.
+    ///
+    /// **Mutation:** drop `defused` from `PlainSurface::line` and this reddens
+    /// on the ESC.
+    #[test]
+    fn a_repository_named_with_control_bytes_cannot_redraw_the_prompt() {
+        use crate::render::PlainSurface;
+
+        // Valid UTF-8, and every byte legal in a POSIX path component — this is
+        // a directory somebody can create, not a crafted wire payload.
+        const HOSTILE_ROOT: &str = "~/dev/safe\n\x1b[2K\x1b[1A~/dev/evil";
+
+        let subject = PermissionSubject::ProjectSkillTrust {
+            root: HOSTILE_ROOT.to_owned(),
+            skills: vec![events::ProjectSkillTrustEntry {
+                name: "deploy".to_owned(),
+                shadows_user_skill: false,
+            }],
+            more: 0,
+            invoked_by: events::InvokedBy::User,
+        };
+        let req = trust_permission_request(Some(subject));
+
+        let mut bytes: Vec<u8> = Vec::new();
+        {
+            let mut surface = PlainSurface::new(&mut bytes);
+            let mut prompter = ScriptedPrompter::new(&["y"]);
+            let mut grants = SessionGrants::default();
+            let _ = resolve_permission(&req, &mut surface, &mut prompter, &mut grants, true);
+        }
+        let written = String::from_utf8(bytes).expect("the surface writes UTF-8");
+
+        assert!(
+            !written.contains('\x1b'),
+            "a directory name put an escape sequence on the terminal: it can \
+             erase and rewrite the row that asked whether to trust that very \
+             repository — {written:?}"
+        );
+        // The newline goes too: `Surface::line` owns exactly one row, so a
+        // second row is one the root claimed for itself.
+        assert_eq!(
+            written
+                .lines()
+                .filter(|line| line.contains("this repository's skills"))
+                .count(),
+            1,
+            "the acknowledgment must occupy one row: {written:?}"
+        );
+        // Neutralized, not deleted: the characters are still visible as text, so
+        // a user looking at an odd-looking root sees that it really is odd.
+        assert!(
+            written.contains("~/dev/safe") && written.contains("~/dev/evil"),
+            "defusing must leave the name legible rather than silently drop \
+             half of it: {written:?}"
+        );
+    }
+
     /// **The typed door names the person who typed (REQ-589 TASK-261).**
     ///
     /// The test above pins the model's sentence byte for byte; this one pins the

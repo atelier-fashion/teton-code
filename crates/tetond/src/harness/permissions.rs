@@ -4875,6 +4875,112 @@ mod tests {
         assert_eq!(route.delivered().len(), 2);
     }
 
+    /// **BR-6 / AC-12: a row is matched whole. Trusting `~/dev/repo` says
+    /// nothing about `~/dev/repo/vendor/other`.**
+    ///
+    /// The rule was written into `acknowledged_unattended`'s comment and never
+    /// checked. Nothing that existed before this could tell exact equality from
+    /// a prefix test: the neighbouring "another repository" leg lists
+    /// `~/dev/somewhere-else`, which no prefix rule would match either, and
+    /// `the_durable_name_resolves_the_link_and_names_the_tree` (skill.rs) proves
+    /// only that the two *names* differ — which is precisely what a
+    /// `starts_with` would then ignore. This is the leg about the **membership
+    /// test**.
+    ///
+    /// Why it matters more than the shape of the string suggests: the tree
+    /// inside a listed root need not have been put there by the person who
+    /// listed it. A dependency update, a vendored checkout or a merged PR can
+    /// place a whole repository under `~/dev/repo`, and under a prefix rule it
+    /// would inherit — silently, durably, and for unattended sessions — an
+    /// acknowledgment a human gave about a different set of authors.
+    ///
+    /// **Both legs are one fixture**: the same gate configuration, the same
+    /// listed row, the same client, the same door — only the `durable` name the
+    /// turn arrives with changes. So a gate that allowed nothing fails the
+    /// positive leg and a gate that allowed everything fails the negative one,
+    /// and neither can be green by accident.
+    ///
+    /// The names are minted by the production minter over real directories
+    /// rather than spelled by hand, for `the_durable_name_…`'s reason: a literal
+    /// `~/dev/repo/vendor/other` here would be a second copy of the rule, green
+    /// on the day the first one changed. The non-vacuity assertion is what says
+    /// the two strings really do share a prefix — without it the negative leg
+    /// would pass against any two unrelated names and prove nothing.
+    ///
+    /// **Mutation:** make the membership test
+    /// `self.trusted_project_roots.iter().any(|row| name.starts_with(row))` and
+    /// the nested leg goes red while the positive one stays green.
+    #[tokio::test]
+    async fn a_row_does_not_extend_to_a_repository_nested_inside_it() {
+        use crate::harness::tools::skill::durable_trust_root_name_by_resolving;
+
+        let base = std::env::temp_dir().join(format!(
+            "teton-nested-trust-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_or(0, |d| d.as_nanos())
+        ));
+        let repo = base.join("repo");
+        let nested = repo.join("vendor").join("other");
+        std::fs::create_dir_all(&nested).expect("the fixture tree");
+
+        let mint = |path: &std::path::Path| {
+            durable_trust_root_name_by_resolving(path, None)
+                .unwrap_or_else(|| panic!("{} did not canonicalise", path.display()))
+        };
+        let listed = mint(&repo);
+        let inside = mint(&nested);
+        assert!(
+            inside.starts_with(&listed),
+            "non-vacuity: the nested tree's name must really extend the listed \
+             one, or a prefix rule would miss it for reasons that have nothing \
+             to do with this test — `{listed}` / `{inside}`"
+        );
+
+        for (durable, expected, what) in [
+            (
+                &listed,
+                SkillConsent::Allowed,
+                "the repository the row names",
+            ),
+            (
+                &inside,
+                SkillConsent::Refused(RefusalReason::NoTerminal),
+                "a repository a dependency update dropped inside it",
+            ),
+        ] {
+            let listed_row = listed.clone();
+            let (gate, route, _bus, _pending, conn) = wired(
+                move |bus, pending| {
+                    PermissionGate::new(
+                        SessionId::from("s1"),
+                        PermissionConfig::with_default(PermissionPolicy::Ask),
+                        bus,
+                        pending,
+                    )
+                    .with_trusted_project_roots(vec![listed_row])
+                },
+                RouteBehaviour::RefusesWithoutAsking(RefusalReason::NoTerminal),
+            );
+
+            assert_eq!(
+                ask_trust(&gate, Some(durable), InvokedBy::User, conn).await,
+                expected,
+                "{what}: `[skills] trusted_project_roots` holds `{listed}` and the \
+                 session arrived at `{durable}`"
+            );
+            assert_eq!(
+                route.delivered().len(),
+                1,
+                "{what}: the question was put and answered by the client, so the \
+                 settlement above is the list's doing rather than an earlier guard's"
+            );
+        }
+
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
     /// **The list never answers for a human.**
     ///
     /// An attended session at a listed root is asked, and what it says is what
@@ -5089,6 +5195,101 @@ mod tests {
                  it is the one whose label said so"
             );
         }
+    }
+
+    /// **BR-7 / AC-13: the label and the write are one fact, pinned by one
+    /// test.**
+    ///
+    /// The two halves were already asserted — the label by
+    /// `the_typed_prompt_names_the_write_and_the_models_prompt_has_none`, the
+    /// effect by `only_the_permanent_answer_reaches_the_sink` — and that is the
+    /// arrangement LESSON-495 records failing. REQ-563's `enable_permanent`
+    /// promised `[web] tier = "…"` and wrote a different key entirely, with a
+    /// test on each side, both green: *"a prompt describing a write that
+    /// provably could not happen."* Two tests can only catch a change to the
+    /// half each one watches. Drift is a change to **one** of them, and only a
+    /// test holding both at once can see it.
+    ///
+    /// So the row is **read out of the label the user was shown** and compared
+    /// with the string the sink was handed. Nothing in this test spells the
+    /// write twice: change the label's table, key or `+=`, and the parse below
+    /// finds nothing; change *which* string the label names, or which string the
+    /// write appends, and the two stop matching. There is no edit to either side
+    /// alone that leaves this green.
+    ///
+    /// The third assertion is what keeps the derivation from being circular. A
+    /// label promising `+= ""` beside a write of `""` would satisfy the
+    /// comparison and describe nothing, so the row is also pinned to the root
+    /// this door was actually asked about — which is a fact about the fixture's
+    /// own input, not a second copy of the mint.
+    #[tokio::test]
+    async fn the_label_promises_exactly_the_row_the_write_appends() {
+        let sink = RecordingTrustSink::new(false);
+        let (gate, route, _bus, _pending, conn) = wired(
+            {
+                let sink = Arc::clone(&sink);
+                move |bus, pending| {
+                    PermissionGate::new(
+                        SessionId::from("s1"),
+                        PermissionConfig::with_default(PermissionPolicy::Ask),
+                        bus,
+                        pending,
+                    )
+                    .with_project_trust_persistence(sink as Arc<dyn ProjectTrustPersistence>)
+                }
+            },
+            RouteBehaviour::Answers(OPTION_ID_ENABLE_PERMANENT),
+        );
+
+        assert_eq!(
+            ask_trust(&gate, Some(DURABLE), InvokedBy::User, conn).await,
+            SkillConsent::Allowed,
+            "the answer under test has to be one the door accepted"
+        );
+
+        let label = route.delivered()[0]
+            .options
+            .iter()
+            .find(|option| option.option_id == OPTION_ID_ENABLE_PERMANENT)
+            .unwrap_or_else(|| {
+                panic!(
+                    "the typed prompt offered no durable option, so it promised \
+                     nothing and this test is about a prompt that does not exist: \
+                     {:?}",
+                    route.delivered()[0].options
+                )
+            })
+            .label
+            .clone();
+
+        // The parse *is* the assertion about the label's shape: table, key and
+        // `+=` all have to read exactly as a user would grep for them, or there
+        // is no row to extract.
+        let promised = label
+            .split_once("`[skills] trusted_project_roots += \"")
+            .and_then(|(_, rest)| rest.split_once('"'))
+            .map(|(row, _)| row.to_owned())
+            .unwrap_or_else(|| {
+                panic!(
+                    "the label names no `[skills] trusted_project_roots += \"…\"` \
+                     write, so a user who picked it and then grepped their config \
+                     has nothing to grep for: {label}"
+                )
+            });
+
+        assert_eq!(
+            sink.written(),
+            vec![promised.clone()],
+            "the label promised `{promised}` and the write appended something \
+             else — LESSON-495's failure exactly: a prompt describing a write \
+             that did not happen"
+        );
+        assert_eq!(
+            promised, DURABLE,
+            "non-vacuity: the row named must be the root this door was asked \
+             about, or label and write could agree on a string that names no \
+             repository"
+        );
     }
 
     /// **A failed write costs the session nothing, and claims nothing.**

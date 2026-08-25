@@ -2742,3 +2742,173 @@ Date / build                                  :
 (c) an ambiguous name listed candidates and moved nowhere : yes / no  (n/a if none)
 Notes / findings :
 ```
+
+---
+
+# Manual verification runbook — REQ-591 AC-11 (project-skill trust, unattended)
+
+**Status: OUTSTANDING.** REQ-591 puts an acknowledgment in front of every
+project-authored skill body — the typed `/name` path as well as the model's
+`skill` tool — and then gives an unattended session one way past it: a
+`[skills] trusted_project_roots` row a human wrote earlier. CI proves both
+halves against fixtures: a scripted route double for the gate, and a whole
+`run_prompt_turn` against a temporary directory tree. What no CI run exercises
+is the shape the feature is *for*: a real `teton` on a real pipe, on a machine
+whose `config.toml` a person edited by hand, against a repository whose
+canonical path the daemon has to agree with. Leave this outstanding in
+`.adlc/specs/REQ-591-project-skill-trust-and-unattended-allowlist/requirement.md`
+until a person runs the procedure below.
+
+## What this proves that CI does not
+
+Three things, and the third is the one nobody can fixture:
+
+- **The row a human copies is the row that matches.** Every automated leg mints
+  both sides of the comparison from the same function. By hand, the user reads
+  a row out of a refusal message, pastes it into a file, restarts, and the
+  daemon has to agree — through `$TETON_CONFIG` resolution, TOML quoting, and
+  whatever `/tmp` → `/private/tmp` firmlinking macOS applies on the way.
+- **The unattended refusal is legible on a pipe**, arriving as a message a
+  script's author can act on rather than as a silent empty turn.
+- **OQ-4 in the flesh.** A row's meaning depends on `$HOME` *at consult time*.
+  A daemon launched with a different `HOME` than the session's environment
+  reads the same file and can resolve the same row differently. This runbook is
+  where that stops being a paragraph in the spec.
+
+## Prerequisites
+
+- A `--release` build, `TETON_TEST_SEAMS` **unset**.
+- Two repositories with a project skill each, so "listed" and "unlisted" are two
+  trees rather than one tree in two states:
+  ```sh
+  for r in ~/dev/teton-trusted ~/dev/teton-unlisted; do
+    mkdir -p "$r/.claude/skills/dogfood"
+    printf -- '---\ndescription: dogfood\n---\n\nSay OK and stop.\n' \
+      > "$r/.claude/skills/dogfood/SKILL.md"
+    git -C "$r" init -q 2>/dev/null || true
+  done
+  ```
+- A config file you can edit, and knowledge of which one the daemon reads:
+  `$TETON_CONFIG`, else `<base>/config.toml`, where `<base>` is
+  `$XDG_RUNTIME_DIR/teton` or, on macOS,
+  `~/Library/Application Support/teton`.
+- Start from **no** recorded decision: confirm `[skills] trusted_project_roots`
+  is absent from that file before leg (a).
+
+## Procedure
+
+### Leg (a) — an unlisted root refuses, and the refusal names the row
+
+1. With `trusted_project_roots` absent, run the invocation with **no terminal**:
+   ```sh
+   printf '/dogfood\n' | teton --cwd ~/dev/teton-unlisted
+   ```
+   Stdin is a pipe, so there is no terminal to ask. Note the `y` test: put a
+   `y` on the line *after* `/dogfood` and confirm it is never consumed as
+   consent — it should arrive as your next prompt line, or not at all.
+2. Expect a refusal naming the repository, saying `there was no client to ask`,
+   and ending with the remedy — *acknowledge it once at a terminal and answer
+   `p`, or add `<row>` to `[skills] trusted_project_roots` in your config.*
+3. **Record the `<row>` verbatim.** This is the assertion no fixture can make:
+   the string is the canonical name of the tree, and on macOS it is frequently
+   *not* the path you typed.
+4. Confirm nothing ran: no model output, and `[skills] trusted_project_roots`
+   is still absent from the config file. An unattended run consults the list; it
+   never writes one.
+
+### Leg (b) — the same root, listed, proceeds with no prompt
+
+1. Add the row **exactly as leg (a) printed it**:
+   ```toml
+   [skills]
+   trusted_project_roots = ["<row from leg (a)>"]
+   ```
+2. Restart the daemon (the list is read at session create).
+3. Re-run the piped invocation from leg (a) step 1. Expect the skill to expand
+   and the model to answer, with **no prompt drawn** and nothing written back to
+   the config.
+4. Now the negative pair, on the same config: run the piped invocation in
+   `~/dev/teton-unlisted`'s *sibling*:
+   ```sh
+   printf '/dogfood\n' | teton --cwd ~/dev/teton-trusted
+   ```
+   Whichever of the two is not listed must still refuse. A list that admits both
+   is a list matched by prefix or by `$HOME` alone, and either is a defect.
+5. And the nesting case, which is BR-6 by hand:
+   ```sh
+   mkdir -p ~/dev/teton-trusted/vendor/other/.claude/skills/dogfood
+   cp ~/dev/teton-trusted/.claude/skills/dogfood/SKILL.md \
+      ~/dev/teton-trusted/vendor/other/.claude/skills/dogfood/SKILL.md
+   printf '/dogfood\n' | teton --cwd ~/dev/teton-trusted/vendor/other
+   ```
+   With the *parent* listed, this must **refuse**. A tree a dependency update
+   dropped inside a trusted root does not inherit its trust.
+
+### Leg (c) — the attended path, and the durable answer
+
+1. At a real terminal, in a repository that is **not** listed:
+   `cd ~/dev/teton-unlisted && teton`, then type `/dogfood`.
+2. Expect the acknowledgment prompt to name **you** as the asker ("you asked to
+   run this repository's skills as instructions"), never the model, and to offer
+   a fifth option whose label spells the concrete write:
+   `Trust this repository permanently (writes `[skills] trusted_project_roots +=
+   "<row>"` …)`.
+3. Answer `p`. Then read the config file with your own eyes and confirm the row
+   that landed is byte-for-byte the row the label named. This is BR-7 by hand.
+4. Decline the same prompt in a fresh session (answer reject) and confirm the
+   turn is refused with the trust sentence — and that nothing was appended.
+
+### Leg (d) — OQ-4: a daemon whose `$HOME` is not its launch environment's
+
+This is the leg the spec's OQ-4 is about, and it is the reason this runbook
+exists rather than one more integration test.
+
+1. With leg (b)'s row in place and working, stop the daemon.
+2. Start the daemon with a **different** `HOME` than the shell that will run
+   `teton`:
+   ```sh
+   mkdir -p /tmp/teton-other-home
+   HOME=/tmp/teton-other-home teton-code &   # or the launchd/brew service, edited
+   ```
+   Keep `$TETON_CONFIG` (or the state dir) pointing at the *same* config file, so
+   the only thing that moved is `HOME`.
+3. Re-run leg (b) step 3 from your ordinary shell.
+4. **Record what happens, both ways.** A home-relative row (`~/dev/…`) resolved
+   against the daemon's `HOME` now names `/tmp/teton-other-home/dev/…`, a tree
+   nobody wrote a row for; an absolute row is unaffected. Either outcome is
+   data for OQ-4 — what must not happen is a session *trusting a tree nobody
+   named*, so if the invocation proceeds, record which directory's bytes it
+   actually expanded.
+5. Restore the daemon's environment before signing off.
+
+## Sign-off
+
+```
+REQ-591 AC-11 sign-off
+----------------------
+Verified by      :
+Date             :
+Platform / OS    :
+Build            :               (cargo build --release)
+TETON_TEST_SEAMS confirmed unset : yes / no
+Config file the daemon read      :
+(a) piped run at an UNLISTED root refused          : yes / no
+(a) refusal named `there was no client to ask`     : yes / no
+(a) refusal printed a copy-pasteable row           : yes / no
+     — row, verbatim :
+     — did it differ from the path you typed?  yes / no  (how:)
+(a) nothing was written to the config              : yes / no
+(b) piped run at the LISTED root proceeded         : yes / no
+(b) no prompt was drawn                            : yes / no
+(b) the sibling, unlisted, still refused           : yes / no
+(b) the NESTED tree under the listed root refused  : yes / no
+(c) the prompt said YOU asked, not the model       : yes / no
+(c) the `p` label named the exact row              : yes / no
+(c) the row in the file matched the label byte for byte : yes / no
+(c) a declined prompt wrote nothing                : yes / no
+(d) daemon HOME differed from the shell's          : yes / no
+(d) the listed root still resolved / still ran     : ran / refused
+(d) if it ran — which directory's bytes expanded?  :
+(d) any tree was trusted that nobody named         : yes / no   <-- must be "no"
+Notes / findings :
+```
