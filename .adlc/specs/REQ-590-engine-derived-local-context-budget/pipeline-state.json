@@ -1,0 +1,31 @@
+{
+  "req": "REQ-590",
+  "branch": "feat/REQ-590-engine-derived-local-context-budget",
+  "startedAt": "2026-08-25T00:00:00Z",
+  "completed": false,
+  "currentPhase": 0,
+  "completedPhases": [],
+  "integrationBranch": "main",
+  "phaseHistory": [],
+  "repos": {
+    "teton-code": {
+      "primary": true,
+      "path": "/Users/brettluelling/Documents/GitHub/teton-code",
+      "worktree": "/Users/brettluelling/Documents/GitHub/teton-code/.worktrees/REQ-590",
+      "branch": "feat/REQ-590-engine-derived-local-context-budget",
+      "touched": true,
+      "prUrl": null,
+      "prNumber": null,
+      "merged": false
+    }
+  },
+  "mergeOrder": [
+    "teton-code"
+  ],
+  "phase4": {
+    "currentTask": null,
+    "completedTasks": [],
+    "failedTasks": []
+  },
+  "notes": "Spec merged as 64b6052 (#215) before the pipeline started. D-3/D-4 decided by owner: take the full window -> 10,240 words / 30,720 bytes."
+}
