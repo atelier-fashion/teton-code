@@ -7081,8 +7081,12 @@ fn a_row_written_under_one_home_still_names_its_tree_under_another() {
         // no permission level settles.
         home.write(
             ".claude/skills/validate/SKILL.md",
-            &skill_file("the user validate", None, "User body.
-"),
+            &skill_file(
+                "the user validate",
+                None,
+                "User body.
+",
+            ),
         );
         // **Inside** the home, which is what makes the two spellings differ.
         let project = project_at(home.path(), "proj");
@@ -7121,10 +7125,13 @@ fn a_row_written_under_one_home_still_names_its_tree_under_another() {
             None,
             &[("HOME", home.path())],
         );
-        assert!(status.success(), "stdout:
+        assert!(
+            status.success(),
+            "stdout:
 {stdout}
 stderr:
-{stderr}");
+{stderr}"
+        );
 
         // True of both legs: the daemon asked, and this client answered that
         // there is nobody here to ask. So whatever happens next is the *row*'s

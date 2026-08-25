@@ -1397,8 +1397,10 @@ async fn the_remedy_is_written_only_where_a_verified_human_stands_behind_it() {
             .providers
             .iter()
             .find(|p| p.id.0 == "frontier")
-            .expect("`frontier` survives either way — a refusal writes nothing, it \
-                     does not corrupt")
+            .expect(
+                "`frontier` survives either way — a refusal writes nothing, it \
+                     does not corrupt",
+            )
             .max_context;
         assert_eq!(
             declared == Some(RECIPE_WINDOW),

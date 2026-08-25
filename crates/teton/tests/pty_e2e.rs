@@ -1228,8 +1228,12 @@ fn a_move_to_a_non_project_root_re_fires_the_notice_at_a_terminal() {
     let home = PathBuf::from("/tmp").join(format!("tcptyhome{:x}", std::process::id() & 0xffff));
     let _ = std::fs::remove_dir_all(&home);
     std::fs::create_dir_all(&home).unwrap();
-    let daemon =
-        TestDaemon::spawn_with_env(&daemon_path, "", &["scripted reply"], &[("HOME", home.as_os_str())]);
+    let daemon = TestDaemon::spawn_with_env(
+        &daemon_path,
+        "",
+        &["scripted reply"],
+        &[("HOME", home.as_os_str())],
+    );
     let project = daemon.root.join("proj");
     let plain = daemon.root.join("plain");
     std::fs::create_dir_all(&project).unwrap();
@@ -2023,8 +2027,12 @@ fn park_at_the_over_budget_offer(tag: &str) -> OfferSession {
         .map(|t| format!("[[tiers]]\ntier = \"{t}\"\nprovider_id = \"local\"\n\n"))
         .collect();
     let config = format!("[[providers]]\nid = \"local\"\nkind = \"local\"\n\n{tiers}");
-    let daemon =
-        TestDaemon::spawn_with_env(&daemon_path, &config, &[SENT_MARKER], &[("HOME", home.as_os_str())]);
+    let daemon = TestDaemon::spawn_with_env(
+        &daemon_path,
+        &config,
+        &[SENT_MARKER],
+        &[("HOME", home.as_os_str())],
+    );
 
     let project = daemon.root.join("proj");
     std::fs::create_dir_all(project.join(".claude/skills/analyze")).unwrap();

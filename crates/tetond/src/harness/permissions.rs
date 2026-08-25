@@ -2946,8 +2946,7 @@ impl PermissionGate {
             let refusal = match addressee {
                 Some(addressee) => seam.attest_daemon_wide_commitment(addressee).err(),
                 None => Some(
-                    "the answer names no connection, so nobody can be verified for it"
-                        .to_owned(),
+                    "the answer names no connection, so nobody can be verified for it".to_owned(),
                 ),
             };
             if let Some(err) = refusal {
@@ -6095,10 +6094,7 @@ mod tests {
             SkillConsent::DeniedByLevel,
             "`plan` still settles the model's acknowledgment by its default"
         );
-        assert!(
-            route.delivered().is_empty(),
-            "and asks nobody about it"
-        );
+        assert!(route.delivered().is_empty(), "and asks nobody about it");
     }
 
     /// **The typed prompt offers the durable write, names it concretely, and the

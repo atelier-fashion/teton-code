@@ -1685,10 +1685,7 @@ impl SkillTool {
         // REQ-589 D-13, and the one place this caller may read the durable name
         // from: the snapshot holding the body it is about to expand. After the
         // guard above, which needs no filesystem to answer.
-        let durable_root = self
-            .registry
-            .read_under()
-            .map(durable_trust_root_name);
+        let durable_root = self.registry.read_under().map(durable_trust_root_name);
         let entries = project_trust_entries(&self.registry);
         let shadows = shadows_user_skill(&self.registry, name);
         let consent = self
@@ -4060,7 +4057,11 @@ mod tests {
         use teton_protocol::methods::RefusalReason;
 
         for (listed, expected, what) in [
-            (row.clone(), SkillConsent::Allowed, "the row this build writes"),
+            (
+                row.clone(),
+                SkillConsent::Allowed,
+                "the row this build writes",
+            ),
             (
                 "~/dev/repo".to_owned(),
                 SkillConsent::Refused(RefusalReason::NoTerminal),
@@ -4313,8 +4314,7 @@ mod tests {
         std::os::unix::fs::symlink(&acknowledged, &link).unwrap();
 
         let row_for = |tree: &Path| {
-            durable_trust_root_name_by_resolving(tree)
-                .expect("the fixture tree canonicalises")
+            durable_trust_root_name_by_resolving(tree).expect("the fixture tree canonicalises")
         };
 
         let wired = |rows: Vec<String>| {

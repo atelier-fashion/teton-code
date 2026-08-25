@@ -6261,11 +6261,9 @@ cache_ttl_secs = 60
             "/dev/re%ffpo",
             "/dev/repo%",
         ] {
-            let document = format!(
-                "[skills]\ntrusted_project_roots = [\"/Users/you/dev/ok\", {bad:?}]\n"
-            );
-            let err = Config::load(&document)
-                .expect_err("a malformed row must not load: {bad:?}");
+            let document =
+                format!("[skills]\ntrusted_project_roots = [\"/Users/you/dev/ok\", {bad:?}]\n");
+            let err = Config::load(&document).expect_err("a malformed row must not load: {bad:?}");
             let LoadError::Validate(ConfigError::MalformedTrustedProjectRoot(named)) = err else {
                 panic!("`{bad}` was refused for the wrong reason: {err:?}");
             };
