@@ -24,6 +24,8 @@
 //! | AC-7 (BR-7's remedy table) | [`every_bound_offers_exactly_the_remedy_the_table_names`] |
 //! | AC-7a (the risk sentence) | [`a_raise_window_offer_cannot_be_rendered_without_its_risk`] |
 //! | AC-7b (four combinations) | [`proceed_and_remedy_are_answered_independently_in_all_four_combinations`] |
+//! | AC-9 (trust asked first, decline wins) | [`a_project_skills_trust_question_is_put_before_its_budget_question`] |
+//! | AC-9 (a user skill raises no trust question) | [`a_user_authored_skill_is_asked_only_the_budget_question`] |
 //! | AC-10 (no grant survives) | [`accepting_twice_asks_twice_and_no_grant_survives_the_invocation`] |
 //! | AC-11 (no "no provider saw this turn") | [`the_accepted_path_never_says_no_provider_saw_this_turn`] |
 //! | AC-18 (BR-11 on every not-sent path) | [`every_not_sent_path_reaches_no_provider_and_spends_nothing`] |
@@ -56,6 +58,8 @@
 //! | the accepted tail borrows the refusal's consequence clause | [`the_accepted_path_never_says_no_provider_saw_this_turn`] |
 //! | the offer consults a grant | [`accepting_twice_asks_twice_and_no_grant_survives_the_invocation`] |
 //! | the naming duty moves above Stage A | [`every_not_sent_path_reaches_no_provider_and_spends_nothing`] |
+//! | the project-trust gate moves below Stage A | [`a_project_skills_trust_question_is_put_before_its_budget_question`] |
+//! | the trust gate stops asking about `source` and asks for every skill | [`a_user_authored_skill_is_asked_only_the_budget_question`] |
 //! | `apply_remedy` folded into the consent decision | [`proceed_and_remedy_are_answered_independently_in_all_four_combinations`] |
 //! | the `clearing_the_cap_clears` gate dropped from `plan_over_budget_remedy` | [`a_cap_is_only_offered_for_clearing_where_clearing_it_would_help`] |
 //! | the closing question read back off `Remedy::is_offered` | [`a_cap_is_only_offered_for_clearing_where_clearing_it_would_help`], [`a_raise_window_offer_cannot_be_rendered_without_its_risk`] |
@@ -323,6 +327,19 @@ impl Client {
     /// Install the mid-flight action described on [`Client::while_offered`].
     fn while_offered(&self, action: impl Fn() + Send + 'static) {
         *self.while_offered.lock().expect("while_offered mutex") = Some(Box::new(action));
+    }
+
+    /// **Every** question this client was shown, in the order it was shown
+    /// them — the unfiltered log.
+    ///
+    /// [`Client::offers`] below is the filtered view, and a filtered view can
+    /// say nothing about BR-6: `deliver` dispatches on the request's *type*, so
+    /// it answers the acknowledgment and the offer correctly whichever arrives
+    /// first, and every assertion written through `offers()` survives an
+    /// implementation that puts the budget question first. The order is a fact
+    /// only this reader holds.
+    fn asked(&self) -> Vec<PermissionRequest> {
+        self.asked.lock().expect("asked mutex").clone()
     }
 
     /// Only the over-budget offers — the acknowledgment is a different question.
@@ -654,6 +671,23 @@ fn subject_of(request: &PermissionRequest) -> Offer {
         },
         other => panic!("not an over-budget offer: {other:?}"),
     }
+}
+
+/// Which of a skill turn's questions a request *is*, as a word an assertion can
+/// print — so a wrong order fails saying what the order actually was rather than
+/// `false != true`.
+fn question(request: &PermissionRequest) -> &'static str {
+    match request.subject {
+        Some(PermissionSubject::ProjectSkillTrust { .. }) => "project trust",
+        Some(PermissionSubject::SkillOverBudget { .. }) => "over-budget offer",
+        Some(PermissionSubject::SkillDynamicContext { .. }) => "dynamic context",
+        _ => "some other question",
+    }
+}
+
+/// The questions this client was shown, named and in order.
+fn questions(client: &Client) -> Vec<&'static str> {
+    client.asked().iter().map(question).collect()
 }
 
 fn option_ids(request: &PermissionRequest) -> Vec<String> {
@@ -2266,6 +2300,178 @@ async fn the_accepted_path_never_says_no_provider_saw_this_turn() {
         "the offer is a question about a send that has not happened yet, not a \
          report that nothing was sent: {}",
         offer.sentence
+    );
+}
+
+// ---------------------------------------------------------------------------
+// AC-9 — the trust question comes first
+// ---------------------------------------------------------------------------
+
+/// **AC-9 / BR-6 / D-10 — a project-sourced skill's trust question is put
+/// *before* its budget question, and a declined acknowledgment ends the turn
+/// before the budget question is ever put.**
+///
+/// BR-6's whole content is an ordering, and D-10 says why it is the order it is:
+/// asking the budget question first "would have a user authorize an over-budget
+/// send of bytes from a repository they have not yet said they trust — a file on
+/// disk would be choosing when it gets a consent prompt."
+///
+/// # Why this is asserted through [`Client::asked`] and not [`Client::offers`]
+///
+/// Nothing else in this file states an order. [`Client::deliver`] dispatches on
+/// the request's **type**: any `SkillOverBudget` goes to the offer branch and
+/// anything else to the acknowledgment branch, so it answers both questions
+/// correctly whichever one arrives first — and `offers()`, the reader every
+/// other test here goes through, filters the acknowledgment out entirely. Put
+/// Stage A above the trust gate and the only other test that notices is AC-18's
+/// trust-declined row, which fails on a side effect (an offer reached a client
+/// that should have seen none) rather than on the rule; the order itself is a
+/// fact only the raw log holds.
+///
+/// # The two legs
+///
+/// **Acknowledged** — both questions are put, and the raw log's order is the
+/// assertion. **Declined** — the trust refusal wins and the budget question is
+/// never put at all, which is BR-6's last sentence and the half that actually
+/// protects the user. That leg's client is set to *accept* an over-budget send
+/// (`over_budget_proceed_once`), so the absence of an offer is a statement about
+/// the daemon rather than about a fixture that would have refused anyway: under
+/// the inverted order this client authorizes exactly the send D-10 forbids.
+///
+/// **Mutation:** move `accept_invocation`'s `SkillSource::Project` trust block
+/// below Stage A's `offer_or_refuse_over_budget` call in `run_prompt_turn`, and
+/// both legs fail — the first on the order, the second on an offer that was put
+/// to a repository the session went on to refuse.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_project_skills_trust_question_is_put_before_its_budget_question() {
+    // -- leg 1: acknowledged — both questions, in BR-6's order ---------------
+    let fx = Fixture::new(Spec::new(
+        "ac9ord",
+        local_route(),
+        sized_body(6_000, 24_000),
+    ));
+    let session = fx.session();
+    let refusal = fx
+        .invoke(&session)
+        .await
+        .expect_err("the offer is declined, so the turn is refused");
+    assert_eq!(
+        refusal.code,
+        error_code::SKILL_EXPANSION_TOO_LARGE,
+        "leg 1 must reach the budget door for its order to mean anything: {refusal:?}"
+    );
+    assert_eq!(
+        questions(&fx.client),
+        ["project trust", "over-budget offer"],
+        "BR-6/D-10: the repository is acknowledged before an over-budget send \
+         from it is authorized — a user asked the other way round would be \
+         approving bytes from a repository they had not yet said they trust"
+    );
+    match fx.client.asked()[0].subject.clone() {
+        Some(PermissionSubject::ProjectSkillTrust { root, skills, .. }) => {
+            let dir = fx
+                .tree
+                .path()
+                .file_name()
+                .expect("the fixture tree has a name")
+                .to_string_lossy()
+                .into_owned();
+            assert!(
+                root.contains(&dir),
+                "the first question names the repository the skill came from: \
+                 `{root}` does not name `{dir}`"
+            );
+            assert!(
+                skills.iter().any(|entry| entry.name == SKILL),
+                "and covers the skill that was typed: {skills:?}"
+            );
+        }
+        other => panic!("the first question is the acknowledgment: {other:?}"),
+    }
+
+    // -- leg 2: declined — the trust refusal wins, and there is no offer ------
+    let declined = Fixture::new(
+        Spec::new("ac9dec", local_route(), sized_body(6_000, 24_000))
+            .declining_trust()
+            .answering(Answer::Select(OPTION_ID_OVER_BUDGET_PROCEED_ONCE)),
+    );
+    let session = declined.session();
+    let mut sub = declined.events.subscribe(512);
+    let refusal = declined
+        .invoke(&session)
+        .await
+        .expect_err("a declined acknowledgment refuses the turn");
+    let published = drain(&mut sub);
+    assert_eq!(
+        questions(&declined.client),
+        ["project trust"],
+        "the budget question was put to a session that had just refused to trust \
+         the repository the bytes come from"
+    );
+    assert_eq!(
+        refusal.code,
+        error_code::CONSENT_DENIED,
+        "declining trust is a consent denial, not a budget refusal: {refusal:?}"
+    );
+    assert!(
+        refusal
+            .message
+            .contains("has not acknowledged: you declined it"),
+        "and it is the trust sentence that is returned: {}",
+        refusal.message
+    );
+    for clause in EVERY_VERDICT_CLAUSE {
+        assert!(
+            !refusal.message.contains(clause),
+            "a trust refusal must not carry a budget verdict — the turn never \
+             reached the measurement: {}",
+            refusal.message
+        );
+    }
+    for closing in [CLOSING_WITH_REMEDY, CLOSING_ONE_TIME_ONLY] {
+        assert!(
+            !refusal.message.contains(closing),
+            "nor a question, having asked none: {}",
+            refusal.message
+        );
+    }
+    assert!(
+        offered(&published).is_empty(),
+        "no offer may be recorded on a turn that was refused above Stage A: {:?}",
+        published.iter().map(Event::name).collect::<Vec<_>>()
+    );
+}
+
+/// **AC-9's other half — a user-authored skill raises no acknowledgment at all,
+/// and its only question is the budget one** (BR-6: "for a **user-authored**
+/// skill the current order stands").
+///
+/// The negative that gives the test above its meaning: without it, a daemon that
+/// asked the trust question for *every* skill would satisfy the ordering while
+/// putting a repository-trust prompt in front of a file the user wrote
+/// themselves — BR-4's question is about repository text, and a user's own
+/// `~/.claude/skills` is not that.
+///
+/// Same route, same body, same over-budget measurement; one field changed.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_user_authored_skill_is_asked_only_the_budget_question() {
+    let fx =
+        Fixture::new(Spec::new("ac9usr", local_route(), sized_body(6_000, 24_000)).user_sourced());
+    let session = fx.session();
+    let refusal = fx
+        .invoke(&session)
+        .await
+        .expect_err("the offer is declined, so the turn is refused");
+    assert_eq!(
+        refusal.code,
+        error_code::SKILL_EXPANSION_TOO_LARGE,
+        "the same budget door the project fixture reaches: {refusal:?}"
+    );
+    assert_eq!(
+        questions(&fx.client),
+        ["over-budget offer"],
+        "a skill the user installed themselves raises no repository-trust \
+         question — only the budget one"
     );
 }
 
