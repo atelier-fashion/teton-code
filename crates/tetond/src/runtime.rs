@@ -86,6 +86,7 @@
 //! *describing* the machine, changes no safety decision, and is how the offline
 //! session path is exercised at all.
 
+use std::cell::RefCell;
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
@@ -172,9 +173,7 @@ use crate::harness::budget::{
 };
 use crate::harness::completion::{context_provenance, RemoteProviderSource};
 use crate::harness::context::{Fit, NoopProvenanceHook, PressureReport};
-use crate::harness::permissions::{
-    AddressedPermissionDelivery, OverBudgetOptionLabels, SkillConsent,
-};
+use crate::harness::permissions::{AddressedPermissionDelivery, SkillConsent};
 use crate::harness::tools::shell;
 use crate::harness::tools::skill::register_skill_tool;
 use crate::harness::tools::web::{register_web_tool, tier_name, SeamError, WebLookupSeam};
@@ -1809,8 +1808,9 @@ struct RemedyPlan {
     /// provider the tier is being bound **to**, never the one the route is
     /// leaving.
     provider_id: ProviderId,
-    /// What the setting read before the write, spelled by [`declared_value`].
-    previous_value: String,
+    /// **How** to read what the setting held before the write — not the value
+    /// itself, because the value is only true at the instant it is read.
+    previous_value: PreviousValue,
     /// What it reads after, spelled the same way.
     new_value: String,
     /// The updates themselves, in the order they must be applied.
@@ -1829,6 +1829,66 @@ struct RemedyPlan {
     /// `None` for the three single-write remedies. They are addressed to the
     /// route's own provider, which the offer already holds and already quotes.
     rebind_target: Option<RebindTarget>,
+}
+
+/// Which setting a [`RemedyPlan`]'s record names as *previous*, as a rule for
+/// reading it rather than as a value already read (REQ-589 BR-7).
+///
+/// # Why a rule and not a string
+///
+/// The plan is built while the offer is being composed and applied after an
+/// await on a human, which has no timeout: minutes can pass, and `config/set`
+/// is open the whole time. A `previous_value` rendered from the turn's snapshot
+/// therefore states what the setting held *when the question was asked*, and
+/// [`SkillOverBudgetRemedyApplied`]'s job is to say what the write actually
+/// replaced. Those are different facts the moment anything else moves.
+///
+/// So the plan carries the rule, and [`DaemonRuntime::apply_over_budget_remedy`]
+/// evaluates it **inside the guard `apply_config_update_guarded` runs while
+/// holding the config lock** — the same lock the write takes, immediately
+/// before it takes it, so nothing can slip between the reading and the writing.
+enum PreviousValue {
+    /// `capabilities.max_context` on the addressed provider.
+    Window,
+    /// `capabilities.context_budget_cap` on the addressed provider.
+    Cap,
+    /// **BR-9's pair, both halves.** The tier's binding *and* the target's
+    /// declared window: a record naming only the binding would leave a reader
+    /// unable to tell the fix from the circle it exists to close.
+    TierAndWindow(Tier),
+}
+
+impl PreviousValue {
+    /// Read the rule against a config, spelled by [`declared_value`].
+    ///
+    /// A provider absent from `config` reads as its own absence rather than
+    /// panicking: this runs inside a consent path, and the identity guard
+    /// beside it is what actually refuses that case.
+    fn read(&self, config: &Config, provider_id: &str) -> String {
+        let capabilities = config
+            .providers
+            .iter()
+            .find(|provider| provider.id == provider_id)
+            .map(|provider| provider.capabilities);
+        let window = || declared_value(capabilities.map_or(0, |c| c.max_context), "undeclared");
+        match self {
+            PreviousValue::Window => window(),
+            PreviousValue::Cap => {
+                declared_value(capabilities.map_or(0, |c| c.context_budget_cap), "no cap")
+            }
+            // `unbound` is the honest word for the absent row: the tier still
+            // routed somewhere (the local engine — that is what made this bound
+            // `LocalEngine`), but no `[[tiers]]` row said so.
+            PreviousValue::TierAndWindow(tier) => {
+                let bound = config
+                    .tiers
+                    .iter()
+                    .find(|binding| binding.tier == *tier)
+                    .map_or("unbound", |binding| binding.provider_id.as_str());
+                format!("{bound}, capabilities.max_context {}", window())
+            }
+        }
+    }
 }
 
 /// The `config/set` updates one [`RemedyPlan`] performs, **in order**
@@ -1924,6 +1984,55 @@ fn field_wise_registration(
     }
 }
 
+/// Refuse a [`field_wise_registration`] whose identity half no longer matches
+/// what is stored (REQ-589 review pass).
+///
+/// # The three fields `RegisterProvider` replaces wholesale
+///
+/// `endpoint`, `model` and `auth_ref`. [`field_wise_registration`] re-states
+/// them precisely because they are *not* merged, and re-stating a value read
+/// minutes ago is a write of that old value. Between an over-budget offer being
+/// raised and answered — an await on a human, with no timeout — `config/set`
+/// and `teton provider add` are both open, so the provider can legitimately
+/// move underneath the plan.
+///
+/// Comparing them here, under the config lock, is what turns a silent revert
+/// into a refusal. The capability fields are deliberately **not** compared: they
+/// merge field-wise, so a cap or window the user changed in the meantime is
+/// preserved by the merge itself and is not a reason to refuse the remedy.
+///
+/// A provider absent from `config` fails here too. It cannot be re-registered
+/// from a plan built for the provider it used to be.
+///
+/// # Errors
+/// [`error_code::CONFIG_REJECTED`], naming the provider and saying nothing was
+/// changed — the same shape every other refusal on this path takes.
+fn provider_identity_unchanged(config: &Config, write: &ProviderConfig) -> Result<(), RpcError> {
+    let id = write.id.0.as_str();
+    let moved = |what: &str| {
+        Err(RpcError::new(
+            error_code::CONFIG_REJECTED,
+            format!(
+                "provider '{id}' {what} since this offer was put on screen, so the remedy was \
+                 not applied — writing it now would have restored the registration the offer \
+                 was composed from and undone that change. Nothing was changed; invoking the \
+                 skill again measures the provider as it now stands."
+            ),
+        ))
+    };
+    let Some(live) = config.providers.iter().find(|provider| provider.id == id) else {
+        return moved("was unregistered");
+    };
+    if to_proto_kind(live.kind) != write.kind
+        || live.endpoint != write.endpoint
+        || live.model != write.model
+        || live.auth_ref != write.auth_ref
+    {
+        return moved("was re-registered with a different endpoint, model, kind or credential");
+    }
+    Ok(())
+}
+
 /// **BR-7's remedies as writes** — what an accepted offer would durably change,
 /// or `None` where this build has nothing it may write (REQ-589 BR-7, BR-9;
 /// ADR-1, ADR-12).
@@ -1932,7 +2041,7 @@ fn field_wise_registration(
 /// |---|---|
 /// | [`Remedy::RaiseWindow`] | `capabilities.max_context` = the recipe's figure |
 /// | [`Remedy::DeclareWindow`] | the same field, first declared |
-/// | [`Remedy::RaiseCap`] | `capabilities.context_budget_cap` = `0` ("no cap") |
+/// | [`Remedy::RaiseCap`] | `capabilities.context_budget_cap` = `0` ("no cap"), and **only** where clearing it clears the measurement |
 /// | [`Remedy::BindTierRemote`] | the window **then** the tier binding (ADR-5) |
 ///
 /// `None` — the offer keeps its one-time override and its decline, and gains no
@@ -1944,6 +2053,14 @@ fn field_wise_registration(
 /// * a **rebind this daemon may not decide**: no configured remote to bind to,
 ///   or more than one and therefore a choice about where a whole category's
 ///   spend goes (ADR-12) — each said on the record channel below;
+/// * a **cap whose removal would not clear the measurement** (ADR-6 rule 2).
+///   That rule was written about a proposed *window* and binds this remedy at
+///   least as hard, because this is the one write that **deletes** a value the
+///   user set. Planning it unconditionally means a route bound by a 50k cap
+///   under a 200k window can spend a user's spend ceiling on an expansion the
+///   window would refuse anyway: the config is durably written, the route
+///   re-derives at `bound: window`, and the very next invocation meets the
+///   same refusal with nothing left to protect the spend;
 /// * [`Remedy::NotOffered`], `RedactScan`'s answer (BR-7b), which the gate
 ///   already drops the remedy options for — answered here rather than assumed
 ///   away;
@@ -1972,7 +2089,7 @@ fn plan_over_budget_remedy(
             Some(RemedyPlan {
                 kind: remedy.kind(),
                 provider_id: ProviderId::from(existing.id.as_str()),
-                previous_value: declared_value(existing.capabilities.max_context, "undeclared"),
+                previous_value: PreviousValue::Window,
                 new_value: declared_value(proposal.tokens, "undeclared"),
                 writes: RemedyWrites::Provider(field_wise_registration(
                     existing,
@@ -1988,16 +2105,39 @@ fn plan_over_budget_remedy(
             provider_id: Some(id),
         } => {
             let existing = registered(id)?;
+            // **ADR-6 rule 2, on the one destructive write** — the same gate
+            // `proposed_window` puts on a catalogued figure and `rebind_window`
+            // puts on a rebind, applied to the candidate this remedy would
+            // actually produce: the route with its cap removed and nothing else
+            // changed. `budget_inputs_for` hands out the route's own inputs and
+            // `clearing_the_cap_clears` runs them through the one classifier,
+            // so no second budget is minted here (REQ-586 AC-12).
+            if !crate::harness::budget::clearing_the_cap_clears(
+                router.budget_inputs_for(Some(existing.id.as_str())),
+                measured,
+            ) {
+                eprintln!(
+                    "tetond: an over-budget offer on `{}` carries no cap option — clearing \
+                     `capabilities.context_budget_cap` would leave the expansion over the \
+                     budget the declared window derives on its own, so the refusal would \
+                     stand and the spend ceiling would be gone for nothing (ADR-6 rule 2). \
+                     Raise `capabilities.max_context` to the provider's real window instead, \
+                     or send this one turn whole.",
+                    existing.id
+                );
+                return None;
+            }
             Some(RemedyPlan {
                 kind: remedy.kind(),
                 provider_id: ProviderId::from(existing.id.as_str()),
-                previous_value: declared_value(existing.capabilities.context_budget_cap, "no cap"),
-                // **Cleared, not guessed at.** The label offers to "raise or
-                // clear" this ceiling and the cap is the user's own number —
-                // the daemon has no second opinion about what it should be, and
-                // `0` is the config's own spelling of "no cap", the one value
-                // this daemon can write without inventing the user's policy.
-                // The window underneath still bounds the route.
+                previous_value: PreviousValue::Cap,
+                // **Cleared, not guessed at.** The cap is the user's own number
+                // — the daemon has no second opinion about what it should be,
+                // and `0` is the config's own spelling of "no cap", the one
+                // value this daemon can write without inventing the user's
+                // policy. The label says in as many words that this removes the
+                // ceiling rather than moving it, and the gate above is what
+                // stops it being removed for a refusal that would stand anyway.
                 new_value: declared_value(0, "no cap"),
                 writes: RemedyWrites::Provider(field_wise_registration(existing, None, Some(0))),
                 rebind_target: None,
@@ -2086,15 +2226,6 @@ fn plan_tier_rebind(
         );
         return None;
     };
-    // The `[[tiers]]` row as it stands, which is exactly what the second write
-    // replaces. `unbound` is the honest word for its absence: the tier still
-    // routed somewhere (here, the local engine — that is what made this bound
-    // `LocalEngine`), but no row said so.
-    let previously_bound = config
-        .tiers
-        .iter()
-        .find(|binding| binding.tier == tier)
-        .map_or("unbound", |binding| binding.provider_id.as_str());
     // **The chosen target, built once and read by everything downstream**
     // (ADR-1, ADR-18 item 2). The plan's `provider_id`, the record's
     // `new_value`, both writes, and the name the offer's sentence and option
@@ -2116,10 +2247,7 @@ fn plan_tier_rebind(
         // from the circle — a tier bound to a provider with no declared window
         // is the failure this remedy exists to close, and it has to be legible
         // in the record that it did not happen.
-        previous_value: format!(
-            "{previously_bound}, capabilities.max_context {}",
-            declared_value(existing.capabilities.max_context, "undeclared")
-        ),
+        previous_value: PreviousValue::TierAndWindow(tier),
         new_value: format!(
             "{}, capabilities.max_context {}",
             target.provider_id,
@@ -3418,6 +3546,38 @@ impl DaemonRuntime {
     /// category to a provider that cannot serve a turn, or if the resulting
     /// config fails validation (e.g. a raw key in `auth_ref`, BR-7).
     pub fn apply_config_update(&self, update: ConfigUpdate) -> Result<(), RpcError> {
+        self.apply_config_update_guarded(update, |_| Ok(()))
+    }
+
+    /// [`Self::apply_config_update`], with a precondition evaluated **under the
+    /// config lock this write takes** (REQ-589 review pass).
+    ///
+    /// `guard` runs after the lock is acquired and before anything is copied,
+    /// validated or persisted, so what it reads is the config this call is
+    /// about to mutate — not a snapshot that was current when the caller
+    /// decided to make the call. A `Err` from it is returned verbatim and
+    /// nothing is written.
+    ///
+    /// # Why this exists rather than a re-read at the call site
+    ///
+    /// The over-budget remedy is planned before a question is put to a human
+    /// and applied after they answer, with **no timeout** on the answer. A
+    /// caller that re-read the config, dropped the lock, and then called
+    /// [`Self::apply_config_update`] would have shrunk the window from minutes
+    /// to microseconds and left a race that no test can reliably show. The
+    /// guard closes it: read and write are one critical section.
+    ///
+    /// The public method keeps its exact posture by passing a guard that reads
+    /// nothing, so `config/set` traffic is unaffected — this adds a
+    /// precondition some callers may state, never a new authority.
+    ///
+    /// # Errors
+    /// The guard's error, or [`Self::apply_config_update`]'s.
+    fn apply_config_update_guarded(
+        &self,
+        update: ConfigUpdate,
+        guard: impl FnOnce(&Config) -> Result<(), RpcError>,
+    ) -> Result<(), RpcError> {
         if let ConfigUpdate::RegisterProvider(pc) = &update {
             let kind = to_core_kind(pc.kind);
             let declared = pc.model.as_deref().map(str::trim).filter(|m| !m.is_empty());
@@ -3435,6 +3595,10 @@ impl DaemonRuntime {
             }
         }
         let mut config = self.config.lock().expect("config mutex poisoned");
+        // The caller's precondition, against the config this write is about to
+        // replace — inside the critical section, so there is no instant between
+        // the two in which anything else can land.
+        guard(&config)?;
         reject_unusable_binding(&config, &update)?;
         let mut candidate = config.clone();
         apply_update(&mut candidate, update);
@@ -4032,6 +4196,20 @@ impl DaemonRuntime {
         // `enable_permanent` shipped once already.
         let plan = plan_over_budget_remedy(config, router, &offer.remedy, measured);
 
+        // **The plan is the fact, and it is told to the offer once** (ADR-1).
+        //
+        // Both halves of what a reader meets — which option rows are drawn, and
+        // which closing question the sentence ends on — are read off
+        // `OverBudgetOffer::remedy_offer` from here. They used to be decided
+        // separately: the rows from this plan, the closing from
+        // `Remedy::is_offered`. Those disagree exactly where BR-7c ships no
+        // figure, where ADR-6 rule 2 rejects a cap, and where ADR-12 withholds
+        // the rebind — and the offer then closed *"take the durable fix"* above
+        // a prompt with no row for one.
+        if plan.is_none() {
+            offer.withhold_remedy();
+        }
+
         // **BR-9's provider, named** (ADR-1; ADR-18 item 2). The rebind is the
         // one remedy whose target `Remedy::for_bound` could not know: it is
         // keyed on the bound, and the only provider id in its hand names the
@@ -4048,14 +4226,9 @@ impl DaemonRuntime {
             offer.name_rebind_target(target);
         }
 
-        let labels = if plan.is_some() {
-            offer.option_labels()
-        } else {
-            OverBudgetOptionLabels {
-                remedy: None,
-                ..offer.option_labels()
-            }
-        };
+        // No second decision here: `option_labels` reads the same
+        // `remedy_offer` the closing question does.
+        let labels = offer.option_labels();
 
         let answer = gate
             .authorize_skill_over_budget(
@@ -4177,6 +4350,31 @@ impl DaemonRuntime {
     /// the turn's own answer already stands, and a user told their limit was
     /// raised when the write failed would meet the same refusal next turn with
     /// no explanation.
+    ///
+    /// # The plan is checked against the **live** config, not the one it was
+    /// built from
+    ///
+    /// `RegisterProvider` replaces `endpoint`, `model` and `auth_ref`
+    /// **wholesale** — only the two capability fields merge field-wise — and
+    /// the plan captured all three from the snapshot the *question* was
+    /// composed under, before an await on a human with no timeout. So an offer
+    /// raised at 10:00 and answered at 10:05 would, unguarded, restore 10:00's
+    /// identity over whatever `config/set` or `teton provider add` wrote at
+    /// 10:02: a credential change silently reverted, and the next turn calling
+    /// the old endpoint.
+    ///
+    /// [`Self::apply_config_update_guarded`] closes it. Every
+    /// `RegisterProvider` this plan makes is admitted only if the stored
+    /// provider's identity still equals what the write re-states, read under
+    /// the config lock the write itself takes — so there is no instant between
+    /// the check and the write. A provider that moved (or was removed) fails
+    /// the remedy through the same stderr line every other failure takes,
+    /// rather than being reverted; the limit still stands, and re-invoking the
+    /// skill measures the provider as it now is.
+    ///
+    /// The **record** is read in the same guard, for the same reason: BR-7's
+    /// `previous_value` is a claim about what the write replaced, and a value
+    /// rendered minutes earlier is a claim about something else.
     fn apply_over_budget_remedy(
         &self,
         events: &Arc<EventBus>,
@@ -4195,7 +4393,42 @@ impl DaemonRuntime {
             // ignored with `..` so a later field cannot slip past unread.
             rebind_target: _,
         } = plan;
-        match writes.apply(|update| self.apply_config_update(update)) {
+        // Filled by the guard below, under the lock, on the first write — which
+        // for BR-9's pair is the one that happens before the tier moves, so the
+        // binding it names is the one being replaced.
+        let replaced: RefCell<Option<String>> = RefCell::new(None);
+        let outcome = writes.apply(|update| {
+            // Read off the update before it is handed over, because the guard
+            // cannot borrow a value that has been moved into the call.
+            let restates = match &update {
+                ConfigUpdate::RegisterProvider(pc) => Some(pc.clone()),
+                ConfigUpdate::SetTierBinding(_)
+                | ConfigUpdate::SetCategoryBinding(_)
+                | ConfigUpdate::SetPrivacyBoundary(_)
+                | ConfigUpdate::SetEffort(_) => None,
+            };
+            self.apply_config_update_guarded(update, |config| {
+                if let Some(restates) = &restates {
+                    provider_identity_unchanged(config, restates)?;
+                }
+                // One borrow, held across the test and the write: two would be
+                // a `RefCell` double-borrow waiting on a temporary-lifetime
+                // rule, in a consent path where the cost of being wrong is a
+                // panic.
+                let mut slot = replaced.borrow_mut();
+                if slot.is_none() {
+                    *slot = Some(previous_value.read(config, &provider_id.0));
+                }
+                Ok(())
+            })
+        });
+        // `None` is unreachable on the `Ok` arm — the guard runs before any
+        // mutation, so a write that landed ran it — and is answered rather than
+        // unwrapped, because the alternative is a panic in a consent path.
+        let previous_value = replaced
+            .into_inner()
+            .unwrap_or_else(|| "unrecorded".to_owned());
+        match outcome {
             Ok(()) => events.publish(
                 Some(session_id.clone()),
                 Event::SkillOverBudgetRemedyApplied(SkillOverBudgetRemedyApplied {

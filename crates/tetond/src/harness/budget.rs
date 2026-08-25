@@ -1031,6 +1031,13 @@ enum SkillSentence<'a> {
         source: SkillSource,
         /// Whether the provider already rejected this pair (BR-14.2).
         prior: PriorWindowRejection,
+        /// Whether a remedy-bearing option will actually be **drawn** on the
+        /// prompt this sentence closes.
+        ///
+        /// The closing question is picked from this and from nothing else, so
+        /// it cannot offer "the durable fix" beside an option list that has no
+        /// row for one — see [`RemedyOffer`].
+        offer: RemedyOffer,
     },
     /// A human said proceed, and this is the record of it.
     Accepted {
@@ -1128,6 +1135,7 @@ fn sentence_tail(caller: SkillCaller, bound: BudgetBound, sentence: &SkillSenten
             verdict,
             remedy,
             prior,
+            offer,
             ..
         } => {
             let mut tail = String::new();
@@ -1139,10 +1147,20 @@ fn sentence_tail(caller: SkillCaller, bound: BudgetBound, sentence: &SkillSenten
             tail.push(' ');
             tail.push_str(&remedy_clause(remedy));
             tail.push(' ');
-            tail.push_str(if remedy.is_offered() {
-                OFFER_CLOSING_WITH_REMEDY
-            } else {
-                OFFER_CLOSING_ONE_TIME_ONLY
+            // **The same fact that widens the option list**, and not
+            // `Remedy::is_offered` (REQ-589 ADR-1). BR-7 granting this bound a
+            // remedy is only half of what puts a row on the prompt: BR-7c may
+            // ship no figure, ADR-6 rule 2 may reject the candidate, and ADR-12
+            // may refuse to choose — in each of which the classification still
+            // says "offered" while nothing is drawn. Closing with "take the
+            // durable fix" there names an answer the reader cannot give.
+            //
+            // The clause *above* is unchanged either way: BR-7c's posture is to
+            // state the fix and ask for what the daemon does not have. What may
+            // not happen is the closing question implying there is a button.
+            tail.push_str(match offer {
+                RemedyOffer::Drawn => OFFER_CLOSING_WITH_REMEDY,
+                RemedyOffer::Withheld => OFFER_CLOSING_ONE_TIME_ONLY,
             });
             tail
         }
@@ -1364,8 +1382,10 @@ const fn window_clause(verdict: WindowVerdict, bound: BudgetBound) -> &'static s
 enum RemedyConsequence {
     /// Declaring a window for a provider that has none.
     DeclaringAWindow,
-    /// Raising the user's own `context_budget_cap`.
-    RaisingACap,
+    /// **Clearing** the user's own `context_budget_cap` — the one remedy whose
+    /// write *removes* a limit the user set rather than moving one, so the
+    /// sentence has to say the ceiling is gone.
+    ClearingACap,
     /// **BR-7a.** Raising a window the user already declared.
     RaisingADeclaredWindow,
     /// **BR-9.** Rebinding a whole tier to a remote provider.
@@ -1381,9 +1401,16 @@ impl RemedyConsequence {
                  has to be the provider's real one: declare more than the provider has and this \
                  refusal becomes an error at the provider instead"
             }
-            RemedyConsequence::RaisingACap => {
-                "that ceiling is your own and sits below what the provider would take, so raising \
-                 it lets every later prompt on this route carry more context, and cost more"
+            // The one **destructive** remedy: the write is `= 0`, which is the
+            // config's own spelling of "no cap", so what happens is that the
+            // spend ceiling stops existing. A sentence that said "raising it"
+            // would describe a write this daemon does not make and would leave
+            // the reader believing a smaller limit is still in force.
+            RemedyConsequence::ClearingACap => {
+                "that ceiling is your own spend limit and sits below what the provider would \
+                 take, so clearing it removes the limit rather than moving it: nothing but the \
+                 provider's own window bounds this route afterwards, and every later prompt on \
+                 it may carry more context, and cost more, until you set a new ceiling"
             }
             // BR-7a, verbatim in force: raising `max_context` above the
             // provider's real window does not enlarge that window, it converts
@@ -1501,12 +1528,20 @@ fn remedy_clause_of(remedy: &Remedy) -> Option<RemedyClause> {
             write: window_write("raise", provider_id.as_deref(), proposal.as_ref()),
             consequence: RemedyConsequence::RaisingADeclaredWindow,
         }),
+        // **ADR-1's rule, on the one remedy that deletes rather than sets.**
+        // The label used to read "raise or clear `capabilities.context_budget_cap`
+        // for `kimi`", which names no value — and the write it stands for is
+        // `context_budget_cap = 0`, the removal of the user's own spend
+        // ceiling. A label vague about *which* of raise-or-clear it does is
+        // worse here than anywhere else in this table, because the reader
+        // cannot tell a loosened limit from no limit at all.
         Remedy::RaiseCap { provider_id } => Some(RemedyClause {
             write: format!(
-                "raise or clear `capabilities.context_budget_cap` for {}",
+                "write `capabilities.context_budget_cap = 0` for {}, which removes the ceiling \
+                 you set rather than raising it (`0` is the config's own spelling of no cap)",
                 provider_phrase(provider_id.as_deref())
             ),
-            consequence: RemedyConsequence::RaisingACap,
+            consequence: RemedyConsequence::ClearingACap,
         }),
         // BR-9, and the half that is *not* here matters as much as the halves
         // that are: there is no `capabilities.max_context` write addressed to
@@ -1705,6 +1740,53 @@ pub fn proposed_window(
         vendor: recipe.label,
         verified_on: recipe.verified_on,
     })
+}
+
+/// Whether **clearing** `capabilities.context_budget_cap` would actually clear
+/// the measured expansion (REQ-589 BR-7, ADR-6 rule 2).
+///
+/// # ADR-6 rule 2 applies here too, and here it costs the most
+///
+/// The rule is "never propose a value that would not clear the measured
+/// expansion", and it was written about [`proposed_window`]. It binds
+/// [`Remedy::RaiseCap`] at least as hard, because that remedy's write is the
+/// only **destructive** one this daemon makes: `context_budget_cap = 0` removes
+/// the user's own spend ceiling.
+///
+/// Without this test the failure is concrete and complete. A provider with
+/// `max_context = 200000` and `context_budget_cap = 50000` derives its budget
+/// from the cap and stamps `bound: user cap`. An expansion past the *window*-
+/// derived pair is over budget all the same, so the offer is raised, the remedy
+/// is `RaiseCap`, and answering it writes `0` to the config. The route then
+/// re-derives at `bound: window`, against a budget the same expansion still
+/// overflows — **the very next invocation meets the same refusal**, and the
+/// ceiling is gone for nothing.
+///
+/// # The same two terms as [`proposed_window`], for the same two reasons
+///
+/// The candidate goes through [`derive`] — the one classifier (BR-8, AC-12),
+/// never a second opinion — with the cap removed and nothing else touched, and
+/// it clears only if the derived pair is not [`floored`](RouteBudget::floored)
+/// and holds the measurement in **both** currencies. `floored` matters on the
+/// same pre-flight footing it does there: a route whose window is small enough
+/// to derive below the floor is one whose declared ceiling is not in force, and
+/// deleting a cap underneath it changes nothing a user would recognize.
+///
+/// # It answers `false` for a route with no cap to clear
+///
+/// `cap == 0` derives the identical pair, so a measurement that overflowed the
+/// route's own budget overflows the candidate too. That is the right answer
+/// rather than a special case: there is no ceiling to remove, so removing it
+/// clears nothing.
+///
+/// The measurement is a [`Fit`] for [`proposed_window`]'s reason — it can only
+/// have come from the estimator the refusal itself ran on.
+#[must_use]
+pub fn clearing_the_cap_clears(route: BudgetInputs<'_>, measured: Fit) -> bool {
+    let candidate = derive(BudgetInputs { cap: 0, ..route });
+    !candidate.floored
+        && measured.tokens <= candidate.budget_tokens
+        && measured.bytes <= candidate.budget_bytes
 }
 
 // -- Who BR-9's rebind would bind the tier to (REQ-589 BR-9, ADR-12) ---------
@@ -1977,12 +2059,21 @@ pub enum Remedy {
         /// one gets written to a user's config.
         proposal: Option<ProposedWindow>,
     },
-    /// A user cap sat below the window and is what bound the budget: raise or
-    /// clear `capabilities.context_budget_cap` (BR-7, `UserCap`).
+    /// A user cap sat below the window and is what bound the budget: **clear**
+    /// `capabilities.context_budget_cap` (BR-7, `UserCap`).
     ///
     /// It carries no proposal: the cap is the user's own number, and BR-7c's
     /// catalog lookup answers a question about a *vendor's* window, which is
-    /// not what a cap is.
+    /// not what a cap is. The daemon therefore has no second opinion about what
+    /// the ceiling *should* be, and the only value it can write without
+    /// inventing the user's policy is `0` — so the remedy is a removal, and the
+    /// clause says so in as many words rather than offering "raise or clear".
+    ///
+    /// It is also the one remedy whose write is destructive, which is why
+    /// [`crate::runtime`] refuses to plan it unless clearing the cap would
+    /// actually clear the measured expansion (ADR-6 rule 2): a spend ceiling
+    /// deleted for nothing is strictly worse than the refusal it was meant to
+    /// resolve.
     RaiseCap {
         /// The provider whose cap is in question, sanitized. `None` is
         /// defensive, as on [`Remedy::DeclareWindow`].
@@ -2057,7 +2148,7 @@ impl Remedy {
     /// | Bound | Remedy | Why |
     /// |---|---|---|
     /// | `DefaultUnknown` | [`Remedy::DeclareWindow`] | the window is undeclared; declaring it is the real fix |
-    /// | `UserCap` | [`Remedy::RaiseCap`] | the user set this ceiling and may raise it |
+    /// | `UserCap` | [`Remedy::RaiseCap`] | the user set this ceiling and may clear it |
     /// | `Window` | [`Remedy::RaiseWindow`] | the user's declaration is the user's to correct |
     /// | `LocalEngine` | [`Remedy::BindTierRemote`] | the local *pair* has no lever, but the route does |
     /// | `RedactScan` | [`Remedy::NotOffered`] | the byte clamp is an egress-privacy guarantee (BR-7b) |
@@ -2198,6 +2289,44 @@ pub struct OverBudgetOffer {
     /// [`Remedy::for_bound`] — [`Remedy::NotOffered`] where the bound has none,
     /// never an `Option`.
     pub remedy: Remedy,
+    /// Whether a remedy-bearing option is actually **drawn** on this offer's
+    /// prompt (REQ-589 ADR-1).
+    ///
+    /// Seeded from [`Remedy::is_offered`] and narrowed — never widened — by
+    /// [`OverBudgetOffer::withhold_remedy`], which the applying surface calls
+    /// when it planned no write. Both [`OverBudgetOffer::question`] and
+    /// [`OverBudgetOffer::option_labels`] read *this* field, so the closing
+    /// question and the option list are two readings of one fact rather than
+    /// two decisions that agree today.
+    pub remedy_offer: RemedyOffer,
+}
+
+/// Whether the surface applying an [`OverBudgetOffer`] has a durable write in
+/// hand for it (REQ-589 ADR-1).
+///
+/// # Why this is not `Remedy::is_offered`
+///
+/// BR-7 granting a bound a remedy is a fact about the *classification*. Whether
+/// a row promising that remedy appears on the prompt is a fact about the
+/// **plan**, and the two legitimately disagree: BR-7c ships no figure for a
+/// provider matching no vendor recipe, ADR-6 rule 2 rejects a candidate that
+/// would not clear the measurement, and ADR-12 will not choose between two
+/// configured remotes. In each of those the classification still says
+/// `RaiseWindow` / `DeclareWindow` / `RaiseCap` / `BindTierRemote` while the
+/// option list carries only the one-time override and the decline.
+///
+/// Reading the classification for the sentence and the plan for the options is
+/// how an offer came to close *"Send it whole this once, take the durable fix,
+/// both, or neither?"* above a prompt with no row for the durable fix. One
+/// value, read by both, is the fix.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RemedyOffer {
+    /// A durable write is in hand: both remedy-bearing options are drawn, and
+    /// the closing question offers the fix.
+    Drawn,
+    /// There is none to draw — either BR-7b grants this bound no remedy at all,
+    /// or the applying surface could plan no write for the one it has.
+    Withheld,
 }
 
 impl OverBudgetOffer {
@@ -2235,12 +2364,22 @@ impl OverBudgetOffer {
         proposal: Option<ProposedWindow>,
         tier: Option<Tier>,
     ) -> Self {
+        let remedy = Remedy::for_bound(budget.bound, budget.provider_id.as_deref(), proposal, tier);
         Self {
             skill: skill.to_owned(),
             stage,
             measured,
             window_verdict: window_verdict(budget.bound, window, measured),
-            remedy: Remedy::for_bound(budget.bound, budget.provider_id.as_deref(), proposal, tier),
+            // BR-7's own answer, which is the widest this can ever be. The
+            // applying surface narrows it with
+            // [`OverBudgetOffer::withhold_remedy`] once it knows whether it
+            // could plan the write; nothing widens it again.
+            remedy_offer: if remedy.is_offered() {
+                RemedyOffer::Drawn
+            } else {
+                RemedyOffer::Withheld
+            },
+            remedy,
             budget: budget.clone(),
         }
     }
@@ -2279,22 +2418,46 @@ impl OverBudgetOffer {
         }
     }
 
+    /// **Withhold the remedy-bearing options** because the applying surface
+    /// planned no write for them (REQ-589 ADR-1).
+    ///
+    /// The companion to [`OverBudgetOffer::name_rebind_target`], and it takes
+    /// the same posture: the offer does not go looking for the plan, the
+    /// surface that made the plan tells it. Call it before
+    /// [`OverBudgetOffer::question`] or [`OverBudgetOffer::option_labels`] —
+    /// both read the field it sets, so a withholding declared afterwards would
+    /// reach neither.
+    ///
+    /// It only ever narrows. A bound BR-7 grants no remedy is already
+    /// [`RemedyOffer::Withheld`] from [`OverBudgetOffer::new`], and there is
+    /// deliberately no method that puts an option back: the classification is
+    /// the ceiling and the plan is the floor.
+    pub const fn withhold_remedy(&mut self) {
+        self.remedy_offer = RemedyOffer::Withheld;
+    }
+
     /// How far past the word budget the measurement ran, or `0`.
     ///
     /// Derived on read (ADR-13); `saturating_sub` because a Stage B
     /// measurement can be under the word budget while over the byte one, and
     /// "over by nothing in this currency" is the honest answer there.
-    #[must_use]
-    pub const fn overrun_tokens(&self) -> usize {
+    ///
+    /// **Test-only.** ADR-13's claim is that the overrun is *derived*, never a
+    /// third stored figure beside the two it subtracts, and the tests below pin
+    /// that. No sentence, label or event quotes an overrun, so shipping this as
+    /// a `pub` accessor was an unwired producer that the dead-code lint cannot
+    /// see through `pub` — the shape LESSON-544 is about, in the small.
+    #[cfg(test)]
+    const fn overrun_tokens(&self) -> usize {
         self.measured
             .tokens
             .saturating_sub(self.budget.budget_tokens)
     }
 
     /// How far past the byte budget the measurement ran, or `0`. See
-    /// [`OverBudgetOffer::overrun_tokens`].
-    #[must_use]
-    pub const fn overrun_bytes(&self) -> usize {
+    /// [`OverBudgetOffer::overrun_tokens`], including why it is test-only.
+    #[cfg(test)]
+    const fn overrun_bytes(&self) -> usize {
         self.measured.bytes.saturating_sub(self.budget.budget_bytes)
     }
 
@@ -2319,6 +2482,10 @@ impl OverBudgetOffer {
             remedy: &self.remedy,
             source,
             prior,
+            // The **same** field `option_labels` reads, which is what makes
+            // "the closing question offers a fix the prompt has no row for"
+            // unrepresentable rather than merely untested.
+            offer: self.remedy_offer,
         })
     }
 
@@ -2369,11 +2536,15 @@ impl OverBudgetOffer {
     ///   from [`RemedyClause::render`] like the sentence is, and that is the
     ///   only rendering there is (AC-7a).
     ///
-    /// `None` for a bound BR-7 grants no remedy: the one-time override stands
-    /// alone and nothing on the prompt implies a durable fix exists (BR-7b).
-    /// The gate drops remedy labels on such a bound too — an invariant enforced
-    /// at two seams needs an adversarial test at each (LESSON-502) — and this
-    /// is the seam that decides.
+    /// `None` for a [`RemedyOffer::Withheld`] offer: BR-7b's remedy-less bound,
+    /// and equally an offer whose applying surface could plan no write. The
+    /// one-time override stands alone and nothing on the prompt implies a
+    /// durable fix exists (BR-7b). The gate drops remedy labels on such a bound
+    /// too — an invariant enforced at two seams needs an adversarial test at
+    /// each (LESSON-502) — and this is the seam that decides.
+    ///
+    /// [`OverBudgetOffer::question`] reads the same field, so the closing
+    /// question cannot name a fix this list has no row for.
     #[must_use]
     pub fn option_labels(&self) -> OverBudgetOptionLabels {
         OverBudgetOptionLabels {
@@ -2386,13 +2557,18 @@ impl OverBudgetOffer {
             decline: "Do not send it — refuse the turn exactly as this route does today, and \
                       write nothing"
                 .to_owned(),
-            remedy: remedy_clause_of(&self.remedy).map(|clause| {
-                let rendered = clause.render();
-                OverBudgetRemedyLabels {
-                    proceed_and_remedy: format!("Send it whole this once, and {rendered}"),
-                    remedy_only: format!("Do not send it, but {rendered}"),
-                }
-            }),
+            // `RemedyOffer` is read here **and** by the closing question, so
+            // the two cannot disagree about whether a fix is on the table.
+            remedy: match self.remedy_offer {
+                RemedyOffer::Withheld => None,
+                RemedyOffer::Drawn => remedy_clause_of(&self.remedy).map(|clause| {
+                    let rendered = clause.render();
+                    OverBudgetRemedyLabels {
+                        proceed_and_remedy: format!("Send it whole this once, and {rendered}"),
+                        remedy_only: format!("Do not send it, but {rendered}"),
+                    }
+                }),
+            },
         }
     }
 
@@ -4437,9 +4613,9 @@ mod tests {
     /// architecture.md's normative table, LESSON-520).
     ///
     /// Verdict and bound are not independent axes: a window verdict exists only
-    /// where a window was declared, so nine of the fifteen cells cannot occur
-    /// and a test written for one of them would pass vacuously. The six that do
-    /// occur are here, each reached by *deriving* the bound from real inputs
+    /// where a window was declared, so seven of the fifteen cells cannot occur
+    /// and a test written for one of them would pass vacuously. The eight that
+    /// do occur are all here, each reached by *deriving* the bound from real inputs
     /// rather than by asserting a hand-built `RouteBudget` — so a row that stops
     /// producing the bound it is named for fails here instead of quietly
     /// testing a different cell.
@@ -5049,7 +5225,7 @@ mod tests {
 
     /// **AC-6: all three verdicts offer, and each arm pins its own wording.**
     ///
-    /// Swept over the reachability table and nothing else — nine of the fifteen
+    /// Swept over the reachability table and nothing else — seven of the fifteen
     /// cells cannot occur and a test written for one passes vacuously
     /// (LESSON-520). Every row asserts in **both** directions: the arm's own
     /// claim present, and the other two arms' claims absent, so an
@@ -5568,11 +5744,16 @@ mod tests {
                 "raise `capabilities.max_context = 1000000` for `kimi`",
             ),
             (
-                "raise a cap",
+                // The **destructive** row, and the one this test used to
+                // cement the violation on: "raise or clear …" names neither
+                // the value written nor which of the two it does, and what it
+                // actually writes is `0` — the removal of the user's own spend
+                // ceiling.
+                "clear a cap",
                 remote(200_000, 40_000, false),
                 measured(200_000, 60_000, false),
                 None,
-                "raise or clear `capabilities.context_budget_cap` for `kimi`",
+                "write `capabilities.context_budget_cap = 0` for `kimi`",
             ),
             (
                 "bind a tier",
@@ -5607,6 +5788,13 @@ mod tests {
                 assert!(
                     !label.to_lowercase().contains("raise the limit"),
                     "{name}: the vague promise ADR-1 forbids: {label}"
+                );
+                // The same vagueness in the shape this table actually shipped
+                // it: an either/or that names no value and leaves the reader
+                // unable to tell a loosened limit from a deleted one.
+                assert!(
+                    !label.to_lowercase().contains("raise or clear"),
+                    "{name}: a label that will not say which of the two it does: {label}"
                 );
             }
             assert!(
@@ -5851,6 +6039,187 @@ mod tests {
         assert!(
             !decline.contains("this repository's skill"),
             "today's refusal carries no marker, and the decline arm is today's refusal: {decline}"
+        );
+    }
+
+    // -- The review pass (REQ-589 Phase 5) -----------------------------------
+
+    /// **The cap remedy names the write it makes, and that write is a
+    /// removal** (ADR-1; REQ-589 review pass).
+    ///
+    /// This is the only remedy in BR-7's table whose write *deletes* a value
+    /// the user set. It shipped labelled ``raise or clear
+    /// `capabilities.context_budget_cap` for `kimi` ``, which names no value
+    /// and will not say which of the two it does — while the write is
+    /// `context_budget_cap = 0`, the removal of the ceiling. The consequence
+    /// half compounded it by describing *raising* a cap, so both halves told a
+    /// reader their limit was being loosened.
+    ///
+    /// **Mutation**: restore either half of the old wording and this reddens —
+    /// the write assertion on the first, the "removes"/"clearing" assertions on
+    /// the second.
+    #[test]
+    fn the_cap_remedy_says_it_removes_the_ceiling_rather_than_raising_it() {
+        let rendered = remedy_clause_of(&Remedy::RaiseCap {
+            provider_id: Some("kimi".to_owned()),
+        })
+        .expect("`UserCap` carries BR-7's remedy")
+        .render();
+
+        // ADR-1: the concrete write, key and value, addressed to a provider.
+        assert!(
+            rendered.contains("`capabilities.context_budget_cap = 0`"),
+            "the label must name the value it writes: {rendered}"
+        );
+        assert!(rendered.contains("for `kimi`"), "{rendered}");
+        // And that the write is a deletion, in both halves of the clause.
+        assert!(
+            rendered.contains("removes the ceiling you set rather than raising it"),
+            "the write half must say the ceiling goes away: {rendered}"
+        );
+        assert!(
+            rendered.contains("clearing it removes the limit rather than moving it"),
+            "the consequence half must say the same: {rendered}"
+        );
+        assert!(
+            !rendered.to_lowercase().contains("raise or clear"),
+            "the either/or that names neither: {rendered}"
+        );
+        // The old consequence's claim, which described a write this daemon
+        // does not make.
+        assert!(
+            !rendered.contains("so raising it lets every later prompt"),
+            "a cleared ceiling is not a raised one: {rendered}"
+        );
+    }
+
+    /// **ADR-6 rule 2 binds the cap remedy too, and a cap whose removal would
+    /// not clear the measurement is not one to remove** (REQ-589 review pass).
+    ///
+    /// The reviewer's construction, exactly: `max_context = 200_000` with
+    /// `context_budget_cap = 50_000`. Both rows are over budget and both stamp
+    /// `bound: user cap`; they differ only in whether the *window*-derived pair
+    /// underneath would hold the same expansion.
+    ///
+    /// The negative row is the whole point. Clearing the cap there writes `0`,
+    /// re-derives the route at `bound: window`, and meets the identical
+    /// refusal on the next invocation — with the user's spend ceiling deleted
+    /// for nothing. The positive row is the non-vacuity guard: the predicate is
+    /// not simply always false.
+    ///
+    /// **Mutation**: return `true` unconditionally and the first row fails;
+    /// drop the `floored` term and the third fails.
+    #[test]
+    fn a_cap_is_only_cleared_where_clearing_it_would_clear_the_measurement() {
+        let capped = remote(200_000, 50_000, false);
+        let stamped = derive(capped);
+        assert_eq!(
+            stamped.bound,
+            BudgetBound::UserCap,
+            "both rows must be the bound whose remedy is the destructive one"
+        );
+
+        // Past the window-derived pair as well as the cap-derived one: nothing
+        // this write could do resolves it.
+        let hopeless = measured(200_000, 900_000, false);
+        assert!(
+            hopeless.tokens > stamped.budget_tokens || hopeless.bytes > stamped.budget_bytes,
+            "non-vacuity: the row must actually be over budget"
+        );
+        assert!(
+            !clearing_the_cap_clears(capped, hopeless),
+            "a spend ceiling deleted for a refusal that stands anyway"
+        );
+
+        // Over the cap and comfortably inside the window behind it: this is
+        // what the remedy exists for.
+        let resolvable = measured(40_000, 60_000, false);
+        assert!(
+            resolvable.tokens > stamped.budget_tokens || resolvable.bytes > stamped.budget_bytes,
+            "non-vacuity: the row must actually be over budget"
+        );
+        assert!(
+            clearing_the_cap_clears(capped, resolvable),
+            "the predicate rejects the case BR-7 wrote the remedy for"
+        );
+
+        // The `floored` term, on its own footing: a window small enough to
+        // derive below the floor is a declaration that is not in force, so
+        // deleting a cap underneath it changes nothing a reader would
+        // recognize. Measured with a trivially-clearing fit, so only `floored`
+        // can be what answers.
+        let tiny = remote(2_000, 1_000, false);
+        assert!(
+            derive(BudgetInputs { cap: 0, ..tiny }).floored,
+            "the fixture must be the floored case, or this row asserts nothing"
+        );
+        assert!(!clearing_the_cap_clears(tiny, measured(1, 1, false)));
+
+        // A route with no cap at all: there is no ceiling to remove, so
+        // removing it clears nothing.
+        assert!(!clearing_the_cap_clears(
+            remote(200_000, 0, false),
+            hopeless
+        ));
+    }
+
+    /// **The closing question is read off the same fact that widens the option
+    /// list** (ADR-1; REQ-589 review pass).
+    ///
+    /// The offer shipped choosing its closing clause from `Remedy::is_offered`
+    /// — a property of the *classification* — while the rows were widened only
+    /// where a `RemedyPlan` existed. On a provider BR-7c ships no figure for
+    /// (and on ADR-12's withheld rebind, and on ADR-6 rule 2's rejected cap)
+    /// the sentence ended *"Send it whole this once, take the durable fix,
+    /// both, or neither?"* above a prompt with two rows and no durable fix
+    /// among them.
+    ///
+    /// **Mutation**: point `sentence_tail`'s closing back at
+    /// `remedy.is_offered()` and the withheld half of this test reddens; drop
+    /// the `RemedyOffer` read from `option_labels` and the label half does.
+    #[test]
+    fn a_withheld_remedy_closes_the_question_it_can_actually_answer() {
+        // A bound BR-7 *does* grant a remedy, so `is_offered()` stays true
+        // throughout and cannot be what the assertions are reading.
+        let mut offer = offer_over(
+            remote(128_000, 0, false),
+            measured(200_000, 100_000, false),
+            Some(kimi_proposal()),
+            None,
+        );
+        assert!(
+            offer.remedy.is_offered(),
+            "non-vacuity: the classification must say a fix exists"
+        );
+        assert_eq!(offer.remedy_offer, RemedyOffer::Drawn);
+        assert!(offer.option_labels().remedy.is_some());
+        assert!(offer
+            .question(SkillSource::User, PriorWindowRejection::None)
+            .ends_with(OFFER_CLOSING_WITH_REMEDY));
+
+        offer.withhold_remedy();
+
+        assert_eq!(offer.remedy_offer, RemedyOffer::Withheld);
+        assert!(
+            offer.remedy.is_offered(),
+            "the classification is untouched: only the plan withdrew"
+        );
+        let labels = offer.option_labels();
+        assert!(
+            labels.remedy.is_none(),
+            "no write was planned, so no row may promise one: {labels:?}"
+        );
+        let question = offer.question(SkillSource::User, PriorWindowRejection::None);
+        assert!(
+            question.ends_with(OFFER_CLOSING_ONE_TIME_ONLY),
+            "the closing must offer only the answers the prompt draws: {question}"
+        );
+        // BR-7c's posture is unchanged: the sentence still *names* the durable
+        // fix and asks for what the daemon does not have. What it may not do is
+        // imply there is a button for it.
+        assert!(
+            question.contains("The durable fix is to"),
+            "the fix is still stated: {question}"
         );
     }
 }
