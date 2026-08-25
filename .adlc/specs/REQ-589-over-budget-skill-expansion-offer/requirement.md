@@ -173,7 +173,15 @@ AC-9's "nobody was asked and nobody decided" distinction, kept where it already 
   names, the skill's name, and a sanitized provider id may reach any of them; no
   provider response body is an input, because none is in scope. (informed by REQ-586)
 
-- [ ] **BR-6: A project skill's trust question comes first — and must first exist.**
+- [x] **BR-6 — MOVED TO REQ-591. Not this REQ's rule any more.**
+  The trust gate, its unattended allowlist, and every decision about them were carved out
+  on 2026-08-25 after a six-agent review found that all of REQ-589's serious findings
+  traced to this work rather than to the offer. **REQ-591 owns it.** The text below is
+  retained as history — it records why the carve-out happened — and is NOT a rule REQ-589
+  must satisfy. REQ-589's only remaining obligation here is AC-10 of REQ-591: the offer
+  behaves identically before and after the split.
+
+  *(Historical:)* **A project skill's trust question comes first — and must first exist.**
   *(Cross-REQ rule references in this document are always qualified with their REQ —
   this document has its own BR-4 and BR-10 meaning different things.)*
 
@@ -377,7 +385,8 @@ AC-9's "nobody was asked and nobody decided" distinction, kept where it already 
   unreachable** — `max_context` first, tier binding second. A partial failure then
   leaves a declared window on an unbound tier, which is harmless; only the reverse
   order can produce the circle.
-- [ ] AC-9: A project-sourced over-budget skill asks the trust question before the
+- [x] AC-9 — **MOVED TO REQ-591** (its AC-1 owns this, mutation-verified there).
+      *(Historical:)* A project-sourced over-budget skill asks the trust question before the
   budget question; a user-authored one does not (BR-6). Declining trust yields the trust
   refusal, not a budget sentence.
 - [ ] AC-10: Accepting twice in one session prompts twice — no grant is persisted
@@ -502,7 +511,7 @@ was validated. **D-8 reversed the draft's lean; the other four confirmed it.**
 
 **Third round — decisions taken during the architecture phase, 2026-08-24.**
 
-- **D-10 — build the project-skill trust gate on the typed path.** Exploration proved
+- **D-10 — build the project-skill trust gate on the typed path.** ***[CARRIED TO REQ-591]*** Exploration proved
   BR-6's premise false: no trust gate exists on the user-typed `/name` path, so the rule
   as drafted was a no-op. The product owner chose to **build** the gate rather than drop
   the rule and file the gap. This is an accepted scope increase: `accept_invocation`
@@ -514,7 +523,7 @@ was validated. **D-8 reversed the draft's lean; the other four confirmed it.**
 
 **Fourth round — product owner, 2026-08-24, mid-implementation.**
 
-- **D-13 — give the trust gate an unattended path.** D-10's gate blocked piped/unattended
+- **D-13 — give the trust gate an unattended path.** ***[CARRIED TO REQ-591]*** D-10's gate blocked piped/unattended
   sessions from running any typed project skill. The owner chose to preserve automation over
   accepting the refusal. → TASK-262, built on `[web] permission_allow`'s precedent: a human
   still decides, durably and out of band; the unattended path only *consults* that decision.
@@ -545,6 +554,22 @@ tier rebind rather than recite it.
   produced it. *Lean:* record the recipe's verification date in the same write — as a
   comment or an adjacent field — so a later `/doctor` can tell a declared window that
   was measured from one that was inherited. Do not block the write on freshness.
+
+## The REQ-591 carve-out (2026-08-25)
+
+The project-skill trust gate (D-10) and its unattended allowlist (D-13) **left this REQ**
+and are now **REQ-591**. Commits `b4e4b01`, `4be0c34`, `b071da5`, `bda079d` and `37a2e6c`
+belong to that requirement.
+
+Why: a six-agent review found every serious finding traced to the trust work, not to the
+offer. The offer's consent path audited clean — no bypass constructible — its injection
+surface clean, its refusal invariant intact. Reviewing a security feature as a rider on a
+budget fix was the mistake; this undoes it.
+
+**One seam spans both REQs and they must not answer it differently:** a durable config write
+that skips `refuse_daemon_wide` and `refuse_unattested_commitment`. REQ-589 owns the
+*remedy's* write (capability numbers); REQ-591 owns the *trust row's* write (a standing
+permission). REQ-591 OQ-1 is where the question is stated in full.
 
 ## Out of Scope
 

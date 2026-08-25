@@ -152,25 +152,39 @@ Two things, and the second exists only because the first broke automation:
 
 ## Acceptance Criteria
 
-- [ ] AC-1: A typed project-sourced skill raises the acknowledgment; a user-authored one does
+- [ ] AC-1 (BR-1, BR-2): A typed project-sourced skill raises the acknowledgment; a user-authored one does
   not. **The ordering is asserted from the raw prompt log, not a filtered view** — reversing
   the two gate calls must redden (this was vacuous in REQ-589 and is now mutation-verified).
-- [ ] AC-2: The typed prompt says the user asked; the model-invoked prompt is byte-identical
+- [ ] AC-2 (BR-3): The typed prompt says the user asked; the model-invoked prompt is byte-identical
   to its pre-REQ-589 form.
 - [ ] AC-3: The BR-4 attack is reproduced and refused: bodies read from an unlisted tree, the
   session-root symlink re-pointed at a listed tree, unattended run **refuses**.
-- [ ] AC-4: An unattended session at an **unlisted** root refuses. This is the criterion that
+- [ ] AC-4 (BR-5): An unattended session at an **unlisted** root refuses. This is the criterion that
   keeps the gate meaningful and it must be mutation-sensitive.
 - [ ] AC-5: An unattended session at a **listed** root proceeds with no prompt drawn.
-- [ ] AC-6: The durable write is verified by reading the config **file** and re-parsing it,
+- [ ] AC-6 (BR-9): The durable write is verified by reading the config **file** and re-parsing it,
   paired with a refusal leg on the same fixture proving nothing was written (BR-9).
-- [ ] AC-7: A row granted for one door does not silently answer for the other — or, if OQ-2
+- [ ] AC-7 (BR-8): A row granted for one door does not silently answer for the other — or, if OQ-2
   decides it should, a test asserts that breadth deliberately and the label says so (BR-8).
 - [ ] AC-8: No surface claims a refusal that did not happen (BR-10). The existing test that
   pins the contradictory line is corrected, not preserved.
 - [ ] AC-9: `cargo audit` clean; the previously verified non-exploitable vectors stay
   non-exploitable — symlink at a listed path, `..` traversal, percent-escape collisions,
   home-prefix confusion, case-insensitive and firmlinked filesystems.
+- [ ] AC-12 (BR-6): Trusting `~/dev/repo` does NOT authorize `~/dev/repo/vendor/other`. The
+  exact-match rule has no test today; a prefix match would let a dependency update place a
+  tree inside a listed root and inherit its trust. Paired with a positive leg on the same
+  fixture so neither passes by accident.
+- [ ] AC-13 (BR-7): The option label names the write it performs, and a test pins label and
+  effect together so they cannot drift — the failure LESSON-495 records is a prompt
+  describing a write that provably could not happen.
+- [ ] AC-14 (BR-11): A directory name containing a newline or ESC does not reach a client
+  raw. Either the daemon bounds and strips it at the minting door (and a test asserts that),
+  or the wire contract is corrected to say the client must defuse — but not the present
+  state, where the contract claims a bounding that does not happen.
+- [ ] AC-15 (BR-12): `skills.md` documents the acknowledgment and `trusted_project_roots`,
+  and the existing byte-ceiling test still passes. The commit states what was cut to pay for
+  the words.
 - [ ] AC-10: The split itself is clean: REQ-589's offer behaves identically before and after
   the carve-out, and neither REQ answers OQ-1 differently from the other.
 - [ ] AC-11: Dogfood — a real unattended invocation against a listed root, and against an
