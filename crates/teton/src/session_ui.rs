@@ -8409,7 +8409,10 @@ mod skill_tests {
     fn trust_permission_request(subject: Option<PermissionSubject>) -> PermissionRequest {
         PermissionRequest {
             request_id: RequestId::from("r-trust"),
-            tool_name: teton_protocol::methods::project_skill_trust_key("~/dev/teton"),
+            tool_name: teton_protocol::methods::project_skill_trust_key(
+                events::InvokedBy::User,
+                "~/dev/teton",
+            ),
             ..skill_permission_request(subject)
         }
     }
@@ -10038,7 +10041,8 @@ mod skill_tests {
         let user = skill_permission_key(SkillSource::User, "status");
         // REQ-587 BR-4 / ASSUME-017: the acknowledgment is the second family a
         // root move invalidates, and the one whose survival costs most.
-        let acknowledgment = project_skill_trust_key("~/dev/before");
+        let acknowledgment =
+            project_skill_trust_key(teton_protocol::events::InvokedBy::User, "~/dev/before");
         state.grants.allow_always(&project);
         state.grants.allow_always(&user);
         state.grants.allow_always("shell");

@@ -1712,7 +1712,7 @@ impl SkillTool {
         let consent = self
             .gate
             .authorize_project_skill_trust(
-                &project_skill_trust_key(&root),
+                &project_skill_trust_key(InvokedBy::Model, &root),
                 crate::harness::permissions::TrustRoot {
                     display: &root,
                     // REQ-589 D-13's canonical name, **discarded on this
@@ -1743,6 +1743,12 @@ impl SkillTool {
                 // reads as it always has here — REQ-587's wording is this
                 // caller's wording, byte for byte, because on this caller it
                 // was always true.
+                //
+                // Since REQ-591 D-7 it is also the door's half of the key
+                // above, and the two must be the same value: a mismatch means
+                // the question is asked at one door and the answer remembered
+                // at the other. `authorize_project_skill_trust`'s own
+                // `debug_assert_eq!` is what holds them together.
                 InvokedBy::Model,
                 connection,
             )
@@ -3693,8 +3699,8 @@ mod tests {
              character that stood for every unnameable byte: {name_one}"
         );
         assert_ne!(
-            project_skill_trust_key(&name_one),
-            project_skill_trust_key(&name_two),
+            project_skill_trust_key(InvokedBy::Model, &name_one),
+            project_skill_trust_key(InvokedBy::Model, &name_two),
             "the key is minted from the name, so the two follow"
         );
 
@@ -4101,7 +4107,7 @@ mod tests {
             let grants = crate::grants::GrantRegistry::default();
             assert_eq!(
                 gate.authorize_project_skill_trust(
-                    &project_skill_trust_key("~/dev/repo"),
+                    &project_skill_trust_key(InvokedBy::User, "~/dev/repo"),
                     TrustRoot {
                         display: "~/dev/repo",
                         durable: Some(&row),
@@ -4222,7 +4228,7 @@ mod tests {
         );
         assert_eq!(
             request.tool_name,
-            project_skill_trust_key(&expected),
+            project_skill_trust_key(InvokedBy::Model, &expected),
             "the acknowledgment is remembered under the faithful name of its root"
         );
         match request.subject {
@@ -4393,7 +4399,10 @@ mod tests {
         let grants = crate::grants::GrantRegistry::default();
         assert_eq!(
             gate.authorize_project_skill_trust(
-                &project_skill_trust_key(&trust_root_name(&link, home().as_deref())),
+                &project_skill_trust_key(
+                    InvokedBy::User,
+                    &trust_root_name(&link, home().as_deref()),
+                ),
                 crate::harness::permissions::TrustRoot {
                     display: &trust_root_name(&link, home().as_deref()),
                     durable: Some(&row_for(&unlisted)),

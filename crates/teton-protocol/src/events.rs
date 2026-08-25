@@ -5477,7 +5477,7 @@ mod tests {
         }
         let wire = serde_json::to_string(&PermissionRequest {
             request_id: RequestId::from("r1"),
-            tool_name: crate::methods::project_skill_trust_key("~/dev/teton"),
+            tool_name: crate::methods::project_skill_trust_key(InvokedBy::User, "~/dev/teton"),
             description: None,
             options: vec![],
             subject: Some(subject),
@@ -5568,7 +5568,7 @@ mod tests {
         // And the key the refusal line renders is the acknowledgment's own —
         // the client prints it, and may not parse it (ADR-7). It names the
         // question, is nobody's skill key, and carries no username.
-        assert_eq!(old.tool_name, "project_skill_trust:~/dev/teton");
+        assert_eq!(old.tool_name, "project_skill_trust:user:~/dev/teton");
         assert!(!crate::methods::is_project_skill_key(&old.tool_name));
         assert!(crate::methods::is_project_acknowledgment_key(
             &old.tool_name

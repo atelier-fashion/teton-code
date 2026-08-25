@@ -409,7 +409,9 @@ async fn acknowledge(
     tokio::time::timeout(
         PROMPT_WAIT,
         gate.authorize_project_skill_trust(
-            &project_skill_trust_key(root),
+            // REQ-591 D-7: the door is half the key, and this helper is the
+            // model's door (see the `InvokedBy::Model` it passes below).
+            &project_skill_trust_key(InvokedBy::Model, root),
             TrustRoot {
                 display: root,
                 // REQ-589 D-13. `Some`, always, and that is what makes the
@@ -1333,7 +1335,7 @@ async fn the_acknowledgment_asks_under_its_own_key_and_names_the_root_and_its_sk
     let prompt = answerer.prompts().remove(0);
     assert_eq!(
         prompt.request.tool_name,
-        project_skill_trust_key("~/dev/teton"),
+        project_skill_trust_key(InvokedBy::Model, "~/dev/teton"),
         "the acknowledgment asks under its own key, never a skill's and never a \
          tool's name"
     );
@@ -1475,7 +1477,7 @@ async fn the_level_default_governs_the_acknowledgment_at_every_level() {
 
         if level == PermissionLevel::Plan {
             let note = gate
-                .denial_note(&project_skill_trust_key("~/dev/teton"))
+                .denial_note(&project_skill_trust_key(InvokedBy::Model, "~/dev/teton"))
                 .expect("plan refused it, so the level has a sentence for it");
             assert!(note.contains(level.name()), "{note}");
         }
@@ -2189,7 +2191,7 @@ async fn each_skill_door_refuses_the_others_key_in_every_build_profile() {
 
     // The acknowledgment's key through the door that asks whether a skill's
     // commands may run.
-    let acknowledgment = project_skill_trust_key("~/dev/teton");
+    let acknowledgment = project_skill_trust_key(InvokedBy::Model, "~/dev/teton");
     assert_eq!(
         tokio::time::timeout(
             PROMPT_WAIT,

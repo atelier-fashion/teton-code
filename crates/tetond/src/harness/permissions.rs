@@ -2412,10 +2412,11 @@ impl PermissionGate {
         // model-invocable project skills.
         debug_assert_eq!(
             key,
-            project_skill_trust_key(root),
+            project_skill_trust_key(invoked_by, root),
             "the key the acknowledgment is remembered under must be the key this \
-             root mints, or the user answers about one repository and the grant \
-             is kept for another"
+             root mints **at this door**, or the user answers about one repository \
+             and the grant is kept for another — or, since REQ-591 D-7, answers at \
+             one door and the grant is kept for the other"
         );
 
         let (listed, more) = bound_listed_skills(skills);
@@ -3768,7 +3769,7 @@ mod tests {
         let (_bus, _pending, gate) = gate(PermissionConfig::with_default(PermissionPolicy::Allow));
         let consent = gate
             .authorize_skill(
-                &project_skill_trust_key("~/dev/teton"),
+                &project_skill_trust_key(InvokedBy::User, "~/dev/teton"),
                 "status",
                 SkillSource::User,
                 vec!["git status".to_owned()],
@@ -3802,7 +3803,7 @@ mod tests {
             String::new(),
             // The bare prefix names no root, so it is not an acknowledgment key
             // either — a grant under it would be an answer to no question.
-            project_skill_trust_key(""),
+            project_skill_trust_key(InvokedBy::Model, ""),
         ];
         for key in keys {
             let consent = gate
@@ -3875,8 +3876,8 @@ mod tests {
         let one = root_of(b"\xff");
         let two = root_of(b"\xfe");
         assert_ne!(
-            project_skill_trust_key(&one),
-            project_skill_trust_key(&two),
+            project_skill_trust_key(InvokedBy::User, &one),
+            project_skill_trust_key(InvokedBy::User, &two),
             "the two repositories must not share the name this door remembers an \
              answer under, or a `y` about `{one}` frees `{two}`"
         );
@@ -3885,7 +3886,7 @@ mod tests {
         for root in [one.as_str(), two.as_str(), "~/dev/te\u{FFFD}ton"] {
             assert!(
                 gate.authorize_project_skill_trust(
-                    &project_skill_trust_key(root),
+                    &project_skill_trust_key(InvokedBy::Model, root),
                     TrustRoot {
                         display: root,
                         durable: None,
@@ -3915,7 +3916,7 @@ mod tests {
         let (_bus, _pending, gate) = gate(PermissionConfig::with_default(PermissionPolicy::Allow));
         let _ = gate
             .authorize_project_skill_trust(
-                &project_skill_trust_key("~/dev/other"),
+                &project_skill_trust_key(InvokedBy::Model, "~/dev/other"),
                 TrustRoot {
                     display: "~/dev/teton",
                     durable: None,
@@ -3941,8 +3942,11 @@ mod tests {
     async fn the_generic_door_admits_a_project_acknowledgment_key() {
         let (_bus, _pending, gate) = gate(PermissionConfig::with_default(PermissionPolicy::Allow));
         assert_eq!(
-            gate.authorize(&project_skill_trust_key("~/dev/teton"), None)
-                .await,
+            gate.authorize(
+                &project_skill_trust_key(InvokedBy::User, "~/dev/teton"),
+                None
+            )
+            .await,
             PermissionDecision::Allowed
         );
     }
@@ -3957,7 +3961,10 @@ mod tests {
     /// BR-4's posture, exactly.
     #[test]
     fn the_acknowledgment_key_is_unenumerated_and_rides_the_levels_default() {
-        let key = project_skill_trust_key("~/dev/teton");
+        // The **model's** door, which is the one that still rides this key's
+        // level default: D-3 gave the typed door a `PROJECT_TRUST_LEVEL_KEY`
+        // row, consulted before this lookup ever happens.
+        let key = project_skill_trust_key(InvokedBy::Model, "~/dev/teton");
         for (level, want) in [
             (PermissionLevel::Guarded, PermissionPolicy::Ask),
             (PermissionLevel::Edits, PermissionPolicy::Ask),
@@ -4183,7 +4190,7 @@ mod tests {
             "shell".to_owned(),
             skill_permission_key_for(SkillSource::Project, "deploy"),
             skill_permission_key_for(SkillSource::User, "canary"),
-            project_skill_trust_key("~/dev/teton"),
+            project_skill_trust_key(InvokedBy::User, "~/dev/teton"),
             // The digest over a *different* command set: same skill, same
             // source, different question.
             skill_grant_key(
@@ -4266,7 +4273,7 @@ mod tests {
         let (_bus, _pending, gate) = gate(PermissionConfig::coding_defaults());
         let project = skill_permission_key_for(SkillSource::Project, "deploy");
         let user = skill_permission_key_for(SkillSource::User, "deploy");
-        let acknowledgment = project_skill_trust_key("~/dev/teton");
+        let acknowledgment = project_skill_trust_key(InvokedBy::User, "~/dev/teton");
         gate.remember(&project, RememberedGrant::AllowAlways);
         // A refusal is a grant too, and it is about the same moved file.
         gate.remember(
@@ -5658,7 +5665,7 @@ mod tests {
         from: ConnectionId,
     ) -> SkillConsent {
         gate.authorize_project_skill_trust(
-            &project_skill_trust_key(DISPLAY),
+            &project_skill_trust_key(invoked_by, DISPLAY),
             TrustRoot {
                 display: DISPLAY,
                 durable,
@@ -6354,7 +6361,7 @@ mod tests {
             );
             assert_eq!(
                 gate.grant_keys(),
-                vec![project_skill_trust_key(DISPLAY)],
+                vec![project_skill_trust_key(InvokedBy::User, DISPLAY)],
                 "{what}: and their answer is remembered for the session, which \
                  is the half no presence check governs"
             );
@@ -6388,7 +6395,7 @@ mod tests {
         .with_commitment_attestation(Arc::clone(&attestation) as Arc<dyn CommitmentAttestation>);
 
         let settled = gate.interpret(
-            &project_skill_trust_key(DISPLAY),
+            &project_skill_trust_key(InvokedBy::User, DISPLAY),
             PermissionOutcome::Selected {
                 option_id: OPTION_ID_ENABLE_PERMANENT.to_owned(),
             },
@@ -6543,7 +6550,7 @@ mod tests {
         );
         assert_eq!(sink.written(), vec![DURABLE.to_owned()], "it was attempted");
         assert_eq!(
-            gate.remembered(&project_skill_trust_key(DISPLAY)),
+            gate.remembered(&project_skill_trust_key(InvokedBy::User, DISPLAY)),
             Some(RememberedGrant::AllowAlways),
             "the session half of the answer holds whether or not the disk did"
         );
@@ -6575,7 +6582,7 @@ mod tests {
         let _ = ask_trust(&gate, Some(DURABLE), InvokedBy::User, conn).await;
         assert_eq!(
             gate.grant_keys(),
-            vec![project_skill_trust_key(DISPLAY)],
+            vec![project_skill_trust_key(InvokedBy::User, DISPLAY)],
             "one answer, one key: a `p` about a repository must not answer \
              whether any skill's commands may run"
         );
@@ -6685,7 +6692,7 @@ mod tests {
         for key in [
             "shell",
             "edit",
-            &project_skill_trust_key("~/dev/teton"),
+            &project_skill_trust_key(InvokedBy::User, "~/dev/teton"),
             // A bare prefix names no skill, so it is not a key this daemon
             // could have minted.
             "skill:user:",

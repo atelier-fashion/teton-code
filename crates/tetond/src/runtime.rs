@@ -3987,7 +3987,10 @@ impl DaemonRuntime {
             let consent = match invoker {
                 Some(connection) => {
                     gate.authorize_project_skill_trust(
-                        &teton_protocol::methods::project_skill_trust_key(&root),
+                        &teton_protocol::methods::project_skill_trust_key(
+                            teton_protocol::events::InvokedBy::User,
+                            &root,
+                        ),
                         crate::harness::permissions::TrustRoot {
                             display: &root,
                             durable: durable_root.as_deref(),
@@ -4003,9 +4006,14 @@ impl DaemonRuntime {
                         // human who typed `/analyze` was told "the model wants
                         // to run this repository's skills as instructions" by
                         // the one prompt whose job is letting them decide
-                        // whether to trust the repository. The answer is still
-                        // remembered under the root's key alone, shared with
-                        // the model's caller (ADR-7); only the sentence differs.
+                        // whether to trust the repository.
+                        //
+                        // Since REQ-591 D-7 it decides the **key** as well as
+                        // the sentence: the answer is remembered under
+                        // `project_skill_trust:user:<root>`, and the model's
+                        // door at this very root keeps asking. That is D-2's
+                        // rule about a durable row, applied to the session
+                        // answer that is the same question at a shorter range.
                         teton_protocol::events::InvokedBy::User,
                         connection,
                     )
@@ -32743,22 +32751,43 @@ provider_id = \"deepseek\"
             let _ = std::fs::remove_dir_all(&dir);
         }
 
-        /// **AC-5's paired assertion: the model path's acknowledgment is
-        /// unchanged, and it is the same one.**
+        /// **REQ-591 D-7: a typed answer settles the typed door, and only it.**
         ///
-        /// The typed path answers "allow for this session"; the model's `skill`
-        /// tool then invokes the same skill under the same root and is **not**
-        /// asked again. That holds only if both doors mint one key from one root
-        /// — which is the property `authorize_project_skill_trust`'s own
-        /// `debug_assert` states and the reason ADR-10 said to reuse the gate
-        /// verbatim rather than mint a key family for the typed path.
+        /// This test used to assert the opposite, under the name
+        /// `one_answer_settles_the_typed_door_and_the_model_door`, and the
+        /// property it pinned was a real widening this REQ introduced. Both doors
+        /// minted `project_skill_trust:<root>` from the same tree — the typed
+        /// path from `probed.path`, the `skill` tool from `ctx.repo_root()`,
+        /// which `ToolContext::for_root` sets from that same `probed` — so a
+        /// human answering "allow for this session" to a `/marked` **they typed**
+        /// also settled the model's door in that tree, with no second prompt and
+        /// nothing on any screen saying so.
         ///
-        /// A second prompt here would mean a user answering the same question
-        /// twice for one repository in one session; a *missing* first prompt
-        /// would mean the typed path had gone back to running project bodies
-        /// unasked.
+        /// Before REQ-591 there was nothing to inherit: the typed path had no
+        /// gate and minted no grant. The widening arrived with the gate.
+        ///
+        /// D-2 decided the two doors are not the same question for a *durable*
+        /// row. A session answer is that question at a shorter range, so D-7
+        /// gives it the same rule and puts `InvokedBy` in the key.
+        ///
+        /// **Four invocations, and each one is a claim** (LESSON-520 — the
+        /// narrowing is worthless unpaired):
+        ///
+        /// 1. typed, asks — the typed door is gated at all;
+        /// 2. typed again, does **not** ask — the answer is remembered, so the
+        ///    scoping did not simply break the grant;
+        /// 3. the model's door, **asks** — this is D-7. The typed answer did not
+        ///    travel;
+        /// 4. the model's door again, does not ask — its own answer is
+        ///    remembered under its own key.
+        ///
+        /// Without 2 and 4 a build that never remembered anything would pass;
+        /// without 3 the widening is back.
+        ///
+        /// **Mutation:** collapse `project_skill_trust_key` back to the root
+        /// alone and 3 goes red — the model's door finds the typed answer.
         #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-        async fn one_answer_settles_the_typed_door_and_the_model_door() {
+        async fn a_typed_answer_settles_the_typed_door_and_not_the_models() {
             let dir = project_root("trust-paired", "marked");
             let engine = Recorder::new();
             let runtime = runtime_with(&engine);
@@ -32777,24 +32806,36 @@ provider_id = \"deepseek\"
             let gate = install_gate(&runtime, &events, &session_id, Arc::clone(&client));
             let conn = GrantRegistry::new().next_connection_id();
 
-            runtime
-                .run_prompt_turn(
-                    &events,
-                    &sessions,
-                    session_id.clone(),
-                    SessionMode::Freeform,
-                    None,
-                    Some(dir.clone()),
-                    String::new(),
-                    Some(SkillInvocation {
-                        name: "marked".to_owned(),
-                        raw_arguments: String::new(),
-                    }),
-                    Some(conn),
-                    ClientPresence::unwatched(),
-                )
-                .await
-                .expect("an acknowledged repository runs its skill");
+            let typed = |n: u8| {
+                let runtime = Arc::clone(&runtime);
+                let events = Arc::clone(&events);
+                let sessions = sessions.clone();
+                let session_id = session_id.clone();
+                let dir = dir.clone();
+                async move {
+                    runtime
+                        .run_prompt_turn(
+                            &events,
+                            &sessions,
+                            session_id,
+                            SessionMode::Freeform,
+                            None,
+                            Some(dir),
+                            String::new(),
+                            Some(SkillInvocation {
+                                name: "marked".to_owned(),
+                                raw_arguments: String::new(),
+                            }),
+                            Some(conn),
+                            ClientPresence::unwatched(),
+                        )
+                        .await
+                        .unwrap_or_else(|err| panic!("typed invocation {n} must run — {err:?}"));
+                }
+            };
+
+            // 1. The typed door is gated at all.
+            typed(1).await;
             assert_eq!(
                 client.trust_questions(),
                 1,
@@ -32802,8 +32843,20 @@ provider_id = \"deepseek\"
                 client.subjects()
             );
 
-            // The model's door, over the same registry snapshot, the same gate
-            // and the same root.
+            // 2. …and remembers. Without this the scoping below would be
+            // satisfied by a build that had simply stopped recording answers.
+            typed(2).await;
+            assert_eq!(
+                client.trust_questions(),
+                1,
+                "the typed door asked twice for one root in one session, so the \
+                 answer is not being remembered at all: {:?}",
+                client.subjects()
+            );
+
+            // 3. **D-7.** The model's door, over the same registry snapshot, the
+            // same gate and the same root — and it asks, because the human
+            // answered about the door they were standing at.
             let tool = SkillTool::new(
                 sessions.skills(&session_id),
                 gate,
@@ -32817,17 +32870,56 @@ provider_id = \"deepseek\"
                     &serde_json::json!({ "name": "marked" }),
                 )
                 .await;
-
             assert!(
                 !outcome.is_error,
-                "the model path was refused after the user had already acknowledged \
-                 this repository — the two doors are minting different keys: {}",
+                "the model's door was refused rather than asked — this test is \
+                 about which question is put, so a refusal here would make every \
+                 count below meaningless: {}",
                 outcome.content
             );
             assert_eq!(
                 client.trust_questions(),
-                1,
-                "the model path asked a second time for one root in one session: {:?}",
+                2,
+                "a typed `allow_always` settled the model's door: one human \
+                 answered about the skill they typed and a file on disk inherited \
+                 it for the rest of the session — {:?}",
+                client.subjects()
+            );
+            assert_eq!(
+                client
+                    .subjects()
+                    .iter()
+                    .filter_map(|subject| match subject {
+                        Some(PermissionSubject::ProjectSkillTrust { invoked_by, .. }) =>
+                            Some(*invoked_by),
+                        _ => None,
+                    })
+                    .collect::<Vec<_>>(),
+                vec![
+                    teton_protocol::events::InvokedBy::User,
+                    teton_protocol::events::InvokedBy::Model,
+                ],
+                "one question per door, in the order they were reached"
+            );
+
+            // 4. And the model's own answer is remembered under its own key, so
+            // the narrowing costs a repeat invocation nothing.
+            //
+            // Different `args`, because BR-6b refuses a *byte-identical* repeat
+            // before any gate is consulted — a second call with the same
+            // arguments would be answered by the repeat guard and would say
+            // nothing about which key the acknowledgment was remembered under.
+            let outcome = tool
+                .invoke(
+                    &ToolContext::for_root(&probed),
+                    &serde_json::json!({ "name": "marked", "args": "again" }),
+                )
+                .await;
+            assert!(!outcome.is_error, "{}", outcome.content);
+            assert_eq!(
+                client.trust_questions(),
+                2,
+                "the model's door asked twice for one root in one session: {:?}",
                 client.subjects()
             );
 
