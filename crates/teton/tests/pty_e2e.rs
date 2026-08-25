@@ -1703,8 +1703,22 @@ const WINDOW_UNKNOWN_CLAUSE: &str = "This route declares no context window, so t
 /// and a label that named no tier would be the vague promise ADR-1's precedent
 /// (`enable_permanent`, which once promised a write that was silently a no-op)
 /// exists to forbid.
-const REMEDY_WRITE: &str = "bind the `build` tier to a remote provider and declare that \
-                            provider's `capabilities.max_context` in the same change";
+///
+/// **TASK-260.** `deepseek` and its window are here for the same reason the tier
+/// is. This fixture registers exactly one remote provider, which is ADR-12's
+/// *propose by name* count, so both halves of BR-9's pair are concrete: the
+/// provider by id and its window by figure, with the date it was read. Until
+/// TASK-260 this constant read "a remote provider … that provider's
+/// `capabilities.max_context`", which is the vagueness ADR-18 item 2 recorded
+/// and the same promise ADR-1's precedent forbids.
+///
+/// The window figure and its date are literals here because this crate is the
+/// thin client and cannot read `tetond`'s recipe catalog. They are the one
+/// place in this crate that copies a vendor window, and `recipe_window_one_home.rs`
+/// — which sweeps the daemon's `src/`, not this crate's tests — cannot see them.
+const REMEDY_WRITE: &str = "bind the `build` tier to `deepseek` and declare its \
+                            `capabilities.max_context = 1000000` in the same change (DeepSeek's \
+                            own published window, read 2026-08-19)";
 
 /// BR-9's cost, which [`REMEDY_WRITE`] cannot be rendered without (AC-7a):
 /// `RemedyClause::render` is the only way out of that type and it concatenates

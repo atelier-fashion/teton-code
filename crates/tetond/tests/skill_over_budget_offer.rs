@@ -1507,8 +1507,12 @@ async fn every_bound_offers_exactly_the_remedy_the_table_names() {
             BudgetBound::LocalEngine,
             RemedyKind::BindTierRemote,
             true,
-            "bind the `build` tier to a remote provider and declare that provider's \
-             `capabilities.max_context` in the same change",
+            // TASK-260: this row's fixture registers exactly one remote, which
+            // is ADR-12's *propose by name* count — so BR-9's write is concrete
+            // in both halves, `frontier` and its window, rather than the "a
+            // remote provider" ADR-18 item 2 recorded.
+            "bind the `build` tier to `frontier` and declare its \
+             `capabilities.max_context = 1000000` in the same change",
         ),
         (
             BudgetBound::RedactScan,
