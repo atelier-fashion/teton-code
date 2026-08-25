@@ -135,6 +135,13 @@ Two things, and the second exists only because the first broke automation:
   log-scraper cannot tell a genuine refusal from a successful trusted run. This is the same
   class as BR-7 — a surface describing an outcome that did not occur.
 
+  > **Discharged by D-6 (2026-08-25).** The `NoTerminal if project_trust` arm of
+  > `session_ui::refusal_line` now opens *"could not be asked here"* — what the client did,
+  > which is all it is in a position to say. The other three arms keep *"was refused without
+  > asking"*, and that was checked rather than assumed: `acknowledged_unattended` is the only
+  > rewrite of a `Refused(NoTerminal)` in the daemon and its only caller is
+  > `authorize_project_skill_trust`, so no other arm is overridable.
+
 - [ ] **BR-11: A repository-authored string on the wire is bounded and control-stripped at
   the door that mints it.** `ProjectSkillTrust::root`'s contract claims it is `display_for`-
   minted and *"bounded"*. Neither is true: it is `trust_root_name`, deliberately untruncated,
@@ -168,6 +175,16 @@ Two things, and the second exists only because the first broke automation:
   decides it should, a test asserts that breadth deliberately and the label says so (BR-8).
 - [ ] AC-8: No surface claims a refusal that did not happen (BR-10). The existing test that
   pins the contradictory line is corrected, not preserved.
+
+  > **Discharged by D-6 (2026-08-25).** Both pinning tests move to the neutral phrase, and the
+  > *listed* leg of each gains `!stdout.contains("was refused without asking")` — the assertion
+  > with the bite, and the one whose absence is why this criterion was previously
+  > implemented-as-zero. A third site the verify panel had not found, the model's-door pipe leg
+  > in `cli_e2e`, renders the same subject through the same arm and moved with them.
+  >
+  > Mutation-verified in isolation: reverting the wording outright reddens the *positive*
+  > assertion first and proves nothing about the negative, so the mutation used was a line
+  > carrying both phrases. That reddens only the new negative, in both tests.
 - [ ] AC-9: `cargo audit` clean; the previously verified non-exploitable vectors stay
   non-exploitable — symlink at a listed path, `..` traversal, percent-escape collisions,
   home-prefix confusion, case-insensitive and firmlinked filesystems.
@@ -237,8 +254,34 @@ Two things, and the second exists only because the first broke automation:
   canonical mint, with an error naming the correct form — converting a silent no-op (the
   allowlist appears to contain a repository and does not) into a loud error at load time.
 
+### Second round (product owner, 2026-08-25, after the five-agent verify panel)
+
+The panel reported four findings that needed a product decision rather than a fix. All four
+were decided and implemented in the same pass.
+
+- **D-6 — BR-10/AC-8: the client's line stops claiming an outcome.** Only the
+  `NoTerminal if project_trust` arm. The client answers `NoTerminal` and the daemon may then
+  rewrite the settlement to `Allowed`, so a line claiming a refusal is contradicted two lines
+  later by the skill's own echo. The other three arms are genuine refusals and keep their
+  wording.
+- **D-7 — the session grant is keyed by (invoker, root).** Both doors minted
+  `project_skill_trust:<root>` from the same tree, so a typed `allow_always` also settled the
+  *model's* door for the session with no prompt. REQ-591 created that widening: before it the
+  typed path had no gate and minted no grant. D-2's rule for the durable row, applied to the
+  session answer, which is the same question at a shorter range.
+- **D-8 — `plan` may READ a row and may not WRITE one.** Answering `p` appends to the user's
+  config; `plan`'s promise is that nothing changes. The *consultation* is untouched — an
+  unattended `plan` session at an already-listed root still proceeds, which is D-13's widening
+  and not `plan`'s to revoke.
+- **D-9 — the prompt shows `~/dev/repo`; the absolute row appears only where it is
+  actionable.** The acknowledgment label names the repository home-relatively;
+  `project_trust_refusal` keeps the absolute row, because there the user is being told what to
+  paste. The label is worded so it is true of an absolute row while displaying the
+  home-relative name — a label quoting `~/dev/repo` as the row would name a write that never
+  happens, which is strictly worse than the username.
+
 *Not yet answered: the operational question of whether `req589-pre-carveout` is pushed for
-redundancy. OQ-1..OQ-5 are all decided (D-1..D-5) and implemented.*
+redundancy. OQ-1..OQ-5 are all decided (D-1..D-5) and implemented, as are D-6..D-9.*
 
 ## Open Questions
 

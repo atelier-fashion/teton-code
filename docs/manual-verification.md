@@ -2930,6 +2930,34 @@ repository.
    command is **not run** — a placeholder, never a hostname. `plan`'s promise is
    that nothing changes and nothing leaves; D-3 relaxed the refusal, not that.
 
+### Leg (g) — a typed answer does not open the model's door (D-7)
+
+Leg (e) is the *durable* half of D-2. This is the session half, and it is the
+one a user can trip over in a single sitting.
+
+1. At a real terminal in `~/dev/teton-unlisted`, run `teton` and type
+   `/dogfood`. Answer `a` (allow for this session).
+2. In the **same session**, ask the model to use the skill:
+   `use the dogfood skill`.
+3. Expect a **second** acknowledgment prompt, naming the model as the asker.
+   Before D-7 there was none: one answer about a skill you typed also let a
+   file on disk reach the model for the rest of the session.
+4. Answer it, then ask again. The second ask must draw no prompt — the model's
+   own answer is remembered under its own key.
+
+### Leg (h) — the prompt names the repository the way the rest of the prompt does (D-9)
+
+1. At a terminal in `~/dev/teton-unlisted`, type `/dogfood` and read the
+   acknowledgment.
+2. No line of it may contain `/Users/` (or your home path). The repository is
+   named `~/dev/teton-unlisted`.
+3. Answer `p`, then read the config file. The row that landed is the **absolute**
+   path — the label said "by its full path", and this is that.
+4. Now the pair: in a fresh session at a root that is *not* listed, run the
+   piped invocation from leg (a) and read the refusal. That sentence **does**
+   carry the absolute row, deliberately — it is what you are being told to
+   paste, and after D-5 a `~/…` row stops the daemon starting.
+
 ## Sign-off
 
 ```
@@ -2964,5 +2992,10 @@ Config file the daemon read      :
 (f) `plan` PUT the acknowledgment (did not refuse) : yes / no
 (f) the body expanded at `plan` after `y`          : yes / no
 (f) the `!`cmd`` slot was NOT run at `plan`        : yes / no   <-- must be "yes"
+(g) the model's door asked AGAIN after a typed `a`  : yes / no   <-- must be "yes"
+(g) answering it, then re-asking, drew no prompt    : yes / no
+(h) no line of the acknowledgment contained `/Users/` : yes / no <-- must be "yes"
+(h) the row written to config was the ABSOLUTE path : yes / no
+(h) the unattended refusal DID quote the absolute row : yes / no
 Notes / findings :
 ```
