@@ -28,6 +28,7 @@ ADR-3 + ADR-7. `git rebase --onto origin/main` dropping exactly the five SHAs. N
 - [ ] `grep -rn 'trusted_project_roots\|durable_trust_root_name\|acknowledged_unattended\|read_under'` over `crates/*/src` returns NOTHING
 - [ ] **`cli_e2e::a_typed_invocation_names_the_swap_and_its_flags_and_counts_no_turn_budget` passes in its ORIGINAL origin/main form.** This is the sharpest test in the REQ: it passes only if the gate that broke it is genuinely gone rather than disabled
 - [ ] `cargo test --workspace --no-fail-fast` green
+- [ ] **Spec AC-10** (the split is clean): the offer's own behaviour is unchanged
 - [ ] The offer's own behaviour is unchanged — REQ-589's AC-1 (the reported /analyze failure) still reproduces and still offers
 
 ## Technical Notes
