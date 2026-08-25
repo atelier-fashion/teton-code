@@ -3,12 +3,13 @@
   "branch": "feat/REQ-591-project-skill-trust-and-unattended-allowlist",
   "startedAt": "2026-08-25T00:00:00Z",
   "completed": false,
-  "currentPhase": 4,
+  "currentPhase": 5,
   "completedPhases": [
     0,
     1,
     2,
-    3
+    3,
+    4
   ],
   "integrationBranch": "main",
   "pipelineShape": "RE-AIMED AT THE CARVE-OUT. REQ-591's code already exists as 5 commits on feat/REQ-589 (b4e4b01, 4be0c34, b071da5, bda079d, 37a2e6c) interleaved among 33. Phase 2 architects the SPLIT, not the feature; Phase 4 executes it; Phase 5's reviewers check the split itself. Running the pipeline as written would have produced a SECOND implementation diverging from the one six agents already reviewed.",
@@ -39,6 +40,12 @@
       "fixed": [
         "13 of 15 spec ACs had no task \u2014 split into Group A (satisfied by tests that travel; now cited by name in TASK-264/266) and Group B (AC-11..AC-15, genuinely unbuilt; now TASK-268)"
       ]
+    },
+    {
+      "phase": 4,
+      "name": "Execute the carve-out",
+      "completedAt": "2026-08-25T00:00:00Z",
+      "result": "BOTH BRANCHES PUSHED. REQ-589 rewritten 9067374 -> e8a6e77 (force-with-lease held); REQ-591 new at 6a4b11a."
     }
   ],
   "repos": {
@@ -57,11 +64,14 @@
     "teton-code"
   ],
   "phase4": {
-    "currentTask": "TASK-266 + TASK-268 (wave 3)",
+    "currentTask": null,
     "completedTasks": [
       "TASK-263",
       "TASK-264",
-      "TASK-265"
+      "TASK-265",
+      "TASK-266",
+      "TASK-267",
+      "TASK-268"
     ],
     "failedTasks": [],
     "waves": [
@@ -97,5 +107,24 @@
     "pushed": false,
     "note": "Local tip 6d4d2fd is AHEAD of remote 9067374. Of the five trust commits, THREE are pushed (b4e4b01, 4be0c34, b071da5) and TWO are local-only (37a2e6c, bda079d). The force-push removes the pushed three."
   },
-  "remoteTipForLease": "90673743edf4b3a073c2497dd80af31e97b04c19"
+  "remoteTipForLease": "90673743edf4b3a073c2497dd80af31e97b04c19",
+  "carveOutResult": {
+    "req589": {
+      "remote": "e8a6e77",
+      "commits": 30,
+      "tests": "3837 passed / 0 failed",
+      "trustCommitsRemoved": [
+        "b4e4b01",
+        "4be0c34",
+        "b071da5"
+      ]
+    },
+    "req591": {
+      "remote": "6a4b11a",
+      "commits": 11,
+      "tests": "3702 passed / 0 failed"
+    },
+    "recoveryTag": "req589-pre-carveout -> 6d4d2fd (local, intact)",
+    "sharpestCheck": "cli_e2e::a_typed_invocation_names_the_swap... passes on REQ-589 BYTE-IDENTICAL to origin/main's version; spawn_scripted_trusting has zero hits. The gate is absent, not disabled."
+  }
 }
