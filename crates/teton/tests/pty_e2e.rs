@@ -1928,16 +1928,6 @@ fn park_at_the_over_budget_offer(tag: &str) -> OfferSession {
     );
     parked.type_line("/analyze");
 
-    // BR-6's acknowledgment, which a typed project skill now raises before it
-    // expands (ADR-10). Answered `y`, because this leg is about what comes
-    // after it.
-    assert!(
-        parked.wait_for("permission requested: project_skill_trust:"),
-        "a typed project skill must be acknowledged before it expands; transcript:\n{}",
-        parked.snapshot()
-    );
-    parked.type_line("y");
-
     // The **last** line of the offer block, not the first: waiting on the first
     // would let a snapshot be taken between two writes and assert about a
     // prompt that was still arriving.

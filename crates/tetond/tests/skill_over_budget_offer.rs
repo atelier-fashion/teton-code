@@ -107,10 +107,9 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 
 use teton_protocol::events::{
-    BudgetBound, Event, PermissionOption, PermissionOptionKind, PermissionRequest,
-    PermissionSubject, RemedyKind, WindowVerdict, OPTION_ID_OVER_BUDGET_DECLINE,
-    OPTION_ID_OVER_BUDGET_PROCEED_AND_REMEDY, OPTION_ID_OVER_BUDGET_PROCEED_ONCE,
-    OPTION_ID_OVER_BUDGET_REMEDY_ONLY,
+    BudgetBound, Event, PermissionOption, PermissionRequest, PermissionSubject, RemedyKind,
+    WindowVerdict, OPTION_ID_OVER_BUDGET_DECLINE, OPTION_ID_OVER_BUDGET_PROCEED_AND_REMEDY,
+    OPTION_ID_OVER_BUDGET_PROCEED_ONCE, OPTION_ID_OVER_BUDGET_REMEDY_ONLY,
 };
 use teton_protocol::jsonrpc::error_code;
 use teton_protocol::methods::{PermissionOutcome, SkillInvocation};
@@ -267,15 +266,7 @@ fn seams() {
     });
 }
 
-/// How this fixture's client answers the **project-skill trust** acknowledgment
-/// REQ-589 ADR-10 raises above Stage A.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Trust {
-    Acknowledge,
-    Decline,
-}
-
-/// How it answers the **offer**.
+/// How this fixture's client answers the **offer**.
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum Answer {
     /// Select this option id.
@@ -292,11 +283,10 @@ enum Answer {
 }
 
 /// The client every turn here comes from: it records every request it was shown
-/// and answers the two questions a skill turn can raise.
+/// and answers the offer.
 struct Client {
     pending: Arc<PendingPermissions>,
     answer: Mutex<Answer>,
-    trust: Trust,
     asked: Mutex<Vec<PermissionRequest>>,
     /// Something to do **while the offer is on screen and before it is
     /// answered**.
@@ -310,11 +300,10 @@ struct Client {
 }
 
 impl Client {
-    fn new(pending: &Arc<PendingPermissions>, answer: Answer, trust: Trust) -> Arc<Self> {
+    fn new(pending: &Arc<PendingPermissions>, answer: Answer) -> Arc<Self> {
         Arc::new(Self {
             pending: Arc::clone(pending),
             answer: Mutex::new(answer),
-            trust,
             asked: Mutex::new(Vec::new()),
             while_offered: Mutex::new(None),
         })
@@ -399,18 +388,10 @@ impl AddressedPermissionDelivery for Client {
                 Answer::Cancel => PermissionOutcome::Cancelled,
             }
         } else {
-            let want = match self.trust {
-                Trust::Acknowledge => PermissionOptionKind::AllowOnce,
-                Trust::Decline => PermissionOptionKind::RejectOnce,
-            };
-            let option = request
-                .options
-                .iter()
-                .find(|o| o.kind == want)
-                .unwrap_or_else(|| panic!("the acknowledgment offers {want:?}: {request:?}"));
-            PermissionOutcome::Selected {
-                option_id: option.option_id.clone(),
-            }
+            // The offer is the only question a turn in this file raises. Anything
+            // else is a fixture this file does not model, and answering it with a
+            // default would let that go unnoticed.
+            panic!("this fixture answers the over-budget offer and nothing else: {request:?}");
         };
         self.pending
             .resolve_from(&request.request_id, outcome, connection)
@@ -425,11 +406,10 @@ struct Spec {
     body: String,
     arguments: String,
     answer: Answer,
-    trust: Trust,
-    /// A **project**-sourced skill is the shape the reported failure had, and
-    /// the one ADR-10's acknowledgment sits above. A **user**-sourced one is
-    /// what AC-3 needs: today's refusal carries no source marker, so only a
-    /// user skill's offer and refusal share a byte-identical head.
+    /// A **project**-sourced skill is the shape the reported failure had. A
+    /// **user**-sourced one is what AC-3 needs: today's refusal carries no
+    /// source marker, so only a user skill's offer and refusal share a
+    /// byte-identical head.
     project_sourced: bool,
     /// Whether the daemon has a route to deliver an addressed request on. False
     /// is `SkillConsent::Unanswerable` — a real posture, not a broken fixture.
@@ -446,7 +426,6 @@ impl Spec {
             body,
             arguments: String::new(),
             answer: Answer::Select(OPTION_ID_OVER_BUDGET_DECLINE),
-            trust: Trust::Acknowledge,
             project_sourced: true,
             addressed: true,
             connected: true,
@@ -465,11 +444,6 @@ impl Spec {
 
     fn user_sourced(mut self) -> Self {
         self.project_sourced = false;
-        self
-    }
-
-    fn declining_trust(mut self) -> Self {
-        self.trust = Trust::Decline;
         self
     }
 
@@ -514,7 +488,7 @@ impl Fixture {
         let runtime = Arc::new(
             DaemonRuntime::from_env(tree.path(), &events).expect("the fixture daemon starts"),
         );
-        let client = Client::new(runtime.pending(), spec.answer, spec.trust);
+        let client = Client::new(runtime.pending(), spec.answer);
         if spec.addressed {
             runtime.install_addressed_delivery(
                 Arc::clone(&client) as Arc<dyn AddressedPermissionDelivery>
@@ -2279,10 +2253,9 @@ async fn the_accepted_path_never_says_no_provider_saw_this_turn() {
 /// "The question was put" and "a human saw it" are **not** the same fact.
 /// `skill_over_budget_offered` is published when the daemon puts the question,
 /// which happens whenever there is a connection to address it to — even where
-/// no delivery route can carry it there. Only the `invoker: None` arm and a
-/// trust refusal above Stage A publish nothing, because on those the question is
-/// never put at all. REQ-585 AC-9's "nobody was asked and nobody decided"
-/// distinction lives exactly here.
+/// no delivery route can carry it there. Only the `invoker: None` arm publishes
+/// nothing, because on that one the question is never put at all. REQ-585
+/// AC-9's "nobody was asked and nobody decided" distinction lives exactly here.
 struct NotSentLeg {
     /// How this path is named in an assertion message.
     leg: &'static str,
@@ -2301,10 +2274,9 @@ struct NotSentLeg {
 /// This is the invariant that makes the refusal `-32023` rather than `-32022`.
 /// Without a test it is a comment.
 ///
-/// Four not-sent paths, all driven from real turns on the same route shape:
-/// **declined**, **unanswerable** (no delivery route), **never offered** (no
-/// connection to address), and **trust-declined** (ADR-10's acknowledgment
-/// refused above Stage A, so no budget question is ever reached).
+/// Three not-sent paths, all driven from real turns on the same route shape:
+/// **declined**, **unanswerable** (no delivery route), and **never offered**
+/// (no connection to address).
 ///
 /// The naming duty is checked by **claiming** it. `claim_title` is the
 /// synchronous act of spending it, so a `true` afterwards is a race-free proof
@@ -2344,16 +2316,6 @@ async fn every_not_sent_path_reaches_no_provider_and_spends_nothing() {
                 Spec::new("a18non", cfg, sized_body(6_000, 24_000))
                     .user_sourced()
                     .unconnected()
-                    .answering(Answer::Select(OPTION_ID_OVER_BUDGET_PROCEED_ONCE))
-            },
-            question_raised: false,
-            client_saw_the_question: false,
-        },
-        NotSentLeg {
-            leg: "trust declined",
-            build: |cfg| {
-                Spec::new("a18tru", cfg, sized_body(6_000, 24_000))
-                    .declining_trust()
                     .answering(Answer::Select(OPTION_ID_OVER_BUDGET_PROCEED_ONCE))
             },
             question_raised: false,

@@ -118,12 +118,11 @@ use teton_inference::{ChatFormat, Completion, Engine, EngineError, GenParams, Mo
 
 use teton_protocol::events::{
     BlockCause, BudgetBound, CapabilityDeadEnd, ContextCleared, ContextPressureKind, Event,
-    ModelLifecycle, ModelLifecycleStage, PermissionSubject, PrivacyAction,
-    ProviderTested, RemedyKind, SessionRootChanged, SessionTitled, SkillInvoked,
-    SkillOverBudgetAccepted, SkillOverBudgetOffered, SkillOverBudgetRemedyApplied,
-    SkillStage as WireSkillStage, TierWarming, TurnQueued,
-    WebCapabilityState as WireWebCapabilityState, WebLookup, WebSetupCompleted, WebTaintOverridden,
-    WebTier as WireWebTier,
+    ModelLifecycle, ModelLifecycleStage, PermissionSubject, PrivacyAction, ProviderTested,
+    RemedyKind, SessionRootChanged, SessionTitled, SkillInvoked, SkillOverBudgetAccepted,
+    SkillOverBudgetOffered, SkillOverBudgetRemedyApplied, SkillStage as WireSkillStage,
+    TierWarming, TurnQueued, WebCapabilityState as WireWebCapabilityState, WebLookup,
+    WebSetupCompleted, WebTaintOverridden, WebTier as WireWebTier,
 };
 use teton_protocol::jsonrpc::{error_code, RpcError};
 use teton_protocol::methods::{
@@ -4143,8 +4142,8 @@ impl DaemonRuntime {
         // fixture. The question cannot be *put* to anyone, which is not the same
         // as being declined; what the user gets is BR-4's sentence, which is
         // today's refusal, and no `skill_over_budget_offered` is published
-        // because no offer was made. `settle_dynamic_context` and
-        // `accept_invocation` fail closed at their own doors the same way.
+        // because no offer was made. `settle_dynamic_context` fails closed at
+        // its own door the same way, with `SkillConsent::Unanswerable`.
         let Some(connection) = invoker else {
             return SkillStageVerdict::NotSent(offer.decline_refusal());
         };
