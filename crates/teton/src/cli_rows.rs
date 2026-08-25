@@ -119,6 +119,20 @@ pub(crate) const MODEL_STATUS: Mirror = Mirror {
 };
 
 /// `/doctor` — a read, over this session's own connection (BR-7).
+///
+/// **Still a read after REQ-589 BR-13**, and the classification is worth
+/// stating rather than assuming: the report now asks the daemon which of this
+/// session's skills will not fit on the route it is on, and that question
+/// measures. It resolves no route (ADR-11), expands no dynamic context, reaches
+/// no provider and writes no config — a `writes: true` here would put the one
+/// diagnostic a user reaches for behind [`write_gate`]'s typed-input rule, on a
+/// surface whose whole job is to be answerable from a script.
+///
+/// It is also the one row whose two surfaces legitimately differ by more than
+/// [`crate::DoctorAttach::daemon_line`]: the pre-flight is *about a session*, so
+/// the shell's `teton doctor` — which owns none — says so instead of answering
+/// about a session it picked. That is one line each way and both are the same
+/// renderer's; see [`handle_doctor`].
 pub(crate) const DOCTOR: Mirror = Mirror {
     shell: "teton doctor",
     writes: false,
@@ -525,10 +539,14 @@ pub(crate) fn handle_model_status(
 
 /// The `/doctor` handler (BR-1, BR-7).
 ///
-/// The report is the shell twin's, with one line different: the daemon it names
-/// is the one this session is already attached to
-/// ([`crate::DoctorAttach::Session`]), because a fresh handshake would announce
-/// an attach into the very session being diagnosed.
+/// The report is the shell twin's, with two lines different, and both are the
+/// same code deciding what is true here rather than a second report:
+///
+/// * the daemon it names is the one this session is already attached to
+///   ([`crate::DoctorAttach::Session`]), because a fresh handshake would
+///   announce an attach into the very session being diagnosed; and
+/// * the skill pre-flight (REQ-589 BR-13) answers, because this surface has a
+///   session id to ask about. `teton doctor` has none and says so.
 pub(crate) fn handle_doctor(
     conn: &mut Connection,
     ctx: &mut UiContext<'_>,
@@ -1408,6 +1426,120 @@ mod tests {
             "a session performs no handshake here, so there is no version to \
              quote: {report}"
         );
+    }
+
+    /// **REQ-589 AC-17/AC-19, client half.** Inside a session `/doctor` asks
+    /// the daemon for the skill pre-flight and prints its answer *verbatim*.
+    ///
+    /// Two things are pinned, and the second is the one that matters. The call
+    /// is made — `skills/preflight`, with this session's id and its `/verbose`
+    /// state — and the report reaches the screen **unaltered**: the assertion
+    /// is on the daemon's own bytes, because every figure in that text is the
+    /// one `skill_fit` composed against the stamped budget, and a client that
+    /// re-worded any of it would be the second estimator ADR-11 exists to
+    /// prevent (LESSON-456; REQ-586 verify M1).
+    ///
+    /// **Mutation**: reformat, re-order or summarize the report here and the
+    /// byte assertion fails; drop the `verbose` flag from the params and the
+    /// params assertion does.
+    #[test]
+    fn a_session_doctor_asks_for_the_skill_preflight_and_prints_it_verbatim() {
+        let report = "skills: 1 of 3 dispatchable skill(s) will not fit on this route \
+                      — budget 4,096 words / 32 KB (bound: local engine).\n  /bulky: …";
+        let (mut conn, peer) = Connection::scripted(&[
+            empty_config(),
+            serde_json::to_value(teton_protocol::methods::SkillsPreflightResult {
+                rendered: report.to_owned(),
+            })
+            .expect("the result serializes"),
+        ]);
+        let mut surface = RecordingSurface::new();
+        let mut state = SessionState::new();
+        state.verbose = true;
+        let mut prompter = ScriptedPrompter::new(&[]);
+        {
+            let mut ctx = session_ctx(&mut surface, &mut state, &mut prompter, true);
+            ctx.session_id = Some(teton_protocol::SessionId::from("sess-doc"));
+            run_mirrored_seamed(DOCTOR, "", &mut conn, &mut ctx, false)
+                .expect("the report renders");
+        }
+
+        // One read of the socket: `requests_written` drains it, so a second
+        // reader would see nothing and assert vacuously.
+        let sent = crate::client::requests_written(&peer);
+        let params = sent
+            .into_iter()
+            .find(|req| req["method"] == "skills/preflight")
+            .expect("the session's `/doctor` owes BR-13's question");
+        assert_eq!(params["params"]["session_id"], "sess-doc");
+        assert_eq!(
+            params["params"]["verbose"], true,
+            "AC-19: `/verbose` is the client's state and rides in the params, \
+             because the side that holds the budget is the side that words it"
+        );
+
+        let lines = surface.lines_of(LineKind::Info);
+        for line in report.lines() {
+            assert!(
+                lines.contains(&line),
+                "the daemon's report must reach the screen verbatim; missing \
+                 `{line}` from {lines:?}"
+            );
+        }
+    }
+
+    /// The shell twin owns no session, so it says so rather than answering
+    /// about one it picked — and it asks the daemon nothing.
+    ///
+    /// **Mutation**: fall back to "whichever session exists" and this reports
+    /// another conversation's skills to a terminal that is not in it.
+    #[test]
+    fn a_sessionless_doctor_names_no_session_and_asks_for_no_preflight() {
+        let (mut conn, peer) = Connection::scripted(&[empty_config()]);
+        let mut surface = RecordingSurface::new();
+        let mut state = SessionState::new();
+        let mut prompter = ScriptedPrompter::new(&[]);
+        {
+            let mut ctx = session_ctx(&mut surface, &mut state, &mut prompter, true);
+            assert!(ctx.session_id.is_none());
+            run_mirrored_seamed(DOCTOR, "", &mut conn, &mut ctx, false)
+                .expect("the report renders");
+        }
+        assert!(
+            !methods_sent(&peer).contains(&"skills/preflight".to_owned()),
+            "with no session there is nothing to ask about: {:?}",
+            methods_sent(&peer)
+        );
+        assert!(
+            surface
+                .lines_of(LineKind::Notice)
+                .iter()
+                .any(|line| line.contains("no session here")),
+            "the absence is stated, not silent: {:?}",
+            surface.lines_of(LineKind::Notice)
+        );
+    }
+
+    /// `/doctor` stays a **read** even though it now measures (REQ-589 BR-13).
+    ///
+    /// The pre-flight resolves no route, expands no dynamic context, reaches no
+    /// provider and writes no config. Flipping [`DOCTOR`]'s `writes` would put
+    /// the one diagnostic a user reaches for behind the typed-input gate, on a
+    /// surface whose whole point is to be answerable from a script — so the
+    /// classification is asserted where the read rows are, rather than left as
+    /// a comment on the constant.
+    #[test]
+    fn the_read_rows_including_doctor_are_still_reads() {
+        for row in [
+            PROVIDER_LIST,
+            BOUNDARY_LIST,
+            POLICY_SHOW,
+            MODEL_LIST,
+            MODEL_STATUS,
+            DOCTOR,
+        ] {
+            assert!(!row.writes, "`{}` is a read", row.shell);
+        }
     }
 
     /// ADR-3: a `provider add` refusal is a rendered line and the session

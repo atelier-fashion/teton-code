@@ -187,6 +187,103 @@ pub enum HarnessError {
         /// under — never re-derived here (BR-8).
         budget_tokens: usize,
     },
+    /// The **local engine** refused the rendered prompt as larger than its
+    /// context window (REQ-589 ADR-3).
+    ///
+    /// The same class of outcome as
+    /// [`ContextLengthExceeded`](Self::ContextLengthExceeded) and for the same
+    /// reasons — no health record, no fallback, no retry — but arriving from a
+    /// tier that has no provider to name. Before this variant the local
+    /// refusal was an [`Engine`](Self::Engine) error and the daemon reported it
+    /// as `INTERNAL_ERROR "the local engine could not serve the turn"`: wrong
+    /// about the cause and naming no remedy, on the route the reported
+    /// `/analyze` failure actually ran.
+    ///
+    /// # Why a sibling variant and not `provider_id: Option<String>`
+    ///
+    /// Both admit a local origin. This one admits it *by shape* rather than by
+    /// convention: `None` would mean "local" only because there happen to be
+    /// exactly two [`CompletionSource`](super::completion::CompletionSource)
+    /// implementations and only one names a provider — a fact a third source
+    /// would quietly falsify, with no compiler complaint, at every site that
+    /// had read `None` as "the local engine". It also leaves the remote
+    /// variant's shape, its `Display`, and every test that pins them
+    /// byte-identical, so "the remote path is unchanged" is true by
+    /// construction rather than by inspection.
+    ///
+    /// The cost of two variants is that a consumer could handle one and miss
+    /// the other. That is paid off by [`Self::context_refusal`], the single
+    /// tier-agnostic projection every such consumer reads instead of matching
+    /// here — the same arrangement [`Self::privacy_block_detail`] already uses.
+    ///
+    /// Carries the same two numbers in the same currency as the remote
+    /// variant, and for the same reason: they are the harness's own estimate
+    /// and the harness's own budget, so the gap between them is readable. The
+    /// engine's tokenized count is *not* carried, because it is measured in a
+    /// different currency (real BPE tokens against the engine's `n_ctx`) and
+    /// reporting it beside a word budget would make every refusal look like a
+    /// wildly wrong window.
+    #[error(
+        "the local engine refused the turn: about {assembled_tokens} words \
+         were assembled against a {budget_tokens}-word budget"
+    )]
+    LocalContextLengthExceeded {
+        /// The assembled context's size in the harness's own word estimator —
+        /// what this daemon believed it was sending.
+        assembled_tokens: usize,
+        /// The route's word budget, from the [`HarnessConfig`] the attempt ran
+        /// under — never re-derived here.
+        budget_tokens: usize,
+    },
+}
+
+/// Which tier refused a turn as larger than its context window.
+///
+/// A borrow of what the [`HarnessError`] already holds, not a second copy of
+/// it: the sentence and any remedy read the origin from here rather than
+/// re-matching the error, so the two window refusals cannot come to be worded —
+/// or acted on — differently by accident (REQ-589 ADR-3).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ContextRefusalOrigin<'a> {
+    /// A remote provider answered that the request does not fit its window.
+    Provider(&'a str),
+    /// The local engine refused the rendered prompt. Carries no id: the local
+    /// tier is transport-free and there is no provider to name.
+    LocalEngine,
+}
+
+/// A window refusal's facts, whichever tier produced it (REQ-589 ADR-3).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ContextRefusal<'a> {
+    /// The tier that refused.
+    pub origin: ContextRefusalOrigin<'a>,
+    /// The assembled context's size in the harness's own word estimator.
+    pub assembled_tokens: usize,
+    /// The word budget the attempt ran under.
+    pub budget_tokens: usize,
+}
+
+impl ContextRefusal<'_> {
+    /// The daemon's `CONTEXT_LENGTH_EXCEEDED` sentence for this refusal,
+    /// against the route's `window_label`.
+    ///
+    /// **One composer for both tiers** (conventions.md): the remote wording is
+    /// byte-identical to what REQ-586 shipped and the local tier differs only
+    /// in its subject, so a later edit cannot improve one sentence and leave
+    /// the other behind. Content-free by construction — a provider id, two
+    /// integers and a label, never a response body or prompt text (BR-11).
+    #[must_use]
+    pub fn sentence(&self, window_label: &str) -> String {
+        let subject = match self.origin {
+            ContextRefusalOrigin::Provider(id) => format!("`{id}`"),
+            ContextRefusalOrigin::LocalEngine => "the local engine".to_owned(),
+        };
+        format!(
+            "{subject} refused this turn as larger than {window_label}: about {} words \
+             were assembled against a {}-word budget",
+            self.assembled_tokens, self.budget_tokens
+        )
+    }
 }
 
 impl HarnessError {
@@ -216,6 +313,51 @@ impl HarnessError {
             HarnessError::Remote(e) => e.privacy_block_detail(),
             _ => None,
         }
+    }
+
+    /// The window refusal this error carries — which tier refused and the two
+    /// numbers — or `None` if it is not one (REQ-589 ADR-3).
+    ///
+    /// **The one place that answers "was this turn refused at the window".**
+    /// The condition has two variants because only one of the two tiers has a
+    /// provider to name; a consumer that matched them itself could handle the
+    /// remote one and quietly miss the local one, which is the tier the
+    /// reported failure ran on. Reading them through one projection is the
+    /// arrangement [`Self::privacy_block_detail`] already uses for the same
+    /// reason.
+    #[must_use]
+    pub fn context_refusal(&self) -> Option<ContextRefusal<'_>> {
+        match self {
+            HarnessError::ContextLengthExceeded {
+                provider_id,
+                assembled_tokens,
+                budget_tokens,
+            } => Some(ContextRefusal {
+                origin: ContextRefusalOrigin::Provider(provider_id),
+                assembled_tokens: *assembled_tokens,
+                budget_tokens: *budget_tokens,
+            }),
+            HarnessError::LocalContextLengthExceeded {
+                assembled_tokens,
+                budget_tokens,
+            } => Some(ContextRefusal {
+                origin: ContextRefusalOrigin::LocalEngine,
+                assembled_tokens: *assembled_tokens,
+                budget_tokens: *budget_tokens,
+            }),
+            _ => None,
+        }
+    }
+
+    /// This error's `CONTEXT_LENGTH_EXCEEDED` sentence against the route's
+    /// `window_label`, or `None` if it is not a window refusal at all.
+    ///
+    /// Defined in terms of [`Self::context_refusal`] so the predicate and the
+    /// wording cannot come to disagree about which errors are window refusals.
+    #[must_use]
+    pub fn window_refusal_sentence(&self, window_label: &str) -> Option<String> {
+        self.context_refusal()
+            .map(|refusal| refusal.sentence(window_label))
     }
 }
 
@@ -737,6 +879,71 @@ fn announce_pressure(
     }
 }
 
+/// Whether this turn's **first** iteration runs the top-of-loop pressure gate
+/// (REQ-589 BR-12 / D-3, ADR-8).
+///
+/// The gate's ordinary answer to a conversation that does not fit is to shed
+/// older turns — compact what it can, then truncate oldest-first (REQ-561
+/// ADR-4, REQ-567 BR-4). On the one turn a user was shown an over-budget
+/// measurement for and knowingly accepted, that answer is wrong: they consented
+/// to *sending* an oversized expansion, not to *losing* their conversation, and
+/// silently deleting history to accommodate the first consent would be a second
+/// loss they were never asked about. So this turn is assembled whole, and if it
+/// then does not fit at the engine or the provider it fails with the typed
+/// [`ContextRefusal`] — a visible, recoverable error, which BR-12 holds is
+/// strictly preferable to a turn that succeeds by discarding the conversation
+/// that gave it meaning.
+///
+/// # Why this shape
+///
+/// It is a **by-value parameter of the one-turn function**, and deliberately
+/// neither `Copy` nor `Clone`. D-7 scopes the suspension to the turn that was
+/// consented to and says ordinary pressure resumes afterwards; here that is not
+/// a rule anyone has to remember but a property of the type. The value is moved
+/// into the call, spent by the first iteration
+/// ([`Self::enforces_this_iteration`] replaces it with [`Self::Enforced`]) and
+/// dropped when the turn returns. A caller cannot hold one across two turns,
+/// because passing it once consumes it; a second turn needs a second value,
+/// constructed where a second accept answer is known. Leaking it is not
+/// *avoided* here — it does not compile.
+///
+/// This is also why it is not a [`HarnessConfig`] field: that struct is a
+/// route's long-lived settings, borrowed by every turn on that route, so a flag
+/// living there would have to be set and unset, which is exactly the shape D-7
+/// asks not to depend on.
+#[derive(Debug, PartialEq, Eq)]
+pub enum PressurePolicy {
+    /// The ordinary rule: the gate runs at the top of every iteration, and a
+    /// pressured conversation is compacted and truncated to fit (REQ-561 ADR-4,
+    /// REQ-567 BR-4). Every turn that was not accepted over budget — which is
+    /// nearly all of them — runs under this.
+    Enforced,
+    /// This turn's over-budget measurement was shown to the user and accepted
+    /// (REQ-589 BR-12). The first iteration's gate is skipped so the turn is
+    /// assembled with its history intact; every later iteration of the same turn
+    /// is [`Enforced`](Self::Enforced) again, because the consent was to send
+    /// *this* prompt, not to run the rest of the turn unbounded.
+    SuspendedForAcceptedTurn,
+}
+
+impl PressurePolicy {
+    /// Whether the top-of-loop gate runs on this iteration — and, in the same
+    /// call, the one place the suspension is spent.
+    ///
+    /// Answers `false` **at most once**, on the first iteration of a turn that
+    /// was accepted over budget, and `true` on every iteration after it. The
+    /// clearing is `mem::replace`'s doing rather than a separate reset
+    /// statement, so "exactly one iteration" cannot be broken by a later edit
+    /// that moves, duplicates, or forgets the reset: there is no reset to
+    /// forget, and calling this twice cannot yield `false` twice.
+    fn enforces_this_iteration(&mut self) -> bool {
+        matches!(
+            std::mem::replace(self, PressurePolicy::Enforced),
+            PressurePolicy::Enforced
+        )
+    }
+}
+
 /// Drive one prompt turn to completion against the local engine.
 ///
 /// `ctx` must already hold the system prompt and the user's prompt (see
@@ -852,6 +1059,12 @@ pub async fn run_session_turn(
 /// handed to every tool result rather than switched on a tool name, because a
 /// category selected by a string comparison is exactly what BR-1 forbids.
 ///
+/// The turn runs under [`PressurePolicy::Enforced`] — the ordinary budget rule.
+/// A turn the user was shown an over-budget measurement for and *accepted* goes
+/// through [`run_session_turn_with_pressure_policy`] instead (REQ-589 BR-12);
+/// this entry point exists so every other caller keeps saying nothing about
+/// pressure and gets the enforcing answer.
+///
 /// # Errors
 /// [`HarnessError::Engine`] on a local backend failure, or
 /// [`HarnessError::Remote`] on a provider/transport failure (including a privacy
@@ -869,6 +1082,57 @@ pub async fn run_session_turn_with_source(
     digest: &DutyRoute,
     compact: &DutyRoute,
     duties: &ToolDuties<'_>,
+) -> Result<TurnOutcome, HarnessError> {
+    run_session_turn_with_pressure_policy(
+        source,
+        tools,
+        tool_ctx,
+        gate,
+        events,
+        ctx,
+        config,
+        hook,
+        digest,
+        compact,
+        duties,
+        PressurePolicy::Enforced,
+    )
+    .await
+}
+
+/// [`run_session_turn_with_source`], with the turn's [`PressurePolicy`] named.
+///
+/// The same loop and the same guarantees; the only difference is that the
+/// caller states whether this turn's first iteration may shed history to fit
+/// (REQ-589 BR-12 / D-3, ADR-8). The daemon's routed path calls this with
+/// [`PressurePolicy::SuspendedForAcceptedTurn`] on the turn whose over-budget
+/// expansion the user accepted, and with [`PressurePolicy::Enforced`] — which is
+/// what [`run_session_turn_with_source`] passes — on every other turn.
+///
+/// `pressure` is taken **by value**: it is this turn's answer, spent by this
+/// turn's first iteration, and cannot be carried into the next one. See
+/// [`PressurePolicy`] for why that is a property of the type rather than a rule.
+///
+/// # Errors
+/// As [`run_session_turn_with_source`]. A suspended turn additionally reaches
+/// [`HarnessError::LocalContextLengthExceeded`] /
+/// [`HarnessError::ContextLengthExceeded`] where an enforced one would have
+/// dropped blocks to fit — that visible refusal is BR-12's intended outcome, not
+/// a regression.
+#[allow(clippy::too_many_arguments)]
+pub async fn run_session_turn_with_pressure_policy(
+    source: &mut dyn CompletionSource,
+    tools: &ToolRegistry,
+    tool_ctx: &ToolContext,
+    gate: &PermissionGate,
+    events: &SessionEvents,
+    ctx: &mut ContextManager,
+    config: &HarnessConfig,
+    hook: &mut dyn ProvenanceHook,
+    digest: &DutyRoute,
+    compact: &DutyRoute,
+    duties: &ToolDuties<'_>,
+    mut pressure: PressurePolicy,
 ) -> Result<TurnOutcome, HarnessError> {
     let exposed = tools.exposed_names(config.max_tools);
     // What "relevant" is measured against, read once: the loop appends model
@@ -938,23 +1202,46 @@ pub async fn run_session_turn_with_source(
         //
         // A failure is never silent: this duty guards the context window, so the
         // deterministic drop standing in for it is logged with the reason.
-        let compaction = ctx.compact_if_pressured(compact).await;
-        if let Some(error) = &compaction.reason {
-            eprintln!(
-                "tetond: the `compact` duty could not be served ({error}); the \
-                 context was truncated deterministically instead"
+        //
+        // ---- REQ-589 BR-12 / D-3: the one exception to all of the above ----
+        //
+        // Both calls are skipped on the **first** iteration of a turn the user
+        // was shown an over-budget measurement for and accepted. That consent
+        // was to send an oversized expansion, not to lose the conversation, and
+        // the rule this exception is carved into — compact, then truncate,
+        // unconditionally (REQ-561 ADR-4, REQ-567 BR-4, the comment above) —
+        // would answer the first consent by silently spending something the
+        // user was never asked about. A turn that then does not fit leaves as
+        // `ContextLengthExceeded` / `LocalContextLengthExceeded`, which is a
+        // visible and recoverable outcome; a shortened conversation is neither.
+        //
+        // The exception is one iteration wide, not one turn: `pressure` is spent
+        // by this call, so a fold, a denied tool, a malformed call and the
+        // verification nudge all pass through the enforcing gate again on the way
+        // round (D-7). The two exits below — the `max_turns` gate above and the
+        // `EndTurn` gate after the model's answer — are deliberately *not*
+        // suspended: they bound what the **next** turn carries, after this one's
+        // prompt has already been assembled and sent, which is the ordinary
+        // pressure handling D-7 says resumes.
+        if pressure.enforces_this_iteration() {
+            let compaction = ctx.compact_if_pressured(compact).await;
+            if let Some(error) = &compaction.reason {
+                eprintln!(
+                    "tetond: the `compact` duty could not be served ({error}); the \
+                     context was truncated deterministically instead"
+                );
+            }
+            // BR-7: never silent. This is the gate that fires on a carried
+            // conversation meeting a smaller route (BR-10) and on a tool result
+            // that outgrew the budget, so it is where most of this event comes
+            // from.
+            announce_pressure(
+                events,
+                &ctx.truncate_to_budget(),
+                &config.budget,
+                &mut said_it_did_not_fit,
             );
         }
-        // BR-7: never silent. This is the gate that fires on a carried
-        // conversation meeting a smaller route (BR-10) and on a tool result
-        // that outgrew the budget, so it is where most of this event comes
-        // from.
-        announce_pressure(
-            events,
-            &ctx.truncate_to_budget(),
-            &config.budget,
-            &mut said_it_did_not_fit,
-        );
 
         // ---- model call ----
         // The egress provenance of the assembled context travels with the turn so
@@ -2434,6 +2721,89 @@ mod tests {
     use crate::harness::context::{NoopProvenanceHook, PreparedPrompt};
     use crate::harness::permissions::{PendingPermissions, PermissionConfig};
 
+    /// **REQ-589 AC-3.** The remote refusal's wording is byte-identical to what
+    /// REQ-586 shipped, and the local one differs from it in exactly one place.
+    ///
+    /// Both sentences are written out in full rather than derived, because the
+    /// claim under test *is* the bytes: this is the pin that fails if extending
+    /// the outcome to the local tier changed what a remote refusal says.
+    #[test]
+    fn one_composer_words_both_window_refusals_and_leaves_the_remote_one_unchanged() {
+        let remote = HarnessError::ContextLengthExceeded {
+            provider_id: "kimi".to_owned(),
+            assembled_tokens: 5_000,
+            budget_tokens: 4_096,
+        };
+        assert_eq!(
+            remote
+                .window_refusal_sentence("kimi's context window")
+                .expect("a window refusal"),
+            "`kimi` refused this turn as larger than kimi's context window: about 5000 \
+             words were assembled against a 4096-word budget"
+        );
+
+        let local = HarnessError::LocalContextLengthExceeded {
+            assembled_tokens: 5_000,
+            budget_tokens: 4_096,
+        };
+        assert_eq!(
+            local
+                .window_refusal_sentence("the local context window")
+                .expect("a window refusal"),
+            "the local engine refused this turn as larger than the local context window: \
+             about 5000 words were assembled against a 4096-word budget"
+        );
+
+        // Both project to the same shape, so a consumer reading the projection
+        // cannot handle one tier and silently miss the other.
+        assert_eq!(
+            remote.context_refusal().map(|r| r.origin),
+            Some(ContextRefusalOrigin::Provider("kimi"))
+        );
+        assert_eq!(
+            local.context_refusal().map(|r| r.origin),
+            Some(ContextRefusalOrigin::LocalEngine)
+        );
+        for refusal in [&remote, &local] {
+            let facts = refusal.context_refusal().expect("a window refusal");
+            assert_eq!(facts.assembled_tokens, 5_000);
+            assert_eq!(facts.budget_tokens, 4_096);
+        }
+
+        // And nothing else is one. `NoTierAvailable` is the neighbouring
+        // "the turn did not run" outcome, and it names no window.
+        assert!(HarnessError::NoTierAvailable.context_refusal().is_none());
+        assert!(HarnessError::NoTierAvailable
+            .window_refusal_sentence("the local context window")
+            .is_none());
+    }
+
+    /// The remote variant's `Display` is unchanged too — it is what the daemon
+    /// falls back to, what the stderr line renders, and what the REQ-586 suite
+    /// asserts is content-free.
+    #[test]
+    fn the_remote_window_refusals_display_is_byte_identical_to_req_586() {
+        assert_eq!(
+            HarnessError::ContextLengthExceeded {
+                provider_id: "kimi".to_owned(),
+                assembled_tokens: 5_000,
+                budget_tokens: 4_096,
+            }
+            .to_string(),
+            "provider `kimi` refused the turn: about 5000 words were assembled \
+             against a 4096-word budget"
+        );
+        assert_eq!(
+            HarnessError::LocalContextLengthExceeded {
+                assembled_tokens: 5_000,
+                budget_tokens: 4_096,
+            }
+            .to_string(),
+            "the local engine refused the turn: about 5000 words were assembled \
+             against a 4096-word budget"
+        );
+    }
+
     /// A source that reports `format` and streams a reply which fabricates the
     /// **next** turn's role header — the template-mode analogue of BUG-147's
     /// invented `Tool (read):` block.
@@ -2771,6 +3141,563 @@ mod tests {
             "the turn ended {} bytes over its budget with a `compact` duty that never served",
             ctx.estimated_bytes() - BUDGET_BYTES
         );
+    }
+
+    /// The oldest block of the over-budget fixture below — the first thing the
+    /// enforcing gate drops, and therefore the witness for whether it ran.
+    const OLDEST_BLOCK_MARKER: &str = "the-oldest-block-BR-12-must-keep";
+
+    /// The byte budget the BR-12 fixtures are measured against.
+    const SUSPENSION_BUDGET_BYTES: usize = 4_000;
+
+    /// A conversation comfortably past its byte budget, whose oldest block
+    /// carries [`OLDEST_BLOCK_MARKER`].
+    ///
+    /// Asserts its own non-vacuity: a fixture that is not actually over budget
+    /// would make every test below pass for the wrong reason, since a gate with
+    /// nothing to drop is indistinguishable from a gate that did not run.
+    fn over_budget_context() -> ContextManager {
+        let mut ctx =
+            ContextManager::new("sys", 1_000_000).with_budget_bytes(SUSPENSION_BUDGET_BYTES);
+        ctx.push_user(format!("{OLDEST_BLOCK_MARKER} {}", "x".repeat(1_000)));
+        for i in 0..5 {
+            ctx.push_user(format!("block {i} {}", "x".repeat(1_000)));
+        }
+        assert!(
+            ctx.estimated_bytes() > SUSPENSION_BUDGET_BYTES,
+            "non-vacuity: the fixture must start over budget, or the gate has nothing to shed"
+        );
+        ctx
+    }
+
+    /// The loop's non-pressure furniture, so the BR-12 tests differ from one
+    /// another in the policy and the script alone.
+    struct LoopFixture {
+        gate: PermissionGate,
+        events: SessionEvents,
+        tools: ToolRegistry,
+        tool_ctx: ToolContext,
+    }
+
+    impl LoopFixture {
+        fn new(session: &str) -> Self {
+            let session_id = SessionId::from(session);
+            let bus = Arc::new(EventBus::new());
+            let gate = PermissionGate::new(
+                session_id.clone(),
+                PermissionConfig::permissive(),
+                Arc::clone(&bus),
+                Arc::new(PendingPermissions::new()),
+            );
+            Self {
+                gate,
+                events: SessionEvents::new(bus, session_id),
+                tools: ToolRegistry::with_builtins(),
+                tool_ctx: ToolContext::new(std::env::temp_dir()),
+            }
+        }
+    }
+
+    /// What [`RecordingSource`] answers on one call.
+    enum ScriptedTurn {
+        /// The window refusal the local tier produces when the rendered prompt
+        /// does not fit its context window: `EngineError::ContextWindowExceeded`
+        /// reaches the loop as [`HarnessError::LocalContextLengthExceeded`]
+        /// (REQ-589 TASK-239, `completion.rs`). The numbers are the pair the
+        /// reported `/analyze` failure measured.
+        WindowRefusal,
+        /// A `read` of a file that does not exist — the shortest route to a
+        /// folded tool result, and therefore to a second iteration.
+        ToolCall,
+        /// A plain final answer.
+        End,
+    }
+
+    /// A scripted source that records the prompt it was asked from.
+    ///
+    /// What BR-12's suspension changes is **what the model was asked** — which
+    /// blocks survived into the assembled prompt — not what it answered, so
+    /// these fixtures read the recorded prompt rather than the reply.
+    struct RecordingSource {
+        /// Every `prompt.flat` this source was called with, in order.
+        prompts: Vec<String>,
+        /// One entry per call, in call order.
+        script: Vec<ScriptedTurn>,
+    }
+
+    impl RecordingSource {
+        fn new(script: Vec<ScriptedTurn>) -> Self {
+            Self {
+                prompts: Vec::new(),
+                script,
+            }
+        }
+    }
+
+    #[async_trait]
+    impl CompletionSource for RecordingSource {
+        fn chat_format(&self) -> ChatFormat {
+            ChatFormat::Flat
+        }
+
+        async fn produce_turn(
+            &mut self,
+            prompt: &PreparedPrompt,
+            _provenance: &EgressProvenance,
+            _config: &HarnessConfig,
+            _tools: &ToolRegistry,
+            _exposed: &[&str],
+            _on_token: &mut (dyn for<'s> FnMut(&'s str) + Send),
+        ) -> Result<SourceTurn, HarnessError> {
+            self.prompts.push(prompt.flat.clone());
+            let call = self.prompts.len();
+            match self.script.get(call - 1) {
+                Some(ScriptedTurn::WindowRefusal) => {
+                    Err(HarnessError::LocalContextLengthExceeded {
+                        assembled_tokens: 4_097,
+                        budget_tokens: 4_096,
+                    })
+                }
+                Some(ScriptedTurn::ToolCall) => Ok(SourceTurn {
+                    text: "{\"tool\":\"read\",\"arguments\":{\"path\":\"nope.txt\"}}".to_owned(),
+                    decision: TurnDecision::ToolCall {
+                        name: "read".to_owned(),
+                        arguments: serde_json::json!({ "path": "nope.txt" }),
+                    },
+                    usage: TokenUsage::default(),
+                    dropped_calls: 0,
+                    cache: None,
+                    call_in_text: true,
+                }),
+                Some(ScriptedTurn::End) => Ok(SourceTurn {
+                    text: "Done.".to_owned(),
+                    decision: TurnDecision::EndTurn {
+                        final_text: "Done.".to_owned(),
+                    },
+                    usage: TokenUsage::default(),
+                    dropped_calls: 0,
+                    cache: None,
+                    call_in_text: false,
+                }),
+                None => panic!("the loop asked for turn {call} and the script has no such entry"),
+            }
+        }
+    }
+
+    /// **REQ-589 BR-12 / D-3 / ADR-8, AC-16 — the seam test LESSON-508 requires.**
+    ///
+    /// An accepted over-budget turn is assembled with its history **intact**:
+    /// the block list is byte-identical across the turn, the model is asked with
+    /// the whole conversation, and a turn that then does not fit leaves as the
+    /// typed window refusal rather than as a silently shortened conversation.
+    ///
+    /// # Why this test exists at this seam
+    ///
+    /// The suspension is a *redundant-looking* guard, and LESSON-508 is about
+    /// exactly that class: deleting it does not break anything visible. Without
+    /// it the loop sheds older turns and the turn very often **succeeds** — the
+    /// user gets an answer, no error is raised, no event says anything was lost,
+    /// and every end-to-end leg of REQ-589 (the offer renders, the accept
+    /// dispatches, the expansion goes whole) stays green while the conversation
+    /// quietly shrinks. There is no natural failing signal to rely on, so the
+    /// signal is written down here: this test compares the block list across the
+    /// turn, and deleting the `pressure.enforces_this_iteration()` guard in
+    /// [`run_session_turn_with_pressure_policy`] turns it red on its own.
+    ///
+    /// Its partner
+    /// [`the_same_turn_enforced_sheds_history_before_the_model_is_asked`] runs
+    /// the identical fixture under [`PressurePolicy::Enforced`] and asserts the
+    /// opposite, so a fixture that had drifted under budget — which would make
+    /// this test pass for no reason — cannot go unnoticed.
+    #[tokio::test]
+    async fn an_accepted_over_budget_turn_keeps_every_block_and_refuses_visibly() {
+        let fx = LoopFixture::new("br12-suspended");
+        let config = HarnessConfig::default();
+        let mut hook = NoopProvenanceHook;
+        let mut ctx = over_budget_context();
+        let before = ctx.blocks().to_vec();
+
+        let mut source = RecordingSource::new(vec![ScriptedTurn::WindowRefusal]);
+        let result = run_session_turn_with_pressure_policy(
+            &mut source,
+            &fx.tools,
+            &fx.tool_ctx,
+            &fx.gate,
+            &fx.events,
+            &mut ctx,
+            &config,
+            &mut hook,
+            &DutyRoute::unresolved("no digest route in this test"),
+            &DutyRoute::unresolved("no compact route in this test"),
+            &ToolDuties {
+                triage: &DutyRoute::unresolved("no triage route in this test"),
+                shell: &DutyRoute::unresolved("no shell route in this test"),
+            },
+            PressurePolicy::SuspendedForAcceptedTurn,
+        )
+        .await;
+
+        // The turn was asked with the whole conversation — the half a deleted
+        // suspension would silently change.
+        assert!(
+            source.prompts[0].contains(OLDEST_BLOCK_MARKER),
+            "the accepted turn must be assembled from the whole conversation"
+        );
+        // AC-16: the block list before and after, compared.
+        assert_eq!(
+            ctx.blocks(),
+            before.as_slice(),
+            "BR-12: consent to send an oversized expansion is not consent to lose history"
+        );
+        assert!(
+            !ctx.was_truncated(),
+            "BR-12: nothing may be shed on the accepted turn"
+        );
+
+        // And the turn that cannot fit says so, in the typed outcome the daemon
+        // renders as CONTEXT_LENGTH_EXCEEDED (TASK-239) — a visible, recoverable
+        // error, which BR-12 holds is strictly preferable to a turn that
+        // succeeds by discarding the conversation that gave it meaning.
+        let error = result.expect_err("the assembled turn does not fit, so it must refuse");
+        let refusal = error
+            .context_refusal()
+            .expect("a window refusal, not a generic engine failure");
+        assert_eq!(refusal.origin, ContextRefusalOrigin::LocalEngine);
+        assert_eq!(refusal.assembled_tokens, 4_097);
+        assert_eq!(refusal.budget_tokens, 4_096);
+
+        // D-7: ordinary pressure resumes on the **next** turn. The policy above
+        // was moved into that call and cannot be reused — a second turn states
+        // its own answer, and this one is the enforcing default.
+        let mut next = RecordingSource::new(vec![ScriptedTurn::End]);
+        run_session_turn_with_source(
+            &mut next,
+            &fx.tools,
+            &fx.tool_ctx,
+            &fx.gate,
+            &fx.events,
+            &mut ctx,
+            &config,
+            &mut hook,
+            &DutyRoute::unresolved("no digest route in this test"),
+            &DutyRoute::unresolved("no compact route in this test"),
+            &ToolDuties {
+                triage: &DutyRoute::unresolved("no triage route in this test"),
+                shell: &DutyRoute::unresolved("no shell route in this test"),
+            },
+        )
+        .await
+        .expect("the following turn ends");
+        assert!(
+            !next.prompts[0].contains(OLDEST_BLOCK_MARKER),
+            "D-7: the suspension is scoped to the turn that was consented to"
+        );
+        assert!(
+            ctx.estimated_bytes() <= SUSPENSION_BUDGET_BYTES,
+            "D-7: the following turn is bounded like any other"
+        );
+    }
+
+    /// The non-vacuity partner of
+    /// [`an_accepted_over_budget_turn_keeps_every_block_and_refuses_visibly`]:
+    /// the identical fixture, under the ordinary policy, sheds history before
+    /// the model is asked and the turn then completes.
+    ///
+    /// This is the behaviour D-3 overruled, and it is worth pinning: it is what
+    /// makes the suspension's absence *silent* (the turn succeeds, nothing
+    /// errors), and it proves the fixture really does put the gate to work.
+    #[tokio::test]
+    async fn the_same_turn_enforced_sheds_history_before_the_model_is_asked() {
+        let fx = LoopFixture::new("br12-enforced");
+        let config = HarnessConfig::default();
+        let mut hook = NoopProvenanceHook;
+        let mut ctx = over_budget_context();
+        let before = ctx.blocks().to_vec();
+
+        let mut source = RecordingSource::new(vec![ScriptedTurn::End]);
+        run_session_turn_with_pressure_policy(
+            &mut source,
+            &fx.tools,
+            &fx.tool_ctx,
+            &fx.gate,
+            &fx.events,
+            &mut ctx,
+            &config,
+            &mut hook,
+            &DutyRoute::unresolved("no digest route in this test"),
+            &DutyRoute::unresolved("no compact route in this test"),
+            &ToolDuties {
+                triage: &DutyRoute::unresolved("no triage route in this test"),
+                shell: &DutyRoute::unresolved("no shell route in this test"),
+            },
+            PressurePolicy::Enforced,
+        )
+        .await
+        .expect("the turn ends");
+
+        assert!(
+            !source.prompts[0].contains(OLDEST_BLOCK_MARKER),
+            "the enforcing gate drops oldest-first before the model is asked"
+        );
+        assert!(
+            ctx.blocks().len() < before.len(),
+            "the enforcing gate really did shed blocks"
+        );
+    }
+
+    /// **D-7, at the iteration boundary.** The suspension is one iteration wide,
+    /// not one turn wide: the accepted prompt goes out whole, and the very next
+    /// assembly of the same turn — after a tool result was folded — passes
+    /// through the enforcing gate again.
+    ///
+    /// Widening the exception to the whole turn (hoisting the flag out of the
+    /// loop, or re-arming it at the fold) leaves the marker in the second prompt
+    /// and turns this red; deleting the exception removes it from the first.
+    #[tokio::test]
+    async fn the_suspension_is_spent_by_the_first_iteration() {
+        let fx = LoopFixture::new("br12-one-iteration");
+        let config = HarnessConfig {
+            max_turns: 4,
+            ..HarnessConfig::default()
+        };
+        let mut hook = NoopProvenanceHook;
+        let mut ctx = over_budget_context();
+
+        let mut source = RecordingSource::new(vec![ScriptedTurn::ToolCall, ScriptedTurn::End]);
+        run_session_turn_with_pressure_policy(
+            &mut source,
+            &fx.tools,
+            &fx.tool_ctx,
+            &fx.gate,
+            &fx.events,
+            &mut ctx,
+            &config,
+            &mut hook,
+            &DutyRoute::unresolved("no digest route in this test"),
+            &DutyRoute::unresolved("no compact route in this test"),
+            &ToolDuties {
+                triage: &DutyRoute::unresolved("no triage route in this test"),
+                shell: &DutyRoute::unresolved("no shell route in this test"),
+            },
+            PressurePolicy::SuspendedForAcceptedTurn,
+        )
+        .await
+        .expect("the turn ends");
+
+        assert_eq!(
+            source.prompts.len(),
+            2,
+            "non-vacuity: the tool result was folded and the model was asked again"
+        );
+        assert!(
+            source.prompts[0].contains(OLDEST_BLOCK_MARKER),
+            "the accepted iteration is assembled whole"
+        );
+        assert!(
+            !source.prompts[1].contains(OLDEST_BLOCK_MARKER),
+            "D-7: the exception is one iteration wide — every later assembly is gated"
+        );
+    }
+
+    /// **ADR-8's two named edges: the exits below the gate stay enforcing
+    /// (D-7).**
+    ///
+    /// # Why this test exists
+    ///
+    /// The suspension's *edge* is as silent as the suspension itself, and the
+    /// tests above cannot see it. ADR-8 records that the `max_turns` and
+    /// `EndTurn` exits are deliberately **not** suspended, because they bound
+    /// what the *next* turn carries — after this turn's prompt was already
+    /// assembled and sent — and that record was prose. Widening the exception
+    /// to cover either of them (capturing the policy in an
+    /// `let accepted = matches!(pressure, …)` at the top of the turn and gating
+    /// an exit on it) costs nothing visible: the accepted turn still goes out
+    /// whole, still answers, still raises no error and still drops no block,
+    /// and the next turn silently inherits a conversation nothing bounded. Both
+    /// mutations were run against this crate before this test was written and
+    /// **both passed all 2,343 tests**. That is LESSON-508 exactly — a guard
+    /// that is real, correct and completely untested — so the signal is written
+    /// down here.
+    ///
+    /// # What it asserts, and what it deliberately does not
+    ///
+    /// TASK-245's warning applies in full: "no history block is dropped" is
+    /// exact only for the **prompt** and the **refusal** path. Both turns below
+    /// *succeed*, so each reaches an un-suspended exit and the context is
+    /// trimmed on the way out — that is D-7 working, not a BR-12 breach. So the
+    /// BR-12 half is asserted against the **assembled prompt** (the model was
+    /// asked with the whole conversation) and the D-7 half against what the
+    /// turn leaves behind (bounded). Asserting the post-turn block list here
+    /// would read as a violation when nothing is wrong.
+    #[tokio::test]
+    async fn the_accepted_turns_exit_gates_still_bound_what_the_next_turn_carries() {
+        // ---- the `EndTurn` exit, below the model's answer ----
+        let fx = LoopFixture::new("br12-endturn-exit");
+        let config = HarnessConfig::default();
+        let mut hook = NoopProvenanceHook;
+        let mut ctx = over_budget_context();
+
+        let mut source = RecordingSource::new(vec![ScriptedTurn::End]);
+        let outcome = run_session_turn_with_pressure_policy(
+            &mut source,
+            &fx.tools,
+            &fx.tool_ctx,
+            &fx.gate,
+            &fx.events,
+            &mut ctx,
+            &config,
+            &mut hook,
+            &DutyRoute::unresolved("no digest route in this test"),
+            &DutyRoute::unresolved("no compact route in this test"),
+            &ToolDuties {
+                triage: &DutyRoute::unresolved("no triage route in this test"),
+                shell: &DutyRoute::unresolved("no shell route in this test"),
+            },
+            PressurePolicy::SuspendedForAcceptedTurn,
+        )
+        .await
+        .expect("the accepted turn answers");
+
+        assert_eq!(
+            outcome.stop_reason,
+            StopReason::EndTurn,
+            "non-vacuity: this leg must leave by the `EndTurn` door"
+        );
+        assert!(
+            source.prompts[0].contains(OLDEST_BLOCK_MARKER),
+            "BR-12: the accepted turn was still asked with the whole conversation"
+        );
+        assert!(
+            ctx.estimated_bytes() <= SUSPENSION_BUDGET_BYTES,
+            "D-7: the `EndTurn` exit is not suspended — it bounds what the next turn \
+             carries, and this turn left {} bytes against a {SUSPENSION_BUDGET_BYTES}-byte \
+             budget",
+            ctx.estimated_bytes()
+        );
+
+        // ---- the `max_turns` exit, above the gate ----
+        //
+        // `max_turns: 1` with a single tool call is the shortest way to leave by
+        // this door *after* a model call: the first iteration is the suspended
+        // one, the tool result is folded, and the loop top then finds the
+        // ceiling reached.
+        let fx = LoopFixture::new("br12-max-turns-exit");
+        let config = HarnessConfig {
+            max_turns: 1,
+            ..HarnessConfig::default()
+        };
+        let mut ctx = over_budget_context();
+
+        let mut source = RecordingSource::new(vec![ScriptedTurn::ToolCall]);
+        let outcome = run_session_turn_with_pressure_policy(
+            &mut source,
+            &fx.tools,
+            &fx.tool_ctx,
+            &fx.gate,
+            &fx.events,
+            &mut ctx,
+            &config,
+            &mut hook,
+            &DutyRoute::unresolved("no digest route in this test"),
+            &DutyRoute::unresolved("no compact route in this test"),
+            &ToolDuties {
+                triage: &DutyRoute::unresolved("no triage route in this test"),
+                shell: &DutyRoute::unresolved("no shell route in this test"),
+            },
+            PressurePolicy::SuspendedForAcceptedTurn,
+        )
+        .await
+        .expect("the accepted turn reaches its ceiling");
+
+        assert_eq!(
+            outcome.stop_reason,
+            StopReason::MaxTurnRequests,
+            "non-vacuity: this leg must leave by the `max_turns` door"
+        );
+        assert!(
+            source.prompts[0].contains(OLDEST_BLOCK_MARKER),
+            "BR-12: the accepted turn was still asked with the whole conversation"
+        );
+        assert!(
+            ctx.estimated_bytes() <= SUSPENSION_BUDGET_BYTES,
+            "D-7: the `max_turns` exit is not suspended either — a turn that hit its \
+             ceiling left {} bytes against a {SUSPENSION_BUDGET_BYTES}-byte budget",
+            ctx.estimated_bytes()
+        );
+    }
+
+    /// **ADR-8's unreachability claim, made resident rather than left as prose.**
+    ///
+    /// The BR-12 exception is sound only because an accepted turn always
+    /// reaches the model before any exit gate can trim. A `max_turns` of `0`
+    /// breaks that: the loop would return through the truncating `max_turns`
+    /// exit *above* the model call, so an accepted turn could shed history
+    /// without ever sending anything — the one loss BR-12 exists to prevent,
+    /// arriving through the door the exception deliberately left enforcing.
+    ///
+    /// ADR-8 chose to record that as unreachable from this module's
+    /// constructors rather than widen the exception to cover it. That makes the
+    /// unreachability **load-bearing**, and load-bearing prose is the shape
+    /// LESSON-508 warns about: a constructor that grew a zero — or a
+    /// `.max(1)` dropped as redundant in a refactor — would quietly make the
+    /// exception unsound with nothing going red. So the claim is pinned here.
+    #[test]
+    fn no_harness_config_this_module_builds_admits_a_zero_turn_ceiling() {
+        let profile = HarnessProfile {
+            max_tools: None,
+            // The value `from_harness_profile`'s `.max(1)` exists for: a
+            // degraded provider that declares no tool iterations at all.
+            max_tool_iterations: 0,
+            require_verification: false,
+            allow_parallel_tool_calls: false,
+        };
+        for (name, config) in [
+            ("HarnessConfig::default", HarnessConfig::default()),
+            (
+                "HarnessConfig::for_strong_model",
+                HarnessConfig::for_strong_model(),
+            ),
+            (
+                "HarnessConfig::from_harness_profile",
+                HarnessConfig::from_harness_profile(profile),
+            ),
+        ] {
+            assert!(
+                config.max_turns >= 1,
+                "`{name}` builds a turn whose first exit is the truncating `max_turns` door, \
+                 above the model call — which would let an accepted over-budget turn shed \
+                 history without sending anything (REQ-589 ADR-8)"
+            );
+        }
+    }
+
+    /// The suspension is spendable **once**, as a property of the value rather
+    /// than of a reset statement (ADR-8, D-7).
+    ///
+    /// The predicate half of the pair LESSON-508 asks for: the tests above pin
+    /// the call site, this pins the rule it calls. `PressurePolicy` is neither
+    /// `Copy` nor `Clone`, so a caller cannot carry one into a second turn —
+    /// that half is enforced by the compiler and needs no test.
+    #[test]
+    fn a_pressure_suspension_can_be_spent_only_once() {
+        let mut accepted = PressurePolicy::SuspendedForAcceptedTurn;
+        assert!(
+            !accepted.enforces_this_iteration(),
+            "the first iteration of an accepted turn is the suspended one"
+        );
+        assert!(
+            accepted.enforces_this_iteration(),
+            "and the second iteration is not"
+        );
+        assert!(accepted.enforces_this_iteration());
+        assert_eq!(
+            accepted,
+            PressurePolicy::Enforced,
+            "a spent suspension is indistinguishable from the ordinary policy"
+        );
+
+        let mut ordinary = PressurePolicy::Enforced;
+        assert!(ordinary.enforces_this_iteration());
     }
 
     /// `ToolThenEndSource` with `pad` bytes of filler on its first turn.
@@ -3917,7 +4844,9 @@ mod tests {
             "the guide has {} lines that mention asking, and exactly one may: the \
              prohibition. If a new sentence legitimately needs the word, it is a decision \
              — make it here, deliberately, rather than letting a second instruction about \
-             asking for a credential arrive unnoticed.\nlines: {asking:?}",
+             asking for a credential arrive unnoticed. REQ-589's permission-memory fact \
+             is the sentence that came closest and did not spend it: it says \"the next \
+             turn prompts again\" precisely so this stays at one.\nlines: {asking:?}",
             asking.len()
         );
         assert_eq!(
@@ -4076,6 +5005,169 @@ mod tests {
                 system.contains(line),
                 "the capability fact is in self_config.md but not in the built system \
                  prompt for {config:?}"
+            );
+        }
+    }
+
+    /// **REQ-589 BR-14.2 / BR-10: an approval is never remembered; an
+    /// observation is.**
+    ///
+    /// TASK-246 gave the session a memo of the window rejections the daemon has
+    /// actually seen, so the next offer for the same skill on the same route
+    /// leads with what happened last time. It is deliberately **not** a stored
+    /// consent — BR-10 holds, and every over-budget send is authorized for the
+    /// one invocation that asked. Those two facts sit one word apart, and a
+    /// model with neither of them resident answers "do you remember that I said
+    /// yes?" from whatever it can see, which is LESSON-543's failure with a new
+    /// subject: the memo exists, the model can tell the memo exists, and the
+    /// wrong inference from that is that the *approval* was kept.
+    ///
+    /// What is pinned, and why in parts rather than by whole-line equality: the
+    /// sentence carries three claims across five needles, and a later REQ that
+    /// re-words it must fail on the claim it dropped rather than on a diff a
+    /// reader has to spot the difference in (LESSON-543's amendment rule, the
+    /// posture `the_system_prompt_states_what_the_session_can_run_and_from_where`
+    /// arrived at). This one *will* be re-worded — BR-7's durable remedy means
+    /// a route that was refused stops being refused — so the needles are the
+    /// short semantic cores, not the prose around them.
+    ///
+    /// 1. **`never remembers`** — the BR-10 half. Without it the guide says
+    ///    only that Teton has a memory, and the memory it names is a refusal.
+    /// 2. **`one turn only`** — the scope that makes an approval not a consent.
+    ///    A grant with no stated end is a grant a model will describe as
+    ///    standing.
+    /// 3. **`observed`** — the BR-14.2 half, and the word the distinction turns
+    ///    on: what is recorded is a measurement the daemon watched happen, not
+    ///    an authorization a user gave.
+    /// 4. **`same route`** — the observation is route-scoped (ADR-9: raising the
+    ///    window makes it a different route). Dropped, the model generalizes one
+    ///    provider's refusal into a property of the skill.
+    /// 5. **`Never say you remember an approval`** — the negative half, asserted
+    ///    on its own exactly as BUG-181's "loads nothing from" was. LESSON-543's
+    ///    rule is that a self-fact names the negative space and not only the
+    ///    roster; the roster half here ("it does remember observations") is the
+    ///    half that invites the false claim, so the prohibition travels with it
+    ///    or the sentence is worse than silence.
+    ///
+    /// Order is asserted too, for the reason REQ-579's live A/B established
+    /// about this file: what the model reads first is what frames the rest. The
+    /// line leads with the rule and names the memory second, so a model reading
+    /// left to right cannot reach "it does remember" before "never remembers".
+    ///
+    /// **The word `ask` is deliberately absent from this sentence.** The guide
+    /// is allowed exactly one line that mentions asking — the credential
+    /// prohibition, guarded in
+    /// `the_system_prompt_forbids_asking_for_a_credential_in_the_conversation`
+    /// — so "the next turn prompts again" says what "asks again" would. A later
+    /// re-wording that reaches for the natural word will redden that test with a
+    /// message about credentials; the fix is either a different word here or a
+    /// deliberate amendment there, never a deleted guard.
+    #[test]
+    fn the_system_prompt_states_that_an_approval_is_never_remembered() {
+        let memory: Vec<&str> = SELF_CONFIG_GUIDE
+            .lines()
+            .filter(|line| line.to_ascii_lowercase().contains("remember"))
+            .collect();
+        assert_eq!(
+            memory.len(),
+            1,
+            "the guide has {} lines about what Teton remembers, and exactly one may. A \
+             second sentence on the subject is how the file comes to say both that an \
+             approval is kept and that it is not — and whole-line pins cannot catch a \
+             contradiction added elsewhere (the hole the credential prohibition's own \
+             test documents). Fold it into the one line, or amend this test on \
+             purpose.\nlines: {memory:?}",
+            memory.len()
+        );
+        let line = memory[0];
+
+        for (needle, claim) in [
+            (
+                "never remembers",
+                "that a permission answer is not carried forward at all (BR-10). Without \
+                 it the guide names a memory and never says what is kept out of it",
+            ),
+            (
+                "one turn only",
+                "the scope of an approval. A grant with no stated end is one a model \
+                 will describe as standing, which is the false self-account this fact \
+                 exists to prevent",
+            ),
+            (
+                "observed",
+                "that what IS remembered is a measurement the daemon watched happen, not \
+                 an authorization a user gave (BR-14.2). That one word is the whole \
+                 distinction between the memo and a stored consent",
+            ),
+            (
+                "same route",
+                "that the observation is scoped to the route it was made on (ADR-9 — \
+                 raising the window makes it a different route). Dropped, the model \
+                 turns one provider's refusal into a property of the skill",
+            ),
+        ] {
+            assert!(
+                line.contains(needle),
+                "the permission-memory fact no longer says `{needle}`, so it no longer \
+                 states {claim}. If the wording changed deliberately, re-word this needle \
+                 with the sentence — deleting it is never the fix (LESSON-543).\n\
+                 line: {line}"
+            );
+        }
+
+        // The negative half, on its own. The roster half above ("it does
+        // remember what it observed") is precisely what invites a model to
+        // claim it remembers the approval too, so the prohibition is not a
+        // flourish on the end of the sentence — it is the clause that makes the
+        // rest safe to state.
+        assert!(
+            line.contains("Never say you remember an approval"),
+            "the permission-memory fact no longer forbids claiming a remembered \
+             approval. LESSON-543's rule is that a self-fact names the negative space \
+             and not only the roster: a sentence that says Teton keeps observations, \
+             with no sentence saying it keeps no approvals, is the half that gets \
+             generalized.\nline: {line}"
+        );
+
+        // Order inside the line, the assertion this file already makes about
+        // the prohibition and about step 1 (REQ-579 A1–A3: the model follows
+        // what it reads first). The rule leads; the memory is named second.
+        let rule = line
+            .find("never remembers")
+            .expect("the rule clause is present");
+        let memo = line
+            .find("observed")
+            .expect("the observation clause is present");
+        assert!(
+            rule < memo,
+            "the fact names what Teton remembers before it says an approval is not part \
+             of it, so a model reading top-down meets the memory first (BR-10 second). \
+             Order is the assertion here, as it is for step 1.\nline: {line}"
+        );
+
+        // Before the first numbered step, for the same reason the capability
+        // fact is: what precedes the recipes frames them.
+        let step_one = SELF_CONFIG_GUIDE
+            .find("\n1. ")
+            .expect("the guide has a numbered step 1");
+        let fact_at = SELF_CONFIG_GUIDE
+            .find(line)
+            .expect("the permission-memory line is in the guide");
+        assert!(
+            fact_at < step_one,
+            "the permission-memory fact moved below step 1; it has to frame the steps, \
+             not trail them.\nfact at {fact_at}, step 1 at {step_one}"
+        );
+
+        // Resident, in both harness shapes: a fact in the file the builder
+        // dropped passes every assertion above and still leaves the model with
+        // nothing to answer from.
+        for config in [HarnessConfig::default(), HarnessConfig::for_strong_model()] {
+            let system = build_system_prompt(&ToolRegistry::with_builtins(), &config);
+            assert!(
+                system.contains(line),
+                "the permission-memory fact is in self_config.md but not in the built \
+                 system prompt for {config:?}"
             );
         }
     }

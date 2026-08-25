@@ -811,6 +811,63 @@ impl RpcMethod for SkillsListParams {
     type Result = SkillsListResult;
 }
 
+/// Ask which of a session's skills will not fit on the route it is on
+/// (REQ-589 BR-13, ADR-11).
+///
+/// `skills/list`'s sibling, and the split is the question rather than the data:
+/// that one reports the registry, this one reports a **measurement** of the
+/// registry against the session's stamped route budget. They are two methods
+/// because a `/help` listing must not pay for a measurement, and because a
+/// daemon may have the first and not the second — the capability is proven by a
+/// successful call here exactly as it is there, so neither
+/// [`crate::PROTOCOL_VERSION`] nor [`crate::PROTOCOL_VERSION_MIN`] moves for
+/// this addition and a client whose daemon answers
+/// [`crate::jsonrpc::error_code::METHOD_NOT_FOUND`] reports a pending
+/// capability rather than an error.
+///
+/// It carries a `session_id` for `skills/list`'s reason — half the answer comes
+/// from the session root, which moves under `/cd` — and the route half comes
+/// from the same session's stamped budget.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SkillsPreflightParams {
+    /// The session whose registry and stamped route to report on.
+    pub session_id: SessionId,
+    /// Whether the asking surface is in `/verbose` (REQ-589 AC-19).
+    ///
+    /// The count of skills that will not fit is reported either way; this is
+    /// what adds the route's budget and bound beside it. It rides in the
+    /// **params** rather than being applied client-side because the side that
+    /// holds the budget is the side that words it — a client formatting the
+    /// pair itself would be a second spelling of a figure the daemon already
+    /// composes (LESSON-456).
+    ///
+    /// `#[serde(default)]` so a caller that omits it means "not verbose",
+    /// which is what every pre-REQ-589 surface meant.
+    #[serde(default)]
+    pub verbose: bool,
+}
+
+/// Result of [`SkillsPreflightParams`] — the pre-flight answer, already
+/// composed.
+///
+/// **Rendered text, not rows**, on [`ProjectsListResult`]'s precedent and for
+/// its reason, with one addition specific to this REQ: every figure in the
+/// report comes out of the daemon's one skill-budget composer, measured against
+/// the budget the router stamped. Shipping rows would invite a client to build
+/// a second sentence from them, and a surface naming a budget the turn was not
+/// running under is precisely the defect REQ-586's verify pass found. The CLI
+/// may style what it is given; it does not restate it.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SkillsPreflightResult {
+    /// The report, one fact per line.
+    pub rendered: String,
+}
+
+impl RpcMethod for SkillsPreflightParams {
+    const METHOD: &'static str = "skills/preflight";
+    type Result = SkillsPreflightResult;
+}
+
 // ---------------------------------------------------------------------------
 // prompt turn
 // ---------------------------------------------------------------------------
@@ -940,6 +997,17 @@ pub enum PermissionOutcome {
     /// The user picked one of the offered options.
     Selected {
         /// The chosen option's id (see `PermissionOption`).
+        ///
+        /// **Single-choice, and it stays that way.** REQ-589's over-budget
+        /// offer is two independent answers — send this turn's expansion, and
+        /// write the going-forward fix — and its ADR-1 expresses all four
+        /// combinations as four named ids on this field rather than widening
+        /// this enum for one caller (see
+        /// [`crate::events::OPTION_ID_OVER_BUDGET_PROCEED_ONCE`] and its three
+        /// siblings). That is ASSUME-B's promise, and
+        /// `permission_outcome_did_not_widen_for_the_over_budget_offer` is what
+        /// keeps it: a second field here would be a wire change every client
+        /// has to be taught, to carry a fact a string already carries.
         option_id: String,
     },
     /// The user dismissed the prompt without choosing.
@@ -5921,6 +5989,120 @@ mod tests {
         assert!(
             serde_json::from_str::<AttachConsentParams>(unknown).is_err(),
             "an unreadable decision must not deserialize to one the daemon acts on"
+        );
+    }
+
+    /// REQ-589 ASSUME-B: the over-budget offer ships **without** widening
+    /// [`PermissionOutcome`].
+    ///
+    /// Worth its own test rather than left to inspection, because the shape
+    /// that tempts a widening is exactly the one BR-7 describes: two
+    /// independent booleans, which a single-choice outcome cannot carry, and
+    /// the obvious fix is a second field. ADR-1 chose four named option ids
+    /// instead, so this pins the promise from the outside — the enum's tag set,
+    /// and the fact that `selected` still carries one key and only one.
+    ///
+    /// The regression it catches is not cosmetic. A client that answers with an
+    /// outcome shape the daemon predates gets `INVALID_PARAMS`, and
+    /// [`RefusalReason`]'s own doc records what that costs: the params fail, the
+    /// `request_id` is not reliably in hand, and the standing prompt is neither
+    /// answered nor withdrawn. On this path that is an oversized turn a human
+    /// approved and nothing sent.
+    #[test]
+    fn permission_outcome_did_not_widen_for_the_over_budget_offer() {
+        use crate::events::{
+            OPTION_ID_OVER_BUDGET_DECLINE, OPTION_ID_OVER_BUDGET_PROCEED_AND_REMEDY,
+            OPTION_ID_OVER_BUDGET_PROCEED_ONCE, OPTION_ID_OVER_BUDGET_REMEDY_ONLY,
+        };
+
+        // All four answers ride the shipped `selected` shape, unchanged: one
+        // tag, one key, and the id echoed back byte for byte.
+        for id in [
+            OPTION_ID_OVER_BUDGET_PROCEED_ONCE,
+            OPTION_ID_OVER_BUDGET_PROCEED_AND_REMEDY,
+            OPTION_ID_OVER_BUDGET_REMEDY_ONLY,
+            OPTION_ID_OVER_BUDGET_DECLINE,
+        ] {
+            let outcome = PermissionOutcome::Selected {
+                option_id: id.to_owned(),
+            };
+            round_trip(&PermissionRespondParams {
+                request_id: RequestId::from("r1"),
+                outcome: outcome.clone(),
+            });
+
+            let wire = serde_json::to_value(&outcome).unwrap();
+            let mut keys: Vec<&str> = wire
+                .as_object()
+                .expect("an outcome is an object")
+                .keys()
+                .map(String::as_str)
+                .collect();
+            keys.sort_unstable();
+            assert_eq!(
+                keys,
+                ["option_id", "outcome"],
+                "ASSUME-B: the over-budget answer is an id, not a second field: {wire}"
+            );
+            assert_eq!(wire["outcome"], "selected", "{wire}");
+            assert_eq!(wire["option_id"], id, "{wire}");
+        }
+
+        // The tag set is exactly the three that shipped. A fourth arm — an
+        // `OfferAnswer { proceed, apply_remedy }` by any name — reddens here.
+        let tags: Vec<String> = [
+            PermissionOutcome::Selected {
+                option_id: OPTION_ID_OVER_BUDGET_DECLINE.to_owned(),
+            },
+            PermissionOutcome::Cancelled,
+            PermissionOutcome::Refused {
+                reason: RefusalReason::NoTerminal,
+            },
+        ]
+        .iter()
+        .map(|o| {
+            serde_json::to_value(o).unwrap()["outcome"]
+                .as_str()
+                .unwrap()
+                .to_owned()
+        })
+        .collect();
+        assert_eq!(tags, ["selected", "cancelled", "refused"]);
+
+        // The claim from the other side: a reader compiled against the shipped
+        // three arms reads every over-budget answer. This is the leg that would
+        // fail if the enum widened, because such a reader could not.
+        #[derive(Debug, Deserialize)]
+        #[serde(tag = "outcome", rename_all = "snake_case")]
+        #[allow(dead_code)]
+        enum OutcomeAsShipped {
+            Selected { option_id: String },
+            Cancelled,
+            Refused { reason: RefusalReason },
+        }
+        for id in [
+            OPTION_ID_OVER_BUDGET_PROCEED_ONCE,
+            OPTION_ID_OVER_BUDGET_PROCEED_AND_REMEDY,
+            OPTION_ID_OVER_BUDGET_REMEDY_ONLY,
+            OPTION_ID_OVER_BUDGET_DECLINE,
+        ] {
+            let wire = serde_json::to_string(&PermissionOutcome::Selected {
+                option_id: id.to_owned(),
+            })
+            .unwrap();
+            let back: OutcomeAsShipped = serde_json::from_str(&wire)
+                .expect("a client predating REQ-589 reads every one of its answers");
+            match back {
+                OutcomeAsShipped::Selected { option_id } => assert_eq!(option_id, id),
+                other => panic!("an over-budget answer must stay a `selected`: {other:?}"),
+            }
+        }
+
+        assert_eq!(
+            crate::PROTOCOL_VERSION,
+            crate::ProtocolVersion(2),
+            "REQ-589 adds one subject variant, four option ids and three events — all \
+             additive on the daemon-to-client side — so the negotiated version does not move"
         );
     }
 }

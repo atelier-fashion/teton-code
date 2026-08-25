@@ -86,6 +86,7 @@
 //! *describing* the machine, changes no safety decision, and is how the offline
 //! session path is exercised at all.
 
+use std::cell::RefCell;
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
@@ -116,9 +117,11 @@ use teton_inference::probe::{decide, GpuClass, HardwareProfile, TierDecision, GI
 use teton_inference::{ChatFormat, Completion, Engine, EngineError, GenParams, MockEngine};
 
 use teton_protocol::events::{
-    BlockCause, CapabilityDeadEnd, ContextCleared, ContextPressureKind, Event, ModelLifecycle,
-    ModelLifecycleStage, NotRunReason, PrivacyAction, ProviderTested, SessionRootChanged,
-    SessionTitled, SkillInvoked, TierWarming, TurnQueued,
+    BlockCause, BudgetBound, CapabilityDeadEnd, ContextCleared, ContextPressureKind, Event,
+    ModelLifecycle, ModelLifecycleStage, NotRunReason, PermissionSubject, PrivacyAction,
+    ProviderTested, RemedyKind, SessionRootChanged, SessionTitled, SkillInvoked,
+    SkillOverBudgetAccepted, SkillOverBudgetOffered, SkillOverBudgetRemedyApplied,
+    SkillStage as WireSkillStage, TierWarming, TurnQueued,
     WebCapabilityState as WireWebCapabilityState, WebLookup, WebSetupCompleted, WebTaintOverridden,
     WebTier as WireWebTier,
 };
@@ -164,14 +167,19 @@ use crate::egress::{
     LookupRequest, Provenance, RedactionGate, RedactionVerdict, TaintView,
 };
 use crate::grants::ConnectionId;
-use crate::harness::budget::{skill_fit, RouteBudget, SkillCaller, SkillFit, SkillStage};
+use crate::harness::budget::{
+    proposed_window, skill_fit, OverBudgetOffer, PriorWindowRejection, RebindTarget, RebindWindow,
+    Remedy, RouteBudget, SkillCaller, SkillFit, SkillStage,
+};
 use crate::harness::completion::{context_provenance, RemoteProviderSource};
-use crate::harness::context::{NoopProvenanceHook, PressureReport};
+use crate::harness::context::{Fit, NoopProvenanceHook, PressureReport};
 use crate::harness::permissions::{AddressedPermissionDelivery, SkillConsent};
 use crate::harness::tools::shell;
 use crate::harness::tools::skill::register_skill_tool;
 use crate::harness::tools::web::{register_web_tool, tier_name, SeamError, WebLookupSeam};
-use crate::harness::turn_loop::{pressure_kind, run_session_turn_with_source, HarnessError};
+use crate::harness::turn_loop::{
+    pressure_kind, run_session_turn_with_pressure_policy, HarnessError, PressurePolicy,
+};
 use crate::harness::{
     build_system_prompt, ContextManager, DutyKind, DutyRoute, LocalEngineSource,
     PendingPermissions, PermissionGate, ProjectTrustPersistence, SessionEvents, ToolContext,
@@ -186,7 +194,8 @@ use crate::model_consent::{
     ModelConsentGate, NoInstaller, PendingModelDecisions, WeightsInstaller,
 };
 use crate::router::{
-    to_protocol_category, to_protocol_phase, to_protocol_tier, Router, TierOrigin, TierReport,
+    to_protocol_category, to_protocol_phase, to_protocol_tier, RemoteProvider, Router, TierOrigin,
+    TierReport,
 };
 use crate::selection_store::SelectionStore;
 use crate::session_root::{home, ProbedRoot};
@@ -609,6 +618,144 @@ impl EffortRefusals {
             .filter(|(s, _)| s == session)
             .map(|(_, p)| p.clone())
             .collect()
+    }
+}
+
+/// The window a route ran under, as the identity half of an observed rejection
+/// (REQ-589 BR-14.2 / ADR-9).
+///
+/// Every field is read off the [`RouteBudget`] the router stamped — nothing is
+/// derived here, and nothing is parsed out of [`RouteBudget::window_label`],
+/// which is prose (see that field's docs).
+///
+/// # Why the *figures* are part of the route's identity
+///
+/// "The same route" has to mean the same window, not the same provider. The
+/// whole point of the offer's remedy is that a user can **raise** the window;
+/// after they do, the route resolves to a larger budget and the rejection this
+/// memo observed no longer describes what would happen. Keying on the provider
+/// alone would carry that stale observation across the remedy and open the next
+/// offer with "the provider rejected this last time" about a window that no
+/// longer exists — a stale record replaying, which is the harm ASSUME-017
+/// records in its other half. With the pair in the key, a remedied route is
+/// simply a different route and the memo says nothing about it.
+///
+/// [`BudgetBound`] and the provider id ride along for the reverse reason: the
+/// redact clamp renames the window without changing whose it is, so two routes
+/// can share a pair and still be different windows.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct RouteWindow {
+    /// Which constraint bound the pair (REQ-586 BR-8).
+    bound: BudgetBound,
+    /// The provider whose declaration the pair came from — `None` on the local
+    /// tier, exactly as [`RouteBudget::provider_id`] means it.
+    provider_id: Option<String>,
+    /// The budget in words, as stamped.
+    budget_tokens: usize,
+    /// The budget in bytes, as stamped.
+    budget_bytes: usize,
+}
+
+impl RouteWindow {
+    /// The window identity of a stamped route budget.
+    #[must_use]
+    pub fn of(budget: &RouteBudget) -> Self {
+        Self {
+            bound: budget.bound,
+            provider_id: budget.provider_id.clone(),
+            budget_tokens: budget.budget_tokens,
+            budget_bytes: budget.budget_bytes,
+        }
+    }
+}
+
+/// Skill expansions a tier **actually refused at the window**, per session
+/// (REQ-589 BR-14.2 / ADR-9, D-8).
+///
+/// **Session-scoped and never persisted.** BR-14.2 asks for one thing: that a
+/// user who approved an over-budget send once, and watched it come back
+/// `context_length_exceeded`, is not made to choose blind the next time. So the
+/// next offer for the same skill on the same route opens with the rejection
+/// this daemon watched happen. Remembering is not consenting.
+///
+/// # An observation, not a consent — and the difference is the whole point
+///
+/// What is recorded here is a **measurement the daemon observed**: the tier
+/// refused these bytes at this window. It is not an authorization anybody
+/// granted. BR-10 forbids remembering the consent — a stored "yes" would be
+/// applied to a question that was never asked, and could send something nobody
+/// approved — while a stored *observation* can only ever make the next question
+/// better informed. That asymmetry is why this store may exist at all where
+/// [`crate::harness::permissions::PermissionGate`]'s one-time override may not
+/// be persisted.
+///
+/// Two consequences, and both are negative:
+///
+/// * **It does not suppress the next offer.** D-1 is always-ask. Whether an
+///   offer happens is [`skill_fit`]'s verdict against the stamped budget, and
+///   this store is not an input to it; a marked pair reaches the same question
+///   an unmarked one does
+///   (`an_observed_rejection_does_not_suppress_the_next_offer`).
+/// * **It does not pre-answer the next offer.** Nothing here is written to a
+///   [`PermissionGate`](crate::harness::permissions::PermissionGate), so the
+///   next offer is still asked and still has to be answered by a person; the
+///   record only changes the sentence it opens with
+///   (`an_observed_rejection_does_not_pre_answer_the_next_offer`).
+///
+/// # One store, daemon-side
+///
+/// Per **ASSUME-017** the CLI must not memoize this fact. That assumption
+/// records what the second store cost the last time: a client-side memo of a
+/// daemon decision answered a question the daemon had already forgotten, and
+/// the user never saw the prompt. There is no client half here by construction
+/// — the record never crosses the wire, and the only thing that does is the
+/// sentence the offer is composed with.
+///
+/// Keyed by `(session, skill, window)` — the skill by the name the user typed,
+/// the window by [`RouteWindow`] — on the same "a remembered fact is scoped by
+/// its key" principle [`EffortRefusals`] states beside it.
+#[derive(Debug, Default)]
+pub struct ObservedWindowRejections {
+    rejected: Mutex<HashSet<(SessionId, String, RouteWindow)>>,
+}
+
+impl ObservedWindowRejections {
+    /// An empty memo.
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Remember that `skill` was refused at `window` in `session`.
+    ///
+    /// Returns whether this was the **first** rejection observed for that
+    /// triple, so the caller can announce it once rather than on every
+    /// subsequent turn — the same announce-once discipline
+    /// [`EffortRefusals::mark`] and [`SessionTaint::mark`] use, and for the same
+    /// reason: a consequence nothing says out loud is one the user discovers as
+    /// "why does this keep failing".
+    ///
+    /// Not `#[must_use]`: a caller that only wants the fact recorded — the
+    /// withdrawal path already composing its own sentence — should not have to
+    /// say so, exactly as [`SessionTaint::mark`] reasons.
+    pub fn mark(&self, session: &SessionId, skill: &str, window: &RouteWindow) -> bool {
+        self.rejected
+            .lock()
+            .expect("observed rejection mutex poisoned")
+            .insert((session.clone(), skill.to_owned(), window.clone()))
+    }
+
+    /// Whether this skill on this route has already been refused at the window
+    /// in `session` — what the next offer opens its sentence from.
+    ///
+    /// A read and nothing else: it decides no offer, answers no question, and a
+    /// caller that ignores it loses only the opening clause.
+    #[must_use]
+    pub fn was_observed(&self, session: &SessionId, skill: &str, window: &RouteWindow) -> bool {
+        self.rejected
+            .lock()
+            .expect("observed rejection mutex poisoned")
+            .contains(&(session.clone(), skill.to_owned(), window.clone()))
     }
 }
 
@@ -1623,6 +1770,637 @@ struct SkillTurn {
     unknown: bool,
 }
 
+/// What one of BR-8's two budget stages decided about a **typed** skill turn
+/// (REQ-589 BR-2, BR-3, BR-4).
+///
+/// # Three answers, and only one of them is new
+///
+/// Before REQ-589 a stage answered two things: it fits, or it is refused with
+/// [`skill_fit`]'s sentence. The offer splits the second in two — a human may
+/// now say *send it anyway* — and leaves the refusing half byte-identical
+/// (AC-3).
+///
+/// [`Self::NotSent`] is deliberately **one** variant covering every way a turn
+/// does not run: declined at the prompt, `Unanswerable`, refused by a client
+/// that asked nobody, or never offered because no connection could be asked.
+/// BR-4 gives them all the same sentence — *"a declined or unanswerable offer
+/// is exactly today's refusal"* — so a second variant would exist only to be
+/// collapsed at the one call site that reads it, and would invite a future edit
+/// to give one of them a softer answer. The distinction between them is a fact
+/// about the *record*, which is what `skill_over_budget_offered`'s presence or
+/// absence carries.
+///
+/// There is no model arm. `SkillCaller::Model` is measured by the loop's
+/// `skill_append_fit` and never reaches this type (BR-2).
+#[derive(Debug)]
+enum SkillStageVerdict {
+    /// Both currencies land inside the route's stamped budget. Nobody was
+    /// asked, nothing was published, and the turn proceeds exactly as it did
+    /// before this REQ existed.
+    Fits,
+    /// Over budget, and a human answered *send it whole* (BR-1). The expansion
+    /// goes out unshortened — this variant carries no text precisely because
+    /// there is nothing to say instead of running the turn.
+    ///
+    /// Also the answer Stage B gets for an expansion the dynamic-context fold
+    /// left byte-identical: that is not a second question, so it is not asked a
+    /// second time. See the carry at the top of
+    /// [`Self::offer_or_refuse_over_budget`](DaemonRuntime::offer_or_refuse_over_budget).
+    Accepted,
+    /// Over budget and not sent, carrying BR-4's sentence for
+    /// `SKILL_EXPANSION_TOO_LARGE`.
+    ///
+    /// The `String` is [`OverBudgetOffer::decline_refusal`], which composes
+    /// through the same `skill_refusal` arm [`skill_fit`] does, from the same
+    /// [`Fit`](crate::harness::context::Fit) and the same stamped budget — so
+    /// "byte-identical to today's refusal" is a property of the construction
+    /// rather than of two sentences being kept in step (AC-3).
+    NotSent(String),
+}
+
+/// The daemon's [`SkillStage`] as the **wire's** same-named enum (REQ-589
+/// ADR-13).
+///
+/// Two types, one name, and the collision is deliberate rather than an
+/// oversight to be tidied away. `harness::budget::SkillStage` carries
+/// [`SkillStage::measured_clause`] — the words this daemon composes its
+/// refusal from — so it could not be re-exported into `teton-protocol`, which
+/// holds no sentence and must not start: what crosses the wire is the *fact* of
+/// which stage spoke, and the sentence is composed by the surface that words it
+/// (this crate) rather than re-parsed by the one that renders it (LESSON-529).
+///
+/// So the mapping is written out, once, here — at the surface that publishes —
+/// rather than left to a `From` impl that could not live in either crate
+/// without the other depending on it. The match is exhaustive on the daemon's
+/// enum, which is what makes a third stage a compile error at this line instead
+/// of a silent [`WireSkillStage::Unknown`] on a record someone reads later.
+const fn wire_skill_stage(stage: SkillStage) -> WireSkillStage {
+    match stage {
+        SkillStage::Body => WireSkillStage::Body,
+        SkillStage::WithDynamicContext => WireSkillStage::WithDynamicContext,
+    }
+}
+
+/// A declared window or cap as a **record** spells it (REQ-589 BR-7).
+///
+/// `0` is not the number zero on either field — it is the config's own spelling
+/// of "undeclared" for a window and "no cap" for a ceiling — and a remedy
+/// record that printed a bare `0` would leave a reader unable to tell a fix
+/// from a wipe. [`SkillOverBudgetRemedyApplied`] carries both sides as strings
+/// for exactly this reason: the four remedies do not write one type, and the
+/// only consumer is a line a person reads.
+fn declared_value(tokens: u32, absent: &str) -> String {
+    if tokens == 0 {
+        format!("0 ({absent})")
+    } else {
+        tokens.to_string()
+    }
+}
+
+/// The durable write an accepted over-budget remedy **is**, decided before the
+/// question is asked (REQ-589 BR-7, BR-8, BR-9; ADR-1, ADR-4, ADR-5).
+///
+/// # Why the plan is made before the offer, and not after the answer
+///
+/// ADR-1's binding precedent is `enable_permanent`, whose own comment records
+/// that an earlier version promised a write which was silently a no-op. The
+/// same defect is reachable here in a subtler form, because two of BR-7's own
+/// rules legitimately answer "not this time": BR-7c ships **no figure** for a
+/// provider matching no vendor recipe, and ADR-12 refuses to **choose** when
+/// more than one remote provider is configured. A remedy can therefore be
+/// classified — `RemedyKind::DeclareWindow`, say — and still have nothing this
+/// build may write. An option list widened on the classification alone puts a
+/// label promising a write in front of a human whose selection then applies
+/// nothing, which is exactly the failure ADR-1 cites.
+///
+/// So the write is planned **first**, and the plan is the single fact that
+/// decides both halves of the question: `Some` puts the two remedy-bearing
+/// options on the prompt and is applied verbatim when one is chosen, `None`
+/// withholds them and leaves the one-time override and the decline standing
+/// alone. One representation, read twice, so the option and the write cannot
+/// disagree about whether a fix exists (LESSON-545).
+///
+/// The composed **sentence** is unchanged either way. It still names the
+/// durable fix and, where the daemon has no figure, still says it ships none
+/// and will not invent one — which is BR-7c's *ask, never invent*. The offer
+/// asks for the value; it just does not pretend to have a button for it.
+struct RemedyPlan {
+    /// Which fix this is, for the record [`SkillOverBudgetRemedyApplied`]
+    /// carries. Never [`RemedyKind::NotOffered`]: a plan exists only where a
+    /// write does.
+    kind: RemedyKind,
+    /// The provider the write is addressed to. For a rebind that is the
+    /// provider the tier is being bound **to**, never the one the route is
+    /// leaving.
+    provider_id: ProviderId,
+    /// **How** to read what the setting held before the write — not the value
+    /// itself, because the value is only true at the instant it is read.
+    previous_value: PreviousValue,
+    /// What it reads after, spelled the same way.
+    new_value: String,
+    /// The updates themselves, in the order they must be applied.
+    writes: RemedyWrites,
+    /// **BR-9's target, for the offer to quote** — `Some` only on a rebind
+    /// (REQ-589 BR-9, ADR-1; ADR-18 item 2).
+    ///
+    /// The provider name and the window figure that the sentence and both
+    /// remedy labels must state, taken from *this* plan rather than looked up a
+    /// second time. That is the whole point of putting it here: ADR-1's rule is
+    /// that a label names the concrete write, and a label composed from an
+    /// independent lookup could name a different provider than the one
+    /// [`RemedyWrites`] carries — which is a worse failure than the vagueness it
+    /// replaced, because it would be confidently wrong.
+    ///
+    /// `None` for the three single-write remedies. They are addressed to the
+    /// route's own provider, which the offer already holds and already quotes.
+    rebind_target: Option<RebindTarget>,
+}
+
+/// Which setting a [`RemedyPlan`]'s record names as *previous*, as a rule for
+/// reading it rather than as a value already read (REQ-589 BR-7).
+///
+/// # Why a rule and not a string
+///
+/// The plan is built while the offer is being composed and applied after an
+/// await on a human, which has no timeout: minutes can pass, and `config/set`
+/// is open the whole time. A `previous_value` rendered from the turn's snapshot
+/// therefore states what the setting held *when the question was asked*, and
+/// [`SkillOverBudgetRemedyApplied`]'s job is to say what the write actually
+/// replaced. Those are different facts the moment anything else moves.
+///
+/// So the plan carries the rule, and [`DaemonRuntime::apply_over_budget_remedy`]
+/// evaluates it **inside the guard `apply_config_update_guarded` runs while
+/// holding the config lock** — the same lock the write takes, immediately
+/// before it takes it, so nothing can slip between the reading and the writing.
+enum PreviousValue {
+    /// `capabilities.max_context` on the addressed provider.
+    Window,
+    /// `capabilities.context_budget_cap` on the addressed provider.
+    Cap,
+    /// **BR-9's pair, both halves.** The tier's binding *and* the target's
+    /// declared window: a record naming only the binding would leave a reader
+    /// unable to tell the fix from the circle it exists to close.
+    TierAndWindow(Tier),
+}
+
+impl PreviousValue {
+    /// Read the rule against a config, spelled by [`declared_value`].
+    ///
+    /// A provider absent from `config` reads as its own absence rather than
+    /// panicking: this runs inside a consent path, and the identity guard
+    /// beside it is what actually refuses that case.
+    fn read(&self, config: &Config, provider_id: &str) -> String {
+        let capabilities = config
+            .providers
+            .iter()
+            .find(|provider| provider.id == provider_id)
+            .map(|provider| provider.capabilities);
+        let window = || declared_value(capabilities.map_or(0, |c| c.max_context), "undeclared");
+        match self {
+            PreviousValue::Window => window(),
+            PreviousValue::Cap => {
+                declared_value(capabilities.map_or(0, |c| c.context_budget_cap), "no cap")
+            }
+            // `unbound` is the honest word for the absent row: the tier still
+            // routed somewhere (the local engine — that is what made this bound
+            // `LocalEngine`), but no `[[tiers]]` row said so.
+            PreviousValue::TierAndWindow(tier) => {
+                let bound = config
+                    .tiers
+                    .iter()
+                    .find(|binding| binding.tier == *tier)
+                    .map_or("unbound", |binding| binding.provider_id.as_str());
+                format!("{bound}, capabilities.max_context {}", window())
+            }
+        }
+    }
+}
+
+/// The `config/set` updates one [`RemedyPlan`] performs, **in order**
+/// (REQ-589 ADR-4, ADR-5).
+///
+/// Not a `Vec<ConfigUpdate>`: for BR-9's pair the order is the whole mechanism,
+/// so it is a variant whose field names say which write is which and whose only
+/// consumer walks them in one direction. A collection would let a later caller
+/// build the pair backwards without saying anything false.
+enum RemedyWrites {
+    /// One field-wise `RegisterProvider` — [`Remedy::RaiseWindow`],
+    /// [`Remedy::DeclareWindow`], [`Remedy::RaiseCap`].
+    Provider(ProviderConfig),
+    /// **BR-9's pair, ordered so the forbidden state is unreachable (ADR-5).**
+    ///
+    /// `config/set` persists one update per call and `architecture.md:169-172`
+    /// forbids generalizing it, so atomicity is not available and ordering is
+    /// what buys the invariant instead. In *this* order a partial failure
+    /// leaves a declared window on a tier still bound where it was: harmless,
+    /// no routing change, nothing the user must undo. In the **reverse** order
+    /// it leaves a newly-bound remote tier with `max_context = 0`, which
+    /// derives the same default pair under `bound: unknown window` — the exact
+    /// circle the reported `/analyze` failure was already sitting in.
+    TierRebind {
+        /// FIRST: the target provider re-registered with its window declared.
+        window: ProviderConfig,
+        /// SECOND: the tier binding that moves the category's work to it.
+        binding: TierBindingConfig,
+    },
+}
+
+impl RemedyWrites {
+    /// Apply every update in order, stopping at the first failure — and say
+    /// what *did* land, because "nothing changed" and "half of BR-9's pair
+    /// changed" are different things to tell a user.
+    ///
+    /// `write` is the applier rather than `&DaemonRuntime` so the ordering is
+    /// assertable at this seam: a caller that fails the second write can prove
+    /// the config never reaches the forbidden state. Per LESSON-508 that guard
+    /// needs a test of its own — without one, a reversed pair is silent until
+    /// a user hits the circle.
+    fn apply(
+        self,
+        mut write: impl FnMut(ConfigUpdate) -> Result<(), RpcError>,
+    ) -> Result<(), (RpcError, &'static str)> {
+        match self {
+            Self::Provider(provider) => write(ConfigUpdate::RegisterProvider(provider))
+                .map_err(|err| (err, "nothing was applied")),
+            Self::TierRebind { window, binding } => {
+                // FIRST — and the `?` is the mechanism (ADR-5). A window this
+                // write failed to declare stops the rebind here, so the tier
+                // is never bound to a provider with no window.
+                write(ConfigUpdate::RegisterProvider(window))
+                    .map_err(|err| (err, "nothing was applied"))?;
+                // SECOND.
+                write(ConfigUpdate::SetTierBinding(binding)).map_err(|err| {
+                    (
+                        err,
+                        "the provider's window was declared and the tier was left bound exactly \
+                         as it was — the harmless half of the pair, which is why it is written \
+                         first",
+                    )
+                })
+            }
+        }
+    }
+}
+
+/// A **field-wise** provider registration: the identity re-stated, at most one
+/// capability field written, everything else `None` (REQ-586 ADR-7's merge).
+///
+/// The three carried fields are carried rather than omitted because
+/// `RegisterProvider` replaces them wholesale and
+/// [`DaemonRuntime::apply_config_update`] refuses a remote provider with no
+/// model — so a write that only means to touch a capability still has to
+/// re-state the identity it is not changing. `None` on the two capability
+/// fields preserves what is stored, so a cap the user set survives a window
+/// write and a window the user declared survives a cap write.
+fn field_wise_registration(
+    existing: &ModelProvider,
+    max_context: Option<u32>,
+    context_budget_cap: Option<u32>,
+) -> ProviderConfig {
+    ProviderConfig {
+        id: ProviderId::from(existing.id.as_str()),
+        kind: to_proto_kind(existing.kind),
+        endpoint: existing.endpoint.clone(),
+        model: existing.model.clone(),
+        auth_ref: existing.auth_ref.clone(),
+        max_context,
+        context_budget_cap,
+        floored_budget: None,
+    }
+}
+
+/// Refuse a [`field_wise_registration`] whose identity half no longer matches
+/// what is stored (REQ-589 review pass).
+///
+/// # The three fields `RegisterProvider` replaces wholesale
+///
+/// `endpoint`, `model` and `auth_ref`. [`field_wise_registration`] re-states
+/// them precisely because they are *not* merged, and re-stating a value read
+/// minutes ago is a write of that old value. Between an over-budget offer being
+/// raised and answered — an await on a human, with no timeout — `config/set`
+/// and `teton provider add` are both open, so the provider can legitimately
+/// move underneath the plan.
+///
+/// Comparing them here, under the config lock, is what turns a silent revert
+/// into a refusal. The capability fields are deliberately **not** compared: they
+/// merge field-wise, so a cap or window the user changed in the meantime is
+/// preserved by the merge itself and is not a reason to refuse the remedy.
+///
+/// A provider absent from `config` fails here too. It cannot be re-registered
+/// from a plan built for the provider it used to be.
+///
+/// # Errors
+/// [`error_code::CONFIG_REJECTED`], naming the provider and saying nothing was
+/// changed — the same shape every other refusal on this path takes.
+fn provider_identity_unchanged(config: &Config, write: &ProviderConfig) -> Result<(), RpcError> {
+    let id = write.id.0.as_str();
+    let moved = |what: &str| {
+        Err(RpcError::new(
+            error_code::CONFIG_REJECTED,
+            format!(
+                "provider '{id}' {what} since this offer was put on screen, so the remedy was \
+                 not applied — writing it now would have restored the registration the offer \
+                 was composed from and undone that change. Nothing was changed; invoking the \
+                 skill again measures the provider as it now stands."
+            ),
+        ))
+    };
+    let Some(live) = config.providers.iter().find(|provider| provider.id == id) else {
+        return moved("was unregistered");
+    };
+    if to_proto_kind(live.kind) != write.kind
+        || live.endpoint != write.endpoint
+        || live.model != write.model
+        || live.auth_ref != write.auth_ref
+    {
+        return moved("was re-registered with a different endpoint, model, kind or credential");
+    }
+    Ok(())
+}
+
+/// **BR-7's remedies as writes** — what an accepted offer would durably change,
+/// or `None` where this build has nothing it may write (REQ-589 BR-7, BR-9;
+/// ADR-1, ADR-12).
+///
+/// | Remedy | Write |
+/// |---|---|
+/// | [`Remedy::RaiseWindow`] | `capabilities.max_context` = the recipe's figure |
+/// | [`Remedy::DeclareWindow`] | the same field, first declared |
+/// | [`Remedy::RaiseCap`] | `capabilities.context_budget_cap` = `0` ("no cap"), and **only** where clearing it clears the measurement |
+/// | [`Remedy::BindTierRemote`] | the window **then** the tier binding (ADR-5) |
+///
+/// `None` — the offer keeps its one-time override and its decline, and gains no
+/// option that would write nothing:
+///
+/// * a **window remedy with no proposal**: BR-7c's catalog matched nothing, and
+///   inventing a number that gets persisted into a user's config is worse than
+///   the silently defaulted window REQ-586 BR-3 exists to name (AC-21);
+/// * a **rebind this daemon may not decide**: no configured remote to bind to,
+///   or more than one and therefore a choice about where a whole category's
+///   spend goes (ADR-12) — each said on the record channel below;
+/// * a **cap whose removal would not clear the measurement** (ADR-6 rule 2).
+///   That rule was written about a proposed *window* and binds this remedy at
+///   least as hard, because this is the one write that **deletes** a value the
+///   user set. Planning it unconditionally means a route bound by a 50k cap
+///   under a 200k window can spend a user's spend ceiling on an expansion the
+///   window would refuse anyway: the config is durably written, the route
+///   re-derives at `bound: window`, and the very next invocation meets the
+///   same refusal with nothing left to protect the spend;
+/// * [`Remedy::NotOffered`], `RedactScan`'s answer (BR-7b), which the gate
+///   already drops the remedy options for — answered here rather than assumed
+///   away;
+/// * a remedy addressed to a provider that is no longer in this turn's config.
+///
+/// The provider is looked up in **this turn's** config snapshot, the same one
+/// the route was decided from, so the "previous" value the record names is the
+/// value the refusal was actually measured under.
+fn plan_over_budget_remedy(
+    config: &Config,
+    router: &Router,
+    remedy: &Remedy,
+    measured: Fit,
+) -> Option<RemedyPlan> {
+    let registered = |id: &String| config.providers.iter().find(|p| &p.id == id);
+    match remedy {
+        Remedy::RaiseWindow {
+            provider_id: Some(id),
+            proposal: Some(proposal),
+        }
+        | Remedy::DeclareWindow {
+            provider_id: Some(id),
+            proposal: Some(proposal),
+        } => {
+            let existing = registered(id)?;
+            Some(RemedyPlan {
+                kind: remedy.kind(),
+                provider_id: ProviderId::from(existing.id.as_str()),
+                previous_value: PreviousValue::Window,
+                new_value: declared_value(proposal.tokens, "undeclared"),
+                writes: RemedyWrites::Provider(field_wise_registration(
+                    existing,
+                    Some(proposal.tokens),
+                    None,
+                )),
+                // Addressed to the route's own provider, which the offer
+                // already names — there is no second party for it to quote.
+                rebind_target: None,
+            })
+        }
+        Remedy::RaiseCap {
+            provider_id: Some(id),
+        } => {
+            let existing = registered(id)?;
+            // **ADR-6 rule 2, on the one destructive write** — the same gate
+            // `proposed_window` puts on a catalogued figure and `rebind_window`
+            // puts on a rebind, applied to the candidate this remedy would
+            // actually produce: the route with its cap removed and nothing else
+            // changed. `budget_inputs_for` hands out the route's own inputs and
+            // `clearing_the_cap_clears` runs them through the one classifier,
+            // so no second budget is minted here (REQ-586 AC-12).
+            if !crate::harness::budget::clearing_the_cap_clears(
+                router.budget_inputs_for(Some(existing.id.as_str())),
+                measured,
+            ) {
+                eprintln!(
+                    "tetond: an over-budget offer on `{}` carries no cap option — clearing \
+                     `capabilities.context_budget_cap` would leave the expansion over the \
+                     budget the declared window derives on its own, so the refusal would \
+                     stand and the spend ceiling would be gone for nothing (ADR-6 rule 2). \
+                     Raise `capabilities.max_context` to the provider's real window instead, \
+                     or send this one turn whole.",
+                    existing.id
+                );
+                return None;
+            }
+            Some(RemedyPlan {
+                kind: remedy.kind(),
+                provider_id: ProviderId::from(existing.id.as_str()),
+                previous_value: PreviousValue::Cap,
+                // **Cleared, not guessed at.** The cap is the user's own number
+                // — the daemon has no second opinion about what it should be,
+                // and `0` is the config's own spelling of "no cap", the one
+                // value this daemon can write without inventing the user's
+                // policy. The label says in as many words that this removes the
+                // ceiling rather than moving it, and the gate above is what
+                // stops it being removed for a refusal that would stand anyway.
+                new_value: declared_value(0, "no cap"),
+                writes: RemedyWrites::Provider(field_wise_registration(existing, None, Some(0))),
+                rebind_target: None,
+            })
+        }
+        Remedy::BindTierRemote {
+            tier: Some(tier), ..
+        } => plan_tier_rebind(config, router, *tier, measured),
+        // Exhaustive rather than a `_`: a sixth remedy must be answered here
+        // deliberately, and the answer "no write" is a decision rather than a
+        // fall-through. The reachable members are listed above.
+        Remedy::RaiseWindow { .. }
+        | Remedy::DeclareWindow { .. }
+        | Remedy::RaiseCap { .. }
+        | Remedy::BindTierRemote { .. }
+        | Remedy::NotOffered => None,
+    }
+}
+
+/// **BR-9's rebind, planned**: which provider, what window, and the ordered
+/// pair that writes them (REQ-589 BR-9; ADR-5, ADR-12).
+///
+/// # ADR-12: exactly one may be proposed, two or more are not this daemon's to
+/// choose
+///
+/// D-9 authorized *performing* the remedy, not deciding where a whole
+/// category's work — and spend — goes. So the count
+/// [`Router::remote_providers`] returns is the whole gate: one is proposed by
+/// name, none and many both withhold the option and say why on the daemon's
+/// record channel. Picking the first in id order would be a routing decision
+/// taken on a user's behalf inside a consent answer, which is the one thing
+/// this remedy must not do.
+fn plan_tier_rebind(
+    config: &Config,
+    router: &Router,
+    tier: Tier,
+    measured: Fit,
+) -> Option<RemedyPlan> {
+    let configured = router.remote_providers();
+    let candidate = match configured.as_slice() {
+        [] => {
+            eprintln!(
+                "tetond: an over-budget offer on the local tier carries no rebind option — \
+                 BR-9's durable fix is to bind the `{}` tier to a remote provider and declare \
+                 that provider's window in the same change, and no remote provider is \
+                 configured to bind it to. Register one with `teton provider add` first.",
+                tier.as_str()
+            );
+            return None;
+        }
+        [only] => only,
+        many => {
+            eprintln!(
+                "tetond: an over-budget offer on the local tier carries no rebind option — \
+                 {} remote providers are configured ({}), and rebinding the `{}` tier moves \
+                 every turn that tier serves to whichever one is chosen, at that provider's \
+                 prices. Choosing that for you is not what answering this question authorizes \
+                 (ADR-12), so the binding is left to `teton policy set-tier {} <provider>`.",
+                many.len(),
+                many.iter()
+                    .map(|provider| provider.id.as_str())
+                    .collect::<Vec<_>>()
+                    .join(", "),
+                tier.as_str(),
+                tier.as_str(),
+            );
+            return None;
+        }
+    };
+    // Registered in the router but absent from this config snapshot is not a
+    // state either can produce — the router is built from this config — and it
+    // is answered rather than unwrapped, because the alternative is a panic in
+    // a consent path.
+    let existing = config.providers.iter().find(|p| p.id == candidate.id)?;
+    let Some(window) = rebind_window(router, candidate, measured) else {
+        eprintln!(
+            "tetond: an over-budget offer on the local tier carries no rebind option — \
+             binding the `{}` tier to `{}` has to declare that provider's window in the same \
+             change (BR-9), and this daemon ships no figure for `{}` and will not invent one. \
+             Declare it with `teton provider add {} --max-context <tokens>` and the binding \
+             follows.",
+            tier.as_str(),
+            candidate.id,
+            candidate.model,
+            candidate.id
+        );
+        return None;
+    };
+    // **The chosen target, built once and read by everything downstream**
+    // (ADR-1, ADR-18 item 2). The plan's `provider_id`, the record's
+    // `new_value`, both writes, and the name the offer's sentence and option
+    // labels quote all come off this one value, so ADR-1's "the label names the
+    // concrete write" is a property of the construction rather than of two
+    // lookups agreeing.
+    let target = RebindTarget {
+        provider_id: existing.id.clone(),
+        window,
+    };
+    let tokens = target.window.tokens();
+    Some(RemedyPlan {
+        // The one remedy that reaches here, so it is named rather than
+        // projected from a `Remedy` this function does not hold.
+        kind: RemedyKind::BindTierRemote,
+        provider_id: ProviderId::from(target.provider_id.as_str()),
+        // **Both halves on both sides.** BR-9's remedy is a pair, so a record
+        // naming only the binding would leave a reader unable to tell the fix
+        // from the circle — a tier bound to a provider with no declared window
+        // is the failure this remedy exists to close, and it has to be legible
+        // in the record that it did not happen.
+        previous_value: PreviousValue::TierAndWindow(tier),
+        new_value: format!(
+            "{}, capabilities.max_context {}",
+            target.provider_id,
+            declared_value(tokens, "undeclared")
+        ),
+        writes: RemedyWrites::TierRebind {
+            window: field_wise_registration(existing, Some(tokens), None),
+            binding: TierBindingConfig {
+                tier: to_protocol_tier(tier),
+                provider_id: ProviderId::from(target.provider_id.as_str()),
+                // Not invented: a fallback is a second routing decision, and
+                // nobody was asked for one.
+                fallback_id: None,
+            },
+        },
+        rebind_target: Some(target),
+    })
+}
+
+/// The window BR-9's second half declares for `candidate`, or `None` when this
+/// build cannot name one (REQ-589 BR-7c, BR-9; ADR-6).
+///
+/// Two sources, in this order and no others — and **which** one answered rides
+/// out with the figure, as a [`RebindWindow`], because ADR-7's provenance is
+/// only true of one of them:
+///
+/// 1. **The provider's own declaration**, where it has one that actually holds
+///    the measurement. A user who declared this provider's window months ago
+///    should not be told the daemon ships no figure for it, and re-stating the
+///    value they wrote invents nothing. There is no vendor and no date to quote
+///    about a number the user wrote themselves, and
+///    [`RebindWindow::Declared`] is what says so.
+/// 2. **The shipped vendor catalog**, through [`proposed_window`] — keyed off
+///    the candidate's **model**, never its id (ADR-6 rule 1: ids are the user's
+///    namespace), and only where the recipe's window would actually clear what
+///    was measured (rule 2, the rule Ollama's honest 4,096 exists to trip).
+///    This is the one that carries a vendor and a date, and
+///    [`RebindWindow::Catalogued`] carries them whole rather than reducing the
+///    proposal to its integer (ADR-7).
+///
+/// `None` is the honest third answer, and it withholds the **whole** remedy
+/// rather than half of it. Binding a tier to a provider with no declared window
+/// derives the same default pair under `bound: unknown window`: the user pays a
+/// remote provider and meets the identical refusal, which is the circle the
+/// reported `/analyze` failure was already sitting in.
+///
+/// **Nothing is derived here.** Both figures come from `Router::budget_for`,
+/// the routing layer's single caller of `budget::derive` (REQ-586 AC-12) — a
+/// second derivation would be a second figure, correct when computed and wrong
+/// the moment the route is re-decided.
+fn rebind_window(
+    router: &Router,
+    candidate: &RemoteProvider,
+    measured: Fit,
+) -> Option<RebindWindow> {
+    let inputs = router.budget_inputs_for(Some(&candidate.id));
+    if inputs.window > 0 {
+        let declared = router.budget_for(Some(&candidate.id));
+        if !declared.floored
+            && measured.tokens <= declared.budget_tokens
+            && measured.bytes <= declared.budget_bytes
+        {
+            return Some(RebindWindow::Declared(inputs.window));
+        }
+    }
+    proposed_window(Some(&candidate.model), inputs, measured).map(RebindWindow::Catalogued)
+}
+
 /// The assembled daemon runtime shared by every client task.
 pub struct DaemonRuntime {
     /// The live configuration (providers, routing, boundaries). Mutated by
@@ -1725,6 +2503,13 @@ pub struct DaemonRuntime {
     /// (REQ-559 BR-12 / ADR-F). Beside `session_taint` because both are
     /// session-scoped runtime degradation records rather than configuration.
     effort_refusals: Arc<EffortRefusals>,
+    /// Skill expansions a tier refused at the window, per session (REQ-589
+    /// BR-14.2 / ADR-9). Beside the two above because it is the same kind of
+    /// fact — something this daemon *observed* about one conversation, in
+    /// memory only — and deliberately **not** beside [`Self::session_gates`],
+    /// which is where answers a person gave live. An `Arc` for their reason
+    /// too: the turn path marks it from wherever the failed turn unwound.
+    window_rejections: Arc<ObservedWindowRejections>,
     /// Per-session lifts of the BR-13 web restriction (REQ-563). Behind an `Arc`
     /// because the lookup seam reads it through a [`TaintView`] on whatever task
     /// the turn is running on, while the `web/override` RPC writes it from the
@@ -1850,6 +2635,7 @@ impl DaemonRuntime {
             turn_counter: AtomicU64::new(0),
             session_taint: Arc::new(SessionTaint::new()),
             effort_refusals: Arc::new(EffortRefusals::new()),
+            window_rejections: Arc::new(ObservedWindowRejections::new()),
             web_override: Arc::new(WebTaintOverride::new()),
             session_user_urls: Mutex::new(HashMap::new()),
             session_gates: Mutex::new(HashMap::new()),
@@ -2071,6 +2857,7 @@ impl DaemonRuntime {
             turn_counter: AtomicU64::new(0),
             session_taint: Arc::new(SessionTaint::new()),
             effort_refusals: Arc::new(EffortRefusals::new()),
+            window_rejections: Arc::new(ObservedWindowRejections::new()),
             web_override: Arc::new(WebTaintOverride::new()),
             session_user_urls: Mutex::new(HashMap::new()),
             session_gates: Mutex::new(HashMap::new()),
@@ -2844,6 +3631,38 @@ impl DaemonRuntime {
     /// category to a provider that cannot serve a turn, or if the resulting
     /// config fails validation (e.g. a raw key in `auth_ref`, BR-7).
     pub fn apply_config_update(&self, update: ConfigUpdate) -> Result<(), RpcError> {
+        self.apply_config_update_guarded(update, |_| Ok(()))
+    }
+
+    /// [`Self::apply_config_update`], with a precondition evaluated **under the
+    /// config lock this write takes** (REQ-589 review pass).
+    ///
+    /// `guard` runs after the lock is acquired and before anything is copied,
+    /// validated or persisted, so what it reads is the config this call is
+    /// about to mutate — not a snapshot that was current when the caller
+    /// decided to make the call. A `Err` from it is returned verbatim and
+    /// nothing is written.
+    ///
+    /// # Why this exists rather than a re-read at the call site
+    ///
+    /// The over-budget remedy is planned before a question is put to a human
+    /// and applied after they answer, with **no timeout** on the answer. A
+    /// caller that re-read the config, dropped the lock, and then called
+    /// [`Self::apply_config_update`] would have shrunk the window from minutes
+    /// to microseconds and left a race that no test can reliably show. The
+    /// guard closes it: read and write are one critical section.
+    ///
+    /// The public method keeps its exact posture by passing a guard that reads
+    /// nothing, so `config/set` traffic is unaffected — this adds a
+    /// precondition some callers may state, never a new authority.
+    ///
+    /// # Errors
+    /// The guard's error, or [`Self::apply_config_update`]'s.
+    fn apply_config_update_guarded(
+        &self,
+        update: ConfigUpdate,
+        guard: impl FnOnce(&Config) -> Result<(), RpcError>,
+    ) -> Result<(), RpcError> {
         if let ConfigUpdate::RegisterProvider(pc) = &update {
             let kind = to_core_kind(pc.kind);
             let declared = pc.model.as_deref().map(str::trim).filter(|m| !m.is_empty());
@@ -2861,6 +3680,10 @@ impl DaemonRuntime {
             }
         }
         let mut config = self.config.lock().expect("config mutex poisoned");
+        // The caller's precondition, against the config this write is about to
+        // replace — inside the critical section, so there is no instant between
+        // the two in which anything else can land.
+        guard(&config)?;
         reject_unusable_binding(&config, &update)?;
         let mut candidate = config.clone();
         apply_update(&mut candidate, update);
@@ -3396,6 +4219,442 @@ impl DaemonRuntime {
         );
     }
 
+    /// Measure one of BR-8's two budget stages for a **typed** skill turn and,
+    /// where the expansion does not fit, put BR-3's question to the user
+    /// instead of refusing it (REQ-589 BR-2, BR-3, BR-4, BR-11; ADR-1, ADR-13,
+    /// ADR-15, ADR-16).
+    ///
+    /// # BR-2: the offer is the typed caller's alone
+    ///
+    /// Both call sites are in [`Self::run_prompt_turn`], which runs only for a
+    /// user-typed `/name`. A model-issued `skill` call is measured mid-loop by
+    /// `skill_append_fit` and keeps today's refusal verbatim — there is no
+    /// human inside a tool call to answer per-invocation, and a consent nobody
+    /// could give is not one to ask for. The reroute guard below is refusal-only
+    /// for the same reason plus one more: by then the block is already in the
+    /// conversation, and the choice there is between refusing whole and
+    /// middle-eliding, which BR-8 and BR-4 both answer without asking.
+    /// [`OverBudgetOffer`]'s own composer hardcodes `SkillCaller::User`, so the
+    /// Model arm's sentence is not merely unused here — it is unreachable.
+    ///
+    /// # The measurement is the one estimator, called once
+    ///
+    /// [`ContextManager::would_seed_fit`] is what `skill_fit` calls, against the
+    /// budget `Router::budget_for` stamped on this route. Nothing here derives a
+    /// budget and nothing re-counts the text. `skill_fit` itself is not called
+    /// on this path because it consumes the [`Fit`](crate::harness::context::Fit)
+    /// and hands back only a sentence, and the offer needs the pair — ADR-11's
+    /// rule is one *estimator*, not one caller of it. The sentence a decline
+    /// produces is [`OverBudgetOffer::decline_refusal`], which composes through
+    /// the identical `skill_refusal` arm with the identical arguments, so AC-3's
+    /// "byte-identical to today's refusal" holds by construction rather than by
+    /// two sentences being kept in step.
+    ///
+    /// # `.window`, never `.cap`
+    ///
+    /// [`Router::budget_inputs_for`] hands back the provider's **raw declared**
+    /// `capabilities.max_context`, and that is what the verdict is measured
+    /// against (ADR-15): the cap is *this daemon's* policy exactly as the
+    /// generation reservation is, while the window is the provider's own bound.
+    /// Passing `.cap` here would collapse the reachable `UserCap` + `FitsWindow`
+    /// row — a measurement can be over budget, over the cap, and still
+    /// legitimately inside the window — and would tell a user their send will
+    /// blow a window it fits.
+    ///
+    /// # Nothing is remembered, and nothing remembered is read
+    ///
+    /// `PermissionGate::authorize_skill_over_budget` consults no grant and
+    /// records none (BR-10, ADR-14). What *is* read is
+    /// [`ObservedWindowRejections`] — a rejection this daemon watched a provider
+    /// perform — and it reaches the composed sentence and nothing else: it does
+    /// not suppress the question and it does not pre-answer it (BR-14.2, AC-23).
+    ///
+    /// # BR-11 holds on every not-sent path
+    ///
+    /// Every arm that returns [`SkillStageVerdict::NotSent`] returns *from the
+    /// caller* before a dispatch: no provider is reached, no `context_pressure`
+    /// is emitted, no health changes, and — at Stage A — the session-naming duty
+    /// is still below the gate, so a refused turn has not spent it.
+    #[allow(clippy::too_many_arguments)]
+    async fn offer_or_refuse_over_budget(
+        &self,
+        events: &Arc<EventBus>,
+        session_id: &SessionId,
+        config: &Config,
+        router: &Router,
+        route: &crate::router::Route,
+        gate: &PermissionGate,
+        invoker: Option<ConnectionId>,
+        stage: SkillStage,
+        skill: &SkillTurn,
+        system: &str,
+        already_accepted: Option<&str>,
+    ) -> SkillStageVerdict {
+        let budget = &route.harness.budget;
+        let measured = ContextManager::would_seed_fit(
+            system,
+            &skill.text,
+            budget.budget_tokens,
+            budget.budget_bytes,
+        );
+        if measured.fits {
+            return SkillStageVerdict::Fits;
+        }
+
+        // **One question per expansion, not one per stage.** BR-8's two stages
+        // are two questions only when the fold between them changed something:
+        // a skill with no `` !`command` `` slots — or one whose commands all
+        // failed closed — reaches Stage B with byte-identical text, and asking
+        // again there would put the *same* measurement of the *same* bytes in
+        // front of the same person twice in one turn, with the second refusal
+        // able to kill a turn they had just approved.
+        //
+        // Compared as **text**, not as a measured pair: two different
+        // expansions can measure the same figures, and this decides whether a
+        // human is asked about bytes they have not seen. This is not BR-10's
+        // remembering, either — nothing survives the invocation; what is carried
+        // is *this turn's* answer to *this turn's* question, one line up the
+        // same function.
+        if already_accepted == Some(skill.text.as_str()) {
+            return SkillStageVerdict::Accepted;
+        }
+
+        // The route's own inputs, for the two facts the *budget* does not carry:
+        // the declared window the verdict is measured against, and the shape
+        // `proposed_window` substitutes a vendor recipe into. Read, never
+        // re-derived — `budget_for` stays the single `derive` caller.
+        let inputs = router.budget_inputs_for(route.provider_id.as_ref().map(|id| id.0.as_str()));
+        let mut offer = OverBudgetOffer::new(
+            &skill.name,
+            stage,
+            measured,
+            budget,
+            inputs.window,
+            // BR-7c: the shipped catalog's figure or nothing. Keyed off the
+            // route's **model**, never its provider id — ids are the user's
+            // namespace (ADR-6).
+            proposed_window(route.model.as_deref(), inputs, measured),
+            // ADR-12's payload for the `LocalEngine` row: which tier a
+            // `BindTierRemote` remedy would rebind, read off the resolution the
+            // route was built from rather than re-resolved.
+            route.resolution.as_ref().map(|r| r.tier),
+        );
+
+        // No connection to address the question to — an internal driver, or a
+        // fixture. The question cannot be *put* to anyone, which is not the same
+        // as being declined; what the user gets is BR-4's sentence, which is
+        // today's refusal, and no `skill_over_budget_offered` is published
+        // because no offer was made. `settle_dynamic_context` fails closed at
+        // its own door the same way, with `SkillConsent::Unanswerable`.
+        let Some(connection) = invoker else {
+            return SkillStageVerdict::NotSent(offer.decline_refusal());
+        };
+
+        // BR-14.2: a rejection this daemon *observed*, not a consent it
+        // remembered. It leads the sentence and changes nothing else.
+        let prior = if self.window_rejections.was_observed(
+            session_id,
+            &skill.name,
+            &RouteWindow::of(budget),
+        ) {
+            PriorWindowRejection::Observed
+        } else {
+            PriorWindowRejection::None
+        };
+
+        // Published when the offer is **raised**, not when it is answered: that
+        // is what makes "asked and declined" distinguishable from "nobody could
+        // be reached", which is REQ-585 AC-9's distinction and the reason
+        // `OVER_BUDGET_REASON` needs no second refusal token.
+        events.publish(
+            Some(session_id.clone()),
+            Event::SkillOverBudgetOffered(SkillOverBudgetOffered {
+                skill: skill.name.clone(),
+                source: skill.source,
+                stage: wire_skill_stage(stage),
+                measured_tokens: measured.tokens as u64,
+                measured_bytes: measured.bytes as u64,
+                budget_tokens: budget.budget_tokens as u64,
+                budget_bytes: budget.budget_bytes as u64,
+                bound: budget.bound,
+                window_verdict: offer.window_verdict,
+                // The fact a later reader cannot recover: the option list is
+                // gone by then, and "this bound had no remedy" is what explains
+                // an offer that presented the one-time override alone.
+                remedy_kind: offer.remedy.kind(),
+            }),
+        );
+
+        // **The write is planned before the question is asked**, and the plan
+        // is what decides whether the two remedy-bearing options appear at all
+        // (ADR-1). A `None` here is not a failure: BR-7c ships no figure for a
+        // provider matching no recipe, and ADR-12 will not choose between two
+        // configured remotes — in both cases the honest offer is the one-time
+        // override and the decline, with the sentence still naming the durable
+        // fix and asking for what the daemon does not have. What is *not*
+        // acceptable is an option a human can select that writes nothing, and
+        // [`RemedyPlan`]'s doc records why that is the same defect
+        // `enable_permanent` shipped once already.
+        let plan = plan_over_budget_remedy(config, router, &offer.remedy, measured);
+
+        // **The plan is the fact, and it is told to the offer once** (ADR-1).
+        //
+        // Both halves of what a reader meets — which option rows are drawn, and
+        // which closing question the sentence ends on — are read off
+        // `OverBudgetOffer::remedy_offer` from here. They used to be decided
+        // separately: the rows from this plan, the closing from
+        // `Remedy::is_offered`. Those disagree exactly where BR-7c ships no
+        // figure, where ADR-6 rule 2 rejects a cap, and where ADR-12 withholds
+        // the rebind — and the offer then closed *"take the durable fix"* above
+        // a prompt with no row for one.
+        if plan.is_none() {
+            offer.withhold_remedy();
+        }
+
+        // **BR-9's provider, named** (ADR-1; ADR-18 item 2). The rebind is the
+        // one remedy whose target `Remedy::for_bound` could not know: it is
+        // keyed on the bound, and the only provider id in its hand names the
+        // route being *left*. The planner above is where the choice was made —
+        // ADR-12's exactly-one case — so the name is taken from that plan and
+        // from nowhere else, which is what makes the sentence's provider and the
+        // written provider the same value rather than two lookups that agree
+        // today. Where ADR-12 withheld the choice there is no plan and no name,
+        // and the clause states BR-9's fix without inventing one.
+        //
+        // Before the labels and the sentence, both of which read the remedy as
+        // it stands.
+        if let Some(target) = plan.as_ref().and_then(|plan| plan.rebind_target.clone()) {
+            offer.name_rebind_target(target);
+        }
+
+        // No second decision here: `option_labels` reads the same
+        // `remedy_offer` the closing question does.
+        let labels = offer.option_labels();
+
+        let answer = gate
+            .authorize_skill_over_budget(
+                // The **plain** key `skill:<source>:<name>`, never the digest
+                // spelling `SkillTurn::permission_key` carries: a digest exists
+                // so a remembered grant follows its substituted commands, and
+                // this door remembers nothing for it to follow (ADR-14). The
+                // gate asserts this exact spelling.
+                &crate::skills::permission_key_for(skill.source, &skill.name),
+                PermissionSubject::SkillOverBudget {
+                    skill: skill.name.clone(),
+                    source: skill.source,
+                    stage: wire_skill_stage(stage),
+                    measured_tokens: measured.tokens as u64,
+                    measured_bytes: measured.bytes as u64,
+                    budget_tokens: budget.budget_tokens as u64,
+                    budget_bytes: budget.budget_bytes as u64,
+                    bound: budget.bound,
+                    window_verdict: offer.window_verdict,
+                    // ADR-16: the daemon words it, the client renders it
+                    // verbatim. The structure around it is for presentation and
+                    // for the `Unknown` hedge — not for a second composer.
+                    sentence: offer.question(skill.source, prior),
+                    // The id the **budget** carries, which is the one the remedy
+                    // was addressed to — not a second opinion about who declared
+                    // this window, and already sanitized by `derive`.
+                    provider_id: budget.provider_id.as_deref().map(ProviderId::from),
+                },
+                // The gate words nothing (BR-5): finished text arrives, and what
+                // it decides is which options reach the prompt.
+                labels,
+                connection,
+            )
+            .await;
+
+        // Read **both**, and independently: `remedy_only` is a legitimate answer
+        // — fix the limit, do not send this turn — and `proceed_once` is the
+        // other (AC-7b). Applied before the accept is announced because the
+        // remedy is the going-forward half and holds whichever way the send went.
+        if answer.apply_remedy() {
+            match plan {
+                Some(plan) => self.apply_over_budget_remedy(events, session_id, plan),
+                // Unreachable, and stated rather than assumed away: the two
+                // remedy ids are denied by `interpret_over_budget` unless the
+                // option list carried them, and it carried them only where a
+                // plan existed. A client that answered one anyway gets the
+                // decline it was given, and the daemon says so — the one thing
+                // that must not happen quietly here is nothing.
+                None => eprintln!(
+                    "tetond: an over-budget answer authorized a durable write this build \
+                     planned none for — nothing was written, the limit still stands, and \
+                     the next invocation will meet the same measurement"
+                ),
+            }
+        }
+
+        if answer.consent().is_allowed() {
+            events.publish(
+                Some(session_id.clone()),
+                Event::SkillOverBudgetAccepted(SkillOverBudgetAccepted {
+                    skill: skill.name.clone(),
+                    source: skill.source,
+                    stage: wire_skill_stage(stage),
+                    // BR-1's "whole" is these numbers: what goes out is what was
+                    // measured, and nothing on this path shortens it.
+                    measured_tokens: measured.tokens as u64,
+                    measured_bytes: measured.bytes as u64,
+                    budget_tokens: budget.budget_tokens as u64,
+                    budget_bytes: budget.budget_bytes as u64,
+                    // What the user was told before they answered.
+                    window_verdict: offer.window_verdict,
+                }),
+            );
+            // BR-5's third sentence, which the refusal's *"no provider saw this
+            // turn"* clause cannot be borrowed for: it becomes false the moment a
+            // human proceeds, and that clause is what makes `-32023` different
+            // from `-32022`. Written to the daemon's own record channel, as the
+            // taint pin and the degraded-duty lines are, because an accepted turn
+            // has no refusal frame to carry it and the typed
+            // `skill_over_budget_accepted` above deliberately holds no prose.
+            eprintln!("tetond: {}", offer.accepted_record(skill.source));
+            SkillStageVerdict::Accepted
+        } else {
+            SkillStageVerdict::NotSent(offer.decline_refusal())
+        }
+    }
+
+    /// Perform the offer's **going-forward** remedy, through the one
+    /// durable-write path this daemon has (REQ-589 BR-7, BR-8, BR-9; ADR-4,
+    /// ADR-5).
+    ///
+    /// [`Self::apply_config_update`] is `config/set`'s own body, so this
+    /// inherits that method's posture verbatim — its validation, its atomic
+    /// persist, its refusals — rather than minting a second way to write the
+    /// same class of fact. **No new authority is created here**: a change
+    /// `config/set` would refuse is refused identically, and the event below is
+    /// the announcement rather than the permission.
+    ///
+    /// # What it writes is not decided here
+    ///
+    /// [`plan_over_budget_remedy`] decided it, *before* the question was asked,
+    /// and the same plan is what put the remedy options on the prompt at all.
+    /// That is the whole guard against ADR-1's cautionary precedent: there is
+    /// no arm in this function that can accept an answer it has no write for,
+    /// because a remedy with no write never became an option. A remedy this
+    /// build cannot apply is not offered — never offered and then quietly
+    /// dropped.
+    ///
+    /// # Ordering, for the one remedy that is two writes
+    ///
+    /// [`RemedyWrites::apply`] walks BR-9's pair in the one order that makes
+    /// the forbidden state unreachable (ADR-5): the window is declared first,
+    /// the tier is bound second. A failure between them leaves a declared
+    /// window on a tier bound exactly where it was, which is harmless; the
+    /// reverse order leaves a newly-bound remote tier with `max_context = 0`,
+    /// which is the circle the reported `/analyze` failure was sitting in.
+    ///
+    /// A failure is stated rather than swallowed, and says which half landed:
+    /// the turn's own answer already stands, and a user told their limit was
+    /// raised when the write failed would meet the same refusal next turn with
+    /// no explanation.
+    ///
+    /// # The plan is checked against the **live** config, not the one it was
+    /// built from
+    ///
+    /// `RegisterProvider` replaces `endpoint`, `model` and `auth_ref`
+    /// **wholesale** — only the two capability fields merge field-wise — and
+    /// the plan captured all three from the snapshot the *question* was
+    /// composed under, before an await on a human with no timeout. So an offer
+    /// raised at 10:00 and answered at 10:05 would, unguarded, restore 10:00's
+    /// identity over whatever `config/set` or `teton provider add` wrote at
+    /// 10:02: a credential change silently reverted, and the next turn calling
+    /// the old endpoint.
+    ///
+    /// [`Self::apply_config_update_guarded`] closes it. Every
+    /// `RegisterProvider` this plan makes is admitted only if the stored
+    /// provider's identity still equals what the write re-states, read under
+    /// the config lock the write itself takes — so there is no instant between
+    /// the check and the write. A provider that moved (or was removed) fails
+    /// the remedy through the same stderr line every other failure takes,
+    /// rather than being reverted; the limit still stands, and re-invoking the
+    /// skill measures the provider as it now is.
+    ///
+    /// The **record** is read in the same guard, for the same reason: BR-7's
+    /// `previous_value` is a claim about what the write replaced, and a value
+    /// rendered minutes earlier is a claim about something else.
+    fn apply_over_budget_remedy(
+        &self,
+        events: &Arc<EventBus>,
+        session_id: &SessionId,
+        plan: RemedyPlan,
+    ) {
+        let RemedyPlan {
+            kind,
+            provider_id,
+            previous_value,
+            new_value,
+            writes,
+            // Spent before this point, on the offer's own wording: the target
+            // is what the *question* had to name, and by the time an answer
+            // reaches here the writes carry it. Destructured rather than
+            // ignored with `..` so a later field cannot slip past unread.
+            rebind_target: _,
+        } = plan;
+        // Filled by the guard below, under the lock, on the first write — which
+        // for BR-9's pair is the one that happens before the tier moves, so the
+        // binding it names is the one being replaced.
+        let replaced: RefCell<Option<String>> = RefCell::new(None);
+        let outcome = writes.apply(|update| {
+            // Read off the update before it is handed over, because the guard
+            // cannot borrow a value that has been moved into the call.
+            let restates = match &update {
+                ConfigUpdate::RegisterProvider(pc) => Some(pc.clone()),
+                ConfigUpdate::SetTierBinding(_)
+                | ConfigUpdate::SetCategoryBinding(_)
+                | ConfigUpdate::SetPrivacyBoundary(_)
+                | ConfigUpdate::SetEffort(_) => None,
+            };
+            self.apply_config_update_guarded(update, |config| {
+                if let Some(restates) = &restates {
+                    provider_identity_unchanged(config, restates)?;
+                }
+                // One borrow, held across the test and the write: two would be
+                // a `RefCell` double-borrow waiting on a temporary-lifetime
+                // rule, in a consent path where the cost of being wrong is a
+                // panic.
+                let mut slot = replaced.borrow_mut();
+                if slot.is_none() {
+                    *slot = Some(previous_value.read(config, &provider_id.0));
+                }
+                Ok(())
+            })
+        });
+        // `None` is unreachable on the `Ok` arm — the guard runs before any
+        // mutation, so a write that landed ran it — and is answered rather than
+        // unwrapped, because the alternative is a panic in a consent path.
+        let previous_value = replaced
+            .into_inner()
+            .unwrap_or_else(|| "unrecorded".to_owned());
+        match outcome {
+            Ok(()) => events.publish(
+                Some(session_id.clone()),
+                Event::SkillOverBudgetRemedyApplied(SkillOverBudgetRemedyApplied {
+                    // Never `NotOffered` on a published event: that value means
+                    // no fix existed to take, and nothing reaches this line
+                    // without one having been written.
+                    remedy_kind: kind,
+                    provider_id: Some(provider_id),
+                    // **Both values, always.** A record naming only the new one
+                    // leaves a reader unable to tell a raise from a first
+                    // declaration — which is the difference between
+                    // `RaiseWindow` and `DeclareWindow`, and between a fix and a
+                    // surprise.
+                    previous_value,
+                    new_value,
+                }),
+            ),
+            Err((err, applied)) => eprintln!(
+                "tetond: the over-budget remedy for `{}` could not be written ({}); {} and \
+                 the limit still stands",
+                provider_id.0, err.message, applied
+            ),
+        }
+    }
+
     /// Run one prompt turn for `session`, streaming events over `events` and
     /// returning the turn result.
     ///
@@ -3825,23 +5084,70 @@ impl DaemonRuntime {
         // A refused turn returns from here: no `context_pressure` of any kind,
         // no health change, no degradation, no retry — none of the machinery
         // below has run.
+        //
+        // ── REQ-589 BR-2/BR-3: and the refusal is now a *question* ───────────
+        //
+        // Over budget no longer ends the turn on its own. On the user-typed path
+        // — this one, and only this one — the measurement is put to the person
+        // who typed the name, who may send it anyway, take a durable fix, or
+        // decline. Declining is byte-for-byte the refusal above it replaced
+        // (AC-3), and every not-sent arm still returns from here with BR-11
+        // intact: the naming duty is below this line, so a refused turn has
+        // spent no model call.
+        //
+        // `SkillCaller::User` is not passed because it cannot be anything else:
+        // `skill_turn` is `Some` only for a typed `/name`, and
+        // `OverBudgetOffer`'s composer hardcodes it (BR-2). The model's own
+        // expansions are measured by the loop's `skill_append_fit` and are never
+        // offered a choice.
+        //
+        // The one place this turn's pressure policy can be decided, because it
+        // is the one place an over-budget send is consented to (BR-12).
+        //
+        // **One variable, not a flag beside a payload** (REQ-589 BR-14.1). This
+        // was a `bool` and an `Option<String>` set on the same two arms; the
+        // withdrawal below needs the skill's *name* as well, and a third local
+        // that three arms have to remember to keep in step is how one of them
+        // comes to say a turn was accepted while another cannot say what was
+        // accepted. `Some` **is** "this turn's over-budget send was consented
+        // to", and everything downstream reads it from here.
+        let mut accepted: Option<AcceptedExpansion> = None;
         if let Some(skill) = &skill_turn {
-            if let SkillFit::TooLarge { message } = skill_fit(
-                // BR-8's two stages are the typed turn's, and only the typed
-                // turn's: a model-issued call is measured by the loop's
-                // `skill_append_fit`, never here.
-                SkillCaller::User,
-                SkillStage::Body,
-                &skill.name,
-                &system,
-                &skill.text,
-                &route.harness.budget,
-                route.provider_id.as_ref().map(|id| id.0.as_str()),
-            ) {
-                return Err(RpcError::new(
-                    error_code::SKILL_EXPANSION_TOO_LARGE,
-                    message,
-                ));
+            match self
+                .offer_or_refuse_over_budget(
+                    events,
+                    &session_id,
+                    &config,
+                    &router,
+                    &route,
+                    &gate,
+                    invoker,
+                    SkillStage::Body,
+                    skill,
+                    &system,
+                    // Nothing has been accepted yet: this is the turn's first
+                    // question.
+                    None,
+                )
+                .await
+            {
+                SkillStageVerdict::Fits => {}
+                SkillStageVerdict::Accepted => {
+                    // The exact bytes the answer was about, carried to Stage B
+                    // so an unchanged expansion is not put to the user twice —
+                    // and to the failure path below, which has to find this
+                    // block in the conversation to withdraw it (BR-14.1).
+                    accepted = Some(AcceptedExpansion {
+                        skill: skill.name.clone(),
+                        text: skill.text.clone(),
+                    });
+                }
+                SkillStageVerdict::NotSent(message) => {
+                    return Err(RpcError::new(
+                        error_code::SKILL_EXPANSION_TOO_LARGE,
+                        message,
+                    ));
+                }
             }
         }
 
@@ -3902,23 +5208,67 @@ impl DaemonRuntime {
         // ── REQ-585 BR-8 / ADR-11: Stage B — does it still fit with the
         // dynamic-context output folded in? ──────────────────────────────────
         //
-        // Reached only once Stage A has answered `Fits`, which is what entitles
-        // this stage's sentence to say the body itself fit. Still before
-        // `CarriedTurn::begin`, for Stage A's reason.
+        // Reached only once Stage A has answered `Fits` **or was accepted**,
+        // which is what entitles this stage's sentence to say the body itself
+        // fit. Still before `CarriedTurn::begin`, for Stage A's reason.
+        //
+        // REQ-589: this stage offers too, and the wire carries which stage
+        // spoke precisely so it can. The two are different questions and the
+        // sentence says so — Stage A's is about the body, Stage B's has to say
+        // that the dynamic-context output is what spent the room, which is a
+        // different thing for the user to act on. Leaving this one a hard
+        // refusal would mean a skill with one oversized `` !`command` `` output
+        // could never be sent even by someone who understood exactly what they
+        // were asking for, and would leave `SkillStage::WithDynamicContext`
+        // unreachable on every surface TASK-241 put it on.
+        //
+        // BR-11 reads differently here, and the difference is not new: the
+        // naming duty and the dynamic-context commands are both *above* this
+        // line, so a Stage B refusal has spent them — exactly as it did before
+        // REQ-589. What is unchanged is the invariant that matters for
+        // `-32023`: no provider has seen this turn.
         if let Some(skill) = &skill_turn {
-            if let SkillFit::TooLarge { message } = skill_fit(
-                SkillCaller::User,
-                SkillStage::WithDynamicContext,
-                &skill.name,
-                &system,
-                &skill.text,
-                &route.harness.budget,
-                route.provider_id.as_ref().map(|id| id.0.as_str()),
-            ) {
-                return Err(RpcError::new(
-                    error_code::SKILL_EXPANSION_TOO_LARGE,
-                    message,
-                ));
+            match self
+                .offer_or_refuse_over_budget(
+                    events,
+                    &session_id,
+                    &config,
+                    &router,
+                    &route,
+                    &gate,
+                    invoker,
+                    SkillStage::WithDynamicContext,
+                    skill,
+                    &system,
+                    // What Stage A's answer was about, if there was one. An
+                    // expansion the fold left untouched is the same question,
+                    // already answered a few lines up — asking again would let
+                    // a second refusal kill a turn the user had just approved.
+                    accepted.as_ref().map(|a| a.text.as_str()),
+                )
+                .await
+            {
+                SkillStageVerdict::Fits => {}
+                // Recorded with **this** stage's bytes, which is the point of
+                // re-assigning rather than only raising a flag: the fold may
+                // have grown the expansion since Stage A, and it is the folded
+                // text that becomes the block a failure has to withdraw
+                // (BR-14.1). A Stage-B-only acceptance — Stage A said `Fits`,
+                // the dynamic-context output is what spent the room — leaves
+                // this `None` if it does not write here, and the withdrawal
+                // would then have nothing to look for.
+                SkillStageVerdict::Accepted => {
+                    accepted = Some(AcceptedExpansion {
+                        skill: skill.name.clone(),
+                        text: skill.text.clone(),
+                    });
+                }
+                SkillStageVerdict::NotSent(message) => {
+                    return Err(RpcError::new(
+                        error_code::SKILL_EXPANSION_TOO_LARGE,
+                        message,
+                    ));
+                }
             }
         }
 
@@ -4003,6 +5353,14 @@ impl DaemonRuntime {
 
         let mut attempts = 0u32;
         let mut rerouted_local = false;
+        // Whether an accepted expansion was withdrawn from this conversation
+        // because the tier refused it at the window (REQ-589 BR-14.1).
+        //
+        // It travels out of the loop rather than being acted on inside it
+        // because it decides which of the two outcomes below this turn takes,
+        // and the loop's whole shape is that every ending funnels through that
+        // one seam. See the commit/abandon match for what it changes and why.
+        let mut withdrew_accepted_expansion = false;
         // The loop is labelled and its endings `break` a value rather than
         // returning one, so every one of them funnels through the single
         // commit/abandon below instead of each exit remembering to disarm —
@@ -4042,6 +5400,19 @@ impl DaemonRuntime {
                     &stream_events,
                     conversation.ctx_mut(),
                     prompt_spend.as_ref(),
+                    // REQ-589 BR-12 / ADR-8: the one turn whose top-of-loop
+                    // pressure gate is suspended is the one whose over-budget
+                    // measurement a human was shown and accepted. Built fresh
+                    // per attempt because `PressurePolicy` is consumed by the
+                    // call — which is the type carrying the "exactly one
+                    // iteration" rule rather than a flag someone has to reset —
+                    // and because a fallback attempt re-assembles the *same*
+                    // consented prompt, so it is owed the same suspension.
+                    if accepted.is_some() {
+                        PressurePolicy::SuspendedForAcceptedTurn
+                    } else {
+                        PressurePolicy::Enforced
+                    },
                 )
                 .await;
 
@@ -4113,6 +5484,55 @@ impl DaemonRuntime {
                 }
             }
 
+            // ── REQ-589 BR-14.1 / D-8: an approval must not leave the session
+            // hitting the same wall ──────────────────────────────────────────
+            //
+            // The tier refused the very bytes a human just approved. The turn
+            // is over either way — nothing about resending them can succeed —
+            // but the *session* must not be left holding the expansion that
+            // earned the refusal, because the budget the next turn is measured
+            // against is the one that already said these bytes fit. A window
+            // that disagrees with the stamped budget disagrees with it again on
+            // the next turn, and the next, which is the circle the reported
+            // `/analyze` failure walked.
+            //
+            // **Read through `context_refusal`, never by matching the two
+            // variants** (ADR-3). The local engine's refusal is its own variant
+            // and it is the tier the reported failure ran on; a predicate that
+            // matched `ContextLengthExceeded` here would handle the remote half
+            // and quietly miss the one that matters, exactly as the arm below
+            // used to.
+            //
+            // Sited here rather than in that arm for the same reason the
+            // privacy block above is: this is where `result` is still a
+            // `HarnessError` and `conversation` is still writable. The arm
+            // below composes the user's sentence from the same projection, so
+            // the words the model reads in the withdrawn block and the words
+            // the user reads in the error are one composer's (BR-5).
+            if let (Some(accepted), Some(refusal)) = (
+                accepted.as_ref(),
+                result
+                    .as_ref()
+                    .err()
+                    .and_then(HarnessError::context_refusal),
+            ) {
+                let sentence = refusal.sentence(&route.budget.window_label);
+                // BR-14.2, and it is marked whether or not the withdrawal below
+                // finds its block: the rejection is a thing this daemon
+                // *watched happen*, and the next offer for this pair is owed it
+                // regardless of what the conversation turned out to look like.
+                // Keyed off the route that actually refused — a fallback may
+                // have moved the turn since the offer was made, and it is the
+                // refusing window the next offer's lead is a claim about.
+                self.window_rejections.mark(
+                    &session_id,
+                    &accepted.skill,
+                    &RouteWindow::of(&route.harness.budget),
+                );
+                withdrew_accepted_expansion =
+                    withdraw_accepted_expansion(&mut conversation, &accepted.text, &sentence);
+            }
+
             match result {
                 Ok(outcome) => {
                     // REQ-544 M-5: a provider that just served a turn is healthy
@@ -4134,11 +5554,10 @@ impl DaemonRuntime {
                         stop_reason: outcome.stop_reason,
                     });
                 }
-                // REQ-586 BR-2 / ADR-8: the provider answered that the
-                // request does not fit its window. A **typed outcome**, and
-                // therefore ahead of every `Remote` arm below: this is not a
-                // provider failure and must not be run through the machinery
-                // that treats one.
+                // REQ-586 BR-2 / ADR-8: the tier answered that the request does
+                // not fit its window. A **typed outcome**, and therefore ahead
+                // of every `Remote` arm below: this is not a provider failure
+                // and must not be run through the machinery that treats one.
                 //
                 // No `record_health` — a provider that correctly reported its
                 // own limit is not unhealthy, and downgrading it would move
@@ -4150,24 +5569,34 @@ impl DaemonRuntime {
                 // unchanged bytes can succeed.
                 //
                 // The sentence carries the three numbers a user can act on and
-                // no response body (BR-11): the provider, what was assembled,
+                // no response body (BR-11): who refused, what was assembled,
                 // and the budget the route was running under. A wide gap
                 // between the last two says the declared window is wrong; a
                 // narrow one says this content tokenizes denser than the
                 // estimator assumed.
-                Err(HarnessError::ContextLengthExceeded {
-                    provider_id,
-                    assembled_tokens,
-                    budget_tokens,
-                }) => {
+                //
+                // REQ-589 ADR-3: **both** window refusals arrive here, on one
+                // arm. The local engine has no provider to name, so it is its
+                // own variant; giving it its own arm as well would be a second
+                // place for the same sentence to be edited, and the local tier
+                // is precisely the one whose report was found wrong. Before
+                // this, a local over-window turn fell through to the
+                // `HarnessError::Engine` arm below and reached the user as
+                // `INTERNAL_ERROR "the local engine could not serve the turn"`.
+                Err(
+                    err @ (HarnessError::ContextLengthExceeded { .. }
+                    | HarnessError::LocalContextLengthExceeded { .. }),
+                ) => {
                     break 'turn Err(RpcError::new(
                         error_code::CONTEXT_LENGTH_EXCEEDED,
-                        format!(
-                            "`{provider_id}` refused this turn as larger than {}: about \
-                             {assembled_tokens} words were assembled against a \
-                             {budget_tokens}-word budget",
-                            route.budget.window_label,
-                        ),
+                        // `Display` is the total fallback rather than an
+                        // `expect`: the pattern above admits only the two
+                        // variants `window_refusal_sentence` answers for, so
+                        // the fallback is unreachable, and a future third
+                        // window refusal degrades to a true sentence instead of
+                        // panicking the daemon.
+                        err.window_refusal_sentence(&route.budget.window_label)
+                            .unwrap_or_else(|| err.to_string()),
                     ));
                 }
                 // REQ-588 BR-3 / ADR-4: the spend ceiling, answered here and
@@ -4322,6 +5751,30 @@ impl DaemonRuntime {
         // turn that failed writes nothing at all, which is what makes BR-6's
         // "byte-identical to the failed turn never having run" true by
         // construction: the pre-turn vector was never touched.
+        //
+        // # The one failure that writes, and why (REQ-589 BR-14.1 / D-8)
+        //
+        // BR-14.1 asks for an accepted expansion to be *withdrawn* from the
+        // session when the tier refuses it at the window, so the next turn
+        // assembles without it. Under abandon alone that withdrawal is
+        // unobservable: the manager it edited is dropped, the pre-turn vector
+        // is what the session keeps, and nothing any test can drive would tell
+        // the withdrawal apart from its deletion (LESSON-544's exact shape —
+        // a producer with no consumer, invisible to a green suite). So the
+        // withdrawal is what this turn commits, and BR-6's "no trace" is
+        // narrowed by exactly one path: an over-budget send a human approved,
+        // that the tier then refused at the window, whose block was found.
+        //
+        // What it writes is **smaller than what it was handed** — the same
+        // conversation with the expansion replaced by the refusal that killed
+        // it, and the block's provenance absorbed rather than shed (BUG-188).
+        // A user who approved once is left with a session that can take
+        // another turn, which is D-8's whole ask; the alternative is a
+        // withdrawal that is a comment.
+        //
+        // **This is a deviation from REQ-567 BR-6 and is flagged as one.** The
+        // narrowness is the mitigation: every other failure — every retry
+        // class, every reroute, every panic — still abandons.
         match outcome {
             Ok(result) => {
                 // REQ-586 BR-10: the commit re-asserts the budget one last
@@ -4331,6 +5784,15 @@ impl DaemonRuntime {
                 // [`commit_and_publish`].
                 commit_and_publish(conversation, &stream_events, &route.budget);
                 Ok(result)
+            }
+            Err(err) if withdrew_accepted_expansion => {
+                // The withdrawal, and the turn's error, both. The commit runs
+                // the same protocol the success arm does — it re-asserts the
+                // budget and evaluates the taint pin — because what is being
+                // handed over is a conversation the session will assemble from
+                // next, not a special case of one.
+                commit_and_publish(conversation, &stream_events, &route.budget);
+                Err(err)
             }
             Err(err) => {
                 conversation.abandon();
@@ -5157,6 +6619,7 @@ impl DaemonRuntime {
         stream_events: &SessionEvents,
         ctx: &mut ContextManager,
         prompt_spend: Option<&Arc<teton_core::cost_ceiling::PromptSpend>>,
+        pressure: PressurePolicy,
     ) -> Result<crate::harness::TurnOutcome, HarnessError> {
         let mut hook = NoopProvenanceHook;
 
@@ -5231,7 +6694,7 @@ impl DaemonRuntime {
             AttemptSource::Local(engine, format) => {
                 let mut source = LocalEngineSource::new(engine, format, session_id.clone())
                     .metered(Arc::new(self.ledger.clone()));
-                return run_session_turn_with_source(
+                return run_session_turn_with_pressure_policy(
                     &mut source,
                     tools,
                     tool_ctx,
@@ -5243,6 +6706,7 @@ impl DaemonRuntime {
                     &digest,
                     &compact,
                     &duties,
+                    pressure,
                 )
                 .await;
             }
@@ -5311,7 +6775,7 @@ impl DaemonRuntime {
             source = source.with_category(to_protocol_category(category));
         }
 
-        let outcome = run_session_turn_with_source(
+        let outcome = run_session_turn_with_pressure_policy(
             &mut source,
             tools,
             tool_ctx,
@@ -5323,6 +6787,7 @@ impl DaemonRuntime {
             &digest,
             &compact,
             &duties,
+            pressure,
         )
         .await;
 
@@ -5647,6 +7112,24 @@ impl DaemonRuntime {
     #[must_use]
     pub fn session_taint(&self) -> Arc<SessionTaint> {
         Arc::clone(&self.session_taint)
+    }
+
+    /// The observed-window-rejection memo (REQ-589 BR-14.2 / ADR-9).
+    ///
+    /// The **one** store of this fact, and it is on this side of the wire
+    /// (ASSUME-017). Handed out rather than kept private because the turn path
+    /// marks it from wherever an accepted over-budget turn unwound, and because
+    /// a suite proving "one store, daemon-side" has to be able to look at the
+    /// store it is claiming is the only one.
+    ///
+    /// Handing it out grants nothing dangerous, on [`Self::session_taint`]'s
+    /// reasoning one step further: the worst a holder can do is record that a
+    /// rejection happened, and a recorded rejection can only change the words
+    /// the next offer opens with. It cannot answer that offer — there is no
+    /// answer in here to read.
+    #[must_use]
+    pub fn window_rejections(&self) -> Arc<ObservedWindowRejections> {
+        Arc::clone(&self.window_rejections)
     }
 
     /// The two session flags the lookup taint gate reads (REQ-563 BR-13).
@@ -11171,6 +12654,71 @@ fn withdraw_model_expansion(
     conversation
         .ctx_mut()
         .withdraw_block(committed, crate::harness::turn_loop::error_result(refusal))
+}
+
+/// What an over-budget answer was about, carried from the stage that asked to
+/// the failure that has to undo it (REQ-589 BR-14.1).
+///
+/// The name rides with the text because BR-14.1 and BR-14.2 need different
+/// halves of the same fact — the bytes to find in the conversation, and the
+/// skill to record the observed rejection under — and two locals set on the
+/// same arms is how one of them comes to be `Some` while the other is not.
+struct AcceptedExpansion {
+    /// The skill as the user named it, the key
+    /// [`ObservedWindowRejections`] is scoped by.
+    skill: String,
+    /// The exact bytes the offer was about, and therefore the exact block the
+    /// seed pushed.
+    text: String,
+}
+
+/// Withdraw an expansion **the user approved over budget** after the tier
+/// refused it at the window, and leave the refusal in its place (REQ-589
+/// BR-14.1 / D-8).
+///
+/// # Why this is not [`withdraw_model_expansion`]
+///
+/// The two bodies are the same call and deliberately stay two functions. That
+/// one answers a *reroute guard*: the turn continues, the model reads the
+/// refusal as a tool result, and its caller has a `SkillCaller` to consult and
+/// a tool's bookkeeping to keep in step. This one answers a **terminal window
+/// refusal** on a turn a human consented to; there is no next iteration, no
+/// model waiting on a result, and no caller distinction — a model-invoked
+/// expansion is never offered a choice (BR-2), so everything reaching here was
+/// typed. Folding them into one would put a parameter in front of that
+/// difference and invite a later edit to make the reroute's decisions on this
+/// path.
+///
+/// # What it leaves behind
+///
+/// The refusal the user is also being told, through the same composer
+/// ([`crate::harness::turn_loop::ContextRefusal::sentence`]), so the block the
+/// next turn assembles and the error the client renders cannot come to say
+/// different things (BR-5).
+///
+/// **Provenance is absorbed, never shed** — [`ContextManager::withdraw_block`]
+/// does it, which is why BR-14.1 names that function rather than inventing a
+/// path. A skill block that shed its sources on the way out would let a
+/// `local-only` body egress on the next turn through a block nobody can see
+/// (BUG-188), and the pin has to outlive the text it is a pin for.
+///
+/// Returns `false` when no block matched, which leaves the turn to abandon
+/// exactly as it always did. That is the honest fallback rather than a
+/// best-effort search: the seed pushes the accepted bytes verbatim, so a miss
+/// means something re-fitted or elided the block mid-turn — a second
+/// iteration's enforced pressure gate, or a reroute's clamp — and a
+/// conversation this does not recognise is one to leave alone.
+fn withdraw_accepted_expansion(
+    conversation: &mut CarriedTurn,
+    accepted: &str,
+    refusal: &str,
+) -> bool {
+    // Matched on exact text: the seed block is `SkillTurn::text` as the offer
+    // measured it and as the answer approved it, pushed by `CarriedTurn::begin`
+    // without an edit in between.
+    conversation
+        .ctx_mut()
+        .withdraw_block(accepted, crate::harness::turn_loop::error_result(refusal))
 }
 
 fn skill_would_not_survive_refit(
@@ -28755,7 +30303,7 @@ provider_id = \"deepseek\"
     mod route_budget {
         use super::*;
         use crate::carry::CarriedTurn;
-        use crate::harness::budget::{derive, BudgetInputs, RouteBudget};
+        use crate::harness::budget::{derive, BudgetInputs, RouteBudget, LOCAL_WINDOW_LABEL};
         use crate::sessions::SessionRegistry;
         use std::io::{Read, Write};
         use std::net::TcpListener;
@@ -29402,6 +30950,177 @@ provider_id = \"deepseek\"
             assert!(
                 hits.load(Ordering::SeqCst) >= 1,
                 "non-vacuity: the daemon really did reach the mock vendor"
+            );
+        }
+
+        /// An engine that refuses anything over `window_bytes` with the same
+        /// [`EngineError::ContextWindowExceeded`] variant
+        /// `teton_inference::over_window` produces in production — the local
+        /// tier's `RefuseOversized`.
+        ///
+        /// Byte currency rather than tokens because this double has no
+        /// tokenizer; the harness discards the engine's figures either way
+        /// (REQ-589 ADR-3), so only the variant travels.
+        struct RefusesOverWindow {
+            window_bytes: usize,
+        }
+
+        impl Engine for RefusesOverWindow {
+            fn model_id(&self) -> &str {
+                "refuses-over-window"
+            }
+            fn complete(
+                &self,
+                prompt: &str,
+                _params: &GenParams,
+                _on_token: &mut dyn FnMut(&str) -> bool,
+            ) -> Result<Completion, EngineError> {
+                let measured = u32::try_from(prompt.len()).unwrap_or(u32::MAX);
+                let window = u32::try_from(self.window_bytes).unwrap_or(u32::MAX);
+                if measured > window {
+                    return Err(EngineError::ContextWindowExceeded {
+                        prompt_tokens: measured,
+                        budget_tokens: window,
+                        n_ctx: window,
+                        max_tokens: 0,
+                    });
+                }
+                Ok(Completion::cold("Done.".to_owned(), 1, 1))
+            }
+        }
+
+        /// Every tier bound to a declared local provider, so the turn is served
+        /// on this machine rather than resolving to an endpoint nothing is
+        /// listening on.
+        fn local_only_config() -> Config {
+            Config {
+                providers: vec![ModelProvider {
+                    id: "local".to_owned(),
+                    kind: ProviderKind::Local,
+                    endpoint: None,
+                    model: None,
+                    auth_ref: None,
+                    capabilities: ProviderCapabilities::default(),
+                }],
+                tiers: Tier::ALL
+                    .iter()
+                    .map(|tier| TierBinding {
+                        tier: *tier,
+                        provider_id: "local".to_owned(),
+                        fallback_id: None,
+                    })
+                    .collect(),
+                ..Config::default()
+            }
+        }
+
+        /// A daemon whose local tier is live and refuses anything past
+        /// `window_bytes`.
+        fn refusing_local_runtime(engine: impl Engine + 'static) -> Arc<DaemonRuntime> {
+            let runtime = DaemonRuntime::minimal();
+            *runtime.config.lock().expect("config mutex") = local_only_config();
+            runtime.engine.install(
+                "refuses-over-window".to_owned(),
+                Arc::new(Mutex::new(engine)),
+            );
+            runtime.local_available.store(true, Ordering::SeqCst);
+            Arc::new(runtime)
+        }
+
+        async fn local_turn(runtime: &Arc<DaemonRuntime>) -> Result<PromptTurnResult, RpcError> {
+            let events = Arc::new(EventBus::new());
+            let sessions = SessionRegistry::new();
+            let session_id = sessions
+                .create(SessionMode::Freeform, None, None)
+                .expect("a freeform session needs no phase")
+                .session_id;
+            runtime
+                .run_prompt_turn(
+                    &events,
+                    &sessions,
+                    session_id,
+                    SessionMode::Freeform,
+                    None,
+                    None,
+                    "a prompt the local engine will say is too large".to_owned(),
+                    None,
+                    None,
+                    ClientPresence::unwatched(),
+                )
+                .await
+        }
+
+        /// **REQ-589 AC-1, at the runtime.** A local-engine turn whose rendered
+        /// prompt crosses the engine's window ends with
+        /// `CONTEXT_LENGTH_EXCEEDED` — the same code the remote tier has
+        /// produced since REQ-586 — rather than the `INTERNAL_ERROR` this path
+        /// produced for the whole life of the typed outcome.
+        ///
+        /// Driven end to end through `run_prompt_turn` rather than off the
+        /// error type, because the claim is about the arm the daemon takes: the
+        /// variant existing proves nothing if the runtime still lets it fall
+        /// through to the `HarnessError::Engine` arm below it (LESSON-544).
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn a_local_over_window_turn_is_the_typed_outcome_not_an_internal_error() {
+            // A system prompt alone is thousands of bytes, so any real turn
+            // crosses a 16-byte window.
+            let runtime = refusing_local_runtime(RefusesOverWindow { window_bytes: 16 });
+            let err = local_turn(&runtime)
+                .await
+                .expect_err("a refused turn must not report success");
+
+            assert_eq!(err.code, error_code::CONTEXT_LENGTH_EXCEEDED, "{err:?}");
+            assert!(
+                err.message.contains("the local engine refused this turn"),
+                "the report must name the tier that refused: {}",
+                err.message
+            );
+            assert!(
+                err.message.contains(LOCAL_WINDOW_LABEL),
+                "the report must name the window it was measured against: {}",
+                err.message
+            );
+            assert!(
+                err.message.contains("word budget"),
+                "the report must carry the gap a user acts on: {}",
+                err.message
+            );
+            assert!(
+                !err.message.contains("could not serve the turn"),
+                "the old opaque sentence must be gone: {}",
+                err.message
+            );
+        }
+
+        /// The paired half. An engine that simply falls over is still an
+        /// `INTERNAL_ERROR` naming the engine's own sentence — the arm this REQ
+        /// must not have widened.
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn a_local_inference_failure_is_still_an_internal_error() {
+            struct FallsOver;
+            impl Engine for FallsOver {
+                fn model_id(&self) -> &str {
+                    "falls-over"
+                }
+                fn complete(
+                    &self,
+                    _prompt: &str,
+                    _params: &GenParams,
+                    _on_token: &mut dyn FnMut(&str) -> bool,
+                ) -> Result<Completion, EngineError> {
+                    Err(EngineError::Backend("the backend went away".to_owned()))
+                }
+            }
+
+            let err = local_turn(&refusing_local_runtime(FallsOver))
+                .await
+                .expect_err("a failed turn must not report success");
+            assert_eq!(err.code, error_code::INTERNAL_ERROR, "{err:?}");
+            assert!(
+                err.message
+                    .contains("the local engine could not serve the turn"),
+                "{}",
+                err.message
             );
         }
     }
@@ -31783,6 +33502,2146 @@ provider_id = \"deepseek\"
 
             let _ = std::fs::remove_dir_all(&from);
             let _ = std::fs::remove_dir_all(&to);
+        }
+    }
+    /// REQ-589 BR-14.2 / ADR-9 (D-8) — the observed-rejection memo.
+    ///
+    /// The store is the easy half. What these tests are actually holding is the
+    /// **boundary** between BR-14.2 and BR-10: a rejection this daemon watched
+    /// happen may be remembered, and an answer a person gave may not. The two
+    /// negative assertions below are what keeps a later edit from turning the
+    /// first into the second — the failure would otherwise be silent, because a
+    /// memo that quietly suppressed or pre-answered the next offer looks exactly
+    /// like a memo that works, right up until something is sent that nobody
+    /// approved.
+    mod observed_window_rejections {
+        use super::*;
+        use crate::harness::budget::{derive, BudgetInputs};
+        use crate::harness::permissions::PermissionConfig;
+        use crate::skills::permission_key_for;
+
+        /// The route the reported `/analyze` failure ran on — the local pair.
+        fn local_window() -> RouteWindow {
+            RouteWindow::of(&derive(BudgetInputs::local()))
+        }
+
+        /// A remote route whose provider declares `window` tokens.
+        fn remote_window(window: u32) -> RouteWindow {
+            RouteWindow::of(&derive(BudgetInputs {
+                window,
+                cap: 0,
+                reservation: 1_024,
+                is_local: false,
+                redact_scan: false,
+                provider_id: Some("kimi"),
+            }))
+        }
+
+        /// Every regular file under `dir`, recursively.
+        fn files_under(dir: &Path) -> Vec<PathBuf> {
+            let mut found = Vec::new();
+            let mut stack = vec![dir.to_path_buf()];
+            while let Some(next) = stack.pop() {
+                let Ok(entries) = std::fs::read_dir(&next) else {
+                    continue;
+                };
+                for entry in entries.flatten() {
+                    let path = entry.path();
+                    if path.is_dir() {
+                        stack.push(path);
+                    } else {
+                        found.push(path);
+                    }
+                }
+            }
+            found
+        }
+
+        /// `mark` reports the clean→observed transition, so the caller announces
+        /// once (`EffortRefusals::mark`'s discipline, and for its reason).
+        #[test]
+        fn mark_reports_the_first_time_transition_so_the_caller_announces_once() {
+            let memo = ObservedWindowRejections::new();
+            let session = SessionId::from("s");
+
+            assert!(
+                memo.mark(&session, "analyze", &local_window()),
+                "the first rejection observed for a pair is the transition"
+            );
+            assert!(
+                !memo.mark(&session, "analyze", &local_window()),
+                "a re-mark owes the user nothing — the sentence was already said"
+            );
+            assert!(memo.was_observed(&session, "analyze", &local_window()));
+        }
+
+        /// The record is scoped by its key, and the **window is part of it**.
+        ///
+        /// The last assertion is the one with teeth: raising the declared window
+        /// is the remedy the offer proposes, and a route that came back with a
+        /// bigger budget is a different route. A memo keyed on the provider
+        /// alone would open the next offer with "the provider rejected this last
+        /// time" about a window that no longer exists — a stale record
+        /// replaying, which is ASSUME-017's harm wearing a different hat.
+        #[test]
+        fn the_record_is_scoped_by_session_skill_and_window() {
+            let memo = ObservedWindowRejections::new();
+            let mine = SessionId::from("mine");
+            let theirs = SessionId::from("theirs");
+
+            assert!(memo.mark(&mine, "analyze", &local_window()));
+
+            assert!(
+                !memo.was_observed(&theirs, "analyze", &local_window()),
+                "another session's conversation is not evidence about this one"
+            );
+            assert!(
+                !memo.was_observed(&mine, "review", &local_window()),
+                "another skill's expansion is a different set of bytes"
+            );
+            assert!(
+                !memo.was_observed(&mine, "analyze", &remote_window(8_192)),
+                "another route's window refused nothing here"
+            );
+
+            assert!(memo.mark(&mine, "analyze", &remote_window(8_192)));
+            assert!(
+                !memo.was_observed(&mine, "analyze", &remote_window(200_000)),
+                "a raised window is a different route: the rejection observed \
+                 under the old one says nothing about what this one will do"
+            );
+        }
+
+        /// **Negative assertion 1 (BR-10, AC-23): the record does not suppress
+        /// the next offer.**
+        ///
+        /// D-1 is always-ask, and what decides whether the user is asked is
+        /// [`skill_fit`]'s verdict against the stamped budget — a function of
+        /// the system prompt, the expansion and the pair, and of nothing else.
+        /// This drives that function either side of a `mark` for the very pair
+        /// it is measuring and asserts the verdict is unchanged **byte for
+        /// byte**, message included: the memo is not an input to it, so a marked
+        /// pair reaches the same question an unmarked one does.
+        ///
+        /// It looks redundant and is not (LESSON-508). Nothing else would fail
+        /// if a later edit consulted this store before offering: the turn would
+        /// simply stop asking, which reads as the feature working — the user
+        /// hits the wall silently instead of being offered the remedy, which is
+        /// D-8's failure restored.
+        #[test]
+        fn an_observed_rejection_does_not_suppress_the_next_offer() {
+            let budget = derive(BudgetInputs::local());
+            let system = "You are Teton Code.";
+            let expansion = "word ".repeat(budget.budget_tokens + 1);
+            let verdict = || {
+                skill_fit(
+                    SkillCaller::User,
+                    SkillStage::Body,
+                    "analyze",
+                    system,
+                    &expansion,
+                    &budget,
+                    None,
+                )
+            };
+
+            let before = verdict();
+            assert!(
+                matches!(before, SkillFit::TooLarge { .. }),
+                "non-vacuity: this fixture must be the over-budget case, or the \
+                 comparison below is between two `Fits`"
+            );
+
+            let memo = ObservedWindowRejections::new();
+            let session = SessionId::from("s");
+            assert!(memo.mark(&session, "analyze", &RouteWindow::of(&budget)));
+
+            assert_eq!(
+                verdict(),
+                before,
+                "the offer is still reached, and its sentence is unchanged: the \
+                 memo may inform the question, never skip it"
+            );
+        }
+
+        /// **Negative assertion 2 (BR-10, AC-23): the record does not pre-answer
+        /// the next offer.**
+        ///
+        /// Answers a person gave live on the session's [`PermissionGate`], and
+        /// that is the only place a later turn can read one from. Marking an
+        /// observation writes nothing there — under either skill key — so the
+        /// next offer is still asked and still has to be answered by a human.
+        ///
+        /// This is the assertion that keeps an *observation* from becoming a
+        /// *consent*: a stored consent could send something nobody approved
+        /// (BR-10, BUG-161's shape), while a stored observation can only make
+        /// the next question better informed.
+        #[test]
+        fn an_observed_rejection_does_not_pre_answer_the_next_offer() {
+            let session = SessionId::from("s");
+            let gate = PermissionGate::new(
+                session.clone(),
+                PermissionConfig::default(),
+                Arc::new(EventBus::new()),
+                Arc::new(PendingPermissions::new()),
+            );
+
+            let memo = ObservedWindowRejections::new();
+            assert!(memo.mark(&session, "analyze", &local_window()));
+
+            for key in [
+                permission_key_for(SkillSource::User, "analyze"),
+                permission_key_for(SkillSource::Project, "analyze"),
+            ] {
+                assert!(
+                    gate.remembered(&key).is_none(),
+                    "an observation answered `{key}` — the next offer would be \
+                     resolved from a question nobody was asked"
+                );
+            }
+        }
+
+        /// **The memo is session-scoped and never persisted** (ADR-9), and the
+        /// guard is redundant-looking for LESSON-508's exact reason: nothing
+        /// else in the suite would redden if someone gave this store a serde
+        /// derive and a write, and a rejection observed in one session that
+        /// replayed into the next would open an offer with a claim about a route
+        /// this daemon has never run.
+        ///
+        /// Both halves, because either alone is satisfiable by accident: the
+        /// state directory gains no file naming the skill, **and** a daemon
+        /// restarted over that same directory has forgotten it.
+        #[test]
+        fn an_observed_rejection_never_reaches_disk_and_is_gone_on_restart() {
+            let dir = scratch_dir("observed-rejection");
+            let events = Arc::new(EventBus::new());
+            let runtime = DaemonRuntime::from_env(&dir, &events).expect("the daemon starts");
+
+            let session = SessionId::from("s");
+            // Distinctive enough that a substring hit anywhere under the state
+            // dir is this record and not a coincidence.
+            let skill = "zzz-observed-rejection-witness";
+            assert!(runtime
+                .window_rejections()
+                .mark(&session, skill, &local_window()));
+            assert!(
+                runtime
+                    .window_rejections()
+                    .was_observed(&session, skill, &local_window()),
+                "non-vacuity: the record is really in the store this is about to \
+                 claim wrote nothing"
+            );
+
+            let on_disk = files_under(&dir);
+            assert!(
+                !on_disk.is_empty(),
+                "non-vacuity: a state directory this daemon wrote nothing into \
+                 would satisfy the scan below for the wrong reason"
+            );
+            let named: Vec<_> = on_disk
+                .into_iter()
+                .filter(|path| {
+                    std::fs::read(path)
+                        .map(|bytes| String::from_utf8_lossy(&bytes).contains(skill))
+                        .unwrap_or(false)
+                })
+                .collect();
+            assert!(
+                named.is_empty(),
+                "the observation reached disk: {named:?} — it is evidence about \
+                 one conversation and must not outlive it"
+            );
+
+            let restarted = DaemonRuntime::from_env(&dir, &events).expect("the daemon restarts");
+            assert!(
+                !restarted
+                    .window_rejections()
+                    .was_observed(&session, skill, &local_window()),
+                "a restarted daemon remembered a rejection it never observed"
+            );
+
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+    }
+    /// **REQ-589 TASK-247 — the offer, wired into Stage A.**
+    ///
+    /// Everything here drives a **real prompt turn**. That is not a style
+    /// preference: REQ-585 and REQ-587 each shipped Critical defects past a
+    /// green ~3,500-test suite because a new wire fact was pinned by a struct
+    /// literal, which leaves the *producer* unguarded (LESSON-544, LESSON-552).
+    /// Each of the three events TASK-241 added is published from exactly one
+    /// line, and deleting or mutating any of those lines reddens a named test
+    /// below:
+    ///
+    /// | Mutation | Test that fails |
+    /// |---|---|
+    /// | the `skill_over_budget_offered` publish | [`a_declined_offer_is_todays_refusal_and_no_provider_sees_the_turn`] |
+    /// | the `skill_over_budget_accepted` publish | [`an_accepted_offer_dispatches_the_expansion_whole`] |
+    /// | the `skill_over_budget_remedy_applied` publish | [`a_capped_route_reads_the_declared_window_and_its_remedy_clears_the_cap`] |
+    /// | `offer.question(..)` dropped from the subject (ADR-16) | [`the_offer_carries_the_daemons_own_words_and_the_figures_it_measured`] |
+    /// | `inputs.window` swapped for `inputs.cap` (ADR-15) | [`a_capped_route_reads_the_declared_window_and_its_remedy_clears_the_cap`] |
+    /// | the `invoker: None` arm mapped to proceed (BR-4) | [`an_offer_with_nobody_to_ask_is_todays_refusal_and_announces_nothing`] |
+    /// | an offer raised on the model's path (BR-2) | [`the_offer_is_reachable_only_from_the_typed_path`] |
+    /// | `PressurePolicy::SuspendedForAcceptedTurn` dropped (BR-12) | [`an_accepted_offer_dispatches_the_expansion_whole`] |
+    ///
+    /// The route the reported failure ran on is the **local engine**, so that is
+    /// what most of these use; the `UserCap` leg exists because it is the one
+    /// bound whose remedy this build applies in-line, and because it is the row
+    /// that discriminates `.window` from `.cap`.
+    mod the_over_budget_offer {
+        use super::*;
+        use crate::grants::GrantRegistry;
+        use crate::harness::budget::{LOCAL_BUDGET_BYTES, LOCAL_BUDGET_TOKENS};
+        use crate::harness::permissions::{AddressedPermissionDelivery, PermissionConfig};
+        use crate::sessions::SessionRegistry;
+        use crate::skills::{discover, RealFs};
+        use teton_protocol::events::{
+            PermissionRequest, RemedyKind, WindowVerdict, OPTION_ID_OVER_BUDGET_DECLINE,
+            OPTION_ID_OVER_BUDGET_PROCEED_AND_REMEDY, OPTION_ID_OVER_BUDGET_PROCEED_ONCE,
+            OPTION_ID_OVER_BUDGET_REMEDY_ONLY,
+        };
+        use teton_protocol::methods::PermissionOutcome;
+
+        /// A body marker no other fixture in this crate uses, so a prompt
+        /// carrying it can only have come from this expansion.
+        const MARKER: &str = "SKILLBODYMARKER-247";
+
+        /// The **last** line of that same body, and the reason it exists: the
+        /// naming duty sends a *bounded prefix* of the expansion, so a prompt
+        /// carrying [`MARKER`] alone might be the title duty rather than the
+        /// turn. Only a prompt carrying this one reached the end of the body.
+        const TAIL_MARKER: &str = "SKILLTAILMARKER-247";
+
+        /// A body comfortably past the local pair in both currencies, and past a
+        /// 6,000-token cap by a wide margin.
+        ///
+        /// Sized off [`LOCAL_BUDGET_TOKENS`] rather than a literal, so the
+        /// fixture cannot quietly stop being over budget if the pair moves.
+        fn oversized_body() -> String {
+            format!(
+                "Handle {MARKER} now.\n\n{}\n\nAnd then {TAIL_MARKER}.",
+                "word ".repeat(LOCAL_BUDGET_TOKENS * 2)
+            )
+        }
+
+        /// A remote provider declaring a large window under a small user cap —
+        /// the `UserCap` row of the reachability table, and the one that
+        /// discriminates the declared window from this daemon's own ceiling.
+        ///
+        /// Only `build` is bound to it, so the freeform classifier and the
+        /// naming duty (both `reflex`) still run on the local engine and no
+        /// transport is needed to reach the refusal.
+        const CAPPED_ROUTE: &str = "[[providers]]\n\
+             id = \"capped\"\n\
+             kind = \"openai-compatible\"\n\
+             endpoint = \"http://127.0.0.1:1/v1\"\n\
+             model = \"capped-model\"\n\
+             [providers.capabilities]\n\
+             max_context = 200000\n\
+             context_budget_cap = 6000\n\
+             \n\
+             [[tiers]]\n\
+             tier = \"build\"\n\
+             provider_id = \"capped\"\n";
+
+        /// An engine that answers `edit` — parseable as a judgment category, as
+        /// a session title, and as a finished turn — and remembers every prompt
+        /// it was handed.
+        ///
+        /// It is the **egress capture** for a local route (AC-18): on this tier
+        /// the engine *is* the provider, so "nothing was sent and no provider
+        /// saw this turn" is the statement that no prompt beyond the
+        /// classifier's ever reached it.
+        ///
+        /// **It can also be told to refuse the expansion** (TASK-249). Once
+        /// [`RecordingEngine::refuse_the_expansion`] is called it answers any
+        /// prompt carrying the whole body with the same
+        /// `EngineError::ContextWindowExceeded` variant
+        /// `teton_inference::over_window` produces in production — the local
+        /// tier's real window refusal, which is what BR-14.1's withdrawal
+        /// triggers on. The classifier is excluded from that rule for
+        /// [`RecordingEngine::beyond_the_classifier`]'s reason (it runs above
+        /// Stage A and is not the turn), and the naming duty excludes itself:
+        /// it sends a bounded *prefix*, which is precisely why [`TAIL_MARKER`]
+        /// exists.
+        #[derive(Clone)]
+        struct RecordingEngine {
+            prompts: Arc<Mutex<Vec<String>>>,
+            refusing: Arc<AtomicBool>,
+        }
+
+        impl RecordingEngine {
+            fn new() -> Self {
+                Self {
+                    prompts: Arc::new(Mutex::new(Vec::new())),
+                    refusing: Arc::new(AtomicBool::new(false)),
+                }
+            }
+
+            /// From here on, a prompt carrying the whole expansion is refused
+            /// at the window. Shared through the fixture's clone, so flipping
+            /// it here flips the engine the daemon holds.
+            fn refuse_the_expansion(&self) {
+                self.refusing.store(true, Ordering::SeqCst);
+            }
+
+            fn prompts(&self) -> Vec<String> {
+                self.prompts.lock().expect("recorder mutex").clone()
+            }
+
+            /// Every prompt that is **not** the freeform classifier's — which,
+            /// on this tier, is every model call the turn itself spent.
+            ///
+            /// The classifier is excluded rather than counted because it runs
+            /// *above* Stage A by design (REQ-585 ADR-3: the expansion is built
+            /// before both readers of the prompt text), so a refused turn has
+            /// legitimately paid for it and BR-11 does not claim otherwise.
+            fn beyond_the_classifier(&self) -> Vec<String> {
+                self.prompts()
+                    .into_iter()
+                    .filter(|prompt| !prompt.contains("Classify one software-engineering request"))
+                    .collect()
+            }
+        }
+
+        impl Engine for RecordingEngine {
+            fn model_id(&self) -> &str {
+                "recording"
+            }
+
+            fn complete(
+                &self,
+                prompt: &str,
+                _params: &GenParams,
+                _on_token: &mut dyn FnMut(&str) -> bool,
+            ) -> Result<Completion, EngineError> {
+                self.prompts
+                    .lock()
+                    .expect("recorder mutex")
+                    .push(prompt.to_owned());
+                // Recorded first, refused second: a refusal the recorder never
+                // saw would leave the "the accepted turn really did carry the
+                // whole body" non-vacuity check below unable to see it either.
+                if self.refusing.load(Ordering::SeqCst)
+                    && prompt.contains(TAIL_MARKER)
+                    && !prompt.contains("Classify one software-engineering request")
+                {
+                    let measured = u32::try_from(prompt.len()).unwrap_or(u32::MAX);
+                    return Err(EngineError::ContextWindowExceeded {
+                        prompt_tokens: measured,
+                        budget_tokens: 1,
+                        n_ctx: 1,
+                        max_tokens: 0,
+                    });
+                }
+                Ok(Completion::cold("edit".to_owned(), 0, 1))
+            }
+        }
+
+        /// A client that answers the project-skill acknowledgment with "allow
+        /// for this session" and the **over-budget offer** with one named option
+        /// id, recording every request it was shown.
+        ///
+        /// The option is picked by **id**, never by `PermissionOptionKind`: the
+        /// four ids are what ADR-1's single-select actually turns on, and two of
+        /// them necessarily share a kind — a fixture selecting by kind could not
+        /// tell `proceed_once` from `proceed_and_remedy`, which is the whole
+        /// distinction AC-7b is about.
+        struct Client {
+            pending: Arc<PendingPermissions>,
+            answer: &'static str,
+            asked: Mutex<Vec<PermissionRequest>>,
+        }
+
+        impl Client {
+            fn answering(pending: &Arc<PendingPermissions>, answer: &'static str) -> Arc<Self> {
+                Arc::new(Self {
+                    pending: Arc::clone(pending),
+                    answer,
+                    asked: Mutex::new(Vec::new()),
+                })
+            }
+
+            /// Only the offers — the acknowledgment is a different question and
+            /// TASK-248 owns it.
+            fn offers(&self) -> Vec<PermissionRequest> {
+                self.asked
+                    .lock()
+                    .expect("asked mutex poisoned")
+                    .iter()
+                    .filter(|request| {
+                        matches!(
+                            request.subject,
+                            Some(PermissionSubject::SkillOverBudget { .. })
+                        )
+                    })
+                    .cloned()
+                    .collect()
+            }
+        }
+
+        impl AddressedPermissionDelivery for Client {
+            fn deliver(
+                &self,
+                connection: ConnectionId,
+                _session_id: &SessionId,
+                request: PermissionRequest,
+            ) -> bool {
+                self.asked
+                    .lock()
+                    .expect("asked mutex poisoned")
+                    .push(request.clone());
+                let option_id = if matches!(
+                    request.subject,
+                    Some(PermissionSubject::SkillOverBudget { .. })
+                ) {
+                    // Asserted rather than defaulted: an id the prompt did not
+                    // carry would mean the gate narrowed the option list, and
+                    // quietly answering something else would hide that.
+                    assert!(
+                        request
+                            .options
+                            .iter()
+                            .any(|option| option.option_id == self.answer),
+                        "the offer did not carry `{}`: {:?}",
+                        self.answer,
+                        request.options
+                    );
+                    self.answer.to_owned()
+                } else {
+                    "allow_always".to_owned()
+                };
+                self.pending.resolve_from(
+                    &request.request_id,
+                    PermissionOutcome::Selected { option_id },
+                    connection,
+                )
+            }
+        }
+
+        /// One session in a fixture repo whose only skill is the oversized one,
+        /// with `client` wired as the addressed-delivery route.
+        struct Fixture {
+            runtime: Arc<DaemonRuntime>,
+            engine: RecordingEngine,
+            events: Arc<EventBus>,
+            sessions: SessionRegistry,
+            session_id: SessionId,
+            client: Arc<Client>,
+            connection: Option<ConnectionId>,
+            dir: PathBuf,
+            body: String,
+        }
+
+        impl Fixture {
+            /// A **project** skill — the shape the reported failure had, and the
+            /// one ASSUME-018 is about. `config` is `None` for that failure's own
+            /// route, the local engine, and `Some(document)` for a remote one.
+            fn new(tag: &str, answer: &'static str, config: Option<&str>) -> Self {
+                Self::build(tag, answer, config, false)
+            }
+
+            /// A **user** skill, for the one leg that has to reach Stage A with
+            /// no connection at all.
+            ///
+            /// A project skill cannot: REQ-589 ADR-10 puts the repository
+            /// acknowledgment above the expansion, and a turn with nobody to ask
+            /// fails closed there — so it never reaches a budget question. That
+            /// is BR-6 working (AC-9), and it is why this leg installs the skill
+            /// in a fixture home instead.
+            fn user_sourced(tag: &str, answer: &'static str) -> Self {
+                Self::build(tag, answer, None, true)
+            }
+
+            fn build(
+                tag: &str,
+                answer: &'static str,
+                config: Option<&str>,
+                user_sourced: bool,
+            ) -> Self {
+                let dir = scratch_dir(tag);
+                std::fs::write(dir.join("Cargo.toml"), "[package]\n").unwrap();
+                let body = oversized_body();
+                // A fixture home, never the runner's: left at the developer's own
+                // `~/.claude/skills` this session would register whatever that
+                // machine happens to have.
+                let home = dir.join("home");
+                let skill_dir = if user_sourced {
+                    home.join(".claude/skills/heavy")
+                } else {
+                    dir.join(".claude/skills/heavy")
+                };
+                std::fs::create_dir_all(&skill_dir).unwrap();
+                std::fs::write(
+                    skill_dir.join("SKILL.md"),
+                    format!("---\ndescription: heavy\n---\n\n{body}\n"),
+                )
+                .unwrap();
+
+                let engine = RecordingEngine::new();
+                let slot = EngineSlot::empty();
+                slot.install(
+                    "recording".to_owned(),
+                    Arc::new(Mutex::new(engine.clone())) as Arc<Mutex<dyn Engine>>,
+                );
+                let mut runtime = DaemonRuntime {
+                    engine: slot,
+                    local_available: AtomicBool::new(true),
+                    ..DaemonRuntime::minimal()
+                };
+                if let Some(document) = config {
+                    // Memory and disk agreeing, which is what a real start
+                    // produces — and what lets the remedy leg read the write
+                    // back off the file rather than off a return code
+                    // (LESSON-519).
+                    let path = dir.join("config.toml");
+                    std::fs::write(&path, document).expect("seed the config");
+                    runtime.config =
+                        Mutex::new(Config::load(document).expect("the fixture config loads"));
+                    runtime.config_path = Some(path);
+                }
+                let runtime = Arc::new(runtime);
+
+                let events = Arc::new(EventBus::new());
+                let sessions = SessionRegistry::new();
+                let session_id = sessions
+                    .create(SessionMode::Freeform, None, Some(dir.clone()))
+                    .expect("a freeform session")
+                    .session_id;
+                let probed = runtime.session_root_for(Some(&dir));
+                // The home is the **fixture's**, so the four discovery globs
+                // cover this tree only — these assertions are about this file
+                // rather than about whatever `~/.claude/skills` the runner
+                // happens to have.
+                sessions.set_skills(
+                    &session_id,
+                    discover(
+                        user_sourced.then_some(home.as_path()),
+                        &probed.path,
+                        probed.view.kind,
+                        &RealFs,
+                    ),
+                );
+
+                let pending = Arc::clone(runtime.pending());
+                let client = Client::answering(&pending, answer);
+                let delivery: Arc<dyn AddressedPermissionDelivery> = client.clone();
+                runtime
+                    .session_gates
+                    .lock()
+                    .expect("session gate mutex poisoned")
+                    .insert(
+                        session_id.clone(),
+                        Arc::new(
+                            PermissionGate::new(
+                                session_id.clone(),
+                                PermissionConfig::default(),
+                                Arc::clone(&events),
+                                Arc::clone(&pending),
+                            )
+                            .with_addressed_delivery(delivery),
+                        ),
+                    );
+
+                Self {
+                    connection: Some(GrantRegistry::new().next_connection_id()),
+                    runtime,
+                    engine,
+                    events,
+                    sessions,
+                    session_id,
+                    client,
+                    dir,
+                    body,
+                }
+            }
+
+            async fn invoke(&self) -> Result<PromptTurnResult, RpcError> {
+                self.runtime
+                    .run_prompt_turn(
+                        &self.events,
+                        &self.sessions,
+                        self.session_id.clone(),
+                        SessionMode::Freeform,
+                        None,
+                        Some(self.dir.clone()),
+                        String::new(),
+                        Some(SkillInvocation {
+                            name: "heavy".to_owned(),
+                            raw_arguments: String::new(),
+                        }),
+                        self.connection,
+                        ClientPresence::unwatched(),
+                    )
+                    .await
+            }
+
+            /// An ordinary typed turn in the **same session** — no skill, no
+            /// offer. What BR-14.1's "the next turn assembles without it" is a
+            /// claim about, and the only way to observe what this session now
+            /// carries without inspecting the block list (AC-22).
+            async fn prompt(&self, text: &str) -> Result<PromptTurnResult, RpcError> {
+                self.runtime
+                    .run_prompt_turn(
+                        &self.events,
+                        &self.sessions,
+                        self.session_id.clone(),
+                        SessionMode::Freeform,
+                        None,
+                        Some(self.dir.clone()),
+                        text.to_owned(),
+                        None,
+                        self.connection,
+                        ClientPresence::unwatched(),
+                    )
+                    .await
+            }
+        }
+
+        impl Drop for Fixture {
+            fn drop(&mut self) {
+                let _ = std::fs::remove_dir_all(&self.dir);
+            }
+        }
+
+        /// Everything the bus carried, in order. `publish` is synchronous, so a
+        /// drain taken after the turn returns covers everything the turn itself
+        /// published (LESSON-450: no wall-clock polling).
+        fn drain(sub: &mut crate::broadcast::Subscription) -> Vec<Event> {
+            let mut out = Vec::new();
+            while let Some(envelope) = sub.try_recv() {
+                out.push(envelope.event);
+            }
+            out
+        }
+
+        /// **BR-4, BR-11, AC-3, AC-18 — the not-sent path, by egress capture.**
+        ///
+        /// A declined offer is today’s refusal in every byte, and the turn that
+        /// carried it spent nothing: no model call beyond the classifier that
+        /// ran above Stage A, no `context_pressure`, no health change, and — the
+        /// clause that makes this `-32023` rather than `-32022` — the session’s
+        /// one naming attempt is still unspent, because the duty sits below the
+        /// gate.
+        ///
+        /// The naming duty is checked by **claiming** it: `claim_title` is the
+        /// synchronous act of spending it, so a `true` here is proof the turn
+        /// left it alone, with no dependence on whether a detached task had a
+        /// chance to run.
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn a_declined_offer_is_todays_refusal_and_no_provider_sees_the_turn() {
+            let fx = Fixture::new("ob-decline", OPTION_ID_OVER_BUDGET_DECLINE, None);
+            let mut sub = fx.events.subscribe(256);
+
+            let err = fx.invoke().await.expect_err("a declined offer refuses");
+            assert_eq!(err.code, error_code::SKILL_EXPANSION_TOO_LARGE, "{err:?}");
+            assert!(
+                err.message
+                    .contains("the body alone, with the system prompt, comes to"),
+                "Stage A’s own clause: {}",
+                err.message
+            );
+            assert!(
+                err.message
+                    .contains("Nothing was sent and no provider saw this turn"),
+                "a decline is today’s refusal, and that clause is what makes it \
+                 `-32023`: {}",
+                err.message
+            );
+            assert!(
+                !err.message.contains("You chose to send it anyway"),
+                "the accepted record must be unreachable from a refusal (BR-5): {}",
+                err.message
+            );
+
+            // The offer was actually put to a human — without this the refusal
+            // above would also be produced by a daemon that never asked.
+            assert_eq!(
+                fx.client.offers().len(),
+                1,
+                "Stage A asks exactly once: {:?}",
+                fx.client.offers()
+            );
+
+            // BR-11, by capture rather than by inspection: on a local route the
+            // engine is the provider.
+            assert!(
+                fx.engine.beyond_the_classifier().is_empty(),
+                "a refused turn reached a model call: {:?}",
+                fx.engine.beyond_the_classifier()
+            );
+            let published = drain(&mut sub);
+            assert!(
+                !published
+                    .iter()
+                    .any(|event| matches!(event, Event::ContextPressure(_))),
+                "a refused skill turn emits no context pressure of any kind: {published:?}"
+            );
+            assert!(
+                fx.runtime.health_snapshot().is_empty(),
+                "a turn that reached no provider changed a provider’s health"
+            );
+            assert_eq!(
+                fx.sessions
+                    .conversation_snapshot(&fx.session_id)
+                    .blocks()
+                    .len(),
+                0,
+                "a refused turn seeds nothing"
+            );
+            assert!(
+                fx.sessions.claim_title(&fx.session_id),
+                "the session’s one naming attempt is a model call, and a refused turn \
+                 must leave it unspent (BR-11) — the duty stays below the gate"
+            );
+
+            // The record: offered, and nothing more. A turn nobody accepted
+            // publishes no accept, and a turn that wrote nothing publishes no
+            // remedy.
+            let offered: Vec<&Event> = published
+                .iter()
+                .filter(|event| matches!(event, Event::SkillOverBudgetOffered(_)))
+                .collect();
+            assert_eq!(
+                offered.len(),
+                1,
+                "the offer is announced when it is raised: {published:?}"
+            );
+            let Event::SkillOverBudgetOffered(record) = offered[0] else {
+                unreachable!("filtered above")
+            };
+            assert_eq!(record.skill, "heavy");
+            assert_eq!(record.stage, WireSkillStage::Body);
+            assert_eq!(record.bound, BudgetBound::LocalEngine);
+            assert_eq!(record.window_verdict, WindowVerdict::WindowUnknown);
+            assert_eq!(
+                record.remedy_kind,
+                RemedyKind::BindTierRemote,
+                "BR-7’s table for the local engine"
+            );
+            assert_eq!(
+                record.budget_tokens, LOCAL_BUDGET_TOKENS as u64,
+                "the budget the router stamped, verbatim"
+            );
+            assert!(
+                record.measured_tokens > record.budget_tokens,
+                "non-vacuity: this fixture must be the over-budget case ({} vs {})",
+                record.measured_tokens,
+                record.budget_tokens
+            );
+            assert!(
+                !published
+                    .iter()
+                    .any(|event| matches!(event, Event::SkillOverBudgetAccepted(_))),
+                "a declined turn must not record an accept: {published:?}"
+            );
+            assert!(
+                !published
+                    .iter()
+                    .any(|event| matches!(event, Event::SkillOverBudgetRemedyApplied(_))),
+                "a decline writes nothing, so there is no remedy to announce: {published:?}"
+            );
+        }
+
+        /// **AC-1, AC-11, BR-1, BR-12 — accepting sends the expansion whole.**
+        ///
+        /// The reported failure’s own route, answered `over_budget_proceed_once`:
+        /// the turn runs, and what reaches the model carries **every byte** the
+        /// measurement counted. Asserting the whole body rather than a marker is
+        /// the point — a middle-elided expansion still carries its first line.
+        ///
+        /// BR-12 rides the same assertion: the accepted turn’s first iteration
+        /// runs with the pressure gate suspended, so a prompt this far over the
+        /// local pair is assembled intact instead of being truncated to fit.
+        /// Restoring `PressurePolicy::Enforced` at the call site reddens the
+        /// whole-body assertion below, because `truncate_to_budget` would
+        /// middle-elide the one block there is.
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn an_accepted_offer_dispatches_the_expansion_whole() {
+            let fx = Fixture::new("ob-accept", OPTION_ID_OVER_BUDGET_PROCEED_ONCE, None);
+            let mut sub = fx.events.subscribe(256);
+
+            fx.invoke().await.expect("an accepted offer runs the turn");
+
+            let sent = fx.engine.beyond_the_classifier();
+            // **The whole body, in one prompt.** Asserting a marker would not
+            // say this: a middle-elided expansion still carries its first line
+            // *and* its last — which is exactly what the naming duty's own
+            // bounded copy of this text looks like, and why that copy cannot
+            // satisfy this assertion. Only an unshortened send can.
+            assert!(
+                sent.iter().any(|prompt| prompt.contains(fx.body.trim())),
+                "BR-1: the expansion is carried whole — the same bytes that were \
+                 measured, unshortened. The body is {} bytes and the {} prompts the \
+                 model was handed were {:?} bytes",
+                fx.body.len(),
+                sent.len(),
+                sent.iter().map(String::len).collect::<Vec<_>>()
+            );
+            assert!(
+                sent.iter()
+                    .any(|prompt| prompt.contains(TAIL_MARKER) && prompt.contains(MARKER)),
+                "non-vacuity: both ends of this fixture's body reached the model"
+            );
+
+            let published = drain(&mut sub);
+            let accepted: Vec<&Event> = published
+                .iter()
+                .filter(|event| matches!(event, Event::SkillOverBudgetAccepted(_)))
+                .collect();
+            assert_eq!(
+                accepted.len(),
+                1,
+                "an accepted offer records the send: {published:?}"
+            );
+            let Event::SkillOverBudgetAccepted(record) = accepted[0] else {
+                unreachable!("filtered above")
+            };
+            assert_eq!(record.skill, "heavy");
+            assert_eq!(record.stage, WireSkillStage::Body);
+            assert_eq!(record.window_verdict, WindowVerdict::WindowUnknown);
+            assert!(
+                record.measured_tokens > record.budget_tokens,
+                "the record names what was over budget, not a figure that fits"
+            );
+            assert!(
+                published
+                    .iter()
+                    .any(|event| matches!(event, Event::SkillOverBudgetOffered(_))),
+                "an accept is only meaningful beside the offer it answered: {published:?}"
+            );
+            assert!(
+                !published
+                    .iter()
+                    .any(|event| matches!(event, Event::SkillOverBudgetRemedyApplied(_))),
+                "`proceed_once` writes nothing (BR-10): {published:?}"
+            );
+
+            // AC-10 / BR-10: nothing was remembered, so a second identical
+            // invocation asks a second time.
+            fx.invoke().await.expect("the second invocation runs too");
+            assert_eq!(
+                fx.client.offers().len(),
+                2,
+                "accepting twice in one session must prompt twice — there is no \
+                 “don’t ask me again” for the override"
+            );
+        }
+
+        /// **ADR-16 and AC-2 — the daemon words the question, and quotes the
+        /// figures it measured.**
+        ///
+        /// The sentence is on the subject because otherwise it reaches nobody:
+        /// only the four option labels have a surface of their own, so the
+        /// verdict clause would ship dead. This drives a real turn and reads the
+        /// subject the client was actually handed.
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn the_offer_carries_the_daemons_own_words_and_the_figures_it_measured() {
+            let fx = Fixture::new("ob-sentence", OPTION_ID_OVER_BUDGET_DECLINE, None);
+            let _ = fx.invoke().await.expect_err("declined");
+
+            let offers = fx.client.offers();
+            let Some(PermissionSubject::SkillOverBudget {
+                sentence,
+                measured_tokens,
+                budget_tokens,
+                bound,
+                ..
+            }) = offers.first().and_then(|request| request.subject.clone())
+            else {
+                panic!("the offer’s subject never reached the client: {offers:?}");
+            };
+
+            assert!(
+                sentence.starts_with("`/heavy`"),
+                "the question opens with the subject the composer writes: {sentence}"
+            );
+            assert!(
+                sentence.contains("does not fit this route's context budget"),
+                "and it is the head of the refusal it replaced, unchanged — which \
+                 is what stops the offer and its own decline quoting different \
+                 numbers for one measurement: {sentence}"
+            );
+            assert!(
+                sentence.contains("(this repository's skill)"),
+                "ASSUME-018: a project-sourced name is repository-authored text and \
+                 is marked as such rather than borrowing the harness's voice: \
+                 {sentence}"
+            );
+            assert!(
+                sentence.contains("bound: local engine"),
+                "AC-2: the bound is named verbatim, from the stamped budget: {sentence}"
+            );
+            assert!(
+                sentence.contains("cannot promise"),
+                "BR-3’s `WindowUnknown` clause is the one true thing about a route \
+                 with no window fact, and it has no other surface: {sentence}"
+            );
+            assert!(
+                !sentence.contains("Nothing was sent and no provider saw this turn"),
+                "the question is not the refusal — that clause belongs to the \
+                 sentence a decline earns (BR-5): {sentence}"
+            );
+
+            // The subject’s structure and its sentence describe one measurement.
+            assert_eq!(bound, BudgetBound::LocalEngine);
+            assert!(measured_tokens > budget_tokens);
+
+            // The two ids every offer carries, whatever BR-7's table said.
+            // Whether the other two join them is a question about the *write*
+            // rather than about the bound — this fixture configures no remote
+            // provider, so BR-9's rebind has nothing to bind to and the option
+            // that would promise it is withheld
+            // ([`a_rebind_is_offered_to_nobody_when_the_daemon_would_have_to_choose`]).
+            let ids: Vec<&str> = offers[0]
+                .options
+                .iter()
+                .map(|option| option.option_id.as_str())
+                .collect();
+            assert!(
+                ids.contains(&OPTION_ID_OVER_BUDGET_PROCEED_ONCE)
+                    && ids.contains(&OPTION_ID_OVER_BUDGET_DECLINE),
+                "every offer carries the one-time override and the decline: {ids:?}"
+            );
+        }
+
+        /// **ADR-15 and BR-7 — the verdict reads the declared window, and the
+        /// remedy clears the ceiling that actually bound the route.**
+        ///
+        /// A `UserCap` route is the row where `.window` and `.cap` disagree, and
+        /// the disagreement is not academic: the provider declares 200,000
+        /// tokens while the user’s ceiling is 6,000. The measurement is over
+        /// budget, over the cap, and comfortably **inside the window** — so the
+        /// honest verdict is `FitsWindow`. Passing `.cap` to
+        /// `OverBudgetOffer::new` collapses this row and tells the user their
+        /// send will blow a window it fits.
+        ///
+        /// The answer is `remedy_only`, which is BR-7’s independent half: fix
+        /// the ceiling, do not run this turn. So the turn still refuses with
+        /// `-32023` while the config is written — and the write is checked by
+        /// **reading the file back off disk and re-parsing it**, not by trusting
+        /// a return code (LESSON-519).
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn a_capped_route_reads_the_declared_window_and_its_remedy_clears_the_cap() {
+            let fx = Fixture::new(
+                "ob-usercap",
+                OPTION_ID_OVER_BUDGET_REMEDY_ONLY,
+                Some(CAPPED_ROUTE),
+            );
+            let mut sub = fx.events.subscribe(256);
+
+            let err = fx.invoke().await.expect_err("remedy-only does not send");
+            assert_eq!(err.code, error_code::SKILL_EXPANSION_TOO_LARGE, "{err:?}");
+
+            let published = drain(&mut sub);
+            let Some(Event::SkillOverBudgetOffered(record)) = published
+                .iter()
+                .find(|event| matches!(event, Event::SkillOverBudgetOffered(_)))
+            else {
+                panic!("no offer was raised on the capped route: {published:?}");
+            };
+            assert_eq!(
+                record.bound,
+                BudgetBound::UserCap,
+                "non-vacuity: this fixture must actually be the `UserCap` row, or \
+                 the verdict below proves nothing"
+            );
+            assert_eq!(
+                record.window_verdict,
+                WindowVerdict::FitsWindow,
+                "the verdict is measured against the provider’s **declared window** \
+                 (200,000), not against this daemon’s own cap (6,000) — over budget, \
+                 over the cap, and still inside the window is a reachable state \
+                 and the sentence has to say so"
+            );
+            assert_eq!(record.remedy_kind, RemedyKind::RaiseCap);
+
+            let applied: Vec<&Event> = published
+                .iter()
+                .filter(|event| matches!(event, Event::SkillOverBudgetRemedyApplied(_)))
+                .collect();
+            assert_eq!(
+                applied.len(),
+                1,
+                "a remedy that was written is announced: {published:?}"
+            );
+            let Event::SkillOverBudgetRemedyApplied(remedy) = applied[0] else {
+                unreachable!("filtered above")
+            };
+            assert_eq!(remedy.remedy_kind, RemedyKind::RaiseCap);
+            assert_eq!(
+                remedy.provider_id.as_ref().map(|id| id.0.as_str()),
+                Some("capped")
+            );
+            assert_eq!(
+                (remedy.previous_value.as_str(), remedy.new_value.as_str()),
+                ("6000", "0 (no cap)"),
+                "both values, always: a record naming only the new one cannot tell \
+                 a fix from a wipe"
+            );
+            assert!(
+                !published
+                    .iter()
+                    .any(|event| matches!(event, Event::SkillOverBudgetAccepted(_))),
+                "`remedy_only` is a decline that writes — it never records a send: \
+                 {published:?}"
+            );
+
+            // The write, read back off disk and re-parsed — the double check
+            // `config_preservation.rs` is the exemplar for.
+            let document = std::fs::read_to_string(fx.dir.join("config.toml"))
+                .expect("the config document survives the write");
+            let reloaded = Config::load(&document).expect("and still parses");
+            let provider = reloaded
+                .providers
+                .iter()
+                .find(|p| p.id == "capped")
+                .expect("the provider survives a field-wise write");
+            assert_eq!(
+                provider.capabilities.context_budget_cap, 0,
+                "the ceiling the offer promised to clear is cleared on disk: {document}"
+            );
+            assert_eq!(
+                provider.capabilities.max_context, 200_000,
+                "and the field this remedy does not touch is preserved (ADR-7’s \
+                 field-wise merge): {document}"
+            );
+            assert_eq!(
+                provider.model.as_deref(),
+                Some("capped-model"),
+                "a field-wise window write must re-state the identity it is not \
+                 changing, or `RegisterProvider` drops it: {document}"
+            );
+        }
+
+        /// **BR-4 and AC-4 — silence is never consent.**
+        ///
+        /// A turn with no connection to address the question to cannot put it to
+        /// anyone. What that earns is today’s refusal, and — because no offer
+        /// was raised — no `skill_over_budget_offered`, which is exactly the
+        /// distinction the record exists to carry: "nobody was asked" is not
+        /// "somebody was asked and said no".
+        ///
+        /// Mapping this arm to proceed would send an oversized turn nobody
+        /// approved, and nothing else in the suite would notice.
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn an_offer_with_nobody_to_ask_is_todays_refusal_and_announces_nothing() {
+            let mut fx =
+                Fixture::user_sourced("ob-unanswerable", OPTION_ID_OVER_BUDGET_PROCEED_ONCE);
+            // An internal driver or a fixture: there is no connection, so the
+            // question is unanswerable rather than declined. The client above
+            // would have said *yes* — which is what makes this the fail-closed
+            // direction rather than a fixture that simply says no.
+            fx.connection = None;
+            let mut sub = fx.events.subscribe(256);
+
+            let err = fx
+                .invoke()
+                .await
+                .expect_err("an unanswerable offer must never resolve to proceed");
+            assert_eq!(err.code, error_code::SKILL_EXPANSION_TOO_LARGE, "{err:?}");
+            assert!(
+                err.message
+                    .contains("Nothing was sent and no provider saw this turn"),
+                "{}",
+                err.message
+            );
+            assert!(
+                fx.engine.beyond_the_classifier().is_empty(),
+                "an unanswerable offer reached a model call: {:?}",
+                fx.engine.beyond_the_classifier()
+            );
+
+            let published = drain(&mut sub);
+            assert!(
+                !published
+                    .iter()
+                    .any(|event| matches!(event, Event::SkillOverBudgetOffered(_))),
+                "no offer was raised, so none is announced — that absence is what \
+                 distinguishes it from a decline: {published:?}"
+            );
+            assert!(
+                fx.client.offers().is_empty(),
+                "the question must not have been delivered to anybody"
+            );
+        }
+
+        /// One configured remote and nothing bound to it — the shape the
+        /// reported machine had, and ADR-12's *propose by name* case.
+        ///
+        /// No `[[tiers]]` row, so every tier still falls through to the local
+        /// engine (REQ-557 BR-4 removed the "pick the first remote" fallback),
+        /// which is what makes this route's bound `LocalEngine` and its remedy
+        /// BR-9's rebind. The model is `kimi-k3` because BR-7c looks a window up
+        /// by **model**, never by id.
+        const ONE_REMOTE: &str = "[[providers]]\n\
+             id = \"kimi\"\n\
+             kind = \"openai-compatible\"\n\
+             endpoint = \"http://127.0.0.1:1/v1\"\n\
+             model = \"kimi-k3\"\n";
+
+        /// Two configured remotes, neither bound — ADR-12's *ask, never pick*
+        /// case. `anthropic` is second in id order and `kimi` first, so a
+        /// daemon that silently took "the first one" would take `anthropic`
+        /// here and `kimi` above.
+        const TWO_REMOTES: &str = "[[providers]]\n\
+             id = \"kimi\"\n\
+             kind = \"openai-compatible\"\n\
+             endpoint = \"http://127.0.0.1:1/v1\"\n\
+             model = \"kimi-k3\"\n\
+             \n\
+             [[providers]]\n\
+             id = \"anthropic\"\n\
+             kind = \"anthropic\"\n\
+             endpoint = \"http://127.0.0.1:1\"\n\
+             model = \"claude-opus-5\"\n";
+
+        /// A remote route whose provider declares no window and whose model
+        /// matches **no vendor recipe** — BR-7c's "ask, never invent" case, and
+        /// the one the DEFECT this task closes lived in.
+        const UNKNOWN_VENDOR_ROUTE: &str = "[[providers]]\n\
+             id = \"mystery\"\n\
+             kind = \"openai-compatible\"\n\
+             endpoint = \"http://127.0.0.1:1/v1\"\n\
+             model = \"mystery-model-9\"\n\
+             \n\
+             [[tiers]]\n\
+             tier = \"build\"\n\
+             provider_id = \"mystery\"\n";
+
+        /// The option ids an offer actually carried, in the order the prompt
+        /// listed them.
+        fn option_ids(request: &PermissionRequest) -> Vec<&str> {
+            request
+                .options
+                .iter()
+                .map(|option| option.option_id.as_str())
+                .collect()
+        }
+
+        /// **AC-8, ADR-5 — the window is declared FIRST, and the circle is
+        /// unreachable from a partial failure.**
+        ///
+        /// `config/set` persists one update per call and `architecture.md:169-172`
+        /// forbids generalizing it, so BR-9's pair is bought with *ordering*
+        /// rather than atomicity. That makes the order the invariant, and an
+        /// invariant a comment states is a convention — so this fails the
+        /// **second** write and reads what the config was left holding.
+        ///
+        /// The first write goes through the real production path
+        /// (`apply_config_update`: real validation, real atomic persist), so
+        /// what is asserted afterwards is a real file on disk. Reversing the two
+        /// lines in [`RemedyWrites::apply`] reddens this test twice over: the
+        /// declared window would be missing, and the tier would be bound.
+        ///
+        /// The last block is the *why*, demonstrated rather than described —
+        /// the state the reverse order would leave really is the circle the
+        /// reported `/analyze` failure was sitting in.
+        #[test]
+        fn the_rebind_declares_the_window_first_so_the_circle_is_unreachable() {
+            let dir = scratch_dir("ob-order");
+            let path = dir.join("config.toml");
+            std::fs::write(&path, ONE_REMOTE).expect("seed the config");
+            let config = Config::load(ONE_REMOTE).expect("the fixture config loads");
+            let router = build_router(&config, true, &BTreeMap::new());
+
+            // Over the local pair in both currencies, and the same shape
+            // `would_seed_fit` produces.
+            let measured = Fit {
+                tokens: LOCAL_BUDGET_TOKENS * 2,
+                bytes: LOCAL_BUDGET_BYTES * 2,
+                fits: false,
+            };
+            let plan = plan_over_budget_remedy(
+                &config,
+                &router,
+                // As the classifier mints it: no target, because the only
+                // provider id `for_bound` holds names the route being left.
+                // Choosing one is this planner's job, and the assertion below
+                // is that it did.
+                &Remedy::BindTierRemote {
+                    tier: Some(Tier::Build),
+                    target: None,
+                },
+                measured,
+            )
+            .expect("one configured remote with a catalogued model is ADR-12's proposed case");
+            assert_eq!(plan.kind, RemedyKind::BindTierRemote);
+            assert_eq!(plan.provider_id.0, "kimi");
+            assert_eq!(
+                plan.rebind_target
+                    .as_ref()
+                    .map(|target| target.provider_id.as_str()),
+                Some("kimi"),
+                "the plan carries the name the offer must quote, so the sentence and the \
+                 write cannot name two different providers (ADR-1)"
+            );
+
+            let runtime = Arc::new(DaemonRuntime {
+                config: Mutex::new(config.clone()),
+                config_path: Some(path.clone()),
+                ..DaemonRuntime::minimal()
+            });
+
+            // The applier: the first write is the real one, the second fails.
+            let mut order: Vec<&'static str> = Vec::new();
+            let outcome = plan.writes.apply(|update| match &update {
+                ConfigUpdate::SetTierBinding(_) => {
+                    order.push("set-tier-binding");
+                    Err(RpcError::new(
+                        error_code::CONFIG_REJECTED,
+                        "the second write fails here, and only here",
+                    ))
+                }
+                _ => {
+                    order.push("register-provider");
+                    runtime.apply_config_update(update)
+                }
+            });
+
+            let (err, applied) = outcome.expect_err("the second write was made to fail");
+            assert_eq!(err.code, error_code::CONFIG_REJECTED, "{err:?}");
+            assert_eq!(
+                order,
+                vec!["register-provider", "set-tier-binding"],
+                "ADR-5: `max_context` is declared first and the tier is bound second — \
+                 the order is the whole mechanism, so it is asserted directly"
+            );
+            assert!(
+                applied.contains("window was declared"),
+                "a half-applied pair says which half landed, or the user is told \
+                 nothing changed when something did: {applied}"
+            );
+
+            // What the config was left holding — read off disk and re-parsed,
+            // not off a return code (LESSON-519).
+            let document = std::fs::read_to_string(&path).expect("the document survives");
+            let reloaded = Config::load(&document).expect("and still parses");
+            assert_eq!(
+                reloaded
+                    .providers
+                    .iter()
+                    .find(|p| p.id == "kimi")
+                    .expect("the provider survives a field-wise write")
+                    .capabilities
+                    .max_context,
+                1_000_000,
+                "the harmless half landed: a declared window on a tier nobody rebound: \
+                 {document}"
+            );
+            assert!(
+                reloaded
+                    .tiers
+                    .iter()
+                    .all(|binding| binding.tier != Tier::Build),
+                "**the forbidden state**: a partial failure bound the tier. In this order \
+                 it cannot — the binding is the write that did not happen: {document}"
+            );
+
+            // And the reason the order is that way round, demonstrated: the
+            // reverse order's first write, applied alone, is the circle.
+            let mut reversed = config.clone();
+            apply_update(
+                &mut reversed,
+                ConfigUpdate::SetTierBinding(TierBindingConfig {
+                    tier: ProtoTier::Build,
+                    provider_id: ProviderId::from("kimi"),
+                    fallback_id: None,
+                }),
+            );
+            let circled = build_router(&reversed, true, &BTreeMap::new()).budget_for(Some("kimi"));
+            assert_eq!(
+                circled.bound,
+                BudgetBound::DefaultUnknown,
+                "a tier bound to a provider with no declared window derives the default \
+                 pair under `bound: unknown window` — which is why that state must be \
+                 unreachable, not merely unlikely"
+            );
+            assert!(
+                measured.tokens > circled.budget_tokens,
+                "and the same measurement overflows it again: {} vs {} — the user would \
+                 have paid a remote provider to meet the identical refusal (BR-9)",
+                measured.tokens,
+                circled.budget_tokens
+            );
+
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+
+        /// **The DEFECT TASK-247 found, closed — an option that writes nothing
+        /// is never offered (ADR-1, BR-7c, AC-21).**
+        ///
+        /// `mystery-model-9` matches no vendor recipe, so BR-7c proposes no
+        /// figure and there is no `capabilities.max_context` this daemon may
+        /// write. The remedy is still *classified* — `DeclareWindow` rides the
+        /// `skill_over_budget_offered` record — and the sentence still names the
+        /// durable fix and asks for the value. What must not appear is an option
+        /// whose label promises the write: selecting it would apply nothing,
+        /// which is precisely the `enable_permanent` failure ADR-1 cites.
+        ///
+        /// Deleting the plan's `None` arm — widening the options on the
+        /// classification alone — reddens the id assertion below.
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn a_window_remedy_with_no_figure_offers_no_option_that_would_write_nothing() {
+            let fx = Fixture::new(
+                "ob-nofigure",
+                OPTION_ID_OVER_BUDGET_DECLINE,
+                Some(UNKNOWN_VENDOR_ROUTE),
+            );
+            let before =
+                std::fs::read_to_string(fx.dir.join("config.toml")).expect("the seeded document");
+            let mut sub = fx.events.subscribe(256);
+
+            let err = fx.invoke().await.expect_err("declined");
+            assert_eq!(err.code, error_code::SKILL_EXPANSION_TOO_LARGE, "{err:?}");
+
+            let published = drain(&mut sub);
+            let Some(Event::SkillOverBudgetOffered(record)) = published
+                .iter()
+                .find(|event| matches!(event, Event::SkillOverBudgetOffered(_)))
+            else {
+                panic!("no offer was raised on the unrecognized route: {published:?}");
+            };
+            assert_eq!(
+                record.bound,
+                BudgetBound::DefaultUnknown,
+                "non-vacuity: this fixture must be the undeclared-window row"
+            );
+            assert_eq!(
+                record.remedy_kind,
+                RemedyKind::DeclareWindow,
+                "the remedy is still classified — what is withheld is the *option*, not \
+                 the diagnosis"
+            );
+
+            let offers = fx.client.offers();
+            assert_eq!(offers.len(), 1, "{offers:?}");
+            assert_eq!(
+                option_ids(&offers[0]),
+                vec![
+                    OPTION_ID_OVER_BUDGET_PROCEED_ONCE,
+                    OPTION_ID_OVER_BUDGET_DECLINE
+                ],
+                "BR-7c found no figure, so there is no write to promise — and an option \
+                 a human can select that applies nothing is the defect this closes"
+            );
+
+            let Some(PermissionSubject::SkillOverBudget { sentence, .. }) =
+                offers[0].subject.clone()
+            else {
+                panic!("the offer's subject never reached the client: {offers:?}");
+            };
+            assert!(
+                sentence.contains("ships no figure for it and will not invent one"),
+                "the ask survives in the sentence — withholding the option is not \
+                 withholding the fix: {sentence}"
+            );
+
+            assert!(
+                !published
+                    .iter()
+                    .any(|event| matches!(event, Event::SkillOverBudgetRemedyApplied(_))),
+                "nothing was written: {published:?}"
+            );
+            assert_eq!(
+                std::fs::read_to_string(fx.dir.join("config.toml")).expect("the document"),
+                before,
+                "the config is byte-identical afterwards"
+            );
+        }
+
+        /// **AC-24, BR-9, ADR-12 (the one-provider case) — the rebind is
+        /// applied, and the circle is closed.**
+        ///
+        /// One configured remote, nothing bound to it, and a `/heavy` that will
+        /// not fit the local pair: BR-7's table says `BindTierRemote`, and
+        /// `Router::remote_providers` returns exactly one, so it may be proposed
+        /// by name. The answer is `remedy_only` — fix the route, do not run this
+        /// turn — so the write is observed with no send beside it.
+        ///
+        /// The second invocation is the proof the reported `/analyze` circle is
+        /// closed: the same skill, the same session, and **no offer at all**,
+        /// because the route now holds it. Its turn outcome is deliberately not
+        /// asserted — the fixture's endpoint is a closed port — since what AC-24
+        /// claims is about the budget question, not about a transport.
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn one_configured_remote_is_bound_by_name_and_the_next_invocation_finds_no_offer() {
+            let fx = Fixture::new(
+                "ob-rebind",
+                OPTION_ID_OVER_BUDGET_REMEDY_ONLY,
+                Some(ONE_REMOTE),
+            );
+            let mut sub = fx.events.subscribe(256);
+
+            let err = fx.invoke().await.expect_err("remedy-only does not send");
+            assert_eq!(err.code, error_code::SKILL_EXPANSION_TOO_LARGE, "{err:?}");
+            assert!(
+                fx.engine.beyond_the_classifier().is_empty(),
+                "`remedy_only` writes and does not send: {:?}",
+                fx.engine.beyond_the_classifier()
+            );
+
+            let published = drain(&mut sub);
+            let applied: Vec<&Event> = published
+                .iter()
+                .filter(|event| matches!(event, Event::SkillOverBudgetRemedyApplied(_)))
+                .collect();
+            assert_eq!(applied.len(), 1, "the rebind is announced: {published:?}");
+            let Event::SkillOverBudgetRemedyApplied(remedy) = applied[0] else {
+                unreachable!("filtered above")
+            };
+            assert_eq!(remedy.remedy_kind, RemedyKind::BindTierRemote);
+            assert_eq!(
+                remedy.provider_id.as_ref().map(|id| id.0.as_str()),
+                Some("kimi"),
+                "the record names the provider bound **to**, never the route being left"
+            );
+            assert_eq!(
+                (remedy.previous_value.as_str(), remedy.new_value.as_str()),
+                (
+                    "unbound, capabilities.max_context 0 (undeclared)",
+                    "kimi, capabilities.max_context 1000000"
+                ),
+                "both halves on both sides: a record naming only the binding could not \
+                 tell this fix from the circle it exists to close"
+            );
+
+            // The write, read back off disk and re-parsed.
+            let document = std::fs::read_to_string(fx.dir.join("config.toml"))
+                .expect("the config document survives the write");
+            let reloaded = Config::load(&document).expect("and still parses");
+            assert_eq!(
+                reloaded
+                    .providers
+                    .iter()
+                    .find(|p| p.id == "kimi")
+                    .expect("the provider survives a field-wise write")
+                    .capabilities
+                    .max_context,
+                1_000_000,
+                "BR-7c's catalogued figure for `kimi-k3`, looked up by model: {document}"
+            );
+            let bound = reloaded
+                .tiers
+                .iter()
+                .find(|binding| binding.tier == Tier::Build)
+                .expect("the tier the offer named is bound on disk");
+            assert_eq!(bound.provider_id, "kimi", "{document}");
+            assert!(
+                bound.fallback_id.is_none(),
+                "a fallback is a second routing decision nobody asked for: {document}"
+            );
+
+            // AC-24: the same invocation again, and no question this time.
+            let mut second = fx.events.subscribe(256);
+            let _ = fx.invoke().await;
+            assert_eq!(
+                fx.client.offers().len(),
+                1,
+                "the route now holds this expansion, so the second invocation reaches no \
+                 offer — the end-to-end proof the circle is closed: {:?}",
+                fx.client.offers()
+            );
+            assert!(
+                !drain(&mut second)
+                    .iter()
+                    .any(|event| matches!(event, Event::SkillOverBudgetOffered(_))),
+                "and none was announced either"
+            );
+        }
+
+        /// **BR-9 / ADR-1 / ADR-18 item 2 — the provider the offer names is the
+        /// provider the write binds.**
+        ///
+        /// The defect: `Remedy::BindTierRemote` carried no provider, so the
+        /// sentence and both remedy labels said "a remote provider" where BR-9
+        /// requires the tier, the provider and the cost, and where ADR-1
+        /// requires the concrete write. At ADR-12's one-provider count the
+        /// daemon *does* know the name — it binds by it — so saying it was never
+        /// a question of knowledge.
+        ///
+        /// **The assertion is a tie, not a spelling.** Nothing here is compared
+        /// against the literal `kimi`. The id and the window are read back off
+        /// the config document the answer actually wrote, and the sentence and
+        /// both labels are required to quote *those*. A build whose composer and
+        /// whose planner picked different providers would pass a `contains("some
+        /// name")` check and fail this one — and it is the reachable failure,
+        /// because the offer's own budget carries the id of the route being
+        /// **left**, one field away from the composer.
+        ///
+        /// The route is `LocalEngine` with one unbound remote, which is the
+        /// shape the reported `/analyze` failure ran in.
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn the_rebind_offer_names_the_provider_the_write_actually_binds() {
+            let fx = Fixture::new(
+                "ob-namedrebind",
+                OPTION_ID_OVER_BUDGET_REMEDY_ONLY,
+                Some(ONE_REMOTE),
+            );
+            let mut sub = fx.events.subscribe(256);
+            let err = fx.invoke().await.expect_err("remedy-only does not send");
+            assert_eq!(err.code, error_code::SKILL_EXPANSION_TOO_LARGE, "{err:?}");
+
+            // Non-vacuity: this is the rebind row, and it is the one whose
+            // remedy `for_bound` cannot address.
+            let published = drain(&mut sub);
+            let Some(Event::SkillOverBudgetOffered(record)) = published
+                .iter()
+                .find(|event| matches!(event, Event::SkillOverBudgetOffered(_)))
+            else {
+                panic!("no offer was raised: {published:?}");
+            };
+            assert_eq!(
+                (record.bound, record.remedy_kind),
+                (BudgetBound::LocalEngine, RemedyKind::BindTierRemote),
+            );
+
+            // --- what the write actually did, read off disk (LESSON-519) ----
+            let document = std::fs::read_to_string(fx.dir.join("config.toml"))
+                .expect("the config document survives the write");
+            let reloaded = Config::load(&document).expect("and still parses");
+            let bound_to = reloaded
+                .tiers
+                .iter()
+                .find(|binding| binding.tier == Tier::Build)
+                .expect("the rebind bound the tier on disk")
+                .provider_id
+                .clone();
+            let declared = reloaded
+                .providers
+                .iter()
+                .find(|provider| provider.id == bound_to)
+                .expect("and declared a window for the provider it bound to")
+                .capabilities
+                .max_context;
+            assert_ne!(
+                bound_to, "local",
+                "non-vacuity: the tier moved to a remote provider, which is what makes \
+                 naming the wrong one reachable: {document}"
+            );
+
+            // --- and what the human was shown, tied to it -------------------
+            let offers = fx.client.offers();
+            assert_eq!(offers.len(), 1, "{offers:?}");
+            let Some(PermissionSubject::SkillOverBudget { sentence, .. }) =
+                offers[0].subject.clone()
+            else {
+                panic!("the offer's subject never reached the client: {offers:?}");
+            };
+            let labels: Vec<&str> = offers[0]
+                .options
+                .iter()
+                .filter(|option| {
+                    matches!(
+                        option.option_id.as_str(),
+                        OPTION_ID_OVER_BUDGET_PROCEED_AND_REMEDY
+                            | OPTION_ID_OVER_BUDGET_REMEDY_ONLY
+                    )
+                })
+                .map(|option| option.label.as_str())
+                .collect();
+            assert_eq!(
+                labels.len(),
+                2,
+                "ADR-1's two remedy-bearing options: {:?}",
+                offers[0].options
+            );
+
+            let first_half = format!("to `{bound_to}`");
+            let second_half = format!("`capabilities.max_context = {declared}`");
+            for (surface, text) in std::iter::once(("sentence", sentence.as_str()))
+                .chain(labels.iter().map(|label| ("label", *label)))
+            {
+                assert!(
+                    text.contains(&first_half),
+                    "{surface}: the provider named must be the provider bound — expected \
+                     {first_half}: {text}"
+                );
+                assert!(
+                    text.contains(&second_half),
+                    "{surface}: and the window named must be the window declared — expected \
+                     {second_half}: {text}"
+                );
+                assert!(
+                    !text.contains("to a remote provider"),
+                    "{surface}: the vagueness ADR-18 item 2 recorded: {text}"
+                );
+                // BR-9's cost consequence, which the naming does not buy off.
+                assert!(
+                    text.contains("at that provider's prices"),
+                    "{surface}: this remedy moves a whole category's spend, and says so \
+                     before it is answered: {text}"
+                );
+            }
+        }
+
+        /// **ADR-12 — where the daemon would have to choose, it does not.**
+        ///
+        /// Zero configured remotes and two configured remotes are the same
+        /// answer for different reasons: there is nothing to bind to, and there
+        /// is no single thing to bind to. Rebinding a tier moves every turn that
+        /// tier serves to a paid provider, and D-9 authorized *performing* the
+        /// remedy, not deciding where a whole category's spend goes.
+        ///
+        /// Both legs assert the option list rather than the write, because
+        /// picking silently would be indistinguishable from picking correctly
+        /// until a bill arrived. A daemon that took "the first in id order"
+        /// would take `anthropic` in the second leg.
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn a_rebind_is_offered_to_nobody_when_the_daemon_would_have_to_choose() {
+            for (tag, config, why) in [
+                (
+                    "ob-noremote",
+                    None,
+                    "no remote provider is configured, so BR-9's fix has nothing to bind to",
+                ),
+                (
+                    "ob-tworemotes",
+                    Some(TWO_REMOTES),
+                    "two remotes are configured, and choosing between them is a routing \
+                     decision this answer does not authorize (ADR-12)",
+                ),
+            ] {
+                let fx = Fixture::new(tag, OPTION_ID_OVER_BUDGET_DECLINE, config);
+                let mut sub = fx.events.subscribe(256);
+
+                let err = fx.invoke().await.expect_err("declined");
+                assert_eq!(err.code, error_code::SKILL_EXPANSION_TOO_LARGE, "{err:?}");
+
+                let published = drain(&mut sub);
+                let Some(Event::SkillOverBudgetOffered(record)) = published
+                    .iter()
+                    .find(|event| matches!(event, Event::SkillOverBudgetOffered(_)))
+                else {
+                    panic!("no offer was raised: {published:?}");
+                };
+                assert_eq!(
+                    (record.bound, record.remedy_kind),
+                    (BudgetBound::LocalEngine, RemedyKind::BindTierRemote),
+                    "non-vacuity: {why}, and this must be the row that would earn a rebind"
+                );
+
+                let offers = fx.client.offers();
+                assert_eq!(
+                    option_ids(&offers[0]),
+                    vec![
+                        OPTION_ID_OVER_BUDGET_PROCEED_ONCE,
+                        OPTION_ID_OVER_BUDGET_DECLINE
+                    ],
+                    "{why}"
+                );
+                assert!(
+                    !published
+                        .iter()
+                        .any(|event| matches!(event, Event::SkillOverBudgetRemedyApplied(_))),
+                    "and nothing was written: {published:?}"
+                );
+
+                // TASK-260: naming the target where there IS one must not have
+                // taught the sentence to name one where there is not. Silence
+                // about *which* provider is the whole of ADR-12's guarantee at
+                // these two counts — a sentence that named `kimi` here would be
+                // the silent routing choice, made in prose instead of in
+                // config.
+                let Some(PermissionSubject::SkillOverBudget { sentence, .. }) =
+                    offers[0].subject.clone()
+                else {
+                    panic!("the offer's subject never reached the client: {offers:?}");
+                };
+                assert!(
+                    sentence.contains(
+                        "bind the `build` tier to a remote provider and declare that \
+                         provider's `capabilities.max_context` in the same change"
+                    ),
+                    "{why}: the fix is still stated, unnamed: {sentence}"
+                );
+                for candidate in ["`kimi`", "`anthropic`"] {
+                    assert!(
+                        !sentence.contains(candidate),
+                        "{why}: {candidate} was named in a sentence that chose nobody: \
+                         {sentence}"
+                    );
+                }
+            }
+        }
+
+        /// **AC-7b — the send and the write are two answers, not one.**
+        ///
+        /// `remedy_only` has a leg of its own twice over (the capped route and
+        /// the rebind); these are the other two, and they are the pair that
+        /// would be indistinguishable if the two booleans were ever collapsed
+        /// into a single "yes":
+        ///
+        /// * **proceed-and-remedy** — the turn is authorized *and* the ceiling
+        ///   is cleared on disk. The turn's own transport outcome is not
+        ///   asserted (the fixture's endpoint is a closed port); what proves the
+        ///   send was authorized is `skill_over_budget_accepted`, which is
+        ///   published from the allow arm and from nowhere else.
+        /// * **proceed-only** — the turn runs and the config document is
+        ///   **byte-identical** afterwards. Read off disk rather than inferred
+        ///   from the absence of an event: an event nobody publishes and a write
+        ///   nobody makes look the same from the bus.
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn the_send_and_the_write_are_answered_independently() {
+            // Both, on the one bound whose remedy is a single write.
+            let both = Fixture::new(
+                "ob-both",
+                OPTION_ID_OVER_BUDGET_PROCEED_AND_REMEDY,
+                Some(CAPPED_ROUTE),
+            );
+            let mut sub = both.events.subscribe(256);
+            let _ = both.invoke().await;
+
+            let published = drain(&mut sub);
+            assert!(
+                published
+                    .iter()
+                    .any(|event| matches!(event, Event::SkillOverBudgetAccepted(_))),
+                "`proceed_and_remedy` authorizes the send: {published:?}"
+            );
+            assert!(
+                published
+                    .iter()
+                    .any(|event| matches!(event, Event::SkillOverBudgetRemedyApplied(_))),
+                "and the write beside it: {published:?}"
+            );
+            let document = std::fs::read_to_string(both.dir.join("config.toml"))
+                .expect("the config document survives");
+            assert_eq!(
+                Config::load(&document)
+                    .expect("and still parses")
+                    .providers
+                    .iter()
+                    .find(|p| p.id == "capped")
+                    .expect("the provider survives")
+                    .capabilities
+                    .context_budget_cap,
+                0,
+                "the ceiling is cleared on disk, on the same answer that sent the turn: \
+                 {document}"
+            );
+
+            // Proceed only — on a route whose remedy this build *can* apply, so
+            // the absence of a write is a choice rather than an inability.
+            let once = Fixture::new(
+                "ob-onceonly",
+                OPTION_ID_OVER_BUDGET_PROCEED_ONCE,
+                Some(ONE_REMOTE),
+            );
+            let before =
+                std::fs::read_to_string(once.dir.join("config.toml")).expect("the seeded document");
+            let mut sub = once.events.subscribe(256);
+            once.invoke()
+                .await
+                .expect("an accepted offer runs the turn");
+
+            let published = drain(&mut sub);
+            assert!(
+                published
+                    .iter()
+                    .any(|event| matches!(event, Event::SkillOverBudgetAccepted(_))),
+                "the turn ran: {published:?}"
+            );
+            assert!(
+                !published
+                    .iter()
+                    .any(|event| matches!(event, Event::SkillOverBudgetRemedyApplied(_))),
+                "`proceed_once` writes nothing (BR-10): {published:?}"
+            );
+            assert_eq!(
+                std::fs::read_to_string(once.dir.join("config.toml")).expect("the document"),
+                before,
+                "byte-identical afterwards — and the offer this answered *did* carry the \
+                 remedy options, so this is the user declining the durable half rather \
+                 than the daemon having none to write"
+            );
+            assert_eq!(
+                option_ids(&once.client.offers()[0]).len(),
+                4,
+                "non-vacuity: all four ids were on this prompt, so `proceed_once` is a \
+                 choice between them"
+            );
+        }
+
+        /// **BR-2 and AC-5 — the offer is the typed caller’s alone, as a fact
+        /// about where the code is.**
+        ///
+        /// The behavioural half lives in the model path’s own suite; what that
+        /// cannot show is an offer being *added* to the loop later. A model
+        /// inside a tool call has no human to answer per-invocation, so an offer
+        /// raised there would park a waiter nobody can resolve — and the failure
+        /// would be a hung turn, not a red test.
+        ///
+        /// The scan reads production source only: every module in this crate
+        /// puts its test items last, so truncating at the first `#[cfg(test)]`
+        /// is exact today and conservative if that changes.
+        #[test]
+        fn the_offer_is_reachable_only_from_the_typed_path() {
+            let production = |relative: &str| -> String {
+                let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                    .join("src")
+                    .join(relative);
+                let text = std::fs::read_to_string(&path)
+                    .unwrap_or_else(|err| panic!("unreadable source {}: {err}", path.display()));
+                match text.find("\n#[cfg(test)]") {
+                    Some(at) => text[..at].to_owned(),
+                    None => text,
+                }
+            };
+
+            for module in ["harness/turn_loop.rs", "harness/tools/skill.rs"] {
+                let source = production(module);
+                for reached in ["OverBudgetOffer", "authorize_skill_over_budget"] {
+                    assert!(
+                        !source.contains(reached),
+                        "`{module}` reached `{reached}`: a model-invoked expansion keeps \
+                         today’s refusal and is never offered a choice (BR-2), because \
+                         there is no human in a mid-loop tool call to answer one"
+                    );
+                }
+            }
+
+            // And the typed path calls it exactly twice — BR-8's two stages —
+            // so a third check is a decision someone has to make here rather
+            // than a call site that quietly appeared.
+            let runtime = production("runtime.rs");
+            assert_eq!(
+                runtime.matches(".offer_or_refuse_over_budget(").count(),
+                2,
+                "the offer has exactly two call sites, and both are `run_prompt_turn`’s \
+                 own budget stages"
+            );
+        }
+
+        /// **REQ-589 BR-14.1, AC-22 (D-8) — an approval must not leave the
+        /// session hitting the same wall.**
+        ///
+        /// Two real turns. The first is the reported failure's own shape: a
+        /// typed `/heavy` on the local engine, over budget, offered, accepted,
+        /// and then refused **by the tier** at the window. The second is an
+        /// ordinary prompt in the same session, and what *it* assembles is the
+        /// whole claim — read off the bytes that reached the engine rather than
+        /// off the block list, because a block list can be right while the
+        /// prompt built from it is not (AC-22 says so in as many words).
+        ///
+        /// The fixture's engine refuses **any** prompt carrying the whole
+        /// expansion, not just the first, which is what makes this a test of
+        /// the dead end rather than of one turn: leave the expansion in the
+        /// session and the second turn does not merely carry it, it *fails the
+        /// same way*, forever. Three mutations redden this (LESSON-544):
+        ///
+        /// | Mutation | How it fails |
+        /// |---|---|
+        /// | drop the `withdraw_accepted_expansion` call | the second turn carries the expansion, the engine refuses it again, and `expect` on that turn panics — D-8's circle, reproduced |
+        /// | abandon instead of committing the withdrawal | nothing of the refusal survives, and the "the withdrawal is *there*" assertion fails |
+        /// | trigger on `ContextLengthExceeded` alone (ADR-3) | the local tier refuses with the *other* variant, so nothing is withdrawn — the first row again |
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn a_window_refusal_withdraws_the_expansion_so_the_next_turn_assembles_without_it() {
+            /// Distinctive enough that a prompt carrying it is the second turn's
+            /// and not the first's, not the classifier's, and not the naming
+            /// duty's.
+            const SECOND_TURN: &str = "SECONDTURNMARKER-249, what happened?";
+
+            let fx = Fixture::new("ob-withdraw", OPTION_ID_OVER_BUDGET_PROCEED_ONCE, None);
+            fx.engine.refuse_the_expansion();
+
+            let err = fx
+                .invoke()
+                .await
+                .expect_err("the tier refused the accepted turn");
+            assert_eq!(err.code, error_code::CONTEXT_LENGTH_EXCEEDED, "{err:?}");
+            assert!(
+                err.message.contains("the local engine refused this turn"),
+                "the refusal must be the local tier's own (ADR-3): {}",
+                err.message
+            );
+
+            // Non-vacuity, both halves: the offer really was put to a human,
+            // and the accepted turn really did carry the whole body to the tier
+            // that refused it. Without them everything below is a claim about a
+            // turn that never happened.
+            assert_eq!(
+                fx.client.offers().len(),
+                1,
+                "Stage A asks exactly once: {:?}",
+                fx.client.offers()
+            );
+            assert!(
+                fx.engine
+                    .beyond_the_classifier()
+                    .iter()
+                    .any(|prompt| prompt.contains(TAIL_MARKER)),
+                "the accepted turn must have reached the engine with the whole expansion"
+            );
+
+            // A **real** second turn, and it has to succeed: an engine that
+            // still sees the expansion refuses this one too.
+            fx.prompt(SECOND_TURN)
+                .await
+                .expect("the next turn in this session must assemble and run");
+
+            let assembled: Vec<String> = fx
+                .engine
+                .prompts()
+                .into_iter()
+                .filter(|prompt| {
+                    prompt.contains("SECONDTURNMARKER-249")
+                        && !prompt.contains("Classify one software-engineering request")
+                })
+                .collect();
+            assert!(
+                !assembled.is_empty(),
+                "non-vacuity: the second turn never reached the engine, so nothing \
+                 below is about an assembled prompt"
+            );
+            for prompt in &assembled {
+                assert!(
+                    !prompt.contains(TAIL_MARKER),
+                    "the withdrawn expansion survived into the next turn's prompt"
+                );
+                assert!(
+                    !prompt.contains(MARKER),
+                    "the withdrawn expansion survived into the next turn's prompt"
+                );
+            }
+            // And the withdrawal is *present*, not merely the expansion absent.
+            // This is what tells a committed withdrawal apart from a turn that
+            // wrote nothing at all — the two are indistinguishable by absence.
+            assert!(
+                assembled
+                    .iter()
+                    .any(|prompt| prompt.contains("refused this turn as larger than")),
+                "the next turn must carry the refusal that replaced the expansion: \
+                 {assembled:#?}"
+            );
+        }
+
+        /// **REQ-589 BR-14.1 / AC-22, BUG-188's own regression shape — the
+        /// withdrawn block's `local-only` source is absorbed, never shed.**
+        ///
+        /// The skill file is behind a `local-only` boundary, so the expansion's
+        /// provenance is exactly the thing that must not be laundered by the
+        /// withdrawal. Both halves, because either alone is satisfiable by
+        /// accident:
+        ///
+        /// * **the source does not survive on a visible block** — the block the
+        ///   next turn assembles from carries no skill file's identity, because
+        ///   nothing of that file is in it any more;
+        /// * **the pin survives anyway** — the identity went into
+        ///   `DroppedProvenance`, so the session is still pinned local and a
+        ///   later model paraphrase of what this turn read cannot egress
+        ///   through a block nobody can see. That is the hole BUG-188 closed,
+        ///   and dropping the absorb would open it silently: the conversation
+        ///   would look *cleaner*, right up until the next turn routes remote.
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn the_withdrawn_expansions_local_only_source_is_absorbed_not_shed() {
+            use crate::harness::context::{Provenance as CtxProvenance, ToolProvenance};
+
+            let fx = Fixture::new("ob-withdraw-pin", OPTION_ID_OVER_BUDGET_PROCEED_ONCE, None);
+            fx.runtime
+                .config
+                .lock()
+                .expect("config mutex poisoned")
+                .boundaries
+                .push(PrivacyBoundary {
+                    path_glob: ".claude/**".to_owned(),
+                    mode: teton_core::entities::BoundaryMode::LocalOnly,
+                });
+            fx.engine.refuse_the_expansion();
+
+            fx.invoke()
+                .await
+                .expect_err("the tier refused the accepted turn");
+
+            let conversation = fx.sessions.conversation_snapshot(&fx.session_id);
+            assert!(
+                !conversation.blocks().is_empty(),
+                "non-vacuity: a session holding nothing would satisfy the \
+                 does-not-survive half for the wrong reason"
+            );
+
+            let sources_of = |provenance: &CtxProvenance| -> Vec<String> {
+                match provenance {
+                    CtxProvenance::User { sources, .. } => {
+                        sources.iter().map(|id| id.as_str().to_owned()).collect()
+                    }
+                    CtxProvenance::Tool {
+                        provenance: ToolProvenance::Sources(sources),
+                        ..
+                    } => sources.iter().map(|id| id.as_str().to_owned()).collect(),
+                    _ => Vec::new(),
+                }
+            };
+            for block in conversation.blocks() {
+                let named = sources_of(&block.provenance);
+                assert!(
+                    !named.iter().any(|id| id.contains("SKILL.md")),
+                    "a retained block still names the withdrawn skill file: {named:?}"
+                );
+            }
+
+            let dropped: Vec<&str> = conversation
+                .retained()
+                .dropped_provenance()
+                .sources()
+                .iter()
+                .map(|id| id.as_str())
+                .collect();
+            assert!(
+                dropped.iter().any(|id| id.contains("heavy")),
+                "the withdrawn block's provenance was shed rather than absorbed — a \
+                 `local-only` body could egress on the next turn through a block \
+                 nobody can see (BUG-188): {dropped:?}"
+            );
+            assert!(
+                fx.runtime.session_taint.is_tainted(&fx.session_id),
+                "the pin has to outlive the text it is a pin for: this session read a \
+                 `local-only` file and must stay on the local tier"
+            );
+        }
+
+        /// **REQ-589 BR-14.2 — the rejection this daemon watched leads the next
+        /// offer for the same pair.**
+        ///
+        /// The withdrawal's other half, and the one that makes the memo more
+        /// than a store: `ObservedWindowRejections::mark` is called from
+        /// exactly one production line, and this drives two real invocations to
+        /// reach it. The first offer cannot carry the lead — nothing had been
+        /// observed yet — and the second must, on the same skill and the same
+        /// route. Deleting the `mark` leaves the second offer worded like the
+        /// first, which no other test in this crate would notice.
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn a_watched_rejection_leads_the_next_offer_for_the_same_pair() {
+            let fx = Fixture::new("ob-withdraw-memo", OPTION_ID_OVER_BUDGET_PROCEED_ONCE, None);
+            fx.engine.refuse_the_expansion();
+
+            fx.invoke()
+                .await
+                .expect_err("the tier refused the accepted turn");
+            fx.invoke()
+                .await
+                .expect_err("and refuses the same bytes again");
+
+            let lead = "This skill was already rejected at the provider's window on this route";
+            let offers = fx.client.offers();
+            assert_eq!(offers.len(), 2, "one offer per invocation: {offers:#?}");
+            let worded = |request: &PermissionRequest| -> String {
+                match &request.subject {
+                    Some(PermissionSubject::SkillOverBudget { sentence, .. }) => sentence.clone(),
+                    other => panic!("not an over-budget offer: {other:?}"),
+                }
+            };
+            assert!(
+                !worded(&offers[0]).contains(lead),
+                "the first offer had nothing to lead with: {}",
+                worded(&offers[0])
+            );
+            assert!(
+                worded(&offers[1]).contains(lead),
+                "the second offer for this pair must open with the rejection this \
+                 daemon watched happen: {}",
+                worded(&offers[1])
+            );
         }
     }
 }

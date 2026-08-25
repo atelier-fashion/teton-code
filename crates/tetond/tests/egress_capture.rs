@@ -1149,3 +1149,181 @@ async fn a_user_skill_outside_the_root_pins_the_turn_wherever_any_boundary_exist
     assert_eq!(sink.events().len(), 1, "one privacy_block for one refusal");
     std::fs::remove_dir_all(root.parent().unwrap()).ok();
 }
+
+// ---------------------------------------------------------------------------
+// REQ-589 — an accepted over-budget expansion at the choke point
+// ---------------------------------------------------------------------------
+
+/// The head and tail of the oversized fixture body, so "it went out whole" is a
+/// claim about bytes rather than about a call count.
+const OVER_BUDGET_HEAD: &str = "OVERBUDGET-EGRESS-HEAD";
+const OVER_BUDGET_TAIL: &str = "OVERBUDGET-EGRESS-TAIL";
+
+/// The short system head these expansions are measured against — the same one
+/// [`skill_expansion_turn`] builds its [`ContextManager`] with, so the
+/// measurement below is of the block the request actually carries.
+///
+/// [`ContextManager`]: tetond::harness::ContextManager
+const MEASURED_AGAINST: &str = "You are Teton Code.";
+
+/// A repo holding two **oversized** project skills: one the boundary covers and
+/// one it does not.
+///
+/// Its own tree, for the reason [`skill_trees`] gives — a boundary claim wants
+/// its own root — and its own bodies, because these two have to be genuinely
+/// past the local route's budget or the test below is about an ordinary skill
+/// wearing a REQ-589 name.
+fn over_budget_skill_trees(tag: &str) -> (std::path::PathBuf, std::path::PathBuf) {
+    let base = std::path::PathBuf::from("/tmp")
+        .join(format!("tegob{tag}{:x}", std::process::id() & 0xffff));
+    let _ = std::fs::remove_dir_all(&base);
+    let root = base.join("repo");
+    let home = base.join("home");
+    // Comfortably past the local pair in words (4,096) at four bytes a word, and
+    // comfortably inside discovery's 64 KiB ceiling for one `SKILL.md`.
+    let filler = "abc ".repeat(6_000);
+    let write = |path: std::path::PathBuf, body: String| {
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(path, body).unwrap();
+    };
+    write(
+        root.join(".claude/skills/bigsecret/SKILL.md"),
+        format!(
+            "---\ndescription: the oversized guarded skill\n---\n{OVER_BUDGET_HEAD}\n{filler}\n\
+             {SECRET_ENV}\n{OVER_BUDGET_TAIL}\n"
+        ),
+    );
+    write(
+        root.join(".claude/skills/bigopen/SKILL.md"),
+        format!(
+            "---\ndescription: the oversized public skill\n---\n{OVER_BUDGET_HEAD}\n{filler}\n\
+             {OVER_BUDGET_TAIL}\n"
+        ),
+    );
+    (root, home)
+}
+
+/// **REQ-589 BR-1 + BR-11 at the choke point: consenting to an over-budget send
+/// is not consenting to a boundary crossing, and a send that is allowed goes
+/// out whole.**
+///
+/// `skill_over_budget_offer.rs` owns AC-18's four not-sent legs, because they
+/// are claims about a **turn** — no provider reached, no `context_pressure`, no
+/// health change, the naming duty unspent — and this file never runs one. What
+/// belongs here is the half only the choke point can settle: what happens to the
+/// bytes once a human has said yes.
+///
+/// Two facts, and each is the other's control:
+///
+/// * The **open** oversized expansion reaches the transport carrying every byte
+///   that was measured — head, tail, and the full filler count. BR-1 forbids
+///   middle-eliding an accepted expansion, and a build that elided one would
+///   arrive here with both ends and none of the middle.
+/// * The **guarded** one, identical but for the boundary file's bytes, is
+///   refused under that file's own identity. The user answered a question about
+///   a *budget*; nothing about that answer widens what may leave the machine.
+///
+/// The fixture's non-vacuity is asserted rather than assumed: `skill_fit` is
+/// asked, against the real local pair, whether these bodies are over budget at
+/// all. Shrink them and this test says so instead of quietly becoming a test
+/// about ordinary skills.
+#[tokio::test]
+async fn an_accepted_over_budget_expansion_still_answers_to_the_boundary() {
+    use tetond::harness::budget::{derive, skill_fit, SkillCaller, SkillFit, SkillStage};
+    use tetond::harness::BudgetInputs;
+
+    let (root, home) = over_budget_skill_trees("a");
+    let local_pair = derive(BudgetInputs::local());
+
+    let (open, open_file) = expansion_of(Some(&home), &root, "bigopen");
+    let (secret, secret_file) = expansion_of(Some(&home), &root, "bigsecret");
+
+    // The fixture is about REQ-589 only if these really are over budget.
+    for (name, expansion) in [("bigopen", &open), ("bigsecret", &secret)] {
+        assert!(
+            matches!(
+                skill_fit(
+                    SkillCaller::User,
+                    SkillStage::Body,
+                    name,
+                    MEASURED_AGAINST,
+                    expansion,
+                    &local_pair,
+                    local_pair.provider_id.as_deref(),
+                ),
+                SkillFit::TooLarge { .. }
+            ),
+            "fixture: `{name}` must genuinely exceed the local route's budget, or \
+             this test is about an ordinary skill wearing an over-budget name"
+        );
+    }
+    assert!(
+        secret.contains(SECRET_ENV),
+        "fixture: the guarded expansion must actually carry the boundary file's \
+         bytes, or the block below is about nothing"
+    );
+
+    let capture = CaptureTransport::default();
+    let sink = Arc::new(CapturingSink::default());
+    let egress = Egress::new(
+        capture.clone(),
+        vec![PrivacyBoundary {
+            path_glob: ".claude/skills/bigsecret/**".to_owned(),
+            mode: BoundaryMode::LocalOnly,
+        }],
+        sink.clone(),
+    );
+    let ctx = EgressContext::new("anthropic").with_session("sess-over-budget");
+
+    // BR-1: the accepted send carries the expansion whole.
+    let (req, prov) = skill_expansion_turn(&root, &open_file, &open);
+    assert!(
+        egress.send(req, &prov, &ctx).await.is_ok(),
+        "an oversized skill outside every boundary must still reach the wire once \
+         a human has accepted it"
+    );
+    let captured = capture.captured();
+    assert_eq!(captured.len(), 1, "only the open skill may be forwarded");
+    let body = String::from_utf8_lossy(&captured[0].body).into_owned();
+    assert!(
+        body.contains(OVER_BUDGET_HEAD) && body.contains(OVER_BUDGET_TAIL),
+        "the accepted expansion reached the wire without one of its ends"
+    );
+    assert_eq!(
+        body.matches("abc").count(),
+        open.matches("abc").count(),
+        "the accepted expansion reached the wire shortened — BR-1 carries it \
+         whole or refuses it, never in between"
+    );
+
+    // BR-11's boundary half: the same answer buys nothing here.
+    let (req, prov) = skill_expansion_turn(&root, &secret_file, &secret);
+    match egress.send(req, &prov, &ctx).await {
+        Err(EgressError::PrivacyBlocked {
+            ref path,
+            ref action,
+            ..
+        }) => {
+            assert_eq!(
+                path, ".claude/skills/bigsecret/SKILL.md",
+                "the block names the skill file, exactly as a `read` of it would"
+            );
+            assert_eq!(*action, PrivacyAction::ReroutedToLocal);
+        }
+        other => panic!(
+            "an over-budget expansion the user accepted is still boundary \
+             content: {other:?}"
+        ),
+    }
+    for req in &capture.captured() {
+        for secret in [SECRET_ENV, "sk-live"] {
+            assert!(
+                !contains_bytes(&req.body, secret),
+                "boundary bytes reached the wire from an accepted over-budget \
+                 expansion — a budget answer is not a privacy answer"
+            );
+        }
+    }
+    assert_eq!(sink.events().len(), 1, "one privacy_block for one refusal");
+    std::fs::remove_dir_all(root.parent().unwrap()).ok();
+}
