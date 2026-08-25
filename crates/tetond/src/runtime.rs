@@ -183,9 +183,9 @@ use crate::harness::turn_loop::{
 };
 use crate::harness::{
     build_system_prompt, ContextManager, DutyKind, DutyRoute, LocalEngineSource,
-    PendingPermissions, PermissionGate, SessionEvents, ToolContext, ToolDuties, ToolRegistry,
-    WebTierPersistence, COMPACT_DUTY, DIGEST_DUTY, REDACT_DUTY, SHELL_DUTY, TITLE_DUTY,
-    TRIAGE_DUTY,
+    PendingPermissions, PermissionGate, ProjectTrustPersistence, SessionEvents, ToolContext,
+    ToolDuties, ToolRegistry, WebTierPersistence, COMPACT_DUTY, DIGEST_DUTY, REDACT_DUTY,
+    SHELL_DUTY, TITLE_DUTY, TRIAGE_DUTY,
 };
 use crate::install::{CapFreeSpace, FetchCause, HostFreeSpace, LifecycleProgress, WeightsInstall};
 use crate::keychain::SecretResolver;
@@ -1415,10 +1415,31 @@ fn refused_claim_error(err: &TurnClaimError) -> RpcError {
 /// five facts nobody consumes; if one ever needs to be acted on differently, the
 /// change is a code of its own in the numbering module, not a widened match here.
 ///
+/// # The unattended refusal names the way out (REQ-589 D-13)
+///
+/// This is the sentence a scripted run meets, and after D-13 it is the sentence
+/// that must tell it what to do — a refusal without a remedy is a dead end, and
+/// this one now has a remedy that is not "go find a terminal". The remedy is
+/// spelled with the **exact row** `[skills] trusted_project_roots` must hold,
+/// because that string is the canonical name of this tree and is not always the
+/// one the line above it prints: `/tmp/x` and `/private/tmp/x` are the same
+/// directory, and a user who copied the wrong one would have added a row that
+/// silently never matches. Naming the row here makes hand-editing a
+/// copy-and-paste rather than a guess.
+///
+/// `durable_root` is `None` for a root that will not canonicalise, and then the
+/// line falls back to the terminal remedy alone: there is no row that would help.
+///
 /// The name is safe to interpolate — it resolved against the registry, so it
-/// satisfies `is_valid_skill_name` — and the root is `trust_root_name`'s
-/// home-relative spelling, so no username reaches the line.
-fn project_trust_refusal(name: &str, root: &str, door: NotRunReason) -> RpcError {
+/// satisfies `is_valid_skill_name` — and both roots are `trust_root_name`'s
+/// home-relative spelling, so no username reaches the line for a repository
+/// under `HOME`.
+fn project_trust_refusal(
+    name: &str,
+    root: &str,
+    durable_root: Option<&str>,
+    door: NotRunReason,
+) -> RpcError {
     let because = match door {
         NotRunReason::Declined => "you declined it",
         NotRunReason::Level => {
@@ -1434,13 +1455,26 @@ fn project_trust_refusal(name: &str, root: &str, door: NotRunReason) -> RpcError
         NotRunReason::CouldNotStart => "the acknowledgment could not be raised",
         NotRunReason::Unknown => "the acknowledgment did not happen",
     };
+    // REQ-589 D-13. Only the "nobody could be asked" door earns the durable
+    // remedy: every other door had a human at it, and telling someone who just
+    // declined how to make the answer permanent is proposing the opposite of
+    // what they chose.
+    let unattended_remedy = match (door, durable_root) {
+        (NotRunReason::NoTerminal, Some(durable)) => format!(
+            " To run this repository's skills from a session with nobody at the terminal, \
+             acknowledge it once at a terminal and answer `p`, or add \
+             `{durable}` to `[skills] trusted_project_roots` in your config."
+        ),
+        _ => String::new(),
+    };
     RpcError::new(
         error_code::CONSENT_DENIED,
         format!(
             "`/{name}` is defined by this repository (`{root}`), whose skills this \
              session has not acknowledged: {because}. Nothing was expanded, nothing \
              was sent, and no provider saw this turn. Type `/{name}` again to be \
-             asked once more; a user-level skill of your own needs no acknowledgment."
+             asked once more; a user-level skill of your own needs no \
+             acknowledgment.{unattended_remedy}"
         ),
     )
 }
@@ -3694,11 +3728,26 @@ impl DaemonRuntime {
             // onto one name — and one name is one grant.
             let root =
                 crate::harness::tools::skill::trust_root_name(&probed.path, home().as_deref());
+            // REQ-589 D-13, and a **deliberate security widening**: the same
+            // root, named canonically, is what `[skills] trusted_project_roots`
+            // is written and matched under. It is a second name rather than the
+            // one above because a row in config outlives the session that wrote
+            // it and is matched against a path that has had every chance to
+            // change what it points at — a symlink dropped at a listed path
+            // would otherwise hand an unacknowledged repository the trust of an
+            // acknowledged one. See `durable_trust_root_name`.
+            let durable_root = crate::harness::tools::skill::durable_trust_root_name(
+                &probed.path,
+                home().as_deref(),
+            );
             let consent = match invoker {
                 Some(connection) => {
                     gate.authorize_project_skill_trust(
                         &teton_protocol::methods::project_skill_trust_key(&root),
-                        &root,
+                        crate::harness::permissions::TrustRoot {
+                            display: &root,
+                            durable: durable_root.as_deref(),
+                        },
                         // The project's whole model-invocable set, which is what
                         // the user is being asked about; the door bounds the
                         // list it renders.
@@ -3729,7 +3778,12 @@ impl DaemonRuntime {
             // the model's tool and this path must not come to disagree about
             // which settlement is a decline and which is a refusal (LESSON-528).
             if let Some(door) = closed_door(consent) {
-                return Err(project_trust_refusal(&skill.name, &root, door));
+                return Err(project_trust_refusal(
+                    &skill.name,
+                    &root,
+                    durable_root.as_deref(),
+                    door,
+                ));
             }
         }
 
@@ -6084,7 +6138,19 @@ impl DaemonRuntime {
                 // REQ-563 BR-4: the one consent answer that outlives the session
                 // writes through the daemon, never the client. The gate holds
                 // the seam and this is the only place it is filled in.
-                .with_web_persistence(Arc::clone(self) as Arc<dyn WebTierPersistence>);
+                .with_web_persistence(Arc::clone(self) as Arc<dyn WebTierPersistence>)
+                // REQ-589 D-13, and the second such answer — a **deliberate
+                // security widening**. `[skills] trusted_project_roots` is read
+                // here, once, for the same reason `permission_allow` is: a
+                // session keeps the posture it started with. What it buys is
+                // the only unattended answer D-10's trust gate has; what it
+                // costs is that a project-authored body can now reach the model
+                // in a session where nobody acknowledged it, on the strength of
+                // a row a human wrote earlier and out of band.
+                .with_trusted_project_roots(config.skills.trusted_project_roots.clone())
+                .with_project_trust_persistence(
+                    Arc::clone(self) as Arc<dyn ProjectTrustPersistence>
+                );
             // REQ-585 ADR-7: and the route a skill's dynamic-context consent is
             // *addressed* on. Filled in here for the same reason the web sink is
             // — the gate is built in one place and is cached for the session's
@@ -7251,6 +7317,63 @@ impl DaemonRuntime {
             // write, and `Persistent` is the truthful scope.
             return Ok(());
         }
+        candidate
+            .validate()
+            .map_err(|e| format!("the resulting configuration would not load: {e}"))?;
+        let Some(path) = &self.config_path else {
+            return Err(
+                "this daemon has no configuration file to write, so the choice could not be \
+                 made permanent"
+                    .to_owned(),
+            );
+        };
+        persist_config(path, &config, &candidate)
+            .map_err(|err| format!("the configuration could not be saved ({err})"))?;
+        *config = candidate;
+        Ok(())
+    }
+
+    /// Append `root` to `[skills] trusted_project_roots` — the whole effect of
+    /// answering the project-skill acknowledgment *permanently* (REQ-589 D-13).
+    ///
+    /// **This write is a security widening, and it is the point of the option
+    /// that reaches it.** The row it adds is what lets a session with nobody at
+    /// the terminal run this repository's skills without an in-session
+    /// acknowledgment, which D-10's gate otherwise refuses at every permission
+    /// level. It is written only by a human answering `p` at a prompt they were
+    /// shown, and the label they answered names this key, this `+=` and this
+    /// exact string.
+    ///
+    /// [`Self::persist_web_tier`]'s shape throughout, and for its reasons: the
+    /// atomic config path (BUG-155), the candidate validated before it is
+    /// written, the in-memory config replaced only after the file lands, and an
+    /// append rather than a set so an earlier answer about another repository is
+    /// not revoked by this one. `root` is stored verbatim — it is
+    /// `durable_trust_root_name`'s canonical mint, and re-deriving it here would
+    /// be a second minter for the string a later session matches.
+    ///
+    /// An answer whose row is **already there** writes nothing and reports
+    /// success: the file already says what the user asked it to say.
+    ///
+    /// # Errors
+    /// A message naming what stopped the write, in the three cases
+    /// [`Self::persist_web_tier`] distinguishes and for the same reason — each
+    /// means "this did not become permanent", and the caller says so rather than
+    /// letting the user believe they automated something they did not.
+    pub fn persist_trusted_project_root(&self, root: &str) -> Result<(), String> {
+        let mut config = self.config.lock().expect("config mutex poisoned");
+        let mut candidate = config.clone();
+        if candidate
+            .skills
+            .trusted_project_roots
+            .iter()
+            .any(|listed| listed == root)
+        {
+            // Already acknowledged on disk. Nothing to write, and success is
+            // the truthful answer.
+            return Ok(());
+        }
+        candidate.skills.trusted_project_roots.push(root.to_owned());
         candidate
             .validate()
             .map_err(|e| format!("the resulting configuration would not load: {e}"))?;
@@ -9297,6 +9420,12 @@ fn load_config(path: Option<&Path>) -> anyhow::Result<Config> {
 impl WebTierPersistence for DaemonRuntime {
     fn persist_web_tier(&self, tier: WebTier) -> Result<(), String> {
         DaemonRuntime::persist_web_tier(self, tier)
+    }
+}
+
+impl ProjectTrustPersistence for DaemonRuntime {
+    fn persist_trusted_project_root(&self, root: &str) -> Result<(), String> {
+        DaemonRuntime::persist_trusted_project_root(self, root)
     }
 }
 
@@ -16719,6 +16848,7 @@ permission_allow = [\"fetch_user_url\"]
             web: teton_core::WebConfig::default(),
             lifetime: teton_core::LifetimeConfig::default(),
             permissions: teton_core::PermissionsConfig::default(),
+            skills: teton_core::SkillsConfig::default(),
             providers: vec![ModelProvider {
                 id: "remote".to_owned(),
                 kind: ProviderKind::OpenaiCompatible,
@@ -17036,6 +17166,7 @@ permission_allow = [\"fetch_user_url\"]
             web: teton_core::WebConfig::default(),
             lifetime: teton_core::LifetimeConfig::default(),
             permissions: teton_core::PermissionsConfig::default(),
+            skills: teton_core::SkillsConfig::default(),
             providers: vec![
                 ModelProvider {
                     id: "anthropic".to_owned(),
@@ -31661,7 +31792,9 @@ provider_id = \"deepseek\"
         use crate::harness::tools::skill::SkillTool;
         use crate::sessions::SessionRegistry;
         use crate::skills::{discover, RealFs};
-        use teton_protocol::events::{PermissionOptionKind, PermissionRequest, PermissionSubject};
+        use teton_protocol::events::{
+            PermissionOptionKind, PermissionRequest, PermissionSubject, OPTION_ID_ENABLE_PERMANENT,
+        };
         use teton_protocol::methods::{PermissionOutcome, SkillInvocation};
 
         /// A body marker no other fixture in this crate uses, so a prompt
@@ -31677,6 +31810,16 @@ provider_id = \"deepseek\"
         struct Client {
             pending: Arc<PendingPermissions>,
             answer: PermissionOptionKind,
+            /// The exact id to pick, when a *kind* cannot say which option is
+            /// meant (REQ-589 D-13).
+            ///
+            /// `enable_permanent` and `allow_always` share
+            /// [`PermissionOptionKind::AllowAlways`], and the whole of the
+            /// write-pairing leg is that one of them edits a file and the other
+            /// does not. A fixture selecting by kind could not tell them apart —
+            /// which is the same reason the daemon's own `interpret` matches on
+            /// the id.
+            by_id: Option<&'static str>,
             asked: Mutex<Vec<PermissionRequest>>,
         }
 
@@ -31688,6 +31831,17 @@ provider_id = \"deepseek\"
                 Arc::new(Self {
                     pending: Arc::clone(pending),
                     answer,
+                    by_id: None,
+                    asked: Mutex::new(Vec::new()),
+                })
+            }
+
+            /// A client that picks one named option, whatever kind it carries.
+            fn selecting(pending: &Arc<PendingPermissions>, option_id: &'static str) -> Arc<Self> {
+                Arc::new(Self {
+                    pending: Arc::clone(pending),
+                    answer: PermissionOptionKind::AllowAlways,
+                    by_id: Some(option_id),
                     asked: Mutex::new(Vec::new()),
                 })
             }
@@ -31724,16 +31878,28 @@ provider_id = \"deepseek\"
                     .lock()
                     .expect("asked mutex poisoned")
                     .push(request.clone());
-                let option = request
-                    .options
-                    .iter()
-                    .find(|option| option.kind == self.answer)
-                    .unwrap_or_else(|| {
-                        panic!(
-                            "the prompt offered no {:?}: {:?}",
-                            self.answer, request.options
-                        )
-                    });
+                let option = match self.by_id {
+                    // Asserted rather than defaulted: an id the prompt did not
+                    // carry would mean the option list narrowed, and quietly
+                    // answering something else would hide that.
+                    Some(id) => request
+                        .options
+                        .iter()
+                        .find(|option| option.option_id == id)
+                        .unwrap_or_else(|| {
+                            panic!("the prompt offered no `{id}`: {:?}", request.options)
+                        }),
+                    None => request
+                        .options
+                        .iter()
+                        .find(|option| option.kind == self.answer)
+                        .unwrap_or_else(|| {
+                            panic!(
+                                "the prompt offered no {:?}: {:?}",
+                                self.answer, request.options
+                            )
+                        }),
+                };
                 // `resolve_from`, exactly as `permission/respond` does: an
                 // addressed waiter is answerable only by the connection it was
                 // addressed to (REQ-585 ADR-7), so a fixture answering
@@ -32250,6 +32416,444 @@ provider_id = \"deepseek\"
             );
 
             let _ = std::fs::remove_dir_all(&dir);
+        }
+
+        // -------------------------------------------------------------------
+        // REQ-589 D-13 — the unattended path, end to end (TASK-262)
+        // -------------------------------------------------------------------
+        //
+        // **A deliberate security widening.** The gate above has no unattended
+        // answer: a piped session has nobody to ask, and this fixture's skill
+        // shadows a user skill, so `full` asks too. Before D-13 an automated run
+        // could not invoke a typed project skill at any permission level. D-13
+        // traded the guarantee that every project-authored body is acknowledged
+        // *in the session that sends it* for the ability to automate, and bounded
+        // the trade with a list a human writes.
+        //
+        // These legs are about the bound rather than the feature. The unit
+        // witnesses are in `harness::permissions::tests`; these are the ones that
+        // need the whole turn — the refusal a scripted run actually reads, the
+        // expansion actually reaching the engine, and the durable answer actually
+        // reaching a file.
+
+        /// The client an unattended session has: it refuses **without asking**,
+        /// which is what `teton` does on a pipe (`session_ui::consent_gate`), and
+        /// records what it was shown.
+        ///
+        /// Not a variant of [`Client`], deliberately: the widening turns on this
+        /// exact answer and nothing else, so the fixture that produces it is its
+        /// own thing rather than a mode of the one that answers.
+        struct Unattended {
+            pending: Arc<PendingPermissions>,
+            asked: Mutex<Vec<PermissionRequest>>,
+        }
+
+        impl Unattended {
+            fn new(pending: &Arc<PendingPermissions>) -> Arc<Self> {
+                Arc::new(Self {
+                    pending: Arc::clone(pending),
+                    asked: Mutex::new(Vec::new()),
+                })
+            }
+
+            fn trust_questions(&self) -> usize {
+                self.asked
+                    .lock()
+                    .expect("asked mutex poisoned")
+                    .iter()
+                    .filter(|request| {
+                        matches!(
+                            request.subject,
+                            Some(PermissionSubject::ProjectSkillTrust { .. })
+                        )
+                    })
+                    .count()
+            }
+        }
+
+        impl AddressedPermissionDelivery for Unattended {
+            fn deliver(
+                &self,
+                connection: ConnectionId,
+                _session_id: &SessionId,
+                request: PermissionRequest,
+            ) -> bool {
+                self.asked
+                    .lock()
+                    .expect("asked mutex poisoned")
+                    .push(request.clone());
+                self.pending.resolve_from(
+                    &request.request_id,
+                    PermissionOutcome::Refused {
+                        reason: teton_protocol::methods::RefusalReason::NoTerminal,
+                    },
+                    connection,
+                )
+            }
+        }
+
+        /// [`install_gate`] with `[skills] trusted_project_roots` seeded, and
+        /// optionally a sink for what a permanent answer writes.
+        fn install_gate_trusting(
+            runtime: &Arc<DaemonRuntime>,
+            events: &Arc<EventBus>,
+            session_id: &SessionId,
+            client: Arc<dyn AddressedPermissionDelivery>,
+            roots: Vec<String>,
+            sink: Option<Arc<dyn crate::harness::permissions::ProjectTrustPersistence>>,
+        ) {
+            let mut gate = PermissionGate::new(
+                session_id.clone(),
+                PermissionConfig::default(),
+                Arc::clone(events),
+                Arc::clone(runtime.pending()),
+            )
+            .with_addressed_delivery(client)
+            .with_trusted_project_roots(roots);
+            if let Some(sink) = sink {
+                gate = gate.with_project_trust_persistence(sink);
+            }
+            runtime
+                .session_gates
+                .lock()
+                .expect("session gate mutex poisoned")
+                .insert(session_id.clone(), Arc::new(gate));
+        }
+
+        /// One typed `/marked` turn in `dir`, with `gate_setup` deciding what the
+        /// session's gate knows.
+        ///
+        /// Everything but the gate is the module's ordinary fixture, so the legs
+        /// below differ in exactly the thing they are about.
+        async fn typed_turn_in(
+            dir: &Path,
+            engine: &Recorder,
+            runtime: &Arc<DaemonRuntime>,
+            gate_setup: impl FnOnce(&Arc<DaemonRuntime>, &Arc<EventBus>, &SessionId),
+        ) -> Result<(), RpcError> {
+            let events = Arc::new(EventBus::new());
+            let sessions = SessionRegistry::new();
+            let session_id = sessions
+                .create(SessionMode::Freeform, None, Some(dir.to_path_buf()))
+                .expect("a freeform session")
+                .session_id;
+            let probed = runtime.session_root_for(Some(dir));
+            sessions.set_skills(
+                &session_id,
+                discover(None, &probed.path, probed.view.kind, &RealFs),
+            );
+            gate_setup(runtime, &events, &session_id);
+            let conn = GrantRegistry::new().next_connection_id();
+            let _ = engine;
+            runtime
+                .run_prompt_turn(
+                    &events,
+                    &sessions,
+                    session_id,
+                    SessionMode::Freeform,
+                    None,
+                    Some(dir.to_path_buf()),
+                    String::new(),
+                    Some(SkillInvocation {
+                        name: "marked".to_owned(),
+                        raw_arguments: String::new(),
+                    }),
+                    Some(conn),
+                    ClientPresence::unwatched(),
+                )
+                .await
+                .map(|_| ())
+        }
+
+        /// **The load-bearing leg, through the whole turn: an unattended session
+        /// at a root nobody listed still refuses — and the refusal says exactly
+        /// what to add.**
+        ///
+        /// If this goes green the wrong way, D-10 bought nothing: any scripted
+        /// run on any machine would expand any repository's skills, because "no
+        /// human is here" would itself be the permission.
+        ///
+        /// The second half is the remedy. A refusal without one is a dead end,
+        /// and the row this names has to be the **canonical** name of the tree —
+        /// `/tmp/x` and `/private/tmp/x` are one directory with two spellings,
+        /// and a user who copied the wrong one would have added a row that
+        /// silently never matches. The assertion reads the string out of the
+        /// production minter for that reason: a literal here would be a second
+        /// copy of the rule, green on the day the first one changed.
+        ///
+        /// **Mutation:** delete the `trusted_project_roots` consultation and the
+        /// companion leg below fails while this one stays green; make it allow
+        /// any `NoTerminal` and this one fails.
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn an_unattended_session_at_an_unlisted_root_refuses_and_names_the_row() {
+            let dir = project_root("trust-unattended-unlisted", "marked");
+            let engine = Recorder::new();
+            let runtime = runtime_with(&engine);
+            let client = Unattended::new(runtime.pending());
+
+            let err = typed_turn_in(&dir, &engine, &runtime, |runtime, events, session_id| {
+                install_gate_trusting(
+                    runtime,
+                    events,
+                    session_id,
+                    Arc::clone(&client) as Arc<dyn AddressedPermissionDelivery>,
+                    // A list, and a non-empty one: "it refused" must be a fact
+                    // about *this* root's absence rather than about a machine
+                    // that has never trusted anything.
+                    vec!["~/dev/some-other-repository".to_owned()],
+                    None,
+                )
+            })
+            .await
+            .expect_err("an unattended session at an unlisted root must refuse");
+
+            assert_eq!(err.code, error_code::CONSENT_DENIED, "{err:?}");
+            assert!(
+                err.message.contains("has not acknowledged")
+                    && err.message.contains("there was no client to ask"),
+                "the refusal must be the acknowledgment's, and must say nobody \
+                 could be asked: {}",
+                err.message
+            );
+
+            let expected = crate::harness::tools::skill::durable_trust_root_name(
+                &runtime.session_root_for(Some(&dir)).path,
+                home().as_deref(),
+            )
+            .expect("the fixture root canonicalises");
+            assert!(
+                err.message.contains("[skills] trusted_project_roots"),
+                "a refusal a scripted run meets must name the way out: {}",
+                err.message
+            );
+            assert!(
+                err.message.contains(&expected),
+                "and it must name the **canonical** row, or a user who pastes it \
+                 adds a line that never matches — expected `{expected}` in: {}",
+                err.message
+            );
+
+            assert_eq!(client.trust_questions(), 1, "the question was put");
+            assert!(
+                engine.prompts().is_empty(),
+                "the turn reached the engine, so the refusal came after the \
+                 expansion rather than before it: {} prompts",
+                engine.prompts().len()
+            );
+
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+
+        /// **The widening: an unattended session at a listed root runs the
+        /// repository's skill, and no human answered anything.**
+        ///
+        /// The companion that makes the leg above non-vacuous. Same fixture, same
+        /// unattended client, same refusal from that client — only the row
+        /// changes, so "it refused" up there is a fact about the list.
+        ///
+        /// The engine assertion is the point rather than a detail: the body
+        /// really did reach the model, in a session where nobody was asked
+        /// anything. That is what D-13 bought and what it cost, in one line.
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn an_unattended_session_at_a_listed_root_expands_the_repositorys_skill() {
+            let dir = project_root("trust-unattended-listed", "marked");
+            let engine = Recorder::new();
+            let runtime = runtime_with(&engine);
+            let client = Unattended::new(runtime.pending());
+            let listed = crate::harness::tools::skill::durable_trust_root_name(
+                &runtime.session_root_for(Some(&dir)).path,
+                home().as_deref(),
+            )
+            .expect("the fixture root canonicalises");
+
+            typed_turn_in(&dir, &engine, &runtime, |runtime, events, session_id| {
+                install_gate_trusting(
+                    runtime,
+                    events,
+                    session_id,
+                    Arc::clone(&client) as Arc<dyn AddressedPermissionDelivery>,
+                    vec!["~/dev/some-other-repository".to_owned(), listed],
+                    None,
+                )
+            })
+            .await
+            .expect("a listed root runs its skills unattended");
+
+            assert_eq!(
+                client.trust_questions(),
+                1,
+                "the question was still put — and still refused by the client, \
+                 which is what makes the allow the list's and not a human's"
+            );
+            assert!(
+                engine
+                    .prompts()
+                    .iter()
+                    .any(|prompt| prompt.contains(MARKER)),
+                "the expansion never reached the engine, so this leg is about a \
+                 turn that did not happen: {} prompts",
+                engine.prompts().len()
+            );
+
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+
+        /// **A human at a terminal is still asked, at a listed root, and their
+        /// answer is what happens.**
+        ///
+        /// The widening is confined to the posture it was written for. The
+        /// rewrite acts on the client's *"nobody could be asked"*, which a
+        /// session with somebody in it never produces — so a row in config never
+        /// speaks over the person in front of the prompt.
+        ///
+        /// **Mutation:** consult the list before settling, which is the obvious
+        /// simplification, and this reddens.
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn a_listed_root_still_asks_the_human_who_is_there() {
+            let dir = project_root("trust-listed-attended", "marked");
+            let engine = Recorder::new();
+            let runtime = runtime_with(&engine);
+            let client = Client::answering(runtime.pending(), PermissionOptionKind::RejectOnce);
+            let listed = crate::harness::tools::skill::durable_trust_root_name(
+                &runtime.session_root_for(Some(&dir)).path,
+                home().as_deref(),
+            )
+            .expect("the fixture root canonicalises");
+
+            let err = typed_turn_in(&dir, &engine, &runtime, |runtime, events, session_id| {
+                install_gate_trusting(
+                    runtime,
+                    events,
+                    session_id,
+                    Arc::clone(&client) as Arc<dyn AddressedPermissionDelivery>,
+                    vec![listed],
+                    None,
+                )
+            })
+            .await
+            .expect_err("the human said no, and a config row does not overrule them");
+
+            assert!(
+                err.message.contains("you declined it"),
+                "a listed root must still reach the human, and their `no` must be \
+                 the reason: {}",
+                err.message
+            );
+            assert_eq!(client.trust_questions(), 1, "they were asked");
+            assert!(engine.prompts().is_empty(), "and nothing was expanded");
+
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+
+        /// **The permanent answer reaches the config *file*, and only that
+        /// answer does (LESSON-519, LESSON-520).**
+        ///
+        /// LESSON-519's rule is that "assert by inspecting the artifact" means
+        /// the real one: a daemon with a real `config_path`, the production write
+        /// path, and the bytes read back through the production loader — not an
+        /// in-memory struct and not an inference from a returned code.
+        ///
+        /// LESSON-520's rule is that the silent leg is worthless unpaired. Both
+        /// legs here are the **same** turn, the same fixture, the same root and
+        /// the same five offered options; only the id the client picks differs.
+        /// So a build that wrote on every answer fails the second leg, and one
+        /// that wrote on none fails the first — and the payload in the silent leg
+        /// is one that *would* have persisted, because the accepted leg shows it
+        /// persisting.
+        ///
+        /// `allow_always` is the right pair for exactly one reason: it shares a
+        /// [`PermissionOptionKind`] with the durable option. A gate that picked
+        /// by kind would edit a user's config because they answered "allow for
+        /// this session", and this is the leg that would catch it.
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn the_permanent_answer_reaches_the_config_file_and_only_that_answer() {
+            for (answer, writes, what) in [
+                (OPTION_ID_ENABLE_PERMANENT, true, "trust permanently"),
+                ("allow_always", false, "allow for this session"),
+            ] {
+                let dir = project_root(&format!("trust-write-{writes}"), "marked");
+                let config_path = dir.join("teton-config.toml");
+                // A real document with something in it, so "byte-identical" is a
+                // claim about a file rather than about two absences — and so the
+                // accepted leg also shows the delta leaving the rest alone.
+                let seed = "[permissions]\ndefault_level = \"guarded\"\n";
+                std::fs::write(&config_path, seed).unwrap();
+
+                let engine = Recorder::new();
+                let slot = EngineSlot::empty();
+                slot.install(
+                    "recording".to_owned(),
+                    Arc::new(Mutex::new(engine.clone())) as Arc<Mutex<dyn Engine>>,
+                );
+                let runtime = Arc::new(DaemonRuntime {
+                    engine: slot,
+                    local_available: AtomicBool::new(true),
+                    config_path: Some(config_path.clone()),
+                    ..DaemonRuntime::minimal()
+                });
+                let client = Client::selecting(runtime.pending(), answer);
+                let expected = crate::harness::tools::skill::durable_trust_root_name(
+                    &runtime.session_root_for(Some(&dir)).path,
+                    home().as_deref(),
+                )
+                .expect("the fixture root canonicalises");
+
+                typed_turn_in(&dir, &engine, &runtime, |runtime, events, session_id| {
+                    install_gate_trusting(
+                        runtime,
+                        events,
+                        session_id,
+                        Arc::clone(&client) as Arc<dyn AddressedPermissionDelivery>,
+                        // Empty: the row this leg is about must be the one the
+                        // answer wrote, never one the fixture seeded.
+                        Vec::new(),
+                        Some(Arc::clone(runtime)
+                            as Arc<
+                                dyn crate::harness::permissions::ProjectTrustPersistence,
+                            >),
+                    )
+                })
+                .await
+                .unwrap_or_else(|err| panic!("{what}: the turn must run — {err:?}"));
+
+                let bytes = std::fs::read_to_string(&config_path).expect("the file is still there");
+                let reloaded = load_config(Some(&config_path)).expect("the written config loads");
+                if writes {
+                    assert_eq!(
+                        reloaded.skills.trusted_project_roots,
+                        vec![expected.clone()],
+                        "{what}: the row the label promised did not survive the \
+                         reload a later session performs; file:\n{bytes}"
+                    );
+                    assert!(
+                        bytes.contains(seed.trim()),
+                        "the delta rewrote the rest of the user's document; \
+                         file:\n{bytes}"
+                    );
+                    // And the daemon this turn ran under agrees with the disk.
+                    assert_eq!(
+                        runtime
+                            .config
+                            .lock()
+                            .expect("config mutex")
+                            .skills
+                            .trusted_project_roots,
+                        vec![expected.clone()]
+                    );
+                } else {
+                    assert_eq!(
+                        bytes, seed,
+                        "{what}: an answer that promised no write edited the file"
+                    );
+                    assert!(
+                        reloaded.skills.trusted_project_roots.is_empty(),
+                        "{what}: a row appeared from an answer that did not ask \
+                         for one"
+                    );
+                }
+
+                let _ = std::fs::remove_dir_all(&dir);
+            }
         }
     }
 

@@ -110,7 +110,7 @@ use tetond::broadcast::{EventBus, Subscription};
 use tetond::grants::{ConnectionId, GrantRegistry};
 use tetond::harness::permissions::{
     skill_grant_key, AddressedPermissionDelivery, ArgumentInterpolation, PendingPermissions,
-    PermissionDecision, PermissionGate, SkillConsent,
+    PermissionDecision, PermissionGate, SkillConsent, TrustRoot,
 };
 use tetond::skills::{permission_key_for, SkillSource};
 
@@ -410,7 +410,18 @@ async fn acknowledge(
         PROMPT_WAIT,
         gate.authorize_project_skill_trust(
             &project_skill_trust_key(root),
-            root,
+            TrustRoot {
+                display: root,
+                // REQ-589 D-13. `Some`, always, and that is what makes the
+                // option-set leg below a live pin rather than a vacuous one: the
+                // model's caller *does* hand this door a canonical name, and the
+                // rule being asserted is that having one in hand still buys the
+                // model's prompt no fifth option. A helper passing `None` would
+                // assert the absence of an option the door was never given the
+                // chance to offer. The spelling stands in for the canonical
+                // mint — this door only ever tests it for membership.
+                durable: Some(root),
+            },
             skills,
             shadows_user_skill,
             // REQ-589 TASK-261. This helper stands in for REQ-587's caller, the
@@ -527,10 +538,19 @@ async fn one_consent_per_invocation_lists_every_command_verbatim_in_document_ord
 
 /// **ADR-6: the standard four options, and never the fifth.**
 ///
-/// `enable_permanent` is web-only because a tier is the one thing a consent
-/// answer can write down. There is no `[skills] tier`, and an "always" over
-/// file-supplied shell commands in a file re-read every session would be a far
-/// larger promise than the prompt makes.
+/// A consent that writes something down needs something to write, and this
+/// question has nothing: an "always" over file-supplied shell commands in a file
+/// the daemon re-reads every session would be a far larger promise than the
+/// prompt makes.
+///
+/// **REQ-589 D-13 gave a `[skills]` table to the question one door over**, and
+/// this leg is worth keeping straight against it. The acknowledgment now has a
+/// durable form because it grants no *effect* — what it grants is repository
+/// text reaching the model labelled instructions — and because without one an
+/// unattended session could not run a typed project skill at all. The
+/// dynamic-context prompt below grants an effect and still writes nothing. The
+/// two are one function apart in `permissions.rs`, which is exactly why the
+/// absence is asserted here rather than assumed.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_skill_prompt_offers_the_standard_four_and_never_the_permanent_one() {
     let conns = connections(1);
@@ -560,7 +580,7 @@ async fn a_skill_prompt_offers_the_standard_four_and_never_the_permanent_one() {
     );
     assert!(
         !ids.contains(&OPTION_ID_ENABLE_PERMANENT),
-        "there is no `[skills] tier` for a permanent answer to write"
+        "a dynamic-context consent has nothing durable to write, and REQ-589          D-13's `[skills] trusted_project_roots` is the *acknowledgment*'s key,          not this question's"
     );
     answerer.stop();
 }
@@ -1355,9 +1375,20 @@ async fn the_acknowledgment_asks_under_its_own_key_and_names_the_root_and_its_sk
              the key (BR-11); subject was {other:?}"
         ),
     }
-    // The four standard options, and never the fifth: durable project trust is
-    // wholly Deferred (OQ-3), so there is nothing for `enable_permanent` to
-    // write and nothing that survives this session.
+    // The four standard options, and never the fifth — **the model-invoked
+    // path, unchanged by REQ-589 D-13** (TASK-262).
+    //
+    // D-13 gave this question a durable form and put `enable_permanent` on the
+    // prompt that asks it. On the *typed* path only: a config write is
+    // authorized at a moment, and the only moment a human chose is the one where
+    // they typed the name themselves. This prompt exists because the **model**
+    // reached for a skill, which is the "a file on disk would be choosing when it
+    // gets a consent prompt" shape BR-6 is written against.
+    //
+    // Non-vacuous: `acknowledge` hands this door a durable name (see its own
+    // comment), so the door had one and declined to offer it. The *answer* is
+    // still shared across both callers — one key per root — and only the offer
+    // to write is withheld.
     let ids: Vec<&str> = prompt
         .request
         .options
@@ -2173,7 +2204,10 @@ async fn each_skill_door_refuses_the_others_key_in_every_build_profile() {
             PROMPT_WAIT,
             gate.authorize_project_skill_trust(
                 &permission_key_for(SkillSource::Project, "validate"),
-                "~/dev/teton",
+                TrustRoot {
+                    display: "~/dev/teton",
+                    durable: None,
+                },
                 &[entry("validate", true)],
                 false,
                 InvokedBy::Model,

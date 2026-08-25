@@ -697,6 +697,69 @@ impl PermissionsConfig {
     }
 }
 
+/// Durable skill consent (the `[skills]` table, REQ-589 D-13).
+///
+/// # This table is a deliberate security widening, not a convenience
+///
+/// REQ-589 D-10 put a trust gate on the user-typed `/name` path, so a project
+/// skill's body is acknowledged before it reaches the model labelled
+/// *instructions*. That gate has no unattended answer: a piped session has no
+/// human to ask, and the shadowing case is asked even at `full`, so an
+/// automated run could not invoke a typed project skill at all. D-13 chose to
+/// preserve automation, and this table is the price — the guarantee that
+/// **every** project-authored body is acknowledged *in the session that sends
+/// it* is traded for a human decision made **once, out of band**, and consulted
+/// later without a prompt.
+///
+/// The half that is *not* traded away is the whole point: a human still decides.
+/// An unattended session at a root this list does not name refuses exactly as it
+/// did before D-13. This list is consulted; it is never written by the
+/// unattended path, and nothing here invents a decision nobody made.
+///
+/// # The precedent
+///
+/// `[web] permission_allow` (REQ-563 BR-4) is the same shape and is deliberately
+/// mirrored rather than reinvented: a durable, human-made consent recorded in
+/// config by an option on an interactive prompt whose **label names the key it
+/// writes**, and consulted by later sessions without re-asking.
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub struct SkillsConfig {
+    /// The project roots whose skills a human has durably acknowledged
+    /// (REQ-589 D-13).
+    ///
+    /// Each entry is the **canonical** root name minted by
+    /// `tetond::harness::tools::skill::durable_trust_root_name`: the session
+    /// root with every symlink resolved, then spelled home-relative and
+    /// percent-escaped exactly as the acknowledgment key's root is. Canonical,
+    /// because an entry naming a path rather than a tree is a bypass — a
+    /// symlink dropped at a listed path would hand a repository nobody
+    /// acknowledged the trust of one somebody did. See that function for the
+    /// full rule and for what this identity deliberately does *not* defend
+    /// against.
+    ///
+    /// **Matched by exact equality, never by prefix.** Trusting `~/dev/repo`
+    /// says nothing about `~/dev/repo/vendor/other`, which is a different
+    /// repository with different authors; a prefix test would extend one
+    /// answer over every tree nested under it, including one a dependency
+    /// update dropped there.
+    ///
+    /// An entry that matches no root is inert rather than an error: it can only
+    /// ever fail to allow, which is the direction to be wrong in, so a stale
+    /// row left behind by a moved repository costs one prompt and nothing else.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub trusted_project_roots: Vec<String>,
+}
+
+impl SkillsConfig {
+    /// Whether every field still holds its default, used to keep the
+    /// `[skills]` table out of a config that never set one — the same treatment
+    /// [`PermissionsConfig::is_unset`] gives `[permissions]`.
+    #[must_use]
+    pub fn is_unset(&self) -> bool {
+        *self == Self::default()
+    }
+}
+
 /// Top-level configuration document.
 ///
 /// Field order matters for TOML serialization: the scalar `pinned_local_model`
@@ -768,6 +831,14 @@ pub struct Config {
     /// fields, for the TOML-ordering reason above.
     #[serde(default, skip_serializing_if = "PermissionsConfig::is_unset")]
     pub permissions: PermissionsConfig,
+    /// Durable skill consent (`[skills]`, REQ-589 D-13): the project roots a
+    /// human has acknowledged out of band, so an unattended session may run
+    /// their skills. Absent means the empty list — every unattended session
+    /// refuses a typed project skill exactly as it did before D-13. Declared
+    /// here among the tables, before the array-of-table fields, for the
+    /// TOML-ordering reason above.
+    #[serde(default, skip_serializing_if = "SkillsConfig::is_unset")]
+    pub skills: SkillsConfig,
     /// Registered providers.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub providers: Vec<ModelProvider>,
@@ -2818,6 +2889,10 @@ effort_ladder = []
             // REQ-560: likewise the shipped default (guarded); the levels have
             // their own tests.
             permissions: PermissionsConfig::default(),
+            // REQ-589 D-13: likewise the shipped default (nothing durably
+            // acknowledged), so the round trip proves `[skills]` stays out of a
+            // config that never trusted a repository.
+            skills: SkillsConfig::default(),
             providers: vec![
                 ModelProvider {
                     id: "local".to_owned(),

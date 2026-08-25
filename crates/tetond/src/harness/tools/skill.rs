@@ -632,6 +632,58 @@ pub(crate) fn trust_root_name(root: &Path, home: Option<&Path>) -> String {
     percent_escaped(root)
 }
 
+/// The name a **durable** acknowledgment of this root is written and matched
+/// under (REQ-589 D-13): [`trust_root_name`] over the root with every symlink
+/// resolved.
+///
+/// # Why this is not [`trust_root_name`]
+///
+/// That function names the root *as the session stands on it*, which is right
+/// for a key and a prompt: both are scoped to one session, and the session is
+/// already standing on whatever that path resolves to. A row in `config.toml`
+/// is not. It is read months later, by a session the person who wrote it is not
+/// watching, and matched against a path that has had every opportunity to
+/// change what it points at. A list of *paths* is therefore a bypass waiting to
+/// happen: drop a symlink at `~/dev/repo` and a repository nobody acknowledged
+/// inherits the trust of one somebody did, with the same string on both sides
+/// of the comparison. `std::fs::canonicalize` resolves the link, so the name
+/// this mints is the name of a **tree** and the substitution simply misses.
+///
+/// It also normalises the two ways one tree is spelled — a `..` in the middle,
+/// macOS's `/private` prefix and its `/System/Volumes/Data` firmlink — so a
+/// user who typed `--cwd ../repo` is the same acknowledgment as one who typed
+/// the path in full, rather than a second one nobody wrote down.
+///
+/// `home` is canonicalised for the same reason and in the same breath: the
+/// home-relative rule is `strip_prefix`, and stripping an *un*resolved home
+/// from a resolved root would silently stop matching on any machine whose home
+/// directory is itself a link.
+///
+/// # What it deliberately does not defend against
+///
+/// **Replacement of the tree at a listed path.** Delete `~/dev/repo` and clone
+/// a different repository there and the row still matches, because it is the
+/// same directory. No name for a location can tell those apart, and the
+/// alternatives that could — a device/inode pair, a content digest — are
+/// unwritable by hand, unreadable by the person auditing the file, and would
+/// not survive a restore from backup. `[web] permission_allow` has exactly this
+/// character too: it records a decision about a *thing*, and the thing can be
+/// changed by whoever owns it. What the row promises is that a human named this
+/// tree; it does not promise the tree never changes, and neither does the
+/// in-session acknowledgment it stands in for.
+///
+/// # `None` is a refusal
+///
+/// A root that will not canonicalise — deleted, or unreadable — mints no name,
+/// so nothing in the list can match it and nothing can be written for it. That
+/// is fail-closed in both directions and it is the only honest answer: a name
+/// derived from a path the filesystem would not resolve names nothing.
+pub(crate) fn durable_trust_root_name(root: &Path, home: Option<&Path>) -> Option<String> {
+    let root = std::fs::canonicalize(root).ok()?;
+    let home = home.and_then(|home| std::fs::canonicalize(home).ok());
+    Some(trust_root_name(&root, home.as_deref()))
+}
+
 /// `path`'s bytes as a string that names exactly those bytes: each byte outside
 /// a valid UTF-8 sequence, and each literal `%`, written `%XX`.
 ///
@@ -1571,7 +1623,19 @@ impl SkillTool {
             .gate
             .authorize_project_skill_trust(
                 &project_skill_trust_key(&root),
-                &root,
+                crate::harness::permissions::TrustRoot {
+                    display: &root,
+                    // REQ-589 D-13: the canonical name a durable acknowledgment
+                    // is matched under. Passed on **this** caller too, and the
+                    // door's own doc says why the two uses of it differ: the
+                    // model may not be offered the write (a config write is
+                    // authorized at a moment a human chose, and this moment is
+                    // one the model chose), but a root a human already listed
+                    // answers for both callers — one key per root has meant one
+                    // answer per root since REQ-587, and a durable answer the
+                    // model's door could not read would make that two.
+                    durable: durable_trust_root_name(ctx.repo_root(), home().as_deref()).as_deref(),
+                },
                 &entries,
                 shadows,
                 // TASK-261: the model reached for this one. The typed path
@@ -3555,6 +3619,121 @@ mod tests {
             "the escape is injective: a path spelling `%FF` is not the path \
              holding the byte 0xFF"
         );
+    }
+
+    /// **The durable name is a name for a *tree*, not for a path (REQ-589
+    /// D-13).**
+    ///
+    /// This is the anti-spoofing property the `[skills] trusted_project_roots`
+    /// list stands on, and it is worth stating what fails without it. A row in
+    /// that list is a standing "yes" read by sessions its author is not
+    /// watching. If the row named a *path*, anyone who could create a file where
+    /// that path points — a checked-in `install.sh`, a dependency's postinstall,
+    /// a stray `ln -s` — could hand an unacknowledged repository the trust of an
+    /// acknowledged one, with the same string on both sides of the comparison
+    /// and nothing for the daemon to notice. Resolving the link first is what
+    /// makes the substitution simply miss.
+    ///
+    /// Four claims:
+    ///
+    /// 1. **the premise** — the un-canonical mint really does collapse the link
+    ///    onto the tree's name, so there is a hazard here to close;
+    /// 2. **the fix** — the durable mint does not: a link and its target are two
+    ///    names, and the link's is the target's, so a row written for one tree
+    ///    cannot be matched by a link standing somewhere else;
+    /// 3. **not a prefix** — a nested directory under an acknowledged root mints
+    ///    a different name, so nothing extends one answer over a tree a
+    ///    dependency dropped inside another;
+    /// 4. **two spellings, one tree** — `dir/../dir` is the same acknowledgment
+    ///    as `dir`, so a `--cwd` a user typed relatively is not a second row
+    ///    nobody wrote.
+    ///
+    /// **Mutation:** drop the `canonicalize` in `durable_trust_root_name` and
+    /// (2) and (4) both fail.
+    #[test]
+    fn the_durable_name_resolves_the_link_and_names_the_tree() {
+        let base = std::env::temp_dir().join(format!(
+            "teton-durable-root-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_or(0, |d| d.as_nanos())
+        ));
+        let real = base.join("real");
+        let decoy = base.join("decoy");
+        std::fs::create_dir_all(real.join("nested")).unwrap();
+        std::fs::create_dir_all(&decoy).unwrap();
+        // The substitution: a link standing where an acknowledged root stood.
+        let link = base.join("link");
+        std::os::unix::fs::symlink(&decoy, &link).unwrap();
+
+        let durable = |path: &Path| {
+            durable_trust_root_name(path, None).unwrap_or_else(|| {
+                panic!("{} did not canonicalise", path.display());
+            })
+        };
+
+        // (1) The premise: the un-canonical mint cannot tell the link from a
+        // real directory of that name, which is the whole reason the durable one
+        // is a second function.
+        assert_eq!(
+            trust_root_name(&link, None),
+            trust_root_name(&link, None),
+            "sanity"
+        );
+        assert!(
+            trust_root_name(&link, None).ends_with("/link"),
+            "the un-canonical mint names the path as given: {}",
+            trust_root_name(&link, None)
+        );
+
+        // (2) The fix. The link mints its *target's* name, so a row written for
+        // `real` is not matched by a link, and a row written for the link's own
+        // spelling is not what this list ever holds.
+        assert_eq!(
+            durable(&link),
+            durable(&decoy),
+            "a link must name the tree it points at, or the list is a list of \
+             paths and a path can be pointed anywhere"
+        );
+        assert_ne!(
+            durable(&link),
+            durable(&real),
+            "the acknowledged tree and the decoy must never mint one name"
+        );
+
+        // (3) Not a prefix. Trusting a repository says nothing about a
+        // repository nested inside it — the membership test is exact equality,
+        // and this is the half that makes that meaningful.
+        assert_ne!(
+            durable(&real.join("nested")),
+            durable(&real),
+            "a nested directory must be its own acknowledgment"
+        );
+        assert!(
+            durable(&real.join("nested")).starts_with(&durable(&real)),
+            "non-vacuity: the two names really do share a prefix, so an exact \
+             match is doing the work rather than the strings being unrelated"
+        );
+
+        // (4) Two spellings, one tree.
+        assert_eq!(
+            durable(&real.join("nested").join("..")),
+            durable(&real),
+            "`dir/../dir` is the same repository, and a user who typed it \
+             relatively must not need a second row"
+        );
+
+        // A root that does not resolve mints nothing, so nothing in the list can
+        // match it and nothing can be written for it.
+        assert_eq!(
+            durable_trust_root_name(&base.join("nothing-here"), None),
+            None,
+            "a name derived from a path the filesystem will not resolve names \
+             nothing, and must not be matched"
+        );
+
+        let _ = std::fs::remove_dir_all(&base);
     }
 
     /// **The acknowledgment really asks under that name (BR-4, ADR-7).**

@@ -763,6 +763,59 @@ pub trait WebTierPersistence: Send + Sync {
     fn persist_web_tier(&self, tier: WebTier) -> Result<(), String>;
 }
 
+/// The two names one repository root answers to at BR-4's door (REQ-589 D-13).
+///
+/// They travel as a pair because they are two spellings of one thing and every
+/// question below is about which spelling belongs where. Passing them
+/// separately invited a call site that named one root and looked another up —
+/// the exact confusion the per-root scope exists to prevent.
+#[derive(Debug, Clone, Copy)]
+pub struct TrustRoot<'a> {
+    /// The session's own spelling, from
+    /// [`crate::harness::tools::skill::trust_root_name`]: what the
+    /// acknowledgment key is minted from and what the prompt shows.
+    ///
+    /// Scoped to this session, which is why it is the wrong name for a config
+    /// row — see [`Self::durable`].
+    pub display: &'a str,
+    /// The canonical name, from
+    /// [`crate::harness::tools::skill::durable_trust_root_name`]: what
+    /// `[skills] trusted_project_roots` is matched and written against.
+    ///
+    /// `None` for a root that will not canonicalise, which matches nothing and
+    /// offers nothing — fail-closed in both directions.
+    pub durable: Option<&'a str>,
+}
+
+/// Where a durable project-trust answer is written down (REQ-589 D-13).
+///
+/// A second seam rather than a second method on [`WebTierPersistence`], for the
+/// reason that trait is a seam at all: this module is the permission *model* and
+/// owns no configuration. Two questions that happen to write to the same file
+/// are still two questions, and a gate wired for one of them must not be
+/// silently able to perform the other.
+///
+/// The `Result` is load-bearing here for a sharper reason than it is there.
+/// This write is the entire difference between "an unattended session may run
+/// this repository's skills" and "it may not", and the option's label promises
+/// it by name; a failure that went unreported would leave the user believing
+/// they had automated something they had not. The gate reports it on the
+/// daemon's stderr and still grants the *session*, which is the honest split —
+/// the answer they gave holds for the session they gave it in, and only the
+/// part that would have outlived it did not happen.
+pub trait ProjectTrustPersistence: Send + Sync {
+    /// Record `root` as durably acknowledged.
+    ///
+    /// `root` is the canonical name minted by
+    /// [`crate::harness::tools::skill::durable_trust_root_name`] — the
+    /// implementor appends it and does not re-derive it, so the string written
+    /// is the string the label named and the string a later session matches.
+    ///
+    /// # Errors
+    /// A human-readable sentence naming what stopped the write.
+    fn persist_trusted_project_root(&self, root: &str) -> Result<(), String>;
+}
+
 /// Where an **addressed** permission request is delivered (REQ-585 ADR-7).
 ///
 /// A seam rather than a connection registry handle for the reason
@@ -1028,6 +1081,30 @@ enum Question {
     /// `enable_permanent` when the payload names the tier a decision could be
     /// written down at.
     Standard(Option<WebTier>),
+    /// REQ-587 BR-4's project-skill acknowledgment, which since REQ-589 D-13 has
+    /// a durable form and therefore an option set of its own.
+    ProjectTrust {
+        /// The canonical root name a permanent answer would write to
+        /// `[skills] trusted_project_roots`, when this prompt may offer to
+        /// write one at all.
+        ///
+        /// `None` — and therefore the standard four options, byte for byte as
+        /// REQ-587 shipped them — in two cases, and the second is the
+        /// interesting one:
+        ///
+        /// - the root will not canonicalise, so there is no name to write;
+        /// - **the model raised this prompt.** A durable config write is
+        ///   authorized at a moment, and D-13 only ever meant a moment the
+        ///   *human* chose. The typed path's prompt exists because the user
+        ///   typed `/name`; this door's other caller exists because the model
+        ///   reached for a skill, which is the "a file on disk would be
+        ///   choosing when it gets a consent prompt" shape BR-6 is written
+        ///   against. The *answer* is still shared — one key per root, read by
+        ///   both callers — so a repository trusted at the typed prompt needs no
+        ///   second acknowledgment when the model reaches for it. Only the offer
+        ///   to write is withheld.
+        durable_root: Option<String>,
+    },
     /// REQ-589's over-budget offer (architecture ADR-1).
     OverBudget {
         /// The labels, composed elsewhere (BR-5).
@@ -1049,7 +1126,22 @@ impl Question {
     const fn web(&self) -> Option<WebTier> {
         match self {
             Self::Standard(web) => *web,
-            Self::OverBudget { .. } => None,
+            Self::ProjectTrust { .. } | Self::OverBudget { .. } => None,
+        }
+    }
+
+    /// The root a permanent answer to *this* question would write down, if this
+    /// question offers one at all (REQ-589 D-13).
+    ///
+    /// The precondition [`interpret`](PermissionGate::interpret) reads before
+    /// treating `enable_permanent` as a durable answer, exactly as `web` is the
+    /// precondition on the tier side: an id that was not on the prompt is not an
+    /// answer to it, and one question's fifth option must never authorize the
+    /// other's write.
+    fn durable_project_root(&self) -> Option<&str> {
+        match self {
+            Self::ProjectTrust { durable_root } => durable_root.as_deref(),
+            Self::Standard(_) | Self::OverBudget { .. } => None,
         }
     }
 
@@ -1077,7 +1169,7 @@ impl Question {
     /// available to it.
     const fn consults_grants(&self) -> bool {
         match self {
-            Self::Standard(_) => true,
+            Self::Standard(_) | Self::ProjectTrust { .. } => true,
             Self::OverBudget { .. } => false,
         }
     }
@@ -1086,7 +1178,7 @@ impl Question {
     /// prompt — the precondition for treating either as an answer.
     const fn remedy_offered(&self) -> bool {
         match self {
-            Self::Standard(_) => false,
+            Self::Standard(_) | Self::ProjectTrust { .. } => false,
             Self::OverBudget { labels, .. } => labels.remedy.is_some(),
         }
     }
@@ -1331,6 +1423,31 @@ pub struct PermissionGate {
     /// achieved. An unwired sink is a gate that cannot promise permanence, not a
     /// gate that lies about it.
     web_persistence: Option<Arc<dyn WebTierPersistence>>,
+    /// The project roots `[skills] trusted_project_roots` names, snapshotted
+    /// when this gate was built (REQ-589 D-13).
+    ///
+    /// **A deliberate security widening.** These are the roots at which an
+    /// *unattended* session — one whose client answered that there is no human
+    /// to ask — may run project-authored skills without an in-session
+    /// acknowledgment. D-10's gate has no other unattended answer, and D-13
+    /// chose automation over the refusal. What survives is that a human wrote
+    /// each of these rows: [`Self::authorize_project_skill_trust`] *consults*
+    /// this list and never appends to it, so an unattended session at a root
+    /// nobody listed refuses exactly as it did before.
+    ///
+    /// Read-only for the life of the gate, like the web tiers folded into the
+    /// policy table beside it and for the same reason: a session keeps the
+    /// posture it started with, and a config edit cannot narrow — or widen — a
+    /// conversation already in progress.
+    trusted_project_roots: Vec<String>,
+    /// Where a permanent project-trust answer is written (REQ-589 D-13).
+    ///
+    /// `None` on a gate nobody wired one into, with [`Self::web_persistence`]'s
+    /// consequence rather than [`Self::addressed`]'s: the option is still
+    /// offered and still allows for the session, and the failure to make it
+    /// durable is reported. An unwired sink is a gate that cannot promise
+    /// permanence, not a gate that lies about it.
+    project_trust_persistence: Option<Arc<dyn ProjectTrustPersistence>>,
     /// Where an addressed request is routed (REQ-585 ADR-7).
     ///
     /// `None` on a gate nobody wired one into — which, unlike
@@ -1393,6 +1510,8 @@ impl PermissionGate {
             events,
             pending,
             web_persistence: None,
+            trusted_project_roots: Vec::new(),
+            project_trust_persistence: None,
             addressed: None,
         }
     }
@@ -1489,6 +1608,29 @@ impl PermissionGate {
     #[must_use]
     pub fn with_web_persistence(mut self, sink: Arc<dyn WebTierPersistence>) -> Self {
         self.web_persistence = Some(sink);
+        self
+    }
+
+    /// Seed the roots a human has durably acknowledged, from
+    /// `[skills] trusted_project_roots` (REQ-589 D-13).
+    ///
+    /// The one place the widening enters this module. A gate built without it
+    /// holds the empty list, which is D-10's posture exactly: every unattended
+    /// session refuses.
+    #[must_use]
+    pub fn with_trusted_project_roots(mut self, roots: Vec<String>) -> Self {
+        self.trusted_project_roots = roots;
+        self
+    }
+
+    /// Wire the sink a permanent project-trust answer writes through
+    /// (REQ-589 D-13).
+    #[must_use]
+    pub fn with_project_trust_persistence(
+        mut self,
+        sink: Arc<dyn ProjectTrustPersistence>,
+    ) -> Self {
+        self.project_trust_persistence = Some(sink);
         self
     }
 
@@ -1691,8 +1833,13 @@ impl PermissionGate {
         // No `description`: the subject already carries the skill, its source
         // and every command, and a sentence restating them would be a second
         // spelling of one fact for the two to drift apart at (LESSON-456).
-        self.settle_skill_consent(key, addressed, LevelAllow::Settles)
-            .await
+        self.settle_skill_consent(
+            key,
+            addressed,
+            Question::Standard(None),
+            LevelAllow::Settles,
+        )
+        .await
     }
 
     /// Put an **over-budget skill expansion** to the user as a question instead
@@ -1945,15 +2092,58 @@ impl PermissionGate {
     /// the question **says**. It does not touch what the answer is remembered
     /// under: the key is still the root's alone, so the paragraph above holds
     /// unchanged — one answer per root per session, shared by both callers.
+    /// ## The unattended path, and what it costs (REQ-589 D-13)
+    ///
+    /// **This is a security widening the product owner chose deliberately, and
+    /// it should be read as one.** Everything above describes a question put to
+    /// a human in the session that is about to send the repository's text. D-10
+    /// left that question with no unattended answer at all: a piped session has
+    /// nobody to ask, the shadowing case is asked even at `full`, and so an
+    /// automated run could not invoke a typed project skill under any permission
+    /// level. D-13 traded the guarantee that *every* project-authored body is
+    /// acknowledged **in the session that sends it** for the ability to
+    /// automate.
+    ///
+    /// [`TrustRoot::durable`] is what makes the trade bounded rather than a hole.
+    /// It is the canonical name of this root
+    /// ([`crate::harness::tools::skill::durable_trust_root_name`]), and the
+    /// widening is exactly this: when the client answers
+    /// [`RefusalReason::NoTerminal`] — *there is no human here* — and that name
+    /// is one `[skills] trusted_project_roots` already holds, the refusal
+    /// becomes an allow. Every other settlement is untouched.
+    ///
+    /// Three properties are what keep D-10 from becoming decorative, and each is
+    /// a thing this function does *not* do:
+    ///
+    /// - **It never writes that list from the unattended path.** A root nobody
+    ///   listed still refuses, forever, however many times it is invoked. The
+    ///   list is consulted; a decision is never invented.
+    /// - **It is consulted after the level, not before it.** The rewrite acts on
+    ///   a settlement, so `plan`'s `deny` has already returned and no row here
+    ///   can lift it — REQ-560 BR-5's ordering, preserved by construction.
+    /// - **It cannot reach an attended session.** `NoTerminal` is the client
+    ///   saying nobody could be asked without reading a line; a session with a
+    ///   human in it settles by that human's answer and never lands here. So no
+    ///   prompt this list touches was one anybody saw.
+    ///
+    /// The residual, stated plainly: a `[skills] trusted_project_roots` row is a
+    /// standing answer for a *tree*, given once and consulted by sessions its
+    /// author is not watching, and the repository under it can change after the
+    /// row is written. That is the same character `[web] permission_allow` has,
+    /// and it is what D-13 bought automation with.
     pub async fn authorize_project_skill_trust(
         &self,
         key: &str,
-        root: &str,
+        root: TrustRoot<'_>,
         skills: &[ProjectSkillTrustEntry],
         shadows_user_skill: bool,
         invoked_by: InvokedBy,
         addressee: ConnectionId,
     ) -> SkillConsent {
+        let TrustRoot {
+            display: root,
+            durable: durable_root,
+        } = root;
         // The misroute this door drops. A skill's own key here would remember
         // "the model may run this repository's skills" under the question "may
         // `/deploy`'s commands run", and nothing downstream could tell the two
@@ -2009,10 +2199,62 @@ impl PermissionGate {
         } else {
             LevelAllow::Settles
         };
+        // REQ-589 D-13. Two different uses of one name, and the asymmetry is
+        // deliberate — see `Question::ProjectTrust::durable_root`:
+        //
+        // - the **offer to write** is withheld from the model's caller, because
+        //   a durable config write is authorized at a moment and only the typed
+        //   path's moment was chosen by a human;
+        // - the **consultation** below takes the name whoever asked, because the
+        //   answer is one answer per root and splitting it would mean a
+        //   repository a human trusted was trusted for `/deploy` typed and not
+        //   for the model's `skill { name: "deploy" }`.
+        let question = Question::ProjectTrust {
+            durable_root: match invoked_by {
+                InvokedBy::User => durable_root.map(str::to_owned),
+                InvokedBy::Model => None,
+            },
+        };
         // No `description`, for [`Self::authorize_skill`]'s reason: the subject
         // carries the root and the named set, and a sentence restating them
         // would be a second spelling of one fact (LESSON-456).
-        self.settle_skill_consent(key, addressed, level_allow).await
+        let settled = self
+            .settle_skill_consent(key, addressed, question, level_allow)
+            .await;
+        self.acknowledged_unattended(settled, durable_root)
+    }
+
+    /// D-13's widening, and the whole of it: a `NoTerminal` refusal at a root a
+    /// human durably acknowledged becomes an allow.
+    ///
+    /// Written as a rewrite *of a settlement* rather than as a check before one,
+    /// which is what makes the three properties in
+    /// [`Self::authorize_project_skill_trust`]'s doc structural. The level has
+    /// already decided by the time this runs, so a `plan` deny cannot be lifted
+    /// here; a human's own answer has already been read, so an attended session
+    /// cannot reach the rewrite at all; and the only arm it touches is the one
+    /// that means *nobody was asked*.
+    ///
+    /// A root with no canonical name (`None`) matches nothing, so a root the
+    /// filesystem would not resolve refuses — fail-closed, and the only honest
+    /// reading of a name that names nothing.
+    fn acknowledged_unattended(
+        &self,
+        settled: SkillConsent,
+        durable_root: Option<&str>,
+    ) -> SkillConsent {
+        if !matches!(settled, SkillConsent::Refused(RefusalReason::NoTerminal)) {
+            return settled;
+        }
+        // Exact equality, never a prefix test: `~/dev/repo` is not an answer
+        // about `~/dev/repo/vendor/other`, which a dependency update can create
+        // and which a different set of people wrote.
+        match durable_root {
+            Some(name) if self.trusted_project_roots.iter().any(|row| row == name) => {
+                SkillConsent::Allowed
+            }
+            Some(_) | None => settled,
+        }
     }
 
     /// The shared tail of both skill doors: settle an addressed request and
@@ -2025,17 +2267,12 @@ impl PermissionGate {
         &self,
         key: &str,
         addressed: Addressed,
+        question: Question,
         level_allow: LevelAllow,
     ) -> SkillConsent {
         skill_consent_for(
-            self.settle(
-                key,
-                None,
-                Question::Standard(None),
-                Some(addressed),
-                level_allow,
-            )
-            .await,
+            self.settle(key, None, question, Some(addressed), level_allow)
+                .await,
         )
     }
 
@@ -2341,6 +2578,21 @@ impl PermissionGate {
                     let scope = self.persist_web_tier(web.unwrap_or(WebTier::Off));
                     (PermissionDecision::Allowed, scope)
                 }
+                // REQ-589 D-13: the same id, the other durable question. Told
+                // apart by which question was *asked* rather than by the id,
+                // which is the rule the arm above already follows — an id that
+                // was not on this prompt is not an answer to it, so neither
+                // write can ever be reached from the other's prompt. The
+                // session grant is recorded first and unconditionally for the
+                // arm above's reason.
+                //
+                // No `web_consent_decided` follows, because `web` is `None`:
+                // the scope below is inert and exists only to satisfy the tuple.
+                OPTION_ID_ENABLE_PERMANENT if question.durable_project_root().is_some() => {
+                    self.remember(tool_name, RememberedGrant::AllowAlways);
+                    self.persist_project_trust(question.durable_project_root().unwrap_or_default());
+                    (PermissionDecision::Allowed, WebConsentScope::Session)
+                }
                 OPTION_REJECT_ALWAYS => {
                     self.remember(tool_name, RememberedGrant::RejectAlways);
                     (PermissionDecision::Denied, WebConsentScope::Session)
@@ -2419,6 +2671,40 @@ impl PermissionGate {
                 );
                 WebConsentScope::Session
             }
+        }
+    }
+
+    /// Write a durable project-trust answer through the persistence seam
+    /// (REQ-589 D-13).
+    ///
+    /// Reports a failure on the operator's stderr and grants the session
+    /// anyway, which is [`Self::persist_web_tier`]'s split and is honest for the
+    /// same reason: the user said yes, and the only thing that did not happen is
+    /// the part that would have outlived the session. It matters more here than
+    /// it does there — this write is the entire difference between an unattended
+    /// run that works and one that refuses — so the line names the reason, and
+    /// says which key did not get the row, so "why is my scripted run still
+    /// refusing" has an answer on this machine.
+    ///
+    /// There is deliberately no scope to downgrade and no event to publish:
+    /// unlike a web consent, this answer's session half is the ordinary
+    /// `allow_always` grant recorded beside it, and the durable half is visible
+    /// where the label said it would be — in the file.
+    fn persist_project_trust(&self, root: &str) {
+        let Some(sink) = &self.project_trust_persistence else {
+            eprintln!(
+                "teton: `{root}`'s skills were acknowledged for this session only — this daemon \
+                 has no configured place to record the choice permanently, so an unattended \
+                 session will still refuse them."
+            );
+            return;
+        };
+        if let Err(err) = sink.persist_trusted_project_root(root) {
+            eprintln!(
+                "teton: `{root}`'s skills were acknowledged for this session only — \
+                 `[skills] trusted_project_roots` could not be written ({err}), so an unattended \
+                 session will still refuse them."
+            );
         }
     }
 
@@ -2674,18 +2960,28 @@ fn skill_key_prefix(source: SkillSource) -> String {
 /// would be a much larger promise than the one the prompt makes.
 ///
 /// A skill's dynamic context gets the standard four for exactly that reason
-/// (REQ-585): there is no `[skills] tier` either, and "never ask about
+/// (REQ-585): there is no `[skills]` key it could write, and "never ask about
 /// `/deploy` on this machine again" is a durable grant over file-supplied shell
 /// commands in a file the daemon re-reads every session — a promise a consent
 /// prompt has no business making. The absence is asserted rather than assumed,
 /// because it is the kind of option that gets added for symmetry.
 ///
-/// REQ-589's over-budget offer is the second question whose option set is
+/// **The project-skill acknowledgment stopped sharing that reason at REQ-589
+/// D-13**, and the distinction is worth keeping straight, because these two
+/// questions are one function apart. The dynamic-context prompt grants an
+/// *effect* — file-supplied shell commands run — and still writes nothing. The
+/// acknowledgment grants no effect at all; what it grants is repository text
+/// reaching the model labelled instructions, and D-13 gave it a durable form
+/// because without one an unattended session could not run a typed project
+/// skill under any level. See [`project_trust_options`].
+///
+/// REQ-589's over-budget offer is the third question whose option set is
 /// widened by a fact in hand, and it is deliberately built the same way — see
 /// [`over_budget_options`].
 fn options_for(question: &Question) -> Vec<PermissionOption> {
     match question {
         Question::Standard(web) => standard_options(*web),
+        Question::ProjectTrust { durable_root } => project_trust_options(durable_root.as_deref()),
         Question::OverBudget {
             labels,
             lead_with_remedy,
@@ -2696,6 +2992,61 @@ fn options_for(question: &Question) -> Vec<PermissionOption> {
 /// The four standard options, plus the persistent enable when `web` names a
 /// tier — every question this module asked before REQ-589.
 fn standard_options(web: Option<WebTier>) -> Vec<PermissionOption> {
+    // Named in the label, because BR-4 wants consent concrete: "enable
+    // permanently" alone does not say what is being enabled, and the two fetch
+    // tiers are a distinction a user has to be able to see.
+    //
+    // The label names the key that is actually written. It used to promise
+    // `[web] tier = "…"`, which is the raise-only ceiling — and the ceiling is
+    // checked *before* any prompt exists, so the tier write was a no-op in every
+    // case a user could reach this option. The durable effect is the consent
+    // list, and the label says so, including the "+=" that makes the per-tier
+    // append visible: this answer adds one tier, and leaves the other two
+    // asking.
+    options_around(web.map(|tier| {
+        let name = tier_name(tier);
+        format!(
+            "Enable permanently (writes `[web] permission_allow += \"{name}\"` — stop asking \
+             about {name} lookups on this machine)"
+        )
+    }))
+}
+
+/// The four standard options, plus the durable acknowledgment when this prompt
+/// may offer to write one (REQ-589 D-13).
+///
+/// **The label names the concrete write**, which is ADR-1's binding rule and
+/// `enable_permanent`'s own hard-won lesson: that option once promised a key it
+/// silently did not write. So this one spells the table, the key, the `+=` and
+/// the exact string that lands in it — and then names the consequence in the
+/// words the person answering actually cares about, because "a row in a list" is
+/// not what they are deciding. They are deciding whether a session with nobody
+/// watching may run this repository's skills.
+///
+/// It rides [`OPTION_ID_ENABLE_PERMANENT`] rather than an id of its own,
+/// deliberately. That constant is the protocol's word for *the durable option on
+/// this prompt*, the client finds it by that id and renders it as `[p]`, and a
+/// second id would be a second thing for both sides to agree about for no
+/// behaviour anyone can observe. Which write it authorizes is decided by the
+/// **question**, not by the id — see [`Question::durable_project_root`].
+fn project_trust_options(durable_root: Option<&str>) -> Vec<PermissionOption> {
+    options_around(durable_root.map(|root| {
+        format!(
+            "Trust this repository permanently (writes \
+             `[skills] trusted_project_roots += \"{root}\"` — a session with nobody at the \
+             terminal may then run its skills without asking)"
+        )
+    }))
+}
+
+/// The four standard options with `permanent`'s label, when there is one, in the
+/// fifth slot.
+///
+/// One body, so the two durable questions cannot come to disagree about where
+/// the option sits or what the other four say. The slot is between the allows
+/// and the rejects because that is where `enable_permanent` has always sat, and
+/// a client that renders options in order should not have them move under it.
+fn options_around(permanent: Option<String>) -> Vec<PermissionOption> {
     let mut options = vec![
         PermissionOption {
             option_id: OPTION_ALLOW_ONCE.to_owned(),
@@ -2708,25 +3059,10 @@ fn standard_options(web: Option<WebTier>) -> Vec<PermissionOption> {
             kind: PermissionOptionKind::AllowAlways,
         },
     ];
-    if let Some(tier) = web {
-        // Named in the label, because BR-4 wants consent concrete: "enable
-        // permanently" alone does not say what is being enabled, and the two
-        // fetch tiers are a distinction a user has to be able to see.
-        //
-        // The label names the key that is actually written. It used to promise
-        // `[web] tier = "…"`, which is the raise-only ceiling — and the ceiling
-        // is checked *before* any prompt exists, so the tier write was a no-op in
-        // every case a user could reach this option. The durable effect is the
-        // consent list, and the label says so, including the "+=" that makes the
-        // per-tier append visible: this answer adds one tier, and leaves the
-        // other two asking.
-        let name = tier_name(tier);
+    if let Some(label) = permanent {
         options.push(PermissionOption {
             option_id: OPTION_ID_ENABLE_PERMANENT.to_owned(),
-            label: format!(
-                "Enable permanently (writes `[web] permission_allow += \"{name}\"` — stop asking \
-                 about {name} lookups on this machine)"
-            ),
+            label,
             kind: PermissionOptionKind::AllowAlways,
         });
     }
@@ -3188,7 +3524,10 @@ mod tests {
             let consent = gate
                 .authorize_project_skill_trust(
                     &key,
-                    "~/dev/teton",
+                    TrustRoot {
+                        display: "~/dev/teton",
+                        durable: None,
+                    },
                     &[],
                     false,
                     InvokedBy::Model,
@@ -3263,7 +3602,10 @@ mod tests {
             assert!(
                 gate.authorize_project_skill_trust(
                     &project_skill_trust_key(root),
-                    root,
+                    TrustRoot {
+                        display: root,
+                        durable: None,
+                    },
                     &[],
                     false,
                     InvokedBy::Model,
@@ -3290,7 +3632,10 @@ mod tests {
         let _ = gate
             .authorize_project_skill_trust(
                 &project_skill_trust_key("~/dev/other"),
-                "~/dev/teton",
+                TrustRoot {
+                    display: "~/dev/teton",
+                    durable: None,
+                },
                 &[],
                 false,
                 InvokedBy::Model,
@@ -4426,10 +4771,18 @@ mod tests {
         (decision, options, rest)
     }
 
-    /// AC-2's option list, and its negative half: the persistent choice belongs
-    /// to the web tiers alone. `shell` and `edit` keep exactly four, because a
-    /// consent answer that quietly edited config would be a far larger promise
-    /// than "allow for this session".
+    /// AC-2's option list, and its negative half: among the keys **a tool call
+    /// is decided under**, the persistent choice belongs to the web tiers alone.
+    /// `shell` and `edit` keep exactly four, because a consent answer that
+    /// quietly edited config would be a far larger promise than "allow for this
+    /// session".
+    ///
+    /// REQ-589 D-13 gave the durable option a second question — BR-4's
+    /// project-skill acknowledgment, which is not a tool call and is asked at
+    /// its own door. The negative half here is unaffected and is the half that
+    /// matters: no *tool* key acquired a way to write config. See
+    /// [`the_typed_prompt_names_the_write_and_the_models_prompt_has_none`] for
+    /// the other question's own pin.
     #[tokio::test]
     async fn only_the_web_keys_are_offered_the_persistent_option() {
         let (bus, pending, gate) = gate(PermissionConfig::with_default(PermissionPolicy::Ask));
@@ -5944,5 +6297,487 @@ mod tests {
         let unanswered = OverBudgetAnswer::not_answered(SkillConsent::Unanswerable);
         assert_eq!(unanswered.consent(), SkillConsent::Unanswerable);
         assert!(!unanswered.apply_remedy());
+    }
+
+    // -----------------------------------------------------------------------
+    // REQ-589 D-13 — the unattended trust path
+    // -----------------------------------------------------------------------
+    //
+    // These are the witnesses for a **deliberate security widening**. D-10 put
+    // an acknowledgment on the user-typed `/name` path and left it with no
+    // unattended answer at all: a piped session has nobody to ask, and the
+    // shadowing case is asked even at `full`. D-13 traded the guarantee that
+    // every project-authored body is acknowledged *in the session that sends it*
+    // for the ability to automate, and bounded the trade with a list a human
+    // writes.
+    //
+    // What is being pinned is therefore not "the feature works". It is the shape
+    // of the bound: the list is consulted and never written by the unattended
+    // path, it is consulted after the level rather than before it, and it cannot
+    // reach a session that has a human in it. Take any of those away and D-10
+    // bought nothing.
+
+    /// A [`ProjectTrustPersistence`] that records what it was asked to write.
+    struct RecordingTrustSink {
+        written: Mutex<Vec<String>>,
+        fails: bool,
+    }
+
+    impl RecordingTrustSink {
+        fn new(fails: bool) -> Arc<Self> {
+            Arc::new(Self {
+                written: Mutex::new(Vec::new()),
+                fails,
+            })
+        }
+
+        fn written(&self) -> Vec<String> {
+            self.written.lock().expect("sink mutex").clone()
+        }
+    }
+
+    impl ProjectTrustPersistence for RecordingTrustSink {
+        fn persist_trusted_project_root(&self, root: &str) -> Result<(), String> {
+            self.written
+                .lock()
+                .expect("sink mutex")
+                .push(root.to_owned());
+            if self.fails {
+                return Err("the disk said no".to_owned());
+            }
+            Ok(())
+        }
+    }
+
+    /// The canonical name these legs use. Spelling is irrelevant to the door —
+    /// it tests the string for membership and nothing else — so a literal keeps
+    /// the fixture off the filesystem. `durable_trust_root_name`'s own suite owns
+    /// the question of what this string *is*.
+    const DURABLE: &str = "~/dev/acknowledged";
+    const DISPLAY: &str = "~/dev/acknowledged";
+
+    /// Ask BR-4's acknowledgment of `gate`, as the typed path does.
+    async fn ask_trust(
+        gate: &PermissionGate,
+        durable: Option<&str>,
+        invoked_by: InvokedBy,
+        from: ConnectionId,
+    ) -> SkillConsent {
+        gate.authorize_project_skill_trust(
+            &project_skill_trust_key(DISPLAY),
+            TrustRoot {
+                display: DISPLAY,
+                durable,
+            },
+            &[],
+            // Shadowing, which is the case that made D-13 necessary: it asks
+            // even at `full`, so no permission level is an unattended answer to
+            // it and the list is the only one there is.
+            true,
+            invoked_by,
+            from,
+        )
+        .await
+    }
+
+    /// **The load-bearing test. An unattended session at a root nobody listed
+    /// still refuses.**
+    ///
+    /// Without this the widening is unbounded and D-10 is decorative: an
+    /// automated run could expand any repository's skills on any machine,
+    /// because "there is no human here" would itself be the permission. The list
+    /// is *consulted*; a decision is never invented.
+    ///
+    /// Three ways to be unlisted, and each is a real one:
+    ///
+    /// - an empty list — the shipped default, and the posture of every machine
+    ///   whose owner has never answered this question;
+    /// - a list naming some **other** repository — the shape a machine that
+    ///   automates one project has;
+    /// - a root that mints **no** durable name at all, on a machine whose list
+    ///   happens to name the same string the prompt shows. `None` matches
+    ///   nothing, and this leg is what keeps that from being an accident.
+    ///
+    /// **Mutation:** make `acknowledged_unattended` answer `Allowed` whenever the
+    /// settlement is `NoTerminal` and all three fail.
+    #[tokio::test]
+    async fn an_unattended_session_at_a_root_nobody_listed_still_refuses() {
+        for (roots, durable, what) in [
+            (
+                Vec::new(),
+                Some(DURABLE),
+                "the shipped default: nothing listed",
+            ),
+            (
+                vec!["~/dev/somewhere-else".to_owned()],
+                Some(DURABLE),
+                "a list that names another repository",
+            ),
+            (
+                vec![DISPLAY.to_owned()],
+                None,
+                "a root that mints no durable name, listed under the name the \
+                 prompt shows",
+            ),
+        ] {
+            let (gate, route, _bus, _pending, conn) = wired(
+                |bus, pending| {
+                    PermissionGate::new(
+                        SessionId::from("s1"),
+                        PermissionConfig::with_default(PermissionPolicy::Ask),
+                        bus,
+                        pending,
+                    )
+                    .with_trusted_project_roots(roots.clone())
+                },
+                RouteBehaviour::RefusesWithoutAsking(RefusalReason::NoTerminal),
+            );
+
+            assert_eq!(
+                ask_trust(&gate, durable, InvokedBy::User, conn).await,
+                SkillConsent::Refused(RefusalReason::NoTerminal),
+                "{what}: an unattended session reached a root no human \
+                 acknowledged and ran its skills anyway"
+            );
+            // Non-vacuity: the question really was put and really was refused
+            // for want of a human, rather than dying at some earlier guard.
+            assert_eq!(
+                route.delivered().len(),
+                1,
+                "{what}: the refusal must be the client's answer to a delivered \
+                 question, or this leg is about something else entirely"
+            );
+        }
+    }
+
+    /// **The widening itself: an unattended session at a listed root proceeds.**
+    ///
+    /// The counterpart that makes the test above non-vacuous — take the
+    /// consultation out and this one goes red, so "it refused" is a fact about
+    /// the list rather than about a fixture that always refuses.
+    ///
+    /// No human answered anything here: the client refused *without asking*,
+    /// which is what `RefusesWithoutAsking` models and what the CLI does on a
+    /// pipe. The allow comes from the row, and the row came from a human, once,
+    /// out of band.
+    #[tokio::test]
+    async fn an_unattended_session_at_a_listed_root_runs_the_repositorys_skills() {
+        let (gate, route, _bus, _pending, conn) = wired(
+            |bus, pending| {
+                PermissionGate::new(
+                    SessionId::from("s1"),
+                    PermissionConfig::with_default(PermissionPolicy::Ask),
+                    bus,
+                    pending,
+                )
+                .with_trusted_project_roots(vec![
+                    "~/dev/somewhere-else".to_owned(),
+                    DURABLE.to_owned(),
+                ])
+            },
+            RouteBehaviour::RefusesWithoutAsking(RefusalReason::NoTerminal),
+        );
+
+        assert_eq!(
+            ask_trust(&gate, Some(DURABLE), InvokedBy::User, conn).await,
+            SkillConsent::Allowed,
+            "a root a human durably acknowledged must not refuse in the posture \
+             the acknowledgment was written for"
+        );
+        // The model's caller reads the same answer out of the same list: one key
+        // per root has meant one answer per root since REQ-587, and a durable
+        // answer only the typed door could see would make that two.
+        assert_eq!(
+            ask_trust(&gate, Some(DURABLE), InvokedBy::Model, conn).await,
+            SkillConsent::Allowed,
+            "the acknowledgment is the repository's, not the caller's"
+        );
+        assert_eq!(route.delivered().len(), 2);
+    }
+
+    /// **The list never answers for a human.**
+    ///
+    /// An attended session at a listed root is asked, and what it says is what
+    /// happens — including "no". This is the property that keeps the widening
+    /// confined to the posture it was written for: the rewrite acts on the
+    /// *client's* `NoTerminal` refusal, which a session with somebody in it never
+    /// produces.
+    ///
+    /// **Mutation:** consult the list *before* settling — the obvious
+    /// simplification — and both legs fail, because a listed root would stop
+    /// asking anyone at all.
+    #[tokio::test]
+    async fn a_human_at_a_terminal_is_still_asked_at_a_listed_root() {
+        for (behaviour, expected, what) in [
+            (
+                RouteBehaviour::Answers(OPTION_REJECT_ONCE),
+                SkillConsent::Declined,
+                "a human said no",
+            ),
+            (
+                RouteBehaviour::Cancels,
+                SkillConsent::Declined,
+                "a human dismissed the prompt",
+            ),
+        ] {
+            let (gate, route, _bus, _pending, conn) = wired(
+                |bus, pending| {
+                    PermissionGate::new(
+                        SessionId::from("s1"),
+                        PermissionConfig::with_default(PermissionPolicy::Ask),
+                        bus,
+                        pending,
+                    )
+                    .with_trusted_project_roots(vec![DURABLE.to_owned()])
+                },
+                behaviour,
+            );
+            assert_eq!(
+                ask_trust(&gate, Some(DURABLE), InvokedBy::User, conn).await,
+                expected,
+                "{what}, at a root the config lists — the row must not overrule \
+                 the person in front of the prompt"
+            );
+            assert_eq!(route.delivered().len(), 1, "{what}: and they were asked");
+        }
+    }
+
+    /// **`plan` still denies at a listed root, and asks nobody.**
+    ///
+    /// REQ-560 BR-5's ordering, which the widening preserves *by construction*
+    /// rather than by a check: the rewrite acts on a settlement, and a `deny`
+    /// row has already returned one by then. A version that consulted the list
+    /// first would make a config row outrank the level — the one direction
+    /// `LevelAllow`'s whole design refuses.
+    #[tokio::test]
+    async fn plan_denies_at_a_listed_root_and_asks_nobody() {
+        let (gate, route, _bus, _pending, conn) = wired(
+            |bus, pending| {
+                PermissionGate::with_level(
+                    SessionId::from("s1"),
+                    PermissionLevel::Plan,
+                    Vec::new(),
+                    bus,
+                    pending,
+                )
+                .with_trusted_project_roots(vec![DURABLE.to_owned()])
+            },
+            RouteBehaviour::RefusesWithoutAsking(RefusalReason::NoTerminal),
+        );
+        assert_eq!(
+            ask_trust(&gate, Some(DURABLE), InvokedBy::User, conn).await,
+            SkillConsent::DeniedByLevel,
+            "a durable acknowledgment must not lift a level that would not have \
+             asked the question"
+        );
+        assert!(
+            route.delivered().is_empty(),
+            "the level settled it, so nobody was asked and the list was never \
+             reached"
+        );
+    }
+
+    /// **The typed prompt offers the durable write, names it concretely, and the
+    /// model's prompt does not (ADR-1's label rule, D-13's caller rule).**
+    ///
+    /// The label is asserted against the *concrete* write — the table, the key,
+    /// the `+=` and the exact string that lands in the list — because ADR-1 binds
+    /// it and because `enable_permanent`'s own comment records what a label that
+    /// promised a key it did not write cost. A user who picks this option and
+    /// then greps their config must find the line the label named.
+    #[tokio::test]
+    async fn the_typed_prompt_names_the_write_and_the_models_prompt_has_none() {
+        let (gate, route, _bus, _pending, conn) = wired(
+            |bus, pending| {
+                PermissionGate::new(
+                    SessionId::from("s1"),
+                    PermissionConfig::with_default(PermissionPolicy::Ask),
+                    bus,
+                    pending,
+                )
+            },
+            RouteBehaviour::Answers(OPTION_REJECT_ONCE),
+        );
+
+        let _ = ask_trust(&gate, Some(DURABLE), InvokedBy::User, conn).await;
+        let _ = ask_trust(&gate, Some(DURABLE), InvokedBy::Model, conn).await;
+        // And the typed path on a root that mints no name: nothing to write, so
+        // nothing offered.
+        let _ = ask_trust(&gate, None, InvokedBy::User, conn).await;
+
+        assert_eq!(
+            route.option_ids(0),
+            vec![
+                OPTION_ALLOW_ONCE,
+                OPTION_ALLOW_ALWAYS,
+                OPTION_ID_ENABLE_PERMANENT,
+                OPTION_REJECT_ONCE,
+                OPTION_REJECT_ALWAYS,
+            ],
+            "the durable option belongs in the fifth slot `enable_permanent` has \
+             always occupied, so a client rendering options in order does not \
+             have them move under it"
+        );
+        let label = route.delivered()[0]
+            .options
+            .iter()
+            .find(|option| option.option_id == OPTION_ID_ENABLE_PERMANENT)
+            .expect("the id is in the list above")
+            .label
+            .clone();
+        assert!(
+            label.contains(&format!(
+                "`[skills] trusted_project_roots += \"{DURABLE}\"`"
+            )),
+            "ADR-1: the label must name the concrete write, table, key, `+=` and \
+             the exact string — never \"trust this permanently\": {label}"
+        );
+        assert!(
+            label.contains("nobody at the terminal"),
+            "and it must say what the row buys, which is the whole reason \
+             somebody would pick it: {label}"
+        );
+
+        for (n, what) in [
+            (1, "the model raised this prompt"),
+            (2, "the root mints no durable name"),
+        ] {
+            assert_eq!(
+                route.option_ids(n),
+                vec![
+                    OPTION_ALLOW_ONCE,
+                    OPTION_ALLOW_ALWAYS,
+                    OPTION_REJECT_ONCE,
+                    OPTION_REJECT_ALWAYS,
+                ],
+                "{what}: the standard four, and never the fifth"
+            );
+        }
+    }
+
+    /// **The write happens on the answer that promised it, and on no other —
+    /// the accepted leg and its pair (LESSON-519, LESSON-520).**
+    ///
+    /// The pairing is what makes "nothing was written" mean anything. Every leg
+    /// below is the *same* fixture, the same door, the same root and the same
+    /// offered option list; only the id the client picks changes. So a gate that
+    /// wrote on every answer fails the four silent legs, and a gate that wrote on
+    /// none fails the first — neither can be green by accident.
+    ///
+    /// `allow_always` is the leg that matters most. It shares
+    /// [`PermissionOptionKind::AllowAlways`] with the durable option, which is
+    /// exactly why the id is what decides: a gate selecting by kind would write
+    /// config for a user who answered "allow for this session".
+    ///
+    /// The end-to-end version of this — through a real `DaemonRuntime`, to a
+    /// real file, read back through the production loader — is
+    /// `runtime::tests::…::the_permanent_answer_reaches_the_config_file_and_only_that_answer`.
+    #[tokio::test]
+    async fn only_the_permanent_answer_reaches_the_sink() {
+        for (answer, expected, what) in [
+            (
+                OPTION_ID_ENABLE_PERMANENT,
+                vec![DURABLE.to_owned()],
+                "the answer that promised a write",
+            ),
+            (OPTION_ALLOW_ALWAYS, Vec::new(), "allow for this session"),
+            (OPTION_ALLOW_ONCE, Vec::new(), "allow once"),
+            (OPTION_REJECT_ONCE, Vec::new(), "reject once"),
+            (OPTION_REJECT_ALWAYS, Vec::new(), "reject for this session"),
+        ] {
+            let sink = RecordingTrustSink::new(false);
+            let (gate, _route, _bus, _pending, conn) = wired(
+                {
+                    let sink = Arc::clone(&sink);
+                    move |bus, pending| {
+                        PermissionGate::new(
+                            SessionId::from("s1"),
+                            PermissionConfig::with_default(PermissionPolicy::Ask),
+                            bus,
+                            pending,
+                        )
+                        .with_project_trust_persistence(sink as Arc<dyn ProjectTrustPersistence>)
+                    }
+                },
+                RouteBehaviour::Answers(answer),
+            );
+            let _ = ask_trust(&gate, Some(DURABLE), InvokedBy::User, conn).await;
+            assert_eq!(
+                sink.written(),
+                expected,
+                "{what}: the durable list is written by exactly one answer, and \
+                 it is the one whose label said so"
+            );
+        }
+    }
+
+    /// **A failed write costs the session nothing, and claims nothing.**
+    ///
+    /// `persist_web_tier`'s split, applied to the answer it matters more for: the
+    /// user said yes and this session honours it, and the only thing that did not
+    /// happen is the part that would have outlived the session. The gate's own
+    /// stderr line is where the reason goes; what is pinned here is that the
+    /// answer still allows and the grant is still recorded, so a filesystem
+    /// failure does not become a re-asked question on top of a lost row.
+    #[tokio::test]
+    async fn a_permanent_answer_that_cannot_be_written_still_allows_this_session() {
+        let sink = RecordingTrustSink::new(true);
+        let (gate, _route, _bus, _pending, conn) = wired(
+            {
+                let sink = Arc::clone(&sink);
+                move |bus, pending| {
+                    PermissionGate::new(
+                        SessionId::from("s1"),
+                        PermissionConfig::with_default(PermissionPolicy::Ask),
+                        bus,
+                        pending,
+                    )
+                    .with_project_trust_persistence(sink as Arc<dyn ProjectTrustPersistence>)
+                }
+            },
+            RouteBehaviour::Answers(OPTION_ID_ENABLE_PERMANENT),
+        );
+        assert_eq!(
+            ask_trust(&gate, Some(DURABLE), InvokedBy::User, conn).await,
+            SkillConsent::Allowed
+        );
+        assert_eq!(sink.written(), vec![DURABLE.to_owned()], "it was attempted");
+        assert_eq!(
+            gate.remembered(&project_skill_trust_key(DISPLAY)),
+            Some(RememberedGrant::AllowAlways),
+            "the session half of the answer holds whether or not the disk did"
+        );
+    }
+
+    /// **The durable answer is remembered under the root's key and nothing
+    /// else** — LESSON-495, on the one answer that also writes a file.
+    ///
+    /// A `p` here must not free a skill's *commands*, which is a different
+    /// question asked under a different key one door over.
+    #[tokio::test]
+    async fn a_permanent_acknowledgment_frees_only_the_acknowledgment_key() {
+        let sink = RecordingTrustSink::new(false);
+        let (gate, _route, _bus, _pending, conn) = wired(
+            {
+                let sink = Arc::clone(&sink);
+                move |bus, pending| {
+                    PermissionGate::new(
+                        SessionId::from("s1"),
+                        PermissionConfig::with_default(PermissionPolicy::Ask),
+                        bus,
+                        pending,
+                    )
+                    .with_project_trust_persistence(sink as Arc<dyn ProjectTrustPersistence>)
+                }
+            },
+            RouteBehaviour::Answers(OPTION_ID_ENABLE_PERMANENT),
+        );
+        let _ = ask_trust(&gate, Some(DURABLE), InvokedBy::User, conn).await;
+        assert_eq!(
+            gate.grant_keys(),
+            vec![project_skill_trust_key(DISPLAY)],
+            "one answer, one key: a `p` about a repository must not answer \
+             whether any skill's commands may run"
+        );
     }
 }
