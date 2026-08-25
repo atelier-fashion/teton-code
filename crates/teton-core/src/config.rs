@@ -729,13 +729,18 @@ pub struct SkillsConfig {
     ///
     /// Each entry is the **canonical** root name minted by
     /// `tetond::harness::tools::skill::durable_trust_root_name`: the session
-    /// root with every symlink resolved, then spelled home-relative and
-    /// percent-escaped exactly as the acknowledgment key's root is. Canonical,
-    /// because an entry naming a path rather than a tree is a bypass — a
-    /// symlink dropped at a listed path would hand a repository nobody
-    /// acknowledged the trust of one somebody did. See that function for the
-    /// full rule and for what this identity deliberately does *not* defend
-    /// against.
+    /// root with every symlink resolved, spelled as an **absolute** path and
+    /// percent-escaped. Canonical, because an entry naming a path rather than a
+    /// tree is a bypass — a symlink dropped at a listed path would hand a
+    /// repository nobody acknowledged the trust of one somebody did. Absolute
+    /// since REQ-591 D-4, because a `$HOME`-relative row means a different tree
+    /// under a different `HOME` and a row is documented as naming a tree. See
+    /// that function for the full rule and for what this identity deliberately
+    /// does *not* defend against.
+    ///
+    /// The **prompt** still reads home-relative (`~/dev/repo`); that is
+    /// `TrustRoot::display`, and it is a rendering concern rather than an
+    /// identity.
     ///
     /// **Matched by exact equality, never by prefix.** Trusting `~/dev/repo`
     /// says nothing about `~/dev/repo/vendor/other`, which is a different
@@ -746,6 +751,16 @@ pub struct SkillsConfig {
     /// An entry that matches no root is inert rather than an error: it can only
     /// ever fail to allow, which is the direction to be wrong in, so a stale
     /// row left behind by a moved repository costs one prompt and nothing else.
+    ///
+    /// A **malformed** entry is different, and since REQ-591 D-5 it is fatal at
+    /// load. The failure it prevents is specific and silent: a user hand-edits
+    /// `~/dev/repo` — an entirely reasonable-looking thing to write — the
+    /// minter produces the canonical absolute form, the two never match, and
+    /// their automation keeps refusing with no indication why. The allowlist
+    /// *appears* to contain their repository and does not. Inertness is the
+    /// right answer for a row that names a real tree the daemon cannot see; it
+    /// is the wrong answer for a row that could never have named one.
+    /// [`is_canonical_trust_root`] is the rule.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub trusted_project_roots: Vec<String>,
 }
@@ -1062,6 +1077,30 @@ pub enum ConfigError {
     /// Two providers share an id.
     #[error("provider '{0}' is defined more than once; provider ids must be unique")]
     DuplicateProvider(String),
+
+    /// A `[skills] trusted_project_roots` row that could never name a tree
+    /// (REQ-591 D-5).
+    ///
+    /// **Structural, so it is fatal at load**, for `UnusableSpendCeiling`'s
+    /// reason: this is not an incomplete record the daemon can refuse at the
+    /// point of use — it is a security allowlist the user believes they added a
+    /// repository to. A row that is merely *stale* stays inert, because it can
+    /// only fail to allow; a row that is **malformed** never matched anything
+    /// and never will, and leaving it inert means a user's automation refuses
+    /// forever with the allowlist apparently naming their repository.
+    ///
+    /// The message names the correct form and the way to obtain it, because the
+    /// only thing wrong is the spelling.
+    #[error(
+        "[skills] trusted_project_roots contains {0}, which cannot name a repository. A row is \
+         the canonical absolute path of the tree — every symlink resolved, no `.` or `..` \
+         component, no trailing slash, and `~` is not expanded — for example \
+         \"/Users/you/dev/repo\". Teton writes it for you when you answer `p` \
+         (\"trust this repository permanently\") at the acknowledgment prompt; a path typed by \
+         hand only matches if it is already in that form."
+    )]
+    /// Carries the row **as written**, quoted, so the user can find the line.
+    MalformedTrustedProjectRoot(String),
 
     /// `[cost] prompt_ceiling_usd` is not a usable amount (REQ-588 BR-5).
     ///
@@ -1488,10 +1527,23 @@ impl Config {
         Ok(cfg)
     }
 
-    /// Validate cross-field invariants and the BR-7 no-raw-keys rule.
+    /// **REQ-591 D-5.** Every `[skills] trusted_project_roots` row is a
+    /// well-formed canonical mint.
     ///
-    /// # Errors
-    /// Returns the first [`ConfigError`] found.
+    /// One rule, and deliberately no caps. An entry-length cap and a list-length
+    /// cap were considered and dropped: they guard nothing real — a long row
+    /// simply fails to match, a long list is a user's own file, and neither is
+    /// reachable by anything but the person who owns the config. A security
+    /// allowlist earns a rule about **meaning**, not about size.
+    fn validate_skills(&self) -> Result<(), ConfigError> {
+        for row in &self.skills.trusted_project_roots {
+            if !is_canonical_trust_root(row) {
+                return Err(ConfigError::MalformedTrustedProjectRoot(format!("{row:?}")));
+            }
+        }
+        Ok(())
+    }
+
     /// `[cost]`'s structural check (REQ-588 BR-5).
     ///
     /// Only structure: a ceiling that is absent is the ordinary case and a
@@ -1507,11 +1559,16 @@ impl Config {
         Ok(())
     }
 
+    /// Validate cross-field invariants and the BR-7 no-raw-keys rule.
+    ///
+    /// # Errors
+    /// Returns the first [`ConfigError`] found.
     pub fn validate(&self) -> Result<(), ConfigError> {
         self.validate_local_model()?;
         self.validate_web()?;
         self.validate_lifetime()?;
         self.validate_cost()?;
+        self.validate_skills()?;
 
         let mut ids: HashSet<&str> = HashSet::with_capacity(self.providers.len());
         for p in &self.providers {
@@ -2205,6 +2262,72 @@ fn split_http_scheme(value: &str) -> Option<(bool, &str)> {
 /// later reader has to be right about it.
 fn url_authority(rest: &str) -> &str {
     rest.split(['/', '?', '#', '\\']).next().unwrap_or_default()
+}
+
+/// Whether `row` is a well-formed `[skills] trusted_project_roots` entry — the
+/// shape `tetond::harness::tools::skill::durable_trust_root_name` mints
+/// (REQ-591 D-5).
+///
+/// # What it checks, and what it deliberately does not
+///
+/// **Form only. It touches no filesystem.** Whether the tree exists, is
+/// mounted, or still holds a repository is not a validity question: a laptop
+/// with an unplugged drive would otherwise refuse to start a daemon over a
+/// perfectly good config, and a row for a tree that is merely absent is exactly
+/// the *inert* case the field's doc keeps inert. What this rejects is a row that
+/// could never have named a tree on any machine — a spelling the minter cannot
+/// produce, so a comparison against it can only ever fail.
+///
+/// The rule is the canonical mint's own shape:
+///
+/// - **absolute** — `canonicalize` returns an absolute path, and `~` is not
+///   expanded anywhere on this path, so a `~/dev/repo` row is the exact
+///   hand-written mistake this rule exists to catch;
+/// - **no `.` or `..` component, and no empty one** — `canonicalize` resolves
+///   them, so their presence means the row was not minted;
+/// - **no trailing slash** except for the root itself, for the same reason;
+/// - **well-formed percent escapes** — the mint writes `%XX` in upper-case hex
+///   for each byte outside a valid UTF-8 sequence and `%25` for a literal `%`,
+///   and nothing else in the string can contain a bare `%`.
+///
+/// # Why the rule lives here and the mint lives in `tetond`
+///
+/// This crate is I/O-free by construction and the mint reads the filesystem, so
+/// they cannot be one function. What binds them is a test rather than a call:
+/// `tetond`'s `every_name_the_minter_produces_is_a_row_this_config_accepts`
+/// feeds real minted names through this predicate, so a change to either side
+/// that separates them is caught where a shared function would have caught it.
+#[must_use]
+pub fn is_canonical_trust_root(row: &str) -> bool {
+    if row.is_empty() || !row.starts_with('/') {
+        return false;
+    }
+    if row.len() > 1 && row.ends_with('/') {
+        return false;
+    }
+    // `split('/')` on an absolute path yields a leading empty segment, which is
+    // the root and is the only empty one allowed.
+    if row[1..]
+        .split('/')
+        .any(|segment| segment.is_empty() || segment == "." || segment == "..")
+        && row != "/"
+    {
+        return false;
+    }
+    let mut bytes = row.bytes();
+    while let Some(byte) = bytes.next() {
+        if byte != b'%' {
+            continue;
+        }
+        // Upper-case hex, because that is what `format!("%{byte:02X}")` writes:
+        // accepting lower-case here would admit a spelling the minter never
+        // produces and therefore a row that never matches.
+        let ok = |b: Option<u8>| matches!(b, Some(b'0'..=b'9' | b'A'..=b'F'));
+        if !ok(bytes.next()) || !ok(bytes.next()) {
+            return false;
+        }
+    }
+    true
 }
 
 /// Whether `value` is an absolute `http`/`https` URL with a non-empty host.
@@ -6096,5 +6219,85 @@ cache_ttl_secs = 60
         let ok: Config = toml::from_str("[cost]\nprompt_ceiling_usd = 2.50\n").unwrap();
         ok.validate().expect("a usable ceiling loads");
         assert_eq!(ok.cost.ceiling_micro_cents(), Some(250_000));
+    }
+
+    /// **REQ-591 D-5: a row that could never name a tree is refused at load,
+    /// and the error names the correct form.**
+    ///
+    /// The failure this prevents is specific and silent. A user hand-edits
+    /// `~/dev/repo` into `[skills] trusted_project_roots` — an entirely
+    /// reasonable-looking thing to write, and what the *prompt* shows them —
+    /// the minter produces the canonical absolute form, the two never match,
+    /// and their automation keeps refusing with no indication why. The
+    /// allowlist appears to contain their repository and does not. That is a
+    /// silent no-op, and this converts it into a loud error at load time.
+    ///
+    /// **Paired on one fixture** (LESSON-520): every rejected spelling sits
+    /// beside a well-formed row in the same document, so a rule that refused
+    /// *everything* fails the accepting leg and a rule that refused nothing
+    /// fails the rejecting ones. An unpaired rejection test proves only that
+    /// some string was refused.
+    ///
+    /// The error's **words** are asserted, not just its variant. Naming the
+    /// correct form is the whole remedy here — the row is not wrong about which
+    /// repository the user meant, only about how to spell it — so a message
+    /// that said "invalid" would leave them exactly as stuck as the silence
+    /// did.
+    #[test]
+    fn a_row_that_could_never_name_a_tree_is_refused_at_load() {
+        // The one that matters: what a user types by hand, and what the prompt
+        // shows them.
+        for bad in [
+            "~/dev/repo",
+            "dev/repo",
+            "",
+            "/dev/repo/",
+            "/dev/../repo",
+            "/dev/./repo",
+            "/dev//repo",
+            // A `%` the mint never writes: its escapes are upper-case hex pairs,
+            // so a bare or lower-case one is a spelling nothing produces.
+            "/dev/re%po",
+            "/dev/re%ffpo",
+            "/dev/repo%",
+        ] {
+            let document = format!(
+                "[skills]\ntrusted_project_roots = [\"/Users/you/dev/ok\", {bad:?}]\n"
+            );
+            let err = Config::load(&document)
+                .expect_err("a malformed row must not load: {bad:?}");
+            let LoadError::Validate(ConfigError::MalformedTrustedProjectRoot(named)) = err else {
+                panic!("`{bad}` was refused for the wrong reason: {err:?}");
+            };
+            assert_eq!(
+                named,
+                format!("{bad:?}"),
+                "the error must quote the row as written, or the user cannot \
+                 find the line"
+            );
+            let message = ConfigError::MalformedTrustedProjectRoot(named).to_string();
+            for phrase in [
+                "canonical absolute path",
+                "no trailing slash",
+                "`~` is not expanded",
+                "answer `p`",
+            ] {
+                assert!(
+                    message.contains(phrase),
+                    "the message must name the correct form and how to obtain \
+                     it — missing `{phrase}`: {message}"
+                );
+            }
+        }
+
+        // The accepting leg, on the same shapes the minter really produces:
+        // an ordinary tree, the escape for a non-UTF-8 byte, the escape for a
+        // literal `%`, and the root itself.
+        let ok = Config::load(
+            "[skills]\ntrusted_project_roots = [\
+             \"/Users/you/dev/repo\", \"/tmp/re%FFpo\", \"/tmp/100%25\", \"/\"]\n",
+        )
+        .expect("a well-formed list loads");
+        assert_eq!(ok.skills.trusted_project_roots.len(), 4);
     }
 }

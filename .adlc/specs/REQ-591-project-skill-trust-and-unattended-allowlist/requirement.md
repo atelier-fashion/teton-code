@@ -313,6 +313,16 @@ redundancy. OQ-1..OQ-5 are all decided (D-1..D-5) and implemented.*
   (an actor who can rewrite the daemon's environment can rewrite `config.toml`), but the row
   is documented as naming *a tree*, and a `$HOME`-relative string does not.
 
+- [x] **OQ-5 — ANSWERED by D-5, implemented.** One rule, no caps.
+  `teton_core::config::is_canonical_trust_root` rejects a row that is not a well-formed
+  canonical mint — absolute, no `.`/`..`/empty component, no trailing slash, well-formed
+  upper-case `%XX` escapes — and `Config::validate` refuses it at load with
+  `MalformedTrustedProjectRoot`, whose message names the correct form and how to obtain it.
+  Entry-length and list-length caps were considered and dropped: they guard nothing real and
+  config is user-owned. The predicate lives in `teton-core` (I/O-free) while the mint lives in
+  `tetond` (reads the filesystem), so they are bound by a test rather than by a call —
+  `every_name_the_minter_produces_is_a_row_this_config_accepts`. Original question follows.
+
 - [ ] **OQ-5: Should `trusted_project_roots` be validated?** No entry-length cap, no list
   cap, no `Config::validate` rule. Impact is negligible today — mismatches fail closed — but
   a security allowlist with no validation pass is worth a rule, if only to reject a row that

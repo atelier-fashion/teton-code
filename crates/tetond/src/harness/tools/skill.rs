@@ -3824,6 +3824,101 @@ mod tests {
         let _ = std::fs::remove_dir_all(&base);
     }
 
+    /// **REQ-591 D-5 — the rule `Config::validate` enforces is the shape this
+    /// crate mints** (LESSON-552: test the derivation, not the minter).
+    ///
+    /// `teton_core` is I/O-free by construction and the mint reads the
+    /// filesystem, so they cannot be one function. That makes them exactly the
+    /// pair LESSON-495 warns about — two places deciding what one string means
+    /// — and this test is what binds them: every name the real minter produces
+    /// is fed to the real predicate. A change to either side that separates
+    /// them reddens here, where a shared function would have caught it.
+    ///
+    /// The fixture spells the three shapes the mint can take: an ordinary tree,
+    /// a directory whose name is not valid UTF-8 (`%XX`), and one containing a
+    /// literal `%` (`%25`). The last two are the only reason the predicate has a
+    /// percent rule at all, and a test that used plain names would leave that
+    /// rule unbound.
+    ///
+    /// **The negative half is the point of the pairing**: the *display* name of
+    /// the same tree — home-relative, which is what a user reads on the prompt
+    /// and therefore what they are most likely to paste — is rejected. Without
+    /// it, a predicate that accepted everything would pass the positive legs.
+    #[test]
+    fn every_name_the_minter_produces_is_a_row_this_config_accepts() {
+        use teton_core::config::is_canonical_trust_root;
+
+        let base = std::env::temp_dir().join(format!(
+            "teton-mint-accepted-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_or(0, |d| d.as_nanos())
+        ));
+        let home = base.join("home");
+        std::fs::create_dir_all(&home).unwrap();
+        let canonical_home = std::fs::canonicalize(&home).unwrap();
+
+        // Real trees, canonicalised the way production's `read_under` is, so
+        // this half binds the predicate to what the *filesystem* hands back —
+        // `/private` prefixes and all.
+        let mut rows = Vec::new();
+        for name in ["dev/repo", "one hundred % sure"] {
+            let tree = home.join(name);
+            std::fs::create_dir_all(&tree).unwrap();
+            let resolved = std::fs::canonicalize(&tree).expect("the fixture tree canonicalises");
+            rows.push(durable_trust_root_name(&resolved));
+
+            // The negative, on the same tree: the home-relative spelling — what
+            // the prompt shows and what a user is most likely to paste — is not
+            // a row, and must be refused loudly rather than never matching.
+            let displayed = trust_root_name(&resolved, Some(&canonical_home));
+            assert!(
+                displayed.starts_with('~'),
+                "the fixture is only meaningful if the display name really is \
+                 home-relative here: {displayed}"
+            );
+            assert!(
+                !is_canonical_trust_root(&displayed),
+                "the spelling a user is most likely to paste must be refused: \
+                 {displayed}"
+            );
+        }
+
+        // A directory name that is not valid UTF-8 — the only thing that makes
+        // the mint emit a `%XX` escape, and **not** creatable on this test's
+        // filesystem (APFS refuses the byte sequence). The path is constructed
+        // instead, which is exactly what the mint is a function of: since D-4 it
+        // resolves nothing itself and names the bytes it is handed.
+        {
+            use std::os::unix::ffi::OsStrExt;
+            let weird = canonical_home.join(std::ffi::OsStr::from_bytes(b"weird\xffname"));
+            rows.push(durable_trust_root_name(&weird));
+        }
+
+        for row in &rows {
+            assert!(
+                is_canonical_trust_root(row),
+                "the minter produced a row `Config::validate` would refuse at \
+                 load: {row}"
+            );
+        }
+
+        // Non-vacuity for the percent rule: both escape kinds really occurred,
+        // or that half of the predicate is unbound by this test.
+        assert!(
+            rows.iter().any(|row| row.contains("%25")),
+            "a literal `%` in a directory name must reach the row as `%25`: \
+             {rows:?}"
+        );
+        assert!(
+            rows.iter().any(|row| row.contains("%FF")),
+            "a non-UTF-8 byte must reach the row as an upper-case `%XX`: {rows:?}"
+        );
+
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
     /// **REQ-591 D-4 — a row outlives the `$HOME` it was written under, and the
     /// spelling a human reads does not have to.**
     ///
@@ -3857,11 +3952,14 @@ mod tests {
     ///
     /// # What happens to a row written in the old form
     ///
-    /// Nothing matches it, and that is the safe direction — the fourth leg. An
-    /// unattended session at that root refuses exactly as one at an unlisted
-    /// root does. REQ-591 D-5 turns that silent no-op into a loud one at load
-    /// time; here it is pinned as a *fail-closed* fact so the two decisions
-    /// cannot drift apart.
+    /// **Two independent guards, and the fourth leg is the second one.**
+    /// REQ-591 D-5 refuses such a row at *load*, by name, with the correct form
+    /// in the message — so it cannot reach a running daemon at all. Underneath
+    /// that, the gate itself matches nothing against it and the unattended
+    /// session refuses exactly as one at an unlisted root does. That is the
+    /// direction a stale row has to fail in, and it is pinned here rather than
+    /// left to the load-time rule alone: the gate takes its list as a `Vec` and
+    /// has no idea a validator ran.
     ///
     /// # Where the bite is, stated because it is not here
     ///

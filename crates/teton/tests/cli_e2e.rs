@@ -7044,22 +7044,27 @@ fn an_unattended_session_at_an_unlisted_root_refuses_and_names_the_row() {
 ///
 /// # Why the project lives inside `HOME` here
 ///
-/// That is the whole fixture. Everywhere else in this file the project sits
-/// beside the fixture home, where the two spellings coincide and neither mint
-/// can be told from the other. Under a home that **contains** the project they
-/// diverge — `~/proj` against `/private/tmp/…/proj` — so each leg below fails
-/// under the opposite implementation:
+/// That is the whole fixture, and it is what gives this test its bite.
+/// Everywhere else in this file the project sits *beside* the fixture home,
+/// where the absolute and home-relative spellings of a tree coincide and
+/// neither mint can be told from the other. Under a home that **contains** the
+/// project they diverge — `~/proj` against `/private/tmp/…/proj` — so the
+/// listed leg below runs the skill today and would **refuse** under the pre-D-4
+/// mint, because the row would no longer be a string this build ever produces.
 ///
-/// - the **absolute** row runs the skill today, and would refuse if the mint
-///   went back to home-relative;
-/// - the **home-relative** row refuses today, and would run under that same
-///   revert.
+/// The unlisted leg is the pairing (LESSON-520): the same daemon, the same
+/// home, the same piped invocation, and a well-formed row naming a *sibling*
+/// tree. Without it "it ran" would be satisfied by a build that matched
+/// everything.
 ///
-/// So this is a two-way pin rather than a one-way one, and it is the migration
-/// answer as well: a row left in the old spelling **fails closed** — the
-/// unattended session refuses exactly as it does at a root nobody listed. It
-/// does not silently authorize something else. REQ-591 D-5 turns that silence
-/// into a load-time error naming the correct form.
+/// # Where the old spelling went
+///
+/// A row left in the pre-D-4 home-relative form cannot appear in a config this
+/// daemon will start on: REQ-591 D-5 refuses it at load, by name, with the
+/// correct form in the message. That is louder than the fail-closed consult it
+/// replaces, and the consult is still underneath it —
+/// `skill::tests::the_durable_name_outlives_the_home_it_was_minted_under`
+/// drives the gate with such a row directly and it still matches nothing.
 ///
 /// Piped, and shadowing, for the reason
 /// [`an_unattended_session_at_an_unlisted_root_refuses_and_names_the_row`] is:
@@ -7070,8 +7075,8 @@ fn a_row_written_under_one_home_still_names_its_tree_under_another() {
     let daemon_bin = daemon_bin();
     let teton = teton_bin();
 
-    for (absolute, expect_run) in [(true, true), (false, false)] {
-        let home = SkillTree::new(if absolute { "ha" } else { "hr" });
+    for (listed, expect_run) in [(true, true), (false, false)] {
+        let home = SkillTree::new(if listed { "ha" } else { "hr" });
         // The user's own `validate`, so the repository's shadows it — the case
         // no permission level settles.
         home.write(
@@ -7093,15 +7098,13 @@ fn a_row_written_under_one_home_still_names_its_tree_under_another() {
         )
         .unwrap();
 
-        let row = if absolute {
+        // Both rows are well-formed absolute mints — D-5 refuses anything else
+        // at load, so a home-relative row cannot be the pairing here. What
+        // differs is only *which tree* the row names.
+        let row = if listed {
             trusting(&project)
         } else {
-            // Exactly what a pre-D-4 daemon under this `HOME` would have
-            // written.
-            "[skills]
-trusted_project_roots = [\"~/proj\"]
-
-".to_owned()
+            trusting(&project_at(home.path(), "other"))
         };
         let daemon = TestDaemon::spawn_scripted_trusting(
             &daemon_bin,
@@ -7128,22 +7131,22 @@ stderr:
         // doing.
         assert!(
             stdout.contains("was refused without asking"),
-            "absolute={absolute}: the client must report that it could not \
-             ask; output:\n{stdout}"
+            "listed={listed}: the client must report that it could not ask; \
+             output:\n{stdout}"
         );
         assert_eq!(
             stdout.contains("/validate → skill validate (project — shadows your user skill"),
             expect_run,
-            "absolute={absolute}: a row naming this tree absolutely is the one \
-             this build mints and matches; the home-relative spelling names \
-             nothing this build will ever produce, and must fail closed; \
-             output:\n{stdout}"
+            "listed={listed}: the row this build mints for a tree **inside** \
+             `$HOME` is that tree's absolute path, so it matches here — a \
+             home-relative mint would name `~/proj` and this row would match \
+             nothing; output:\n{stdout}"
         );
         assert_eq!(
             !stdout.contains("has not acknowledged"),
             expect_run,
-            "absolute={absolute}: and the refusal and the run are exclusive — \
-             a build that did both would be BR-10's defect; output:\n{stdout}"
+            "listed={listed}: and the refusal and the run are exclusive — a \
+             build that did both would be BR-10's defect; output:\n{stdout}"
         );
     }
 }
