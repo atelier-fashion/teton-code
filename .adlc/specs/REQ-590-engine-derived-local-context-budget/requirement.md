@@ -1,7 +1,7 @@
 ---
 id: REQ-590
 title: "Derive the local tier's context budget from the engine's real window"
-status: draft
+status: approved
 deployable: true
 created: 2026-08-24
 updated: 2026-08-25
@@ -226,6 +226,16 @@ local engine a default-feature build can have.*
 - [ ] AC-12: The `/analyze` case that motivated REQ-589 — 4,097 words on the local tier — is not
   refused and raises no over-budget offer. The field report, turned into a test.
 - [ ] AC-13: `cargo audit` clean; full suite green; no new clippy warnings.
+- [ ] AC-15 (BR-8): `derive` fed a **synthetic** small window (e.g. 4,096) produces a pair whose
+  byte half, at `DUTY_REQUEST_BYTES_PER_TOKEN`, does not exceed that window — i.e. the floor did
+  not raise it past what such an engine could hold. Paired on the same fixture with a window
+  large enough that the floor does not bite, so the test cannot pass by the floor never applying.
+  **This rule is latent today** (at 16,384 the floor never bites), so the AC is written against a
+  synthetic window rather than a real engine — a criterion that can only run on a configuration
+  nobody ships is a criterion that never runs.
+- [ ] AC-16 (BR-12): The rendered `LocalEngine` bound names the window and the reservation that
+  produced the pair. Asserted on the string a user actually sees, not on the fields behind it —
+  a budget a user cannot account for is one they will report as a bug.
 - [ ] AC-14: A dogfood leg in `docs/manual-verification.md` — a large local turn by hand,
   confirming the reported budget and that the turn serves. **REQ-589 AC-15's runbook was never
   written**, which is why this REQ still has no field data; this AC is not satisfied by intending

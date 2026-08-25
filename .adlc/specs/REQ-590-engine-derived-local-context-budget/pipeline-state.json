@@ -3,10 +3,27 @@
   "branch": "feat/REQ-590-engine-derived-local-context-budget",
   "startedAt": "2026-08-25T00:00:00Z",
   "completed": false,
-  "currentPhase": 0,
-  "completedPhases": [],
+  "currentPhase": 2,
+  "completedPhases": [
+    0,
+    1
+  ],
   "integrationBranch": "main",
-  "phaseHistory": [],
+  "phaseHistory": [
+    {
+      "phase": 0,
+      "name": "Resolve repos + worktree + preflight",
+      "completedAt": "2026-08-25T00:00:00Z",
+      "note": "single-repo; integration branch main (no staging signals); cleared a 4b collision from this REQ's own merged spec worktree"
+    },
+    {
+      "phase": 1,
+      "name": "Validate the requirement spec",
+      "completedAt": "2026-08-25T00:00:00Z",
+      "result": "approved after 2 blockers fixed: BR-8 (the latent floor rule) and BR-12 (observability) had no acceptance criterion \u2014 added AC-15 and AC-16",
+      "note": "LESSON-560's failure shape, caught by the gate one day after the lesson was written"
+    }
+  ],
   "repos": {
     "teton-code": {
       "primary": true,
@@ -14,8 +31,8 @@
       "worktree": "/Users/brettluelling/Documents/GitHub/teton-code/.worktrees/REQ-590",
       "branch": "feat/REQ-590-engine-derived-local-context-budget",
       "touched": true,
-      "prUrl": null,
-      "prNumber": null,
+      "prUrl": "https://github.com/atelier-fashion/teton-code/pull/216",
+      "prNumber": 216,
       "merged": false
     }
   },
