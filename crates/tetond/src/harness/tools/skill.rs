@@ -633,8 +633,37 @@ pub(crate) fn trust_root_name(root: &Path, home: Option<&Path>) -> String {
 }
 
 /// The name a **durable** acknowledgment of this root is written and matched
-/// under (REQ-589 D-13): [`trust_root_name`] over the root with every symlink
-/// resolved.
+/// under (REQ-589 D-13): [`trust_root_name`] over the session root **as
+/// discovery resolved it**.
+///
+/// # The argument is `SkillRegistry::read_under`, and that is the whole fix
+///
+/// `resolved_root` is not a path to resolve. It is the path
+/// [`crate::skills::discover`] *already* resolved, kept on the snapshot it
+/// built, and every project body this name can authorize was read out of it.
+/// Both callers take it from the registry they are about to expand a skill
+/// from — never from `ProbedRoot::path`, and never from anything they
+/// canonicalise themselves.
+///
+/// That rule is not decoration. Bodies are read eagerly and exactly twice per
+/// session, at `session/create` and at `/cd`
+/// (`discovery_is_paid_at_create_and_at_cd_and_never_per_turn`); the registry is
+/// frozen from then on. This name used to be minted per turn by canonicalising
+/// `ProbedRoot::path`, which `ProbedRoot::probe` deliberately leaves unresolved
+/// — so the identity that authorized the bodies and the identity the bodies were
+/// read under were two resolutions of one path, taken as much as a session
+/// apart. A link at the session root, re-pointed in between, made the second one
+/// name a tree the first one had never read: an unattended run whose skills came
+/// out of `~/evil` spent a row a human wrote for `~/dev/trusted`, exact match and
+/// all. Minting from the resolution the reads went through is what makes the
+/// substitution miss — the window is not narrowed, it is closed, because there
+/// is now only one resolution.
+///
+/// (The alternative — pin device and inode at discovery and re-`stat` at the
+/// door — closes the same hole, but it adds a *second* identity mechanism beside
+/// the name, and the name is what a human writes in `config.toml` and audits
+/// there. Pinning the resolution keeps one identity and one comparison; the
+/// section below is unchanged by either choice.)
 ///
 /// # Why this is not [`trust_root_name`]
 ///
@@ -646,18 +675,22 @@ pub(crate) fn trust_root_name(root: &Path, home: Option<&Path>) -> String {
 /// change what it points at. A list of *paths* is therefore a bypass waiting to
 /// happen: drop a symlink at `~/dev/repo` and a repository nobody acknowledged
 /// inherits the trust of one somebody did, with the same string on both sides
-/// of the comparison. `std::fs::canonicalize` resolves the link, so the name
-/// this mints is the name of a **tree** and the substitution simply misses.
+/// of the comparison. The resolution behind `resolved_root` follows the link, so
+/// the name this mints is the name of a **tree** and the substitution simply
+/// misses.
 ///
 /// It also normalises the two ways one tree is spelled — a `..` in the middle,
 /// macOS's `/private` prefix and its `/System/Volumes/Data` firmlink — so a
 /// user who typed `--cwd ../repo` is the same acknowledgment as one who typed
 /// the path in full, rather than a second one nobody wrote down.
 ///
-/// `home` is canonicalised for the same reason and in the same breath: the
-/// home-relative rule is `strip_prefix`, and stripping an *un*resolved home
-/// from a resolved root would silently stop matching on any machine whose home
-/// directory is itself a link.
+/// `home` is canonicalised here rather than by the caller, for the reason the
+/// root is resolved at all: the home-relative rule is `strip_prefix`, and
+/// stripping an *un*resolved home from a resolved root would silently stop
+/// matching on any machine whose home directory is itself a link. It stays at
+/// this end because it is a *spelling* of the answer and not the answer — the
+/// same tree under a home that resolves differently is the same tree, and both
+/// sides of every comparison are minted here in one breath.
 ///
 /// # What it deliberately does not defend against
 ///
@@ -672,16 +705,37 @@ pub(crate) fn trust_root_name(root: &Path, home: Option<&Path>) -> String {
 /// tree; it does not promise the tree never changes, and neither does the
 /// in-session acknowledgment it stands in for.
 ///
-/// # `None` is a refusal
+/// # `None` is still a refusal — it just arrives one step earlier
 ///
-/// A root that will not canonicalise — deleted, or unreadable — mints no name,
-/// so nothing in the list can match it and nothing can be written for it. That
-/// is fail-closed in both directions and it is the only honest answer: a name
-/// derived from a path the filesystem would not resolve names nothing.
-pub(crate) fn durable_trust_root_name(root: &Path, home: Option<&Path>) -> Option<String> {
-    let root = std::fs::canonicalize(root).ok()?;
+/// A session root that will not resolve mints no `read_under`, so the caller
+/// holds `None`, nothing in the list can match it and nothing can be written for
+/// it. It is fail-closed twice over now rather than once: that same root
+/// registers **no project skill at all**, because `discover`'s containment test
+/// has nothing to compare against, so the door it would have refused is not
+/// reached either.
+pub(crate) fn durable_trust_root_name(resolved_root: &Path, home: Option<&Path>) -> String {
     let home = home.and_then(|home| std::fs::canonicalize(home).ok());
-    Some(trust_root_name(&root, home.as_deref()))
+    trust_root_name(resolved_root, home.as_deref())
+}
+
+/// [`durable_trust_root_name`] over a path this resolves **itself** — the shape
+/// production had, and must never have again.
+///
+/// `#[cfg(test)]` is the point of it. Every production caller now takes the
+/// resolution from the snapshot whose bodies it authorizes
+/// ([`crate::skills::SkillRegistry::read_under`]), and the defect that shape
+/// replaced was precisely a mint that resolved a path of its own at a moment
+/// nobody had read anything at. A function that resolves-then-names is still
+/// what the *rule* is, and the tests below are about the rule; making it
+/// unavailable outside them is what stops the rule from being reached for again
+/// at a call site where the timing is wrong.
+#[cfg(test)]
+pub(crate) fn durable_trust_root_name_by_resolving(
+    root: &Path,
+    home: Option<&Path>,
+) -> Option<String> {
+    let root = std::fs::canonicalize(root).ok()?;
+    Some(durable_trust_root_name(&root, home))
 }
 
 /// `path`'s bytes as a string that names exactly those bytes: each byte outside
@@ -1617,6 +1671,13 @@ impl SkillTool {
                 door: NotRunReason::NoTerminal,
             });
         };
+        // REQ-589 D-13, and the one place this caller may read the durable name
+        // from: the snapshot holding the body it is about to expand. After the
+        // guard above, which needs no filesystem to answer.
+        let durable_root = self
+            .registry
+            .read_under()
+            .map(|resolved| durable_trust_root_name(resolved, home().as_deref()));
         let entries = project_trust_entries(&self.registry);
         let shadows = shadows_user_skill(&self.registry, name);
         let consent = self
@@ -1634,7 +1695,13 @@ impl SkillTool {
                     // answers for both callers — one key per root has meant one
                     // answer per root since REQ-587, and a durable answer the
                     // model's door could not read would make that two.
-                    durable: durable_trust_root_name(ctx.repo_root(), home().as_deref()).as_deref(),
+                    //
+                    // Minted from **this registry's** resolution, not from
+                    // `ctx.repo_root()`: the bodies this answer authorizes are
+                    // the ones in `self.registry`, and the name that authorizes
+                    // them has to be the name they were read under. See
+                    // `durable_trust_root_name`.
+                    durable: durable_root.as_deref(),
                 },
                 &entries,
                 shadows,
@@ -3648,8 +3715,14 @@ mod tests {
     ///    as `dir`, so a `--cwd` a user typed relatively is not a second row
     ///    nobody wrote.
     ///
-    /// **Mutation:** drop the `canonicalize` in `durable_trust_root_name` and
-    /// (2) and (4) both fail.
+    /// **Mutation:** drop the `canonicalize` in
+    /// `durable_trust_root_name_by_resolving` and (2) and (4) both fail.
+    ///
+    /// The composition is `#[cfg(test)]` since the TOCTOU fix, and this test is
+    /// why it still exists: it is the *rule* a durable name obeys, exercised
+    /// where the timing is a fixture's. Production reaches the same rule from
+    /// the other end — `SkillRegistry::read_under` is the resolution, taken once
+    /// where the bodies were read, and `durable_trust_root_name` names it.
     #[test]
     fn the_durable_name_resolves_the_link_and_names_the_tree() {
         let base = std::env::temp_dir().join(format!(
@@ -3668,7 +3741,7 @@ mod tests {
         std::os::unix::fs::symlink(&decoy, &link).unwrap();
 
         let durable = |path: &Path| {
-            durable_trust_root_name(path, None).unwrap_or_else(|| {
+            durable_trust_root_name_by_resolving(path, None).unwrap_or_else(|| {
                 panic!("{} did not canonicalise", path.display());
             })
         };
@@ -3727,7 +3800,7 @@ mod tests {
         // A root that does not resolve mints nothing, so nothing in the list can
         // match it and nothing can be written for it.
         assert_eq!(
-            durable_trust_root_name(&base.join("nothing-here"), None),
+            durable_trust_root_name_by_resolving(&base.join("nothing-here"), None),
             None,
             "a name derived from a path the filesystem will not resolve names \
              nothing, and must not be matched"
@@ -3862,6 +3935,138 @@ mod tests {
                 );
             }
             other => panic!("BR-4's own subject, never another: {other:?}"),
+        }
+    }
+
+    /// **The model's door spends the trust of the tree its bodies came from,
+    /// and of no other (REQ-589 D-13).**
+    ///
+    /// The typed path's leg for this lives in `runtime`, where a whole turn is
+    /// available; this is the other caller, which reaches the same door with the
+    /// same durable name and had the same defect. `SkillTool` holds the frozen
+    /// registry directly, so the identity it names comes off that registry —
+    /// never off `ToolContext::repo_root`, which is the path as the session
+    /// spells it and resolves to whatever the link points at *now*.
+    ///
+    /// Two legs, one fixture, one substitution, and the row is the only thing
+    /// that differs:
+    ///
+    /// - the **allow** leg lists the tree the bodies were actually read from, so
+    ///   the unattended widening is live here and a refusal below is a fact
+    ///   about identity rather than about a fixture that could never have run;
+    /// - the **refuse** leg lists the tree the link was re-pointed at, which is
+    ///   exactly what an attacker can arrange and exactly what must not work.
+    ///
+    /// **Mutation:** name `ctx.repo_root()` again and the refuse leg allows —
+    /// an unlisted repository's text reaching the model with nobody asked.
+    #[tokio::test]
+    async fn the_models_door_names_the_tree_its_registry_read_not_the_link() {
+        use crate::harness::permissions::AddressedPermissionDelivery;
+        use teton_protocol::events::PermissionRequest;
+        use teton_protocol::methods::{PermissionOutcome, RefusalReason};
+
+        /// The client an unattended session has: nobody to ask, answered
+        /// without a line being read.
+        struct Unattended(Arc<PendingPermissions>);
+
+        impl AddressedPermissionDelivery for Unattended {
+            fn deliver(
+                &self,
+                connection: ConnectionId,
+                _session_id: &SessionId,
+                request: PermissionRequest,
+            ) -> bool {
+                self.0.resolve_from(
+                    &request.request_id,
+                    PermissionOutcome::Refused {
+                        reason: RefusalReason::NoTerminal,
+                    },
+                    connection,
+                )
+            }
+        }
+
+        let fx = Fixture::new();
+        // The tree the body is read from, and which nobody lists.
+        let unlisted = fx.root.join("unlisted");
+        fx.skill(&unlisted, "gamma", "", "Gamma body.\n");
+        // The tree somebody did acknowledge.
+        let acknowledged = fx.root.join("acknowledged");
+        std::fs::create_dir_all(&acknowledged).unwrap();
+
+        // The session stands on a link, and discovery reads through it.
+        let link = fx.root.join("proj");
+        std::os::unix::fs::symlink(&unlisted, &link).unwrap();
+        let registry = Arc::new(discover(None, &link, RootKind::Plain, &RealFs));
+        assert!(
+            registry.invocable_by_model("gamma").is_some(),
+            "non-vacuity: the body really was read through the link"
+        );
+
+        // The attack, after the read and before the call.
+        std::fs::remove_file(&link).unwrap();
+        std::os::unix::fs::symlink(&acknowledged, &link).unwrap();
+
+        let row_for = |tree: &Path| {
+            durable_trust_root_name_by_resolving(tree, home().as_deref())
+                .expect("the fixture tree canonicalises")
+        };
+
+        for (tree, listed, expect_error, what) in [
+            (
+                &unlisted,
+                row_for(&unlisted),
+                false,
+                "the tree the registry read is listed, so the widening runs it",
+            ),
+            (
+                &acknowledged,
+                row_for(&acknowledged),
+                true,
+                "the tree the link now points at is listed, and that is not an \
+                 answer about the bodies in this registry",
+            ),
+        ] {
+            let pending = Arc::new(PendingPermissions::new());
+            let gate = Arc::new(
+                PermissionGate::new(
+                    SessionId::from("skill-tool-repoint"),
+                    PermissionConfig::with_default(PermissionPolicy::Ask),
+                    Arc::new(EventBus::new()),
+                    Arc::clone(&pending),
+                )
+                .with_addressed_delivery(Arc::new(Unattended(Arc::clone(&pending))))
+                .with_trusted_project_roots(vec![listed]),
+            );
+            let grants = crate::grants::GrantRegistry::default();
+            let tool = SkillTool::new(
+                Arc::clone(&registry),
+                gate,
+                Some(grants.next_connection_id()),
+                Handle::current(),
+                1_000,
+            );
+
+            // The jail is the link, as every surface spells it — which is
+            // precisely the spelling that must not decide this.
+            let outcome = tool
+                .invoke(&ToolContext::new(link.clone()), &call(Some("gamma"), ""))
+                .await;
+            assert_eq!(
+                outcome.is_error,
+                expect_error,
+                "{what} (listing {}): {}",
+                tree.display(),
+                outcome.content
+            );
+            if !expect_error {
+                assert!(
+                    outcome.content.contains("Gamma body."),
+                    "the allow leg must really expand the body, or it pairs \
+                     nothing: {}",
+                    outcome.content
+                );
+            }
         }
     }
 

@@ -310,6 +310,14 @@ pub fn discover(
     // `/tmp/repo` is stored that way while everything under it resolves through
     // `/private`. Comparing the resolved root against the unresolved one would
     // refuse every project root on that machine.
+    //
+    // **Taken once, and kept.** REQ-589 D-13: this value leaves on the registry
+    // (`SkillRegistry::read_under`) because it is the tree the bodies below are
+    // about to be read out of, and BR-4's durable trust name is minted from it
+    // rather than re-derived at turn time. A second resolution of
+    // `session_root`, taken whenever the model reaches for a skill, is a second
+    // answer to *which tree is this* — and the session is long enough for a
+    // link to have been re-pointed in between.
     let boundary = fs.canonicalize(session_root);
 
     // In precedence order (project before user, `skills/` before `commands/`),
@@ -368,7 +376,13 @@ pub fn discover(
         }
     }
 
-    assemble(candidates, skipped)
+    let mut registry = assemble(candidates, skipped);
+    // Written here rather than passed through `assemble`, which is the name
+    // contest and has nothing to do with the filesystem. A child module may
+    // reach a private field of its parent's type, and this is the one place
+    // entitled to fill this one: it is the only code that resolved anything.
+    registry.read_under = boundary;
+    registry
 }
 
 /// One skill file's repo-relative identity for the egress provenance channel,
@@ -872,5 +886,74 @@ mod tests {
         );
         assert!(RealFs.list(&root).unwrap().is_empty());
         std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// **The snapshot names the tree its bodies came out of, not the path it
+    /// was asked about (REQ-589 D-13).**
+    ///
+    /// The discovery half of the fix that made the durable trust name
+    /// un-substitutable. `read_under` is what the trust door mints
+    /// `[skills] trusted_project_roots` from, and its whole value is that it is
+    /// **this** resolution — the one the containment test used and the one the
+    /// bodies below were read through — rather than a second one taken at the
+    /// door, hours later, off a path a link may have been re-pointed under.
+    ///
+    /// Both halves are asserted, because either alone is passable by a mistake:
+    /// the link's own spelling must not be the answer (that is the substitution)
+    /// **and** the target must be, byte for byte, so the name minted from it is
+    /// the acknowledged tree's rather than nothing at all.
+    ///
+    /// A root that will not resolve answers `None`, and answers it together with
+    /// an empty project set: the door is fail-closed and unreachable at once.
+    ///
+    /// **Mutation:** leave `read_under` at `assemble`'s `None` and the whole
+    /// unattended path refuses everything; fill it from `session_root` instead
+    /// of from `boundary` and the first assertion fails.
+    #[test]
+    fn the_registry_records_the_root_its_bodies_were_read_under() {
+        let base = temp_root("read-under");
+        let real = base.join("real");
+        std::fs::create_dir_all(real.join(".claude/skills/marked")).unwrap();
+        std::fs::write(
+            real.join(".claude/skills/marked/SKILL.md"),
+            "---\ndescription: marked\n---\n\nbody\n",
+        )
+        .unwrap();
+        let link = base.join("link");
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+
+        let registry = discover(None, &link, RootKind::Project, &RealFs);
+        assert!(
+            registry
+                .skills()
+                .iter()
+                .any(|skill| skill.name == "marked" && skill.source == SkillSource::Project),
+            "non-vacuity: the body really was read through the link, so the \
+             identity below is one that authorizes something: {:?}",
+            registry.skipped()
+        );
+        assert_eq!(
+            registry.read_under(),
+            Some(std::fs::canonicalize(&real).unwrap().as_path()),
+            "the snapshot must name the tree it read, or a row written for that \
+             tree can be spent by a link standing somewhere else"
+        );
+        assert_ne!(
+            registry.read_under(),
+            Some(link.as_path()),
+            "the path as spelled is exactly what must not be the identity"
+        );
+
+        // A session root that does not resolve: no identity, and nothing for one
+        // to have authorized.
+        let gone = discover(None, &base.join("absent"), RootKind::Project, &RealFs);
+        assert_eq!(gone.read_under(), None);
+        assert!(
+            gone.skills().is_empty(),
+            "fail-closed twice: an unresolvable root registers no project skill \
+             either, so the door it would refuse is never reached"
+        );
+
+        std::fs::remove_dir_all(&base).ok();
     }
 }
