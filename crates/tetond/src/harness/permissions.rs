@@ -448,6 +448,31 @@ const READ_ONLY_TOOLS: &[&str] = &["read", "glob", "grep", DOCS_TOOL_NAME, SKILL
 /// anywhere, because a gate skipped when a flag is set is a guard whose
 /// condition names something unrelated to what it guards — it becomes a silent
 /// no-op the moment anything else moves that condition (LESSON-443).
+/// The row a level's table decides the **project-skill acknowledgment** under
+/// (REQ-591 D-3).
+///
+/// The question is asked under `project_skill_trust:<root>`, which is
+/// per-repository by construction and therefore unenumerable: a level cannot
+/// name every root a machine will ever stand on, and REQ-560 ADR-A refuses to
+/// enumerate open sets. The **question**, though, is one question — "may
+/// repository text reach the model labelled instructions?" — and a level has a
+/// posture about it. This is that row: the family, named once, so a level can
+/// state its answer instead of leaving it to a default that was written about
+/// tools.
+///
+/// Consulted through [`Question::level_key`] and nowhere else, so **which**
+/// questions it governs is a function of the [`InvokedBy`] the question carries
+/// rather than of a string test — the same shape [`durable_row_for`] gives the
+/// durable row, for the same reason (LESSON-495).
+///
+/// The **grant** key is untouched. An answer is still remembered per root,
+/// because a human acknowledged *a repository* and not the idea of
+/// repositories.
+///
+/// It is not a config surface. `[permissions]` carries `default_level` and
+/// nothing else, so the only writer is [`table_for`].
+const PROJECT_TRUST_LEVEL_KEY: &str = "project_skill_trust";
+
 #[must_use]
 pub fn table_for(level: PermissionLevel) -> PermissionConfig {
     match level {
@@ -480,6 +505,32 @@ pub fn table_for(level: PermissionLevel) -> PermissionConfig {
         PermissionLevel::Plan => {
             let mut cfg = PermissionConfig::with_default(PermissionPolicy::Deny);
             allow_read_only(&mut cfg);
+            // REQ-591 D-3, and the one row that is not a tool.
+            //
+            // The acknowledgment reached this table unenumerated and took the
+            // deny default, so `plan` refused a typed project skill outright —
+            // no body, no prompt, nothing. That is inverted: `plan` is the level
+            // a user picks to explore a repository **read-only**, and refusing
+            // to expand that repository's own instructions is the most
+            // restrictive outcome at the safest level. Before REQ-589 D-10 the
+            // body expanded here with its command slots unrun; this restores
+            // that, with the acknowledgment still in front of it.
+            //
+            // `ask` rather than `allow`, deliberately. BR-1 says a
+            // project-authored body is acknowledged on **every** path that can
+            // run one, and D-3 is about not refusing rather than about not
+            // asking. What `plan` still denies is everything the body would
+            // *do*: `skill:project:<name>` is a tool key, falls to the default
+            // above, and no dynamic command runs. The body arrives; nothing in
+            // it executes.
+            //
+            // Reached only by the **typed** door ([`Question::level_key`]). The
+            // model's door took `plan`'s deny default before REQ-589 too, and
+            // D-3 restores a pre-REQ-589 posture rather than inventing one — so
+            // it keeps taking it. Widening the model's door at `plan` in the
+            // same change that narrows its durable answer (D-2) would be two
+            // decisions pointing opposite ways.
+            cfg.set(PROJECT_TRUST_LEVEL_KEY, PermissionPolicy::Ask);
             cfg
         }
         // Byte-equal to the pre-REQ-560 `permissive()`. The three web keys stay
@@ -1150,6 +1201,15 @@ enum Question {
     /// REQ-587 BR-4's project-skill acknowledgment, which since REQ-589 D-13 has
     /// a durable form and therefore an option set of its own.
     ProjectTrust {
+        /// Which door asked.
+        ///
+        /// Carried as a **fact**, with the two policies that depend on it
+        /// derived from it rather than folded into it: what a durable row may
+        /// say ([`durable_row_for`], REQ-591 D-2) and which row a level decides
+        /// this question by ([`Question::level_key`], D-3). Two conditions on
+        /// one dimension, spelled where the dimension is, so a third caller
+        /// cannot acquire either answer by default.
+        invoked_by: InvokedBy,
         /// The canonical root name a permanent answer would write to
         /// `[skills] trusted_project_roots`, when this prompt may offer to
         /// write one at all.
@@ -1225,6 +1285,30 @@ impl Question {
         }
     }
 
+    /// The row a **level's table** decides this question by, or `None` to use
+    /// the caller's own key — and therefore the level's default (REQ-591 D-3).
+    ///
+    /// `None` for everything but the **typed** acknowledgment, which is the one
+    /// question a level has a posture about that its own key cannot express:
+    /// `project_skill_trust:<root>` is per-repository, and REQ-560 ADR-A
+    /// refuses to enumerate open sets, so it fell to a default written about
+    /// tools. At `plan` that default is deny, and the result was the most
+    /// restrictive outcome at the safest level — `plan` refusing to expand the
+    /// instructions of the very repository a user picked `plan` to read.
+    ///
+    /// The model's door is deliberately not here. It took `plan`'s deny default
+    /// before REQ-589 as well, so leaving it there restores a posture rather
+    /// than inventing one — and it is the same door D-2 just narrowed.
+    const fn level_key(&self) -> Option<&'static str> {
+        match self {
+            Self::Standard(_) | Self::OverBudget { .. } => None,
+            Self::ProjectTrust { invoked_by, .. } => match invoked_by {
+                InvokedBy::User => Some(PROJECT_TRUST_LEVEL_KEY),
+                InvokedBy::Model => None,
+            },
+        }
+    }
+
     /// The root a permanent answer to *this* question would write down, if this
     /// question offers one at all (REQ-589 D-13).
     ///
@@ -1235,7 +1319,7 @@ impl Question {
     /// other's write.
     fn durable_project_root(&self) -> Option<&str> {
         match self {
-            Self::ProjectTrust { durable_root } => durable_root.as_deref(),
+            Self::ProjectTrust { durable_root, .. } => durable_root.as_deref(),
             Self::Standard(_) | Self::OverBudget { .. } => None,
         }
     }
@@ -2349,6 +2433,7 @@ impl PermissionGate {
         // is a function of the invoker rather than a condition at each use.
         let durable_row = durable_row_for(invoked_by, durable_root);
         let question = Question::ProjectTrust {
+            invoked_by,
             durable_root: durable_row.clone(),
         };
         // No `description`, for [`Self::authorize_skill`]'s reason: the subject
@@ -2557,7 +2642,10 @@ impl PermissionGate {
         //
         // Nothing is published for a policy answer: `allow` and `deny` rows are
         // configuration, and no one decided anything just now.
-        match self.effective_table().policy_for(tool_name) {
+        // The row a level decides this question by. `tool_name` for every
+        // caller but the typed acknowledgment — see [`Question::level_key`].
+        let level_key = question.level_key().unwrap_or(tool_name);
+        match self.effective_table().policy_for(level_key) {
             // The one caller that does not take this arm is BR-4's shadowing
             // acknowledgment, which falls through to the grant and then to the
             // prompt. `deny` below is *not* overridable, so the override can
@@ -3168,7 +3256,9 @@ fn options_for(question: &Question) -> Vec<PermissionOption> {
             labels,
             lead_with_remedy,
         } => over_budget_options(labels, *lead_with_remedy),
-        Question::ProjectTrust { durable_root } => project_trust_options(durable_root.as_deref()),
+        Question::ProjectTrust { durable_root, .. } => {
+            project_trust_options(durable_root.as_deref())
+        }
     }
 }
 
@@ -5907,16 +5997,58 @@ mod tests {
         }
     }
 
-    /// **`plan` still denies at a listed root, and asks nobody.**
+    /// **A level that would not have asked is not lifted by a row — and `plan`
+    /// is no longer such a level (REQ-560 BR-5 ordering, REQ-591 D-3).**
     ///
-    /// REQ-560 BR-5's ordering, which the widening preserves *by construction*
-    /// rather than by a check: the rewrite acts on a settlement, and a `deny`
-    /// row has already returned one by then. A version that consulted the list
-    /// first would make a config row outrank the level — the one direction
-    /// `LevelAllow`'s whole design refuses.
+    /// The ordering rule is preserved *by construction* rather than by a check:
+    /// [`PermissionGate::acknowledged_unattended`] rewrites a **settlement**,
+    /// and only the `Refused(NoTerminal)` arm of one. A `deny` row has already
+    /// returned `DeniedByLevel` by then, and nothing here can reach past it. A
+    /// version that consulted the list *first* would make a config row outrank
+    /// the level — the one direction `LevelAllow`'s whole design refuses.
+    ///
+    /// **The fixture had to move, and that move is D-3.** This used to be
+    /// witnessed at `plan`, because `plan` denied the acknowledgment by
+    /// default. It no longer does: the typed door reads
+    /// `PROJECT_TRUST_LEVEL_KEY`, which `plan` sets to `ask`. So the rule is
+    /// witnessed against a table that genuinely denies the question — which is
+    /// what it was always about — and the `plan` leg now pins the new
+    /// behaviour beside it.
+    ///
+    /// Both legs on one fixture (LESSON-520), so neither can be green because
+    /// the list was mis-seeded or the route mis-wired.
     #[tokio::test]
-    async fn plan_denies_at_a_listed_root_and_asks_nobody() {
-        let (gate, route, _bus, _pending, conn) = wired(
+    async fn a_row_never_lifts_a_level_that_would_not_have_asked() {
+        // A table that denies everything, including the acknowledgment family.
+        let (denied, route, _bus, _pending, conn) = wired(
+            |bus, pending| {
+                PermissionGate::new(
+                    SessionId::from("s1"),
+                    PermissionConfig::with_default(PermissionPolicy::Deny),
+                    bus,
+                    pending,
+                )
+                .with_trusted_project_roots(vec![DURABLE.to_owned()])
+            },
+            RouteBehaviour::RefusesWithoutAsking(RefusalReason::NoTerminal),
+        );
+        assert_eq!(
+            ask_trust(&denied, Some(DURABLE), InvokedBy::User, conn).await,
+            SkillConsent::DeniedByLevel,
+            "a durable acknowledgment must not lift a level that would not have \
+             asked the question"
+        );
+        assert!(
+            route.delivered().is_empty(),
+            "the level settled it, so nobody was asked and the list was never \
+             reached"
+        );
+
+        // D-3: `plan` is not that level any more. The question **is** put, the
+        // client has nobody to ask, and the row a human wrote answers it — which
+        // is D-13's widening reaching `plan` for the first time, and is the same
+        // answer `guarded` gives on the same fixture.
+        let (planning, route, _bus, _pending, conn) = wired(
             |bus, pending| {
                 PermissionGate::with_level(
                     SessionId::from("s1"),
@@ -5930,15 +6062,42 @@ mod tests {
             RouteBehaviour::RefusesWithoutAsking(RefusalReason::NoTerminal),
         );
         assert_eq!(
-            ask_trust(&gate, Some(DURABLE), InvokedBy::User, conn).await,
+            ask_trust(&planning, Some(DURABLE), InvokedBy::User, conn).await,
+            SkillConsent::Allowed,
+            "at `plan` the acknowledgment is asked, so a listed root answers it \
+             — the body expands, and `plan` still denies every command in it"
+        );
+        assert_eq!(
+            route.delivered().len(),
+            1,
+            "and the question was genuinely put: a `plan` that settled it itself \
+             would be the pre-D-3 refusal wearing a different name"
+        );
+
+        // The model's door keeps `plan`'s deny default, which is what it had
+        // before REQ-589 as well. D-3 restores a posture; it does not widen the
+        // door D-2 just narrowed.
+        let (planning, route, _bus, _pending, conn) = wired(
+            |bus, pending| {
+                PermissionGate::with_level(
+                    SessionId::from("s1"),
+                    PermissionLevel::Plan,
+                    Vec::new(),
+                    bus,
+                    pending,
+                )
+                .with_trusted_project_roots(vec![DURABLE.to_owned()])
+            },
+            RouteBehaviour::RefusesWithoutAsking(RefusalReason::NoTerminal),
+        );
+        assert_eq!(
+            ask_trust(&planning, Some(DURABLE), InvokedBy::Model, conn).await,
             SkillConsent::DeniedByLevel,
-            "a durable acknowledgment must not lift a level that would not have \
-             asked the question"
+            "`plan` still settles the model's acknowledgment by its default"
         );
         assert!(
             route.delivered().is_empty(),
-            "the level settled it, so nobody was asked and the list was never \
-             reached"
+            "and asks nobody about it"
         );
     }
 
@@ -6226,6 +6385,7 @@ mod tests {
                 option_id: OPTION_ID_ENABLE_PERMANENT.to_owned(),
             },
             &Question::ProjectTrust {
+                invoked_by: InvokedBy::User,
                 durable_root: Some(DURABLE.to_owned()),
             },
             None,

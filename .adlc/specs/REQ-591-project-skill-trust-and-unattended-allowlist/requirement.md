@@ -275,6 +275,14 @@ operational question of whether `req589-pre-carveout` is pushed for redundancy.*
   invoker — LESSON-495's prescription is to make the key a function of the dimension so
   adding one is a compile error rather than a silent grant. (informed by LESSON-495)
 
+- [x] **OQ-3 — ANSWERED by D-3, implemented.** No. `plan` now carries the acknowledgment
+  family's own row (`PROJECT_TRUST_LEVEL_KEY = ask`), reached through
+  `Question::level_key()` — so it is scoped to the **typed** door, which is the door OQ-3
+  is about. The body expands after the acknowledgment; every command in it still falls to
+  `plan`'s deny default and does not run. No other level's answer changed, and the model's
+  door keeps `plan`'s deny default, which is what it had before REQ-589 too. Original
+  question follows.
+
 - [ ] **OQ-3: Should `plan` refuse a typed project skill outright?** It now does, where it
   previously ran the body with *"not run at plan"* in its command slots. The counter-argument:
   `plan` is the level users select to explore a repository **read-only**, so refusing to

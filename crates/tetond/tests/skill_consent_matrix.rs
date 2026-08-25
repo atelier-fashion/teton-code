@@ -1408,6 +1408,16 @@ async fn the_acknowledgment_asks_under_its_own_key_and_names_the_root_and_its_sk
 /// **BR-4: `guarded`/`edits` ask once, `plan` denies, `full` allows — from the
 /// level's *default*, with no row of the acknowledgment's own.**
 ///
+/// This is the **model's** door (see [`acknowledge`]), and REQ-591 D-3 leaves it
+/// exactly here. D-3 gave the *typed* door its own row at `plan`
+/// (`PROJECT_TRUST_LEVEL_KEY`, set to `ask`) because refusing to expand a
+/// repository's instructions at the level a user picks to read that repository
+/// is inverted. The model's door took `plan`'s deny default before REQ-589 too,
+/// so it keeps taking it — restoring a posture rather than inventing one, and
+/// not widening in the same change that narrowed this door's durable answer
+/// (D-2). The typed door's `plan` leg is
+/// `permissions::tests::a_row_never_lifts_a_level_that_would_not_have_asked`.
+///
 /// The two silent legs assert the prompt count as well as the answer, because
 /// "allowed" and "allowed without being asked" are different claims and only
 /// the second one is the level's. The "once" half is in the same test as the
@@ -1539,8 +1549,10 @@ async fn a_shadowing_project_skill_is_acknowledged_even_at_full() {
     answerer.stop();
 
     // The override is allow-only. At `plan` the level still denies a shadowing
-    // acknowledgment, and denies it *without asking* — an override that reached
-    // past `deny` would be a hole rather than a narrowing.
+    // acknowledgment on this door, and denies it *without asking* — an override
+    // that reached past `deny` would be a hole rather than a narrowing. REQ-591
+    // D-3 changed the typed door's `plan` row and left this one alone, so this
+    // leg still says what it always said.
     let conns = connections(1);
     let Session {
         gate,
