@@ -4,7 +4,7 @@ title: "Derive the local tier's context budget from the engine's real window"
 status: draft
 deployable: true
 created: 2026-08-24
-updated: 2026-08-24
+updated: 2026-08-25
 component: "daemon/router"
 domain: "routing"
 stack: ["rust", "daemon", "llama.cpp"]
@@ -14,70 +14,348 @@ tags: ["context-budget", "local-engine", "n_ctx", "oq-3", "generation-reservatio
 
 ## Description
 
-**This REQ discharges REQ-586's recorded OQ-3.** It is filed, not yet specified: the
-open question explicitly calls for a *measured* decision, and the measurement has not
-been taken. What follows is the problem statement and the facts a specifier will need,
-so they are not rediscovered a third time.
+**This REQ discharges REQ-586's recorded OQ-3.**
 
-REQ-586 made every route's context budget derive from that route's window facts —
-except the local tier, which short-circuits in `derive` to a fixed pair
-(`LOCAL_BUDGET_TOKENS` 4,096 words, `LOCAL_BUDGET_BYTES` 32,768 B) regardless of what
-engine is loaded or how large its window is. OQ-3 asked whether that pair should come
-from the engine's real `n_ctx` instead, and deferred on the grounds that REQ-564's
-prefix-cache work and local prompt-processing cost make it a measured call.
+REQ-586 made every route's context budget derive from that route's window facts — except the
+local tier, which short-circuits in `derive` (`harness/budget.rs`) to a fixed pair of
+`(LOCAL_BUDGET_TOKENS 4,096 words, LOCAL_BUDGET_BYTES 32,768 B)` regardless of what engine is
+loaded or how large its window is.
 
-REQ-589 hit the consequence in the field: a user's `/analyze` was refused at 4,097
-words against the fixed 4,096-word budget on a machine whose engine had a
-16,384-token window loaded. REQ-589 gives that user an exit (offer to proceed); it
-deliberately does **not** touch the budget itself, which is this REQ.
+REQ-589 hit the consequence in the field: `/analyze` refused at **4,097 words against 4,096**, on
+a machine whose engine had a 16,384-token window loaded. REQ-589 gave that user an exit — an
+offer to proceed — and deliberately did not touch the budget. This REQ is the budget.
 
-## Facts for whoever specifies this
+### What the local tier gets wrong, precisely
 
-Three findings, each verified against the code, that shape the work:
+There are **two** defects, and they point in opposite directions.
 
-1. **The router cannot currently read the engine's window at all.** `EngineLoadReport`
-   (`crates/tetond/src/model_consent.rs:665`) carries only `benchmark` and `duty`. The
-   16,384 figure is visible in llama.cpp's own stdout, not in any Rust value the router
-   can reach. Any engine-derived budget needs the window plumbed from
-   `LocalEngineLoader` up through the engine slot to `Router::budget_for` — this is real
-   plumbing, not a constant swap.
+**The word half is far too small.** 4,096 whitespace words against a 16,384-token window. At the
+codebase's own remote safety ratio (3 BPE tokens per 2 words), 4,096 words claim at most ~6,144
+tokens — leaving roughly 10,000 tokens of the engine's window unused. A remote route with a
+declared 16,384-token window would derive ~10,240 words for the same engine.
 
-2. **The two halves are not symmetric, and the byte half is the dangerous one.** This is
-   OQ-3's own note: `LOCAL_BUDGET_BYTES` (32,768) is exactly `LOCAL_ENGINE_N_CTX`
-   (16,384) × 2 B/token — *the whole engine window, with no room left for the reply* —
-   whereas every remote pair subtracts the generation reservation from the window
-   first (REQ-586 BR-2). The word half (4,096 ≈ 6,144 provider tokens at the 3/2 safety
-   ratio) is well under the window. So "raise the local budget" is not one decision: the
-   word half has headroom, and the byte half is already past where a remote route would
-   have stopped. A naive `n_ctx`-derived pair that applied the remote formula would
-   *lower* the byte half — which may well be correct, and would be a behavior change.
+**The byte half has no generation reservation, and every neighbour it meets does.** This is the
+defect REQ-586's OQ-3 gestured at, and its reasoning needs correcting before it is built on:
 
-3. **The local pair is load-bearing beyond the local tier.** `derive` returns it for the
-   unresolvable route too, and `HarnessConfig::default()` reads the same constants
-   (REQ-586 AC-1 pins `max_context = 0` yielding today's `(4096, 32768)`). Changing the
-   constants moves those callers; changing only the local *tier's* derivation does not.
-   A specifier must decide which is intended.
+> OQ-3 recorded that `LOCAL_BUDGET_BYTES` is `LOCAL_ENGINE_N_CTX × 2 B/token` — the whole window.
+> **It is not.** It is `LOCAL_BUDGET_TOKENS × APPROX_BYTES_PER_TOKEN` = 4,096 words × 8 B/word.
+> The two derivations coincide at 32,768 by arithmetic accident.
+
+The *conclusion* survives the corrected premise, by a different route. Converted at
+`DUTY_REQUEST_BYTES_PER_TOKEN` — the 2 B/token BPE floor this codebase uses everywhere a byte
+budget must be safe against dense content — 32,768 bytes is **16,384 tokens: the entire window,
+with nothing left for the reply.**
+
+Three things in this daemon disagree with that, all reachable from the same engine:
+
+| Site | Rule |
+|---|---|
+| `teton-inference/src/engine.rs:103` `over_window` | refuses any prompt where `prompt_tokens > n_ctx − max_tokens` |
+| `egress/redact.rs:133` `REDACT_PROMPT_BUDGET_BYTES` | `(LOCAL_ENGINE_N_CTX − 1,024) × 2 B/token`, citing LESSON-446 |
+| `harness/budget.rs:118` `LOCAL_BUDGET_BYTES` | window × 2 B/token, **reservation zero** |
+
+So the harness's local budget permits, at its own worst-case bridge, a prompt the engine will
+refuse — and the refusal is correct but arrives wearing the wrong label. `harness/turn_loop.rs:390`
+states the budget "keeps a full assembled prompt within the local engine's 16,384-token window
+with headroom": true of typical prose at ~4 B/token, false at the 2 B/token floor the same file
+names two paragraphs earlier as the reason bytes are bounded at all.
+
+**This has not bitten because dense content is rare, not because the bound is right.** That is
+LESSON-446's own failure shape — a budget, a threshold and a window that all say 4,096 in
+different currencies agree on nothing — and the original `/analyze` refusal was at 4,097 *words*
+against a 4,096-*word* budget.
+
+### What this REQ does
+
+Give the local tier a budget derived from the engine's window and a real generation reservation,
+instead of a pair that ignores both.
+
+**It is not a one-line change, and an adversarial pass on the first draft of this spec is why
+this section is worded carefully.** Three things the naive version gets wrong:
+
+- The local budget is **not only a ceiling.** It drives `under_pressure` (compaction fires at
+  70% of it) and `digest_thresholds` (when a tool result gets condensed). Raising it changes what
+  goes *into* prompts, not just what is refused — so REQ-586 OQ-3's cost concern is live, and the
+  size of the raise is a product decision with behavioural blast radius. See D-3.
+- `derive` **cannot simply stop short-circuiting.** `HarnessConfig::default()` calls
+  `derive(BudgetInputs::local())` (`turn_loop.rs:493`), and `generation_reservation()` calls
+  `HarnessConfig::default()` (`budget.rs:614`). The short-circuit is the only thing keeping that
+  cycle open. See BR-2 and BR-3.
+- Lowering the byte half is **a user-visible regression**, not a free correction. See BR-7.
+
+## System Model
+
+### Entities
+
+| Entity | Field | Type | Constraints |
+|--------|-------|------|-------------|
+| `LOCAL_ENGINE_N_CTX` | — | u32 | existing (`runtime.rs:11999`); the window the daemon loads with and the one the local derivation reads |
+| *(new constant)* | — | u32 | the local generation reservation; D-2. One home, reachable **without** constructing a `HarnessConfig` (BR-3) |
+| `BudgetInputs` | `window`, `reservation` | u32 | already exist; `local()` currently hardcodes both to 0 |
+| `RouteBudget` | `(words, bytes)` | (usize, usize) | shape unchanged |
+| `BudgetBound::LocalEngine` | — | variant | retained; meaning narrows from "a fixed pair" to "derived from the local engine's window" |
+
+*No new field on `EngineLoadReport`, and no change to the `Engine` trait — D-1 reversed. This
+also removes the problem that the `ScriptedFileEngine` install path (`runtime.rs:11818`) never
+builds an `EngineLoadReport` at all, so a plumbed window would have had no source on the only
+local engine a default-feature build can have.*
+
+### Events
+
+| Event | Trigger | Payload |
+|-------|---------|---------|
+| `route.budget` (existing) | a route decision stamps a budget | unchanged fields; `LocalEngine` now reports a derived pair |
+
+## Business Rules
+
+- [ ] **BR-1: The local tier's budget is derived from the engine's window and a real generation
+  reservation**, through the same arithmetic every other route uses — `(window − reservation)`,
+  then the 3/2 words rule and the 2 B/token bytes rule.
+
+- [ ] **BR-2: `derive` keeps a local branch; it does not lose one.** `HarnessConfig::default()`
+  calls `derive(BudgetInputs::local())`, so simply deleting the `is_local` arm drops that call
+  into the `window == 0` path and flips its bound `LocalEngine → DefaultUnknown` — which then
+  renders the `capabilities.max_context` remedy BR-6 forbids. The local branch must carry the
+  window and reservation into the shared arithmetic while keeping its own bound.
+
+- [ ] **BR-3: The local reservation is a constant, not `generation_reservation()`.**
+  `generation_reservation()` reads `HarnessConfig::default()`, which calls `derive`. Sourcing the
+  local reservation from it closes a cycle — `derive → generation_reservation →
+  HarnessConfig::default → derive` — a stack overflow in the most-constructed value in the crate.
+  The reservation has one home, and that home is reachable without constructing a `HarnessConfig`.
+
+- [ ] **BR-4: The local window is `LOCAL_ENGINE_N_CTX`, the value the daemon loads with.**
+  Not plumbed from the loaded engine. See D-1 — the clamp that would have justified plumbing does
+  not exist. This is the rule `egress/redact.rs:133` already follows against the same engine.
+
+- [ ] **BR-5: The no-better-fact default keeps its constants and its other callers.**
+  `LOCAL_BUDGET_TOKENS` / `LOCAL_BUDGET_BYTES` stay **the one home** (LESSON-456) of the pair a
+  route with no window runs under: a remote provider declaring `max_context = 0`, and the
+  unresolvable route. REQ-586 AC-1 stays true. **But see BR-2** — `HarnessConfig::default()` is
+  not simply "a caller of the constants"; it is a caller of `derive`, and this REQ must say what
+  bound and pair it ends up with rather than assuming it is untouched.
+
+- [ ] **BR-6: The bound stays `LocalEngine`, and offers no `capabilities.max_context` remedy.**
+  There is no provider declaration to go and edit for this route; a surface implying otherwise
+  sends the user to change something that does not exist.
+
+- [ ] **BR-7: No turn that serves today is newly refused.** Both halves are enforced
+  conjunctively. Lowering the byte half 32,768 → 30,720 newly refuses byte-dense local content
+  in that 2,048-byte band — minified JSON, base64, path-heavy build logs, the classes
+  `budget.rs:55-62` names as measured. For an ordinary turn that is a new elision; for a skill
+  turn it is a **new over-budget offer on content that has never raised one**. If the byte half
+  is to fall, this rule is what must be consciously overridden, with the affected classes named.
+
+- [ ] **BR-8 (floor): `MIN_BUDGET_*` may never raise the local pair above what the engine holds.**
+  The floor's "only ever raises" property is safe for a remote route with a declared window and is
+  not safe against a hard engine limit. **This rule is presently latent** — at
+  `LOCAL_ENGINE_N_CTX = 16,384` the floor never bites — and becomes live only if that constant
+  falls. It is stated so that whoever lowers it inherits the rule rather than the bug. Note the
+  remedy is *not* obviously "clamp to the window": at a 4,096-token engine the derived byte half
+  is 6,144, which `budget.rs:126-133` documents as **below the smallest prompt the harness can
+  produce**. That case is OQ-2, and BR-8 does not pretend to resolve it.
+
+- [ ] **BR-9: `COMPACT_OUTPUT_MAX_BYTES` must not exceed the local budget it repairs to.**
+  It is defined as `LOCAL_BUDGET_BYTES` (`compact.rs:134`) and its doc states the invariant:
+  a repair may not return more than the budget it is repairing to. If the local byte budget falls
+  below that constant, a compaction landing in the gap is rejected and the turn degrades to
+  oldest-first eviction — on exactly the route that most needed the model's judgement.
+
+- [ ] **BR-10: The word half must not lose its slack silently.** Today 4,096 words claim at most
+  ~6,144 tokens against 15,360 usable — 2.5× headroom. The derived pair sets
+  `words × 3/2 = usable` **exactly**, by construction, so any content denser than 1.5 real tokens
+  per whitespace word overruns the engine at full budget. `budget.rs:205-212` measures Rust at
+  1.69. The byte guard covers dense-and-heavy content; it does not cover **token-dense but
+  byte-light** content (whitespace-separated single-character tokens, numeric columns), which
+  passes the byte guard and overruns anyway. Either the derivation carries explicit margin, or
+  this REQ states that `context_length_exceeded` becomes an ordinary local outcome and REQ-589's
+  offer is the intended catch.
+
+- [ ] **BR-11: A larger local budget does not degrade a local turn below REQ-544's BR-8 latency
+  duty** (`router.rs:405` — named by REQ id because this document has its own BR-8).
+
+- [ ] **BR-12: The change is observable.** A user can see which window their local budget came
+  from and what was reserved.
+
+## Acceptance Criteria
+
+- [ ] AC-1: With the local window and reservation, the local route's pair equals what the remote
+  path yields for a declared window of the same size. One formula, tested from both sides.
+- [ ] AC-2 (BR-2): `HarnessConfig::default().budget.bound` is still `LocalEngine`, and its pair is
+  still `(4096, 32768)` **or** the value D-3 settles on — asserted explicitly, because today's
+  pin (`turn_loop.rs:465-468`) compares only the numbers and would pass while the bound flipped.
+- [ ] AC-3 (BR-3): A test constructs `HarnessConfig::default()` and `derive` on the local path.
+  Passing is not enough — a cycle is a stack overflow, so this AC is satisfied by the test
+  *existing and terminating*, and by a note at the reservation's home saying why it is not
+  `generation_reservation()`.
+- [ ] AC-4 (BR-1/BR-4): `budget_bytes / DUTY_REQUEST_BYTES_PER_TOKEN ≤ LOCAL_ENGINE_N_CTX −
+  reservation`, as a property over the derivation. **This assertion fails against today's
+  constants**, which is the point.
+- [ ] AC-5 (BR-5): `max_context = 0` still yields `(4096, 32768)` (REQ-586 AC-1, unchanged), on a
+  fixture that is *not* the local route — so it cannot pass by accident if the local pair happens
+  to match.
+- [ ] AC-6 (BR-6): The `LocalEngine` bound names the engine window as its source and offers no
+  `max_context` remedy. Paired against a remote `Window` bound, which does.
+- [ ] AC-7 (BR-7): A local turn of byte-dense content sized in the band between the new and old
+  byte budgets. **Whichever way D-4 goes, this AC pins the chosen behaviour** — it serves, or it
+  raises exactly one over-budget offer and no elision. A test that only pins the improving
+  direction is what let this regression go unnoticed in the first draft.
+- [ ] AC-8 (BR-9): `COMPACT_OUTPUT_MAX_BYTES ≤` the local byte budget, asserted as a relation
+  between the two rather than as two literals.
+- [ ] AC-9 (BR-10): A token-dense, byte-light corpus sample at full word budget, tokenized by a
+  **real** tokenizer, not `approx_tokens`. Either it fits, or the test records that it does not
+  and names `context_length_exceeded` as the intended outcome. An assertion written in
+  whitespace-words cannot see this — it would pass identically at 1.2 or 2.0 tokens per word.
+- [ ] AC-10 (BR-11): Two measurements on the reference machine, recorded as numbers: **(a)** wall
+  clock to prefill a full-budget local prompt against the same at today's budget; **(b)** the
+  REQ-544 BR-8 duty (`min_tokens_per_sec: 5.0`, `benchmark.rs:43`) re-run with a full-budget
+  context resident — **pass = the duty still passes**. (b) reuses a threshold this project already
+  chose. Note the gap: that duty measures *generation* on a *short* prompt, so as it stands it
+  can see neither prefill cost nor generation under a large resident context.
+- [ ] AC-11 (BR-11/D-3): The compaction trigger's new value, measured on a real multi-turn local
+  session: how many turns accumulate before `under_pressure` fires, before and after. This is the
+  number D-3 needs and the one REQ-586 OQ-3 actually asked for.
+- [ ] AC-12: The `/analyze` case that motivated REQ-589 — 4,097 words on the local tier — is not
+  refused and raises no over-budget offer. The field report, turned into a test.
+- [ ] AC-13: `cargo audit` clean; full suite green; no new clippy warnings.
+- [ ] AC-14: A dogfood leg in `docs/manual-verification.md` — a large local turn by hand,
+  confirming the reported budget and that the turn serves. **REQ-589 AC-15's runbook was never
+  written**, which is why this REQ still has no field data; this AC is not satisfied by intending
+  to run it.
+
+## Decisions
+
+- **D-1 — REVERSED after adversarial review. Use the `LOCAL_ENGINE_N_CTX` constant; do not plumb
+  the engine's window.** The first draft argued for plumbing on the grounds that llama.cpp may
+  clamp `n_ctx` below the request, making the engine's own `over_window` check pass a prompt the
+  real context cannot hold — a `GGML_ASSERT` and a dead daemon. **That is false.**
+  `llama-cpp-sys-2-0.1.151/llama.cpp/src/llama-context.cpp:77` (vendored, not in this repo) takes the requested value verbatim; exceeding the trained window is a
+  `LLAMA_LOG_WARN` (:251), not a clamp; `GGML_PAD` (:215) rounds **up**; and the only downward
+  adjustment (:220-229) is gated on `n_seq_max > 1`, which defaults to 1. So realised `n_ctx` ≥
+  requested, and at 16,384 (already a multiple of 256) they are equal. With the hazard gone the
+  plumbing had no remaining justification, and reusing the constant — as `egress/redact.rs:133`
+  already does against this same engine — is correct and far smaller.
+  *Recorded rather than quietly deleted because the refuted claim is the interesting part: the
+  accessors `LlamaContext::n_ctx()` and `LlamaModel::n_ctx_train()` do exist, which is what the
+  first draft checked. Their existence says nothing about whether a clamp exists. The draft
+  validated the wrong proposition.*
+
+- **D-2 — the reservation is 1,024 tokens, and its home is a new constant.** Not
+  `REDACT_DUTY.max_tokens()`, which the first draft named: that value is `16 findings × 128 B / 2`
+  — an *output contract* for redaction findings that equals 1,024 by coincidence, with unrelated
+  meaning. Not `generation_reservation()` either, which would close the BR-3 cycle. A constant
+  with its own home, cited by both the local derivation and its test.
+
+- **D-3 — OPEN, and it is the REQ's real decision. How much to raise the word half?**
+  The first draft asserted "a budget is a ceiling, not a target", concluded REQ-586 OQ-3's
+  prefix-cache concern did not apply, and shipped the full derivation. **The premise is false in
+  this codebase:** `under_pressure` fires compaction at 70% of the budget (`compact.rs:397`) and
+  `digest_thresholds` scales the condense trigger off it (`budget.rs:598`). The budget decides
+  what enters a prompt.
+
+  | | word budget | compaction fires at | digest folds raw above |
+  |---|---|---|---|
+  | today | 4,096 | 2,867 words | 1,500 words |
+  | full derivation | 10,240 | 7,168 words | 3,750 words |
+
+  So the full raise means a local session accumulates ~2.5× more conversation before anything is
+  forgotten, and every turn after that point prefills ~2.5× more — on the machine that must also
+  serve routing and redaction. That is precisely the cost REQ-586 deferred on, and it is a
+  product decision: **fix the 4,097-word refusal with the smallest raise that does it, or take
+  the full window and accept the compaction change?** AC-10 and AC-11 are the measurements.
+
+- **D-4 — OPEN: does the byte half fall?** Lowering it to 30,720 is what gives the reply room and
+  satisfies AC-4, and it is a regression for byte-dense content (BR-7) and breaks
+  `COMPACT_OUTPUT_MAX_BYTES` (BR-9). Holding it at 32,768 avoids both and leaves the reply with no
+  reserved room at the 2 B/token floor. There is no free option; the spec declines to pick one
+  silently.
+
+## External Dependencies
+
+- **None.** D-1's reversal removed the only one. The derivation reads `LOCAL_ENGINE_N_CTX`, a
+  constant in this workspace, so nothing here depends on the non-default `llama` feature or on
+  any llama-cpp-2 accessor — and the default build, which links only the `Engine` trait,
+  `MockEngine` and `ScriptedFileEngine`, is unaffected.
+
+  *A future llama.cpp bump that introduces a downward clamp would invalidate D-1. That is a
+  hypothetical, and a REQ cannot justify present plumbing against one — but if it happens, D-1's
+  record above is the thing to re-read.*
+
+## Assumptions
+
+- **A-1: REFUTED — see D-1.** The first draft assumed llama.cpp might clamp `n_ctx` below the
+  request. It does not. Kept as a record because the refutation is what reversed D-1, and because
+  the draft's *check* (do the accessors exist?) validated a different proposition than the one it
+  needed (does a clamp exist?).
+
+- **A-2: The 3/2 words-per-token safety ratio holds for the local engine.** Both are BPE and the
+  ratio is a worst case — but BR-10 records that the derived pair leaves it **zero** slack, where
+  today it has 2.5×, and `budget.rs:205-212` measures Rust at 1.69 tokens/word. This assumption is
+  load-bearing in a way it was not before, and AC-9 is its detector. *The first draft nominated
+  AC-12 (the `/analyze` case) as the detector; that was wrong — AC-12 measures in whitespace
+  words and would pass identically at any real tokenizer density.*
+
+- **A-3: No user has hand-set a local context budget expecting 4,096.** `context_budget_cap` only
+  lowers, and only on remote routes.
+
+- **A-4: The reference machine's measurements generalize.** AC-10 and AC-11 are taken on one
+  machine; the local tier is hardware-adaptive by design. A raise that is comfortable on an
+  M-series Mac may not be on the slowest machine the probe admits.
 
 ## Open Questions
 
-- [ ] OQ-1: Derive from `n_ctx` with the remote formula (window − reservation, then the
-  3/2 and 2 B/token rules), or keep a local-specific rule? The remote formula lowers
-  today's byte half.
-- [ ] OQ-2: What does the prefix-cache (REQ-564) cost model say about a larger local
-  budget — does a bigger context defeat the KV reuse that made local turns cheap?
-- [ ] OQ-3: Does `HarnessConfig::default()` / the unresolvable route follow the local
-  tier, or keep today's constants?
-- [ ] OQ-4: What measurement settles it? REQ-589 AC-15's dogfood runbook produces the
-  first real data point (an accepted over-budget local turn, and whether it serves).
+- [ ] OQ-1: Should the local budget re-derive when the engine is swapped mid-session, or is
+  stamping it at route-decision time enough?
+- [ ] OQ-2: If `LOCAL_ENGINE_N_CTX` ever falls, the derived byte half can land *below* the
+  harness's own 5,979-byte system prompt plus the 1 KiB truncation floor — a tier that cannot
+  serve anything. Is the answer a proportionally tiny budget, or should the tier decline to serve
+  and say why? BR-8 keeps this honest; it does not resolve it.
+- [ ] OQ-3: D-3 and D-4 above are open product decisions, not analysis gaps. They need the AC-10
+  and AC-11 measurements, and REQ-589 AC-15's runbook — never written — was to have been the
+  first data point.
+
+### Resolved from the placeholder
+
+- ~~OQ-1 (remote formula or a local rule?)~~ → **the remote formula, over the constant window.**
+  See BR-1/BR-4 and D-1 (which reversed on how the window is obtained, not on the formula).
+- ~~OQ-2 (prefix-cache cost?)~~ → **NOT resolved; the draft's dismissal was wrong.** The budget
+  drives compaction and digest thresholds, so it is not merely a ceiling. Now D-3, open.
+- ~~OQ-3 (does `HarnessConfig::default()` follow?)~~ → **not the question it looked like.** It
+  calls `derive`, so it is affected structurally whatever the constants do. See BR-2 and AC-2.
+- ~~OQ-4 (what measurement settles it?)~~ → **AC-10 and AC-11**, the second being the one
+  REQ-586 OQ-3 actually asked for.
 
 ## Out of Scope
 
-- Anything REQ-589 covers — the over-budget offer, the consent flow, and the durable
-  remedy for remote routes.
+- Anything REQ-589 covers — the over-budget offer, its consent flow, the durable remedy.
+- Changing `LOCAL_ENGINE_N_CTX` itself, or how large a window the daemon requests.
+- The redact path's own budget. It is already derived correctly and is cited here as the
+  precedent, not as a target.
+- Hardware-adaptive selection of a *different* model, and any change to `LOCAL_ENGINE_N_CTX`
+  itself. BR-8 states the rule such a change would inherit; making it is REQ-547's business.
+- Changing `COMPACT_PRESSURE_PERCENT` or the digest threshold *ratios*. D-3 decides how far the
+  budget moves; it does not re-tune the fractions that read it.
+
+## Provenance of this document
+
+The first complete draft was written 2026-08-25 and immediately attacked by an adversarial pass,
+which broke five of its ten business rules. Two Criticals were confirmed against source and are
+recorded above rather than silently fixed, because both are instructive: **D-1** rested on a
+llama.cpp clamp that does not exist, and **BR-2/BR-3** on not noticing that
+`HarnessConfig::default()` calls `derive` while `generation_reservation()` calls
+`HarnessConfig::default()`. The draft also asserted the budget was "a ceiling, not a target" and
+used that to dismiss REQ-586's deferred cost question; `under_pressure` and `digest_thresholds`
+both read the budget, so the dismissal was wrong and that question is now D-3.
+
+Anyone revisiting this spec should assume the same treatment is warranted again.
 
 ## Retrieved Context
 
-Filed as a deferred follow-up rather than authored from retrieval — the retrieval that
-produced it is recorded in REQ-589. Primary sources: REQ-586 OQ-3
-(`.adlc/specs/REQ-586-route-aware-context-budget/requirement.md:610`) and the REQ-589
-field report.
+Primary sources, each read rather than recalled: `harness/budget.rs` (`derive`, the constants and
+their doc comments), `egress/redact.rs:118-175` (the worked derivation and LESSON-446's citation),
+`teton-inference/src/engine.rs:100-115` (`over_window`) and `:1010` (`with_n_ctx`),
+`harness/turn_loop.rs:380-398` (the byte-budget doc), `harness/duty.rs:445`
+(`DUTY_REQUEST_BYTES_PER_TOKEN`). Lessons: LESSON-446 (token budgets must share a currency — the
+same failure family), LESSON-456 (one home per fact — why BR-5 keeps the constants),
+LESSON-447 (fallbacks must preserve the guarded invariant — bears on D-1's fallback option).
+Field report: REQ-589's motivating refusal.
