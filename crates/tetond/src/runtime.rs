@@ -1430,9 +1430,20 @@ fn refused_claim_error(err: &TurnClaimError) -> RpcError {
 /// line falls back to the terminal remedy alone: there is no row that would help.
 ///
 /// The name is safe to interpolate — it resolved against the registry, so it
-/// satisfies `is_valid_skill_name` — and both roots are `trust_root_name`'s
-/// home-relative spelling, so no username reaches the line for a repository
-/// under `HOME`.
+/// satisfies `is_valid_skill_name`.
+///
+/// **The two roots are spelled differently, and only one of them is
+/// home-relative** (REQ-591 D-4). `root` is [`trust_root_name`]'s spelling, so a
+/// repository under `HOME` reads `~/dev/repo` and no username reaches the
+/// sentence. `durable_root` is [`durable_trust_root_name`]'s, which takes no
+/// `home` at all and is therefore absolute — `/Users/<you>/dev/repo` — and that
+/// is deliberate rather than an oversight: it is the literal row the user is
+/// being told to paste into `config.toml`, and a row spelled `~/…` is one the
+/// matcher would never match. The privacy cost is real and is bought back
+/// nowhere; what buys it is that the alternative is a remedy that does not work.
+///
+/// [`trust_root_name`]: crate::harness::tools::skill::trust_root_name
+/// [`durable_trust_root_name`]: crate::harness::tools::skill::durable_trust_root_name
 fn project_trust_refusal(
     name: &str,
     root: &str,

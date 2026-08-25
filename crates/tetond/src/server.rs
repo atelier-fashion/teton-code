@@ -3560,6 +3560,12 @@ fn wire_addressed_delivery(
 /// constructor already wired the shipped one, and a first-writer-wins slot would
 /// leave an injected verifier inert on exactly the paths a fixture installed it
 /// to exercise.
+///
+/// That paragraph described the slot before it was one:
+/// `install_commitment_attestation` was `let _ = OnceLock::set`, so the second
+/// call really was discarded and this comment was a claim the code did not have.
+/// `runtime::tests::a_typed_project_skill_is_acknowledged_first::an_injected_verifier_is_the_one_the_durable_write_asks`
+/// is what now holds it to it.
 fn wire_commitment_attestation(runtime: &Arc<DaemonRuntime>, verifier: &Arc<dyn PresenceVerifier>) {
     runtime.install_commitment_attestation(Arc::new(VerifiedCommitment {
         verifier: Arc::clone(verifier),

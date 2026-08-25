@@ -656,8 +656,29 @@ pub(crate) fn trust_root_name(root: &Path, home: Option<&Path>) -> String {
 /// name a tree the first one had never read: an unattended run whose skills came
 /// out of `~/evil` spent a row a human wrote for `~/dev/trusted`, exact match and
 /// all. Minting from the resolution the reads went through is what makes the
-/// substitution miss — the window is not narrowed, it is closed, because there
-/// is now only one resolution.
+/// substitution miss.
+///
+/// # The window is **narrowed**, and here is the residual
+///
+/// Not closed. `discover` performs two resolutions of the session root, not one:
+/// `fs.canonicalize(session_root)` takes the `boundary` this name is minted
+/// from, and the bodies are then read through each root's own unresolved path
+/// (`fs.list`, then `SKILL.md` per candidate), which traverses the link again.
+/// A flip that lands between those two is a flip this name cannot see.
+///
+/// Both earlier flips fail closed, which is what makes the residual small:
+/// re-pointed *before* the `canonicalize`, the name minted is the substituted
+/// tree's and matches no row a human wrote; re-pointed between the
+/// `canonicalize` and the `resolves_under` check, the project root no longer
+/// resolves under the boundary and is skipped as `EscapingRoot`. Only a flip
+/// after the boundary check and before the reads leaves the good name on bytes
+/// from elsewhere.
+///
+/// That window is sub-millisecond and requires write access to the session-root
+/// symlink itself — an attacker who already has it has cheaper moves. It is
+/// stated here rather than closed because closing it needs the device/inode
+/// mechanism the parenthesis below rejects, and the cost of that mechanism is
+/// unchanged by the size of this window.
 ///
 /// (The alternative — pin device and inode at discovery and re-`stat` at the
 /// door — closes the same hole, but it adds a *second* identity mechanism beside

@@ -2348,8 +2348,14 @@ impl PermissionGate {
     ///   model's door keeps REQ-587's posture exactly: it asks, and where
     ///   nobody can be asked it refuses.
     /// - **It is consulted after the level, not before it.** The rewrite acts on
-    ///   a settlement, so `plan`'s `deny` has already returned and no row here
-    ///   can lift it — REQ-560 BR-5's ordering, preserved by construction.
+    ///   a settlement, so a level that denied has already returned
+    ///   `DeniedByLevel` and no row here can lift it — REQ-560 BR-5's ordering,
+    ///   preserved by construction. The witness is the **model's door**: it has
+    ///   no `Question::level_key`, so at `plan` it takes the deny default and
+    ///   a listed root does not save it. (`plan` is no longer the witness on the
+    ///   *typed* door — D-3 gave that door an `ask` row — which is exactly why
+    ///   the property has to be read off the ordering rather than off any one
+    ///   level.)
     /// - **It cannot reach an attended session.** `NoTerminal` is the client
     ///   saying nobody could be asked without reading a line; a session with a
     ///   human in it settles by that human's answer and never lands here. So no
@@ -2451,10 +2457,16 @@ impl PermissionGate {
     /// Written as a rewrite *of a settlement* rather than as a check before one,
     /// which is what makes the three properties in
     /// [`Self::authorize_project_skill_trust`]'s doc structural. The level has
-    /// already decided by the time this runs, so a `plan` deny cannot be lifted
-    /// here; a human's own answer has already been read, so an attended session
-    /// cannot reach the rewrite at all; and the only arm it touches is the one
-    /// that means *nobody was asked*.
+    /// already decided by the time this runs, so a deny it returned cannot be
+    /// lifted here — the model's door at `plan` is the live witness, since D-3
+    /// gave the typed door an `ask` row and left that one on the deny default;
+    /// a human's own answer has already been read, so an attended session cannot
+    /// reach the rewrite at all; and the only arm it touches is the one that
+    /// means *nobody was asked*.
+    ///
+    /// `a_row_never_lifts_a_level_that_would_not_have_asked` pins all three,
+    /// including a deny-default table that is nobody's shipped level — the
+    /// property is the ordering, not any particular level's rows.
     ///
     /// A root with no canonical name (`None`) matches nothing, so a root the
     /// filesystem would not resolve refuses — fail-closed, and the only honest
