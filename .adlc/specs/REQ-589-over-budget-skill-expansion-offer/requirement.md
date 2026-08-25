@@ -126,8 +126,11 @@ AC-9's "nobody was asked and nobody decided" distinction, kept where it already 
     window consequence and presents the one-time override alone; it must not imply a
     durable fix exists. This cell is reachable and is not an oversight — see the
     reachability table below.
-  - `FitsWindow` — over budget but inside the declared window: offer, noting the send
-    is expected to serve.
+  - `FitsWindow` — over budget but inside the declared window: offer. **Superseded in part
+    by ADR-15/ADR-17:** "expected to serve" is too strong on `Window`/`UserCap`, where that
+    band IS the generation reservation — the sentence says the prompt fits the declared
+    window but may leave the reply little room. On `RedactScan` the band is the egress byte
+    clamp, and the sentence claims neither fact.
   - `WindowUnknown` — no window fact exists (the local tier, or a remote provider with
     `max_context = 0`): offer, stating that the daemon **cannot promise** the send will
     fit, with the typed `context_length_exceeded` outcome as the backstop.
@@ -508,6 +511,17 @@ was validated. **D-8 reversed the draft's lean; the other four confirmed it.**
   correction, ADR-3.
 - **D-12 — ordering replaces atomicity for the two-write remedy.** → AC-8 correction,
   ADR-5.
+
+**Fourth round — product owner, 2026-08-24, mid-implementation.**
+
+- **D-13 — give the trust gate an unattended path.** D-10's gate blocked piped/unattended
+  sessions from running any typed project skill. The owner chose to preserve automation over
+  accepting the refusal. → TASK-262, built on `[web] permission_allow`'s precedent: a human
+  still decides, durably and out of band; the unattended path only *consults* that decision.
+- **D-14 — the two remaining decisions go to Phase 5 review first.** The remedy's daemon-wide
+  gate gap (ADR-18 item 3) and BR-14.1's unobservable withdrawal are left for the review agents
+  to reach independently before the owner rules, rather than being settled on the
+  orchestrator's summary.
 
 ## Open Questions
 

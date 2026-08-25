@@ -1,7 +1,7 @@
 ---
 id: TASK-242
 title: "The window-verdict classifier and BR-7 remedy table"
-status: draft
+status: complete
 parent: REQ-589
 created: 2026-08-24
 updated: 2026-08-24
