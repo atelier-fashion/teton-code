@@ -5895,7 +5895,7 @@ mod tests {
         std::fs::create_dir_all(&nested).expect("the fixture tree");
 
         let mint = |path: &std::path::Path| {
-            durable_trust_root_name_by_resolving(path, None)
+            durable_trust_root_name_by_resolving(path)
                 .unwrap_or_else(|| panic!("{} did not canonicalise", path.display()))
         };
         let listed = mint(&repo);

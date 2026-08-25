@@ -226,9 +226,19 @@ Two things, and the second exists only because the first broke automation:
   expand that repository's own instructions is the most restrictive outcome at the safest level.
   Restore the pre-REQ-589 posture — the body expands, its command slots do not run — without
   weakening the acknowledgment for any other level.
+- **D-4 — store the canonical ABSOLUTE path, not the `$HOME`-relative one (OQ-4).** The security
+  argument is weak on its own; the reason is truthfulness. The row is documented as naming a
+  *tree*, and a `$HOME`-relative string does not — the same defect class as BR-7, BR-10 and
+  BR-11, and shipping a fourth knowingly in the same change would be incoherent. `TrustRoot`
+  already models the split: `display` stays home-relative (rendering is a rendering concern),
+  `durable` becomes the canonical absolute path. A row written in the old form fails **closed**.
+- **D-5 — one validation rule, no caps (OQ-5).** No entry-length or list-length cap; config is
+  user-owned and those guard nothing. `Config::validate` rejects a row that is not a well-formed
+  canonical mint, with an error naming the correct form — converting a silent no-op (the
+  allowlist appears to contain a repository and does not) into a loud error at load time.
 
-*Not yet answered: OQ-4 (`$HOME`-relative identity), OQ-5 (allowlist validation), and the
-operational question of whether `req589-pre-carveout` is pushed for redundancy.*
+*Not yet answered: the operational question of whether `req589-pre-carveout` is pushed for
+redundancy. OQ-1..OQ-5 are all decided (D-1..D-5) and implemented.*
 
 ## Open Questions
 
@@ -288,6 +298,14 @@ operational question of whether `req589-pre-carveout` is pushed for redundancy.*
   `plan` is the level users select to explore a repository **read-only**, so refusing to
   expand that repository's own instructions is the most restrictive outcome at the safest
   level — inverted. *Lean:* no lean. This one genuinely needs the owner.
+
+- [x] **OQ-4 — ANSWERED by D-4, implemented.** No. `durable_trust_root_name` takes no `$HOME`
+  at all now — it is `percent_escaped` over the resolution the bodies were read under, so the
+  row is a canonical absolute path. `TrustRoot::display` is unchanged and still home-relative,
+  because what a human reads on the prompt is a rendering concern. A row left in the old
+  home-relative spelling matches nothing and the unattended session refuses — fail-closed, and
+  D-5 makes it loud. No shipped release carries a `trusted_project_roots` row (the table is new
+  on this branch), so nothing in the wild migrates. Original question follows.
 
 - [ ] **OQ-4: Is a `$HOME`-relative durable identity right for a row that outlives its
   session?** A row's meaning depends on `$HOME` at consult time, so a daemon later launched

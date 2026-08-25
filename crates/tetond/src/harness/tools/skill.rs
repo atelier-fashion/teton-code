@@ -684,13 +684,28 @@ pub(crate) fn trust_root_name(root: &Path, home: Option<&Path>) -> String {
 /// user who typed `--cwd ../repo` is the same acknowledgment as one who typed
 /// the path in full, rather than a second one nobody wrote down.
 ///
-/// `home` is canonicalised here rather than by the caller, for the reason the
-/// root is resolved at all: the home-relative rule is `strip_prefix`, and
-/// stripping an *un*resolved home from a resolved root would silently stop
-/// matching on any machine whose home directory is itself a link. It stays at
-/// this end because it is a *spelling* of the answer and not the answer — the
-/// same tree under a home that resolves differently is the same tree, and both
-/// sides of every comparison are minted here in one breath.
+/// # It names an absolute path, and takes no `$HOME` (REQ-591 D-4)
+///
+/// It used to be home-relative — `~/dev/repo` — which made a row's meaning a
+/// function of `$HOME` **at consult time**. A daemon later launched with a
+/// different `HOME` (a launchd plist edit, a changed profile, a service account)
+/// would resolve the same row against a different tree, and one nobody named.
+///
+/// The security argument for changing that is weak on its own: an actor who can
+/// rewrite the daemon's environment can rewrite `config.toml` directly. **That
+/// is not why.** The row is documented as naming *a tree*, and a
+/// `$HOME`-relative string does not name one — it names a tree *and* an
+/// environment variable. That is the same defect class this REQ already fixes
+/// three times over: BR-7 (a label naming a write it does not perform), BR-10 (a
+/// surface claiming a refusal that did not happen), BR-11 (a contract claiming a
+/// bounding that does not exist). Shipping a fourth knowingly, in the same
+/// change, would be incoherent.
+///
+/// [`TrustRoot`](crate::harness::permissions::TrustRoot) already models the
+/// split this needs: `display` stays home-relative, because rendering is a
+/// rendering concern and `~/dev/repo` is what a human reads; `durable` is this
+/// name, absolute, because a stored identity should be stable under the one
+/// thing that can move it.
 ///
 /// # What it deliberately does not defend against
 ///
@@ -713,9 +728,8 @@ pub(crate) fn trust_root_name(root: &Path, home: Option<&Path>) -> String {
 /// registers **no project skill at all**, because `discover`'s containment test
 /// has nothing to compare against, so the door it would have refused is not
 /// reached either.
-pub(crate) fn durable_trust_root_name(resolved_root: &Path, home: Option<&Path>) -> String {
-    let home = home.and_then(|home| std::fs::canonicalize(home).ok());
-    trust_root_name(resolved_root, home.as_deref())
+pub(crate) fn durable_trust_root_name(resolved_root: &Path) -> String {
+    percent_escaped(resolved_root)
 }
 
 /// [`durable_trust_root_name`] over a path this resolves **itself** — the shape
@@ -730,12 +744,9 @@ pub(crate) fn durable_trust_root_name(resolved_root: &Path, home: Option<&Path>)
 /// unavailable outside them is what stops the rule from being reached for again
 /// at a call site where the timing is wrong.
 #[cfg(test)]
-pub(crate) fn durable_trust_root_name_by_resolving(
-    root: &Path,
-    home: Option<&Path>,
-) -> Option<String> {
+pub(crate) fn durable_trust_root_name_by_resolving(root: &Path) -> Option<String> {
     let root = std::fs::canonicalize(root).ok()?;
-    Some(durable_trust_root_name(&root, home))
+    Some(durable_trust_root_name(&root))
 }
 
 /// `path`'s bytes as a string that names exactly those bytes: each byte outside
@@ -1677,7 +1688,7 @@ impl SkillTool {
         let durable_root = self
             .registry
             .read_under()
-            .map(|resolved| durable_trust_root_name(resolved, home().as_deref()));
+            .map(durable_trust_root_name);
         let entries = project_trust_entries(&self.registry);
         let shadows = shadows_user_skill(&self.registry, name);
         let consent = self
@@ -3745,7 +3756,7 @@ mod tests {
         std::os::unix::fs::symlink(&decoy, &link).unwrap();
 
         let durable = |path: &Path| {
-            durable_trust_root_name_by_resolving(path, None).unwrap_or_else(|| {
+            durable_trust_root_name_by_resolving(path).unwrap_or_else(|| {
                 panic!("{} did not canonicalise", path.display());
             })
         };
@@ -3804,11 +3815,188 @@ mod tests {
         // A root that does not resolve mints nothing, so nothing in the list can
         // match it and nothing can be written for it.
         assert_eq!(
-            durable_trust_root_name_by_resolving(&base.join("nothing-here"), None),
+            durable_trust_root_name_by_resolving(&base.join("nothing-here")),
             None,
             "a name derived from a path the filesystem will not resolve names \
              nothing, and must not be matched"
         );
+
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// **REQ-591 D-4 — a row outlives the `$HOME` it was written under, and the
+    /// spelling a human reads does not have to.**
+    ///
+    /// A row is a standing answer consulted months later by sessions its author
+    /// is not watching. While the durable name was home-relative — `~/dev/repo`
+    /// — its meaning was a function of `$HOME` **at consult time**, so a daemon
+    /// relaunched with a different `HOME` (a launchd plist edit, a changed
+    /// profile, a service account) resolved the same row against a tree nobody
+    /// named.
+    ///
+    /// The security case for changing that is weak on its own and is not the
+    /// reason: an actor who can rewrite the daemon's environment can rewrite
+    /// `config.toml`. The reason is that the row is documented as naming **a
+    /// tree**, and a `$HOME`-relative string names a tree *and* an environment
+    /// variable — the same defect class as a label naming a write it does not
+    /// perform (BR-7), a surface claiming a refusal that did not happen (BR-10)
+    /// and a contract claiming a bounding that does not exist (BR-11).
+    ///
+    /// # The three legs, and why the middle one is the test
+    ///
+    /// 1. The **display** name still moves with `$HOME`. That is correct and it
+    ///    is what makes the rest non-vacuous: `~/dev/repo` is what a human reads
+    ///    on the prompt, and rendering is a rendering concern.
+    /// 2. The **durable** name does not move, so the row written under one home
+    ///    still names the same tree under another. Asserted against a name
+    ///    minted for the *other* home in the same breath, so it is a comparison
+    ///    rather than a restatement.
+    /// 3. The **old shape would have failed**, on this exact fixture. Without
+    ///    this the second leg would be satisfied by any pair of equal strings
+    ///    and would say nothing about the hazard it closes.
+    ///
+    /// # What happens to a row written in the old form
+    ///
+    /// Nothing matches it, and that is the safe direction — the fourth leg. An
+    /// unattended session at that root refuses exactly as one at an unlisted
+    /// root does. REQ-591 D-5 turns that silent no-op into a loud one at load
+    /// time; here it is pinned as a *fail-closed* fact so the two decisions
+    /// cannot drift apart.
+    ///
+    /// # Where the bite is, stated because it is not here
+    ///
+    /// This test cannot redden under the pre-D-4 mint, and saying so is more
+    /// useful than implying otherwise: its tree is under the temp directory,
+    /// not under the process's real `$HOME`, so a home-relative mint would find
+    /// no prefix to strip and produce the same absolute string. Only a fixture
+    /// whose **daemon** runs with a `HOME` containing the project can tell the
+    /// two mints apart, and that needs a spawned daemon —
+    /// `cli_e2e::a_row_written_under_one_home_still_names_its_tree_under_another`
+    /// is it, and it is mutation-verified in both directions. What this test
+    /// owns is the rule and the fail-closed consult; what that one owns is that
+    /// the rule is the one production runs.
+    #[tokio::test]
+    async fn the_durable_name_outlives_the_home_it_was_minted_under() {
+        let base = std::env::temp_dir().join(format!(
+            "teton-durable-home-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_or(0, |d| d.as_nanos())
+        ));
+        // The tree lives under `home_a`, so the home-relative spelling of it is
+        // genuinely shorter there — the fixture has to be able to produce the
+        // old form or leg 3 asserts nothing.
+        let home_a = base.join("home-a");
+        let home_b = base.join("home-b");
+        let repo = home_a.join("dev/repo");
+        std::fs::create_dir_all(&repo).unwrap();
+        std::fs::create_dir_all(&home_b).unwrap();
+        let resolved = std::fs::canonicalize(&repo).expect("the fixture tree canonicalises");
+        let canonical_home_a = std::fs::canonicalize(&home_a).unwrap();
+        let canonical_home_b = std::fs::canonicalize(&home_b).unwrap();
+
+        // 1. The display name is the human's, and it moves with the home.
+        assert_eq!(
+            trust_root_name(&resolved, Some(&canonical_home_a)),
+            "~/dev/repo",
+            "the prompt still reads home-relative under the home the tree is in"
+        );
+        let displayed_elsewhere = trust_root_name(&resolved, Some(&canonical_home_b));
+        assert_ne!(
+            displayed_elsewhere, "~/dev/repo",
+            "and it genuinely moves under another home, or leg 3 is vacuous"
+        );
+
+        // 2. The durable name is the tree's, and it does not.
+        let row = durable_trust_root_name(&resolved);
+        assert!(
+            row.starts_with('/'),
+            "a stored identity names a tree, absolutely: {row}"
+        );
+        assert_eq!(
+            row,
+            durable_trust_root_name(&resolved),
+            "and it is a function of the tree alone — no environment is read \
+             anywhere on this path"
+        );
+
+        // 3. The old shape, on this fixture: a row minted home-relative under
+        // `home_a` is a different string from the same tree minted under
+        // `home_b`, so it would have stopped matching on relaunch.
+        assert_ne!(
+            trust_root_name(&resolved, Some(&canonical_home_a)),
+            displayed_elsewhere,
+            "the hazard is real on this fixture: the pre-D-4 mint of one tree \
+             is two strings under two homes"
+        );
+
+        /// The client an unattended session has: nobody to ask, answered
+        /// without a line being read.
+        struct Unattended(Arc<PendingPermissions>);
+        impl crate::harness::permissions::AddressedPermissionDelivery for Unattended {
+            fn deliver(
+                &self,
+                connection: ConnectionId,
+                _session_id: &SessionId,
+                request: teton_protocol::events::PermissionRequest,
+            ) -> bool {
+                self.0.resolve_from(
+                    &request.request_id,
+                    teton_protocol::methods::PermissionOutcome::Refused {
+                        reason: teton_protocol::methods::RefusalReason::NoTerminal,
+                    },
+                    connection,
+                )
+            }
+        }
+
+        // 4. The consult, paired on one fixture (LESSON-520): the row this
+        // build writes matches, and a row left in the pre-D-4 home-relative
+        // spelling matches nothing. The second is the migration answer — a
+        // stale row fails **closed**, so an unattended session at that root
+        // refuses exactly as one at an unlisted root does. D-5 turns that
+        // silent no-op into a load-time error; both directions are pinned here
+        // so the two decisions cannot drift.
+        use crate::harness::permissions::{SkillConsent, TrustRoot};
+        use teton_protocol::methods::RefusalReason;
+
+        for (listed, expected, what) in [
+            (row.clone(), SkillConsent::Allowed, "the row this build writes"),
+            (
+                "~/dev/repo".to_owned(),
+                SkillConsent::Refused(RefusalReason::NoTerminal),
+                "a row left in the pre-D-4 home-relative spelling",
+            ),
+        ] {
+            let pending = Arc::new(PendingPermissions::new());
+            let gate = PermissionGate::new(
+                SessionId::from("durable-home"),
+                PermissionConfig::with_default(PermissionPolicy::Ask),
+                Arc::new(EventBus::new()),
+                Arc::clone(&pending),
+            )
+            .with_addressed_delivery(Arc::new(Unattended(Arc::clone(&pending))))
+            .with_trusted_project_roots(vec![listed]);
+            let grants = crate::grants::GrantRegistry::default();
+            assert_eq!(
+                gate.authorize_project_skill_trust(
+                    &project_skill_trust_key("~/dev/repo"),
+                    TrustRoot {
+                        display: "~/dev/repo",
+                        durable: Some(&row),
+                    },
+                    &[],
+                    false,
+                    InvokedBy::User,
+                    grants.next_connection_id(),
+                )
+                .await,
+                expected,
+                "{what}: the unattended session consults the durable name this \
+                 build mints, and nothing else"
+            );
+        }
 
         let _ = std::fs::remove_dir_all(&base);
     }
@@ -4027,7 +4215,7 @@ mod tests {
         std::os::unix::fs::symlink(&acknowledged, &link).unwrap();
 
         let row_for = |tree: &Path| {
-            durable_trust_root_name_by_resolving(tree, home().as_deref())
+            durable_trust_root_name_by_resolving(tree)
                 .expect("the fixture tree canonicalises")
         };
 
@@ -4110,7 +4298,7 @@ mod tests {
             .read_under()
             .expect("the fixture registry resolved its root");
         assert_eq!(
-            durable_trust_root_name(read_under, home().as_deref()),
+            durable_trust_root_name(read_under),
             row_for(&unlisted),
             "the mint follows the bodies, not the link: `{}` was re-pointed at \
              `{}` after the read",

@@ -3943,9 +3943,9 @@ impl DaemonRuntime {
             // listed tree's row on a body from an unlisted one, because a link
             // may be re-pointed at any time in a session that reads its skills
             // exactly twice.
-            let durable_root = registry.read_under().map(|resolved| {
-                crate::harness::tools::skill::durable_trust_root_name(resolved, home().as_deref())
-            });
+            let durable_root = registry
+                .read_under()
+                .map(crate::harness::tools::skill::durable_trust_root_name);
             let consent = match invoker {
                 Some(connection) => {
                     gate.authorize_project_skill_trust(
@@ -33084,10 +33084,7 @@ provider_id = \"deepseek\"
                 err.message
             );
 
-            let expected = crate::harness::tools::skill::durable_trust_root_name_by_resolving(
-                &runtime.session_root_for(Some(&dir)).path,
-                home().as_deref(),
-            )
+            let expected = crate::harness::tools::skill::durable_trust_root_name_by_resolving(&runtime.session_root_for(Some(&dir)).path)
             .expect("the fixture root canonicalises");
             assert!(
                 err.message.contains("[skills] trusted_project_roots"),
@@ -33128,10 +33125,7 @@ provider_id = \"deepseek\"
             let engine = Recorder::new();
             let runtime = runtime_with(&engine);
             let client = Unattended::new(runtime.pending());
-            let listed = crate::harness::tools::skill::durable_trust_root_name_by_resolving(
-                &runtime.session_root_for(Some(&dir)).path,
-                home().as_deref(),
-            )
+            let listed = crate::harness::tools::skill::durable_trust_root_name_by_resolving(&runtime.session_root_for(Some(&dir)).path)
             .expect("the fixture root canonicalises");
 
             typed_turn_in(&dir, &engine, &runtime, |runtime, events, session_id| {
@@ -33207,10 +33201,7 @@ provider_id = \"deepseek\"
             let engine = Recorder::new();
             let runtime = runtime_with(&engine);
             let client = Unattended::new(runtime.pending());
-            let listed = crate::harness::tools::skill::durable_trust_root_name_by_resolving(
-                &acknowledged,
-                home().as_deref(),
-            )
+            let listed = crate::harness::tools::skill::durable_trust_root_name_by_resolving(&acknowledged)
             .expect("the fixture root canonicalises");
 
             let err = typed_turn_in_after(
@@ -33274,10 +33265,7 @@ provider_id = \"deepseek\"
             let engine = Recorder::new();
             let runtime = runtime_with(&engine);
             let client = Client::answering(runtime.pending(), PermissionOptionKind::RejectOnce);
-            let listed = crate::harness::tools::skill::durable_trust_root_name_by_resolving(
-                &runtime.session_root_for(Some(&dir)).path,
-                home().as_deref(),
-            )
+            let listed = crate::harness::tools::skill::durable_trust_root_name_by_resolving(&runtime.session_root_for(Some(&dir)).path)
             .expect("the fixture root canonicalises");
 
             let err = typed_turn_in(&dir, &engine, &runtime, |runtime, events, session_id| {
@@ -33352,10 +33340,7 @@ provider_id = \"deepseek\"
                     ..DaemonRuntime::minimal()
                 });
                 let client = Client::selecting(runtime.pending(), answer);
-                let expected = crate::harness::tools::skill::durable_trust_root_name_by_resolving(
-                    &runtime.session_root_for(Some(&dir)).path,
-                    home().as_deref(),
-                )
+                let expected = crate::harness::tools::skill::durable_trust_root_name_by_resolving(&runtime.session_root_for(Some(&dir)).path)
                 .expect("the fixture root canonicalises");
 
                 typed_turn_in(&dir, &engine, &runtime, |runtime, events, session_id| {

@@ -7031,6 +7031,123 @@ fn an_unattended_session_at_an_unlisted_root_refuses_and_names_the_row() {
     }
 }
 
+/// **REQ-591 D-4 — a row names a tree, and a tree does not move when `$HOME`
+/// does.**
+///
+/// The durable name used to be home-relative (`~/proj`), which made a row's
+/// meaning a function of `$HOME` **at consult time**: a daemon later launched
+/// with a different `HOME` resolved the same row against a different tree. The
+/// security argument for changing that is weak on its own — anyone who can
+/// rewrite the daemon's environment can rewrite `config.toml` — and it is not
+/// the reason. The row is *documented as naming a tree*, and a home-relative
+/// string names a tree and an environment variable.
+///
+/// # Why the project lives inside `HOME` here
+///
+/// That is the whole fixture. Everywhere else in this file the project sits
+/// beside the fixture home, where the two spellings coincide and neither mint
+/// can be told from the other. Under a home that **contains** the project they
+/// diverge — `~/proj` against `/private/tmp/…/proj` — so each leg below fails
+/// under the opposite implementation:
+///
+/// - the **absolute** row runs the skill today, and would refuse if the mint
+///   went back to home-relative;
+/// - the **home-relative** row refuses today, and would run under that same
+///   revert.
+///
+/// So this is a two-way pin rather than a one-way one, and it is the migration
+/// answer as well: a row left in the old spelling **fails closed** — the
+/// unattended session refuses exactly as it does at a root nobody listed. It
+/// does not silently authorize something else. REQ-591 D-5 turns that silence
+/// into a load-time error naming the correct form.
+///
+/// Piped, and shadowing, for the reason
+/// [`an_unattended_session_at_an_unlisted_root_refuses_and_names_the_row`] is:
+/// no permission level settles this question, so the row is the only answer
+/// there is and what the row *says* is the entire subject of the test.
+#[test]
+fn a_row_written_under_one_home_still_names_its_tree_under_another() {
+    let daemon_bin = daemon_bin();
+    let teton = teton_bin();
+
+    for (absolute, expect_run) in [(true, true), (false, false)] {
+        let home = SkillTree::new(if absolute { "ha" } else { "hr" });
+        // The user's own `validate`, so the repository's shadows it — the case
+        // no permission level settles.
+        home.write(
+            ".claude/skills/validate/SKILL.md",
+            &skill_file("the user validate", None, "User body.
+"),
+        );
+        // **Inside** the home, which is what makes the two spellings differ.
+        let project = project_at(home.path(), "proj");
+        std::fs::create_dir_all(project.join(".claude/skills/validate")).unwrap();
+        std::fs::write(
+            project.join(".claude/skills/validate/SKILL.md"),
+            skill_file(
+                "the project validate",
+                None,
+                "Validate the repository's way.
+",
+            ),
+        )
+        .unwrap();
+
+        let row = if absolute {
+            trusting(&project)
+        } else {
+            // Exactly what a pre-D-4 daemon under this `HOME` would have
+            // written.
+            "[skills]
+trusted_project_roots = [\"~/proj\"]
+
+".to_owned()
+        };
+        let daemon = TestDaemon::spawn_scripted_trusting(
+            &daemon_bin,
+            TURN_REPLIES,
+            &[("HOME", home.path().to_str().unwrap())],
+            &|_| row.clone(),
+        );
+
+        let (stdout, stderr, status) = daemon.run_cli_from(
+            &teton,
+            &["--cwd", project.to_str().unwrap()],
+            "/validate
+",
+            None,
+            &[("HOME", home.path())],
+        );
+        assert!(status.success(), "stdout:
+{stdout}
+stderr:
+{stderr}");
+
+        // True of both legs: the daemon asked, and this client answered that
+        // there is nobody here to ask. So whatever happens next is the *row*'s
+        // doing.
+        assert!(
+            stdout.contains("was refused without asking"),
+            "absolute={absolute}: the client must report that it could not \
+             ask; output:\n{stdout}"
+        );
+        assert_eq!(
+            stdout.contains("/validate → skill validate (project — shadows your user skill"),
+            expect_run,
+            "absolute={absolute}: a row naming this tree absolutely is the one \
+             this build mints and matches; the home-relative spelling names \
+             nothing this build will ever produce, and must fail closed; \
+             output:\n{stdout}"
+        );
+        assert_eq!(
+            !stdout.contains("has not acknowledged"),
+            expect_run,
+            "absolute={absolute}: and the refusal and the run are exclusive — \
+             a build that did both would be BR-10's defect; output:\n{stdout}"
+        );
+    }
+}
+
 /// **AC-14: `/cd` re-derives the project skills and leaves the user skills
 /// alone — and `/help` says so without a restart.**
 ///
