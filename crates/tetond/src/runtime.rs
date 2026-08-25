@@ -3900,10 +3900,18 @@ impl DaemonRuntime {
             // change what it points at — a symlink dropped at a listed path
             // would otherwise hand an unacknowledged repository the trust of an
             // acknowledged one. See `durable_trust_root_name`.
-            let durable_root = crate::harness::tools::skill::durable_trust_root_name(
-                &probed.path,
-                home().as_deref(),
-            );
+            //
+            // From `registry.read_under()` and **not** from `probed.path`. The
+            // probe is re-derived every turn and never resolves anything; the
+            // registry is the frozen snapshot these bodies were read into, and
+            // it carries the one resolution they were read under. Naming the
+            // path as spelled here is how an unattended session came to spend a
+            // listed tree's row on a body from an unlisted one, because a link
+            // may be re-pointed at any time in a session that reads its skills
+            // exactly twice.
+            let durable_root = registry.read_under().map(|resolved| {
+                crate::harness::tools::skill::durable_trust_root_name(resolved, home().as_deref())
+            });
             let consent = match invoker {
                 Some(connection) => {
                     gate.authorize_project_skill_trust(
@@ -32764,6 +32772,26 @@ provider_id = \"deepseek\"
             runtime: &Arc<DaemonRuntime>,
             gate_setup: impl FnOnce(&Arc<DaemonRuntime>, &Arc<EventBus>, &SessionId),
         ) -> Result<(), RpcError> {
+            typed_turn_in_after(dir, engine, runtime, gate_setup, || {}).await
+        }
+
+        /// [`typed_turn_in`], with `between` run in the one gap the session has:
+        /// after discovery has read the bodies into the frozen snapshot and
+        /// before the turn asks whether this root may send them.
+        ///
+        /// That gap is a *session lifetime* in production — discovery is paid at
+        /// `session/create` and at `/cd` and never per turn — so a fixture that
+        /// could not act in it could not express the question the leg below
+        /// asks: whether the identity the trust check mints is the identity the
+        /// bodies were read under, or merely the identity the path resolves to
+        /// now.
+        async fn typed_turn_in_after(
+            dir: &Path,
+            engine: &Recorder,
+            runtime: &Arc<DaemonRuntime>,
+            gate_setup: impl FnOnce(&Arc<DaemonRuntime>, &Arc<EventBus>, &SessionId),
+            between: impl FnOnce(),
+        ) -> Result<(), RpcError> {
             let events = Arc::new(EventBus::new());
             let sessions = SessionRegistry::new();
             let session_id = sessions
@@ -32775,6 +32803,7 @@ provider_id = \"deepseek\"
                 &session_id,
                 discover(None, &probed.path, probed.view.kind, &RealFs),
             );
+            between();
             gate_setup(runtime, &events, &session_id);
             let conn = GrantRegistry::new().next_connection_id();
             let _ = engine;
@@ -32849,7 +32878,7 @@ provider_id = \"deepseek\"
                 err.message
             );
 
-            let expected = crate::harness::tools::skill::durable_trust_root_name(
+            let expected = crate::harness::tools::skill::durable_trust_root_name_by_resolving(
                 &runtime.session_root_for(Some(&dir)).path,
                 home().as_deref(),
             )
@@ -32893,7 +32922,7 @@ provider_id = \"deepseek\"
             let engine = Recorder::new();
             let runtime = runtime_with(&engine);
             let client = Unattended::new(runtime.pending());
-            let listed = crate::harness::tools::skill::durable_trust_root_name(
+            let listed = crate::harness::tools::skill::durable_trust_root_name_by_resolving(
                 &runtime.session_root_for(Some(&dir)).path,
                 home().as_deref(),
             )
@@ -32931,6 +32960,98 @@ provider_id = \"deepseek\"
             let _ = std::fs::remove_dir_all(&dir);
         }
 
+        /// **The bodies decide whose trust is being spent: a session root
+        /// re-pointed after discovery does not inherit the listed tree's row.**
+        ///
+        /// The hole this closes was a TOCTOU with a *session-lifetime* window,
+        /// not a microsecond race. Skill **bodies** are read eagerly, at
+        /// `session/create` and at `/cd` and never again
+        /// (`discovery_is_paid_at_create_and_at_cd_and_never_per_turn`); the
+        /// registry is frozen from then on. The durable trust **name** used to
+        /// be minted fresh every turn by canonicalising `probed.path`, which
+        /// `ProbedRoot::probe` deliberately leaves unresolved. Two resolutions of
+        /// one path, taken hours apart, and only the second one decided whether
+        /// the first one's bytes could run with nobody watching.
+        ///
+        /// So: an unattended run starts at a link into an unlisted tree,
+        /// discovery reads *that* tree's skill into the snapshot, and the link is
+        /// then re-pointed at a tree somebody did acknowledge. Nothing about the
+        /// bodies changed. If the mint follows the link at turn time, the row
+        /// matches, `NoTerminal` is rewritten to `Allowed`, and the unlisted
+        /// tree's text runs as instructions with no human in the session.
+        ///
+        /// The assertion is the refusal **and** the silent engine: an allow here
+        /// would mean the body reached the model, which is the whole of the harm.
+        ///
+        /// **Mutation:** mint the durable name from `probed.path` again — the
+        /// shape this fix replaced — and this leg goes green the wrong way while
+        /// every other leg in this module stays as it is.
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn a_root_re_pointed_after_discovery_cannot_spend_the_listed_trees_trust() {
+            // The tree whose skill will actually be read, and which nobody
+            // listed.
+            let unlisted = project_root("trust-repoint-unlisted", "marked");
+            // The tree a human did acknowledge. It carries the same skill name,
+            // so the substitution is invisible to every name-based check.
+            let acknowledged = project_root("trust-repoint-acknowledged", "marked");
+            // The session stands on neither: it stands on a link.
+            let link = scratch_dir("trust-repoint-link").join("proj");
+            std::os::unix::fs::symlink(&unlisted, &link).unwrap();
+
+            let engine = Recorder::new();
+            let runtime = runtime_with(&engine);
+            let client = Unattended::new(runtime.pending());
+            let listed = crate::harness::tools::skill::durable_trust_root_name_by_resolving(
+                &acknowledged,
+                home().as_deref(),
+            )
+            .expect("the fixture root canonicalises");
+
+            let err = typed_turn_in_after(
+                &link,
+                &engine,
+                &runtime,
+                |runtime, events, session_id| {
+                    install_gate_trusting(
+                        runtime,
+                        events,
+                        session_id,
+                        Arc::clone(&client) as Arc<dyn AddressedPermissionDelivery>,
+                        vec![listed],
+                        None,
+                    )
+                },
+                || {
+                    // The whole attack, in two syscalls the session never sees.
+                    std::fs::remove_file(&link).unwrap();
+                    std::os::unix::fs::symlink(&acknowledged, &link).unwrap();
+                },
+            )
+            .await
+            .expect_err(
+                "the bodies were read from a tree nobody listed, so the turn must \
+                 refuse however the link is pointed now",
+            );
+
+            assert_eq!(err.code, error_code::CONSENT_DENIED, "{err:?}");
+            assert!(
+                engine.prompts().is_empty(),
+                "the unlisted tree's body reached the model in a session with no \
+                 human in it: {} prompts",
+                engine.prompts().len()
+            );
+            assert_eq!(
+                client.trust_questions(),
+                1,
+                "the question was still put — the refusal is the client's, \
+                 unrewritten, rather than a check that ran before it"
+            );
+
+            let _ = std::fs::remove_file(&link);
+            let _ = std::fs::remove_dir_all(&unlisted);
+            let _ = std::fs::remove_dir_all(&acknowledged);
+        }
+
         /// **A human at a terminal is still asked, at a listed root, and their
         /// answer is what happens.**
         ///
@@ -32947,7 +33068,7 @@ provider_id = \"deepseek\"
             let engine = Recorder::new();
             let runtime = runtime_with(&engine);
             let client = Client::answering(runtime.pending(), PermissionOptionKind::RejectOnce);
-            let listed = crate::harness::tools::skill::durable_trust_root_name(
+            let listed = crate::harness::tools::skill::durable_trust_root_name_by_resolving(
                 &runtime.session_root_for(Some(&dir)).path,
                 home().as_deref(),
             )
@@ -33025,7 +33146,7 @@ provider_id = \"deepseek\"
                     ..DaemonRuntime::minimal()
                 });
                 let client = Client::selecting(runtime.pending(), answer);
-                let expected = crate::harness::tools::skill::durable_trust_root_name(
+                let expected = crate::harness::tools::skill::durable_trust_root_name_by_resolving(
                     &runtime.session_root_for(Some(&dir)).path,
                     home().as_deref(),
                 )
