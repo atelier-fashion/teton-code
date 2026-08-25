@@ -210,6 +210,26 @@ Two things, and the second exists only because the first broke automation:
   are separable by path, but `b4e4b01` made `accept_invocation` async and that signature
   change reaches callers the offer also touches.
 
+## Decisions (product owner, 2026-08-25)
+
+- **D-1 — fix the daemon-wide gate gap (OQ-1).** `persist_trusted_project_root` must pass the
+  presence gate. The fix needs only the verifier handle and the addressee `ConnectionId`, both
+  already at the gate — not `&Daemon`/`&ConnState` threaded through a turn. **REQ-589 owns the
+  other half of this seam** (the remedy's capability write, merged at `8956a93`); the two must
+  not end up answered differently, so this fix should be shaped to cover both or to be trivially
+  extended to it.
+- **D-2 — scope the allowlist row by invoker (OQ-2).** A row must not silently answer for the
+  model's door as well as the typed one. Per LESSON-495, make the key a function of the invoker
+  dimension so adding a caller is a compile error rather than a silent grant.
+- **D-3 — `plan` must NOT refuse a typed project skill (OQ-3).** **This reverses current
+  behaviour.** `plan` is the level a user selects to explore a repository read-only; refusing to
+  expand that repository's own instructions is the most restrictive outcome at the safest level.
+  Restore the pre-REQ-589 posture — the body expands, its command slots do not run — without
+  weakening the acknowledgment for any other level.
+
+*Not yet answered: OQ-4 (`$HOME`-relative identity), OQ-5 (allowlist validation), and the
+operational question of whether `req589-pre-carveout` is pushed for redundancy.*
+
 ## Open Questions
 
 - [ ] **OQ-1: Does the durable trust write pass the daemon-wide commitment gates?**
