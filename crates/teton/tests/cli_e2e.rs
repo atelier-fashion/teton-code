@@ -6988,7 +6988,7 @@ fn an_unattended_session_at_an_unlisted_root_refuses_and_names_the_row() {
         // rather than a session that was never gated: the daemon asked, and this
         // client answered that there is nobody here to ask.
         assert!(
-            stdout.contains("was refused without asking")
+            stdout.contains("could not be asked here")
                 && stdout.contains("[skills] trusted_project_roots"),
             "the client must report that it could not ask, and name where the \
              standing answer lives; listed={listed}, output:\n{stdout}"
@@ -7005,6 +7005,20 @@ fn an_unattended_session_at_an_unlisted_root_refuses_and_names_the_row() {
                 stdout.contains("/validate → skill validate (project — shadows your user skill"),
                 "a root a human durably acknowledged must run its skills with \
                  nobody at the terminal — that is what D-13 bought; output:\n{stdout}"
+            );
+            // **BR-10/AC-8, and the assertion with the bite** (REQ-591 D-6).
+            // This leg is the one where the client's line and the session's
+            // outcome disagree: the client answered `NoTerminal`, the daemon
+            // rewrote it to `Allowed` from the row, and the skill echoes two
+            // lines below. A client that claimed a refusal here would be
+            // contradicted by its own transcript — which is what AC-8 is about,
+            // and what the shared assertion above cannot see because "could not
+            // be asked" is true of both legs.
+            assert!(
+                !stdout.contains("was refused without asking"),
+                "the client claimed an outcome it cannot know: the row made this \
+                 turn go ahead, and the line above says it was refused; \
+                 output:\n{stdout}"
             );
             assert!(
                 !stdout.contains("has not acknowledged"),
@@ -7137,7 +7151,7 @@ stderr:
         // there is nobody here to ask. So whatever happens next is the *row*'s
         // doing.
         assert!(
-            stdout.contains("was refused without asking"),
+            stdout.contains("could not be asked here"),
             "listed={listed}: the client must report that it could not ask; \
              output:\n{stdout}"
         );
@@ -7155,6 +7169,17 @@ stderr:
             "listed={listed}: and the refusal and the run are exclusive — a \
              build that did both would be BR-10's defect; output:\n{stdout}"
         );
+        if expect_run {
+            // REQ-591 D-6, as in
+            // [`an_unattended_session_at_an_unlisted_root_refuses_and_names_the_row`]:
+            // on the leg the row rescues, the client must not have claimed a
+            // refusal it does not get to observe.
+            assert!(
+                !stdout.contains("was refused without asking"),
+                "listed={listed}: the client claimed an outcome the daemon then \
+                 reversed; output:\n{stdout}"
+            );
+        }
     }
 }
 
@@ -7492,7 +7517,7 @@ fn on_a_pipe_at_guarded_a_model_issued_project_skill_is_refused_without_eating_t
         "the refusal must still show what it refused; output:\n{stdout}"
     );
     assert!(
-        stdout.contains("was refused without asking: this session's input is not a terminal"),
+        stdout.contains("could not be asked here: this session's input is not a terminal"),
         "BR-11's refusal line is missing; output:\n{stdout}"
     );
     assert!(

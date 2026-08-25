@@ -3651,6 +3651,28 @@ fn invoker_clause(invoked_by: events::InvokedBy, voice: InvokerVoice) -> &'stati
 /// name, which this client cannot derive from the subject's and would therefore
 /// have to guess at. The daemon's own refusal, which arrives right behind this
 /// line when the turn does refuse, prints it exactly.
+///
+/// # And it is the one arm that does not claim an outcome (REQ-591 BR-10/AC-8)
+///
+/// The other three open "was refused without asking", which is a statement about
+/// what *happened*. This client is not in a position to make that statement
+/// here: it answers `NoTerminal`, and for the acknowledgment the daemon may then
+/// rewrite the settlement to `Allowed` from `[skills] trusted_project_roots`
+/// (`PermissionGate::acknowledged_unattended`). A line claiming a refusal is
+/// contradicted two lines later by the skill's own echo — the client telling the
+/// user one thing while the session does another.
+///
+/// So this arm states what the client **did**: the question could not be asked
+/// here. That is true whichever way the daemon settles it, and it is why the
+/// remedy clause below is worded as a condition ("the turn goes ahead where it
+/// already names this repository") rather than as a fix for a refusal.
+///
+/// The other three arms keep "was refused without asking", and keep it
+/// correctly: `acknowledged_unattended` is the only rewrite of a
+/// `Refused(NoTerminal)` anywhere in the daemon and it is reached only from
+/// `authorize_project_skill_trust`, so the over-budget question, an ordinary
+/// tool and an unrecognized subject are all genuinely settled by the time this
+/// line is composed.
 /// # The over-budget offer gets a different remedy, because the usual one is
 /// false for it
 ///
@@ -3699,8 +3721,8 @@ fn refusal_line(req: &PermissionRequest, reason: RefusalReason) -> String {
     };
     match reason {
         RefusalReason::NoTerminal if project_trust => format!(
-            "{subject} was refused without asking: this session's input is not a terminal, so \
-             nobody could be asked — send `/permissions full` ahead of it, or set \
+            "{subject} could not be asked here: this session's input is not a terminal, so \
+             nobody could answer — send `/permissions full` ahead of it, or set \
              `[permissions] default_level`, to allow it unattended. That does not cover a \
              repository whose skill shadows one of your own; `[skills] trusted_project_roots` \
              does, and the turn goes ahead where it already names this repository — acknowledge \
