@@ -1,7 +1,7 @@
 ---
 id: TASK-282
 title: "The daemon's output-format clause, measured against both prompt budgets"
-status: draft
+status: complete
 parent: REQ-592
 created: 2026-08-26
 updated: 2026-08-26
@@ -25,16 +25,17 @@ re-measured against **both** resident-prompt ceilings. Covers BR-1 and BR-2.
 
 ## Acceptance Criteria
 
-- [ ] AC-1: `build_system_prompt` output contains the clause, and contains it **exactly once** —
+- [x] AC-1: `build_system_prompt` output contains the clause, and contains it **exactly once** —
       filter for its anchor phrase, assert the count is 1, with a message saying a second sentence
       about output format is a decision rather than an accident. Mutation-checked: remove the
       `push_str` and the test fails.
-- [ ] AC-2: `the_total_cap_clears_the_harness_context_budget_with_margin` (redact.rs:2276) is green.
-- [ ] `min_budget_bytes_holds_the_harnesss_own_system_prompt` (budget.rs:4016) is green — the
+- [x] AC-2: `the_total_cap_clears_the_harness_context_budget_with_margin` (redact.rs:2276) is green.
+- [x] `min_budget_bytes_holds_the_harnesss_own_system_prompt` (budget.rs:4016) is green — the
       **second** ceiling, which the spec's BR-2 did not name.
-- [ ] `a_harness_authored_system_prompt_is_byte_identical` (harness/render.rs:825) is green — so
+- [x] `a_harness_authored_system_prompt_is_byte_identical` (harness/render.rs:825) is green — so
       the clause carries no flush-left `User:` or `Assistant:` label.
-- [ ] If either constant moved: the PR shows the re-stated chunk count and scannable bound
+- [x] If either constant moved: (n/a — neither moved; redact margin 476 -> 129, default prompt 6,411 -> 6,758)
+- [ ] ~~If either constant moved:~~ the PR shows the re-stated chunk count and scannable bound
       (`the_overhead_raise_restates_the_chunk_count_and_the_scannable_bound`), and the new margin is
       recorded in the constant's doc-comment ledger beside the REQ-577/BUG-181/REQ-587 entries.
 
