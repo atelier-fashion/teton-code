@@ -3,14 +3,15 @@
   "branch": "feat/REQ-590-engine-derived-local-context-budget",
   "startedAt": "2026-08-25T00:00:00Z",
   "completed": false,
-  "currentPhase": 6,
+  "currentPhase": 7,
   "completedPhases": [
     0,
     1,
     2,
     3,
     4,
-    5
+    5,
+    6
   ],
   "integrationBranch": "main",
   "phaseHistory": [
@@ -56,6 +57,13 @@
       "panel": "adversary, correctness-reviewer, test-auditor, reflector",
       "result": "69 targets / 3,896 passed / 0 failed; 7/7 mutations caught; 0 new vacuity",
       "headline": "The derivation held under attack; every Critical and Major any agent raised was a SENTENCE, not a line of logic. The sharpest finding was against the ORCHESTRATOR's own reasoning: the 31,014-byte figure used to justify reversing D-4 was never measured \u2014 REQ-589's record is a rendered '31 KB', an interval [30,500, 31,499] that straddles D-4's 30,720. The reversal stands on the crossover and on BR-7's strict non-regression, neither of which needs a measurement."
+    },
+    {
+      "phase": 6,
+      "name": "Create PR",
+      "completedAt": "2026-08-26T00:00:00Z",
+      "pr": "https://github.com/atelier-fashion/teton-code/pull/216",
+      "note": "draft flipped to ready; footprint block preserved"
     }
   ],
   "repos": {
