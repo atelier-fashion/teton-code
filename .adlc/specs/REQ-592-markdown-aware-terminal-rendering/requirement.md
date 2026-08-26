@@ -311,7 +311,11 @@ an AC that covers no rule, or a rule no AC names, is a finding against this list
       blindfold with the gate on the other side.
 - [ ] **AC-9** *(BR-8, interleave)*: A `Notice`/`Tool` line arriving mid-stream emits after the
       pending buffer, not through it: the streamed sentence is complete on its own rows and the
-      notice starts clean. Asserted on a `RecordingSurface` as an ordered `(kind, text)` sequence.
+      notice starts clean. Asserted on a `RecordingSurface` as an ordered `(kind, text)` sequence
+      — **and, because a recorder has no buffer and so preserves call order trivially, that leg is
+      near-vacuous. The substantive assertion is the byte-level one on `PlainSurface`,** which is
+      where the pending buffer actually exists. Noted 2026-08-26 rather than left to look like
+      coverage it is not.
 - [ ] **AC-10** *(BR-8, tail flush)*: **No line may fall off the end of a turn.** A turn whose
       final chunk carries no trailing newline still has its last line on screen before the session
       returns to the entry prompt. Asserted on both legs, because neither alone is sufficient:
@@ -341,6 +345,14 @@ an AC that covers no rule, or a rule no AC names, is a finding against this list
       with no panic, no dropped characters, and no partial styling. This is the mitigation OQ-2's
       hand-rolled decision rests on, so it is asserted rather than assumed: an unrecognized
       construct that mangles or swallows content would make the decision wrong.
+
+      **"No dropped characters" means no lost content, not preserved markers** (clarified
+      2026-08-26). A `|` inside a code span inside a table cell falls through to prose as promised
+      — and as prose, its code span is an ordinary code span, so the backticks are consumed exactly
+      as `**bold**`'s asterisks are. Reading the phrase literally would forbid inline styling
+      everywhere. The implemented assertions say what actually matters for that construct: every
+      pipe survives, no rule is drawn, no column padding is applied, and the span is styled whole
+      rather than split at the pipe.
 
       **One carve-out, recorded during implementation (2026-08-26): the `-----` setext underline.**
       A line of three or more dashes is *already* a thematic break in the recognized-construct
