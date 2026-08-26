@@ -1,10 +1,10 @@
 ---
 id: REQ-590
 title: "Derive the local tier's context budget from the engine's real window"
-status: approved
+status: complete
 deployable: true
 created: 2026-08-24
-updated: 2026-08-25
+updated: 2026-08-26
 component: "daemon/router"
 domain: "routing"
 stack: ["rust", "daemon", "llama.cpp"]
@@ -546,3 +546,45 @@ their doc comments), `egress/redact.rs:118-175` (the worked derivation and LESSO
 same failure family), LESSON-456 (one home per fact — why BR-5 keeps the constants),
 LESSON-447 (fallbacks must preserve the guarded invariant — bears on D-1's fallback option).
 Field report: REQ-589's motivating refusal.
+
+## Verification record (added at wrapup, 2026-08-26)
+
+Merged as PR #216, `8ecffba`. 69 targets, 3,896 passed, 0 failed; `cargo audit`, clippy and
+`fmt --check` all clean; CI 7/7.
+
+**The BR/AC checkboxes above are deliberately left as they are.** Ticking them retroactively
+would assert per-rule verification that was not performed per-rule. What was established:
+
+A four-agent panel (adversary, correctness, test-audit, reflection) attacked the merged state.
+**The derivation held** — `derive`, `window_pair`, the floor split, the closed recursion, digest
+scaling and the compaction chain each survived a deliberate attempt to break them. 7 of 7
+mutation spot-checks reddened; no new vacuity was found; 14 of 16 ACs are witnessed by a test,
+with AC-7 honestly void and AC-10/AC-14 honestly recorded as measurements rather than dressed as
+tests.
+
+**Every Critical and Major the panel raised was a sentence, not a line of logic** — see
+LESSON-567.
+
+**AC-10(b) is unticked and failed.** A full-budget local turn takes 12,885 ms to its first token
+against the REQ-544 BR-8 duty's 1,000 ms bound. That duty is a short-prompt model-selection gate
+run once after download; it never covered full-budget turns, and today's 4,096-word budget was
+already 3.1× over it. Recorded rather than reworded — see LESSON-560.
+
+**AC-14's runbook is written and OUTSTANDING.** A runbook is discharged by a person.
+
+### Open, and not closed by this REQ
+
+- **OQ-2's hazard runs the opposite direction from its own text**, corrected here but still open:
+  at a reduced `LOCAL_ENGINE_N_CTX` the local byte half stays 32,768 regardless, so a 4,096-token
+  engine would claim 16,384 tokens against 3,072 usable — a **5.3×** overclaim with no floor,
+  because BR-8 only guards against *raising* a derived pair.
+- `ContextManager::new`'s doc was false for ~20 call sites. Two were corrected; the rest have a
+  correct doc and still run at a byte guard 2.5× looser than the config's.
+- `SKILL_MAX_BYTES` (64 KiB) did not rise with the word budget. Above ~5.1 B/word a 10,240-word
+  skill no longer fits in a `SKILL.md`, and it fails as *"no skill you can dispatch"* — a message
+  about discovery, for a cause that is a budget.
+- At the byte boundary the over-budget offer quotes two identical KB figures, so a user cannot
+  tell which currency refused them. `bytes_figure` rounds to the nearest KB.
+- Two owner questions were asked and unanswered, and the pipeline proceeded on its own
+  recommendations: whether to keep the full window given prefill measured 4.35× rather than the
+  predicted 2.5×, and how to record AC-10(b). Both remain reversible.
