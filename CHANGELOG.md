@@ -88,6 +88,13 @@ user having asked for it.
   silently truncated. Measured, recorded, and not fixed here: a real bound needs
   a tokenizer, not a byte proxy.
 
+- A client from **0.1.24 or earlier talking to a 0.1.25 daemon** does not render
+  the three new over-budget event lines — `Event` is a closed enum, so a frame
+  naming a variant the client has never heard of is dropped whole. The offer
+  itself is a permission request, not an event, so such a client is still asked
+  and still answers; it loses the transcript lines only. Upgrading both halves —
+  which `brew upgrade` does — avoids it.
+
 ## [0.1.24] - 2026-08-23
 
 ### Added
