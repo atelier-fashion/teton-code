@@ -1,7 +1,7 @@
 ---
 id: TASK-271
 title: "COMPACT_OUTPUT_MAX_BYTES follows the budget it repairs to"
-status: draft
+status: complete
 parent: REQ-590
 created: 2026-08-25
 updated: 2026-08-25
@@ -27,14 +27,14 @@ deterministic oldest-first eviction — on the route that most needed the model'
 
 ## Acceptance Criteria
 
-- [ ] AC-8: `COMPACT_OUTPUT_MAX_BYTES ≤` the local byte budget, asserted **as a relation between
+- [x] AC-8: `COMPACT_OUTPUT_MAX_BYTES ≤` the local byte budget, asserted **as a relation between
       the two**, not as two literals that happen to agree. LESSON-491: derive each number from
       its neighbour
-- [ ] A test drives a compaction whose candidate lands in what *was* the gap (30,721–32,768) and
+- [x] A test drives a compaction whose candidate lands in what *was* the gap (30,721–32,768) and
       shows it is accepted, not degraded. Mutation: pin the ceiling back at `LOCAL_BUDGET_BYTES`;
       this must redden
-- [ ] `COMPACT_DUTY`'s `max_tokens` still derives from the ceiling, and the relation survives
-- [ ] Existing compact tests green
+- [x] `COMPACT_DUTY`'s `max_tokens` still derives from the ceiling, and the relation survives
+- [x] Existing compact tests green
 
 ## Technical Notes
 
